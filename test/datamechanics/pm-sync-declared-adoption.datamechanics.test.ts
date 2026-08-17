@@ -29,6 +29,7 @@ const issue = (over: Record<string, unknown> = {}) => ({
 
 function linearMock(opts: { issues?: unknown[] } = {}) {
   const mutations: string[] = [];
+  const descriptions: string[] = [];
   const states = [
     { id: "ls-todo", name: "Todo", type: "unstarted" },
     { id: "ls-started", name: "In Progress", type: "started" },
@@ -50,11 +51,13 @@ function linearMock(opts: { issues?: unknown[] } = {}) {
     }
     if (query.includes("issueUpdate")) {
       mutations.push("issueUpdate");
+      const desc = (variables?.input as { description?: string } | undefined)?.description;
+      if (typeof desc === "string") descriptions.push(desc);
       return Response.json({ data: { issueUpdate: { success: true, issue: { id: variables.id, identifier: "AIO-877", url: "https://linear.app/AIO-877" } } } });
     }
     return Response.json({ data: {} });
   }) as unknown as typeof fetch;
-  return { fetchImpl, mutations };
+  return { fetchImpl, mutations, descriptions };
 }
 
 async function seedLinearPrimary(seed: Seed) {
@@ -122,6 +125,35 @@ describe("ADOPTDECL-1 — a declaration survives ingest and adopts (real Postgre
     const second = linearMock({ issues: [issue({ title: "Ship the thing", description: "" })] });
     await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "D1"), { fetchImpl: second.fetchImpl });
     expect(second.mutations, "a settled row must not be re-written every run").toEqual([]);
+  });
+
+  it("THE ERASURE BOTH REVIEWERS TRACED: a post-adoption status push must not wipe the write-up", async () => {
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+    await pushTasks(seed, "e1", [
+      { row_key: "E1", title: "Ship it", status: "in_progress", pm_provider: "linear", pm_external_id: "AIO-877" },
+    ]);
+
+    // Push 1 — adopt. The issue's own write-up is sent, and MUST be persisted into the brain.
+    const first = linearMock({ issues: [issue()] });
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "E1"), { fetchImpl: first.fetchImpl });
+
+    const { data: seeded } = await db().from("tasks").select("body").eq("team_id", seed.teamId).eq("row_key", "E1").single();
+    expect(
+      (seeded as { body: string }).body,
+      "if the seed is not persisted the brain still holds '' and push 2 erases the issue"
+    ).toContain("A real write-up nobody wants deleted.");
+
+    // Push 2 — an ordinary status flip, the repo's own close gate. It resolves by resource id and
+    // takes the NON-adoption path, so whatever the brain holds is what Linear gets.
+    await pushTasks(seed, "e2", [
+      { row_key: "E1", title: "Ship it", status: "done", pm_provider: "linear", pm_external_id: "AIO-877" },
+    ]);
+    const second = linearMock({ issues: [issue({ description: "A real write-up nobody wants deleted.\n\naios-ext: E1 · source: aios-backlog" })] });
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "E1"), { fetchImpl: second.fetchImpl });
+
+    const sent = second.descriptions.at(-1) ?? "";
+    expect(sent, "the write-up must survive the status push").toContain("A real write-up nobody wants deleted.");
   });
 
   it("an unresolvable declared key records the error and claims NO resource id", async () => {

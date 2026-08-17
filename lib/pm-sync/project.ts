@@ -287,6 +287,26 @@ export async function projectTask(
   }
 
   try {
+    /**
+     * ADOPTDECL-1 — resource ids already claimed by OTHER rows in this team, so the adapter can refuse
+     * to adopt an issue that is already someone's. A footer-only check misses an issue owned by a link
+     * but carrying no footer, which is the shape prod actually holds (three TT1 links, one issue).
+     * Read only when this row could actually adopt, so ordinary pushes pay nothing.
+     */
+    let ownedResourceIds: ReadonlySet<string> | undefined;
+    if ((link.declared_external_id ?? "").trim() && !link.provider_resource_id) {
+      const { data: owners } = await db
+        .from("task_pm_links")
+        .select("provider_resource_id, row_key")
+        .eq("team_id", row.team_id)
+        .eq("provider", provider)
+        .not("provider_resource_id", "is", null);
+      ownedResourceIds = new Set(
+        ((owners ?? []) as { provider_resource_id: string | null; row_key: string }[])
+          .filter((o) => o.provider_resource_id && o.row_key !== row.row_key)
+          .map((o) => o.provider_resource_id as string)
+      );
+    }
     const result = await adapter.upsertWorkItem({
       task,
       link,
@@ -295,8 +315,27 @@ export async function projectTask(
       statusOnly: opts.statusOnly,
       bootstrap: opts.bootstrap,
       fetchImpl: opts.fetchImpl,
+      ownedResourceIds,
     });
-    await persistSuccess(db, link, result, fingerprint, row.status);
+    /**
+     * ADOPTDECL-1 — an adoption that SEEDED the brain from the provider's description must persist that
+     * body, and the fingerprint must be computed over it.
+     *
+     * Without this the seed is one push deep: the brain still holds `''`, the stored fingerprint
+     * describes a projection of `''` that never happened, and the next ordinary push (a status flip —
+     * this repo's own close gate) resolves by resource id, takes the non-adoption path, and sends
+     * `withFooter('')`, erasing the human's write-up. `lib/pm-sync/inbound.ts` persists its seed the
+     * same way for exactly this reason.
+     */
+    let effectiveFingerprint = fingerprint;
+    if (result.seededBody != null) {
+      await db.from("tasks").update({ body: result.seededBody, updated_at: new Date().toISOString() }).eq("id", row.id);
+      effectiveFingerprint = projectionFingerprint(
+        toProjectable({ ...row, body: result.seededBody }, parentResourceId),
+        parentResourceId
+      );
+    }
+    await persistSuccess(db, link, result, effectiveFingerprint, row.status);
     opts.resolved?.set(row.row_key, result.providerResourceId);
     return { row_key: row.row_key, provider, status: result.status, providerResourceId: result.providerResourceId };
   } catch (e) {

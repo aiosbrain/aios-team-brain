@@ -277,7 +277,7 @@ export const linearAdapter: PmAdapter = {
     return seen;
   },
 
-  async upsertWorkItem({ task, link, integration, desiredFingerprint, statusOnly, bootstrap, fetchImpl }: UpsertWorkItemInput): Promise<UpsertWorkItemResult> {
+  async upsertWorkItem({ task, link, integration, desiredFingerprint, statusOnly, bootstrap, fetchImpl, ownedResourceIds }: UpsertWorkItemInput): Promise<UpsertWorkItemResult> {
     const ctx = linearCtx({ integration, link, fetchImpl });
     const desired = desiredStateForStatus(task.status);
 
@@ -352,13 +352,19 @@ export const linearAdapter: PmAdapter = {
             : `Linear issue ${declared} declared on ${task.row_key} was not found in this team`
         );
       }
-      // Refuse to take an issue that already belongs to someone. Ownership by ANY means, not just by
-      // another declaration: the loop that actually happens in prod is "row A created it, a human then
-      // declares it on row B" — three TT1 links across three projects share one issue today.
+      // Refuse to take an issue that already belongs to someone — by EITHER means. A footer-only check
+      // misses the shape that actually happens in prod: three TT1 links across three projects share
+      // Linear issue AIO-444, and that issue carries NO footer. `ownedResourceIds` comes from the
+      // caller, the only layer that can see other rows' links.
       const ownerExt = parseExt(candidate.description);
       if (ownerExt && ownerExt !== task.row_key) {
         throw new PmSyncError(
           `Linear issue ${declared} declared on ${task.row_key} already belongs to ${ownerExt} — refusing to give one issue two writers`
+        );
+      }
+      if (ownedResourceIds?.has(candidate.id)) {
+        throw new PmSyncError(
+          `Linear issue ${declared} declared on ${task.row_key} is already linked to another task row — refusing to give one issue two writers`
         );
       }
       adopted = candidate;
@@ -398,7 +404,13 @@ export const linearAdapter: PmAdapter = {
           { payload: "issueUpdate", entity: "issue" }
         );
         issue = { ...issue, ...data.issueUpdate.issue, state: { id: state.id }, priority, labels: { nodes: labelIds.map((id) => ({ id, name: "" })) }, parent: parent ? { id: parent } : null, assignee: assigneeId !== undefined ? { id: assigneeId } : issue.assignee, title: task.title, description };
+        // ALL THREE indexes, not just the first. Refreshing only `issuesById` left `issuesByExt` and
+        // `issuesByIdentifier` holding the PRE-update object, so a second row in the same batch
+        // declaring the same key read a description with no footer and adopted the issue too —
+        // deterministically, no race required.
         boot.issuesById.set(issue.id, issue);
+        if (issue.identifier) boot.issuesByIdentifier.set(issue.identifier, issue);
+        boot.issuesByExt.set(task.row_key, issue);
         mutated = true;
       }
     } else {
@@ -422,6 +434,9 @@ export const linearAdapter: PmAdapter = {
       // An adoption reports as an adoption even when no mutation was needed: the row DID change hands,
       // and burying that under `synced`/`skipped` is how the duplicate damage stayed invisible.
       status: adopted ? "adopted" : mutated ? "synced" : "skipped",
+      // The caller persists this into `tasks.body` and fingerprints over it — see
+      // `ProviderSyncResult.seededBody`. Without that the seed evaporates on the next push.
+      seededBody: adopted && adoptionBody !== task.body ? adoptionBody : null,
       providerResourceId: issue.id,
       providerUrl: issue.url || link?.provider_url || "",
       parentResourceId: parent,

@@ -41,6 +41,11 @@ export function projectionToSyncReport(report: ProjectionReport): TaskPmSyncRepo
 
 function mapStatus(status: ProjectionReport["status"]): TaskPmSyncReport["status"] {
   switch (status) {
+    // ADOPTDECL-1 — an adoption IS a successful provider write. Falling through to `default` reported
+    // it as `failed` on the work-events surface (a merge that adopts would say the PM sync failed),
+    // which is the FIFTH consumer of this status; the slice originally claimed four.
+    case "adopted":
+      return "synced";
     case "synced":
     case "skipped":
     case "failed":

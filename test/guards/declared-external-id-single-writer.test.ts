@@ -52,6 +52,9 @@ const writesColumn = (src: string): boolean => {
   if (/declared_external_id\s*:/.test(src)) return true;
   const rawInsert = /insert\s+into\s+task_pm_links[\s\S]{0,400}?\)/gi;
   for (const m of src.match(rawInsert) ?? []) if (m.includes("declared_external_id")) return true;
+  // A raw `update task_pm_links set …` is the style `inbound.ts` already uses on this table, so a
+  // future write in that shape would have slipped past the two forms above (found in review).
+  if (/update\s+task_pm_links[\s\S]{0,400}?set[\s\S]{0,400}?declared_external_id/i.test(src)) return true;
   return false;
 };
 

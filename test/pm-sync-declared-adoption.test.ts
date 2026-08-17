@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { linearAdapter } from "@/lib/pm-sync/linear";
 import { projectionFingerprint, type ProjectableTask, type TaskPmLink } from "@/lib/pm-sync/provider";
 import { summarizeProjectionReports } from "@/lib/pm-sync/runs";
+import { projectionToSyncReport } from "@/lib/pm-sync";
 import type { IntegrationWithSecret } from "@/lib/integrations/manage";
 
 /**
@@ -224,6 +225,76 @@ describe("ADOPTDECL-1 — a declared issue is adopted, not duplicated", () => {
     expect(summary.synced, "an adoption wrote to the provider").toBe(1);
     expect(summary.unchanged).toBe(1);
     expect(summary.meta).toMatchObject({ adopted: 1 });
+  });
+
+  it("SEEDS ARE RETURNED so the caller can persist them — otherwise the seed is one push deep", async () => {
+    // Both reviewers traced the same erasure: push 1 adopts and sends the write-up, but the brain body
+    // stays "" and the fingerprint describes a projection of "" that never happened. Push 2 (a status
+    // flip — this repo's own close gate) resolves by resource id, takes the NON-adoption path, and
+    // sends withFooter("") — erasing the prose. The adapter must hand the seed back.
+    const { fetchImpl } = linearMock({ issues: [issue()] });
+    const result = await run(projectable({ body: "" }), { ...baseLink, declared_external_id: "AIO-877" }, fetchImpl);
+    expect(result.seededBody, "nothing to persist means the seed evaporates next push").toContain(
+      "Paragraph one of a real write-up."
+    );
+  });
+
+  it("…and does NOT claim a seed when the brain already had a body", async () => {
+    const { fetchImpl } = linearMock({ issues: [issue()] });
+    const result = await run(
+      projectable({ body: "The brain has an opinion." }),
+      { ...baseLink, declared_external_id: "AIO-877" },
+      fetchImpl
+    );
+    expect(result.seededBody, "persisting here would overwrite the brain with its own body").toBeNull();
+  });
+
+  it("refuses an issue owned by another row's LINK, even with no footer on it", async () => {
+    // The footer-only check missed exactly the shape prod holds: three TT1 links across three projects
+    // share Linear issue AIO-444, and that issue carries no footer at all.
+    const { fetchImpl } = linearMock({ issues: [issue({ description: "no footer here" })] });
+    await expect(
+      linearAdapter.upsertWorkItem({
+        task: projectable(),
+        link: { ...baseLink, declared_external_id: "AIO-877" },
+        integration,
+        desiredFingerprint: "fp",
+        fetchImpl,
+        ownedResourceIds: new Set(["issue-877"]),
+      })
+    ).rejects.toThrow(/already linked to another task row/);
+  });
+
+  it("SAME-BATCH: after one row adopts, the identifier index no longer offers that issue unowned", async () => {
+    // The update branch used to refresh only `issuesById`, so a second row in the same batch read the
+    // PRE-update description (no footer) and adopted the same issue. Deterministic, no race.
+    const shared = issue();
+    const { fetchImpl } = linearMock({ issues: [shared] });
+    const bootstrap = await linearAdapter.prepare?.({ integration, fetchImpl });
+    await linearAdapter.upsertWorkItem({
+      task: projectable({ row_key: "TT39" }),
+      link: { ...baseLink, row_key: "TT39", declared_external_id: "AIO-877" },
+      integration,
+      desiredFingerprint: "fp",
+      fetchImpl,
+      bootstrap,
+    });
+    await expect(
+      linearAdapter.upsertWorkItem({
+        task: projectable({ row_key: "TT40" }),
+        link: { ...baseLink, row_key: "TT40", declared_external_id: "AIO-877" },
+        integration,
+        desiredFingerprint: "fp",
+        fetchImpl,
+        bootstrap,
+      })
+    ).rejects.toThrow(/already belongs to TT39/);
+  });
+
+  it("the work-events surface maps an adoption to SUCCESS, not failure", () => {
+    // The FIFTH consumer. `mapStatus` had no `adopted` case, so it fell to `default: "failed"` — a
+    // merge that adopted would have reported the PM sync as failed with no error.
+    expect(projectionToSyncReport({ row_key: "TT39", provider: "linear", status: "adopted" }).status).toBe("synced");
   });
 
   it("the THROTTLE is paid for an adoption — a bulk adopt must not hammer the API", () => {

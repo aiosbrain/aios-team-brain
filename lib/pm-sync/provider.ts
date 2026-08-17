@@ -38,6 +38,12 @@ export interface TaskPmLink {
 export interface ProviderSyncResult {
   provider: PmProvider;
   status: "synced" | "adopted" | "skipped";
+  /**
+   * ADOPTDECL-1 — set ONLY on an adoption that seeded the brain from the provider's own description.
+   * The caller MUST persist it to `tasks.body` and fingerprint over it: without that the brain still
+   * holds an empty body, and the next ordinary push sends `withFooter("")` and erases the write-up.
+   */
+  seededBody?: string | null;
   providerResourceId?: string | null;
   providerUrl?: string;
   syncedStatus?: string;
@@ -80,6 +86,12 @@ export interface UpsertWorkItemInput {
   statusOnly?: boolean;
   // Optional per-run prefetch (states/labels/items) shared across a projectAllTasks batch.
   bootstrap?: unknown;
+  /**
+   * ADOPTDECL-1 — provider resource ids already claimed by OTHER task rows in this team.
+   * Only the orchestrator can see other rows' links, so the adapter cannot compute this itself; a
+   * footer-only ownership check misses an issue owned by a link but carrying no footer.
+   */
+  ownedResourceIds?: ReadonlySet<string>;
   fetchImpl?: typeof fetch;
 }
 

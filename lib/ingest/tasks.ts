@@ -240,7 +240,11 @@ export async function materializeTasks(
         .update({ declared_external_id: null, updated_at: syncedAt })
         .eq("team_id", teamId)
         .eq("project_id", projectId)
-        .eq("row_key", row.row_key);
+        .eq("row_key", row.row_key)
+        // Only rows that actually carry a declaration. Without this the clear fires for EVERY
+        // undeclared row on EVERY push — one round-trip each, and `updated_at` stops meaning "last
+        // change" and starts meaning "last file push", which the admin panel sorts by.
+        .not("declared_external_id", "is", null);
       if (clearError) throw new Error(`task PM link clear ${row.row_key}: ${clearError.message}`);
     }
   }
