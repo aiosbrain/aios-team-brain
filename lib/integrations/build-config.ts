@@ -78,7 +78,12 @@ export function buildConfig(
       // Keys are dropped when absent rather than set to `undefined` — `config` is stored as jsonb
       // and a re-save must not add null-ish keys the `.strict()` allowlist then has to tolerate.
       const out: Record<string, unknown> = {};
+      // A lone bare token is the workspace id — the hint shows `workspaceId=…`, but an admin who
+      // types just `9001` would otherwise have it silently dropped and save an empty config with no
+      // complaint. linear/plane already fall back this way for `projectId`; matching that.
+      const bare = list.filter((entry) => !entry.includes("="));
       if (kv.workspaceId) out.workspaceId = kv.workspaceId;
+      else if (bare.length === 1) out.workspaceId = bare[0];
       out.listIds = kv.listIds ? subList(kv.listIds) : [];
       if (kv.docIds) out.docIds = subList(kv.docIds);
       if (kv.docParentType) out.docParentType = kv.docParentType.toUpperCase();

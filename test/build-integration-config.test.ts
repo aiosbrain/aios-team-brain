@@ -81,6 +81,17 @@ describe("clickup — the pk_ token is the secret, the selection is workspace + 
     expect(buildConfig("clickup", "")).toEqual({ listIds: [] });
   });
 
+  it("reads a lone bare token as the workspace id rather than silently dropping it", () => {
+    // The hint says `workspaceId=…`, but an admin who types just the id would otherwise save an
+    // empty config with no complaint — the one failure here that is silent rather than a visible
+    // 400. linear/plane already fall back this way for `projectId`.
+    expect(buildConfig("clickup", "9001")).toEqual({ workspaceId: "9001", listIds: [] });
+    // An explicit key always wins over the fallback.
+    expect(buildConfig("clickup", "9001, workspaceId=7777")).toEqual({ workspaceId: "7777", listIds: [] });
+    // Ambiguous (two bare tokens) stays dropped — guessing which is the workspace would be worse.
+    expect(buildConfig("clickup", "9001, 9002")).toEqual({ listIds: [] });
+  });
+
   it("produces config the downstream validator accepts (round-trip)", () => {
     const cfg = buildConfig("clickup", "workspaceId=9001, listIds=101, docParentType=space, docParentId=s1");
     expect(validateIntegrationConfig("clickup", cfg)).toEqual({
