@@ -82,14 +82,21 @@ describe("TEAM_SLUG — a typo must not become a failed deployment", () => {
   });
 
   it("produces something lib/admin/teams.ts will accept, for every input it accepts at all", () => {
-    // The point of normalising is to never reach `createTeam`'s throw. Pin it against the REAL
-    // regex read out of that module, so a tightening there fails here instead of in a client's
-    // deploy log.
-    const teams = readFileSync(join(import.meta.dirname, "..", "lib", "admin", "teams.ts"), "utf8");
-    const source = /const SLUG_RE = \/(.+?)\/;/.exec(teams);
-    expect(source, "SLUG_RE not found in lib/admin/teams.ts").toBeTruthy();
-    const slugRe = new RegExp(source![1]);
+    // The point of normalising is to never reach `createTeam`'s throw, so the rule this asserts
+    // against has to be the rule createTeam actually applies. Pinned three ways rather than by
+    // compiling the file's text into a live RegExp (a dynamic RegExp from file contents is a
+    // ReDoS shape, and CI is right to flag it): the literal below, the literal in the normaliser,
+    // and the literal in teams.ts must all read identically — so tightening any one of them fails
+    // here instead of in a client's deploy log.
+    const readSlugRe = (rel: string[]) => {
+      const src = readFileSync(join(import.meta.dirname, "..", ...rel), "utf8");
+      return /const SLUG_RE = (\/.+?\/);/.exec(src)?.[1];
+    };
+    const pinned = "/^[a-z0-9][a-z0-9-]*$/";
+    expect(readSlugRe(["lib", "admin", "teams.ts"]), "SLUG_RE not found in lib/admin/teams.ts").toBe(pinned);
+    expect(readSlugRe(["scripts", "setup", "deploy-policy.mjs"])).toBe(pinned);
 
+    const slugRe = /^[a-z0-9][a-z0-9-]*$/; // === pinned, asserted above
     for (const input of ["Acme Corp", "ACME", "acme corp inc", "Café Ltd", "  spaced  ", "a", "9lives", "-x-"]) {
       const { slug } = normalizeTeamSlug(input);
       expect(slug, `no slug for ${input}`).toBeTruthy();
