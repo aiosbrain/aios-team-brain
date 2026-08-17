@@ -3,6 +3,7 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } from "./project";
+import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
 import { reconcileProjectedEpisodes } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
@@ -50,6 +51,13 @@ export interface GraphProjectionSummary {
    * this run. Non-zero means self-healing has quietly stopped for those groups — surfaced rather than
    * swallowed, per the no-silent-caps rule (raise `GRAPH_LANDED_SCAN_DEPTH`). */
   saturatedGroups: number;
+  /** RECONCILE-1 measurement — items with some chunks present and some missing. Counted, not acted on. */
+  partialItems: number;
+  /** The BOUNDED missing-name sample, carried through to `ingest_runs.meta`. Without it the count
+   *  alone cannot tell a real tail hole from an index-shift false positive (an edited doc re-chunks,
+   *  so an expected `#k` may never have existed) — which is the entire question the metric exists to
+   *  answer. Review found this dropped between reconcile and the durable row. */
+  partialDetail: { sample: { itemId: string; missing: string[]; missingCount: number }[]; elided: number; namesElided: number };
   /** Ledger rows a pass declined to re-queue because too many looked absent at once — the signal that
    * Graphiti is wedged rather than that N workers crashed. Non-zero for several runs in a row is an
    * incident, not noise. */
@@ -121,6 +129,8 @@ async function runGraphProjectionInner(opts?: {
     cleaned: 0,
     pendingCleanups: 0,
     saturatedGroups: 0,
+    partialItems: 0,
+    partialDetail: { sample: [], elided: 0, namesElided: 0 },
     requeueThrottled: 0,
     errors: [],
   };
@@ -175,6 +185,15 @@ async function runGraphProjectionInner(opts?: {
       summary.cleaned += r.cleaned;
       summary.pendingCleanups += r.pendingCleanups;
       summary.saturatedGroups += r.saturatedGroups;
+      summary.partialItems += r.partialItems;
+      // Merge across teams and RE-BOUND: each team's sample is already capped, but N teams would
+      // otherwise multiply the blob by N.
+      summary.partialDetail = boundPartialDetail(
+        [...summary.partialDetail.sample, ...r.partialDetail.sample],
+        PARTIAL_DETAIL_LIMIT
+      );
+      summary.partialDetail.elided += r.partialDetail.elided;
+      summary.partialDetail.namesElided += r.partialDetail.namesElided;
       summary.requeueThrottled += r.requeueThrottled;
 
       // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches

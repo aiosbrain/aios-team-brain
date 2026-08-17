@@ -54,6 +54,16 @@ export function projectionRunInput(
       // Re-queues declined because a mass disappearance reads as a wedged Graphiti (H7). Recorded so a
       // throttle that persists across runs is visible rather than inferred from logs.
       requeueThrottled: summary.requeueThrottled,
+      // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
+      // whole question is whether this is real in prod — a log line would leave the rate unknowable,
+      // which is exactly the position that made this hole invisible for so long. Counted only; no
+      // verdict changed, nothing re-queued on it (see lib/graph/landed-state.ts).
+      partialItems: summary.partialItems,
+      // The bounded missing-name sample. The COUNT alone cannot separate a real tail hole from the
+      // index-shift false positive (an edited doc re-chunks, so an expected `#k` may never have
+      // existed) — and that discrimination is the whole reason to measure before enforcing. Review
+      // caught this being dropped between reconcile and the durable row.
+      partialDetail: summary.partialDetail,
     },
     startedAt,
     finishedAt,

@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
+import { landedState, boundPartialDetail } from "./landed-state";
 import {
   GROUP_SCAN_DEPTH,
   IN_CLAUSE_BATCH,
@@ -113,6 +114,15 @@ export interface ReconcileSummary {
    * a service problem rather than N crashed workers. Non-zero means Graphiti is probably unhealthy; the
    * rows are untouched and retried next pass. */
   requeueThrottled: number;
+  /** Items with SOME chunks present and SOME missing — the partial-loss population (RECONCILE-1).
+   * MEASURED ONLY: these still count as `confirmed` and are not re-queued, exactly as before. The
+   * number exists to answer whether the hole is real in prod before anything enforces on it; see
+   * `lib/graph/landed-state.ts` for the three ways enforcing today would make the graph worse. */
+  partialItems: number;
+  /** A BOUNDED sample of those items and their missing episode names, so an operator can tell a real
+   * hole from the index-shift false positive (an edited doc re-chunks, so an expected `#k` may never
+   * have existed). `elided` is how many were dropped from the sample. */
+  partialDetail: { sample: { itemId: string; missing: string[]; missingCount: number }[]; elided: number; namesElided: number };
   /** Groups whose episode list came back FULL, so nothing in them could be judged this pass. Reported
    * rather than swallowed: it means the group has outgrown the scan window and self-healing has
    * quietly stopped for it (raise `GRAPH_LANDED_SCAN_DEPTH`). */
@@ -212,6 +222,8 @@ export async function reconcileProjectedEpisodes(
       groupsChecked: 0,
       confirmed: 0,
       reQueued: 0,
+      partialItems: 0,
+      partialDetail: { sample: [], elided: 0, namesElided: 0 },
       cleaned: 0,
       cleanedExternal: 0,
       pendingCleanups: 0,
@@ -257,6 +269,8 @@ export async function reconcileProjectedEpisodes(
   const cutoff = Date.now() - LANDED_GRACE_MS;
   let confirmed = 0;
   let reQueued = 0;
+  let partialItems = 0;
+  const partialFound: { itemId: string; missing: string[] }[] = [];
   let saturatedGroups = 0;
   let requeueThrottled = 0;
 
@@ -276,7 +290,12 @@ export async function reconcileProjectedEpisodes(
     // An item is projected as one OR MANY chunk episodes (`items:<id>` / `items:<id>#k`) — it "landed"
     // if ANY of its chunks is present. Map each item id → one of its episode uuids.
     const uuidByItemId = new Map<string, string>();
+    // RECONCILE-1 (measurement only): the full set of episode names present, so a row's chunks can be
+    // checked individually. The uuid map above stays FIRST-WINS and keeps deciding the verdict — this
+    // set is read for counting and nothing else, so this pass behaves identically to before.
+    const presentNames = new Set<string>();
     for (const e of episodes) {
+      if (e.name) presentNames.add(e.name);
       const itemId = itemIdFromEpisodeName(e.name);
       if (itemId && !uuidByItemId.has(itemId)) uuidByItemId.set(itemId, e.uuid);
     }
@@ -286,6 +305,20 @@ export async function reconcileProjectedEpisodes(
       const uuid = uuidByItemId.get(row.source_id);
       if (uuid) {
         confirmed++;
+        // COUNT the partial case; do not act on it. `chunk_shas` is the expected-chunk ledger; an
+        // empty one means never-pushed and reports "none", which is why this cannot mistake a
+        // reservation row for a hole.
+        const { state, missing } = landedState(row.source_id, row.chunk_shas?.length ?? 0, presentNames);
+        // UNDER-COUNT, named rather than left silent (review): `state === "none"` is reachable INSIDE
+        // the confirmed branch — a doc that shrinks 3 chunks → 1 has its single sha already pushed, so
+        // `items:x` is never written while legacy `items:x#0..2` still confirm the item. That is a
+        // hole-by-renaming this counter does not see. Left uncounted deliberately: it is a different
+        // class with a different repair, and inventing a number for it here would blur the one metric
+        // increment 2 is meant to be gated on.
+        if (state === "partial") {
+          partialItems++;
+          partialFound.push({ itemId: row.source_id, missing });
+        }
         if (!row.episode_uuid) {
           await db.from("graph_episodes").update({ episode_uuid: uuid }).eq("id", row.id);
         }
@@ -485,5 +518,7 @@ export async function reconcileProjectedEpisodes(
     pendingCleanups: (pendingRows ?? []).length,
     requeueThrottled,
     saturatedGroups,
+    partialItems,
+    partialDetail: boundPartialDetail(partialFound),
   };
 }
