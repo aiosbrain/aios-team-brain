@@ -4,12 +4,12 @@ import { authenticateApiKey, authenticateAgentToken, isAgentBearer } from "@/lib
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import {
-  itemPayloadSchema,
   normalizeTier,
   errorResponse,
   IngestValidationError,
   TierViolationError,
 } from "@/lib/api/schemas";
+import { MAX_PAYLOAD_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
 import { ingestItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
@@ -20,7 +20,33 @@ import {
 
 export const runtime = "nodejs";
 
+/** The per-item `body` cap. Also enforced by `commonItemFields.body` in the payload schema. */
 const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
+
+/**
+ * The whole-REQUEST transport ceiling (brain-api 1.20, AIO-923) — deliberately NOT `MAX_PAYLOAD`.
+ *
+ * A `task`/`decision` payload is `body` PLUS up to `MAX_PAYLOAD_ROWS` rows, and this gate used to be
+ * `MAX_PAYLOAD * 1.2` = 1.2 MB — so it fired at roughly 1,100 rows, long before any row bound, with a
+ * bare `413 payload_too_large / "max 1 MB"` that named no field. Since chunking client-side is not
+ * available for `task` (the sweep in `lib/ingest/tasks.ts` is PROJECT-wide, so chunk 2 deletes chunk
+ * 1 — the other row kinds sweep per-item and could be split), a whole workspace has to fit in ONE
+ * request or fail with a reason. 1 MB body + 5,000 rows × ~700 B, +20% JSON framing slack =
+ * **5,400,000 B (5.4 MB)**, a 4.5× raise.
+ *
+ * NOT a guarantee that 5,000 rows always fit: 700 B is the measured ClickUp average, and 5,000 rows
+ * of schema-legal maximums (2,000-char titles, 50 × 80-char labels) exceed this and still 413. That
+ * failure is now at least diagnosable — the message names both bounds — but the two limits are
+ * independent, and neither implies the other.
+ *
+ * DoS surface: worst case per key is 120 × 5.4 MB ≈ **648 MB/min**, up from 120 × 1.2 MB ≈ 144 MB/min.
+ * The mitigation is the rate limit below plus authentication: this is a ceiling on an ALREADY-
+ * AUTHENTICATED principal in a self-hosted, single-org deployment, so the population that can reach
+ * it is the team's own issued keys, and the pre-existing 144 MB/min was already well past what a
+ * malicious key needs to hurt. A 4.5× raise on an authenticated, rate-limited path is a real but
+ * small increase in blast radius, taken deliberately so that legitimate imports stop failing.
+ */
+const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
 
 export async function POST(req: NextRequest) {
@@ -33,7 +59,13 @@ export async function POST(req: NextRequest) {
   }
 
   const len = parseInt(req.headers.get("content-length") || "0", 10);
-  if (len > MAX_PAYLOAD * 1.2) return errorResponse("payload_too_large", "max 1 MB", 413);
+  if (len > MAX_REQUEST_BYTES) {
+    return errorResponse(
+      "payload_too_large",
+      `request exceeds ${MAX_REQUEST_BYTES} bytes (body max 1 MB, rows max ${MAX_PAYLOAD_ROWS})`,
+      413
+    );
+  }
 
   let json: unknown;
   try {
@@ -41,10 +73,15 @@ export async function POST(req: NextRequest) {
   } catch {
     return errorResponse("invalid_payload", "body must be JSON", 422);
   }
-  const parsed = itemPayloadSchema.safeParse(json);
+  const parsed = wireItemPayloadSchema.safeParse(json);
   if (!parsed.success) {
     return errorResponse("invalid_payload", parsed.error.issues[0]?.message ?? "invalid", 422);
   }
+  // UNREACHABLE, and kept deliberately. `commonItemFields.body` is `z.string().max(1_000_000)`, so an
+  // over-cap body already 422'd at the parse above — a body overflow is `invalid_payload`, NOT this
+  // 413, which is why the brain-api 1.20 envelope says 413 means the TRANSPORT ceiling. Left as a
+  // belt-and-braces backstop in case the schema's own cap is ever relaxed or decoupled from
+  // `MAX_PAYLOAD`; if it fires, the two have drifted.
   if (parsed.data.body.length > MAX_PAYLOAD) {
     return errorResponse("payload_too_large", "body exceeds 1 MB", 413);
   }

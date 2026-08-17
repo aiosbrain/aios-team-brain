@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
+import { MAX_PAYLOAD_ROWS as MAX_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
+import { parseAuthorRefs, primaryAuthorRef } from "@/lib/attribution/resolve-authors";
 import type { ClickUpDoc, ClickUpDocPage, ClickUpTask, ClickUpTaskRecord } from "@/lib/ingest/sources/clickup";
 import {
   ClickUpNormalizationError,
@@ -166,6 +168,53 @@ describe("ClickUp task normalization", () => {
     });
   });
 
+  it("emits authors[] that the source-agnostic attribution resolver actually reads", () => {
+    // AIO-924. `taskMetadata` stamps `assignee_ids`/`assignee_emails` (PLURAL), but nothing consumes
+    // them: `parseAuthorRefs` handles `assignee_id` (SINGULAR) for linear/plane only, and there is no
+    // `clickup` branch at all — so every ClickUp task document resolved to ZERO author refs and the
+    // work landed unattributed, with every existing test still green because none of them crossed the
+    // normalizer→resolver seam. Asserting through `parseAuthorRefs` is the point: an assertion on the
+    // normalizer's own output shape is exactly what let this ship.
+    const docs = normalizeClickUpTaskDocs(input);
+    const assigned = docs.find((doc) => doc.frontmatter.native_id === "1001")!;
+
+    const refs = parseAuthorRefs(assigned.frontmatter);
+    expect(refs).not.toHaveLength(0);
+    expect(refs).toContainEqual({
+      role: "assignee",
+      provider: "clickup",
+      externalId: "7",
+      email: "alex@example.invalid",
+      displayName: "Alex",
+      handle: undefined,
+    });
+    // The plural provenance keys stay — `authors[]` is additive, not a replacement.
+    expect(assigned.frontmatter.assignee_ids).toEqual(["7"]);
+
+    // Multi-assignee is carried in full: the singular `assignee_id` the other connectors use could
+    // only ever have named one of them.
+    const multi = normalizeClickUpTaskDocs({
+      ...input,
+      records: [
+        {
+          task: {
+            ...records[0].task,
+            assignees: [
+              { id: 7, username: "Alex", email: "alex@example.invalid" },
+              { id: 9, username: "Robin", email: "robin@example.invalid" },
+            ],
+          },
+          observedListIds: ["101"],
+        },
+      ],
+    });
+    expect(parseAuthorRefs(multi[0].frontmatter).map((ref) => ref.externalId)).toEqual(["7", "9"]);
+
+    // An unassigned task claims nobody — an empty `authors[]` must not invent an author.
+    const unassigned = docs.find((doc) => doc.frontmatter.native_id === "1002")!;
+    expect(parseAuthorRefs(unassigned.frontmatter)).toHaveLength(0);
+  });
+
   it("keeps its ticket documents out of the timeline's evidence lane", () => {
     // The timeline gate is `str(fm.identifier) && sourceRules(source).emitsTicketDocuments`
     // (lib/dashboard/work-timeline.ts). BOTH halves have to hold or a workspace of N tasks pushes N
@@ -244,6 +293,34 @@ describe("ClickUp task normalization", () => {
     expect(payload.frontmatter.detail_truncated).toBe(true);
     // Truncation must be declared, not silent.
     expect(payload.frontmatter.detail_count).toBeLessThan(4000);
+  });
+
+  it("names the row limit instead of failing a 5,001-task workspace as an opaque transport error", () => {
+    // AIO-923. `rows` used to be unbounded, so the ONLY thing that stopped an over-large workspace was
+    // the transport gate on `content-length` — a bare `413 payload_too_large / "max 1 MB"` that names
+    // no field and no limit, firing at ~1,100 tasks. Client-side chunking is not the escape hatch (the
+    // row sweep in lib/ingest/tasks.ts deletes every synced row the incoming item omits, so chunk 2
+    // deletes chunk 1), so the bound has to be a SERVER-side one that says what it is.
+    const workspaceOf = (count: number) =>
+      normalizeClickUpTasks({
+        workspaceId: 9001,
+        statusMaps: { "101": list101Map },
+        records: Array.from({ length: count }, (_, index) => ({
+          task: { ...records[0].task, id: `big-${index}`, custom_id: null, parent: null, name: `Task ${index}` },
+          observedListIds: ["101"],
+        })),
+      });
+
+    // The documented ceiling itself still parses — the cap must not shrink the supported workspace.
+    expect(() => wireItemPayloadSchema.parse(workspaceOf(MAX_ROWS))).not.toThrow();
+
+    const parsed = wireItemPayloadSchema.safeParse(workspaceOf(MAX_ROWS + 1));
+    expect(parsed.success).toBe(false);
+    // The bound is on the WIRE schema only: `itemPayloadSchema` (what `ingestItem` re-parses) stays
+    // uncapped so the in-process Linear/GitHub/Plane mirrors keep working — see
+    // test/guards/wire-vs-storage-payload-schema.test.ts. route.ts surfaces `issues[0].message`
+    // verbatim as a 422 `invalid_payload`, so the limit has to be IN that message.
+    expect(parsed.error!.issues[0].message).toContain(String(MAX_ROWS));
   });
 
   it("advances the item sha when a task the body omitted changes", () => {
@@ -338,6 +415,24 @@ describe("ClickUp Doc normalization", () => {
     expect(payload.body.indexOf("## Agenda")).toBeLessThan(payload.body.indexOf("### Decisions"));
     expect(payload.body.indexOf("### Decisions")).toBeLessThan(payload.body.indexOf("## Action items"));
     expect(payload.body).toContain("Proceed with the read-only pilot.");
+  });
+
+  it("emits authors[] the resolver reads, creator ranked above editors", () => {
+    // AIO-924, Doc half: `creator_id`/`editor_ids` were provenance nothing consumed, so a team writing
+    // its specs in ClickUp Docs got zero attribution for them. Asserting through `parseAuthorRefs` and
+    // `primaryAuthorRef` — the resolver's OWN ordering — rather than the raw frontmatter, which is the
+    // assertion that stayed green while the behaviour was broken.
+    const payload = normalizeClickUpDoc(9001, {
+      doc: docAlpha as ClickUpDoc,
+      pages: docAlphaPages as ClickUpDocPage[],
+    });
+    const refs = parseAuthorRefs(payload.frontmatter);
+
+    // creator 7 once (not repeated as an editor) + editor 8.
+    expect(refs.map((ref) => `${ref.role}:${ref.externalId}`)).toEqual(["creator:7", "editor:8"]);
+    for (const ref of refs) expect(ref.provider).toBe("clickup");
+    // The Doc's author is whoever wrote it, not whoever last touched a page.
+    expect(primaryAuthorRef(refs)).toMatchObject({ role: "creator", externalId: "7" });
   });
 
   it("de-duplicates editors across ClickUp's mixed number/string user ids", () => {

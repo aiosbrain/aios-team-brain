@@ -226,7 +226,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.19** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.20** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -398,6 +398,48 @@ sequenceDiagram
   I->>DB: append audit_log
   I-->>R: {status, id}
 ```
+
+**Payload limits (brain-api 1.20, AIO-923).** Three DIFFERENT bounds, deliberately not one:
+
+| Bound | Value | Where | Failure |
+|---|---|---|---|
+| `body` (one item's prose) | 1 MB | `commonItemFields.body` in `lib/api/item-payload-schema.ts`, re-checked in the route | `422 invalid_payload` (schema) |
+| `rows` (a `task`/`decision`/`fact`/`stakeholder_mention` payload's row count) | 5,000 — `MAX_PAYLOAD_ROWS`, **wire only** | `wireItemPayloadSchema`, parsed by the route; `itemPayloadSchema` (what `ingestItem` re-parses) is UNCAPPED | `422 invalid_payload`, message names `rows` and the limit |
+| whole request | `MAX_REQUEST_BYTES` = 5,400,000 B (5.4 MB) — `(1 MB + 5,000 × 700 B) × 1.2` | `content-length` gate in the route | `413 payload_too_large` |
+
+The transport gate was `1 MB × 1.2` and `rows` was UNBOUNDED, so the only thing that stopped a large
+workspace was the 413 — firing at roughly **1,100 rows** with a message naming no field (measured:
+1,000 rows = 1,089,970 B accepted, 3,500 = 1,918,564 B rejected). A 35-List ClickUp workspace failed
+atomically at ~32 tasks per List.
+
+**For `task`, the client cannot fix this by chunking** — which is why the bound had to move
+server-side. `lib/ingest/tasks.ts` sweeps **PROJECT-wide** (`project_id` + `origin='sync'`, no item
+filter), so a second `task` item in the same project deletes the first one's rows: splitting one
+project's tasks across pushes silently destroys data. A task source above 5,000 rows must be split
+into separate **projects** (fewer Lists per integration), never into two pushes of the same project.
+
+**`task` is the exception, not the rule.** The other three row-bearing kinds sweep **per-ITEM**:
+`lib/ingest/decisions.ts` scopes its diff-delete to `source_item_id = itemId` (so a UI-created
+decision and other items' rows are never touched), and `lib/ingest/evidence.ts` does the same for
+`fact`/`stakeholder_mention`. For those, splitting across distinct paths **is** safe. The shared
+`rows` error message stays conservative — "narrow the selection" is true for every kind, where
+"never split across pushes" would be true only for tasks.
+
+**The cap is WIRE-ONLY, and that distinction is load-bearing.** `ingestItem` re-parses every payload
+through `itemPayloadSchema`, including the ones the in-process mirror legs build — and those have no
+transport step and legitimately exceed 5,000 (`fetchLinearTeam` paginates 200 × 100 = up to 20,000
+issues into ONE `task` item; GitHub and Plane are shaped the same). So the route parses with
+`wireItemPayloadSchema` (capped) and `ingestItem` with `itemPayloadSchema` (uncapped); collapsing the
+two would turn a working Linear import into an `IngestValidationError` on every scheduler tick.
+Guarded by `test/guards/wire-vs-storage-payload-schema.test.ts`, which pins both the ceilings and the
+two call sites.
+
+The transport gate is sized to fit the row ceiling **for average rows** — 700 B is the measured
+ClickUp figure; 5,000 rows of schema-legal maximums still 413, so neither limit implies the other.
+DoS: worst case per key rises from ~144 MB/min to ~648 MB/min (120 × 5.4 MB), mitigated by the
+existing **120 pushes/min per key** rate limit on an already-authenticated principal in a self-hosted,
+single-org deployment — a real but small increase in blast radius, taken so legitimate imports stop
+failing.
 
 ### Grounded query — `POST /api/v1/query` (SSE)
 

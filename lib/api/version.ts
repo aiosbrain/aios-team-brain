@@ -35,8 +35,22 @@
  *        written; rate limits and cost metering attribute to the launching member. The
  *        Phase A 403 `delegation_not_supported` is retired for this route. Member `aios_*`
  *        keys are byte-for-byte unchanged.
+ * 1.20 — POST /api/v1/items payload limits become explicit and, for every realistic client, MORE
+ *        PERMISSIVE (AIO-923). `rows` is bounded at 5,000 per payload (`MAX_PAYLOAD_ROWS`) on every
+ *        row-bearing kind, and the whole-request transport gate rises from 1.2 MB to 5.4 MB
+ *        (`MAX_REQUEST_BYTES` = (1 MB + 5,000 x 700 B) x 1.2) so 5,000 rows actually fit. `body`
+ *        keeps its independent 1 MB cap. Net effect: a push that used to die at ~1,100 rows on a
+ *        bare `413 payload_too_large / "max 1 MB"` now succeeds, and a push that genuinely exceeds
+ *        the ceiling gets a `422 invalid_payload` naming `rows` and the limit.
+ *        HONEST EDGE: this is not a pure superset. >5,000 rows that were COMPACT enough to fit the
+ *        old 1.2 MB gate (~60-130 B/row minimal rows) were accepted before and now 422. That window
+ *        is narrow and the new failure names its cause, where the old one did not; the alternative
+ *        (no row bound) leaves the opaque 413 in place. A NEW client sending >1.2 MB to an OLD
+ *        server still gets the pre-1.20 413 — the failure it already handles — so no negotiation is
+ *        needed. The cap is WIRE-ONLY: `ingestItem` re-parses with the uncapped storage schema, so
+ *        the in-process Linear/GitHub/Plane mirrors (up to 20,000 rows) are unaffected.
  */
-export const BRAIN_API_VERSION = "1.19";
+export const BRAIN_API_VERSION = "1.20";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";
