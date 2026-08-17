@@ -39,6 +39,7 @@ export function startGraphScheduler(): void {
               ? ` tier-cleanup: ${s.cleaned} done, ${s.pendingCleanups} outstanding`
               : "") +
             (s.saturatedGroups ? ` ${s.saturatedGroups} group(s) past the reconcile scan window` : "") +
+            (s.partialItems ? ` ${s.partialItems} partially-landed item(s)` : "") +
             (s.requeueThrottled ? ` ${s.requeueThrottled} re-queue(s) throttled — Graphiti may be wedged` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );

@@ -448,7 +448,11 @@ export async function projectToGraphNow(
     // calls-per-episode ratio a numerator with no denominator — and the admin most likely to click it
     // is the one diagnosing extraction, who would then read a spuriously high ratio caused by their
     // own clicking. Best-effort: a ledger write must never fail the projection.
-    if (s.projected || s.errors.length) {
+    // `partialItems` joins the condition (RECONCILE-1): a manual run that projects nothing but
+    // OBSERVES partially-landed items carries the one signal this measurement exists to capture, and
+    // dropping it here would make the metric queryable from the scheduler but not from the button an
+    // admin actually clicks while diagnosing extraction.
+    if (s.projected || s.errors.length || s.partialItems) {
       await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now()));
     }
     if (!s.configured) {

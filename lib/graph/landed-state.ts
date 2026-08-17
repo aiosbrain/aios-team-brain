@@ -76,12 +76,17 @@ export const PARTIAL_DETAIL_LIMIT = 5;
 export function boundPartialDetail(
   items: { itemId: string; missing: string[] }[],
   limit: number = PARTIAL_DETAIL_LIMIT
-): { sample: { itemId: string; missing: string[] }[]; elided: number } {
-  const sample = items.slice(0, limit).map((d) => ({
-    itemId: d.itemId,
+): { sample: { itemId: string; missing: string[]; missingCount: number }[]; elided: number; namesElided: number } {
+  let namesElided = 0;
+  const sample = items.slice(0, limit).map((d) => {
     // A 40-chunk item missing 39 names would itself be a blob; the count is the signal, the first few
     // names are the diagnosis.
-    missing: d.missing.slice(0, limit),
-  }));
-  return { sample, elided: Math.max(0, items.length - sample.length) };
+    const missing = d.missing.slice(0, limit);
+    namesElided += Math.max(0, d.missing.length - missing.length);
+    return { itemId: d.itemId, missing, missingCount: d.missing.length };
+  });
+  // `missingCount` per item + `namesElided` overall, because review found within-item truncation was
+  // INVISIBLE: an item missing 40 names showed 5 with `elided: 0`, indistinguishable from an item
+  // missing exactly 5 — and "how deep is the hole" is a different question from "how many items".
+  return { sample, elided: Math.max(0, items.length - sample.length), namesElided };
 }

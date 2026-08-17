@@ -59,6 +59,11 @@ export function projectionRunInput(
       // which is exactly the position that made this hole invisible for so long. Counted only; no
       // verdict changed, nothing re-queued on it (see lib/graph/landed-state.ts).
       partialItems: summary.partialItems,
+      // The bounded missing-name sample. The COUNT alone cannot separate a real tail hole from the
+      // index-shift false positive (an edited doc re-chunks, so an expected `#k` may never have
+      // existed) — and that discrimination is the whole reason to measure before enforcing. Review
+      // caught this being dropped between reconcile and the durable row.
+      partialDetail: summary.partialDetail,
     },
     startedAt,
     finishedAt,

@@ -22,6 +22,8 @@ const base: GraphProjectionSummary = {
   pendingCleanups: 0,
   saturatedGroups: 0,
   requeueThrottled: 0,
+  partialItems: 0,
+  partialDetail: { sample: [], elided: 0, namesElided: 0 },
   errors: [],
 };
 
@@ -42,6 +44,12 @@ describe("projectionRunInput", () => {
     expect(run.meta).toMatchObject({
       episodes: 9,
       episodesByGroup: { acme_team: 6, acme_external: 3 },
+      // Pinned at the CALL SITE (RECONCILE-1): this file is excluded from `tsc --noEmit`, so a field
+      // missing from `base` compiles fine and silently exempts itself from the shape it claims to pin
+      // — which is how the literal drifted six fields behind once before. Review caught it drifting
+      // again in the very PR that added the field.
+      partialItems: 0,
+      partialDetail: { sample: [], elided: 0, namesElided: 0 },
       fanoutThrottled: 0,
       restrictionMovesPending: 0,
     });

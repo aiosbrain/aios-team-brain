@@ -75,12 +75,44 @@ describe("boundPartialDetail — the meta blob must stay loadable", () => {
     const b = boundPartialDetail([{ itemId: "big", missing }]);
     expect(b.sample[0].missing).toHaveLength(PARTIAL_DETAIL_LIMIT);
     expect(b.elided).toBe(0); // one item, so nothing elided at the ITEM level
+    // …but the DEPTH of the hole must still be visible: 40 missing shown as 5 with elided:0 read
+    // identically to an item missing exactly 5 (review).
+    expect(b.sample[0].missingCount).toBe(40);
+    expect(b.namesElided).toBe(35);
   });
 
   it("elides nothing when the input already fits", () => {
     expect(boundPartialDetail([{ itemId: "a", missing: [] }])).toEqual({
-      sample: [{ itemId: "a", missing: [] }],
+      sample: [{ itemId: "a", missing: [], missingCount: 0 }],
       elided: 0,
+      namesElided: 0,
+    });
+  });
+});
+
+describe("AC5 — the measurement reaches the DURABLE row, not just the return value", () => {
+  it("projectionRunInput carries partialItems AND the bounded detail into ingest_runs.meta", async () => {
+    // Review caught this: the dm test asserted reconcile's RETURN, so deleting the meta write left it
+    // green. `partialDetail` was in fact being dropped between reconcile and the durable row — the
+    // count alone cannot separate a real hole from the index-shift false positive, which is the whole
+    // question the metric exists to answer.
+    const { projectionRunInput } = await import("@/lib/graph/projection-run");
+    const summary = {
+      ok: true, configured: true, teams: 1, scanned: 1, projected: 0, episodes: 0,
+      episodesByGroup: {}, fanoutThrottled: 0, restrictionMovesPending: 0, skipped: 0,
+      reconciled: 1, requeued: 0, cleaned: 0, cleanedExternal: 0, pendingCleanups: 0,
+      saturatedGroups: 0, requeueThrottled: 0,
+      partialItems: 2,
+      partialDetail: { sample: [{ itemId: "abc", missing: ["items:abc#3"], missingCount: 1 }], elided: 1, namesElided: 0 },
+      errors: [],
+    } as unknown as Parameters<typeof projectionRunInput>[0];
+
+    const row = projectionRunInput(summary, "scheduler", 0, 1);
+    expect(row.meta?.partialItems).toBe(2);
+    expect(row.meta?.partialDetail).toEqual({
+      sample: [{ itemId: "abc", missing: ["items:abc#3"], missingCount: 1 }],
+      elided: 1,
+      namesElided: 0,
     });
   });
 });

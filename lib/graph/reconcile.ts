@@ -122,7 +122,7 @@ export interface ReconcileSummary {
   /** A BOUNDED sample of those items and their missing episode names, so an operator can tell a real
    * hole from the index-shift false positive (an edited doc re-chunks, so an expected `#k` may never
    * have existed). `elided` is how many were dropped from the sample. */
-  partialDetail: { sample: { itemId: string; missing: string[] }[]; elided: number };
+  partialDetail: { sample: { itemId: string; missing: string[]; missingCount: number }[]; elided: number; namesElided: number };
   /** Groups whose episode list came back FULL, so nothing in them could be judged this pass. Reported
    * rather than swallowed: it means the group has outgrown the scan window and self-healing has
    * quietly stopped for it (raise `GRAPH_LANDED_SCAN_DEPTH`). */
@@ -223,7 +223,7 @@ export async function reconcileProjectedEpisodes(
       confirmed: 0,
       reQueued: 0,
       partialItems: 0,
-      partialDetail: { sample: [], elided: 0 },
+      partialDetail: { sample: [], elided: 0, namesElided: 0 },
       cleaned: 0,
       cleanedExternal: 0,
       pendingCleanups: 0,
@@ -309,6 +309,12 @@ export async function reconcileProjectedEpisodes(
         // empty one means never-pushed and reports "none", which is why this cannot mistake a
         // reservation row for a hole.
         const { state, missing } = landedState(row.source_id, row.chunk_shas?.length ?? 0, presentNames);
+        // UNDER-COUNT, named rather than left silent (review): `state === "none"` is reachable INSIDE
+        // the confirmed branch — a doc that shrinks 3 chunks → 1 has its single sha already pushed, so
+        // `items:x` is never written while legacy `items:x#0..2` still confirm the item. That is a
+        // hole-by-renaming this counter does not see. Left uncounted deliberately: it is a different
+        // class with a different repair, and inventing a number for it here would blur the one metric
+        // increment 2 is meant to be gated on.
         if (state === "partial") {
           partialItems++;
           partialFound.push({ itemId: row.source_id, missing });
