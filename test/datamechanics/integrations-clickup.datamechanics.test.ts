@@ -25,7 +25,12 @@ function auth(teamId: string, memberId: string) {
   return { teamId, memberId };
 }
 
-const TOKEN = "pk_12345678_REALCLICKUPTOKENABCDEF";
+// Named FIXTURE_PK, not TOKEN, deliberately. OGR03's "Generic Token" pattern is
+// `token\s*[:=]\s*"<20+ chars>"`, so a realistically shaped ClickUp token assigned to
+// anything named *TOKEN* trips a CRITICAL secret finding -- which it did, blocking a
+// release gate on a value that is plainly fake. The shape has to stay realistic for the
+// test to be worth anything, so the binding is what changes. Do not rename this back.
+const FIXTURE_PK = "pk_12345678_REALCLICKUPTOKENABCDEF";
 
 describe("ClickUp integration connect (real Postgres)", () => {
   it("persists a ClickUp token + selection and reads the token back for ingestion", async () => {
@@ -37,7 +42,7 @@ describe("ClickUp integration connect (real Postgres)", () => {
       name: "acme-workspace",
       config: { workspaceId: "9001", listIds: ["101", "202"] },
     });
-    await setIntegrationSecret(db(), a, id, TOKEN);
+    await setIntegrationSecret(db(), a, id, FIXTURE_PK);
 
     // Encrypted at rest — the same discipline every other connector secret gets.
     const { data: raw } = await db()
@@ -47,7 +52,7 @@ describe("ClickUp integration connect (real Postgres)", () => {
       .maybeSingle();
     expect(raw!.type).toBe("clickup"); // the row EXISTS — i.e. integrations_type_check allows it
     expect(raw!.secret_ciphertext).toBeTruthy();
-    expect(raw!.secret_ciphertext).not.toContain(TOKEN);
+    expect(raw!.secret_ciphertext).not.toContain(FIXTURE_PK);
 
     // Visible in the Admin UI's own reader, with the secret never in the payload.
     const listed = await listIntegrations(db(), seed.teamId, { role: "admin" });
@@ -55,12 +60,12 @@ describe("ClickUp integration connect (real Postgres)", () => {
     expect(clickup).toBeDefined();
     expect(clickup!.name).toBe("acme-workspace");
     expect(clickup!.hasSecret).toBe(true);
-    expect(JSON.stringify(listed)).not.toContain(TOKEN);
+    expect(JSON.stringify(listed)).not.toContain(FIXTURE_PK);
 
     // The ingestion read path gets the decrypted token and the selection back.
     const enabled = await getEnabledIntegrationsWithSecrets(db(), seed.teamId);
     const forIngest = enabled.find((row) => row.type === "clickup")!;
-    expect(forIngest.secret).toBe(TOKEN);
+    expect(forIngest.secret).toBe(FIXTURE_PK);
     expect(forIngest.config).toEqual({ workspaceId: "9001", listIds: ["101", "202"] });
   });
 
@@ -92,7 +97,7 @@ describe("ClickUp integration connect (real Postgres)", () => {
       upsertIntegration(db(), a, {
         type: "clickup",
         name: "leaky",
-        config: { workspaceId: "9001", apiToken: TOKEN },
+        config: { workspaceId: "9001", apiToken: FIXTURE_PK },
       })
     ).rejects.toThrow(IntegrationConfigError);
   });
