@@ -86,6 +86,15 @@ export function scoreSummaryHealth(rows) {
   for (const r of nonEmpty) {
     const own = words(r.name);
     const w = new Set([...words(r.summary)].filter((x) => !own.has(x)));
+    // A summary with NOTHING left after its own name is stripped is pure name-repetition: it says
+    // nothing about the entity. Review measured this scoring {distinctness:1, factOverlap:1} —
+    // PERFECT on every term — because an empty word set matched no previous summary and the name
+    // itself appears in the entity's facts. Count it as a duplicate: it is the degenerate case of
+    // boilerplate, not a distinct summary.
+    if (w.size === 0) {
+      duplicates += 1;
+      continue;
+    }
     const dup = seen.some((prev) => {
       if (prev.text === norm(r.summary)) return true;
       if (w.size === 0 || prev.w.size === 0) return false;
@@ -121,5 +130,10 @@ export function scoreTemporalCoverage(edges) {
     if (v === null || v === undefined) return false;
     return String(v).trim().length > 0;
   }).length;
+  // ZERO dated edges is UNDEFINED, not 0.0 (AC5). The metric is only meaningful as a ratio to the
+  // incumbent, and an incumbent of 0 makes that ratio Infinity/NaN — a number no band can read. "No
+  // datable edges in this corpus" is an absence of evidence, and must not be reported as total
+  // coverage collapse.
+  if (dated === 0) return { total, share: null };
   return { total, share: dated / total };
 }

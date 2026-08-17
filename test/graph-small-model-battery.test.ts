@@ -9,7 +9,15 @@ import {
   assertArmsDiffer,
   ARM_FIELD,
 } from "../scripts/graph-window-battery/small-model-arms.mjs";
-import { SMALL_MODEL_METRICS, smallModelMetrics, METRICS } from "../scripts/graph-window-battery/decision.mjs";
+import {
+  SMALL_MODEL_METRICS,
+  smallModelMetrics,
+  METRICS,
+  judgeMetric,
+  decide,
+  assessSession,
+  VERDICT,
+} from "../scripts/graph-window-battery/decision.mjs";
 import { SMALL_ELIGIBLE_KINDS, wantsSmallModel, GRAPHITI_SMALL_MODEL_MARKER } from "@/lib/llm/graph-call-kind";
 import { selectSmallExtractionBackend } from "@/lib/query/llm-backend";
 
@@ -212,10 +220,24 @@ describe("marker pre-flight — settles 28.7% vs 18.7% before anything is spent"
       req(DEDUPE_EDGES, GRAPHITI_SMALL_MODEL_MARKER),
       req(SUMMARIES, "qwen/qwen3.7-plus"), // deployed image does NOT ask for a small model here
     ]);
-    const a = assessEligibility(t, { dedupe_edges: 0.173, node_summaries_batch: 0.1 });
+    // The cost map MUST be shares of TOTAL graph spend. An earlier version of this test passed only
+    // two kinds and pinned 0.173/0.273 = 0.634 as correct — which would select the 15% band when the
+    // true addressable share is 17.3% and the spec demands 10%. The test itself taught the wrong
+    // contract; review caught it.
+    const FULL_COST_SHARE = {
+      dedupe_nodes: 0.251,
+      extract_edges: 0.242,
+      extract_nodes: 0.219,
+      dedupe_edges: 0.173,
+      node_summaries_batch: 0.1,
+      edge_timestamps: 0.014,
+    };
+    const a = assessEligibility(t, FULL_COST_SHARE);
     expect(a.missing).toContain("node_summaries_batch");
-    // 0.173 / 0.273 — dedupe_edges is routable, summaries are not.
-    expect(a.addressableShare).toBeCloseTo(0.634, 2);
+    // dedupe_edges routable only → 17.3% of ALL graph spend, i.e. the 18.7%-ish case…
+    expect(a.addressableShare).toBeCloseTo(0.173, 3);
+    // …and that share must select the 10% band, which is the whole point of measuring it.
+    expect(smallModelMetrics({ addressableShare: a.addressableShare! }).C2.margin).toBe(0.1);
   });
 
   it("flags a kind that carries the marker but is NOT declared eligible (table drift)", async () => {
@@ -227,5 +249,137 @@ describe("marker pre-flight — settles 28.7% vs 18.7% before anything is spent"
     expect(a.unexpected).toContain("extract_nodes");
     expect(a.routable).not.toContain("extract_nodes"); // the proxy still routes it strong
     expect(a.addressableShare).toBe(0);
+  });
+});
+
+describe("folded review findings — regressions", () => {
+  it("a name-repetition arm is NOT scored as distinct (Fable: perfect score on every term)", () => {
+    // Summaries that are just the entity name repeated. Before the fold these emptied the word set
+    // after name-stripping, were exempted from duplicate detection, and scored
+    // {distinctness:1, factOverlap:1} — a PERFECT score for the exact shape Q10 exists to catch.
+    const s = scoreSummaryHealth([
+      entity("Chetan", "Chetan Chetan Chetan Chetan Chetan Chetan Chetan Chetan.", ["Chetan shipped it"]),
+      entity("Graphiti", "Graphiti Graphiti Graphiti Graphiti Graphiti Graphiti.", ["Graphiti extracts"]),
+    ]);
+    expect(s.distinctness).toBe(0);
+  });
+
+  it("Q11 is UNDEFINED when edges exist but none is datable (AC5), not 0", () => {
+    // 0 would make the ratio-to-incumbent Infinity/NaN and read as a total coverage collapse.
+    expect(scoreTemporalCoverage([{ valid_at: null }, { valid_at: "" }])).toEqual({ total: 2, share: null });
+  });
+
+  it("Q11's band is TWO-SIDED — hallucinated dates must not score as an improvement", () => {
+    // The downgraded prompt says "NEVER hallucinate dates" because that is the weak-model failure
+    // mode; a ratio-lower floor would reward inventing them.
+    expect(SMALL_MODEL_METRICS.Q11.kind).toBe("ratio-both");
+  });
+
+  it("every Q10 term is BANDED — distinctness, fact-overlap, and (two-sided) length", () => {
+    // An earlier registry banded distinctness alone while claiming two-sidedness, leaving a padding
+    // arm ungated despite an acceptance criterion naming it.
+    expect(SMALL_MODEL_METRICS.Q10.kind).toBe("ratio-lower");
+    expect(SMALL_MODEL_METRICS.Q10F.kind).toBe("ratio-lower");
+    expect(SMALL_MODEL_METRICS.Q10L.kind).toBe("ratio-both"); // padding AND truncation
+  });
+
+  it("the pre-flight REFUSES when nothing routable carries the marker (AC10)", async () => {
+    const { tallyMarkers, assessEligibility } = await import(
+      "../scripts/graph-window-battery/small-marker-preflight.mjs"
+    );
+    const t = tallyMarkers([
+      { kind: "request", body: { model: "qwen/qwen3.7-plus", messages: [{ role: "system", content: "You are a fact deduplication assistant." }] } },
+    ]);
+    const a = assessEligibility(t, { dedupe_edges: 1 });
+    expect(a.refusal).toMatch(/cannot save anything|re-derive/i);
+    expect(a.routable).toEqual([]);
+  });
+
+  it("legacy node_attributes absence is NOT reported as drift on a 0.29.3 capture", async () => {
+    const { tallyMarkers, assessEligibility } = await import(
+      "../scripts/graph-window-battery/small-marker-preflight.mjs"
+    );
+    const t = tallyMarkers([
+      { kind: "request", body: { model: GRAPHITI_SMALL_MODEL_MARKER, messages: [{ role: "system", content: "You are a fact deduplication assistant." }] } },
+    ]);
+    const a = assessEligibility(t, { dedupe_edges: 1 });
+    // 0.13.2-only; its absence on the deployed image is expected, and an always-firing alarm is noise.
+    expect(a.missing).not.toContain("node_attributes");
+  });
+});
+
+describe("the judge is WIRED to the small-model registry (the critical fold)", () => {
+  // Both reviewers independently found that SMALL_MODEL_METRICS had zero consumers: judgeMetric
+  // hardcoded METRICS and decide iterated Object.keys(METRICS), so a small-model session would have
+  // been judged on C1 — the guaranteed STOP the C2 amendment exists to remove. These pin the wiring.
+  const flat = [1000, 1000]; // input tokens/episode: UNCHANGED, which is what this lever does
+  const halved = { inc: [0.01, 0.01], arm: [0.005, 0.005] }; // USD/episode: cut in half
+
+  const smallSession = () =>
+    assessSession({
+      incumbent: {
+        Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+        Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [0.5, 0.5], C2: halved.inc,
+      },
+      universeSize: 20,
+      underpowered: [],
+      armsCompleted: true,
+      harnessRefused: false,
+      crossCheckAvailable: true,
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+    });
+
+  it("judgeMetric can judge C2/Q10/Q11 when handed the small-model registry", () => {
+    const reg = smallModelMetrics({ addressableShare: 0.287 });
+    // Before the fold this threw `unknown metric C2` — the registry was unreachable.
+    const r = judgeMetric("C2", halved.arm, halved.inc, {}, reg);
+    expect(r.verdict).toBe(VERDICT.PASS); // a 50% cost fall clears the 15% band
+    expect(() => judgeMetric("Q10", [0.9, 0.9], [0.9, 0.9], {}, reg)).not.toThrow();
+  });
+
+  it("SHIPS an arm that halves cost while leaving tokens flat (AC8b)", () => {
+    const session = smallSession();
+    expect(session.valid).toBe(true);
+    const out = decide({
+      session,
+      incumbent: {
+        Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+        Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [0.5, 0.5], C2: halved.inc,
+      },
+      arms: [{
+        name: "SMALL",
+        metrics: {
+          Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+          Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [0.5, 0.5], C2: halved.arm,
+        },
+        extras: { personsLost: 0 },
+      }],
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+    });
+    expect(out.outcome).toBe("SHIP");
+    // …and C1 is not even considered for this arm.
+    expect(out.arms[0].results.map((r: { key: string }) => r.key)).not.toContain("C1");
+  });
+
+  it("PROVES the C1 trap was real: the same flat-token data FAILS the default registry", () => {
+    // ratio-fall demands a 25% token reduction. This lever sends the same tokens at a lower price,
+    // so judging it on C1 is a pre-registered STOP for a saving it cannot produce.
+    const r = judgeMetric("C1", flat, flat, {}, METRICS);
+    expect(r.verdict).not.toBe(VERDICT.PASS);
+  });
+
+  it("marks a session INVALID when arm separation failed (AC6, wired not documented)", () => {
+    const broken = assessSession({
+      incumbent: { C2: halved.inc },
+      universeSize: 20,
+      underpowered: [],
+      armsCompleted: true,
+      harnessRefused: false,
+      crossCheckAvailable: true,
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+      armSeparation: assertArmsDiffer(effectiveSnapshot("STRONG", "m"), effectiveSnapshot("SMALL", "m")),
+    });
+    expect(broken.valid).toBe(false);
+    expect(broken.problems.join(" ")).toMatch(/IDENTICAL|inherited|separation/i);
   });
 });

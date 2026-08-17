@@ -24,7 +24,7 @@
  * share to feed the decision function.
  */
 import { readFileSync } from "node:fs";
-import { classifyGraphCall, wantsSmallModel, SMALL_ELIGIBLE_KINDS, GRAPHITI_SMALL_MODEL_MARKER } from "../../lib/llm/graph-call-kind.ts";
+import { classifyGraphCall, SMALL_ELIGIBLE_KINDS, GRAPHITI_SMALL_MODEL_MARKER } from "../../lib/llm/graph-call-kind.ts";
 
 /**
  * Tally marker presence per call kind over tap records.
@@ -61,10 +61,27 @@ export function tallyMarkers(records) {
  *                  would keep routing it strong, so it is unclaimed savings, not a risk — but it
  *                  means the table has drifted from the image and should be re-derived.
  */
+/**
+ * Kinds that exist only in graphiti 0.13.2. The deployed image is 0.29.3, where the per-entity
+ * `node_attributes` fan-out was REPLACED by batched `node_summaries_batch` — so its absence from a
+ * healthy capture is expected, not drift. Reporting it as `missing` would raise a false alarm on
+ * every correct run, and an alarm that always fires is one nobody reads.
+ */
+const LEGACY_KINDS = new Set(["node_attributes"]);
+
+/**
+ * `costByKind` MUST be shares of TOTAL graph spend, summing to ~1 across ALL kinds — not a subset.
+ *
+ * This contract is load-bearing and was previously only implied: `addressableShare` feeds
+ * `smallModelMetrics`, whose band flips at 0.2, and those thresholds (0.287 / 0.187) are shares of
+ * the WHOLE graph bill. Pass two kinds totalling 0.273 and the function returns 0.634 — a number that
+ * selects the 15% band when the true addressable share is 17.3% and the spec demands 10%. Review
+ * caught this precisely because a test of mine pinned that wrong usage as if it were correct.
+ */
 export function assessEligibility(tally, costByKind = {}) {
   const observedEligible = tally.kinds.filter((k) => k.marked > 0).map((k) => k.kind);
   const declared = [...SMALL_ELIGIBLE_KINDS];
-  const missing = declared.filter((k) => !observedEligible.includes(k));
+  const missing = declared.filter((k) => !observedEligible.includes(k) && !LEGACY_KINDS.has(k));
   const unexpected = observedEligible.filter((k) => !SMALL_ELIGIBLE_KINDS.has(k));
 
   // Addressable share = the cost share of kinds that are BOTH declared eligible (so the proxy will
@@ -73,11 +90,22 @@ export function assessEligibility(tally, costByKind = {}) {
   const routable = observedEligible.filter((k) => SMALL_ELIGIBLE_KINDS.has(k));
   const addressable = routable.reduce((n, k) => n + (costByKind[k] ?? 0), 0);
 
+  // REFUSE, don't just report (AC10). A capture where nothing routable carries the marker means the
+  // battery can save 0% — running it would spend money to measure a lever that is not connected.
+  // Emitting JSON and exiting 0 let that read as a normal pre-flight.
+  const refusal =
+    routable.length === 0
+      ? "no routable kind carries the small-model marker — the lever cannot save anything on this image; re-derive SMALL_ELIGIBLE_KINDS before running the battery"
+      : null;
+
   return {
     observedEligible,
     routable,
     missing,
     unexpected,
+    refusal,
+    // Shares of TOTAL graph spend — see the contract above. `null` when no cost map was supplied,
+    // so a caller cannot mistake "unknown" for "zero addressable".
     addressableShare: total > 0 ? addressable / total : null,
   };
 }
@@ -110,7 +138,12 @@ function main() {
     node_summaries_batch: 0.1,
     edge_timestamps: 0.014,
   };
-  console.log(JSON.stringify({ ...tally, ...assessEligibility(tally, COST_SHARE) }, null, 2));
+  const assessment = assessEligibility(tally, COST_SHARE);
+  console.log(JSON.stringify({ ...tally, ...assessment }, null, 2));
+  if (assessment.refusal) {
+    console.error(`REFUSING: ${assessment.refusal}`);
+    process.exit(2);
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main();

@@ -117,11 +117,24 @@ export const SMALL_MODEL_METRICS = Object.freeze({
   Q4: METRICS.Q4,
   Q5: METRICS.Q5,
   Q7: METRICS.Q7,
-  // Two-sided: a small model can truncate summaries AND pad them, and a floor sees only one.
-  Q10: { label: "summary health (distinctness)", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
-  // Ratio to the incumbent — the absolute level reflects the corpus, not the model (see
-  // `scoreTemporalCoverage`). A fall means `edge_timestamps` stopped resolving dates it used to.
-  Q11: { label: "temporal coverage", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
+  // THREE banded scalars, not one. An earlier version registered a single `ratio-lower` on
+  // distinctness while its comment claimed two-sidedness — so `factOverlap` and `meanLength` gated
+  // NOTHING and a padding arm (an acceptance criterion names it explicitly) was ungated. Review
+  // caught the mismatch between the comment and the band. Banding each term explicitly beats
+  // inventing a composite weighting nobody can defend, and it names WHICH property failed.
+  Q10: { label: "summary distinctness (anti-boilerplate)", kind: "ratio-lower", margin: 0.15, maxSpreadRatio: 0.075 },
+  // Detachment from the entity's own facts — the other half of "boilerplate", and independently
+  // defeatable, so it needs its own band.
+  Q10F: { label: "summary fact-overlap", kind: "ratio-lower", margin: 0.2, maxSpreadRatio: 0.1 },
+  // TWO-SIDED, and this is the one that catches PADDING: a `ratio-lower` cannot reject a summary that
+  // got longer, and "wrote more words to say the same thing" is a real small-model failure.
+  Q10L: { label: "summary length", kind: "ratio-both", margin: 0.35, maxSpreadRatio: 0.175 },
+  // TWO-SIDED, deliberately. A fall means `edge_timestamps` stopped resolving dates it used to — but
+  // a RISE is just as suspect: the downgraded prompt literally says "NEVER hallucinate dates"
+  // (`lib/llm/graph-call-kind.ts`) because inventing them is the known failure mode of a weak model,
+  // and a one-sided floor would score that as an improvement. Coverage counts dates PRESENT, not
+  // dates CORRECT, so the only honest reading is "should not move".
+  Q11: { label: "temporal coverage", kind: "ratio-both", margin: 0.15, maxSpreadRatio: 0.075 },
   // THE cost gate for this arm. Threshold is set by the pre-flight (see the spec): 0.15 when the full
   // 28.7% is addressable, 0.10 when only 18.7% is. Default is the conservative 0.15.
   C2: { label: "USD / episode", kind: "ratio-fall", margin: 0.15, maxSpreadRatio: 0.075 },
@@ -163,8 +176,8 @@ const over = (value, ceiling) => value > ceiling * (1 + 1e-9) + Number.EPSILON;
  * Returns the verdict plus the numbers behind it, because a verdict without its inputs is exactly
  * the kind of claim this file exists to stop.
  */
-export function judgeMetric(key, arm, incumbent, extras = {}) {
-  const m = METRICS[key];
+export function judgeMetric(key, arm, incumbent, extras = {}, registry = METRICS) {
+  const m = registry[key];
   if (!m) throw new Error(`unknown metric ${key}`);
   if (!Array.isArray(arm) || arm.length !== 2 || !Array.isArray(incumbent) || incumbent.length !== 2) {
     throw new Error(`${key}: both arms need exactly 2 reps — the spread IS the second rep`);
@@ -274,7 +287,7 @@ export function judgeMetric(key, arm, incumbent, extras = {}) {
  * Every trigger here is pre-defined and none of them is "the numbers came out wrong" — that
  * distinction is the difference between a rule and an excuse.
  */
-export function assessSession({ incumbent, universeSize, underpowered, armsCompleted, harnessRefused, crossCheckAvailable }) {
+export function assessSession({ incumbent, universeSize, underpowered, armsCompleted, harnessRefused, crossCheckAvailable, registry = METRICS, armSeparation }) {
   // REQUIRED, not defaulted-permissive. A default of `armsCompleted = true` means a runner that
   // forgets to pass it silently disarms that validity trigger — the same "omission canonicalized as
   // fine" class as the absolute clause above, in the one file whose job is that the readout cannot
@@ -294,11 +307,18 @@ export function assessSession({ incumbent, universeSize, underpowered, armsCompl
   // unmeasurable and C1 loses its guard against a retry-rate shift masquerading as a token saving.
   if (!crossCheckAvailable) problems.push("no cross-check: ingest_runs recorded no finished projector run in the window");
   if (!armsCompleted) problems.push("an arm did not complete every episode");
+  // ARM SEPARATION (GRAPHSMALL-1, AC6). Config-differing arms cannot be checked with `diff` the way
+  // the bind-mounted file arms can, so the check has to live HERE, in session validity — a RUNBOOK
+  // snippet is not a gate. Passing `{ ok:false, reason }` (from `assertArmsDiffer`) makes the session
+  // INVALID rather than letting a collapsed delta read as "no savings, quality equal".
+  if (armSeparation && armSeparation.ok === false) {
+    problems.push(armSeparation.reason ?? "arm separation could not be established");
+  }
   for (const u of underpowered) problems.push(`${u} is UNDERPOWERED — a corpus too thin to measure is not evidence of a regression`);
 
   // The incumbent's spread ceiling, per metric, in band units.
   for (const [key, reps] of Object.entries(incumbent ?? {})) {
-    const m = METRICS[key];
+    const m = registry[key];
     if (!m || !Array.isArray(reps) || reps.length !== 2) continue;
     const s = spread(reps[0], reps[1]);
     if (m.maxSpreadRatio !== undefined) {
@@ -332,12 +352,12 @@ export const MIN_UNIVERSE = 15;
  * `arms` is ordered — SAME before W1 — and the FIRST arm to pass every gate wins. An arm ships only
  * if every metric PASSes; INCONCLUSIVE blocks exactly as FAIL does.
  */
-export function decide({ session, incumbent, arms }) {
+export function decide({ session, incumbent, arms, registry = METRICS }) {
   if (!session.valid) {
     return { outcome: "INVALID", reasons: session.problems, arms: [] };
   }
   const judged = arms.map(({ name, metrics, extras = {} }) => {
-    const results = Object.keys(METRICS).map((key) => judgeMetric(key, metrics[key], incumbent[key], extras));
+    const results = Object.keys(registry).map((key) => judgeMetric(key, metrics[key], incumbent[key], extras, registry));
     const blocking = results.filter((r) => r.verdict !== VERDICT.PASS);
     return { name, results, ships: blocking.length === 0, blocking };
   });
