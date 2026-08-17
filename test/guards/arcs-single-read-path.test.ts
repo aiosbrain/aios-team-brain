@@ -43,6 +43,14 @@ describe("guard: the arcs single read path (PRET-3)", () => {
     expect(hits).toEqual([]);
   });
 
+  it("the recompute route refuses external-shared targets (the H1 write-side corollary)", () => {
+    // No route-level harness exercises this 422, so the branch is byte-pinned: removing the
+    // refusal would store corrections the read side never loads (the H13 dead-correction shape).
+    const src = read("app/api/brain/arcs/recompute/route.ts");
+    expect(src).toContain("if (isExternalGroupId(sourceGroup)) {");
+    expect(src).toContain("corrections cannot target the external-shared partition");
+  });
+
   it("discover-arcs' fallback is the fused read, not a tier synthesis", () => {
     const src = read("lib/social/discover-arcs.ts");
     expect(src).toContain("getFusedArcs(db, teamId, teamSlug, groups, keys)");
