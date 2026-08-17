@@ -50,6 +50,8 @@ export interface GraphProjectionSummary {
    * this run. Non-zero means self-healing has quietly stopped for those groups — surfaced rather than
    * swallowed, per the no-silent-caps rule (raise `GRAPH_LANDED_SCAN_DEPTH`). */
   saturatedGroups: number;
+  /** RECONCILE-1 measurement — items with some chunks present and some missing. Counted, not acted on. */
+  partialItems: number;
   /** Ledger rows a pass declined to re-queue because too many looked absent at once — the signal that
    * Graphiti is wedged rather than that N workers crashed. Non-zero for several runs in a row is an
    * incident, not noise. */
@@ -121,6 +123,7 @@ async function runGraphProjectionInner(opts?: {
     cleaned: 0,
     pendingCleanups: 0,
     saturatedGroups: 0,
+    partialItems: 0,
     requeueThrottled: 0,
     errors: [],
   };
@@ -175,6 +178,7 @@ async function runGraphProjectionInner(opts?: {
       summary.cleaned += r.cleaned;
       summary.pendingCleanups += r.pendingCleanups;
       summary.saturatedGroups += r.saturatedGroups;
+      summary.partialItems += r.partialItems;
       summary.requeueThrottled += r.requeueThrottled;
 
       // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches
