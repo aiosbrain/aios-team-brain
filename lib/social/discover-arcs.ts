@@ -80,6 +80,8 @@ export async function discoverOpportunitiesFromArcs(
   db: DbClient,
   teamId: string,
   teamSlug: string,
+  // PRET-3: no longer scopes the READ (groups is the caller's resolved scope); retained only
+  // because the opportunity writer records the discovery tier — PRET-6 revisits.
   tier: AccessTier,
   groups: string[],
   keys: ProviderKeys,

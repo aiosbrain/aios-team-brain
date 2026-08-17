@@ -18,9 +18,10 @@ export const maxDuration = 120; // arc synthesis (LLM) inline path can take up t
 
 const schema = z.object({
   team: z.string().min(1).max(120),
-  // PPARC-3 (design write-gate ruling): ONE partition per POST. The fused panel annotates every
-  // arc with its sourceGroup; the client sends corrections for one partition at a time. Absent =
-  // the permissive tier path (whose panel carries no sourceGroup). Enforced requests REQUIRE it.
+  // PPARC-3 write-gate ruling, universal since PRET-3: ONE partition per POST, REQUIRED from
+  // every caller (the fused panel annotates each arc with sourceGroup; a group-less POST is a
+  // stale pre-unification client and 422s until the panel reloads). Optional in the SCHEMA only
+  // so the 422 can carry its explanatory message instead of a bare parse error.
   sourceGroup: z.string().min(1).max(200).optional(),
   corrections: z
     .array(

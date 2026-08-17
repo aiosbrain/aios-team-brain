@@ -56,6 +56,29 @@ describe("PRET-3 — resolveArcScope is mode-keyed (the one resolution, spec §3
     expect(r.arm).toBe(true);
     expect(r.groups.length).toBeGreaterThan(0); // the oracle resolved their partitions
   });
+
+  it("enforcing team, EXTERNAL member → their oracle resolves the external-shared partition, arm true (ruling 2's new surface — diff-review L3)", async () => {
+    const { randomUUID } = await import("node:crypto");
+    const seed = await seedTeam();
+    await ingest(seed, { path: "x.md", body: "external shared content", access: "external", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
+    // A REAL external member, created through the admin path so the built-in group sync runs
+    // (a raw insert would leave them ungrouped and the oracle would resolve nothing).
+    const { createMember } = await import("@/lib/admin/members");
+    const m = await createMember(db(), seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Ext", actorHandle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external" });
+    expect(m.id).toBeTruthy();
+    // createMember leaves the member INVITED (the oracle rightly resolves non-active members to
+    // nothing); model activation the way pg-login's hook does — status active + built-in resync.
+    await db().from("members").update({ status: "active" }).eq("id", m.id);
+    const { syncBuiltinMembership } = await import("@/lib/access/groups");
+    expect((await syncBuiltinMembership(db(), seed.teamId)).ok).toBe(true);
+
+    const r = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
+    expect(r.arm, "an enforcing member's read arms — any tier").toBe(true);
+    const extGroup = episodeGroupId(seed.teamSlug, "external");
+    expect(r.groups, "the external member's oracle resolves exactly the external-shared partition").toEqual([extGroup]);
+  });
 });
 
 describe("PRET-3 — the tier-row path stays COLD for re-routed readers (criterion 1, sentinel form)", () => {
@@ -114,6 +137,19 @@ describe("PRET-3 H2 — tier-keyed corrections are re-keyed, not stranded", () =
       .insert({ team_id: seed.teamId, arc_id: "arc-legacy", arc_title: "t", corrected_text: "pre-6b", group_key: "" });
     expect(e2).toBeNull();
 
+    // Diff-review H1/H2 fixtures: a kept-p: multi-group row (the PPARC-3 ruling must survive
+    // this migration) and a COLLIDING second tier-era row for the same arc (two eligible
+    // siblings mapping to one target must not violate the per-scope unique and halt a deploy).
+    const { error: e3 } = await db()
+      .from("arc_corrections")
+      .insert({ team_id: seed.teamId, arc_id: "arc-multi", arc_title: "t", corrected_text: "union take", group_key: `p:${seed.teamId}:${teamGroup},${extGroup}` });
+    expect(e3).toBeNull();
+    const { error: e4 } = await db()
+      .from("arc_corrections")
+      .insert({ team_id: seed.teamId, arc_id: "arc-tier", arc_title: "t", corrected_text: "the OLDER sibling", group_key: `${teamGroup}` });
+    expect(e4).toBeNull();
+    await runSql("update arc_corrections set updated_at = now() - interval '1 day' where team_id = $1 and corrected_text = 'the OLDER sibling'", [seed.teamId]);
+
     const MIG = readFileSync("postgres/migrations/20260817150000_arc_corrections_tier_rekey.sql", "utf8");
     await runSql(MIG);
     await runSql(MIG); // replay-safe
@@ -128,6 +164,17 @@ describe("PRET-3 H2 — tier-keyed corrections are re-keyed, not stranded", () =
       [seed.teamId]
     );
     expect(legacy.rows[0].group_key, "'' rows keep the PPARC-3 disposition — kept, unread").toBe("");
+    const multi = await runSql<{ group_key: string }>(
+      "select group_key from arc_corrections where team_id = $1 and arc_id = 'arc-multi'",
+      [seed.teamId]
+    );
+    expect(multi.rows[0].group_key, "p: multi-group rows keep THEIR ruling too — never laundered into General").toContain("p:");
+    const siblings = await runSql<{ group_key: string }>(
+      "select group_key from arc_corrections where team_id = $1 and arc_id = 'arc-tier' order by group_key",
+      [seed.teamId]
+    );
+    // The NEWEST eligible sibling won the slot; the older one stays kept-unread — no collision.
+    expect(siblings.rows.map((r) => r.group_key)).toEqual([`${teamGroup}`, `g:${teamGroup}`].sort());
   });
 });
 

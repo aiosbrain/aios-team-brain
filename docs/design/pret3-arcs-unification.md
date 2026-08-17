@@ -62,7 +62,15 @@ comment block) — but unread after this slice; counted by the criterion-4 query
   the Fable-6b-Medium-4 allowance (corrections loaded for a `g:<slug>_external` partition
   scope) — that allowance existed BECAUSE no external principal could read the row, the exact
   premise this slice retires; the reversal is the H1 rule applied consistently.
-- **H2 — tier-keyed corrections are RE-KEYED, not stranded.** Every read becomes `g:`-exact
+- **H2 — tier-keyed corrections are RE-KEYED, not stranded** (rules hardened by the diff
+  review — the fleet holds shapes the first draft did not model: kept-`p:` multi-group rows
+  keep the PPARC-3 ruling and are NEVER re-keyed into General, the migration excludes `p:%`;
+  ONE newest eligible sibling per (team, arc) is re-keyed so rename-era duplicate keys cannot
+  collide the per-scope unique and halt a deploy from preDeploy; an existing `g:` row wins its
+  slot with losers kept-unread and honestly counted; teams with no General pointer are skipped
+  and counted; and standing `g:<slug>_external` cache rows synthesized under the old
+  corrections allowance are wiped ONCE, marker-bounded, so externals are never served
+  pre-H1 laundered prose). Every read becomes `g:`-exact
   after this slice, so current tier-set-keyed correction rows (a permissive team's entire
   correction history — and any enforcing team's pre-PPARC rows the retiring `includeLegacy`
   arm still served) would silently stop feeding synthesis: the H13 revert, fleet-wide. A DATA
@@ -76,8 +84,10 @@ comment block) — but unread after this slice; counted by the criterion-4 query
   `lib/cache/tier-invalidation.ts` hard-deletes only the TIER external key and stale-marks the
   rest — sufficient while only team-tier members read `g:` rows, a reopened SWR leak the
   moment externals do (`purgeArcCacheKey`'s own doc names why stale-marking is not enough).
-  `purgeExternalTierCaches` additionally calls
-  `purgePartitionArcCache(db, teamId, episodeGroupId(slug, "external"))`; both existing call
+  `purgeExternalTierCaches` additionally purges the external PARTITION row, resolved from the
+  external-shared project's STORED `graph_group_id` (diff review H4: a renamed team's pointer
+  is frozen under the old slug — a slug-derived key deletes nothing and leaves the served row
+  alive; the slug form is only the unbootstrapped-team fallback); both existing call
   sites (`lib/ingest/reclassify.ts`, `lib/graph/run.ts`) inherit it unchanged; dm-pinned by a
   narrowed-item fixture through the external fused read.
 

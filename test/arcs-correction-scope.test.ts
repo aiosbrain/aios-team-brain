@@ -53,15 +53,22 @@ vi.mock("@/lib/graph/graphiti-client", async (importOriginal) => {
 function fakeDb(projectGroups: string[] = [], upserts?: Array<{ table: string; row: unknown }>) {
   return {
     from: (table: string) => ({
-      select: () => ({
-        eq: () => ({
-          eq: () => ({ maybeSingle: async () => ({ data: null }) }),
-          maybeSingle: async () => ({ data: null }),
-          order: () => ({ limit: async () => ({ data: [] }) }),
-          limit: async () => ({ data: [] }),
-          not: () => Promise.resolve({ data: table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [] }),
-        }),
-      }),
+      select: () => {
+        // Self-referential filter chain: any depth of .eq/.not ends in the same terminals
+        // (PRET-3's pointer-resolved purge reads projects with three .eq levels).
+        const chain: Record<string, unknown> = {};
+        chain.eq = () => chain;
+        chain.maybeSingle = async () => ({ data: null });
+        chain.order = () => ({ limit: async () => ({ data: [] }) });
+        chain.limit = async () => ({ data: [] });
+        chain.not = () => {
+          const rows = table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [];
+          const p = Promise.resolve({ data: rows }) as Promise<{ data: unknown[] }> & { maybeSingle: () => Promise<{ data: unknown }> };
+          p.maybeSingle = async () => ({ data: rows[0] ?? null });
+          return p;
+        };
+        return chain;
+      },
       upsert: async (row: unknown) => {
         // Captured so absence tests can assert on the PERSISTENT half (review: the fence's
         // original no-upsert assertion was dropped in PPARC-4's test surgery — Codex Low 5).

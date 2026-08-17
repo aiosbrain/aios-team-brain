@@ -105,7 +105,8 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
         // `arc_id` is a hash of the title and churns on every recompute, so the server stores the title
         // beside it to keep the correction diagnosable afterwards.
         arc_title: arcs.find((a) => a.id === arc_id && (a.sourceGroup ?? undefined) === sourceGroup)?.title ?? "",
-        // ONE partition per POST (undefined = the permissive tier path, whose panel has no sourceGroup).
+        // ONE partition per POST. Since PRET-3 every served arc carries sourceGroup; an
+        // undefined here means a stale pre-unification panel and the server 422s until reload.
         sourceGroup,
       };
     });
