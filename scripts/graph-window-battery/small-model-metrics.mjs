@@ -137,3 +137,52 @@ export function scoreTemporalCoverage(edges) {
   if (dated === 0) return { total, share: null };
   return { total, share: dated / total };
 }
+
+/**
+ * Is a metric capable of MOVING on this corpus, or is it pinned at a structural extreme?
+ *
+ * WHY THIS EXISTS — it is Q3's lesson, mechanised. Q3 (IS_DUPLICATE_OF share) read a structural ZERO
+ * on every arm because graphiti 0.29.3 stopped writing the relation, and that was only discovered
+ * LIVE, mid-session, after the money was spent (`decision.mjs` Amendment 2). Q11 has the same shape of
+ * risk from the other end: `lib/graph/extraction-health.ts:348` records that graphiti BACKDATES
+ * `valid_at` to the episode's work time, so coverage may be ~1.0 on every arm — a metric that cannot
+ * fall, quietly scoring a meaningless ratio of 1.0 as PASS. It could not be settled empirically before
+ * building: NEO4J_URI is an internal Railway address with no public proxy.
+ *
+ * So the metric proves informativeness on the corpus it is ACTUALLY run against, instead of a human
+ * asserting it once. `bandMargin` makes "room to move" concrete: room to move *by the amount the band
+ * would need to see*. A ceiling metric (coverage 0.99 against a 15% band) cannot fall 15% without
+ * going below what the data can express; a floor metric cannot fall at all.
+ *
+ * UNINFORMATIVE IS NOT PASS. A metric that cannot fail is not evidence of safety — counting it as a
+ * pass is how a battery ships an arm on a gate that was never armed. The caller must exclude it from
+ * gating AND report it, so the readout says which questions this corpus could not answer.
+ */
+export function assessInformativeness(incumbentReps, { bandMargin, floor = 0, ceiling = 1 } = {}) {
+  if (!Array.isArray(incumbentReps) || incumbentReps.length === 0) {
+    return { informative: false, reason: "no incumbent reps" };
+  }
+  const usable = incumbentReps.filter((v) => typeof v === "number" && Number.isFinite(v));
+  if (usable.length === 0) {
+    // `null` is what the scorers return for "no evidence" — an absence, not a zero.
+    return { informative: false, reason: "incumbent produced no measurable value (null/NaN)" };
+  }
+  const mean = usable.reduce((a, b) => a + b, 0) / usable.length;
+  if (typeof bandMargin !== "number" || !(bandMargin > 0)) {
+    return { informative: false, reason: "no band margin supplied — cannot judge room to move" };
+  }
+  // Room to FALL by the band's own margin, expressed in the metric's units.
+  const roomBelow = mean - mean * (1 - bandMargin);
+  if (mean - roomBelow < floor - 1e-9) {
+    return { informative: false, reason: `incumbent mean ${mean.toFixed(4)} cannot fall by the band without passing the floor ${floor}` };
+  }
+  // A metric already AT the ceiling has nowhere to rise, which matters for two-sided bands, and a
+  // metric at the floor has nowhere to fall — both make the gate unarmable in the direction that counts.
+  if (mean >= ceiling - 1e-9) {
+    return { informative: false, reason: `incumbent mean ${mean.toFixed(4)} sits at the structural ceiling ${ceiling} — no room to move` };
+  }
+  if (mean <= floor + 1e-9) {
+    return { informative: false, reason: `incumbent mean ${mean.toFixed(4)} sits at the structural floor ${floor} — no room to move` };
+  }
+  return { informative: true, mean };
+}

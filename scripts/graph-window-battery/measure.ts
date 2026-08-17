@@ -175,6 +175,47 @@ export function peopleFrom(
  * node count. Q7 is computed FROM these (plus the corpus bodies) at judge time, because its universe
  * is the union of the INCUMBENT's two reps and rep 2 does not exist while rep 1 is harvested.
  */
+/**
+ * Q10's input — every entity's summary plus the facts on its OWN adjacent edges (GRAPHSMALL-2).
+ *
+ * Schema (verified in `lib/graph/learning.ts`):
+ * `(:Entity)-[:RELATES_TO {fact, created_at, valid_at, group_id, episodes}]->(:Entity)`.
+ *
+ * Facts come from edges in EITHER direction: a fact about an entity is as often the object as the
+ * subject, and taking only outgoing edges would score a perfectly good summary as "detached" purely
+ * because of edge direction — an artefact, not a quality signal. Scoped to one `group_id` on both the
+ * node and the relationship, per the tier note at the top of this file.
+ */
+export async function summaryRows(
+  groupId: string
+): Promise<{ name: string; summary: string; facts: string[] }[]> {
+  const rows = await runRead<{ name: string; summary: string | null; facts: (string | null)[] }>(
+    `MATCH (n:Entity {group_id: $g})
+     OPTIONAL MATCH (n)-[r:RELATES_TO {group_id: $g}]-()
+     RETURN n.name AS name, n.summary AS summary, collect(r.fact) AS facts`,
+    { g: groupId }
+  );
+  return rows.map((r) => ({
+    name: r.name ?? "",
+    summary: r.summary ?? "",
+    facts: (r.facts ?? []).filter((f): f is string => typeof f === "string" && f.length > 0),
+  }));
+}
+
+/**
+ * Q11's input — the `valid_at` of every fact edge in the group (GRAPHSMALL-2).
+ *
+ * Returns the raw values rather than a count so `scoreTemporalCoverage` owns what "dated" means (it
+ * rejects blank strings), keeping one definition instead of two that can drift apart.
+ */
+export async function temporalEdges(groupId: string): Promise<{ valid_at: string | null }[]> {
+  const rows = await runRead<{ valid_at: string | null }>(
+    "MATCH ()-[r:RELATES_TO {group_id: $g}]->() RETURN r.valid_at AS valid_at",
+    { g: groupId }
+  );
+  return rows.map((r) => ({ valid_at: r.valid_at ?? null }));
+}
+
 export async function entityNameCounts(groupId: string): Promise<{ name: string; nodes: number }[]> {
   const rows = await runRead<{ name: string; nodes: number }>(
     "MATCH (n:Entity {group_id: $g}) RETURN n.name AS name, count(n) AS nodes",

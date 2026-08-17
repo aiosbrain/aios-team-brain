@@ -352,17 +352,26 @@ export const MIN_UNIVERSE = 15;
  * `arms` is ordered — SAME before W1 — and the FIRST arm to pass every gate wins. An arm ships only
  * if every metric PASSes; INCONCLUSIVE blocks exactly as FAIL does.
  */
-export function decide({ session, incumbent, arms, registry = METRICS }) {
+export function decide({ session, incumbent, arms, registry = METRICS, uninformative = [] }) {
   if (!session.valid) {
     return { outcome: "INVALID", reasons: session.problems, arms: [] };
   }
+  // A metric the corpus cannot move does not gate — and is NOT counted as a pass. See
+  // `assessInformativeness`: Q3 read a structural zero on every arm and was only caught live, and
+  // Q11 carries the same risk from the ceiling. Excluding it is honest; passing it is a gate that was
+  // never armed. The excluded keys are reported on the result so a readout says which questions this
+  // corpus could not answer.
+  const skip = new Set(uninformative.map((u) => (typeof u === "string" ? u : u.key)));
   const judged = arms.map(({ name, metrics, extras = {} }) => {
-    const results = Object.keys(registry).map((key) => judgeMetric(key, metrics[key], incumbent[key], extras, registry));
+    const results = Object.keys(registry)
+      .filter((key) => !skip.has(key))
+      .map((key) => judgeMetric(key, metrics[key], incumbent[key], extras, registry));
     const blocking = results.filter((r) => r.verdict !== VERDICT.PASS);
     return { name, results, ships: blocking.length === 0, blocking };
   });
   const winner = judged.find((a) => a.ships);
   return {
+    uninformative: [...skip],
     outcome: winner ? "SHIP" : "NO_SHIP",
     winner: winner?.name ?? null,
     arms: judged,

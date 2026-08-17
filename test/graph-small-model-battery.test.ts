@@ -383,3 +383,62 @@ describe("the judge is WIRED to the small-model registry (the critical fold)", (
     expect(broken.problems.join(" ")).toMatch(/IDENTICAL|inherited|separation/i);
   });
 });
+
+describe("informativeness guard — Q3's lesson, mechanised (GRAPHSMALL-2)", () => {
+  it("calls a CEILING metric uninformative: coverage ~1.0 has no room to fall by the band", async () => {
+    // The Q11 risk: graphiti backdates valid_at to the episode's work time, so coverage may be ~1.0
+    // on every arm — a metric that cannot move, scoring a meaningless 1.0 ratio as PASS. Q3 read a
+    // structural ZERO exactly this way and was only caught live, after the money was spent.
+    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+    const r = assessInformativeness([1.0, 1.0], { bandMargin: 0.15 });
+    expect(r.informative).toBe(false);
+    expect(r.reason).toMatch(/ceiling|no room/i);
+  });
+
+  it("calls a FLOOR metric uninformative (the literal Q3 shape)", async () => {
+    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+    expect(assessInformativeness([0, 0], { bandMargin: 0.15 }).informative).toBe(false);
+  });
+
+  it("calls a MID-RANGE incumbent informative — the guard must not disarm a working metric", async () => {
+    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+    const r = assessInformativeness([0.5, 0.52], { bandMargin: 0.15 });
+    expect(r.informative).toBe(true);
+  });
+
+  it("treats a null/absent incumbent as uninformative, not as zero", async () => {
+    const { assessInformativeness } = await import("../scripts/graph-window-battery/small-model-metrics.mjs");
+    // `null` is what the scorers return for "no evidence"; scoring it 0 would read as total collapse.
+    expect(assessInformativeness([null, null], { bandMargin: 0.15 }).informative).toBe(false);
+    expect(assessInformativeness([], { bandMargin: 0.15 }).informative).toBe(false);
+    expect(assessInformativeness([0.5, 0.5], {}).informative).toBe(false); // no band → cannot judge room
+  });
+
+  it("an UNINFORMATIVE metric is EXCLUDED from gating, never counted as a pass", () => {
+    // A metric that cannot fail is not evidence of safety. Here Q11 would FAIL if judged (arm well
+    // below the incumbent), but it is excluded — and the result reports which questions went unanswered.
+    const base = { Q1: [10, 10], Q2: [1, 1], Q4: [0.5, 0.5], Q5: [0, 0], Q7: [1, 1],
+      Q10: [0.9, 0.9], Q10F: [0.6, 0.6], Q10L: [120, 120], Q11: [1.0, 1.0], C2: [0.01, 0.01] };
+    const session = assessSession({
+      incumbent: base, universeSize: 20, underpowered: [], armsCompleted: true,
+      harnessRefused: false, crossCheckAvailable: true,
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+    });
+    const out = decide({
+      session,
+      incumbent: base,
+      arms: [{ name: "SMALL", metrics: { ...base, Q11: [0.2, 0.2], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+      uninformative: ["Q11"],
+    });
+    expect(out.uninformative).toContain("Q11");
+    expect(out.arms[0].results.map((r: { key: string }) => r.key)).not.toContain("Q11");
+    // …and with Q11 JUDGED instead, that same arm is blocked — proving the exclusion is doing work.
+    const judgedOut = decide({
+      session, incumbent: base,
+      arms: [{ name: "SMALL", metrics: { ...base, Q11: [0.2, 0.2], C2: [0.005, 0.005] }, extras: { personsLost: 0 } }],
+      registry: smallModelMetrics({ addressableShare: 0.287 }),
+    });
+    expect(judgedOut.arms[0].ships).toBe(false);
+  });
+});

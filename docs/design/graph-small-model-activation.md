@@ -226,7 +226,10 @@ So for this arm:
 - The per-`call_kind` cost split in the battery readout, so savings are measured.
 - `scripts/graph-window-battery/RUNBOOK.md` updated with the arm and its config step.
 
-**DEFERRED after review, with the reason (not silently):** the **Neo4j read path** for Q10/Q11.
+**GRAPHSMALL-2 (this follow-up) lands the deferred Neo4j read path** and the informativeness guard
+below. The paragraph that follows describes what GRAPHSMALL-1 shipped without.
+
+**DEFERRED in GRAPHSMALL-1, with the reason (not silently):** the **Neo4j read path** for Q10/Q11.
 `scripts/graph-window-battery/measure.ts` does not yet query `(:Entity){name, summary}` or
 `RELATES_TO.valid_at`, so the scorers are reachable by the judge but not yet fed by a live readout.
 Both reviewers flagged this and both offered the same two options — wire it, or re-scope and say so.
@@ -246,6 +249,32 @@ left for an operator to discover mid-session.
 - **PIPEFF-5** — merging `extract_nodes` + `extract_edges` ($8.46, 46.1%) is the larger lever, changes
   the extraction prompt, and needs its own battery.
 - **GRAPHCOST-2** — excluding zero-payoff paths is 0.6% of spend; tracked as graph hygiene, not cost.
+
+## The informativeness guard (GRAPHSMALL-2) — Q3's lesson, mechanised
+
+**Q11 may be a structural constant, and that is the exact trap that killed Q3.**
+`lib/graph/extraction-health.ts:348` records that graphiti **backdates `valid_at` to the episode's
+work time**. If it does that for essentially every edge, then "share of `RELATES_TO` edges carrying a
+resolved `valid_at`" is ~1.0 on every arm — a metric that *cannot move*, scoring a meaningless 1.0
+ratio as PASS. Q3 read a structural zero the same way and was only caught LIVE, mid-session, after
+the money was spent.
+
+**It could not be settled empirically from this machine.** `NEO4J_URI` is
+`bolt://neo4j.railway.internal:7687` and the neo4j service exposes no public TCP proxy (checked), so
+there is no read path from a laptop, and provisioning one is a production change.
+
+So rather than assume informativeness, the metric must **prove** it:
+
+- `assessInformativeness(incumbentReps, metric)` reads the INCUMBENT's own two reps and reports
+  `UNINFORMATIVE` when the metric sits at a structural floor/ceiling — a coverage of ~1.0 has no room
+  to fall, ~0.0 no room to drop further — with the threshold in band units, so "room to move" means
+  "room to move *by the amount the band would need to see*".
+- An `UNINFORMATIVE` metric **does not gate** and is reported as such. It is NOT a PASS: a metric that
+  cannot fail is not evidence of safety, and silently counting it as PASS is how a battery ships an
+  arm on a gate that was never armed.
+- This generalises rather than special-casing Q11: any future metric that lands at a structural
+  extreme is caught by the same rule, on the corpus it is actually run against, instead of being
+  re-discovered per metric.
 
 ## Acceptance criteria
 
@@ -269,6 +298,11 @@ left for an operator to discover mid-session.
 8b. **unit** — the judge gates this arm on `C2` (USD/episode) and NOT on `C1` (input tokens/episode):
    an arm that halves cost while leaving token count flat PASSES, which is precisely the shape this
    lever produces and the shape `C1`'s `ratio-fall` would have failed.
+8c. **unit** — `assessInformativeness` reports UNINFORMATIVE for an incumbent at a structural
+   ceiling (coverage ~1.0, no room to fall by the band) and for one at a floor, and INFORMATIVE for a
+   mid-range incumbent — and an UNINFORMATIVE metric is excluded from gating rather than counted PASS.
+8d. **unit** — `summaryRows`/`temporalEdges` produce the exact shapes the pure scorers consume, so the
+   readout cannot drift from `scoreSummaryHealth`/`scoreTemporalCoverage`'s inputs.
 9. **docs** — `scripts/graph-window-battery/RUNBOOK.md` gains the small-model arm, and this spec is
    referenced from the ticket; no `docs/ARCHITECTURE.md` drift block changes (no new route/table/source).
 10. **script** — a FREE pre-flight reports which `call_kind`s actually carry
