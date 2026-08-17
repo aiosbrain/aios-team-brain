@@ -102,7 +102,6 @@ export async function getFusedArcs(
   // served immediately and revalidated via the background warm below (they never synthesize
   // inline) — an earlier comment here claimed getArcs would SWR them, but this path reads rows
   // directly and must own its own revalidation (Fable PPARC-3 High 2).
-  const now = Date.now();
   const inlineTarget = rankedGroups.find((g) => entries.find((e) => e.group === g)?.entry == null);
   if (inlineTarget) {
     const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, "team", [inlineTarget], keys, {
@@ -125,14 +124,18 @@ export async function getFusedArcs(
   // scheduling reuses THE ROWS ALREADY READ above (Codex Medium 3: re-probing them through
   // warmPartitionArcs doubled the serial reads), is budgeted, and its count is the pin's
   // observable; the syntheses themselves stay background.
+  // ONE clock for the warm classifier AND the returned envelope, captured AFTER the inline
+  // synthesis (Codex PPARC-4 Medium 2): with the clock taken before a long inline synthesis, a
+  // row crossing its TTL during it was scheduled for refresh yet reported `stale: false` — the
+  // envelope must never contradict the scheduler's own verdict about the same row.
+  const now = Date.now();
   let warmScheduled = 0;
-  const nowForWarm = Date.now();
   for (const e of entries) {
     if (e.group === inlineTarget) continue;
     if (warmScheduled >= PPARC_SYNTH_BUDGET_PER_READ) break;
     const isFresh =
       e.entry != null &&
-      !freshness(e.entry.computedAt, arcTtlMs(e.entry.degraded), { now: nowForWarm, degraded: e.entry.degraded }).stale;
+      !freshness(e.entry.computedAt, arcTtlMs(e.entry.degraded), { now, degraded: e.entry.degraded }).stale;
     if (isFresh) continue;
     const prior = e.entry ? { arcs: e.entry.arcs, factsHash: e.entry.factsHash, degraded: e.entry.degraded } : null;
     if (schedulePartitionRefresh(db, teamId, e.group, keys, prior)) warmScheduled++;

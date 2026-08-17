@@ -3,14 +3,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { DbClient } from "@/lib/db/types";
 
 /**
- * PCCC6B-1 — corrections are SCOPE-KEYED (design §2.4 step 4 as built; spec: "cross-project
- * synthesis is never computed"). The laundering vector this pins closed: corrections were
- * team-global, so a correction whose prose derived from one visibility scope fed EVERY team-tier
- * synthesis, including ones served to principals who cannot see that scope. Spec-first: written
- * against the scope-keyed API before it existed.
- *
- * The seam is the same one test/arcs-degraded-skips-model.test.ts established: vi.mock the module
- * boundaries, drive the real synthesis pipeline.
+ * Corrections are SCOPE-KEYED (PCCC6B-1 origin; PPARC-4 as-built: the per-oracle `p:` namespace
+ * is RETIRED — `g:` is the one partition scope, and test/guards/no-per-oracle-arc-keys.test.ts
+ * pins that nothing re-mints `p:`). This file pins the g:-era rules: the write-back targeting,
+ * exact-scope correction loads, the memory bound, the eviction callers, and the purge-generation
+ * fence. The seam is the vi.mock harness test/arcs-degraded-skips-model.test.ts established.
  */
 
 const factsMock = vi.hoisted(() => ({ recentFacts: vi.fn(), resolveEpisodeItems: vi.fn() }));
@@ -53,42 +50,38 @@ vi.mock("@/lib/graph/graphiti-client", async (importOriginal) => {
   return { ...orig, GraphitiClient: MockClient };
 });
 
-function fakeDb() {
-  const db = {
-    from: () => ({
+function fakeDb(projectGroups: string[] = [], upserts?: Array<{ table: string; row: unknown }>) {
+  return {
+    from: (table: string) => ({
       select: () => ({
         eq: () => ({
           eq: () => ({ maybeSingle: async () => ({ data: null }) }),
           maybeSingle: async () => ({ data: null }),
           order: () => ({ limit: async () => ({ data: [] }) }),
           limit: async () => ({ data: [] }),
+          not: () => Promise.resolve({ data: table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [] }),
         }),
       }),
-      upsert: async () => ({ error: null }),
+      upsert: async (row: unknown) => {
+        // Captured so absence tests can assert on the PERSISTENT half (review: the fence's
+        // original no-upsert assertion was dropped in PPARC-4's test surgery — Codex Low 5).
+        upserts?.push({ table, row });
+        return { error: null };
+      },
     }),
   } as unknown as DbClient;
-  return { db };
 }
 
 const KEYS = { anthropic: "test-key", openai: null, openrouter: null } as unknown as Parameters<
   typeof import("@/lib/graph/arcs").getArcs
 >[5];
-
-// randomUUID, not Math.random — same uniqueness job, and Codacy's weak-RNG security rule fires on
-// Math.random even in a test fixture (observed on this PR; the neighboring older file predates the rule).
 const slug = () => `acme${randomUUID().slice(0, 8)}`;
 const projGroup = () => `g_${randomUUID().replace(/-/g, "")}_p_${randomUUID().replace(/-/g, "")}`;
-
 const FACT = {
-  id: "f1",
-  fact: "shipped the payments retry",
-  at: "2026-07-20T00:00:00Z",
-  subject: "alex",
-  subjectType: "Person",
-  object: "payments",
-  objectType: "Service",
-  episodeUuids: ["ep-1"],
+  id: "f1", fact: "shipped the payments retry", at: "2026-07-20T00:00:00Z", subject: "alex",
+  subjectType: "Person", object: "payments", objectType: "Service", episodeUuids: ["ep-1"],
 };
+const CORRECTION = { arc_id: "a1", arc_title: "Payments", corrected_text: "actually shipped in June" };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -105,185 +98,176 @@ beforeEach(() => {
   graphitiMock.addEpisodes.mockResolvedValue(undefined);
 });
 
-describe("PCCC6B-1 — synthesis loads corrections for EXACTLY its own scope", () => {
-  it("a PARTITION-scope synthesis requests its scope key and REFUSES legacy rows", async () => {
-    const { getArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
+describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
+  it("a SINGLE-group g: recompute writes back to THAT group", async () => {
+    const { recomputeArcs } = await import("@/lib/graph/arcs");
     const t = slug();
-    const groups = [`${t}_team`, `g_${"a".repeat(32)}_p_${"b".repeat(32)}`];
-    const scopeKey = partitionArcScopeKey("team-1", groups);
-    await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
-
-    // PPARC-2's warming piggyback fires g:-scoped background reads alongside — the pin targets
-    // THE p:-scoped call specifically, not a global count.
-    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === scopeKey);
-    expect(scoped).toHaveLength(1);
-    expect(scoped[0][2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
-  });
-
-  it("the TIER path requests its own sorted-set key WITH legacy rows — pre-6b corrections were tier-scope by construction", async () => {
-    const { getArcs } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const groups = [`${t}_team`, `${t}_external`];
-    await getArcs(db, "team-1", t, "team", groups, KEYS);
-
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
-    const args = correctionsMock.listArcCorrections.mock.calls[0];
-    expect(args[2]).toMatchObject({ groupKey: groups.slice().sort().join(","), includeLegacy: true });
-  });
-
-  it("an EXTERNAL-only synthesis still loads no corrections at all (the standing tier gate)", async () => {
-    const { getArcs } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    await getArcs(db, "team-1", t, "external", [`${t}_external`], KEYS);
-    expect(correctionsMock.listArcCorrections).not.toHaveBeenCalled();
-  });
-});
-
-describe("PCCC6B-1 — the graph write-back follows the scope", () => {
-  const CORRECTION = { arc_id: "a1", arc_title: "Payments", corrected_text: "actually shipped in June" };
-
-  it("a SINGLE-group partition scope writes the correction episode to THAT group", async () => {
-    const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const group = `g_${"a".repeat(32)}_p_${"b".repeat(32)}`;
-    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey("team-1", [group]),
-    });
+    const group = projGroup();
+    await recomputeArcs(fakeDb(), "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
     expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
     expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(group);
   });
 
-  it("a MULTI-group partition scope writes NOTHING to the graph — any single target narrower than the derivation scope launders", async () => {
-    const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
+  it("a MULTI-group g: scope writes NOTHING — a target narrower than the derivation scope launders (the route never sends multi; the function rule holds anyway)", async () => {
+    const { recomputeArcs } = await import("@/lib/graph/arcs");
     const t = slug();
-    const groups = [`${t}_team`, `g_${"a".repeat(32)}_p_${"b".repeat(32)}`];
-    await recomputeArcs(db, "team-1", t, "team", groups, [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey("team-1", groups),
-    });
+    const groups = [`${t}_team`, projGroup()];
+    await recomputeArcs(fakeDb(), "team-1", t, "team", groups, [CORRECTION], KEYS, null, { scopeKey: `g:${groups.join(",")}` });
     expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
+  });
+
+  it("an EXTERNAL-shaped g: group refuses the write-back but still LOADS its own corrections", async () => {
+    const { recomputeArcs, getArcs } = await import("@/lib/graph/arcs");
+    const t = slug();
+    const group = `${t}_external`;
+    await recomputeArcs(fakeDb(), "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
+    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
+
+    const t2 = slug();
+    const group2 = `${t2}_external`;
+    await getArcs(fakeDb(), "team-1", t2, "team", [group2], KEYS, { scopeKey: `g:${group2}` });
+    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === `g:${group2}`);
+    expect(scoped).toHaveLength(1);
+    expect(scoped[0][2]).toMatchObject({ groupKey: `g:${group2}`, includeLegacy: false });
   });
 
   it("the TIER path keeps today's <slug>_team target", async () => {
     const { recomputeArcs } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
     const t = slug();
-    await recomputeArcs(db, "team-1", t, "team", [`${t}_team`, `${t}_external`], [CORRECTION], KEYS, null);
+    await recomputeArcs(fakeDb(), "team-1", t, "team", [`${t}_team`, `${t}_external`], [CORRECTION], KEYS, null);
     expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
     expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(`${t}_team`);
   });
 
-  it("an EXTERNAL-shaped single-group scope writes NOTHING to the graph — a restriction-debt window's scope is exactly [<slug>_external] (Fable 6b High 1)", async () => {
-    const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const group = `${t}_external`;
-    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, {
-      scopeKey: partitionArcScopeKey("team-1", [group]),
-    });
-    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
-  });
-
-  it("…but that scope still LOADS its own corrections — refusing would silently revert an edit made during the window (Fable 6b Medium 4)", async () => {
-    const { getArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const groups = [`${t}_external`];
-    const scopeKey = partitionArcScopeKey("team-1", groups);
-    await getArcs(db, "team-1", t, "team", groups, KEYS, { scopeKey });
-    const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === scopeKey);
-    expect(scoped).toHaveLength(1);
-    expect(scoped[0][2]).toMatchObject({ groupKey: scopeKey, includeLegacy: false });
-  });
-
-  it("a g:-scoped SINGLE-group recompute writes back to THAT group — the namespace the enforced route actually sends (Fable PPARC-3 High 1: the p:-only predicate dropped g: into the TIER branch, landing restricted prose in the team group)", async () => {
+  it("the recorded correction carries the g: scope key it was made in", async () => {
     const { recomputeArcs } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
     const t = slug();
     const group = projGroup();
-    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
-    expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
-    expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(group);
-  });
-
-  it("a g:-scoped EXTERNAL-shaped group still refuses the write-back", async () => {
-    const { recomputeArcs } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const group = `${t}_external`;
-    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
-    expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
-  });
-
-  it("the recorded correction carries the scope key it was made in", async () => {
-    const { recomputeArcs, partitionArcScopeKey } = await import("@/lib/graph/arcs");
-    const { db } = fakeDb();
-    const t = slug();
-    const group = `g_${"a".repeat(32)}_p_${"b".repeat(32)}`;
-    const scopeKey = partitionArcScopeKey("team-1", [group]);
-    await recomputeArcs(db, "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey });
+    await recomputeArcs(fakeDb(), "team-1", t, "team", [group], [CORRECTION], KEYS, null, { scopeKey: `g:${group}` });
     expect(correctionsMock.recordArcCorrections).toHaveBeenCalledTimes(1);
-    expect(correctionsMock.recordArcCorrections.mock.calls[0][4]).toBe(scopeKey);
+    expect(correctionsMock.recordArcCorrections.mock.calls[0][4]).toBe(`g:${group}`);
   });
 });
 
-describe("PCCC-7 — the in-memory arc cache is bounded", () => {
-  it("insertion past the bound evicts the oldest entry; scoped eviction removes a team's p: keys", async () => {
-    const { memCacheSet, arcMemoryCacheSize, evictScopedArcMemory } = await import("@/lib/graph/arcs");
+describe("the in-memory arc cache is bounded (PCCC-7 rule, g:-era)", () => {
+  it("insertion past the bound evicts the oldest; per-key g: eviction works", async () => {
+    const { memCacheSet, arcMemoryCacheSize, evictPartitionArcMemory, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
     const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
-    for (let i = 0; i < 600; i++) memCacheSet(`p:bound-team:${i}`, entry);
-    expect(arcMemoryCacheSize()).toBeLessThanOrEqual(512); // the bound holds under churn
-    const before = arcMemoryCacheSize();
-    evictScopedArcMemory("bound-team");
-    expect(arcMemoryCacheSize()).toBeLessThan(before); // id-keyed eviction finds the p: entries
+    for (let i = 0; i < 600; i++) memCacheSet(`g:bound-${i}`, entry);
+    expect(arcMemoryCacheSize()).toBeLessThanOrEqual(512);
+    memCacheSet("g:evict-me", entry);
+    evictPartitionArcMemory("evict-me");
+    expect(arcMemoryCacheHas("g:evict-me")).toBe(false);
   });
 });
 
-describe("PCCC-7 — the eviction call sites reach the id-namespaced keys (Fable Medium 1)", () => {
-  it("bustTeamLearningCaches and purgeExternalTierCaches evict a team's p: memory entries", async () => {
-    const { memCacheSet, arcMemoryCacheSize } = await import("@/lib/graph/arcs");
+describe("the eviction callers reach g: keys (PPARC-2 rule; Fable Medium 1 lineage)", () => {
+  it("bustTeamLearningCaches and purgeExternalTierCaches evict a team's g: memory entries via the pointer list", async () => {
+    const { memCacheSet, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
     const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
     const { purgeExternalTierCaches } = await import("@/lib/cache/tier-invalidation");
-    const { db } = fakeDb();
     const entry = { arcs: [], at: Date.now(), factsHash: null, degraded: false };
 
-    // Observe the CALLER's effect directly — the first version of this test called
-    // evictScopedArcMemory itself "idempotently" and thereby masked its own mutation (caught when
-    // severing the caller's eviction reddened nothing).
-    memCacheSet("p:evict-a:g1", entry);
-    const beforeA = arcMemoryCacheSize();
-    await bustTeamLearningCaches(db, "evict-a", "some-slug");
-    expect(arcMemoryCacheSize()).toBe(beforeA - 1);
+    const gA = projGroup();
+    memCacheSet(`g:${gA}`, entry);
+    await bustTeamLearningCaches(fakeDb([gA]), "evict-a", "some-slug");
+    expect(arcMemoryCacheHas(`g:${gA}`)).toBe(false);
 
-    memCacheSet("p:evict-b:g1", entry);
-    const beforeB = arcMemoryCacheSize();
-    await purgeExternalTierCaches(db, "evict-b", "some-slug");
-    expect(arcMemoryCacheSize()).toBe(beforeB - 1);
+    const gB = projGroup();
+    memCacheSet(`g:${gB}`, entry);
+    await purgeExternalTierCaches(fakeDb([gB]), "evict-b", "some-slug");
+    expect(arcMemoryCacheHas(`g:${gB}`)).toBe(false);
   });
 });
 
-describe("PCCC6B-1 — the partition scope key is its own cache namespace", () => {
-  it("partitionArcScopeKey namespaces on the IMMUTABLE team id, never collides with a tier key, and eviction finds it by id", async () => {
-    const { partitionArcScopeKey, arcKeyBelongsToTeam } = await import("@/lib/graph/arcs");
-    const t = slug();
-    const tierPair = [`${t}_team`, `${t}_external`];
-    const key = partitionArcScopeKey("team-1", tierPair);
-    // A built-ins-only oracle scope must NOT share a cache row with the tier path: same groups,
-    // different corrections rule — a shared row would poison across the boundary.
-    expect(key).not.toBe(tierPair.slice().sort().join(","));
-    // PCCC-7: the NAMESPACE segment is the IMMUTABLE team id — group segments may carry the slug
-    // (built-in pointers are frozen under it), but a rename must not change the key's namespace.
-    expect(key.startsWith("p:team-1:")).toBe(true);
-    expect(arcKeyBelongsToTeam(key, t, "team-1")).toBe(true);
-    expect(arcKeyBelongsToTeam(key, t, "team-2")).toBe(false);
-    expect(arcKeyBelongsToTeam(key, t)).toBe(false); // no id supplied -> a p: key is never claimed
-    // Project-group segments carry no slug — the p: namespace is what keeps eviction exact.
-    const projKey = partitionArcScopeKey("team-1", [`g_${"a".repeat(32)}_p_${"b".repeat(32)}`]);
-    expect(arcKeyBelongsToTeam(projKey, t, "team-1")).toBe(true);
-    expect(arcKeyBelongsToTeam(projKey, "other", "team-2")).toBe(false);
+describe("the fused envelope shares the warm classifier's clock (Codex PPARC-4 Medium 2)", () => {
+  it("a row crossing its TTL during the inline synthesis is BOTH scheduled for refresh AND reported stale", async () => {
+    const { getFusedArcs } = await import("@/lib/graph/arc-fusion");
+    const { ARC_CACHE_TTL_MS } = await import("@/lib/graph/arc-cache");
+    const cold = projGroup();
+    const borderline = projGroup();
+    // Fresh by ~150ms at read time; the 400ms inline synthesis below carries it past its TTL.
+    const borderlineRow = {
+      arcs: [{ id: "b1", title: "t", confidence: "high", summary: "s", participants: [], supporting_sources: [], evidence: [] }],
+      computed_at: new Date(Date.now() - ARC_CACHE_TTL_MS + 150).toISOString(),
+      facts_hash: "h",
+      degraded: false,
+    };
+    const rows: Record<string, unknown> = { [`g:${borderline}`]: borderlineRow };
+    const dbWithRows = {
+      from: (table: string) => ({
+        select: () => ({
+          eq: () => ({
+            eq: (_col: string, key: string) => ({ maybeSingle: async () => ({ data: table === "arc_cache" ? (rows[key] ?? null) : null }) }),
+            maybeSingle: async () => ({ data: null }),
+            order: () => ({ limit: async () => ({ data: [] }) }),
+            limit: async () => ({ data: [] }),
+            not: () => Promise.resolve({ data: [] }),
+          }),
+        }),
+        upsert: async () => ({ error: null }),
+      }),
+    } as unknown as DbClient;
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      return '{"arcs":[{"id":"c1","title":"t","confidence":"high","summary":"cold prose","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+
+    const panel = await getFusedArcs(dbWithRows, "team-clock", slug(), [cold, borderline], KEYS);
+
+    expect(panel.warmScheduled).toBe(1); // the borderline row was classified stale and scheduled
+    // …so the envelope must say so: with the clock captured before the inline synthesis, this
+    // returned stale:false for the very row the same call had just scheduled a refresh for.
+    expect(panel.freshness.stale).toBe(true);
+    await new Promise((r) => setTimeout(r, 600)); // let the fired background warm settle
+  });
+});
+
+describe("the purge-generation fence (g:-era wiring)", () => {
+  it("an in-flight g: refresh overtaken by a purge DROPS its commit — memory AND the persistent row", async () => {
+    const { schedulePartitionRefresh, evictPartitionArcMemory, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
+    const group = projGroup();
+    const upserts: Array<{ table: string; row: unknown }> = [];
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((r) => (release = r));
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await blocked;
+      return '{"arcs":[{"id":"x","title":"t","confidence":"high","summary":"pre-purge prose","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+    const fired = schedulePartitionRefresh(fakeDb([], upserts), "team-fence", group, KEYS, null);
+    expect(fired).toBe(true);
+    await new Promise((r) => setTimeout(r, 100)); // reach the blocked LLM
+    evictPartitionArcMemory(group); // the purge door's mem half — bumps the generation
+    release!();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false); // the commit was dropped, memory half
+    // The PERSISTENT half (Codex Low 5, restoring origin/main's dropped assertion): a fence that
+    // withheld only the memory commit while writing Postgres would serve the poisoned row to
+    // every OTHER process for a TTL — the row must never have been upserted at all.
+    expect(upserts.filter((u) => u.table === "arc_cache")).toHaveLength(0);
+  });
+
+  it("an in-flight g: refresh overtaken by the TEAM-WIDE evictor drops its commit too (Codex PPARC-4 Medium 1)", async () => {
+    const { schedulePartitionRefresh, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
+    const { bustTeamLearningCaches } = await import("@/lib/ingest/reconcile-attribution");
+    const group = projGroup();
+    const upserts: Array<{ table: string; row: unknown }> = [];
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((r) => (release = r));
+    llmMock.completeTextOrNull.mockImplementation(async () => {
+      await blocked;
+      return '{"arcs":[{"id":"x","title":"t","confidence":"high","summary":"pre-correction attribution","participants":[],"supporting_sources":[],"evidence":[]}]}';
+    });
+    const fired = schedulePartitionRefresh(fakeDb([], upserts), "team-fence-wide", group, KEYS, null);
+    expect(fired).toBe(true);
+    await new Promise((r) => setTimeout(r, 100)); // reach the blocked LLM
+    // The attribution-correction percolation path: team-wide eviction must arm the same fence the
+    // per-partition door does — before this fix it only deleted memory, and the resumed refresh
+    // committed the pre-correction payload as fresh for a full TTL.
+    await bustTeamLearningCaches(fakeDb([group]), "team-fence-wide", "some-slug");
+    release!();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(arcMemoryCacheHas(`g:${group}`)).toBe(false);
+    expect(upserts.filter((u) => u.table === "arc_cache")).toHaveLength(0);
   });
 });

@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
   // (PCCC6B-1). On an enforcing team, a TEAM-TIER member's arcs no longer come from the shared tier
   // `arc_cache` row at all: their synthesis runs over their ready-and-unsuppressed partition scope
   // (`selectEnforcedGraphPartitions` — arm-on-read, uncapped; the fact pool bounds input), cached
-  // under `partitionArcScopeKey`. That is what actually closes the PCCB-5 synthesized-prose
+  // per partition (the g: namespace). That is what actually closes the PCCB-5 synthesized-prose
   // residual AND the corrections-laundering hole (a tier row synthesized with ALL team corrections
   // used to serve every enforced member). External-tier members keep the tier path + omit
   // semantics; permissive teams are byte-identical. The enforcement resolution fails CLOSED: a

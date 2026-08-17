@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reattributeItems } from "./reattribute";
 import { staleArcCache } from "@/lib/graph/arc-cache";
-import { evictArcMemoryCache, evictScopedArcMemory, evictTeamPartitionArcMemory } from "@/lib/graph/arcs";
+import { evictArcMemoryCache, evictTeamPartitionArcMemory } from "@/lib/graph/arcs";
 import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
 
 /**
@@ -19,7 +19,6 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
  *  Best-effort. */
 export async function bustTeamLearningCaches(db: DbClient, teamId: string, teamSlug: string): Promise<void> {
   evictArcMemoryCache(teamSlug); // arcs, this process
-  evictScopedArcMemory(teamId); // PCCC-7: p: keys are id-namespaced — the slug eviction cannot see them
   await evictTeamPartitionArcMemory(db, teamId); // PPARC-2: g: keys carry only the group id
   await Promise.all([
     staleArcCache(db, teamId), // arcs, persistent

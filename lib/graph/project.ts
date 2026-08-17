@@ -8,8 +8,8 @@ import { resolvePositiveInt } from "@/lib/util/env";
 import { chunkCdc, type CdcParams } from "./cdc";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
-import { purgeScopedArcCache, purgePartitionArcCache } from "./arc-cache";
-import { evictScopedArcMemory, evictPartitionArcMemory } from "./arcs";
+import { purgePartitionArcCache } from "./arc-cache";
+import { evictPartitionArcMemory } from "./arcs";
 import { ensureArmingRows } from "./arming-row";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
@@ -753,15 +753,8 @@ export async function projectItemsToGraph(
   // flag may clear, else a pre-restriction/pre-redaction `p:` row (whose SUMMARY prose the evidence
   // filter cannot see) is re-served by SWR the moment the scope key resolves again. Memoized once
   // per pass; a failed purge holds every clear this pass — fail closed, converging next pass.
-  let scopedArcPurgeState: boolean | null = null;
-  const scopedArcPurgeGate = async (): Promise<boolean> => {
-    if (scopedArcPurgeState === null) {
-      scopedArcPurgeState = (await purgeScopedArcCache(db, args.teamId)).ok;
-      if (scopedArcPurgeState) evictScopedArcMemory(args.teamId);
-    }
-    return scopedArcPurgeState;
-  };
-  // PPARC-2: the per-partition `g:` twin (see reconcile's door for the narrowing rationale).
+  // PPARC-4: the team-wide p: gate is retired (no p: writers remain); the per-partition `g:`
+  // door stands alone (see reconcile's door for the narrowing rationale).
   const partitionPurgeState = new Map<string, boolean>();
   const partitionArcPurgeGate = async (groupId: string): Promise<boolean> => {
     const memo = partitionPurgeState.get(groupId);
@@ -1519,7 +1512,7 @@ export async function projectItemsToGraph(
           // the delete and only then clears the flag — the same convergence the tier path uses.
           retractFailed
           ? { pending_delete_group_id: groupId, pending_delete_at: projectedAt }
-          : purgeBeforeRepush && !purgeFailed && (await scopedArcPurgeGate()) && (await partitionArcPurgeGate(groupId))
+          : purgeBeforeRepush && !purgeFailed && (await partitionArcPurgeGate(groupId))
             ? { pending_delete_group_id: null, pending_delete_at: null } // purge confirmed + re-pushed (self clear — scoped arc rows purged first, see the gate)
             : {};
 

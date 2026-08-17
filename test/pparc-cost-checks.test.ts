@@ -6,8 +6,10 @@ import type { DbClient } from "@/lib/db/types";
  * PPARC-2 — the PRE-REGISTERED two-sided cost checks (design §2.4, folded per Fable Medium 5:
  * "the check records the measured crossover rather than pretending the model dominates
  * everywhere"). The LLM seam is mocked, so a synthesis call count is exact, not sampled. The union
- * model's counts are arithmetic (one call per distinct `p:` scope key — the 6b/7 machinery, pinned
- * elsewhere); the partition-native counts are MEASURED through the real warm path.
+ * model's counts are arithmetic (one call per distinct retired-`p:` scope key); the partition
+ * counts are measured through schedulePartitionRefresh with a TEST-LOCAL freshness shadow — the
+ * LIVE freshness-skip and budget ceiling are dm-pinned in pparc-partition-arcs (review Medium 3:
+ * this file is the arithmetic illustration; the load-bearing halves live there).
  *
  * REGISTERED EXPECTATIONS (both directions, honest):
  *  (a) MANY DISTINCT SCOPES over FEWER partitions — partition-native WINS: 4 readers with 4
@@ -84,37 +86,38 @@ beforeEach(() => {
   });
 });
 
-describe("PPARC-2 §2.4 — pre-registered cost checks, both directions", () => {
-  it("(a) 4 distinct scopes over 3 partitions: partition-native measures 3 syntheses where the union model's arithmetic is 4", async () => {
-    const { warmPartitionArcs } = await import("@/lib/graph/arcs");
-    const [A, B, C] = [projGroup(), projGroup(), projGroup()];
-    // Four readers, four DISTINCT p: scopes drawn from {A,B,C}: the union model synthesizes one
-    // row per distinct scope key = 4 calls (arithmetic — the 6b path, pinned in its own tests).
-    const unionModelCalls = 4;
-    // Partition-native: the same four reads warm each partition ONCE, shared thereafter.
-    for (const scope of [[A, B], [B, C], [A, C], [A, B]]) {
-      await warmPartitionArcs(fakeDb(), "team-cost-a", scope, KEYS, 5);
+describe("§2.4 pre-registered cost checks, both directions (PPARC-4: driven through the live scheduler; warmPartitionArcs retired)", () => {
+  async function warmScope(groups: string[], teamId: string) {
+    const { schedulePartitionRefresh, arcMemoryCacheHas } = await import("@/lib/graph/arcs");
+    for (const g of groups) {
+      if (arcMemoryCacheHas(`g:${g}`)) continue; // the caller's freshness check — shared rows are never re-minted
+      schedulePartitionRefresh(fakeDb(), teamId, g, KEYS, null);
+      await vi.waitFor(async () => {
+        const { arcMemoryCacheHas: has } = await import("@/lib/graph/arcs");
+        expect(has(`g:${g}`)).toBe(true);
+      }, { timeout: 5000 });
     }
-    await vi.waitFor(() => expect(llmMock.completeTextOrNull.mock.calls.length).toBeGreaterThanOrEqual(3), { timeout: 5000 });
-    // Let any stragglers land before the exact count.
-    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  it("(a) 4 distinct scopes over 3 partitions: partition-native measures 3 syntheses where the union model's arithmetic is 4", async () => {
+    const [A, B, C] = [projGroup(), projGroup(), projGroup()];
+    const unionModelCalls = 4; // one row per distinct p: scope key — the retired union's arithmetic
+    for (const scope of [[A, B], [B, C], [A, C], [A, B]]) await warmScope(scope, "team-cost-a");
+    await new Promise((r) => setTimeout(r, 200));
     const partitionNativeCalls = llmMock.completeTextOrNull.mock.calls.length;
     expect(partitionNativeCalls).toBe(3); // one per PARTITION, not per scope
-    expect(partitionNativeCalls).toBeLessThan(unionModelCalls); // the registered direction
+    expect(partitionNativeCalls).toBeLessThan(unionModelCalls);
   });
 
   it("(b) one SHARED scope over 5 partitions: partition-native measures 5 where the union's arithmetic is 1 — the crossover is scopes ≥ partitions", async () => {
-    const { warmPartitionArcs } = await import("@/lib/graph/arcs");
     const groups = [projGroup(), projGroup(), projGroup(), projGroup(), projGroup()];
-    const unionModelCalls = 1; // one scope key, however many readers share it
-    await warmPartitionArcs(fakeDb(), "team-cost-b", groups, KEYS, 5);
-    await warmPartitionArcs(fakeDb(), "team-cost-b", groups, KEYS, 5); // the second sharing reader adds nothing
-    await vi.waitFor(() => expect(llmMock.completeTextOrNull.mock.calls.length).toBeGreaterThanOrEqual(5), { timeout: 5000 });
-    await new Promise((r) => setTimeout(r, 250));
+    const unionModelCalls = 1;
+    await warmScope(groups, "team-cost-b");
+    await warmScope(groups, "team-cost-b"); // the second sharing reader adds nothing
+    await new Promise((r) => setTimeout(r, 200));
     const partitionNativeCalls = llmMock.completeTextOrNull.mock.calls.length;
-    expect(partitionNativeCalls).toBe(5); // the honest losing direction, recorded not hidden
+    expect(partitionNativeCalls).toBe(5);
     expect(partitionNativeCalls).toBeGreaterThan(unionModelCalls);
-    // CROSSOVER, recorded: at P partitions, partition-native wins once distinct reader scopes > P.
-    expect(groups.length).toBe(5);
+    expect(groups.length).toBe(5); // the recorded crossover: scopes must exceed partitions to win
   });
 });

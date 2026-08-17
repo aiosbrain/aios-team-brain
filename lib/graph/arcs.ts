@@ -745,12 +745,12 @@ async function synthesizeArcs(
   // there is no external-principal path to it. Without this, a correction recorded in that window
   // was stored but never read back — H13's silent revert through a new door. The un-namespaced
   // EXTERNAL TIER path stays corrections-free (the standing gate below).
-  const correctionsEligible =
-    effectiveScopeKey.startsWith("p:") || effectiveScopeKey.startsWith("g:") || teamTier;
+  // PPARC-4: the p: (per-oracle union) namespace is RETIRED — g: is the one partition scope.
+  const correctionsEligible = effectiveScopeKey.startsWith("g:") || teamTier;
   const correctionsRead = correctionsEligible
     ? await listArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
-        includeLegacy: !effectiveScopeKey.startsWith("p:") && !effectiveScopeKey.startsWith("g:"),
+        includeLegacy: !effectiveScopeKey.startsWith("g:"),
       })
     : { corrections: [], ok: true };
   const allCorrections = [
@@ -1010,38 +1010,11 @@ export function arcKeyBelongsToTeam(key: string, teamSlug: string, teamId?: stri
   // and would have stranded every slug-keyed correction and cache row silently. Project-group
   // segments (`g_<teamhex>_p_<projhex>`) carry no slug either way, so the tier prefix test below
   // can never see them — the namespace is what keeps eviction exact.
-  if (key.startsWith("g:")) return false; // PPARC-2: g: keys carry no team — dedicated evictors own them
-  if (key.startsWith("p:")) return teamId != null && key.slice(2).startsWith(`${teamId}:`);
+  // PPARC-4: the p: namespace is retired (nothing mints it); partition (g:) keys carry no team —
+  // their dedicated evictors own them, so neither namespace is ever claimed here.
+  if (key.startsWith("g:") || key.startsWith("p:")) return false;
   const prefix = `${teamSlug}_`;
   return key.split(",").some((g) => g.startsWith(prefix));
-}
-
-/**
- * The cache/scope key for an ENFORCED principal's partition-scoped arcs (PCCC6B-1). Its own
- * namespace, deliberately: a built-ins-only oracle scope contains exactly the tier group pair, and
- * an un-namespaced key would share the tier path's cache row — same bytes, DIFFERENT corrections
- * rule (the tier row admits legacy '' corrections; a partition scope must not), so the shared row
- * would poison across that boundary depending on who computed it first. Keyed on the IMMUTABLE
- * team id (PCCC-7): the slug renames; every scoped correction and cache row keyed by it would be
- * stranded the moment `acme` became `acme-hq`.
- */
-export function partitionArcScopeKey(teamId: string, groups: readonly string[]): string {
-  return `p:${teamId}:${groups.slice().sort().join(",")}`;
-}
-
-/** Evict every partition-scoped in-memory entry for a team (PCCC-7) — the id-keyed twin of
- *  `evictArcMemoryCache`, for callers (reconcile) that hold the id, not the slug. */
-export function evictScopedArcMemory(teamId: string): void {
-  const prefix = `p:${teamId}:`;
-  for (const key of cache.keys()) {
-    if (key.startsWith(prefix)) cache.delete(key);
-  }
-  // Fence in-flight refreshes of ANY of this team's p: keys (the same trailing-write race the g:
-  // namespace fences — pre-existing here, closed in the same fold). Generation entries are tiny;
-  // bump only keys we have seen (cache or refreshing), not a synthetic enumeration.
-  for (const key of refreshing) {
-    if (key.startsWith(prefix)) bumpPurgeGeneration(key);
-  }
 }
 
 /** Purge GENERATIONS (Codex PPARC-2 High 1, the timeline-cache dirty-protection precedent): an
@@ -1072,11 +1045,21 @@ export function evictPartitionArcMemory(groupId: string): void {
  *  group id, so team-wide eviction resolves the team's pointer list — built-ins + initiatives —
  *  and deletes each exactly. Async because the resolution reads `projects.graph_group_id`. */
 export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string): Promise<void> {
+  // Every eviction here ALSO bumps the key's purge generation (Codex PPARC-4 Medium 1): deleting
+  // without the bump left the fence unarmed on exactly this path — an in-flight g: refresh that
+  // read pre-correction attribution would commit AFTER bustTeamLearningCaches evicted + staled,
+  // resurrecting the old payload as fresh for a full TTL (the H13 revert shape, one caller up).
+  const evictAndFence = (key: string) => {
+    cache.delete(key);
+    bumpPurgeGeneration(key);
+  };
   const evictAllPartitionKeys = () => {
     // FAIL CLOSED (Codex PPARC-2 Medium 3): a returned-error read left every g: key warm for a
     // full TTL. We cannot know WHICH keys are this team's without the pointer list, so evict every
-    // g: entry — regenerable, bounded by the map, and one query each to re-warm.
-    for (const key of cache.keys()) if (key.startsWith("g:")) cache.delete(key);
+    // g: entry — regenerable, bounded by the map, and one query each to re-warm. An in-flight
+    // refresh's key need not be resident in `cache`, so fence the `refreshing` set too.
+    for (const key of cache.keys()) if (key.startsWith("g:")) evictAndFence(key);
+    for (const key of refreshing) if (key.startsWith("g:")) bumpPurgeGeneration(key);
   };
   try {
     const { data, error } = await db
@@ -1085,7 +1068,7 @@ export async function evictTeamPartitionArcMemory(db: DbClient, teamId: string):
       .eq("team_id", teamId)
       .not("graph_group_id", "is", null);
     if (error) return evictAllPartitionKeys();
-    for (const r of (data ?? []) as { graph_group_id: string }[]) cache.delete(`g:${r.graph_group_id}`);
+    for (const r of (data ?? []) as { graph_group_id: string }[]) evictAndFence(`g:${r.graph_group_id}`);
   } catch {
     evictAllPartitionKeys();
   }
@@ -1281,8 +1264,8 @@ function refreshArcsInBackground(
           ok: !committed.untrustworthy,
           created: continuity.nextCount,
           meta: {
-            // `group_key` is the SYNTHESIS SCOPE — the tier set for tier rows, a `p:` key for an
-            // enforced member's scoped refresh (each scope is its own continuity series).
+            // `group_key` is the SYNTHESIS SCOPE — the tier set for tier rows, a `g:` key for a
+            // partition refresh (each scope is its own continuity series).
             // and the external one is smaller. Without this the two are indistinguishable and the
             // eyeballed trend silently mixes them.
             group_key: key,
@@ -1328,16 +1311,10 @@ export interface CachedArcs {
  *  slice, counted separately in the pre-registered cost check). */
 export const PPARC_SYNTH_BUDGET_PER_READ = resolvePositiveInt(process.env.PPARC_SYNTH_BUDGET_PER_READ, 3);
 
-/**
- * Schedule background synthesis of PARTITION-NATIVE (`g:`) rows for up to `budget` of the given
- * groups whose rows are missing or stale (PPARC-2 §5 warming ruling). Rides the existing SWR
- * machinery — single-flighted per key by `refreshing`, full BG timeout, per-partition corrections
- * scope — so a union read warms the partition rows the PPARC-3 cutover will serve. Fire-and-forget.
- */
 /** Schedule ONE partition's background refresh from an ALREADY-READ entry (PPARC-3, Codex
- *  Medium 3: getFusedArcs holds every row it just read — re-probing them through
- *  warmPartitionArcs doubled the serial reads on the panel hot path). Returns whether a refresh
- *  was actually fired (single-flighted by `refreshing`). */
+ *  Medium 3: getFusedArcs holds every row it just read — re-probing them doubled the serial reads
+ *  on the panel hot path). Returns whether a refresh was actually fired (single-flighted by
+ *  `refreshing`). */
 export function schedulePartitionRefresh(
   db: DbClient,
   teamId: string,
@@ -1351,32 +1328,6 @@ export function schedulePartitionRefresh(
   return true;
 }
 
-export async function warmPartitionArcs(
-  db: DbClient,
-  teamId: string,
-  groups: readonly string[],
-  keys: ProviderKeys,
-  budget: number = PPARC_SYNTH_BUDGET_PER_READ
-): Promise<number> {
-  let scheduled = 0;
-  for (const group of groups) {
-    if (scheduled >= budget) break;
-    const key = `g:${group}`;
-    if (refreshing.has(key)) continue;
-    const mem = cache.get(key);
-    const now = Date.now();
-    if (mem && !freshness(mem.at, arcTtlMs(mem.degraded), { now, degraded: mem.degraded }).stale) continue;
-    const persisted = await readArcCache(db, teamId, key).catch(() => null);
-    if (persisted && !freshness(persisted.computedAt, arcTtlMs(persisted.degraded), { now, degraded: persisted.degraded }).stale) {
-      memCacheSet(key, { arcs: persisted.arcs, at: persisted.computedAt, factsHash: persisted.factsHash, degraded: persisted.degraded });
-      continue;
-    }
-    refreshArcsInBackground(teamId, key, [group], keys, persisted ? { arcs: persisted.arcs, factsHash: persisted.factsHash, degraded: persisted.degraded } : null, db);
-    scheduled++;
-  }
-  return scheduled;
-}
-
 export async function getArcs(
   db: DbClient,
   teamId: string,
@@ -1384,17 +1335,14 @@ export async function getArcs(
   tier: AccessTier,
   groups: string[],
   keys: ProviderKeys,
-  /** PCCC6B-1: an enforced principal's partition-scoped read passes its `partitionArcScopeKey` —
-   *  the cache row AND the corrections scope both key on it. Absent = the tier path, unchanged. */
+  /** A partition-native read passes its `g:<group>` scope key (PPARC-3 fusion's single-partition
+   *  synthesis) — the cache row AND the corrections scope both key on it. Absent = the tier path. */
   opts?: { scopeKey?: string }
 ): Promise<CachedArcs> {
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = opts?.scopeKey ?? groups.slice().sort().join(",");
-  // PPARC-2 §5 warming ruling: a UNION read schedules partition-native (`g:`) warming for its
-  // scope's partitions, budgeted + background — the rows the PPARC-3 cutover will serve are warm
-  // before any read depends on them. Fire-and-forget; never touches this read's latency.
-  if (key.startsWith("p:")) void warmPartitionArcs(db, teamId, groups, keys);
+
   const now = Date.now();
 
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
@@ -1525,7 +1473,7 @@ export async function recomputeArcs(
   // BOTH partition namespaces (Fable PPARC-3 High 1: the g: key — the one the enforced recompute
   // actually sends post-cutover — fell through to the TIER branch, landing a restricted arc's
   // correction prose in the Everyone-searchable team group).
-  const writebackTarget = key.startsWith("p:") || key.startsWith("g:")
+  const writebackTarget = key.startsWith("g:")
     ? groups.length === 1 && !isExternalGroupId(groups[0])
       ? groups[0]
       : null
