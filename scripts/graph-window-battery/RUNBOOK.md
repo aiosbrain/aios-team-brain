@@ -244,3 +244,13 @@ small label — only the resolved value can tell you.
 Do **not** pick from a price list. `EXMODEL-1` found candidates that 400 outright, or collapse to 1–3
 entities, *while advertising structured outputs*. Run its probe first; a model that fails it produces a
 broken battery, not a battery result.
+
+## NOT YET RUNNABLE TO A Q10/Q11 VERDICT
+
+`measure.ts` does not yet read `(:Entity){name, summary}` or `RELATES_TO.valid_at` out of Neo4j, so
+`Q10`/`Q10F`/`Q10L`/`Q11` have scorers and bands but **no live readout**. Everything else — the
+registry, the C2 cost parse, arm separation, the pre-flight — is wired and tested.
+
+Deferred deliberately after review (see the spec's Scope). Do not start a paid session expecting a
+summary/temporal verdict until the Cypher lands; the cost and dedupe questions (C2, Q1/Q7) are
+answerable today.

@@ -226,6 +226,16 @@ So for this arm:
 - The per-`call_kind` cost split in the battery readout, so savings are measured.
 - `scripts/graph-window-battery/RUNBOOK.md` updated with the arm and its config step.
 
+**DEFERRED after review, with the reason (not silently):** the **Neo4j read path** for Q10/Q11.
+`scripts/graph-window-battery/measure.ts` does not yet query `(:Entity){name, summary}` or
+`RELATES_TO.valid_at`, so the scorers are reachable by the judge but not yet fed by a live readout.
+Both reviewers flagged this and both offered the same two options — wire it, or re-scope and say so.
+It is re-scoped: the decision layer (registry, bands, arm separation, cost parsing, pre-flight) is
+what gates the spend decision and is fully wired and pinned; the Cypher is mechanical and belongs
+with the run that first needs it, when the corpus shape is in front of the author. **The battery
+cannot be run to a Q10/Q11 verdict until that lands** — stated here and in the RUNBOOK rather than
+left for an operator to discover mid-session.
+
 **Cut, deliberately:**
 - **Turning it on in prod.** Setting `teams.extraction_small_model` is a human config action taken
   AFTER the battery reads out; this PR must not change live team config.
