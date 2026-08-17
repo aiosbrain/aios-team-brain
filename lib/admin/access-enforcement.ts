@@ -375,8 +375,14 @@ export async function assessUnattendedWarnings(db: DbClient, teamId: string): Pr
   return warnings;
 }
 
-/** The operator-undo HOLD (spec §1.1): a member-attributed downgrade to permissive excludes the
- *  team from auto-flip permanently; only a manual re-flip re-arms it. System history never holds. */
+/** The operator-undo HOLD (spec §1.1, corrected during build): ANY downgrade to permissive
+ *  excludes the team from auto-flip; only a manual re-flip to enforcing re-arms it. The spec's
+ *  original member-attributed-only rule was DEFEATED by reality: the CLI — the one real undo
+ *  path — runs with no member id and audits as actor_kind 'system', so an attribution-keyed
+ *  hold never engaged for exactly the undo it protects (the H3 scenario, reopened). Every
+ *  downgrade writer that exists today is human-driven; a future genuinely-mechanical
+ *  downgrader must opt back into auto-flip explicitly (a marker in its audit meta), not by
+ *  this hold silently ignoring it. Fail direction: fewer auto-flips — safe. */
 async function operatorDowngraded(db: DbClient, teamId: string): Promise<boolean> {
   const { data, error } = await db
     .from("audit_log")
@@ -387,7 +393,7 @@ async function operatorDowngraded(db: DbClient, teamId: string): Promise<boolean
     .limit(1);
   if (error) throw new Error(`audit read failed: ${error.message}`);
   const last = ((data ?? []) as { actor_kind: string; meta: { to?: string } }[])[0];
-  return last != null && last.actor_kind === "member" && last.meta?.to === "permissive";
+  return last != null && last.meta?.to === "permissive";
 }
 
 /** One deferral row per DISTINCT state (spec §1.1's fingerprint latch): an unchanged stuck state

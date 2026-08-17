@@ -28,11 +28,15 @@ logic):
 
 1. **`autoFlipIfReady(db, teamId)`** in `lib/admin/access-enforcement.ts`, with cost-ordered
    stages and two absolute exclusions:
-   - **The operator-undo hold (cold-read H3):** if the team's most recent
-     `access.enforcement_changed` audit row has `to: "permissive"` and `actor_kind: "member"`,
-     the team is EXCLUDED from auto-flip permanently — an operator's one-command undo is not a
-     30-minute lease; only a subsequent MANUAL enforcing flip re-arms the team. System-
-     attributed history never excludes.
+   - **The operator-undo hold (cold-read H3; rule corrected during build):** if the team's most
+     recent `access.enforcement_changed` audit row has `to: "permissive"`, the team is EXCLUDED
+     from auto-flip — an operator's one-command undo is not a 30-minute lease; only a
+     subsequent MANUAL enforcing flip re-arms the team. The hold keys on the DOWNGRADE, not its
+     attribution: the original member-attributed-only rule was defeated by reality — the CLI
+     (the one real undo path) runs member-less and audits as `actor_kind: "system"`, so an
+     attribution-keyed hold never engaged for exactly the undo it protects. Every downgrade
+     writer today is human-driven; a future genuinely-mechanical downgrader must opt back into
+     auto-flip explicitly via its audit meta, never by the hold silently ignoring it.
    - **The cheap warning pre-check BEFORE any drain (cold-read H2):** warnings
      (unplaced agents, active connectors) are computable from the members read + oracle alone —
      no coverage scan, no drain. A warned team defers HERE, paying nothing.
@@ -158,7 +162,8 @@ The 422 wire contract and every route's refusal behavior are byte-identical thro
    property the module already pins for the manual path); the RACE arm: a flip whose guarded
    write (`.eq("access_enforcement", previous)`) loses to a concurrent change fails cleanly
    with no mis-attributed audit row; and the OPERATOR-UNDO HOLD: a team whose latest
-   enforcement change is a member-attributed downgrade to permissive is never auto-flipped.
+   enforcement change is a downgrade to permissive is never auto-flipped — regardless of
+   attribution, including the member-less CLI shape (audits as `system`).
 5. Same file — FIVE ready permissive teams, one scheduler pass: exactly
    `PRET_FLIP_MAX_PER_TICK` (3) flip; the remaining two flip on the next pass
    (rate limit, mutation-verified: budget 3→5 reddens the exact-count assertion).

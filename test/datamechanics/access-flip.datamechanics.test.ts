@@ -146,28 +146,29 @@ describe("PRET-2 — error containment, idempotency, and the operator-undo hold 
     expect((await deferralRows(seed.teamId)).length).toBe(before);
   });
 
-  it("a member-attributed downgrade HOLDS the team out of auto-flip; a system downgrade does not", async () => {
+  it("ANY downgrade HOLDS the team out of auto-flip — including the member-less CLI shape", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "h.md", body: `held ${TERM}`, access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
 
     expect((await autoFlipIfReady(db(), seed.teamId)).flipped).toBe(true);
-    // The operator's one-command undo — member-attributed (seedTeam's member: group-synced,
-    // so no blind-human blocker muddies this fixture — one condition per fixture).
+    // The operator's one-command undo, member-attributed.
     const undo = await setAccessEnforcement(db(), seed.teamId, "permissive", { actorMemberId: seed.memberId });
     expect(undo.ok).toBe(true);
-
     const r = await autoFlipIfReady(db(), seed.teamId);
     expect(r.flipped, "the undo is not a 30-minute lease").toBe(false);
     expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
 
-    // A SYSTEM-attributed downgrade (no operator intent) does not hold.
-    const sys = await setAccessEnforcement(db(), seed.teamId, "enforcing");
-    expect(sys.ok).toBe(true);
-    const sysDown = await setAccessEnforcement(db(), seed.teamId, "permissive");
-    expect(sysDown.ok).toBe(true);
+    // The CLI shape: NO member id → audits as actor_kind 'system'. The spec's original
+    // member-attributed-only rule never engaged for exactly this — the one real undo path
+    // (caught during build; the rule is now any-downgrade-holds).
+    const rearm = await setAccessEnforcement(db(), seed.teamId, "enforcing");
+    expect(rearm.ok).toBe(true);
+    const cliDown = await setAccessEnforcement(db(), seed.teamId, "permissive");
+    expect(cliDown.ok).toBe(true);
     const r2 = await autoFlipIfReady(db(), seed.teamId);
-    expect(r2.flipped, "system-attributed history never excludes").toBe(true);
+    expect(r2.flipped, "a member-less CLI undo holds too — attribution must not decide safety").toBe(false);
+    expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
   });
 });
 
