@@ -104,11 +104,17 @@ Several spellings are accepted because this is a cross-repo boundary and a reaso
 must not silently yield an unlinkable meeting — the lesson already written into `from-calendar.ts`:
 
 ```
-calendar_event_id | calendarEventId | event_id | gcal_event_id     → eid: key
-ical_uid | icalUID | iCalUID                                        → uid: key
-conference_url | hangout_link | hangoutLink | meeting_url           → conference key (measured, never joined)
-google_calendar_event: { id, iCalUID, hangoutLink, conferenceData } → the nested shape, same keys
+calendar_event_id | calendarEventId | event_id | gcal_event_id            → eid: key
+ical_uid | icalUID | iCalUID | ical_uid_raw                              → uid: key
+conference_url | hangout_link | hangoutLink | meeting_url | conferenceUrl → conference key (measured, never joined)
+google_calendar_event: { id, iCalUID, hangoutLink, conferenceData }       → the nested shape, same keys
 ```
+
+This list is the CONTRACT and must match `EVENT_ID_KEYS` / `UID_KEYS` / `CONFERENCE_KEYS` in
+`lib/meetings/event-identity.ts` exactly — a reviewer reading it as the inventory and finding a
+spelling missing would reasonably delete the parser path that handles it. The guard test asserts
+every accepted conference spelling is watched, which keeps the code side honest; this paragraph is
+the doc side.
 
 **Keys are qualified by kind** (`eid:` / `uid:`). An unqualified normaliser that stripped
 `@google.com` would make the UID `Foo@google.com` and a bare producer key `foo` the same string — a
