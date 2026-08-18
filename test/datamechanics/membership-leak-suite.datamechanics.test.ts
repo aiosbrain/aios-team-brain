@@ -89,6 +89,13 @@ async function buildFixture(): Promise<Fixture> {
   const y = await ingest(seed, { path: "y.md", body: `beta ${TERM_Y}`, access: "team", project: "src" });
   await backfillTeamContext(db(), seed.teamId);
 
+  // Recency-leg eligibility (the leg reads only attributed, source-dated items): both probes
+  // must be visible to the recency leg or its gate's mutation is unobservable.
+  await db()
+    .from("items")
+    .update({ member_id: seed.memberId, work_at: new Date().toISOString(), work_at_from_source: true })
+    .in("id", [x.id, y.id]);
+
   const X = await mkInitiative(seed, `x-${randomUUID().slice(0, 6)}`);
   const Y = await mkInitiative(seed, `y-${randomUUID().slice(0, 6)}`);
   await moveMembership(seed, x.id, X.projectId);
