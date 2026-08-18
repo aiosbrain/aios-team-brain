@@ -87,7 +87,12 @@ axis it partitions by does not exist in this data (§2).
    narrowed org visibility, per §2.
 3. **Delegated/attenuated tokens (`principal: "token"`) keep the fail-closed omission of all
    three legs, absolutely** — tier-independent, exactly today's behavior.
-4. **External tier keeps its omission** (`isRestrictedTier` conjunct, audit H1) — unchanged.
+4. ~~**External tier keeps its omission** (`isRestrictedTier` conjunct, audit H1) — unchanged.~~
+   **SUPERSEDED by PRET-4** (`docs/design/pret4-tier-wall-teardown.md` §1d, operator ruling 3
+   confirmed 2026-08-17: people/structure are visible to every member): the tier disjunct is
+   deliberately REMOVED from the actors/REPORTS_TO legs — external members get the
+   org-structural legs like any member. The row above is kept as history, per §5 criterion 5's
+   own convention; rulings 3 (tokens) and 5 (commitments allowlist) stand unchanged.
 5. **The commitments leg stays omitted for every enforcing principal**, and the enforcing rels
    filter is an ALLOWLIST (`REPORTS_TO`), not today's permissive triple: those types have no
    production writer, and the moment one lands its rows are item-derived and must be

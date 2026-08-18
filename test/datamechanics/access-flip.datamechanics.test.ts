@@ -149,6 +149,19 @@ describe("PRET-2 — the AUTHORITATIVE warning gate nets what the cheap scan mis
     expect(r.deferred?.warnings.join(" ")).toContain("agent");
     expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
   });
+
+  it("PRET-4 (cold-read M4): an agent whose ONLY membership is a materialized builtin row still trips the CHEAP scan — posture rows are not placements", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "m4.md", body: `builtinrow ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    // seedMember writes the agent's builtin-posture row (the cutover materialization shape);
+    // the agent holds NO grant-carrying group. Pre-M4-fix, placedMemberIds counted the builtin
+    // row, the cheap scan went quiet, and the team paid a full drain every tick forever.
+    await seedMember(seed, { kind: "agent" });
+    const { assessUnattendedWarnings } = await import("@/lib/admin/access-enforcement");
+    const warnings = await assessUnattendedWarnings(db(), seed.teamId);
+    expect(warnings.join(" "), "the cheap pre-drain scan itself must warn — not just the post-drain assessment").toContain("agent");
+  });
 });
 
 describe("PRET-2 — error containment, idempotency, and the operator-undo hold (criterion 4)", () => {

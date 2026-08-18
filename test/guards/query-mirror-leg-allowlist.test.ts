@@ -53,4 +53,20 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
   it("PRET-4: the restricted-posture permissive rels arm narrows to REPORTS_TO (no triple for the opened audience)", () => {
     expect(SRC).toContain('enforce == null && !isRestrictedTier(tier) ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"]');
   });
+
+  it("PRET-4: both query routes pass graphProjectIds for EVERY member principal (ruling 2's graph unlock — no tier condition)", () => {
+    const V1 = readFileSync(join(import.meta.dirname, "..", "..", "app", "api", "v1", "query", "route.ts"), "utf8");
+    const DASH = readFileSync(join(import.meta.dirname, "..", "..", "app", "api", "dashboard", "query", "route.ts"), "utf8");
+    for (const [name, src] of [["v1", V1], ["dashboard", DASH]] as const) {
+      expect(src, `${name}: graphProjectIds is unconditional on the member arm`).toContain(
+        'principal: "member", graphProjectIds: projectIds'
+      );
+      expect(src, `${name}: no tier condition may gate the graph scope`).not.toMatch(
+        /=== "team"\s*\?\s*\{\s*graphProjectIds/
+      );
+    }
+    // And retrieve's enforced graph arm keys on scope presence alone:
+    expect(SRC).toContain("if (!enforce.graphProjectIds) return [];");
+    expect(SRC).not.toContain('tier !== "team" || !enforce.graphProjectIds');
+  });
 });
