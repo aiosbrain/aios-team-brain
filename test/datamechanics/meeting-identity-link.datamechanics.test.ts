@@ -59,7 +59,10 @@ async function pushTranscript(seed: Seed, opts: { eventId?: string; body?: strin
  * calendar. Without it the "submitter" under test is the same member on both sides and the credit
  * assertion passes for the wrong reason.
  */
-async function pushCalendarEvent(seed: Seed, opts: { eventId?: string; attendees?: unknown; date?: string; asMemberId?: string } = {}) {
+async function pushCalendarEvent(
+  seed: Seed,
+  opts: { eventId?: string; attendees?: unknown; date?: string; asMemberId?: string; body?: string } = {}
+) {
   const frontmatter = {
     source: "calendar",
     title: "Design review",
@@ -72,7 +75,15 @@ async function pushCalendarEvent(seed: Seed, opts: { eventId?: string; attendees
     return ingestItem(
       db(),
       { teamId: seed.teamId, memberId: opts.asMemberId, apiKeyId: uuid() },
-      { project: "calendar", kind: "artifact", actor: "tester", frontmatter, content_sha256: sha(""), path, body: "" },
+      {
+        project: "calendar",
+        kind: "artifact",
+        actor: "tester",
+        frontmatter,
+        content_sha256: sha(opts.body ?? ""),
+        path,
+        body: opts.body ?? "",
+      },
       "team"
     );
   }
@@ -80,7 +91,7 @@ async function pushCalendarEvent(seed: Seed, opts: { eventId?: string; attendees
     kind: "artifact",
     access: "team",
     path: `1-inbox/calendar/${randomUUID().slice(0, 8)}.md`,
-    body: "",
+    body: opts.body ?? "",
     project: "calendar",
     frontmatter: {
       source: "calendar",
@@ -169,6 +180,22 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     // second meeting on the next one.
     await tick(seed);
     expect(await liveNotes(seed)).toHaveLength(1);
+  });
+
+  it("a WHITESPACE-only calendar body does not outrank the transcript", async () => {
+    // Pins the caller's `body.trim()`, which the pure rule cannot: `plan()` receives `hasBody` already
+    // computed, so without this a producer emitting "\n" for an invite would make the empty note the
+    // survivor and hide the real transcript. Found by a surviving mutation, not by review.
+    const seed = await seedTeam();
+    await pushCalendarEvent(seed, { body: "  \n\t \n" });
+    await pushTranscript(seed);
+    await tick(seed);
+
+    const notes = await liveNotes(seed);
+    expect(notes).toHaveLength(1);
+    expect(await bodyOf(seed, notes[0].id), "the transcript survived, not the blank invite").toContain(
+      "We agreed the rollout."
+    );
   });
 
   it("is idempotent — a second tick changes nothing", async () => {
