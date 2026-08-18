@@ -1,6 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { EVERYONE_SLUG } from "@/lib/access/groups";
+import { EVERYONE_SLUG, PRET4_MATERIALIZE_MARKER } from "@/lib/access/groups";
 
 /**
  * Viewer POSTURE (PRET-4, docs/design/pret4-tier-wall-teardown.md §1a): the two-bucket wall
@@ -26,7 +26,7 @@ import { EVERYONE_SLUG } from "@/lib/access/groups";
 
 export type ViewerPosture = "team" | "external";
 
-export const PRET4_MATERIALIZE_MARKER = "pret4_builtin_materialize";
+export { PRET4_MATERIALIZE_MARKER };
 
 let materializationConfirmedCache = false;
 

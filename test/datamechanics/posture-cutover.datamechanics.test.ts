@@ -177,6 +177,27 @@ describe("PRET-4 AC1 — the recompute is retired: deliberate membership edits a
   });
 });
 
+describe("PRET-4 §1c — connectors mint their posture row on the INGEST path (diff-review H1)", () => {
+  it("a connector minted AFTER the materialization marker still resolves team posture — ensureConnectorMember writes the row", async () => {
+    const seed = await seedTeam();
+    await ensureBuiltins(db(), seed.teamId);
+    const ran = await materializeBuiltinMembershipOnce(db());
+    expect(ran.ok, ran.error).toBe(true);
+
+    // The post-marker connector flow: mint via the REAL ingest path, not createMember.
+    const { resolveConnectorAuth } = await import("@/lib/ingest/run");
+    const minted = await resolveConnectorAuth(db(), seed.teamId, {
+      handle: `conn-${randomUUID().slice(0, 8)}`,
+      displayName: "Slack Connector",
+      email: `${randomUUID()}@connector.local`,
+    });
+    expect(minted).not.toBeNull();
+    // Pre-H1-fix this resolved "external" (no row, marker confirmed) and the connector's
+    // permissive corpus reads silently narrowed to access='external'.
+    expect(await resolveViewerPosture(db(), seed.teamId, minted!.memberId)).toBe("team");
+  });
+});
+
 describe("PRET-4 §1c — createMember writes the invite default as explicit state", () => {
   it("a created member holds their tier's builtin row from CREATE (invited, inert until active), for every kind", async () => {
     const seed = await seedTeam();

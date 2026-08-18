@@ -60,12 +60,17 @@ export async function createMember(
   // unchanged upsert must never clobber a deliberate cross-enrollment.
   let priorTier: string | null = null;
   if (opts.upsert) {
-    const { data: prior } = await admin
+    const { data: prior, error: priorErr } = await admin
       .from("members")
       .select("tier")
       .eq("team_id", teamId)
       .eq("email", email)
       .maybeSingle();
+    // Diff-review M2: a swallowed read error here reads as "no prior member" → a
+    // tier-CHANGING upsert would add the new builtin row without reconciling the old one —
+    // posture stuck at "team" while the record says "external", durably. Fail the create
+    // loudly instead; the caller retries.
+    if (priorErr) throw new Error(`create member failed: prior-tier read errored (${priorErr.message})`);
     priorTier = (prior as { tier: string } | null)?.tier ?? null;
   }
   // `status` is intentionally omitted so the column default ('invited') applies on
@@ -104,15 +109,27 @@ export async function createMember(
   // (posture parity; grant-inert for non-humans via the oracle's eligibility). New member →
   // write the target row; upsert whose tier CHANGED → reconcile (a deliberate posture move);
   // unchanged upsert → leave rows alone (a cross-enrollment survives). Best-effort: access
-  // maintenance must never fail member creation; the materialize sweep is the backstop for a
-  // row missed here.
+  // maintenance must never fail member creation — but a failure is AUDITED, not just warned
+  // (diff-review M1: the one-time sweep is NOT a backstop after its marker stamps; a member
+  // missed here stays external-posture until an admin heals them via add-group-member, so the
+  // failure must be findable).
   try {
     const effectiveTier = input.tier ?? "team";
     const tierChanged = priorTier !== null && priorTier !== effectiveTier;
     if (priorTier === null || tierChanged) {
       const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
       const w = await writeInviteDefaultMembership(admin, teamId, data.id, effectiveTier, { reconcile: tierChanged });
-      if (!w.ok) console.warn(`[access] invite-default membership write failed: ${w.error}`);
+      if (!w.ok) {
+        console.error(`[access] invite-default membership write failed: ${w.error}`);
+        await audit(admin, {
+          team_id: teamId,
+          actor_kind: "system",
+          action: "access.invite_default_write_failed",
+          target_type: "member",
+          target_id: data.id,
+          meta: { tier: effectiveTier, error: w.error ?? "unknown" },
+        }).catch(() => {});
+      }
     }
   } catch {
     // never fail member creation on access maintenance

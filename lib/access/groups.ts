@@ -27,6 +27,9 @@ import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
  */
 
 export const EVERYONE_SLUG = "everyone";
+/** The one-time materialization's migration_markers name — single-sourced here (the writer);
+ *  lib/access/posture re-exports it for the reader side (diff-review L3). */
+export const PRET4_MATERIALIZE_MARKER = "pret4_builtin_materialize";
 export const EXTERNAL_SLUG = "external";
 
 /** Slugs an ordinary group may not take: the two built-ins and the singleton namespace.
@@ -191,7 +194,7 @@ export async function materializeBuiltinMembershipOnce(db: DbClient): Promise<Wr
   const { data: marker, error: mkErr } = await db
     .from("migration_markers")
     .select("name")
-    .eq("name", "pret4_builtin_materialize")
+    .eq("name", PRET4_MATERIALIZE_MARKER)
     .maybeSingle();
   if (mkErr) return { ok: false, error: `marker read failed: ${mkErr.message}` };
   if (marker) return { ok: true, ran: false }; // already materialized (any replica, any boot)
@@ -259,7 +262,7 @@ export async function materializeBuiltinMembershipOnce(db: DbClient): Promise<Wr
   // Marker LAST — only a fully-succeeded fleet reconcile claims it.
   const { error: stampErr } = await db
     .from("migration_markers")
-    .upsert({ name: "pret4_builtin_materialize" }, { onConflict: "name" });
+    .upsert({ name: PRET4_MATERIALIZE_MARKER }, { onConflict: "name" });
   if (stampErr) return { ok: false, error: `marker write failed: ${stampErr.message}` };
   return { ok: true, ran: true };
 }
@@ -358,7 +361,10 @@ export async function removeMemberFromGroup(
   if (group.person_member_id) return { ok: false, error: "a singleton group's membership is fixed to its person" };
   if (group.is_builtin) {
     const member = await getMember(db, teamId, memberId);
-    if (member && !isBuiltinEligible(member)) {
+    // Removal is narrowing: allow it for any HUMAN (including disabled/invited — an admin may
+    // clear a stale row; diff-review L6), refuse only non-humans (their posture is set at
+    // creation, same as the add gate).
+    if (member && member.kind !== "human") {
       return { ok: false, error: "built-in groups admit humans only — non-human posture is set by the invite default at creation" };
     }
   }

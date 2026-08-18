@@ -72,8 +72,9 @@ interface ConnectorIdentity {
   displayName: string;
 }
 
-/** Find (or auto-provision) the per-team connector member used as a given source's ingest actor. */
-async function resolveConnectorAuth(
+/** Find (or auto-provision) the per-team connector member used as a given source's ingest actor.
+ *  Exported for the PRET-4 dm arm (a post-marker connector mint must resolve team posture). */
+export async function resolveConnectorAuth(
   db: DbClient,
   teamId: string,
   identity: ConnectorIdentity
@@ -107,6 +108,20 @@ async function resolveConnectorAuth(
     memberId = (created as { id: string } | null)?.id;
   }
   if (!memberId) return null;
+
+  // PRET-4 (diff-review H1): connectors are minted HERE, not via createMember, so the
+  // invite-default membership write must ride this path or a post-materialization connector
+  // is permanently external-posture and its key's permissive corpus reads silently narrow —
+  // the exact class the spec's connector row exists to prevent. Idempotent and called on
+  // EVERY ensure (not just create), so a previously-failed write self-heals on the next
+  // ingest run. Loud on failure; never fails ingestion.
+  try {
+    const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
+    const w = await writeInviteDefaultMembership(db, teamId, memberId, "team");
+    if (!w.ok) console.error(`[ingest] connector posture write failed (retries next run): ${w.error}`);
+  } catch (e) {
+    console.error(`[ingest] connector posture write threw (retries next run): ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   // api_key_id is recorded in the audit row (no FK); reuse one if present.
   const { data: key } = await db

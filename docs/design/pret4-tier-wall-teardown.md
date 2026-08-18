@@ -313,9 +313,16 @@ full on the next tick, and two replicas racing the un-claimed marker merely repe
 converging idempotent statements — a permanently-suppressed half-materialization (marker
 claimed, reconcile dead) is impossible by construction. The deliberate-edit clobber window
 this opens (an admin edit between activation and a late-succeeding sweep could be reverted
-by the sweep's tier-derived diff) is accepted and bounded: the CLI edit surface ships in the
-same deploy, the window is ticks-until-first-success, and the sweep's audit row names every
-row it moved. One-time, fleet-wide, per team:
+by the sweep's tier-derived diff — including the ms-scale in-run interleave the diff review
+named as L1: an edit landing between the sweep's members read and its apply) is accepted and
+bounded: one-time per fleet, the CLI edit surface ships in the same deploy, the window is
+ticks-until-first-success, and the sweep's audit row names every row it moved. AS-BUILT
+addendum (diff-review H1/M1): connectors are minted by `lib/ingest/run.ts
+ensureConnectorMember` — NOT `createMember` — so the invite-default write rides that path
+too, idempotently on EVERY ensure (self-healing); and because the sweep is one-time, a
+FAILED `createMember` write has no automatic backstop — it audits
+(`access.invite_default_write_failed`) and an admin heals via `add-group-member` once the
+member is active. One-time, fleet-wide, per team:
 
 - ADD the rows the recompute's predicate implies for HUMANS (including `invited` — the new
   ruling: rows exist from invite, inert until active) and, once, for standing AGENTS and

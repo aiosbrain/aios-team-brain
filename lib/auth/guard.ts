@@ -27,7 +27,7 @@ export async function currentMember(teamId: string): Promise<CurrentMember | nul
     .eq("status", "active")
     .maybeSingle();
   if (!data) return null;
-  const m = data as { id: string; role: CurrentMember["role"]; tier: CurrentMember["tier"] };
+  const m = data as { id: string; role: CurrentMember["role"] };
   // PRET-4 §1a: `tier` here is POSTURE (everyone-membership), not the members.tier record —
   // same vocabulary, membership-derived. A resolver error propagates (fail closed at the
   // boundary), never a silent default.
