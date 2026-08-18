@@ -8,7 +8,7 @@ import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./l
 import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import { extractAndStoreActionItems } from "./action-items";
 import { remapMeetingTodoSourceItem } from "./extract-todos";
-import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
+import { canLlmMerge, mergeTranscripts, transcriptOverlap, titleSimilarity } from "./merge-format";
 import {
   MEETING_NOTES_PROJECT_SLUG,
   addMeetingNoteAttendees,
@@ -102,12 +102,25 @@ export interface DuplicateMatch {
  * meeting. Returns the best match ≥ threshold, or null (also null when `occurredAt` is unknown —
  * without a date we don't auto-merge). Reads only.
  */
+/**
+ * Title overlap at or above this counts as "the same meeting" when neither side has a comparable
+ * body (MTGATT-1). Two producers name one meeting differently — Google keeps the invite subject,
+ * Granola derives its own — so this is set where the real pairs land while "Meeting with John" vs
+ * "Meeting with Sarah" (which share only stopwords) score 0.
+ */
+export const DEFAULT_TITLE_MERGE_THRESHOLD = 0.5;
+
 export async function findDuplicateMeeting(
   admin: DbClient,
   teamId: string,
   occurredAt: string | null,
   rawText: string,
-  threshold = DEFAULT_MERGE_THRESHOLD
+  threshold = DEFAULT_MERGE_THRESHOLD,
+  /**
+   * The incoming note's title. Supplied ONLY for the bodyless case (a calendar event), where text
+   * overlap cannot decide anything. Omitted, behaviour is exactly as before.
+   */
+  incomingTitle?: string
 ): Promise<DuplicateMatch | null> {
   if (!occurredAt) return null;
 
@@ -133,11 +146,25 @@ export async function findDuplicateMeeting(
   );
 
   let best: DuplicateMatch | null = null;
+  const incomingHasBody = rawText.trim().length > 0;
   for (const n of noteRows) {
     const item = itemById.get(n.source_item_id);
-    if (!item?.body) continue;
-    const overlap = transcriptOverlap(rawText, item.body);
-    if (overlap >= threshold && (!best || overlap > best.overlap)) {
+    if (!item) continue;
+
+    // TWO comparators, chosen by what evidence exists — not one comparator that silently skips.
+    //
+    // BODY-to-BODY is the original path and stays exactly as it was: two transcripts of the same
+    // conversation share text. TITLE-to-TITLE is the new one, reached only when a side has no body,
+    // which in practice means a calendar event. Before this, `if (!item?.body) continue` made that
+    // case unreachable, so a pushed calendar event could never fold into its own transcript.
+    const bothHaveBodies = incomingHasBody && !!item.body;
+    const overlap = bothHaveBodies
+      ? transcriptOverlap(rawText, item.body)
+      : incomingTitle
+        ? titleSimilarity(incomingTitle, n.title)
+        : 0;
+    const bar = bothHaveBodies ? threshold : DEFAULT_TITLE_MERGE_THRESHOLD;
+    if (overlap >= bar && (!best || overlap > best.overlap)) {
       best = {
         noteId: n.id,
         sourceItemId: n.source_item_id,
@@ -256,7 +283,12 @@ export async function mergeIntoMeetingNote(
   try {
     const ex = await extractFromTranscript(merged, input.roster, input.keys, undefined, { db: admin, teamId });
     if (ex.summary.trim()) await updateMeetingSummary(admin, teamId, match.noteId, ex.summary);
-    if (ex.attendeeMemberIds.length) await addMeetingNoteAttendees(admin, match.noteId, ex.attendeeMemberIds);
+    // ATTENDANCE IS NOT WRITTEN FROM THE MODEL HERE (MTGATT-1). This runs automatically on every
+    // scheduler tick via `backfillMergeDuplicateMeetings`, so writing inferred attendees would undo
+    // the repair on the next tick — the fix would appear to work and then silently revert, which is
+    // worse than never having shipped it. The summary still comes from the model; who was present
+    // does not. `input.newAttendeeIds` above is the caller's RESOLVED set and is still unioned.
+    void ex.attendeeMemberIds;
   } catch {
     // summary refresh is a bonus
   }

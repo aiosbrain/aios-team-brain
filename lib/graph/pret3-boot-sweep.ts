@@ -13,8 +13,13 @@ import { runSql } from "@/lib/db/pg/pool";
  * safe: the marker insert is on-conflict-do-nothing, the delete and re-key are idempotent, and
  * a second replica racing the first merely repeats no-op statements.
  *
- * Best-effort with a LOUD failure (the caller records a failed ingest run): an unswept fleet
- * serves ≤ one TTL of pre-H1 external rows — bounded, but not silently acceptable.
+ * Best-effort; the caller records a failed ingest run. Be precise about how loud that actually is:
+ * BANNERFLAP-1 requires TWO consecutive failures before a leg enters the loud banner, and the marker
+ * is inserted BEFORE the wipe/re-key — so a failure AFTER the marker lands consumes it, the sweep
+ * never retries, and that single `ok:false` row stays `unconfirmed` and QUIET forever. Only a failing
+ * marker insert itself retries each tick and can reach a confirmed streak. Impact of the quiet case is
+ * bounded (wipe: ≤ one cache TTL of pre-H1 external rows; re-key: healed by the next migration
+ * replay) — bounded, but not silently acceptable, and not as loud as this header used to claim.
  */
 export async function runPret3BootSweep(db: DbClient): Promise<{ ran: boolean; error?: string }> {
   try {

@@ -1,7 +1,7 @@
 # Third-party licenses
 
-`aios-ingest` is MIT-licensed. It imports the following open-source components. All are
-permissive (MIT / Apache-2.0 / BSD) and compatible with redistribution under MIT.
+`aios-ingest` is **Apache-2.0** licensed. It imports the following open-source components. All are
+permissive (MIT / Apache-2.0 / BSD) and compatible with redistribution under Apache-2.0.
 
 | Component | Purpose | License |
 |-----------|---------|---------|
@@ -30,4 +30,7 @@ uv run pip-licenses --format=markdown \
   --fail-on 'GPL;AGPL;LGPL;Server Side Public License;Elastic License'
 ```
 
-This keeps the package cleanly MIT-redistributable.
+This keeps the package cleanly Apache-2.0-redistributable. The `--fail-on` list matters more now
+than it did under MIT: this directory is the permissive side of a repository whose default license
+is AGPL-3.0-only, and a copyleft dependency arriving here would make its Apache grant
+undeliverable. See [`../LICENSING.md`](../LICENSING.md) for the dependency-direction rule.

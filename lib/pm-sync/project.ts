@@ -288,25 +288,38 @@ export async function projectTask(
 
   try {
     /**
-     * ADOPTDECL-1 — resource ids already claimed by OTHER rows in this team, so the adapter can refuse
-     * to adopt an issue that is already someone's. A footer-only check misses an issue owned by a link
-     * but carrying no footer, which is the shape prod actually holds (three TT1 links, one issue).
-     * Read only when this row could actually adopt, so ordinary pushes pay nothing.
+     * Resource ids already claimed by OTHER rows in this team, so the adapter can refuse to adopt an
+     * issue that is already someone's (ADOPTDECL-1, extended by ADOPTFOOT-1).
+     *
+     * TWO THINGS HERE WERE WRONG WHEN ADOPTDECL-1 SHIPPED, and both let the hijack through:
+     *
+     *  1. THE GATE. It loaded only for a row with a declaration and no `provider_resource_id`. But the
+     *     adoption rungs fire whenever RUNG 1 MISSES, and rung 1 misses for a NON-NULL resource id whose
+     *     issue was deleted (`linear.ts` does `issuesById.get(id)`, which returns undefined). So the set
+     *     was never loaded on exactly the path that re-forms the collision. It now loads for every
+     *     projection that reaches the adapter — which is after the fingerprint short-circuit above, so a
+     *     settled board still pays nothing.
+     *  2. THE SELF-EXCLUSION KEY. It excluded owners by `row_key` alone. The live collision is THREE ROWS
+     *     KEYED `TT1` in three different projects, so the true owner was dropped from the set as
+     *     "itself" and the refusal could not fire. A link's identity is
+     *     `(team_id, project_id, row_key, provider)` — the table's own unique constraint — so the
+     *     exclusion has to name the project too.
+     *
+     * The exclusion is defence only: a candidate always comes from the bootstrap listing, and if its id
+     * equalled this link's own resource id, rung 1 would have resolved it and no adoption rung would run.
+     * Keyed correctly it is harmless; keyed on `row_key` alone it was the bug.
      */
-    let ownedResourceIds: ReadonlySet<string> | undefined;
-    if ((link.declared_external_id ?? "").trim() && !link.provider_resource_id) {
-      const { data: owners } = await db
-        .from("task_pm_links")
-        .select("provider_resource_id, row_key")
-        .eq("team_id", row.team_id)
-        .eq("provider", provider)
-        .not("provider_resource_id", "is", null);
-      ownedResourceIds = new Set(
-        ((owners ?? []) as { provider_resource_id: string | null; row_key: string }[])
-          .filter((o) => o.provider_resource_id && o.row_key !== row.row_key)
-          .map((o) => o.provider_resource_id as string)
-      );
-    }
+    const { data: owners } = await db
+      .from("task_pm_links")
+      .select("provider_resource_id, project_id, row_key")
+      .eq("team_id", row.team_id)
+      .eq("provider", provider)
+      .not("provider_resource_id", "is", null);
+    const ownedResourceIds: ReadonlySet<string> = new Set(
+      ((owners ?? []) as { provider_resource_id: string | null; project_id: string; row_key: string }[])
+        .filter((o) => o.provider_resource_id && !(o.project_id === row.project_id && o.row_key === row.row_key))
+        .map((o) => o.provider_resource_id as string)
+    );
     const result = await adapter.upsertWorkItem({
       task,
       link,

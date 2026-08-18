@@ -1,5 +1,8 @@
 # AIOS Team Brain
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Connectors: Apache 2.0](https://img.shields.io/badge/Connectors-Apache_2.0-blue.svg)](LICENSING.md)
+
 **The collective organ of [AIOS](https://aiosbrain.dev) — the operating system for teams of humans and agents.**
 
 Team Brain is **a shared context layer for humans and agents**: one queryable store of what your team
@@ -25,8 +28,10 @@ every surface, and every agent.
   <img alt="Users working in Claude Code, Conductor and Cursor, plus integrations with Slack, Notion, Linear, GitHub and Google, all feeding one Team Brain (knowledge, memory, reasoning, policy, insights) with a Context Engine beneath it; the brain in turn drives surfaces — a kanban board, a KPI dashboard and a query interface — and actions such as spawning agents, executing tasks and improving the harness" src="docs/images/team-brain-schematic-light.png">
 </picture>
 
-**MIT licensed. Self-hosted. Private by default.** Postgres is the only required backend. Nothing
-leaves your instance unless you push it, and it runs fully on-machine at $0 if you want it to.
+**Open source. Self-hosted. Private by default.** Postgres and the graph engine (Neo4j + Graphiti)
+are the required backends. Nothing leaves your instance unless you push it, and it runs fully
+on-machine at $0 if you want it to. The server is [AGPL-3.0](LICENSE); the connector and
+graph-deployment directories are Apache-2.0. **Internal use is unrestricted** — see [LICENSING.md](LICENSING.md).
 
 ---
 
@@ -118,12 +123,12 @@ concluding the product is broken:
 |---|---|
 | **4 · One LLM key — any provider** | The brain is model-agnostic: **Anthropic**, **OpenAI**, **OpenRouter** (one key, hundreds of models from every major lab), or any **OpenAI-compatible endpoint** — including a model on your own hardware for **$0**. Switchable per team from Admin → Integrations with no redeploy, and **answering / reasoning / embeddings are chosen independently**, so a cheap model can do the routine work while a stronger one handles synthesis. Without a key the dashboard works, but the query box can't answer. See [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | **5 · Embeddings + pgvector** | `npm run pg:schema:vector` once, then an embeddings model (Admin → Integrations, or `EMBEDDINGS_*` env). **Skipping this is quiet:** retrieval silently degrades to keyword-only FTS, so a question whose answer never uses the question's words stops being findable |
+| **6 · Neo4j + Graphiti** | the **context engine**, and a required part of the architecture. Two more services and a **second** LLM key (Graphiti runs its own entity extraction). Powers the **narrative arcs on Pulse**, the learning panel, and graph-grounded answers. The app starts without it and timeline, search, tasks and meetings keep working — but **Pulse opens without its headline** and answers lose their temporal grounding, so treat a graph-less instance as incomplete rather than as a supported configuration. §2.8 |
 
-**Optional — but each one turns something off**
+**Optional**
 
 | | |
 |---|---|
-| **6 · Neo4j + Graphiti** | the **context engine**. Two more services and a **second** LLM key (Graphiti runs its own entity extraction). Powers the **narrative arcs on Pulse**, the learning panel, and graph-grounded answers. Leave it out and timeline, search, tasks and meetings are unaffected — but **Pulse opens without its headline**. §2.8 |
 | **7 · Python ≥ 3.11 + `uv`** | **only** for the sidecar connectors — Notion / Google Drive / Confluence / RSS / web / local files. Slack, GitHub, Linear and Plane run inside the app and need none of it |
 
 **What it costs:** every connector API is free. You pay for embeddings and LLM calls — plus a second
@@ -151,7 +156,7 @@ drive it yourself.
 | 4 | Load the vector schema (`npm run pg:schema:vector`) | ~1 min | **yours** — needs an embeddings model chosen first |
 | 5 | Create the first team + admin | ~1 min | bootstrap during first start |
 | 6 | Connect one source | ~4 min | **yours** — the Admin UI is the only legal writer for tokens |
-| + | Add Neo4j + Graphiti | later, or never | **yours**, §2.8 |
+| 7 | Add Neo4j + Graphiti | ~10 min | **yours**, §2.8 — required for the context engine |
 
 On the Railway path, the wizard opens **https://aiosbrain.dev/deploy/team-brain/**. The template
 deploys directly from the official repository, so a GitHub fork and `--resume` run are not required.
@@ -201,7 +206,7 @@ There is no `.nvmrc` or `.node-version` in the repo.
 |---|---|---|
 | **A host for the app** | **Required** | Railway is what we run and the best-supported path. Render, Fly, a VPS with Docker, or Kubernetes all work — it's a plain Next.js app with no platform-specific APIs. |
 | **Postgres 16 or newer** | **Required** | Managed (Railway, Neon, RDS…) or your own. Plain SQL schema, no vendor lock-in. 16 is what CI and `compose.yml` run; the Railway template provisions Railway's own current Postgres image, which is newer. No version is enforced at runtime. |
-| **Neo4j 5.26.2** + **Graphiti** | Optional | Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. Everything else works without it. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
+| **Neo4j 5.26.2** + **Graphiti** | **Required** | The context engine. Powers narrative arcs, the "what the brain is learning" panel, and graph-grounded answers. The app degrades gracefully rather than crashing if it's absent — everything else keeps working — but a graph-less instance is an incomplete one, not a supported configuration. Self-hosted via `graphiti/docker-compose.yml`. **Neo4j Aura is untested** — no code path references `neo4j+s://`, so treat cloud Aura as unverified. |
 | **Email (Resend or SMTP)** | Recommended | Magic links and invites. Without it the mail is **dropped in every environment** — logged server-side as `[mailer] no provider` (production) or `[mailer] (dev, no provider) would send …` (development), and nowhere else. The link itself is **never** printed: it carries a one-time token, so `mailer.ts` deliberately logs only the subject and recipient. To sign in locally without email, use `/auth/dev-login` (dev only) or the password from `npm run admin -- create-member`. |
 
 There is no Supabase dependency. It was removed — if you see Supabase env vars anywhere in your
@@ -513,10 +518,14 @@ the route 404s when `NODE_ENV=production`.
 asserts that ≥ 8 tasks and ≥ 20 decisions materialised, so it doubles as a regression test of the
 write path.
 
-### 2.8 — Graph memory: Neo4j + Graphiti (optional)
+### 2.8 — Graph memory: Neo4j + Graphiti (required)
 
-This is the most involved part of the setup and the easiest to get subtly wrong. Skip it entirely if
-you don't need narrative arcs or the learning panel — the app is fully functional without it.
+This is the most involved part of the setup and the easiest to get subtly wrong, but it is part of
+the architecture rather than an add-on. The app **boots and degrades gracefully** without it —
+timeline, search, tasks and meetings are unaffected — so nothing crashes if you defer it. What you
+lose is the narrative arcs on Pulse, the learning panel, and the temporal grounding under
+graph-backed answers. Treat a graph-less instance as incomplete rather than as a supported
+configuration.
 
 **Topology.** Three processes. The Next.js app talks to Graphiti over REST (writing episodes,
 searching facts) *and* to Neo4j directly over bolt, read-only, for the learning panel — the Graphiti
@@ -974,4 +983,22 @@ narrow single-writer module and the contract-level 422.
 
 ---
 
-MIT licensed. See [`LICENSE`](LICENSE).
+## License
+
+AIOS Team Brain is open source.
+
+- **The server is [AGPL-3.0-only](LICENSE).** Running it inside your company is
+  **unrestricted** — the AGPL creates no obligation for internal use, at any scale, however
+  much you modify it. The obligation appears only if you modify AIOS *and* offer your
+  modified version to third parties as a service.
+- **The connector and graph-deployment directories (`ingestion/`, `graphiti/`) are
+  Apache-2.0**, so they
+  can be embedded in your own software with no strings.
+- **If your organization's policy bans AGPL**, there is a
+  [**free commercial license**](COMMERCIAL-LICENSE.md) for internal use. No charge, no seat
+  count. Email **cn@fluora.ai**.
+- **Earlier releases remain MIT**, preserved in [`LICENSE-MIT`](LICENSE-MIT). The change is
+  going-forward only.
+
+Full breakdown in [`LICENSING.md`](LICENSING.md); the questions people actually ask are
+answered in the [licensing FAQ](docs/LICENSING-FAQ.md).
