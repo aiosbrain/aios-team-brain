@@ -49,6 +49,37 @@ describe("eventIdentity — the shapes a producer might send", () => {
     expect(week1).not.toEqual(week2);
   });
 
+  it("two occurrences of one series share NO meeting key, even though they share an iCalUID", () => {
+    // The fusion the second reviewer found. Google: "in recurring events, all occurrences of one
+    // event have different ids while they all share the same iCalUIDs." So the UID is a SERIES
+    // identity — and the bare-eid derivation carried that fusion into the meeting channel too, which
+    // is what made keeping the instance suffix a false guarantee rather than a protection.
+    const occ = (day: string) =>
+      eventIdentity({ google_calendar_event: { id: `base0abc_2026${day}T090000Z`, iCalUID: "base0abc@google.com" } });
+    const w1 = occ("0811");
+    const w2 = occ("0818");
+    expect(w1.eventKeys.filter((k) => w2.eventKeys.includes(k)), "no shared MEETING key").toEqual([]);
+    // Not discarded — moved to a channel that is counted separately and never joined on.
+    expect(w1.seriesKeys).toEqual(["suid:base0abc@google.com"]);
+    expect(w2.seriesKeys).toEqual(w1.seriesKeys);
+  });
+
+  it("recognises a recurring instance from `recurringEventId` alone, with no suffix on the id", () => {
+    const id = eventIdentity({
+      google_calendar_event: { id: "instance01", iCalUID: "series99@google.com", recurringEventId: "base0abc" },
+    });
+    expect(id.eventKeys).toEqual(["eid:instance01"]);
+    expect(id.seriesKeys).toEqual(["suid:series99@google.com"]);
+  });
+
+  it("a SINGLE event's UID still lands in eventKeys and still derives its bare id", () => {
+    // The inverse: if recurrence detection over-fired, every UID would drain into seriesKeys and the
+    // identity channel would quietly empty — a failure that looks exactly like "no producer sent one".
+    const id = eventIdentity({ google_calendar_event: { id: "single01a", iCalUID: "single01a@google.com" } });
+    expect(id.eventKeys.sort()).toEqual(["eid:single01a", "uid:single01a@google.com"]);
+    expect(id.seriesKeys).toEqual([]);
+  });
+
   it("two copies of ONE event normalise equal despite case and whitespace", () => {
     const mine = eventIdentity({ calendar_event_id: "  6F3K9Q2N1M8H5S7D  " }).eventKeys;
     const theirs = eventIdentity({ google_calendar_event: { id: "6f3k9q2n1m8h5s7d" } }).eventKeys;
@@ -80,9 +111,10 @@ describe("eventIdentity — the shapes a producer might send", () => {
   it("yields nothing at all for an item with no calendar fields", () => {
     expect(eventIdentity({ source: "granola", participants: "[John Ellison]" })).toEqual({
       eventKeys: [],
+      seriesKeys: [],
       conferenceKey: null,
     });
-    expect(eventIdentity(null)).toEqual({ eventKeys: [], conferenceKey: null });
+    expect(eventIdentity(null)).toEqual({ eventKeys: [], seriesKeys: [], conferenceKey: null });
   });
 });
 
@@ -92,6 +124,20 @@ describe("eventIdentity — the conference link (diagnostic only)", () => {
     const b = eventIdentity({ hangoutLink: "https://Meet.Google.com/abc-defg-hij/" }).conferenceKey;
     expect(a).toBe("meet.google.com/abc-defg-hij");
     expect(b).toBe(a);
+  });
+
+  it("prefers the VIDEO entry point over a dial-in — a phone number is not a conference link", () => {
+    const key = eventIdentity({
+      google_calendar_event: {
+        conferenceData: {
+          entryPoints: [
+            { entryPointType: "phone", uri: "tel:+15551234567" },
+            { entryPointType: "video", uri: "https://meet.google.com/xyz-1234-abc" },
+          ],
+        },
+      },
+    }).conferenceKey;
+    expect(key).toBe("meet.google.com/xyz-1234-abc");
   });
 
   it("reads Google's conferenceData.entryPoints[].uri when there is no hangoutLink", () => {

@@ -3,7 +3,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * GUARD: a conference link must never decide that two meetings are the same one (MTGATT-2).
+ * GUARD: a conference link — or a SERIES key — must never decide that two meetings are the same one
+ * (MTGATT-2).
  *
  * `eventIdentity` parses a normalised `conferenceKey` because it is worth MEASURING — how often would
  * a Meet/Zoom link have been the only shared signal between a calendar event and its transcript? It
@@ -27,10 +28,17 @@ const ALLOWED = new Set(["lib/meetings/event-identity.ts", "scripts/meeting-pair
  * `conferenceKey` left the obvious bypass open — a future join reading `fm.conference_url` or
  * `fm.hangoutLink` straight off the item would never touch the parser and would sail through.
  */
-const NEEDLES = [/conferenceKey/, /conference_url/, /hangoutLink/, /hangout_link/, /meeting_url/, /conferenceUrl/];
-// Every spelling `CONFERENCE_KEYS` in the parser accepts must appear above, or a join can read the
-// raw field under a name the guard does not know. `meeting_url` and `conferenceUrl` were exactly
-// that gap: accepted by the parser, invisible to the first version of this list.
+const NEEDLES = [
+  /conferenceKey/,
+  /conference_url/,
+  /hangoutLink/,
+  /hangout_link/,
+  /meeting_url/,
+  /conferenceUrl/,
+  // A SERIES key fuses in exactly the same way: every occurrence of a recurring event shares one
+  // iCalUID, so joining on it unions a year of standups into one meeting.
+  /seriesKeys/,
+];
 
 /**
  * Comment lines, dropped LINE BY LINE rather than by stripping `/* … *\/` across the file.
@@ -45,6 +53,7 @@ const NEEDLES = [/conferenceKey/, /conference_url/, /hangoutLink/, /hangout_link
 function codeOnly(src: string): string {
   return src
     .split("\n")
+    .map((line) => line.replace(/\/\*.*?\*\//g, " ")) // `/* legacy */ const k = fm.conference_url;` keeps its code
     .filter((line) => {
       const t = line.trim();
       return !(t.startsWith("*") || t.startsWith("//") || t.startsWith("/*"));
@@ -57,14 +66,17 @@ function filesUnder(dir: string): string[] {
   for (const entry of readdirSync(join(process.cwd(), dir), { withFileTypes: true })) {
     const rel = `${dir}/${entry.name}`;
     if (entry.isDirectory()) out.push(...filesUnder(rel));
-    else if (/\.(ts|tsx)$/.test(entry.name)) out.push(rel);
+    else if (/\.(ts|tsx|mjs|js)$/.test(entry.name)) out.push(rel);
   }
   return out;
 }
 
 describe("guard: the conference link is measured, never joined on", () => {
   it("no module outside the parser and the report touches a conference link, by any spelling", () => {
-    const offenders = [...filesUnder("lib"), ...filesUnder("scripts"), ...filesUnder("app")]
+    // `components/` and `.mjs` are in scope deliberately: the UI could group by a key off an API
+    // payload, and `scripts/backfill-meeting-attendance.mjs` shows repair scripts are .mjs here — both
+    // were outside the first version of this walk.
+    const offenders = [...filesUnder("lib"), ...filesUnder("scripts"), ...filesUnder("app"), ...filesUnder("components")]
       .filter((rel) => !ALLOWED.has(rel))
       .filter((rel) => {
         const code = codeOnly(readFileSync(join(process.cwd(), rel), "utf8"));
@@ -83,7 +95,9 @@ describe("guard: the conference link is measured, never joined on", () => {
       "fm.hangout_link",
       "fm.meeting_url",
       "fm.conferenceUrl",
+      "groupBy(note.seriesKeys)",
     ];
+    expect(samples, "a needle with no sample is an untested needle").toHaveLength(NEEDLES.length);
     for (const [i, n] of NEEDLES.entries()) expect(n.test(samples[i]), samples[i]).toBe(true);
   });
 

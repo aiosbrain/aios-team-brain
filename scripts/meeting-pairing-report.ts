@@ -39,6 +39,8 @@ export interface Note {
   /** The producer's own timestamp, when it carried one (42 of 63 granola items in prod do). */
   startedAt: string | null;
   eventKeys: string[];
+  /** Keys that identify a SERIES, not a meeting. Counted apart — never as pairs. */
+  seriesKeys: string[];
   conferenceKey: string | null;
 }
 
@@ -94,6 +96,7 @@ async function reportTeam(db: ReturnType<typeof adminClient>, team: TeamRow): Pr
       source: isCalendarEvent(src) ? "calendar" : "transcript",
       startedAt: startedAt(fm),
       eventKeys: identity.eventKeys,
+      seriesKeys: identity.seriesKeys,
       conferenceKey: identity.conferenceKey,
     };
   });
@@ -123,6 +126,23 @@ async function reportTeam(db: ReturnType<typeof adminClient>, team: TeamRow): Pr
     console.log(`  of the CROSS pairs, ${summary.missedByDate} would have been MISSED by a same-date rule (the timezone case)`);
   }
 
+  if (summary.oversizedGroups) {
+    // A key shared by three or more notes is not a pair. Reported loudly because the most likely
+    // cause is a key that identifies something broader than one meeting, and a measurement that
+    // folded those into its headline would argue for a join that fuses them.
+    console.log(`  ⚠ ${summary.oversizedGroups} key group(s) hold MORE than two notes — inspect before treating them as pairs`);
+  }
+
+  const seriesGroups = new Map<string, Note[]>();
+  for (const n of enriched) for (const k of n.seriesKeys) seriesGroups.set(k, [...(seriesGroups.get(k) ?? []), n]);
+  const seriesNotes = enriched.filter((n) => n.seriesKeys.length > 0).length;
+  // Diagnostic, and deliberately NOT part of the pair count. Every occurrence of a recurring event
+  // shares one iCalUID, so these keys identify a SERIES: joining on them would union a year of
+  // standups into one meeting.
+  console.log(
+    `  notes carrying a SERIES key: ${seriesNotes} across ${seriesGroups.size} series — never a join key, recurring occurrences share one UID`
+  );
+
   const confGroups = new Map<string, Note[]>();
   for (const n of enriched) if (n.conferenceKey) confGroups.set(n.conferenceKey, [...(confGroups.get(n.conferenceKey) ?? []), n]);
   const confPairs = [...confGroups.values()].flatMap((m) => pairsOf(m));
@@ -140,6 +160,13 @@ export interface PairSummary {
   same: number;
   /** Of the cross pairs, how many a same-date pre-filter would have thrown away (the timezone case). */
   missedByDate: number;
+  /**
+   * Key groups holding MORE than two notes. A true pair is two — one calendar event and one
+   * transcript — so a bigger group is either several people pushing the same event or, more likely, a
+   * key that identifies something broader than one meeting. Surfaced rather than folded into `cross`,
+   * because a series masquerading as pairs is exactly how this measurement would overstate itself.
+   */
+  oversizedGroups: number;
   rows: string[];
 }
 
@@ -156,8 +183,9 @@ export function summarisePairs(notes: Note[]): PairSummary {
 
   const seen = new Set<string>();
   const missed = new Set<string>();
-  const out: PairSummary = { cross: 0, same: 0, missedByDate: 0, rows: [] };
+  const out: PairSummary = { cross: 0, same: 0, missedByDate: 0, oversizedGroups: 0, rows: [] };
   for (const [key, members] of groups) {
+    if (members.length > 2) out.oversizedGroups++;
     for (const [a, b] of pairsOf(members)) {
       if (a.id === b.id) continue;
       const pairId = [a.id, b.id].sort().join("|");

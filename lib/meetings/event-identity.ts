@@ -55,7 +55,7 @@ const PLACEHOLDER_KEYS = new Set(["none", "null", "nil", "n/a", "na", "unknown",
 
 export interface EventIdentity {
   /**
-   * Every distinct event key this item carries, each QUALIFIED by which identifier it came from
+   * Every distinct key that identifies THIS MEETING, each QUALIFIED by which identifier it came from
    * (`eid:` / `uid:`).
    *
    * The qualifier is not decoration. An unqualified normaliser that stripped `@google.com` would make
@@ -65,8 +65,26 @@ export interface EventIdentity {
    * stability guarantees and either side of a future pair may carry only one of them.
    */
   eventKeys: string[];
+  /**
+   * Keys that identify a SERIES rather than a meeting — kept apart from `eventKeys` so they can never
+   * be joined on by accident. See `isRecurringInstance`.
+   */
+  seriesKeys: string[];
   /** The normalised conference link, if any. Diagnostic. Never a join key — see the file header. */
   conferenceKey: string | null;
+}
+
+/**
+ * True when this frontmatter describes ONE OCCURRENCE of a recurring event.
+ *
+ * Google names an instance `<base>_20260811T090000Z` and sets `recurringEventId` on it. Either signal
+ * is enough; both are checked because a producer may forward only one.
+ */
+function isRecurringInstance(fm: Record<string, unknown>, nested: Record<string, unknown>): boolean {
+  const recurringId = fm.recurring_event_id ?? fm.recurringEventId ?? nested.recurringEventId;
+  if (typeof recurringId === "string" && recurringId.trim()) return true;
+  const ids = [firstString(fm, EVENT_ID_KEYS), typeof nested.id === "string" ? nested.id : null];
+  return ids.some((v) => typeof v === "string" && /_\d{8}t\d{6}z$/i.test(v.trim()));
 }
 
 /**
@@ -77,10 +95,16 @@ export interface EventIdentity {
  * distinguishes this week's standup from next week's. Stripping it would fuse a whole series into one
  * meeting, which is the same class of error as matching on a Zoom PMI.
  *
- * The `@google.com` suffix on a UID is likewise KEPT. Google documents the derivation
- * (`iCalUID = <eventId>@google.com` for an event it created), so the bare form is emitted as a
- * SEPARATE `eid:` key below rather than by mutating the UID — the derivation is then visible in the
- * key set and measurable, instead of being an invisible equivalence baked into a normaliser.
+ * ⚠️ THE SUFFIX RULE ALONE IS NOT THE PROTECTION, and an earlier version of this comment claimed it
+ * was. Every occurrence of a recurring event shares ONE `iCalUID`, so the UID channel fuses the series
+ * even while `eid:` correctly separates it — and the bare-`eid:` derivation below carried that fusion
+ * straight into the meeting channel. Recurring UIDs now go to `seriesKeys` instead (see
+ * `isRecurringInstance`), and the derivation is applied only to a single event's UID.
+ *
+ * The `@google.com` suffix on a UID is otherwise KEPT. Google documents the derivation
+ * (`iCalUID = <eventId>@google.com` for a single event it created), so the bare form is emitted as a
+ * SEPARATE `eid:` key rather than by mutating the UID — the derivation is then visible in the key set
+ * and measurable, instead of being an invisible equivalence baked into a normaliser.
  */
 function normaliseId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -124,12 +148,14 @@ function firstString(source: Record<string, unknown>, keys: readonly string[]): 
  * a producer that forwards the whole object works without a second contract.
  */
 export function eventIdentity(fm: Record<string, unknown> | null | undefined): EventIdentity {
-  if (!fm) return { eventKeys: [], conferenceKey: null };
+  if (!fm) return { eventKeys: [], seriesKeys: [], conferenceKey: null };
 
   const nested = fm.google_calendar_event ?? fm.calendar_event ?? null;
   const nestedObj: Record<string, unknown> = nested && typeof nested === "object" ? (nested as Record<string, unknown>) : {};
+  const recurring = isRecurringInstance(fm, nestedObj);
 
   const keys = new Set<string>();
+  const series = new Set<string>();
   const addEventId = (raw: unknown): void => {
     const k = normaliseId(raw);
     if (k) keys.add(`eid:${k}`);
@@ -137,10 +163,23 @@ export function eventIdentity(fm: Record<string, unknown> | null | undefined): E
   const addUid = (raw: unknown): void => {
     const k = normaliseId(raw);
     if (!k) return;
+
+    // A UID IS A SERIES IDENTITY WHEN THE EVENT RECURS, and that is Google's documented behaviour, not
+    // an edge case: "in recurring events, all occurrences of one event have different ids while they
+    // all share the same iCalUIDs". So every Tuesday standup for a year carries ONE iCalUID. Treating
+    // it as a meeting key would group the whole series — the exact fusion the instance suffix on
+    // `eid:` exists to prevent, arriving through the identifier beside it — and the derived bare
+    // `eid:` below would smuggle the same fusion into the meeting channel, because for an instance the
+    // bare form is the SERIES id and not this occurrence's id.
+    if (recurring) {
+      series.add(`suid:${k}`);
+      return;
+    }
+
     keys.add(`uid:${k}`);
-    // Google's documented derivation: an event it created has `iCalUID = <eventId>@google.com`. The
-    // bare form is added as its own `eid:` key so a producer that sends only the UID can still line up
-    // with one that sends only the id — as an EXPLICIT extra key, never by rewriting the UID.
+    // Google's documented derivation for a SINGLE event: `iCalUID = <eventId>@google.com`. The bare
+    // form is added as its own `eid:` key so a producer that sends only the UID can still line up with
+    // one that sends only the id — as an EXPLICIT extra key, never by rewriting the UID.
     const bare = k.replace(/@google\.com$/, "");
     if (bare !== k) addEventId(bare);
   };
@@ -156,19 +195,27 @@ export function eventIdentity(fm: Record<string, unknown> | null | undefined): E
     normaliseConference(firstString(nestedObj, CONFERENCE_KEYS)) ??
     normaliseConference(entryPointUri(nestedObj.conferenceData));
 
-  return { eventKeys: [...keys], conferenceKey: conference };
+  return { eventKeys: [...keys], seriesKeys: [...series], conferenceKey: conference };
 }
 
-/** Google buries the joinable link at `conferenceData.entryPoints[].uri` when there is no `hangoutLink`. */
+/**
+ * Google buries the joinable link at `conferenceData.entryPoints[].uri` when there is no
+ * `hangoutLink`.
+ *
+ * The VIDEO entry point is preferred, not merely the first one: a conference with a dial-in lists
+ * `{entryPointType: "phone", uri: "tel:+1…"}` too, and on a phone-first payload taking the first uri
+ * would record a telephone number as the meeting's conference link — junk in a measurement whose
+ * whole job is to say how often a link would have identified a meeting.
+ */
 function entryPointUri(conferenceData: unknown): string | null {
   if (!conferenceData || typeof conferenceData !== "object") return null;
   const points = (conferenceData as { entryPoints?: unknown }).entryPoints;
   if (!Array.isArray(points)) return null;
-  for (const p of points) {
-    if (p && typeof p === "object") {
-      const uri = (p as { uri?: unknown }).uri;
-      if (typeof uri === "string" && uri.trim()) return uri;
-    }
-  }
-  return null;
+  const uriOf = (p: unknown): string | null => {
+    const uri = p && typeof p === "object" ? (p as { uri?: unknown }).uri : null;
+    return typeof uri === "string" && uri.trim() ? uri : null;
+  };
+  const isVideo = (p: unknown): boolean =>
+    !!p && typeof p === "object" && (p as { entryPointType?: unknown }).entryPointType === "video";
+  return uriOf(points.find(isVideo)) ?? uriOf(points.find((p) => uriOf(p) && !((p as { entryPointType?: unknown })?.entryPointType === "phone")));
 }

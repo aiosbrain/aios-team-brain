@@ -149,8 +149,13 @@ describe("calendar RSVP: a declined invitee is not an attendee (real Postgres)",
 
     const summary = await pushEventAndBackfill(seed, [{ email: a, responseStatus: "declined" }]);
     expect(summary.created).toBe(1);
-    // MTGATT-1's rule still holds: a structured list that resolves to nobody must NOT fall through to
-    // an LLM guess. An empty calendar answer is an answer.
+    // An empty calendar answer is an answer — the note exists with nobody on it.
+    //
+    // HONEST LIMIT: this does NOT prove the no-fallthrough rule. On the calendar path the model is
+    // never consulted at all (`from-items.ts` hands rank 3 a hardcoded empty list), so a
+    // fall-through would produce this same zero. The rule itself lives in `attendance.ts` and is
+    // pinned where it can actually fail — `test/meetings-attendance-source.test.ts`, which asserts
+    // the llm callback is not invoked.
     expect(await attendeeIds(seed)).toEqual([]);
   });
 });

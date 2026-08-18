@@ -107,7 +107,8 @@ must not silently yield an unlinkable meeting — the lesson already written int
 calendar_event_id | calendarEventId | event_id | gcal_event_id            → eid: key
 ical_uid | icalUID | iCalUID | ical_uid_raw                              → uid: key
 conference_url | hangout_link | hangoutLink | meeting_url | conferenceUrl → conference key (measured, never joined)
-google_calendar_event: { id, iCalUID, hangoutLink, conferenceData }       → the nested shape, same keys
+google_calendar_event | calendar_event: { id, iCalUID, recurringEventId,   → the nested shape, same keys
+                        hangoutLink, conferenceData }
 ```
 
 This list is the CONTRACT and must match `EVENT_ID_KEYS` / `UID_KEYS` / `CONFERENCE_KEYS` in
@@ -115,6 +116,14 @@ This list is the CONTRACT and must match `EVENT_ID_KEYS` / `UID_KEYS` / `CONFERE
 spelling missing would reasonably delete the parser path that handles it. The guard test asserts
 every accepted conference spelling is watched, which keeps the code side honest; this paragraph is
 the doc side.
+
+**A recurring occurrence's UID is a SERIES key, not a meeting key.** Google: *"in recurring events,
+all occurrences of one event have different ids while they all share the same iCalUIDs"* — so a year of
+standups carries one UID. Those land in `seriesKeys` (`suid:`), are counted separately by the report,
+and are never joined on; the bare-`eid:` derivation below is applied only to a single event's UID,
+because for an occurrence the bare form is the SERIES id. Recurrence is recognised from an instance
+suffix (`_20260811T090000Z`) or `recurringEventId`. A UID arriving with neither signal cannot be
+classified, which is why the report flags any key group holding more than two notes.
 
 **Keys are qualified by kind** (`eid:` / `uid:`). An unqualified normaliser that stripped
 `@google.com` would make the UID `Foo@google.com` and a bare producer key `foo` the same string — a

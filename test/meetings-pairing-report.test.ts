@@ -16,6 +16,7 @@ const note = (over: Partial<Note> & { id: string }): Note => ({
   source: "transcript",
   startedAt: null,
   eventKeys: [],
+  seriesKeys: [],
   conferenceKey: null,
   ...over,
 });
@@ -69,7 +70,30 @@ describe("summarisePairs — one meeting pair is counted once", () => {
       note({ id: "cal", source: "calendar", eventKeys: ["eid:aaa11111"] }),
       note({ id: "tx", eventKeys: ["eid:bbb22222"] }),
     ]);
-    expect(summary).toEqual({ cross: 0, same: 0, missedByDate: 0, rows: [] });
+    expect(summary).toEqual({ cross: 0, same: 0, missedByDate: 0, oversizedGroups: 0, rows: [] });
+  });
+
+  it("flags a key group holding MORE than two notes instead of silently counting pairs", () => {
+    // Where this bites: every occurrence of a recurring event shares one iCalUID, so a key that is
+    // really a SERIES id collects the whole series and reports C(n,2) pairs. The parser now routes
+    // recurring UIDs to `seriesKeys`, but a producer sending a UID with no recurrence signal is
+    // unclassifiable — so the count that MTGATT-3 gets fitted to has to say when a group is not a pair.
+    const keys = ["uid:weekly@google.com"];
+    const summary = summarisePairs([
+      note({ id: "w1", source: "calendar", eventKeys: keys, occurredAt: "2026-08-11" }),
+      note({ id: "w2", eventKeys: keys, occurredAt: "2026-08-18" }),
+      note({ id: "w3", eventKeys: keys, occurredAt: "2026-08-25" }),
+    ]);
+    expect(summary.oversizedGroups, "3 notes on one key is not a pair").toBe(1);
+  });
+
+  it("does not flag a legitimate two-note pair as oversized", () => {
+    // The inverse — otherwise the warning fires on every real pair and stops meaning anything.
+    const summary = summarisePairs([
+      note({ id: "cal", source: "calendar", eventKeys: ["eid:abc12345"] }),
+      note({ id: "tx", eventKeys: ["eid:abc12345"] }),
+    ]);
+    expect(summary.oversizedGroups).toBe(0);
   });
 
   it("ignores notes with no keys rather than grouping them together", () => {

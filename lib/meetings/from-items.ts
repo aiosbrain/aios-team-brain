@@ -252,10 +252,11 @@ export async function backfillMeetingNotesFromItems(
         : await extract(body, roster).catch(() => ({ summary: "", attendeeMemberIds: [] }));
 
       // A DECLINED invitee is not an attendee (MTGATT-2). Filtered here, at the one site that turns an
-      // event's invite list into attendance, and counted so the removal is visible rather than silent.
+      // event's invite list into attendance. The COUNT is taken below, only once the note is actually
+      // written: an item that throws or is skipped removed nobody, and counting it there would let a
+      // persistently failing item add the same declines on every tick.
       const invited = calendar ? calendarAttendees(c.frontmatter) : [];
       const attending = attendingAttendees(invited);
-      summary.calendarDeclined += invited.length - attending.length;
 
       const attendance = await resolveAttendance({
         isCalendar: calendar,
@@ -283,6 +284,7 @@ export async function backfillMeetingNotesFromItems(
       });
       if (res.created) {
         summary.created++;
+        summary.calendarDeclined += invited.length - attending.length;
         // Pre-compute action items so a pushed meeting opens with its todos already filled in
         // (not empty until someone clicks "extract"). Best-effort — never fail the note over it.
         //
