@@ -116,7 +116,7 @@ admin; a delegated token minted for the external member with an empty project sc
 | A3 graph scope | `selectEnforcedGraphPartitions` over the member's oracle projects resolves the EXACT set {X's partition, external-shared's partition} — General ABSENT is the ruling-2 boundary, Y ABSENT (cold-read M2; the dm-reachable pin — live Graphiti search is not in the dm tier, the PPARC-3 dispensation). Fixture: X's partition pointer minted AND ready-latched via the FakeGraphiti project+confirm pattern (`test/datamechanics/graph-arming.datamechanics.test.ts` precedent) — an unarmed initiative never enters any scope |
 | A4 arcs | the route's exact composition (`memberEnforcement` → `resolveArcScope` → `getFusedArcs` — the session-authed route itself is dm-unreachable, cold-read M3; precedent `arcs-unified-read.datamechanics.test.ts`) serves a panel containing X's partition prose; Y's partition prose ABSENT. Deterministic: the fixture pre-seeds fresh `arc_cache` `g:` rows for EVERY scope group (X's + external-shared's) AND a distinctively-prosed row for Y's partition — the absence probe must exist to be absent (one-condition-per-fixture) |
 | A5 roster/structure | v1 members returns the same roster a team key gets; the retrieve org-structural legs serve actors + REPORTS_TO to this member |
-| A6 timeline (the §1 change) | the member's ledger carries X's team-access evidence across the LEG CLASSES (a git item, a slack item, a sourced task header incl. the `:488` chip read, a decision — cold-read M6); Y's evidence ABSENT; a null-source hand-typed team task ABSENT for this external-posture member (the H2 sub-assertion); a meeting note whose transcript is in X ABSENT (the kept carve-out, cold-read L1) |
+| A6 timeline (the §1 change) | the member's ledger carries X's team-access evidence across the LEG CLASSES (a git item, a sourced task header incl. the `:488` chip read, a decision — cold-read M6; the SLACK call site's mode-keying is covered STRUCTURALLY by the A6 wall mutation, which reverts the shared `walledItems` helper feeding all three item legs — a per-participant slack fixture needs identity-mapping machinery this proof suite deliberately does not fabricate, amended per diff-review M2); Y's evidence ABSENT; a null-source hand-typed team task ABSENT for this external-posture member (the H2 sub-assertion, with a VISIBLE citer so the absence is non-vacuous); a CREDITED meeting note whose transcript is in X ABSENT (the kept carve-out, cold-read L1 — with a team-posture-granted-X POSITIVE control, diff-review H1) |
 | A7 token | SPLIT (cold-read H1 — an external-launcher token is UNMINTABLE, `mintAgentToken` refuses and `verifyAgentToken` re-nulls; that refusal IS the token-semantics observable): (a) a token minted for the team-posture admin with `projectScope: []` reads NOTHING of X or Y and no org-structural legs (the AC3 attenuation proof); (b) minting for the external member returns the Phase-A refusal — pinned |
 | A8 permissive control | an EQUIVALENTLY-INVITED external member on a SECOND, still-permissive team (members are per-team rows — "same member" is unrepresentable, cold-read M4) reads only `access='external'` rows via v1 items AND their timeline tier row (the §1 permissive arm's pin) |
 
@@ -128,10 +128,14 @@ exactly its own gate — the omission-breaks-absence discipline, verdicts pasted
 This slice's build change writes NOTHING new: `lib/dashboard/work-timeline.ts` keeps its sole
 writer relationship to `work_timeline_cache` (via `lib/dashboard/timeline-cache.ts`, whose
 per-variant upsert discipline is untouched — the wall drop changes row SELECTION inside the
-builder, not the cache write path). The SUITE's only writes go through sanctioned writers:
-`createMember`/`addMemberToGroup`/`grantProjectToGroup` (the access single writer),
-`writeArcCache` (the arc-cache single writer, for A4's deterministic pre-seed), `ingest`
-(items), and `mintAgentToken` (the token single writer). No locks are introduced or bypassed.
+builder, not the cache write path). The SUITE's writes go through sanctioned writers
+(`createMember`/`addMemberToGroup`/`grantProjectToGroup`, `writeArcCache`, `ingest`,
+`mintAgentToken`) PLUS direct substrate-state modeling that tests are exempt from the
+single-writer guard for (diff-review L3, named honestly): `projects.graph_group_id` set to
+the exact `projectGroupId` value the guarded writer would mint, membership-row moves,
+`graph_episodes` landing simulation (the graph-arming precedent), item attribution, and
+member activation. Each models a REAL state reachable in production; none invents an
+impossible one. No locks are introduced or bypassed.
 
 ## 3. What this slice does NOT do (named, with destinations)
 
@@ -181,6 +185,7 @@ builder, not the cache write path). The SUITE's only writes go through sanctione
    | A7 | `lib/access/oracle.ts` | `projectIds = new Set([...projectIds].filter((p) => scope.has(p)));` → `` (attenuation drops — reddens A7a) |
    | A2b | `lib/query/fts-search.ts` | `where += ` and `i.id = any($${params.length}::uuid[])`;` → `` (the fts vis application — cold-read M5's missing gate) |
    | A6b | `lib/dashboard/work-timeline.ts` | the §1 null-source posture conjunct (`!isRestrictedTier` on the `created_by` arm) → `` (the H2 widen — reddens the hand-typed-task sub-assertion) |
+   | A6c | `lib/dashboard/work-timeline.ts` | `  if (canSeeMeetingNotes(tier)) {` → `  if (true) {` (the meeting carve-out's gate — reddens the credited-meeting absence; diff-review H1's missing table row) |
 
    Every needle above is a verbatim, grep-able line (A6/A6b's exist after §1's change lands,
    in the same PR). Each `red:` verdict line must name the row's arm. "Exactly that arm" is

@@ -47,6 +47,7 @@ interface Fixture {
   groupY: string;
   itemXId: string;
   itemYId: string;
+  groupXMembersId: string; // the clients-x group (granted X)
 }
 
 async function mkInitiative(seed: Seed, slug: string): Promise<{ projectId: string; group: string }> {
@@ -82,7 +83,7 @@ const ARC = (title: string): NarrativeArc[] => [
   { arc_id: `a-${sha(title).slice(0, 8)}`, title, summary: `${title} prose`, arc_type: "milestone", status: "active", people: [], itemIds: [] } as unknown as NarrativeArc,
 ];
 
-/** The full enforcing-team fixture, built ONCE (read-only across arms). */
+/** The full enforcing-team fixture — built PER TEST (the dm harness truncates between tests). */
 async function buildFixture(): Promise<Fixture> {
   const seed = await seedTeam();
   const x = await ingest(seed, { path: "x.md", body: `alpha ${TERM_X}`, access: "team", project: "src" });
@@ -169,6 +170,7 @@ async function buildFixture(): Promise<Fixture> {
     groupY: Y.group,
     itemXId: x.id,
     itemYId: y.id,
+    groupXMembersId: g.groupId!,
   };
 }
 
@@ -215,9 +217,10 @@ describe("PRET-5 A3 — the graph scope is EXACTLY the membership set", () => {
       .eq("team_id", F.seed.teamId)
       .in("slug", ["general", "external-shared"]);
     const bySlug = new Map((builtins ?? []).map((p: { slug: string; graph_group_id: string }) => [p.slug, p.graph_group_id]));
-    expect(scope.groups, "X's partition resolves").toContain(F.groupX);
     expect(scope.groups, "Y's partition is the oracle's absence").not.toContain(F.groupY);
     expect(scope.groups, "General ABSENT — the exact ruling-2 boundary").not.toContain(bySlug.get("general"));
+    // The spec's EXACT-set assertion (diff-review M1): nothing beyond the membership set.
+    expect(new Set(scope.groups)).toEqual(new Set([F.groupX, bySlug.get("external-shared")]));
   });
 });
 
@@ -246,9 +249,12 @@ describe("PRET-5 A5 — structure serves every member", () => {
     const ext = await membersGET(v1("/api/v1/members", F.externalKey));
     expect(ext.status).toBe(200);
     const team = await membersGET(v1("/api/v1/members", F.teamKey));
-    const extIds = ((await ext.json()) as { members: { id: string }[] }).members.map((m) => m.id).sort();
-    const teamIds = ((await team.json()) as { members: { id: string }[] }).members.map((m) => m.id).sort();
-    expect(extIds).toEqual(teamIds);
+    const byId = (arr: { id: string }[]) => [...arr].sort((a, b) => a.id.localeCompare(b.id));
+    const extMembers = byId(((await ext.json()) as { members: { id: string }[] }).members);
+    const teamMembers = byId(((await team.json()) as { members: { id: string }[] }).members);
+    // Deep payload equality (diff-review L1): the SAME roster objects, not just the same ids —
+    // a future per-posture field redaction would silently pass an id-only check.
+    expect(extMembers).toEqual(teamMembers);
 
     // Org-structural legs (the QMIR inversion, re-asserted inside the matrix): seed one actor +
     // REPORTS_TO edge, then read through the enforced member arm.
@@ -322,12 +328,16 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
         .insert({ team_id: F.seed.teamId, project_id: F.projectXId, row_key: "DX-1", title: "X decision", decided_by: "tester", decided_at: now.slice(0, 10), still_valid: true, source_item_id: gitX.id, audience: "team" })
     ).error;
     expect(JSON.stringify(decErr ?? null), "decision fixture must insert").toBe("null");
-    const mtgErr = (
-      await db()
-        .from("meeting_notes")
-        .insert({ team_id: F.seed.teamId, source_item_id: gitX.id, title: "X standup", summary: "standup", occurred_at: now.slice(0, 10) })
-    ).error;
+    const { data: mtg, error: mtgErr } = await db()
+      .from("meeting_notes")
+      .insert({ team_id: F.seed.teamId, source_item_id: gitX.id, title: "X standup", summary: "standup", occurred_at: now.slice(0, 10) })
+      .select("id")
+      .single();
     expect(JSON.stringify(mtgErr ?? null), "meeting fixture must insert").toBe("null");
+    // Credited attendee — an unattributable note is dropped for EVERY viewer, which made the
+    // carve-out absence vacuous (diff-review H1, the third catch of this fixture class).
+    const attErr = (await db().from("meeting_note_attendees").insert({ meeting_note_id: (mtg as { id: string }).id, member_id: F.seed.memberId })).error;
+    expect(JSON.stringify(attErr ?? null), "attendee fixture must insert").toBe("null");
 
     const enforce = await memberEnforcement(db(), { teamId: F.seed.teamId, memberId: F.external });
     const days = await getWorkTimeline(db(), F.seed.teamId, "external", 14, enforce);
@@ -338,6 +348,13 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     expect(flat, "Y's evidence never flows").not.toContain("y secret");
     expect(flat, "the null-source hand-typed team task stays walled (H2 ruling)").not.toContain("Hand-typed team task");
     expect(flat, "meeting notes keep the posture gate (the kept carve-out)").not.toContain("X standup");
+
+    // POSITIVE CONTROL for the carve-out (diff-review H1): a TEAM-POSTURE member GRANTED X
+    // does see the meeting — so the external absence above is provably the posture gate, not
+    // an unattributable-note artifact (nor an oracle one: this viewer has the same X grant).
+    expect((await addMemberToGroup(db(), F.seed.teamId, F.groupXMembersId, F.seed.memberId, F.seed.memberId)).ok).toBe(true);
+    const teamDays = await getWorkTimeline(db(), F.seed.teamId, "team", 14, await memberEnforcement(db(), { teamId: F.seed.teamId, memberId: F.seed.memberId }));
+    expect(JSON.stringify(teamDays), "the entitled viewer sees the meeting").toContain("X standup");
   });
 });
 
@@ -346,6 +363,12 @@ describe("PRET-5 A7 — token semantics, byte-unchanged", () => {
     const F: Fixture = await buildFixture();
     const minted = await mintAgentToken(db(), F.seed.teamId, { memberId: F.seed.memberId, projectScope: [] }, F.seed.memberId);
     expect(minted.ok, (minted as { error?: string }).error).toBe(true);
+    // The claims→scope round-trip (diff-review L2): the token VERIFIES and its principal
+    // carries the empty scope the mint bound.
+    const { verifyAgentToken } = await import("@/lib/access/agent-tokens");
+    const principal = await verifyAgentToken(db(), minted.token!);
+    expect(principal, "the minted token verifies").not.toBeNull();
+    expect(principal!.projectScope, "the empty scope survives the round-trip").toEqual([]);
     const effective = await effectiveVisibleProjects(db(), {
       teamId: F.seed.teamId,
       memberId: F.seed.memberId,
@@ -363,9 +386,21 @@ describe("PRET-5 A7 — token semantics, byte-unchanged", () => {
 describe("PRET-5 A8 — the permissive control (no stealth widen)", () => {
   it("an equivalently-invited external member on a second, still-permissive team reads only access='external' rows", async () => {
     const seed2 = await seedTeam();
-    await ingest(seed2, { path: "t2.md", body: "internal two", access: "team", project: "src" });
-    await ingest(seed2, { path: "e2.md", body: "shared two", access: "external", project: "src" });
+    const t2 = await ingest(seed2, {
+      path: "t2.md",
+      body: "internal two",
+      access: "team",
+      project: "src",
+      frontmatter: { title: "Internal Two Doc" },
+    });
+    const e2 = await ingest(seed2, { path: "e2.md", body: "shared two", access: "external", project: "src" });
     await backfillTeamContext(db(), seed2.teamId);
+    // Timeline-eligible (attributed + source-dated) so the permissive-arm pin is REAL — the
+    // first draft probed a payload-unreachable body string on ineligible items (diff-review H2).
+    await db()
+      .from("items")
+      .update({ member_id: seed2.memberId, work_at: new Date().toISOString(), work_at_from_source: true })
+      .in("id", [t2.id, e2.id]);
     const m2 = await createMember(db(), seed2.teamId, {
       email: `${randomUUID()}@test.local`,
       displayName: "Collaborator Two",
@@ -380,8 +415,11 @@ describe("PRET-5 A8 — the permissive control (no stealth widen)", () => {
     expect(paths).toContain("e2.md");
     expect(paths, "the posture wall stands where enforcement is off").not.toContain("t2.md");
 
-    // ...and their timeline serves under the tier row with the wall applied.
-    const days = await getWorkTimeline(db(), seed2.teamId, "external", 14, null);
-    expect(JSON.stringify(days)).not.toContain("internal two");
+    // ...and their timeline serves under the tier row with the wall applied — probed on the
+    // payload-reachable TITLE, with the entitled-viewer positive control.
+    const extDays = await getWorkTimeline(db(), seed2.teamId, "external", 14, null);
+    expect(JSON.stringify(extDays), "the permissive posture wall stands on the timeline").not.toContain("Internal Two Doc");
+    const teamDays2 = await getWorkTimeline(db(), seed2.teamId, "team", 14, null);
+    expect(JSON.stringify(teamDays2), "the entitled permissive viewer sees it").toContain("Internal Two Doc");
   });
 });
