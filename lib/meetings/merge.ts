@@ -513,6 +513,11 @@ export async function backfillMergeDuplicateMeetings(
         // BOTH reads, not just the submitters: since the identity link runs first, this dup may be
         // carrying attendance it absorbed from a calendar event moments ago. An unchecked failure
         // reads as "nobody attended" and the merge then hides the note — losing that credit for good.
+        //
+        // NOT MUTATION-COVERED, and said so rather than implied: forcing a read error here would mean
+        // stubbing the whole merge path, which reaches `ingestItem` and the real ingest pipeline. The
+        // equivalent checks in `link-notes.ts` ARE proven (`test/meetings-link-read-errors.test.ts`)
+        // and this mirrors them; that is the argument for it, not a test.
         if (attErr || dupSubsErr) continue;
         try {
           await mergeIntoMeetingNote(admin, teamId, match, {
