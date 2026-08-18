@@ -20,12 +20,7 @@ import { createTeam, renameTeam } from "@/lib/admin/teams";
 import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
-import {
-  ENFORCEMENT_MODES,
-  isEnforcementMode,
-  setAccessEnforcement,
-  type EnforcementReadiness,
-} from "@/lib/admin/access-enforcement";
+import { assessAccessHealth, type AccessHealth } from "@/lib/admin/access-health";
 // EXPLICIT-ID purge only. `purgeItemsByPathPrefix` is deliberately NOT imported: it is path-scoped
 // and team-wide, and the workspace path roots (`0-context/`, `2-work/`, `3-log/`) are shared by every
 // project in a team — a prefix purge from a command line would take out unrelated real content. That
@@ -83,14 +78,8 @@ const USAGE = `Team Brain admin CLI — commands:
   link-identity <member-email> <provider> <external-id> [--handle <h>] [--email <e>] [--team <id|slug>] [--force]
                                          # link a provider user id (e.g. slack U…) to a member
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
-  auto-flip <team-slug>                  # PRET-2: the unattended gated flip (refuses on warnings/
-                                         # blockers/operator hold; the scheduler pass retries)
-  set-access-enforcement <team-slug> <permissive|enforcing> [--dry-run]
-                                         # arm/disarm per-project access enforcement for ONE team.
-                                         # 'enforcing' bootstraps + drains the §11 backfill first,
-                                         # then REFUSES if anyone would be locked out of their own
-                                         # content. 'permissive' is today's behaviour and the undo.
-                                         # The team is a POSITIONAL here — never the --team default.
+  access-health <team-slug>              # standing lockout/read-zero scan (the re-homed readiness check)
+  drain-context <team-slug>              # partition a team's items (the demo bootstrap's post-seed step)
   purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]
                                          # irreversibly remove specific items + their versions/chunks/
                                          # facts, retire their graph episodes, audit, bust derived
@@ -102,28 +91,12 @@ Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PURGE_USAGE = `purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]`;
 
-/** Print an enforcement readiness verdict. Blockers are why the flip is refused; warnings are real
- *  behaviour changes the operator still has to know about, so they print on a PASS too. */
-function printReadiness(r: EnforcementReadiness): void {
-  console.log(
-    `readiness: ${r.itemsScanned} item(s) scanned, ${r.unpartitioned.count} unpartitioned; ` +
-      `${r.humanPrincipals} human + ${r.agentPrincipals} agent principal(s)`
-  );
-  if (r.unpartitioned.examples.length > 0) {
-    console.log(`  unpartitioned e.g.: ${r.unpartitioned.examples.join(", ")}`);
-  }
-  if (r.blindHumans.length > 0) {
-    console.log("  members who would see NOTHING under enforcing:");
-    console.table(r.blindHumans.map((m) => ({ email: m.email, tier: m.tier, member_id: m.memberId })));
-  }
+/** Print the standing access-health verdict: lockouts are what an operator must FIX (grants/
+ *  backfill); warnings are read-zero states worth knowing. */
+function printHealth(r: AccessHealth): void {
+  console.log(`  health: ${r.healthy ? "OK" : "LOCKOUTS"} · ${r.humanPrincipals} human(s), ${r.agentPrincipals} agent(s), ${r.itemsScanned} item(s) scanned`);
+  for (const b of r.blockers) console.log(`  ✗ ${b}`);
   for (const w of r.warnings) console.log(`  ⚠ ${w}`);
-  for (const [label, rows] of [
-    ["agent", r.unplacedAgents],
-    ["connector", r.activeConnectors],
-  ] as const) {
-    if (rows.length > 0) console.table(rows.map((m) => ({ [label]: m.email, member_id: m.memberId })));
-  }
-  console.log(r.ready ? "  ✓ ready to enforce" : "  ✗ NOT ready to enforce");
 }
 
 async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: string, email: string) {
@@ -366,90 +339,25 @@ async function main() {
       console.log(`✓ ${provider}:${externalId} → ${email} (${r.created ? "created" : r.updated ? "updated" : "unchanged"})`);
       break;
     }
-    case "set-access-enforcement": {
-      // The team is POSITIONAL, deliberately: every other command falls back to `--team demo`, and
-      // a silent default on the one flag that decides what a whole team can see is exactly the
-      // accident this command must not enable. Naming the team is the point.
-      const teamRef =
-        positionals[0] ||
-        die(`usage: set-access-enforcement <team-slug> <${ENFORCEMENT_MODES.join("|")}> [--dry-run]`);
-      const mode = positionals[1];
-      if (!mode || !isEnforcementMode(mode)) {
-        // Reject anything outside the two literals BEFORE touching the DB. `teamEnforcesAccess`
-        // treats every non-'enforcing' string as permissive, so a typo ('enforce', 'Enforcing')
-        // would write a value that reads back as OFF while looking like it worked.
-        die(
-          `invalid mode '${mode ?? ""}' — must be exactly one of: ${ENFORCEMENT_MODES.join(", ")}\n` +
-            `  usage: set-access-enforcement <team-slug> <${ENFORCEMENT_MODES.join("|")}> [--dry-run]`
-        );
-      }
+    case "access-health": {
+      // PRET-6: the standing health check (the flip subsystem's readiness scan, re-homed) —
+      // lockouts and read-zero states, asked of the oracle itself.
+      const teamRef = positionals[0] || die("usage: access-health <team-slug>");
       const team = await resolveTeam(admin, teamRef);
-      const dryRun = Boolean(flags["dry-run"]);
-      if (mode === "enforcing" && !dryRun) {
-        console.log(`• preparing ${team.slug}: access bootstrap + §11 context backfill (idempotent) …`);
-      }
-      const r = await setAccessEnforcement(admin, team.id, mode, { dryRun });
-      if (r.prepared) {
-        console.log(
-          `  prepared: ${r.prepared.batches} batch(es), ${r.prepared.unitsCreated} unit(s), ${r.prepared.membershipsCreated} membership(s) created`
-        );
-      }
-      if (r.readiness) printReadiness(r.readiness);
-      if (!r.ok) die(r.error ?? "failed");
-      if (dryRun) {
-        console.log(
-          `• dry run — nothing written. ${team.slug} is '${r.previous}'; '${mode}' would ` +
-            (mode === "permissive" ? "always be safe (it is the fail-open direction)." : "be safe to apply now.")
-        );
-        // PRET-2 stuck-state: show the scheduler's view of this team too (same read the
-        // permission inspector serves), so the operator sees why auto-flip is waiting.
-        const { latestAutoFlipDeferral } = await import("@/lib/admin/access-enforcement");
-        const d = await latestAutoFlipDeferral(admin, team.id);
-        if (d && r.previous === "permissive") {
-          console.log(
-            `• last auto-flip deferral (${d.at}):` +
-              (d.blockers.length ? ` blockers: ${d.blockers.join("; ")}` : "") +
-              (d.warnings.length ? ` warnings: ${d.warnings.join("; ")}` : "") +
-              (d.error ? ` error: ${d.error}` : "")
-          );
-        }
-        break;
-      }
-      // The mode below is the value READ BACK from the row, not the one we asked for.
-      console.log(
-        r.changed
-          ? `✓ ${team.slug} access_enforcement: ${r.previous} → ${r.mode}`
-          : `• ${team.slug} access_enforcement already '${r.mode}' (no change)`
-      );
-      if (r.mode === "enforcing") {
-        console.log(
-          "  scope: enforcement covers GET /api/v1/items, retrieval + both query routes, delegated\n" +
-            "  aiosd_ tokens, the work timeline and narrative arcs. Other dashboard surfaces are NOT\n" +
-            "  yet enforced — see docs/OPS.md §9. Undo with: set-access-enforcement <team> permissive"
-        );
-      }
+      const h = await assessAccessHealth(admin, team.id);
+      printHealth(h);
+      if (!h.healthy) process.exitCode = 1;
       break;
     }
-    case "auto-flip": {
-      // PRET-2 (docs/design/pret2-convergence-gated-flip.md §1.3): the UNATTENDED gated flip —
-      // seed → drain → gated flip is the new-team path, and docker/bootstrap.mjs invokes exactly
-      // this subcommand post-seed. Same positional-team discipline as set-access-enforcement.
-      const teamRef = positionals[0] || die("usage: auto-flip <team-slug>");
+    case "drain-context": {
+      // PRET-6 (cold-read H3): the demo bootstrap's post-seed drain — a team is born enforcing,
+      // so its seeded rows must be partitioned before first serve (the PRET-2 cold-read-M2 fix,
+      // kept without the retired flip machinery).
+      const teamRef = positionals[0] || die("usage: drain-context <team-slug>");
       const team = await resolveTeam(admin, teamRef);
-      const { autoFlipIfReady } = await import("@/lib/admin/access-enforcement");
-      const r = await autoFlipIfReady(admin, team.id);
-      if (r.flipped) {
-        console.log(`✓ ${team.slug} auto-flipped to enforcing`);
-      } else if (r.deferred) {
-        console.log(
-          `• ${team.slug} NOT flipped — deferred:` +
-            (r.deferred.blockers.length ? `\n  blockers: ${r.deferred.blockers.join("; ")}` : "") +
-            (r.deferred.warnings.length ? `\n  warnings (manual flip decides): ${r.deferred.warnings.join("; ")}` : "") +
-            (r.deferred.error ? `\n  error: ${r.deferred.error}` : "")
-        );
-      } else {
-        console.log(`• ${team.slug} not flipped (already enforcing, or an operator hold stands)`);
-      }
+      const { drainTeamContext } = await import("@/lib/projects/context/backfill");
+      const d = await drainTeamContext(admin, team.id);
+      console.log(`✓ drained ${team.slug}: ${d.batches} batch(es), ${d.unitsCreated} unit(s), ${d.membershipsCreated} membership(s)`);
       break;
     }
     case "purge-items": {
