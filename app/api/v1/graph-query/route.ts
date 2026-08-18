@@ -6,7 +6,7 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 import { GraphitiClient } from "@/lib/graph/graphiti-client";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 
 export const runtime = "nodejs";
 
@@ -18,7 +18,8 @@ const schema = z.object({
 /**
  * POST /api/v1/graph-query — natural-language query against the Graphiti graph memory
  * (experiment, alongside `/api/v1/query`). Tier-enforced: results are scoped to the group_ids
- * the caller's tier may see (`visibleGroupIds`) — Graphiti has no tier awareness, so this is the
+ * the caller's tier may see (`visibleTierGroupIds` — pointer-resolved, so a renamed team still
+ * reads its own graph) — Graphiti has no tier awareness, so this is the
  * SOLE isolation (CLAUDE.md §5). Returns citable facts (text + temporal validity + source).
  */
 export async function POST(req: NextRequest) {
@@ -47,9 +48,16 @@ export async function POST(req: NextRequest) {
   // Resolve the team slug, then scope to the tiers this caller may see.
   const { data: team } = await db.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
   if (!team) return errorResponse("internal", "team not found", 500);
-  const groupIds = visibleGroupIds((team as { slug: string }).slug, auth.memberTier);
 
   try {
+    // Inside the try: a pointer-read failure is a 502 like any other backend failure. It must NOT
+    // fall back to a slug-derived id — on a renamed team that names a group nothing ever wrote to,
+    // and this endpoint would answer 200 with zero facts (see lib/graph/tier-groups.ts).
+    const groupIds = await visibleTierGroupIds(db, {
+      teamId: auth.teamId,
+      teamSlug: (team as { slug: string }).slug,
+      tier: auth.memberTier,
+    });
     const facts = await client.search(parsed.data.query, groupIds, parsed.data.maxFacts ?? 20);
     await audit(db, {
       team_id: auth.teamId,

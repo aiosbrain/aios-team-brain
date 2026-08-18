@@ -35,15 +35,17 @@ export function isExternalGroupId(groupId: string): boolean {
   return groupId.endsWith("_external");
 }
 
-/**
- * The group_ids a viewer of `tier` may search. An `external` viewer sees ONLY external content;
- * a `team` viewer sees both. Never widen this without re-checking the tier-isolation invariant.
- */
-export function visibleGroupIds(teamSlug: string, viewerTier: AccessTier): string[] {
-  return viewerTier === "team"
-    ? [episodeGroupId(teamSlug, "team"), episodeGroupId(teamSlug, "external")]
-    : [episodeGroupId(teamSlug, "external")];
-}
+// `visibleGroupIds(teamSlug, tier)` USED TO LIVE HERE and is deliberately GONE. It recomputed the
+// tier-visible read set from the LIVE team slug, while the projector writes to the built-ins'
+// IMMUTABLE `projects.graph_group_id` pointer — so after a team slug rename the writer and the
+// reader named different groups and every graph-backed surface went silently empty (found
+// 2026-08-18 on a real rename; no error, no banner, `graphHasFacts` still reporting true). The
+// read set is now resolved from the pointers by `lib/graph/tier-groups.visibleTierGroupIds`.
+//
+// It is DELETED rather than deprecated so the fix is structural: there is no symbol left for a
+// future read leg to import, and tsc refuses the mistake instead of a guard noticing it later.
+// `episodeGroupId` stays — it is the MINT (what a pointer is minted FROM, and the projector's
+// documented quiet fallback for an unbootstrapped team), not a read authority.
 
 // ── Per-project graph partitions (Phase C, spec §6) ──────────────────────────────────────────────
 //
@@ -54,7 +56,7 @@ export function visibleGroupIds(teamSlug: string, viewerTier: AccessTier): strin
 // AUTHORITY for that partition key; the projector (writer) and the read legs (arcs/retrieve) both go
 // through it, so the scheme can never drift between who writes a partition and who searches it.
 //
-// ADDITIVE for now: `episodeGroupId`/`visibleGroupIds` above are UNCHANGED and still drive today's
+// ADDITIVE for now: `episodeGroupId` above is UNCHANGED and still mints today's
 // tier-scoped graph. The projector fan-out, the read-leg migration, and the one-time re-projection of
 // the existing graph are LATER Phase C slices (each touches schema + LLM extraction cost, so each gets
 // its own design doc). This slice just establishes the key scheme + the oracle→group-id mapping.

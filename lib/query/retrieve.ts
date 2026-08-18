@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { visibleTasks, isRestrictedTier } from "@/lib/auth/visibility";
 import {
@@ -143,7 +143,12 @@ async function fetchGraphFacts(
     const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
     const slug = (team as { slug: string } | null)?.slug;
     if (!slug) return [];
-    let groupIds = visibleGroupIds(slug, tier);
+    // POINTER-RESOLVED (the rename doctrine): a slug-derived id disjoins from the projector's
+    // frozen pointer the moment a team is renamed, and the graph leg then silently contributes
+    // nothing to every answer — worse than the arcs panel, because there is no panel to look
+    // empty. See lib/graph/tier-groups.ts. Throws on a read failure; the catch below degrades
+    // this leg to Postgres-only, which is this function's documented behaviour anyway.
+    let groupIds = await visibleTierGroupIds(db, { teamId, teamSlug: slug, tier });
     // PCCC-6 permissive UNION (design §2.2's sequencing consequence): once restriction-purge can
     // move content out of `_team`, the permissive team-tier read must also cover the initiative
     // partitions that content moved into. arm:false — a permissive read is not a reader-signal;

@@ -3,7 +3,7 @@ import { Client } from "pg";
 import { describe, expect, it } from "vitest";
 import { ingestItem } from "@/lib/ingest";
 import { TierViolationError } from "@/lib/api/schemas";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 import type { ItemPayload } from "@/lib/api/item-payload-schema";
 import { PAYLOAD_VERSION } from "@/lib/dashboard/timeline-cache";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
@@ -60,10 +60,17 @@ async function ingestAs(
   );
 }
 
+/** The legacy tier `arc_cache` key, built the way the production purge builds it: from the
+ *  pointer-resolved tier group set, never from the live slug (VIB-341 — a renamed team's built-ins
+ *  keep frozen pointers, so a slug-derived key names a row nobody reads). */
+async function tierArcKey(teamId: string, teamSlug: string, tier: "team" | "external"): Promise<string> {
+  return (await visibleTierGroupIds(db(), { teamId, teamSlug, tier })).slice().sort().join(",");
+}
+
 /** A cache row that was computed under the OLD tier — i.e. one that may still be serving the content. */
 async function seedCaches(teamId: string, teamSlug: string): Promise<void> {
-  const externalKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
-  const teamKey = visibleGroupIds(teamSlug, "team").slice().sort().join(",");
+  const externalKey = await tierArcKey(teamId, teamSlug, "external");
+  const teamKey = await tierArcKey(teamId, teamSlug, "team");
   const now = new Date().toISOString();
   for (const key of [externalKey, teamKey]) {
     await db()
@@ -110,8 +117,8 @@ describe("tier reclassification propagates past items.access (real Postgres)", (
     // The external rows must be gone.
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
-    const externalArcKey = visibleGroupIds(slug, "external").slice().sort().join(",");
-    const teamArcKey = visibleGroupIds(slug, "team").slice().sort().join(",");
+    const externalArcKey = await tierArcKey(seed.teamId, slug, "external");
+    const teamArcKey = await tierArcKey(seed.teamId, slug, "team");
 
     await ingest(seed, { kind: "deliverable", path: "docs/spec.md", body: "the client spec", access: "external" });
     await seedCaches(seed.teamId, slug);
