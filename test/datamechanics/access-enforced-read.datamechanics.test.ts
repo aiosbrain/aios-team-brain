@@ -51,19 +51,39 @@ async function seedMember(seed: Seed): Promise<string> {
 }
 
 describe("access enforcement flag", () => {
-  it("permissive (default) is byte-identical to today — even for a member in NO groups (the discriminating case)", async () => {
-    // Deliberately NOT converged / groupless: under enforcing this member would see nothing; under
-    // permissive they must see everything. This is the case that distinguishes the modes — a
-    // backfilled admin sees everything either way and wouldn't catch enforcement leaking on.
+  it("permissive (default) is byte-identical for a team-posture member — even on an UNCONVERGED team (the mode discriminator)", async () => {
+    // PRET-4 re-spec of the discriminating case: the mode split is no longer groups-vs-none
+    // (posture IS everyone-membership now) but converged-vs-not. Deliberately unbackfilled
+    // items: under enforcing this member would see nothing (no membership rows yet); under
+    // permissive their team posture must serve everything.
     const seed = await seedTeam();
     await ingest(seed, { path: "a.md", body: "a", access: "team", project: "src" });
     await ingest(seed, { path: "b.md", body: "b", access: "team", project: "src" });
-    const groupless = await seedMember(seed);
-    const { data: everyone } = await db().from("groups").select("id").eq("team_id", seed.teamId).eq("slug", "everyone").maybeSingle();
-    if (everyone) await db().from("group_members").delete().eq("group_id", everyone.id).eq("member_id", groupless);
-    const got = await paths(await memberKey(seed, groupless)); // team stays permissive (default)
+    const member = await seedMember(seed); // seedMember places the everyone row (team posture)
+    const got = await paths(await memberKey(seed, member)); // team stays permissive (default)
     expect(got).toContain("a.md");
     expect(got).toContain("b.md");
+  });
+
+  it("PRET-4: a member removed from EVERY builtin has external posture — the permissive wall narrows to external rows (deterministic post-marker)", async () => {
+    // The inverse of the retired "no groups = full visibility" rule: absence from `everyone`
+    // IS external posture, in both modes. Marker-controlled so the assertion is deterministic
+    // regardless of file order (pre-marker the legacy window would read the tier record).
+    const seed = await seedTeam();
+    await ingest(seed, { path: "t.md", body: "t", access: "team", project: "src" });
+    await ingest(seed, { path: "e.md", body: "e", access: "external", project: "src" });
+    const removed = await seedMember(seed);
+    const { materializeBuiltinMembershipOnce } = await import("@/lib/access/groups");
+    const { _resetPostureConfirmationForTests } = await import("@/lib/access/posture");
+    await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
+    _resetPostureConfirmationForTests();
+    const mat = await materializeBuiltinMembershipOnce(db());
+    expect(mat.ok, mat.error).toBe(true);
+    const { data: everyone } = await db().from("groups").select("id").eq("team_id", seed.teamId).eq("slug", "everyone").maybeSingle();
+    await db().from("group_members").delete().eq("group_id", everyone!.id).eq("member_id", removed);
+    const got = await paths(await memberKey(seed, removed));
+    expect(got, "team rows are walled for external posture").not.toContain("t.md");
+    expect(got, "external rows still serve").toContain("e.md");
   });
 
   it("enforcing: a team member still sees ALL backfilled General content (byte-identical when converged)", async () => {
