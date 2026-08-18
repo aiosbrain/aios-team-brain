@@ -129,6 +129,17 @@ describe("backfill candidate predicate (data-mechanics)", () => {
     expect(await candidates(seed), "an unrepairable retracted unit must NOT be a candidate").not.toContain(item.id);
     expect((await countUnrepairable(seed.teamId))?.retractedUnits, "…but it MUST be counted").toBe(1);
 
+    // …and counted PER ITEM, not per membership row. The count left-joins memberships, so a plain
+    // count(*) multiplies: give this unit a second (closed) membership and a row-count would say 2.
+    // A one-membership fixture is green either way — the mutation that reverts count(distinct i.id)
+    // SURVIVED until this existed.
+    const p2 = await projectIds(seed);
+    await db().from("project_context_memberships").insert({
+      team_id: seed.teamId, project_id: p2.ext, context_unit_id: uid,
+      decision: "include", valid_to: new Date().toISOString(),
+    });
+    expect((await countUnrepairable(seed.teamId))?.retractedUnits, "one ITEM, not one row per membership").toBe(1);
+
     const r = await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
     expect(r.scanned, "and must not be reconciled").toBe(0);
   });
