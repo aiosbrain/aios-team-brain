@@ -37,6 +37,8 @@ export const INGEST_LEG_SOURCES: readonly string[] = [
   "meeting_notes",
   "plane",
   "pm_sync",
+  "pret3_sweep",
+  "pret4_materialize",
   "scan",
   "slack",
 ];

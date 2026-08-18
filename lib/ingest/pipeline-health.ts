@@ -59,6 +59,11 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
+  // One-time marker-guarded sweeps: they write a row ONLY on failure (success is silent + the
+  // marker), so "no row for N hours" is their healthy steady state forever — a staleness
+  // threshold can only cry wolf. A recorded FAILURE row still reddens via the failing set.
+  pret3_sweep: null,
+  pret4_materialize: null,
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
   // FITTED, NOT NULLED (BANNERFLAP-2) — and fitted UNIFORMLY, which is the part that matters. All
   // three sit in the deep half of the tick chain and their large gaps are THE SAME EVENT: measured to
