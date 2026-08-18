@@ -31,14 +31,17 @@ export async function GET(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("tier")
+    .select("id")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  const tier = (me as { tier: "team" | "external" }).tier;
+  // PRET-4/6: the tier lens is POSTURE (everyone-membership) — members.tier is never an
+  // access input (the tier-no-access-reads guard caught this route's raw select in the merge).
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const tier = await resolveViewerPosture(adminClient(), team.id, (me as { id: string }).id);
   // Pointer-resolved, admin-scoped by teamId (the pointer lives on `projects`, which the member's
   // RLS view does not cover). A resolution failure degrades HONESTLY — `degraded: true` with no
   // facts — rather than falling back to a slug-derived id, which on a renamed team is a group that

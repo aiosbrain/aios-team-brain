@@ -83,7 +83,6 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
     // The legs that were defective. Named individually because "no episodeGroupId" is satisfied
     // vacuously by a leg that stops reading the graph at all.
     const legs = [
-      "lib/query/retrieve.ts",
       "app/api/brain/facts/route.ts",
       "app/api/brain/events/route.ts",
       "app/api/v1/graph-query/route.ts",
@@ -95,6 +94,12 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
         "visibleTierGroupIds("
       );
     }
+    // retrieve.ts is pointer-resolved through the PARTITION path since PRET-6 (the enforced
+    // read's `selectEnforcedGraphPartitions` reads stored pointers) — pin that reference, not
+    // the tier-groups helper the retirement removed from this file.
+    expect(code(join(ROOT, "lib/query/retrieve.ts")), "retrieve resolves groups via the stored-pointer partition read").toContain(
+      "selectEnforcedGraphPartitions("
+    );
     // The arcs legs resolve through resolveArcScope, which is pointer-resolved already (PRET-3)
     // and is pinned by test/guards/arcs-single-read-path.test.ts.
   });
