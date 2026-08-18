@@ -416,13 +416,19 @@ export function startIngestScheduler(): void {
             membershipsCreated: o.membershipsCreated,
             truncated: o.truncated,
             drained: o.drained,
-            shortCircuit: o.shortCircuit,
             elapsedMs: o.elapsedMs,
             cursor: o.cursor,
           },
           startedAt,
         });
       }
+      // The exclude-shadow count is DETECTION for a state this sweep deliberately does not repair
+      // (EXCLSHADOW-1): a current `exclude` in the target project makes reconcile a silent no-op, and
+      // the obvious prod check (items minus units) is blind to it because the item HAS a unit.
+      const { countExcludeShadows } = await import("@/lib/projects/context/backfill-candidates");
+      const excludeShadows = (
+        await Promise.all(r.outcomes.map((o) => countExcludeShadows(o.teamId)))
+      ).reduce((n, c) => n + c, 0);
       const truncated = r.outcomes.filter((o) => o.truncated).length;
       if (truncated || r.deferred.length) {
         console.info(`[ingest] context backfill bounded by budget — ${truncated} truncated, ${r.deferred.length} deferred to the next pass`);
@@ -446,6 +452,7 @@ export function startIngestScheduler(): void {
           served: r.outcomes.length,
           failedTeams: r.outcomes.filter((o) => !o.ok).length,
           truncated,
+          excludeShadows,
           deferred: r.deferred.length,
           scanned: r.outcomes.reduce((n, o) => n + o.scanned, 0),
         },
