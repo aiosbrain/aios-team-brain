@@ -5,6 +5,15 @@ This product is licensed under the GNU Affero General Public License v3.0 only
 (AGPL-3.0-only), except for the directories listed in LICENSING.md, which are
 licensed under the Apache License 2.0.
 
+The grant is version 3 ONLY, not "version 3 or (at your option) any later version":
+a future FSF revision does not apply to this software on its own. The LICENSE file is
+the verbatim FSF text with a copyright line and nothing else, so that automated license
+detection recognises it; this NOTICE, LICENSING.md and package.json are where the
+version choice is recorded.
+
+Earlier releases were published under the MIT License, reproduced in LICENSE-MIT, and
+those releases remain available under those terms.
+
 This file records third-party components that carry an attribution or notice
 obligation, or whose license is worth stating plainly for anyone running a
 compliance review. It is not a complete dependency list — see package.json,
