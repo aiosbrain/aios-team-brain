@@ -243,10 +243,13 @@ team rotation with a stated bound; the per-team outcome shape through `backfillA
 4. **data-mechanics** — a drained pass RESETS the cursor to null, and an item created AFTER that drain
    whose id sorts BELOW the old cursor still gains a membership on a later pass — the post-drain
    backstop, i.e. the "visible to nobody" direction.
-5. **data-mechanics** — an item created MID-PASS (after the tick cutoff) whose id sorts BELOW the
-   stored cursor is skipped by the resuming pass and then covered once a drain resets the cursor. The
-   sharper half of criterion 4: it pins the actual window during which such an item is uncovered,
-   rather than assuming "the next pass" catches it — which the resume logic does not do.
+5. **data-mechanics** — WAIVED for this slice, stated rather than left silent (Fable review). The
+   intended test — an item created MID-PASS whose id sorts BELOW the stored cursor is skipped by the
+   resuming pass, then covered after a drain reset — cannot be written deterministically today: item
+   ids are random uuids, so "sorts below the cursor" is not constructible without a retry loop whose
+   flakiness would exceed its value. Criterion 4 proves the MECHANISM that covers it (reset-on-drain
+   is what makes any low-id latecomer reachable); what stays unproven is the WINDOW during which such
+   an item is uncovered. Carried to TICKSTALL-2, which needs a deterministic id fixture anyway.
 6. **data-mechanics** — the newest-row read that restores the cursor is deterministic under
    same-`finished_at` rows (`order by finished_at desc, id desc`), so two rows written in the same
    millisecond cannot make the resume point arbitrary.
@@ -254,9 +257,11 @@ team rotation with a stated bound; the per-team outcome shape through `backfillA
    (no O(N) drain), so the existing optimization is pinned and this PR cannot have removed it.
 8. **data-mechanics** — a budget-truncated team records `ok: true` with `meta.truncated === true`, so
    a partial pass does NOT enter the failure-streak path and cannot redden the banner.
-9. **data-mechanics** — with N teams, every team is served within N scheduler passes even when the
-   first team never converges — the observable bound that makes rotation checkable rather than
-   asserted.
+9. **unit** — with N teams, every team is served within N passes even when one is served every pass:
+   `orderByRotation` is a PURE comparator, so the bound is simulated directly over it rather than
+   through Postgres. Tier changed from data-mechanics deliberately (Fable review): a dm variant would
+   seed N teams only to re-prove the same comparator through a slower path, and prod runs one team so
+   the property is otherwise never exercised at all.
 10. **unit** — `runContextBackfill`'s `recordIngestRun` call sites pass real per-team counts, and a
     guard fails the build if either reintroduces a hardcoded `created: 0` (the defect that hid this
     for six days).

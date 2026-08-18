@@ -55,7 +55,11 @@ async function itemsWithoutMembership(seed: Seed): Promise<number> {
   return missing;
 }
 
-/** One served turn, persisted the way the scheduler persists it — so the NEXT call resumes. */
+/** One served turn, persisting the SUBSET of the scheduler's row that the cursor read depends on
+ *  (team_id / source / trigger / meta.cursor) — enough to prove the round-trip, but deliberately NOT
+ *  a stand-in for the production writer. That the real call site writes these same keys is pinned
+ *  separately by `test/guards/context-backfill-budget-single-parse`, because if it ever drifted this
+ *  file would keep passing while the cursor silently read null forever. */
 async function pass(seed: Seed, opts: { budgetMs: number }) {
   const r = await backfillAllTeams(db(), CUTOFF(), { budgetMs: opts.budgetMs, batchSize: BATCH });
   for (const o of r.outcomes) {
@@ -165,6 +169,28 @@ describe("context backfill — bounded by a budget, resumable across ticks (data
     expect(o.truncated).toBe(true);
     expect(o.ok).toBe(true);
     expect(o.error).toBeUndefined();
+  });
+
+  it("the newest-row read is DETERMINISTIC under same-finished_at rows (id desc decides)", async () => {
+    // Criterion 6. Two rows written in the same millisecond is not hypothetical — the stage writes a
+    // per-team row and the instance row microseconds apart, and `lib/ingest/pipeline-health` already
+    // had to learn this tie-break the hard way. Without `id desc` the resume point is arbitrary
+    // between them, which silently means "resume from somewhere".
+    const seed = await seedTeam();
+    const sameInstant = new Date(Date.now() - 5_000).toISOString();
+    for (const cur of ["cursor-written-first", "cursor-written-second"]) {
+      await recordIngestRun(db(), {
+        teamId: seed.teamId,
+        source: "context_backfill",
+        trigger: "scheduler",
+        ok: true,
+        meta: { cursor: cur },
+        startedAt: Date.parse(sameInstant) - 1,
+        finishedAt: Date.parse(sameInstant),
+      });
+    }
+    const state = await readTeamBackfillState(db(), seed.teamId);
+    expect(state.cursor, "the LAST row written must win, not an arbitrary one").toBe("cursor-written-second");
   });
 
   it("the stored cursor round-trips through ingest_runs.meta", async () => {

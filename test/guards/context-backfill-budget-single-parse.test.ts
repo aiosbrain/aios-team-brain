@@ -74,6 +74,18 @@ describe("guard: the context-backfill leg records what it actually did", () => {
     expect(tryBody).toMatch(/created: r\.outcomes\.reduce/);
   });
 
+  it("writes the per-team row with the EXACT keys the cursor read filters on", () => {
+    // The silent-regression path Fable found. `readTeamBackfillState` filters on
+    // team_id / source='context_backfill' / trigger='scheduler'. If this writer ever drifted to
+    // `teamId: null` or another source, the read would match NOTHING, the cursor would come back null
+    // every tick, and RESTART-FROM-NULL — the precise defect this PR exists to kill — would return
+    // with every test still green, because the dm tier persists its own rows rather than going
+    // through this call site.
+    expect(tryBody).toMatch(/teamId: o\.teamId/);
+    expect(tryBody).toMatch(/source: "context_backfill"/);
+    expect(tryBody).toMatch(/trigger: "scheduler"/);
+  });
+
   it("records the three distinct facts — truncated, drained, shortCircuit — plus the resume cursor", () => {
     for (const key of ["truncated:", "drained:", "shortCircuit:", "cursor:", "elapsedMs:"]) {
       expect(tryBody, `meta must carry ${key}`).toContain(key);
