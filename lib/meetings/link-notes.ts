@@ -64,6 +64,9 @@ export async function linkMeetingNotesByIdentity(admin: DbClient, teamId: string
     .is("merged_into", null)
     .order("created_at", { ascending: false })
     .limit(NOTE_SCAN_LIMIT);
+  // Belt-and-braces only, and said so rather than left looking load-bearing: a failed read yields
+  // `notes = []`, which the `< 2` guard below already turns into the same early return. No mutation
+  // can redden this line; it is here so the intent survives a future refactor of that guard.
   if (noteErr) return EMPTY_LINK_SUMMARY;
   const notes = (noteRows ?? []) as NoteRow[];
   if (notes.length < 2) return EMPTY_LINK_SUMMARY;
