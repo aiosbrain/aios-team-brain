@@ -58,15 +58,6 @@ const STALE_MS = 3 * 60 * 60 * 1000; // 3h default
 const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
-  // ONE-TIME and ERROR-ONLY, so staleness is meaningless for it rather than merely generous.
-  // `runPret3BootSweep` is marker-guarded and no-ops forever after its first successful run on the
-  // fleet (lib/ingest/scheduler), and it records a row ONLY on failure (`ok: false`). So this leg has
-  // no cadence to be late against: on a healthy fleet it is expected to have written NOTHING, ever,
-  // and the 3h default would redden the banner permanently the moment it wrote its one failure row.
-  // Nulled rather than fitted — inventing a threshold for a leg with no cadence is precisely the
-  // guess BANNERFLAP-2 exists to stop. A real failure still surfaces: the row is `ok: false`, which
-  // the banner reads independently of staleness.
-  pret3_sweep: null,
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
   // FITTED, NOT NULLED (BANNERFLAP-2) — and fitted UNIFORMLY, which is the part that matters. All
