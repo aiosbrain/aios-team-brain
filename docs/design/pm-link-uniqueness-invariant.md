@@ -1,6 +1,6 @@
 # Nothing enforces the invariant the two adoption fixes exist to protect — ADOPTINV-1
 
-**Status:** spec, draft 2. Draft 1 was BLOCKED by both reviewers. The sharpest finding was that draft 1's
+**Status:** spec, draft 3 (built). Draft 1 was BLOCKED by both reviewers. The sharpest finding was that draft 1's
 own mutation criterion **could not go red** — it named the wrong file, and the mutant it described makes
 the adapter refuse *everything*, so no duplicate forms and the test stays green. · **Date:** 2026-08-18 ·
 **Owner:** Chetan · **Task:** `ADOPTINV-1`
@@ -13,7 +13,7 @@ the adapter refuse *everything*, so no duplicate forms and the test stays green.
 
 ## 0. What is wrong
 
-`ADOPTDECL-1` and `ADOPTFOOT-1` between them shipped nine tests across the unit and data-mechanics
+`ADOPTDECL-1` and `ADOPTFOOT-1` between them shipped their tests across the unit and data-mechanics
 tiers. Every one of them pins **a rung's decision** — the footer rung's scope, the declared rung's
 error, the ownership refusal, the single-writer guard on the declared column.
 
@@ -90,9 +90,16 @@ the two previous fixes did not close, which is a result, not a setback** — see
   so a footered fixture would prove the wrong path — and the prod shape is footerless, which
   `linear.ts:377-379` says in as many words.
 - **The inbound writer is covered too** (§3 explains why it is in): a mirror-adopt of an issue a
-  workspace link already owns does not produce a second link. `lib/pm-sync/inbound.ts:448-457` inserts
-  `provider_resource_id` directly with `on conflict (team_id, project_id, row_key, provider) do nothing`
-  — conflict on **row identity only**, so nothing there stops a second link to an owned issue.
+  workspace link already owns does not produce a second link. The insert at
+  `lib/pm-sync/inbound.ts:448-457` conflicts on **row identity only**, so the conflict clause is not
+  what protects the invariant — the team-wide candidate filter at `inbound.ts:405-414`
+  (`!ownedIds.has(it.id)`) is. That filter is the mutation target for this scenario. (Draft 2 named the
+  conflict clause as the protection, which was wrong; round-2 review caught it.)
+  **Two fixture preconditions, both learned by a SURVIVING mutation rather than by reading:** the
+  integration config must set `inboundApply: true` or `runInboundForTeam` returns an empty result at
+  `inbound.ts:526` before reading an issue, and a **mirror task** must exist under the
+  `linear-<teamKey>` project or the candidate is skipped as "no mirror task yet" (`:416-428`). Missing
+  either, the scenario is green and proves nothing.
 
 ### The test is not green by construction
 
@@ -104,7 +111,10 @@ the two previous fixes did not close, which is a result, not a setback** — see
 - **Count anchor:** each scenario asserts the expected number of links with a non-null
   `provider_resource_id` exists, so a scenario that silently projected nothing cannot pass.
 - **The inverse control:** insert two links that deliberately share `(team_id, provider,
-  provider_resource_id)` and assert the §1 query **returns** that group. Draft 1's "the query returns
+  provider_resource_id)` and assert the §1 query **returns** that group. **Note for whoever lands
+  `ADOPTUNIQ-1`:** this control deliberately writes the exact state that index forbids, so the insert
+  will start failing the day the index ships. That is expected, not a regression — convert it then to
+  asserting a unique-violation error. Draft 1's "the query returns
   zero rows on a team with no links" proved the opposite of what it claimed — that the query passes on
   nothing, which is the vacuity, not a control against it. The surviving mutant it missed is any query
   typo that matches nothing at all.
@@ -116,6 +126,11 @@ the two previous fixes did not close, which is a result, not a setback** — see
   in that file, and both refusals (`linear.ts:360-362`, `:389-395`) **fail closed** on
   `ownedResourceIds === undefined`, so removing the owner set makes the adapter refuse *everything* —
   every row creates its own issue, no duplicate forms, and the test stays green.
+- **What the deleted-issue scenario does NOT guard, stated so nobody deletes its sibling.**
+  Reintroducing `ADOPTFOOT-1`'s original load gate (owner set loaded only when a declaration exists and
+  the resource id is null) survives this whole file: the refusals fail CLOSED, so an unloaded set means
+  over-refusal, and over-refusal preserves the invariant. What kills that mutant is the RECOVERY case in
+  `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts`. This file does not replace it.
 - **A mutation per scenario, not one for the suite.** The mutant above only exercises the footer path,
   so a deleted-issue scenario seeded with an unchanged `projection_fingerprint` would short-circuit and
   be silently vacuous while the suite still reddens elsewhere. Each scenario carries its own positive
