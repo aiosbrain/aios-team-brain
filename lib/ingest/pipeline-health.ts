@@ -26,12 +26,73 @@ const STALE_MS = 3 * 60 * 60 * 1000; // 3h default
  * reactive / event-driven — real failures still surface via `ok=false`). Anything not listed uses the
  * 3h default. `auth_cleanup` runs every 24h (`lib/ingest/scheduler` housekeeping) — 3h was the bug
  * that fired this banner on a healthy job.
+ *
+ * BANNERFLAP-2 (`docs/design/staleness-threshold-fit.md`). Staleness has NO debounce — the failure
+ * side got one in BANNERFLAP-1, but `stale` is derived from a single timestamp per page load, so one
+ * late tick reddens the banner immediately. That makes a mis-fitted threshold here directly visible
+ * to the user as "N ingestion legs are broken", and it has now happened six times. The thresholds
+ * below marked "fitted" were set from MEASURED prod cadence (7 days, `trigger='scheduler'` rows only
+ * — the same filter the staleness clock uses), not from a guess.
+ *
+ * WHAT THE TAIL ACTUALLY IS — measured, because the obvious answer was wrong. It is NOT each leg's
+ * own cadence, and it is NOT chain congestion (a slow upstream stage delaying downstream recording),
+ * which is what an earlier draft of this claimed. Counting scheduler rows inside the single worst gap
+ * (2026-08-17 04:27→09:18 UTC): `slack`/`linear`/`linear_inbound` recorded 13 times,
+ * `github`/`access_bootstrap` 7, and `context_backfill`/`context_backfill_all`/`meeting_notes`/
+ * `doc_task_infer`/`dense` recorded ZERO. The loop was alive and ticking the whole time — congestion
+ * would have delayed `slack` too, and it did not. The tick was being TRUNCATED partway down the
+ * chain, eight passes in a row.
+ *
+ * Two consequences worth having in front of you before you touch these numbers:
+ *   1. The tail moves with deploy/restart churn, NOT corpus size. A bar fitted to it is fitted to how
+ *      often a tick fails to finish.
+ *   2. These three are therefore weaker heartbeats than they look: their age is "last time a tick got
+ *      this far", not "last time the poller ran". They are kept finite anyway because a genuinely
+ *      dead scheduler is caught at 3h by the UPSTREAM legs regardless — so widening them costs no
+ *      dead-scheduler detection, and nulling them would delete the only deep-chain-wedge signal.
+ *
+ * The real defect underneath (the deep half of the chain silently not recording when a pass does not
+ * complete) is DEFERRED, not dismissed — it is instrumentation work that changes what every leg's row
+ * means, and it wants its own measurement of restart frequency. See the spec's §Scope.
  */
 const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
+  // FITTED, NOT NULLED (BANNERFLAP-2) — and fitted UNIFORMLY, which is the part that matters. All
+  // three sit in the deep half of the tick chain and their large gaps are THE SAME EVENT: measured to
+  // the second, they go quiet together (04:26:21 / 04:26:26 / 04:26:21) and resume together
+  // (09:19:30 / 09:19:35 / 09:19:30). There is one tail here, so there is one number.
+  //
+  // 6h = the measured 293-min worst gap + ~67 min. An earlier fit gave `context_backfill` 5h from a
+  // measurement window taken hours earlier that happened to miss the largest gap — 7 minutes of
+  // grace, which would have reproduced this ticket within days. Re-measure before narrowing any of
+  // these, and fit the SHARED tail, not a single window's maximum per leg.
+  //
+  // Widening is cheap here and that is checkable: a dead scheduler still reddens the banner within 3h
+  // via slack/linear/github/access_bootstrap, which are upstream and on the default. What these three
+  // uniquely detect is a wedge confined to the deep chain.
+  //
+  // KNOWN COST, stated not buried: `runMeetingNotesBackfill`'s OUTER catch (`lib/ingest/scheduler.ts`)
+  // records no row at all, so if its `teams` read throws, staleness is the only detector — and 3h→6h
+  // doubles that blind window. Deliberately not fixed here (it is a failure-path change, and the spec
+  // scopes the failure path out); bounded because reaching that catch takes a DB-wide fault that
+  // reddens the upstream legs at 3h anyway. Tracked as the next slice with the truncation defect.
+  meeting_notes: 6 * 60 * 60 * 1000,
+  context_backfill: 6 * 60 * 60 * 1000,
+  // Written by the SAME `runContextBackfill` invocation as `context_backfill`, milliseconds later
+  // (`lib/ingest/scheduler.ts`), so its gaps are identical BY CONSTRUCTION — measurement confirms it
+  // (identical 276 runs / 293min worst / 78min p95). It must move with its sibling or the banner keeps
+  // flapping on the leg alone. The spec's first draft fitted only two legs and would have shipped
+  // leaving this one firing.
+  context_backfill_all: 6 * 60 * 60 * 1000,
+  // A LATENT recurrence, fixed pre-emptively rather than as the 7th instance. `runAutoFlip`
+  // (`lib/ingest/scheduler.ts`) records ONLY when it flips, defers, or errors — a quiet pass returns
+  // before `recordIngestRun`. It has zero rows today, so it is absent from `legs` entirely and is not
+  // firing; but the first row it ever writes would age past the 3h default it would otherwise inherit
+  // and pin the banner red forever on a healthy leg. That is the `doc_task_infer` class exactly.
+  auto_flip: null,
   // Record-only-when-active legs: their scheduler writes an `ingest_runs` row ONLY when the tick did
   // something (indexed/projected/applied) or errored — a quiet pass writes nothing. So the newest
   // row's age reflects "last time there was work", NOT "last time the poller ran", and an age-based
@@ -40,11 +101,19 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // card: `dense` via its `pendingItems` backlog, `graph_project` via `isGraphStale` (6h-no-writes →
   // degraded). `linear_inbound` has no dedicated probe (a silently-wedged inbound lock is invisible) —
   // an accepted tradeoff since it's per-team opt-in and any throw records `ok=false`.
-  // (Contrast slack/plane/linear/github AND meeting_notes, which record EVERY tick — the first four via
-  // scheduler.runImport "still record configured sources (proves the poller ran)", meeting_notes
-  // unconditionally per team (scheduler.ts:222) — so last-SCHEDULER-row age == last-poll age and the 3h
-  // default is meaningful there; nulling meeting_notes would have removed a real dead-scheduler
-  // heartbeat. Note "scheduler row", not "last row": meeting_notes ALSO runs on demand from `aios push`
+  // (Contrast the legs that record on every tick THEY REACH, which is a different and weaker property
+  // than "every tick" — see the truncation note above. `runImport` records each CONFIGURED connector
+  // (slack/plane/linear/github) "to prove the poller ran"; `runAccessBootstrap` writes an
+  // unconditional instance-wide heartbeat; `runContextBackfill` writes a per-team row per succeeded
+  // team PLUS an instance-wide `context_backfill_all` heartbeat; `runMeetingNotesBackfill` writes one
+  // row per team unconditionally inside its loop. For all of those an age threshold IS meaningful.
+  // What differs is only its VALUE: the connectors and access_bootstrap sit inside the 3h default
+  // (worst observed 30–95min), the three fitted above are deep in the chain and share a 293min tail.
+  // Nulling any of them would delete a real signal rather than fix a threshold bug.
+  // Caveat on the connectors: `runImport` records only when that integration type is CONFIGURED, so a
+  // connector with no enabled integration writes nothing — it is `isOrphanedConnector` (not this map)
+  // that stops it crying wolf.
+  // Note "scheduler row", not "last row": meeting_notes ALSO runs on demand from `aios push`
   // (trigger `api`), so the staleness clock below reads scheduler-triggered rows only — an on-demand run
   // must never be mistaken for proof that the poller is alive.)
   dense: null,
@@ -112,7 +181,7 @@ const CONNECTOR_SOURCES: ReadonlySet<string> = new Set(["slack", "plane", "linea
  * `graph_health` is excluded for an unrelated pre-existing reason (it is a transition ledger, not a
  * leg); the two are kept in one place so the banner's leg set is readable as a set.
  */
-const NOT_PIPELINE_LEGS: ReadonlySet<string> = new Set([GRAPH_HEALTH_SOURCE, "llm"]);
+export const NOT_PIPELINE_LEGS: ReadonlySet<string> = new Set([GRAPH_HEALTH_SOURCE, "llm"]);
 
 /** A connector leg is "orphaned" when its integration type is no longer enabled (deleted/disabled).
  *  Its frozen last-failure row is a fossil the scheduler can't overwrite — not a live break.
