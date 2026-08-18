@@ -98,6 +98,15 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // firing; but the first row it ever writes would age past the 3h default it would otherwise inherit
   // and pin the banner red forever on a healthy leg. That is the `doc_task_infer` class exactly.
   auto_flip: null,
+  // Records ONLY on failure — `runPret3BootSweep`'s caller (`lib/ingest/scheduler.ts`) writes a row
+  // inside `if (s.error)` plus exactly ONE `ok:true` row when it ran cleanly, and the sweep is
+  // marker-guarded so it no-ops forever after its first run that got past the marker insert — whether
+  // that run then succeeded OR failed. Its newest row's age is therefore "time since the last
+  // failure", never "last poll": on the 3h default a single error row would age past the bar and pin
+  // the banner red PERMANENTLY, with no success path able to write a newer row to clear it. Same
+  // class as `doc_task_infer`. Caught by `test/guards/ingest-leg-ledger` on the first leg added after
+  // that guard shipped — which is the whole reason it scans call sites instead of trusting a list.
+  pret3_sweep: null,
   // Record-only-when-active legs: their scheduler writes an `ingest_runs` row ONLY when the tick did
   // something (indexed/projected/applied) or errored — a quiet pass writes nothing. So the newest
   // row's age reflects "last time there was work", NOT "last time the poller ran", and an age-based

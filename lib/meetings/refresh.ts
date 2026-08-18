@@ -116,7 +116,11 @@ export async function refreshMeetingNoteExtraction(
       const ex = await extract(body, roster).catch(() => ({ summary: "", attendeeMemberIds: [] }));
       if (ex.summary.trim()) {
         await updateMeetingSummary(admin, teamId, note.id, ex.summary);
-        await addMeetingNoteAttendees(admin, note.id, ex.attendeeMemberIds);
+        // ATTENDANCE IS NOT REFRESHED FROM THE MODEL (MTGATT-1). `scripts/backfill-meeting-summaries`
+        // defaults to refreshing EVERY note, so re-adding inferred attendees here would re-pollute
+        // every meeting the attendance repair had just corrected. This function heals SUMMARIES;
+        // attendance is owned by `lib/meetings/attendance.ts`'s precedence at create time and by the
+        // attendance backfill for existing rows.
         result.summarized++;
       } else {
         result.skipped++;

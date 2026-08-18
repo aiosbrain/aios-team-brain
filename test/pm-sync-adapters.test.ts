@@ -206,6 +206,9 @@ describe("Linear projection — upsertWorkItem", () => {
       integration: linearIntegration,
       desiredFingerprint: projectionFingerprint(task, null),
       fetchImpl,
+      // ADOPTFOOT-1 — the footer rung fails closed on a MISSING owner set, so a direct caller has to
+      // state its assumption. This fixture's issue is owned by nobody: an empty set, not `undefined`.
+      ownedResourceIds: new Set<string>(),
     });
 
     expect(result.status).toBe("synced");

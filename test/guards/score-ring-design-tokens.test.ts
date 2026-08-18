@@ -283,6 +283,11 @@ describe("ScoreRing design-token contract", () => {
         .filter(([, values]) => values.length > 0),
     );
     expect(found).toEqual({
+      // The AIOS prism gradient on the app icon. A favicon is a fixed artwork asset —
+      // it cannot resolve a runtime CSS custom property, and it must not follow the
+      // page theme. Copied verbatim from @aios-alpha/design (DESIGN.md § Brand & Logo),
+      // which is the only place these three stops may be authored.
+      "app/icon.svg": ["#8b5cf6", "#10b981", "#84cc16"],
       "components/charts/cost-charts.tsx": ["#3b82f6"],
       "components/icons/source-icon.tsx": [
         "#5E6AD2",
