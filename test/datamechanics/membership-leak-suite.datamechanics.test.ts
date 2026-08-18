@@ -316,12 +316,31 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     const xTaskErr = (
       await db()
         .from("tasks")
-        .insert({ team_id: F.seed.teamId, project_id: F.projectXId, row_key: "LX-1", title: "X sourced task", assignee: "Tester", status: "in_progress", source_item_id: gitX.id, audience: "team", origin: "sync" })
+        .insert({ team_id: F.seed.teamId, project_id: F.projectXId, row_key: "LX-1", title: "X sourced task", assignee: "Tester", status: "done", source_item_id: gitX.id, audience: "team", origin: "sync" })
     ).error;
     expect(JSON.stringify(xTaskErr ?? null), "the sourced task fixture must insert").toBe("null");
     await db()
       .from("tasks")
       .insert({ team_id: F.seed.teamId, project_id: F.projectXId, row_key: "HT-1", title: "Hand-typed team task", assignee: "Tester", status: "in_progress", source_item_id: null, created_by: F.seed.memberId, audience: "team", origin: "ui" });
+    // The link-target leak channel (Codex M1): a NON-ACTIVE task sourced from INVISIBLE Y,
+    // whose key is cited by VISIBLE X evidence — reachable only via the all-status read; its
+    // title must never surface for this member.
+    await db()
+      .from("tasks")
+      .insert({ team_id: F.seed.teamId, project_id: F.projectYId, row_key: "LY-9", title: "Y secret linked task", assignee: "Tester", status: "done", source_item_id: gitY.id, audience: "team", origin: "sync" });
+    const citerErr = (
+      await ingest(F.seed, {
+        path: "commits/xcite.md",
+        body: `chore: cross-cite (LY-9) ${TERM_X}`,
+        access: "team",
+        project: "src",
+        kind: "deliverable",
+        frontmatter: { source: "git", author: "tester" },
+      })
+    );
+    await backfillTeamContext(db(), F.seed.teamId);
+    await moveMembership(F.seed, citerErr.id, F.projectXId);
+    await db().from("items").update({ member_id: F.external, work_at: now, work_at_from_source: true }).eq("id", citerErr.id);
     const decErr = (
       await db()
         .from("decisions")
@@ -343,7 +362,8 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
     const days = await getWorkTimeline(db(), F.seed.teamId, "external", 14, enforce);
     const flat = JSON.stringify(days);
     expect(flat, "X's team git evidence flows (ruling 2 on the timeline)").toContain("x work");
-    expect(flat, "X's sourced task header flows").toContain("X sourced task");
+    expect(flat, "X's sourced task header flows — reachable ONLY via the all-status :488 read (status done, Codex M1)").toContain("X sourced task");
+    expect(flat, "an invisible-source task's title never surfaces via link-target maps (Codex M1's leak channel)").not.toContain("Y secret linked task");
     expect(flat, "X's decision flows").toContain("X decision");
     expect(flat, "Y's evidence never flows").not.toContain("y secret");
     expect(flat, "the null-source hand-typed team task stays walled (H2 ruling)").not.toContain("Hand-typed team task");
