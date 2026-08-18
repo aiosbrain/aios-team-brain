@@ -132,14 +132,10 @@ function linearMock(opts: { issues?: unknown[] } = {}) {
   return { fetchImpl, mutations, updated, created };
 }
 
-async function seedLinearPrimary(seed: Seed) {
+async function seedLinearPrimary(seed: Seed, config: Record<string, unknown> = { teamId: "team-uuid" }) {
   await db().from("teams").update({ primary_pm_provider: "linear" }).eq("id", seed.teamId);
   const auth = { teamId: seed.teamId, memberId: seed.memberId };
-  const { id } = await upsertIntegration(db(), auth, {
-    type: "linear",
-    name: "linear",
-    config: { teamId: "team-uuid" },
-  });
+  const { id } = await upsertIntegration(db(), auth, { type: "linear", name: "linear", config });
   await setIntegrationSecret(db(), auth, id, "lin_api_x");
 }
 
@@ -447,7 +443,10 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     // inbound.ts:405-414 (`!ownedIds.has(it.id)`) is. A test that drove only the outbound path would
     // leave the second writer unbound, which is the whole reason this scenario is in scope.
     const seed = await seedTeam();
-    await seedLinearPrimary(seed);
+    // `inboundApply: true` is not decoration: without it `runInboundForTeam` returns an empty result at
+    // inbound.ts:526 before reading a single issue, and this scenario asserts nothing at all. A mutation
+    // deleting the ownership filter SURVIVED until this flag was set — the test was green and vacuous.
+    await seedLinearPrimary(seed, { teamId: "team-uuid", inboundApply: true });
 
     // A workspace row legitimately owns a FOOTERLESS issue — footerless because the inbound candidate
     // filter also excludes anything carrying an `aios-ext` footer, so a footered fixture would be
@@ -471,9 +470,12 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
 
     // Now the inbound leg sees that same issue in the Linear team and tries to mirror it in.
     const inbound = linearMock({ issues: [OWNED_ISSUE] });
-    await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
+    const result = await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
 
     expect(await duplicateGroups(seed.teamId), "mirror-adopt claimed an already-owned issue").toEqual([]);
+    // POSITIVE ANCHOR: the leg actually ran. `enabled: false` is the silent no-op above.
+    expect(result.enabled, "the inbound leg did not run — this scenario would prove nothing").toBe(true);
+    expect(result.reason ?? "", "the inbound leg bailed early").toBe("");
     expect(await ownedLinkCount(seed.teamId), "inbound must not have added a link for an owned issue").toBe(
       before
     );
