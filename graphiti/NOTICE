@@ -1,0 +1,40 @@
+AIOS Team Brain — Graphiti deployment and patches
+Copyright (C) 2026 Chetan Nandakumar and John Ellison
+
+This component is licensed under the Apache License, Version 2.0. See LICENSE
+in this directory.
+
+This is a deliberate exception to the repository default. The rest of AIOS Team
+Brain is AGPL-3.0-only. This directory is permissively licensed because its
+patch scripts patch graphiti_core, which is itself Apache-2.0 — matching the
+upstream license is what keeps these patches contributable back to that
+project. Under the AGPL they could not be sent upstream at all.
+
+Because this directory is Apache-2.0 and the rest of the repository is AGPL,
+the import direction is one-way: nothing in this directory may import from the
+AGPL portions of the repository. See ../LICENSING.md.
+
+
+Third-party components
+----------------------
+
+Graphiti — Apache License 2.0
+    https://github.com/getzep/graphiti
+    Copyright Zep Software, Inc.
+
+    The Dockerfile in this directory builds FROM a digest-pinned upstream
+    `zepai/graphiti` image and installs a pinned `graphiti-core` into it. The
+    patch-*.py scripts modify graphiti_core's behaviour at build time. Those
+    modifications are covered by Section 4 of the Apache License; this notice
+    records that files from Graphiti have been changed.
+
+    The resulting image is built locally by whoever deploys it. We do not
+    redistribute a modified Graphiti image.
+
+Neo4j Community Edition — GNU General Public License v3.0
+    https://github.com/neo4j/neo4j
+
+    docker-compose.yml references the upstream `neo4j:5.26.2` image by tag;
+    Docker pulls it from Docker Hub at run time. Neo4j is not bundled, not
+    modified, and not redistributed here. Graphiti and AIOS both communicate
+    with it over the network (Bolt) as separate programs.

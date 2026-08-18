@@ -69,6 +69,17 @@ changes bump the major version.
 - Label status honestly: ✅ done-and-verified / 🟡 partial / 🔴 blocked. Never claim done without
   a green test or the observable outcome.
 
+## Licensing of contributions
+
+Contributions are accepted under **AGPL-3.0-only**, or **Apache-2.0** for the `ingestion/` and
+`graphiti/` directories — see [`LICENSING.md`](LICENSING.md). A Contributor License Agreement will
+be introduced once our company is formed, at which point contributors will be asked to sign one.
+
+One rule worth knowing before you write an import: **Apache-2.0 code must never import from
+AGPL-3.0 code.** Apache → AGPL is fine; the reverse is a license violation. It's pinned by
+[`test/guards/license-import-direction.test.ts`](test/guards/license-import-direction.test.ts),
+which runs in CI as part of `npm test`.
+
 ## Code of conduct
 
 Be kind and direct. This is real work for real teams — assume good faith, prefer the durable fix

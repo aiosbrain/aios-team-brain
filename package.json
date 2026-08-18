@@ -2,7 +2,7 @@
   "name": "aios-team-brain",
   "version": "0.10.0",
   "private": true,
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
