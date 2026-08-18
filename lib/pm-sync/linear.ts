@@ -338,7 +338,29 @@ export const linearAdapter: PmAdapter = {
      */
     const declared = (link?.declared_external_id ?? "").trim();
     const byResourceId = link?.provider_resource_id ? boot.issuesById.get(link.provider_resource_id) : undefined;
-    const byFooter = boot.issuesByExt.get(task.row_key);
+
+    /**
+     * ADOPTFOOT-1 — the FOOTER rung may not take an issue another row already owns.
+     *
+     * `aios-ext:` carries only the row key (`parseExt` discards the source, and the source is the same
+     * default for ~945 of 949 links here anyway), so `issuesByExt` is keyed on the row key alone. The
+     * AIOS workspace scaffold seeds a row keyed `TT1`, which means every new workspace's `TT1` resolved
+     * to whatever issue already carried `aios-ext: TT1` — in prod, a real person's `AIO-444`, twice.
+     *
+     * The candidate is DROPPED, not merely flagged: `existing` below is
+     * `byResourceId || byFooter || adopted`, so leaving an owned candidate in place would still update
+     * someone else's issue.
+     *
+     * FAIL CLOSED when the owner set is missing. An adapter called without it cannot prove a match is
+     * unowned, and an optional-chained check that passes on `undefined` is how the first version of this
+     * guard stayed invisible. Stated for a FRESH link too, not just one that claimed a resource id —
+     * a fresh link is exactly the scaffold shape this exists for.
+     */
+    const footerCandidate = boot.issuesByExt.get(task.row_key);
+    const footerOwnedElsewhere =
+      !!footerCandidate && (ownedResourceIds === undefined || ownedResourceIds.has(footerCandidate.id));
+    const byFooter = footerOwnedElsewhere ? undefined : footerCandidate;
+
     let adopted: LinearIssue | undefined;
     if (!byResourceId && !byFooter && declared) {
       const candidate = boot.issuesByIdentifier.get(declared);
@@ -362,9 +384,13 @@ export const linearAdapter: PmAdapter = {
           `Linear issue ${declared} declared on ${task.row_key} already belongs to ${ownerExt} — refusing to give one issue two writers`
         );
       }
-      if (ownedResourceIds?.has(candidate.id)) {
+      // Fail closed on a MISSING set as well as on a hit: `ownedResourceIds?.has(...)` silently passed
+      // when the orchestrator had not loaded it, which is the same hole the footer rung above closes.
+      if (ownedResourceIds === undefined || ownedResourceIds.has(candidate.id)) {
         throw new PmSyncError(
-          `Linear issue ${declared} declared on ${task.row_key} is already linked to another task row — refusing to give one issue two writers`
+          ownedResourceIds === undefined
+            ? `Linear issue ${declared} declared on ${task.row_key} cannot be adopted — ownership is unknown to this caller`
+            : `Linear issue ${declared} declared on ${task.row_key} is already linked to another task row — refusing to give one issue two writers`
         );
       }
       adopted = candidate;
