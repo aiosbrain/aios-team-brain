@@ -1,5 +1,6 @@
 import "server-only";
 import { isMeetingTranscript } from "./from-items";
+import { isCalendarEvent } from "./from-calendar";
 // Type-only — erased at build, so the API route still pays nothing for these server-only modules, but
 // the dependency seam below is checked at compile time instead of behind `never` casts.
 import type { BackfillSummary } from "./from-items";
@@ -45,7 +46,13 @@ export function shouldScheduleMeetingBackfill(input: {
   if (input.status === "unchanged") return false;
   // Meeting sources only. `kind='transcript'` also covers Slack threads, and the Meetings page must never
   // fill up with chat threads — same rule `backfillMeetingNotesFromItems` applies when it scans.
-  return isMeetingTranscript(input.kind, typeof input.source === "string" ? input.source : null);
+  //
+  // A CALENDAR EVENT COUNTS TOO (MTGATT-3). It is keyed on SOURCE, not kind (a producer may send
+  // `artifact`), so the transcript test alone silently excluded it: pushing your calendar would sit
+  // unlinked until a scheduler tick while someone else's transcript was noted instantly. That
+  // asymmetry is invisible from the outside and reads as the feature not working.
+  const source = typeof input.source === "string" ? input.source : null;
+  return isMeetingTranscript(input.kind, source) || isCalendarEvent(source);
 }
 
 export type BackfillRunner = (teamId: string) => Promise<unknown>;

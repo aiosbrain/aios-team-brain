@@ -46,6 +46,30 @@ describe("shouldScheduleMeetingBackfill — what earns an immediate run", () => 
     expect(shouldScheduleMeetingBackfill({ kind: "transcript", source: undefined, status: "created" })).toBe(false);
     expect(shouldScheduleMeetingBackfill({ kind: "transcript", source: 42, status: "created" })).toBe(false);
   });
+
+  it("schedules for a CALENDAR EVENT, which is keyed on source and not on kind (MTGATT-3)", () => {
+    // Before this, a pushed calendar event returned false — `isMeetingTranscript` requires
+    // kind='transcript' and a producer may reasonably send `artifact`. So your own calendar push sat
+    // unlinked until a scheduler tick while someone else's transcript was noted instantly: an
+    // invisible half-hour asymmetry between the two producers of the same meeting.
+    for (const kind of ["artifact", "transcript"]) {
+      expect(shouldScheduleMeetingBackfill({ kind, source: "calendar", status: "created" }), `kind=${kind}`).toBe(true);
+    }
+    for (const source of ["gcal", "google_calendar", "googlecalendar"]) {
+      expect(shouldScheduleMeetingBackfill({ kind: "artifact", source, status: "created" }), source).toBe(true);
+    }
+  });
+
+  it("still refuses an UNCHANGED calendar re-push — the widening must not cost the dedupe", () => {
+    // The inverse half. `aios push` re-sends byte-identical files routinely, so a widening that
+    // forgot this would pay for a full scan on every no-op push.
+    expect(shouldScheduleMeetingBackfill({ kind: "artifact", source: "calendar", status: "unchanged" })).toBe(false);
+  });
+
+  it("still refuses a non-meeting artifact — the widening is scoped to calendar sources", () => {
+    expect(shouldScheduleMeetingBackfill({ kind: "artifact", source: "github", status: "created" })).toBe(false);
+    expect(shouldScheduleMeetingBackfill({ kind: "artifact", source: null, status: "created" })).toBe(false);
+  });
 });
 
 describe("createMeetingBackfillScheduler — coalescing", () => {

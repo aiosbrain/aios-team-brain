@@ -1,0 +1,186 @@
+import { describe, expect, it } from "vitest";
+import { eventIdentity } from "@/lib/meetings/event-identity";
+
+/**
+ * Spec (MTGATT-2 §2): the identity a calendar event and its transcript can SHARE, normalised.
+ *
+ * Nothing joins on these yet — they are emitted by the producer and counted by
+ * `scripts/meeting-pairing-report.ts`, so MTGATT-3's matching rule is fitted to measured pairs. That
+ * makes these tests the ONLY thing standing between a mis-normalisation and a silently wrong
+ * measurement, which is why the false-join cases are pinned as hard as the true-match ones.
+ */
+
+describe("eventIdentity — the shapes a producer might send", () => {
+  it("finds the key in every accepted flat spelling", () => {
+    for (const key of ["calendar_event_id", "calendarEventId", "event_id", "gcal_event_id"]) {
+      expect(eventIdentity({ [key]: "6f3k9q2n1m8h5s7d" }).eventKeys, key).toEqual(["eid:6f3k9q2n1m8h5s7d"]);
+    }
+  });
+
+  it("finds the key inside the nested google_calendar_event object", () => {
+    const id = eventIdentity({
+      google_calendar_event: { id: "6f3k9q2n1m8h5s7d", iCalUID: "6f3k9q2n1m8h5s7d@google.com" },
+    });
+    expect(id.eventKeys.sort()).toEqual(["eid:6f3k9q2n1m8h5s7d", "uid:6f3k9q2n1m8h5s7d@google.com"]);
+  });
+
+  it("a UID yields its bare event id too — Google's documented derivation, as an EXPLICIT extra key", () => {
+    // The flat and nested producers can each send only one of the two; this is what lets them line up
+    // without a normaliser silently rewriting a UID into something it is not.
+    expect(eventIdentity({ ical_uid: "abc12345@google.com" }).eventKeys.sort()).toEqual([
+      "eid:abc12345",
+      "uid:abc12345@google.com",
+    ]);
+  });
+
+  it("qualifies keys by kind, so an event id can never collide with a UID", () => {
+    // The un-qualified version of this normaliser made `Foo@google.com` and a bare `foo` the same
+    // string — a second, unproven merge rule hidden inside the first.
+    const uid = eventIdentity({ ical_uid: "shared01@zoom.us" }).eventKeys;
+    const eid = eventIdentity({ calendar_event_id: "shared01@zoom.us" }).eventKeys;
+    expect(uid).toEqual(["uid:shared01@zoom.us"]);
+    expect(eid).toEqual(["eid:shared01@zoom.us"]);
+    expect(uid.some((k) => eid.includes(k))).toBe(false);
+  });
+
+  it("KEEPS a recurring instance suffix — two weeks of one series are two meetings", () => {
+    const week1 = eventIdentity({ calendar_event_id: "base0abc_20260811T090000Z" }).eventKeys;
+    const week2 = eventIdentity({ calendar_event_id: "base0abc_20260818T090000Z" }).eventKeys;
+    expect(week1).not.toEqual(week2);
+  });
+
+  it("two occurrences of one series share NO meeting key, even though they share an iCalUID", () => {
+    // The fusion the second reviewer found. Google: "in recurring events, all occurrences of one
+    // event have different ids while they all share the same iCalUIDs." So the UID is a SERIES
+    // identity — and the bare-eid derivation carried that fusion into the meeting channel too, which
+    // is what made keeping the instance suffix a false guarantee rather than a protection.
+    const occ = (day: string) =>
+      eventIdentity({ google_calendar_event: { id: `base0abc_2026${day}T090000Z`, iCalUID: "base0abc@google.com" } });
+    const w1 = occ("0811");
+    const w2 = occ("0818");
+    expect(w1.eventKeys.filter((k) => w2.eventKeys.includes(k)), "no shared MEETING key").toEqual([]);
+    // Not discarded — moved to a channel that is counted separately and never joined on.
+    expect(w1.seriesKeys).toEqual(["suid:base0abc@google.com"]);
+    expect(w2.seriesKeys).toEqual(w1.seriesKeys);
+  });
+
+  it("recognises a recurring instance from `recurringEventId` alone, with no suffix on the id", () => {
+    const id = eventIdentity({
+      google_calendar_event: { id: "instance01", iCalUID: "series99@google.com", recurringEventId: "base0abc" },
+    });
+    expect(id.eventKeys).toEqual(["eid:instance01"]);
+    expect(id.seriesKeys).toEqual(["suid:series99@google.com"]);
+  });
+
+  it("a SINGLE event's UID still lands in eventKeys and still derives its bare id", () => {
+    // The inverse: if recurrence detection over-fired, every UID would drain into seriesKeys and the
+    // identity channel would quietly empty — a failure that looks exactly like "no producer sent one".
+    const id = eventIdentity({ google_calendar_event: { id: "single01a", iCalUID: "single01a@google.com" } });
+    expect(id.eventKeys.sort()).toEqual(["eid:single01a", "uid:single01a@google.com"]);
+    expect(id.seriesKeys).toEqual([]);
+  });
+
+  it("two copies of ONE event normalise equal despite case and whitespace", () => {
+    const mine = eventIdentity({ calendar_event_id: "  6F3K9Q2N1M8H5S7D  " }).eventKeys;
+    const theirs = eventIdentity({ google_calendar_event: { id: "6f3k9q2n1m8h5s7d" } }).eventKeys;
+    expect(mine).toEqual(theirs);
+  });
+
+  it("discards a placeholder a producer sends for 'nothing to put here'", () => {
+    for (const junk of ["", "-", "none", "n/a", "   ", "null", "unknown", "undefined", "TBD"]) {
+      expect(eventIdentity({ calendar_event_id: junk }).eventKeys, junk).toEqual([]);
+    }
+  });
+
+  it("discards `false`/`undefined` even though Google's charset allows them — the deliberate trade", () => {
+    // Both are legal Google ids (charset a-v + 0-9), so this is a real, if vanishing, false negative.
+    // It is chosen: a missed key undercounts a diagnostic, a placeholder key would fuse two unrelated
+    // meetings. Asserted so the trade is visible and cannot be "fixed" without meeting this comment.
+    expect(eventIdentity({ calendar_event_id: "false" }).eventKeys).toEqual([]);
+    expect(eventIdentity({ calendar_event_id: "undefined" }).eventKeys).toEqual([]);
+  });
+
+  it("KEEPS a valid short Google id — the floor must not discard real ids (review fold)", () => {
+    // Google documents an event id as 5–1024 characters. An 8-char floor silently dropped valid
+    // short ids, which would have made the pairing report undercount and a later join miss them,
+    // with nothing to show it had happened.
+    expect(eventIdentity({ calendar_event_id: "abcde" }).eventKeys).toEqual(["eid:abcde"]);
+    expect(eventIdentity({ calendar_event_id: "abcd" }).eventKeys, "4 chars is below Google's own minimum").toEqual([]);
+  });
+
+  it("yields nothing at all for an item with no calendar fields", () => {
+    expect(eventIdentity({ source: "granola", participants: "[John Ellison]" })).toEqual({
+      eventKeys: [],
+      seriesKeys: [],
+      conferenceKey: null,
+    });
+    expect(eventIdentity(null)).toEqual({ eventKeys: [], seriesKeys: [], conferenceKey: null });
+  });
+});
+
+describe("eventIdentity — the conference link (diagnostic only)", () => {
+  it("normalises away the per-person query string and trailing slash", () => {
+    const a = eventIdentity({ conference_url: "https://meet.google.com/abc-defg-hij?authuser=1" }).conferenceKey;
+    const b = eventIdentity({ hangoutLink: "https://Meet.Google.com/abc-defg-hij/" }).conferenceKey;
+    expect(a).toBe("meet.google.com/abc-defg-hij");
+    expect(b).toBe(a);
+  });
+
+  it("prefers the VIDEO entry point over a dial-in — a phone number is not a conference link", () => {
+    const key = eventIdentity({
+      google_calendar_event: {
+        conferenceData: {
+          entryPoints: [
+            { entryPointType: "phone", uri: "tel:+15551234567" },
+            { entryPointType: "video", uri: "https://meet.google.com/xyz-1234-abc" },
+          ],
+        },
+      },
+    }).conferenceKey;
+    expect(key).toBe("meet.google.com/xyz-1234-abc");
+  });
+
+  it("picks the video entry point even when an untyped one comes first", () => {
+    // Pins the PREFERENCE itself, not just the outcome. The earlier phone/video case passed even with
+    // the video preference disabled, because the dial-in fallback happened to land on the same entry —
+    // a layer masking the mutation of the layer above it. Here the two layers disagree, so only the
+    // preference produces this answer.
+    const key = eventIdentity({
+      google_calendar_event: {
+        conferenceData: {
+          entryPoints: [
+            { uri: "https://dial-in.example.com/room/9" },
+            { entryPointType: "video", uri: "https://meet.google.com/xyz-1234-abc" },
+          ],
+        },
+      },
+    }).conferenceKey;
+    expect(key).toBe("meet.google.com/xyz-1234-abc");
+  });
+
+  it("reads Google's conferenceData.entryPoints[].uri when there is no hangoutLink", () => {
+    const key = eventIdentity({
+      google_calendar_event: { conferenceData: { entryPoints: [{ uri: "https://meet.google.com/xyz-1234-abc" }] } },
+    }).conferenceKey;
+    expect(key).toBe("meet.google.com/xyz-1234-abc");
+  });
+
+  it("two different rooms stay different, and a Zoom PMI stays a single key", () => {
+    // The PMI case is exactly WHY this is never a join key: one person's personal room serves every
+    // meeting they host, so this key being stable across unrelated meetings is the expected behaviour
+    // — it is the JOIN that would be wrong, not the normalisation.
+    expect(eventIdentity({ conference_url: "https://meet.google.com/aaa-bbbb-ccc" }).conferenceKey).not.toBe(
+      eventIdentity({ conference_url: "https://meet.google.com/ddd-eeee-fff" }).conferenceKey
+    );
+    expect(eventIdentity({ conference_url: "https://zoom.us/j/1234567890" }).conferenceKey).toBe("zoom.us/j/1234567890");
+  });
+
+  it("a conference link never becomes an event key", () => {
+    const id = eventIdentity({ conference_url: "https://meet.google.com/abc-defg-hij" });
+    expect(id.eventKeys).toEqual([]);
+  });
+
+  it("garbage that is not a URL yields null rather than a key", () => {
+    expect(eventIdentity({ conference_url: "not a url at all::" }).conferenceKey).toBeNull();
+  });
+});

@@ -68,7 +68,17 @@ describe("meeting-notes backfill (data-mechanics)", () => {
     const seed = await seedTeam();
     await seedTranscript(seed, "slack", { path: "slack/x.md", body: "# thread\n\nchat" });
     const s = await backfillMeetingNotesFromItems(db(), seed.teamId, { extract: stubExtract });
-    expect(s).toEqual({ scanned: 0, created: 0, skipped: 0, merged: 0, unresolvedAttendees: 0 });
+    // Deep-equality on the WHOLE summary, deliberately: it is what catches a counter being added and
+    // left unwired, or silently defaulting to something other than zero on an empty run.
+    expect(s).toEqual({
+      scanned: 0,
+      created: 0,
+      skipped: 0,
+      merged: 0,
+      unresolvedAttendees: 0,
+      calendarDeclined: 0,
+      link: { linked: 0, refusals: { "two-bodies": 0, "dates-too-far-apart": 0, "unknown-date": 0 } },
+    });
   });
 
   // Spec: a pushed meeting arrives with its action items ALREADY materialized as tasks, not empty
