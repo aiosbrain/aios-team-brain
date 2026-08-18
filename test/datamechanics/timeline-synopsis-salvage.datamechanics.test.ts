@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, visOf, externalMember, type Seed } from "./helpers";
 import { getCachedWorkTimeline, PAYLOAD_VERSION, MIN_SALVAGEABLE_VERSION } from "@/lib/dashboard/timeline-cache";
 
 /**
@@ -31,6 +31,12 @@ async function seedLinkedTeam(): Promise<Seed> {
     .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
     .select("id")
     .single();
+  // PRET-6: the synced task carries an EXTERNAL-access source doc (visible to both viewer
+  // classes), so the tier test still fails on the ITEM's access, never on the header.
+  const src = await ingest(seed, {
+    path: `task-docs/${randomUUID()}.md`, access: "external", body: "task source SALV-1",
+    frontmatter: { source: "linear" },
+  });
   await db().from("tasks").insert({
     team_id: seed.teamId,
     project_id: (proj as { id: string }).id,
@@ -40,12 +46,13 @@ async function seedLinkedTeam(): Promise<Seed> {
     assignee: "Tester",
     origin: "sync",
     audience: "external",
+    source_item_id: src.id,
   });
   return seed;
 }
 
 async function seedCommit(seed: Seed, title: string, whenIso: string, access: "team" | "external" = "team") {
-  return ingest(seed, {
+  const r = await ingest(seed, {
     path: `commits/x/${title}.md`,
     project: "commits",
     kind: "artifact",
@@ -53,7 +60,13 @@ async function seedCommit(seed: Seed, title: string, whenIso: string, access: "t
     body: `# ${title} (SALV-1)`,
     access,
   });
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  const b = await backfillTeamContext(db(), seed.teamId);
+  if (!b.ok) throw new Error(`seedCommit backfill failed: ${b.error}`);
+  return r;
 }
+
+const visKey = async (seed: Seed, memberId: string = seed.memberId, tier = "team"): Promise<string> => `vis:${tier}:${(await visOf(seed, memberId))!.visibilityHash}`;
 
 /** Write a cache row from a PREVIOUS payload version that carries a synopsis for one person-day. */
 async function seedPriorRow(args: {
@@ -63,7 +76,7 @@ async function seedPriorRow(args: {
   summary: string;
   version?: number;
   computedAt?: string;
-  tier?: "team" | "external";
+  groupKey: string;
 }) {
   const payload = {
     // A FOREIGN version that is still SALVAGEABLE. It used to be `PAYLOAD_VERSION - 1`, which broke the
@@ -97,7 +110,9 @@ async function seedPriorRow(args: {
   const { error } = await db().from("work_timeline_cache").upsert(
     {
       team_id: args.teamId,
-      group_key: args.tier ?? "team",
+      // PRET-6: salvage is same-key and every served row is a vis-variant — the prior row must
+      // sit at the READER's key or the fixture tests nothing.
+      group_key: args.groupKey,
       payload: JSON.stringify(payload),
       computed_at: args.computedAt ?? new Date().toISOString(),
     },
@@ -138,12 +153,13 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
+      groupKey: await visKey(seed),
       date: dayOfWhen,
       summary: "Shipped the carried work.",
     });
 
     // Cold miss by version mismatch — exactly what every deploy that bumps the version produces.
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBe("Shipped the carried work.");
   });
 
@@ -157,12 +173,13 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
+      groupKey: await visKey(seed),
       date: dayOfWhen,
       summary: "Shared two sizzle reels.", // the shape of the misattributed claim
       version: MIN_SALVAGEABLE_VERSION - 1,
     });
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
@@ -173,11 +190,12 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: randomUUID(),
+      groupKey: await visKey(seed), // the READER's key — the foreign person-day is inside their own row
       date: dayOfWhen,
       summary: "Someone else's day.",
     });
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
@@ -188,12 +206,13 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
+      groupKey: await visKey(seed),
       date: dayOfWhen,
       summary: "Stale from last week.",
       computedAt: new Date(Date.now() - 8 * 24 * 3600_000).toISOString(),
     });
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 
@@ -208,12 +227,12 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
+      groupKey: await visKey(seed),
       date: dayOfWhen,
       summary: "Team-tier sentence about work an external viewer must not learn about.",
-      tier: "team",
     });
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "external");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "external", await externalMember(seed));
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 });

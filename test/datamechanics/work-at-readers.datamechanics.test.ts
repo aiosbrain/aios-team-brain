@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { getWorkTimeline, ITEM_LIMIT } from "@/lib/dashboard/work-timeline";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, ingest, seedTeam } from "./helpers";
+import { db, ingest, seedTeam, viewFor } from "./helpers";
 
 /**
  * Spec (Pass-1 review, Wave 2): the READERS move onto the persisted work-time.
@@ -34,9 +34,16 @@ async function seedLinkedTeam() {
     .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
     .select("id")
     .single();
+  // PRET-6: the synced task carries its source item (as production sync does) or the enforced
+  // read drops it as purged-basis. Timeline-inert (no work time), so the window assertions hold.
+  const src = await ingest(seed, {
+    kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "team",
+    body: "task source LNK-1", frontmatter: { source: "linear" },
+  });
   await db().from("tasks").insert({
     team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "LNK-1",
     title: "Windowed work", status: "in_progress", assignee: "Tester", origin: "sync", audience: "team",
+    source_item_id: src.id,
   });
   return seed;
 }
@@ -68,7 +75,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
     // Both rows are re-synced NOW, exactly as every 30-minute tick does.
     await db().from("items").update({ synced_at: new Date().toISOString() }).eq("team_id", seed.teamId);
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
 
     expect(titles).toContain("docs/recent.md (LNK-1)");
     // The point: a shared `synced_at` says these two are equally "recent". Their work times don't.
@@ -96,7 +103,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       .eq("team_id", seed.teamId)
       .neq("path", "docs/real-work.md");
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).toContain("docs/real-work.md (LNK-1)");
     expect(titles.filter((t) => t.startsWith("docs/old-"))).toHaveLength(0);
   });
@@ -111,7 +118,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       frontmatter: { title: "docs/undated.md" },
     });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).not.toContain("docs/undated.md");
   });
 
@@ -146,7 +153,7 @@ describe("the timeline windows on work_at, not sync time (real Postgres)", () =>
       },
     });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).toContain("#eng: long-running incident thread (LNK-1)");
   });
 });

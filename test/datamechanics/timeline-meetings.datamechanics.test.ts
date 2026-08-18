@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, seedTeam, viewFor, type Seed } from "./helpers";
 import { createMeetingNote } from "@/lib/meetings/notes";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 
@@ -63,7 +63,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
       attendeeMemberIds: [seed.memberId, other],
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
 
     const pusher = meetingsFor(days, seed.memberId);
     const attendee = meetingsFor(days, other);
@@ -91,7 +91,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
       attendeeMemberIds: [seed.memberId, other],
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(meetingsFor(days, seed.memberId)).toHaveLength(1);
     // …and no OTHER lane picked the transcript up under a different source.
     const pusherDay = days.flatMap((d) => d.people).find((p) => p.memberId === seed.memberId);
@@ -110,10 +110,10 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
       attendeeMemberIds: [seed.memberId],
     });
 
-    const teamDays = await getWorkTimeline(db(), seed.teamId, "team");
+    const teamDays = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(meetingsFor(teamDays, seed.memberId), "control: team tier DOES see it").toHaveLength(1);
 
-    const externalDays = await getWorkTimeline(db(), seed.teamId, "external");
+    const externalDays = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     const leaked = externalDays
       .flatMap((d) => d.people)
       .flatMap((p) => p.other)
@@ -134,7 +134,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
       attendeeMemberIds: [],
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const found = meetingsFor(days, seed.memberId);
     expect(found).toHaveLength(1);
     expect(found[0].via).toBe("submitter");
@@ -164,7 +164,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     });
     await db().from("meeting_notes").update({ merged_into: targetId }).eq("id", dupId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     for (const memberId of [seed.memberId, other]) {
       const found = meetingsFor(days, memberId);
       expect(found, `${memberId} should see the merged meeting exactly once`).toHaveLength(1);
@@ -185,7 +185,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     });
     await db().from("meeting_notes").update({ submitted_by: null }).eq("id", noteId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const anyMeeting = days
       .flatMap((d) => d.people)
       .flatMap((p) => p.other)
@@ -206,7 +206,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
       attendeeMemberIds: [seed.memberId],
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const found = meetingsFor(days, seed.memberId);
     expect(found).toHaveLength(1);
     expect(found[0].at).toBe(twoDaysAgo); // bare YYYY-MM-DD, not an ISO timestamp

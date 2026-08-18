@@ -991,10 +991,14 @@ export async function retrieve(
   // absent graphProjectIds (external principals, delegated tokens) that leg stays OMITTED —
   // §5.8b fail-closed. The ORG-STRUCTURAL mirror legs (actors + REPORTS_TO) are tier-classed
   // (QMIR-1): served when `principal === "member"`, omitted for tokens and both default-deny
-  // arms; commitments stay omitted under enforcing. The aggregate digests remain omitted under
-  // enforcing. Absent enforce = permissive → tier path with the partition union.
+  // arms; commitments and the aggregate digests stay omitted for everyone.
+  // PRET-6: enforcement is REQUIRED — with the permissive posture walls deleted, a null view
+  // would run the item legs UNFILTERED (fail open), so a caller without a principal's view is a
+  // bug and throws (the timeline's memberId==null rule, applied here). Both query routes
+  // construct the view or 500 before calling.
   enforce?: RetrieveEnforce | null
 ): Promise<RetrievedContext> {
+  if (enforce == null) throw new Error("retrieve without an enforcement view (fail closed)");
   const provider = selectedProviderName() === "external" ? externalProvider : nativeProvider;
-  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce: enforce ?? null });
+  return provider.retrieve({ db, teamId, tier, question, projectSlug: projectSlug ?? null, enforce });
 }

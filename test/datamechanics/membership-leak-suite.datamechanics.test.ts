@@ -7,7 +7,7 @@ import { GET as membersGET } from "@/app/api/v1/members/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { createMember } from "@/lib/admin/members";
 import { createGroup, addMemberToGroup, grantProjectToGroup } from "@/lib/access/groups";
-import { setAccessEnforcement } from "@/lib/admin/access-enforcement";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { visibleItemIds, memberEnforcement } from "@/lib/access/enforce";
 import { visibleProjects } from "@/lib/access/oracle";
@@ -125,8 +125,9 @@ async function buildFixture(): Promise<Fixture> {
   expect(ready.ready.has(X.projectId), "X must be ready-latched or A3 is vacuous").toBe(true);
   expect(ready.ready.has(Y.projectId), "Y must be ready-latched too — its absence must be the oracle's doing").toBe(true);
 
-  const flip = await setAccessEnforcement(db(), seed.teamId, "enforcing");
-  expect(flip.ok, flip.error).toBe(true);
+  // PRET-6: no flip — every team is enforcing; the bootstrap the flip used to run is explicit.
+  const boot = await ensureAccessBootstrap(db(), seed.teamId);
+  expect(boot.ok, boot.error).toBe(true);
 
   // The external member: PRODUCTION creation (spec AC4 — never the fixture backdoor), then
   // activation, then deliberate membership in a group granted X only.

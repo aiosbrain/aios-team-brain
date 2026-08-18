@@ -13,7 +13,6 @@ import {
   materializeBuiltinMembershipOnce,
 } from "@/lib/access/groups";
 import { visibleProjects } from "@/lib/access/oracle";
-import { _resetPostureConfirmationForTests } from "@/lib/access/posture";
 
 // Phase A slice 1 (spec §4/§5.1), re-specified by PRET-4 (explicit builtin state) — real-
 // Postgres proofs of the access skeleton's invariants: eligibility enforced at write AND read,
@@ -22,10 +21,9 @@ import { _resetPostureConfirmationForTests } from "@/lib/access/posture";
 
 beforeEach(async () => {
   // The materialization is one-time PER FLEET (marker-guarded) and the shared test DB carries
-  // the marker across tests/files — clear it so each test's teams materialize freshly, and
-  // reset the process-level confirmation cache the oracle consults.
+  // the marker across tests/files — clear it so each test's teams materialize freshly. (The
+  // process-level confirmation cache retired with the PRET-4 legacy window — PRET-6.)
   await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
-  _resetPostureConfirmationForTests();
 });
 
 async function seedMember(
