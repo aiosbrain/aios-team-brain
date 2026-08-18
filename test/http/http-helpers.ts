@@ -32,6 +32,11 @@ export async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promis
       .select("id")
       .single();
     if (error || !data) throw new Error(`external member seed failed: ${error?.message}`);
+    // PRET-4 explicit state: the raw-inserted external member gets their builtin-posture row
+    // (production mints members via createMember, which writes it; absent-row would ALSO
+    // resolve external, but the row keeps fixtures production-shaped).
+    const { placeMemberByTier } = await import("../datamechanics/helpers");
+    await placeMemberByTier(seed.teamId, data.id as string, "external");
     memberId = (data as { id: string }).id;
   }
   const { key } = await issueApiKey(db(), seed.teamId, memberId, `${tier} key`);
@@ -54,6 +59,8 @@ export async function issueAdminKey(seed: Seed): Promise<{ key: string }> {
     .select("id")
     .single();
   if (error || !data) throw new Error(`admin member seed failed: ${error?.message}`);
+  const { placeMemberByTier } = await import("../datamechanics/helpers");
+  await placeMemberByTier(seed.teamId, (data as { id: string }).id, "team");
   const { key } = await issueApiKey(db(), seed.teamId, (data as { id: string }).id, "admin key");
   return { key };
 }
@@ -74,6 +81,9 @@ export async function seedMemberEmail(seed: Seed): Promise<{ email: string; pass
       status: "active",
     });
   if (error) throw new Error(`login member seed failed: ${error.message}`);
+  const { data: loginRow } = await db().from("members").select("id").eq("team_id", seed.teamId).eq("email", email).single();
+  const { placeMemberByTier } = await import("../datamechanics/helpers");
+  await placeMemberByTier(seed.teamId, (loginRow as { id: string }).id, "team");
   await adminSetPassword(email, password);
   return { email, password };
 }
