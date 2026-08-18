@@ -1,137 +1,185 @@
 # Nothing enforces the invariant the two adoption fixes exist to protect — ADOPTINV-1
 
-**Status:** spec, draft 1 · **Date:** 2026-08-18 · **Owner:** Chetan · **Task:** `ADOPTINV-1`
+**Status:** spec, draft 2. Draft 1 was BLOCKED by both reviewers. The sharpest finding was that draft 1's
+own mutation criterion **could not go red** — it named the wrong file, and the mutant it described makes
+the adapter refuse *everything*, so no duplicate forms and the test stays green. · **Date:** 2026-08-18 ·
+**Owner:** Chetan · **Task:** `ADOPTINV-1`
 **Follows:** [`pm-sync-declared-issue-adoption.md`](./pm-sync-declared-issue-adoption.md) (`ADOPTDECL-1`,
 #581) and [`pm-sync-footer-adoption-scope.md`](./pm-sync-footer-adoption-scope.md) (`ADOPTFOOT-1`, #588).
 **Unblocks:** `ADOPTUNIQ-1` — proves the code cannot violate the constraint *before* the constraint is added.
-**Code:** `test/datamechanics/` only. No production code changes are planned; see §4.
+**Code:** `test/datamechanics/` only, unless §4.1 fires.
 
 ---
 
 ## 0. What is wrong
 
 `ADOPTDECL-1` and `ADOPTFOOT-1` between them shipped nine tests across the unit and data-mechanics
-tiers. Every one of them pins **a rung's decision**:
-
-- `test/pm-sync-footer-adoption-scope.test.ts` — the adapter refuses an owned footer match when it is
-  handed an owner set.
-- `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts` — the orchestrator builds
-  that set correctly from real rows (`a SAME-KEYED row in another project does not take the owner's
-  issue`), and the recovery direction still works.
-- `test/pm-sync-declared-adoption.test.ts`, `test/datamechanics/pm-sync-declared-adoption.datamechanics.test.ts`
-  — a declaration is persisted, adopted, short-circuits on the second run, errors when unresolvable,
-  and withdraws cleanly.
-- `test/guards/declared-external-id-single-writer.test.ts` — only ingest writes the column.
+tiers. Every one of them pins **a rung's decision** — the footer rung's scope, the declared rung's
+error, the ownership refusal, the single-writer guard on the declared column.
 
 **Not one of them asserts the outcome those rungs exist to produce:** that after a projection,
-`task_pm_links` does not contain two rows in the same team pointing at the same
-`provider_resource_id`. Every assertion is on a return value, a call, or one link's stored fields.
+`task_pm_links` does not contain two rows in one team, for one provider, pointing at the same
+`provider_resource_id`. Both reviewers went looking for a counter-example and neither found one. Two
+specifics worth recording, because they show how close the existing tests get without arriving:
 
-That is the difference CLAUDE.md §2.3 names — *"a claim isn't real until a red test reproduces the bad
-outcome (wrong row in the DB…), not a name, a proxy, or a call-site reading."* The rungs are proxies
-for the invariant. They are individually correct and the invariant can still break, because the rungs
-are not the only writers of that column and no test looks at the table as a whole.
+- `test/datamechanics/pm-sync-inbound.datamechanics.test.ts:554` asserts `toHaveLength(1)` for links
+  filtered `.eq("row_key", "ENG-1")` — keyed on **row_key**, so two links with *different* row keys
+  sharing one `provider_resource_id`, which is the incident's exact shape, pass it.
+- `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts:146` asserts the **mock's**
+  recorded calls, never the scaffold row's stored id. A `persistSuccess` bug writing `issue-444` into
+  the scaffold's link while the adapter dutifully created a new issue would stay green today.
 
-**And the DB cannot cover it either, today.** `ADOPTUNIQ-1` would add
+**And the DB cannot cover it either.** `postgres/schema.sql:1280` carries only
+`unique (team_id, project_id, row_key, provider)`; lines 1282-1283 add plain, non-unique indexes, and
+no migration adds more. `ADOPTUNIQ-1` would add
 `unique (team_id, provider, provider_resource_id) where provider_resource_id is not null`, but it
-cannot ship: production currently holds exactly one violating group — three links on `AIO-444` — and
-`npm run pg:schema` is Railway's `preDeployCommand`, so an index that fails to build takes the release
-down with it. Reconciling those three rows is an outward-facing decision (detaching them mints new
-issues on a colleague's board), and it is still open.
+cannot ship: a prod query on **2026-08-18** found exactly one violating group — three links on
+`AIO-444` — and `npm run pg:schema` is Railway's `preDeployCommand`, so an index that fails to build
+takes the release down. (That count is a dated measurement taken outside this repo and is not
+verifiable from it.) Reconciling those rows is an outward-facing decision that is still open.
 
-So the invariant is enforced by **nothing** in CI right now, and will stay that way until a decision
-that has no deadline. That is the gap this slice closes.
+So the invariant is enforced by **nothing** in CI, and will stay that way until a decision with no
+deadline. That is the gap this slice closes.
 
 ## 1. The decision
 
 Add a **data-mechanics** test that drives the real projector through the collision shapes that actually
-occurred, and asserts the **table state** after each: no `(team_id, provider, provider_resource_id)`
-group has more than one row.
+occurred, and asserts the **table state** after each.
 
-The assertion is one SQL query, expressed once and reused:
+The invariant, expressed once and reused — note the `provider` term, which draft 1 omitted from the SQL
+while claiming it in prose:
 
 ```sql
-select provider_resource_id, count(*) from task_pm_links
+select provider, provider_resource_id, count(*) from task_pm_links
 where team_id = $1 and provider_resource_id is not null
-group by provider_resource_id having count(*) > 1
+group by provider, provider_resource_id having count(*) > 1
 ```
 
-**Why data-mechanics and not unit** (CLAUDE.md §4): the invariant is a property of *stored rows across
-projects*, and the legacy in-memory fake has no constraints and no real grouping. The live defect was
-exactly a cross-project stored-state bug that an adapter-level assertion greened straight past.
+It must match `ADOPTUNIQ-1`'s index exactly, or it does not pre-verify it. Without `provider`, a Plane
+link and a Linear link sharing an id string are a false positive against a constraint that would
+permit them.
 
-**Why this is not a re-run of the existing tests.** Those assert one scenario each, in isolation, and
-each asserts the rung. This asserts the *composition*: several rows projecting in one run, and paths
-run back to back, which is the shape the incident actually had (three workspaces, months apart, each
-individually behaving "correctly" by the rung's own lights).
+**Team-wide is the right scope, verified rather than assumed:** both owner sets in production code —
+the projector's (`lib/pm-sync/project.ts:312-317`) and the inbound path's (`lib/pm-sync/inbound.ts:402-412`)
+— are already team-wide across projects, including the `linear-*` mirror project. The code already
+treats team-wide uniqueness as intended, so the test is not inventing a rule the product does not want.
+
+**Why data-mechanics and not unit** (CLAUDE.md §4): the invariant is a property of *stored rows across
+projects*, and the in-memory fake has no constraints and no real grouping.
 
 ## 2. Acceptance criteria
 
-Spec-first: these are written from what the product must guarantee, not from what the code does. **If
-any goes red it has found a live path the two previous fixes did not close, and that is a result, not a
-setback** — see §4.
+Spec-first: written from what the product must guarantee. **If any goes red it has found a live path
+the two previous fixes did not close, which is a result, not a setback** — see §4.
+
+### The invariant holds
 
 - `npm run test:datamechanics:iso test/datamechanics/pm-link-uniqueness.datamechanics.test.ts` passes,
-  and every case ends with the no-duplicate-group query returning zero rows.
-- The incident's exact shape: **three** rows keyed `TT1` in three different projects of one team, all
-  projected in the same run against a Linear team whose existing issue carries `aios-ext: TT1` — one
-  row keeps the issue, the other two do not share it.
-- Rung 1 missing because the issue was **deleted** at the provider (the path `ADOPTFOOT-1` found its
-  load-gate blind to), run twice in succession, still ends with no duplicate group.
-- A row that **declares** an id already owned by another row's link does not end up sharing it, and the
-  declaring row records an error rather than silently inventing a second issue (`ADOPTDECL-1`'s rule).
-- The invariant query is **mutation-verified**: with the ownership refusal removed from
-  `lib/pm-sync/project.ts`, the new test goes **red**, and it is the *invariant* assertion that fails,
-  not an incidental one.
-- A **negative control**: the same query returns zero rows on a team with no links at all, so a passing
-  run cannot be explained by the query matching nothing. (`grep-before-claiming` / vacuity: a
-  `having count(*) > 1` assertion is trivially satisfiable by an empty table.)
+  and every scenario ends with the §1 query returning **zero rows**.
+- **The incident's shape:** three rows keyed `TT1` in three different projects of one team, projected in
+  **three back-to-back per-project runs** — not one run. `projectAllTasks` is `(team, project)`-scoped
+  (`lib/pm-sync/project.ts:432-437`), so a single run cannot span three projects; draft 1's "all
+  projected in the same run" was impossible. Each run's bootstrap listing must reflect the previous
+  run's state. Only the first row ends up owning the issue.
+- **Rung 1 missing because the issue was deleted** at the provider, run twice in succession, ends with
+  no duplicate group.
+- **A declared id already owned by another row's link** does not end up shared, and the declaring row
+  records an error (`persistError`, `lib/pm-sync/project.ts:354-357`) rather than inventing a second
+  issue. The owned issue in this fixture **must carry no `aios-ext` footer**: `linear.ts:381-386`
+  throws on a footer naming another row *before* the `ownedResourceIds` check at `:388-395` is reached,
+  so a footered fixture would prove the wrong path — and the prod shape is footerless, which
+  `linear.ts:377-379` says in as many words.
+- **The inbound writer is covered too** (§3 explains why it is in): a mirror-adopt of an issue a
+  workspace link already owns does not produce a second link. `lib/pm-sync/inbound.ts:448-457` inserts
+  `provider_resource_id` directly with `on conflict (team_id, project_id, row_key, provider) do nothing`
+  — conflict on **row identity only**, so nothing there stops a second link to an owned issue.
+
+### The test is not green by construction
+
+- **Positive anchor per scenario:** each scenario asserts that the projection actually *reached the
+  adapter for the row under test* — a recorded issue mutation/update for that row, and its report
+  status not `skipped`. "The fetch mock was called" is **not** sufficient: `projectRows` calls the
+  adapter's `prepare` before any row projects (`lib/pm-sync/project.ts:401`), so bootstrap alone
+  satisfies it even when every row short-circuits at `:284`.
+- **Count anchor:** each scenario asserts the expected number of links with a non-null
+  `provider_resource_id` exists, so a scenario that silently projected nothing cannot pass.
+- **The inverse control:** insert two links that deliberately share `(team_id, provider,
+  provider_resource_id)` and assert the §1 query **returns** that group. Draft 1's "the query returns
+  zero rows on a team with no links" proved the opposite of what it claimed — that the query passes on
+  nothing, which is the vacuity, not a control against it. The surviving mutant it missed is any query
+  typo that matches nothing at all.
+- **Mutation — the right mutant, and why the obvious one is wrong.** Re-key the self-exclusion at
+  `lib/pm-sync/project.ts:320` to `row_key` alone (drop the `o.project_id === row.project_id &&` term):
+  that is the live bug's exact shape, it drops the true owner from the owner set, and all three `TT1`
+  rows adopt `issue-444`. The **invariant assertion specifically** must be the one that reddens.
+  Do **not** use draft 1's mutant ("remove the ownership refusal from `project.ts`"): the refusal is not
+  in that file, and both refusals (`linear.ts:360-362`, `:389-395`) **fail closed** on
+  `ownedResourceIds === undefined`, so removing the owner set makes the adapter refuse *everything* —
+  every row creates its own issue, no duplicate forms, and the test stays green.
+- **A mutation per scenario, not one for the suite.** The mutant above only exercises the footer path,
+  so a deleted-issue scenario seeded with an unchanged `projection_fingerprint` would short-circuit and
+  be silently vacuous while the suite still reddens elsewhere. Each scenario carries its own positive
+  anchor for this reason.
+
+### Fixture hygiene
+
+- **The create mock must mint unique ids.** The two adoption dm tests' mock returns a constant
+  `id: "brand-new"` for every `issueCreate`. In the three-`TT1` scenario two rows are refused and each
+  mints its own issue, so that mock makes both links persist the same id and the invariant query flags
+  a duplicate that is a **pure fixture artifact**. Use the `li-${++n}` pattern already in
+  `test/datamechanics/pm-sync-refusal.datamechanics.test.ts:48`.
 - `npm test`, `npx tsc --noEmit`, `npm run lint`, `npm run check:docs` all pass.
 
 ## 3. Scope
 
-**In:** one new file, `test/datamechanics/pm-link-uniqueness.datamechanics.test.ts`, plus a line in
-`docs/ARCHITECTURE.md` if the drift guard requires one.
+**In:** one new file, `test/datamechanics/pm-link-uniqueness.datamechanics.test.ts`, plus an
+`docs/ARCHITECTURE.md` line if the drift guard requires one.
 
-**Deliberately out:**
+**The inbound writer is IN, not fenced out.** Draft 1 justified the slice with "the rungs are not the
+only writers of that column" and then tested only the outbound projector — fencing out the second
+writer with no stated destination. `adoptInbound` (`lib/pm-sync/inbound.ts:448`) writes the column
+directly under its own ownership logic, so one inbound scenario is part of this slice.
 
-- **The DB constraint itself** (`ADOPTUNIQ-1`) — blocked on the production reconciliation, which is a
-  human, outward-facing call. This slice is explicitly the *interim* enforcement, and does not replace
-  it: a test binds this repo's code paths, an index binds the data whatever writes it.
-- **Repairing the three live links.** No production write happens here.
-- **A runtime health signal for duplicate links.** Considered and rejected for now: it would go red
-  immediately on the known violation and stay red until that decision is made, and this repo has been
-  bitten six times by a banner that cries wolf (`docs/design/staleness-threshold-fit.md`). It belongs
-  *with* the repair, not before it.
-- **The Plane adapter's copy of the defect** (`ADOPTPLANE-1`). The invariant query is provider-scoped
-  and would cover Plane if a case were added, but Plane's live status is itself an open question —
-  the workspace CLI's `parsePmCell` already treats Plane as retired while the brain still ships an
-  adapter.
+**Deliberately out, each with a destination:**
+
+- **The DB constraint itself** (`ADOPTUNIQ-1`) — blocked on the production reconciliation, a human,
+  outward-facing call. This slice is the *interim* enforcement and does not replace it: a test binds
+  this repo's code paths, an index binds the data whatever writes it.
+- **Repairing the three live links.** No production write happens here. `ADOPTUNIQ-1`.
+- **A runtime health signal for duplicate links.** It would go red immediately on the known violation
+  and stay red until that decision is made, and this repo has been bitten six times by a banner that
+  cries wolf (`docs/design/staleness-threshold-fit.md`). The obvious middle option — baseline or
+  allowlist the one known group — is real, and is deliberately deferred with the repair rather than
+  rejected: allowlisting a violation before anyone has decided to fix it is how a known-issue
+  suppression becomes permanent. Revisit as part of `ADOPTUNIQ-1`.
+- **The Plane adapter's copy of the defect** (`ADOPTPLANE-1`). The §1 query is provider-scoped and
+  would cover Plane if a case were added, but Plane's live status is itself open — the workspace CLI's
+  `parsePmCell` already treats Plane as retired while the brain still ships an adapter.
 
 ## 4. What would falsify this
 
-The spec claims the invariant is currently unenforced but *held* by the code. Two ways that is wrong,
-both of which the slice is designed to surface rather than hide:
-
-1. **The test goes red on first run.** Then a live path still produces duplicates, `ADOPTFOOT-1` is
-   incomplete, and the fix belongs in `lib/pm-sync/` — the slice grows a production change and says so.
-2. **The test is green for the wrong reason** — the scenarios never actually reach the adoption rungs
-   (e.g. the fingerprint short-circuit skips the provider call, so nothing is ever at risk of
-   adopting). The mutation criterion above exists precisely to detect this: if removing the ownership
-   refusal does not redden the test, the test is not exercising the path it claims to.
+1. **The test goes red on first run.** Then a live path still produces duplicates and the fix belongs in
+   `lib/pm-sync/`. Decision rule, pre-committed: if the failing path is the **outbound** projector the
+   fix lands in this slice; if it is the **inbound** writer it becomes its own ticket (`ADOPTINB-1`)
+   unless the fix is a one-line conflict-target change, because inbound has its own echo-loop contract
+   that a hurried fix would break.
+2. **The test is green for the wrong reason** — the scenarios never reach the adoption rungs because the
+   fingerprint short-circuit fires. The per-scenario positive anchors above exist to detect exactly
+   this, and the mutation criterion is deliberately not relied on alone for it.
 
 ## Dependencies
 
-Depends on: `ADOPTFOOT-1` (#588, merged) for the ownership machinery being keyed correctly. Sequenced
+Depends on `ADOPTFOOT-1` (#588, merged) for the ownership machinery being keyed correctly. Sequenced
 before `ADOPTUNIQ-1`, which it de-risks but does not replace.
 
 ## Build-with
 
-Build-with: Sonnet 5, medium effort. One test file against an existing dm harness
-(`test/datamechanics/helpers.ts` + the Linear mock already used by the two adoption tests), with the
-mutation check as the real work.
+Build-with: Sonnet 5, medium effort. One test file against the existing dm harness
+(`test/datamechanics/helpers.ts`), copying the mock shape from
+`test/datamechanics/pm-sync-refusal.datamechanics.test.ts` (unique create ids) rather than from the two
+adoption tests (constant id). The real work is the anchors and the mutation, not the scenarios.
 
 ## Tier safety
 
-No tier boundary moves; no read path changes. The test seeds its own team via `seedTeam()` and asserts
-only within that `team_id`, so it cannot pass by observing another team's rows.
+No tier boundary moves; no read path changes. The test seeds its own team via `seedTeam()` and every
+assertion is scoped to that `team_id`, so it cannot pass by observing another team's rows.
