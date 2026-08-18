@@ -190,6 +190,18 @@ export interface MergeInput {
    *  uploads are always "team"; defaults to "team" (fail-safe — never widens). */
   newAccess?: "team" | "external";
   newAttendeeIds?: string[];
+  /**
+   * EVERY submitter already credited on the note being folded away, not just its `submitted_by`
+   * (MTGATT-3).
+   *
+   * The identity link ACCUMULATES submitters on a note — a calendar push folds into a transcript and
+   * both people are credited. If that note is then folded here by transcript overlap, crediting only
+   * `submitted_by` strands everyone the link had added, silently, because nothing counts submitters.
+   * MTGATT-2 recorded this as latent; MTGATT-3 is what makes it reachable, so it is closed here.
+   */
+  newSubmitterIds?: string[];
+  /** The item behind the note being folded away — its calendar identity is carried too (MTGATT-3). */
+  newSourceItemId?: string | null;
   roster: RosterPerson[];
   keys: ProviderKeys;
   /** A valid member to attribute the re-ingest to when neither note has a submitter (e.g. backfill). */
@@ -236,6 +248,9 @@ export async function mergeIntoMeetingNote(
   // body's, and the merge is silently overwritten. Keying on the surviving note id makes re-merges
   // upsert the same item.
   const mergedPath = notePath(match.noteId);
+  // BOTH sides: the keyed meeting is often the one being folded AWAY (it is the newer push), so
+  // reading only the survivor's item silently drops the key on exactly the path that motivated this.
+  const identityFrontmatter = await carriedIdentity(admin, [match.sourceItemId, input.newSourceItemId]);
   const mergedItem = await ingestItem(
     admin,
     { teamId, memberId: author, apiKeyId: randomUUID() },
@@ -246,7 +261,8 @@ export async function mergeIntoMeetingNote(
       content_sha256: sha256(merged),
       actor: "meeting-notes-merge",
       access: mergedAccess,
-      frontmatter: { title: match.title },
+      // CARRY THE CALENDAR IDENTITY (MTGATT-3) — see `carriedIdentity` for what and why.
+      frontmatter: { title: match.title, ...identityFrontmatter },
       body: merged,
     },
     mergedAccess,
@@ -276,7 +292,11 @@ export async function mergeIntoMeetingNote(
   }
 
   // Credit both submitters + union attendees from the new upload.
-  await addMeetingNoteSubmitters(admin, match.noteId, [match.primarySubmitterId, input.newSubmitterId].filter((x): x is string => !!x));
+  await addMeetingNoteSubmitters(
+    admin,
+    match.noteId,
+    [match.primarySubmitterId, input.newSubmitterId, ...(input.newSubmitterIds ?? [])].filter((x): x is string => !!x)
+  );
   if (input.newAttendeeIds?.length) await addMeetingNoteAttendees(admin, match.noteId, input.newAttendeeIds);
 
   // Refresh summary + attendees + action items on the merged text — best-effort (never fail merge).
@@ -322,6 +342,51 @@ export async function mergeIntoMeetingNote(
   });
 
   return match.noteId;
+}
+
+/** Flat frontmatter keys that carry a calendar event id, in the spellings `event-identity` accepts. */
+const EVENT_ID_KEYS = ["calendar_event_id", "calendarEventId", "event_id", "gcal_event_id"] as const;
+const UID_KEYS = ["ical_uid", "icalUID", "iCalUID"] as const;
+
+function firstString(fm: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const k of keys) {
+    const v = fm[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/**
+ * The calendar identity of the items being merged, reduced to TWO flat fields.
+ *
+ * WHY IT EXISTS. This merge writes a NEW item that replaces the ones it folds, and it used to write
+ * `{ title }` alone — so a meeting that carried an event id lost it the moment two recordings merged,
+ * and a calendar event pushed afterwards could never find it again: a second visible meeting forever,
+ * its pusher uncredited, and no refusal counted because no component ever forms.
+ *
+ * ONLY `calendar_event_id` AND `ical_uid` ARE WRITTEN, extracted from whatever spelling the source
+ * used, INCLUDING a nested `google_calendar_event`. Copying that nested object wholesale would drag a
+ * full Google event — attendees, description, conference data — onto a merge-owned item that has no
+ * business holding it. The linker reads these flat keys, so nothing is lost by narrowing.
+ *
+ * Best-effort: a failed read costs a future link (a visible duplicate), while refusing the merge here
+ * would cost the merge itself.
+ */
+async function carriedIdentity(admin: DbClient, itemIds: (string | null | undefined)[]): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const id of itemIds.filter((x): x is string => !!x)) {
+    const { data, error } = await admin.from("items").select("frontmatter").eq("id", id).maybeSingle();
+    if (error || !data) continue;
+    const fm = ((data as { frontmatter: Record<string, unknown> | null }).frontmatter ?? {}) as Record<string, unknown>;
+    const nested = fm.google_calendar_event ?? fm.calendar_event;
+    const nestedObj = nested && typeof nested === "object" ? (nested as Record<string, unknown>) : {};
+    const eventId = firstString(fm, EVENT_ID_KEYS) ?? (typeof nestedObj.id === "string" ? nestedObj.id.trim() : null);
+    const uid = firstString(fm, UID_KEYS) ?? firstString(nestedObj, UID_KEYS);
+    // First side that carries one wins; the two sides of a merge describe one meeting.
+    if (eventId && !out.calendar_event_id) out.calendar_event_id = eventId;
+    if (uid && !out.ical_uid) out.ical_uid = uid;
+  }
+  return out;
 }
 
 /** Build a fresh DuplicateMatch for a note by re-reading its (possibly just-merged) transcript. */
@@ -429,13 +494,39 @@ export async function backfillMergeDuplicateMeetings(
       for (const dup of cl.slice(1)) {
         const match = await loadMatchForNote(admin, teamId, primary.id);
         if (!match) continue;
-        const { data: att } = await admin.from("meeting_note_attendees").select("member_id").eq("meeting_note_id", dup.id);
+        const { data: att, error: attErr } = await admin
+          .from("meeting_note_attendees")
+          .select("member_id")
+          .eq("meeting_note_id", dup.id);
+        // The dup's FULL submitter set, so credit the identity link accumulated on it survives being
+        // folded again here (MTGATT-3). `authorFallbackMemberId` is deliberately NOT part of this —
+        // it is an attribution fallback for the re-ingest, never a claim that someone submitted the
+        // meeting.
+        const { data: dupSubs, error: dupSubsErr } = await admin
+          .from("meeting_note_submitters")
+          .select("member_id")
+          .eq("meeting_note_id", dup.id);
+        // The pg adapter RETURNS errors rather than throwing, so an unchecked read here would look
+        // like "this note had no submitters" and strand exactly the credit `newSubmitterIds` exists
+        // to preserve — while the merge went on to hide the note. Skip; the dup stays live and the
+        // next tick retries.
+        // BOTH reads, not just the submitters: since the identity link runs first, this dup may be
+        // carrying attendance it absorbed from a calendar event moments ago. An unchecked failure
+        // reads as "nobody attended" and the merge then hides the note — losing that credit for good.
+        //
+        // NOT MUTATION-COVERED, and said so rather than implied: forcing a read error here would mean
+        // stubbing the whole merge path, which reaches `ingestItem` and the real ingest pipeline. The
+        // equivalent checks in `link-notes.ts` ARE proven (`test/meetings-link-read-errors.test.ts`)
+        // and this mirrors them; that is the argument for it, not a test.
+        if (attErr || dupSubsErr) continue;
         try {
           await mergeIntoMeetingNote(admin, teamId, match, {
             newRawText: bodyById.get(dup.source_item_id) ?? "",
             newSubmitterId: dup.submitted_by,
             newAccess: accessById.get(dup.source_item_id) ?? "team",
             newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
+            newSubmitterIds: ((dupSubs ?? []) as { member_id: string }[]).map((r) => r.member_id),
+            newSourceItemId: dup.source_item_id,
             roster,
             keys: opts.keys,
             // Automatic path has no human actor; fall back to an active member so a pair whose
