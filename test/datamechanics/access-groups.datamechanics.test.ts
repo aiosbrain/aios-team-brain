@@ -265,6 +265,9 @@ describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
     }
     // A squatter planted directly (bypassing the writer): ensureBuiltins must fail loudly,
     // not flip it to builtin and expose its grants team-wide (the review-caught hijack).
+    // seedTeam pre-creates the builtins since PRET-4 (the invite-default write needs them) —
+    // model the pre-bootstrap team this fixture is about by removing them first.
+    await db().from("groups").delete().eq("team_id", seed.teamId).eq("is_builtin", true);
     const project = await seedProject(seed);
     const { data: squatter } = await db()
       .from("groups")

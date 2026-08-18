@@ -18,6 +18,9 @@ async function seedMember(seed: Seed, tier: "team" | "external" = "team"): Promi
     .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier, status: "active" })
     .select("id")
     .single();
+  // PRET-4 explicit state: every real member holds their builtin-posture row from creation.
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, tier);
   return data!.id as string;
 }
 async function setEnforcement(seed: Seed, mode: "permissive" | "enforcing") {
@@ -47,7 +50,7 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     expect(v.visible).toBe(true);
     const everyoneChain = v.chains.find((c) => c.group.kind === "everyone");
     expect(everyoneChain, "the path runs through the Everyone built-in").toBeDefined();
-    expect(everyoneChain!.membership.via).toBe("builtin_tier");
+    expect(everyoneChain!.membership.via).toBe("builtin"); // PRET-4: the tier-derived label is retired
     expect(everyoneChain!.unit.method).toBeTruthy();
   });
 
@@ -97,28 +100,26 @@ describe("permission inspector — explainItemVisibility (Phase B slice 6)", () 
     expect(v.chains, "no project gate is active under permissive").toEqual([]);
   });
 
-  it("the TIER conjunct is applied: an external-tier member in an ordinary group granted a TEAM-access item is NOT visible even under enforcing (Fable B6 High)", async () => {
+  it("PRET-4 (inverts Fable B6 High): an external-posture member in an ordinary group granted a TEAM-access item IS visible under enforcing — the inspector agrees with the ruling-2 read", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "t.md", body: "team-only", access: "team", project: "src" });
     const external = await seedMember(seed, "external");
     await backfillTeamContext(db(), seed.teamId);
-    // Put the external member IN the restricting ordinary group (tier-independent by design) → the
-    // oracle would grant the project, but the tier conjunct must still deny a team-access item.
+    // The external member IS in the restricting ordinary group → the oracle grants the project,
+    // and since PRET-4 the oracle ALONE decides under enforcing (the wall conjunct is retired —
+    // an inspector still applying it would report this legitimate read as invisible/leaked).
     const { projectId, groupId } = await restrictInto(seed, item.id, external);
     await setEnforcement(seed, "enforcing");
 
-    // POSITIVE CONTROL (Codex B6 Low): prove the ORACLE actually grants the project — a TEAM-tier
-    // member added to the SAME group DOES see it. So the external denial below is provably the tier
-    // conjunct, not an oracle/setup miss making the test green for the wrong reason.
     const teammate = await seedMember(seed);
     await addMemberToGroup(db(), seed.teamId, groupId, teammate, seed.memberId);
     const control = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: teammate, itemId: item.id });
-    expect(control.visible, "control: a team-tier member in the same group DOES see it (oracle grants)").toBe(true);
+    expect(control.visible, "control: a team-posture member in the same group sees it").toBe(true);
 
     const v = await explainItemVisibility(db(), { teamId: seed.teamId, memberId: external, itemId: item.id });
-    expect(v.visible, "the tier conjunct denies external→team even when the oracle grants the project").toBe(false);
-    expect(v.reason).toMatch(/tier/i);
-    void projectId;
+    expect(v.visible, "ruling 2: membership grants the read; the inspector must agree").toBe(true);
+    const chain = v.chains.find((c) => c.projectId === projectId);
+    expect(chain, "the visibility chain names the granting project").toBeDefined();
   });
 
   it("a NON-PRINCIPAL member (disabled) is NOT visible in permissive mode — the oracle can't catch it there (Codex B6 Medium)", async () => {
