@@ -86,8 +86,11 @@ describe("guard: the context-backfill leg records what it actually did", () => {
     expect(tryBody).toMatch(/trigger: "scheduler"/);
   });
 
-  it("records the three distinct facts — truncated, drained, shortCircuit — plus the resume cursor", () => {
-    for (const key of ["truncated:", "drained:", "shortCircuit:", "cursor:", "elapsedMs:"]) {
+  it("records the distinct facts — truncated, drained, elapsedMs, excludeShadows — plus the resume cursor", () => {
+    // `shortCircuit` is deliberately GONE (TICKSTALL-2 removed the heuristic it reported). It is not
+    // pinned false: a flag frozen at one value is a dead signal readers may still trust.
+    expect(tryBody, "shortCircuit was retired with the heuristic").not.toMatch(/shortCircuit/);
+    for (const key of ["truncated:", "drained:", "cursor:", "elapsedMs:", "excludeShadows:", "retractedUnits:"]) {
       expect(tryBody, `meta must carry ${key}`).toContain(key);
     }
   });
