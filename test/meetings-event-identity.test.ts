@@ -140,6 +140,24 @@ describe("eventIdentity — the conference link (diagnostic only)", () => {
     expect(key).toBe("meet.google.com/xyz-1234-abc");
   });
 
+  it("picks the video entry point even when an untyped one comes first", () => {
+    // Pins the PREFERENCE itself, not just the outcome. The earlier phone/video case passed even with
+    // the video preference disabled, because the dial-in fallback happened to land on the same entry —
+    // a layer masking the mutation of the layer above it. Here the two layers disagree, so only the
+    // preference produces this answer.
+    const key = eventIdentity({
+      google_calendar_event: {
+        conferenceData: {
+          entryPoints: [
+            { uri: "https://dial-in.example.com/room/9" },
+            { entryPointType: "video", uri: "https://meet.google.com/xyz-1234-abc" },
+          ],
+        },
+      },
+    }).conferenceKey;
+    expect(key).toBe("meet.google.com/xyz-1234-abc");
+  });
+
   it("reads Google's conferenceData.entryPoints[].uri when there is no hangoutLink", () => {
     const key = eventIdentity({
       google_calendar_event: { conferenceData: { entryPoints: [{ uri: "https://meet.google.com/xyz-1234-abc" }] } },
