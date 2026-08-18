@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { NextRequest } from "next/server";
 import { GET as itemByIdGET } from "@/app/api/v1/items/[id]/route";
+import { GET as okfGET } from "@/app/api/v1/okf-bundle/route";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 import { issueApiKey } from "@/lib/admin/keys";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
@@ -116,5 +117,100 @@ describe("ENFB-1 AC1 — GET /api/v1/items/[id] gates on membership; 404 is indi
     expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: lonely }, item.id)).toBe(false);
     // Cross-team: the probe is team-scoped — another team's principal resolves nothing for it.
     expect(await canSeeItem(db(), { teamId: other.teamId, memberId: other.memberId }, item.id)).toBe(false);
+  });
+});
+
+describe("ENFB-1 AC2 — the okf-bundle pages only membership-visible rows; §2.4 links; §2.5 cursor", () => {
+  type Node = { path: string; links: string[]; body: string | null; access: string };
+
+  async function drain(seed: Seed, memberId: string, params = ""): Promise<Node[]> {
+    const { key } = await issueApiKey(db(), seed.teamId, memberId, "okf");
+    const all: Node[] = [];
+    let cursor: string | null = null;
+    for (let i = 0; i < 12; i++) {
+      const url = `http://test/api/v1/okf-bundle?include_body=true${params}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const res = await okfGET(new Request(url, { headers: { authorization: `Bearer ${key}` } }) as unknown as NextRequest);
+      expect(res.status).toBe(200);
+      const j = (await res.json()) as { bundle: { nodes: Node[] }; next_cursor: string | null };
+      all.push(...j.bundle.nodes);
+      cursor = j.next_cursor;
+      if (!cursor) break;
+    }
+    return all;
+  }
+
+  it("a restricted item's node (path, title, body) never reaches an outsider's drain; the entitled member gets it; General flows to both", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    const restricted = await ingest(seed, { path: "okf/secret.md", body: "# Secret Codename\nrestricted prose", access: "team", project: "src" });
+    await ingest(seed, { path: "okf/open.md", body: "# Open\nopen prose", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictInto(seed, restricted.id, insider);
+
+    const out = await drain(seed, outsider);
+    expect(out.map((n) => n.path)).toContain("okf/open.md");
+    expect(JSON.stringify(out), "the restricted node must be absent for the outsider").not.toContain("okf/secret.md");
+    expect(JSON.stringify(out)).not.toContain("Secret Codename");
+
+    const ins = await drain(seed, insider);
+    expect(ins.map((n) => n.path)).toContain("okf/secret.md");
+    const secretNode = ins.find((n) => n.path === "okf/secret.md")!;
+    expect(secretNode.body, "include_body parity for the entitled member").toContain("restricted prose");
+  });
+
+  it("§2.4 three-state links in ONE fixture: dangling preserved, membership-invisible redacted, visible preserved", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    const invisible = await ingest(seed, { path: "okf/hidden-target.md", body: "target", access: "team", project: "src" });
+    await ingest(seed, { path: "okf/visible-target.md", body: "target", access: "team", project: "src" });
+    await ingest(seed, {
+      path: "okf/linker.md",
+      body: "see [a](hidden-target.md) and [b](visible-target.md) and [c](dangling-target.md)",
+      access: "team",
+      project: "src",
+    });
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictInto(seed, invisible.id, insider);
+
+    const out = await drain(seed, outsider);
+    const linker = out.find((n) => n.path === "okf/linker.md");
+    expect(linker, "the linker itself is General-visible").toBeDefined();
+    expect(linker!.links, "a dangling target is preserved").toContain("dangling-target.md");
+    expect(linker!.links, "a visible target is preserved").toContain("visible-target.md");
+    expect(linker!.links, "a membership-invisible target is redacted").not.toContain("hidden-target.md");
+
+    const ins = await drain(seed, insider);
+    expect(ins.find((n) => n.path === "okf/linker.md")!.links, "the entitled member keeps all resolvable links").toContain("hidden-target.md");
+  });
+
+  it("§2.5 cursor: >PAGE-worth of rows sharing ONE updated_at drain losslessly (small page via many single-row pages is impractical here, so the pin is the composite bound itself), and a LEGACY bare-timestamp cursor still resumes", async () => {
+    const seed = await seedTeam();
+    const member = await seedMember(seed);
+    // Three rows, one shared timestamp — with the OLD bare-ts cursor, resuming after row 1
+    // skipped rows 2-3 (strictly-greater timestamp). The composite cursor must not.
+    const a = await ingest(seed, { path: "okf/t1.md", body: "t1", access: "team", project: "src" });
+    const b = await ingest(seed, { path: "okf/t2.md", body: "t2", access: "team", project: "src" });
+    const c = await ingest(seed, { path: "okf/t3.md", body: "t3", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const shared = new Date().toISOString();
+    await db().from("items").update({ updated_at: shared }).in("id", [a.id, b.id, c.id]);
+
+    const { pageVisibleOkfItems, parseOkfCursor, formatOkfCursor } = await import("@/lib/okf/page");
+    const { ids } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: member });
+    const page1 = await pageVisibleOkfItems({ teamId: seed.teamId, visibleIds: [...ids], after: { ts: "1970-01-01T00:00:00Z", id: null }, projectId: null, externalOnly: false, limit: 2 });
+    expect(page1.length).toBe(2);
+    const cur = parseOkfCursor(formatOkfCursor(page1[1].updated_at, page1[1].id))!;
+    const page2 = await pageVisibleOkfItems({ teamId: seed.teamId, visibleIds: [...ids], after: cur, projectId: null, externalOnly: false, limit: 2 });
+    const got = [...page1, ...page2].map((r) => r.path).filter((p) => p.startsWith("okf/t"));
+    expect(new Set(got).size, "the composite keyset must drain all three same-timestamp rows").toBe(3);
+
+    // Legacy bare-timestamp cursor: strictly-after semantics still hold (rows BEFORE the shared
+    // timestamp are excluded, the shared-timestamp rows are excluded — the legacy contract).
+    const legacy = parseOkfCursor(shared)!;
+    expect(legacy.id).toBeNull();
+    const after = await pageVisibleOkfItems({ teamId: seed.teamId, visibleIds: [...ids], after: legacy, projectId: null, externalOnly: false, limit: 10 });
+    expect(after.map((r) => r.path).filter((p) => p.startsWith("okf/t")), "legacy cursor = strictly after the timestamp").toEqual([]);
   });
 });
