@@ -71,11 +71,33 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 #
 #   * temperature=0 — deployed 0.13.2 had DEFAULT_TEMPERATURE = 0; 0.29.3 has **1**. A bare
 #     LLMConfig() would silently move every extraction/dedupe/summary call to temperature-1 sampling.
-#   * small_model='gpt-4.1-nano' — LLMConfig.small_model defaults to None and the server never sets
-#     it, so ModelSize.small would fall back to the STRONG model and the brain's small-model routing
-#     (AIO-753) would stop firing while looking fine. This literal MUST equal
-#     GRAPHITI_SMALL_MODEL_MARKER in lib/llm/graph-call-kind.ts — that marker is how the proxy
-#     recognises a small call.
+#   * small_model — LLMConfig.small_model defaults to None and the server never sets it, so
+#     ModelSize.small would fall back to the STRONG model and the brain's small-model routing
+#     (AIO-753) would stop firing while looking fine.
+#
+# ── THE SMALL MODEL IS NO LONGER HARDCODED (2026-08-18) ────────────────────────────────────────────
+#
+# It reads `GRAPHITI_SMALL_MODEL` from the environment, defaulting to `gpt-4.1-nano` so an existing
+# deployment that sets nothing is byte-identical to before. A baked-in model name is a pricing
+# decision welded into an image: changing it meant a rebuild, and the image is pinned by digest and
+# gated by five build-time asserts, so nobody was going to do that to save a few dollars a month.
+#
+# On OpenRouter the cheap frontier moves faster than we rebuild. Today `qwen/qwen3.7-flash` is
+# $0.03/$0.13 per M against `gpt-4.1-nano`'s $0.10/$0.40 — ~3x cheaper for the high-volume half of
+# graph extraction, and the strong model (`MODEL_NAME`) was already an env var. This closes the
+# inconsistency: both halves of the routing pair are now configuration.
+#
+# ⚠️ WHEN USING THE BRAIN'S LLM PROXY, this value MUST equal `GRAPHITI_SMALL_MODEL_MARKER` in
+# `lib/llm/graph-call-kind.ts` — that marker is how the proxy recognises a small call and bills it to
+# the right `call_kind`. They disagree silently: routing still works, the ledger just mislabels every
+# small call as a strong one. Not applicable when Graphiti talks to a provider directly (no proxy in
+# the path, nothing reading the marker).
+#
+# ⚠️ A REASONING MODEL NEEDS OUTPUT HEADROOM. Verified on `qwen/qwen3.7-flash`: at max_tokens=900 the
+# reasoning trace consumes the whole budget and the API returns content=None, which surfaces as
+# graphiti's `EmptyResponseError` and burns all four tenacity retries. Harmless here only because
+# DEFAULT_MAX_TOKENS is 16384 (asserted below) — but do not lower that while a reasoning model is
+# configured, and prefer an `-instruct` variant if you do.
 #
 # base_url/api_key need no plumbing: the AsyncOpenAI client reads OPENAI_BASE_URL/OPENAI_API_KEY from
 # env, which the graphiti service sets. (`get_graphiti`'s post-construction `config.base_url`/
@@ -83,10 +105,11 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 # assignment is LIVE and still works.)
 RUN F=/app/graph_service/zep_graphiti.py \
  && grep -q 'super().__init__(uri, user, password, llm_client)' "$F" \
- && sed -i 's|from graphiti_core.llm_client import LLMClient  # type: ignore|from graphiti_core.llm_client import LLMClient  # type: ignore\nfrom graphiti_core.llm_client.config import LLMConfig  # type: ignore\nfrom graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient  # type: ignore|' "$F" \
- && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model="gpt-4.1-nano")))|' "$F" \
- && grep -q 'OpenAIGenericClient(config=LLMConfig(temperature=0, small_model="gpt-4.1-nano"))' "$F" \
- && grep -q 'from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient' "$F"
+ && sed -i 's|from graphiti_core.llm_client import LLMClient  # type: ignore|import os  # type: ignore\nfrom graphiti_core.llm_client import LLMClient  # type: ignore\nfrom graphiti_core.llm_client.config import LLMConfig  # type: ignore\nfrom graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient  # type: ignore|' "$F" \
+ && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or "gpt-4.1-nano")))|' "$F" \
+ && grep -q 'small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or "gpt-4.1-nano"' "$F" \
+ && grep -q 'from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient' "$F" \
+ && /app/.venv/bin/python -c "import ast; ast.parse(open('/app/graph_service/zep_graphiti.py').read()); print('patch 1 parses')"
 
 # ── PATCH 2: teach OpenAIGenericClient about ModelSize.small ───────────────────────────────────────
 #
@@ -250,6 +273,77 @@ RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/graphiti.py \
    && sha256sum "$F" | grep -q '^49ee534a1043760f9e3b58617f7853edd65e7e643a75f34f75267528cb0ec72d ' ; \
     fi \
  && grep -q 'PIPEFF-2: carry only the SAME ITEM' "$F"
+
+# ── PATCH 5: make the json_schema response_format acceptable to STRICT providers ─────────
+#
+# `_build_response_format` sends the raw `model_json_schema()` and deliberately omits `"strict": true`,
+# betting that every OpenAI-compatible provider validates a non-strict json_schema leniently. Routed
+# through OpenRouter, OpenAI and Azure intermittently do not:
+#
+#   Invalid schema for response_format 'SummarizedEntities': In context=(),
+#   'additionalProperties' is required to be supplied and to be false.
+#
+# INTERMITTENTLY is the point. OpenRouter picks a provider per request, so the identical schema 400s on
+# one call and succeeds on the next — this was observed failing on `SummarizedEntities` and, minutes
+# later, passing on the same model with the same schema. It is not reproducible on demand, so it cannot
+# be diagnosed by retrying; it has to be designed out.
+#
+# And the way it fails is the worst shape available: `POST /messages` still returns 202, so the brain
+# records a successful push, and the graph simply stays empty. Symptom to recognise before spending an
+# hour on the projector: episode count climbs, `yield: 0.00 entities/episode`, and Admin → Integrations
+# reads "episodes are flowing but the census reads zero names". Nothing in the brain is wrong.
+#
+# The patch adds `additionalProperties: false` to every object node in the schema. Lenient providers
+# ignore it, so the working path cannot regress; strict providers stop rejecting it. `json_schema` mode
+# is KEPT — switching to graphiti's `json_object` fallback was tried first and is WORSE, not merely
+# lower quality: without constrained decoding, gpt-4o returns the injected JSON *schema* back as its
+# answer instead of an instance, `ExtractedEntities(**llm_response)` raises pydantic ValidationError,
+# and PATCH 6 explains what that does to the queue. See patch-strict-schema.py for what is deliberately
+# NOT done (forcing every field into `required`).
+COPY patch-strict-schema.py /tmp/patch-strict-schema.py
+RUN F=/app/.venv/lib/python3.12/site-packages/graphiti_core/llm_client/openai_generic_client.py \
+ && /app/.venv/bin/python /tmp/patch-strict-schema.py "$F" \
+ && grep -q 'PATCH-STRICT: harden for strict providers' "$F"
+
+# Verified against a REAL graphiti prompt model, not a toy dict: `SummarizedEntities` is the exact
+# schema observed being rejected, and it has a `$defs` block, so this also pins that nested
+# definitions are hardened and not just the root.
+RUN /app/.venv/bin/python -c "import graphiti_core.llm_client.openai_generic_client as m; from graphiti_core.prompts.extract_nodes import SummarizedEntities as S; c = m.OpenAIGenericClient.__new__(m.OpenAIGenericClient); c.structured_output_mode = 'json_schema'; s = m.OpenAIGenericClient._build_response_format(c, S)['json_schema']['schema']; assert s['additionalProperties'] is False, 'root not hardened'; d = s.get('\$defs', {}); assert d and all(v.get('additionalProperties') is False for v in d.values()), 'defs not hardened'; print('patch 5 verified on a real graphiti schema')"
+
+# ── PATCH 6: one bad episode must not kill the queue ─────────────────────────────────────
+#
+# `graph_service/routers/ingest.py`'s AsyncWorker is:
+#
+#     while True:
+#         try:
+#             print(f'Got a job: ...'); job = await self.queue.get(); await job()
+#         except asyncio.CancelledError:
+#             break
+#
+# Only CancelledError is caught. ANY other exception from `job()` propagates out of `worker()`, the
+# asyncio task ends, its exception is never retrieved, and NOTHING IS LOGGED. The queue then accepts
+# episodes forever — `/messages` keeps returning 202 — and processes none of them. The whole pipeline
+# is dead and every observable surface says it is merely busy.
+#
+# This is not hypothetical: it is exactly how PATCH 5's provider-dependent 400 took the graph down.
+# A single episode whose extraction hit the strict validator raised ValidationError (which the tenacity
+# wrapper does not retry, since it is neither JSONDecodeError nor RateLimitError), and all 91 queued
+# episodes silently went nowhere.
+#
+# PATCH 5 removes that particular trigger. This removes the AMPLIFIER, which is the more valuable half:
+# any future bad episode — one malformed record, one provider hiccup, one prompt the model refuses —
+# should cost that episode, not the pipeline. The `print` also moves AFTER `queue.get()`, because
+# printing before the await makes the log claim a job was received while the worker is in fact idle,
+# which is what made the dead worker read as a busy one.
+#
+# Deliberately a bare `except Exception` with a traceback: the worker's job is to stay alive. The
+# reconcile pass (lib/graph/reconcile.ts) is what re-pushes the episode that was dropped here, so
+# swallowing it loses nothing permanently.
+COPY patch-resilient-worker.py /tmp/patch-resilient-worker.py
+RUN F=/app/graph_service/routers/ingest.py \
+ && test "$(grep -c 'except asyncio.CancelledError:' "$F")" = "1" \
+ && /app/.venv/bin/python /tmp/patch-resilient-worker.py "$F" \
+ && grep -q 'PATCH-RESILIENT-WORKER' "$F"
 
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
 #
