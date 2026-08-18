@@ -290,10 +290,22 @@ describe("PRET-5 A6 — the timeline wall drop (the §1 change)", () => {
       kind: "deliverable",
       frontmatter: { source: "git", author: "tester" },
     });
+    // A visible citer for the hand-typed task: without one the evidence-gated grouper never
+    // surfaces HT-1 for ANY viewer and the H2 absence is vacuous (its mutation survived —
+    // the one-condition-per-fixture rule caught it).
+    const gitHT = await ingest(F.seed, {
+      path: "commits/ht1.md",
+      body: `chore: hand-typed follow-up (HT-1) ${TERM_X}`,
+      access: "team",
+      project: "src",
+      kind: "deliverable",
+      frontmatter: { source: "git", author: "tester" },
+    });
     await backfillTeamContext(db(), F.seed.teamId);
     await moveMembership(F.seed, gitX.id, F.projectXId);
+    await moveMembership(F.seed, gitHT.id, F.projectXId);
     await moveMembership(F.seed, gitY.id, F.projectYId);
-    await db().from("items").update({ member_id: F.external, work_at: now, work_at_from_source: true }).in("id", [gitX.id, gitY.id]);
+    await db().from("items").update({ member_id: F.external, work_at: now, work_at_from_source: true }).in("id", [gitX.id, gitY.id, gitHT.id]);
 
     const xTaskErr = (
       await db()
