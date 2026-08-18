@@ -1,10 +1,10 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { runSql } from "@/lib/db/pg/pool";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 import { budgetExpired, contextBackfillBudgetMs } from "./backfill-budget";
 import { orderByRotation, readTeamBackfillState, type TeamBackfillState } from "./backfill-cursor";
+import { selectCandidateItemIds } from "./backfill-candidates";
 
 /**
  * §11 backfill — the "give every existing item a membership" half of the migration. For each
@@ -29,7 +29,9 @@ export interface BackfillResult {
   cursor: string | null;
 }
 
-type ItemRow = { id: string; access: "team" | "external" };
+/** Only the id is needed — `reconcileItemContext` re-reads the item. `access` was selected here
+ *  and never read. */
+type ItemRow = { id: string };
 
 export async function backfillTeamContext(
   db: DbClient,
@@ -45,21 +47,28 @@ export async function backfillTeamContext(
   const projectId = await resolveSystemProjectIds(db, teamId);
   if (!projectId.ok) return { ok: false, error: projectId.error, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
 
-  let q = db
-    .from("items")
-    .select("id, access")
-    .eq("team_id", teamId)
-    .order("id", { ascending: true })
-    .limit(batchSize);
-  if (opts.afterId) q = q.gt("id", opts.afterId);
-  // Random uuids are stable once assigned, so id-keyset covers every EXISTING row exactly once.
-  // A cutoff bounds the run to the pre-existing corpus so a concurrent insert (which the ingest
-  // hook will unit-ize itself, next slice) can't be skipped-yet-reported-drained (Codex Medium).
-  if (opts.createdBefore) q = q.lt("created_at", opts.createdBefore);
-  const { data, error } = await q;
-  if (error) return { ok: false, error: error.message, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
+  // CANDIDATES ONLY (TICKSTALL-2). This used to select every item and lean on reconcile being
+  // idempotent — ~1.3 s per item to re-confirm 2,672 finished ones in order to fix 6. The predicate
+  // lives in `backfill-candidates`; getting it wrong the "no work" way silently leaves an item
+  // visible to NOBODY, so read that file's header before touching it.
+  //
+  // Random uuids are stable once assigned, so id-keyset still covers each row at most once per pass.
+  // The cutoff still bounds the run to the pre-existing corpus so a concurrent insert (which the
+  // ingest hook partitions itself) can't be skipped-yet-reported-drained (slice-5 Codex Medium).
+  let ids: string[];
+  try {
+    const page = await selectCandidateItemIds(teamId, {
+      afterId: opts.afterId ?? null,
+      createdBefore: opts.createdBefore ?? null,
+      limit: batchSize,
+    });
+    ids = page.ids;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "candidate query failed";
+    return { ok: false, error: msg, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
+  }
 
-  const items = (data ?? []) as ItemRow[];
+  const items: ItemRow[] = ids.map((id) => ({ id }));
   let unitsCreated = 0;
   let membershipsCreated = 0;
   let scanned = 0;
@@ -93,6 +102,12 @@ async function resolveSystemProjectIds(
     .from("projects")
     .select("id, slug")
     .eq("team_id", teamId)
+    // kind='system' matches `lib/projects/context/reconcile-item`, which has carried this filter
+    // since slice 5. THIS resolver did not, so an initiative squatting the slug 'general' /
+    // 'external-shared' resolved here but was refused there — the sweep and the hook partitioning
+    // into different projects, the divergence the shared core exists to prevent. Found by the
+    // TICKSTALL-2 spec review; the candidate SQL filters on it too, so all three now agree.
+    .eq("kind", "system")
     .in("slug", [GENERAL_SLUG, EXTERNAL_SHARED_SLUG]);
   if (error) return { ok: false, error: error.message };
   const bySlug = new Map(((data ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
@@ -118,9 +133,8 @@ export interface DrainResult {
  * something else — today that is the demo bootstrap (`docker/bootstrap.mjs` post-seed, via
  * `scripts/admin.ts drain-context`; PRET-6: the enforcement flip that used to own this call is
  * retired), because a team must not serve its first read while any item still lacks a
- * membership. Deliberately has
- * NO convergence short-circuit: the count heuristic `backfillAllTeams` uses is a cheap tick
- * optimization, and a caller about to change what a whole team can see needs the real drain.
+ * membership. Deliberately has NO candidate-predicate shortcut: a caller about to decide what
+ * a whole team can see needs the real per-item drain.
  * Guard-exhaustion is reported as a FAILURE, never a silent partial (Fable M1).
  */
 export async function drainTeamContext(
@@ -149,7 +163,7 @@ export async function drainTeamContext(
   };
 }
 
-/** What one team's turn did. `truncated`, `drained` and `shortCircuit` are three DIFFERENT facts:
+/** What one team's turn did. `truncated` and `drained` are DIFFERENT facts:
  *  hit the budget / reached the end of the corpus / skipped because the convergence predicate held.
  *  An earlier draft folded them into one flag called `converged`, which lied — it meant "this call hit
  *  the budget" while any reader takes it as "this team satisfies the predicate". */
@@ -162,7 +176,6 @@ export interface TeamBackfillOutcome {
   membershipsCreated: number;
   truncated: boolean;
   drained: boolean;
-  shortCircuit: boolean;
   /** Wall-clock this team's turn consumed — the per-team number the aggregate `duration_ms` cannot
    *  give, and the one that says whether the budget is well-sized. */
   elapsedMs: number;
@@ -244,7 +257,6 @@ async function backfillOneTeamTurn(
     membershipsCreated: 0,
     truncated: false,
     drained: false,
-    shortCircuit: false,
     elapsedMs: 0,
     cursor: state.cursor,
   };
@@ -252,31 +264,16 @@ async function backfillOneTeamTurn(
   const t = { id: state.teamId };
   {
     try {
-      // Cheap convergence short-circuit — PRET-6 fixed the program's named latent bug: the old
-      // `memCount >= itemCount` compared RAW membership rows to items, so one multi-membership
-      // item could mask another item with NO membership (skipped forever, invisible under
-      // enforcing). Now the covered side counts DISTINCT partitioned ITEMS via the units join —
-      // exact (multi-membership cannot mask an uncovered item), still two aggregates. Counting
-      // CURRENT MEMBERSHIPS not units stands (slice-5 Codex HIGH: a unit whose membership
-      // creation failed must not read as covered).
-      const [{ count: itemCount }, coveredRes] = await Promise.all([
-        db.from("items").select("id", { count: "exact", head: true }).eq("team_id", t.id),
-        runSql<{ n: number }>(
-          `select count(distinct u.source_item_id)::int as n
-             from project_context_memberships m
-             join project_context_units u on u.id = m.context_unit_id
-            where m.team_id = $1 and m.valid_to is null
-              and u.unit_kind = 'item' and u.source_item_id is not null`,
-          [t.id]
-        ),
-      ]);
-      const coveredItems = coveredRes.rows[0]?.n ?? null;
-      if (typeof itemCount === "number" && typeof coveredItems === "number" && coveredItems >= itemCount) {
-        // Converged: nothing to sweep. The cursor is cleared, not preserved — a stale cursor left
-        // behind here would resume mid-corpus the next time the predicate fails and skip everything
-        // below it.
-        return { ...base, elapsedMs: o.now() - turnStartedAt, shortCircuit: true, drained: true, cursor: null };
-      }
+      // NO CONVERGENCE SHORT-CIRCUIT (TICKSTALL-2). It compared a global `items` count to a global
+      // count of all current memberships — no `decision`, no target project, no per-item grain —
+      // while the schema permits multiple current memberships per unit across projects and tests
+      // deliberately preserve initiative memberships across a move. So `memberships >= items` could
+      // be TRUE while a real candidate existed and the sweep was skipped: a pre-existing path that
+      // silently dropped work. The candidate query is the cheap check now, and it is exact.
+      //
+      // Cost, honestly: a converged team still walks its items via an index-probed anti-join, which
+      // is cost-PARITY with the two exact `count(*)`s this replaces — those were O(N) too. What
+      // collapses is the ~1.3 s-per-item reconcile loop, not the query.
       let cursor: string | null = state.cursor;
       let drained = false;
       let truncated = false;
