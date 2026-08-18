@@ -182,6 +182,40 @@ removing named people from meetings the owner has already read.
 **Falsifier for the slice:** if the backfill changes attendance on a meeting whose structured list
 agrees with what is already recorded, it is doing something other than what it claims.
 
+## 4b. What actually shipped — AC status, after review
+
+| AC | status |
+|---|---|
+| AC1 precedence | ✅ `test/meetings-attendance-source.test.ts` |
+| AC2 no-fallthrough on an unresolvable list | ✅ same file |
+| AC3 the `"[John Ellison]"` shape | ✅ same file |
+| AC4 rewritten prompt | ✅ same file (source-text pins) |
+| AC5 the reported bug | ✅ **at unit level** (`resolveAttendance` with the shipped hallucination mocked). The spec asked for data-mechanics; **not built** |
+| AC6 calendar + transcript → one note | ❌ **not delivered — the merge is DORMANT** |
+| AC7 merge never crosses dates / merged notes | ❌ deferred with AC6 |
+| AC8 backfill corrects the bad meeting, leaves correct ones | ✅ **proven on prod, dry-run**: 17 changed, **22 already correct**, and exactly `REMOVE: Abe Isleem, Fatma` on the reported meeting |
+
+**AC6/AC7 are not delivered, and the first review is why this says so.** The title comparator was
+built and tested, and I wrote in `docs/ARCHITECTURE.md` and the commit message that a calendar event
+"now folds into the transcript's note". It does not: `findDuplicateMeeting`'s only caller passes no
+title, and the path a pushed calendar event actually takes never calls it. **The tests were green over
+a feature nobody could reach** — the pin-the-call-site failure exactly. The claim is retracted
+everywhere it appeared and the comparator is labelled dormant at its definition.
+
+**Wiring it is MTGATT-2**, and it must first close two hazards the review surfaced, both of which
+*destroy* data rather than merely fail:
+
+1. Person names are not stopwords, so two different same-day meetings titled "1:1 with John" and
+   "Meeting with John" score **1.0** and would merge.
+2. The merge survivor is whichever note existed first, so a transcript arriving after its calendar
+   event folds INTO the bodyless note and **loses its body** — the inverse of §3.3's stated direction.
+
+**Also found and fixed by that review, and more dangerous than the missing feature:** the precedence
+was enforced only at create time. `mergeIntoMeetingNote` (every scheduler tick) and
+`refreshMeetingNoteExtraction` (the summary-healing script's default mode) both wrote the model's
+attendees unconditionally — so a repaired meeting would be re-polluted on the next tick. Both closed,
+and pinned by `test/guards/meeting-attendance-write-routes.test.ts`.
+
 ## 5. Deliberately not in this slice
 
 - **Non-member attendees.** `meeting_note_attendees.member_id` is NOT NULL and FKs to `members`, so

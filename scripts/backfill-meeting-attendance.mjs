@@ -52,9 +52,21 @@ function parseParticipantNames(raw) {
   return out.filter((n) => (seen.has(n.toLowerCase()) ? false : (seen.add(n.toLowerCase()), true)));
 }
 
-const norm = (s) => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+/**
+ * MUST mirror `normalizeName` in lib/meetings/llm-extract.ts EXACTLY, including the punctuation
+ * strip. An earlier version here only lowercased and collapsed whitespace, which diverges on any
+ * name carrying punctuation — and `Michael 'Porch' Contreras` is a real prod value. A name that
+ * resolves in the live path but not here would be DELETED by --apply: the script would "repair" an
+ * attendee the product considers correct.
+ */
+const norm = (s) =>
+  String(s ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-/** Mirrors `matchAttendees`: exact on display name, else an unambiguous first-name match. */
+/** Mirrors `matchAttendees` in lib/meetings/llm-extract.ts, including `normalizeName` above. */
 function matchAttendees(names, roster) {
   const byExact = new Map(roster.map((p) => [norm(p.display_name), p.id]));
   const matched = new Set();

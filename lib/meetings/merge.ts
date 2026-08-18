@@ -283,7 +283,12 @@ export async function mergeIntoMeetingNote(
   try {
     const ex = await extractFromTranscript(merged, input.roster, input.keys, undefined, { db: admin, teamId });
     if (ex.summary.trim()) await updateMeetingSummary(admin, teamId, match.noteId, ex.summary);
-    if (ex.attendeeMemberIds.length) await addMeetingNoteAttendees(admin, match.noteId, ex.attendeeMemberIds);
+    // ATTENDANCE IS NOT WRITTEN FROM THE MODEL HERE (MTGATT-1). This runs automatically on every
+    // scheduler tick via `backfillMergeDuplicateMeetings`, so writing inferred attendees would undo
+    // the repair on the next tick — the fix would appear to work and then silently revert, which is
+    // worse than never having shipped it. The summary still comes from the model; who was present
+    // does not. `input.newAttendeeIds` above is the caller's RESOLVED set and is still unioned.
+    void ex.attendeeMemberIds;
   } catch {
     // summary refresh is a bonus
   }

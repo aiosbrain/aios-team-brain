@@ -85,6 +85,15 @@ export function mergeTranscripts(a: string, b: string): string {
  * Granola derives its own ("Stephan & John — DSM-Firmenich Demo Prep + AIOS"). Requiring equality
  * would merge almost nothing; requiring a shared token would merge almost everything ("Meeting").
  *
+ * ⚠️ DORMANT — it has NO production caller yet. `findDuplicateMeeting` accepts an `incomingTitle`
+ * and uses it, but its one call site (`app/t/[team]/meetings/actions.ts`) does not pass one, and the
+ * path a pushed calendar event actually takes (`backfillMergeDuplicateMeetings`) excludes bodyless
+ * notes and never calls `findDuplicateMeeting` at all. Wiring it is MTGATT-2, which must FIRST close
+ * two hazards the review found: two different same-day meetings titled only with a person's name
+ * score 1.0 here (names are not stopwords), and the merge survivor is whichever note existed first,
+ * so a transcript arriving after its calendar event would fold INTO the bodyless note and lose its
+ * body.
+ *
  * Returns the Jaccard overlap of significant tokens, 0..1. Pure.
  */
 export function titleSimilarity(a: string, b: string): number {

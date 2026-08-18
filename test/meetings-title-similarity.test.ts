@@ -3,7 +3,11 @@ import { titleSimilarity } from "@/lib/meetings/merge-format";
 import { DEFAULT_TITLE_MERGE_THRESHOLD } from "@/lib/meetings/merge";
 
 /**
- * MTGATT-1 / AIO-962 — the comparator that lets a calendar event fold into its own transcript.
+ * MTGATT-1 / AIO-962 — the comparator that WILL let a calendar event fold into its own transcript.
+ *
+ * ⚠️ It is DORMANT: nothing in production passes a title to `findDuplicateMeeting` yet, so these tests
+ * pin a pure function and NOT a behaviour anyone gets. Wiring is MTGATT-2. Said plainly because a
+ * green suite over an unwired feature is exactly how a call site comes to be pinned by nothing.
  *
  * A calendar event has NO BODY by design, so `transcriptOverlap` cannot judge it and
  * `findDuplicateMeeting` used to skip it outright (`if (!item?.body) continue`). That is why a pushed
