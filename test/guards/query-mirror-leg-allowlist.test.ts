@@ -34,4 +34,23 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
   it("the actor leg filters entity_type to actor", () => {
     expect(SRC).toContain('.eq("entity_type", "actor")');
   });
+
+  // PRET-4 §1d — the inversion's own pins (docs/design/pret4-tier-wall-teardown.md): without
+  // these, a revert of the tier-disjunct removal goes unnoticed with every positive pin green.
+  it("PRET-4: the org-structural legs carry NO posture disjunct (the inversion holds)", () => {
+    expect(SRC, "the rels leg opens on serveOrgStructural alone").not.toMatch(
+      /isRestrictedTier\(tier\)\s*\|\|\s*!serveOrgStructural/
+    );
+    // The rels/actors gates are the bare positive form:
+    expect(SRC).toContain("const relsB = !serveOrgStructural");
+    expect(SRC).toContain("const actorsB = !serveOrgStructural");
+  });
+
+  it("PRET-4: the commitments leg keeps its exact surviving predicate (posture wall + enforcing omit)", () => {
+    expect(SRC).toMatch(/isRestrictedTier\(tier\)\s*\|\|\s*omitGraph/);
+  });
+
+  it("PRET-4: the restricted-posture permissive rels arm narrows to REPORTS_TO (no triple for the opened audience)", () => {
+    expect(SRC).toContain('enforce == null && !isRestrictedTier(tier) ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"]');
+  });
 });

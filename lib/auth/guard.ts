@@ -21,7 +21,7 @@ export async function currentMember(teamId: string): Promise<CurrentMember | nul
   const db = await serverClient();
   const { data } = await db
     .from("members")
-    .select("id, role, tier")
+    .select("id, role")
     .eq("team_id", teamId)
     .eq("auth_user_id", user.id)
     .eq("status", "active")

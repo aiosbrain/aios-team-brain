@@ -142,7 +142,7 @@ export async function authenticateApiKey(
 
   const { data: key } = await db
     .from("api_keys")
-    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, tier, status, role, display_name, email), teams(slug)")
+    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, status, role, display_name, email), teams(slug)")
     .eq("key_id", keyId)
     .maybeSingle();
 
@@ -154,7 +154,7 @@ export async function authenticateApiKey(
     return fail("bad_secret");
   }
 
-  const member = key.members as unknown as { actor_handle: string; tier: "team" | "external"; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
+  const member = key.members as unknown as { actor_handle: string; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
   if (member?.status !== "active") return fail("member_not_active");
 
   const team = key.teams as unknown as { slug: string };

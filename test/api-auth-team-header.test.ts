@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
+vi.mock("@/lib/access/posture", () => ({ resolveViewerPosture: async () => "team" }));
 vi.mock("@/lib/api/audit", () => ({ audit: h.audit }));
 vi.mock("@/lib/db/admin", () => ({
   adminClient: () => ({

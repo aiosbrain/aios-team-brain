@@ -56,16 +56,19 @@ export async function POST(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("id, tier")
+    .select("id")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
-  const { id: memberId, tier } = me as { id: string; tier: "team" | "external" };
-  if (tier !== "team") return errorResponse("forbidden", "corrections are team-tier only", 403);
+  const memberId = (me as { id: string }).id;
 
   const admin = adminClient();
+  // PRET-4 §1a: posture, not the record — the correction-write gate keys on team posture.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const tier = await resolveViewerPosture(admin, team.id, memberId);
+  if (tier !== "team") return errorResponse("forbidden", "corrections are team-posture only", 403);
 
   // Access enforcement (Phase B slice 5, spec §5.8). Resolve the member's visibility ONCE, fail
   // closed on a substrate error (→ 500), and use it for the scope + BOTH gates below.

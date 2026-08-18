@@ -33,6 +33,7 @@ vi.mock("@/lib/db/server", () => ({
   }),
 }));
 
+vi.mock("@/lib/access/posture", () => ({ resolveViewerPosture: async () => h.memberTier }));
 vi.mock("@/lib/db/admin", () => ({
   adminClient: () => ({ from: h.adminFrom }),
 }));

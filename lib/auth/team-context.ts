@@ -42,7 +42,7 @@ export const resolveTeamContext = cache(async (teamSlug: string): Promise<TeamCo
   const db = await serverClient();
   const { data } = await db
     .from("members")
-    .select("id, role, tier, display_name, status, teams(id, slug, name)")
+    .select("id, role, display_name, status, teams(id, slug, name)")
     .eq("auth_user_id", user.id)
     .neq("status", "disabled");
 

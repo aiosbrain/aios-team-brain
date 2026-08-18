@@ -3,7 +3,6 @@ import type { Metadata } from "next";
 import { ChevronLeft, Coins } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { resolveTeamContext } from "@/lib/auth/team-context";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
 import { getLlmCostBreakdown, getLedgerLifetimeUsd, getLedgerMonthUsd } from "@/lib/metrics/llm-costs";
 import { getGraphEfficiency, HEALTHY_CALLS_PER_EPISODE } from "@/lib/metrics/graph-efficiency";

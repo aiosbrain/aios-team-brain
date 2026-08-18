@@ -3,7 +3,6 @@ import { z } from "zod";
 import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { getFusedArcs } from "@/lib/graph/arc-fusion";

@@ -34,13 +34,16 @@ async function resolveAdminTeam(req: NextRequest, teamSlug: string | null) {
   if (!team) return { error: errorResponse("forbidden", "not a member of this team", 403) };
   const { data: me } = await rls
     .from("members")
-    .select("role, tier")
+    .select("id, role")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return { error: errorResponse("forbidden", "not a member of this team", 403) };
-  if (!canAccessAdmin(me as { role?: string | null; tier?: string | null })) {
+  // PRET-4 §1d: role ∧ POSTURE (membership-derived) — see lib/auth/admin-access.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(adminClient(), (team as { id: string }).id, (me as { id: string }).id);
+  if (!canAccessAdmin({ role: (me as { role?: string | null }).role, tier: posture })) {
     return { error: errorResponse("forbidden", "admin only", 403) };
   }
   return { teamId: (team as { id: string }).id };

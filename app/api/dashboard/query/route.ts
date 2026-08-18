@@ -112,7 +112,7 @@ export async function POST(req: NextRequest) {
 
   const { data: me } = await rls
     .from("members")
-    .select("id, tier, display_name, email, actor_handle")
+    .select("id, display_name, email, actor_handle")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")

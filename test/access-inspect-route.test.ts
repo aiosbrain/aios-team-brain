@@ -15,6 +15,8 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/auth/session", () => ({ getSessionUser: async () => h.user }));
+// PRET-4: the route resolves POSTURE; in this unit harness it follows the member stub's tier.
+vi.mock("@/lib/access/posture", () => ({ resolveViewerPosture: async () => h.member?.tier ?? "external" }));
 vi.mock("@/lib/db/server", () => ({
   serverClient: async () => ({
     from: (table: string) => {

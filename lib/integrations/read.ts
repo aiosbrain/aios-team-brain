@@ -73,7 +73,7 @@ export async function resolveIntegrationsAdmin(
   if (!team) return null;
   const { data: me } = await db
     .from("members")
-    .select("id, role, tier")
+    .select("id, role")
     .eq("team_id", team.id)
     .eq("auth_user_id", userId)
     .eq("status", "active")
