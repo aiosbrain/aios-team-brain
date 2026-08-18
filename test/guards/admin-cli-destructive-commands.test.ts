@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ENFORCEMENT_MODES, isEnforcementMode } from "@/lib/admin/access-enforcement";
 
 /**
  * The two admin-CLI commands whose absence forced operators into raw SQL against a production
@@ -9,7 +8,7 @@ import { ENFORCEMENT_MODES, isEnforcementMode } from "@/lib/admin/access-enforce
  * the primitive keeps its own tests green whether or not anything still calls it, and a deleted
  * `case` in a switch statement is invisible to every one of them.
  *
- *  • `set-access-enforcement` — the ONLY writer of `teams.access_enforcement` outside tests.
+ *  • (PRET-6: the flip command retired — its absence is now itself pinned below.)
  *  • `purge-items` — the ONLY caller of `purgeItemIds` outside the ingest paths, and deliberately
  *    NOT of `purgeItemsByPathPrefix`: the prefix form is team-wide and the workspace path roots are
  *    shared across projects, so exposing it on a command line would let one typo delete a team's
@@ -20,14 +19,13 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const cli = () => readFileSync(join(ROOT, "scripts", "admin.ts"), "utf8");
 
 describe("admin CLI — the destructive/one-way commands", () => {
-  it("set-access-enforcement is wired to the audited setter and is documented in USAGE", () => {
+  it("PRET-6: the flip command is GONE and the CLI still never writes teams directly", () => {
     const src = cli();
-    expect(src).toMatch(/case "set-access-enforcement":/);
-    expect(src, "must go through the lib setter, not write the column itself").toMatch(/setAccessEnforcement\s*\(/);
-    expect(src, "the CLI must not write teams.access_enforcement directly").not.toMatch(
+    expect(src, "the retired flip command must not resurface").not.toMatch(/set-access-enforcement/);
+    expect(src, "the CLI must never write the teams table directly").not.toMatch(
       /from\(\s*["']teams["']\s*\)\s*\.\s*update/
     );
-    expect(src, "an undocumented admin command may as well not exist").toMatch(/set-access-enforcement <team-slug>/);
+    expect(src, "the re-homed health check is documented").toMatch(/access-health <team-slug>/);
   });
 
   it("purge-items goes through purgeItemIds and never exposes the path-prefix purge", () => {
@@ -59,13 +57,5 @@ describe("admin CLI — the destructive/one-way commands", () => {
     ).toBeLessThan(command.indexOf("purgeItemIds("));
   });
 
-  it("the enforcement mode literals are closed — a typo can never read back as 'off'", () => {
-    // `teamEnforcesAccess` treats EVERY non-'enforcing' string as permissive, so a mode the CLI
-    // accepted but the reader doesn't recognise would look armed and be off.
-    expect([...ENFORCEMENT_MODES]).toEqual(["permissive", "enforcing"]);
-    for (const bad of ["enforce", "Enforcing", "ENFORCING", "enforcing ", "", "true", "on", "strict"]) {
-      expect(isEnforcementMode(bad), `'${bad}' must be rejected`).toBe(false);
-    }
-    for (const good of ENFORCEMENT_MODES) expect(isEnforcementMode(good)).toBe(true);
-  });
 });
+// PRET-6: the enforcement-mode literal arm retired with the flag (its subject no longer exists).
