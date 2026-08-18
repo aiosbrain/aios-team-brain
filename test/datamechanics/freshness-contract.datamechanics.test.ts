@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, visOf } from "./helpers";
 import { writeArcCache, ARC_CACHE_TTL_MS } from "@/lib/graph/arc-cache";
 import { getArcs, type NarrativeArc } from "@/lib/graph/arcs";
 import {
@@ -86,12 +86,12 @@ describe("freshness contract: a cached payload reports when it was COMPUTED (R2/
     // process-local memo keyed by (team, tier) and consults it first, so a call-then-backdate sequence
     // reads the memo and never exercises the persisted branch this test is about — the first draft of
     // this test did exactly that and passed against a `computedAt` of `now`.
-    await writeTimelineCache(db(), seed.teamId, "team", []);
+    await writeTimelineCache(db(), seed.teamId, "team", [], false, await visOf(seed));
     const ageMs = TIMELINE_TTL_MS + 60_000; // past the 5-min TTL → the stale-serve branch
     const at = new Date(Date.now() - ageMs).toISOString();
     await db().from("work_timeline_cache").update({ computed_at: at }).eq("team_id", seed.teamId);
 
-    const res = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const res = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
 
     expect(res.freshness.computedAt).toBe(Date.parse(at));
     expect(res.freshness.stale).toBe(true);
@@ -103,12 +103,12 @@ describe("freshness contract: a cached payload reports when it was COMPUTED (R2/
     // hours old; if the memo stamped its own fill time, freshness would reset to zero on every deploy —
     // the same lie, just harder to see. So the memo carries the row's `computed_at` through.
     const seed = await seedTeam();
-    await writeTimelineCache(db(), seed.teamId, "team", []);
+    await writeTimelineCache(db(), seed.teamId, "team", [], false, await visOf(seed));
     const at = new Date(Date.now() - 2 * 60_000).toISOString(); // 2 min old: inside the 5-min TTL
     await db().from("work_timeline_cache").update({ computed_at: at }).eq("team_id", seed.teamId);
 
-    await getCachedWorkTimeline(db(), seed.teamId, "team"); // fills the memo from Postgres
-    const res = await getCachedWorkTimeline(db(), seed.teamId, "team"); // …and this one is the memo hit
+    await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId); // fills the memo from Postgres
+    const res = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId); // …and this one is the memo hit
 
     expect(res.freshness.computedAt).toBe(Date.parse(at));
     expect(res.freshness.stale).toBe(false);

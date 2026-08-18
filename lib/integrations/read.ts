@@ -73,14 +73,19 @@ export async function resolveIntegrationsAdmin(
   if (!team) return null;
   const { data: me } = await db
     .from("members")
-    .select("id, role, tier")
+    .select("id, role")
     .eq("team_id", team.id)
     .eq("auth_user_id", userId)
     .eq("status", "active")
     .maybeSingle();
-  // Admin AND team-tier — the single write-side admin gate for six admin actions.ts files. An
-  // external-tier admin must not perform internal admin mutations (member mgmt, key issuance) — no
-  // RLS backstop (CLAUDE.md §5). See lib/auth/admin-access.
-  if (!me || !canAccessAdmin(me)) return null;
+  // Admin AND team-POSTURE (PRET-4 §1d) — the single write-side admin gate for six admin
+  // actions.ts files. The defense-in-depth conjunct survives with a membership input: a
+  // collaborator must not perform internal admin mutations even with a bad role write — making
+  // someone a real admin is role + deliberate everyone-enrollment, two writes. No RLS backstop
+  // (CLAUDE.md §5). See lib/auth/admin-access.
+  if (!me) return null;
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(db, team.id as string, me.id as string);
+  if (!canAccessAdmin({ role: me.role as string, tier: posture })) return null;
   return { teamId: team.id as string, memberId: me.id as string };
 }

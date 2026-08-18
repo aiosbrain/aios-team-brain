@@ -59,6 +59,12 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
+  // One-time marker-guarded materialization (PRET-4): the tick retry writes a row ONLY on
+  // failure (success is the boot log + the marker), so "no row for N hours" is its healthy
+  // steady state forever — a staleness threshold can only cry wolf; a recorded FAILURE row
+  // still reddens via the failing set. (pret3_sweep's entry lives below with main's fuller
+  // account of the class.)
+  pret4_materialize: null,
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
   // FITTED, NOT NULLED (BANNERFLAP-2) — and fitted UNIFORMLY, which is the part that matters. All
   // three sit in the deep half of the tick chain and their large gaps are THE SAME EVENT: measured to
@@ -92,6 +98,9 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // before `recordIngestRun`. It has zero rows today, so it is absent from `legs` entirely and is not
   // firing; but the first row it ever writes would age past the 3h default it would otherwise inherit
   // and pin the banner red forever on a healthy leg. That is the `doc_task_infer` class exactly.
+  // PRET-6: the auto-flip subsystem retired — prod's ingest_runs history holds auto_flip rows
+  // forever, and deleting this entry would re-inherit the 3h default and pin the banner red on
+  // a dead leg (the doc_task_infer class). HISTORICAL source: kept null, written by nothing.
   auto_flip: null,
   // Records ONLY on failure — `runPret3BootSweep`'s caller (`lib/ingest/scheduler.ts`) writes a row
   // inside `if (s.error)` plus exactly ONE `ok:true` row when it ran cleanly, and the sweep is

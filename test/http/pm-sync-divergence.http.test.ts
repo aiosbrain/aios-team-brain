@@ -21,6 +21,9 @@ async function seedAdmin(seed: Seed): Promise<{ email: string; password: string 
     status: "active",
   });
   if (error) throw new Error(`admin seed failed: ${error.message}`);
+  const { data: adminRow } = await db().from("members").select("id").eq("team_id", seed.teamId).eq("email", email).single();
+  const { placeMemberByTier } = await import("../datamechanics/helpers");
+  await placeMemberByTier(seed.teamId, (adminRow as { id: string }).id, "team");
   await adminSetPassword(email, password);
   return { email, password };
 }

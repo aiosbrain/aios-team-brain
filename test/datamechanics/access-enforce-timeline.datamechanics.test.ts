@@ -8,11 +8,11 @@ import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { createGroup, grantProjectToGroup, addMemberToGroup } from "@/lib/access/groups";
 
-// Phase B slice 4 (spec §5.8/§17-B) — the work-timeline read path through the oracle. The proofs:
-// permissive = today byte-identical (and no variant rows); enforcing = every leg carries the
-// membership filter (items in-query, tasks/decisions/meetings via their source item), served from a
-// work_timeline_cache VISIBILITY VARIANT keyed by the sorted effective-project-set hash — never
-// from the full-tier row, whose payload (titles + LLM prose) can name restricted work.
+// Phase B slice 4 (spec §5.8/§17-B), post-PRET-6 — the work-timeline read path through the
+// oracle, the only path: every leg carries the membership filter (items in-query,
+// tasks/decisions/meetings via their source item), served from a work_timeline_cache VISIBILITY
+// VARIANT keyed by the sorted effective-project-set hash — never from the legacy full-tier row,
+// whose payload (titles + LLM prose) can name restricted work.
 
 const recentIso = new Date(Date.now() - 2 * 86_400_000).toISOString();
 
@@ -39,10 +39,9 @@ async function seedMember(seed: Seed): Promise<string> {
     .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier: "team", status: "active" })
     .select("id")
     .single();
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, "team");
   return data!.id as string;
-}
-async function setEnforcement(seed: Seed, mode: "permissive" | "enforcing") {
-  await db().from("teams").update({ access_enforcement: mode }).eq("id", seed.teamId);
 }
 /** Move an item's context membership into a fresh RESTRICTED project the seed admin can see but
  *  a plain member cannot (no grant to Everyone). Returns the project id. */
@@ -67,7 +66,6 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     const outsider = await seedMember(seed); // BEFORE the backfill sweep, which converges builtin membership
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     expect(enforce, "enforcing team must yield an enforcement view").not.toBeNull();
@@ -91,7 +89,6 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
@@ -116,7 +113,6 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretT.id);
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
@@ -133,7 +129,6 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     await insertTask(seed, generalProj, { row_key: "UI-1", title: "Dashboard-made task", status: "in_progress", origin: "ui", source_item_id: null, created_by: seed.memberId });
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
@@ -152,7 +147,6 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
     await db().from("items").delete().eq("id", secretItem.id); // FK on delete set null → task.source_item_id = null
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
@@ -170,24 +164,15 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
     await db().from("items").delete().eq("id", secretItem.id); // source → null; origin stays 'ui'
-    await setEnforcement(seed, "enforcing");
 
     const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: outsider });
     const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, enforce);
     expect(JSON.stringify(days), "an adopted (origin='ui', created_by null) task must not resurface via a purged source").not.toContain("Adopted restricted title");
   });
 
-  it("permissive: the enforce view is null and the ledger is byte-identical to today", async () => {
-    const seed = await seedTeam();
-    const item = await commit(seed, "feat: anything (AIO-40)");
-    await insertTask(seed, item.projectId!, { row_key: "AIO-40", title: "Anything", source_item_id: item.id });
-    const member = await seedMember(seed);
-    const enforce = await memberEnforcement(db(), { teamId: seed.teamId, memberId: member });
-    expect(enforce, "permissive team → null view").toBeNull();
-    const plain = await getWorkTimeline(db(), seed.teamId, "team");
-    const withNull = await getWorkTimeline(db(), seed.teamId, "team", undefined, null);
-    expect(JSON.stringify(withNull)).toBe(JSON.stringify(plain));
-  });
+  // Deleted WITH its subject (PRET-6): "permissive: the enforce view is null and the ledger is
+  // byte-identical to today" — memberEnforcement now always resolves a view for a live principal,
+  // and the null-view builder arm survives only for no-principal internal callers.
 });
 
 describe("visibility-keyed timeline cache (§5.8)", () => {
@@ -204,7 +189,6 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
       payload: JSON.stringify({ v: PAYLOAD_VERSION, days: [{ date: "2026-08-12", people: [{ memberId: seed.memberId, name: "X", summary: "POISON restricted prose", tasks: [], unlinked: 0, total: 0, signals: [] }] }] }),
       computed_at: new Date().toISOString(),
     }, { onConflict: "team_id,group_key" });
-    await setEnforcement(seed, "enforcing");
 
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
     await settleTimelineRefreshes();
@@ -222,7 +206,6 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     const b = await seedMember(seed);
     const c = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await setEnforcement(seed, "enforcing");
     await getCachedWorkTimeline(db(), seed.teamId, "team", a);
     await getCachedWorkTimeline(db(), seed.teamId, "team", b);
     await settleTimelineRefreshes();
@@ -256,7 +239,6 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
       payload: JSON.stringify({ v: PAYLOAD_VERSION - 1, days: [{ date: recentIso.slice(0, 10), people: [{ memberId: seed.memberId, name: "X", summary: "SALVAGE-POISON secret prose", tasks: [], unlinked: 0, total: 0, signals: [] }] }] }),
       computed_at: new Date().toISOString(),
     }, { onConflict: "team_id,group_key" });
-    await setEnforcement(seed, "enforcing");
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", member);
     await settleTimelineRefreshes();
     expect(JSON.stringify(days), "cross-key salvage would leak tier prose into an enforced payload").not.toContain("SALVAGE-POISON");
@@ -267,7 +249,6 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     await commit(seed, "feat: purge probe (AIO-80)");
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await setEnforcement(seed, "enforcing");
     await getCachedWorkTimeline(db(), seed.teamId, "team", member); // writes a vis:team:<hash> variant
     await settleTimelineRefreshes();
     // Seed the plain tier row DIRECTLY (an enforcing read never writes it, so the "removes the tier
@@ -290,7 +271,6 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     await commit(seed, "feat: probe (ERR-1)");
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
-    await setEnforcement(seed, "enforcing");
     const { resolveTimelineEnforcement, memberVisibility } = await import("@/lib/access/enforce");
     const vis = await memberVisibility(db(), { teamId: seed.teamId, memberId: member });
     expect(vis, "enforcing team yields a visibility").not.toBeNull();
@@ -309,21 +289,12 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
     expect(rows.some((r) => r.group_key.startsWith("vis:")), "no variant row may be persisted from a failed resolution").toBe(false);
   });
 
-  it("fail closed: an enforcing team refuses a timeline read with NO principal (throw, never the tier row)", async () => {
+  it("fail closed: a timeline read with NO principal throws — the memberId==null arm is always-throw (PRET-6), never the tier row", async () => {
     const seed = await seedTeam();
-    await setEnforcement(seed, "enforcing");
     await expect(getCachedWorkTimeline(db(), seed.teamId, "team", null)).rejects.toThrow();
   });
 
-  it("permissive: a member read writes the plain tier row and NO variant (byte-identical cache behavior)", async () => {
-    const seed = await seedTeam();
-    await commit(seed, "feat: plain (AIO-90)");
-    const member = await seedMember(seed);
-    await getCachedWorkTimeline(db(), seed.teamId, "team", member);
-    await settleTimelineRefreshes();
-    const { data } = await db().from("work_timeline_cache").select("group_key").eq("team_id", seed.teamId);
-    const keys = ((data ?? []) as { group_key: string }[]).map((r) => r.group_key);
-    expect(keys).toContain("team");
-    expect(keys.some((k) => k.startsWith("vis:")), "no variant rows on a permissive team").toBe(false);
-  });
+  // Deleted WITH its subject (PRET-6): "permissive: a member read writes the plain tier row and
+  // NO variant" — the tier-row write arm is gone; a member read only ever writes vis:<hash>
+  // variants, which the first test of this describe pins positively.
 });

@@ -22,16 +22,18 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
 
   const user = await getSessionUser();
 
-  // The viewer's tier gates the decision read (audience filter) — fetch it before the
-  // query so an external principal never receives team-audience rows (no RLS backstop).
+  // The viewer's POSTURE gates the decision read (audience filter) — resolved before the
+  // query so an external-posture principal never receives team-audience rows (no RLS backstop;
+  // PRET-4 §1a: membership-derived, the members.tier record is not consulted).
   const { data: me } = await db
     .from("members")
-    .select("role, tier")
+    .select("id, role")
     .eq("team_id", team.id)
     .eq("auth_user_id", user?.id ?? "")
     .eq("status", "active")
     .maybeSingle();
-  const tier = (me?.tier as "team" | "external" | undefined) ?? "external";
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const tier = me ? await resolveViewerPosture(db, team.id, (me as { id: string }).id) : "external";
 
   const [{ data: decisions }, { data: projects }] = await Promise.all([
     visibleDecisions(

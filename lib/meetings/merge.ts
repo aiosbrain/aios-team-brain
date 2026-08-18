@@ -8,7 +8,7 @@ import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./l
 import type { LlmMeterCtx } from "@/lib/costs/llm-usage";
 import { extractAndStoreActionItems } from "./action-items";
 import { remapMeetingTodoSourceItem } from "./extract-todos";
-import { canLlmMerge, mergeTranscripts, transcriptOverlap } from "./merge-format";
+import { canLlmMerge, mergeTranscripts, transcriptOverlap, titleSimilarity } from "./merge-format";
 import {
   MEETING_NOTES_PROJECT_SLUG,
   addMeetingNoteAttendees,
@@ -102,12 +102,25 @@ export interface DuplicateMatch {
  * meeting. Returns the best match ≥ threshold, or null (also null when `occurredAt` is unknown —
  * without a date we don't auto-merge). Reads only.
  */
+/**
+ * Title overlap at or above this counts as "the same meeting" when neither side has a comparable
+ * body (MTGATT-1). Two producers name one meeting differently — Google keeps the invite subject,
+ * Granola derives its own — so this is set where the real pairs land while "Meeting with John" vs
+ * "Meeting with Sarah" (which share only stopwords) score 0.
+ */
+export const DEFAULT_TITLE_MERGE_THRESHOLD = 0.5;
+
 export async function findDuplicateMeeting(
   admin: DbClient,
   teamId: string,
   occurredAt: string | null,
   rawText: string,
-  threshold = DEFAULT_MERGE_THRESHOLD
+  threshold = DEFAULT_MERGE_THRESHOLD,
+  /**
+   * The incoming note's title. Supplied ONLY for the bodyless case (a calendar event), where text
+   * overlap cannot decide anything. Omitted, behaviour is exactly as before.
+   */
+  incomingTitle?: string
 ): Promise<DuplicateMatch | null> {
   if (!occurredAt) return null;
 
@@ -133,11 +146,25 @@ export async function findDuplicateMeeting(
   );
 
   let best: DuplicateMatch | null = null;
+  const incomingHasBody = rawText.trim().length > 0;
   for (const n of noteRows) {
     const item = itemById.get(n.source_item_id);
-    if (!item?.body) continue;
-    const overlap = transcriptOverlap(rawText, item.body);
-    if (overlap >= threshold && (!best || overlap > best.overlap)) {
+    if (!item) continue;
+
+    // TWO comparators, chosen by what evidence exists — not one comparator that silently skips.
+    //
+    // BODY-to-BODY is the original path and stays exactly as it was: two transcripts of the same
+    // conversation share text. TITLE-to-TITLE is the new one, reached only when a side has no body,
+    // which in practice means a calendar event. Before this, `if (!item?.body) continue` made that
+    // case unreachable, so a pushed calendar event could never fold into its own transcript.
+    const bothHaveBodies = incomingHasBody && !!item.body;
+    const overlap = bothHaveBodies
+      ? transcriptOverlap(rawText, item.body)
+      : incomingTitle
+        ? titleSimilarity(incomingTitle, n.title)
+        : 0;
+    const bar = bothHaveBodies ? threshold : DEFAULT_TITLE_MERGE_THRESHOLD;
+    if (overlap >= bar && (!best || overlap > best.overlap)) {
       best = {
         noteId: n.id,
         sourceItemId: n.source_item_id,
@@ -163,6 +190,18 @@ export interface MergeInput {
    *  uploads are always "team"; defaults to "team" (fail-safe — never widens). */
   newAccess?: "team" | "external";
   newAttendeeIds?: string[];
+  /**
+   * EVERY submitter already credited on the note being folded away, not just its `submitted_by`
+   * (MTGATT-3).
+   *
+   * The identity link ACCUMULATES submitters on a note — a calendar push folds into a transcript and
+   * both people are credited. If that note is then folded here by transcript overlap, crediting only
+   * `submitted_by` strands everyone the link had added, silently, because nothing counts submitters.
+   * MTGATT-2 recorded this as latent; MTGATT-3 is what makes it reachable, so it is closed here.
+   */
+  newSubmitterIds?: string[];
+  /** The item behind the note being folded away — its calendar identity is carried too (MTGATT-3). */
+  newSourceItemId?: string | null;
   roster: RosterPerson[];
   keys: ProviderKeys;
   /** A valid member to attribute the re-ingest to when neither note has a submitter (e.g. backfill). */
@@ -209,6 +248,9 @@ export async function mergeIntoMeetingNote(
   // body's, and the merge is silently overwritten. Keying on the surviving note id makes re-merges
   // upsert the same item.
   const mergedPath = notePath(match.noteId);
+  // BOTH sides: the keyed meeting is often the one being folded AWAY (it is the newer push), so
+  // reading only the survivor's item silently drops the key on exactly the path that motivated this.
+  const identityFrontmatter = await carriedIdentity(admin, [match.sourceItemId, input.newSourceItemId]);
   const mergedItem = await ingestItem(
     admin,
     { teamId, memberId: author, apiKeyId: randomUUID() },
@@ -219,7 +261,8 @@ export async function mergeIntoMeetingNote(
       content_sha256: sha256(merged),
       actor: "meeting-notes-merge",
       access: mergedAccess,
-      frontmatter: { title: match.title },
+      // CARRY THE CALENDAR IDENTITY (MTGATT-3) — see `carriedIdentity` for what and why.
+      frontmatter: { title: match.title, ...identityFrontmatter },
       body: merged,
     },
     mergedAccess,
@@ -249,14 +292,23 @@ export async function mergeIntoMeetingNote(
   }
 
   // Credit both submitters + union attendees from the new upload.
-  await addMeetingNoteSubmitters(admin, match.noteId, [match.primarySubmitterId, input.newSubmitterId].filter((x): x is string => !!x));
+  await addMeetingNoteSubmitters(
+    admin,
+    match.noteId,
+    [match.primarySubmitterId, input.newSubmitterId, ...(input.newSubmitterIds ?? [])].filter((x): x is string => !!x)
+  );
   if (input.newAttendeeIds?.length) await addMeetingNoteAttendees(admin, match.noteId, input.newAttendeeIds);
 
   // Refresh summary + attendees + action items on the merged text — best-effort (never fail merge).
   try {
     const ex = await extractFromTranscript(merged, input.roster, input.keys, undefined, { db: admin, teamId });
     if (ex.summary.trim()) await updateMeetingSummary(admin, teamId, match.noteId, ex.summary);
-    if (ex.attendeeMemberIds.length) await addMeetingNoteAttendees(admin, match.noteId, ex.attendeeMemberIds);
+    // ATTENDANCE IS NOT WRITTEN FROM THE MODEL HERE (MTGATT-1). This runs automatically on every
+    // scheduler tick via `backfillMergeDuplicateMeetings`, so writing inferred attendees would undo
+    // the repair on the next tick — the fix would appear to work and then silently revert, which is
+    // worse than never having shipped it. The summary still comes from the model; who was present
+    // does not. `input.newAttendeeIds` above is the caller's RESOLVED set and is still unioned.
+    void ex.attendeeMemberIds;
   } catch {
     // summary refresh is a bonus
   }
@@ -290,6 +342,51 @@ export async function mergeIntoMeetingNote(
   });
 
   return match.noteId;
+}
+
+/** Flat frontmatter keys that carry a calendar event id, in the spellings `event-identity` accepts. */
+const EVENT_ID_KEYS = ["calendar_event_id", "calendarEventId", "event_id", "gcal_event_id"] as const;
+const UID_KEYS = ["ical_uid", "icalUID", "iCalUID"] as const;
+
+function firstString(fm: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const k of keys) {
+    const v = fm[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/**
+ * The calendar identity of the items being merged, reduced to TWO flat fields.
+ *
+ * WHY IT EXISTS. This merge writes a NEW item that replaces the ones it folds, and it used to write
+ * `{ title }` alone — so a meeting that carried an event id lost it the moment two recordings merged,
+ * and a calendar event pushed afterwards could never find it again: a second visible meeting forever,
+ * its pusher uncredited, and no refusal counted because no component ever forms.
+ *
+ * ONLY `calendar_event_id` AND `ical_uid` ARE WRITTEN, extracted from whatever spelling the source
+ * used, INCLUDING a nested `google_calendar_event`. Copying that nested object wholesale would drag a
+ * full Google event — attendees, description, conference data — onto a merge-owned item that has no
+ * business holding it. The linker reads these flat keys, so nothing is lost by narrowing.
+ *
+ * Best-effort: a failed read costs a future link (a visible duplicate), while refusing the merge here
+ * would cost the merge itself.
+ */
+async function carriedIdentity(admin: DbClient, itemIds: (string | null | undefined)[]): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const id of itemIds.filter((x): x is string => !!x)) {
+    const { data, error } = await admin.from("items").select("frontmatter").eq("id", id).maybeSingle();
+    if (error || !data) continue;
+    const fm = ((data as { frontmatter: Record<string, unknown> | null }).frontmatter ?? {}) as Record<string, unknown>;
+    const nested = fm.google_calendar_event ?? fm.calendar_event;
+    const nestedObj = nested && typeof nested === "object" ? (nested as Record<string, unknown>) : {};
+    const eventId = firstString(fm, EVENT_ID_KEYS) ?? (typeof nestedObj.id === "string" ? nestedObj.id.trim() : null);
+    const uid = firstString(fm, UID_KEYS) ?? firstString(nestedObj, UID_KEYS);
+    // First side that carries one wins; the two sides of a merge describe one meeting.
+    if (eventId && !out.calendar_event_id) out.calendar_event_id = eventId;
+    if (uid && !out.ical_uid) out.ical_uid = uid;
+  }
+  return out;
 }
 
 /** Build a fresh DuplicateMatch for a note by re-reading its (possibly just-merged) transcript. */
@@ -397,13 +494,39 @@ export async function backfillMergeDuplicateMeetings(
       for (const dup of cl.slice(1)) {
         const match = await loadMatchForNote(admin, teamId, primary.id);
         if (!match) continue;
-        const { data: att } = await admin.from("meeting_note_attendees").select("member_id").eq("meeting_note_id", dup.id);
+        const { data: att, error: attErr } = await admin
+          .from("meeting_note_attendees")
+          .select("member_id")
+          .eq("meeting_note_id", dup.id);
+        // The dup's FULL submitter set, so credit the identity link accumulated on it survives being
+        // folded again here (MTGATT-3). `authorFallbackMemberId` is deliberately NOT part of this —
+        // it is an attribution fallback for the re-ingest, never a claim that someone submitted the
+        // meeting.
+        const { data: dupSubs, error: dupSubsErr } = await admin
+          .from("meeting_note_submitters")
+          .select("member_id")
+          .eq("meeting_note_id", dup.id);
+        // The pg adapter RETURNS errors rather than throwing, so an unchecked read here would look
+        // like "this note had no submitters" and strand exactly the credit `newSubmitterIds` exists
+        // to preserve — while the merge went on to hide the note. Skip; the dup stays live and the
+        // next tick retries.
+        // BOTH reads, not just the submitters: since the identity link runs first, this dup may be
+        // carrying attendance it absorbed from a calendar event moments ago. An unchecked failure
+        // reads as "nobody attended" and the merge then hides the note — losing that credit for good.
+        //
+        // NOT MUTATION-COVERED, and said so rather than implied: forcing a read error here would mean
+        // stubbing the whole merge path, which reaches `ingestItem` and the real ingest pipeline. The
+        // equivalent checks in `link-notes.ts` ARE proven (`test/meetings-link-read-errors.test.ts`)
+        // and this mirrors them; that is the argument for it, not a test.
+        if (attErr || dupSubsErr) continue;
         try {
           await mergeIntoMeetingNote(admin, teamId, match, {
             newRawText: bodyById.get(dup.source_item_id) ?? "",
             newSubmitterId: dup.submitted_by,
             newAccess: accessById.get(dup.source_item_id) ?? "team",
             newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
+            newSubmitterIds: ((dupSubs ?? []) as { member_id: string }[]).map((r) => r.member_id),
+            newSourceItemId: dup.source_item_id,
             roster,
             keys: opts.keys,
             // Automatic path has no human actor; fall back to an active member so a pair whose

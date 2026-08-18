@@ -116,6 +116,7 @@ export async function POST(req: NextRequest) {
           displayName: body.display_name,
           actorHandle: body.actor_handle,
           role: body.role,
+          tier: body.tier,
         },
         { actor: { kind: "member", memberId: auth.memberId } }
       );
@@ -132,7 +133,7 @@ export async function POST(req: NextRequest) {
       email,
       displayName: body.display_name,
       role: body.role,
-      tier: "team",
+      tier: body.tier,
     };
   }
 

@@ -23,10 +23,9 @@ async function seedMember(seed: Seed): Promise<string> {
     .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier: "team", status: "active" })
     .select("id")
     .single();
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, "team");
   return data!.id as string;
-}
-async function setEnforcement(seed: Seed, mode: "permissive" | "enforcing") {
-  await db().from("teams").update({ access_enforcement: mode }).eq("id", seed.teamId);
 }
 async function restrictItem(seed: Seed, itemId: string): Promise<void> {
   const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: `r-${randomUUID().slice(0, 8)}`, name: "R", kind: "initiative" }).select("id").single();
@@ -66,7 +65,6 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     const outsider = await seedMember(seed); // BEFORE backfill — it converges Everyone membership
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "enforcing");
     await seedArcCache(seed, [
       arc("general", [openItem.id]),
       arc("restricted", [secretItem.id]),
@@ -79,20 +77,6 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     expect(titles, "an arc citing ANY restricted item must not (no partial redaction)").not.toContain("arc mixed");
   });
 
-  it("permissive: the same outsider sees every arc — served through the fused built-in row (PRET-3)", async () => {
-    const seed = await seedTeam();
-    const openItem = await ingest(seed, { path: "o.md", body: "o", access: "team", project: "src" });
-    const secretItem = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "src" });
-    const outsider = await seedMember(seed);
-    await backfillTeamContext(db(), seed.teamId);
-    await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "permissive");
-    await seedArcCache(seed, [arc("general", [openItem.id]), arc("restricted", [secretItem.id])]);
-
-    const titles = await visibleArcTitles(seed, outsider);
-    expect(titles.sort()).toEqual(["arc general", "arc restricted"]);
-  });
-
   it("enforcing: a MIXED arc — one visible item + one entry whose source is restricted — is dropped (real composition, Fable B5 High)", async () => {
     const seed = await seedTeam();
     const openItem = await ingest(seed, { path: "vis.md", body: "vis", access: "team", project: "src" });
@@ -100,7 +84,6 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "enforcing");
     // Both entries carry a real itemId — one visible, one restricted. The restricted one must fail
     // the whole arc closed (evidence.every, not a filter-then-every).
     await seedArcCache(seed, [arc("mixed", [openItem.id, secretItem.id]), arc("clean", [openItem.id])]);
@@ -117,7 +100,6 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     const outsider = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
     await restrictItem(seed, secretItem.id);
-    await setEnforcement(seed, "enforcing");
     await seedArcCache(seed, [arc("visible", [openItem.id]), arc("restricted", [secretItem.id])]);
 
     // Reproduce the recompute route's gate post-PRET-3: the route reads the member's OWN
@@ -135,7 +117,6 @@ describe("enforced arc reads (Phase B slice 5)", () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "a.md", body: "a", access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
-    await setEnforcement(seed, "enforcing");
     await seedArcCache(seed, [arc("grounded", [item.id]), { ...arc("pure-graph", []), evidence: [{ fact: "ungrounded fact" }] }]);
     // The seed admin sees General, so the grounded arc stays; the ungrounded one drops for everyone.
     const titles = await visibleArcTitles(seed, seed.memberId);
@@ -148,10 +129,9 @@ describe("the arcs read serves ONLY partition rows (PCCC6B-1 property; PRET-3: f
   it("a tier-key row is structurally unreachable — present in the cache, absent from every panel", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
-    await setEnforcement(seed, "enforcing");
     // The laundering artifact: a tier row synthesized with every team correction folded in.
-    // PRE-PRET-3 this was the permissive/external serving row; now it is dead weight awaiting
-    // PRET-6 cleanup — no read path can reach a non-g: key (getArcs/getFusedArcs are g:-only by
+    // PRE-PRET-3 this was the permissive/external serving row; post-PRET-6 it is unreachable
+    // dead weight — no read path can reach a non-g: key (getArcs/getFusedArcs are g:-only by
     // signature), which is the WHOLE mechanism.
     const tierKey = [episodeGroupId(seed.teamSlug, "team"), episodeGroupId(seed.teamSlug, "external")].sort().join(",");
     await db().from("arc_cache").upsert(

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
-import { db, seedTeam, ingest, type Seed } from "./helpers";
+import { db, seedTeam, ingest, viewFor, type Seed } from "./helpers";
 
 // Spec: the Learning Timeline reads Postgres items+tasks into a day → person → (tasks + Other) ledger.
 // A task appears iff ≥1 of the person's in-window evidence references it (EVIDENCE-GATED) — empty headers
@@ -31,6 +31,20 @@ const taskStatuses = (days: TimelineDay[]): Map<string, string> =>
   new Map(days.flatMap((d) => d.people).flatMap((p) => p.tasks).map((t) => [t.title, t.status]));
 
 async function insertTask(seed: Seed, projectId: string, over: Record<string, unknown>) {
+  // PRET-6: a synced task must carry its SOURCE ITEM (production sync always writes one) or the
+  // enforced read drops it as purged-basis. Mint a timeline-inert source doc (no work time) per
+  // task, matching the task's audience so the tier-lens assertions keep their meaning.
+  if (!("source_item_id" in over)) {
+    const access = over.audience === "external" ? "external" : "team";
+    const src = await ingest(seed, {
+      kind: "deliverable",
+      path: `task-docs/${randomUUID()}.md`,
+      access: access as "team" | "external",
+      body: `task source ${String(over.row_key ?? "")}`,
+      frontmatter: { source: "linear" },
+    });
+    over = { ...over, source_item_id: src.id };
+  }
   await db()
     .from("tasks")
     .insert({ team_id: seed.teamId, project_id: projectId, title: "task", assignee: "Tester", status: "in_progress", audience: "team", origin: "sync", ...over });
@@ -61,7 +75,7 @@ describe("work timeline (real Postgres)", () => {
     await ingest(seed, { kind: "deliverable", path: `docs/${randomUUID()}.md`, access: "team", body: "d", frontmatter: { source: "github", title: "No work time" } });
     await ingest(seed, { kind: "transcript", path: `meetings/${randomUUID()}.md`, access: "team", body: "m", frontmatter: { source: "granola", source_ts: recentIso, title: "Standup" } });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(days)).toContain("Active adapter"); // active + evidence
     expect(nestedUnder(days, "Active adapter")).toContain("feat: adapter (AIO-1)");
     expect(taskTitles(days)).toContain("Backlog thing"); // referenced → heads its group, status irrelevant
@@ -83,7 +97,7 @@ describe("work timeline (real Postgres)", () => {
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-11", title: "Shipped work", status: "done" });
     await commit(seed, "feat: finish it (AIO-11)");
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(days)).toContain("Blocked work");
     expect(nestedUnder(days, "Blocked work")).toContain("wip: unblock (AIO-10)");
     // A ticket that shipped TODAY is still work someone did today — it heads its own group, and its
@@ -119,7 +133,7 @@ describe("work timeline (real Postgres)", () => {
       },
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     // The mapped replier gets the thread in THEIR day, exactly ONCE (dedup). Labelled as a REPLY: this
     // fixture records no `author_id`, and an unprovable root must not be rendered as this person's words.
     expect(evidenceTitles(days).filter((t) => t === "Replied in #eng: dual-backend rollout plan (AIO-1)")).toHaveLength(1);
@@ -166,7 +180,7 @@ describe("work timeline (real Postgres)", () => {
       },
     });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     // (a) John's opening line is NEVER presented as this member's own words.
     expect(titles).not.toContain("#eng: Hey Tester! two sizzle reels for AIO-9");
     expect(titles).toContain("Replied in #eng: Hey Tester! two sizzle reels for AIO-9");
@@ -193,7 +207,7 @@ describe("work timeline (real Postgres)", () => {
       },
     });
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(nestedUnder(days, "Rollout task")).toContain("#eng: shipping AIO-42 today");
   });
 
@@ -210,7 +224,7 @@ describe("work timeline (real Postgres)", () => {
       },
     });
 
-    const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
+    const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external")));
     expect(extTitles).not.toContain("#eng: team-only slack thread");
   });
 
@@ -228,8 +242,8 @@ describe("work timeline (real Postgres)", () => {
       body: "Public external commit PUB-9", frontmatter: { source: "git", committed_at: recentIso },
     });
 
-    const teamTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
-    const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
+    const teamTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
+    const extTitles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external")));
     expect(teamTitles).toEqual(expect.arrayContaining(["Secret team-only commit PUB-9", "Public external commit PUB-9"]));
     expect(extTitles).not.toContain("Secret team-only commit PUB-9"); // only the ITEM's tier hides it
     expect(extTitles).toContain("Public external commit PUB-9");
@@ -248,8 +262,8 @@ describe("work timeline (real Postgres)", () => {
       body: "Ten-day-old commit AIO-10", frontmatter: { source: "git", committed_at: tenDaysAgo },
     });
 
-    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"))).not.toContain("Ten-day-old commit AIO-10");
-    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", 14))).toContain("Ten-day-old commit AIO-10");
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)))).not.toContain("Ten-day-old commit AIO-10");
+    expect(evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", 14, await viewFor(seed)))).toContain("Ten-day-old commit AIO-10");
   });
 });
 
@@ -280,7 +294,7 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     await ingest(seed, { kind: "deliverable", path: `docs/future-${randomUUID()}.md`, access: "team", body: "f",
       frontmatter: { title: "Next-month plan AIO-20", date: new Date(Date.now() + 30 * 86_400_000).toISOString() } });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).toContain("Auth rollout spec AIO-20");
     expect(titles).toContain("Q3 plan AIO-20");
     expect(titles).not.toContain("Ancient doc AIO-20");
@@ -307,7 +321,7 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     await ingest(seed, { kind: "deliverable", path: `github/o-r/readme-${randomUUID()}.md`, access: "team", body: "r",
       frontmatter: { source: "github", title: "Repo readme AIO-21", committed_at: day1ago } });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).toContain("Drive doc spaced key AIO-21");
     expect(titles).toContain("Confluence doc updatedAt AIO-21");
     expect(titles).toContain("Repo readme AIO-21");
@@ -323,7 +337,7 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     await ingest(seed, { kind: "deliverable", path: `linear/aio/AIO-901-${randomUUID()}.md`, access: "team", body: "ticket prose",
       frontmatter: { source: "linear", identifier: "AIO-901", title: "Ticket description doc", source_ts: day1ago } });
 
-    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team"));
+    const titles = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed)));
     expect(titles).not.toContain("Ticket description doc");
   });
 
@@ -331,7 +345,7 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     const seed = await seedTeam();
     await ingest(seed, { kind: "deliverable", path: `notion/int-${randomUUID()}.md`, access: "team", body: "x",
       frontmatter: { source: "notion", title: "Internal notion doc", last_edited_time: new Date(Date.now() - 86_400_000).toISOString() } });
-    const ext = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external"));
+    const ext = evidenceTitles(await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external")));
     expect(ext).not.toContain("Internal notion doc");
   });
 });
@@ -350,7 +364,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     const c = await commit(seed, "feat: did the actual work AIO-30"); // A authors the commit (+ its version)
     await db().from("items").update({ member_id: (bRow as { id: string }).id }).eq("id", c.id); // pure reassign → B, no B version
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const names = days.flatMap((d) => d.people.map((p) => p.name));
     expect(names).toContain("Tester"); // A, the worker
     expect(names).not.toContain("Person B"); // B never worked → not credited
@@ -366,7 +380,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-777", title: "Ship the widget", status: "done" });
     await commit(seed, "fix: polish the widget (AIO-777)");
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(days)).toContain("Ship the widget");
     expect(nestedUnder(days, "Ship the widget")).toContain("fix: polish the widget (AIO-777)");
     // …exactly once. Since unlinked evidence is OMITTED, a status-based regression would now DELETE
@@ -383,7 +397,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-889", title: "Touched backlog item", status: "backlog" });
     await commit(seed, "chore: start on it (AIO-889)");
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(days)).not.toContain("Untouched backlog item"); // no evidence → absent
     expect(taskTitles(days)).toContain("Touched backlog item"); // evidence → present
   });
@@ -404,7 +418,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     // unlinked evidence is omitted, so there is no second surface to sidestep the check through.
     const exposed = (days: TimelineDay[]): (string | undefined)[] => taskTitles(days);
 
-    const asExternal = await getWorkTimeline(db(), seed.teamId, "external");
+    const asExternal = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     expect(exposed(asExternal)).toContain("Public ticket"); // non-vacuous: an external task DOES surface
     expect(exposed(asExternal)).not.toContain("Team secret ticket"); // NEVER leaked to an external viewer
     // The commit IS external-visible, but its only task is team-tier — so with unlinked evidence omitted
@@ -413,23 +427,26 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     expect(evidenceTitles(asExternal)).not.toContain("fix: touch the secret (SEC-99)");
     expect(evidenceTitles(asExternal)).toContain("fix: touch the public thing (PUB-1)"); // non-vacuous
 
-    const asTeam = await getWorkTimeline(db(), seed.teamId, "team");
+    const asTeam = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(exposed(asTeam)).toEqual(expect.arrayContaining(["Team secret ticket", "Public ticket"]));
   });
 
   it("SIGNAL: a decision appears in the Context lane (attributed via decided_by), never counted as work; unmatched dropped", async () => {
     const seed = await seedTeam(); // seed member display_name = "Tester"
     const anchor = await commit(seed, "seed");
+    // PRET-6: a synced decision carries its source item (the decision-log doc) or the enforced
+    // read drops it as purged-basis.
+    const decSrc = await ingest(seed, { kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "team", body: "decision log", frontmatter: { source: "workspace" } });
     const insertDecision = (over: Record<string, unknown>) =>
       db().from("decisions").insert({
         team_id: seed.teamId, project_id: anchor.projectId!, row_key: `D-${randomUUID().slice(0, 8)}`,
-        title: "decision", decided_at: recentIso.slice(0, 10), decided_by: "Tester", audience: "team", ...over,
+        title: "decision", decided_at: recentIso.slice(0, 10), decided_by: "Tester", audience: "team", source_item_id: decSrc.id, ...over,
       });
     await insertDecision({ title: "chose Postgres over the graph", decided_by: "Tester" });
     await insertDecision({ title: "a call nobody here made", decided_by: "Someone Else" }); // no roster match → dropped
     await insertDecision({ title: "an anonymous call", decided_by: "" }); // empty → dropped
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const signalTitles = days.flatMap((d) => d.people).flatMap((p) => p.signals.flatMap((g) => g.items.map((i) => i.title)));
     expect(signalTitles).toContain("chose Postgres over the graph");
     expect(signalTitles).not.toContain("a call nobody here made"); // unmatched decided_by → dropped
@@ -442,8 +459,11 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     ); // work only — signals excluded
 
     // TIER: an external viewer never gets a team-audience decision (public one DOES show — non-vacuous).
-    await insertDecision({ title: "public decision", decided_by: "Tester", audience: "external" });
-    const ext = await getWorkTimeline(db(), seed.teamId, "external");
+    // PRET-6: the wall is the SOURCE's placement — an external-audience decision's source doc is
+    // external-access, so it lands in external-shared and the external viewer's oracle admits it.
+    const extDecSrc = await ingest(seed, { kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "external", body: "public decision log", frontmatter: { source: "workspace" } });
+    await insertDecision({ title: "public decision", decided_by: "Tester", audience: "external", source_item_id: extDecSrc.id });
+    const ext = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     const extSignals = ext.flatMap((d) => d.people).flatMap((p) => p.signals.flatMap((g) => g.items.map((i) => i.title)));
     expect(extSignals).toContain("public decision");
     expect(extSignals).not.toContain("chose Postgres over the graph"); // team-audience → not leaked
@@ -459,10 +479,11 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await addMember("Tester Two"); // shares the first name "Tester" → makes bare "Tester" ambiguous
     await addMember("Dana Rivers"); // a distinct name → the unambiguous positive control
     const anchor = await commit(seed, "seed");
+    const decSrc = await ingest(seed, { kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "team", body: "decision log", frontmatter: { source: "workspace" } });
     const dec = (over: Record<string, unknown>) =>
       db().from("decisions").insert({
         team_id: seed.teamId, project_id: anchor.projectId!, row_key: `D-${randomUUID().slice(0, 8)}`,
-        title: "decision", decided_at: recentIso.slice(0, 10), decided_by: "Tester", audience: "team", ...over,
+        title: "decision", decided_at: recentIso.slice(0, 10), decided_by: "Tester", audience: "team", source_item_id: decSrc.id, ...over,
       });
     await dec({ title: "ambiguous first name", decided_by: "Tester" }); // matches Tester + Tester Two → dropped
     // A JOINT call: "Tester" is still ambiguous and contributes nothing, but Dana resolves — so the
@@ -471,7 +492,7 @@ describe("work timeline — attribution oracle (credits the worker, not the reas
     await dec({ title: "a joint call", decided_by: "Tester + Dana Rivers" });
     await dec({ title: "unambiguous", decided_by: "Dana Rivers" }); // one distinct match → attributed
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const signalTitles = days.flatMap((d) => d.people).flatMap((p) => p.signals.flatMap((g) => g.items.map((i) => i.title)));
     expect(signalTitles).not.toContain("ambiguous first name"); // ≥2 roster matches → still dropped
     expect(signalTitles).toContain("a joint call"); // the resolvable half is credited, not discarded
@@ -504,16 +525,17 @@ describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)",
   it("a commit with NO key in its message nests under the task its PR resolved to", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
+    const src900 = await ingest(seed, { kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "team", body: "task source AIO-900", frontmatter: { source: "linear" } });
     const { data: task } = await db().from("tasks").insert({
       team_id: seed.teamId, project_id: anchor.projectId!, row_key: "AIO-900", title: "Inherited task",
-      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester",
+      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester", source_item_id: src900.id,
     }).select("id").single();
     const taskId = (task as { id: string }).id;
     const fullSha = "abcdef0123456789abcdef0123456789abcdef01";
     await workEvent(seed, fullSha, taskId);
     await commitWithSha(seed, fullSha, "chore: no ticket key anywhere in this message");
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     // The task appears as a nesting header, with the key-less commit nested under it.
     expect(taskTitles(days)).toContain("Inherited task");
     expect(nestedUnder(days, "Inherited task")).toContain("chore: no ticket key anywhere in this message");
@@ -522,9 +544,12 @@ describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)",
   it("TIER: an inherited link never surfaces a task the viewer can't see", async () => {
     const seed = await seedTeam();
     const anchor = await commit(seed, "seed");
+    // The task's SOURCE is team-access — that (via the oracle), not the audience column, is
+    // what walls it from the external viewer post-PRET-6.
+    const src901 = await ingest(seed, { kind: "deliverable", path: `task-docs/${randomUUID()}.md`, access: "team", body: "task source AIO-901", frontmatter: { source: "linear" } });
     const { data: task } = await db().from("tasks").insert({
       team_id: seed.teamId, project_id: anchor.projectId!, row_key: "AIO-901", title: "Team-only inherited",
-      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester", // TEAM audience
+      status: "in_progress", origin: "sync", audience: "team", assignee: "Tester", source_item_id: src901.id,
     }).select("id").single();
     const fullSha = "bbbbbb0123456789abcdef0123456789abcdef01";
     await workEvent(seed, fullSha, (task as { id: string }).id);
@@ -534,9 +559,9 @@ describe("PR-inherited task links (the commit's key lives on the PULL REQUEST)",
       body: "chore: external-visible commit, no key", frontmatter: { source: "git", committed_at: recentIso, sha: fullSha.slice(0, 10) },
     });
 
-    const ext = await getWorkTimeline(db(), seed.teamId, "external");
+    const ext = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     expect(taskTitles(ext)).not.toContain("Team-only inherited"); // never leaked via the inherited link
-    const team = await getWorkTimeline(db(), seed.teamId, "team");
+    const team = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(team)).toContain("Team-only inherited"); // non-vacuous: the team viewer does see it
   });
 });
@@ -569,7 +594,7 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     const doc = await keylessDoc(seed, "Attribution ownership design");
     await inferredLink(seed, await taskId("AIO-500"), doc.id);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(nestedUnder(days, "Ownership timeline")).toContain("Attribution ownership design");
     const via = days.flatMap((d) => d.people).flatMap((p) => p.tasks).flatMap((t) => t.sources.flatMap((g) => g.items))
       .filter((i) => i.title === "Attribution ownership design").map((i) => i.linkVia);
@@ -590,7 +615,7 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-504", title: "Genuine task" });
     await commit(seed, "feat: real work (AIO-504)");
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(days)).not.toContain("Low confidence task");
     // …and the doc is OMITTED rather than shown taskless: a sub-threshold guess buys no visibility.
     expect(evidenceTitles(days)).not.toContain("Vaguely related doc");
@@ -606,7 +631,7 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     const doc = await keylessDoc(seed, "Design for AIO-502");
     await inferredLink(seed, await taskId("AIO-503"), doc.id);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(nestedUnder(days, "The cited task")).toContain("Design for AIO-502");
     expect(taskTitles(days)).not.toContain("The inferred task");
   });
@@ -621,10 +646,10 @@ describe("INFERRED task links (the LLM doc→task pass — the first reader of t
     await inferredLink(seed, await taskId("SEC-1"), secret.id);
     await inferredLink(seed, await taskId("PUB-2"), pub.id);
 
-    const ext = await getWorkTimeline(db(), seed.teamId, "external");
+    const ext = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     expect(taskTitles(ext)).not.toContain("Team-only task"); // never leaked
     expect(taskTitles(ext)).toContain("Public task"); // non-vacuous: the read path DOES work for external
-    const team = await getWorkTimeline(db(), seed.teamId, "team");
+    const team = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(taskTitles(team)).toEqual(expect.arrayContaining(["Team-only task", "Public task"]));
   });
 });

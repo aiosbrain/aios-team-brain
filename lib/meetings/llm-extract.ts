@@ -37,8 +37,13 @@ const SYSTEM_PROMPT =
   "specific point: a topic discussed, a decision made, a problem or blocker raised, or a next step. " +
   "Present tense, concrete, no filler or generic phrasing. Each bullet MUST start with '- ' and be " +
   "on its own line.\n" +
-  "(2) The full names of every person who appears to have attended or spoken, exactly as they're " +
-  "referred to in the text.\n" +
+  "(2) The full names of the people who were PRESENT — exactly as they're referred to in the text.\n" +
+  "A person counts as present ONLY with evidence they took part: they speak, they are spoken TO, or " +
+  "the text records them as attending.\n" +
+  "DO NOT list someone merely because they are MENTIONED. Exclude anyone talked ABOUT in the third " +
+  "person, named as absent or elsewhere, or proposed for a FUTURE meeting. For example, from " +
+  "\"it would be great to get Sam on a call one day — can we get him on Zoom?\", Sam is NOT present. " +
+  "Being a colleague, or being discussed at length, is not attendance.\n" +
   'Return ONLY a JSON object of the form {"summary":"- ...\\n- ...","attendees":["Full Name", ...]}. ' +
   "No prose outside the JSON, no markdown code fences. If you can't tell who attended, return an " +
   "empty attendees array — never guess.";
@@ -198,7 +203,9 @@ export async function extractFromTranscript(
   const empty: TranscriptExtraction = { summary: "", attendeeMemberIds: [] };
   const truncated = rawText.slice(0, MAX_TRANSCRIPT_CHARS);
   const rosterHint = roster.length
-    ? `\n\nKnown team members (for reference, not exhaustive): ${roster.map((p) => p.displayName).join(", ")}.`
+    ? `\n\nSpelling reference ONLY — these are team members, NOT a list of who attended this meeting. ` +
+      `Use it to spell a name you already decided was present; never to decide someone was present: ` +
+      `${roster.map((p) => p.displayName).join(", ")}.`
     : "";
   const raw = await callMeetingsLLM(SYSTEM_PROMPT, `Transcript:\n\n${truncated}${rosterHint}`, keys, timeoutMs, meter, "meeting-summary");
   if (!raw) return empty;

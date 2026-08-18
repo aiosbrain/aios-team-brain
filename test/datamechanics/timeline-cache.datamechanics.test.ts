@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, visOf, externalMember, type Seed } from "./helpers";
 import {
   getCachedWorkTimeline,
   settleTimelineRefreshes,
@@ -25,15 +25,23 @@ async function seedLinkedTeam(): Promise<Seed> {
     .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
     .select("id")
     .single();
+  // PRET-6: the task carries an EXTERNAL-access source doc (external-shared is visible to both
+  // viewer classes), preserving this fixture's design: the tier test fails on the ITEM's access,
+  // never on the task header being invisible.
+  const src = await ingest(seed, {
+    path: `task-docs/${randomUUID()}.md`, access: "external", body: "task source CACHE-1",
+    frontmatter: { source: "linear" },
+  });
   await db().from("tasks").insert({
     team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "CACHE-1",
     title: "Cached work", status: "in_progress", assignee: "Tester", origin: "sync", audience: "external",
+    source_item_id: src.id,
   });
   return seed;
 }
 
 async function seedCommit(seed: Seed, title: string, whenIso: string) {
-  return ingest(seed, {
+  const r = await ingest(seed, {
     path: `commits/x/${title}.md`,
     project: "commits",
     kind: "artifact",
@@ -41,16 +49,24 @@ async function seedCommit(seed: Seed, title: string, whenIso: string) {
     body: `# ${title} (CACHE-1)`,
     access: "team",
   });
+  // PRET-6: the enforced build reads item MEMBERSHIPS — converge after every ingest so a commit
+  // seeded mid-test (the SWR rebuild case) is visible to the rebuild that follows.
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  const b = await backfillTeamContext(db(), seed.teamId);
+  if (!b.ok) throw new Error(`seedCommit backfill failed: ${b.error}`);
+  return r;
 }
 
 const recentIso = () => new Date(Date.now() - 3_600_000).toISOString(); // 1h ago (in the 7-day window)
 
-async function readRow(teamId: string, tier: "team" | "external") {
+/** PRET-6: every row is a vis-variant — read the VIEWER's row (`vis:<tier>:<hash>`). */
+async function readRow(seed: Seed, tier: "team" | "external", memberId: string = seed.memberId) {
+  const vis = await visOf(seed, memberId);
   const { data } = await db()
     .from("work_timeline_cache")
     .select("group_key, payload, computed_at")
-    .eq("team_id", teamId)
-    .eq("group_key", tier)
+    .eq("team_id", seed.teamId)
+    .eq("group_key", `vis:${tier}:${vis!.visibilityHash}`)
     .maybeSingle();
   return data as { group_key: string; payload: unknown; computed_at: string | Date } | null;
 }
@@ -60,15 +76,16 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "shipped-the-thing", recentIso());
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     // The build found the commit → a day with the seed member, nested under the task it cites.
     expect(days.length).toBeGreaterThan(0);
     const people = days.flatMap((d) => d.people);
     expect(people.some((p) => p.tasks.some((t) => t.sources.some((s) => s.source === "github")))).toBe(true);
 
-    // It persisted the versioned payload { v, days } to the 'team' row, matching what was returned.
-    const row = await readRow(seed.teamId, "team");
-    expect(row?.group_key).toBe("team");
+    // It persisted the versioned payload { v, days } to the viewer's vis-variant row (PRET-6:
+    // the plain tier row is never written), matching what was returned.
+    const row = await readRow(seed, "team");
+    expect(row?.group_key).toMatch(/^vis:team:/);
     // A LITERAL, deliberately: it forces a conscious edit every time the version moves, which is the
     // moment to ask "did the payload shape or meaning change?". v10 adds `TaskGroup.assignee`, so a
     // v9 row would render a teammate's ticket as if it were the viewer's own.
@@ -79,7 +96,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     expect((row?.payload as { days: unknown[] }).days.length).toBe(days.length);
 
     // readTimelineCache round-trips it.
-    const cached = await readTimelineCache(db(), seed.teamId, "team");
+    const cached = await readTimelineCache(db(), seed.teamId, "team", await visOf(seed));
     expect(cached?.days.length).toBe(days.length);
   });
 
@@ -87,15 +104,16 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "internal-work", recentIso()); // team-tier item
 
-    const { days: teamDays } = await getCachedWorkTimeline(db(), seed.teamId, "team");
-    const { days: extDays } = await getCachedWorkTimeline(db(), seed.teamId, "external");
+    const ext = await externalMember(seed);
+    const { days: teamDays } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
+    const { days: extDays } = await getCachedWorkTimeline(db(), seed.teamId, "external", ext);
 
     expect(teamDays.length).toBeGreaterThan(0); // team viewer sees it
     expect(extDays).toEqual([]); // external viewer does NOT see team-tier work
 
-    // Two distinct rows, one per tier — the external payload is empty, the team payload is not.
-    const teamRow = await readRow(seed.teamId, "team");
-    const extRow = await readRow(seed.teamId, "external");
+    // Two distinct viewer rows — the external payload is empty, the team payload is not.
+    const teamRow = await readRow(seed, "team");
+    const extRow = await readRow(seed, "external", ext);
     expect((teamRow?.payload as { days: unknown[] }).days.length).toBeGreaterThan(0);
     expect((extRow?.payload as { days: unknown[] }).days.length).toBe(0);
   });
@@ -103,7 +121,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
   it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "commit-a", recentIso());
-    const { days: first } = await getCachedWorkTimeline(db(), seed.teamId, "team"); // cold miss → builds [A], persists
+    const { days: first } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId); // cold miss → builds [A], persists
     // Count the RENDERED evidence — task-nested only.
     const evCount = (people: { tasks: { evidenceCount: number }[] }[]): number =>
       people.reduce((n, p) => n + p.tasks.reduce((a, t) => a + t.evidenceCount, 0), 0);
@@ -121,14 +139,14 @@ describe("work-timeline cache layer (real Postgres)", () => {
     await bustTeamTimeline(db(), seed.teamId);
 
     // Next read returns the STALE payload immediately (still 1 item) and fires the background rebuild.
-    const { days: staleServe } = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const { days: staleServe } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(evCount(staleServe.flatMap((d) => d.people))).toBe(1); // served stale, not yet rebuilt
 
     // The deduped background rebuild lands the new payload (2 items) into the persisted row. Await the
     // actual in-flight promise rather than polling a timeout — the rebuild does real DB work, so a fixed
     // budget is a race, not an assertion (this failed ~1 in 3 on a loaded runner).
     await settleTimelineRefreshes();
-    const row = await readRow(seed.teamId, "team");
+    const row = await readRow(seed, "team");
     const days = ((row?.payload as { days?: { people: { tasks: { evidenceCount: number }[] }[] }[] })?.days) ?? [];
     expect(evCount(days.flatMap((d) => d.people))).toBe(2);
   });
@@ -136,11 +154,11 @@ describe("work-timeline cache layer (real Postgres)", () => {
   it("bustTeamTimeline marks the row stale (computed_at older than the TTL)", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "x", recentIso());
-    await getCachedWorkTimeline(db(), seed.teamId, "team"); // populate
+    await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId); // populate
 
-    const before = await readRow(seed.teamId, "team");
+    const before = await readRow(seed, "team");
     await bustTeamTimeline(db(), seed.teamId);
-    const after = await readRow(seed.teamId, "team");
+    const after = await readRow(seed, "team");
 
     const ms = (v: string | Date) => (v instanceof Date ? v.getTime() : Date.parse(v));
     // Stale-marked to > the 5-min TTL in the past, so the next view rebuilds behind the request.

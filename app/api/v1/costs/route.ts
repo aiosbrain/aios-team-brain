@@ -12,9 +12,13 @@ const MAX_PAYLOAD = 50_000;
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-
+  // PRET-4 §1d correction (recorded in the spec): this is the cost-INGEST write, an OPS
+  // surface — the gate stays, with POSTURE as its input (memberTier is membership-derived at
+  // the auth boundary since PRET-4; the members.tier record is not consulted). The money READ
+  // ruling (admin: company bill; member: own usage) lands on the costs page and its data
+  // functions, not here.
   if (auth.memberTier !== "team") {
-    return errorResponse("forbidden_tier", "usage costs are team-tier only", 403);
+    return errorResponse("forbidden_tier", "cost ingestion is a team-posture operation", 403);
   }
 
   const db = adminClient();

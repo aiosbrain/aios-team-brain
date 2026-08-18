@@ -1,18 +1,8 @@
--- Phase B slice 1 (spec §5/§11): the permissive→enforcing rollout flag.
--- 'permissive' (default) = reads behave EXACTLY as today (legacy tier filter only) — byte-identical,
--- so no team is affected until an admin flips it. SCOPE: this slice enforces only GET /api/v1/items
--- (member AND agent keys); query/FTS/timeline/arcs/dashboard are NOT yet gated by this flag (later
--- Phase B slices). 'enforcing' = reads apply the oracle membership
--- filter AND the legacy tier check (visibility = oracle ∧ legacy-tier, §5.6 conjunct: a bug in
--- either fails closed). A team flips to enforcing only once its §11 backfill is confirmed complete
--- (else an un-partitioned item would fail closed and vanish — the flag IS the fail-open-to-today
--- transition mechanism). Named drop-and-re-add CHECK (replay-repairable).
-
-alter table teams add column if not exists access_enforcement text not null default 'permissive';
-
-do $$
-begin
-  alter table teams drop constraint if exists teams_access_enforcement_check;
-  alter table teams add constraint teams_access_enforcement_check
-    check (access_enforcement in ('permissive','enforcing'));
-end $$;
+-- NEUTERED by PRET-6 (docs/design/pret6-retirement.md §2.1 — the replay-demands-editing rule
+-- postgres/migrations/README.md sanctions). This file originally created
+-- `teams.access_enforcement` ('permissive' default) — the Phase B rollout flag. Left as DML-free
+-- history because pg-load-schema replays every migration on every deploy: re-creating the column
+-- after 20260818210000 dropped it would re-default every team to permissive and wedge that
+-- migration's refusing precondition forever (the cold-read H1 fleet-bricker). The flag's whole
+-- life: created here (2026-08-11) → auto-flip era (PRET-2, 20260817120000) → retired
+-- (20260818210000). Enforcing is the only behavior now; membership is the sole access model.

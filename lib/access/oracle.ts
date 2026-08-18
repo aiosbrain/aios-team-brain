@@ -49,7 +49,7 @@ function empty(): VisibleSet {
 export async function visibleProjects(db: DbClient, principal: Principal): Promise<VisibleSet> {
   const { data: member } = await db
     .from("members")
-    .select("id, kind, is_connector, status, tier")
+    .select("id, kind, is_connector, status")
     .eq("team_id", principal.teamId)
     .eq("id", principal.memberId)
     .maybeSingle();
@@ -62,11 +62,9 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
     .eq("member_id", principal.memberId);
   if (gmErr) return empty(); // fail closed on read error
 
-  // Read-side tier consistency for BUILT-IN memberships (review F2): the write-side sync maps
-  // tier onto Everyone/External, but a member whose tier changed keeps the stale row until the
-  // next sync — without this filter a human downgraded team→external would keep full team
-  // visibility through Everyone. Ordinary/singleton groups are tier-independent by design.
-  const tierFor: Record<string, string> = { [EVERYONE_SLUG]: "team", [EXTERNAL_SLUG]: "external" };
+  // BUILT-IN membership acceptance — PRET-6: builtin rows are authoritative (the marker-keyed legacy conjunct retired with the
+  // permissive model — the release precondition guarantees materialization). PERMANENT checks:
+  // isBuiltinEligible (a planted non-human row never grants) and the unknown-slug fail-closed.
   const rows = (memberships ?? []) as { group_id: string; groups: { slug: string; is_builtin: boolean } | null }[];
   const groupIds = new Set(
     rows
@@ -74,15 +72,8 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
         const g = r.groups;
         if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
         if (!g.is_builtin) return true;
-        // Built-in membership is legitimate ONLY for builtin-eligible humans of the matching
-        // tier. Tier alone is not enough: a planted team-tier AGENT in Everyone would pass a
-        // tier-only check and inherit every General project (slice-2 Codex High) — agents are
-        // principals for ordinary groups, never for built-ins.
         if (!isBuiltinEligible(member)) return false;
-        const requiredTier = tierFor[g.slug];
-        // An is_builtin row with a slug outside the two known built-ins cannot be created by
-        // the writer; if one exists it is a direct write — fail closed, never "unknown = allow".
-        return requiredTier !== undefined && member.tier === requiredTier;
+        return g.slug === EVERYONE_SLUG || g.slug === EXTERNAL_SLUG;
       })
       .map((r) => r.group_id)
   );

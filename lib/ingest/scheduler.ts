@@ -4,6 +4,7 @@ import type { ImportSummary, IngestSummary } from "./run";
 import { adminClient } from "@/lib/db/admin";
 import { recordIngestRun } from "./runs";
 import { runLinearInbound } from "@/lib/pm-sync/inbound";
+import { singleFlight } from "./single-flight";
 
 /**
  * In-process poller — the single-service alternative to a separate cron worker.
@@ -62,11 +63,22 @@ export function startIngestScheduler(): void {
         await recordIngestRun(db, { teamId: null, source: "pret3_sweep", trigger: "scheduler", ok: true, startedAt: Date.now() }).catch(() => {});
       }
     }
-    // PRET-2 auto-flip: move warning-free, un-held, ready permissive teams to enforcing —
-    // sequenced AFTER bootstrap+backfill so a team's first eligible tick can flip it. Cheap
-    // stages run for every permissive team; at most PRET_FLIP_MAX_PER_TICK drains per pass
-    // (lib/admin/auto-flip-pass). Best-effort, traced when it did anything.
-    await runAutoFlip(db);
+    // PRET-4 one-time builtin materialization — the RETRY slot for the boot-time run
+    // (instrumentation.register). Marker-guarded no-op after first fleet success; sequenced
+    // early in the tick so a fresh fleet materializes before anything assesses posture.
+    {
+      const startedAt = Date.now();
+      const { materializeBuiltinMembershipOnce } = await import("@/lib/access/groups");
+      const m = await materializeBuiltinMembershipOnce(db).catch((err: unknown) => ({
+        ok: false as const,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+      if (m.ok && (m as { ran?: boolean }).ran) console.info("[ingest] pret4 builtin materialization ran (explicit posture state live)");
+      if (!m.ok) {
+        console.error("[ingest] pret4 builtin materialization FAILED:", m.error);
+        await recordIngestRun(db, { teamId: null, source: "pret4_materialize", trigger: "scheduler", ok: false, errors: [m.error ?? "unknown"], startedAt }).catch(() => {});
+      }
+    }
     // Turn freshly-synced meeting transcripts (source granola/zoom/… — never slack) into meeting
     // notes, so CLI-pushed meetings show up on the Meetings page automatically. Idempotent + cheap
     // when nothing new (finds 0 candidates → returns); best-effort, never fails the tick.
@@ -326,40 +338,6 @@ export function startIngestScheduler(): void {
   // PRET-2 (docs/design/pret2-convergence-gated-flip.md §1.2): the unattended flip pass.
   // AUTO_FLIP_ENABLED=false is the operator kill switch (the rate-limit env cannot express
   // zero) — same opt-out pattern as GRAPH_PROJECT_ENABLED.
-  async function runAutoFlip(db: ReturnType<typeof adminClient>): Promise<void> {
-    if (process.env.AUTO_FLIP_ENABLED === "false") return;
-    const startedAt = Date.now();
-    try {
-      const { runAutoFlipPass } = await import("@/lib/admin/auto-flip-pass");
-      const r = await runAutoFlipPass(db);
-      if (r.error) {
-        // The pass itself could not run (fleet enumeration failed) — record a FAILED run so the
-        // mechanism cannot stop silently (Codex M3); the fail-closed direction (nothing flipped)
-        // is already the pass's own behavior.
-        console.error("[ingest] auto-flip pass could not enumerate teams:", r.error);
-        await recordIngestRun(db, { teamId: null, source: "auto_flip", trigger: "scheduler", ok: false, errors: [r.error], startedAt });
-        return;
-      }
-      if (r.flipped.length || r.deferred.length) {
-        console.info(
-          `[ingest] auto-flip: flipped ${r.flipped.length}, deferred ${r.deferred.length} (drain attempts ${r.attempted.length})`
-        );
-        await recordIngestRun(db, {
-          teamId: null,
-          source: "auto_flip",
-          trigger: "scheduler",
-          ok: true,
-          created: r.flipped.length,
-          meta: { flipped: r.flipped, attempted: r.attempted.length, deferred: r.deferred.length },
-          startedAt,
-        });
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[ingest] auto-flip pass failed:", msg);
-      await recordIngestRun(db, { teamId: null, source: "auto_flip", trigger: "scheduler", ok: false, errors: [msg], startedAt }).catch(() => {});
-    }
-  }
 
   async function runContextBackfill(db: ReturnType<typeof adminClient>): Promise<void> {
     const startedAt = Date.now();
@@ -369,37 +347,83 @@ export function startIngestScheduler(): void {
       // Cutoff = tick start: bound this run to content that existed when the tick began, so a
       // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
       const cutoff = new Date(startedAt).toISOString();
-      const r = await backfillAllTeams(db, cutoff);
-      // Record a per-team outcome EVERY tick (success AND failure), so a team that failed once
-      // and later recovers gets a newer OK row rather than staying permanently red under
-      // distinct-on (slice-5 Codex Medium).
-      for (const teamId of r.succeeded) {
-        await recordIngestRun(db, { teamId, source: "context_backfill", trigger: "scheduler", ok: true, created: 0, startedAt });
-      }
-      for (const f of r.failed) {
-        if (f.teamId === "*") continue;
+      // BOUNDED (TICKSTALL-1). The stage used to drain to completion or not at all, which measured
+      // 57-60 min against a 30-min interval and starved every stage below it. `batchSize: 100`, not
+      // the 500 default, because the budget is checked at a BATCH boundary — a batch that has started
+      // runs to completion, so the stage's real bound is `budget + one batch` and a smaller batch
+      // keeps that overshoot near a couple of minutes instead of ~11.
+      const r = await backfillAllTeams(db, cutoff, { batchSize: 100 });
+      // Record a per-team outcome EVERY served turn (success AND failure), so a team that failed once
+      // and later recovers gets a newer OK row rather than staying permanently red under distinct-on
+      // (slice-5 Codex Medium). This row is ALSO the durable resume cursor and the rotation clock
+      // (`lib/projects/context/backfill-cursor` reads it back), which is why every turn must write one
+      // even when it did nothing: a turn that recorded nothing would never leave the front of the
+      // rotation queue.
+      //
+      // `created` and `meta` carry what the pass ACTUALLY did. They used to be hardcoded `created: 0`,
+      // so every row read identically whether the pass drained 2600 items or spun for an hour — which
+      // is precisely why a 59-minute stage ran for six days without anyone noticing.
+      for (const o of r.outcomes) {
         await recordIngestRun(db, {
-          teamId: f.teamId,
+          teamId: o.teamId,
           source: "context_backfill",
           trigger: "scheduler",
-          ok: false,
-          created: 0,
-          errors: [f.error],
+          ok: o.ok,
+          created: o.membershipsCreated,
+          errors: o.ok ? undefined : [o.error ?? "unknown"],
+          meta: {
+            scanned: o.scanned,
+            unitsCreated: o.unitsCreated,
+            membershipsCreated: o.membershipsCreated,
+            truncated: o.truncated,
+            drained: o.drained,
+            elapsedMs: o.elapsedMs,
+            cursor: o.cursor,
+          },
           startedAt,
         });
       }
-      const globalFailure = r.failed.find((f) => f.teamId === "*");
+      // DETECTION for the two states this sweep deliberately does not repair (EXCLSHADOW-1): a
+      // current `exclude` in the target project, and a `retracted` unit. Reconcile can fix neither,
+      // and the obvious prod check (items minus units) is blind to both because each HAS a unit.
+      // `null` when the count could not be taken — "unreadable" must not read as "none".
+      const { countUnrepairable } = await import("@/lib/projects/context/backfill-candidates");
+      const counts = await Promise.all(r.outcomes.map((o) => countUnrepairable(o.teamId)));
+      const readable = counts.filter((c): c is NonNullable<typeof c> => c !== null);
+      const unrepairable = readable.length === counts.length
+        ? {
+            excludeShadows: readable.reduce((n, c) => n + c.excludeShadows, 0),
+            retractedUnits: readable.reduce((n, c) => n + c.retractedUnits, 0),
+          }
+        : null;
+      const truncated = r.outcomes.filter((o) => o.truncated).length;
+      if (truncated || r.deferred.length) {
+        console.info(`[ingest] context backfill bounded by budget — ${truncated} truncated, ${r.deferred.length} deferred to the next pass`);
+      }
       // Instance-wide heartbeat under a DISTINCT source ('context_backfill_all') so a per-team
       // failed 'context_backfill' row isn't masked by the newer global ok row under distinct-on
       // (slice-5 Fable Medium — the same latent shape access_bootstrap has; tracked separately).
+      //
+      // A budget-truncated pass is NOT a failure: `ok` stays true and the fact lives in
+      // `meta.truncated`. Routing truncation through the failure path would put a healthy leg into the
+      // BANNERFLAP-1 streak and redden the banner — re-introducing the bug BANNERFLAP-2 just fixed.
       await recordIngestRun(db, {
         teamId: null,
         source: "context_backfill_all",
         trigger: "scheduler",
-        ok: !globalFailure,
-        created: 0,
-        errors: globalFailure ? [globalFailure.error] : undefined,
-        meta: { teams: r.teams, failedTeams: r.failed.length },
+        ok: !r.error,
+        created: r.outcomes.reduce((n, o) => n + o.membershipsCreated, 0),
+        errors: r.error ? [r.error] : undefined,
+        meta: {
+          teams: r.teams,
+          served: r.outcomes.length,
+          failedTeams: r.outcomes.filter((o) => !o.ok).length,
+          truncated,
+          excludeShadows: unrepairable?.excludeShadows ?? null,
+          retractedUnits: unrepairable?.retractedUnits ?? null,
+          deferred: r.deferred.length,
+          scanned: r.outcomes.reduce((n, o) => n + o.scanned, 0),
+        },
         startedAt,
       });
     } catch (err) {
@@ -497,7 +521,15 @@ export function startIngestScheduler(): void {
   }
 
   // Delay the first run so boot isn't blocked; then poll on the interval.
-  setTimeout(tick, 20_000).unref?.();
-  setInterval(tick, intervalMs).unref?.();
+  //
+  // SINGLE-FLIGHT (TICKSTALL-1). `setInterval` fires whether or not the previous tick finished, and
+  // this chain can outlast its own interval — `runContextBackfill` was measured at ~59 min against a
+  // 30-min interval, and the overlap is visible in prod as `slack` recording 13 times in 4.85h where
+  // ~9.7 is expected. Beyond the wasted work, the backfill's durable resume cursor lives in
+  // `ingest_runs.meta` with no compare-and-swap behind it, so a second in-flight pass can resurrect a
+  // superseded cursor. One pass at a time is what makes that cursor sound.
+  const guardedTick = singleFlight(tick);
+  setTimeout(guardedTick, 20_000).unref?.();
+  setInterval(guardedTick, intervalMs).unref?.();
   console.info(`[ingest] scheduler started — Slack + Plane + Linear + GitHub every ${minutes}m`);
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { sha } from "../datamechanics/helpers";
-import { BASE_URL, db, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
+import { BASE_URL, convergeTeam, db, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
 
 // HTTP edge of POST/GET /api/v1/items — the cross-the-wire path the in-process
 // data-mechanics tier bypasses. Closes the gap previously covered only by the
@@ -248,6 +248,7 @@ describe("GET /api/v1/items (HTTP) — tier filter over the wire", () => {
       });
       expect(r.status).toBe(201);
     }
+    await convergeTeam(seed); // PRET-6: the enforced read serves memberships, not bare rows
 
     const teamView = await fetch(ITEMS, { headers: keyHeaders(teamKey, seed.teamSlug) });
     expect(teamView.status).toBe(200);

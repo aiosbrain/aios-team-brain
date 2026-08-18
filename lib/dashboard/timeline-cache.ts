@@ -6,7 +6,7 @@ import { getWorkTimeline } from "./work-timeline";
 import { attachPersonDaySummaries, type SummaryPassResult } from "./timeline-summary";
 import type { TimelineDay } from "./timeline-group";
 import { freshness, type Freshness } from "@/lib/freshness";
-import { memberVisibility, resolveTimelineEnforcement, teamEnforcesAccess, type MemberVisibility } from "@/lib/access/enforce";
+import { memberVisibility, resolveTimelineEnforcement, type MemberVisibility } from "@/lib/access/enforce";
 
 /**
  * The persisted, queryable work-timeline LAYER. `lib/dashboard/work-timeline.getWorkTimeline` is the
@@ -38,7 +38,10 @@ interface TimelineView {
   tier: ViewerTier;
   vis: MemberVisibility | null;
 }
-const viewKey = (v: TimelineView): string => (v.vis ? `vis:${v.tier}:${v.vis.visibilityHash}` : v.tier);
+// The POSTURE segment is LOAD-BEARING (PRET-5 L3): since the enforcing walls dropped, two
+// members sharing a visibilityHash differ in payload ONLY by the meeting leg's posture gate —
+// a hash-only "simplification" of this key would merge postures and leak meeting evidence.
+const viewKey = (v: TimelineView): string => `vis:${v.tier}:${v.vis!.visibilityHash}`; // PRET-6: the tier-row arm retired — every read is a vis-variant
 /** Resolve the item-id set for a build. Called ONLY on a miss/rebuild — and freshly on each
  *  trailing-edge re-run, so a bust landing mid-rebuild rebuilds with the CURRENT membership set,
  *  not a frozen snapshot (Fable B4 Low). */
@@ -90,7 +93,10 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // `meeting_note_attendees`), not just the one person who pushed the transcript — plus the new optional
 // `via` key marking a submitter fallback. Both a shape change (a new key) and a meaning change (a v11
 // row keeps serving meeting-less person-days for a full TTL after deploy), so it bumps under either rule.
-export const PAYLOAD_VERSION = 12;
+// v14 (PRET-6): the permissive tier row is retired — every row is a vis-variant and the
+// posture walls are gone from the evidence legs; pre-change rows read as misses.
+// v13 (PRET-5): the enforcing build's walls went mode-keyed.
+export const PAYLOAD_VERSION = 14;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
@@ -472,9 +478,10 @@ export async function getCachedWorkTimeline(
 ): Promise<CachedTimeline> {
   let vis: MemberVisibility | null = null;
   if (memberId != null) {
-    vis = await memberVisibility(db, { teamId, memberId }); // CHEAP (projects only) — null on a permissive team
-  } else if (await teamEnforcesAccess(db, teamId)) {
-    throw new Error("timeline read without a principal on an enforcing team (fail closed)");
+    vis = await memberVisibility(db, { teamId, memberId }); // CHEAP (projects only)
+  } else {
+    // PRET-6: there is no permissive tier row anymore — a principal-less read is a caller bug.
+    throw new Error("timeline read without a principal (fail closed)");
   }
   const view: TimelineView = { tier, vis };
   const key = memKey(teamId, viewKey(view));

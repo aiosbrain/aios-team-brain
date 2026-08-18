@@ -15,8 +15,12 @@ const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 for (const route of ["app/api/v1/query/route.ts", "app/api/dashboard/query/route.ts"]) {
   describe(`enforcement wired in ${route}`, () => {
     const src = read(route);
-    it("checks the enforcement flag", () => {
-      expect(src).toMatch(/teamEnforcesAccess\s*\(/);
+    it("PRET-6 (the anti-zombie inverted pin): enforcement is constructed UNCONDITIONALLY — no flag read, no mode branch, no permissive null arm", () => {
+      // AC1's greps cannot catch a renamed mode source; this call-site pin can. The member arm
+      // must build enforce with no conditional guarding it.
+      expect(src).not.toMatch(/teamEnforcesAccess/);
+      expect(src).toContain('PRET-6: enforcing is the only behavior');
+      expect(src).toContain('principal: "member", graphProjectIds: projectIds');
     });
     it("resolves the member's visible items and passes enforce to retrieve", () => {
       expect(src).toMatch(/visibleItemIds\s*\(/);
@@ -67,10 +71,12 @@ describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5
     const recomputeAt = rc.indexOf("await recomputeArcs(");
     expect(gateAt, "the write gate must precede recomputeArcs").toBeLessThan(recomputeAt);
   });
-  it("both arc routes neutralize the response for an enforcing member whose result is empty (§5.7 — no absent-vs-invisible disclosure)", () => {
-    // main route: the team-wide diagnostic runs ONLY on a permissive team …
-    expect(read("app/api/brain/arcs/route.ts")).toMatch(/if\s*\(arcs\.length === 0 && enforce == null\)/);
-    // … and both routes return a neutral envelope on enforcing-empty.
+  it("both arc routes neutralize the response for a member whose result is empty (§5.7 — no absent-vs-invisible disclosure)", () => {
+    // PRET-6: the team-wide empty-panel DIAGNOSTIC is RETIRED with the permissive mode (it read
+    // unscoped graph/LLM health, which §5.7 forbids serving to a partitioned member) — pin its
+    // ABSENCE, not its gating.
+    expect(read("app/api/brain/arcs/route.ts")).not.toMatch(/no_facts|model_failing|synthesis_empty/);
+    // … and both routes return a neutral envelope on empty.
     expect(read("app/api/brain/arcs/route.ts")).toMatch(/enforce != null && arcs\.length === 0/);
     expect(read("app/api/brain/arcs/recompute/route.ts")).toMatch(/enforcingEmpty\s*=\s*enforce != null && arcs\.length === 0/);
   });
@@ -88,7 +94,7 @@ describe("timeline enforcement wiring (Phase B slice 4, §5.8)", () => {
     expect(src).toMatch(/getWorkTimeline\([^;]*days,\s*await\s+memberEnforcement\(/);
   });
   it("the cache layer fails closed: no principal on an enforcing team throws", () => {
-    expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal on an enforcing team/);
+    expect(read("lib/dashboard/timeline-cache.ts")).toMatch(/timeline read without a principal/); // PRET-6: always throws
   });
 });
 
@@ -105,7 +111,8 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     // here silently costs nothing today but is the field a future refactor must not drop.
     // Comment lines between the resolve and the assignment are permitted; code is not.
     expect(src).toMatch(
-      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*\}\s*;\s*\}\s*else\s+if\s*\(await\s+teamEnforcesAccess/
+      // PRET-6: the member arm is the unconditional ELSE (the flag read retired).
+      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*\}\s*;\s*\}\s*else\s*\{/
     );
     // No bare `enforce = null` assignment may exist anywhere (Codex B3 Low: the sequence regex
     // above survives a later re-null). The typed declaration (`let enforce: … | null = null`)

@@ -144,13 +144,34 @@ describe("triple intersection + scope semantics (spec §10)", () => {
   });
 });
 
+/** Curate an item's context membership into `projectId` (the §11 backfill parks everything in
+ *  General; project scope operates over MEMBERSHIPS, so scoped-visibility fixtures must move
+ *  the item the way the Phase D curation surface will — PRET-6 deleted the Phase-A project_id
+ *  proxy, so EVERY project-granted fixture goes through this now). */
+async function curateInto(seed: Seed, itemId: string, projectId: string): Promise<void> {
+  const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", itemId).single();
+  // Expire only the CURRENT membership (Fable B3 Low: without the null filter this helper
+  // rewrites valid_to on already-expired history rows — wrong when copied to real curation).
+  await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
+  const { error } = await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: projectId, context_unit_id: unit!.id, method: "manual" });
+  if (error) throw new Error(`curate failed: ${error.message}`);
+}
+async function backfill(seed: Seed): Promise<void> {
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  const r = await backfillTeamContext(db(), seed.teamId);
+  if (!r.ok) throw new Error(`backfill failed: ${r.error}`);
+}
+
 describe("the items route honors delegated tokens with the oracle filter (the ONE Phase A route)", () => {
   it("agent token sees only items in its effective projects — and inheritance is live, gain direction included", async () => {
     const seed = await seedTeam();
-    await ingest(seed, { path: "a/visible.md", body: "agent visible", access: "team", project: "agentproj" });
+    const vis = await ingest(seed, { path: "a/visible.md", body: "agent visible", access: "team", project: "agentproj" });
     await ingest(seed, { path: "b/hidden.md", body: "agent hidden", access: "team", project: "otherproj" });
+    await backfill(seed);
     const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
     const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+    // PRET-6: membership, not the ingest project_id, is what a grant serves.
+    await curateInto(seed, vis.id, bySlug.get("agentproj")!);
 
     const agent = await seedMember(seed, { kind: "agent" });
     const g = await createGroup(db(), seed.teamId, "agent-g", "G", seed.memberId);
@@ -185,6 +206,7 @@ describe("the items route honors delegated tokens with the oracle filter (the ON
   it("member keys behave exactly as before (no filter change for aios_ keys)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "m/anything.md", body: "member sees all team", access: "team" });
+    await backfill(seed);
     const { issueApiKey } = await import("@/lib/admin/keys");
     const { key } = await issueApiKey(db(), seed.teamId, seed.memberId, "k");
     const res = await itemsGET(itemsReq(key));
@@ -197,9 +219,11 @@ describe("the items route honors delegated tokens with the oracle filter (the ON
 describe("stored scope end to end (Fable H2: the []→NULL fail-open direction must have a red test)", () => {
   it("a token minted with projectScope [] sees ZERO items through the route — distinct from NULL = all granted", async () => {
     const seed = await seedTeam();
-    await ingest(seed, { path: "s/one.md", body: "scoped one", access: "team", project: "sproj" });
+    const one = await ingest(seed, { path: "s/one.md", body: "scoped one", access: "team", project: "sproj" });
+    await backfill(seed);
     const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
     const proj = ((projects ?? []) as { id: string; slug: string }[]).find((p) => p.slug === "sproj")!.id;
+    await curateInto(seed, one.id, proj);
 
     const agent = await seedMember(seed, { kind: "agent" });
     const g = await createGroup(db(), seed.teamId, "sg", "G", seed.memberId);
@@ -218,10 +242,13 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
 
   it("a token minted with projectScope [P] where the principal sees {P,Q} serves only P through the route", async () => {
     const seed = await seedTeam();
-    await ingest(seed, { path: "p/in.md", body: "in scope", access: "team", project: "pproj" });
-    await ingest(seed, { path: "q/out.md", body: "out of scope", access: "team", project: "qproj" });
+    const pin = await ingest(seed, { path: "p/in.md", body: "in scope", access: "team", project: "pproj" });
+    const qout = await ingest(seed, { path: "q/out.md", body: "out of scope", access: "team", project: "qproj" });
+    await backfill(seed);
     const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
     const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+    await curateInto(seed, pin.id, bySlug.get("pproj")!);
+    await curateInto(seed, qout.id, bySlug.get("qproj")!);
 
     const agent = await seedMember(seed, { kind: "agent" });
     const g = await createGroup(db(), seed.teamId, "pq", "G", seed.memberId);
@@ -243,10 +270,13 @@ describe("stored scope end to end (Fable H2: the []→NULL fail-open direction m
 
   it("a mixed token (agent + human on_behalf_of) through the route reads only the intersection (§14 row, route tier)", async () => {
     const seed = await seedTeam();
-    await ingest(seed, { path: "x/shared.md", body: "both", access: "team", project: "xshared" });
-    await ingest(seed, { path: "y/humanonly.md", body: "human", access: "team", project: "yhuman" });
+    const xs = await ingest(seed, { path: "x/shared.md", body: "both", access: "team", project: "xshared" });
+    const yh = await ingest(seed, { path: "y/humanonly.md", body: "human", access: "team", project: "yhuman" });
+    await backfill(seed);
     const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
     const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+    await curateInto(seed, xs.id, bySlug.get("xshared")!);
+    await curateInto(seed, yh.id, bySlug.get("yhuman")!);
 
     const agent = await seedMember(seed, { kind: "agent" });
     const ag = await createGroup(db(), seed.teamId, "ag", "A", seed.memberId);
@@ -344,20 +374,8 @@ describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (
     return ctx.sources.map((s) => s.path);
   }
 
-  /** Curate an item's context membership into `projectId` (the §11 backfill parks everything in
-   *  General; project scope operates over MEMBERSHIPS, so scoped-visibility fixtures must move
-   *  the item the way the Phase D curation surface will). */
-  async function curateInto(seed: Seed, itemId: string, projectId: string): Promise<void> {
-    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", itemId).single();
-    // Expire only the CURRENT membership (Fable B3 Low: without the null filter this helper
-    // rewrites valid_to on already-expired history rows — wrong when copied to real curation).
-    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
-    const { error } = await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: projectId, context_unit_id: unit!.id, method: "manual" });
-    if (error) throw new Error(`curate failed: ${error.message}`);
-  }
-
-  it("on a PERMISSIVE team, a scoped token retrieves ONLY its effective set — the flag is the member rollout control, not the delegation gate", async () => {
-    const seed = await seedTeam(); // access_enforcement defaults to 'permissive'
+  it("a scoped token retrieves ONLY its effective set — delegation is attenuated regardless of any member's own visibility", async () => {
+    const seed = await seedTeam();
     const inScope = await ingest(seed, { path: "a/in-scope.md", body: `in ${TERM}`, access: "team", project: "agentproj" });
     const outScope = await ingest(seed, { path: "b/out-of-scope.md", body: `out ${TERM}`, access: "team", project: "otherproj" });
     await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
@@ -405,11 +423,13 @@ describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (
     expect(got).toEqual([]);
   });
 
-  it("graph legs are omitted for a delegated principal EVEN on a permissive team (§5.8b — the mirrors are unpartitioned until C)", async () => {
+  it("org-structural graph legs are omitted for a delegated principal — while a member read serves them (§5.8b; PRET-6: one mode, and the commitment control retired with the QMIR allowlist)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "gq/x.md", body: `gq ${TERM}`, access: "team", project: "gqproj" });
-    await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);
-    await db().from("graph_entities").insert({ team_id: seed.teamId, entity_id: `c-${randomUUID().slice(0, 8)}`, entity_type: "commitment", name: "ship the delegated widget", attrs: { status: "open" } });
+    await backfill(seed);
+    // The QMIR served allowlist is actors + REPORTS_TO — so the LIVE-leg control plants an actor
+    // (the old commitment control died with the allowlist: commitments serve NOBODY now).
+    await db().from("graph_entities").insert({ team_id: seed.teamId, entity_id: `member:delegated-ctl`, entity_type: "actor", name: "Delegated Control Actor", attrs: { role: "eng" } });
     const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
     const gqproj = ((projects ?? []) as { id: string; slug: string }[]).find((p) => p.slug === "gqproj")!.id;
     const agent = await seedMember(seed, { kind: "agent" });
@@ -417,16 +437,18 @@ describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (
     await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
     await grantProjectToGroup(db(), seed.teamId, gqproj, g.groupId!, seed.memberId);
 
-    // Permissive member retrieval SEES the commitment (control: the leg is live)…
+    // A MEMBER retrieval sees the actor roster (control: the leg is live)…
     const { retrieve } = await import("@/lib/query/retrieve");
-    const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
-    expect(permissive.structured, "control: the graph leg serves members under permissive").toContain("ship the delegated widget");
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    const memberIds = await visibleItemIds(db(), { teamId: seed.teamId, memberId: seed.memberId });
+    const asMember = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, { visibleItemIds: memberIds.ids, principal: "member" });
+    expect(asMember.structured, "control: the org-structural leg serves members").toContain("Delegated Control Actor");
 
-    // …but the delegated principal must never get it, permissive or not.
+    // …but the delegated principal must never get it.
     const { delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     const { ids } = await delegatedVisibleItemIds(db(), { teamId: seed.teamId, memberId: agent, onBehalfOf: null, projectScope: null });
-    const delegated = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, { visibleItemIds: ids });
-    expect(delegated.structured, "graph legs must be OMITTED for every aiosd_ principal").not.toContain("ship the delegated widget");
+    const delegated = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, { visibleItemIds: ids, principal: "token" });
+    expect(delegated.structured, "org-structural legs must be OMITTED for every aiosd_ principal").not.toContain("Delegated Control Actor");
   });
 
   it("a mixed token (agent launcher + human on_behalf_of) retrieves only the intersection", async () => {

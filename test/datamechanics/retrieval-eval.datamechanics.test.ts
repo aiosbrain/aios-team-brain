@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, type Seed, memberRetrieveEnforce } from "./helpers";
 
 /**
  * Retrieval-quality EVAL HARNESS (context-management, Organ 3). A deterministic recall benchmark:
@@ -75,7 +75,7 @@ const OVERALL_RECALL_BASELINE = 6 / 9;
 let seed: Seed;
 
 async function pathsFor(question: string): Promise<string[]> {
-  const ctx = await retrieve(db(), seed.teamId, "team", question);
+  const ctx = await retrieve(db(), seed.teamId, "team", question, null, await memberRetrieveEnforce(seed));
   return ctx.sources.map((s) => s.path);
 }
 

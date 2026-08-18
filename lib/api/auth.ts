@@ -142,7 +142,7 @@ export async function authenticateApiKey(
 
   const { data: key } = await db
     .from("api_keys")
-    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, tier, status, role, display_name, email), teams(slug)")
+    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, status, role, display_name, email), teams(slug)")
     .eq("key_id", keyId)
     .maybeSingle();
 
@@ -154,7 +154,7 @@ export async function authenticateApiKey(
     return fail("bad_secret");
   }
 
-  const member = key.members as unknown as { actor_handle: string; tier: "team" | "external"; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
+  const member = key.members as unknown as { actor_handle: string; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
   if (member?.status !== "active") return fail("member_not_active");
 
   const team = key.teams as unknown as { slug: string };
@@ -167,10 +167,23 @@ export async function authenticateApiKey(
   // route opts out and persists this marker synchronously as its explicit contract.
   if (recordUsage) void markApiKeyUsed(key.id);
 
+  // PRET-4 §1a: the VALUE every downstream consumer receives as `memberTier` is POSTURE —
+  // membership in the everyone built-in — not the members.tier record. Same vocabulary, so
+  // every consumer survives verbatim; the source is now explicit membership state. A resolver
+  // error fails the request closed (auth returns null → 401), never a silent widen/narrow.
+  let posture: "team" | "external";
+  try {
+    const { resolveViewerPosture } = await import("@/lib/access/posture");
+    posture = await resolveViewerPosture(db, key.team_id, key.member_id);
+  } catch (e) {
+    console.error("[auth] posture resolution failed:", e instanceof Error ? e.message : e);
+    return fail("posture_unresolvable");
+  }
+
   return {
     teamId: key.team_id,
     memberId: key.member_id,
-    memberTier: member.tier,
+    memberTier: posture,
     memberRole: member.role,
     apiKeyId: key.id,
     actorHandle: member.actor_handle,

@@ -74,11 +74,15 @@ export default async function TeamLayout({
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
       <aside className="frosted sticky top-0 flex h-dvh w-60 shrink-0 flex-col border-r border-border-subtle px-4 py-6">
+        {/* No AIOS lockup here on purpose. This is the team's workspace, so the team name is
+            the subject and AIOS is the tool it runs on — the mark lives in the favicon, the way
+            Slack keeps its own logo out of a workspace sidebar. If this sidebar ever gains a
+            collapsed state, collapse to the bare mark in currentColor (DESIGN.md § Brand & Logo). */}
         <div className="mb-8 px-3">
-          <p className="font-display text-[11px] uppercase tracking-[0.18em] text-ink-tertiary">
+          <p className="font-display text-[10px] uppercase tracking-[0.18em] text-ink-tertiary">
             Team Brain
           </p>
-          <h2 className="mt-1 truncate font-display text-lg text-ink" title={team.name}>
+          <h2 className="mt-1.5 truncate font-display text-lg text-ink" title={team.name}>
             {team.name}
           </h2>
         </div>

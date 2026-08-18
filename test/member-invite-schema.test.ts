@@ -49,6 +49,17 @@ describe("memberInviteRequestSchema", () => {
 
   it("is strict — rejects unknown top-level keys", () => {
     expect(memberInviteRequestSchema.safeParse({ ...valid, password: "sneaky" }).success).toBe(false);
-    expect(memberInviteRequestSchema.safeParse({ ...valid, tier: "external" }).success).toBe(false);
+    // `tier` was this test's example unknown key until PRET-4 made it a REAL field (the
+    // invite-time access default) — a different never-valid key keeps the strictness pin.
+    expect(memberInviteRequestSchema.safeParse({ ...valid, is_admin: true }).success).toBe(false);
+  });
+
+  it("accepts each allowed tier, defaults to team, and rejects an unknown tier (PRET-4 invite default)", () => {
+    for (const tier of ["team", "external"]) {
+      expect(memberInviteRequestSchema.safeParse({ ...valid, tier }).success, tier).toBe(true);
+    }
+    const parsed = memberInviteRequestSchema.safeParse(valid);
+    expect(parsed.success && parsed.data.tier).toBe("team");
+    expect(memberInviteRequestSchema.safeParse({ ...valid, tier: "admin" }).success).toBe(false);
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, ingest, memberRetrieveEnforce, type Seed } from "./helpers";
+import { randomUUID } from "node:crypto";
 
 /**
  * Spec for the structured tasks digest on real Postgres: retrieval must include tasks of ALL
@@ -19,21 +20,24 @@ async function seedProject(teamId: string, slug: string): Promise<string> {
 }
 
 async function seedTask(
-  teamId: string,
+  seed: Seed,
   projectId: string,
   rowKey: string,
   title: string,
   status: string,
   updatedAt: string
 ): Promise<void> {
+  // PRET-6: a synced task carries its source item or the enforced read drops it as purged-basis.
+  const src = await ingest(seed, { path: `task-docs/${randomUUID()}.md`, access: "team", body: `task source ${rowKey}`, frontmatter: { source: "linear" } });
   await db().from("tasks").insert({
-    team_id: teamId,
+    team_id: seed.teamId,
     project_id: projectId,
     row_key: rowKey,
     title,
     status,
     origin: "sync",
     updated_at: updatedAt,
+    source_item_id: src.id,
   });
 }
 
@@ -42,11 +46,11 @@ describe("retrieve() tasks digest (real Postgres)", () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "apollo");
     // Distinct updated_at so ordering is deterministic; the done task is the most recent.
-    await seedTask(seed.teamId, proj, "T-DONE", "Ship the login flow", "done", "2026-06-26T10:00:00Z");
-    await seedTask(seed.teamId, proj, "T-WIP", "Wire the dashboard", "in_progress", "2026-06-25T10:00:00Z");
-    await seedTask(seed.teamId, proj, "T-BACK", "Draft the RFC", "backlog", "2026-06-20T10:00:00Z");
+    await seedTask(seed, proj, "T-DONE", "Ship the login flow", "done", "2026-06-26T10:00:00Z");
+    await seedTask(seed, proj, "T-WIP", "Wire the dashboard", "in_progress", "2026-06-25T10:00:00Z");
+    await seedTask(seed, proj, "T-BACK", "Draft the RFC", "backlog", "2026-06-20T10:00:00Z");
 
-    const ctx = await retrieve(db(), seed.teamId, "team", "what got completed today");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what got completed today", null, await memberRetrieveEnforce(seed));
     const s = ctx.structured;
 
     // The done task is present (was structurally excluded before) and tagged + dated.

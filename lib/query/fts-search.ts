@@ -1,6 +1,5 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * Ranked keyword (FTS) retrieval over `items.search`. The builder path emits a bare
@@ -42,7 +41,7 @@ export async function rankedFtsSearch(
   if (visibleIds && visibleIds.length === 0) return []; // enforcing, sees nothing
   const params: unknown[] = [orQuery, teamId];
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
-  if (isRestrictedTier(tier)) where += " and i.access = 'external'";
+  // PRET-6: the oracle set alone (the permissive posture wall retired with the model).
   if (visibleIds) {
     params.push(visibleIds);
     where += ` and i.id = any($${params.length}::uuid[])`;

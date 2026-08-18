@@ -25,9 +25,9 @@ export const runtime = "nodejs";
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  if (auth.memberTier !== "team") {
-    return errorResponse("forbidden_tier", "the roster is team-tier only", 403);
-  }
+  // PRET-4 §1d (the triad): the roster is STRUCTURE — visible to every member. The tier 403
+  // that stood here is deliberately gone; a collaborator you invited meets these people in
+  // meetings and threads anyway, and QMIR-1's F2 named this exact consistency obligation.
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:members:get`, 60))) {

@@ -31,6 +31,8 @@ async function issueKeyForRole(
     .select("id")
     .single();
   if (error || !data) throw new Error(`member seed failed: ${error?.message}`);
+  const { placeMemberByTier } = await import("../datamechanics/helpers");
+  await placeMemberByTier(seed.teamId, (data as { id: string }).id, tier);
   const { key } = await issueApiKey(db(), seed.teamId, (data as { id: string }).id, `${role} ${tier} key`);
   return { key };
 }

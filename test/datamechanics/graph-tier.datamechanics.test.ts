@@ -3,7 +3,7 @@ import type { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueApiKey } from "@/lib/admin/keys";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, seedTeam, memberRetrieveEnforce, type Seed } from "./helpers";
 
 const GRAPH_URL = "http://graphiti.test";
 const ROUTE_URL = "http://test/api/v1/graph-query";
@@ -103,15 +103,18 @@ describe("Graphiti tier scoping (real routes/retrieval, stubbed Graphiti)", () =
     expect(requests[0]?.max_facts).toBe(20);
   });
 
-  it("retrieve() blends graph facts but scopes an external viewer to the external group only", async () => {
+  it("retrieve() blends graph facts but scopes an external MEMBER to their granted partitions only (PRET-6: the oracle, not a tier lens)", async () => {
     const seed = await seedTeam();
+    const enforce = await memberRetrieveEnforce(seed, "external");
     const { requests } = stubGraphiti();
 
-    const ctx = await retrieve(db(), seed.teamId, "external", "who owns payments?");
+    const ctx = await retrieve(db(), seed.teamId, "external", "who owns payments?", null, enforce);
 
     expect(ctx.structured).toContain("## Graph memory");
     expect(ctx.structured).toContain("Alex owns payments");
     expect(requests).toHaveLength(1);
+    // The external member's oracle admits external-shared only, whose STORED pointer is the
+    // grandfathered legacy id — so the graph scope is exactly that one partition.
     expect(requests[0]?.group_ids).toEqual([`${seed.teamSlug}_external`]);
   });
 });

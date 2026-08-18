@@ -238,24 +238,17 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external"); // legacy-tier conjunct — always
-
-  // Enforced read (Phase B slice 1, spec §5/§11): visibility = oracle ∧ legacy-tier. When the team
-  // is 'enforcing', BOTH member and agent reads intersect with the membership-visible item set
-  // (an agent must never exceed its launcher — slice-B1 Fable HIGH; the agent's Phase-A project_id
-  // proxy is used ONLY under permissive). 'permissive' (default) → member reads unchanged,
-  // byte-identical to today. A flag-read error throws → 500 (fail closed, never a wrong mode).
-  let enforcing: boolean;
-  try {
-    const { teamEnforcesAccess } = await import("@/lib/access/enforce");
-    enforcing = await teamEnforcesAccess(db, auth.teamId);
-  } catch (e) {
-    // Fail closed on a flag-read error, but don't leak the raw DB error to the client (Codex Low).
-    console.error("[access] enforcement check failed:", e instanceof Error ? e.message : e);
-    return errorResponse("internal", "enforcement check failed", 500);
-  }
-
-  if (enforcing) {
+  // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
+  // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
+  // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
+  // the only thing blocking that); permissive → the posture wall alone (applied below, after
+  // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
+  // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
+  // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
+  // A flag-read error throws → 500 (fail closed, never a wrong mode).
+  // PRET-6: enforcing is the only behavior — the oracle decides, unconditionally (the mode
+  // branch, the permissive posture wall, and the agent Phase-A project_id proxy all retired).
+  {
     const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
     let projectSet: ReadonlySet<string>;
     if (agentProjects !== null) {
@@ -267,10 +260,6 @@ export async function GET(req: NextRequest) {
     const { ids, empty } = await visibleItemIdsForProjects(db, auth.teamId, projectSet);
     if (empty) return Response.json({ items: [], next_cursor: null });
     q = q.in("id", [...ids]);
-  } else if (agentProjects !== null) {
-    // Permissive team + agent token: the Phase-A ingestion-project proxy (unchanged).
-    if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
-    q = q.in("project_id", [...agentProjects]);
   }
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.

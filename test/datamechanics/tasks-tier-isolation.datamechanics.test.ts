@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, ingest, memberRetrieveEnforce, type Seed } from "./helpers";
+import { randomUUID } from "node:crypto";
 
 /**
  * Spec for audit finding H1: `tasks` had no tier column, so an `external`-tier principal read every
@@ -20,14 +21,17 @@ async function seedProject(teamId: string, slug: string): Promise<string> {
 }
 
 async function seedTask(
-  teamId: string,
+  seed: Seed,
   projectId: string,
   rowKey: string,
   title: string,
   audience: "team" | "external"
 ): Promise<void> {
+  // PRET-6: a synced task carries its source item, ACCESS-matched to its audience — the source's
+  // placement (General vs external-shared) is what walls it now, not the audience column.
+  const src = await ingest(seed, { path: `task-docs/${randomUUID()}.md`, access: audience, body: `task source ${rowKey}`, frontmatter: { source: "linear" } });
   await db().from("tasks").insert({
-    team_id: teamId,
+    team_id: seed.teamId,
     project_id: projectId,
     row_key: rowKey,
     title,
@@ -35,6 +39,7 @@ async function seedTask(
     origin: "sync",
     audience,
     updated_at: "2026-06-26T10:00:00Z",
+    source_item_id: src.id,
   });
 }
 
@@ -42,17 +47,17 @@ describe("tasks tier isolation in retrieval (real Postgres)", () => {
   it("hides team-audience tasks from an external principal but shows them to a team principal", async () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "apollo");
-    await seedTask(seed.teamId, proj, "T-INTERNAL", "Internal roadmap planning", "team");
-    await seedTask(seed.teamId, proj, "T-SHARED", "Client-shared deliverable", "external");
+    await seedTask(seed, proj, "T-INTERNAL", "Internal roadmap planning", "team");
+    await seedTask(seed, proj, "T-SHARED", "Client-shared deliverable", "external");
 
     // External principal: must NOT see the internal task, may see the external one.
-    const ext = await retrieve(db(), seed.teamId, "external", "what is the team working on");
+    const ext = await retrieve(db(), seed.teamId, "external", "what is the team working on", null, await memberRetrieveEnforce(seed, "external"));
     expect(ext.structured).not.toContain("Internal roadmap planning");
     expect(ext.structured).not.toContain("T-INTERNAL");
     expect(ext.structured).toContain("Client-shared deliverable");
 
     // Team principal: sees the full board (the filter is not over-restrictive).
-    const team = await retrieve(db(), seed.teamId, "team", "what is the team working on");
+    const team = await retrieve(db(), seed.teamId, "team", "what is the team working on", null, await memberRetrieveEnforce(seed));
     expect(team.structured).toContain("Internal roadmap planning");
     expect(team.structured).toContain("Client-shared deliverable");
   });
@@ -67,7 +72,7 @@ describe("tasks tier isolation in retrieval (real Postgres)", () => {
       name: "Deliver the internal Q3 plan",
       attrs: {},
     });
-    const ext = await retrieve(db(), seed.teamId, "external", "what commitments exist");
+    const ext = await retrieve(db(), seed.teamId, "external", "what commitments exist", null, await memberRetrieveEnforce(seed, "external"));
     expect(ext.structured).not.toContain("Deliver the internal Q3 plan");
   });
 });

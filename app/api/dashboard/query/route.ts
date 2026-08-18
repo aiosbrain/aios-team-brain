@@ -11,7 +11,6 @@ import { retrieve } from "@/lib/query/retrieve";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import {
   ownsConversation,
-  recentTurns,
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
@@ -112,7 +111,7 @@ export async function POST(req: NextRequest) {
 
   const { data: me } = await rls
     .from("members")
-    .select("id, tier, display_name, email, actor_handle")
+    .select("id, display_name, email, actor_handle")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
@@ -131,8 +130,10 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   const timeZone = pickTimezone([tz, prof?.timezone, DEFAULT_TIMEZONE]);
 
-  const memberTier = me.tier as "team" | "external";
   const db = adminClient();
+  // PRET-4 §1a: `memberTier` is POSTURE (everyone-membership), membership-derived.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const memberTier = await resolveViewerPosture(db, team.id, me.id as string);
 
   // The query box doubles as a scrape trigger: "/sync" / "scrape now" / … pulls every enabled
   // connector instead of asking the LLM. team-tier only (external collaborators can't trigger a
@@ -172,12 +173,12 @@ export async function POST(req: NextRequest) {
     return errorResponse("rate_limited", "team daily query budget reached — see admin/policy", 429);
   }
 
-  // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one.
-  // Load the prior turns for the LLM memory window BEFORE persisting the current question, then
-  // record the user message. The assistant message is persisted once the answer finishes streaming.
+  // Resolve the persistent thread: adopt the caller's conversation if they own it, else start one,
+  // then record the user message. The assistant message is persisted once the answer finishes
+  // streaming. (PRET-6: the prior-turn LLM memory load retired with the permissive arm — see the
+  // historyTurns note below.)
   const owner = { teamId: team.id, memberId: me.id };
   let conversationId = conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  const priorTurns = conversationId ? await recentTurns(db, owner, conversationId) : [];
   let createdNew = false;
   if (!conversationId) {
     const created = await createConversation(db, owner, question);
@@ -190,25 +191,28 @@ export async function POST(req: NextRequest) {
   // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
-    if (await teamEnforcesAccess(db, team.id)) {
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    {
+      // PRET-6: enforcing is the only behavior — enforcement is always constructed.
       const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
       // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
       // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
       // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
       // QMIR-1: only members reach this route — it authenticates via getSessionUser() (session
       // cookie + members lookup); an aiosd_ bearer has no session, so no token can land here.
-      // Hence `principal: "member"` — the org-structural legs follow the tier.
-      enforce = { visibleItemIds: ids, principal: "member", ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
+      // Hence `principal: "member"`. PRET-4 §1b (ruling 2): every member principal carries
+      // graphProjectIds — an external member's oracle resolves their granted projects.
+      enforce = { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
-  // Access enforcement (Codex HIGH): prior assistant turns can quote content whose items are no
-  // longer visible to this principal (e.g. after a group change) — omit history under enforcing
-  // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
-  const historyTurns = enforce ? [] : priorTurns;
+  // Access enforcement (Codex HIGH; PRET-6 made it unconditional): prior assistant turns can
+  // quote content whose items are no longer visible to this principal (e.g. after a group
+  // change), so the LLM history window is EMPTY for every conversation until turns are
+  // visibility-revalidated — a named backlog item, not an accident.
+  const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
   const started = Date.now();
   const ctx = await retrieve(db, team.id, memberTier, question, project, enforce);
 

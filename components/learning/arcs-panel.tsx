@@ -46,7 +46,11 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   const [arcs, setArcs] = useState<Arc[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
-  // Why the panel is empty (server-diagnosed): no_facts | model_failing | synthesis_empty | null.
+  // LEGACY-ALWAYS-NULL since PRET-6: the server's empty-panel diagnosis retired with the
+  // permissive mode (§5.7 — it read team-wide health a partitioned member must not see), so
+  // `reason`/`note` arrive as null/undefined and the red problem-card branch below never fires.
+  // Kept as wire-tolerant state (an older server could still populate them); diagnosis lives on
+  // the admin health surfaces.
   const [emptyReason, setEmptyReason] = useState<string | null>(null);
   const [emptyNote, setEmptyNote] = useState<string | null>(null);
   // COMPOSITE identity (Codex PPARC-3 High 1): arc_id is sha(title) and legitimately collides
@@ -184,8 +188,8 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
     );
   }
   if (arcs.length === 0) {
-    // A real problem (no graph facts, or a failing model) is shown as an actionable red card; a
-    // transient/quiet-week empty stays a benign note. The server diagnoses which (see the arcs route).
+    // PRET-6: the server sends reason=null always (diagnosis retired — see the state note above),
+    // so this renders the benign empty note; the red card survives only for an older server.
     const isProblem = emptyReason === "no_facts" || emptyReason === "model_failing";
     if (isProblem && emptyNote) {
       return (

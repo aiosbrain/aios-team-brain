@@ -186,6 +186,7 @@ export function InviteMember({
             displayName: String(formData.get("displayName") ?? ""),
             actorHandle: String(formData.get("actorHandle") ?? ""),
             role: (String(formData.get("role")) as "admin" | "lead" | "member") || "member",
+            tier: (String(formData.get("tier")) as "team" | "external") || "team",
             manualInvite: manual,
             password: manual ? password || undefined : undefined,
             tools: selected.size === 0 ? "none" : Array.from(selected),
@@ -207,6 +208,14 @@ export function InviteMember({
           <option value="member">member</option>
           <option value="lead">lead</option>
           <option value="admin">admin</option>
+        </select>
+        {/* PRET-4: the ONE access decision an invite carries — internal teammates auto-enroll
+            in the everyone group (see everything); collaborators enroll in the external group
+            only (see exactly what is shared or granted). */}
+        <select name="tier" defaultValue="team"
+          className="col-span-2 rounded-lg border border-border-default bg-surface-base px-3 py-2 text-sm text-ink outline-none focus:border-violet">
+          <option value="team">internal — sees everything not deliberately restricted</option>
+          <option value="external">collaborator — sees only shared and granted projects</option>
         </select>
       </div>
 

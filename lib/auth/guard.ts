@@ -21,14 +21,19 @@ export async function currentMember(teamId: string): Promise<CurrentMember | nul
   const db = await serverClient();
   const { data } = await db
     .from("members")
-    .select("id, role, tier")
+    .select("id, role")
     .eq("team_id", teamId)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!data) return null;
-  const m = data as { id: string; role: CurrentMember["role"]; tier: CurrentMember["tier"] };
-  return { id: m.id, role: m.role, tier: m.tier, userId: user.id };
+  const m = data as { id: string; role: CurrentMember["role"] };
+  // PRET-4 §1a: `tier` here is POSTURE (everyone-membership), not the members.tier record —
+  // same vocabulary, membership-derived. A resolver error propagates (fail closed at the
+  // boundary), never a silent default.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(db, teamId, m.id);
+  return { id: m.id, role: m.role, tier: posture, userId: user.id };
 }
 
 /**

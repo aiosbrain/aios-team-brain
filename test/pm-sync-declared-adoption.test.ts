@@ -102,6 +102,14 @@ function linearMock(opts: { issues?: unknown[]; teamKey?: string | null } = {}) 
   return { fetchImpl, mutations, queries };
 }
 
+/**
+ * ADOPTFOOT-1 made both adoption rungs FAIL CLOSED on a missing `ownedResourceIds`: an adapter that
+ * cannot prove a match is unowned does not adopt it. A direct caller therefore has to state its
+ * assumption, and for these fixtures the assumption is "no other row owns anything" — an EMPTY set,
+ * which is different from `undefined` and has to be written out rather than defaulted.
+ */
+const NOTHING_OWNED: ReadonlySet<string> = new Set();
+
 const run = (task: ProjectableTask, link: TaskPmLink, fetchImpl: typeof fetch) =>
   linearAdapter.upsertWorkItem({
     task,
@@ -109,6 +117,7 @@ const run = (task: ProjectableTask, link: TaskPmLink, fetchImpl: typeof fetch) =
     integration,
     desiredFingerprint: projectionFingerprint(task, null),
     fetchImpl,
+    ownedResourceIds: NOTHING_OWNED,
   });
 
 describe("ADOPTDECL-1 — a declared issue is adopted, not duplicated", () => {
@@ -278,6 +287,7 @@ describe("ADOPTDECL-1 — a declared issue is adopted, not duplicated", () => {
       desiredFingerprint: "fp",
       fetchImpl,
       bootstrap,
+      ownedResourceIds: NOTHING_OWNED,
     });
     await expect(
       linearAdapter.upsertWorkItem({

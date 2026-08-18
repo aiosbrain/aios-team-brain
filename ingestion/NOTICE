@@ -1,0 +1,32 @@
+AIOS Team Brain — ingestion sidecar (aios-ingest)
+Copyright (C) 2026 Chetan Nandakumar and John Ellison
+
+This component is licensed under the Apache License, Version 2.0. See LICENSE
+in this directory.
+
+This is a deliberate exception to the repository default. The rest of AIOS Team
+Brain is AGPL-3.0-only. The sidecar is permissively licensed because it is a
+separately packaged connector service: it has its own pyproject.toml, reaches
+the brain only over HTTP, and is never imported by the brain's TypeScript code.
+It is meant to be embedded in and deployed alongside other people's systems.
+
+Because this directory is Apache-2.0 and the rest of the repository is AGPL,
+the import direction is one-way: nothing in this directory may import from the
+AGPL portions of the repository. See ../LICENSING.md.
+
+
+Third-party components
+----------------------
+
+The reader and parser libraries this sidecar can import are listed with their
+licenses in THIRD_PARTY_LICENSES.md. All are permissive (MIT / Apache-2.0 /
+BSD). They are declared as optional extras rather than required dependencies,
+so a default install pulls none of them.
+
+Notable Apache-2.0 components, which carry an attribution obligation:
+
+    Unstructured — https://github.com/Unstructured-IO/unstructured
+    Apache License 2.0
+
+LlamaHub readers (llama-index-readers-google, -notion, -confluence) and
+llama-index-core are MIT licensed.

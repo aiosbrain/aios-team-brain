@@ -1,12 +1,14 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { extractFromTranscript, type ProviderKeys, type RosterPerson } from "./llm-extract";
+import { resolveAttendance } from "./attendance";
 import { extractAndStoreActionItems } from "./action-items";
 import type { ExtractedTodo } from "./extract-todos";
 import { createMeetingNoteFromItem } from "./notes";
 import { backfillMergeDuplicateMeetings } from "./merge";
+import { EMPTY_LINK_SUMMARY, linkMeetingNotesByIdentity, type LinkSummary } from "./link-notes";
 import { buildIdentityMap } from "@/lib/identity/resolve";
-import { CALENDAR_SOURCES, calendarAttendees, calendarTitle, isCalendarEvent } from "./from-calendar";
+import { CALENDAR_SOURCES, attendingAttendees, calendarAttendees, calendarTitle, isCalendarEvent } from "./from-calendar";
 
 /**
  * Bridge: turn transcript `items` that arrived through the CLI/ingest path (`aios push`) into
@@ -109,6 +111,26 @@ export interface BackfillSummary {
   skipped: number;
   /** Same-day duplicate meetings auto-merged after creation (see backfillMergeDuplicateMeetings). */
   merged: number;
+  /**
+   * Names the producer ASSERTED as participants that resolve to nobody on this team (MTGATT-1).
+   *
+   * Counted rather than ignored because it is the honest size of a known gap: attendance rows are a
+   * NOT NULL FK to `members`, so an external guest cannot be recorded at all. Prod examples: Pete
+   * Longworth, Anusheel Bhushan, Rob White. A rising number here means real attendees are being lost
+   * — invisible if nobody counts it.
+   */
+  unresolvedAttendees: number;
+  /**
+   * Calendar invitees dropped because their RSVP said `declined` (MTGATT-2).
+   *
+   * Counted for the same reason as `unresolvedAttendees`: this is the one place attendance is
+   * deliberately REMOVED, and a removal nobody can see is indistinguishable from a parser that
+   * silently stopped matching. A rising number with no declines in the real calendars would mean the
+   * RSVP field is being misread — which only a count makes visible.
+   */
+  calendarDeclined: number;
+  /** Identity-link outcome (MTGATT-3): what folded, and what was refused and why. */
+  link: LinkSummary;
 }
 
 /**
@@ -123,7 +145,15 @@ export async function backfillMeetingNotesFromItems(
   opts: BackfillOptions = {}
 ): Promise<BackfillSummary> {
   const limit = opts.limit ?? 50;
-  const summary: BackfillSummary = { scanned: 0, created: 0, skipped: 0, merged: 0 };
+  const summary: BackfillSummary = {
+    scanned: 0,
+    created: 0,
+    skipped: 0,
+    merged: 0,
+    unresolvedAttendees: 0,
+    calendarDeclined: 0,
+    link: EMPTY_LINK_SUMMARY,
+  };
 
   // Which transcript items already have a note — exclude them.
   const { data: noted } = await admin.from("meeting_notes").select("source_item_id").eq("team_id", teamId);
@@ -217,9 +247,37 @@ export async function backfillMeetingNotesFromItems(
         summary.skipped++;
         continue;
       }
-      const ex = calendar
-        ? { summary: "", attendeeMemberIds: await resolveEmails(calendarAttendees(c.frontmatter).map((a) => a.email)) }
+      // SUMMARY and ATTENDANCE are resolved separately on purpose (MTGATT-1). A transcript still
+      // needs the model for its summary; what it must NOT need the model for is WHO WAS THERE when
+      // the producer already said. Blending the two is how the old code came to prefer a guess over
+      // `frontmatter.participants` — it asked one function for both and took the whole answer.
+      const summaryOnly = calendar
+        ? { summary: "", attendeeMemberIds: [] as string[] }
         : await extract(body, roster).catch(() => ({ summary: "", attendeeMemberIds: [] }));
+
+      // A DECLINED invitee is not an attendee (MTGATT-2). Filtered here, at the one site that turns an
+      // event's invite list into attendance. The COUNT is taken below, only once the note is actually
+      // written: an item that throws or is skipped removed nobody, and counting it there would let a
+      // persistently failing item add the same declines on every tick.
+      const invited = calendar ? calendarAttendees(c.frontmatter) : [];
+      const attending = attendingAttendees(invited);
+
+      const attendance = await resolveAttendance({
+        isCalendar: calendar,
+        calendarMemberIds: calendar ? await resolveEmails(attending.map((a) => a.email)) : null,
+        participants: c.frontmatter?.participants,
+        roster,
+        // Rank 3. Reached only when nothing was asserted — and it reuses the summary pass's answer
+        // rather than making a second call, so the fallback costs nothing extra.
+        llm: async () => summaryOnly.attendeeMemberIds,
+      });
+      if (attendance.unresolved.length) {
+        // Named attendees who are not members of this team. Reported rather than dropped silently —
+        // they are the reason real participants appear to "vanish", and the schema (a NOT NULL FK to
+        // `members`) is why they cannot be recorded. Deliberately out of this slice's scope.
+        summary.unresolvedAttendees += attendance.unresolved.length;
+      }
+      const ex = { summary: summaryOnly.summary, attendeeMemberIds: attendance.memberIds };
       const res = await createMeetingNoteFromItem(admin, teamId, {
         sourceItemId: c.id,
         title: calendar ? calendarTitle(c.frontmatter, c.path) : deriveMeetingTitle(body, c.path),
@@ -230,6 +288,7 @@ export async function backfillMeetingNotesFromItems(
       });
       if (res.created) {
         summary.created++;
+        summary.calendarDeclined += invited.length - attending.length;
         // Pre-compute action items so a pushed meeting opens with its todos already filled in
         // (not empty until someone clicks "extract"). Best-effort — never fail the note over it.
         //
@@ -254,6 +313,14 @@ export async function backfillMeetingNotesFromItems(
     } catch {
       summary.skipped++; // best-effort — one bad item never fails the batch
     }
+  }
+
+  // IDENTITY LINK (MTGATT-3) — before the overlap merge, so a calendar event that belongs to a
+  // transcript is already folded and cannot be reconsidered by a comparator that reads bodies.
+  try {
+    summary.link = await linkMeetingNotesByIdentity(admin, teamId);
+  } catch {
+    // best-effort, like every other leg here: a link hiccup must not cost the notes just created
   }
 
   // Auto-merge same-day duplicate meetings — a re-record / re-push creates a second note for the same

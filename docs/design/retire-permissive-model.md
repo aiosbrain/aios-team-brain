@@ -91,8 +91,9 @@ synthesis has no callers.
 
 ## 4. Contracts declared up front (the interfaces precede the slices)
 - **The flip gate is the REAL readiness assessment, never the count short-circuit** (cold-read
-  H1): the sole permission-to-flip is `lib/admin/access-enforcement.ts`'s existing gated path
-  (`assessEnforcementReadiness` → `setAccessEnforcement`) — the per-item unpartitioned scan +
+  H1): the sole permission-to-flip is the flip module's gated path (`assessEnforcementReadiness`
+  → `setAccessEnforcement`; the module deleted WITH the subsystem in PRET-6 — its readiness scan
+  survives as `lib/admin/access-health.ts`) — the per-item unpartitioned scan +
   full drain that `drainTeamContext`'s own header mandates for "a caller about to change what a
   whole team can see" (`lib/projects/context/backfill.ts:113-119`). The backfill's
   `memCount >= itemCount` short-circuit is satisfiable by multi-membership items while others
@@ -142,7 +143,9 @@ synthesis has no callers.
   invite (the invite default: internal → the everyone group, external → the external group)
   and thereafter changed only by deliberate membership actions on the same admin surfaces as
   any project membership; existing members are migrated by materializing their current derived
-  memberships verbatim (a no-op diff by construction, dm-proven in the slice). `members.tier`
+  memberships verbatim (amended by PRET-4 §3.2, cold-read L2: proven in dm as
+  ORACLE-VISIBILITY equality rather than row-set equality — the materialization deliberately
+  also writes invited-member and non-human posture rows, all visibility-inert). `members.tier`
   keeps its column through PRET-5 as the invite-default record only — no read OR recompute
   path may consult it for access (guard-pinned by grep in PRET-4's spec); PRET-6 decides
   whether the column renames or drops.

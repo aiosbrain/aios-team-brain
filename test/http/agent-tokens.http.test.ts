@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { BASE_URL, db, keyHeaders, seedTeam, type Seed } from "./http-helpers";
+import { BASE_URL, convergeTeam, db, keyHeaders, seedTeam, type Seed } from "./http-helpers";
 import { mintAgentToken } from "@/lib/access/agent-tokens";
 import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 import { ingestItem } from "@/lib/ingest";
@@ -21,10 +21,17 @@ async function seedAgentWithItem(seed: Seed): Promise<{ token: string; visiblePa
       { project, kind: "deliverable", actor: "t", frontmatter: {}, path, body: text, content_sha256: createHash("sha256").update(text).digest("hex") },
       "team"
     );
-  await mk("agent/visible.md", "agentside", body("visible"));
+  const vis = await mk("agent/visible.md", "agentside", body("visible"));
   await mk("agent/hidden.md", "hiddenside", body("hidden"));
+  await convergeTeam(seed);
   const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
   const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+  // PRET-6: the project_id proxy is retired — the grant serves MEMBERSHIPS, so the visible item's
+  // context membership moves into the granted project (what the curation surface does).
+  const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", vis.id).single();
+  await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id).is("valid_to", null);
+  const insErr = (await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: bySlug.get("agentside")!, context_unit_id: unit!.id, method: "manual" })).error;
+  if (insErr) throw new Error(`curate failed: ${insErr.message}`);
 
   const { data: agentRow } = await db()
     .from("members")

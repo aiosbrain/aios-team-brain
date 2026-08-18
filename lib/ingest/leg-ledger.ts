@@ -23,7 +23,7 @@ export const INGEST_LEG_SOURCES: readonly string[] = [
   "access_bootstrap",
   "arcs",
   "auth_cleanup",
-  "auto_flip",
+
   "context_backfill",
   "context_backfill_all",
   "dense",
@@ -38,6 +38,7 @@ export const INGEST_LEG_SOURCES: readonly string[] = [
   "plane",
   "pm_sync",
   "pret3_sweep",
+  "pret4_materialize",
   "scan",
   "slack",
 ];

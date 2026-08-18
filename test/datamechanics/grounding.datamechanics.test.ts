@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, type Seed, memberRetrieveEnforce } from "./helpers";
 
 // Spec (stay-quiet): retrieve() reports `grounded` — true when query-specific search (FTS/semantic)
 // matched, false when the only sources are recency padding. The answer layer uses this to abstain
@@ -19,13 +19,13 @@ describe("retrieve grounding signal (real Postgres)", () => {
   });
 
   it("grounded=true when the question matches a document", async () => {
-    const ctx = await retrieve(db(), seed.teamId, "team", "passwordless authentication magic links");
+    const ctx = await retrieve(db(), seed.teamId, "team", "passwordless authentication magic links", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(true);
     expect(ctx.sources.some((s) => s.path === "deliverables/auth.md")).toBe(true);
   });
 
   it("grounded=false for an off-topic question (only recency padding, no real match)", async () => {
-    const ctx = await retrieve(db(), seed.teamId, "team", "quarterly gross margin forecast for the Tokyo subsidiary");
+    const ctx = await retrieve(db(), seed.teamId, "team", "quarterly gross margin forecast for the Tokyo subsidiary", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(false);
     // recency still returns the recent items as background — that's exactly what the signal guards against
     expect(ctx.sources.length).toBeGreaterThan(0);

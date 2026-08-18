@@ -31,6 +31,8 @@ async function seedMember(seed: Seed, over: Partial<{ tier: string; status: stri
     .select("id")
     .single();
   if (error || !data) throw new Error(`seed member failed: ${error?.message}`);
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data.id as string, over.tier ?? "team");
   return data.id as string;
 }
 
@@ -228,6 +230,12 @@ describe("lifecycle hook (awaited path)", () => {
 
     const r = await deleteMember(db(), seed.teamId, row!.email);
     expect(r.deleted).toBe(true);
-    expect(await inEveryone(), "the hook must drop a disabled member from Everyone immediately").toBe(false);
+    // PRET-4 lifecycle ruling (inverts the recompute-era drop): the row STAYS — explicit state
+    // is not recomputed on lifecycle — and is access-inert read-side (isPrincipal in the
+    // oracle refuses a disabled member; auth refuses them before posture).
+    expect(await inEveryone(), "the surviving row is the explicit-state design").toBe(true);
+    const { visibleProjects } = await import("@/lib/access/oracle");
+    const vis = await visibleProjects(db(), { teamId: seed.teamId, memberId: other });
+    expect(vis.projectIds.size, "and it grants NOTHING — inert, not live").toBe(0);
   });
 });

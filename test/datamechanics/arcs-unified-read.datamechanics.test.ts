@@ -4,7 +4,6 @@ import { runSql } from "@/lib/db/pg/pool";
 import { readFileSync } from "node:fs";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
-import { setAccessEnforcement } from "@/lib/admin/access-enforcement";
 import { episodeGroupId } from "@/lib/graph/group";
 import { writeArcCache, readArcCache } from "@/lib/graph/arc-cache";
 import { getFusedArcs } from "@/lib/graph/arc-fusion";
@@ -30,49 +29,36 @@ async function tierKeyRows(teamId: string): Promise<number> {
   return r.rows[0].n;
 }
 
-describe("PRET-3 — resolveArcScope is mode-keyed (the one resolution, spec §3)", () => {
-  it("permissive team-tier → built-in pointer partitions, arm false; external → the external built-in", async () => {
-    const seed = await seedTeam();
-    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
-    const teamGroup = episodeGroupId(seed.teamSlug, "team");
-    const extGroup = episodeGroupId(seed.teamSlug, "external");
-
-    const t = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: seed.memberId, tier: "team" });
-    expect(t.arm).toBe(false);
-    expect([...t.groups].sort()).toEqual([extGroup, teamGroup].sort());
-
-    const x = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: seed.memberId, tier: "external" });
-    expect(x.arm).toBe(false);
-    expect(x.groups).toEqual([extGroup]);
-  });
-
-  it("enforcing team → the member's oracle scope, arm true — for EVERY tier (no external-specific branch)", async () => {
+// Deleted WITH its subject (PRET-6): "permissive team-tier → built-in pointer partitions, arm
+// false" — the permissive arm of resolveArcScope is retired; the oracle scope is the one
+// resolution, pinned below for both member classes.
+describe("PRET-3/6 — resolveArcScope is the ONE resolution (spec §3; oracle-only since PRET-6)", () => {
+  it("the member's oracle scope, arm true — for EVERY tier (no external-specific branch)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "e.md", body: "enforced content", access: "team", project: "src" });
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true); // PRET-6: the flip's bootstrap, explicit
     await backfillTeamContext(db(), seed.teamId);
-    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
 
     const r = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: seed.memberId, tier: "team" });
     expect(r.arm).toBe(true);
     expect(r.groups.length).toBeGreaterThan(0); // the oracle resolved their partitions
   });
 
-  it("enforcing team, EXTERNAL member → their oracle resolves the external-shared partition, arm true (ruling 2's new surface — diff-review L3)", async () => {
+  it("EXTERNAL member → their oracle resolves the external-shared partition, arm true (ruling 2's new surface — diff-review L3)", async () => {
     const { randomUUID } = await import("node:crypto");
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: "external shared content", access: "external", project: "src" });
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true); // PRET-6: the flip's bootstrap, explicit
     await backfillTeamContext(db(), seed.teamId);
-    expect((await setAccessEnforcement(db(), seed.teamId, "enforcing")).ok).toBe(true);
     // A REAL external member, created through the admin path so the built-in group sync runs
     // (a raw insert would leave them ungrouped and the oracle would resolve nothing).
     const { createMember } = await import("@/lib/admin/members");
     const m = await createMember(db(), seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Ext", actorHandle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external" });
     expect(m.id).toBeTruthy();
-    // createMember leaves the member INVITED (the oracle rightly resolves non-active members to
-    // nothing); model activation the way pg-login's hook does — status active + built-in resync.
+    // createMember leaves the member INVITED (the oracle rightly resolves non-active members
+    // to nothing) but — since PRET-4 — has already written their builtin row from the invite
+    // default, so activation is just the status flip (no recompute exists to call).
     await db().from("members").update({ status: "active" }).eq("id", m.id);
-    const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    expect((await syncBuiltinMembership(db(), seed.teamId)).ok).toBe(true);
 
     const r = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
     expect(r.arm, "an enforcing member's read arms — any tier").toBe(true);
@@ -82,7 +68,7 @@ describe("PRET-3 — resolveArcScope is mode-keyed (the one resolution, spec §3
 });
 
 describe("PRET-3 — the tier-row path stays COLD for re-routed readers (criterion 1, sentinel form)", () => {
-  it("a permissive member's panel serves g: content; the tier-key sentinel never appears; no new tier row is minted", async () => {
+  it("a member's panel serves g: content; the tier-key sentinel never appears; no new tier row is minted", async () => {
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
@@ -103,15 +89,21 @@ describe("PRET-3 — the tier-row path stays COLD for re-routed readers (criteri
     expect(await tierKeyRows(seed.teamId), "a cold tier read would have minted a new tier-key row").toBe(before);
   });
 
-  it("an external member's panel is the external partition's row only", async () => {
+  it("an external MEMBER's panel is their oracle's partition rows only (PRET-6: posture via the builtin row, not a tier lens)", async () => {
+    const { randomUUID } = await import("node:crypto");
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
     const extGroup = episodeGroupId(seed.teamSlug, "external");
     await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC("team-only-prose") as never, "h1");
     await writeArcCache(db(), seed.teamId, `g:${extGroup}`, ARC("ext-shared-prose") as never, "h2");
+    // A REAL external member — the retired permissive arm read the tier ARG; the one resolution
+    // reads the MEMBER's oracle, so the fixture needs an actual external-posture principal.
+    const { createMember } = await import("@/lib/admin/members");
+    const m = await createMember(db(), seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Ext", actorHandle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external" });
+    await db().from("members").update({ status: "active" }).eq("id", m.id);
 
-    const scope = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: seed.memberId, tier: "external" });
+    const scope = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
     const panel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, scope.groups, KEYS);
     const summaries = panel.arcs.map((a) => a.summary).join(" ");
     expect(summaries).toContain("ext-shared-prose");

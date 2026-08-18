@@ -55,3 +55,7 @@ supabase/
 # gitleaks would catch — it is ordinary PII-shaped content that only an ignore rule keeps out of a
 # commit. Recorded fixtures belong in test/fixtures/, redacted, never here.
 tmp/
+
+# Codacy CLI extension output — a per-machine Cursor rules file it regenerates on install.
+# The shared, reviewed Codacy config is .codacy.yaml at the repo root; this one is local noise.
+.cursor/rules/codacy.mdc

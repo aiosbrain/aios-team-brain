@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
   EVERYONE_SLUG,
@@ -10,14 +10,21 @@ import {
   ensurePersonSingleton,
   grantProjectToGroup,
   removeMemberFromGroup,
-  syncBuiltinMembership,
+  materializeBuiltinMembershipOnce,
 } from "@/lib/access/groups";
 import { visibleProjects } from "@/lib/access/oracle";
 
-// Phase A slice 1 (spec §4/§5.1) — real-Postgres proofs of the access skeleton's invariants:
-// eligibility enforced at write AND read, built-ins auto-admit humans only (both of them —
-// the round-3 Codex Critical was agents excluded from Everyone but not External), singleton
-// integrity, cross-team edges unrepresentable, and the oracle's NULL-vs-empty scope semantics.
+// Phase A slice 1 (spec §4/§5.1), re-specified by PRET-4 (explicit builtin state) — real-
+// Postgres proofs of the access skeleton's invariants: eligibility enforced at write AND read,
+// non-human builtin rows grant-inert, singleton integrity, cross-team edges unrepresentable,
+// and the oracle's NULL-vs-empty scope semantics.
+
+beforeEach(async () => {
+  // The materialization is one-time PER FLEET (marker-guarded) and the shared test DB carries
+  // the marker across tests/files — clear it so each test's teams materialize freshly. (The
+  // process-level confirmation cache retired with the PRET-4 legacy window — PRET-6.)
+  await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
+});
 
 async function seedMember(
   seed: Seed,
@@ -67,44 +74,58 @@ async function membersOfBuiltin(seed: Seed, slug: string): Promise<Set<string>> 
   return new Set(((rows ?? []) as { member_id: string }[]).map((r) => r.member_id));
 }
 
-describe("built-in groups (ensureBuiltins + syncBuiltinMembership)", () => {
-  it("auto-admits active humans by tier — and NEITHER built-in admits agents, connectors, or offroster", async () => {
+describe("built-in groups (PRET-4 explicit state: materialization + grant-inertness)", () => {
+  it("materialization writes rows for EVERY kind per tier; the oracle keeps non-human rows GRANT-inert (the Critical, re-specified)", async () => {
     const seed = await seedTeam(); // seed member: active human, tier=team
     const externalHuman = await seedMember(seed, { tier: "external" });
-    const agent = await seedMember(seed, { kind: "agent" });
     const externalAgent = await seedMember(seed, { kind: "agent", tier: "external" });
-    const offroster = await seedMember(seed, { kind: "offroster" });
-    const connector = await seedMember(seed, { is_connector: true });
-    const invited = await seedMember(seed, { status: "invited" });
 
     const r = await ensureBuiltins(db(), seed.teamId);
     expect(r.ok, r.error).toBe(true);
+    const mat = await materializeBuiltinMembershipOnce(db());
+    expect(mat.ok, mat.error).toBe(true);
 
     const everyone = await membersOfBuiltin(seed, EVERYONE_SLUG);
     const external = await membersOfBuiltin(seed, EXTERNAL_SLUG);
-
     expect(everyone.has(seed.memberId)).toBe(true);
     expect(external.has(externalHuman)).toBe(true);
-    // The Critical class: an external-tier agent auto-admitted to External would inherit
-    // external-shared with no explicit grant. Assert absence from BOTH built-ins, per kind.
-    for (const excluded of [agent, externalAgent, offroster, connector, invited]) {
-      expect(everyone.has(excluded)).toBe(false);
-      expect(external.has(excluded)).toBe(false);
+    expect(external.has(externalAgent)).toBe(true); // a POSTURE row — the grant question is the oracle's
+
+    // The Critical class, re-specified for explicit state: an external-tier agent's builtin
+    // row must NOT grant external-shared — grant-inertness is read-side and permanent.
+    const { data: extShared } = await db()
+      .from("projects")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("slug", "external-shared")
+      .maybeSingle();
+    if (extShared) {
+      const agentVis = await visibleProjects(db(), { teamId: seed.teamId, memberId: externalAgent });
+      expect(agentVis.projectIds.has((extShared as { id: string }).id)).toBe(false);
+    } else {
+      // bootstrap hasn't minted the system projects in this fixture — the oracle must still
+      // resolve the agent to zero grants
+      const agentVis = await visibleProjects(db(), { teamId: seed.teamId, memberId: externalAgent });
+      expect(agentVis.projectIds.size).toBe(0);
     }
-    // tier separation: the team human is not in External and vice versa
+    // tier separation at materialization: the team human is not in External and vice versa
     expect(external.has(seed.memberId)).toBe(false);
     expect(everyone.has(externalHuman)).toBe(false);
   });
 
-  it("re-sync removes a member who stops qualifying (deactivation) — membership is maintained, not accreted", async () => {
+  it("deactivation no longer moves rows — the surviving row is grant-inert read-side (isPrincipal), the PRET-4 lifecycle ruling", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
+    const mat = await materializeBuiltinMembershipOnce(db());
+    expect(mat.ok, mat.error).toBe(true);
     expect((await membersOfBuiltin(seed, EVERYONE_SLUG)).has(seed.memberId)).toBe(true);
 
     await db().from("members").update({ status: "disabled" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
-    const r = await syncBuiltinMembership(db(), seed.teamId);
-    expect(r.ok, r.error).toBe(true);
-    expect((await membersOfBuiltin(seed, EVERYONE_SLUG)).has(seed.memberId)).toBe(false);
+    // No recompute exists to drop the row; it stays — and resolves to nothing.
+    expect((await membersOfBuiltin(seed, EVERYONE_SLUG)).has(seed.memberId)).toBe(true);
+    const vis = await visibleProjects(db(), { teamId: seed.teamId, memberId: seed.memberId });
+    expect(vis.projectIds.size).toBe(0);
+    expect(vis.groupIds.size).toBe(0);
   });
 });
 
@@ -123,17 +144,22 @@ describe("write-side eligibility (the groups single writer refuses non-principal
     expect(asAgent.ok, asAgent.error).toBe(true);
   });
 
-  it("refuses ordinary-membership edits against built-ins and singletons", async () => {
+  it("builtin edits: a HUMAN add is the deliberate posture move (legal since PRET-4); non-humans and singletons stay refused", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
-    const other = await seedMember(seed);
+    const other = await seedMember(seed, { tier: "external" });
+    const agent = await seedMember(seed, { kind: "agent" });
     const { data: everyone } = await db()
       .from("groups")
       .select("id")
       .eq("team_id", seed.teamId)
       .eq("slug", EVERYONE_SLUG)
       .single();
-    expect((await addMemberToGroup(db(), seed.teamId, everyone!.id, other, seed.memberId)).ok).toBe(false);
+    // PRET-4 inverted the old blanket refusal: the deliberate-action door admits humans.
+    const asHuman = await addMemberToGroup(db(), seed.teamId, everyone!.id, other, seed.memberId);
+    expect(asHuman.ok, asHuman.error).toBe(true);
+    // Non-humans stay out (cold-read H3 — the round-3 Critical's posture half).
+    expect((await addMemberToGroup(db(), seed.teamId, everyone!.id, agent, seed.memberId)).ok).toBe(false);
 
     const s = await ensurePersonSingleton(db(), seed.teamId, seed.memberId, seed.memberId);
     expect(s.ok, s.error).toBe(true);
@@ -237,6 +263,9 @@ describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
     }
     // A squatter planted directly (bypassing the writer): ensureBuiltins must fail loudly,
     // not flip it to builtin and expose its grants team-wide (the review-caught hijack).
+    // seedTeam pre-creates the builtins since PRET-4 (the invite-default write needs them) —
+    // model the pre-bootstrap team this fixture is about by removing them first.
+    await db().from("groups").delete().eq("team_id", seed.teamId).eq("is_builtin", true);
     const project = await seedProject(seed);
     const { data: squatter } = await db()
       .from("groups")
@@ -250,9 +279,11 @@ describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
     expect(after!.is_builtin, "squatter must not be converted").toBe(false);
   });
 
-  it("tier consistency is read-side too: a team→external downgrade loses Everyone visibility BEFORE any sync runs", async () => {
+  it("revocation is row-keyed: a deliberate everyone removal loses visibility immediately, and nothing resurrects it", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
+    const mat = await materializeBuiltinMembershipOnce(db());
+    expect(mat.ok, mat.error).toBe(true);
     const project = await seedProject(seed);
     const { data: everyone } = await db()
       .from("groups")
@@ -264,15 +295,21 @@ describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
     const principal = { teamId: seed.teamId, memberId: seed.memberId };
     expect((await visibleProjects(db(), principal)).projectIds.has(project)).toBe(true);
 
-    // Downgrade the tier WITHOUT calling syncBuiltinMembership — the stale Everyone row remains.
-    await db().from("members").update({ tier: "external" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
+    // PRET-4 re-spec: the recompute-era "stale row" class is closed by the materialization
+    // sweep + the marker-keyed legacy conjunct (pinned in posture-cutover.datamechanics); the
+    // property THIS file keeps is revocation-by-row: a deliberate remove is honored by the
+    // oracle immediately, with nothing resurrecting the grant.
+    const rm = await removeMemberFromGroup(db(), seed.teamId, everyone!.id, seed.memberId, seed.memberId);
+    expect(rm.ok, rm.error).toBe(true);
     expect(
       (await visibleProjects(db(), principal)).projectIds.has(project),
-      "stale Everyone membership must not serve a downgraded member"
+      "a removed everyone membership must stop serving immediately"
     ).toBe(false);
+    await ensureBuiltins(db(), seed.teamId); // the old resurrection path — must be a no-op now
+    expect((await visibleProjects(db(), principal)).projectIds.has(project)).toBe(false);
   });
 
-  it("audit rows land: an admin add writes access.member_added; a builtin sync that changed something writes access.builtin_synced", async () => {
+  it("audit rows land: an admin add writes access.member_added; a materialization that changed something writes access.builtin_materialized", async () => {
     const seed = await seedTeam();
     const g = await createGroup(db(), seed.teamId, "audited", "A", seed.memberId);
     const other = await seedMember(seed);
@@ -284,12 +321,14 @@ describe("review-fold regressions (Fable round: hijack, tier, audit)", () => {
       .eq("action", "access.member_added");
     expect((added ?? []).length).toBeGreaterThan(0);
 
-    await ensureBuiltins(db(), seed.teamId); // first sync adds the seed member → a change
+    await ensureBuiltins(db(), seed.teamId);
+    const mat = await materializeBuiltinMembershipOnce(db()); // first materialization adds the seed member → a change
+    expect(mat.ok, mat.error).toBe(true);
     const { data: synced } = await db()
       .from("audit_log")
       .select("id")
       .eq("team_id", seed.teamId)
-      .eq("action", "access.builtin_synced");
+      .eq("action", "access.builtin_materialized");
     expect((synced ?? []).length).toBeGreaterThan(0);
   });
 });

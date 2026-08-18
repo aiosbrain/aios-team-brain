@@ -46,7 +46,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const { data: me } = user
     ? await sessionDb
         .from("members")
-        .select("role, tier")
+        .select("id, role")
         .eq("team_id", team.id)
         .eq("auth_user_id", user.id)
         .eq("status", "active")
@@ -60,7 +60,12 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     getPipelineHealth(team.id),
     // Already-scanned repos (from codebase scans) → offered as one-click link suggestions. Read
     // through the tier-gated codebases choke point (CLAUDE.md §5), never the table directly.
-    getCodebaseFreshness(db, team.id, (me?.tier as "team" | "external") ?? "external"),
+    getCodebaseFreshness(
+      db,
+      team.id,
+      // PRET-4 §1a: posture, membership-derived.
+      me ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, team.id, (me as { id: string }).id) : "external"
+    ),
     getRetrievalHealth(team.id),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
