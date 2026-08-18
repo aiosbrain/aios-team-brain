@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { projectTaskByIdAfterWrite } from "@/lib/pm-sync";
+import { runInboundForTeam } from "@/lib/pm-sync/inbound";
 import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/manage";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
  * ADOPTINV-1 — the OUTCOME the adoption fixes exist to produce, asserted on the table.
  *
- * `ADOPTDECL-1` (#581) and `ADOPTFOOT-1` (#588) shipped nine tests between them and every one pins a
+ * `ADOPTDECL-1` (#581) and `ADOPTFOOT-1` (#588) shipped a suite of tests between them and every one pins a
  * RUNG'S DECISION: the footer rung's scope, the declared rung's error, the ownership refusal, the
  * single-writer guard. None asserts the state those rungs exist to produce — that no two links in one
  * team, for one provider, point at the same `provider_resource_id`.
@@ -96,6 +97,17 @@ function linearMock(opts: { issues?: unknown[] } = {}) {
           },
         },
       });
+    if (query.includes("ImportIssues")) {
+      return Response.json({
+        data: {
+          team: {
+            key: "AIO",
+            members: { nodes: [] },
+            issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: opts.issues ?? [] },
+          },
+        },
+      });
+    }
     if (query.includes("IssueForPmSync")) {
       const wanted = (opts.issues ?? []).find((i) => (i as { id: string }).id === variables?.id);
       return Response.json({ data: { issue: wanted ?? null } });
@@ -165,7 +177,7 @@ const taskIdOf = async (teamId: string, rowKey: string, projectSlug = "acme"): P
 const linkOf = async (teamId: string, rowKey: string) => {
   const { data } = await db()
     .from("task_pm_links")
-    .select("id, project_id, provider_resource_id, projection_fingerprint")
+    .select("id, project_id, provider_resource_id, projection_fingerprint, last_error")
     .eq("team_id", teamId)
     .eq("row_key", rowKey)
     .maybeSingle();
@@ -174,8 +186,29 @@ const linkOf = async (teamId: string, rowKey: string) => {
     project_id: string;
     provider_resource_id: string | null;
     projection_fingerprint: string | null;
+    last_error: string | null;
   } | null;
 };
+
+/** The resource id stored on ONE project's link. Resolved by (project, row_key) rather than a join:
+ *  the pg adapter does not implement Supabase's `!inner` embed, and a silently-undefined join reads
+ *  exactly like a missing id. */
+async function storedIdIn(teamId: string, projectSlug: string, rowKey: string): Promise<string | null> {
+  const { data: project } = await db()
+    .from("projects")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("slug", projectSlug)
+    .single();
+  const { data } = await db()
+    .from("task_pm_links")
+    .select("provider_resource_id")
+    .eq("team_id", teamId)
+    .eq("project_id", (project as { id: string }).id)
+    .eq("row_key", rowKey)
+    .maybeSingle();
+  return (data as { provider_resource_id: string | null } | null)?.provider_resource_id ?? null;
+}
 
 /** A real second project — `task_pm_links.project_id` is an FK, so a made-up uuid silently no-ops
  *  the update and the test passes for the wrong reason. */
@@ -198,14 +231,17 @@ async function duplicateGroups(teamId: string): Promise<{ provider: string; id: 
     .select("provider, provider_resource_id")
     .eq("team_id", teamId)
     .not("provider_resource_id", "is", null);
+  // NUL as the separator, not a space: a space still GROUPS correctly (the `provider` CHECK at
+  // postgres/schema.sql forbids spaces) but the reporting split would truncate a resource id that
+  // contained one, naming the wrong id in the failure message.
   const counts = new Map<string, number>();
   for (const row of (data ?? []) as { provider: string; provider_resource_id: string }[]) {
-    const key = `${row.provider} ${row.provider_resource_id}`;
+    const key = `${row.provider}\u0000${row.provider_resource_id}`;
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return [...counts.entries()]
     .filter(([, n]) => n > 1)
-    .map(([key, n]) => ({ provider: key.split(" ")[0], id: key.split(" ")[1], n }));
+    .map(([key, n]) => ({ provider: key.split("\u0000")[0], id: key.split("\u0000")[1], n }));
 }
 
 /** How many links actually hold a resource id — the COUNT ANCHOR. A scenario that silently projected
@@ -297,15 +333,24 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     // alone) the scaffold row adopts the owner's issue, `issueCreate` never happens, and the anchor
     // fires before the invariant assertion is ever evaluated. The invariant would then be caught by a
     // sibling layer instead of proving itself, which is how a guard ends up decorative.
-    const anchors: { slug: string; mutations: string[]; updated: string[] }[] = [];
-    for (const slug of ["ws-two", "ws-three"]) {
+    const anchors: { slug: string; mutations: string[]; updated: string[]; created: string[] }[] = [];
+    // Each run's listing carries what the PREVIOUS run created, footer and all. Without that, run 3 never
+    // sees a scaffold-owned candidate, and `issuesByExt` is last-write-wins on `TT1`
+    // (linear.ts:186-187) — so the refusal against another SCAFFOLD's issue, not just the original
+    // owner's, would go unexercised.
+    const listing: unknown[] = [FOOTERED_ISSUE];
+    const anchorsFor = async (slug: string) => {
       await pushTasks(seed, slug, [{ row_key: "TT1", title: "Example team task", status: "ready" }], slug);
-      const scaffold = linearMock({ issues: [FOOTERED_ISSUE] });
+      const scaffold = linearMock({ issues: [...listing] });
       await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", slug), {
         fetchImpl: scaffold.fetchImpl,
       });
-      anchors.push({ slug, mutations: scaffold.mutations, updated: scaffold.updated });
-    }
+      for (const id of scaffold.created) {
+        listing.push({ ...FOOTERED_ISSUE, id, identifier: `AIO-${id}`, url: `u/${id}` });
+      }
+      anchors.push({ slug, mutations: scaffold.mutations, updated: scaffold.updated, created: scaffold.created });
+    };
+    for (const slug of ["ws-two", "ws-three"]) await anchorsFor(slug);
 
     // THE INVARIANT, first.
     expect(await duplicateGroups(seed.teamId)).toEqual([]);
@@ -317,6 +362,13 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     for (const a of anchors) {
       expect(a.mutations, `scaffold ${a.slug} never reached the adapter`).toContain("issueCreate");
       expect(a.updated, "it must not write into the owner's issue").not.toContain(OWNED_ISSUE_ID);
+      // Bind the STORED id to what the adapter actually created. The invariant alone cannot see a
+      // persist bug that swaps two links' ids: two non-null, distinct, WRONG ids are still not a
+      // duplicate group.
+      expect(
+        await storedIdIn(seed.teamId, a.slug, "TT1"),
+        `${a.slug}'s link must store the id its own run created`
+      ).toBe(a.created[0]);
     }
   });
 
@@ -352,21 +404,79 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
         .eq("project_id", secondProjectId);
     };
 
-    // TWICE, because the re-fire sequence needs a second bite: pass 1 resolves and stamps a fingerprint,
-    // so a naive second pass would legitimately SKIP at project.ts:284 and prove nothing. Re-seeding the
-    // deleted id and clearing the fingerprint is the "a later edit breaks the short-circuit" step that
-    // reopened the hijack in the real incident.
+    // TWICE, and the two passes must not be the same test run twice. Pass 1 arrives with the fingerprint
+    // NULLED (a fresh link). Pass 2 arrives the way the incident actually re-fired: the link still holds
+    // a dead id, but its fingerprint is a STALE NON-NULL value, and a content edit is what breaks the
+    // short-circuit at project.ts:284. Re-nulling the fingerprint before both passes — as an earlier
+    // draft did — makes pass 2 a byte-identical replay with no unique kill power.
     for (const pass of [1, 2]) {
-      await setDeleted();
+      if (pass === 1) {
+        await setDeleted();
+      } else {
+        // Keep whatever fingerprint pass 1 stamped; only re-point the id at a dead issue, then edit the
+        // row so the fingerprint no longer matches.
+        await db()
+          .from("task_pm_links")
+          .update({ provider_resource_id: "issue-deleted-2" })
+          .eq("team_id", seed.teamId)
+          .eq("project_id", secondProjectId);
+        const before = await linkOf(seed.teamId, "TT1");
+        expect(
+          before?.projection_fingerprint,
+          "pass 2 must start from a STALE fingerprint, not a null one, or it is a replay of pass 1"
+        ).toBeTruthy();
+        await pushTasks(seed, "d3", [{ row_key: "TT1", title: "Example team task (edited)", status: "ready" }], "ws-deleted");
+      }
+
       const run = linearMock({ issues: [FOOTERED_ISSUE] });
       await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", "ws-deleted"), {
         fetchImpl: run.fetchImpl,
       });
       // Invariant first, anchors second — see the note in the scenario above.
       expect(await duplicateGroups(seed.teamId), `pass ${pass} produced a duplicate group`).toEqual([]);
+      expect(await ownedLinkCount(seed.teamId), `pass ${pass}: owner + this row, no more, no fewer`).toBe(2);
       expect(run.mutations.length, `pass ${pass} never reached the adapter`).toBeGreaterThan(0);
       expect(run.updated, `pass ${pass} wrote into the owner's issue`).not.toContain(OWNED_ISSUE_ID);
     }
+  });
+
+  it("THE INBOUND WRITER: mirror-adopt must not take an issue a workspace link already owns", async () => {
+    // The outbound projector is not the only writer of `provider_resource_id`. `adoptInbound`
+    // (lib/pm-sync/inbound.ts:448) inserts it directly, and its `on conflict` clause is keyed on ROW
+    // IDENTITY, so the clause is not what protects the invariant — the team-wide candidate filter at
+    // inbound.ts:405-414 (`!ownedIds.has(it.id)`) is. A test that drove only the outbound path would
+    // leave the second writer unbound, which is the whole reason this scenario is in scope.
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+
+    // A workspace row legitimately owns a FOOTERLESS issue — footerless because the inbound candidate
+    // filter also excludes anything carrying an `aios-ext` footer, so a footered fixture would be
+    // skipped for the wrong reason and prove nothing about ownership.
+    await pushTasks(seed, "i1", [
+      {
+        row_key: "TT1",
+        title: "Finish verified operator loop",
+        status: "in_progress",
+        pm_provider: "linear",
+        pm_external_id: "AIO-444",
+      },
+    ]);
+    const owner = linearMock({ issues: [OWNED_ISSUE] });
+    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1"), { fetchImpl: owner.fetchImpl });
+    expect(
+      await storedIdIn(seed.teamId, "acme", "TT1"),
+      "the owner must hold the issue or the inbound filter has nothing to exclude"
+    ).toBe(OWNED_ISSUE_ID);
+    const before = await ownedLinkCount(seed.teamId);
+
+    // Now the inbound leg sees that same issue in the Linear team and tries to mirror it in.
+    const inbound = linearMock({ issues: [OWNED_ISSUE] });
+    await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
+
+    expect(await duplicateGroups(seed.teamId), "mirror-adopt claimed an already-owned issue").toEqual([]);
+    expect(await ownedLinkCount(seed.teamId), "inbound must not have added a link for an owned issue").toBe(
+      before
+    );
   });
 
   it("A DECLARED id already owned by another row is refused, and the row records an error", async () => {
@@ -402,10 +512,23 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     });
 
     expect(await duplicateGroups(seed.teamId)).toEqual([]);
-    const claimantLink = await linkOf(seed.teamId, "TT9");
-    expect(claimantLink?.provider_resource_id, "the claimant must not end up holding the owner's issue").not.toBe(
-      OWNED_ISSUE_ID
+
+    // The invariant alone cannot tell "refused with an error" from "silently invented a SECOND issue" —
+    // and the second is exactly the behaviour ADOPTDECL-1 removed. A mutant that turns the throw at
+    // linear.ts:389-395 into a silent fall-through creates `li-N` for the claimant: no duplicate, a
+    // non-null id that is not the owner's, nothing written into the owner's issue — green, while the
+    // product regressed. So pin the refusal itself: nothing was created, the link claims NO id, and the
+    // error says why.
+    expect(claimant.mutations, "a refused declaration must not create a replacement issue").not.toContain(
+      "issueCreate"
     );
+    expect(
+      await ownedLinkCount(seed.teamId),
+      "only the owner may hold an id — the claimant's link must stay unresolved"
+    ).toBe(1);
+    const claimantLink = await linkOf(seed.teamId, "TT9");
+    expect(claimantLink?.provider_resource_id, "the claimant must not end up holding the owner's issue").toBeNull();
+    expect(claimantLink?.last_error ?? "", "the refusal must be recorded on the row").toContain("already linked");
     expect(claimant.updated, "and must not have written into it").not.toContain(OWNED_ISSUE_ID);
   });
 });
