@@ -171,7 +171,20 @@ const taskIdOf = async (teamId: string, rowKey: string, projectSlug = "acme"): P
   return (data as { id: string }).id;
 };
 
+/** Reads the ONE link for a row key, and fails loudly if there is more than one.
+ *  `.maybeSingle()` returns the FIRST row when several match (lib/db/pg/query-builder.ts:331 — only
+ *  `.single()` errors), and several scenarios here deliberately create two links keyed `TT1`. Reading
+ *  "the" link in that state silently answers about the wrong project, which is how an anchor ends up
+ *  asserting something true of a row it was not testing. */
 const linkOf = async (teamId: string, rowKey: string) => {
+  const { data: all } = await db()
+    .from("task_pm_links")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("row_key", rowKey);
+  if ((all ?? []).length > 1) {
+    throw new Error(`linkOf(${rowKey}) is ambiguous — ${(all ?? []).length} links; use linkIn(project)`);
+  }
   const { data } = await db()
     .from("task_pm_links")
     .select("id, project_id, provider_resource_id, projection_fingerprint, last_error")
@@ -205,6 +218,29 @@ async function storedIdIn(teamId: string, projectSlug: string, rowKey: string): 
     .eq("row_key", rowKey)
     .maybeSingle();
   return (data as { provider_resource_id: string | null } | null)?.provider_resource_id ?? null;
+}
+
+/** The link for ONE project's row — the unambiguous read. */
+async function linkIn(teamId: string, projectSlug: string, rowKey: string) {
+  const { data: project } = await db()
+    .from("projects")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("slug", projectSlug)
+    .single();
+  const { data } = await db()
+    .from("task_pm_links")
+    .select("id, provider_resource_id, projection_fingerprint, last_error")
+    .eq("team_id", teamId)
+    .eq("project_id", (project as { id: string }).id)
+    .eq("row_key", rowKey)
+    .maybeSingle();
+  return data as {
+    id: string;
+    provider_resource_id: string | null;
+    projection_fingerprint: string | null;
+    last_error: string | null;
+  } | null;
 }
 
 /** A real second project — `task_pm_links.project_id` is an FK, so a made-up uuid silently no-ops
@@ -339,9 +375,10 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     const anchorsFor = async (slug: string) => {
       await pushTasks(seed, slug, [{ row_key: "TT1", title: "Example team task", status: "ready" }], slug);
       const scaffold = linearMock({ issues: [...listing] });
-      await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", slug), {
+      const report = await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", slug), {
         fetchImpl: scaffold.fetchImpl,
       });
+      expect(report?.status, `${slug} short-circuited instead of projecting`).not.toBe("skipped");
       for (const id of scaffold.created) {
         listing.push({ ...FOOTERED_ISSUE, id, identifier: `AIO-${id}`, url: `u/${id}` });
       }
@@ -417,18 +454,19 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
           .update({ provider_resource_id: "issue-deleted-2" })
           .eq("team_id", seed.teamId)
           .eq("project_id", secondProjectId);
-        const before = await linkOf(seed.teamId, "TT1");
+        const before = await linkIn(seed.teamId, "ws-deleted", "TT1");
         expect(
           before?.projection_fingerprint,
-          "pass 2 must start from a STALE fingerprint, not a null one, or it is a replay of pass 1"
+          "pass 2 must start from a STALE fingerprint ON THE ROW UNDER TEST, not a null one, or it is a replay of pass 1"
         ).toBeTruthy();
         await pushTasks(seed, "d3", [{ row_key: "TT1", title: "Example team task (edited)", status: "ready" }], "ws-deleted");
       }
 
       const run = linearMock({ issues: [FOOTERED_ISSUE] });
-      await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", "ws-deleted"), {
+      const report = await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", "ws-deleted"), {
         fetchImpl: run.fetchImpl,
       });
+      expect(report?.status, `pass ${pass} short-circuited instead of projecting`).not.toBe("skipped");
       // Invariant first, anchors second — see the note in the scenario above.
       expect(await duplicateGroups(seed.teamId), `pass ${pass} produced a duplicate group`).toEqual([]);
       expect(await ownedLinkCount(seed.teamId), `pass ${pass}: owner + this row, no more, no fewer`).toBe(2);
@@ -488,7 +526,6 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     const result = await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
 
     expect(await duplicateGroups(seed.teamId), "mirror-adopt claimed an already-owned issue").toEqual([]);
-    // POSITIVE ANCHOR: the leg actually ran. `enabled: false` is the silent no-op above.
     expect(result.enabled, "the inbound leg did not run — this scenario would prove nothing").toBe(true);
     expect(result.reason ?? "", "the inbound leg bailed early").toBe("");
     expect(
@@ -499,6 +536,21 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     expect(await ownedLinkCount(seed.teamId), "inbound must not have added a link for an owned issue").toBe(
       before
     );
+
+    // THE PAIRED POSITIVE. Everything above is satisfied by an inbound leg that considered NOTHING —
+    // empty the candidate list for any reason and it stays green. So prove ownership is the actual
+    // discriminator: drop the owner's claim, change nothing else, and the SAME issue must now adopt.
+    const ownerLink = await linkIn(seed.teamId, "acme", "TT1");
+    await db()
+      .from("task_pm_links")
+      .update({ provider_resource_id: null, projection_fingerprint: null })
+      .eq("id", ownerLink!.id);
+    const unowned = linearMock({ issues: [OWNED_ISSUE] });
+    const second = await runInboundForTeam(db(), seed.teamId, { fetchImpl: unowned.fetchImpl });
+    expect(
+      second.adopted,
+      "with nobody owning it the same issue MUST adopt — otherwise the case above proved nothing"
+    ).toContain(OWNED_ISSUE.identifier);
   });
 
   it("A DECLARED id already owned by another row is refused, and the row records an error", async () => {
@@ -529,9 +581,10 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
       "ws-claimant"
     );
     const claimant = linearMock({ issues: [OWNED_ISSUE] });
-    await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT9", "ws-claimant"), {
+    const claimantReport = await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT9", "ws-claimant"), {
       fetchImpl: claimant.fetchImpl,
     });
+    expect(claimantReport?.status, "the claimant short-circuited instead of projecting").not.toBe("skipped");
 
     expect(await duplicateGroups(seed.teamId)).toEqual([]);
 
