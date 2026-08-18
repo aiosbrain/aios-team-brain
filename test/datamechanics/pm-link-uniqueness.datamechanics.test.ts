@@ -264,21 +264,23 @@ async function duplicateGroups(teamId: string): Promise<{ provider: string; id: 
     .select("provider, provider_resource_id")
     .eq("team_id", teamId)
     .not("provider_resource_id", "is", null);
-  // NUL as the separator, not a space: a space still GROUPS correctly (the `provider` CHECK at
-  // postgres/schema.sql forbids spaces) but the reporting split would truncate a resource id that
-  // contained one, naming the wrong id in the failure message.
+  // Keyed on a JSON tuple, not a delimited string: no separator can collide with either component and
+  // nothing has to be split back apart to report. An earlier draft joined on a space (which truncated
+  // the reported id if one contained a space) and then on a NUL (which put a control character in the
+  // source for no benefit).
   const counts = new Map<string, number>();
   for (const row of (data ?? []) as { provider: string; provider_resource_id: string }[]) {
-    const key = `${row.provider}\u0000${row.provider_resource_id}`;
+    const key = JSON.stringify([row.provider, row.provider_resource_id]);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   return [...counts.entries()]
     .filter(([, n]) => n > 1)
-    .map(([key, n]) => ({ provider: key.split("\u0000")[0], id: key.split("\u0000")[1], n }));
+    .map(([key, n]) => {
+      const [provider, id] = JSON.parse(key) as [string, string];
+      return { provider, id, n };
+    });
 }
 
-/** How many links actually hold a resource id — the COUNT ANCHOR. A scenario that silently projected
- *  nothing would otherwise satisfy `duplicateGroups() === []` trivially. */
 async function ownedLinkCount(teamId: string): Promise<number> {
   const { data } = await db()
     .from("task_pm_links")
