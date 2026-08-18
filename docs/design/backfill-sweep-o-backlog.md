@@ -60,8 +60,8 @@ Re-derived from `lib/projects/context/reconcile-item.ts`, reconcile creates the 
 current **include** membership in the **target** system project (`general` for team, `external-shared`
 for external), and **closes the membership in the opposite** system project. An item needs work when:
 
-- it has no `project_context_units` row (matching `reconcileItemUnit`'s lookup, which ignores
-  `state` — so a `retracted` unit counts as missing); **or**
+- it has no item-grain `project_context_units` row (`unit_kind='item'`, matching
+  `reconcileItemUnit`'s own lookup); **or**
 - its unit has no current `include` membership in the target project for its current `items.access`;
   **or**
 - its unit still has a current membership (of ANY `decision` — `closeMembershipInto` closes
@@ -84,7 +84,15 @@ shadow to no effect, and `scanned` would never reach 0 — poisoning the one sig
 has caught up, and breaking criterion 4 in prod. So the state stays out of the candidate set.
 
 **Detection instead of repair (the third option, adopted).** Rather than leaving the hole unwatched,
-the candidate query also COUNTS shadows and the stage records `meta.excludeShadows`. Detection without
+the stage records `meta.excludeShadows` and `meta.retractedUnits` — **null when the count could not be
+taken**, because "unreadable" must not be indistinguishable from "none" for a metric whose only job is
+making an invisible hole visible.
+
+**A SECOND unrepairable state, found in code review: a RETRACTED unit.** Enforced reads require
+`state='active'` (`lib/access/enforce`), but `reconcileItemUnit` only updates audience/sha/occurred_at
+on an existing row — it never writes `state`. So a retracted item unit is invisible to readers AND
+unfixable by the sweep, exactly like the exclude-shadow, and gets the same treatment: excluded from
+candidates, counted, repair carried by EXCLSHADOW-1. Also latent — nothing writes `retracted` today. Detection without
 the per-tick cost. Repair is **`EXCLSHADOW-1`** (filed): `ensureIncludeMembership` no-ops on a current
 `exclude`, and fixing it is not one line — the partial unique index on
 `(team_id, project_id, context_unit_id) where valid_to is null` blocks inserting an include alongside

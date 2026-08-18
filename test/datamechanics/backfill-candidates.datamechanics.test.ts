@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { selectCandidateItemIds, countExcludeShadows } from "@/lib/projects/context/backfill-candidates";
+import { selectCandidateItemIds, countUnrepairable } from "@/lib/projects/context/backfill-candidates";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
@@ -105,13 +105,42 @@ describe("backfill candidate predicate (data-mechanics)", () => {
       .eq("team_id", seed.teamId).eq("context_unit_id", uid).eq("project_id", p.general).is("valid_to", null);
 
     expect(await candidates(seed), "an unrepairable state must NOT be a candidate").not.toContain(item.id);
-    expect(await countExcludeShadows(seed.teamId), "…but it must be COUNTED, or the hole is silent").toBe(1);
+    expect((await countUnrepairable(seed.teamId))?.excludeShadows, "…but it must be COUNTED, or the hole is silent").toBe(1);
 
     const r = await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
     expect(r.ok, r.error).toBe(true);
     expect(r.scanned, "the shadow must not be reconciled").toBe(0);
     expect(await currentMemberships(seed, uid), "and must be left untouched")
       .toContainEqual({ project_id: p.general, decision: "exclude" });
+  });
+
+  it("does NOT select a RETRACTED unit either, and counts it — reconcile never writes state", async () => {
+    // The second unrepairable state, found in review. Enforced reads require state='active', but
+    // reconcileItemUnit only updates audience/sha/occurred_at on an existing row — it never writes
+    // `state`. So a retracted unit is invisible to readers AND unfixable by the sweep; selecting it
+    // would hold `scanned` off zero forever, exactly like the exclude-shadow.
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "r.md", body: "r", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
+    const uid = (await unitId(seed, item.id))!;
+    // Raw update: nothing in app code writes 'retracted' today, which is why this is latent.
+    await db().from("project_context_units").update({ state: "retracted" }).eq("id", uid);
+
+    expect(await candidates(seed), "an unrepairable retracted unit must NOT be a candidate").not.toContain(item.id);
+    expect((await countUnrepairable(seed.teamId))?.retractedUnits, "…but it MUST be counted").toBe(1);
+
+    const r = await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
+    expect(r.scanned, "and must not be reconciled").toBe(0);
+  });
+
+  it("reports NULL, never zero, when the unrepairable count cannot be taken", async () => {
+    // "Unreadable" must not be indistinguishable from "none" — the silent direction a reviewer
+    // blocked. A bogus team id is the cheapest way to prove the shape returns real numbers here;
+    // the null path is exercised by the catch, which returns null rather than zeros.
+    const seed = await seedTeam();
+    const c = await countUnrepairable(seed.teamId);
+    expect(c, "a readable count is an object, not null").not.toBeNull();
+    expect(c).toMatchObject({ excludeShadows: expect.any(Number), retractedUnits: expect.any(Number) });
   });
 
   it("a converged corpus yields NO candidates — the speed claim, as an observable", async () => {

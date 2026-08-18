@@ -422,13 +422,19 @@ export function startIngestScheduler(): void {
           startedAt,
         });
       }
-      // The exclude-shadow count is DETECTION for a state this sweep deliberately does not repair
-      // (EXCLSHADOW-1): a current `exclude` in the target project makes reconcile a silent no-op, and
-      // the obvious prod check (items minus units) is blind to it because the item HAS a unit.
-      const { countExcludeShadows } = await import("@/lib/projects/context/backfill-candidates");
-      const excludeShadows = (
-        await Promise.all(r.outcomes.map((o) => countExcludeShadows(o.teamId)))
-      ).reduce((n, c) => n + c, 0);
+      // DETECTION for the two states this sweep deliberately does not repair (EXCLSHADOW-1): a
+      // current `exclude` in the target project, and a `retracted` unit. Reconcile can fix neither,
+      // and the obvious prod check (items minus units) is blind to both because each HAS a unit.
+      // `null` when the count could not be taken — "unreadable" must not read as "none".
+      const { countUnrepairable } = await import("@/lib/projects/context/backfill-candidates");
+      const counts = await Promise.all(r.outcomes.map((o) => countUnrepairable(o.teamId)));
+      const readable = counts.filter((c): c is NonNullable<typeof c> => c !== null);
+      const unrepairable = readable.length === counts.length
+        ? {
+            excludeShadows: readable.reduce((n, c) => n + c.excludeShadows, 0),
+            retractedUnits: readable.reduce((n, c) => n + c.retractedUnits, 0),
+          }
+        : null;
       const truncated = r.outcomes.filter((o) => o.truncated).length;
       if (truncated || r.deferred.length) {
         console.info(`[ingest] context backfill bounded by budget — ${truncated} truncated, ${r.deferred.length} deferred to the next pass`);
@@ -452,7 +458,8 @@ export function startIngestScheduler(): void {
           served: r.outcomes.length,
           failedTeams: r.outcomes.filter((o) => !o.ok).length,
           truncated,
-          excludeShadows,
+          excludeShadows: unrepairable?.excludeShadows ?? null,
+          retractedUnits: unrepairable?.retractedUnits ?? null,
           deferred: r.deferred.length,
           scanned: r.outcomes.reduce((n, o) => n + o.scanned, 0),
         },

@@ -57,11 +57,11 @@ scoped as (
 select s.id
   from scoped s
  where (
-   -- ARM 1 — no context unit at all. Matches reconcileItemUnit's own lookup, which ignores state,
-   -- so a retracted unit counts as missing rather than as done.
+   -- ARM 1 — no item-grain context unit at all. unit_kind='item' matches reconcileItemUnit's own
+   -- lookup, so "has a unit" here means the same row reconcile would find and update.
    not exists (
      select 1 from project_context_units u
-      where u.team_id = $1 and u.source_item_id = s.id
+      where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
    )
    -- ARM 2 — no current INCLUDE membership in the TARGET system project. include specifically:
    -- the enforced read filters on it, so an exclude is invisible to readers while looking present.
@@ -69,7 +69,7 @@ select s.id
      select 1 from project_context_units u
        join project_context_memberships m
          on m.team_id = u.team_id and m.context_unit_id = u.id
-      where u.team_id = $1 and u.source_item_id = s.id
+      where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
         and m.valid_to is null and m.decision = 'include' and m.project_id = s.target_id
    )
    -- ARM 3 — still a current membership in the OPPOSITE system project: a tier flip that was never
@@ -79,7 +79,7 @@ select s.id
      select 1 from project_context_units u
        join project_context_memberships m
          on m.team_id = u.team_id and m.context_unit_id = u.id
-      where u.team_id = $1 and u.source_item_id = s.id
+      where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
         and m.valid_to is null and m.project_id = s.opposite_id
    )
  )
@@ -94,8 +94,19 @@ select s.id
    select 1 from project_context_units u
      join project_context_memberships m
        on m.team_id = u.team_id and m.context_unit_id = u.id
-    where u.team_id = $1 and u.source_item_id = s.id
+    where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
       and m.valid_to is null and m.decision = 'exclude' and m.project_id = s.target_id
+ )
+ -- RETRACTED-UNIT EXCLUSION, same class as the shadow above and found by the same review.
+ -- Enforced reads require state='active' (lib/access/enforce), but reconcileItemUnit never WRITES
+ -- state — it only updates audience/sha/occurred_at on an existing row. So a retracted unit is
+ -- invisible to readers AND unrepairable by the sweep: selecting it would burn a reconcile every
+ -- tick and hold scanned off zero forever. Excluded and COUNTED, exactly like the exclude-shadow.
+ -- Nothing writes 'retracted' today (enforce says so in its own comment), so this is latent.
+ and not exists (
+   select 1 from project_context_units u
+    where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
+      and u.state <> 'active'
  )
  order by s.id
  limit $6`;
@@ -116,34 +127,52 @@ export async function selectCandidateItemIds(
   return { ids: res.rows.map((r) => r.id) };
 }
 
-const SHADOW_COUNT_SQL = `
+const UNREPAIRABLE_SQL = `
 with sys as (
   select
     (select id from projects where team_id = $1 and kind = 'system' and slug = $2 limit 1) as general_id,
     (select id from projects where team_id = $1 and kind = 'system' and slug = $3 limit 1) as external_id
 )
-select count(*)::int as n
+select
+  count(*) filter (
+    where m.id is not null and m.valid_to is null and m.decision = 'exclude'
+      and m.project_id = (case when i.access = 'external' then sys.external_id else sys.general_id end)
+  )::int as exclude_shadows,
+  count(*) filter (where u.state <> 'active')::int as retracted_units
   from items i
   cross join sys
-  join project_context_units u on u.team_id = i.team_id and u.source_item_id = i.id
-  join project_context_memberships m on m.team_id = u.team_id and m.context_unit_id = u.id
- where i.team_id = $1
-   and m.valid_to is null and m.decision = 'exclude'
-   and m.project_id = (case when i.access = 'external' then sys.external_id else sys.general_id end)`;
+  join project_context_units u
+    on u.team_id = i.team_id and u.source_item_id = i.id and u.unit_kind = 'item'
+  left join project_context_memberships m
+    on m.team_id = u.team_id and m.context_unit_id = u.id
+ where i.team_id = $1`;
+
+/** The two states the sweep deliberately will NOT repair. `null` means the count could not be taken. */
+export interface UnrepairableCounts {
+  excludeShadows: number;
+  retractedUnits: number;
+}
 
 /**
- * How many items are stuck in the exclude-shadow state — deliberately NOT repaired here, so this is
- * the only thing that makes them visible. Without it the hole is silent: the obvious prod check
- * (`items` minus `project_context_units`) cannot see it, because a shadowed item HAS a unit.
+ * How many items sit in a state this sweep skips on purpose — the ONLY thing that makes those holes
+ * visible, since the obvious prod check (`items` minus `project_context_units`) cannot see either:
+ * both have a unit. Repair is EXCLSHADOW-1.
  *
- * Best-effort: a failure reports 0 rather than throwing, because a broken observability count must
- * not fail the sweep that is doing real work. It is a metric, not a gate.
+ * Returns `null` on failure rather than zeros. An earlier version caught and returned 0, which made
+ * "the metric could not be read" indistinguishable from "there are none" — the exact silent direction
+ * this metric exists to prevent, and the reason a reviewer blocked it.
  */
-export async function countExcludeShadows(teamId: string): Promise<number> {
+export async function countUnrepairable(teamId: string): Promise<UnrepairableCounts | null> {
   try {
-    const res = await runSql<{ n: number }>(SHADOW_COUNT_SQL, [teamId, GENERAL_SLUG, EXTERNAL_SHARED_SLUG]);
-    return res.rows[0]?.n ?? 0;
+    const res = await runSql<{ exclude_shadows: number; retracted_units: number }>(UNREPAIRABLE_SQL, [
+      teamId,
+      GENERAL_SLUG,
+      EXTERNAL_SHARED_SLUG,
+    ]);
+    const row = res.rows[0];
+    if (!row) return { excludeShadows: 0, retractedUnits: 0 };
+    return { excludeShadows: row.exclude_shadows ?? 0, retractedUnits: row.retracted_units ?? 0 };
   } catch {
-    return 0;
+    return null;
   }
 }

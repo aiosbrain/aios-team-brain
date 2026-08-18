@@ -68,8 +68,11 @@ describe("guard: the candidate predicate's SQL shape", () => {
     expect(arms.length, "three arms means two `or`s at minimum").toBeGreaterThanOrEqual(3);
     // Arm 1: no unit at all — and it must NOT filter on `state`, matching reconcileItemUnit's own
     // lookup, so a retracted unit counts as missing rather than as done.
-    expect(sql).toMatch(/not exists \(\s*select 1 from project_context_units u\s*where u\.team_id = \$1 and u\.source_item_id = s\.id\s*\)/);
-    expect(sql, "arm 1 must not narrow on unit state").not.toMatch(/u\.state/);
+    expect(sql).toMatch(/not exists \(\s*select 1 from project_context_units u\s*where u\.team_id = \$1 and u\.source_item_id = s\.id and u\.unit_kind = 'item'\s*\)/);
+    // Every unit reference must be item-grain, matching reconcileItemUnit's own lookup — otherwise a
+    // non-item unit on the same source_item_id would satisfy "has a unit" and the item is skipped.
+    expect((sql.match(/u\.unit_kind = 'item'/g) ?? []).length, "every unit reference must be item-grain")
+      .toBeGreaterThanOrEqual(4);
     // Arm 2: no current INCLUDE in the TARGET project.
     expect(sql).toMatch(/m\.decision = 'include' and m\.project_id = s\.target_id/);
     // Arm 3: still a current membership in the OPPOSITE project, of ANY decision — closeMembershipInto
@@ -77,8 +80,18 @@ describe("guard: the candidate predicate's SQL shape", () => {
     expect(sql).toMatch(/m\.valid_to is null and m\.project_id = s\.opposite_id/);
   });
 
-  it("EXCLUDES the exclude-shadow, so the sweep cannot burn a tick on a state it cannot repair", () => {
+  it("EXCLUDES both UNREPAIRABLE states, so the sweep cannot burn a tick on either", () => {
+    // reconcile can fix neither: ensureIncludeMembership no-ops on any current row, and
+    // reconcileItemUnit never writes `state`. Selecting either would hold `scanned` off zero forever.
     expect(sql).toMatch(/and not exists \([\s\S]*m\.decision = 'exclude' and m\.project_id = s\.target_id/);
+    expect(sql, "a retracted unit is unrepairable too").toMatch(/u\.state <> 'active'/);
+  });
+
+  it("maps target and opposite to the RIGHT projects — a swap must not pass", () => {
+    // The gap a reviewer found: asserting both derivations mention i.access still passes when
+    // general_id and external_id are swapped, which would invert every partition decision.
+    expect(sql).toMatch(/case when i\.access = 'external' then sys\.external_id else sys\.general_id end as target_id/);
+    expect(sql).toMatch(/case when i\.access = 'external' then sys\.general_id else sys\.external_id end as opposite_id/);
   });
 
   it("parameterises team, cutoff and paging — no interpolation", () => {
