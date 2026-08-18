@@ -69,7 +69,7 @@ async function pass(seed: Seed, opts: { budgetMs: number }) {
       trigger: "scheduler",
       ok: o.ok,
       created: o.membershipsCreated,
-      meta: { truncated: o.truncated, drained: o.drained, shortCircuit: o.shortCircuit, cursor: o.cursor },
+      meta: { truncated: o.truncated, drained: o.drained, cursor: o.cursor },
       startedAt: Date.now() - 1,
     });
   }
@@ -105,7 +105,7 @@ describe("context backfill — bounded by a budget, resumable across ticks (data
       const r = await pass(seed, { budgetMs: 0 });
       const o = r.outcomes.find((x) => x.teamId === seed.teamId)!;
       cursors.push(o.cursor);
-      if (o.drained || o.shortCircuit) break;
+      if (o.drained) break;
     }
 
     expect(await itemsWithoutMembership(seed), "every item must end up partitioned").toBe(0);
@@ -121,42 +121,59 @@ describe("context backfill — bounded by a budget, resumable across ticks (data
     await seedItems(seed, SIZE);
     for (let i = 0; i < 10; i++) {
       const r = await pass(seed, { budgetMs: 0 });
-      if (r.outcomes[0]?.drained || r.outcomes[0]?.shortCircuit) break;
+      if (r.outcomes[0]?.drained) break;
     }
     const drainedState = await readTeamBackfillState(db(), seed.teamId);
     expect(drainedState.cursor, "a drained pass must clear the cursor").toBeNull();
 
-    // A new item, then strip its membership to simulate the hook having missed it.
+    // A new item whose membership is then CLOSED, to simulate a half-reconciled item.
+    //
+    // The previous version of this could not run: it looked the unit up before any backfill, but the
+    // dm `ingest` helper calls `ingestItem` directly and the partition hook lives in the items ROUTE
+    // — so the fresh item had no unit, `if (unit)` never fired, and the strip never happened. The
+    // test still passed, because an unpartitioned item is a candidate anyway — it was proving the
+    // arm-1 state while its comment claimed otherwise. An earlier fix corrected the `.itemId`/`.id`
+    // key and CLAIMED to have fixed this; that claim was false, and it took a review to catch.
+    // Now: backfill FIRST so the item genuinely has a current include, then close it.
     const late = await ingest(seed, { path: "late/x.md", body: "late", access: "team", project: "src" });
-    const { data: unit } = await db()
-      .from("project_context_units").select("id")
-      .eq("team_id", seed.teamId).eq("source_item_id", late.itemId).maybeSingle();
-    if (unit) {
-      await db().from("project_context_memberships")
-        .update({ valid_to: new Date().toISOString() })
-        .eq("team_id", seed.teamId).eq("context_unit_id", (unit as { id: string }).id).is("valid_to", null);
+    for (let i = 0; i < 10; i++) {
+      const r = await pass(seed, { budgetMs: 60_000 });
+      if (r.outcomes[0]?.drained) break;
     }
+    const lateUnit = await db()
+      .from("project_context_units").select("id")
+      .eq("team_id", seed.teamId).eq("source_item_id", late.id).maybeSingle();
+    const lateUnitId = (lateUnit.data as { id: string } | null)?.id;
+    expect(lateUnitId, "the backfill must have given it a unit before we can close its membership").toBeTruthy();
+    const closed = await db().from("project_context_memberships")
+      .update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId).eq("context_unit_id", lateUnitId!).is("valid_to", null);
+    expect(closed.error, "the strip must actually run — that is the whole point of this fixture").toBeFalsy();
+
     expect(await itemsWithoutMembership(seed)).toBeGreaterThan(0);
 
     for (let i = 0; i < 10; i++) {
       const r = await pass(seed, { budgetMs: 60_000 });
-      if (r.outcomes[0]?.drained || r.outcomes[0]?.shortCircuit) break;
+      if (r.outcomes[0]?.drained) break;
     }
     expect(await itemsWithoutMembership(seed), "the backstop must reach it after the reset").toBe(0);
   });
 
-  it("a converged corpus takes the cheap SHORT-CIRCUIT instead of an O(N) drain", async () => {
+  it("a converged corpus reconciles NOTHING — attributable to the predicate, not a short-circuit", async () => {
+    // TICKSTALL-2 removed the convergence short-circuit (it could report converged while a real
+    // candidate existed). This assertion used to be satisfied by that heuristic never running the
+    // sweep; now `scanned: 0` is the predicate's own result.
     const seed = await seedTeam();
     await seedItems(seed, SIZE);
     for (let i = 0; i < 10; i++) {
       const r = await pass(seed, { budgetMs: 60_000 });
-      if (r.outcomes[0]?.drained || r.outcomes[0]?.shortCircuit) break;
+      if (r.outcomes[0]?.drained) break;
     }
 
     const r = await pass(seed, { budgetMs: 60_000 });
     const o = r.outcomes.find((x) => x.teamId === seed.teamId)!;
-    expect(o.shortCircuit, "a converged team must not be swept again").toBe(true);
-    expect(o.scanned, "the short-circuit is ~2 counts, not a scan").toBe(0);
+    expect(o.scanned, "a converged corpus must reconcile nothing").toBe(0);
+    expect(o.drained, "and drain immediately").toBe(true);
   });
 
   it("a budget-truncated turn is ok:true — it must NOT enter the failure path", async () => {
