@@ -43,6 +43,10 @@ async function seedMemberWithAuth(
   const userId = await ensureAuthUser(email);
   // Team-scoped activation: pass the team so the invited row is linked AND activated here.
   await linkMemberByEmail(userId, email, teamId);
+  // PRET-4 explicit state: raw-inserted fixture members need their builtin-posture row (in
+  // production createMember writes it; the retired recompute no longer heals raw inserts).
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(teamId, m!.id as string, "team");
   return { memberId: m!.id as string, userId };
 }
 

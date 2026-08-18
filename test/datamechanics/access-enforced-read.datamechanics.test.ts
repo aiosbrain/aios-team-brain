@@ -45,6 +45,8 @@ async function seedMember(seed: Seed): Promise<string> {
     })
     .select("id")
     .single();
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, "team");
   return data!.id as string;
 }
 
@@ -104,7 +106,7 @@ describe("access enforcement flag", () => {
     expect(outsiderPaths, "an outsider must not see restricted-project content").not.toContain("secret.md");
   });
 
-  it("enforcing: the legacy-tier conjunct still applies — an external member never sees a team item (oracle ∧ tier)", async () => {
+  it("PRET-4 (inverts oracle∧tier): a team-access item whose membership was moved into external-shared IS served — placement is the sharing act", async () => {
     const seed = await seedTeam();
     const extMember = await seedMember(seed);
     await db().from("members").update({ tier: "external" }).eq("id", extMember).eq("team_id", seed.teamId);
@@ -134,7 +136,11 @@ describe("access enforcement flag", () => {
 
     await setEnforcement(seed, "enforcing");
     const got = await paths(await memberKey(seed, extMember));
-    expect(got, "the legacy tier conjunct must exclude a team-access item from an external principal").not.toContain("team-only.md");
+    // PRET-4 INVERSION (membership is the model, ruling 2): the item's membership was
+    // DELIBERATELY moved into external-shared — that placement IS the sharing act, and the
+    // oracle alone decides under enforcing. The retired wall conjunct would have silently
+    // overridden the placement; the inspector, the read, and the leak check now agree.
+    expect(got, "a team-access item deliberately membershiped into external-shared is served to its members").toContain("team-only.md");
   });
 
   it("enforcing: a delegated agent token is membership-filtered too — cannot exceed its launcher (Fable HIGH H3)", async () => {

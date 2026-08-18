@@ -23,6 +23,8 @@ async function seedMember(seed: Seed): Promise<string> {
     .insert({ team_id: seed.teamId, email: `${randomUUID()}@test.local`, display_name: "M", actor_handle: `h-${randomUUID().slice(0, 10)}`, role: "member", tier: "team", status: "active" })
     .select("id")
     .single();
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, "team");
   return data!.id as string;
 }
 async function setEnforcement(seed: Seed, mode: "permissive" | "enforcing") {
