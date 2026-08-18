@@ -115,9 +115,10 @@ export interface DrainResult {
 /**
  * Drain ONE team's backfill cursor to completion. The single-team counterpart to
  * `backfillAllTeams`, for callers that must know this team is fully partitioned before doing
- * something else — today that is the demo bootstrap (`docker/bootstrap.mjs` post-seed; PRET-6:
- * the enforcement flip that used to own this call is retired), because a team must not serve
- * its first read while any item still lacks a membership. Deliberately has
+ * something else — today that is the demo bootstrap (`docker/bootstrap.mjs` post-seed, via
+ * `scripts/admin.ts drain-context`; PRET-6: the enforcement flip that used to own this call is
+ * retired), because a team must not serve its first read while any item still lacks a
+ * membership. Deliberately has
  * NO convergence short-circuit: the count heuristic `backfillAllTeams` uses is a cheap tick
  * optimization, and a caller about to change what a whole team can see needs the real drain.
  * Guard-exhaustion is reported as a FAILURE, never a silent partial (Fable M1).
