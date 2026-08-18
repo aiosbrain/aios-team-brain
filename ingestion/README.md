@@ -120,4 +120,13 @@ next step (see `docs/TODO.md`).
   timeline. Tracked in `docs/TODO.md`.
 - Large backfills are throttled under the brain's 120 POST/min/key limit.
 
-See `THIRD_PARTY_LICENSES.md` for imported-dependency licenses. This package is MIT.
+## License
+
+This package is **Apache-2.0** (see `LICENSE` and `NOTICE` in this directory) — a deliberate
+exception to the repository default of AGPL-3.0-only, because the sidecar is meant to run inside
+other people's systems. See [`../LICENSING.md`](../LICENSING.md).
+
+Because this directory is Apache-2.0, it must never import from the AGPL portions of the
+repository. It doesn't today: it's a separate Python package that reaches the brain over HTTP.
+
+See `THIRD_PARTY_LICENSES.md` for imported-dependency licenses.

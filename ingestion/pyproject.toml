@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "AIOS Team Brain ingestion sidecar — imports open-source readers (LlamaHub, Unstructured) and pushes normalized content into the brain over HTTP."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
   "httpx>=0.27",
   "pydantic>=2.7",

@@ -1,0 +1,105 @@
+AIOS Team Brain
+Copyright (C) 2026 Chetan Nandakumar and John Ellison
+
+This product is licensed under the GNU Affero General Public License v3.0 only
+(AGPL-3.0-only), except for the directories listed in LICENSING.md, which are
+licensed under the Apache License 2.0.
+
+This file records third-party components that carry an attribution or notice
+obligation, or whose license is worth stating plainly for anyone running a
+compliance review. It is not a complete dependency list — see package.json,
+package-lock.json, and ingestion/THIRD_PARTY_LICENSES.md for that.
+
+
+--------------------------------------------------------------------------------
+Services AIOS runs alongside (not redistributed)
+--------------------------------------------------------------------------------
+
+Graphiti — Apache License 2.0
+    https://github.com/getzep/graphiti
+    A temporal knowledge-graph engine. AIOS calls it over its REST API and never
+    imports it. The graphiti/ directory in this repository contains a Dockerfile
+    and patch scripts that build on the upstream image; those files are licensed
+    Apache-2.0 to match upstream. We do not redistribute the upstream image.
+
+Neo4j Community Edition — GNU General Public License v3.0
+    https://github.com/neo4j/neo4j
+    The graph database Graphiti stores into. Our Compose files reference the
+    upstream `neo4j:5.26.2` image by tag; Docker pulls it from Docker Hub at run
+    time. We do not bundle, modify, or redistribute Neo4j, and AIOS communicates
+    with it over the network (Bolt) as a separate program.
+
+PostgreSQL — PostgreSQL License
+    https://www.postgresql.org/
+    Referenced by upstream image tag in the same way. Not bundled.
+
+
+--------------------------------------------------------------------------------
+Bundled dependencies with notice obligations
+--------------------------------------------------------------------------------
+
+@img/sharp-libvips — GNU LGPL v3.0-or-later
+    https://github.com/libvips/libvips
+    The prebuilt binary packaging of libvips, reached transitively through `sharp`,
+    the image-processing library. The npm packages declare LGPL-3.0-or-later; libvips
+    itself is upstream licensed LGPL-2.1-or-later.
+
+    libvips remains licensed under the LGPL; nothing about it is relicensed by
+    its use here. The obligations the LGPL places on us are attribution — this
+    notice — and the ability for a recipient to run AIOS against a modified
+    version of the library. Both are satisfied structurally rather than by any
+    special step: libvips is installed unmodified as a separate npm package and
+    is loaded dynamically at run time, so a recipient can replace it by
+    substituting the installed package. It is not modified and not statically
+    linked into AIOS.
+
+@sentry/cli — Functional Source License 1.1 (FSL-1.1-MIT)
+    https://github.com/getsentry/sentry-cli
+    Reached transitively: @sentry/nextjs -> @sentry/bundler-plugin-core ->
+    @sentry/cli. Every hop is an ordinary non-optional runtime dependency of the
+    package above it, so this installs under `npm ci --omit=dev` and is present
+    in the container image.
+
+    FSL-1.1-MIT is a source-available license, not an OSI-approved one. It
+    permits use, modification, and redistribution, and restricts only competing
+    commercial offerings of the software itself — a restriction AIOS does not
+    engage, because AIOS is not a Sentry competitor and does not offer
+    sentry-cli as a service. It carries no copyleft obligation and does not
+    affect the licensing of AIOS.
+
+    It is recorded here because automated license scanners flag any non-OSI
+    license, and this is the answer to that finding. Under FSL-1.1-MIT's own
+    terms each release converts to the MIT License two years after its
+    publication date.
+
+    We cannot relocate it to devDependencies: it is not a dependency we declare.
+    Removing it would mean removing the Sentry SDK, which is application code
+    and out of scope for a licensing change.
+
+caniuse-lite — Creative Commons Attribution 4.0 International
+    Browser-support data. Attribution given here.
+
+
+--------------------------------------------------------------------------------
+Build and development tooling (not present in the production image)
+--------------------------------------------------------------------------------
+
+These are devDependencies. They are absent from an `npm ci --omit=dev` install and
+from the container image, so they are not redistributed. Recorded because license
+scanners run against the full dependency tree and will surface them.
+
+lightningcss — Mozilla Public License 2.0
+axe-core — Mozilla Public License 2.0
+    MPL-2.0 is file-level copyleft: it attaches to the MPL-licensed files
+    themselves, which we do not modify. It places no obligation on AIOS's own
+    source and is compatible with the AGPL in any case.
+
+
+--------------------------------------------------------------------------------
+Not a dependency
+--------------------------------------------------------------------------------
+
+FalkorDB (SSPL v1) is NOT a dependency of AIOS, is not installed by any script,
+and appears in no Compose file. It is referenced only in design documents, as a
+graph backend that was evaluated and declined. If you adopt it yourself, its
+SSPL terms are between you and FalkorDB.
