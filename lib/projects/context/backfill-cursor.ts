@@ -16,8 +16,15 @@ import type { DbClient } from "@/lib/db/types";
  * row. No schema change, and it survives a deploy — in-memory state would not, and at ~15 deploys a
  * day it would reset before a multi-tick pass could finish.
  *
- * WHAT MAKES IT SAFE. Exactly one writer: `lib/ingest/single-flight` stops the tick overlapping
- * itself. `recordIngestRun` is append-only and best-effort with no compare-and-swap, so with
+ * WHAT MAKES IT SAFE, AND THE PRECONDITION THAT CLAIM RESTS ON. One writer per PROCESS:
+ * `lib/ingest/single-flight` stops the tick overlapping itself. That is sufficient here because this
+ * deployment runs ONE app replica — `instrumentation.register()` starts a scheduler in every Node
+ * process, and the single-flight flag is a closure-local boolean, so at two or more replicas two
+ * processes would race this cursor and the guarantee below evaporates. That is not a new limitation
+ * introduced here (README §"Background schedulers" already states the in-process-only assumption for
+ * every poller), but it IS load-bearing for the cursor specifically, so it is named rather than
+ * assumed. If this service is ever scaled out, this cursor needs a real lease or CAS — and so do the
+ * other schedulers. `recordIngestRun` is append-only and best-effort with no compare-and-swap, so with
  * concurrent ticks two passes could read the same cursor and race their writes, and a stale pass
  * finishing after a drain could resurrect a superseded cursor. Single-flight is a PREREQUISITE here,
  * not an optimisation. (`lib/graph/extraction-alert` also keeps durable state in `ingest_runs.meta`,
@@ -50,9 +57,11 @@ function cursorFromMeta(meta: unknown): string | null {
  * timestamp (`lib/ingest/pipeline-health` had to learn the same lesson), and without the second key
  * the resume point is arbitrary between same-millisecond rows.
  *
- * `trigger='scheduler'` only: the admin "backfill now" action and the enforcement-flip drain write
- * their own rows, and neither is this stage's cursor. Reading them would resume the scheduler from
- * somebody else's position.
+ * `trigger='scheduler'` only. Today neither the admin "backfill now" action
+ * (`app/t/[team]/admin/access/actions.ts`) nor `drainTeamContext` records an `ingest_runs` row at all
+ * — verified, after an earlier version of this comment claimed they did — so there is no pollution to
+ * filter yet. The filter is kept because it costs nothing and because the moment either one starts
+ * recording, an unfiltered read would resume the scheduler from somebody else's position.
  *
  * Best-effort by design — a read failure yields a null cursor, which restarts the sweep from the top.
  * That is wasteful but always CORRECT (the reconcile is idempotent); the opposite bias, guessing a

@@ -96,7 +96,14 @@ after a drain can RESURRECT a superseded cursor. `recordIngestRun` is append-onl
 swallows its own write failures (`lib/ingest/runs.ts`); it offers no compare-and-swap to build on.
 
 So the tick gets an in-flight flag: a tick that fires while one is running returns immediately. With
-exactly one pass in flight, the cursor has a single writer and everything below is sound. This also
+exactly one pass in flight PER PROCESS, the cursor has a single writer and everything below is sound.
+
+**The precondition, stated rather than assumed:** the flag is closure-local and
+`instrumentation.register()` starts a scheduler in every Node process, so this holds at ONE app
+replica. At two, two processes race the cursor and the guarantee is gone. That is not new — the
+README already records the in-process-only assumption for every poller in this service — but it is
+load-bearing for the cursor specifically, so scaling out requires a real lease or CAS here (and for
+the other schedulers) rather than this flag. This also
 retires the overlap measured in the Problem section (13 `slack` rows in 4.85h against ~9.7 expected).
 
 **3. The cursor must SURVIVE the tick — the first draft asserted a resume mechanism that does not

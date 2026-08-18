@@ -75,7 +75,7 @@ describe("guard: the context-backfill leg records what it actually did", () => {
   });
 
   it("records the three distinct facts — truncated, drained, shortCircuit — plus the resume cursor", () => {
-    for (const key of ["truncated:", "drained:", "shortCircuit:", "cursor:"]) {
+    for (const key of ["truncated:", "drained:", "shortCircuit:", "cursor:", "elapsedMs:"]) {
       expect(tryBody, `meta must carry ${key}`).toContain(key);
     }
   });

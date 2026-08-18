@@ -160,6 +160,9 @@ export interface TeamBackfillOutcome {
   truncated: boolean;
   drained: boolean;
   shortCircuit: boolean;
+  /** Wall-clock this team's turn consumed — the per-team number the aggregate `duration_ms` cannot
+   *  give, and the one that says whether the budget is well-sized. */
+  elapsedMs: number;
   /** Resume point for the next pass; null when drained (or short-circuited). */
   cursor: string | null;
 }
@@ -199,6 +202,14 @@ export async function backfillAllTeams(
   // Rotation: read each team's cursor + clock, then serve least-recently-served first. Without this,
   // a stage-wide budget plus the old sequential loop starves every team behind one that never
   // converges — invisible on single-team prod, permanent everywhere else.
+  //
+  // KNOWN, DEFERRED (Codex review): the clock lives in the row `recordIngestRun` writes, and that
+  // writer SWALLOWS its errors. If `ingest_runs` writes fail persistently, every team reads as
+  // never-served, so the first team by id is served every pass and the rest are deferred forever —
+  // livelock, though not data loss (the reconcile is idempotent; nothing is skipped). Not fixed here
+  // because the precondition is a total failure of the run ledger, which is ALREADY alarmed by a
+  // different mechanism: the upstream connector legs stop recording too and go stale within 3h. A
+  // fix belongs with whatever makes `recordIngestRun` failures visible, not inside the rotation.
   const states = await Promise.all(all.map((t) => readTeamBackfillState(db, t.id)));
   const ordered = orderByRotation(states);
 
@@ -231,8 +242,10 @@ async function backfillOneTeamTurn(
     truncated: false,
     drained: false,
     shortCircuit: false,
+    elapsedMs: 0,
     cursor: state.cursor,
   };
+  const turnStartedAt = o.now();
   const t = { id: state.teamId };
   {
     try {
@@ -250,7 +263,7 @@ async function backfillOneTeamTurn(
         // Converged: nothing to sweep. The cursor is cleared, not preserved — a stale cursor left
         // behind here would resume mid-corpus the next time the predicate fails and skip everything
         // below it.
-        return { ...base, shortCircuit: true, drained: true, cursor: null };
+        return { ...base, elapsedMs: o.now() - turnStartedAt, shortCircuit: true, drained: true, cursor: null };
       }
       let cursor: string | null = state.cursor;
       let drained = false;
@@ -271,7 +284,7 @@ async function backfillOneTeamTurn(
           // A failure keeps the cursor at the last FULLY-succeeded item so the next pass RETRIES the
           // offending item instead of stepping over it — skipping would leave a unit with no
           // membership, i.e. content visible to nobody under an enforced read.
-          return { ...base, ok: false, error: r.error ?? "unknown", scanned, unitsCreated, membershipsCreated, cursor: r.cursor };
+          return { ...base, elapsedMs: o.now() - turnStartedAt, ok: false, error: r.error ?? "unknown", scanned, unitsCreated, membershipsCreated, cursor: r.cursor };
         }
         if (r.cursor === null) {
           drained = true;
@@ -296,9 +309,9 @@ async function backfillOneTeamTurn(
       }
       // Reset on drain. Without it, an item the on-push hook misses whose id sorts BELOW the final
       // cursor is never swept again — the silent-forever direction.
-      return { ...base, scanned, unitsCreated, membershipsCreated, truncated, drained, cursor: drained ? null : cursor };
+      return { ...base, elapsedMs: o.now() - turnStartedAt, scanned, unitsCreated, membershipsCreated, truncated, drained, cursor: drained ? null : cursor };
     } catch (e) {
-      return { ...base, ok: false, error: e instanceof Error ? e.message : "threw" };
+      return { ...base, elapsedMs: o.now() - turnStartedAt, ok: false, error: e instanceof Error ? e.message : "threw" };
     }
   }
 }

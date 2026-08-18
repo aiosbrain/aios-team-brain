@@ -401,6 +401,7 @@ export function startIngestScheduler(): void {
             truncated: o.truncated,
             drained: o.drained,
             shortCircuit: o.shortCircuit,
+            elapsedMs: o.elapsedMs,
             cursor: o.cursor,
           },
           startedAt,
