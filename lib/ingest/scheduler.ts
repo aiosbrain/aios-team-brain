@@ -370,37 +370,68 @@ export function startIngestScheduler(): void {
       // Cutoff = tick start: bound this run to content that existed when the tick began, so a
       // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
       const cutoff = new Date(startedAt).toISOString();
-      const r = await backfillAllTeams(db, cutoff);
-      // Record a per-team outcome EVERY tick (success AND failure), so a team that failed once
-      // and later recovers gets a newer OK row rather than staying permanently red under
-      // distinct-on (slice-5 Codex Medium).
-      for (const teamId of r.succeeded) {
-        await recordIngestRun(db, { teamId, source: "context_backfill", trigger: "scheduler", ok: true, created: 0, startedAt });
-      }
-      for (const f of r.failed) {
-        if (f.teamId === "*") continue;
+      // BOUNDED (TICKSTALL-1). The stage used to drain to completion or not at all, which measured
+      // 57-60 min against a 30-min interval and starved every stage below it. `batchSize: 100`, not
+      // the 500 default, because the budget is checked at a BATCH boundary — a batch that has started
+      // runs to completion, so the stage's real bound is `budget + one batch` and a smaller batch
+      // keeps that overshoot near a couple of minutes instead of ~11.
+      const r = await backfillAllTeams(db, cutoff, { batchSize: 100 });
+      // Record a per-team outcome EVERY served turn (success AND failure), so a team that failed once
+      // and later recovers gets a newer OK row rather than staying permanently red under distinct-on
+      // (slice-5 Codex Medium). This row is ALSO the durable resume cursor and the rotation clock
+      // (`lib/projects/context/backfill-cursor` reads it back), which is why every turn must write one
+      // even when it did nothing: a turn that recorded nothing would never leave the front of the
+      // rotation queue.
+      //
+      // `created` and `meta` carry what the pass ACTUALLY did. They used to be hardcoded `created: 0`,
+      // so every row read identically whether the pass drained 2600 items or spun for an hour — which
+      // is precisely why a 59-minute stage ran for six days without anyone noticing.
+      for (const o of r.outcomes) {
         await recordIngestRun(db, {
-          teamId: f.teamId,
+          teamId: o.teamId,
           source: "context_backfill",
           trigger: "scheduler",
-          ok: false,
-          created: 0,
-          errors: [f.error],
+          ok: o.ok,
+          created: o.membershipsCreated,
+          errors: o.ok ? undefined : [o.error ?? "unknown"],
+          meta: {
+            scanned: o.scanned,
+            unitsCreated: o.unitsCreated,
+            membershipsCreated: o.membershipsCreated,
+            truncated: o.truncated,
+            drained: o.drained,
+            shortCircuit: o.shortCircuit,
+            cursor: o.cursor,
+          },
           startedAt,
         });
       }
-      const globalFailure = r.failed.find((f) => f.teamId === "*");
+      const truncated = r.outcomes.filter((o) => o.truncated).length;
+      if (truncated || r.deferred.length) {
+        console.info(`[ingest] context backfill bounded by budget — ${truncated} truncated, ${r.deferred.length} deferred to the next pass`);
+      }
       // Instance-wide heartbeat under a DISTINCT source ('context_backfill_all') so a per-team
       // failed 'context_backfill' row isn't masked by the newer global ok row under distinct-on
       // (slice-5 Fable Medium — the same latent shape access_bootstrap has; tracked separately).
+      //
+      // A budget-truncated pass is NOT a failure: `ok` stays true and the fact lives in
+      // `meta.truncated`. Routing truncation through the failure path would put a healthy leg into the
+      // BANNERFLAP-1 streak and redden the banner — re-introducing the bug BANNERFLAP-2 just fixed.
       await recordIngestRun(db, {
         teamId: null,
         source: "context_backfill_all",
         trigger: "scheduler",
-        ok: !globalFailure,
-        created: 0,
-        errors: globalFailure ? [globalFailure.error] : undefined,
-        meta: { teams: r.teams, failedTeams: r.failed.length },
+        ok: !r.error,
+        created: r.outcomes.reduce((n, o) => n + o.membershipsCreated, 0),
+        errors: r.error ? [r.error] : undefined,
+        meta: {
+          teams: r.teams,
+          served: r.outcomes.length,
+          failedTeams: r.outcomes.filter((o) => !o.ok).length,
+          truncated,
+          deferred: r.deferred.length,
+          scanned: r.outcomes.reduce((n, o) => n + o.scanned, 0),
+        },
         startedAt,
       });
     } catch (err) {

@@ -2,6 +2,8 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
+import { budgetExpired, contextBackfillBudgetMs } from "./backfill-budget";
+import { orderByRotation, readTeamBackfillState, type TeamBackfillState } from "./backfill-cursor";
 
 /**
  * §11 backfill — the "give every existing item a membership" half of the migration. For each
@@ -144,16 +146,95 @@ export async function drainTeamContext(
   };
 }
 
-/** Backfill every team to completion (drains the cursor per team). Best-effort per team. */
+/** What one team's turn did. `truncated`, `drained` and `shortCircuit` are three DIFFERENT facts:
+ *  hit the budget / reached the end of the corpus / skipped because the convergence predicate held.
+ *  An earlier draft folded them into one flag called `converged`, which lied — it meant "this call hit
+ *  the budget" while any reader takes it as "this team satisfies the predicate". */
+export interface TeamBackfillOutcome {
+  teamId: string;
+  ok: boolean;
+  error?: string;
+  scanned: number;
+  unitsCreated: number;
+  membershipsCreated: number;
+  truncated: boolean;
+  drained: boolean;
+  shortCircuit: boolean;
+  /** Resume point for the next pass; null when drained (or short-circuited). */
+  cursor: string | null;
+}
+
+export interface AllTeamsResult {
+  teams: number;
+  outcomes: TeamBackfillOutcome[];
+  /** Teams never reached this pass because the budget ran out — they lead the next rotation. */
+  deferred: string[];
+  /** Instance-wide read failure (the `teams` select itself). */
+  error?: string;
+}
+
+/**
+ * Backfill teams within a wall-clock BUDGET, resuming each from its stored cursor and serving them
+ * least-recently-first (TICKSTALL-1). Best-effort per team.
+ *
+ * The budget is checked AFTER each batch, so every team whose turn begins makes at least one batch of
+ * progress — a budget of zero (mis-set env, clock jump) must not halt the sweep at nothing. The stage
+ * therefore runs for at most `budget + one batch`; the scheduler passes a small `batchSize` to keep
+ * that overshoot near one batch.
+ *
+ * `now` is injectable so the budget is testable without sleeping.
+ */
 export async function backfillAllTeams(
   db: DbClient,
-  cutoff: string
-): Promise<{ teams: number; succeeded: string[]; failed: { teamId: string; error: string }[] }> {
+  cutoff: string,
+  opts: { budgetMs?: number; batchSize?: number; now?: () => number } = {}
+): Promise<AllTeamsResult> {
+  const now = opts.now ?? Date.now;
+  const budgetMs = opts.budgetMs ?? contextBackfillBudgetMs();
+  const startedAt = now();
   const { data: teams, error } = await db.from("teams").select("id");
-  if (error) return { teams: 0, succeeded: [], failed: [{ teamId: "*", error: `teams read failed: ${error.message}` }] };
-  const succeeded: string[] = [];
-  const failed: { teamId: string; error: string }[] = [];
-  for (const t of (teams ?? []) as { id: string }[]) {
+  if (error) return { teams: 0, outcomes: [], deferred: [], error: `teams read failed: ${error.message}` };
+  const all = (teams ?? []) as { id: string }[];
+
+  // Rotation: read each team's cursor + clock, then serve least-recently-served first. Without this,
+  // a stage-wide budget plus the old sequential loop starves every team behind one that never
+  // converges — invisible on single-team prod, permanent everywhere else.
+  const states = await Promise.all(all.map((t) => readTeamBackfillState(db, t.id)));
+  const ordered = orderByRotation(states);
+
+  const outcomes: TeamBackfillOutcome[] = [];
+  const deferred: string[] = [];
+  for (const state of ordered) {
+    if (outcomes.length > 0 && budgetExpired(startedAt, now(), budgetMs)) {
+      // Out of budget BEFORE this team's turn began — defer it. It leads the next rotation, which is
+      // what bounds every team to being served within `team_count` passes.
+      deferred.push(state.teamId);
+      continue;
+    }
+    outcomes.push(await backfillOneTeamTurn(db, state, cutoff, { budgetMs, batchSize: opts.batchSize, now, startedAt }));
+  }
+  return { teams: all.length, outcomes, deferred };
+}
+
+async function backfillOneTeamTurn(
+  db: DbClient,
+  state: TeamBackfillState,
+  cutoff: string,
+  o: { budgetMs: number; batchSize?: number; now: () => number; startedAt: number }
+): Promise<TeamBackfillOutcome> {
+  const base: TeamBackfillOutcome = {
+    teamId: state.teamId,
+    ok: true,
+    scanned: 0,
+    unitsCreated: 0,
+    membershipsCreated: 0,
+    truncated: false,
+    drained: false,
+    shortCircuit: false,
+    cursor: state.cursor,
+  };
+  const t = { id: state.teamId };
+  {
     try {
       // Cheap convergence short-circuit — counts CURRENT MEMBERSHIPS, not units (slice-5 Codex
       // HIGH): a unit whose membership creation FAILED still has a unit, so a unit-count check
@@ -165,29 +246,59 @@ export async function backfillAllTeams(
         db.from("items").select("id", { count: "exact", head: true }).eq("team_id", t.id),
         db.from("project_context_memberships").select("id", { count: "exact", head: true }).eq("team_id", t.id).is("valid_to", null),
       ]);
-      if (typeof itemCount === "number" && typeof memCount === "number" && memCount >= itemCount) { succeeded.push(t.id); continue; }
-      let cursor: string | null = null;
+      if (typeof itemCount === "number" && typeof memCount === "number" && memCount >= itemCount) {
+        // Converged: nothing to sweep. The cursor is cleared, not preserved — a stale cursor left
+        // behind here would resume mid-corpus the next time the predicate fails and skip everything
+        // below it.
+        return { ...base, shortCircuit: true, drained: true, cursor: null };
+      }
+      let cursor: string | null = state.cursor;
       let drained = false;
+      let truncated = false;
+      let scanned = 0;
+      let unitsCreated = 0;
+      let membershipsCreated = 0;
       for (let guard = 0; guard < MAX_BATCHES; guard++) {
-        const r: BackfillResult = await backfillTeamContext(db, t.id, { afterId: cursor, createdBefore: cutoff });
+        const r: BackfillResult = await backfillTeamContext(db, t.id, {
+          afterId: cursor,
+          createdBefore: cutoff,
+          batchSize: o.batchSize,
+        });
+        scanned += r.scanned;
+        unitsCreated += r.unitsCreated;
+        membershipsCreated += r.membershipsCreated;
         if (!r.ok) {
-          failed.push({ teamId: t.id, error: r.error ?? "unknown" });
-          drained = true; // recorded as failed; don't ALSO report guard-exhaustion below
-          break;
+          // A failure keeps the cursor at the last FULLY-succeeded item so the next pass RETRIES the
+          // offending item instead of stepping over it — skipping would leave a unit with no
+          // membership, i.e. content visible to nobody under an enforced read.
+          return { ...base, ok: false, error: r.error ?? "unknown", scanned, unitsCreated, membershipsCreated, cursor: r.cursor };
         }
         if (r.cursor === null) {
           drained = true;
           break;
         }
         cursor = r.cursor;
+        // AFTER the batch, never before: every team's turn makes at least one batch of progress, so a
+        // zero/mis-set budget cannot halt the sweep at nothing.
+        if (budgetExpired(o.startedAt, o.now(), o.budgetMs)) {
+          truncated = true;
+          break;
+        }
       }
-      // Fail LOUD on a silent partial: a corpus larger than MAX_BATCHES*batchSize left
-      // un-drained would otherwise report as covered (Fable M1).
-      if (!drained) failed.push({ teamId: t.id, error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled` });
-      else if (!failed.some((f) => f.teamId === t.id)) succeeded.push(t.id);
+      if (!drained && !truncated) {
+        // Fail LOUD on a silent partial: a corpus larger than MAX_BATCHES*batchSize left un-drained
+        // would otherwise report as covered (Fable M1). Distinct from `truncated`, which is a
+        // deliberate stop with a resumable cursor.
+        return {
+          ...base, ok: false, scanned, unitsCreated, membershipsCreated, cursor,
+          error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled`,
+        };
+      }
+      // Reset on drain. Without it, an item the on-push hook misses whose id sorts BELOW the final
+      // cursor is never swept again — the silent-forever direction.
+      return { ...base, scanned, unitsCreated, membershipsCreated, truncated, drained, cursor: drained ? null : cursor };
     } catch (e) {
-      failed.push({ teamId: t.id, error: e instanceof Error ? e.message : "threw" });
+      return { ...base, ok: false, error: e instanceof Error ? e.message : "threw" };
     }
   }
-  return { teams: (teams ?? []).length, succeeded, failed };
 }
