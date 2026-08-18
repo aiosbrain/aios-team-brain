@@ -57,7 +57,10 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // A dashboard-created initiative can squat the slug 'general'. Without this the sweep partitions
     // into the squatter while the ingest hook (which has always filtered) refuses — the two paths
     // diverging in exactly the case the shared core exists to prevent.
-    expect(sql).toMatch(/kind = 'system'/);
+    // COUNT, not "contains": there are two project resolutions in this query, and a `contains` check
+    // stays green when only one of them loses the filter — which is the realistic mistake.
+    const hits = (sql.match(/kind = 'system'/g) ?? []).length;
+    expect(hits, "both the general and external-shared resolutions must filter kind='system'").toBe(2);
   });
 
   it("has all THREE needs-work arms", () => {
