@@ -1,7 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
-import { visibleGroupIds } from "@/lib/graph/group";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { visibleTasks, isRestrictedTier } from "@/lib/auth/visibility";
 import {
@@ -133,36 +132,6 @@ async function fetchAugmentedSources(
 const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
 const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
-async function fetchGraphFacts(
-  db: DbClient,
-  teamId: string,
-  tier: "team" | "external",
-  question: string
-): Promise<GraphFact[]> {
-  try {
-    const { data: team } = await db.from("teams").select("slug").eq("id", teamId).maybeSingle();
-    const slug = (team as { slug: string } | null)?.slug;
-    if (!slug) return [];
-    let groupIds = visibleGroupIds(slug, tier);
-    // PCCC-6 permissive UNION (design §2.2's sequencing consequence): once restriction-purge can
-    // move content out of `_team`, the permissive team-tier read must also cover the initiative
-    // partitions that content moved into. arm:false — a permissive read is not a reader-signal;
-    // cold initiatives must never extract for it. External permissive stays `_external` only
-    // (an external principal must never widen).
-    if (tier === "team") {
-      const { data: projRows } = await db.from("projects").select("id").eq("team_id", teamId);
-      const allIds = ((projRows ?? []) as { id: string }[]).map((p) => p.id);
-      // UNCAPPED (review Medium 5): §2.2's co-land justification is coverage-EQUIVALENCE — a
-      // permissive team must see the union of ALL its partitions, and the ready set is bounded by
-      // what enforcing readers ever armed. K applies to the enforced leg, not this union.
-      const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: allIds, arm: false, k: Number.MAX_SAFE_INTEGER });
-      groupIds = [...new Set([...groupIds, ...scope.groups])];
-    }
-    return await fetchGraphFactsForGroups(question, groupIds);
-  } catch {
-    return []; // degrade to Postgres-only retrieval
-  }
-}
 
 /**
  * Enforcement input (PCCC-6 + QMIR-1): the item set gates the item legs; `graphProjectIds` —
@@ -325,7 +294,6 @@ async function resolveChannelSegment(
   // team rows; permissive → the two-bucket posture wall alone.
   let q = db.from("items").select("path").eq("team_id", teamId).eq("frontmatter->>channel", channel).limit(1);
   if (visArr) q = q.in("id", visArr); // enforcement: don't resolve a segment from an invisible item (Codex Medium)
-  else if (isRestrictedTier(tier)) q = q.eq("access", "external");
   const { data } = await q;
   const path = (data as { path: string }[] | null)?.[0]?.path;
   const seg = path ? path.split("/")[1] : "";
@@ -554,13 +522,13 @@ async function nativeRetrieve(
   // no longer speaks for them.) Permissive → all no-ops.
   const visibleIds = enforce?.visibleItemIds ?? null;
   const visible = (itemId: string | null | undefined): boolean => visibleIds === null || (itemId != null && visibleIds.has(itemId));
-  const omitGraph = enforce != null;
+  // PRET-6: enforcement is unconditional — the aggregate omissions are permanent.
   // QMIR-1 (docs/design/query-mirror-legs-classification.md §3): the actors + REPORTS_TO legs are
   // TEAM-STRUCTURAL — an enforcing MEMBER keeps them (they see the roster on every dashboard
   // surface); tokens and both default-deny arms (absent/foreign principal) do not. The POSITIVE
   // `=== "member"` test is the rule — a `!== "token"` negation would fail OPEN for a future
   // constructor that omits the field (guard-pinned).
-  const serveOrgStructural = enforce == null || enforce.principal === "member";
+  const serveOrgStructural = enforce?.principal === "member";
   // In-query filter array (Codex fold): applied inside the item-leg SQL so LIMITs rank over
   // visible rows only. null = permissive. The visible() post-filter below stays as defense-in-depth.
   const visArr: string[] | null = visibleIds ? [...visibleIds] : null;
@@ -584,8 +552,8 @@ async function nativeRetrieve(
     // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
     // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
     if (!new GraphitiClient().configured) return [];
-    if (enforce == null) return fetchGraphFacts(db, teamId, tier, q);
-    if (!enforce.graphProjectIds) return [];
+    // PRET-6: the tier-group path retired with the permissive model; scope presence decides.
+    if (!enforce?.graphProjectIds) return [];
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
@@ -608,7 +576,7 @@ async function nativeRetrieve(
   // omitGraph (= enforcing) also gates the unpartitionable aggregate legs (git/people
   // activity digests): item-derived, name restricted work, can't be membership-filtered → omit
   // under enforcing, fail closed until they gain a partition (slice-B2 Fable HIGH-2/3, §5.8b).
-  const wantsActivity = tier === "team" && !omitGraph && wantsActivityContext(q);
+  const wantsActivity = false; // PRET-6: the unpartitionable activity digests are permanently omitted (enforcement is unconditional)
   const gitDigestP = wantsActivity ? gitActivityDigest(db, teamId) : Promise.resolve("");
   const peopleDigestP = wantsActivity ? peopleActivityDigest(db, teamId) : Promise.resolve("");
 
@@ -625,7 +593,7 @@ async function nativeRetrieve(
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
-  const taskCountsP = omitGraph ? Promise.resolve({ total: 0, open: 0, byStatus: {} as Record<string, number> }) : taskStatusCounts(teamId, tier);
+  const taskCountsP = Promise.resolve({ total: 0, open: 0, byStatus: {} as Record<string, number> }); // PRET-6: the full-corpus aggregate is permanently omitted
   const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, ftsQuery, 10) : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot). Ordered by the
@@ -640,7 +608,6 @@ async function nativeRetrieve(
     .order("id", { ascending: false })
     .limit(8);
   if (visArr) recentB = recentB.in("id", visArr); // enforcement: recency over visible items only
-  else if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external"); // permissive posture wall (PRET-4 §1b)
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
   // segment, resolved from the name first (Slack's segment is its channel ID — see
   // resolveChannelSegment); the FTS leg does the precise matching, this soft filter is padding.
@@ -662,7 +629,6 @@ async function nativeRetrieve(
       .order("id", { ascending: false })
       .limit(SOURCE_RECENCY_LIMIT);
     if (visArr) sourceRecencyB = sourceRecencyB.in("id", visArr); // enforcement
-    else if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external"); // permissive posture wall
     if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
   }
 
@@ -697,7 +663,7 @@ async function nativeRetrieve(
   // production writer today, and the moment one lands its rows are ITEM-DERIVED and must be
   // partition-classed from birth — this leg must not be the door they leak through.
   const commitmentsB =
-    isRestrictedTier(tier) || omitGraph
+    true // PRET-6: commitments stay omitted for every principal (QMIR §3.5 — no production writer)
       ? emptyRows
       : db
           .from("graph_entities")
@@ -719,10 +685,7 @@ async function nativeRetrieve(
         .from("graph_relationships")
         .select("from_id, to_id, relationship_type")
         .eq("team_id", teamId)
-        .in(
-          "relationship_type",
-          enforce == null && !isRestrictedTier(tier) ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"]
-        )
+        .in("relationship_type", ["REPORTS_TO"])
         .limit(80);
   const actorsB = !serveOrgStructural
     ? emptyRows
@@ -752,7 +715,7 @@ async function nativeRetrieve(
     commitmentsB,
     relsB,
     actorsB,
-    omitGraph ? Promise.resolve([] as Awaited<ReturnType<typeof fetchAugmentedSources>>) : fetchAugmentedSources(question, tier),
+    Promise.resolve([] as Awaited<ReturnType<typeof fetchAugmentedSources>>), // PRET-6: external augmentation is unpartitionable — permanently omitted
   ]);
 
   // Merge, dedupe by id, cap sizes. Ranked FTS hits (already ordered by relevance) come first, then
@@ -858,7 +821,7 @@ async function nativeRetrieve(
   // unchanged. Tier already enforced in denseSearch (live items.access).
   // Post-filter grounding under enforcing: a match on only-invisible items must not report
   // grounded=true (abstention side channel, §5.7 — slice-B2 Fable Medium).
-  if (omitGraph && sources.length === 0) grounded = false;
+  if (sources.length === 0) grounded = false; // enforcement is unconditional
   let orderedSources = sources;
   const denseHits = await denseP;
   if (denseHits.length) {
@@ -938,7 +901,7 @@ async function nativeRetrieve(
   );
 
   const structured = [
-    omitGraph
+    true
       ? `## Tasks visible to you` // enforcing: no full-corpus aggregate (§5.7 volume disclosure)
       : `## Task counts (all ${taskCounts.total} tasks: ${taskCounts.open} open, ${taskCounts.byStatus.done ?? 0} done)`,
     "## Recent decisions (newest first)",

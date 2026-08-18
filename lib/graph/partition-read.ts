@@ -164,40 +164,29 @@ export async function resolveArcScope(
     enforcement?: import("@/lib/access/enforce").TimelineEnforcement | null;
   }
 ): Promise<ArcScope> {
+  // PRET-6: enforcing is the only behavior — the member's oracle scope IS the resolution
+  // (the permissive built-in-pointer arm retired with the model). A caller passing
+  // `enforcement: null` gets a fresh resolution rather than a retired branch.
   const { memberEnforcement } = await import("@/lib/access/enforce");
   const enforce =
-    args.enforcement !== undefined
+    args.enforcement != null
       ? args.enforcement
       : await memberEnforcement(db, { teamId: args.teamId, memberId: args.memberId });
-  if (enforce != null) {
-    // Uncapped, same as the arcs GET has since PPARC-3 (Fable 6b Medium 3): arcs need the whole
-    // ready scope for coverage and scope-key stability.
-    const scope = await selectEnforcedGraphPartitions(db, {
-      teamId: args.teamId,
-      visibleProjectIds: [...enforce.visibleProjectIds],
-      k: Number.MAX_SAFE_INTEGER,
-    });
-    if (scope.groups.length === 0) {
-      console.error(`[arcs] resolveArcScope: enforcing member ${args.memberId} on team ${args.teamId} resolves ZERO partitions`);
-    }
-    return { groups: scope.groups, arm: true };
+  if (enforce == null) {
+    // memberVisibility is unconditional post-PRET-6; a null here means the member does not
+    // resolve at all — fail closed with the loud empty scope.
+    console.error(`[arcs] resolveArcScope: member ${args.memberId} on team ${args.teamId} resolves NO enforcement`);
+    return { groups: [], arm: false };
   }
-  // Permissive: the built-in pointer partitions the tier resolves to — read from the STORED
-  // pointers (the rename doctrine: post-rename graphs live under the frozen legacy ids, and the
-  // pointer is the one source of truth; a slug-derived id would disjoin from the graph).
-  const { data, error } = await db
-    .from("projects")
-    .select("slug, graph_group_id")
-    .eq("team_id", args.teamId)
-    .eq("kind", "system")
-    .not("graph_group_id", "is", null);
-  if (error) throw new Error(`arc scope resolution failed: ${error.message}`);
-  const rows = (data ?? []) as { slug: string; graph_group_id: string }[];
-  const { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } = await import("@/lib/access/bootstrap");
-  const wanted = args.tier === "team" ? [GENERAL_SLUG, EXTERNAL_SHARED_SLUG] : [EXTERNAL_SHARED_SLUG];
-  const groups = rows.filter((r) => wanted.includes(r.slug)).map((r) => r.graph_group_id);
-  if (groups.length === 0) {
-    console.error(`[arcs] resolveArcScope: team ${args.teamId} has no built-in pointer partitions — unbootstrapped?`);
+  // Uncapped, same as the arcs GET has since PPARC-3 (Fable 6b Medium 3): arcs need the whole
+  // ready scope for coverage and scope-key stability.
+  const scope = await selectEnforcedGraphPartitions(db, {
+    teamId: args.teamId,
+    visibleProjectIds: [...enforce.visibleProjectIds],
+    k: Number.MAX_SAFE_INTEGER,
+  });
+  if (scope.groups.length === 0) {
+    console.error(`[arcs] resolveArcScope: member ${args.memberId} on team ${args.teamId} resolves ZERO partitions`);
   }
-  return { groups, arm: false };
+  return { groups: scope.groups, arm: true };
 }

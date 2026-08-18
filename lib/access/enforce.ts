@@ -22,17 +22,6 @@ import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib
  * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
  */
 
-/**
- * Whether the team enforces access. THROWS on a flag-read error rather than defaulting — a
- * silent `false` would degrade an ENFORCING team to an unfiltered read (the leak direction, and
- * the one input that must not fail open — slice-B1 Fable HIGH). The route turns a throw into a
- * 500 (fail closed: no data served), never a wrong mode.
- */
-export async function teamEnforcesAccess(db: DbClient, teamId: string): Promise<boolean> {
-  const { data, error } = await db.from("teams").select("access_enforcement").eq("id", teamId).maybeSingle();
-  if (error) throw new Error(`access_enforcement read failed: ${error.message}`);
-  return (data as { access_enforcement?: string } | null)?.access_enforcement === "enforcing";
-}
 
 export interface VisibleItemIds {
   ids: Set<string>;
@@ -130,7 +119,7 @@ export interface MemberVisibility {
 }
 
 export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility | null> {
-  if (!(await teamEnforcesAccess(db, principal.teamId))) return null;
+  // PRET-6: enforcing is the only behavior — visibility always resolves.
   const { projectIds } = await visibleProjects(db, principal);
   const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
   return { visibleProjectIds: projectIds, visibilityHash };

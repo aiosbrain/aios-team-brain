@@ -135,13 +135,14 @@ export async function POST(req: NextRequest) {
   // delegated tokens keep the §5.8b omit. Any error fails closed (500).
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { teamEnforcesAccess, visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
+    const { visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {
       const { ids } = await delegatedVisibleItemIds(db, agent);
       // QMIR-1: a delegated token is `principal: "token"` — the org-structural mirror legs stay
       // absolutely omitted for it, tier-independent (the round-3 Codex Critical posture).
       enforce = { visibleItemIds: ids, principal: "token" };
-    } else if (await teamEnforcesAccess(db, teamId)) {
+    } else {
+      // PRET-6: enforcing is the only behavior — the member arm is unconditional.
       const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
       // PCCC-6, widened by PRET-4 §1b (ruling 2): EVERY member principal gets the graph leg
       // over their oracle-resolved partitions — an external member's projectIds resolve their

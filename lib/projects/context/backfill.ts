@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 import { budgetExpired, contextBackfillBudgetMs } from "./backfill-budget";
@@ -249,17 +250,26 @@ async function backfillOneTeamTurn(
   const t = { id: state.teamId };
   {
     try {
-      // Cheap convergence short-circuit — counts CURRENT MEMBERSHIPS, not units (slice-5 Codex
-      // HIGH): a unit whose membership creation FAILED still has a unit, so a unit-count check
-      // would skip the broken item forever. A current membership means the item was fully
-      // reconciled (unit AND membership) at least once. Stale-audience from a tier change is
-      // reconverged at the reclassification fan-out (settleReclassification), not here — so a
-      // membership-count convergence is safe. ~2 counts when converged instead of an O(N) drain.
-      const [{ count: itemCount }, { count: memCount }] = await Promise.all([
+      // Cheap convergence short-circuit — PRET-6 fixed the program's named latent bug: the old
+      // `memCount >= itemCount` compared RAW membership rows to items, so one multi-membership
+      // item could mask another item with NO membership (skipped forever, invisible under
+      // enforcing). Now the covered side counts DISTINCT partitioned ITEMS via the units join —
+      // exact (multi-membership cannot mask an uncovered item), still two aggregates. Counting
+      // CURRENT MEMBERSHIPS not units stands (slice-5 Codex HIGH: a unit whose membership
+      // creation failed must not read as covered).
+      const [{ count: itemCount }, coveredRes] = await Promise.all([
         db.from("items").select("id", { count: "exact", head: true }).eq("team_id", t.id),
-        db.from("project_context_memberships").select("id", { count: "exact", head: true }).eq("team_id", t.id).is("valid_to", null),
+        runSql<{ n: number }>(
+          `select count(distinct u.source_item_id)::int as n
+             from project_context_memberships m
+             join project_context_units u on u.id = m.context_unit_id
+            where m.team_id = $1 and m.valid_to is null
+              and u.unit_kind = 'item' and u.source_item_id is not null`,
+          [t.id]
+        ),
       ]);
-      if (typeof itemCount === "number" && typeof memCount === "number" && memCount >= itemCount) {
+      const coveredItems = coveredRes.rows[0]?.n ?? null;
+      if (typeof itemCount === "number" && typeof coveredItems === "number" && coveredItems >= itemCount) {
         // Converged: nothing to sweep. The cursor is cleared, not preserved — a stale cursor left
         // behind here would resume mid-corpus the next time the predicate fails and skip everything
         // below it.

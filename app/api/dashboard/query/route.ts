@@ -192,8 +192,9 @@ export async function POST(req: NextRequest) {
   // member's membership-visible items on an 'enforcing' team; permissive → null → byte-identical.
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { teamEnforcesAccess, visibleItemIds } = await import("@/lib/access/enforce");
-    if (await teamEnforcesAccess(db, team.id)) {
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    {
+      // PRET-6: enforcing is the only behavior — enforcement is always constructed.
       const { ids, projectIds } = await visibleItemIds(db, { teamId: team.id, memberId: me.id });
       // PCCC-6: the dashboard chat is the members' PRIMARY conversational surface — it gets the
       // K-capped partitioned graph leg exactly like /api/v1/query (review Medium 7: leaving it on
