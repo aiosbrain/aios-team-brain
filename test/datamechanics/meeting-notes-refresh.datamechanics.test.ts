@@ -7,7 +7,8 @@ import { listMeetingNotesForTeam, getMeetingNote } from "@/lib/meetings/notes";
 /**
  * Spec (real Postgres, stubbed extractor): the refresh backfill heals meeting notes that already
  * exist but were saved with a BLANK summary (the array-shaped-summary parser bug). Re-running the
- * upload-time extraction over the existing note must fill its summary, link attendees, and
+ * upload-time extraction over the existing note must fill its summary and action items (attendees are
+ * NOT refreshed — see MTGATT-1 in the test below), and
  * materialize action items — "as if it had just been uploaded" — WITHOUT creating a duplicate note.
  */
 
@@ -24,7 +25,7 @@ async function seedBlankNote(seed: Awaited<ReturnType<typeof seedTeam>>, path: s
 }
 
 describe("meeting-notes refresh backfill (data-mechanics)", () => {
-  it("fills a blank summary + attendees + action items on an existing note, no duplicate", async () => {
+  it("fills a blank summary + action items on an existing note, no duplicate — and does NOT touch attendees", async () => {
     const seed = await seedTeam();
     await seedBlankNote(seed, "t/blank.md", "# John / Chetan AIOS\n\nAlex will send the deck Friday.");
 
@@ -44,7 +45,15 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     const after = await listMeetingNotesForTeam(db(), seed.teamId, "team");
     expect(after.length).toBe(1); // NO duplicate note created
     expect(after[0].summary).toBe("- Discussed the roadmap\n- Alex owns the deck");
-    expect(after[0].attendees.map((a) => a.id)).toEqual([seed.memberId]);
+    // ATTENDANCE IS NOT WRITTEN HERE ANY MORE (MTGATT-1 / AIO-962). This function is driven by
+    // `scripts/backfill-meeting-summaries`, whose DEFAULT is to refresh every note — so re-adding the
+    // model's inferred attendees would undo the attendance repair on every run, and the fix would
+    // appear to work and then silently revert. It heals SUMMARIES; who was present is owned by
+    // `lib/meetings/attendance.ts` at create time and by the attendance backfill for existing rows.
+    //
+    // This assertion previously required the opposite, which is why the data-mechanics tier caught
+    // the change and the unit tier did not: the behaviour only exists at the DB write.
+    expect(after[0].attendees).toEqual([]);
 
     const detail = await getMeetingNote(db(), seed.teamId, after[0].id, "team");
     expect(detail!.extractedTodos.map((t) => t.title)).toEqual(["Send the deck"]);
