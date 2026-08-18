@@ -42,8 +42,14 @@ const MIN_KEY_LENGTH = 5;
 /**
  * Values that are a producer saying "I had nothing to put here". They must never become keys: an
  * exact matcher that accepted them would fuse every meeting that had nothing to put there — the one
- * failure an exact join is supposed to be incapable of. This is a denylist rather than a length rule
- * because the length rule that caught them also caught real ids.
+ * failure an exact join is supposed to be incapable of. A denylist rather than a length rule, because
+ * the length rule that caught them also caught real ids.
+ *
+ * KNOWN COLLISION, accepted deliberately: Google's event-id charset is `a-v` + `0-9`, so `false` and
+ * `undefined` are *technically* legal ids, and an event whose id is literally one of those would be
+ * discarded here. That trade is one-directional on purpose — a missed key costs an undercount in a
+ * diagnostic, while a placeholder becoming a join key silently fuses unrelated meetings, which is the
+ * failure this whole slice is shaped around. Pinned by a test so it stays a decision, not an accident.
  */
 const PLACEHOLDER_KEYS = new Set(["none", "null", "nil", "n/a", "na", "unknown", "undefined", "tbd", "false", "-"]);
 

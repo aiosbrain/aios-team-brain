@@ -61,6 +61,14 @@ describe("eventIdentity — the shapes a producer might send", () => {
     }
   });
 
+  it("discards `false`/`undefined` even though Google's charset allows them — the deliberate trade", () => {
+    // Both are legal Google ids (charset a-v + 0-9), so this is a real, if vanishing, false negative.
+    // It is chosen: a missed key undercounts a diagnostic, a placeholder key would fuse two unrelated
+    // meetings. Asserted so the trade is visible and cannot be "fixed" without meeting this comment.
+    expect(eventIdentity({ calendar_event_id: "false" }).eventKeys).toEqual([]);
+    expect(eventIdentity({ calendar_event_id: "undefined" }).eventKeys).toEqual([]);
+  });
+
   it("KEEPS a valid short Google id — the floor must not discard real ids (review fold)", () => {
     // Google documents an event id as 5–1024 characters. An 8-char floor silently dropped valid
     // short ids, which would have made the pairing report undercount and a later join miss them,

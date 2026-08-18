@@ -27,7 +27,10 @@ const ALLOWED = new Set(["lib/meetings/event-identity.ts", "scripts/meeting-pair
  * `conferenceKey` left the obvious bypass open — a future join reading `fm.conference_url` or
  * `fm.hangoutLink` straight off the item would never touch the parser and would sail through.
  */
-const NEEDLES = [/conferenceKey/, /conference_url/, /hangoutLink/, /hangout_link/];
+const NEEDLES = [/conferenceKey/, /conference_url/, /hangoutLink/, /hangout_link/, /meeting_url/, /conferenceUrl/];
+// Every spelling `CONFERENCE_KEYS` in the parser accepts must appear above, or a join can read the
+// raw field under a name the guard does not know. `meeting_url` and `conferenceUrl` were exactly
+// that gap: accepted by the parser, invisible to the first version of this list.
 
 /**
  * Comment lines, dropped LINE BY LINE rather than by stripping `/* … *\/` across the file.
@@ -73,8 +76,27 @@ describe("guard: the conference link is measured, never joined on", () => {
   it("the needle list itself is non-vacuous — each pattern matches the text it is meant to catch", () => {
     // A guard whose needles match nothing passes forever. Every pattern is exercised against a line
     // that a real bypass would contain, so a typo in one of them reddens here instead of going quiet.
-    const samples = ["const k = a.conferenceKey;", "fm.conference_url", "event.hangoutLink", "fm.hangout_link"];
+    const samples = [
+      "const k = a.conferenceKey;",
+      "fm.conference_url",
+      "event.hangoutLink",
+      "fm.hangout_link",
+      "fm.meeting_url",
+      "fm.conferenceUrl",
+    ];
     for (const [i, n] of NEEDLES.entries()) expect(n.test(samples[i]), samples[i]).toBe(true);
+  });
+
+  it("every conference spelling the PARSER accepts is covered by a needle", () => {
+    // The drift this closes: adding a key to CONFERENCE_KEYS without adding it here would silently
+    // widen what the parser reads while narrowing what the guard watches.
+    const parser = readFileSync(join(process.cwd(), "lib/meetings/event-identity.ts"), "utf8");
+    const list = parser.match(/const CONFERENCE_KEYS = \[([^\]]+)\]/)?.[1] ?? "";
+    const spellings = [...list.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    expect(spellings.length, "the CONFERENCE_KEYS list must be readable").toBeGreaterThan(0);
+    for (const s of spellings) {
+      expect(NEEDLES.some((n) => n.test(s)), `no guard needle covers the accepted spelling "${s}"`).toBe(true);
+    }
   });
 
   it("the comment filter cannot be switched off by a string containing a comment opener", () => {

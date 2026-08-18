@@ -117,8 +117,11 @@ second, unproven merge rule smuggled in beside the real one. Google's documented
 equivalence is visible in the key set and measurable rather than baked invisibly into a normaliser.
 
 Normalisation is trim + lowercase and nothing else; a URL keeps host + path (query strings carry
-per-person `?authuser=` and passcodes). A value under 8 characters is discarded — `""`, `"-"` and
-`"none"` are not identities. **A recurring instance keeps its suffix** (`<base>_20260811T090000Z`):
+per-person `?authuser=` and passcodes). The length floor is **5** — Google documents an event id as
+5–1024 characters, and an earlier floor of 8 silently discarded valid short ids. Placeholders
+(`"none"`, `"null"`, `"unknown"`, `"-"`, …) are rejected by an explicit denylist instead, which
+knowingly also rejects the two legal-but-absurd ids `false` and `undefined`: a missed key costs an
+undercount, a placeholder key would fuse unrelated meetings. **A recurring instance keeps its suffix** (`<base>_20260811T090000Z`):
 both attendees' copies carry it, and stripping it would fuse a whole series into one meeting.
 
 **Implemented in this operator's own sync**, which today drops all of it: `~/scripts/granola_sync.py`
