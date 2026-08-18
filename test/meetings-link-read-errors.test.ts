@@ -51,16 +51,25 @@ const BODIES = [
   { id: "i-cal", body: "" },
 ];
 
-/** Everything succeeds unless `failing` names the table (and `bodies` distinguishes the two item reads). */
-function results(failing: string | null, bodyCallSeen: { n: number }) {
+/**
+ * Everything succeeds unless `failing` names the table.
+ *
+ * `"items:bodies"` fails only the SECOND `items` read — the module reads that table twice (frontmatter
+ * for every candidate, then bodies for the keyed subset), and only the second failure exercises the
+ * dangerous branch: bodies missing means every candidate looks bodyless, which flips the survivor
+ * rule from "the transcript wins" to "the earliest-created wins".
+ */
+function results(failing: string | null, itemCalls: { n: number }) {
   return (table: string): Result => {
+    if (table === "items") {
+      itemCalls.n += 1;
+      const first = itemCalls.n === 1;
+      if (failing === "items" && first) return { data: null, error: { message: "connection terminated" } };
+      if (failing === "items:bodies" && !first) return { data: null, error: { message: "connection terminated" } };
+      return { data: first ? FRONTMATTER : BODIES, error: null };
+    }
     if (table === failing) return { data: null, error: { message: "connection terminated" } };
     if (table === "meeting_notes") return { data: NOTES, error: null };
-    if (table === "items") {
-      // The module reads `items` twice: frontmatter first, then bodies for the keyed subset.
-      bodyCallSeen.n += 1;
-      return { data: bodyCallSeen.n === 1 ? FRONTMATTER : BODIES, error: null };
-    }
     return { data: [], error: null };
   };
 }
@@ -74,7 +83,7 @@ describe("linkMeetingNotesByIdentity — a failed read hides nothing", () => {
     expect(writes, "and must actually hide the folded note").toContain("meeting_notes.update");
   });
 
-  for (const table of ["meeting_notes", "items", "meeting_note_attendees", "meeting_note_submitters"]) {
+  for (const table of ["meeting_notes", "items", "items:bodies", "meeting_note_attendees", "meeting_note_submitters"]) {
     it(`refuses to hide anything when the ${table} read fails`, async () => {
       const writes: string[] = [];
       const summary = await linkMeetingNotesByIdentity(stubDb(results(table, { n: 0 }), writes), "team-1");
