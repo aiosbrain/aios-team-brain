@@ -44,6 +44,26 @@ export interface VisibleItemIds {
  * for a large corpus this is a large IN list (and >65k ids errors → 500, which fails closed, not
  * open). Moves into SQL (an RPC or the covering index the spec names) when it bites.
  */
+/** The ONE unit-row predicate deciding whether a membership's unit serves its item — shared by
+ *  the list materialization and the by-id probe (ENFB-1 §2.1: one owner, no drift). Only an
+ *  ACTIVE ITEM-GRAIN unit with a source serves (defensive: today the CHECK forces item+non-null
+ *  source and nothing writes 'retracted', but when Phase D relaxes the CHECK a membership on a
+ *  retracted or non-item unit must not re-serve the item — slice-B1 Fable LOW). */
+type UnitRow = { source_item_id: string | null; state: string; unit_kind: string };
+function unitServesItem(u: UnitRow | null | undefined): u is UnitRow & { source_item_id: string } {
+  return !!u && u.state === "active" && u.unit_kind === "item" && !!u.source_item_id;
+}
+
+/** The ONE membership WHERE shape (current include rows within a project set) — the other half
+ *  of the shared predicate, applied identically by the list and by-id paths. */
+function currentIncludeMemberships<T extends { eq(c: string, v: unknown): T; is(c: string, v: null): T; in(c: string, v: string[]): T }>(
+  q: T,
+  teamId: string,
+  projectIds: ReadonlySet<string>
+): T {
+  return q.eq("team_id", teamId).eq("decision", "include").is("valid_to", null).in("project_id", [...projectIds]);
+}
+
 export async function visibleItemIdsForProjects(
   db: DbClient,
   teamId: string,
@@ -51,24 +71,49 @@ export async function visibleItemIdsForProjects(
 ): Promise<VisibleItemIds> {
   if (projectIds.size === 0) return { ids: new Set(), empty: true };
 
-  const { data, error } = await db
-    .from("project_context_memberships")
-    // only ACTIVE item-grain units (defensive: today the CHECK forces item+non-null source, and
-    // nothing writes 'retracted' — but when Phase D relaxes the CHECK, a membership on a retracted
-    // or non-item unit must not re-serve the item — slice-B1 Fable LOW).
-    .select("project_context_units(source_item_id, state, unit_kind)")
-    .eq("team_id", teamId)
-    .eq("decision", "include")
-    .is("valid_to", null)
-    .in("project_id", [...projectIds]);
+  const { data, error } = await currentIncludeMemberships(
+    db.from("project_context_memberships").select("project_context_units(source_item_id, state, unit_kind)"),
+    teamId,
+    projectIds
+  );
   if (error) return { ids: new Set(), empty: true, error: true }; // fail closed on read error (flagged: see `error`)
 
   const ids = new Set<string>();
-  for (const row of (data ?? []) as { project_context_units: { source_item_id: string | null; state: string; unit_kind: string } | null }[]) {
+  for (const row of (data ?? []) as { project_context_units: UnitRow | null }[]) {
     const u = row.project_context_units;
-    if (u && u.state === "active" && u.unit_kind === "item" && u.source_item_id) ids.add(u.source_item_id);
+    if (unitServesItem(u)) ids.add(u.source_item_id);
   }
   return { ids, empty: ids.size === 0 };
+}
+
+/**
+ * By-id membership probe (ENFB-1 §2.1): can THIS principal see THIS item — without
+ * materializing their whole visible-id set (the by-id surfaces' cost shape, and the documented
+ * >65k IN-list wall). Shares BOTH halves of the visibility predicate with the list path
+ * (`unitServesItem` + `currentIncludeMemberships`), so the pair cannot disagree by drift —
+ * dm-pinned for agreement across granted/ungranted/General/retracted arms.
+ * Fail-closed: no principal resolution, read error, empty project set, no active item-grain
+ * unit, no current include membership in a visible project → false.
+ */
+export async function canSeeItem(db: DbClient, principal: Principal, itemId: string): Promise<boolean> {
+  const { projectIds } = await visibleProjects(db, principal);
+  if (projectIds.size === 0) return false;
+
+  const { data: unit, error: uErr } = await db
+    .from("project_context_units")
+    .select("id, source_item_id, state, unit_kind")
+    .eq("team_id", principal.teamId)
+    .eq("source_item_id", itemId)
+    .maybeSingle();
+  if (uErr || !unitServesItem(unit as UnitRow | null)) return false;
+
+  const { data: mems, error: mErr } = await currentIncludeMemberships(
+    db.from("project_context_memberships").select("project_id").eq("context_unit_id", (unit as { id: string }).id),
+    principal.teamId,
+    projectIds
+  );
+  if (mErr) return false;
+  return ((mems ?? []) as unknown[]).length > 0;
 }
 
 /** Member convenience: resolve the principal's visible projects via the oracle, then the item ids.
