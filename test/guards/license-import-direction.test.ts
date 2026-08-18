@@ -33,7 +33,14 @@ const APACHE_DIRS = ["ingestion", "graphiti"] as const;
 
 /** Top-level directories that are AGPL-3.0-only. Importing any of these from an
  *  Apache dir is the violation. `test/` is included: it is AGPL too. */
-const AGPL_DIRS = ["lib", "app", "components", "scripts", "postgres", "test"] as const;
+const AGPL_DIRS: ReadonlySet<string> = new Set([
+  "lib",
+  "app",
+  "components",
+  "scripts",
+  "postgres",
+  "test",
+]);
 
 /** Never walk into build output, virtualenvs, or vendored trees. */
 const SKIP_DIRS = new Set([
@@ -64,27 +71,38 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 /**
- * Import-ish references to an AGPL directory, in the forms a real violation would take:
- *   Python   `from lib.x import y`, `import lib.x`, `sys.path.append("../lib")`
+ * Import-ish references to a directory, in the forms a real violation would take:
+ *   Python   `from lib.x import y`, `import lib.x`
  *   JS/TS    `from "../lib/x"`, `require("../../app/y")`, `import("../scripts/z")`
- *   shell    sourcing or running a path that escapes into an AGPL dir
- * Anchored on a path escape (`../`) or a bare module import, so that an ordinary word
- * ("this app", "the lib") in a comment cannot trip it.
+ *   TS alias `"@/lib/db"`
+ *   shell    sourcing or running a path that escapes into another directory
+ *
+ * Each pattern captures the referenced directory name in group 1, which is then checked
+ * against AGPL_DIRS. Keeping the alternation in DATA rather than string-building a regex
+ * means these stay literal — which reads better and satisfies the static-analysis rule
+ * against non-literal `RegExp` construction.
+ *
+ * Anchored on a path escape (`../`), a statement-position import, or a bare module
+ * specifier, so an ordinary word ("this app", "the lib") in prose cannot trip it.
  */
+const IMPORT_PATTERNS: readonly RegExp[] = [
+  // Python: `from lib.x import y` / `import lib.x` at statement position
+  /^[ \t]*(?:from|import)[ \t]+([A-Za-z_][A-Za-z0-9_]*)(?:[.\s]|$)/gm,
+  // Any relative path escaping upward: `../lib/`, `../../app/`
+  /(?:\.\.\/)+([A-Za-z0-9_-]+)\//g,
+  // Bare specifier import/require: `from "lib/x"`, `require("app/y")`
+  /(?:from|require\(|import\()\s*["'`]([A-Za-z0-9_-]+)\//g,
+  // The repo's own TS path alias into AGPL code: `"@/lib/db"`
+  /["'`]@\/([A-Za-z0-9_-]+)\//g,
+];
+
 function violations(source: string): string[] {
-  const alt = AGPL_DIRS.join("|");
-  const patterns = [
-    // Python: `from lib...` / `import lib...` at statement position
-    new RegExp(`^\\s*(?:from|import)\\s+(?:${alt})(?:[.\\s]|$)`, "gm"),
-    // Any relative path that escapes upward into an AGPL directory
-    new RegExp(`(?:\\.\\./)+(?:${alt})/`, "g"),
-    // Bare specifier import/require of an AGPL dir (JS/TS)
-    new RegExp(`(?:from|require\\(|import\\()\\s*["'\`](?:${alt})/`, "g"),
-    // The repo's own TS path alias into AGPL code
-    new RegExp(`["'\`]@/(?:${alt})/`, "g"),
-  ];
   const hits: string[] = [];
-  for (const re of patterns) for (const m of source.matchAll(re)) hits.push(m[0].trim());
+  for (const re of IMPORT_PATTERNS) {
+    for (const m of source.matchAll(re)) {
+      if (AGPL_DIRS.has(m[1])) hits.push(m[0].trim());
+    }
+  }
   return hits;
 }
 
