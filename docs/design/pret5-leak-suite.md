@@ -55,13 +55,37 @@ alone; permissive → the posture wall alone.**
 
 - The builder receives its enforcement via the existing `enforce` param
   (`TimelineEnforcement | null`); each wall call site becomes mode-keyed on `enforce != null`
-  — the same `else if` shape as `lib/query/fts-search.ts`. No cache-shape change: the vis-variant
-  group_key already hashes the member's visibility (`vis:<posture>:<hash>`), so a member's
-  wall-dropped build lands under their own variant, never a shared one.
-- Meeting notes (no access column; gated by `canSeeMeetingNotes(posture)`) are Phase-D-grain
-  (program §8) and KEEP their posture gate both modes — named, not silently widened.
+  — the same `else if` shape as `lib/query/fts-search.ts`. The SIX call sites, enumerated
+  (cold-read M6 — :488 and :312 are the miss risks): `visibleItems` at
+  `lib/dashboard/work-timeline.ts:257` (git), `:278` (other), `:312` (slack);
+  `visibleTasks` at `:297` (active) and `:488` (the all-status chip/link-target read);
+  `visibleDecisions` at `:337`. The meeting read (`canSeeMeetingNotes` at `:675` +
+  `srcVisible`) is NOT one of them and is KEPT — the named exception.
+- **The null-source task ruling (cold-read H2 — the widen the bare drop would smuggle):** a
+  hand-typed task (`source_item_id` null, `created_by` set) belongs to NO project — no
+  membership axis exists for it — so under enforcing its `taskVisible` arm keeps the posture
+  wall: sourced tasks → the vis-set alone; null-source tasks →
+  `created_by != null && !isRestrictedTier(posture)`. The audience wall survives on exactly
+  the one branch membership cannot express, with its own matrix sub-assertion and mutation.
+- **Why the decisions/tasks drop is sound HERE though PRET-4 kept the query path's audience
+  conjuncts both modes (cold-read M1):** the timeline's decision/task grains carry a REAL
+  source-item gate (`srcVisible`/`taskVisible` — membership-derived under enforcing), which
+  the query path's aggregate legs lack — H-WIDEN's replacement-gate condition holds here and
+  not there. The resulting cross-surface divergence is NAMED: an external member granted X
+  can see a team-audience decision title on the timeline that the query path's structured
+  legs still refuse; harmonization is Phase-D/PRET-6 territory.
+- Cache: no shape change — the vis-variant group_key is `vis:<posture>:<hash>` with posture
+  IN the key (verified `lib/dashboard/timeline-cache.ts:41`), so a wall-dropped build lands
+  under the member's own variant; the posture segment becomes load-bearing solely for the
+  meeting carve-out once the walls drop (cold-read L3 — a comment at the key derivation pins
+  it against a hash-only "simplification"). `PAYLOAD_VERSION` is BUMPED (cold-read L2): the
+  wall drop changes what a `vis:external:*` row means, and the module's own convention bumps
+  on meaning changes; without it, stale walled rows would under-serve for one TTL.
 - The GET `/api/v1/timeline` route and the dashboard timeline/team-work routes inherit the
-  change through the builder; their wire shapes are unchanged.
+  change through the builder; their wire shapes are unchanged. The http tier's external pin
+  (`test/http/timeline.http.test.ts` — external key → 200 `days: []`) SURVIVES because its
+  fixture team is permissive, where the posture wall stands (cold-read L4 — stated so the
+  pin is not "fixed" mid-build).
 - Fail directions unchanged: a substrate error while resolving enforcement still THROWS
   (never a cached error-empty — the existing pin survives); an empty vis-set still builds an
   honest empty ledger.
@@ -89,12 +113,12 @@ admin; a delegated token minted for the external member with an empty project sc
 |---|---|
 | A1 items (route) | v1 items GET serves X's team item; Y's path ABSENT |
 | A2 items (retrieve) | the enforced retrieve grounds X's item on X's term; Y's term grounds NOTHING |
-| A3 graph scope | `selectEnforcedGraphPartitions` over the member's oracle projects resolves X's partition; Y's partition ABSENT from the scope (the dm-reachable pin — live Graphiti search is not in the dm tier, the PPARC-3 dispensation) |
-| A4 arcs | the fused arcs route serves the member a panel resolved from their oracle scope containing X's partition row content; Y's partition prose ABSENT |
+| A3 graph scope | `selectEnforcedGraphPartitions` over the member's oracle projects resolves the EXACT set {X's partition, external-shared's partition} — General ABSENT is the ruling-2 boundary, Y ABSENT (cold-read M2; the dm-reachable pin — live Graphiti search is not in the dm tier, the PPARC-3 dispensation). Fixture: X's partition pointer minted AND ready-latched via the FakeGraphiti project+confirm pattern (`test/datamechanics/graph-arming.datamechanics.test.ts` precedent) — an unarmed initiative never enters any scope |
+| A4 arcs | the route's exact composition (`memberEnforcement` → `resolveArcScope` → `getFusedArcs` — the session-authed route itself is dm-unreachable, cold-read M3; precedent `arcs-unified-read.datamechanics.test.ts`) serves a panel containing X's partition prose; Y's partition prose ABSENT. Deterministic: the fixture pre-seeds fresh `arc_cache` `g:` rows for EVERY scope group (X's + external-shared's) AND a distinctively-prosed row for Y's partition — the absence probe must exist to be absent (one-condition-per-fixture) |
 | A5 roster/structure | v1 members returns the same roster a team key gets; the retrieve org-structural legs serve actors + REPORTS_TO to this member |
-| A6 timeline (the §1 change) | the member's timeline ledger carries X's team-access evidence; Y's evidence ABSENT |
-| A7 token | the delegated token (empty scope) reads NOTHING of X or Y through items; org-structural legs ABSENT (token semantics, program §8, byte-unchanged) |
-| A8 permissive control | the SAME member on a still-permissive team reads only `access='external'` rows (the posture wall stands where enforcement is off — no stealth widen) |
+| A6 timeline (the §1 change) | the member's ledger carries X's team-access evidence across the LEG CLASSES (a git item, a slack item, a sourced task header incl. the `:488` chip read, a decision — cold-read M6); Y's evidence ABSENT; a null-source hand-typed team task ABSENT for this external-posture member (the H2 sub-assertion); a meeting note whose transcript is in X ABSENT (the kept carve-out, cold-read L1) |
+| A7 token | SPLIT (cold-read H1 — an external-launcher token is UNMINTABLE, `mintAgentToken` refuses and `verifyAgentToken` re-nulls; that refusal IS the token-semantics observable): (a) a token minted for the team-posture admin with `projectScope: []` reads NOTHING of X or Y and no org-structural legs (the AC3 attenuation proof); (b) minting for the external member returns the Phase-A refusal — pinned |
+| A8 permissive control | an EQUIVALENTLY-INVITED external member on a SECOND, still-permissive team (members are per-team rows — "same member" is unrepresentable, cold-read M4) reads only `access='external'` rows via v1 items AND their timeline tier row (the §1 permissive arm's pin) |
 
 Absence-assertion mutations (§4 AC3): each absence arm is reddened by deleting or widening
 exactly its own gate — the omission-breaks-absence discipline, verdicts pasted in the PR.
@@ -154,10 +178,17 @@ builder, not the cache write path). The SUITE's only writes go through sanctione
    | A3 | `lib/graph/partition-read.ts` | `.in("id", [...visibleProjectIds])` → `` (the scope restriction drops) |
    | A4 | `lib/graph/partition-read.ts` | `  if (enforce != null) {` (the `resolveArcScope` enforcing-arm guard) → `  if (false) {` — resolution falls through to the permissive built-in partitions, widening past the member's oracle |
    | A6 | `lib/dashboard/work-timeline.ts` | the §1 change's `if (visArr) … .in("id", visArr)` on the items evidence leg → `` |
-   | A7 | `lib/access/oracle.ts` | `projectIds = new Set([...projectIds].filter((p) => scope.has(p)));` → `` (attenuation drops) |
+   | A7 | `lib/access/oracle.ts` | `projectIds = new Set([...projectIds].filter((p) => scope.has(p)));` → `` (attenuation drops — reddens A7a) |
+   | A2b | `lib/query/fts-search.ts` | `where += ` and `i.id = any($${params.length}::uuid[])`;` → `` (the fts vis application — cold-read M5's missing gate) |
+   | A6b | `lib/dashboard/work-timeline.ts` | the §1 null-source posture conjunct (`!isRestrictedTier` on the `created_by` arm) → `` (the H2 widen — reddens the hand-typed-task sub-assertion) |
 
-   Every needle above is a verbatim, grep-able line (A6's exists after §1's change lands, in
-   the same PR). Each `red:` verdict line must name the row's arm.
+   Every needle above is a verbatim, grep-able line (A6/A6b's exist after §1's change lands,
+   in the same PR). Each `red:` verdict line must name the row's arm. "Exactly that arm" is
+   scoped honestly (cold-read M5): a mutation reddens its own arm and only arms DOWNSTREAM of
+   the same gate — A3's `.in` restriction co-reddens A4 (same function feeds
+   `resolveArcScope`) and suites in the stacked branch; A4's own single-arm probe is the
+   enforce-guard flip; each mutation's expected co-reds are named beside its verdict in the
+   PR body.
 4. The suite uses PRODUCTION member creation (`createMember` + activation) for the external
    member — never the fixture backdoor — so fixture-reality divergence cannot green the
    matrix (the PRET-4 Fable-H1 lesson).
