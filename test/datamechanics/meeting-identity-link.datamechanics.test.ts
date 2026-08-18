@@ -1,0 +1,254 @@
+import { randomUUID } from "node:crypto";
+import { describe, expect, it } from "vitest";
+import { randomUUID as uuid } from "node:crypto";
+import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
+import { ingestItem } from "@/lib/ingest";
+import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
+import { getMeetingNote, listMeetingNotesForTeam } from "@/lib/meetings/notes";
+
+/**
+ * Spec (MTGATT-3, real Postgres): a calendar event and the transcript of the same meeting become ONE
+ * meeting, and the person who pushed the calendar is credited on it.
+ *
+ * This tier because every failure here is a ROW: a hidden note, a lost submitter, a resurrected
+ * duplicate, an attendee that never arrived. `plan()` being right proves none of that — it is the
+ * write order, the reads, and the interaction with the merge that runs immediately afterwards that
+ * this file exists to pin.
+ */
+
+const EVENT_ID = "evt12345abc";
+const today = () => new Date().toISOString().slice(0, 10);
+
+async function addMember(seed: Seed, name: string, email: string): Promise<string> {
+  const { data, error } = await db()
+    .from("members")
+    .insert({
+      team_id: seed.teamId,
+      email,
+      display_name: name,
+      actor_handle: `a-${randomUUID().slice(0, 8)}`,
+      role: "member",
+      tier: "team",
+      status: "active",
+    })
+    .select("id")
+    .single();
+  if (error || !data) throw new Error(`member insert failed: ${error?.message}`);
+  return (data as { id: string }).id;
+}
+
+/** A recorded meeting: has a body, carries the event id. */
+async function pushTranscript(seed: Seed, opts: { eventId?: string; body?: string; date?: string } = {}) {
+  return ingest(seed, {
+    kind: "transcript",
+    access: "team",
+    path: `1-inbox/transcripts/${randomUUID().slice(0, 8)}.md`,
+    body: opts.body ?? "# Design review\n\nWe agreed the rollout.",
+    frontmatter: {
+      source: "granola",
+      created: `${opts.date ?? today()}T09:00:00.000Z`,
+      ...(opts.eventId === undefined ? { calendar_event_id: EVENT_ID } : opts.eventId ? { calendar_event_id: opts.eventId } : {}),
+    },
+  });
+}
+
+/**
+ * A pushed calendar event: no body, carries the same event id.
+ *
+ * `asMemberId` pushes it as SOMEONE ELSE — which is the whole scenario: John's transcript, my
+ * calendar. Without it the "submitter" under test is the same member on both sides and the credit
+ * assertion passes for the wrong reason.
+ */
+async function pushCalendarEvent(seed: Seed, opts: { eventId?: string; attendees?: unknown; date?: string; asMemberId?: string } = {}) {
+  const frontmatter = {
+    source: "calendar",
+    title: "Design review",
+    occurred_at: opts.date ?? today(),
+    attendees: opts.attendees ?? [],
+    ...(opts.eventId === undefined ? { calendar_event_id: EVENT_ID } : opts.eventId ? { calendar_event_id: opts.eventId } : {}),
+  };
+  if (opts.asMemberId) {
+    const path = `1-inbox/calendar/${uuid().slice(0, 8)}.md`;
+    return ingestItem(
+      db(),
+      { teamId: seed.teamId, memberId: opts.asMemberId, apiKeyId: uuid() },
+      { project: "calendar", kind: "artifact", actor: "tester", frontmatter, content_sha256: sha(""), path, body: "" },
+      "team"
+    );
+  }
+  return ingest(seed, {
+    kind: "artifact",
+    access: "team",
+    path: `1-inbox/calendar/${randomUUID().slice(0, 8)}.md`,
+    body: "",
+    project: "calendar",
+    frontmatter: {
+      source: "calendar",
+      title: "Design review",
+      occurred_at: opts.date ?? today(),
+      attendees: opts.attendees ?? [],
+      ...(opts.eventId === undefined ? { calendar_event_id: EVENT_ID } : opts.eventId ? { calendar_event_id: opts.eventId } : {}),
+    },
+  });
+}
+
+const tick = (seed: Seed) => backfillMeetingNotesFromItems(db(), seed.teamId, { extract: async () => ({ summary: "", attendeeMemberIds: [] }) });
+
+async function liveNotes(seed: Seed) {
+  return listMeetingNotesForTeam(db(), seed.teamId, "team");
+}
+
+/** The surviving note's transcript text — the list view carries no body, the detail read does. */
+async function bodyOf(seed: Seed, noteId: string): Promise<string> {
+  const detail = await getMeetingNote(db(), seed.teamId, noteId, "team");
+  return detail?.rawText ?? "";
+}
+
+async function submitterIds(noteId: string): Promise<string[]> {
+  const { data } = await db().from("meeting_note_submitters").select("member_id").eq("meeting_note_id", noteId);
+  return ((data ?? []) as { member_id: string }[]).map((r) => r.member_id).sort();
+}
+
+describe("identity link: one meeting, two pushes (real Postgres)", () => {
+  it("folds the calendar event into the TRANSCRIPT and credits the calendar pusher", async () => {
+    const seed = await seedTeam();
+    const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
+    const chetan = await addMember(seed, "Chetan", chetanEmail);
+
+    await pushTranscript(seed);
+    await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail, responseStatus: "accepted" }] });
+    const summary = await tick(seed);
+
+    expect(summary.created, "both items become notes first").toBe(2);
+    expect(summary.link.linked).toBe(1);
+
+    const notes = await liveNotes(seed);
+    expect(notes, "one meeting, not two").toHaveLength(1);
+    // The survivor is identified by CONTENT, not by a uuid — the assertion has to survive being run
+    // in either order (see the reverse-order test below).
+    expect(await bodyOf(seed, notes[0].id), "the transcript's body survived").toContain("We agreed the rollout.");
+    expect(notes[0].attendees.map((a) => a.id), "the calendar pusher is now an attendee").toContain(chetan);
+  });
+
+  it("produces the same outcome when the calendar event arrives FIRST", async () => {
+    const seed = await seedTeam();
+    const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
+    const chetan = await addMember(seed, "Chetan", chetanEmail);
+
+    await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail }] });
+    await pushTranscript(seed);
+    const summary = await tick(seed);
+
+    expect(summary.link.linked).toBe(1);
+    const notes = await liveNotes(seed);
+    expect(notes).toHaveLength(1);
+    // Order-independence, asserted rather than argued: the note with the BODY survives either way.
+    // The reverse would be MTGATT-1's deferred hazard — a transcript folding into an empty note.
+    expect(await bodyOf(seed, notes[0].id)).toContain("We agreed the rollout.");
+    expect(notes[0].attendees.map((a) => a.id)).toContain(chetan);
+  });
+
+  it("hides the folded note without destroying it, and never resurrects it", async () => {
+    const seed = await seedTeam();
+    const cal = await pushCalendarEvent(seed);
+    await pushTranscript(seed);
+    await tick(seed);
+
+    const { data: folded } = await db()
+      .from("meeting_notes")
+      .select("id, merged_into")
+      .eq("source_item_id", cal.id)
+      .maybeSingle();
+    expect((folded as { merged_into: string | null }).merged_into, "hidden behind the survivor").toBeTruthy();
+
+    // The ITEM is untouched — a link is reversible, unlike the overlap merge's item retirement.
+    const { data: item } = await db().from("items").select("id").eq("id", cal.id).maybeSingle();
+    expect(item, "the calendar item still exists").toBeTruthy();
+
+    // The backfill notes every un-noted meeting item each tick; a folded note must not come back as a
+    // second meeting on the next one.
+    await tick(seed);
+    expect(await liveNotes(seed)).toHaveLength(1);
+  });
+
+  it("is idempotent — a second tick changes nothing", async () => {
+    const seed = await seedTeam();
+    const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
+    await addMember(seed, "Chetan", chetanEmail);
+    await pushTranscript(seed);
+    await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail }] });
+
+    await tick(seed);
+    const first = await liveNotes(seed);
+    const firstSubs = await submitterIds(first[0].id);
+
+    const second = await tick(seed);
+    const after = await liveNotes(seed);
+    expect(second.link.linked, "nothing left to link").toBe(0);
+    expect(after).toHaveLength(1);
+    expect(after[0].id).toBe(first[0].id);
+    expect(after[0].attendees.length).toBe(first[0].attendees.length);
+    expect(await submitterIds(after[0].id)).toEqual(firstSubs);
+  });
+
+  it("does NOT link two meetings that share no identifier, even with the same title and date", async () => {
+    // The misassociation the operator asked about at team size, asserted as an absence. If this ever
+    // reddens, the join has started deciding on a resemblance.
+    const seed = await seedTeam();
+    await pushTranscript(seed, { eventId: "" });
+    await pushCalendarEvent(seed, { eventId: "" });
+    const summary = await tick(seed);
+
+    expect(summary.link.linked).toBe(0);
+    expect(await liveNotes(seed), "both meetings stay live").toHaveLength(2);
+  });
+
+  it("REFUSES a component whose dates are weeks apart — the undetectable-series case", async () => {
+    const seed = await seedTeam();
+    const old = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    await pushTranscript(seed, { date: old });
+    await pushCalendarEvent(seed);
+    const summary = await tick(seed);
+
+    expect(summary.link.linked).toBe(0);
+    expect(summary.link.refusals["dates-too-far-apart"]).toBe(1);
+    expect(await liveNotes(seed)).toHaveLength(2);
+  });
+
+  it("credits the calendar PUSHER as a submitter of the surviving meeting", async () => {
+    // The operator's scenario end to end: John records, I push my calendar, and the one meeting that
+    // remains says both of us put it there.
+    const seed = await seedTeam();
+    const chetan = await addMember(seed, "Chetan", `chetan-${randomUUID().slice(0, 6)}@acme.com`);
+    await pushTranscript(seed);
+    await pushCalendarEvent(seed, { asMemberId: chetan });
+    await tick(seed);
+
+    const notes = await liveNotes(seed);
+    expect(notes).toHaveLength(1);
+    expect(await submitterIds(notes[0].id)).toContain(chetan);
+  });
+
+  it("keeps the accumulated submitter when the survivor is then folded by the overlap merge", async () => {
+    // The hazard this slice makes reachable: the overlap merge runs in the SAME tick and used to
+    // propagate only two submitter ids, so a submitter the link had just added to the survivor was
+    // stranded on a note nobody can see. Asserted end to end rather than at the unit that changed.
+    const seed = await seedTeam();
+    const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
+    const chetan = await addMember(seed, "Chetan", chetanEmail);
+
+    const shared = "# Design review\n\nWe agreed the rollout and the launch plan in detail today.";
+    await pushTranscript(seed, { body: shared });
+    await pushCalendarEvent(seed, { asMemberId: chetan, attendees: [{ email: chetanEmail }] });
+    await tick(seed);
+
+    // A second recording of the same meeting — overlapping text, so the overlap merge folds the
+    // survivor into it (or it into the survivor) on the next tick.
+    await pushTranscript(seed, { eventId: "", body: `${shared} Plus a closing note.` });
+    await tick(seed);
+
+    const notes = await liveNotes(seed);
+    const allSubs = (await Promise.all(notes.map((n) => submitterIds(n.id)))).flat();
+    expect(allSubs, "the calendar pusher's credit survived the second fold").toContain(chetan);
+  });
+});

@@ -190,6 +190,16 @@ export interface MergeInput {
    *  uploads are always "team"; defaults to "team" (fail-safe — never widens). */
   newAccess?: "team" | "external";
   newAttendeeIds?: string[];
+  /**
+   * EVERY submitter already credited on the note being folded away, not just its `submitted_by`
+   * (MTGATT-3).
+   *
+   * The identity link ACCUMULATES submitters on a note — a calendar push folds into a transcript and
+   * both people are credited. If that note is then folded here by transcript overlap, crediting only
+   * `submitted_by` strands everyone the link had added, silently, because nothing counts submitters.
+   * MTGATT-2 recorded this as latent; MTGATT-3 is what makes it reachable, so it is closed here.
+   */
+  newSubmitterIds?: string[];
   roster: RosterPerson[];
   keys: ProviderKeys;
   /** A valid member to attribute the re-ingest to when neither note has a submitter (e.g. backfill). */
@@ -276,7 +286,11 @@ export async function mergeIntoMeetingNote(
   }
 
   // Credit both submitters + union attendees from the new upload.
-  await addMeetingNoteSubmitters(admin, match.noteId, [match.primarySubmitterId, input.newSubmitterId].filter((x): x is string => !!x));
+  await addMeetingNoteSubmitters(
+    admin,
+    match.noteId,
+    [match.primarySubmitterId, input.newSubmitterId, ...(input.newSubmitterIds ?? [])].filter((x): x is string => !!x)
+  );
   if (input.newAttendeeIds?.length) await addMeetingNoteAttendees(admin, match.noteId, input.newAttendeeIds);
 
   // Refresh summary + attendees + action items on the merged text — best-effort (never fail merge).
@@ -430,12 +444,21 @@ export async function backfillMergeDuplicateMeetings(
         const match = await loadMatchForNote(admin, teamId, primary.id);
         if (!match) continue;
         const { data: att } = await admin.from("meeting_note_attendees").select("member_id").eq("meeting_note_id", dup.id);
+        // The dup's FULL submitter set, so credit the identity link accumulated on it survives being
+        // folded again here (MTGATT-3). `authorFallbackMemberId` is deliberately NOT part of this —
+        // it is an attribution fallback for the re-ingest, never a claim that someone submitted the
+        // meeting.
+        const { data: dupSubs } = await admin
+          .from("meeting_note_submitters")
+          .select("member_id")
+          .eq("meeting_note_id", dup.id);
         try {
           await mergeIntoMeetingNote(admin, teamId, match, {
             newRawText: bodyById.get(dup.source_item_id) ?? "",
             newSubmitterId: dup.submitted_by,
             newAccess: accessById.get(dup.source_item_id) ?? "team",
             newAttendeeIds: ((att ?? []) as { member_id: string }[]).map((a) => a.member_id),
+            newSubmitterIds: ((dupSubs ?? []) as { member_id: string }[]).map((r) => r.member_id),
             roster,
             keys: opts.keys,
             // Automatic path has no human actor; fall back to an active member so a pair whose

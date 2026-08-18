@@ -1135,9 +1135,21 @@ deliberately taken away is visible rather than indistinguishable from a parser t
 See `lib/meetings/from-calendar.ts`.
 **Event IDENTITY** (`lib/meetings/event-identity.ts`) parses `calendar_event_id`/`ical_uid`/
 `conference_url` (flat, camelCase, or nested under Granola's `google_calendar_event`) into
-kind-qualified keys (`eid:` / `uid:`). **Nothing joins on them yet** — the calendar↔transcript link is
-MTGATT-3, to be fitted to what `scripts/meeting-pairing-report.ts` (read-only) measures: how many
-CROSS-source pairs actually share a key. A **conference link is measured and NEVER joined on** — a Zoom
+kind-qualified keys (`eid:` / `uid:`), with a recurring occurrence's UID routed to `seriesKeys`
+instead (all occurrences of a series share one iCalUID). **The IDENTITY LINK joins on them**
+(MTGATT-3, `lib/meetings/identity-link.ts` = the pure decision + `lib/meetings/link-notes.ts` = the
+writes): live notes are grouped into CONNECTED COMPONENTS over shared event keys — never a conference
+key, a series key, a title, or a date pre-filter — the note **with a body** survives (so a transcript
+can never fold into a bodyless calendar event and lose its text, whatever the arrival order), and the
+folded note's attendees + submitters are ADDED to it before it is hidden via `merged_into`. Credit
+first, hide second: a crash between leaves a visible duplicate, never a hidden uncredited note. Two
+refusals, counted by reason: a component with two bodies (the transcript-overlap merge owns that) and
+one whose dates span more than a day or are unknown (the residual undetectable-series case). It runs
+each tick from `backfillMeetingNotesFromItems` BEFORE the overlap merge, and a calendar push now
+triggers the immediate backfill too (`shouldScheduleMeetingBackfill` was transcript-only, so your own
+calendar push waited for a tick while someone else's transcript was instant). `scripts/meeting-pairing-report.ts`
+(read-only) is how the join is confirmed against the first REAL pair — prod carries zero identifiers
+as of 2026-08-18, so the suite proves the rule, not the wiring to reality. A **conference link is measured and NEVER joined on** — a Zoom
 personal meeting room is reused for every meeting its owner hosts and one Meet room serves a whole
 recurring series, so matching on it fuses unrelated meetings; pinned by
 `test/guards/meeting-identity-not-a-join-key.test.ts`. Producer side: `~/scripts/granola_sync.py` +

@@ -6,6 +6,7 @@ import { extractAndStoreActionItems } from "./action-items";
 import type { ExtractedTodo } from "./extract-todos";
 import { createMeetingNoteFromItem } from "./notes";
 import { backfillMergeDuplicateMeetings } from "./merge";
+import { EMPTY_LINK_SUMMARY, linkMeetingNotesByIdentity, type LinkSummary } from "./link-notes";
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { CALENDAR_SOURCES, attendingAttendees, calendarAttendees, calendarTitle, isCalendarEvent } from "./from-calendar";
 
@@ -128,6 +129,8 @@ export interface BackfillSummary {
    * RSVP field is being misread — which only a count makes visible.
    */
   calendarDeclined: number;
+  /** Identity-link outcome (MTGATT-3): what folded, and what was refused and why. */
+  link: LinkSummary;
 }
 
 /**
@@ -149,6 +152,7 @@ export async function backfillMeetingNotesFromItems(
     merged: 0,
     unresolvedAttendees: 0,
     calendarDeclined: 0,
+    link: EMPTY_LINK_SUMMARY,
   };
 
   // Which transcript items already have a note — exclude them.
@@ -309,6 +313,14 @@ export async function backfillMeetingNotesFromItems(
     } catch {
       summary.skipped++; // best-effort — one bad item never fails the batch
     }
+  }
+
+  // IDENTITY LINK (MTGATT-3) — before the overlap merge, so a calendar event that belongs to a
+  // transcript is already folded and cannot be reconsidered by a comparator that reads bodies.
+  try {
+    summary.link = await linkMeetingNotesByIdentity(admin, teamId);
+  } catch {
+    // best-effort, like every other leg here: a link hiccup must not cost the notes just created
   }
 
   // Auto-merge same-day duplicate meetings — a re-record / re-push creates a second note for the same
