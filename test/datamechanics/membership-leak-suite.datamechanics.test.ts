@@ -185,6 +185,11 @@ describe("PRET-5 A1/A2 — items: X's team rows serve, Y's never (route + retrie
     expect(ctxX.sources.map((s) => s.path)).toContain("x.md");
     const ctxY = await retrieve(db(), F.seed.teamId, "external", `about ${TERM_Y}`, null, enforce);
     expect(ctxY.sources.map((s) => s.path), "Y never grounds").not.toContain("y.md");
+
+    // The RECENCY leg's own gate (its filter is a separate mutation target — a term-less
+    // question makes fts empty, so sources come from the recency leg alone).
+    const ctxR = await retrieve(db(), F.seed.teamId, "external", "what happened recently", null, enforce);
+    expect(ctxR.sources.map((s) => s.path), "the recency leg never serves Y").not.toContain("y.md");
   });
 });
 
