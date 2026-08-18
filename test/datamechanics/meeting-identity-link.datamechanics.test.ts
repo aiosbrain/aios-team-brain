@@ -230,6 +230,24 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     expect(await liveNotes(seed), "both meetings stay live").toHaveLength(2);
   });
 
+  it("REFUSES a component where BOTH notes have bodies, and neither loses its text (AC10)", async () => {
+    // Two recordings of one meeting are the overlap merge's job — it combines their text; this path
+    // would hide one. Bodies are deliberately NON-overlapping so the overlap merge does not
+    // legitimately fold them either, leaving this path's refusal as the only thing under test.
+    const seed = await seedTeam();
+    await pushTranscript(seed, { body: "# Design review\n\nAlpha notes about the rollout schedule." });
+    await pushTranscript(seed, { body: "# Design review\n\nCompletely different words, zero overlap here." });
+    const summary = await tick(seed);
+
+    expect(summary.link.linked).toBe(0);
+    expect(summary.link.refusals["two-bodies"]).toBe(1);
+    const notes = await liveNotes(seed);
+    expect(notes, "both recordings stay live").toHaveLength(2);
+    const bodies = (await Promise.all(notes.map((n) => bodyOf(seed, n.id)))).join("\n");
+    expect(bodies, "the first keeps its text").toContain("Alpha notes");
+    expect(bodies, "and so does the second").toContain("Completely different words");
+  });
+
   it("REFUSES a component whose dates are weeks apart — the undetectable-series case", async () => {
     const seed = await seedTeam();
     const old = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);

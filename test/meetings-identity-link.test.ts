@@ -90,8 +90,10 @@ describe("plan — the survivor is chosen by content, not arrival order", () => 
   });
 
   it("never folds one note twice, so `merged_into` cannot chain onto a hidden note", () => {
-    // A note carrying two keys appears in two groups. Readers filter `merged_into is null` and do not
-    // resolve it transitively, so a chain would hide a note behind something already invisible.
+    // Under connected components this holds BY PARTITION — the three notes below are one component,
+    // not two groups. The test stays because it is what reddens on a regression to per-key grouping,
+    // which produced exactly that chain: readers filter `merged_into is null` and never resolve it
+    // transitively, so a chained note hides behind something already invisible.
     const p = plan([
       note({ noteId: "tx", eventKeys: ["eid:aaa11111"], hasBody: true }),
       note({ noteId: "cal", eventKeys: ["eid:aaa11111", "uid:bbb22222@google.com"] }),

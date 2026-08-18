@@ -246,6 +246,7 @@ export async function mergeIntoMeetingNote(
   // body's, and the merge is silently overwritten. Keying on the surviving note id makes re-merges
   // upsert the same item.
   const mergedPath = notePath(match.noteId);
+  const identityFrontmatter = await carriedIdentity(admin, match.sourceItemId);
   const mergedItem = await ingestItem(
     admin,
     { teamId, memberId: author, apiKeyId: randomUUID() },
@@ -256,7 +257,13 @@ export async function mergeIntoMeetingNote(
       content_sha256: sha256(merged),
       actor: "meeting-notes-merge",
       access: mergedAccess,
-      frontmatter: { title: match.title },
+      // CARRY THE CALENDAR IDENTITY (MTGATT-3). This item REPLACES the ones the merge folds, and it
+      // was written with the title alone — so a meeting that had an event id lost it the moment two
+      // recordings merged, and a calendar event pushed afterwards could never find it again: a second
+      // visible meeting forever, the pusher uncredited, and no refusal counted because no component
+      // ever forms. Only the identity fields are carried; nothing else from a source frontmatter
+      // belongs on a merge-owned item.
+      frontmatter: { title: match.title, ...identityFrontmatter },
       body: merged,
     },
     mergedAccess,
@@ -336,6 +343,34 @@ export async function mergeIntoMeetingNote(
   });
 
   return match.noteId;
+}
+
+/** Frontmatter keys that identify the calendar event a meeting came from (MTGATT-3, `event-identity`). */
+const IDENTITY_KEYS = [
+  "calendar_event_id",
+  "calendarEventId",
+  "event_id",
+  "gcal_event_id",
+  "ical_uid",
+  "icalUID",
+  "iCalUID",
+  "google_calendar_event",
+  "calendar_event",
+] as const;
+
+/**
+ * The identity fields on the item being merged away from, so the merge-owned item keeps them.
+ *
+ * Read-only and best-effort: if the read fails the merge still proceeds — losing the key costs a
+ * future link (a visible duplicate), while refusing the merge here would cost the merge itself.
+ */
+async function carriedIdentity(admin: DbClient, sourceItemId: string): Promise<Record<string, unknown>> {
+  const { data, error } = await admin.from("items").select("frontmatter").eq("id", sourceItemId).maybeSingle();
+  if (error || !data) return {};
+  const fm = ((data as { frontmatter: Record<string, unknown> | null }).frontmatter ?? {}) as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of IDENTITY_KEYS) if (fm[k] !== undefined && fm[k] !== null) out[k] = fm[k];
+  return out;
 }
 
 /** Build a fresh DuplicateMatch for a note by re-reading its (possibly just-merged) transcript. */
@@ -448,10 +483,15 @@ export async function backfillMergeDuplicateMeetings(
         // folded again here (MTGATT-3). `authorFallbackMemberId` is deliberately NOT part of this —
         // it is an attribution fallback for the re-ingest, never a claim that someone submitted the
         // meeting.
-        const { data: dupSubs } = await admin
+        const { data: dupSubs, error: dupSubsErr } = await admin
           .from("meeting_note_submitters")
           .select("member_id")
           .eq("meeting_note_id", dup.id);
+        // The pg adapter RETURNS errors rather than throwing, so an unchecked read here would look
+        // like "this note had no submitters" and strand exactly the credit `newSubmitterIds` exists
+        // to preserve — while the merge went on to hide the note. Skip; the dup stays live and the
+        // next tick retries.
+        if (dupSubsErr) continue;
         try {
           await mergeIntoMeetingNote(admin, teamId, match, {
             newRawText: bodyById.get(dup.source_item_id) ?? "",
