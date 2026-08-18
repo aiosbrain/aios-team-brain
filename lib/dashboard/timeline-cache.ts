@@ -38,6 +38,9 @@ interface TimelineView {
   tier: ViewerTier;
   vis: MemberVisibility | null;
 }
+// The POSTURE segment is LOAD-BEARING (PRET-5 L3): since the enforcing walls dropped, two
+// members sharing a visibilityHash differ in payload ONLY by the meeting leg's posture gate —
+// a hash-only "simplification" of this key would merge postures and leak meeting evidence.
 const viewKey = (v: TimelineView): string => (v.vis ? `vis:${v.tier}:${v.vis.visibilityHash}` : v.tier);
 /** Resolve the item-id set for a build. Called ONLY on a miss/rebuild — and freshly on each
  *  trailing-edge re-run, so a bust landing mid-rebuild rebuilds with the CURRENT membership set,
@@ -90,7 +93,10 @@ export const TIMELINE_TTL_MS = TTL_MS;
 // `meeting_note_attendees`), not just the one person who pushed the transcript — plus the new optional
 // `via` key marking a submitter fallback. Both a shape change (a new key) and a meaning change (a v11
 // row keeps serving meeting-less person-days for a full TTL after deploy), so it bumps under either rule.
-export const PAYLOAD_VERSION = 12;
+// v13 (PRET-5): the enforcing build's walls are mode-keyed — a `vis:external:*` row's
+// meaning changed (team evidence of granted projects now included), so pre-change rows must
+// read as misses, not serve one stale TTL.
+export const PAYLOAD_VERSION = 13;
 
 /** The timeline WITH the per-person-day synopsis attached. Runs the (up to 7d × roster) best-effort LLM
  *  calls — so it's used ONLY on the BACKGROUND refresh path, never inline on a request (a cold miss
