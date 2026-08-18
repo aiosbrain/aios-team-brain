@@ -37,14 +37,16 @@ export async function GET(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("id, tier")
+    .select("id")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  const tier = (me as { tier: "team" | "external" }).tier;
+  // PRET-4 §1a: posture, not the record.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const tier = await resolveViewerPosture(adminClient(), team.id, (me as { id: string }).id);
   const memberId = (me as { id: string }).id;
   // Both branches must yield a bare `TimelineDay[]`: the cached one now returns `{ days, freshness }`, and
   // the two arms only have to AGREE for `Response.json` (typed `any`) to accept a nested shape silently.

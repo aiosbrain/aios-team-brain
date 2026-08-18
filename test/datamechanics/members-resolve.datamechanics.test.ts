@@ -49,7 +49,7 @@ function get(route: (r: NextRequest) => Promise<Response>, url: string, key: str
 }
 
 describe("members + identity-resolve endpoints (real handlers, real Postgres)", () => {
-  it("members: team key 200, external key 403", async () => {
+  it("members: team key 200; external key 200 with the SAME roster (PRET-4 §1d — structure serves every member; inverts the QMIR-era 403)", async () => {
     const seed = await seedTeam();
     const team = await issueKeyFor(seed, "team");
     const ext = await issueKeyFor(seed, "external");
@@ -59,8 +59,10 @@ describe("members + identity-resolve endpoints (real handlers, real Postgres)", 
     const body = (await ok.json()) as { members: { id: string }[] };
     expect(body.members.length).toBeGreaterThanOrEqual(1);
 
-    const forbidden = await get(membersGET, MEMBERS_URL, ext, seed.teamSlug);
-    expect(forbidden.status).toBe(403);
+    const opened = await get(membersGET, MEMBERS_URL, ext, seed.teamSlug);
+    expect(opened.status).toBe(200);
+    const extBody = (await opened.json()) as { members: { id: string }[] };
+    expect(extBody.members.map((m) => m.id).sort()).toEqual(body.members.map((m) => m.id).sort());
   });
 
   it("members: carries avatar_url when the GitHub sync has populated it, null otherwise", async () => {

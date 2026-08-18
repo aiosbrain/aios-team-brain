@@ -320,12 +320,12 @@ async function resolveChannelSegment(
   channel: string,
   visArr?: string[] | null
 ): Promise<string> {
-  // Tier-filtered like every other read (CLAUDE.md §5 — no RLS backstop). The legs this feeds are
-  // themselves tier-scoped, so nothing leaks either way; re-applying it here keeps the invariant
-  // "every items read carries the filter" true by inspection rather than by argument.
+  // Mode-keyed like every content leg since PRET-4 §1b (no RLS backstop): enforcing (visArr
+  // present) → the oracle set alone — the posture conjunct would re-block ruling 2's granted
+  // team rows; permissive → the two-bucket posture wall alone.
   let q = db.from("items").select("path").eq("team_id", teamId).eq("frontmatter->>channel", channel).limit(1);
-  if (isRestrictedTier(tier)) q = q.eq("access", "external");
   if (visArr) q = q.in("id", visArr); // enforcement: don't resolve a segment from an invisible item (Codex Medium)
+  else if (isRestrictedTier(tier)) q = q.eq("access", "external");
   const { data } = await q;
   const path = (data as { path: string }[] | null)?.[0]?.path;
   const seg = path ? path.split("/")[1] : "";
@@ -574,17 +574,18 @@ async function nativeRetrieve(
   const { source: scopedSource } = parseSourceScope(question);
 
   // Kick off the Graphiti graph-memory search concurrently with Postgres retrieval.
-  // PCCC-6 read cutover: an enforcing team-tier MEMBER gets the graph leg back, over their
-  // K-capped, read-ready, unsuppressed partitions (stored pointers). External principals and
-  // delegated tokens keep the §5.8b omit (no graphProjectIds). Permissive keeps the tier path
-  // (now union-widened inside fetchGraphFacts).
+  // PCCC-6 read cutover, widened by PRET-4 §1b (ruling 2): an enforcing MEMBER of ANY posture
+  // gets the graph leg over their K-capped, read-ready, unsuppressed partitions (stored
+  // pointers) — an external member's oracle resolves their granted projects' partitions, no
+  // tier arm. Delegated tokens keep the §5.8b omit (no graphProjectIds). Permissive keeps the
+  // two-bucket path with POSTURE as its input.
   let graphScope: { covered: number; total: number } | undefined;
   const graphFactsP = (async (): Promise<GraphFact[]> => {
     // Configured check FIRST (review Medium 8): a default no-Graphiti install must not pay team,
     // project, arming, or aggregate reads — let alone latch WRITES — for a leg that cannot run.
     if (!new GraphitiClient().configured) return [];
     if (enforce == null) return fetchGraphFacts(db, teamId, tier, q);
-    if (tier !== "team" || !enforce.graphProjectIds) return [];
+    if (!enforce.graphProjectIds) return [];
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
@@ -638,8 +639,8 @@ async function nativeRetrieve(
     .order("work_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(8);
-  if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external");
   if (visArr) recentB = recentB.in("id", visArr); // enforcement: recency over visible items only
+  else if (isRestrictedTier(tier)) recentB = recentB.eq("access", "external"); // permissive posture wall (PRET-4 §1b)
   // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
   // segment, resolved from the name first (Slack's segment is its channel ID — see
   // resolveChannelSegment); the FTS leg does the precise matching, this soft filter is padding.
@@ -660,8 +661,8 @@ async function nativeRetrieve(
       .order("work_at", { ascending: false })
       .order("id", { ascending: false })
       .limit(SOURCE_RECENCY_LIMIT);
-    if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external");
     if (visArr) sourceRecencyB = sourceRecencyB.in("id", visArr); // enforcement
+    else if (isRestrictedTier(tier)) sourceRecencyB = sourceRecencyB.eq("access", "external"); // permissive posture wall
     if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
   }
 
@@ -704,26 +705,33 @@ async function nativeRetrieve(
           .eq("team_id", teamId)
           .eq("entity_type", "commitment")
           .limit(30);
-  // The enforcing arm narrows to the ORG-STRUCTURAL allowlist (REPORTS_TO only — OWNS/BLOCKS have
-  // no production writer and would be item-derived); the permissive triple is today's behavior.
-  const relsB =
-    isRestrictedTier(tier) || !serveOrgStructural
-      ? emptyRows
-      : db
-          .from("graph_relationships")
-          .select("from_id, to_id, relationship_type")
-          .eq("team_id", teamId)
-          .in("relationship_type", enforce == null ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"])
-          .limit(80);
-  const actorsB =
-    isRestrictedTier(tier) || !serveOrgStructural
-      ? emptyRows
-      : db
-          .from("graph_entities")
-          .select("entity_id, name, attrs")
-          .eq("team_id", teamId)
-          .eq("entity_type", "actor")
-          .limit(40);
+  // PRET-4 §1d — the QMIR-1 inversion: structure serves EVERY member, so the posture disjunct
+  // is gone from the two org-structural legs (it was the only thing closing them to external
+  // members; `serveOrgStructural`'s positive principal test already excludes tokens and both
+  // default-deny arms). The enforcing arm narrows to the ORG-STRUCTURAL allowlist (REPORTS_TO
+  // only — OWNS/BLOCKS have no production writer and would be item-derived); the permissive
+  // triple survives for team-posture readers, while the newly-opened restricted-posture
+  // permissive audience gets the same REPORTS_TO narrow as enforcing (cold-read L3: a new
+  // audience gets the allowlist, not fixture types).
+  const relsB = !serveOrgStructural
+    ? emptyRows
+    : db
+        .from("graph_relationships")
+        .select("from_id, to_id, relationship_type")
+        .eq("team_id", teamId)
+        .in(
+          "relationship_type",
+          enforce == null && !isRestrictedTier(tier) ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"]
+        )
+        .limit(80);
+  const actorsB = !serveOrgStructural
+    ? emptyRows
+    : db
+        .from("graph_entities")
+        .select("entity_id, name, attrs")
+        .eq("team_id", teamId)
+        .eq("entity_type", "actor")
+        .limit(40);
 
   const [
     ftsHits,

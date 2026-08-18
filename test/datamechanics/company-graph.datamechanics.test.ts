@@ -140,15 +140,20 @@ describe("company-graph endpoint (real handler, real Postgres)", () => {
     expect(body.ownership.find((o) => o.relationship === "TOUCHES")?.person_id).toBe("actor-002");
   });
 
-  it("tier gate: external key 403 forbidden_tier; bad key 401", async () => {
+  it("PRET-4 §1d: the org chart is structure — an external key gets 200 with PAYLOAD EQUALITY to a team key; bad key still 401", async () => {
+    // INVERTED from the QMIR-1 403 pin (the tier gate this arm used to assert is the wall the
+    // triad tears down). The honest opened-audience assertion is equality: the external caller
+    // receives exactly what team callers receive — nothing tightened, nothing widened (H4).
     const seed = await seedTeam();
     await seedGraph(seed);
 
     const ext = await issueKeyFor(seed, "external");
-    const forbidden = await get(ext, seed.teamSlug);
-    expect(forbidden.status).toBe(403);
-    const err = (await forbidden.json()) as { error: { code: string } };
-    expect(err.error.code).toBe("forbidden_tier");
+    const team = await issueKeyFor(seed, "team");
+    const extRes = await get(ext, seed.teamSlug);
+    expect(extRes.status).toBe(200);
+    const teamRes = await get(team, seed.teamSlug);
+    expect(teamRes.status).toBe(200);
+    expect(await extRes.json()).toEqual(await teamRes.json());
 
     const unauthorized = await get("aios_nope_notakey", seed.teamSlug);
     expect(unauthorized.status).toBe(401);

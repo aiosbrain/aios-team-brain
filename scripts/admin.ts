@@ -75,6 +75,8 @@ const USAGE = `Team Brain admin CLI — commands:
   list-members [--team <slug>]
   list-keys [--team <slug>]
   delete-member <email> [--hard] [--team <id|slug>]   # soft-disable by default; --hard removes
+  add-group-member <group-slug> <member-email> [--team <id|slug>]     # deliberate membership action; builtins = the posture move (humans only)
+  remove-group-member <group-slug> <member-email> [--team <id|slug>]  # inverse; builtin removal mirrors members.tier
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
   link-github <member-email> <github-login> [--team <id|slug>] [--force]   # needs GITHUB_TOKEN env
@@ -265,6 +267,44 @@ async function main() {
         r.deleted
           ? `✓ ${r.mode === "hard" ? "deleted" : "disabled"} ${email} on ${team.slug}`
           : `• no-op for ${email} (${r.reason})`
+      );
+      break;
+    }
+    case "add-group-member":
+    case "remove-group-member": {
+      // PRET-4 §1c: the first deliberate-membership surface. Builtin targets are the posture
+      // move (humans only, members.tier mirrored by the writer); ordinary groups behave as
+      // before. Slug-addressed; audited via the single writer.
+      const groupSlug = positionals[0] || die(`usage: ${cmd} <group-slug> <member-email> [--team <id|slug>]`);
+      const email = positionals[1] || die(`usage: ${cmd} <group-slug> <member-email> [--team <id|slug>]`);
+      const team = await resolveTeam(admin, teamSlug);
+      const { data: g } = await admin
+        .from("groups")
+        .select("id, slug, is_builtin")
+        .eq("team_id", team.id)
+        .eq("slug", groupSlug)
+        .maybeSingle();
+      if (!g) die(`no group '${groupSlug}' on team ${team.slug}`);
+      const { data: m } = await admin
+        .from("members")
+        .select("id, email, tier")
+        .eq("team_id", team.id)
+        .eq("email", email.toLowerCase())
+        .maybeSingle();
+      if (!m) die(`no member ${email} on team ${team.slug}`);
+      const { addMemberToGroup, removeMemberFromGroup } = await import("@/lib/access/groups");
+      const fn = cmd === "add-group-member" ? addMemberToGroup : removeMemberFromGroup;
+      const r = await fn(admin, team.id, (g as { id: string }).id, (m as { id: string }).id, (m as { id: string }).id);
+      if (!r.ok) die(`${cmd} failed: ${r.error}`);
+      const { data: after } = await admin
+        .from("members")
+        .select("tier")
+        .eq("team_id", team.id)
+        .eq("id", (m as { id: string }).id)
+        .single();
+      console.log(
+        `✓ ${cmd === "add-group-member" ? "added" : "removed"} ${email} ${cmd === "add-group-member" ? "to" : "from"} '${groupSlug}'` +
+          ((g as { is_builtin: boolean }).is_builtin ? ` (posture move — tier now '${(after as { tier: string }).tier}')` : "")
       );
       break;
     }

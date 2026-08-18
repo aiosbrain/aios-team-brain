@@ -24,16 +24,21 @@ export default async function AdminLayout({
   const { data: me } = team
     ? await db
         .from("members")
-        .select("role, tier")
+        .select("id, role")
         .eq("team_id", team.id)
         .eq("auth_user_id", user?.id ?? "")
         .eq("status", "active")
         .maybeSingle()
     : { data: null };
+  // PRET-4 §1d: the admin gate's second conjunct is POSTURE (membership-derived).
+  const posture =
+    team && me
+      ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, (team as { id: string }).id, (me as { id: string }).id)
+      : "external";
 
   // Admin AND team-tier — an external-tier admin must not reach the internal admin surface (no RLS
   // backstop, CLAUDE.md §5). See lib/auth/admin-access.
-  if (!canAccessAdmin(me ?? {})) {
+  if (!canAccessAdmin({ role: (me as { role?: string | null } | null)?.role, tier: posture })) {
     return (
       <div className="mx-auto max-w-md pt-16">
         <div className="prism-card flex flex-col items-center gap-3 px-8 py-12 text-center">

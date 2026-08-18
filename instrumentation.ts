@@ -37,6 +37,21 @@ export async function register() {
     );
   }
 
+  // PRET-4 one-time builtin materialization (spec §3.2, cold-read H2/L1): run at BOOT, awaited
+  // BEFORE the scheduler starts, so on a healthy boot the fleet's builtin posture rows are
+  // explicit before any tick assesses or serves against them. Failure is loud but never fails
+  // boot — the marker stays unclaimed, the oracle/posture legacy conjunct keeps the window
+  // fail-closed, and the scheduler-tick slot retries until it succeeds.
+  try {
+    const { adminClient } = await import("@/lib/db/admin");
+    const { materializeBuiltinMembershipOnce } = await import("@/lib/access/groups");
+    const m = await materializeBuiltinMembershipOnce(adminClient());
+    if (!m.ok) console.error(`[boot] pret4 builtin materialization failed (tick will retry): ${m.error}`);
+    else if (m.ran) console.info("[boot] pret4 builtin materialization ran (explicit posture state live)");
+  } catch (err) {
+    console.error(`[boot] pret4 builtin materialization threw (tick will retry): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   if (process.env.INGEST_POLL_ENABLED !== "false") {
     const { startIngestScheduler } = await import("@/lib/ingest/scheduler");
     startIngestScheduler();

@@ -63,6 +63,22 @@ export function startIngestScheduler(): void {
         await recordIngestRun(db, { teamId: null, source: "pret3_sweep", trigger: "scheduler", ok: true, startedAt: Date.now() }).catch(() => {});
       }
     }
+    // PRET-4 one-time builtin materialization — the RETRY slot for the boot-time run
+    // (instrumentation.register). Marker-guarded no-op after first fleet success; sequenced
+    // BEFORE runAutoFlip so a first-tick flip never assesses ahead of the sweep (spec §3.2).
+    {
+      const startedAt = Date.now();
+      const { materializeBuiltinMembershipOnce } = await import("@/lib/access/groups");
+      const m = await materializeBuiltinMembershipOnce(db).catch((err: unknown) => ({
+        ok: false as const,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+      if (m.ok && (m as { ran?: boolean }).ran) console.info("[ingest] pret4 builtin materialization ran (explicit posture state live)");
+      if (!m.ok) {
+        console.error("[ingest] pret4 builtin materialization FAILED:", m.error);
+        await recordIngestRun(db, { teamId: null, source: "pret4_materialize", trigger: "scheduler", ok: false, errors: [m.error ?? "unknown"], startedAt }).catch(() => {});
+      }
+    }
     // PRET-2 auto-flip: move warning-free, un-held, ready permissive teams to enforcing —
     // sequenced AFTER bootstrap+backfill so a team's first eligible tick can flip it. Cheap
     // stages run for every permissive team; at most PRET_FLIP_MAX_PER_TICK drains per pass

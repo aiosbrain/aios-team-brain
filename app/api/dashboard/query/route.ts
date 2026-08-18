@@ -112,7 +112,7 @@ export async function POST(req: NextRequest) {
 
   const { data: me } = await rls
     .from("members")
-    .select("id, tier, display_name, email, actor_handle")
+    .select("id, display_name, email, actor_handle")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
@@ -131,8 +131,10 @@ export async function POST(req: NextRequest) {
     .maybeSingle();
   const timeZone = pickTimezone([tz, prof?.timezone, DEFAULT_TIMEZONE]);
 
-  const memberTier = me.tier as "team" | "external";
   const db = adminClient();
+  // PRET-4 §1a: `memberTier` is POSTURE (everyone-membership), membership-derived.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const memberTier = await resolveViewerPosture(db, team.id, me.id as string);
 
   // The query box doubles as a scrape trigger: "/sync" / "scrape now" / … pulls every enabled
   // connector instead of asking the LLM. team-tier only (external collaborators can't trigger a
@@ -198,8 +200,9 @@ export async function POST(req: NextRequest) {
       // the omit path while the API had the leg was an unrecorded split). Team-tier members only.
       // QMIR-1: only members reach this route — it authenticates via getSessionUser() (session
       // cookie + members lookup); an aiosd_ bearer has no session, so no token can land here.
-      // Hence `principal: "member"` — the org-structural legs follow the tier.
-      enforce = { visibleItemIds: ids, principal: "member", ...(me.tier === "team" ? { graphProjectIds: projectIds } : {}) };
+      // Hence `principal: "member"`. PRET-4 §1b (ruling 2): every member principal carries
+      // graphProjectIds — an external member's oracle resolves their granted projects.
+      enforce = { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

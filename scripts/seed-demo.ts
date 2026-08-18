@@ -128,6 +128,13 @@ async function main() {
     { actor_handle: "sam", display_name: "Sam", email: "sam@demo.aios.local", role: "lead" },
   ];
   const members: Record<string, string> = {};
+  // Builtins must exist before the posture writes below (standalone runs against a fresh DB
+  // may precede the first bootstrap tick). Idempotent.
+  {
+    const { ensureBuiltins } = await import("@/lib/access/groups");
+    const b = await ensureBuiltins(db, team.id);
+    if (!b.ok) console.warn(`[seed-demo] ensureBuiltins: ${b.error}`);
+  }
   for (const m of memberDefs) {
     const { data } = await db
       .from("members")
@@ -138,6 +145,14 @@ async function main() {
       .select("id, actor_handle")
       .single();
     if (data) members[data.actor_handle] = data.id;
+    // PRET-4 (diff-review L2): raw-upserted demo members need their builtin-posture row —
+    // against a marker-stamped DB nothing else writes it, and alex's canAccessAdmin would
+    // fail on external posture. Via the sanctioned writer's function; idempotent.
+    if (data) {
+      const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
+      const w = await writeInviteDefaultMembership(db, team.id, data.id as string, "team");
+      if (!w.ok) console.warn(`[seed-demo] posture write for ${m.actor_handle} failed: ${w.error}`);
+    }
   }
 
   // 3. demo API key (printed once; sha256 stored)

@@ -3,7 +3,6 @@ import type { Metadata } from "next";
 import { ChevronLeft, Coins } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { resolveTeamContext } from "@/lib/auth/team-context";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { parseRange } from "@/lib/metrics/range";
 import { getLlmCostBreakdown, getLedgerLifetimeUsd, getLedgerMonthUsd } from "@/lib/metrics/llm-costs";
 import { getGraphEfficiency, HEALTHY_CALLS_PER_EPISODE } from "@/lib/metrics/graph-efficiency";
@@ -47,16 +46,10 @@ export default async function CostsPage({
   if (!ctx) return null;
   const { team, me } = ctx;
 
-  // Cost is team-internal operational data — never shown to an external-tier collaborator.
-  if (isRestrictedTier(me.tier)) {
-    return (
-      <div className="mx-auto max-w-3xl pt-8">
-        <h1 className="mb-2 text-2xl font-semibold text-ink">Costs</h1>
-        <p className="text-sm text-ink-tertiary">Team-tier membership is required to view spend.</p>
-      </div>
-    );
-  }
-
+  // PRET-4 §1d (money → ROLE, ruling 3): the tier gate that stood here is gone. The page's
+  // existing role scoping is the whole gate — an admin sees team-wide spend; a member
+  // (including an external collaborator with the member role) sees exactly their own usage
+  // via scopeLlmUsage, never the company bill.
   const isAdmin = me.role === "admin";
   const db = await serverClient();
   const breakdown = await getLlmCostBreakdown(db, team.id, range, { isAdmin, memberId: me.id });

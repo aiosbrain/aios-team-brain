@@ -131,22 +131,28 @@ export async function assessEnforcementReadiness(db: DbClient, teamId: string): 
   let humanPrincipals = 0;
   let agentPrincipals = 0;
 
+  // PRET-4 §1c: the required floor derives from EXPLICIT builtin membership, not from tier —
+  // otherwise every legitimately cross-enrolled member red-flags after the model changes. One
+  // bulk read via the groups module's sanctioned helper (`builtinMembershipBySlug`).
+  const { builtinMembershipBySlug } = await import("@/lib/access/groups");
+  const builtinRows = await builtinMembershipBySlug(db, teamId);
   for (const m of principals) {
     const { projectIds } = await visibleProjects(db, { teamId, memberId: m.id });
     const identity: BlindPrincipal = { memberId: m.id, email: m.email, kind: m.kind, tier: m.tier };
     if (m.kind === "human") {
       humanPrincipals++;
-      // A team-tier human must reach BOTH system projects — General (all team content) and
-      // external-shared, which holds the team-visible external content they can see today. A
-      // team member who reaches General alone has silently lost the external corpus, so checking
-      // General only would pass a real regression. An external-tier human must reach
-      // external-shared. Any other tier value reaches NEITHER built-in group, which is a lockout.
-      const required =
-        m.tier === "team"
-          ? [generalId, externalSharedId]
-          : m.tier === "external"
-            ? [externalSharedId]
-            : [undefined];
+      // A member in `everyone` must reach BOTH system projects — General (all team content)
+      // and external-shared, which holds the team-visible external content they can see
+      // today; reaching General alone means they silently lost the external corpus. A member
+      // in `external` only must reach external-shared. A member in NEITHER builtin reaches no
+      // system project — the lockout warning.
+      const inEveryone = builtinRows.everyone.has(m.id);
+      const inExternal = builtinRows.external.has(m.id);
+      const required = inEveryone
+        ? [generalId, externalSharedId]
+        : inExternal
+          ? [externalSharedId]
+          : [undefined];
       if (required.some((p) => !p || !projectIds.has(p))) blindHumans.push(identity);
     } else {
       agentPrincipals++;

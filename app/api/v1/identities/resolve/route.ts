@@ -23,9 +23,8 @@ export const runtime = "nodejs";
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  if (auth.memberTier !== "team") {
-    return errorResponse("forbidden_tier", "identity resolution is team-tier only", 403);
-  }
+  // PRET-4 §1d: identity resolution is roster-shaped (who is this handle/email) — structure,
+  // visible to every member; the tier 403 is gone.
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:resolve:get`, 120))) {

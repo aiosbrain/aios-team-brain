@@ -143,24 +143,27 @@ describe("QMIR-1 — tokens, default-deny arms, and the external tier keep the o
     }
   });
 
-  it("an external-tier read gets none of the three legs (unchanged audit-H1 posture)", async () => {
+  it("a PERMISSIVE external-posture read gets actors + REPORTS_TO (structure opens, PRET-4 §1d) — commitments stay closed, and the triple narrows to REPORTS_TO", async () => {
+    // INVERTED by PRET-4 (the audit-H1 omission this arm used to pin is the ruling the triad
+    // overturns): structure serves every member. The commitments absence and the REPORTS_TO
+    // narrow (no OWNS/BLOCKS for the newly-opened audience — cold-read L3) are the surviving
+    // closures.
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "external", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
     await seedGraphRows(seed);
 
     const ctx = await retrieve(db(), seed.teamId, "external", `about ${TERM}`, null, null);
-    expect(ctx.structured).not.toContain("Alice Chen");
-    expect(ctx.structured).not.toContain("REPORTS_TO");
-    expect(ctx.structured).not.toContain("ship the widget");
+    expect(ctx.structured, "the roster opens").toContain("Alice Chen");
+    expect(ctx.structured, "reporting lines open").toContain("REPORTS_TO");
+    expect(ctx.structured, "the ownership pair stays closed for the opened audience").not.toContain("OWNS");
+    expect(ctx.structured, "commitments stay allowlist-closed").not.toContain("ship the widget");
   });
 
-  it("an ENFORCING EXTERNAL member — the combination the routes actually produce — gets none either (review Medium 2)", async () => {
-    // Both routes assign principal:"member" to external members, so serveOrgStructural is TRUE
-    // for them and ONLY the isRestrictedTier conjunct closes the legs. This arm pins that
-    // conjunct in the enforcing path — a gate rewritten to test the tier only under permissive
-    // (`(isRestrictedTier(tier) && enforce == null) || !serveOrgStructural`) leaks the org chart
-    // to enforcing external members with every other test green.
+  it("an ENFORCING EXTERNAL member — the combination the routes actually produce — gets actors + REPORTS_TO, commitments closed (PRET-4 inverts review Medium 2)", async () => {
+    // This arm was BUILT to catch the exact gate rewrite PRET-4 now makes deliberately (the
+    // tier disjunct's removal from the org legs) — inverted, not deleted: the org chart serves
+    // every member principal; the commitments allowlist closure is what still holds.
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "external", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
@@ -169,8 +172,8 @@ describe("QMIR-1 — tokens, default-deny arms, and the external tier keep the o
     const { ids } = await visibleItemIds(db(), { teamId: seed.teamId, memberId: member });
 
     const ctx = await retrieve(db(), seed.teamId, "external", `about ${TERM}`, null, { visibleItemIds: ids, principal: "member" });
-    expect(ctx.structured, "the tier conjunct must hold on the member arm too").not.toContain("Alice Chen");
-    expect(ctx.structured).not.toContain("REPORTS_TO");
-    expect(ctx.structured).not.toContain("ship the widget");
+    expect(ctx.structured, "structure serves the enforcing external member (ruling 2's roster half)").toContain("Alice Chen");
+    expect(ctx.structured).toContain("REPORTS_TO");
+    expect(ctx.structured, "commitments stay allowlist-closed for every enforcing principal").not.toContain("ship the widget");
   });
 });

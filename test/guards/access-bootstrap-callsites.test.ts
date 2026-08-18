@@ -3,29 +3,41 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Pin the §11 bootstrap/sync CALL SITES, not just the functions (the repo's recurring failure
+ * Pin the access-chain CALL SITES, not just the functions (the repo's recurring failure
  * mode: a helper with green tests whose wiring can be deleted with everything staying green).
- * The fire-and-forget hooks (pg-login) can't be data-mechanics-tested deterministically — the
- * void promise races the assertion — so this source-level pin is their only non-vacuous guard;
- * the awaited hooks (members.ts) get outcome tests in the data-mechanics tier as well.
+ *
+ * PRET-4 re-pinned this file to the EXPLICIT-STATE model (docs/design/pret4-tier-wall-teardown.md
+ * §1c): builtin membership is written at member creation from the invite default and
+ * one-time-materialized at boot/tick — the tier-derived recompute is RETIRED, so this guard now
+ * pins both the new call sites AND the ABSENCE of the old ones (a re-introduced recompute would
+ * silently revert deliberate membership edits on every tick — the clobber class).
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
-describe("§11 access-bootstrap call sites", () => {
-  it("both pg-login activation flips fire the builtin re-sync", () => {
-    const source = read("lib/auth/pg-login.ts");
-    const calls = source.match(/syncBuiltinMembershipSafe\(teamId\)/g) ?? [];
-    expect(calls.length, "both activation paths must re-sync built-ins").toBeGreaterThanOrEqual(2);
-    // the helper really resolves to the groups writer, not a stub
-    expect(source).toMatch(/syncBuiltinMembership\s*\(/);
+describe("PRET-4 explicit builtin-state call sites", () => {
+  it("member creation writes the invite-default membership (the one choke point)", () => {
+    const source = read("lib/admin/members.ts");
+    expect(source).toMatch(/writeInviteDefaultMembership\s*\(/);
   });
 
-  it("member create AND disable/delete re-sync built-ins", () => {
-    const source = read("lib/admin/members.ts");
-    const calls = source.match(/syncBuiltinMembership\s*\(/g) ?? [];
-    expect(calls.length).toBeGreaterThanOrEqual(2);
+  it("the retired recompute has NO call site anywhere — pg-login, members.ts, groups.ts tail-call", () => {
+    for (const rel of ["lib/auth/pg-login.ts", "lib/admin/members.ts", "lib/access/groups.ts", "lib/ingest/scheduler.ts"]) {
+      expect(read(rel), `${rel} must not reference the retired recompute`).not.toMatch(/syncBuiltinMembership/);
+    }
+  });
+
+  it("the one-time materialization runs at BOOT (before the scheduler) and in the tick retry slot", () => {
+    expect(read("instrumentation.ts")).toMatch(/materializeBuiltinMembershipOnce/);
+    const scheduler = read("lib/ingest/scheduler.ts");
+    expect(scheduler).toMatch(/materializeBuiltinMembershipOnce/);
+    // Ordering (spec §3.2/L1): the materialize slot sits BEFORE the auto-flip in the tick, so a
+    // first-tick flip never assesses ahead of the sweep.
+    const matIdx = scheduler.indexOf("materializeBuiltinMembershipOnce");
+    const flipIdx = scheduler.indexOf("runAutoFlip(db)");
+    expect(matIdx).toBeGreaterThan(-1);
+    expect(flipIdx).toBeGreaterThan(matIdx);
   });
 
   it("team creation bootstraps the access topology", () => {

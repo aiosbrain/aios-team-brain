@@ -65,6 +65,9 @@ export async function inviteMember(
     displayName: string;
     actorHandle: string;
     role: "admin" | "lead" | "member";
+    /** PRET-4: the invite-time access default — "team" (internal, auto-enrolled in everyone)
+     *  or "external" (collaborator, enrolled in the external group only). Default "team". */
+    tier?: "team" | "external";
     /** When true, skip the magic-link invite even if mail delivery is configured. */
     manualInvite?: boolean;
     password?: string;
@@ -101,6 +104,7 @@ export async function inviteMember(
         displayName: form.displayName,
         actorHandle: form.actorHandle,
         role: form.role,
+        tier: form.tier ?? "team",
       },
       { actor: { kind: "member", memberId: ctx.memberId } }
     );
@@ -127,7 +131,7 @@ export async function inviteMember(
       email,
       displayName: form.displayName,
       role: form.role,
-      tier: "team",
+      tier: form.tier ?? "team",
     },
     teamName,
     inviterName,

@@ -38,6 +38,9 @@ async function seedMember(seed: Seed, over: { tier?: string; kind?: string; is_c
     })
     .select("id")
     .single();
+  // PRET-4 explicit state: every real member gets their builtin-posture row at creation.
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, over.tier ?? "team");
   return data!.id as string;
 }
 
@@ -145,6 +148,19 @@ describe("PRET-2 — the AUTHORITATIVE warning gate nets what the cheap scan mis
     expect(r.flipped, "refuseOnWarnings must catch the under-detected shape post-drain").toBe(false);
     expect(r.deferred?.warnings.join(" ")).toContain("agent");
     expect(await readAccessEnforcement(db(), seed.teamId)).toBe("permissive");
+  });
+
+  it("PRET-4 (cold-read M4): an agent whose ONLY membership is a materialized builtin row still trips the CHEAP scan — posture rows are not placements", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "m4.md", body: `builtinrow ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    // seedMember writes the agent's builtin-posture row (the cutover materialization shape);
+    // the agent holds NO grant-carrying group. Pre-M4-fix, placedMemberIds counted the builtin
+    // row, the cheap scan went quiet, and the team paid a full drain every tick forever.
+    await seedMember(seed, { kind: "agent" });
+    const { assessUnattendedWarnings } = await import("@/lib/admin/access-enforcement");
+    const warnings = await assessUnattendedWarnings(db(), seed.teamId);
+    expect(warnings.join(" "), "the cheap pre-drain scan itself must warn — not just the post-drain assessment").toContain("agent");
   });
 });
 

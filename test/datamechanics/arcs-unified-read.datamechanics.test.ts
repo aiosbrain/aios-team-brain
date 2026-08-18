@@ -68,11 +68,10 @@ describe("PRET-3 — resolveArcScope is mode-keyed (the one resolution, spec §3
     const { createMember } = await import("@/lib/admin/members");
     const m = await createMember(db(), seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Ext", actorHandle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external" });
     expect(m.id).toBeTruthy();
-    // createMember leaves the member INVITED (the oracle rightly resolves non-active members to
-    // nothing); model activation the way pg-login's hook does — status active + built-in resync.
+    // createMember leaves the member INVITED (the oracle rightly resolves non-active members
+    // to nothing) but — since PRET-4 — has already written their builtin row from the invite
+    // default, so activation is just the status flip (no recompute exists to call).
     await db().from("members").update({ status: "active" }).eq("id", m.id);
-    const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    expect((await syncBuiltinMembership(db(), seed.teamId)).ok).toBe(true);
 
     const r = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
     expect(r.arm, "an enforcing member's read arms — any tier").toBe(true);
