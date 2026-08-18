@@ -138,6 +138,9 @@ const upsert = (fetchImpl: typeof fetch, over: Partial<ProjectableTask> = {}, st
     desiredFingerprint: projectionFingerprint(task, null),
     statusOnly,
     fetchImpl,
+    // ADOPTFOOT-1 — the footer rung now fails closed on a MISSING owner set, and these fixtures resolve
+    // their issue through that rung. Nothing else owns anything here, so: an empty set, not `undefined`.
+    ownedResourceIds: new Set<string>(),
   });
 };
 
