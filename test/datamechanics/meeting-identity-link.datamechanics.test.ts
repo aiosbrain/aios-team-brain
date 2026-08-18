@@ -229,26 +229,31 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     expect(await submitterIds(notes[0].id)).toContain(chetan);
   });
 
-  it("keeps the accumulated submitter when the survivor is then folded by the overlap merge", async () => {
-    // The hazard this slice makes reachable: the overlap merge runs in the SAME tick and used to
-    // propagate only two submitter ids, so a submitter the link had just added to the survivor was
-    // stranded on a note nobody can see. Asserted end to end rather than at the unit that changed.
+  it("keeps the accumulated submitter when the linked note is later folded AWAY by the overlap merge", async () => {
+    // The hazard this slice makes reachable, and the direction matters: stranding only happens when
+    // the note carrying the ACCUMULATED credit is the one folded AWAY — i.e. the later-created of an
+    // overlapping pair, since the merge keeps the earliest as primary. The first version of this test
+    // built the opposite direction and passed with the fix reverted; a mutation caught it.
     const seed = await seedTeam();
     const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
     const chetan = await addMember(seed, "Chetan", chetanEmail);
-
     const shared = "# Design review\n\nWe agreed the rollout and the launch plan in detail today.";
-    await pushTranscript(seed, { body: shared });
+
+    // Tick 1 — the EARLIER note, which will become the merge's primary. No event id.
+    await pushTranscript(seed, { eventId: "", body: shared });
+    await tick(seed);
+
+    // Tick 2 — a second recording of the same meeting, plus Chetan's calendar event for it. The link
+    // folds the calendar event into THIS note (it has the body), crediting Chetan on it...
+    await pushTranscript(seed, { body: `${shared} Plus a closing note.` });
     await pushCalendarEvent(seed, { asMemberId: chetan, attendees: [{ email: chetanEmail }] });
-    await tick(seed);
+    const second = await tick(seed);
+    expect(second.link.linked, "the calendar event linked to the newer transcript").toBe(1);
 
-    // A second recording of the same meeting — overlapping text, so the overlap merge folds the
-    // survivor into it (or it into the survivor) on the next tick.
-    await pushTranscript(seed, { eventId: "", body: `${shared} Plus a closing note.` });
-    await tick(seed);
-
+    // ...and the overlap merge, in that same tick, folds that newer note into the earlier one. Whether
+    // Chetan's credit survives is exactly what `newSubmitterIds` decides.
     const notes = await liveNotes(seed);
-    const allSubs = (await Promise.all(notes.map((n) => submitterIds(n.id)))).flat();
-    expect(allSubs, "the calendar pusher's credit survived the second fold").toContain(chetan);
+    expect(notes, "the two recordings became one meeting").toHaveLength(1);
+    expect(await submitterIds(notes[0].id), "the calendar pusher survived the second fold").toContain(chetan);
   });
 });
