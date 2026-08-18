@@ -64,9 +64,12 @@ export async function linkMeetingNotesByIdentity(admin: DbClient, teamId: string
     .is("merged_into", null)
     .order("created_at", { ascending: false })
     .limit(NOTE_SCAN_LIMIT);
-  // Belt-and-braces only, and said so rather than left looking load-bearing: a failed read yields
-  // `notes = []`, which the `< 2` guard below already turns into the same early return. No mutation
-  // can redden this line; it is here so the intent survives a future refactor of that guard.
+  // BELT-AND-BRACES, and labelled as such rather than left looking load-bearing. A failed read here
+  // yields `notes = []`, which the `< 2` guard below already turns into the same early return — so no
+  // mutation can redden this line, and the same is true of the frontmatter read further down (no
+  // frontmatter → no keys → the `keyed.length < 2` return). Both are kept so the intent survives a
+  // refactor of those guards. The checks that ARE load-bearing — the BODY read and the three
+  // per-component credit reads — are mutation-proven by `test/meetings-link-read-errors.test.ts`.
   if (noteErr) return EMPTY_LINK_SUMMARY;
   const notes = (noteRows ?? []) as NoteRow[];
   if (notes.length < 2) return EMPTY_LINK_SUMMARY;
@@ -75,7 +78,7 @@ export async function linkMeetingNotesByIdentity(admin: DbClient, teamId: string
     .from("items")
     .select("id, frontmatter")
     .in("id", notes.map((n) => n.source_item_id));
-  if (itemErr) return EMPTY_LINK_SUMMARY;
+  if (itemErr) return EMPTY_LINK_SUMMARY; // belt-and-braces, as above
   const fmByItem = new Map(((itemRows ?? []) as ItemMeta[]).map((i) => [i.id, i.frontmatter]));
 
   // Only notes carrying an identity key can be linked, so only their bodies are worth reading.
