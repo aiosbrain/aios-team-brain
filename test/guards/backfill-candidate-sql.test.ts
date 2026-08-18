@@ -66,15 +66,20 @@ describe("guard: the candidate predicate's SQL shape", () => {
   it("has all THREE needs-work arms", () => {
     const arms = sql.split(/\bor\b/);
     expect(arms.length, "three arms means two `or`s at minimum").toBeGreaterThanOrEqual(3);
-    // Arm 1: no unit at all — and it must NOT filter on `state`, matching reconcileItemUnit's own
-    // lookup, so a retracted unit counts as missing rather than as done.
+    // Arm 1: no ITEM-GRAIN unit at all, matching reconcileItemUnit's own lookup. It does not filter
+    // `state` because a retracted unit is handled by its own EXCLUSION below — reconcile cannot
+    // revive one, so treating it as missing would make it a perpetual candidate.
     expect(sql).toMatch(/not exists \(\s*select 1 from project_context_units u\s*where u\.team_id = \$1 and u\.source_item_id = s\.id and u\.unit_kind = 'item'\s*\)/);
     // Every unit reference must be item-grain, matching reconcileItemUnit's own lookup — otherwise a
     // non-item unit on the same source_item_id would satisfy "has a unit" and the item is skipped.
-    expect((sql.match(/u\.unit_kind = 'item'/g) ?? []).length, "every unit reference must be item-grain")
-      .toBeGreaterThanOrEqual(4);
+    // EXACT, not >=: at >= N, dropping exactly one reference (e.g. arm 2's, which the arm-1 regex does
+    // not cover) still passes — the same one-of-N weakness the kind='system' count already fixed once.
+    expect((sql.match(/u\.unit_kind = 'item'/g) ?? []).length, "every unit reference must be item-grain").toBe(5);
     // Arm 2: no current INCLUDE in the TARGET project.
-    expect(sql).toMatch(/m\.decision = 'include' and m\.project_id = s\.target_id/);
+    // `valid_to is null` is part of the term, not decoration: without it a CLOSED include counts as
+    // done, the item is invisible under enforce (which requires it) and never selected — the silent
+    // skip this slice exists to prevent. Nothing killed this before; a mutation proved it.
+    expect(sql).toMatch(/m\.valid_to is null and m\.decision = 'include' and m\.project_id = s\.target_id/);
     // Arm 3: still a current membership in the OPPOSITE project, of ANY decision — closeMembershipInto
     // closes regardless, so narrowing this to include would strand a stale exclude.
     expect(sql).toMatch(/m\.valid_to is null and m\.project_id = s\.opposite_id/);
@@ -83,7 +88,9 @@ describe("guard: the candidate predicate's SQL shape", () => {
   it("EXCLUDES both UNREPAIRABLE states, so the sweep cannot burn a tick on either", () => {
     // reconcile can fix neither: ensureIncludeMembership no-ops on any current row, and
     // reconcileItemUnit never writes `state`. Selecting either would hold `scanned` off zero forever.
-    expect(sql).toMatch(/and not exists \([\s\S]*m\.decision = 'exclude' and m\.project_id = s\.target_id/);
+    // Same currency term, same reason: a CLOSED exclude must not shadow an item forever. EXCLSHADOW-1's
+    // repair is precisely what will start minting closed excludes in the target project.
+    expect(sql).toMatch(/and not exists \([\s\S]*m\.valid_to is null and m\.decision = 'exclude' and m\.project_id = s\.target_id/);
     expect(sql, "a retracted unit is unrepairable too").toMatch(/u\.state <> 'active'/);
   });
 

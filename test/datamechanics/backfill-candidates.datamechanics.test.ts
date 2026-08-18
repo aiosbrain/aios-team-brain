@@ -170,6 +170,49 @@ describe("backfill candidate predicate (data-mechanics)", () => {
     expect(unbounded.ids, "…but the cutoff is the ONLY thing excluding it").toContain(late.id);
   });
 
+  it("a candidate BELOW a legacy cursor waits for the first DRAIN, even with a truncation between", async () => {
+    // Criterion 6. A cursor written by the old full-corpus walk still filters `id > afterId`, so a
+    // candidate sorting below it is invisible until a pass drains and resets. The bound is "until the
+    // first drain", NOT "one tick" — a truncation persists the cursor and extends the wait, which is
+    // why this fixture forces one rather than assuming a small corpus hides the difference.
+    const seed = await seedTeam();
+    const made: string[] = [];
+    for (const n of ["a", "b", "c", "d"]) {
+      const i = await ingest(seed, { path: `lc-${n}.md`, body: n, access: "team", project: "src" });
+      const uid = await unitId(seed, i.id);
+      if (uid) await db().from("project_context_units").delete().eq("id", uid);
+      made.push(i.id);
+    }
+    const all = await candidates(seed);
+    expect(all.length).toBeGreaterThanOrEqual(4);
+
+    // A legacy cursor sitting ABOVE the lowest candidate.
+    const legacy = all[1];
+    const below = all[0];
+    const above = await selectCandidateItemIds(seed.teamId, {
+      afterId: legacy, createdBefore: FAR_FUTURE(), limit: 500,
+    });
+    expect(above.ids, "the low candidate is invisible while the legacy cursor stands").not.toContain(below);
+    expect(above.ids.length, "…but the ones above it are still served").toBeGreaterThan(0);
+
+    // A truncated pass keeps the cursor — the wait is not over after one tick.
+    const trunc = await selectCandidateItemIds(seed.teamId, {
+      afterId: legacy, createdBefore: FAR_FUTURE(), limit: 1,
+    });
+    expect(trunc.ids.length).toBe(1);
+    expect(trunc.ids, "still not the low one").not.toContain(below);
+
+    // Once a pass DRAINS (short page → cursor reset), the next pass sees the whole set again.
+    const drainedPage = await selectCandidateItemIds(seed.teamId, {
+      afterId: all[all.length - 1], createdBefore: FAR_FUTURE(), limit: 500,
+    });
+    expect(drainedPage.ids, "the drain page is short, which is what resets the cursor").toEqual([]);
+    const afterReset = await selectCandidateItemIds(seed.teamId, {
+      afterId: null, createdBefore: FAR_FUTURE(), limit: 500,
+    });
+    expect(afterReset.ids, "and then the low candidate is covered").toContain(below);
+  });
+
   it("pages by id keyset, so the TICKSTALL-1 cursor still works over the candidate set", async () => {
     const seed = await seedTeam();
     for (const n of ["p", "q", "r"]) {

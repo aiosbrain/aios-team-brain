@@ -111,7 +111,18 @@ select s.id
  order by s.id
  limit $6`;
 
-/** Items needing reconcile, `id`-ordered after `afterId`, bounded by `createdBefore` and `limit`. */
+/**
+ * Items needing reconcile, `id`-ordered after `afterId`, bounded by `createdBefore` and `limit`.
+ *
+ * DEFERRED, with the reason (review): `backfillTeamContext` already resolves the two system project
+ * ids and this SQL re-resolves them, so the two could drift apart — which is exactly the bug this
+ * slice fixed in `resolveSystemProjectIds` (it lacked `kind='system'`). Binding the resolved uuids as
+ * parameters would delete both the duplication and the NULL-system-projects case entirely. Not done
+ * here because it is a structural change arriving after two rounds of folds, and the NULL direction
+ * is already the SAFE one: with no system projects every membership comparison is NULL, so arm 2
+ * matches nothing inside its NOT EXISTS and the whole corpus is selected — expensive and loud, not
+ * silent. Unreachable through the only caller anyway (it gates on bootstrap + the resolver first).
+ */
 export async function selectCandidateItemIds(
   teamId: string,
   opts: { afterId?: string | null; createdBefore?: string | null; limit: number }
@@ -134,11 +145,11 @@ with sys as (
     (select id from projects where team_id = $1 and kind = 'system' and slug = $3 limit 1) as external_id
 )
 select
-  count(*) filter (
+  count(distinct i.id) filter (
     where m.id is not null and m.valid_to is null and m.decision = 'exclude'
       and m.project_id = (case when i.access = 'external' then sys.external_id else sys.general_id end)
   )::int as exclude_shadows,
-  count(*) filter (where u.state <> 'active')::int as retracted_units
+  count(distinct i.id) filter (where u.state <> 'active')::int as retracted_units
   from items i
   cross join sys
   join project_context_units u

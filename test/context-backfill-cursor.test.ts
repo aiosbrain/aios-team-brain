@@ -23,7 +23,7 @@ vi.mock("@/lib/projects/context/memberships", () => ({
 const candidates = vi.fn();
 vi.mock("@/lib/projects/context/backfill-candidates", () => ({
   selectCandidateItemIds: (...a: unknown[]) => candidates(...a),
-  countExcludeShadows: () => Promise.resolve(0),
+  countUnrepairable: () => Promise.resolve({ excludeShadows: 0, retractedUnits: 0 }),
 }));
 vi.mock("@/lib/access/bootstrap", () => ({
   ensureAccessBootstrap: (...a: unknown[]) => bootstrap(...a),

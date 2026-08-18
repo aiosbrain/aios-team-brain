@@ -126,20 +126,30 @@ describe("context backfill — bounded by a budget, resumable across ticks (data
     const drainedState = await readTeamBackfillState(db(), seed.teamId);
     expect(drainedState.cursor, "a drained pass must clear the cursor").toBeNull();
 
-    // A new item, then strip its membership to simulate the hook having missed it.
-    // NOTE (TICKSTALL-2): this said `late.itemId` — the helper returns `.id`, so the lookup found
-    // nothing and the strip never ran. The test still passed because a freshly ingested item is
-    // unpartitioned anyway, so it proved the backstop for a DIFFERENT state than its comment claimed.
-    // Fixed here rather than left as a green-by-accident assertion.
+    // A new item whose membership is then CLOSED, to simulate a half-reconciled item.
+    //
+    // The previous version of this could not run: it looked the unit up before any backfill, but the
+    // dm `ingest` helper calls `ingestItem` directly and the partition hook lives in the items ROUTE
+    // — so the fresh item had no unit, `if (unit)` never fired, and the strip never happened. The
+    // test still passed, because an unpartitioned item is a candidate anyway — it was proving the
+    // arm-1 state while its comment claimed otherwise. An earlier fix corrected the `.itemId`/`.id`
+    // key and CLAIMED to have fixed this; that claim was false, and it took a review to catch.
+    // Now: backfill FIRST so the item genuinely has a current include, then close it.
     const late = await ingest(seed, { path: "late/x.md", body: "late", access: "team", project: "src" });
-    const { data: unit } = await db()
+    for (let i = 0; i < 10; i++) {
+      const r = await pass(seed, { budgetMs: 60_000 });
+      if (r.outcomes[0]?.drained) break;
+    }
+    const lateUnit = await db()
       .from("project_context_units").select("id")
       .eq("team_id", seed.teamId).eq("source_item_id", late.id).maybeSingle();
-    if (unit) {
-      await db().from("project_context_memberships")
-        .update({ valid_to: new Date().toISOString() })
-        .eq("team_id", seed.teamId).eq("context_unit_id", (unit as { id: string }).id).is("valid_to", null);
-    }
+    const lateUnitId = (lateUnit.data as { id: string } | null)?.id;
+    expect(lateUnitId, "the backfill must have given it a unit before we can close its membership").toBeTruthy();
+    const closed = await db().from("project_context_memberships")
+      .update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId).eq("context_unit_id", lateUnitId!).is("valid_to", null);
+    expect(closed.error, "the strip must actually run — that is the whole point of this fixture").toBeFalsy();
+
     expect(await itemsWithoutMembership(seed)).toBeGreaterThan(0);
 
     for (let i = 0; i < 10; i++) {

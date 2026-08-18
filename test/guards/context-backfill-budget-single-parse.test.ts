@@ -90,7 +90,7 @@ describe("guard: the context-backfill leg records what it actually did", () => {
     // `shortCircuit` is deliberately GONE (TICKSTALL-2 removed the heuristic it reported). It is not
     // pinned false: a flag frozen at one value is a dead signal readers may still trust.
     expect(tryBody, "shortCircuit was retired with the heuristic").not.toMatch(/shortCircuit/);
-    for (const key of ["truncated:", "drained:", "cursor:", "elapsedMs:", "excludeShadows,"]) {
+    for (const key of ["truncated:", "drained:", "cursor:", "elapsedMs:", "excludeShadows:", "retractedUnits:"]) {
       expect(tryBody, `meta must carry ${key}`).toContain(key);
     }
   });
