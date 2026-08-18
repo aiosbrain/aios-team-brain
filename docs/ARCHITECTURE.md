@@ -1142,7 +1142,9 @@ writes): live notes are grouped into CONNECTED COMPONENTS over shared event keys
 key, a series key, a title, or a date pre-filter — the note **with a body** survives (so a transcript
 can never fold into a bodyless calendar event and lose its text, whatever the arrival order), and the
 folded note's attendees + submitters are ADDED to it before it is hidden via `merged_into`. Credit
-first, hide second: a crash between leaves a visible duplicate, never a hidden uncredited note. Two
+first, hide second — AND every read is error-checked before anything is hidden, because the pg adapter
+RETURNS errors rather than throwing, so an unchecked failed read looks exactly like "no attendees" and
+would hide a note whose credit never moved (permanently: the next tick excludes `merged_into` notes). Two
 refusals, counted by reason: a component with two bodies (the transcript-overlap merge owns that) and
 one whose dates span more than a day or are unknown (the residual undetectable-series case). It runs
 each tick from `backfillMeetingNotesFromItems` BEFORE the overlap merge, and a calendar push now

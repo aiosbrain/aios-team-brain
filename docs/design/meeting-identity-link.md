@@ -161,8 +161,10 @@ the two producers is the kind of thing that reads as "it didn't work".
 `backfillMeetingNotesFromItems`, after note creation and **before** `backfillMergeDuplicateMeetings`,
 so a linked calendar note is already folded and cannot be reconsidered by the overlap merge.
 
-Bounded: one metadata query for live notes (capped at 500 newest), one for their items' `frontmatter`
-+ a body-emptiness flag. At today's 66 notes that is two small reads; with zero identifiers it forms
+Bounded: one metadata query for live notes (capped at 500 newest), one for their items'
+`frontmatter`, and then FULL BODIES — but only for the notes that actually carry an identity key. The
+adapter cannot select an expression, so there is no cheaper emptiness flag; the saving comes from the
+narrow set, not from a narrow column. At today's 66 notes that is two small reads; with zero identifiers it forms
 zero groups and returns immediately. The cap is stated in code, because an unbounded per-tick scan is
 how `TICKSTALL-1` starved the chain.
 
@@ -257,7 +259,10 @@ real pair with the instrument) is kept.
   meetings leg is gated on `canSeeMeetingNotes(tier)` (`work-timeline.ts:672-675`), which is false for
   external. No attendee row this slice writes is readable by an external viewer.
 - *"It skips the invariants `mergeIntoMeetingNote` learned the hard way — merge-owned item, access
-  floor, action-item remap, tombstone."* Those exist because that path WRITES A NEW BODY into an item:
+  floor, action-item remap, tombstone."* The diff review supplied the proof this argument was missing:
+  **a folded note can never have a body** — a one-body component folds only its bodyless members, and
+  a no-body component has none — and action items are only ever extracted where a body exists, so
+  there is nothing to remap; no body write means no access floor; and `merged_into` IS the tombstone. Those exist because that path WRITES A NEW BODY into an item:
   the merge-owned path stops a connector re-sync clobbering merged text, the floor stops merged text
   widening tier, the remap follows action items to the new item. This slice writes no body and creates
   no item, so each has nothing to protect. The one consequence that did carry over is the submitter

@@ -60,9 +60,17 @@ const NO_REFUSALS: Record<RefusalReason, number> = {
 /** A calendar event and its transcript can be a day apart legitimately; a fortnight cannot. */
 export const MAX_DAY_SPAN = 1;
 
+/**
+ * Days between two `YYYY-MM-DD` values, or Infinity if either cannot be parsed.
+ *
+ * INFINITY, NOT ZERO. Returning 0 on an unparseable date would silently disarm the veto — the exact
+ * failure §2.2 exists to prevent — and it would do so on malformed input, which is when a guard is
+ * most needed. Today the adapter pins date columns to `YYYY-MM-DD` so this is unreachable, but
+ * `plan()` is an exported pure API and its callers are not all written yet.
+ */
 function daysApart(a: string, b: string): number {
   const ms = Math.abs(Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`));
-  return Number.isFinite(ms) ? Math.round(ms / 86_400_000) : 0;
+  return Number.isFinite(ms) ? Math.round(ms / 86_400_000) : Number.POSITIVE_INFINITY;
 }
 
 /**
@@ -144,8 +152,9 @@ export function plan(candidates: LinkCandidate[]): LinkPlan {
   const groups: LinkGroup[] = [];
   const refusals: Record<RefusalReason, number> = { ...NO_REFUSALS };
 
-  // Deterministic component order, and deterministic order within one, so two runs over the same
-  // corpus produce byte-identical plans.
+  // Deterministic order WITHIN each component (so the survivor and the folded set never depend on
+  // input order), and a stable sort across components. The array ORDER of `groups` follows the
+  // union-find root and is not itself a contract — each group is applied independently.
   for (const root of [...components.keys()].sort()) {
     const members = (components.get(root) ?? []).sort((a, b) =>
       a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.noteId < b.noteId ? -1 : 1
