@@ -4,6 +4,7 @@ import type { ImportSummary, IngestSummary } from "./run";
 import { adminClient } from "@/lib/db/admin";
 import { recordIngestRun } from "./runs";
 import { runLinearInbound } from "@/lib/pm-sync/inbound";
+import { singleFlight } from "./single-flight";
 
 /**
  * In-process poller — the single-service alternative to a separate cron worker.
@@ -497,7 +498,15 @@ export function startIngestScheduler(): void {
   }
 
   // Delay the first run so boot isn't blocked; then poll on the interval.
-  setTimeout(tick, 20_000).unref?.();
-  setInterval(tick, intervalMs).unref?.();
+  //
+  // SINGLE-FLIGHT (TICKSTALL-1). `setInterval` fires whether or not the previous tick finished, and
+  // this chain can outlast its own interval — `runContextBackfill` was measured at ~59 min against a
+  // 30-min interval, and the overlap is visible in prod as `slack` recording 13 times in 4.85h where
+  // ~9.7 is expected. Beyond the wasted work, the backfill's durable resume cursor lives in
+  // `ingest_runs.meta` with no compare-and-swap behind it, so a second in-flight pass can resurrect a
+  // superseded cursor. One pass at a time is what makes that cursor sound.
+  const guardedTick = singleFlight(tick);
+  setTimeout(guardedTick, 20_000).unref?.();
+  setInterval(guardedTick, intervalMs).unref?.();
   console.info(`[ingest] scheduler started — Slack + Plane + Linear + GitHub every ${minutes}m`);
 }
