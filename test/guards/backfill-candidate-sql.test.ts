@@ -42,8 +42,15 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // The permanent-tier-leak term. `units.audience` lags until reconcile re-mirrors it, so a tier
     // flip whose best-effort fan-out failed reads "already correct" through the mirror and is never
     // selected — team content served through external-shared forever.
-    expect(sql).toMatch(/i\.access = 'external'/);
-    expect(sql, "the mirror must not drive target/opposite selection").not.toMatch(/u\.audience/);
+    // BOTH derivations, not merely "i.access appears somewhere": a mutation that corrupts only the
+    // target expression leaves the opposite one referencing i.access and passes a looser check. That
+    // exact mutation SURVIVED an earlier version of this guard, which is how it got tightened.
+    const target = sql.match(/case when ([^\n]*?) then [^\n]*? end as target_id/);
+    const opposite = sql.match(/case when ([^\n]*?) then [^\n]*? end as opposite_id/);
+    expect(target?.[1], "target_id must be derived from items.access").toContain("i.access");
+    expect(opposite?.[1], "opposite_id must be derived from items.access").toContain("i.access");
+    // …and nothing anywhere may key off the units.audience MIRROR, whatever alias it is given.
+    expect(sql, "the stale mirror must not drive selection").not.toMatch(/\baudience\b/);
   });
 
   it("resolves BOTH system projects with kind='system'", () => {
