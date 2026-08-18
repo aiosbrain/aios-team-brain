@@ -143,21 +143,34 @@ describe("guard: Apache-2.0 directories must not import from AGPL-3.0 code", () 
     );
   });
 
-  it("the root LICENSE is AGPL-3.0-only and the prior MIT text is preserved", () => {
+  it("the root LICENSE stays machine-detectable: a copyright line, then verbatim text", () => {
     const root = readFileSync(join(REPO, "LICENSE"), "utf8");
     expect(root).toContain("GNU AFFERO GENERAL PUBLIC LICENSE");
-    expect(root).toContain("Chetan Nandakumar and John Ellison");
-
-    // AGPL-3.0-only, never -or-later. Scope this to OUR grant header — the verbatim
-    // license body that follows contains the FSF's "How to Apply These Terms" appendix,
-    // which legitimately shows the "or (at your option) any later version" template.
-    // Asserting over the whole file would fail on the upstream text itself.
-    const header = root.split("=".repeat(80))[0];
-    // "Free Software Foundation" wraps across a line break in the header, so match the
-    // half that carries the version restriction.
-    expect(header).toContain("Software Foundation, version 3.");
-    expect(header).not.toMatch(/at your option.*later version/s);
-
     expect(readFileSync(join(REPO, "LICENSE-MIT"), "utf8")).toContain("MIT License");
+
+    // GitHub runs the `licensee` gem, which normalises away a leading COPYRIGHT LINE but
+    // NOT prose. An earlier version of this file opened with a ~20-line grant header and
+    // every relicensed repo dropped to NOASSERTION — the sidebar stopped naming the
+    // license at all, which defeats the point of picking an OSI-approved one. So the
+    // shape is the invariant: copyright line, blank line, then the license verbatim.
+    const lines = root.split("\n");
+    expect(lines[0]).toBe("Copyright (C) 2026 Chetan Nandakumar and John Ellison");
+    expect(lines[1]).toBe("");
+    expect(lines[2]).toContain("GNU AFFERO GENERAL PUBLIC LICENSE");
+  });
+
+  it("the AGPL-3.0-ONLY choice is recorded where it now lives", () => {
+    // The version choice used to be stated in the LICENSE header. Moving that prose out
+    // (above) would have silently dropped the only machine-checkable record of "-only"
+    // versus "-or-later", so pin it in each of its new homes instead.
+    const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8"));
+    expect(pkg.license).toBe("AGPL-3.0-only");
+
+    const notice = readFileSync(join(REPO, "NOTICE"), "utf8");
+    expect(notice).toContain("AGPL-3.0-only");
+    expect(notice).toMatch(/version 3 ONLY/i);
+    expect(notice).toContain("LICENSE-MIT");
+
+    expect(readFileSync(join(REPO, "LICENSING.md"), "utf8")).toContain("AGPL-3.0-only");
   });
 });
