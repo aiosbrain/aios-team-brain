@@ -26,7 +26,7 @@ const DAILY_TEAM_BUDGET_USD = 10;
 export async function POST(req: NextRequest) {
   // Phase B slice 3 (spec §10/§17-B): `query` honors delegated `aiosd_*` tokens — the Phase A 403
   // refusal is lifted now that the retrieval path can attenuate (slice 2). A delegated principal
-  // is ALWAYS oracle-attenuated (independent of `teams.access_enforcement`, which is the MEMBER
+  // is ALWAYS oracle-attenuated (independent of the retired rollout flag, which was the MEMBER
   // rollout flag) and STATELESS: no conversation read/write and no history leg — the launcher's
   // prior turns may quote items outside the token's scope. Rate limits, query_log and cost
   // metering attribute to the LAUNCHING member row — a token never burns the REPRESENTED

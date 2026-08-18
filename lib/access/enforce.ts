@@ -6,7 +6,7 @@ import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib
 /**
  * The enforced-read primitive (Phase B slice 1, spec §5/§11). Visibility = **oracle ∧ legacy-tier**:
  * a read applies the oracle's membership filter (this module) AND keeps its existing legacy tier
- * filter, so a bug in either conjunct fails CLOSED. Gated per team by `teams.access_enforcement`:
+ * filter, so a bug in either conjunct fails CLOSED. PRET-6: enforcement is unconditional —
  *
  *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
  *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
@@ -89,7 +89,7 @@ export async function visibleItemIds(
 
 /**
  * Delegated principals are ALWAYS attenuated (Phase B slice 3, spec §10/§5.8b): the enforce arg
- * for an `aiosd_*` query, computed regardless of `teams.access_enforcement` — that flag is the
+ * for an `aiosd_*` query, always computed — the retired rollout flag was the
  * MEMBER rollout control, and a scoped token must never ride a permissive team to full-corpus
  * answers. Effective projects = the live triple intersection (`effectiveVisibleProjects`), then
  * the item-grain membership set. Fail-closed end to end: an empty effective set, an un-backfilled

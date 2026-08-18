@@ -158,7 +158,7 @@ create table if not exists teams (
 );
 -- PRET-6: the access-enforcement rollout flag and the auto-flip hold are RETIRED — enforcing
 -- is the only behavior (docs/design/pret6-retirement.md). A from-zero load never creates the
--- columns; upgrading fleets drop them via 20260818210000_pret6_retire_access_enforcement.sql
+-- columns; upgrading fleets drop them via the guarded PRET-6 retirement migration (20260818210000)
 -- behind its refusing precondition.
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
