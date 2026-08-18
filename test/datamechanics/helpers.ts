@@ -41,8 +41,36 @@ export async function seedTeam(): Promise<Seed> {
     .select("id")
     .single();
   if (mErr || !member) throw new Error(`seed member failed: ${mErr?.message}`);
+  await placeMemberByTier(team.id, member.id, "team");
 
   return { teamId: team.id, teamSlug: slug, memberId: member.id };
+}
+
+/**
+ * Test plumbing for the PRET-4 explicit-state model: write a member's builtin-posture row the
+ * way `createMember`'s invite-default write does in production — every real member has one
+ * from creation, so raw-inserted fixture members must too or the oracle/posture resolve them
+ * to nothing (the recompute that used to heal this is retired). Direct edge-table writes are
+ * legal from test files (the single-writer guard scans app/lib/scripts only).
+ */
+export async function placeMemberByTier(teamId: string, memberId: string, tier: string): Promise<void> {
+  const admin = db();
+  const { ensureBuiltins } = await import("@/lib/access/groups");
+  const r = await ensureBuiltins(admin, teamId);
+  if (!r.ok) throw new Error(`ensureBuiltins failed: ${r.error}`);
+  const slug = tier === "team" ? "everyone" : "external";
+  const { data: g } = await admin
+    .from("groups")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("slug", slug)
+    .eq("is_builtin", true)
+    .single();
+  if (!g) throw new Error(`builtin ${slug} missing after ensure`);
+  const { error } = await admin
+    .from("group_members")
+    .upsert({ team_id: teamId, group_id: (g as { id: string }).id, member_id: memberId }, { onConflict: "group_id,member_id" });
+  if (error) throw new Error(`place member failed: ${error.message}`);
 }
 
 /** Ingest one item through the real lib/ingest path against the real DB. */

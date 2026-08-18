@@ -62,6 +62,12 @@ async function seedMember(seed: Seed, over: { tier?: string; kind?: string } = {
     })
     .select("id")
     .single();
+  // PRET-4 explicit state: every member gets their builtin-posture row (as the cutover
+  // materialization does for every kind). Builtin rows are grant-inert for non-humans and
+  // deliberately do NOT count as "placed" (M4), so the unplaced-agent warning fixtures below
+  // keep their meaning.
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, over.tier ?? "team");
   return data!.id as string;
 }
 

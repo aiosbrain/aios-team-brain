@@ -8,17 +8,22 @@ import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
  * `project_groups` (spec §4). Nothing else may write them (build-enforced by
  * test/guards/access-single-writer.test.ts), which is what makes the invariants here real:
  *
- *  - built-ins ("everyone"/"external") are machine-maintained from isBuiltinEligible + tier,
- *    never hand-edited, and auto-admit HUMANS ONLY — agents/connectors/off-roster never;
+ *  - built-ins ("everyone"/"external") hold EXPLICIT state (PRET-4): written from the
+ *    invite-time default at member creation, edited thereafter only by deliberate membership
+ *    actions here — the tier-derived recompute is retired. Builtin rows are the POSTURE
+ *    source (lib/access/posture.ts); for non-humans they are grant-inert (the oracle's
+ *    isBuiltinEligible check), and the deliberate-action door admits humans only (a
+ *    human-editable agent-into-everyone door would reopen the round-3 Critical's posture
+ *    half — PRET-4 cold-read H3);
  *  - a membership row for a member failing isPrincipal cannot be created (write-side half of
  *    eligibility; the oracle re-applies it read-side);
  *  - a singleton group (person_member_id set — a "direct person add") always contains exactly
  *    its person; ordinary membership edits against it are refused.
  *
  * Admin-actor mutations audit through lib/api/audit per write; machine maintenance
- * (syncBuiltinMembership, singleton healing) audits one summary row per run that changed
- * anything. Best-effort, never blocks the write result — which is why the data-mechanics
- * tier asserts at least one audit row lands.
+ * (the one-time PRET-4 materialization, singleton healing) audits one summary row per run
+ * that changed anything. Best-effort, never blocks the write result — which is why the
+ * data-mechanics tier asserts at least one audit row lands.
  */
 
 export const EVERYONE_SLUG = "everyone";
@@ -82,7 +87,11 @@ function auditWrite(
   });
 }
 
-/** Create the per-team built-in groups if absent, then sync their membership. Idempotent. */
+/** Create the per-team built-in groups if absent. Idempotent. MEMBERSHIP is not touched here
+ *  (PRET-4): builtin rows are explicit state — written at member creation from the invite
+ *  default, one-time-materialized by materializeBuiltinMembershipOnce, and edited only by the
+ *  deliberate-action functions below. A membership recompute here would silently revert
+ *  deliberate edits on every bootstrap tick (the enforce-the-adjacent-write-route class). */
 export async function ensureBuiltins(db: DbClient, teamId: string): Promise<WriteResult> {
   for (const [slug, name] of [
     [EVERYONE_SLUG, "Everyone"],
@@ -119,23 +128,25 @@ export async function ensureBuiltins(db: DbClient, teamId: string): Promise<Writ
       }
     }
   }
-  return syncBuiltinMembership(db, teamId);
+  return { ok: true };
 }
 
 /**
- * Recompute built-in membership from the members table: everyone = isBuiltinEligible ∧
- * tier='team'; external = isBuiltinEligible ∧ tier='external'. Inserts missing rows, deletes
- * rows that no longer qualify. Hook this on member activation/deactivation AND tier change.
- *
- * DEFERRED (review F3; premise updated by slice 3): this is a read-then-write diff with no
- * serialization — a per-team advisory lock needs a transaction surface the adapter does not
- * expose yet. Since slice 3, concurrent callers DO exist (login-path activation hooks, admin
- * member hooks, the scheduler tick), so interleavings can transiently re-add a just-disabled
- * member's row or drop-then-re-add; the oracle's read-side eligibility + builtin-tier checks
- * keep every such stale row access-inert (availability noise, never a leak), and the next
- * sync converges. Serialize when the adapter grows transactions.
+ * Write a member's builtin-posture row from their invite-time default (PRET-4 §1c): internal
+ * (`tier='team'`) → the `everyone` group, external → the `external` group. Called by
+ * `createMember` for EVERY kind — humans, agents, connectors alike (cold-read H1: posture
+ * parity; the rows are grant-inert for non-humans via the oracle's eligibility). `reconcile`
+ * (an upsert whose tier CHANGED — a stated, deliberate posture move) first removes the member
+ * from BOTH builtins; a plain create just adds the target row. Best-effort semantics belong
+ * to the caller; this returns honest errors.
  */
-export async function syncBuiltinMembership(db: DbClient, teamId: string): Promise<WriteResult> {
+export async function writeInviteDefaultMembership(
+  db: DbClient,
+  teamId: string,
+  memberId: string,
+  tier: string,
+  opts: { reconcile?: boolean } = {}
+): Promise<WriteResult> {
   const { data: groups, error: gErr } = await db
     .from("groups")
     .select("id, slug")
@@ -144,50 +155,113 @@ export async function syncBuiltinMembership(db: DbClient, teamId: string): Promi
     .in("slug", [EVERYONE_SLUG, EXTERNAL_SLUG]);
   if (gErr) return { ok: false, error: gErr.message };
   const bySlug = new Map((groups ?? []).map((g: { id: string; slug: string }) => [g.slug, g.id]));
+  const targetSlug = tier === "team" ? EVERYONE_SLUG : EXTERNAL_SLUG;
+  const targetId = bySlug.get(targetSlug);
+  if (!targetId) return { ok: false, error: `builtin ${targetSlug} missing — bootstrap has not run for this team` };
 
-  const { data: members, error: mErr } = await db
-    .from("members")
-    .select("id, kind, is_connector, status, tier, display_name")
-    .eq("team_id", teamId);
-  if (mErr) return { ok: false, error: mErr.message };
-
-  for (const slug of [EVERYONE_SLUG, EXTERNAL_SLUG]) {
-    const groupId = bySlug.get(slug);
-    if (!groupId) return { ok: false, error: `builtin ${slug} missing after ensure` };
-    const tier = slug === EVERYONE_SLUG ? "team" : "external";
-    const want = new Set(
-      ((members ?? []) as MemberRow[]).filter((m) => isBuiltinEligible(m) && m.tier === tier).map((m) => m.id)
-    );
-    const { data: current, error: cErr } = await db
+  if (opts.reconcile) {
+    const allIds = [...bySlug.values()];
+    const { error } = await db
       .from("group_members")
-      .select("member_id")
+      .delete()
       .eq("team_id", teamId)
-      .eq("group_id", groupId);
-    if (cErr) return { ok: false, error: cErr.message };
-    const have = new Set(((current ?? []) as { member_id: string }[]).map((r) => r.member_id));
+      .eq("member_id", memberId)
+      .in("group_id", allIds);
+    if (error) return { ok: false, error: error.message };
+  }
+  const { error } = await db
+    .from("group_members")
+    .upsert({ team_id: teamId, group_id: targetId, member_id: memberId }, { onConflict: "group_id,member_id" });
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
 
-    const toAdd = [...want].filter((id) => !have.has(id));
-    if (toAdd.length > 0) {
-      const { error } = await db
+/**
+ * PRET-4's ONE-TIME fleet materialization (spec §3.2): freeze the tier-derived builtin
+ * membership as explicit state. Per team: ADD the rows the retired recompute's predicate
+ * implies — for every member kind, per their pre-cutover tier (posture parity, cold-read H1;
+ * invited members included, inert until active) — and DROP builtin rows the tier predicate
+ * refutes (the LAST legal tier-derived delete, closing the stale-row class the oracle's
+ * retiring conjunct kept inert). Marker discipline (SR14, deliberately NOT the PRET-3
+ * claim-first pattern): the reconcile runs FIRST and the marker is written LAST, only after
+ * every team succeeded — idempotent per team, so a crash retries in full and racing replicas
+ * repeat converging statements; a permanently-suppressed half-materialization is impossible.
+ */
+export async function materializeBuiltinMembershipOnce(db: DbClient): Promise<WriteResult & { ran?: boolean }> {
+  const { data: marker, error: mkErr } = await db
+    .from("migration_markers")
+    .select("name")
+    .eq("name", "pret4_builtin_materialize")
+    .maybeSingle();
+  if (mkErr) return { ok: false, error: `marker read failed: ${mkErr.message}` };
+  if (marker) return { ok: true, ran: false }; // already materialized (any replica, any boot)
+
+  const { data: teams, error: tErr } = await db.from("teams").select("id");
+  if (tErr) return { ok: false, error: `teams read failed: ${tErr.message}` };
+
+  for (const t of (teams ?? []) as { id: string }[]) {
+    const ensured = await ensureBuiltins(db, t.id);
+    if (!ensured.ok) return { ok: false, error: `team ${t.id}: ${ensured.error}` };
+
+    const { data: groups, error: gErr } = await db
+      .from("groups")
+      .select("id, slug")
+      .eq("team_id", t.id)
+      .eq("is_builtin", true)
+      .in("slug", [EVERYONE_SLUG, EXTERNAL_SLUG]);
+    if (gErr) return { ok: false, error: `team ${t.id}: ${gErr.message}` };
+    const bySlug = new Map((groups ?? []).map((g: { id: string; slug: string }) => [g.slug, g.id]));
+
+    const { data: members, error: memErr } = await db
+      .from("members")
+      .select("id, kind, is_connector, status, tier, display_name")
+      .eq("team_id", t.id);
+    if (memErr) return { ok: false, error: `team ${t.id}: ${memErr.message}` };
+
+    for (const slug of [EVERYONE_SLUG, EXTERNAL_SLUG]) {
+      const groupId = bySlug.get(slug);
+      if (!groupId) return { ok: false, error: `team ${t.id}: builtin ${slug} missing after ensure` };
+      const tier = slug === EVERYONE_SLUG ? "team" : "external";
+      // EVERY member kind, per tier — the posture source. Grant-inertness for non-humans is
+      // the oracle's read-side eligibility, unchanged and dm-pinned.
+      const want = new Set(((members ?? []) as MemberRow[]).filter((m) => m.tier === tier).map((m) => m.id));
+      const { data: current, error: cErr } = await db
         .from("group_members")
-        .upsert(toAdd.map((member_id) => ({ team_id: teamId, group_id: groupId, member_id })), { onConflict: "group_id,member_id" });
-      if (error) return { ok: false, error: error.message };
-    }
-    const toDrop = [...have].filter((id) => !want.has(id));
-    if (toDrop.length > 0) {
-      const { error } = await db
-        .from("group_members")
-        .delete()
-        .eq("team_id", teamId)
-        .eq("group_id", groupId)
-        .in("member_id", toDrop);
-      if (error) return { ok: false, error: error.message };
-    }
-    if (toAdd.length > 0 || toDrop.length > 0) {
-      await auditWrite(db, teamId, null, "access.builtin_synced", groupId, { slug, added: toAdd, removed: toDrop });
+        .select("member_id")
+        .eq("team_id", t.id)
+        .eq("group_id", groupId);
+      if (cErr) return { ok: false, error: `team ${t.id}: ${cErr.message}` };
+      const have = new Set(((current ?? []) as { member_id: string }[]).map((r) => r.member_id));
+
+      const toAdd = [...want].filter((id) => !have.has(id));
+      if (toAdd.length > 0) {
+        const { error } = await db
+          .from("group_members")
+          .upsert(toAdd.map((member_id) => ({ team_id: t.id, group_id: groupId, member_id })), { onConflict: "group_id,member_id" });
+        if (error) return { ok: false, error: `team ${t.id}: ${error.message}` };
+      }
+      const toDrop = [...have].filter((id) => !want.has(id));
+      if (toDrop.length > 0) {
+        const { error } = await db
+          .from("group_members")
+          .delete()
+          .eq("team_id", t.id)
+          .eq("group_id", groupId)
+          .in("member_id", toDrop);
+        if (error) return { ok: false, error: `team ${t.id}: ${error.message}` };
+      }
+      if (toAdd.length > 0 || toDrop.length > 0) {
+        await auditWrite(db, t.id, null, "access.builtin_materialized", groupId, { slug, added: toAdd, removed: toDrop });
+      }
     }
   }
-  return { ok: true };
+
+  // Marker LAST — only a fully-succeeded fleet reconcile claims it.
+  const { error: stampErr } = await db
+    .from("migration_markers")
+    .upsert({ name: "pret4_builtin_materialize" }, { onConflict: "name" });
+  if (stampErr) return { ok: false, error: `marker write failed: ${stampErr.message}` };
+  return { ok: true, ran: true };
 }
 
 /** Create an ordinary (non-builtin, non-singleton) group. */
@@ -210,9 +284,35 @@ export async function createGroup(
 }
 
 /**
- * Add a member to an ordinary group. Refuses: members failing isPrincipal (offroster/connector/
- * inactive — the write-side eligibility gate), built-in groups (machine-maintained), and
- * singleton groups (their membership is fixed by definition).
+ * PRET-4 §1c (cold-read M3): after a DELIBERATE builtin move, mirror the member's resulting
+ * posture into `members.tier` — the invite-default record follows the move, so the token
+ * layer (agent-tokens mint/verify) and Linear provisioning, which read the record live, can
+ * never diverge from posture. Tier is a maintained mirror of builtin state, never an
+ * independent access input.
+ */
+async function mirrorTierToPosture(db: DbClient, teamId: string, memberId: string): Promise<WriteResult> {
+  const { data, error } = await db
+    .from("group_members")
+    .select("group_id, groups(slug, is_builtin)")
+    .eq("team_id", teamId)
+    .eq("member_id", memberId);
+  if (error) return { ok: false, error: error.message };
+  const rows = (data ?? []) as { groups: { slug: string; is_builtin: boolean } | null }[];
+  const posture = rows.some((r) => r.groups?.is_builtin === true && r.groups.slug === EVERYONE_SLUG)
+    ? "team"
+    : "external";
+  const { error: uErr } = await db.from("members").update({ tier: posture }).eq("team_id", teamId).eq("id", memberId);
+  if (uErr) return { ok: false, error: uErr.message };
+  return { ok: true };
+}
+
+/**
+ * Add a member to a group. Refuses: members failing isPrincipal (offroster/connector/
+ * inactive — the write-side eligibility gate), singleton groups (their membership is fixed by
+ * definition), and — for BUILT-IN targets — non-humans (PRET-4 cold-read H3: builtin rows
+ * carry posture, and a human-editable agent-into-everyone door would reopen the round-3
+ * Critical; non-human posture is set only by the invite default at creation). A builtin add
+ * is the deliberate posture move and mirrors `members.tier` (M3).
  */
 export async function addMemberToGroup(
   db: DbClient,
@@ -223,22 +323,29 @@ export async function addMemberToGroup(
 ): Promise<WriteResult> {
   const group = await getGroup(db, teamId, groupId);
   if (!group) return { ok: false, error: "group not found" };
-  if (group.is_builtin) return { ok: false, error: "built-in membership is machine-maintained, not editable" };
   if (group.person_member_id) return { ok: false, error: "a singleton group's membership is fixed to its person" };
   const member = await getMember(db, teamId, memberId);
   if (!member) return { ok: false, error: "member not found" };
   if (!isPrincipal(member)) {
     return { ok: false, error: `member is not a principal (kind=${member.kind}, connector=${member.is_connector}, status=${member.status})` };
   }
+  if (group.is_builtin && !isBuiltinEligible(member)) {
+    return { ok: false, error: "built-in groups admit humans only — non-human posture is set by the invite default at creation" };
+  }
   const { error } = await db
     .from("group_members")
     .upsert({ team_id: teamId, group_id: groupId, member_id: memberId, added_by: actorMemberId }, { onConflict: "group_id,member_id" });
   if (error) return { ok: false, error: error.message };
   await auditWrite(db, teamId, actorMemberId, "access.member_added", groupId, { memberId });
+  if (group.is_builtin) {
+    const mirror = await mirrorTierToPosture(db, teamId, memberId);
+    if (!mirror.ok) return { ok: false, error: `membership written but tier mirror failed: ${mirror.error}` };
+  }
   return { ok: true };
 }
 
-/** Remove a member from an ordinary group (same built-in/singleton refusals as add). */
+/** Remove a member from a group (same singleton refusal as add; builtin removals are the
+ *  deliberate posture move's other half — humans only, tier mirrored — PRET-4 §1c). */
 export async function removeMemberFromGroup(
   db: DbClient,
   teamId: string,
@@ -248,8 +355,13 @@ export async function removeMemberFromGroup(
 ): Promise<WriteResult> {
   const group = await getGroup(db, teamId, groupId);
   if (!group) return { ok: false, error: "group not found" };
-  if (group.is_builtin) return { ok: false, error: "built-in membership is machine-maintained, not editable" };
   if (group.person_member_id) return { ok: false, error: "a singleton group's membership is fixed to its person" };
+  if (group.is_builtin) {
+    const member = await getMember(db, teamId, memberId);
+    if (member && !isBuiltinEligible(member)) {
+      return { ok: false, error: "built-in groups admit humans only — non-human posture is set by the invite default at creation" };
+    }
+  }
   const { error } = await db
     .from("group_members")
     .delete()
@@ -258,6 +370,10 @@ export async function removeMemberFromGroup(
     .eq("member_id", memberId);
   if (error) return { ok: false, error: error.message };
   await auditWrite(db, teamId, actorMemberId, "access.member_removed", groupId, { memberId });
+  if (group.is_builtin) {
+    const mirror = await mirrorTierToPosture(db, teamId, memberId);
+    if (!mirror.ok) return { ok: false, error: `membership removed but tier mirror failed: ${mirror.error}` };
+  }
   return { ok: true };
 }
 
@@ -334,7 +450,7 @@ export async function grantProjectToGroup(
   groupId: string,
   actorMemberId: string | null
 ): Promise<WriteResult> {
-  // Select-first: audit ONLY on creation (the syncBuiltinMembership audit-on-change pattern).
+  // Select-first: audit ONLY on creation (the audit-on-change pattern).
   // The bootstrap re-runs this every scheduler tick; an unconditional upsert+audit minted 3
   // audit rows/team/tick forever and re-clobbered added_by — drowning the grant trail the
   // spec's accountability story depends on (slice-3 Fable High).
@@ -383,6 +499,27 @@ export async function revokeProjectFromGroup(
  * guard rightly refuses any other file that names the edge tables while containing write verbs
  * (the variable-table idiom defense) — a read in the sanctioned file keeps the coarse net tight.
  */
+/**
+ * READ helper for PRET-4's re-expressed readiness floor (lib/admin/access-enforcement): each
+ * builtin's member-id set, one bulk read. Lives here for the same single-writer-guard reason
+ * as placedMemberIds.
+ */
+export async function builtinMembershipBySlug(
+  db: DbClient,
+  teamId: string
+): Promise<{ everyone: Set<string>; external: Set<string> }> {
+  const { data, error } = await db
+    .from("group_members")
+    .select("member_id, groups(slug, is_builtin)")
+    .eq("team_id", teamId);
+  if (error) throw new Error(`group_members read failed: ${error.message}`);
+  const rows = (data ?? []) as { member_id: string; groups: { slug: string; is_builtin: boolean } | null }[];
+  return {
+    everyone: new Set(rows.filter((r) => r.groups?.is_builtin && r.groups.slug === EVERYONE_SLUG).map((r) => r.member_id)),
+    external: new Set(rows.filter((r) => r.groups?.is_builtin && r.groups.slug === EXTERNAL_SLUG).map((r) => r.member_id)),
+  };
+}
+
 export async function placedMemberIds(
   db: DbClient,
   teamId: string,
@@ -391,9 +528,14 @@ export async function placedMemberIds(
   if (memberIds.length === 0) return new Set();
   const { data, error } = await db
     .from("group_members")
-    .select("member_id")
+    .select("member_id, groups(is_builtin)")
     .eq("team_id", teamId)
     .in("member_id", [...memberIds]);
   if (error) throw new Error(`group_members read failed: ${error.message}`);
-  return new Set(((data ?? []) as { member_id: string }[]).map((r) => r.member_id));
+  // Builtin rows do NOT count as placement (PRET-4 cold-read M4): the callers ask "would the
+  // oracle grant this non-human anything?", and materialized builtin rows are posture-only —
+  // grant-inert. Counting them silences the cheap agent warning while the full assessment
+  // still refuses, burning a full drain per tick forever on a never-flippable team.
+  const rows = (data ?? []) as { member_id: string; groups: { is_builtin: boolean } | null }[];
+  return new Set(rows.filter((r) => r.groups?.is_builtin !== true).map((r) => r.member_id));
 }

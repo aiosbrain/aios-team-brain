@@ -55,6 +55,19 @@ export async function createMember(
   opts: { upsert?: boolean; actor?: ActorContext } = {}
 ): Promise<{ id: string; status: string }> {
   const email = input.email.trim().toLowerCase();
+  // PRET-4 §1c: on the upsert path, read the existing tier BEFORE writing — a tier that
+  // CHANGES in an upsert is a deliberate posture move and reconciles the builtin row; an
+  // unchanged upsert must never clobber a deliberate cross-enrollment.
+  let priorTier: string | null = null;
+  if (opts.upsert) {
+    const { data: prior } = await admin
+      .from("members")
+      .select("tier")
+      .eq("team_id", teamId)
+      .eq("email", email)
+      .maybeSingle();
+    priorTier = (prior as { tier: string } | null)?.tier ?? null;
+  }
   // `status` is intentionally omitted so the column default ('invited') applies on
   // insert while an existing member's status is preserved on upsert-conflict.
   const row = {
@@ -87,14 +100,22 @@ export async function createMember(
     target_id: data.id,
     meta: { email, role: input.role, upsert: Boolean(opts.upsert) },
   });
-  // Membership eligibility may have changed (an upsert can change tier; a connector row is
-  // never eligible) → converge the built-ins now (spec §11). Best-effort; tick is backstop.
+  // PRET-4 §1c: the invite-time default writes EXPLICIT builtin state — every kind, per tier
+  // (posture parity; grant-inert for non-humans via the oracle's eligibility). New member →
+  // write the target row; upsert whose tier CHANGED → reconcile (a deliberate posture move);
+  // unchanged upsert → leave rows alone (a cross-enrollment survives). Best-effort: access
+  // maintenance must never fail member creation; the materialize sweep is the backstop for a
+  // row missed here.
   try {
-    const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    const sync = await syncBuiltinMembership(admin, teamId);
-    if (!sync.ok) console.warn(`[access] builtin sync after member create failed: ${sync.error}`);
+    const effectiveTier = input.tier ?? "team";
+    const tierChanged = priorTier !== null && priorTier !== effectiveTier;
+    if (priorTier === null || tierChanged) {
+      const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
+      const w = await writeInviteDefaultMembership(admin, teamId, data.id, effectiveTier, { reconcile: tierChanged });
+      if (!w.ok) console.warn(`[access] invite-default membership write failed: ${w.error}`);
+    }
   } catch {
-    // access maintenance must never fail member creation
+    // never fail member creation on access maintenance
   }
   return { id: data.id, status: data.status };
 }
@@ -297,14 +318,9 @@ export async function deleteMember(
     target_id: member.id,
     meta: { email: e },
   });
-  // A disabled/deleted member is no longer builtin-eligible → drop them from Everyone/External
-  // now, not at the next tick (spec §11). Best-effort.
-  try {
-    const { syncBuiltinMembership } = await import("@/lib/access/groups");
-    const sync = await syncBuiltinMembership(admin, teamId);
-    if (!sync.ok) console.warn(`[access] builtin sync after member removal failed: ${sync.error}`);
-  } catch {
-    // access maintenance must never fail member removal
-  }
+  // PRET-4 §1c: no membership recompute on lifecycle. A disabled member's builtin rows stay
+  // in place and are access-inert read-side (the oracle's isPrincipal; auth refuses disabled
+  // principals before posture). A hard delete cascades via the composite FK
+  // (postgres/schema.sql group_members → members on delete cascade).
   return { deleted: true, mode: opts.hard ? "hard" : "soft", id: member.id };
 }

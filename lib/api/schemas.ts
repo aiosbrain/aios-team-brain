@@ -442,6 +442,10 @@ export const memberInviteRequestSchema = z
     display_name: z.string().trim().min(1),
     actor_handle: z.string().trim().min(1),
     role: z.enum(["member", "lead", "admin"]).optional().default("member"),
+    // PRET-4 §1c: the invite-time access default — internal ('team', auto-enrolled in the
+    // everyone group) vs external collaborator ('external', enrolled in the external group
+    // only). Optional; absent keeps the historical wire behavior (team).
+    tier: z.enum(["team", "external"]).optional().default("team"),
     tools: z
       .union([
         z.literal("all"),

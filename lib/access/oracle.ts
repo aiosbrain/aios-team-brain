@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
+import { materializationConfirmed } from "@/lib/access/posture";
 
 /**
  * The visibility oracle (spec §5.1): ONE place computes what a principal can see; every
@@ -62,11 +63,16 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
     .eq("member_id", principal.memberId);
   if (gmErr) return empty(); // fail closed on read error
 
-  // Read-side tier consistency for BUILT-IN memberships (review F2): the write-side sync maps
-  // tier onto Everyone/External, but a member whose tier changed keeps the stale row until the
-  // next sync — without this filter a human downgraded team→external would keep full team
-  // visibility through Everyone. Ordinary/singleton groups are tier-independent by design.
-  const tierFor: Record<string, string> = { [EVERYONE_SLUG]: "team", [EXTERNAL_SLUG]: "external" };
+  // BUILT-IN membership acceptance (PRET-4 §1c): builtin rows are EXPLICIT state — the row is
+  // authoritative once the one-time materialization is confirmed. Until then (the
+  // activation→sweep window) the LEGACY tier conjunct applies, so a stale everyone row from a
+  // failed recompute-era hook sync is never served live (cold-read H2 — fails closed to
+  // pre-slice semantics). What is PERMANENT either way: isBuiltinEligible — a planted
+  // team-tier AGENT in Everyone must never inherit General (slice-2 Codex High; materialized
+  // non-human rows are posture-only, grant-inert) — and the unknown-slug fail-closed (a
+  // direct-written builtin row with a foreign slug contributes nothing, cold-read M6).
+  const legacyWindow = !(await materializationConfirmed(db));
+  const legacyTierFor: Record<string, string> = { [EVERYONE_SLUG]: "team", [EXTERNAL_SLUG]: "external" };
   const rows = (memberships ?? []) as { group_id: string; groups: { slug: string; is_builtin: boolean } | null }[];
   const groupIds = new Set(
     rows
@@ -74,15 +80,10 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
         const g = r.groups;
         if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
         if (!g.is_builtin) return true;
-        // Built-in membership is legitimate ONLY for builtin-eligible humans of the matching
-        // tier. Tier alone is not enough: a planted team-tier AGENT in Everyone would pass a
-        // tier-only check and inherit every General project (slice-2 Codex High) — agents are
-        // principals for ordinary groups, never for built-ins.
         if (!isBuiltinEligible(member)) return false;
-        const requiredTier = tierFor[g.slug];
-        // An is_builtin row with a slug outside the two known built-ins cannot be created by
-        // the writer; if one exists it is a direct write — fail closed, never "unknown = allow".
-        return requiredTier !== undefined && member.tier === requiredTier;
+        if (g.slug !== EVERYONE_SLUG && g.slug !== EXTERNAL_SLUG) return false;
+        if (legacyWindow) return member.tier === legacyTierFor[g.slug];
+        return true;
       })
       .map((r) => r.group_id)
   );

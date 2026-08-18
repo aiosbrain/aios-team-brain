@@ -38,6 +38,9 @@ async function seedMember(seed: Seed, over: { tier?: string; kind?: string; is_c
     })
     .select("id")
     .single();
+  // PRET-4 explicit state: every real member gets their builtin-posture row at creation.
+  const { placeMemberByTier } = await import("./helpers");
+  await placeMemberByTier(seed.teamId, data!.id as string, over.tier ?? "team");
   return data!.id as string;
 }
 
