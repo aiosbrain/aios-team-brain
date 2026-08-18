@@ -8,7 +8,7 @@ import {
   ensureBuiltins,
   materializeBuiltinMembershipOnce,
 } from "@/lib/access/groups";
-import { resolveViewerPosture, _resetPostureConfirmationForTests } from "@/lib/access/posture";
+import { resolveViewerPosture } from "@/lib/access/posture";
 import { visibleProjects } from "@/lib/access/oracle";
 import { createMember } from "@/lib/admin/members";
 
@@ -71,10 +71,9 @@ beforeEach(async () => {
   // own materialization pass. Direct marker delete is legal test plumbing (the single-writer
   // guard covers the access edge tables, not migration_markers).
   await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
-  _resetPostureConfirmationForTests();
 });
 
-describe("PRET-4 AC1 — posture equals the materialized tier for every principal class (permissive team)", () => {
+describe("PRET-4 AC1 — posture equals the materialized tier for every principal class", () => {
   it("materializes every member kind per tier, and posture matches the pre-cutover tier byte-for-byte", async () => {
     const seed = await seedTeam(); // active team-tier human
     const externalHuman = await seedMemberRow(seed, { tier: "external" });
@@ -89,7 +88,7 @@ describe("PRET-4 AC1 — posture equals the materialized tier for every principa
 
     // Posture per class == the tier column that seeded it. The connector and agent arms are
     // the classes the old recompute NEVER admitted — their posture must still be their tier
-    // (grant-inert rows carrying posture), or permissive reads narrow at deploy (H1).
+    // (grant-inert rows carrying posture), or corpus reads narrow at deploy (H1).
     expect(await resolveViewerPosture(db(), seed.teamId, seed.memberId)).toBe("team");
     expect(await resolveViewerPosture(db(), seed.teamId, externalHuman)).toBe("external");
     expect(await resolveViewerPosture(db(), seed.teamId, teamConnector)).toBe("team");
@@ -192,8 +191,8 @@ describe("PRET-4 §1c — connectors mint their posture row on the INGEST path (
       email: `${randomUUID()}@connector.local`,
     });
     expect(minted).not.toBeNull();
-    // Pre-H1-fix this resolved "external" (no row, marker confirmed) and the connector's
-    // permissive corpus reads silently narrowed to access='external'.
+    // Pre-H1-fix this resolved "external" (no row) and the connector's corpus reads silently
+    // narrowed to access='external'.
     expect(await resolveViewerPosture(db(), seed.teamId, minted!.memberId)).toBe("team");
   });
 });
@@ -286,36 +285,28 @@ describe("PRET-4 §1c — createMember writes the invite default as explicit sta
   });
 });
 
-describe("PRET-4 §1a/§3.2 — the marker-keyed window fails CLOSED (cold-read H2)", () => {
-  it("BEFORE the materialization marker, a stale everyone row is inert (legacy tier semantics); AFTER, rows are authoritative", async () => {
+// Deleted WITH its subject (PRET-6): "PRET-4 §1a/§3.2 — the marker-keyed window fails CLOSED
+// (cold-read H2)". The legacy tier window is retired — the builtin row alone decides on every
+// supported upgrade path (the release's preDeploy precondition refuses a fleet whose
+// materialization never completed). The half of that test that survives — the materialization
+// sweep DROPS a stale everyone row the tier predicate refutes — is pinned here.
+describe("PRET-6 — the materialization sweep still reconciles stale rows", () => {
+  it("a stale everyone row whose member tier says external is dropped by the sweep", async () => {
     const seed = await seedTeam();
     const { ensureAccessBootstrap } = await import("@/lib/access/bootstrap");
     const boot = await ensureAccessBootstrap(db(), seed.teamId);
     expect(boot.ok, boot.error).toBe(true);
-    // Simulate the recompute-era stale-row class: the member's tier is downgraded but the
-    // everyone row survives (a failed hook sync). Direct writes, as the incident would leave.
+    // The recompute-era stale-row class: the member's tier is downgraded but the everyone row
+    // survives (a failed hook sync). Direct writes, as the incident would leave.
     const everyoneId = await builtinGroupId(seed, EVERYONE_SLUG);
     await db()
       .from("group_members")
       .upsert({ team_id: seed.teamId, group_id: everyoneId, member_id: seed.memberId }, { onConflict: "group_id,member_id" });
     await db().from("members").update({ tier: "external" }).eq("id", seed.memberId).eq("team_id", seed.teamId);
 
-    // Pre-marker: legacy semantics — posture is the TIER (external), the stale row is not live.
-    expect(await resolveViewerPosture(db(), seed.teamId, seed.memberId)).toBe("external");
-    // And the oracle's builtin acceptance applies the same legacy conjunct pre-marker.
-    const preVis = await visibleProjects(db(), { teamId: seed.teamId, memberId: seed.memberId });
-    const { data: generalGrantRows } = await db()
-      .from("projects")
-      .select("id")
-      .eq("team_id", seed.teamId)
-      .eq("slug", "general")
-      .single();
-    expect(preVis.projectIds.has((generalGrantRows as { id: string }).id)).toBe(false);
-
     // The sweep DROPS the stale row (the tier predicate refutes it) and sets the marker.
     const ran = await materializeBuiltinMembershipOnce(db());
     expect(ran.ok, ran.error).toBe(true);
-    _resetPostureConfirmationForTests(); // fresh process-cache read against the now-present marker
     expect(await resolveViewerPosture(db(), seed.teamId, seed.memberId)).toBe("external");
     const { data: staleRow } = await db()
       .from("group_members")

@@ -30,15 +30,15 @@ export interface AccessHealth {
   /** Real behaviour changes that are NOT lockouts of a human — reported, never fatal. */
   warnings: string[];
   itemsScanned: number;
-  /** Items with no CURRENT include-membership: invisible to everyone the moment enforcement is on. */
+  /** Items with no CURRENT include-membership: invisible to everyone. */
   unpartitioned: { count: number; examples: string[] };
   humanPrincipals: number;
   agentPrincipals: number;
-  /** Active humans whose oracle set would NOT include their tier's system project → they go blind. */
+  /** Active humans whose oracle set does NOT include their builtin's system project → blind. */
   blindHumans: BlindPrincipal[];
   /** Active agents the oracle resolves to nothing — expected (agents are never auto-admitted). */
   unplacedAgents: BlindPrincipal[];
-  /** Active connector service accounts: they can read today and will read nothing under enforcing. */
+  /** Active connector service accounts: they push, and a pull through their key reads nothing. */
   activeConnectors: BlindPrincipal[];
 }
 
@@ -52,14 +52,13 @@ type MemberRow = {
 };
 
 /**
- * Would `enforcing` be safe for this team RIGHT NOW? Read-only — it changes nothing, so it is
- * also the `--dry-run` answer.
+ * Is anyone blind, is anything unreachable, RIGHT NOW? Read-only.
  *
  * The checks are deliberately derived from the SAME primitives the enforced read uses rather than
  * from a proxy for them: per-member visibility comes from the oracle itself (`visibleProjects`),
  * so a broken group/grant edge anywhere in the chain shows up as the member actually going blind,
  * not as a table row that looks plausible. An inspector that agrees with enforcement is the only
- * kind worth having (the §15.6 rule, applied to the flip).
+ * kind worth having (the §15.6 rule).
  */
 export async function assessAccessHealth(db: DbClient, teamId: string): Promise<AccessHealth> {
   const blockers: string[] = [];
@@ -125,37 +124,36 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
     }
   }
   // CONNECTORS are not principals by design (service accounts must never resolve visibility), but
-  // `authenticateApiKey` only rejects a non-ACTIVE member — so a connector key can read the corpus
-  // today and will read NOTHING once enforcing. Not a lockout of a person, so not a blocker; but a
-  // silent integration going empty is exactly the kind of change an operator must be told about.
+  // `authenticateApiKey` only rejects a non-ACTIVE member — so a pull through a connector key
+  // reads NOTHING. Not a lockout of a person, so not a blocker; but a silent integration going
+  // empty is exactly the kind of change an operator must be told about.
   // (Live prod check while building this: 4 of that team's 9 active members are connectors.)
   const activeConnectors = all.filter((m) => m.is_connector && m.status === "active");
   if (blindHumans.length > 0) {
     blockers.push(
-      `${blindHumans.length} active human member(s) would see NOTHING under enforcing — their groups grant no path to their tier's system project`
+      `${blindHumans.length} active human member(s) see NOTHING — their groups grant no path to their builtin's system project`
     );
   }
   if (unplacedAgents.length > 0) {
     warnings.push(
-      `${unplacedAgents.length} active agent member(s) are in no granted group and will read ZERO items under enforcing ` +
+      `${unplacedAgents.length} active agent member(s) are in no granted group and read ZERO items ` +
         `(agents are never auto-admitted to Everyone/External by design — place them explicitly, or their pulls go empty)`
     );
   }
   if (activeConnectors.length > 0) {
     warnings.push(
-      `${activeConnectors.length} active connector member(s) can read the corpus today and will read ZERO items under ` +
-        `enforcing (a connector is not a principal, so the oracle resolves it to nothing). Connectors normally only PUSH — ` +
-        `check whether any of yours also pulls before you rely on this being harmless`
+      `${activeConnectors.length} active connector member(s): a connector is not a principal, so a pull through its key ` +
+        `reads ZERO items. Connectors normally only PUSH — check whether any of yours also pulls before you rely on this being harmless`
     );
   }
 
-  // 3. Every item must already be partitioned. An un-partitioned item is invisible to EVERYONE the
-  //    instant the flag flips, so this is the check that decides the whole question.
+  // 3. Every item must be partitioned. An un-partitioned item is invisible to EVERYONE, so this
+  //    is the check that decides the whole question.
   const unpartitioned = await findUnpartitionedItems(db, teamId);
   if (unpartitioned.count > 0) {
     blockers.push(
       `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (scan truncated)" : ""} have no current project membership ` +
-        `and would become invisible to everyone — the §11 backfill has not completed`
+        `and are invisible to everyone — the §11 backfill has not completed`
     );
   } else if (unpartitioned.truncated) {
     // A truncated scan that found nothing is NOT a clean bill of health — it is an unfinished

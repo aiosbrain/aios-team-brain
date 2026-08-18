@@ -356,8 +356,8 @@ describe("delegated retrieval is ALWAYS oracle-attenuated — flag-independent (
     if (error) throw new Error(`curate failed: ${error.message}`);
   }
 
-  it("on a PERMISSIVE team, a scoped token retrieves ONLY its effective set — the flag is the member rollout control, not the delegation gate", async () => {
-    const seed = await seedTeam(); // access_enforcement defaults to 'permissive'
+  it("a scoped token retrieves ONLY its effective set — delegation is attenuated regardless of any member's own visibility", async () => {
+    const seed = await seedTeam();
     const inScope = await ingest(seed, { path: "a/in-scope.md", body: `in ${TERM}`, access: "team", project: "agentproj" });
     const outScope = await ingest(seed, { path: "b/out-of-scope.md", body: `out ${TERM}`, access: "team", project: "otherproj" });
     await (await import("@/lib/projects/context/backfill")).backfillTeamContext(db(), seed.teamId);

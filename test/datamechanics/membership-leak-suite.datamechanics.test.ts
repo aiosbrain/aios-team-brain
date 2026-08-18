@@ -403,8 +403,14 @@ describe("PRET-5 A7 — token semantics, byte-unchanged", () => {
   });
 });
 
-describe("PRET-5 A8 — the permissive control (no stealth widen)", () => {
-  it("an equivalently-invited external member on a second, still-permissive team reads only access='external' rows", async () => {
+// PRET-5's A8 ("the permissive control — no stealth widen") is DELETED WITH ITS SUBJECT
+// (PRET-6): its property — "the posture wall stands where enforcement is off" — died with the
+// permissive mode itself. What replaces it is a DIFFERENT property, not a paraphrase: the
+// INVITE-DEFAULT FLOOR — an external-invited member holding NOTHING beyond their invite default
+// (no grants, no group adds) on a second (necessarily enforcing) team sees exactly the
+// external-shared corpus, through the oracle alone.
+describe("PRET-6 A8′ — the invite-default floor (second team, oracle only)", () => {
+  it("an external-invited member with NO grants reads only external-shared content — items route AND their own timeline vis-variant", async () => {
     const seed2 = await seedTeam();
     const t2 = await ingest(seed2, {
       path: "t2.md",
@@ -415,8 +421,8 @@ describe("PRET-5 A8 — the permissive control (no stealth widen)", () => {
     });
     const e2 = await ingest(seed2, { path: "e2.md", body: "shared two", access: "external", project: "src" });
     await backfillTeamContext(db(), seed2.teamId);
-    // Timeline-eligible (attributed + source-dated) so the permissive-arm pin is REAL — the
-    // first draft probed a payload-unreachable body string on ineligible items (diff-review H2).
+    // Timeline-eligible (attributed + source-dated) so the pin is REAL — the first draft probed
+    // a payload-unreachable body string on ineligible items (PRET-5 diff-review H2).
     await db()
       .from("items")
       .update({ member_id: seed2.memberId, work_at: new Date().toISOString(), work_at_from_source: true })
@@ -426,20 +432,21 @@ describe("PRET-5 A8 — the permissive control (no stealth widen)", () => {
       displayName: "Collaborator Two",
       actorHandle: `c2-${randomUUID().slice(0, 8)}`,
       role: "member",
-      tier: "external",
+      tier: "external", // the invite default writes the external builtin row — their whole floor
     });
     await db().from("members").update({ status: "active" }).eq("id", m2.id).eq("team_id", seed2.teamId);
     const { key } = await issueApiKey(db(), seed2.teamId, m2.id, "ext2");
     const res = await itemsGET(v1("/api/v1/items?all=1", key));
     const paths = ((await res.json()) as { items: { path: string }[] }).items.map((i) => i.path);
-    expect(paths).toContain("e2.md");
-    expect(paths, "the posture wall stands where enforcement is off").not.toContain("t2.md");
+    expect(paths, "the external-shared corpus is the floor, not zero").toContain("e2.md");
+    expect(paths, "General-only content never reaches the invite default").not.toContain("t2.md");
 
-    // ...and their timeline serves under the tier row with the wall applied — probed on the
+    // ...and their timeline serves through their OWN vis-variant — probed on the
     // payload-reachable TITLE, with the entitled-viewer positive control.
-    const extDays = await getWorkTimeline(db(), seed2.teamId, "external", 14, null);
-    expect(JSON.stringify(extDays), "the permissive posture wall stands on the timeline").not.toContain("Internal Two Doc");
-    const teamDays2 = await getWorkTimeline(db(), seed2.teamId, "team", 14, null);
-    expect(JSON.stringify(teamDays2), "the entitled permissive viewer sees it").toContain("Internal Two Doc");
+    const enforce2 = await memberEnforcement(db(), { teamId: seed2.teamId, memberId: m2.id });
+    const extDays = await getWorkTimeline(db(), seed2.teamId, "external", 14, enforce2);
+    expect(JSON.stringify(extDays), "the floor holds on the timeline").not.toContain("Internal Two Doc");
+    const teamDays2 = await getWorkTimeline(db(), seed2.teamId, "team", 14, await memberEnforcement(db(), { teamId: seed2.teamId, memberId: seed2.memberId }));
+    expect(JSON.stringify(teamDays2), "the entitled viewer's variant sees it").toContain("Internal Two Doc");
   });
 });

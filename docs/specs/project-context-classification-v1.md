@@ -519,7 +519,7 @@ full-visibility row — a leak; the effective-set key is also what makes spawn i
 cached surfaces, since a spawner's group change changes the hash). The cardinality bound "distinct
 group combinations, not principal count — 2 people with identical groups share a cache row" holds
 for **member** reads of the COMBINATION-KEYED caches — `work_timeline_cache`'s visibility variants
-and the permissive tier rows. For **enforced arcs** the unit is smaller still (PPARC-3/4 as-built):
+(post-PRET-6 the only row shape; the permissive tier rows are history). For **enforced arcs** the unit is smaller still (PPARC-3/4 as-built):
 `arc_cache` stores one row PER PARTITION (`g:<group>`), fused prose-free at serve time, so readers
 sharing any partition share that row and no group-combination arc row exists to mint — the
 per-oracle combination namespace (`p:`) is retired. **Token-authenticated reads do not populate
@@ -560,15 +560,15 @@ arc/timeline cache rows were staled and the recomputed payloads carry the correc
 "FTS/dense are complete" (§5.9) covers the item lanes; `lib/query/retrieve.ts` ALSO injects
 structured context, and each leg must carry the oracle filter explicitly — a filter proven on two
 legs proves nothing about the other five (`retrieve.ts:570+` decisions/tasks; `:593+` graph
-entities/relationships, whose tier handling today is omission-for-external per the audit-H1 comment
-there; plus actors and Graphiti facts):
+entities/relationships, structure-classed per the amended row below; plus actors and Graphiti
+facts):
 
 | Leg | V2 filter |
 |---|---|
 | Decisions / tasks | join their row-grain units' memberships against the oracle set (Part II units) |
-| graph_entities / graph_relationships | **TIER-classed, not partition-classed (QMIR-1, `docs/design/query-mirror-legs-classification.md` — supersedes the group_id widening this row previously promised; measured 2026-08-16 the tables hold only org-structural rows, sole production writer `lib/graph/company-actors.ts`).** An enforcing TEAM-tier MEMBER is served the org-structural allowlist — `actor` entities and `REPORTS_TO` edges only; the serve test is the positive `principal === "member"` on the route-assigned discriminant. All `aiosd_*` tokens, absent/foreign-principal payloads, and the external tier keep the fail-closed omission of all three legs (round-3 Codex Critical posture, unchanged). **Standing obligation on every serving surface (`lib/query/retrieve.ts` AND `app/api/v1/company-graph/route.ts`, whose entity read is type-unfiltered today): a future writer of item-derived entity types (commitments, OWNS/BLOCKS, …) must partition-class its rows at write (a `group_id` or membership join), and no serving surface may serve those types to a scoped principal** |
+| graph_entities / graph_relationships | **STRUCTURE-classed, not partition-classed (QMIR-1, `docs/design/query-mirror-legs-classification.md`; amended by PRET-4/PRET-6 per the membership triad — structure → every member).** EVERY MEMBER principal — team or external posture — is served the org-structural allowlist, now FLAT: `actor` entities and `REPORTS_TO` edges only; the serve test is the positive `principal === "member"` on the route-assigned discriminant. All `aiosd_*` tokens and absent/foreign-principal payloads keep the fail-closed omission of all three legs. *(Superseded, kept as history per §5: the QMIR round-3 ruling additionally omitted the legs for the external TIER and carried a restricted-posture triple — both retired: the tier died with the permissive model, and the triple's guard pin retired WITH it.)* **Standing obligation on every serving surface (`lib/query/retrieve.ts` AND `app/api/v1/company-graph/route.ts`, whose entity read is type-unfiltered today): a future writer of item-derived entity types (commitments, OWNS/BLOCKS, …) must partition-class its rows at write (a `group_id` or membership join), and no serving surface may serve those types to a scoped principal** |
 | Graphiti facts | `group_ids` parameter from the oracle (§5.9) |
-| Actors / people | the people/git activity DIGESTS derive from visible items only and stay omitted under enforcing — no standalone DIGEST leg may bypass the oracle. The org-structural actor ROSTER leg is the graph_entities row above (QMIR-1): tier-classed, served to enforcing team-tier members — the sanctioned standalone exception, because roster identity is team-structural, not item-derived |
+| Actors / people | the people/git activity DIGESTS stay omitted — no standalone DIGEST leg may bypass the oracle. The org-structural actor ROSTER leg is the graph_entities row above (QMIR-1, as amended): structure-classed, served to every member — the sanctioned standalone exception, because roster identity is team-structural, not item-derived |
 
 Guard: the leak suite (§14) plants structured context (a decision, a graph fact) in project B and
 asserts an A-principal answer contains none of it — per leg, not per function.
@@ -1112,9 +1112,9 @@ precisely so the access chain exists before anything depends on it:
   RLS on content tables + the backstop test; permission inspector + admin screens 1–2; leak suite
   paths 1–2, 4–6, 9–10. Phase B's `query` opened to `aiosd_*` tokens with the
   `graph_entities`/`graph_relationships` legs omitted for attenuated/partitioned principals.
-  **As-built (QMIR-1, post-Phase-C): those mirrors are TIER-classed (§5.8b row above) — an
-  enforcing team-tier member is served the org-structural allowlist (actors + REPORTS_TO);
-  tokens and the external tier keep the omission absolutely.** Enforced retrieval still means
+  **As-built (QMIR-1, as amended by PRET-4/PRET-6): those mirrors are STRUCTURE-classed (§5.8b
+  row above) — every member principal is served the flat org-structural allowlist (actors +
+  REPORTS_TO); tokens keep the omission absolutely.** Enforced retrieval still means
   every leg it serves is enforced, not most.
 - **C — Per-project graphs**: group_id scheme, projector fan-out + cache, per-project arcs, bolt
   guard, cost surfacing; FalkorDB spike = exit gate; leak suite graph paths; eval principal axis.
