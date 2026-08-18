@@ -19,7 +19,7 @@ const SRC = readFileSync(join(import.meta.dirname, "..", "..", "lib", "query", "
 
 describe("guard: the QMIR-1 org-structural leg allowlists", () => {
   it("the serve condition is the positive member test — never a token negation", () => {
-    expect(SRC).toContain('enforce.principal === "member"');
+    expect(SRC).toContain('enforce?.principal === "member"');
     expect(SRC, "a !== token gate fails open on an absent/foreign principal").not.toContain('principal !== "token"');
   });
 
@@ -27,8 +27,8 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
     expect(SRC).toContain('["REPORTS_TO"]');
   });
 
-  it("the permissive relationship triple survives unchanged (today's behavior)", () => {
-    expect(SRC).toContain('["REPORTS_TO", "OWNS", "BLOCKS"]');
+  it("PRET-6: the permissive triple is GONE — the allowlist is REPORTS_TO flat everywhere", () => {
+    expect(SRC).not.toContain('["REPORTS_TO", "OWNS", "BLOCKS"]');
   });
 
   it("the actor leg filters entity_type to actor", () => {
@@ -46,12 +46,12 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
     expect(SRC).toContain("const actorsB = !serveOrgStructural");
   });
 
-  it("PRET-4: the commitments leg keeps its exact surviving predicate (posture wall + enforcing omit)", () => {
-    expect(SRC).toMatch(/isRestrictedTier\(tier\)\s*\|\|\s*omitGraph/);
+  it("PRET-6: the commitments leg is permanently omitted (QMIR §3.5 — no production writer)", () => {
+    expect(SRC).toContain('true // PRET-6: commitments stay omitted for every principal');
   });
 
-  it("PRET-4: the restricted-posture permissive rels arm narrows to REPORTS_TO (no triple for the opened audience)", () => {
-    expect(SRC).toContain('enforce == null && !isRestrictedTier(tier) ? ["REPORTS_TO", "OWNS", "BLOCKS"] : ["REPORTS_TO"]');
+  it("PRET-6: the rels allowlist is the flat REPORTS_TO literal", () => {
+    expect(SRC).toContain('.in("relationship_type", ["REPORTS_TO"])');
   });
 
   it("PRET-4: both query routes pass graphProjectIds for EVERY member principal (ruling 2's graph unlock — no tier condition)", () => {
@@ -66,7 +66,7 @@ describe("guard: the QMIR-1 org-structural leg allowlists", () => {
       );
     }
     // And retrieve's enforced graph arm keys on scope presence alone:
-    expect(SRC).toContain("if (!enforce.graphProjectIds) return [];");
+    expect(SRC).toContain("if (!enforce?.graphProjectIds) return [];"); // PRET-6: optional-chained (enforce is the only path)
     expect(SRC).not.toContain('tier !== "team" || !enforce.graphProjectIds');
   });
 });

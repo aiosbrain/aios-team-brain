@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BASE_URL, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
+import { BASE_URL, convergeTeam, issueKeyFor, keyHeaders, seedTeam } from "./http-helpers";
 import { db, ingest } from "../datamechanics/helpers";
 import { randomUUID } from "node:crypto";
 
@@ -18,9 +18,15 @@ async function seedCommit(seed: Awaited<ReturnType<typeof seedTeam>>, title: str
     .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}`, name: "P" })
     .select("id")
     .single();
+  // PRET-6: the synced task carries its source item or the enforced ledger drops it.
+  const src = await ingest(seed, {
+    path: `task-docs/${randomUUID()}.md`, access: "team", body: "task source HTTP-1",
+    frontmatter: { source: "linear" },
+  });
   await db().from("tasks").insert({
     team_id: seed.teamId, project_id: (proj as { id: string }).id, row_key: "HTTP-1",
     title: "Wire-shape task", status: "in_progress", assignee: "Tester", origin: "sync", audience: "team",
+    source_item_id: src.id,
   });
   await ingest(seed, {
     path: `commits/x/${title}.md`,
@@ -30,6 +36,7 @@ async function seedCommit(seed: Awaited<ReturnType<typeof seedTeam>>, title: str
     body: `# ${title} (HTTP-1)`,
     access: "team",
   });
+  await convergeTeam(seed);
 }
 
 describe("GET /api/v1/timeline (HTTP)", () => {

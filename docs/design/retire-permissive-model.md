@@ -91,8 +91,9 @@ synthesis has no callers.
 
 ## 4. Contracts declared up front (the interfaces precede the slices)
 - **The flip gate is the REAL readiness assessment, never the count short-circuit** (cold-read
-  H1): the sole permission-to-flip is `lib/admin/access-enforcement.ts`'s existing gated path
-  (`assessEnforcementReadiness` → `setAccessEnforcement`) — the per-item unpartitioned scan +
+  H1): the sole permission-to-flip is the flip module's gated path (`assessEnforcementReadiness`
+  → `setAccessEnforcement`; the module deleted WITH the subsystem in PRET-6 — its readiness scan
+  survives as `lib/admin/access-health.ts`) — the per-item unpartitioned scan +
   full drain that `drainTeamContext`'s own header mandates for "a caller about to change what a
   whole team can see" (`lib/projects/context/backfill.ts:113-119`). The backfill's
   `memCount >= itemCount` short-circuit is satisfiable by multi-membership items while others

@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { retrieve } from "@/lib/query/retrieve";
 import { indexItem, indexPendingItems, resetDenseIndexProbe } from "@/lib/query/dense-index";
 import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
-import { db, ingest, seedTeam } from "./helpers";
+import { db, ingest, seedTeam, memberRetrieveEnforce } from "./helpers";
 
 /**
  * End-to-end proof of the optional dense (pgvector) retrieval leg: write → chunk → embed → store →
@@ -76,7 +76,7 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
 
     // "authentication credentials" shares the `auth` concept with the doc, but its stemmed terms
     // (authent/credential) don't overlap the doc's tokens (auth/passwordless/login) → FTS misses it.
-    const ctx = await retrieve(db(), seed.teamId, "team", "authentication credentials");
+    const ctx = await retrieve(db(), seed.teamId, "team", "authentication credentials", null, await memberRetrieveEnforce(seed));
     const paths = ctx.sources.map((s) => s.path);
     expect(paths).toContain("deliverables/auth.md");
     expect(ctx.grounded).toBe(true);
@@ -93,7 +93,7 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
     // nearest chunk is orthogonal (cosine dist ~1). WITHOUT the floor, dense would still return it and
     // flip grounded=true (false grounding — the bug). With the floor it's excluded → grounded stays
     // false, so the answer layer abstains instead of confabulating from an irrelevant nearest-neighbor.
-    const ctx = await retrieve(db(), seed.teamId, "team", "what is causing the high latency?");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what is causing the high latency?", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(false);
     // Recency padding still returns background items — exactly what grounded=false guards against.
     expect(ctx.sources.length).toBeGreaterThan(0);
@@ -114,7 +114,7 @@ live("dense retrieval (real pgvector + stub embeddings)", () => {
     for (const it of (items ?? []) as Array<{ id: string; team_id: string; body: string; access: "team" | "external"; content_sha256: string }>) {
       await indexItem({ id: it.id, teamId: it.team_id, body: it.body, access: it.access, contentSha256: it.content_sha256 }, backend!);
     }
-    const ctx = await retrieve(db(), seed.teamId, "external", "authentication credentials");
+    const ctx = await retrieve(db(), seed.teamId, "external", "authentication credentials", null, await memberRetrieveEnforce(seed, "external"));
     expect(ctx.sources.map((s) => s.path)).not.toContain("deliverables/secret-auth.md");
   });
 });

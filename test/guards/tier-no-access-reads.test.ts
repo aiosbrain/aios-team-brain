@@ -24,12 +24,10 @@ const ROOT = join(import.meta.dirname, "..", "..");
 
 /** §3.3's sanctioned consumers, exhaustively, with reasons. */
 const ALLOWLIST: Record<string, string> = {
-  "lib/access/posture.ts": "the marker-keyed LEGACY window's one read — dies at confirmation",
-  "lib/access/oracle.ts": "the marker-keyed legacy builtin conjunct — dies at confirmation",
   "lib/access/groups.ts": "the single writer: materialization's one-time read + the M3 tier mirror write",
   "lib/admin/members.ts": "createMember writes the invite default; upsert change-detection read",
   "lib/admin/invite.ts": "invite plumbing passes the invite-default through to provisioning",
-  "lib/admin/access-enforcement.ts": "BlindPrincipal.tier — a DIAGNOSTIC payload field in the readiness report",
+  "lib/admin/access-health.ts": "BlindPrincipal.tier — a DIAGNOSTIC payload field in the health report (PRET-6 re-home)",
   "lib/provisioning/linear.ts": "external-system seat mapping (Linear guest/user) — non-access",
   "lib/access/agent-tokens.ts": "token mint/verify semantics — program §8, untouched",
   "lib/gateway/persistence.ts": "gateway lease predicate — delegated-token semantics, program §8",
@@ -97,8 +95,8 @@ describe("guard: members.tier is never an access input outside the sanctioned fi
   it("the guard's shapes are non-vacuous: each matches a real, still-existing sanctioned read", () => {
     // Self-test (one-condition-per-fixture): each shape regex individually matches a known
     // sanctioned read, so an emptied/broken regex cannot pass silently.
-    const posture = stripComments(readFileSync(join(ROOT, "lib/access/posture.ts"), "utf8"));
-    expect(MEMBERS_SELECT_SHAPE.test(posture), "members-select shape matches posture's legacy read").toBe(true);
+    const groups = stripComments(readFileSync(join(ROOT, "lib/access/groups.ts"), "utf8"));
+    expect(MEMBERS_SELECT_SHAPE.test(groups), "members-select shape matches the materialization's one-time read").toBe(true);
     const gateway = stripComments(readFileSync(join(ROOT, "lib/gateway/persistence.ts"), "utf8"));
     expect(RAW_SQL_SHAPE.test(gateway), "raw-sql shape matches the gateway lease predicate").toBe(true);
     const auth = stripComments(readFileSync(join(ROOT, "lib/api/auth.ts"), "utf8"));

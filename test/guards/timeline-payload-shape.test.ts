@@ -51,6 +51,8 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
   // v12 adds `via` to evidenceItem — set only on a meeting credited to its SUBMITTER because no
   // attendee resolved. It is copied explicitly by the grouper, so it is exactly the kind of key that
   // gets silently dropped; the REQUIRED half below forces the fixture to actually produce one.
+  // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
+  get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.
   get 13() { return this[12]; },
   12: {
@@ -89,6 +91,8 @@ const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
     signalGroup: ["kind", "count", "items"],
     signalItem: ["id", "kind", "title", "at", "url", "stillValid"],
   },
+  // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
+  get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.
   get 13() { return this[12]; },
   12: {

@@ -1,7 +1,5 @@
--- PRET-2 (Codex diff-review High 2): the operator-undo hold is CONTROL STATE and must not ride
--- a best-effort audit row — a downgrade whose audit insert silently failed would be re-flipped
--- by the scheduler within one tick, turning the one-command undo into a lease. The hold is a
--- teams column written ATOMICALLY with the mode change (the same UPDATE statement) by the sole
--- flip writer (lib/admin/access-enforcement.ts): any downgrade sets it, any enforcing flip
--- clears it. Additive; mirrored in schema.sql for from-zero.
-alter table teams add column if not exists autoflip_hold boolean not null default false;
+-- NEUTERED by PRET-6 (docs/design/pret6-retirement.md §2.1, same rule as
+-- 20260811160000_access_enforcement_flag.sql). Originally created `teams.autoflip_hold` — the
+-- PRET-2 operator-undo hold, control state written atomically with the mode change. Retired
+-- with the whole flip subsystem by 20260818210000 (which drops both columns behind the
+-- refusing precondition); re-creating it on replay would resurrect a column nothing reads.

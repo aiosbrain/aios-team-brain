@@ -24,11 +24,7 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
     needle: "selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds })",
     why: "the enforced graph leg must resolve partitions, not recompute or omit",
   },
-  {
-    file: join("lib", "query", "retrieve.ts"),
-    needle: "arm: false, k: Number.MAX_SAFE_INTEGER",
-    why: "the permissive union is UNCAPPED and never arms — §2.2's coverage-equivalence co-land",
-  },
+  // PRET-6: the permissive-union pin retired with the union itself (fetchGraphFacts deleted).
   {
     file: join("lib", "query", "retrieve.ts"),
     needle: "graph expansion covered",

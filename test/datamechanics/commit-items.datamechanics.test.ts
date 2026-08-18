@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, memberRetrieveEnforce } from "./helpers";
 
 // Spec: commits become searchable, person-attributed items — so "John's git history" returns real
 // commit messages, attributed to the AUTHOR (not the scanner connector). Verified on real Postgres.
@@ -51,7 +51,7 @@ describe("commits → searchable, attributed items (real Postgres)", () => {
     expect((unresolved as { member_id: string | null }).member_id).toBeNull();
 
     // Searchable: an NL query for the commit message surfaces it via FTS.
-    const ctx = await retrieve(db(), seed.teamId, "team", "login redirect bug");
+    const ctx = await retrieve(db(), seed.teamId, "team", "login redirect bug", null, await memberRetrieveEnforce(seed));
     expect(ctx.sources.some((s) => s.text.includes("Fix the login redirect bug"))).toBe(true);
   });
 

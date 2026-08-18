@@ -6,7 +6,7 @@ import { GET as itemsGET } from "@/app/api/v1/items/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { createMember } from "@/lib/admin/members";
 import { createGroup, addMemberToGroup, grantProjectToGroup } from "@/lib/access/groups";
-import { setAccessEnforcement } from "@/lib/admin/access-enforcement";
+import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { visibleItemIds } from "@/lib/access/enforce";
 import { retrieve } from "@/lib/query/retrieve";
@@ -47,8 +47,9 @@ async function seedEnforcedTeamWithExternalMember(): Promise<{
     .from("project_context_memberships")
     .insert({ team_id: seed.teamId, project_id: projectXId, context_unit_id: unit!.id, method: "manual" });
 
-  const flip = await setAccessEnforcement(db(), seed.teamId, "enforcing");
-  expect(flip.ok, flip.error).toBe(true);
+  // PRET-6: no flip — every team is enforcing; the bootstrap the flip used to run is explicit.
+  const boot = await ensureAccessBootstrap(db(), seed.teamId);
+  expect(boot.ok, boot.error).toBe(true);
 
   const m = await createMember(db(), seed.teamId, {
     email: `${randomUUID()}@test.local`,

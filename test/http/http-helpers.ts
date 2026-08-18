@@ -96,3 +96,11 @@ export function keyHeaders(key: string, teamSlug: string): Record<string, string
     "Content-Type": "application/json",
   };
 }
+
+/** PRET-6: teams are enforcing by construction, so http fixtures must CONVERGE (partition their
+ *  items) before a read — the items route's after() hook is async and racing it is flaky. */
+export async function convergeTeam(seed: Seed): Promise<void> {
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  const r = await backfillTeamContext(db(), seed.teamId);
+  if (!r.ok) throw new Error(`convergeTeam failed: ${r.error}`);
+}

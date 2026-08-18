@@ -1,6 +1,5 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 import { embed, toVectorLiteral } from "./embeddings";
 import { itemChunksTablePresent } from "./dense-index";
 import { resolveEmbeddingBackend } from "./embedding-key";
@@ -64,12 +63,10 @@ export async function denseSearch(
       params.push(projectSlug);
       where += ` and p.slug = $${params.length}`;
     }
-    // Mode-keyed (PRET-4 §1b): enforcing → the oracle set alone; permissive → the posture wall.
+    // PRET-6: the oracle set alone.
     if (visibleIds) {
       params.push(visibleIds);
       where += ` and i.id = any($${params.length}::uuid[])`;
-    } else if (isRestrictedTier(tier)) {
-      where += " and i.access = 'external'";
     }
     params.push(DENSE_MAX_DISTANCE);
     const distIdx = params.length;

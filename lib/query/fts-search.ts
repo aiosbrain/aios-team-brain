@@ -1,6 +1,5 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
-import { isRestrictedTier } from "@/lib/auth/visibility";
 
 /**
  * Ranked keyword (FTS) retrieval over `items.search`. The builder path emits a bare
@@ -42,13 +41,10 @@ export async function rankedFtsSearch(
   if (visibleIds && visibleIds.length === 0) return []; // enforcing, sees nothing
   const params: unknown[] = [orQuery, teamId];
   let where = "i.team_id = $2 and i.search @@ websearch_to_tsquery('english', $1)";
-  // Mode-keyed (PRET-4 §1b): enforcing (visibleIds present) → the oracle set alone; permissive
-  // → the posture wall alone. Both at once would re-block ruling 2's granted team rows.
+  // PRET-6: the oracle set alone (the permissive posture wall retired with the model).
   if (visibleIds) {
     params.push(visibleIds);
     where += ` and i.id = any($${params.length}::uuid[])`;
-  } else if (isRestrictedTier(tier)) {
-    where += " and i.access = 'external'";
   }
   if (channel) {
     // Channel scope (Gap #4). The channel NAME appears in a path's 2nd segment for sources that key

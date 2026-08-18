@@ -322,12 +322,13 @@ async function main() {
       "--upsert",
     ]);
 
-    // PRET-2: seed → drain → gated flip, one path (the seed writes via ingestItem, which
-    // bypasses the items route's reconcile hook — the flip's own drain partitions those rows).
-    // Best-effort: a refusal/deferral here is surfaced by the command and retried by the
+    // PRET-6: seed → drain, one path — the demo team is born enforcing, so its seed rows must
+    // be partitioned before the first serve (the seed writes via ingestItem, which bypasses the
+    // items route's reconcile hook; the retired auto-flip's drain used to own this).
+    // Best-effort: a failure here is surfaced by the command and retried by the
     // scheduler pass; the boot never fails on it.
-    console.log("▶ auto-flipping the demo team to enforcing (gated — refuses rather than bricks)…");
-    runSoft("npx", ["tsx", "--conditions", "react-server", "scripts/admin.ts", "auto-flip", "demo"]);
+    console.log("▶ draining the demo team's context (seed rows partitioned before first serve)…");
+    runSoft("npx", ["tsx", "--conditions", "react-server", "scripts/admin.ts", "drain-context", "demo"]);
   }
 
   // Only reached when the demo actually owns this database. Printing demo credentials after a real

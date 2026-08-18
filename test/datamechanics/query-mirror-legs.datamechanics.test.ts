@@ -103,20 +103,20 @@ describe("QMIR-1 — a departed member's edges do not render (Codex Medium 1)", 
   });
 });
 
-describe("QMIR-1 — the type allowlist holds under enforcing (criterion 2)", () => {
-  it("a planted commitment and a planted OWNS edge reach a PERMISSIVE member but NOT an enforcing one", async () => {
+describe("QMIR-1 — the type allowlist holds (criterion 2; PRET-6: one mode)", () => {
+  it("a planted commitment and a planted OWNS edge never reach a member — the allowlist is actors + REPORTS_TO, flat", async () => {
+    // The PERMISSIVE control half ("commitments reach a permissive member exactly as today")
+    // deleted WITH its mode (PRET-6): the permissive triple and its carve-outs are gone; the
+    // allowlist closure is now the whole property, with the served legs as the positive control.
     const seed = await seedTeam();
     await ingest(seed, { path: "g.md", body: `g ${TERM}`, access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
     await seedGraphRows(seed);
 
-    const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
-    expect(permissive.structured, "permissive serves commitments exactly as today").toContain("ship the widget");
-    expect(permissive.structured, "permissive serves the OWNS edge exactly as today").toContain("member:alice OWNS c-widget");
-
     const enforcing = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, await enforcingMember(seed));
-    expect(enforcing.structured, "no production writer mints commitments — enforcing omits them").not.toContain("ship the widget");
-    expect(enforcing.structured, "OWNS is not org-structural — the enforcing rels allowlist is REPORTS_TO only").not.toContain("OWNS c-widget");
+    expect(enforcing.structured, "positive control: the org-structural legs serve").toContain("Alice Chen");
+    expect(enforcing.structured, "no production writer mints commitments — omitted for everyone").not.toContain("ship the widget");
+    expect(enforcing.structured, "OWNS is not org-structural — the rels allowlist is REPORTS_TO only").not.toContain("OWNS c-widget");
   });
 });
 
@@ -143,24 +143,10 @@ describe("QMIR-1 — tokens, default-deny arms, and the external tier keep the o
     }
   });
 
-  it("a PERMISSIVE external-posture read gets actors + REPORTS_TO (structure opens, PRET-4 §1d) — commitments stay closed, and the triple narrows to REPORTS_TO", async () => {
-    // INVERTED by PRET-4 (the audit-H1 omission this arm used to pin is the ruling the triad
-    // overturns): structure serves every member. The commitments absence and the REPORTS_TO
-    // narrow (no OWNS/BLOCKS for the newly-opened audience — cold-read L3) are the surviving
-    // closures.
-    const seed = await seedTeam();
-    await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "external", project: "src" });
-    await backfillTeamContext(db(), seed.teamId);
-    await seedGraphRows(seed);
-
-    const ctx = await retrieve(db(), seed.teamId, "external", `about ${TERM}`, null, null);
-    expect(ctx.structured, "the roster opens").toContain("Alice Chen");
-    expect(ctx.structured, "reporting lines open").toContain("REPORTS_TO");
-    expect(ctx.structured, "the ownership pair stays closed for the opened audience").not.toContain("OWNS");
-    expect(ctx.structured, "commitments stay allowlist-closed").not.toContain("ship the widget");
-  });
-
-  it("an ENFORCING EXTERNAL member — the combination the routes actually produce — gets actors + REPORTS_TO, commitments closed (PRET-4 inverts review Medium 2)", async () => {
+  // Deleted WITH its subject (PRET-6): "a PERMISSIVE external-posture read gets actors +
+  // REPORTS_TO" — the permissive read is gone; its surviving property (structure serves the
+  // external member, commitments/OWNS stay closed) is exactly the ENFORCING-external arm below.
+  it("an EXTERNAL member — the combination the routes actually produce — gets actors + REPORTS_TO, commitments closed (PRET-4 inverts review Medium 2)", async () => {
     // This arm was BUILT to catch the exact gate rewrite PRET-4 now makes deliberately (the
     // tier disjunct's removal from the org legs) — inverted, not deleted: the org chart serves
     // every member principal; the commitments allowlist closure is what still holds.

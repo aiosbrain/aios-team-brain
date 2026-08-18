@@ -27,10 +27,12 @@ export const externalProvider: RetrievalProvider = {
   name: "external",
   async retrieve(req: RetrievalRequest): Promise<RetrievedContext> {
     if (!URL) return EMPTY;
-    // Access enforcement (Phase B slice 2, Codex CRITICAL): a remote provider is a whole retrieval
-    // backend the oracle can't filter — its wire contract carries no membership scope. Under
-    // enforcing it must FAIL CLOSED (empty context) rather than return unrestricted remote sources.
-    // When the contract learns to accept oracle-scoped ids/projects, this can relax.
+    // Access enforcement (Phase B slice 2, Codex CRITICAL; PRET-6 made it unconditional): a
+    // remote provider is a whole retrieval backend the oracle can't filter — its wire contract
+    // carries no membership scope, and every read now carries a view, so this guard fires on
+    // EVERY query: the external provider FAILS CLOSED (empty context) until the contract learns
+    // to accept oracle-scoped ids/projects. Named in docs/PROVIDERS.md — a parked seam, not a
+    // bug; the transport below is the machinery that seam re-opens onto.
     if (req.enforce != null) return EMPTY;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);

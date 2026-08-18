@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, visOf } from "./helpers";
 import {
   readArcCache,
   writeArcCache,
@@ -135,10 +135,10 @@ describe("degraded is persisted, and computed_at stops doubling as a trust dial 
     // from an older payload version). Before the column, request A was told `degraded: true` and request
     // B, served the row A had just written, was told `false` over the identical bytes.
     const seed = await seedTeam();
-    const first = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    const first = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(first.freshness.degraded).toBe(true);
 
-    const row = await readTimelineCache(db(), seed.teamId, "team");
+    const row = await readTimelineCache(db(), seed.teamId, "team", await visOf(seed));
     expect(row!.degraded).toBe(true); // …and it's on the ROW, not just in that response
     await settleTimelineRefreshes();
   });
@@ -146,8 +146,8 @@ describe("degraded is persisted, and computed_at stops doubling as a trust dial 
   it("a timeline row written by a healthy summary pass reports degraded=false", async () => {
     // The other direction — otherwise the flag is stuck on and means nothing.
     const seed = await seedTeam();
-    await writeTimelineCache(db(), seed.teamId, "team", [], false);
-    const res = await getCachedWorkTimeline(db(), seed.teamId, "team");
+    await writeTimelineCache(db(), seed.teamId, "team", [], false, await visOf(seed));
+    const res = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(res.freshness.degraded).toBe(false);
     await settleTimelineRefreshes();
   });

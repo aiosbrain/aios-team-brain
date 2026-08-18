@@ -241,3 +241,41 @@ describe("membership single writer", () => {
     expect(unitAfter, "unit survives its project's deletion").not.toBeNull();
   });
 });
+
+describe("PRET-6 AC4 (as superseded by TICKSTALL-2) — a multi-membership item can never mask an uncovered item", () => {
+  // The slice's original pin targeted the two-aggregate convergence short-circuit it shipped;
+  // TICKSTALL-2 landed on main mid-flight and deleted the short-circuit entirely (the candidate
+  // predicate IS the exact check now). The PROPERTY this arm exists for — the program's named
+  // latent bug, one covered item's extra membership hiding another item with none — survives the
+  // supersession and is pinned here against the candidates architecture.
+  it("a team where one multi-membership item masks an uncovered item is NOT skipped — the uncovered item gets partitioned", async () => {
+    const { backfillAllTeams } = await import("@/lib/projects/context/backfill");
+    const seed = await seedTeam();
+    const covered = await ingest(seed, { path: "cov.md", body: "covered", access: "team", project: "src" });
+    const uncovered = await ingest(seed, { path: "unc.md", body: "uncovered", access: "team", project: "src" });
+    const r = await backfillTeamContext(db(), seed.teamId);
+    expect(r.ok, r.error).toBe(true);
+
+    // The masking shape: item A holds a SECOND current membership (curated into another project),
+    // item B's only membership is expired. Raw rows: 2 memberships / 2 items — the retired
+    // `memCount >= itemCount` heuristic read this as converged and skipped B forever (invisible
+    // under the enforced read). The candidate predicate must still select B.
+    const { data: extraProj } = await db().from("projects").insert({ team_id: seed.teamId, slug: "extra", name: "Extra", kind: "initiative" }).select("id").single();
+    const { data: covUnit } = await db().from("project_context_units").select("id").eq("source_item_id", covered.id).single();
+    const insErr = (await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: extraProj!.id, context_unit_id: covUnit!.id, method: "manual" })).error;
+    expect(insErr, "the second (masking) membership must insert").toBeNull();
+    const { data: uncUnit } = await db().from("project_context_units").select("id").eq("source_item_id", uncovered.id).single();
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", uncUnit!.id).is("valid_to", null);
+
+    const pass = await backfillAllTeams(db(), new Date(Date.now() + 60_000).toISOString(), { budgetMs: 60_000 });
+    const o = pass.outcomes.find((x) => x.teamId === seed.teamId)!;
+    expect(o.scanned, "the uncovered item must be selected as a candidate").toBeGreaterThan(0);
+    expect((await membershipProjects(seed, uncovered.id)).length, "the masked item ends up partitioned").toBeGreaterThan(0);
+
+    // Positive control: once genuinely converged, the candidate query finds nothing to sweep.
+    const again = await backfillAllTeams(db(), new Date(Date.now() + 60_000).toISOString(), { budgetMs: 60_000 });
+    const o2 = again.outcomes.find((x) => x.teamId === seed.teamId)!;
+    expect(o2.scanned, "a converged team yields zero candidates").toBe(0);
+    expect(o2.drained).toBe(true);
+  });
+});

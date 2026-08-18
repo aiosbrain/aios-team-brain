@@ -93,7 +93,8 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
     // rename, a formatting change that splits `source:` across lines). A guard that reports zero
     // offenders because it matched nothing is worse than no guard.
     expect(scanned.size, `scanned sources: ${[...scanned.keys()].join(", ")}`).toBeGreaterThanOrEqual(10);
-    for (const known of ["meeting_notes", "context_backfill_all", "auto_flip", "graph_health", "scan"]) {
+    // PRET-6: auto_flip retired (a HISTORICAL source now — its threshold row survives, its call site does not).
+    for (const known of ["meeting_notes", "context_backfill_all", "pret4_materialize", "graph_health", "scan"]) {
       expect(scanned.has(known), `the scan must find ${known} — it is written by a real call site`).toBe(true);
     }
     // …and it must resolve the named-constant form, not just bare literals: `graph_health` is only

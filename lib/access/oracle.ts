@@ -2,7 +2,6 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
 import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
-import { materializationConfirmed } from "@/lib/access/posture";
 
 /**
  * The visibility oracle (spec §5.1): ONE place computes what a principal can see; every
@@ -50,7 +49,7 @@ function empty(): VisibleSet {
 export async function visibleProjects(db: DbClient, principal: Principal): Promise<VisibleSet> {
   const { data: member } = await db
     .from("members")
-    .select("id, kind, is_connector, status, tier")
+    .select("id, kind, is_connector, status")
     .eq("team_id", principal.teamId)
     .eq("id", principal.memberId)
     .maybeSingle();
@@ -63,16 +62,9 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
     .eq("member_id", principal.memberId);
   if (gmErr) return empty(); // fail closed on read error
 
-  // BUILT-IN membership acceptance (PRET-4 §1c): builtin rows are EXPLICIT state — the row is
-  // authoritative once the one-time materialization is confirmed. Until then (the
-  // activation→sweep window) the LEGACY tier conjunct applies, so a stale everyone row from a
-  // failed recompute-era hook sync is never served live (cold-read H2 — fails closed to
-  // pre-slice semantics). What is PERMANENT either way: isBuiltinEligible — a planted
-  // team-tier AGENT in Everyone must never inherit General (slice-2 Codex High; materialized
-  // non-human rows are posture-only, grant-inert) — and the unknown-slug fail-closed (a
-  // direct-written builtin row with a foreign slug contributes nothing, cold-read M6).
-  const legacyWindow = !(await materializationConfirmed(db));
-  const legacyTierFor: Record<string, string> = { [EVERYONE_SLUG]: "team", [EXTERNAL_SLUG]: "external" };
+  // BUILT-IN membership acceptance — PRET-6: builtin rows are authoritative (the marker-keyed legacy conjunct retired with the
+  // permissive model — the release precondition guarantees materialization). PERMANENT checks:
+  // isBuiltinEligible (a planted non-human row never grants) and the unknown-slug fail-closed.
   const rows = (memberships ?? []) as { group_id: string; groups: { slug: string; is_builtin: boolean } | null }[];
   const groupIds = new Set(
     rows
@@ -81,9 +73,7 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
         if (!g) return false; // missing embed: unresolvable group → fail closed (review M2)
         if (!g.is_builtin) return true;
         if (!isBuiltinEligible(member)) return false;
-        if (g.slug !== EVERYONE_SLUG && g.slug !== EXTERNAL_SLUG) return false;
-        if (legacyWindow) return member.tier === legacyTierFor[g.slug];
-        return true;
+        return g.slug === EVERYONE_SLUG || g.slug === EXTERNAL_SLUG;
       })
       .map((r) => r.group_id)
   );

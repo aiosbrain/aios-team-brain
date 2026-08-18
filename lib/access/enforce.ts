@@ -4,35 +4,20 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 
 /**
- * The enforced-read primitive (Phase B slice 1, spec §5/§11). Visibility = **oracle ∧ legacy-tier**:
- * a read applies the oracle's membership filter (this module) AND keeps its existing legacy tier
- * filter, so a bug in either conjunct fails CLOSED. Gated per team by `teams.access_enforcement`:
+ * The enforced-read primitive (Phase B slice 1, spec §5/§11; PRET-6: the ONLY read model).
+ * Visibility = the ORACLE's membership filter: every caller intersects its item set with
+ * `visibleItemIds(...)` — there is no mode, no flag, and no posture wall (PRET-4 ruling 2:
+ * placement is the sharing act; the retired tier conjunct never overrides it).
  *
- *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
- *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
- *
- * SCOPE (through Phase B slice 4): `GET /api/v1/items` (member AND agent keys), the retrieval
- * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', delegated
- * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), and the work-timeline read
- * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`).
- * Arcs and the remaining dashboard surfaces are NOT yet enforced — an operator flipping the flag
- * must know that; those are later Phase B slices.
- *
- * Only flip a team to 'enforcing' once its §11 backfill is complete — an un-partitioned item has no
- * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
+ * SCOPE: `GET /api/v1/items` (member AND agent keys), the retrieval path
+ * (`lib/query/retrieve.ts` → both query routes — retrieve THROWS without a view), delegated
+ * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), the work-timeline read
+ * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`),
+ * and the arcs partition scope (`lib/graph/partition-read`). The §11 backfill + the boot
+ * materialization are what make membership state complete — the PRET-6 release's preDeploy
+ * precondition refuses a fleet where they haven't run.
  */
 
-/**
- * Whether the team enforces access. THROWS on a flag-read error rather than defaulting — a
- * silent `false` would degrade an ENFORCING team to an unfiltered read (the leak direction, and
- * the one input that must not fail open — slice-B1 Fable HIGH). The route turns a throw into a
- * 500 (fail closed: no data served), never a wrong mode.
- */
-export async function teamEnforcesAccess(db: DbClient, teamId: string): Promise<boolean> {
-  const { data, error } = await db.from("teams").select("access_enforcement").eq("id", teamId).maybeSingle();
-  if (error) throw new Error(`access_enforcement read failed: ${error.message}`);
-  return (data as { access_enforcement?: string } | null)?.access_enforcement === "enforcing";
-}
 
 export interface VisibleItemIds {
   ids: Set<string>;
@@ -100,7 +85,7 @@ export async function visibleItemIds(
 
 /**
  * Delegated principals are ALWAYS attenuated (Phase B slice 3, spec §10/§5.8b): the enforce arg
- * for an `aiosd_*` query, computed regardless of `teams.access_enforcement` — that flag is the
+ * for an `aiosd_*` query, always computed — the retired rollout flag was the
  * MEMBER rollout control, and a scoped token must never ride a permissive team to full-corpus
  * answers. Effective projects = the live triple intersection (`effectiveVisibleProjects`), then
  * the item-grain membership set. Fail-closed end to end: an empty effective set, an un-backfilled
@@ -120,8 +105,8 @@ export async function delegatedVisibleItemIds(
  * effective-project set, so two members with identical group signatures share one cache row and a
  * group change moves the member to a new key on the next read. This is the CHEAP half (projects
  * only): a cache HIT needs the hash alone, so materializing the item-id set on every read (even a
- * hit) would defeat what the cache is for (Fable B4 Medium). Null = permissive team (serve the
- * plain tier row). Throws on a flag-read error (the caller fails closed — 500/no data).
+ * hit) would defeat what the cache is for (Fable B4 Medium). PRET-6: always resolves (never
+ * null) — a substrate read error throws and the caller fails closed (500/no data).
  */
 export interface MemberVisibility {
   visibleProjectIds: ReadonlySet<string>;
@@ -129,8 +114,7 @@ export interface MemberVisibility {
   visibilityHash: string;
 }
 
-export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility | null> {
-  if (!(await teamEnforcesAccess(db, principal.teamId))) return null;
+export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility> {
   const { projectIds } = await visibleProjects(db, principal);
   const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
   return { visibleProjectIds: projectIds, visibilityHash };
@@ -166,10 +150,10 @@ export async function resolveTimelineEnforcement(
 
 /**
  * Convenience for DIRECT build paths (no cache layer to shield — e.g. the >7d timeline expansion):
- * resolve the full enforcement in one call. Null on a permissive team. The cache layer does NOT
- * use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
+ * resolve the full enforcement in one call. PRET-6: always resolves for a live principal. The
+ * cache layer does NOT use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
  */
-export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement | null> {
+export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement> {
   const vis = await memberVisibility(db, principal);
-  return vis ? resolveTimelineEnforcement(db, principal.teamId, vis) : null;
+  return resolveTimelineEnforcement(db, principal.teamId, vis);
 }

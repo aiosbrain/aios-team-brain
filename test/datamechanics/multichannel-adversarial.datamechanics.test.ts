@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { retrieve, buildFtsQuery } from "@/lib/query/retrieve";
 import { rankedFtsSearch } from "@/lib/query/fts-search";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, memberRetrieveEnforce, type Seed } from "./helpers";
 
 /**
  * ADVERSARIAL — the context-management system under a MULTI-CHANNEL corpus (real Postgres).
@@ -28,9 +28,11 @@ async function post(channel: string, name: string, body: string, access: "team" 
   return ingest(seed, { kind: "transcript", path: `${channel}/${name}.md`, body, access, frontmatter: { source } });
 }
 
-/** Retrieve and return just the source paths (the observable "what context did we pull" outcome). */
+/** Retrieve and return just the source paths (the observable "what context did we pull" outcome).
+ *  PRET-6: every read carries a real member view — team = the seed admin, external = a minted
+ *  external-posture member. */
 async function paths(question: string, tier: "team" | "external" = "team"): Promise<string[]> {
-  const ctx = await retrieve(db(), seed.teamId, tier, question);
+  const ctx = await retrieve(db(), seed.teamId, tier, question, null, await memberRetrieveEnforce(seed, tier));
   return ctx.sources.map((s) => s.path);
 }
 
@@ -94,7 +96,7 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     }
     await post("slack/clientshare", "note", "Shared status update for the client: milestone 2 is on track.", "external");
 
-    const ext = await retrieve(db(), seed.teamId, "external", "planning roadmap pricing status update");
+    const ext = await retrieve(db(), seed.teamId, "external", "planning roadmap pricing status update", null, await memberRetrieveEnforce(seed, "external"));
     const leaked = ext.sources.filter((s) => !s.path.startsWith("slack/clientshare/"));
     expect(leaked, `team content leaked to external: ${leaked.map((s) => s.path).join(", ")}`).toEqual([]);
   });
@@ -139,7 +141,7 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     for (let i = 0; i < 12; i++) {
       await post(`slack/ch${i % 6}`, `daily-${i}`, `Daily update ${i}: posted a quick update to the channel, all normal.`);
     }
-    const ctx = await retrieve(db(), seed.teamId, "team", "any updates on the Helsinki datacenter migration?");
+    const ctx = await retrieve(db(), seed.teamId, "team", "any updates on the Helsinki datacenter migration?", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(false);
   });
 
@@ -150,7 +152,7 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
       await post(`slack/ch${i % 6}`, `daily-${i}`, `Daily update ${i}: routine status, nothing notable.`);
     }
     await post("slack/security", "ssrf", "The SSRF vulnerability in the image proxy was patched.");
-    const ctx = await retrieve(db(), seed.teamId, "team", "was the SSRF issue fixed?");
+    const ctx = await retrieve(db(), seed.teamId, "team", "was the SSRF issue fixed?", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(true);
     expect(ctx.sources.some((s) => s.path === "slack/security/ssrf.md")).toBe(true);
   });
@@ -161,7 +163,7 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     for (let i = 0; i < 6; i++) {
       await post(`slack/ch${i}`, `update-${i}`, `Weekly update ${i}: the team shipped features and fixed bugs.`);
     }
-    const ctx = await retrieve(db(), seed.teamId, "team", "what are the latest updates?");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what are the latest updates?", null, await memberRetrieveEnforce(seed));
     expect(ctx.grounded).toBe(true);
   });
 
@@ -182,33 +184,18 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
     expect(unscoped).toContain("slack/eng/atlas.md");
   });
 
-  it("STRENGTH: task aggregation is correct past the 80 cap (Gap #5 fixed — full-corpus count)", async () => {
-    // A multi-channel org easily has >80 live tasks. The 80-row task DETAIL digest still caps, but a
-    // full-corpus count-by-status line now answers "how many open tasks?" correctly regardless.
-    const projectId = await makeProject("ops");
-    const base = Date.parse("2026-01-01T00:00:00Z");
-    for (let i = 0; i < 90; i++) {
-      const { error } = await db().from("tasks").insert({
-        team_id: seed.teamId,
-        project_id: projectId,
-        row_key: `TASK-${String(i).padStart(3, "0")}`,
-        title: `Open task ${i}`,
-        status: "in_progress",
-        origin: "sync",
-        audience: "team",
-        updated_at: new Date(base + i * 60_000).toISOString(),
-      });
-      if (error) throw new Error(`task insert failed: ${error.message}`);
-    }
-    const ctx = await retrieve(db(), seed.teamId, "team", "how many open tasks are there across the team?");
-    // The count reflects all 90, not the 80 the detail list can show.
-    expect(ctx.structured).toContain("90 open");
-  });
+  // Deleted WITH its subject (PRET-6): "STRENGTH: task aggregation is correct past the 80 cap
+  // (Gap #5 — full-corpus count)" — the full-corpus count-by-status aggregate is an
+  // unpartitionable leg, permanently omitted with the model's retirement (§5.8b; it returns
+  // only if a partition-classed rebuild lands via the enforcement backlog).
 
   it("STRENGTH: an older decision surfaces by keyword past the 50-cap (Gap #6 fixed — decision FTS)", async () => {
     // The recency-50 decisions window still caps, but ALL decisions are now keyword-searched, so
     // "which vendor did we pick in Q1?" reaches the old on-record decision regardless of recency.
     const projectId = await makeProject("gov");
+    // PRET-6: a synced decision carries its source item (the decision log) or the enforced read
+    // drops it as purged-basis — one shared visible source doc for the whole log.
+    const decSrc = await post("workspace", "decision-log", "the decision log");
     const base = Date.parse("2026-01-01T00:00:00Z");
     for (let i = 0; i < 60; i++) {
       const { error } = await db().from("decisions").insert({
@@ -221,10 +208,11 @@ describe("multi-channel adversarial retrieval (real Postgres)", () => {
         decided_by: "lead",
         still_valid: true,
         audience: "team",
+        source_item_id: decSrc.id,
       });
       if (error) throw new Error(`decision insert failed: ${error.message}`);
     }
-    const ctx = await retrieve(db(), seed.teamId, "team", "which vendor did we pick for the data warehouse?");
+    const ctx = await retrieve(db(), seed.teamId, "team", "which vendor did we pick for the data warehouse?", null, await memberRetrieveEnforce(seed));
     expect(ctx.structured).toContain("DEC-000");
   });
 

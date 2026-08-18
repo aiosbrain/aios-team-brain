@@ -10,7 +10,6 @@ import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   ownsConversation,
-  recentTurns,
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
@@ -26,7 +25,7 @@ const DAILY_TEAM_BUDGET_USD = 10;
 export async function POST(req: NextRequest) {
   // Phase B slice 3 (spec §10/§17-B): `query` honors delegated `aiosd_*` tokens — the Phase A 403
   // refusal is lifted now that the retrieval path can attenuate (slice 2). A delegated principal
-  // is ALWAYS oracle-attenuated (independent of `teams.access_enforcement`, which is the MEMBER
+  // is ALWAYS oracle-attenuated (independent of the retired rollout flag, which was the MEMBER
   // rollout flag) and STATELESS: no conversation read/write and no history leg — the launcher's
   // prior turns may quote items outside the token's scope. Rate limits, query_log and cost
   // metering attribute to the LAUNCHING member row — a token never burns the REPRESENTED
@@ -88,12 +87,11 @@ export async function POST(req: NextRequest) {
   }
 
   // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
-  // Telegram-via-Hermes turn continues the member's existing conversation. Load prior turns BEFORE
-  // recording the current question; the assistant turn is persisted once streaming completes.
-  // Delegated tokens get NO thread: nothing is read or written to the member's conversations.
+  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
+  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
+  // written to the member's conversations.
   const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
   let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  const priorTurns = owner && conversationId ? await recentTurns(db, owner, conversationId) : [];
   let createdNew = false;
   if (owner && !conversationId) {
     const created = await createConversation(db, owner, question);
@@ -135,13 +133,14 @@ export async function POST(req: NextRequest) {
   // delegated tokens keep the §5.8b omit. Any error fails closed (500).
   let enforce: import("@/lib/query/retrieve").RetrieveEnforce | null = null;
   try {
-    const { teamEnforcesAccess, visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
+    const { visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {
       const { ids } = await delegatedVisibleItemIds(db, agent);
       // QMIR-1: a delegated token is `principal: "token"` — the org-structural mirror legs stay
       // absolutely omitted for it, tier-independent (the round-3 Codex Critical posture).
       enforce = { visibleItemIds: ids, principal: "token" };
-    } else if (await teamEnforcesAccess(db, teamId)) {
+    } else {
+      // PRET-6: enforcing is the only behavior — the member arm is unconditional.
       const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
       // PCCC-6, widened by PRET-4 §1b (ruling 2): EVERY member principal gets the graph leg
       // over their oracle-resolved partitions — an external member's projectIds resolve their
@@ -154,10 +153,13 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
-  // Access enforcement (Codex HIGH): prior assistant turns can quote content whose items are no
-  // longer visible to this principal (e.g. after a group change) — omit history under enforcing
-  // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
-  const historyTurns = enforce ? [] : priorTurns;
+  // Access enforcement (Codex HIGH; PRET-6 made it unconditional): prior assistant turns can
+  // quote content whose items are no longer visible to this principal (e.g. after a group
+  // change), so the LLM history window is EMPTY for every conversation until turns are
+  // visibility-revalidated — a named backlog item, not an accident (the `recentTurns` load
+  // retired with the permissive arm that consumed it). The thread itself still persists — the
+  // current turn's answer is freshly retrieval-grounded and appended to the conversation.
+  const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
 
   // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
   // `done` — the daily count and team budget read query_log, and a row written only in the done

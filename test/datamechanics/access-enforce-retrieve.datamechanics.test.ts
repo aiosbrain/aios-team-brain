@@ -6,10 +6,10 @@ import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { visibleItemIds } from "@/lib/access/enforce";
 import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
 
-// Phase B slice 2 (spec §5.2/§5.8b) — enforcement extended to the retrieval path. The proofs:
-// permissive retrieve is byte-identical; enforcing filters the item legs so a restricted item's
-// content NEVER reaches an outsider's answer; graph legs are omitted under enforcing (fail closed
-// until Phase C). Item-grounded content is what the answer cites, so a leak here is a live leak.
+// Phase B slice 2 (spec §5.2/§5.8b), post-PRET-6 — the enforced retrieval path is the only one.
+// The proofs: the item legs filter to the member's vis-set so a restricted item's content NEVER
+// reaches an outsider's answer; the unpartitionable legs stay omitted. Item-grounded content is
+// what the answer cites, so a leak here is a live leak.
 
 const TERM = "waffleberry"; // a rare term present in both bodies so FTS matches both
 
@@ -32,14 +32,25 @@ async function seedMember(seed: Seed): Promise<string> {
 }
 
 describe("enforced retrieval (Phase B slice 2)", () => {
-  it("permissive: retrieve returns both items (byte-identical — enforce arg is null)", async () => {
+  // Deleted WITH its subject (PRET-6): "permissive: retrieve returns both items (byte-identical
+  // — enforce arg is null)" — a null view now THROWS (fail closed; with the posture walls gone
+  // it would have run the item legs unfiltered). The member breadth control is below.
+  it("a team member's retrieval reaches the whole General corpus (breadth control)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "open.md", body: `open ${TERM} note`, access: "team", project: "src" });
     await ingest(seed, { path: "other.md", body: `other ${TERM} note`, access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
-    const got = await retrievedPaths(seed, null); // permissive (no enforce)
+    const member = await seedMember(seed);
+    const got = await retrievedPaths(seed, member);
     expect(got).toContain("open.md");
     expect(got).toContain("other.md");
+  });
+
+  it("retrieve WITHOUT an enforcement view throws — the fail-open seam is closed (PRET-6)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "seam.md", body: `seam ${TERM}`, access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    await expect(retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null)).rejects.toThrow(/enforcement view/);
   });
 
   it("enforcing: an outsider's answer cites the General item but NOT a restricted-project item (the leak this closes)", async () => {
@@ -67,12 +78,12 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "g.md", body: `g ${TERM}`, access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId);
-    // Plant a commitment graph entity (a team-tier member sees these under permissive).
+    // Plant a commitment graph entity — served to NOBODY post-PRET-6 (the permissive control
+    // that used to prove the leg live died with its mode; non-vacuity: the row exists, below).
     await db().from("graph_entities").insert({ team_id: seed.teamId, entity_id: `c-${Date.now()}`, entity_type: "commitment", name: "ship the widget", attrs: { status: "open" } });
     const member = await seedMember(seed);
-
-    const permissive = await retrieve(db(), seed.teamId, "team", `about ${TERM}`, null, null);
-    expect(permissive.structured, "permissive shows the commitment").toContain("ship the widget");
+    const { data: planted } = await db().from("graph_entities").select("id").eq("team_id", seed.teamId).eq("entity_type", "commitment");
+    expect((planted ?? []).length, "non-vacuity: the commitment row exists").toBe(1);
 
     // The MEMBER arm — the strongest form: QMIR-1 reopened the org-structural legs for exactly
     // this principal, and the commitments leg must stay closed even so. (The actors-half
@@ -92,10 +103,12 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(taskErr, "task fixture must insert").toBeNull();
     await backfillTeamContext(db(), seed.teamId);
 
-    // Permissive PRESENCE control: both surface today.
-    const permissive = await retrieve(db(), seed.teamId, "team", `${TERM} decision`, null, null);
-    expect(permissive.structured).toContain("DEC-9");
-    expect(permissive.structured).toContain("TSK-9");
+    // PRESENCE control (the permissive one died with its mode): an ENTITLED member sees both.
+    const insider = await seedMember(seed);
+    const insiderView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: insider })).ids };
+    const present = await retrieve(db(), seed.teamId, "team", `${TERM} decision`, null, insiderView);
+    expect(present.structured).toContain("DEC-9");
+    expect(present.structured).toContain("TSK-9");
 
     // Restrict the item away from the outsider, then enforce.
     const outsider = await seedMember(seed);
@@ -112,24 +125,21 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(enforcing.structured, "restricted task must not surface").not.toContain("TSK-9");
   });
 
-  it("enforcing: the people-activity digest AND the full-corpus task-count are omitted (unpartitionable legs)", async () => {
+  it("the people-activity digest AND the full-corpus task-count are omitted for every member (unpartitionable legs, parked pending partition-classing)", async () => {
+    // The permissive live-leg control died with its mode; the fixture still QUALIFIES for the
+    // digest (attributed, non-git source, activity-intent question), so the omission is the
+    // filter's doing, not a missing precondition.
     const seed = await seedTeam();
-    // An item attributed to the seed member with a non-git source → qualifies for the people digest.
     await ingest(seed, { path: "act.md", body: `act ${TERM}`, access: "team", project: "src", frontmatter: { source: "slack" } });
     await db().from("items").update({ member_id: seed.memberId }).eq("team_id", seed.teamId).eq("path", "act.md");
     await backfillTeamContext(db(), seed.teamId);
     const member = await seedMember(seed);
     const q = "who is working on what this week";
 
-    // Permissive: the people digest header appears (proves the leg is live for this question).
-    const permissive = await retrieve(db(), seed.teamId, "team", q, null, null);
-    expect(permissive.structured, "permissive emits the people-activity digest").toContain("## Activity by person");
-
-    // Enforcing: the people digest AND the full-corpus task-count aggregate are omitted.
     const enforce = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
     const enforcing = await retrieve(db(), seed.teamId, "team", q, null, enforce);
-    expect(enforcing.structured, "enforcing omits the people-activity digest (would name restricted work)").not.toContain("## Activity by person");
-    expect(enforcing.structured, "enforcing omits the full-corpus task-count").not.toMatch(/## Task counts \(all \d+ tasks/);
+    expect(enforcing.structured, "the people-activity digest is omitted (would name restricted work)").not.toContain("## Activity by person");
+    expect(enforcing.structured, "the full-corpus task-count is omitted").not.toMatch(/## Task counts \(all \d+ tasks/);
     expect(enforcing.structured).toContain("## Tasks visible to you");
   });
 
@@ -158,6 +168,29 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     await backfillTeamContext(db(), seed.teamId);
     const ctx = await retrieve(db(), seed.teamId, "team", "what is happening lately", null, { visibleItemIds: new Set([vis.id]) });
     expect(ctx.sources.map((s) => s.path), "the recency page must be cut over VISIBLE rows").toContain("vis-old.md");
+  });
+
+  it("a HAND-TYPED task (created_by set, null source) reaches a team member's digest; a purged-basis synced task never does; external posture gets neither (Codex diff-review H2 — the timeline's provenance rule, applied to retrieve)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "t.md", body: `t ${TERM}`, access: "team", project: "src" });
+    const srcProj = (await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "src").single()).data!.id;
+    const handErr = (await db().from("tasks").insert({ team_id: seed.teamId, row_key: "ui-1", title: "Hand-typed dashboard task", status: "backlog", origin: "ui", source_item_id: null, created_by: seed.memberId, project_id: srcProj })).error;
+    expect(handErr).toBeNull();
+    const purgedErr = (await db().from("tasks").insert({ team_id: seed.teamId, row_key: "SYNC-9", title: "Purged-basis synced task", status: "in_progress", origin: "sync", source_item_id: null, created_by: null, project_id: srcProj })).error;
+    expect(purgedErr).toBeNull();
+    await backfillTeamContext(db(), seed.teamId);
+    const member = await seedMember(seed);
+
+    const teamView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    const asTeam = await retrieve(db(), seed.teamId, "team", `${TERM} tasks`, null, teamView);
+    expect(asTeam.structured, "the hand-typed task survives for a team member").toContain("Hand-typed dashboard task");
+    expect(asTeam.structured, "a purged-basis synced task stays dropped").not.toContain("Purged-basis synced task");
+
+    const { externalMember } = await import("./helpers");
+    const ext = await externalMember(seed);
+    const extView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: ext })).ids };
+    const asExt = await retrieve(db(), seed.teamId, "external", `${TERM} tasks`, null, extView);
+    expect(asExt.structured, "a hand-typed row has no membership axis — the posture wall holds").not.toContain("Hand-typed dashboard task");
   });
 
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {

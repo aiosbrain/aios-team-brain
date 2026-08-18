@@ -18,7 +18,11 @@ There are four independent knobs:
 the native Postgres retrieval. `CONTEXT_PROVIDER=external` *replaces* the whole context layer with
 the external service (same `POST {query,limit,tier} → {sources[]}` contract) — the seam for swapping
 in gbrain or another engine wholesale. Both providers implement `RetrievalProvider` (`lib/query/provider.ts`).
-⚠️ An `external` provider must enforce the caller's **tier** itself — there is no DB backstop (CLAUDE.md §5).
+⚠️ **PRET-6: the `external` provider currently yields EMPTY context on every query.** Membership
+enforcement is unconditional and the provider's wire contract carries no oracle scope, so it fails
+closed rather than return unrestricted remote sources (`lib/query/external-provider.ts`). The seam
+re-opens when the contract learns to accept oracle-scoped ids/projects. (`RETRIEVAL_AUGMENT_URL`
+is likewise parked — the augment leg is item-derived and unpartitionable.)
 
 Everything degrades safely: if a local/cloud endpoint is unreachable or times
 out, the brain falls back (LLM → error surfaced; reranker/augmentation → skipped)

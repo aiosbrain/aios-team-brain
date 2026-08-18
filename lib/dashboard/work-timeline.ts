@@ -2,7 +2,7 @@ import "server-only";
 import { ACTIVE_STATUSES } from "@/lib/tasks/activity-policy";
 import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
-import { isRestrictedTier, visibleItems, visibleTasks, visibleDecisions, type ViewerTier } from "@/lib/auth/visibility";
+import { isRestrictedTier, type ViewerTier } from "@/lib/auth/visibility";
 import { commitSubject } from "./team-work";
 import { sourceRules } from "@/lib/ingest/source-rules";
 import { assigneeMember, decisionActors, type RosterPerson } from "./people-match";
@@ -159,7 +159,7 @@ export async function getWorkTimeline(
   // alone (a null source there is the PURGE case — a restricted item removed via `on delete set
   // null` — so fail closed and drop it; Codex B2's retrieve ruling).
   const srcVisible = (sourceItemId: string | null | undefined): boolean =>
-    enforce == null || (sourceItemId != null && enforce.visibleItemIds.has(sourceItemId));
+    enforce != null && sourceItemId != null && enforce.visibleItemIds.has(sourceItemId); // PRET-6: fail closed on null
   // A TASK's null source is ambiguous: a hand-typed dashboard task (no restricted basis, already
   // tier-gated by visibleTasks) OR a synced task whose restricted source was purged (its title
   // still names the restricted work). The FIRST must survive — dropping all null-source tasks
@@ -173,7 +173,7 @@ export async function getWorkTimeline(
   // deletion (`on delete set null`) → the task drops (over-restriction, fail closed). Immutable
   // otherwise: no UPDATE writes it.
   const taskVisible = (t: TaskRow): boolean => {
-    if (enforce == null) return true;
+    if (enforce == null) return false; // PRET-6: a null enforcement is a caller bug — fail closed
     if (t.source_item_id != null) return enforce.visibleItemIds.has(t.source_item_id);
     // PRET-5 H2 ruling: a hand-typed task belongs to NO project — no membership axis exists —
     // so the audience wall survives on exactly this one branch (a team-audience hand-typed
@@ -192,15 +192,12 @@ export async function getWorkTimeline(
   // posture wall would re-block ruling 2: an external member granted X must see X's team
   // evidence); PERMISSIVE → the posture wall alone. The structured legs' enforcing gates are
   // srcVisible/taskVisible below.
-  // NOTE the item call sites pass `withVis(q)` (identity under permissive: visArr null), so
-  // these helpers decide only the WALL half. Signatures mirror the visible* choke-points so
-  // the call sites read unchanged.
-  const walledItems = <T extends { in: (col: string, vals: string[]) => T }>(q: T, t: ViewerTier): T =>
-    visArr ? q : (visibleItems(q, t) as T);
-  const walledTasks = <T extends { in: (col: string, vals: string[]) => T }>(q: T, t: ViewerTier): T =>
-    visArr ? q : (visibleTasks(q, t) as T);
-  const walledDecisions = <T extends { in: (col: string, vals: string[]) => T }>(q: T, t: ViewerTier): T =>
-    visArr ? q : (visibleDecisions(q, t) as T);
+  // PRET-6: the permissive posture-wall arms retired with the model — the vis-set is the only
+  // gate on evidence legs (withVis at the call sites; taskVisible/srcVisible on structured
+  // rows). Kept as named identities so the call sites keep their one obvious handle.
+  const walledItems = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
+  const walledTasks = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
+  const walledDecisions = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
   // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
   // so an unbounded caller value can't widen the query past the cost cap.
   const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));

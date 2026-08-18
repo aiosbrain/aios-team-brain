@@ -98,6 +98,9 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // before `recordIngestRun`. It has zero rows today, so it is absent from `legs` entirely and is not
   // firing; but the first row it ever writes would age past the 3h default it would otherwise inherit
   // and pin the banner red forever on a healthy leg. That is the `doc_task_infer` class exactly.
+  // PRET-6: the auto-flip subsystem retired — prod's ingest_runs history holds auto_flip rows
+  // forever, and deleting this entry would re-inherit the 3h default and pin the banner red on
+  // a dead leg (the doc_task_infer class). HISTORICAL source: kept null, written by nothing.
   auto_flip: null,
   // Records ONLY on failure — `runPret3BootSweep`'s caller (`lib/ingest/scheduler.ts`) writes a row
   // inside `if (s.error)` plus exactly ONE `ok:true` row when it ran cleanly, and the sweep is

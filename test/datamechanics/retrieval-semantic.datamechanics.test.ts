@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { GraphitiClient } from "@/lib/graph/graphiti-client";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, type Seed, memberRetrieveEnforce } from "./helpers";
 
 /**
  * LIVE eval for semantic retrieval (Organ 3). Proves that Graphiti-backed query expansion closes the
@@ -56,7 +56,7 @@ live("semantic retrieval via live Graphiti", () => {
 
     const missed: string[] = [];
     for (const g of GAPS) {
-      const ctx = await retrieve(db(), seed.teamId, "team", g.q);
+      const ctx = await retrieve(db(), seed.teamId, "team", g.q, null, await memberRetrieveEnforce(seed));
       if (!ctx.sources.map((s) => s.path).includes(g.target)) missed.push(`${g.q} → ${g.target}`);
     }
     console.info(`[semantic-live] gaps closed: ${GAPS.length - missed.length}/${GAPS.length}` + (missed.length ? `; still missed: ${missed.join("; ")}` : ""));

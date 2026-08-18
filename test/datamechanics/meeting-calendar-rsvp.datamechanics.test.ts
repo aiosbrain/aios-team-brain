@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, viewFor, type Seed } from "./helpers";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 
@@ -100,7 +100,7 @@ describe("calendar RSVP: a declined invitee is not an attendee (real Postgres)",
       { email: declinedEmail, responseStatus: "declined" },
     ]);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(meetingsFor(days, bob), "an invitee with no RSVP is still credited").toHaveLength(1);
     expect(meetingsFor(days, declined), "declining a meeting is not doing it").toHaveLength(0);
   });

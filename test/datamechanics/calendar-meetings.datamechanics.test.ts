@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, viewFor, type Seed } from "./helpers";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 
@@ -87,7 +87,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     expect(summary.created, "the calendar event should have produced a meeting note").toBe(1);
 
     // ASSOCIATED: it lands on BOTH people's cards, credited as attendance (no submitter fallback).
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     for (const [who, id] of [
       ["organiser", seed.memberId],
       ["attendee", bob],
@@ -109,7 +109,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     await pushCalendarEvent(seed, { title: "Roadmap sync", attendees: [bobEmail] });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const bobDay = days.flatMap((d) => d.people).find((p) => p.memberId === bob);
     expect(bobDay, "a day of only meetings must still produce a person-day").toBeDefined();
     expect(bobDay!.total, "the meeting counts toward his work total").toBe(1);
@@ -126,7 +126,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     expect((await backfillMeetingNotesFromItems(db(), seed.teamId)).created).toBe(1);
     expect((await backfillMeetingNotesFromItems(db(), seed.teamId)).created, "second run creates nothing").toBe(0);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(meetingsFor(days, bob)).toHaveLength(1);
   });
 
@@ -143,7 +143,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     expect(meetingsFor(days, bob)).toHaveLength(1);
     // …and nobody was invented for the unresolvable guests.
     const { data: attendees } = await db()
@@ -159,7 +159,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     await pushCalendarEvent(seed, { title: "External-only call", attendees: ["nobody@elsewhere.com"] });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const found = meetingsFor(days, seed.memberId);
     expect(found).toHaveLength(1);
     expect(found[0].via).toBe("submitter");
@@ -179,7 +179,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     await pushCalendarEvent(seed, { title: "Backdated share", attendees: [bobEmail], occurredAt: threeDaysAgo });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const found = meetingsFor(days, bob);
     expect(found, "a just-shared event for an in-window day must be credited").toHaveLength(1);
     expect(found[0].at).toBe(threeDaysAgo); // dated by the meeting, not by the share
@@ -195,7 +195,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     await pushCalendarEvent(seed, { title: "Solo standup", attendees: [(me as { email: string }).email] });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const days = await getWorkTimeline(db(), seed.teamId, "team");
+    const days = await getWorkTimeline(db(), seed.teamId, "team", undefined, await viewFor(seed));
     const pusher = days.flatMap((d) => d.people).find((p) => p.memberId === seed.memberId);
     expect(pusher?.total, "one event must count once").toBe(1);
     expect(pusher?.other.map((g) => g.source).sort(), "no raw `calendar` lane beside the meetings one").toEqual([
@@ -212,7 +212,7 @@ describe("shared calendar events become per-person work (real Postgres)", () => 
     await pushCalendarEvent(seed, { title: "Internal planning", attendees: [bobEmail] });
     await backfillMeetingNotesFromItems(db(), seed.teamId);
 
-    const external = await getWorkTimeline(db(), seed.teamId, "external");
+    const external = await getWorkTimeline(db(), seed.teamId, "external", undefined, await viewFor(seed, "external"));
     const leaked = external
       .flatMap((d) => d.people)
       .flatMap((p) => p.other)

@@ -32,12 +32,13 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     expect(read("instrumentation.ts")).toMatch(/materializeBuiltinMembershipOnce/);
     const scheduler = read("lib/ingest/scheduler.ts");
     expect(scheduler).toMatch(/materializeBuiltinMembershipOnce/);
-    // Ordering (spec §3.2/L1): the materialize slot sits BEFORE the auto-flip in the tick, so a
-    // first-tick flip never assesses ahead of the sweep.
+    // Ordering (PRET-6 re-anchored — the auto-flip slot retired with its subsystem): the
+    // materialize slot still sits EARLY in the tick, before the downstream consumers that
+    // assess posture-derived state (meeting-notes backfill is the first of them).
     const matIdx = scheduler.indexOf("materializeBuiltinMembershipOnce");
-    const flipIdx = scheduler.indexOf("runAutoFlip(db)");
+    const downstreamIdx = scheduler.indexOf("runMeetingNotesBackfill(db)");
     expect(matIdx).toBeGreaterThan(-1);
-    expect(flipIdx).toBeGreaterThan(matIdx);
+    expect(downstreamIdx).toBeGreaterThan(matIdx);
   });
 
   it("team creation bootstraps the access topology", () => {

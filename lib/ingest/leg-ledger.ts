@@ -23,7 +23,7 @@ export const INGEST_LEG_SOURCES: readonly string[] = [
   "access_bootstrap",
   "arcs",
   "auth_cleanup",
-  "auto_flip",
+
   "context_backfill",
   "context_backfill_all",
   "dense",
