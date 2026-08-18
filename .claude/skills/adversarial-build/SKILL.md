@@ -2,9 +2,9 @@
 name: adversarial-build
 description: >
   The full build loop for a feature slice in this repo: AIOS-CLI ticket
-  (create-or-update) → spec gate (author via `aios spec init` if none exists,
-  then `aios spec eval` must say SPEC_READY) → write code with spec-first
-  tests → Fable adversarial
+  (create-or-update) → write the spec → CODEX REVIEWS THE SPEC (before any
+  code, and before the eval) → spec gate (`aios spec eval` must say
+  SPEC_READY) → write code with spec-first tests → Fable adversarial
   review → fold → Codex adversarial review → fold → push the PR → update the
   ticket. Use when asked to "build the next phase/slice", "build X with
   reviews", or /adversarial-build. Every step below traces to a defect one of
@@ -17,9 +17,9 @@ description: >
 
 The spine, from the operator (spec gate added by operator revision):
 
-> **aios ticket (create or update) → spec gate (author if none + `aios spec eval`) →
-> write code → Fable adversarial review → fold → Codex adversarial review → fold →
-> push the PR → aios ticket update**
+> **aios ticket (create or update) → write the spec → Codex reviews the SPEC → fold →
+> spec gate (`aios spec eval`) → write code → Fable adversarial review → fold →
+> Codex adversarial review → fold → push the PR → aios ticket update**
 
 Two different models review because they demonstrably catch different defect
 distributions: on the slices this loop was built on, Fable found the
@@ -73,6 +73,53 @@ an experiment with replication.
     against the blocker list is usually faster for a spec you just wrote.
 - Re-run the eval after ANY spec amendment mid-build — SPEC_READY is a state,
   not a milestone.
+
+## 0.6 Codex reviews the SPEC — before the eval, before any code
+
+**Order matters and is not arbitrary: the model reads the spec FIRST, then the
+eval runs.** The eval is deterministic and checks SHAPE (anchors, tiers,
+resolvable paths); a model reads the spec cold and attacks the DESIGN. Running
+the eval first only tidies a document that may not deserve to exist, and worse,
+a `SPEC_READY` verdict reads like a green light and makes the design review feel
+like a formality. Review first, fold, then gate the result — so the thing the
+eval blesses is the design that survived.
+
+```
+codex exec --sandbox read-only -m gpt-5.5 "<prompt>" < /dev/null
+```
+
+Prompt discipline (same shape as the diff reviews, aimed at the design):
+
+- Name the spec path and tell it **no code has been written yet**.
+- Name the files/specs it must read to judge the design, and the tests that
+  define behaviour the spec would CHANGE — a spec that quietly reverses shipped
+  intent is the failure this step catches most often.
+- Give it the measured terrain (numbers from prod, read-only) and tell it to
+  **attack the INFERENCES drawn from them**, not the numbers.
+- Ask explicitly whether the slice should be **built at all, built differently,
+  or DECLINED** — and say a decline is a legitimate, non-embarrassing outcome.
+  Require `VERDICT: BLOCKED | CLEAR-WITH-CONDITIONS | CLEAR | DECLINE` plus the
+  one sentence that most changes what to do next.
+- Same evidence bar as a diff review: file:line or a concrete
+  inputs→wrong-outcome scenario; same DB-test prohibition.
+
+**Fold with re-derivation both ways** (step 3's discipline applies here):
+verify each finding against the code before accepting it, and REFUTE with
+evidence what does not hold. Then re-run the review on the REVISED spec — a
+second round attacks the fix, and in practice that is where over-correction gets
+caught.
+
+WHY THIS STEP EXISTS (MTGATT-2, 2026-08-18 — every clause is a real outcome):
+round 1 returned **DECLINE**, killing a safety premise the spec asserted while
+the code it consumed did the opposite, and killing an identifier that would have
+fused unrelated meetings. Round 2 returned **DECLINE on the fix for round 1** —
+the rewrite reversed a shipped, tested product contract (`Bob pushed nothing…
+the meeting is still a record of work he did`) and leaned on a field that is the
+resolved AUTHOR rather than the pusher. Both were re-derived and both held. The
+slice that shipped was a fraction of what was specced, and the two rounds cost
+minutes against a build that would have had to be reversed. Note also what the
+eval could NOT have caught: it passed `SPEC_READY` on the version that was later
+declined **twice** — shape was never the problem.
 
 ## 1. Write the code
 
@@ -221,6 +268,8 @@ end.
 | Fail-open direction untested | Fable | `[]`→`NULL` scope conflation had no red test; suite stayed green |
 | Guard evasion | both | backtick quotes, variable-table idiom, SQL files unscanned |
 | Spec ruling silently unimplemented | Fable | "no external-tier delegation" stated twice, enforced nowhere |
+| A spec whose premise the code contradicts | Codex, on the SPEC | "each person only asserts about themselves" while the code credited every invitee |
+| A fix that reverses shipped intent | Codex, on the REVISED spec | narrowing attendance to the pusher deleted a deliberate, tested behaviour |
 | Reviewer hallucination | you | regex-matches claim refuted with a node repro |
 | Phantom test failures | process rule | concurrent data-mechanics runs on the shared container |
 | Lost work during mutation testing | `scripts/mutate.mjs` | `git checkout` on an uncommitted tree — three times in one session, while the rule was prose plus a skippable check |
