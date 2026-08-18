@@ -47,9 +47,10 @@ export interface CalendarAttendee {
   /**
    * The invitee's RSVP, lowercased, or null when the producer sent none (MTGATT-2).
    *
-   * Only `"declined"` is ever acted on, and only for the person who PUSHED the event — see
-   * `calendarSelfAttendance`. Every other value, including one this codebase has never seen, is
-   * carried through unjudged: a missing RSVP is the overwhelmingly common shape (Granola's nested
+   * Only `"declined"` is ever acted on, for EVERY invitee — see `attendingAttendees`. (An earlier
+   * draft of this slice acted on the pushing member's RSVP alone; that design was withdrawn at
+   * review, and this sentence outlived it by one commit.) Every other value, including one this
+   * codebase has never seen, is carried through unjudged: a missing RSVP is the common shape (Granola's nested
    * event carries none at all), so treating "not recognised" as "not present" would empty the
    * attendee list of nearly every event and look exactly like a broken feature.
    */
@@ -85,8 +86,9 @@ export function calendarAttendees(fm: Record<string, unknown> | null | undefined
       ? raw.split(/[,;]/)
       : [];
 
-  const out: CalendarAttendee[] = [];
-  const seen = new Set<string>();
+  // Keyed by email so a duplicate entry MERGES rather than being dropped on arrival order. A Map
+  // preserves first-insertion position, so source order is unchanged.
+  const byEmail = new Map<string, CalendarAttendee>();
   for (const e of entries) {
     let email: string | null = null;
     let display: string | null = null;
@@ -121,11 +123,22 @@ export function calendarAttendees(fm: Record<string, unknown> | null | undefined
     }
     if (!email) continue;
     const lower = email.toLowerCase();
-    if (!EMAIL_RE.test(lower) || seen.has(lower)) continue; // a bare display name is not an identity
-    seen.add(lower);
-    out.push({ email: lower, display, rsvp });
+    if (!EMAIL_RE.test(lower)) continue; // a bare display name is not an identity
+    const existing = byEmail.get(lower);
+    if (!existing) {
+      byEmail.set(lower, { email: lower, display, rsvp });
+      continue;
+    }
+    // A DECLINE IS STICKY across duplicate entries. Deduping "first wins" meant that a list carrying
+    // the same address twice — `[{a, accepted}, {a, declined}]`, which is what a producer merging two
+    // sources emits — kept the accepted row and credited someone who had declined. Ambiguous evidence
+    // must not produce a claim that a person was somewhere; the direction that under-credits is the
+    // one this system is allowed to fail in.
+    if (rsvp === "declined" && existing.rsvp !== "declined") {
+      byEmail.set(lower, { ...existing, rsvp: "declined" });
+    }
   }
-  return out;
+  return [...byEmail.values()];
 }
 
 /**

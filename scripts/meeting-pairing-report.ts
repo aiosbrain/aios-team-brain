@@ -29,9 +29,9 @@ type NoteRow = { id: string; title: string; occurred_at: string | null; source_i
 type ItemRow = { id: string; frontmatter: Record<string, unknown> | null };
 
 /** Which producer a note came from — the axis that decides whether a pair is useful. */
-type NoteSource = "calendar" | "transcript";
+export type NoteSource = "calendar" | "transcript";
 
-interface Note {
+export interface Note {
   id: string;
   title: string;
   occurredAt: string | null;
@@ -112,38 +112,15 @@ async function reportTeam(db: ReturnType<typeof adminClient>, team: TeamRow): Pr
     );
   }
 
-  // Group by every key a note carries; a note with two keys can join two ways.
-  const groups = new Map<string, Note[]>();
-  for (const n of enriched) for (const k of n.eventKeys) groups.set(k, [...(groups.get(k) ?? []), n]);
-
-  let cross = 0;
-  let same = 0;
-  const rows: string[] = [];
-  for (const [key, members] of groups) {
-    for (const [a, b] of pairsOf(members)) {
-      if (a.id === b.id) continue;
-      const isCross = a.source !== b.source;
-      if (isCross) cross++;
-      else same++;
-      const gap = hoursApart(a.startedAt, b.startedAt);
-      rows.push(
-        `    ${isCross ? "CROSS" : "same "}  ${key.slice(0, 28).padEnd(28)}  ` +
-          `dates ${a.occurredAt ?? "?"}/${b.occurredAt ?? "?"} ${a.occurredAt === b.occurredAt ? "=" : "≠"}  ` +
-          `gap ${gap === null ? "unknown" : `${gap}h`}  ${a.title.slice(0, 30)} | ${b.title.slice(0, 30)}`
-      );
-    }
-  }
-
-  console.log(`  pairs sharing an event key: ${cross + same}  (CROSS calendar↔transcript ${cross} · same-source ${same})`);
+  const summary = summarisePairs(enriched);
+  console.log(
+    `  pairs sharing an event key: ${summary.cross + summary.same}  (CROSS calendar↔transcript ${summary.cross} · same-source ${summary.same})`
+  );
   // The CROSS number is the only one MTGATT-3 can be fitted to. Printed even at zero, next to the
   // denominators above, so "no pairs yet" cannot be mistaken for "the parser found nothing".
-  if (rows.length) {
-    console.log(rows.join("\n"));
-    console.log(
-      `  of the CROSS pairs, ${
-        [...groups.values()].flatMap((m) => pairsOf(m)).filter(([a, b]) => a.source !== b.source && a.occurredAt !== b.occurredAt).length
-      } would have been MISSED by a same-date rule (the timezone case)`
-    );
+  if (summary.rows.length) {
+    console.log(summary.rows.join("\n"));
+    console.log(`  of the CROSS pairs, ${summary.missedByDate} would have been MISSED by a same-date rule (the timezone case)`);
   }
 
   const confGroups = new Map<string, Note[]>();
@@ -154,6 +131,53 @@ async function reportTeam(db: ReturnType<typeof adminClient>, team: TeamRow): Pr
   // recurring series, so this number includes false pairs BY CONSTRUCTION and must never become a
   // join. It is here to answer "how much would it have added?" — not "should we use it?".
   console.log(`  pairs sharing a conference link: ${confPairs.length} (CROSS ${confCross}) — diagnostic, never a join key`);
+}
+
+export interface PairSummary {
+  /** Distinct NOTE pairs where the two sides came from different producers — the MTGATT-3 population. */
+  cross: number;
+  /** Distinct note pairs from the same producer. Real, but not what a calendar↔transcript join needs. */
+  same: number;
+  /** Of the cross pairs, how many a same-date pre-filter would have thrown away (the timezone case). */
+  missedByDate: number;
+  rows: string[];
+}
+
+/**
+ * Count PAIRS OF NOTES that share an event key — pure, so the counting rule is testable without a DB.
+ *
+ * Deduped by note pair, not by key. One pair routinely shares BOTH an `eid:` and a `uid:` (a UID
+ * emits its bare event id as a second key by design), so counting key groups reported two pairs for
+ * one meeting — inflating the exact number a later matching rule would be fitted to.
+ */
+export function summarisePairs(notes: Note[]): PairSummary {
+  const groups = new Map<string, Note[]>();
+  for (const n of notes) for (const k of n.eventKeys) groups.set(k, [...(groups.get(k) ?? []), n]);
+
+  const seen = new Set<string>();
+  const missed = new Set<string>();
+  const out: PairSummary = { cross: 0, same: 0, missedByDate: 0, rows: [] };
+  for (const [key, members] of groups) {
+    for (const [a, b] of pairsOf(members)) {
+      if (a.id === b.id) continue;
+      const pairId = [a.id, b.id].sort().join("|");
+      if (seen.has(pairId)) continue;
+      seen.add(pairId);
+      const isCross = a.source !== b.source;
+      if (isCross) {
+        out.cross++;
+        if (a.occurredAt !== b.occurredAt) missed.add(pairId);
+      } else out.same++;
+      const gap = hoursApart(a.startedAt, b.startedAt);
+      out.rows.push(
+        `    ${isCross ? "CROSS" : "same "}  ${key.slice(0, 28).padEnd(28)}  ` +
+          `dates ${a.occurredAt ?? "?"}/${b.occurredAt ?? "?"} ${a.occurredAt === b.occurredAt ? "=" : "\u2260"}  ` +
+          `gap ${gap === null ? "unknown" : `${gap}h`}  ${a.title.slice(0, 30)} | ${b.title.slice(0, 30)}`
+      );
+    }
+  }
+  out.missedByDate = missed.size;
+  return out;
 }
 
 async function main(): Promise<void> {
@@ -170,7 +194,11 @@ async function main(): Promise<void> {
   for (const t of teams) await reportTeam(db, t);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Run only when invoked directly, so the pure counting rule above can be imported by a test without
+// the import opening a database connection.
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

@@ -55,10 +55,18 @@ describe("eventIdentity — the shapes a producer might send", () => {
     expect(mine).toEqual(theirs);
   });
 
-  it("discards a value too short to be an identity", () => {
-    for (const junk of ["", "-", "none", "n/a", "   "]) {
+  it("discards a placeholder a producer sends for 'nothing to put here'", () => {
+    for (const junk of ["", "-", "none", "n/a", "   ", "null", "unknown", "undefined", "TBD"]) {
       expect(eventIdentity({ calendar_event_id: junk }).eventKeys, junk).toEqual([]);
     }
+  });
+
+  it("KEEPS a valid short Google id — the floor must not discard real ids (review fold)", () => {
+    // Google documents an event id as 5–1024 characters. An 8-char floor silently dropped valid
+    // short ids, which would have made the pairing report undercount and a later join miss them,
+    // with nothing to show it had happened.
+    expect(eventIdentity({ calendar_event_id: "abcde" }).eventKeys).toEqual(["eid:abcde"]);
+    expect(eventIdentity({ calendar_event_id: "abcd" }).eventKeys, "4 chars is below Google's own minimum").toEqual([]);
   });
 
   it("yields nothing at all for an item with no calendar fields", () => {

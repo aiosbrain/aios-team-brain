@@ -37,6 +37,42 @@ describe("calendarAttendees — the RSVP a producer sent", () => {
   });
 });
 
+describe("calendarAttendees — a decline survives deduplication (review fold)", () => {
+  it("a duplicated invitee who declined in EITHER entry is declined, whatever the order", () => {
+    // Dedupe used to be first-wins, so `[{a, accepted}, {a, declined}]` kept the accepted row and
+    // credited someone who had declined. A producer merging two attendee lists emits exactly that.
+    for (const order of [
+      [{ email: "a@x.com", responseStatus: "accepted" }, { email: "a@x.com", responseStatus: "declined" }],
+      [{ email: "a@x.com", responseStatus: "declined" }, { email: "a@x.com", responseStatus: "accepted" }],
+    ]) {
+      const parsed = calendarAttendees({ attendees: order });
+      expect(parsed, "still one attendee, not two").toHaveLength(1);
+      expect(attendingAttendees(parsed), JSON.stringify(order)).toEqual([]);
+    }
+  });
+
+  it("a duplicate with no RSVP does not erase a decline", () => {
+    const parsed = calendarAttendees({
+      attendees: [{ email: "a@x.com", responseStatus: "declined" }, { email: "a@x.com" }],
+    });
+    expect(attendingAttendees(parsed)).toEqual([]);
+  });
+
+  it("deduping still keeps source order and the first display name", () => {
+    // The inverse half: a merge rule that rebuilt the list could quietly reorder it or lose a name.
+    const parsed = calendarAttendees({
+      attendees: [
+        { email: "first@x.com", display: "First" },
+        { email: "second@x.com", display: "Second" },
+        { email: "FIRST@x.com", display: "Renamed", responseStatus: "declined" },
+      ],
+    });
+    expect(parsed.map((a) => a.email)).toEqual(["first@x.com", "second@x.com"]);
+    expect(parsed[0].display).toBe("First");
+    expect(parsed[0].rsvp).toBe("declined");
+  });
+});
+
 describe("attendingAttendees — only an explicit decline is removed", () => {
   it("drops the declined invitee and keeps the rest", () => {
     const invited = [A("keep@x.com"), A("no@x.com", { rsvp: "declined" }), A("yes@x.com", { rsvp: "accepted" })];

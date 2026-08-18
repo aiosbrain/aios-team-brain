@@ -33,12 +33,19 @@ const UID_KEYS = ["ical_uid", "icalUID", "iCalUID", "ical_uid_raw"] as const;
 const CONFERENCE_KEYS = ["conference_url", "hangout_link", "hangoutLink", "meeting_url", "conferenceUrl"] as const;
 
 /**
- * Below this length a value is not an identity. `""`, `"-"`, `"n/a"` and `"none"` are the shapes a
- * producer emits for "I had nothing to put here", and an exact matcher that accepts them would fuse
- * every meeting that had nothing to put there — the one failure mode an exact join is supposed to be
- * incapable of.
+ * Google documents an event id as 5–1024 characters, so the floor is 5 — an earlier 8 silently
+ * discarded valid short ids, which would have made the pairing report undercount real pairs and a
+ * future join miss them, with nothing to show that it had happened.
  */
-const MIN_KEY_LENGTH = 8;
+const MIN_KEY_LENGTH = 5;
+
+/**
+ * Values that are a producer saying "I had nothing to put here". They must never become keys: an
+ * exact matcher that accepted them would fuse every meeting that had nothing to put there — the one
+ * failure an exact join is supposed to be incapable of. This is a denylist rather than a length rule
+ * because the length rule that caught them also caught real ids.
+ */
+const PLACEHOLDER_KEYS = new Set(["none", "null", "nil", "n/a", "na", "unknown", "undefined", "tbd", "false", "-"]);
 
 export interface EventIdentity {
   /**
@@ -72,7 +79,8 @@ export interface EventIdentity {
 function normaliseId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const v = raw.trim().toLowerCase();
-  return v.length >= MIN_KEY_LENGTH ? v : null;
+  if (v.length < MIN_KEY_LENGTH || PLACEHOLDER_KEYS.has(v)) return null;
+  return v;
 }
 
 /**

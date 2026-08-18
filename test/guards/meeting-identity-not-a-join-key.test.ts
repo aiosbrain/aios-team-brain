@@ -23,13 +23,31 @@ import { join } from "node:path";
 const ALLOWED = new Set(["lib/meetings/event-identity.ts", "scripts/meeting-pairing-report.ts"]);
 
 /**
- * Code only — a guard that reads comments fires on its own documentation, and the first version of
- * this file did exactly that (the parser's header explains why it must not join on a title, and the
- * guard read that explanation as the violation). The line-comment pattern requires whitespace or a
- * line start before `//` so a `https://` inside a string is not mistaken for a comment, which would
- * truncate the line and could hide a real violation sitting after it.
+ * The needles: the parsed key AND the raw frontmatter spellings it is parsed from. Grepping only for
+ * `conferenceKey` left the obvious bypass open — a future join reading `fm.conference_url` or
+ * `fm.hangoutLink` straight off the item would never touch the parser and would sail through.
  */
-const codeOnly = (src: string): string => src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|\s)\/\/.*$/gm, "$1");
+const NEEDLES = [/conferenceKey/, /conference_url/, /hangoutLink/, /hangout_link/];
+
+/**
+ * Comment lines, dropped LINE BY LINE rather than by stripping `/* … *\/` across the file.
+ *
+ * A guard that reads comments fires on its own documentation — the first version of this file did
+ * exactly that. But the obvious fix (regex-strip block comments) is defeated by a STRING containing
+ * `/*`, which would swallow real code up to the next `*\/` and hide a violation. Judging each line on
+ * its own leading token cannot be turned off by anything written on another line. It over-reports on
+ * a block comment whose continuation lines do not start with `*`, and that is the safe direction: a
+ * false positive is a loud, fixable failure; a false negative is the leak this guard exists to stop.
+ */
+function codeOnly(src: string): string {
+  return src
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return !(t.startsWith("*") || t.startsWith("//") || t.startsWith("/*"));
+    })
+    .join("\n");
+}
 
 function filesUnder(dir: string): string[] {
   const out: string[] = [];
@@ -42,11 +60,28 @@ function filesUnder(dir: string): string[] {
 }
 
 describe("guard: the conference link is measured, never joined on", () => {
-  it("no module outside the parser and the report references conferenceKey", () => {
+  it("no module outside the parser and the report touches a conference link, by any spelling", () => {
     const offenders = [...filesUnder("lib"), ...filesUnder("scripts"), ...filesUnder("app")]
       .filter((rel) => !ALLOWED.has(rel))
-      .filter((rel) => /conferenceKey/.test(codeOnly(readFileSync(join(process.cwd(), rel), "utf8"))));
+      .filter((rel) => {
+        const code = codeOnly(readFileSync(join(process.cwd(), rel), "utf8"));
+        return NEEDLES.some((n) => n.test(code));
+      });
     expect(offenders, "a conference link must not reach a matching/grouping path").toEqual([]);
+  });
+
+  it("the needle list itself is non-vacuous — each pattern matches the text it is meant to catch", () => {
+    // A guard whose needles match nothing passes forever. Every pattern is exercised against a line
+    // that a real bypass would contain, so a typo in one of them reddens here instead of going quiet.
+    const samples = ["const k = a.conferenceKey;", "fm.conference_url", "event.hangoutLink", "fm.hangout_link"];
+    for (const [i, n] of NEEDLES.entries()) expect(n.test(samples[i]), samples[i]).toBe(true);
+  });
+
+  it("the comment filter cannot be switched off by a string containing a comment opener", () => {
+    // The regex version of this stripper swallowed everything between a `/*` inside a string literal
+    // and the next `*/`, hiding any violation in between.
+    const sneaky = ['const s = "/*";', "joinMeetings(a.conferenceKey, b.conferenceKey);", 'const e = "*/";'].join("\n");
+    expect(NEEDLES.some((n) => n.test(codeOnly(sneaky))), "a real join must remain visible").toBe(true);
   });
 
   it("the parser itself does not group, match or dedupe — it only parses", () => {
