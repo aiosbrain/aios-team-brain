@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, seedTeam, ingest } from "./helpers";
+import { db, seedTeam, ingest, memberRetrieveEnforce } from "./helpers";
 
 /**
  * Spec: a channel-scoped question ("what did we decide in #growth") must retrieve that channel's
@@ -39,7 +39,7 @@ describe("channel-scoped retrieval with ID-keyed Slack paths (real Postgres)", (
       frontmatter: { source: "slack", channel: "random", channel_id: "C0OTHER0000", title: "coffee decision" },
     });
 
-    const ctx = await retrieve(db(), seed.teamId, "team", "what did we decide in #growth");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what did we decide in #growth", null, await memberRetrieveEnforce(seed));
     const paths = ctx.sources.map((s) => s.path);
 
     expect(paths.some((p) => p.includes("c0b8v119g4d"))).toBe(true); // the scoped channel IS reachable
@@ -58,7 +58,7 @@ describe("channel-scoped retrieval with ID-keyed Slack paths (real Postgres)", (
     });
 
     // No frontmatter.channel here — the name must still resolve via the path segment (unchanged path).
-    const ctx = await retrieve(db(), seed.teamId, "team", "what is happening in the aio channel");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what is happening in the aio channel", null, await memberRetrieveEnforce(seed));
     expect(ctx.sources.some((s) => s.path.includes("linear/aio/"))).toBe(true);
   });
 });

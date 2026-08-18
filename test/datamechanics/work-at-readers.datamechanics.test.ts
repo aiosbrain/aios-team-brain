@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { getWorkTimeline, ITEM_LIMIT } from "@/lib/dashboard/work-timeline";
 import { retrieve } from "@/lib/query/retrieve";
-import { db, ingest, seedTeam, viewFor } from "./helpers";
+import { db, ingest, seedTeam, viewFor, memberRetrieveEnforce } from "./helpers";
 
 /**
  * Spec (Pass-1 review, Wave 2): the READERS move onto the persisted work-time.
@@ -173,7 +173,7 @@ describe("retrieval recency reads work_at (real Postgres)", () => {
       .eq("path", "docs/stale.md");
 
     // A question with no keyword overlap, so the recency leg is what answers it.
-    const ctx = await retrieve(db(), seed.teamId, "team", "what is the latest");
+    const ctx = await retrieve(db(), seed.teamId, "team", "what is the latest", null, await memberRetrieveEnforce(seed));
     const blob = JSON.stringify(ctx);
     const freshAt = blob.indexOf("docs/fresh.md");
     const staleAt = blob.indexOf("docs/stale.md");
