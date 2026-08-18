@@ -69,3 +69,49 @@ export function mergeTranscripts(a: string, b: string): string {
   if (extra.length === 0) return base;
   return `${base.trimEnd()}\n\n--- additional from a second transcript ---\n${extra.join("\n")}`;
 }
+
+/**
+ * Title similarity for meetings that cannot be compared by BODY (MTGATT-1 / AIO-962).
+ *
+ * `transcriptOverlap` is the right comparator for two transcripts of the same conversation, and
+ * useless for a calendar event — which has NO BODY by design (`from-calendar.ts`: "a calendar event
+ * needs no body"). That is why a pushed calendar event and the Granola transcript of the same meeting
+ * could never merge: `findDuplicateMeeting` skipped every candidate whose item had no body, so the
+ * two became two notes for one meeting — one with exact attendance and no content, one with content
+ * and inferred (sometimes invented) attendance.
+ *
+ * Deliberately token-set based, not string equality. The two producers name the same meeting
+ * differently — Google carries the invite subject ("Stephan & John — DSM-Firmenich Demo Prep"),
+ * Granola derives its own ("Stephan & John — DSM-Firmenich Demo Prep + AIOS"). Requiring equality
+ * would merge almost nothing; requiring a shared token would merge almost everything ("Meeting").
+ *
+ * Returns the Jaccard overlap of significant tokens, 0..1. Pure.
+ */
+export function titleSimilarity(a: string, b: string): number {
+  const toks = (s: string): Set<string> =>
+    new Set(
+      s
+        .toLowerCase()
+        // Split on anything that is not a letter or digit, so em-dashes, ampersands and punctuation
+        // separate rather than fusing two words into one token.
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length > 2 && !TITLE_STOPWORDS.has(t))
+    );
+  const A = toks(a);
+  const B = toks(b);
+  // No significant tokens on either side means "no evidence", NOT "identical". Two meetings called
+  // "Sync" and "Chat" would otherwise score 1.0 on empty sets and merge.
+  if (A.size === 0 || B.size === 0) return 0;
+  let shared = 0;
+  for (const t of A) if (B.has(t)) shared++;
+  return shared / (A.size + B.size - shared);
+}
+
+/**
+ * Words too common in meeting titles to be evidence of the SAME meeting. "Meeting with John" and
+ * "Meeting with Sarah" share `meeting` and `with`; without this they would look half-identical.
+ */
+const TITLE_STOPWORDS = new Set([
+  "the", "and", "with", "for", "meeting", "call", "sync", "session", "chat", "catch",
+  "min", "mins", "minute", "minutes", "hour", "weekly", "daily", "standup", "check",
+]);
