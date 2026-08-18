@@ -44,7 +44,20 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export interface CalendarAttendee {
   email: string;
   display: string | null;
+  /**
+   * The invitee's RSVP, lowercased, or null when the producer sent none (MTGATT-2).
+   *
+   * Only `"declined"` is ever acted on, and only for the person who PUSHED the event — see
+   * `calendarSelfAttendance`. Every other value, including one this codebase has never seen, is
+   * carried through unjudged: a missing RSVP is the overwhelmingly common shape (Granola's nested
+   * event carries none at all), so treating "not recognised" as "not present" would empty the
+   * attendee list of nearly every event and look exactly like a broken feature.
+   */
+  rsvp: string | null;
 }
+
+/** RSVP spellings a producer might reasonably send. Google's own key is `responseStatus`. */
+const RSVP_KEYS = ["responseStatus", "response_status", "rsvp", "status"] as const;
 
 /**
  * Attendee emails from a calendar item's frontmatter, deduped, lowercased, in source order.
@@ -77,6 +90,7 @@ export function calendarAttendees(fm: Record<string, unknown> | null | undefined
   for (const e of entries) {
     let email: string | null = null;
     let display: string | null = null;
+    let rsvp: string | null = null;
     if (typeof e === "string") {
       email = e.trim();
     } else if (e && typeof e === "object") {
@@ -97,14 +111,45 @@ export function calendarAttendees(fm: Record<string, unknown> | null | undefined
           break;
         }
       }
+      for (const k of RSVP_KEYS) {
+        const v = o[k];
+        if (typeof v === "string" && v.trim()) {
+          rsvp = v.trim().toLowerCase();
+          break;
+        }
+      }
     }
     if (!email) continue;
     const lower = email.toLowerCase();
     if (!EMAIL_RE.test(lower) || seen.has(lower)) continue; // a bare display name is not an identity
     seen.add(lower);
-    out.push({ email: lower, display });
+    out.push({ email: lower, display, rsvp });
   }
   return out;
+}
+
+/**
+ * The invitees who did not say no — everyone except an explicit `declined` (MTGATT-2). Pure.
+ *
+ * WHAT THIS DOES AND DOES NOT CHANGE. The shipped rule is that a shared calendar event credits every
+ * member attendee, and that is deliberate: the point of the feature is that a meeting Bob only
+ * attended is still a record of Bob's work (`test/datamechanics/calendar-meetings.datamechanics.test.ts`).
+ * This does not touch that. It removes the one case where the invite itself says the person was NOT
+ * going to be there — a declined RSVP is the invitee's own statement about themselves, and crediting
+ * a meeting to someone who declined it is the same shape of error as MTGATT-1's invented attendees,
+ * with better paperwork attached.
+ *
+ * ONLY `declined`, deliberately. `needsAction`, `tentative` and a missing RSVP all count as present,
+ * because "no RSVP" is the overwhelmingly common shape — Granola's nested event carries none at all,
+ * and the gog puller's `{id, display, role}` shape has no RSVP field either. Excluding on "not
+ * accepted" would empty the attendee list of nearly every event and be indistinguishable from a
+ * broken feature.
+ *
+ * An unrecognised value is treated as "no RSVP" (present), never as a decline: the tolerant direction
+ * here is the one that keeps a real attendee rather than the one that drops them.
+ */
+export function attendingAttendees(attendees: CalendarAttendee[]): CalendarAttendee[] {
+  return attendees.filter((a) => a.rsvp !== "declined");
 }
 
 /**

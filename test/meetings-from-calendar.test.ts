@@ -48,8 +48,8 @@ describe("attendee resolution — exact, by email", () => {
       ],
     };
     expect(calendarAttendees(fm)).toEqual([
-      { email: "alice@acme.com", display: "Alice" },
-      { email: "bob@acme.com", display: "Bob" },
+      { email: "alice@acme.com", display: "Alice", rsvp: null },
+      { email: "bob@acme.com", display: "Bob", rsvp: null },
     ]);
   });
 
@@ -59,7 +59,7 @@ describe("attendee resolution — exact, by email", () => {
       "b@acme.com",
     ]);
     expect(calendarAttendees({ attendees: [{ email: "c@acme.com", displayName: "Cee" }] })).toEqual([
-      { email: "c@acme.com", display: "Cee" },
+      { email: "c@acme.com", display: "Cee", rsvp: null },
     ]);
     expect(calendarAttendees({ attendees: "d@acme.com, e@acme.com" }).map((a) => a.email)).toEqual([
       "d@acme.com",
@@ -71,7 +71,7 @@ describe("attendee resolution — exact, by email", () => {
     // The gog puller puts a DISPLAY NAME in `id` when an attendee has no email, so `id` must lose to
     // an explicit address or a named-but-addressed attendee resolves to nothing.
     expect(calendarAttendees({ participants: [{ id: "Alice Smith", email: "alice@acme.com" }] })).toEqual([
-      { email: "alice@acme.com", display: null },
+      { email: "alice@acme.com", display: null, rsvp: null },
     ]);
   });
 

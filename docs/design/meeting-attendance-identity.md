@@ -1,40 +1,47 @@
-# Attendance by identifier, not by resemblance — MTGATT-2
+# Declines, identity, and the measurement before the match — MTGATT-2
 
-**Status:** spec, pre-review.
-**Build with:** opus / high — it writes to the attendance surface a human reads daily, it adds a
-column to a table another slice will backfill, and the failure mode it must avoid (putting a person
-in a meeting they were not in) is the exact failure MTGATT-1 shipped to remove.
+**Status:** spec, revised twice. Two cold plan reviews returned **DECLINE** on the two earlier
+versions; §6 records what each one killed and why the survivor is this small.
+**Build with:** opus / high — it touches the rule that decides whether a named colleague is recorded
+as having attended a meeting, which is the exact failure MTGATT-1 shipped to remove.
 
-**Deps: none blocking.** MTGATT-1 (`c10d9e6`) is merged: `resolveAttendance`, `from-calendar.ts` and
-the write-route guard exist and this slice consumes them.
+**Deps: none blocking.** MTGATT-1 (`c10d9e6`) is merged; this slice narrows one edge of the calendar
+path and lays the plumbing a later join needs.
 
 ---
 
 ## What and why
 
-**What:** a pushed calendar event and the Granola transcript of the same meeting are joined by an
-**identifier they both carry** — never by how similar their titles look — and the calendar's
-attendance is added to the surviving note as a **claim that records where it came from**.
+**What:** three things, none of them dormant, none of them a matcher.
 
-**Why it matters:** today they cannot be joined at all. `findDuplicateMeeting` compares transcript
-bodies, and a calendar event has no body by design, so one meeting becomes two notes: one with the
-content and inferred attendance, one with exact attendance and nothing else. The comparator built for
-that case (`titleSimilarity`) is dormant and must stay dormant — it decides on a resemblance, and the
-operator's stated worry is precisely misassociation at larger team sizes.
+1. **A calendar invitee who DECLINED is not an attendee.** Today every invitee on a pushed event is
+   credited, including one whose RSVP says they would not be there.
+2. **The producer emits the event's identity** (`calendar_event_id`, `ical_uid`, `conference_url`) so
+   that a join has an exact key to work with when it is built.
+3. **An instrument** that counts how many meeting pairs actually share each of those keys, split by
+   source, so MTGATT-3's matching rule is fitted to measured pairs rather than a guessed window.
 
-The property that makes this safe is not a better matcher. It is **who is asserting**: when a person
-pushes their own calendar, that is a first-person assertion about themselves. Each person only ever
-asserts about themselves, so no one can accidentally add someone else — at 50 people that is 50
-self-assertions rather than one system guessing 50 times.
+**Why it matters:** the operator starts pushing calendar events this week, and asked for the opposite
+of a guess — "we don't want to misassociate me with a meeting that I wasn't actually at, especially
+for larger teams." A declined RSVP is the one place the current code records exactly that, and it
+does so with the credibility of the structured path rather than the visible sloppiness of a model.
+
+**What this explicitly does NOT do:** decide whether *being invited* should count as attending at all.
+That is a live product question (§4) and it belongs to the operator, not to this slice.
 
 ## Scope
 
-**In:** the event-identity normalizer, exact-identifier linking with a content-chosen survivor,
-per-attendee provenance (`source` + `asserted_by`), RSVP (`declined` is not an attendee), and the
-producer-side frontmatter contract.
+**In:** the decline rule and the RSVP parsing under it; the identity normaliser; the producer-side
+frontmatter; the pairing instrument; the guard that keeps a conference link out of any matching path.
 
-**Cut, deliberately** (each named, none silent): time-window + shared-participant matching → MTGATT-3;
-non-member attendees → MTGATT-4; any use of `titleSimilarity` in a decision — it stays dormant.
+**Cut by review, each with its destination** (§6 has the reasoning):
+
+- the calendar↔transcript **linker** → **MTGATT-3**, built from what the instrument measures;
+- **conference URL as a join key** → nowhere, ever. Measured, never matched on;
+- **per-attendee provenance columns** → **MTGATT-4**, when a second source exists to distinguish;
+- **"the pusher is the only attendee"** → withdrawn entirely (§6, round 2). It reversed a shipped,
+  tested product contract;
+- non-member attendees → **MTGATT-5**; `titleSimilarity` stays dormant and untouched.
 
 ---
 
@@ -42,196 +49,195 @@ non-member attendees → MTGATT-4; any use of `titleSimilarity` in a decision �
 
 | | |
 |---|---|
-| calendar-source items | **0** — the feature has no live data yet; the operator starts pushing this week |
+| calendar-source items | **0** — nothing has exercised the calendar path in production yet |
 | granola transcript items | **63**, of which **62** carry `granola_id`, **45** carry `participants` |
 | granola items with a full ISO timestamp in `created` | **42** (e.g. `2026-08-12T01:14:01.689Z`) |
 | live meeting notes / attendee rows | **60** / **81** |
-| items carrying any calendar identifier today | **0** |
+| items carrying any calendar identifier | **0** |
 
-Two facts from that table shape the design more than anything else:
+**0 calendar items** is why the decline rule is free to land: no stored attendance changes, so this is
+a correction arriving *before* the first wrong row rather than a migration of wrong ones.
 
-**1. Nothing in prod carries an identifier yet, and the transcripts are not ours to change.** Every
-granola item in prod was pushed by *John's* producer (`1-inbox/transcripts/…`, `status: ingested`),
-not by this operator's `~/scripts` staging path — which emits only `type/access/created/source/
-granola_id`. So rank 1 fires only once **both** producers emit the id. That is why §3.5 is a written
-contract with a deliberately tolerant parser, and why this slice's honest claim is *"the join is
-exact and inert until the data arrives"*, not *"meetings now merge"*. Shipping it inert is the point:
-MTGATT-1's review caught a comparator whose tests were green over a feature nobody could reach, so
-this one states its dormancy in the spec, in the code, and in the PR.
+**0 identifiers** is why there is no linker here. A join needs the key on **both** sides, and every
+transcript in prod comes from a producer on another person's machine (`1-inbox/transcripts/…`,
+`frontmatter.status: ingested`) which emits `type/access/created/source/granola_id` and nothing else.
+A linker shipped now could not fire, could not be validated against a real pair, and would read as
+"attendance is fixed" while the thing the operator asked for — being credited on someone else's
+meeting — still did not happen.
 
-**2. The link must not be pre-filtered by date.** `deriveOccurredAt` dates a granola note from UTC
-`created` and a calendar event from its local `start`. A 19:00 PDT meeting is 02:00Z the next day, so
-the two dates legitimately differ for the same meeting. Any date pre-filter would silently drop
-exactly the evening meetings, and it would look like the feature simply "didn't match".
+**What is NOT measured, and is not claimed to be:** the shape of Granola's nested
+`google_calendar_event`. Granola's local cache (`granola.db`) and token file are both encrypted on
+this machine and the calendar CLI lives on another box, so the field list in §2 comes from Google's
+documented Events resource plus our own producer's existing use of `.start.dateTime`
+(`~/scripts/granola_sync.py:109-116`) — not from a payload anyone here has read. That is an adapter
+risk, not a solved problem: the parser is tolerant, every shape is behind one tested function, and
+**the first real sync must report which spelling actually arrived** (§3) rather than assuming the
+guess held.
 
-## 1. Why an identifier, and the order of them
+## 1. A declined invitee is not an attendee
 
-Ranked by how much ambiguity each one can produce:
+The shipped rule is that a shared calendar event credits **every** member attendee, and that is
+deliberate: the point of the feature is that a meeting Bob only attended is still a record of Bob's
+work (`test/datamechanics/calendar-meetings.datamechanics.test.ts:67-113`). This slice does not touch
+it.
 
-1. **`iCalUID`** — Google's documented cross-calendar-stable identifier. Two people's copies of one
-   invitation share it by definition.
-2. **Event `id`** — shared across attendees' copies for Google↔Google invitations, and the field
-   Granola already stores on `google_calendar_event`. Not *guaranteed* stable across calendars the
-   way `iCalUID` is, which is why it is rank 2 rather than rank 1 and why both are indexed.
-3. **Conference URL** (`meet.google.com/abc-defg-hij`, a Zoom `/j/<id>`) — both sides have it, and it
-   is exact after normalisation.
-4. ~~Title similarity~~ — **not used.** It is the only one of these that can misassociate two
-   different meetings, and it is the one with no producer change behind it.
+The one case it gets wrong is the person whose own RSVP says they would not be there. Crediting them
+is the MTGATT-1 failure — a real teammate recorded in a meeting they were not in — with better
+paperwork attached, and a decline is that person's own first-person statement about themselves, which
+is the strongest evidence this system ever gets.
 
-Ranks 1–3 are all **exact string equality after normalisation**. There is no threshold to tune and no
-score to defend, which is the property that makes this safe at 50 people.
+**Only `declined`, deliberately.** `needsAction`, `tentative`, an unrecognised value and a missing
+field all count as present. "No RSVP" is the overwhelmingly common shape — Granola's nested event
+carries none, and the gog puller's `{id, display, role}` shape has no RSVP field at all — so
+excluding on "not accepted" would empty the attendee list of nearly every event and be
+indistinguishable from a broken feature. The tolerant direction here keeps a real attendee; the
+strict one silently deletes them.
 
-**Recurring instances keep their suffix.** Google names an instance `<base>_20260811T090000Z`; both
-attendees' copies carry the same suffix, and stripping it would fuse *every* weekly standup into one
-meeting. So normalisation lowercases and trims and does nothing else.
+**The removal is counted** (`BackfillSummary.calendarDeclined`). This is the only place attendance is
+deliberately *taken away*, and a removal nobody can see is indistinguishable from a parser that
+quietly stopped matching.
 
-## 2. A claim, not a merge
+## 2. The producer contract
 
-`mergeIntoMeetingNote` re-ingests a merged body, retires an item and can call an LLM. Running that
-between a calendar event and a transcript is what produced MTGATT-1's deferred hazard: the survivor is
-whichever note existed first, so a transcript arriving after its event folds **into the bodyless
-note** and loses its text.
-
-This slice does not merge notes. It:
-
-- **adds** attendance rows to the survivor (union; nothing is overwritten),
-- **adds** the folded note's submitter to the survivor,
-- sets `merged_into` on the folded note so one meeting shows once.
-
-No body is rewritten, no item is retired, no model is called. A wrong claim is one row to delete.
-
-**The survivor is chosen by content, not by arrival order** — the note whose item has a body wins.
-That single rule removes the data-loss hazard structurally rather than by ordering the pushes:
-
-| both notes | survivor |
-|---|---|
-| one has a body (transcript), one does not (calendar event) | **the one with a body**, whichever arrived first |
-| neither has a body (two people pushed the same event) | the **earliest-created** note — deterministic, and the outcome is identical whatever order they are processed in |
-| both have bodies (two transcripts of one event) | **no link.** Two real bodies is the transcript-overlap merge's job; folding one away here would hide content |
-
-## 3. The design
-
-### 3.1 `lib/meetings/event-identity.ts` — pure
-
-`eventIdentity(frontmatter)` → `{ eventKeys: string[], conferenceKey: string | null }`.
-
-Accepted, because this is a cross-repo boundary and a reasonable producer choice must not silently
-yield an unlinked meeting (the lesson written into `from-calendar.ts`):
+An item may carry any of these; the brain requires none and behaves exactly as today without them.
+Several spellings are accepted because this is a cross-repo boundary and a reasonable producer choice
+must not silently yield an unlinkable meeting — the lesson already written into `from-calendar.ts`:
 
 ```
-calendar_event_id / calendarEventId / event_id / gcal_event_id   → event key
-ical_uid / icalUID / iCalUID                                     → event key
-google_calendar_event: { id, iCalUID, hangoutLink, conferenceData }  ← the nested Granola shape
-conference_url / hangout_link / hangoutLink / meeting_url         → conference key
+calendar_event_id | calendarEventId | event_id | gcal_event_id     → eid: key
+ical_uid | icalUID | iCalUID                                        → uid: key
+conference_url | hangout_link | hangoutLink | meeting_url           → conference key (measured, never joined)
+google_calendar_event: { id, iCalUID, hangoutLink, conferenceData } → the nested shape, same keys
 ```
 
-Normalisation: trim, lowercase, drop a `@google.com` suffix on a UID, and for a URL keep host + path
-only (query strings carry per-person `?authuser=` and passcodes). A value that normalises to fewer
-than 8 characters is discarded — `""`, `"-"` and `"none"` are not identities, and a short shared
-token is exactly how an exact matcher would fuse unrelated meetings.
+**Keys are qualified by kind** (`eid:` / `uid:`). An unqualified normaliser that stripped
+`@google.com` would make the UID `Foo@google.com` and a bare producer key `foo` the same string — a
+second, unproven merge rule smuggled in beside the real one. Google's documented derivation
+(`iCalUID = <eventId>@google.com`) is instead emitted as an **explicit extra `eid:` key**, so the
+equivalence is visible in the key set and measurable rather than baked invisibly into a normaliser.
 
-### 3.2 `lib/meetings/link-by-identity.ts` — the join
+Normalisation is trim + lowercase and nothing else; a URL keeps host + path (query strings carry
+per-person `?authuser=` and passcodes). A value under 8 characters is discarded — `""`, `"-"` and
+`"none"` are not identities. **A recurring instance keeps its suffix** (`<base>_20260811T090000Z`):
+both attendees' copies carry it, and stripping it would fuse a whole series into one meeting.
 
-Runs each tick from `backfillMeetingNotesFromItems`, after note creation and **before** the
-transcript-overlap merge (so a linked calendar note is already folded and cannot be reconsidered).
+**Implemented in this operator's own sync**, which today drops all of it: `~/scripts/granola_sync.py`
+reads the fields off `google_calendar_event`, `~/scripts/granola_to_obsidian.py` persists them in the
+vault note, and `~/scripts/granola_to_aios_brain.py` forwards them into the staged frontmatter that
+`aios push` sends. Documented in `docs/ARCHITECTURE.md` so the other producer can emit the same keys.
 
-1. Select live notes' items that carry an identity key — two bounded windows (`calendar_event_id`
-   not null, `ical_uid` not null, conference key not null), unioned in app code, newest first, capped.
-   Today that selects **zero rows**, so the tick cost is two indexed metadata queries.
-2. Group by each normalised key. A group of one is ignored.
-3. Apply §2's survivor rule; union attendance + submitters; set `merged_into`.
-4. Return counts (`groups`, `linked`, `skippedBothBodies`) so an inert leg is visibly inert rather
-   than indistinguishable from a broken one.
+**Known limit, not papered over:** `cmd_save` skips a meeting it has already saved
+(`granola_to_obsidian.py:195-209`), so the identity fields appear on **newly synced meetings only**.
+Backfilling the existing vault notes is a separate pass, not done here.
 
-**Never** consults titles, dates or scores. A group is formed only by an exact shared key.
+## 3. The instrument
 
-### 3.3 Provenance: `source` + `asserted_by`
+`scripts/meeting-pairing-report.ts` — read-only, run by hand, importing the *same* normaliser as the
+product code rather than a mirrored copy.
 
-`meeting_note_attendees` gains, by migration (additive, mirrored into `schema.sql`):
+It reports, per team: how many notes of **each source** carry an event key, a conference key and a
+full timestamp; how many **pairs** share an event key, split into **CROSS (calendar ↔ transcript)**
+and same-source; for each pair, whether a naive same-date rule would have found it and how far apart
+the two timestamps are.
 
-- `source text not null default 'unknown'` — `calendar` | `participants` | `llm` | `unknown`
-- `asserted_by uuid null references members(id) on delete set null` — the member whose push carried
-  the assertion (the calendar owner). Null when nobody asserted it (a model's guess).
+The CROSS number is the only one MTGATT-3 can be fitted to — "12 notes share a key" is an adjacent
+number if all twelve are transcripts sharing keys with each other. Zero is always printed **next to
+its denominators**, so "no pairs yet" cannot be mistaken for "the parser matched nothing", which is a
+failure this workstream has already shipped once.
 
-Existing 81 rows become `unknown`, which is true: they predate the column and their real provenance
-is a mix. Backdating them to `calendar` would be an invented fact.
+## 4. The product question this slice deliberately does not answer
 
-**A stronger claim upgrades a weaker one; a weaker one never downgrades.** Rank
-`calendar > participants > llm > unknown`. Without this, the calendar claim for a member the model had
-already guessed would be dropped by `on conflict do nothing`, and the row would keep saying `llm` for
-a fact we now know exactly — the diagnostic would lie in the one case it exists for.
+**Should being on an invite count as attending?**
 
-### 3.4 RSVP — a declined invitee is not an attendee
+The first review's blocker was that a twelve-person invite writes twelve attendance rows, including
+people who never joined. That is true, and it is also the shipped feature working as designed. The
+two readings are:
 
-Today every invitee on an event counts as present. `calendarAttendees` starts carrying
-`responseStatus` (tolerant of `responseStatus` / `response_status` / `rsvp` / `status`), and only an
-explicit, normalised `declined` excludes.
+- **as built** — an invite is the best structured evidence available, and under-crediting real
+  attendance is the worse error (this is why the feature exists);
+- **the alternative** — only self-assertions count: a person's own calendar push credits them, and
+  everyone else needs their own push or a transcript that names them. It can never invent an
+  attendee, and it scales by addition; it also under-credits every meeting where only one person
+  pushes, and it would delete the tested behaviour above.
 
-Only `declined`, deliberately: `needsAction` and a missing field are the overwhelmingly common shapes
-(Granola's nested event carries no RSVP at all), so excluding on "not accepted" would empty the
-attendee list of nearly every event and look exactly like a broken join.
+Deciding this is the operator's call, and reversing a shipped contract inside a slice about RSVPs
+would be exactly the silent scope drift this process exists to stop. **Recorded here, raised in the
+PR, not decided.**
 
-### 3.5 The producer contract
+## 5. Acceptance
 
-Documented in `docs/ARCHITECTURE.md` so the other producer can emit it, and implemented in this
-operator's own sync (`~/scripts/granola_sync.py` → vault frontmatter, `granola_to_aios_brain.py` →
-staged frontmatter), which today drops all of it:
+- **AC1 — unit, `test/meetings-calendar-rsvp.test.ts`:** an invitee whose RSVP is `declined` is
+  dropped, and `accepted`, `tentative`, `needsAction`, a missing RSVP and an *unrecognised* value are
+  all kept — the inverse half, which is what catches a filter that widens past `declined`.
+- **AC2 — unit, `test/meetings-calendar-rsvp.test.ts`:** the RSVP is read from `responseStatus`,
+  `response_status`, `rsvp` and `status`, case-insensitively, and an attendee shape carrying none
+  (the gog puller's) parses to `rsvp: null` rather than failing.
+- **AC3 — data-mechanics, `test/datamechanics/meeting-calendar-rsvp.datamechanics.test.ts`:** the
+  declined member has **no row** in `meeting_note_attendees` and **no meeting** on their timeline
+  card, while a non-declined invitee has both — asserted against the DB, because the failure is a
+  wrong row, not a wrong return value.
+- **AC4 — data-mechanics, same file:** every non-declined invitee is still recorded — the shipped
+  "credit every attendee" contract, re-asserted against this change so a widening reddens here.
+- **AC5 — data-mechanics, same file:** the count of removed invitees is exact, including a
+  **non-member** decline — the metric is "invitees the rule removed", not "members it removed".
+- **AC6 — data-mechanics, same file:** an event where everyone declined produces a note with zero
+  attendees and does **not** fall through to the model — MTGATT-1's no-fallthrough rule still holds.
+- **AC7 — unit, `test/meetings-event-identity.test.ts`:** every accepted spelling in §2 (flat,
+  camelCase, nested) yields the same normalised key; a UID also yields its bare `eid:`; an `eid:` can
+  never equal a `uid:`; a recurring instance suffix is kept; short junk yields no key.
+- **AC8 — unit, `test/meetings-event-identity.test.ts`:** a conference link normalises past its query
+  string and case, two different rooms stay different, and a conference link never becomes an event
+  key.
+- **AC9 — unit, `test/guards/meeting-identity-not-a-join-key.test.ts`:** no module outside the parser
+  and the report references `conferenceKey`; the parser touches no DB and no matching helper; the
+  report calls no write method. Mutation-verified by adding each forbidden reference.
+- **AC10 — producer, `~/scripts/test_calendar_identity.py`:** extraction from a synthetic
+  `google_calendar_event` yields the three keys, and a document without one changes the emitted
+  frontmatter not at all.
 
-```yaml
-calendar_event_id: 6f3k9q2n1m8h5s7d0a4v2b1c3e   # google_calendar_event.id
-ical_uid: 6f3k9q2n1m8h5s7d0a4v2b1c3e@google.com
-conference_url: https://meet.google.com/abc-defg-hij
-```
+**Falsifier for the slice:** if a meeting a person declined shows up as their work, the rule is not
+implemented, whatever the unit tests say — which is why AC3 asserts the timeline card and not just
+the parser. And if AC4 is deleted, nothing else notices that the filter has swallowed `needsAction`.
 
-The brain never *requires* these. An item without them behaves exactly as it does today.
+## 6. What the two reviews killed
 
-## 4. Acceptance
+**Round 1 — DECLINE.** Two blockers, both re-derived against the code before being accepted.
 
-- **AC1 — unit, `test/meetings-event-identity.test.ts`:** every accepted producer shape in §3.1 —
-  flat keys, camelCase, and the nested `google_calendar_event` object — yields the same normalised
-  key, and an item with none of them yields no keys.
-- **AC2 — unit, `test/meetings-event-identity.test.ts`:** a recurring instance suffix is **kept**
-  (`base_20260811T090000Z` ≠ `base_20260818T090000Z`), and values shorter than the floor
-  (`""`, `"-"`, `"none"`) yield no key.
-- **AC3 — unit, `test/meetings-event-identity.test.ts`:** conference URLs differing only by query
-  string or case normalise equal, and two different Meet rooms do not.
-- **AC4 — unit, `test/meetings-attendance-provenance.test.ts`:** the source rank upgrades
-  `llm` → `calendar` and refuses the reverse, for every ordered pair.
-- **AC5 — data-mechanics, `test/datamechanics/meeting-identity-link.datamechanics.test.ts`:** a
-  bodyless calendar event and a transcript sharing an event id produce **one** live note — the one
-  with the body — carrying the union of both attendee sets, with the calendar-derived rows recording
-  `source='calendar'` and the asserting member.
-- **AC6 — data-mechanics, same file:** the same pair linked in the **reverse arrival order** yields
-  the identical surviving note and the identical body — the order-independence §2 claims.
-- **AC7 — data-mechanics, same file:** two notes with **identical titles on the same date** and no
-  shared identifier are **not** linked, and both stay live. This is the misassociation the operator
-  asked about, asserted as an absence.
-- **AC8 — data-mechanics, same file:** two notes that both have bodies and share an identifier are
-  **not** linked here, and neither is hidden — content is never folded away by this path.
-- **AC9 — data-mechanics, same file:** an attendee whose RSVP is `declined` is absent from the
-  resulting attendance, while `accepted`, `tentative`, `needsAction` and a missing RSVP are all
-  present.
-- **AC10 — unit, `test/guards/meeting-identity-no-similarity.test.ts`:** the linking module does not
-  reference `titleSimilarity` or any threshold constant — the guard that keeps the dormant comparator
-  dormant, mutation-verified by re-adding the reference.
-- **AC11 — data-mechanics, same file:** a `unknown`-source row already present for a member is
-  upgraded to `calendar` when the calendar claim arrives, and a later `llm` pass does **not**
-  downgrade it.
+- *The safety premise was a claim about a model I had not built.* The spec asserted "each person only
+  asserts about themselves" while the code recorded every invitee (`from-items.ts:238-242`).
+- *Conference URL cannot be an identity.* A Zoom Personal Meeting ID is reused for every meeting that
+  person hosts and one Meet room serves a whole recurring series, so exact-matching on it fuses
+  unrelated meetings. Now measured, never matched on, and pinned by AC9.
+- *Resequence: the linker was inert.* Accepted; it is MTGATT-3.
 
-**Falsifier for the slice:** if any two notes are linked without sharing a normalised identifier, the
-design has failed, whatever the outcome looks like. And if AC7 is deleted, nothing else in the suite
-notices — which is why it asserts an absence and is mutation-verified against its own gate.
+**Round 2 — DECLINE, on the fix for round 1.** The rewrite made the pusher the only attendee. That
+was an over-correction, and the review caught it with the evidence:
 
-## 5. Deliberately not in this slice
+- *It reverses a shipped, tested product contract.* `calendar-meetings.datamechanics.test.ts:67-113`
+  asserts that a non-pushing attendee is credited, with the reason written in the test — "Bob pushed
+  nothing and wrote nothing that day… the meeting is still a record of work he did". Verified before
+  folding.
+- *"The pusher" is not even a stable handle.* `items.member_id` is the resolved AUTHOR, not the
+  pushing account (`lib/ingest/index.ts:422` + the route's frontmatter-derived `authorMemberId`), and
+  it is null for connector pushes — so "record the pusher" would sometimes record nobody and
+  sometimes record the wrong person.
+- *It would have deleted a live provenance signal.* The timeline distinguishes attendance from a
+  `via: "submitter"` fallback (`lib/dashboard/work-timeline.ts:721`); making the pusher an attendee
+  erases that distinction.
 
-- **Time-window + shared-participant matching (MTGATT-3).** 42 items carry a real timestamp, so it is
-  feasible — but the window and the tie-breaks should be sized from paired data that does not exist
-  yet. Guessing a window now is the "unmeasured constant" failure this workstream has retired twice.
-- **Non-member attendees (MTGATT-4).** `member_id` is a NOT NULL FK, so Pete, Anusheel and Rob still
-  cannot be recorded, whatever the calendar says. Provenance (§3.3) is the natural place to hang them
-  later; it is not done here.
-- **Correcting a survivor's `occurred_at` from the calendar's exact start.** The calendar knows the
-  true local date and the transcript's UTC-derived one can be a day off (§0). That is a *mutation* of
-  an existing note's field, with its own rules, and it is not folded into a slice about attendance.
-- **Any UI change.** The provenance columns are written and readable; nothing renders them yet, and
-  this spec claims nothing about the Meetings page.
+The rule was withdrawn to §4 as a product question. What survived is the part neither review
+disputed: a decline is not attendance.
+
+**Findings recorded rather than fixed here**, because the code they attack is no longer in this slice:
+the transcript merge propagates only two submitter ids (`merge.ts:278-279`) and can strand an
+accumulated submitter set; the pg adapter's `upsert` updates every non-conflict column
+(`query-builder.ts:392`), so MTGATT-4's provenance column needs conditional-rank SQL rather than a
+naive upsert.
+
+## 7. Deliberately not in this slice
+
+- **The linker (MTGATT-3).** Until it lands, a pushed calendar event still creates its **own** note
+  beside the transcript's, and the operator's original ask — being credited on John's meeting — is
+  **not delivered by this slice**. This spec claims nothing else.
+- **Per-attendee provenance (MTGATT-4).** **Non-member attendees (MTGATT-5).**
+- **Correcting a note's `occurred_at` from the calendar's exact start**, and any UI change.
