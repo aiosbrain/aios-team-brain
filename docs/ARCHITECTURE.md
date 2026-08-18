@@ -849,7 +849,10 @@ guard enforces it, it's named.
   cache-purge key did not, and do now. `visibleGroupIds` is **deleted**, so tsc — not a convention —
   refuses the next slug-deriving reader. Tier-safety note: the fence moves from a string suffix to
   **project identity** (the read is scoped `team_id` + selects the built-in by slug), which a
-  renamed slug cannot spell wrong; `project-pointer.ts`'s foreign-history refusal is unchanged.
+  renamed slug cannot spell wrong; `project-pointer.ts`'s foreign-history refusal is unchanged. The
+  slug-derived **fallback** (an unbootstrapped team) mirrors that refusal on the read side — a team
+  created on a slug freed by a rename would otherwise inherit the previous occupant's graph, because
+  the write-side refusal leaves its pointers permanently null.
   _Guard:_ `test/guards/graph-group-slug-derivation.test.ts` (allowlists every `episodeGroupId`
   caller). _Verified:_ `test/datamechanics/graph-rename-read-pointer.datamechanics.test.ts` (real
   PG — renames a projected team and asserts the read set still addresses its episodes; red against

@@ -1479,7 +1479,9 @@ export async function recomputeArcs(
     ? groups.length === 1 && !isExternalGroupId(groups[0])
       ? groups[0]
       : null
-    : await builtinTierGroupId(db, { teamId, teamSlug, access: "team" });
+    : // Best-effort by this block's own doc, and it runs AFTER the correction is persisted — so a
+      // transient pointer-read failure must not 500 a recompute whose edit already landed.
+      await builtinTierGroupId(db, { teamId, teamSlug, access: "team" }).catch(() => null);
   const client = new GraphitiClient();
   if (client.configured && corrections.length && writebackTarget) {
     const now = new Date().toISOString();

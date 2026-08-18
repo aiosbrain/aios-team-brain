@@ -34,7 +34,16 @@ HELPER = '''
 def _harden_schema_for_strict_providers(node):
     """Recursively set additionalProperties=False on every object node. See patch-strict-schema.py."""
     if isinstance(node, dict):
-        if node.get('type') == 'object' or 'properties' in node:
+        # A DICT-valued additionalProperties is a real sub-schema (pydantic's Dict[str, X] emits
+        # {'type': 'object', 'additionalProperties': {<X>}} with no 'properties'). Overwriting it
+        # with False would change validation semantics for LENIENT providers too — breaking the
+        # "cannot regress the working path" property this patch rests on — and would discard the
+        # value schema before the recursion below ever visits it. Harden only where the slot is
+        # free. No current graphiti prompt model uses such a field; this keeps a library bump from
+        # shipping the regression silently, which the build asserts (one schema) would not catch.
+        if (node.get('type') == 'object' or 'properties' in node) and not isinstance(
+            node.get('additionalProperties'), dict
+        ):
             node['additionalProperties'] = False
         for _v in node.values():
             _harden_schema_for_strict_providers(_v)

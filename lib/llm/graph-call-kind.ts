@@ -153,8 +153,17 @@ export function classifyGraphCall(body: unknown): string {
  * otherwise; the deployed service configures neither, so `gpt-4.1-nano` vs `gpt-4.1-mini` is how the
  * request tells us which it is. Verified against
  * zepai/graphiti@sha256:76d14f30afc65d2f914637d67d0c0631a7e779e2740be1ae99b9dc0c5876d2da.
+ *
+ * READS THE SAME ENV THE IMAGE DOES. The graphiti image's small model used to be welded in as
+ * `gpt-4.1-nano`, so a literal here could not drift from it. It is now `GRAPHITI_SMALL_MODEL`
+ * (graphiti/Dockerfile PATCH 1), and the two MUST agree or the proxy stops recognising a small
+ * call — which fails SILENTLY: routing is unaffected, the cost ledger just books every small call
+ * as a strong one. Resolving from the same variable removes the coupling instead of documenting
+ * it, and the default keeps a deployment that sets nothing byte-identical to before. The brain and
+ * the graphiti container share an env in the deployments where this matters; where they do not,
+ * the value is still the image's own default.
  */
-export const GRAPHITI_SMALL_MODEL_MARKER = "gpt-4.1-nano";
+export const GRAPHITI_SMALL_MODEL_MARKER = process.env.GRAPHITI_SMALL_MODEL || "gpt-4.1-nano";
 
 /**
  * The only call kinds we will ever downgrade — the ones Graphiti itself marks `ModelSize.small`.

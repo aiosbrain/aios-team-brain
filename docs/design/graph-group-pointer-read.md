@@ -87,6 +87,24 @@ no team can resolve another team's pointer regardless of what any slug says. The
 merely what the mint happens to produce, never what is trusted.
 `project-pointer.ts`'s foreign-history refusal is the matching write-side guard and is **unchanged**.
 
+**The fallback is the exception, and it is fenced.** A team with no pointer is still on a
+slug-derived id, and one real state reaches it: team A renames off `acme`, team B is **created on**
+`acme`, and B's bootstrap hits the write-side foreign-history refusal — which returns *before*
+filling, so B's built-ins keep `graph_group_id = NULL` permanently (`lib/admin/teams.ts` swallows
+the bootstrap result, and every scheduler tick re-refuses). Unfenced, B's readers resolve
+`acme_team` — team A's live partition — and are served it with no error anywhere. That predates
+this change (the deleted `visibleGroupIds` resolved the same group), but this module is now the read
+authority and its guarantee has to be true, so it **mirrors the writer's refusal**: a fallback id
+whose `graph_episodes` history belongs to another team throws. Found in review; the case is pinned
+in the data-mechanics tier with the exact ordering that produces it.
+
+**Direction check.** `project-pointer.ts` verifies a set built-in pointer's *shape* only
+(`LEGACY_SHAPE`), so an external-shared pointer holding a `_team`-suffixed id passes verification.
+Before this change that corruption was inert on reads; now it would not be, so the external
+resolution refuses an unmistakably team-suffixed id. Deliberately narrow — it does **not** demand an
+`_external` suffix, because a built-in transiently holding its `g_…_p_…` mint is legitimate and must
+not throw.
+
 ## The unbootstrapped fallback
 
 A team with no pointer rows falls back to `episodeGroupId(teamSlug, …)` — deliberately the **same**
@@ -101,6 +119,9 @@ Callers that can degrade catch and say so honestly (`degraded: true`, a logged e
 
 ## What would falsify this
 
+- A team created on a freed slug reading the previous occupant's graph. _Verified:_ the
+  created-on-freed-slug case in the data-mechanics file asserts the write side refuses to mint AND
+  the read side refuses to fall back.
 - A graph read leg that resolves a group id without a pointer read. _Guarded:_
   `test/guards/graph-group-slug-derivation.test.ts` allowlists every `episodeGroupId` caller and
   names why each is not a read leg.

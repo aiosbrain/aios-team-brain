@@ -13,8 +13,15 @@ import { visibleTierGroupIds, builtinTierGroupId } from "@/lib/graph/tier-groups
 
 type Row = { slug: string; graph_group_id: string };
 
-/** Minimal `projects` double: records the filters applied, then serves `rows`. */
-function fakeDb(rows: Row[], opts: { error?: string; seen?: Record<string, string> } = {}): DbClient {
+/**
+ * Table-aware double: `projects` serves the built-in pointers, `graph_episodes` serves the
+ * foreign-history ledger the fallback path consults. Filters are recorded so the call contract
+ * (team scope, kind scope) can be pinned.
+ */
+function fakeDb(
+  rows: Row[],
+  opts: { error?: string; seen?: Record<string, string>; foreign?: string[] } = {}
+): DbClient {
   return {
     from: (table: string) => {
       const chain: Record<string, unknown> = {};
@@ -24,9 +31,17 @@ function fakeDb(rows: Row[], opts: { error?: string; seen?: Record<string, strin
       };
       chain.select = () => chain;
       chain.eq = (col: string, val: unknown) => record(`${table}.${col}`, val);
+      chain.neq = (col: string, val: unknown) => record(`${table}.neq.${col}`, val);
+      chain.in = (col: string, val: unknown) => record(`${table}.in.${col}`, JSON.stringify(val));
       chain.not = () => chain;
-      chain.then = (resolve: (r: unknown) => unknown) =>
-        resolve(opts.error ? { data: null, error: { message: opts.error } } : { data: rows, error: null });
+      chain.limit = () => chain;
+      chain.then = (resolve: (r: unknown) => unknown) => {
+        if (opts.error) return resolve({ data: null, error: { message: opts.error } });
+        if (table === "graph_episodes") {
+          return resolve({ data: (opts.foreign ?? []).map((g) => ({ group_id: g })), error: null });
+        }
+        return resolve({ data: rows, error: null });
+      };
       return chain;
     },
   } as unknown as DbClient;
@@ -94,11 +109,12 @@ describe("visibleTierGroupIds — the pointer-resolved tier read set", () => {
   });
 
   it("dedupes — a duplicated group id in a /search call is pure waste", async () => {
+    // A non-`_team`-suffixed value, so this pins DEDUPE and not the direction check below.
     const shared = [
-      { slug: "general", graph_group_id: "same_team" },
-      { slug: "external-shared", graph_group_id: "same_team" },
+      { slug: "general", graph_group_id: "shared_partition" },
+      { slug: "external-shared", graph_group_id: "shared_partition" },
     ];
-    expect(await visibleTierGroupIds(fakeDb(shared), { ...ARGS, tier: "team" })).toEqual(["same_team"]);
+    expect(await visibleTierGroupIds(fakeDb(shared), { ...ARGS, tier: "team" })).toEqual(["shared_partition"]);
   });
 });
 
@@ -111,5 +127,63 @@ describe("builtinTierGroupId — the single access-tier → partition mapping", 
 
   it("falls back to the mint when the built-in has no pointer", async () => {
     expect(await builtinTierGroupId(fakeDb([]), { ...ARGS, access: "team" })).toBe("newslug_team");
+  });
+});
+
+describe("the fallback is FENCED — it is the one path still keyed on a slug", () => {
+  // Review High 1, and the state that actually reaches it: team A renames off `newslug`, team B is
+  // CREATED on it, and B's bootstrap hits project-pointer.ts's foreign-history refusal — which
+  // returns BEFORE filling, so B's built-ins keep graph_group_id = NULL forever (lib/admin/teams.ts
+  // swallows the bootstrap result; every scheduler tick re-refuses). Unfenced, B's readers resolve
+  // `newslug_team` — team A's live partition — and are served it with no error anywhere.
+  it("REFUSES a slug-derived group whose episode history belongs to another team", async () => {
+    await expect(
+      visibleTierGroupIds(fakeDb([], { foreign: ["newslug_team"] }), { ...ARGS, tier: "team" })
+    ).rejects.toThrow(/holds ANOTHER team's episode history/);
+  });
+
+  it("refuses on the single-group write path too", async () => {
+    await expect(
+      builtinTierGroupId(fakeDb([], { foreign: ["newslug_team"] }), { ...ARGS, access: "team" })
+    ).rejects.toThrow(/holds ANOTHER team's episode history/);
+  });
+
+  it("checks the ledger scoped to the fallback ids and EXCLUDING this team", async () => {
+    const seen: Record<string, string> = {};
+    await visibleTierGroupIds(fakeDb([], { seen }), { ...ARGS, tier: "team" });
+    expect(seen["graph_episodes.in.group_id"]).toBe(JSON.stringify(["newslug_team", "newslug_external"]));
+    expect(seen["graph_episodes.neq.team_id"]).toBe(ARGS.teamId);
+  });
+
+  it("does NOT consult the ledger when every built-in is pointed — a pointed team pays nothing", async () => {
+    const seen: Record<string, string> = {};
+    await visibleTierGroupIds(fakeDb([GENERAL, EXTERNAL], { seen }), { ...ARGS, tier: "team" });
+    expect(Object.keys(seen).some((k) => k.startsWith("graph_episodes."))).toBe(false);
+  });
+
+  it("a foreign-history READ failure throws — it must not degrade into reading the group anyway", async () => {
+    await expect(
+      visibleTierGroupIds(fakeDb([], { error: "boom" }), { ...ARGS, tier: "team" })
+    ).rejects.toThrow(/pointer read failed|foreign-history check failed/);
+  });
+});
+
+describe("the direction check — an external read never yields a team group", () => {
+  // Review Medium 1: project-pointer.ts verifies a set built-in pointer's SHAPE only, so an
+  // external-shared pointer holding a `_team` id passes verification. Before this module that
+  // corruption was inert on reads; now it would not be. group_id is the sole tier fence (§5).
+  it("refuses a `_team`-suffixed id resolved for the external tier", async () => {
+    const corrupt = [{ slug: "external-shared", graph_group_id: "oldslug_team" }];
+    await expect(visibleTierGroupIds(fakeDb(corrupt), { ...ARGS, tier: "external" })).rejects.toThrow(
+      /resolved to "oldslug_team", a TEAM group/
+    );
+  });
+
+  it("does NOT refuse a per-project mint — a built-in may legitimately hold one", async () => {
+    // Deliberately narrow: demanding an `_external` suffix would throw on this legitimate value.
+    const minted = [{ slug: "external-shared", graph_group_id: "g_deadbeef_p_cafebabe" }];
+    expect(await visibleTierGroupIds(fakeDb(minted), { ...ARGS, tier: "external" })).toEqual([
+      "g_deadbeef_p_cafebabe",
+    ]);
   });
 });

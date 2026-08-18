@@ -80,7 +80,9 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
       "app/api/v1/graph-query/route.ts",
     ];
     for (const f of legs) {
-      expect(readFileSync(join(ROOT, f), "utf8"), `${f} must resolve its groups from the pointers`).toContain(
+      // `code()`, not raw text — this suite strips comments precisely so a guard cannot be
+      // satisfied by a comment that merely NAMES the thing it is checking for.
+      expect(code(join(ROOT, f)), `${f} must resolve its groups from the pointers`).toContain(
         "visibleTierGroupIds("
       );
     }

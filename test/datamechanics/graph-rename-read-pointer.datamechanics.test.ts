@@ -116,6 +116,40 @@ describe("a team slug rename does not orphan the graph (VIB-341)", () => {
     for (const g of aGroups) expect(bGroups).not.toContain(g);
   });
 
+  it("a team CREATED on a freed slug is refused, not silently handed the old team's graph", async () => {
+    // Review High 1 — the ordering the test above does NOT cover, and the only one that actually
+    // reaches the slug fallback. B is created ON A's freed slug BEFORE bootstrapping, so B's
+    // `ensureProjectGraphPointer` hits project-pointer.ts's FOREIGN-HISTORY REFUSAL, which returns
+    // before filling. B's built-ins keep `graph_group_id = NULL` permanently (lib/admin/teams.ts
+    // swallows the bootstrap result and every scheduler tick re-refuses), so B's readers fall back
+    // to the slug — which is A's live partition. The read authority must refuse it.
+    const a = await seedTeam();
+    await bootstrapAndProject(a, new FakeGraphiti());
+    const freed = a.teamSlug;
+    await renameTeam(a, RENAMED);
+
+    const b = await seedTeam();
+    await renameTeam(b, freed); // B now occupies A's old slug, and has NO pointers yet
+
+    // The write side refuses to mint (this is what leaves the pointers null) …
+    expect((await ensureAccessBootstrap(db(), b.teamId)).ok).toBe(false);
+    const { data: ptrs } = await db()
+      .from("projects")
+      .select("graph_group_id")
+      .eq("team_id", b.teamId)
+      .eq("kind", "system");
+    expect(((ptrs ?? []) as { graph_group_id: string | null }[]).every((p) => p.graph_group_id == null)).toBe(true);
+
+    // … and the read side must refuse too, rather than resolving A's group and serving A's facts
+    // to B's members with no error anywhere.
+    await expect(
+      visibleTierGroupIds(db(), { teamId: b.teamId, teamSlug: freed, tier: "team" })
+    ).rejects.toThrow(/holds ANOTHER team's episode history/);
+    await expect(
+      builtinTierGroupId(db(), { teamId: b.teamId, teamSlug: freed, access: "team" })
+    ).rejects.toThrow(/holds ANOTHER team's episode history/);
+  });
+
   it("a correction written AFTER a rename targets the group the reader reads", async () => {
     // The spec's second automated AC. `recomputeArcs`' tier write-back used to spell
     // `episodeGroupId(<live-slug>, "team")`, so a correction written post-rename landed in a group

@@ -50,7 +50,7 @@ export async function GET(req: NextRequest) {
     groups = await visibleTierGroupIds(admin, { teamId: team.id, teamSlug, tier });
   } catch (e) {
     console.error(`[events] tier group resolution failed for team ${teamSlug}:`, e);
-    return Response.json({ events: [], as_of: new Date().toISOString() });
+    return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
   }
   const events = await recentEvents(groups, since, LIMIT);
 
@@ -61,5 +61,8 @@ export async function GET(req: NextRequest) {
   const humanByItem = await resolveHumanActorsByItem(admin, team.id, itemIds);
   const attributed = attributeEventParticipants(events, humanByItem);
 
-  return Response.json({ events: attributed, as_of: new Date().toISOString() });
+  // `degraded` on EVERY branch (additive): a field that appears only on the failure path is a
+  // branch-dependent wire shape, and it leaves a genuinely quiet week indistinguishable from a
+  // resolution failure — the ambiguity this whole change exists to remove.
+  return Response.json({ events: attributed, as_of: new Date().toISOString(), degraded: false });
 }
