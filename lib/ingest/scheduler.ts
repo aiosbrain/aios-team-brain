@@ -52,6 +52,14 @@ export function startIngestScheduler(): void {
       if (s.error) {
         console.error("[ingest] pret3 post-activation sweep FAILED:", s.error);
         await recordIngestRun(db, { teamId: null, source: "pret3_sweep", trigger: "scheduler", ok: false, errors: [s.error], startedAt: Date.now() }).catch(() => {});
+      } else if (s.ran) {
+        // Exactly one success row, ever — and it is what lets a CONFIRMED failure streak clear.
+        // Without it: two failed marker-insert ticks reach `confirmed` and go loud, a later success
+        // writes nothing, and the consumed marker forecloses every future row — so the loud banner
+        // latches red permanently on every team, which no staleness threshold can undo (`failing`
+        // includes `confirmed` regardless of age). `else if` because a post-marker failure sets BOTH
+        // `ran` and `error`, and that tick must record the failure, not a success.
+        await recordIngestRun(db, { teamId: null, source: "pret3_sweep", trigger: "scheduler", ok: true, startedAt: Date.now() }).catch(() => {});
       }
     }
     // PRET-2 auto-flip: move warning-free, un-held, ready permissive teams to enforcing —

@@ -92,6 +92,18 @@ describe("staleThresholdMs — per-source staleness cadence", () => {
     expect(staleThresholdMs("auto_flip")).toBeNull();
   });
 
+  it("pret3_sweep is never age-stale — it records ONLY on failure, so a row can never be superseded", () => {
+    // The first leg added AFTER the BANNERFLAP-2 ledger guard shipped, and it arrived red: PR #584
+    // merged 19 seconds before #585, so neither PR's CI saw the other and `main` went red on the
+    // combination. The guard is what caught it.
+    //
+    // Not bookkeeping — a real latent bug. `runPret3BootSweep`'s caller records inside `if (s.error)`
+    // and writes NOTHING on success, and the sweep is marker-guarded so it no-ops forever once it has
+    // succeeded. On the 3h default its first error row would age past the bar and pin the banner red
+    // permanently, because no success path exists that could write a newer row to clear it.
+    expect(staleThresholdMs("pret3_sweep")).toBeNull();
+  });
+
   it("doc_task_infer is never age-stale — five of its outcomes write no row at all", () => {
     // Observed in prod: the banner said "1 ingestion leg is broken — the brain isn't getting fresh
     // data · doc_task_infer, last successful run 10h ago". The leg had never failed. Its four runs sat
