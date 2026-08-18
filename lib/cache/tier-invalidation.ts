@@ -1,7 +1,8 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleGroupIds } from "@/lib/graph/group";
-import { purgeArcCacheKey, staleArcCache } from "@/lib/graph/arc-cache";
+import { visibleGroupIds, episodeGroupId } from "@/lib/graph/group";
+import { EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
+import { purgeArcCacheKey, purgePartitionArcCache, purgeExternalShapedPartitionRows, staleArcCache } from "@/lib/graph/arc-cache";
 import { bustTeamTimeline, purgeTimelineCacheTier } from "@/lib/dashboard/timeline-cache";
 import { evictArcMemoryCache, evictTeamPartitionArcMemory } from "@/lib/graph/arcs";
 
@@ -46,6 +47,34 @@ export async function purgeExternalTierCaches(
   await evictTeamPartitionArcMemory(db, teamId); // PPARC-2: g: keys carry only the group id
   const externalArcKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
   await purgeArcCacheKey(db, teamId, externalArcKey);
+  // PRET-3 H3: the external PARTITION row too — external members are served from `g:<ext>` after
+  // the arcs unification, and a stale-mark is not enough there (SWR hands the stale row to the
+  // next reader; `purgeArcCacheKey`'s own doc). While only team-tier members read g: rows this
+  // was harmless; the moment externals do, skipping it reopens the exact leak the hard-delete
+  // exists to close. POINTER-resolved (diff review H4): a renamed team's external-shared
+  // built-in keeps its pointer FROZEN under the old slug (the rename doctrine) — a slug-derived
+  // key would delete a row that doesn't exist and leave the row externals actually read alive.
+  // The slug-derived id is only the fallback for an unbootstrapped team (no pointer row yet —
+  // then no g: row exists either, so the fallback is belt-and-braces, not correctness).
+  const { data: extProj, error: extErr } = await db
+    .from("projects")
+    .select("graph_group_id")
+    .eq("team_id", teamId)
+    .eq("kind", "system")
+    .eq("slug", EXTERNAL_SHARED_SLUG)
+    .not("graph_group_id", "is", null)
+    .maybeSingle();
+  if (extErr) {
+    // Codex diff-review H3: a swallowed read error fell back to the SLUG-derived key, which on
+    // a renamed team deletes nothing and leaves the served row alive. A purge door's safe
+    // direction is deleting MORE regenerable cache, never less: on error, sweep every
+    // external-shaped partition row for the team — that cannot miss the served one.
+    console.error(`[tier-invalidation] external pointer read failed for team ${teamId} — sweeping all external-shaped rows:`, extErr.message);
+    await purgeExternalShapedPartitionRows(db, teamId);
+  } else {
+    const extGroup = (extProj as { graph_group_id: string } | null)?.graph_group_id ?? episodeGroupId(teamSlug, "external");
+    await purgePartitionArcCache(db, teamId, extGroup);
+  }
   await purgeTimelineCacheTier(db, teamId, "external");
   // Backstop under both purges (they swallow their own errors) and cover the team rows: a stale mark
   // bounds anything that survived to a single TTL rather than a full window of serving it.

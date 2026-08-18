@@ -73,7 +73,7 @@ describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criter
     const { getArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const group = projGroup();
-    await getArcs(fakeDb(), "team-1", t, "team", [group], KEYS, { scopeKey: `g:${group}` });
+    await getArcs(fakeDb(), "team-1", t, [group], KEYS, { scopeKey: `g:${group}` });
     expect(factsMock.recentFacts).toHaveBeenCalledTimes(1);
     expect(factsMock.recentFacts.mock.calls[0][0]).toEqual([group]);
   });
@@ -82,7 +82,7 @@ describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criter
     const { getArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const group = projGroup();
-    await getArcs(fakeDb(), "team-1", t, "team", [group], KEYS, { scopeKey: `g:${group}` });
+    await getArcs(fakeDb(), "team-1", t, [group], KEYS, { scopeKey: `g:${group}` });
     expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
     expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
       groupKey: `g:${group}`,
@@ -90,15 +90,14 @@ describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criter
     });
   });
 
-  it("an EXTERNAL-SHAPED partition's g: synthesis still loads its own corrections (stored + prompt-fed; the graph write-back refusal is separate)", async () => {
+  it("an EXTERNAL-SHAPED partition's g: synthesis loads NO corrections (PRET-3 H1 — inverted from the 6b-M4 allowance)", async () => {
+    // The old allowance rested on "no external-principal path to the g: row"; the arcs
+    // unification routes external members onto exactly this row, so its synthesis is
+    // corrections-free — the write side refuses the matching sourceGroup with a 422.
     const { getArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const group = `${t}_external`;
-    await getArcs(fakeDb(), "team-1", t, "team", [group], KEYS, { scopeKey: `g:${group}` });
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
-    expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
-      groupKey: `g:${group}`,
-      includeLegacy: false,
-    });
+    await getArcs(fakeDb(), "team-1", t, [group], KEYS, { scopeKey: `g:${group}` });
+    expect(correctionsMock.listArcCorrections).not.toHaveBeenCalled();
   });
 });

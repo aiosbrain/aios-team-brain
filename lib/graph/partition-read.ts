@@ -128,3 +128,76 @@ export async function selectEnforcedGraphPartitions(
 
   return { groups: picked.map((p) => p.graph_group_id), covered: picked.length, total };
 }
+
+/**
+ * PRET-3 (spec docs/design/pret3-arcs-unification.md §3) — THE one arcs-scope resolution, for
+ * every reader class. MODE-keyed, not tier-keyed:
+ *
+ *   ENFORCING team  → the member's oracle scope via `selectEnforcedGraphPartitions`, arm: true,
+ *                     for EVERY tier — an external member's oracle today resolves the
+ *                     external-shared built-in; with granted memberships, more (ruling 2: an
+ *                     external collaborator is a member like any other, no special branch).
+ *   PERMISSIVE team → the tier's BUILT-IN pointer partitions, arm: false (PCCC-6a: a permissive
+ *                     read is not a reader-signal; the built-ins' content IS the legacy graph).
+ *
+ * Error boundary (spec SR15 ruling): a READ FAILURE anywhere in resolution THROWS — the route's
+ * existing fail-closed 500, never a silent empty. A STRUCTURALLY-EMPTY result (queries
+ * succeeded, no pointer rows / no memberships) returns `{ groups: [], arm: false }` with one
+ * loud console.error — an unbootstrapped team is an operational fault, not a request error.
+ * Never a fallback union in either case.
+ */
+export interface ArcScope {
+  groups: string[];
+  arm: boolean;
+}
+
+export async function resolveArcScope(
+  db: DbClient,
+  args: {
+    teamId: string;
+    teamSlug: string;
+    memberId: string;
+    tier: "team" | "external";
+    /** Pre-resolved enforcement, when the caller already holds it (the arcs routes need it for
+     *  the evidence filter regardless) — avoids a second oracle resolution. `undefined` =
+     *  resolve here; `null` = the caller resolved and the team is permissive. */
+    enforcement?: import("@/lib/access/enforce").TimelineEnforcement | null;
+  }
+): Promise<ArcScope> {
+  const { memberEnforcement } = await import("@/lib/access/enforce");
+  const enforce =
+    args.enforcement !== undefined
+      ? args.enforcement
+      : await memberEnforcement(db, { teamId: args.teamId, memberId: args.memberId });
+  if (enforce != null) {
+    // Uncapped, same as the arcs GET has since PPARC-3 (Fable 6b Medium 3): arcs need the whole
+    // ready scope for coverage and scope-key stability.
+    const scope = await selectEnforcedGraphPartitions(db, {
+      teamId: args.teamId,
+      visibleProjectIds: [...enforce.visibleProjectIds],
+      k: Number.MAX_SAFE_INTEGER,
+    });
+    if (scope.groups.length === 0) {
+      console.error(`[arcs] resolveArcScope: enforcing member ${args.memberId} on team ${args.teamId} resolves ZERO partitions`);
+    }
+    return { groups: scope.groups, arm: true };
+  }
+  // Permissive: the built-in pointer partitions the tier resolves to — read from the STORED
+  // pointers (the rename doctrine: post-rename graphs live under the frozen legacy ids, and the
+  // pointer is the one source of truth; a slug-derived id would disjoin from the graph).
+  const { data, error } = await db
+    .from("projects")
+    .select("slug, graph_group_id")
+    .eq("team_id", args.teamId)
+    .eq("kind", "system")
+    .not("graph_group_id", "is", null);
+  if (error) throw new Error(`arc scope resolution failed: ${error.message}`);
+  const rows = (data ?? []) as { slug: string; graph_group_id: string }[];
+  const { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } = await import("@/lib/access/bootstrap");
+  const wanted = args.tier === "team" ? [GENERAL_SLUG, EXTERNAL_SHARED_SLUG] : [EXTERNAL_SHARED_SLUG];
+  const groups = rows.filter((r) => wanted.includes(r.slug)).map((r) => r.graph_group_id);
+  if (groups.length === 0) {
+    console.error(`[arcs] resolveArcScope: team ${args.teamId} has no built-in pointer partitions — unbootstrapped?`);
+  }
+  return { groups, arm: false };
+}

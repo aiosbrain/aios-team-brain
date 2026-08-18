@@ -6,10 +6,8 @@ import { getSessionUser } from "@/lib/auth/session";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
-import { visibleGroupIds } from "@/lib/graph/group";
-import { getArcs } from "@/lib/graph/arcs";
 import { getFusedArcs } from "@/lib/graph/arc-fusion";
-import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
+import { resolveArcScope } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
 import { getLlmHealth } from "@/lib/query/llm-health";
@@ -28,9 +26,10 @@ const schema = z.object({ team: z.string().min(1).max(120) });
 
 /**
  * Layer 3 — narrative arcs (synthesized from the last 7d of the Graphiti graph, cached 4h).
- * Session-authed; tier decides the visible group_ids (`visibleGroupIds`, sole enforcement). The LLM
- * key comes from the team's AI model settings (same as the Q&A path). Best-effort empty when the
- * graph/LLM is unavailable.
+ * Session-authed; the member's scope comes from `resolveArcScope` (PRET-3: mode-keyed — the
+ * enforcing oracle scope or the permissive built-in partitions; sole enforcement, fail-closed).
+ * The LLM key comes from the team's AI model settings (same as the Q&A path). Best-effort empty
+ * when the graph/LLM is unavailable.
  */
 export async function POST(req: NextRequest) {
   const rls = await serverClient();
@@ -57,43 +56,25 @@ export async function POST(req: NextRequest) {
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
 
-  // Access enforcement — resolved BEFORE the read, because the read's SCOPE now depends on it
-  // (PCCC6B-1). On an enforcing team, a TEAM-TIER member's arcs no longer come from the shared tier
-  // `arc_cache` row at all: their synthesis runs over their ready-and-unsuppressed partition scope
-  // (`selectEnforcedGraphPartitions` — arm-on-read, uncapped; the fact pool bounds input), cached
-  // per partition (the g: namespace). That is what actually closes the PCCB-5 synthesized-prose
-  // residual AND the corrections-laundering hole (a tier row synthesized with ALL team corrections
-  // used to serve every enforced member). External-tier members keep the tier path + omit
-  // semantics; permissive teams are byte-identical. The enforcement resolution fails CLOSED: a
-  // substrate error throws → 500, never the unfiltered set.
+  // Access enforcement — resolved BEFORE the read, because the read's SCOPE depends on it. The
+  // resolution fails CLOSED: a substrate error throws → 500, never the unfiltered set; a
+  // structurally-empty scope serves an empty panel (spec SR15 boundary).
   let enforce: import("@/lib/access/enforce").TimelineEnforcement | null;
-  let scopeGroups: string[] | null = null;
+  let scope: import("@/lib/graph/partition-read").ArcScope;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
-    if (enforce != null && tier === "team") {
-      // UNCAPPED deliberately (Fable 6b Medium 3 — the default K=8 made the design's "the fact
-      // pool bounds input" rationale false): arcs need the member's WHOLE ready scope, both for
-      // coverage (no undisclosed 8-partition truncation — arcs has no covered/total surface) and
-      // for key stability (a recency-churned pick set would mint new scope keys, cold-synthesizing
-      // and 403ing the correction gate on every churn).
-      const scope = await selectEnforcedGraphPartitions(admin, {
-        teamId: team.id,
-        visibleProjectIds: [...enforce.visibleProjectIds],
-        k: Number.MAX_SAFE_INTEGER,
-      });
-      scopeGroups = scope.groups;
-    }
+    // PRET-3 ARCS UNIFICATION (docs/design/pret3-arcs-unification.md): ONE mode-keyed resolution
+    // for EVERY reader class — enforcing teams get the member's oracle scope (uncapped, arm:true,
+    // any tier: ruling 2 makes externals members); permissive teams get the built-in pointer
+    // partitions (arm:false). The tier-row path has no reader after this.
+    scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
-  // PPARC-3 READ CUTOVER: an enforced team member's panel is the FUSION of their partitions' g:
-  // rows (design §2.2) — the p: union is no longer read here (its writers retire in PPARC-4).
-  // Fusion synthesizes AT MOST ONE missing partition inline, warms the rest under budget, and
-  // discloses coverage. Permissive teams + external members keep the tier path byte-identical.
-  const groups = scopeGroups ?? visibleGroupIds(teamSlug, tier);
-  const fused = scopeGroups ? await getFusedArcs(admin, team.id, teamSlug, scopeGroups, keys) : null;
-  const { arcs: allArcs, freshness } = fused ?? (await getArcs(admin, team.id, teamSlug, tier, groups, keys));
+  // The fused panel is THE arcs read (ruling 1): per-partition g: rows, at most one inline
+  // synthesis, budgeted warming, coverage disclosed — for everyone.
+  const { arcs: allArcs, freshness, covered, total } = await getFusedArcs(admin, team.id, teamSlug, scope.groups, keys);
 
   // The PCCB-5 evidence filter stays as defense-in-depth: a partition scope's facts are
   // principal-visible by construction, but an item restricted BETWEEN synthesis and read is not.
@@ -147,12 +128,16 @@ export async function POST(req: NextRequest) {
     // Neutral envelope via the freshness layer (`computedNow` — not an inline `new Date()`, which the
     // fabricated-freshness guard rightly forbids): an empty result has no cached data whose staleness
     // to report, and stamping the tier row's real time is the §5.7 leak.
-    return Response.json({ arcs, reason: null, note: undefined, ...freshnessWire(computedNow()) });
+    // Coverage pair on EVERY branch (Codex M4: 'universal' meant universal — a branch-dependent
+    // shape is a false wire claim even when no consumer discriminates on it today).
+    return Response.json({ arcs, reason: null, note: undefined, coveredPartitions: covered, totalPartitions: total, ...freshnessWire(computedNow()) });
   }
   return Response.json({
     arcs,
-    // PPARC-3 coverage disclosure (design §2.2) — fused reads only; the tier path omits them.
-    ...(fused ? { coveredPartitions: fused.covered, totalPartitions: fused.total } : {}),
+    // PPARC-3 coverage disclosure (design §2.2) — universal since PRET-3: every read is fused,
+    // so every client receives the pair (spec M4: an ADDITIVE gain for former tier-path clients).
+    coveredPartitions: covered,
+    totalPartitions: total,
     // `degraded` is the ENVELOPE's now (R2/M6): "a leg this payload depended on failed". It subsumes the
     // old back-compat flag, which was `reason === "model_failing"` — i.e. only ever true when arcs were
     // EMPTY, since `reason` is computed solely on the empty path. The envelope's is strictly wider and

@@ -53,15 +53,22 @@ vi.mock("@/lib/graph/graphiti-client", async (importOriginal) => {
 function fakeDb(projectGroups: string[] = [], upserts?: Array<{ table: string; row: unknown }>) {
   return {
     from: (table: string) => ({
-      select: () => ({
-        eq: () => ({
-          eq: () => ({ maybeSingle: async () => ({ data: null }) }),
-          maybeSingle: async () => ({ data: null }),
-          order: () => ({ limit: async () => ({ data: [] }) }),
-          limit: async () => ({ data: [] }),
-          not: () => Promise.resolve({ data: table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [] }),
-        }),
-      }),
+      select: () => {
+        // Self-referential filter chain: any depth of .eq/.not ends in the same terminals
+        // (PRET-3's pointer-resolved purge reads projects with three .eq levels).
+        const chain: Record<string, unknown> = {};
+        chain.eq = () => chain;
+        chain.maybeSingle = async () => ({ data: null });
+        chain.order = () => ({ limit: async () => ({ data: [] }) });
+        chain.limit = async () => ({ data: [] });
+        chain.not = () => {
+          const rows = table === "projects" ? projectGroups.map((g) => ({ graph_group_id: g })) : [];
+          const p = Promise.resolve({ data: rows }) as Promise<{ data: unknown[] }> & { maybeSingle: () => Promise<{ data: unknown }> };
+          p.maybeSingle = async () => ({ data: rows[0] ?? null });
+          return p;
+        };
+        return chain;
+      },
       upsert: async (row: unknown) => {
         // Captured so absence tests can assert on the PERSISTENT half (review: the fence's
         // original no-upsert assertion was dropped in PPARC-4's test surgery — Codex Low 5).
@@ -74,7 +81,7 @@ function fakeDb(projectGroups: string[] = [], upserts?: Array<{ table: string; r
 
 const KEYS = { anthropic: "test-key", openai: null, openrouter: null } as unknown as Parameters<
   typeof import("@/lib/graph/arcs").getArcs
->[5];
+>[4];
 const slug = () => `acme${randomUUID().slice(0, 8)}`;
 const projGroup = () => `g_${randomUUID().replace(/-/g, "")}_p_${randomUUID().replace(/-/g, "")}`;
 const FACT = {
@@ -116,7 +123,12 @@ describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
     expect(graphitiMock.addEpisodes).not.toHaveBeenCalled();
   });
 
-  it("an EXTERNAL-shaped g: group refuses the write-back but still LOADS its own corrections", async () => {
+  it("an EXTERNAL-shaped g: group refuses the write-back AND loads no corrections (PRET-3 H1)", async () => {
+    // Both halves of the H1 rule: no graph write-back (unchanged — Fable 6b High 1), and no
+    // corrections in the synthesis prompt either (inverted from the 6b-M4 allowance, whose
+    // "no external-principal path" premise the arcs unification retired). The route-level
+    // write REFUSAL (422 on an external-shaped sourceGroup) is the third half, pinned at the
+    // route; this exercises the library layers.
     const { recomputeArcs, getArcs } = await import("@/lib/graph/arcs");
     const t = slug();
     const group = `${t}_external`;
@@ -125,19 +137,15 @@ describe("the g: write-back follows the scope (PCCC6B rules, g:-era)", () => {
 
     const t2 = slug();
     const group2 = `${t2}_external`;
-    await getArcs(fakeDb(), "team-1", t2, "team", [group2], KEYS, { scopeKey: `g:${group2}` });
+    await getArcs(fakeDb(), "team-1", t2, [group2], KEYS, { scopeKey: `g:${group2}` });
     const scoped = correctionsMock.listArcCorrections.mock.calls.filter((c) => c[2]?.groupKey === `g:${group2}`);
-    expect(scoped).toHaveLength(1);
-    expect(scoped[0][2]).toMatchObject({ groupKey: `g:${group2}`, includeLegacy: false });
+    expect(scoped, "the external-shaped partition's synthesis is corrections-free").toHaveLength(0);
   });
 
-  it("the TIER path keeps today's <slug>_team target", async () => {
-    const { recomputeArcs } = await import("@/lib/graph/arcs");
-    const t = slug();
-    await recomputeArcs(fakeDb(), "team-1", t, "team", [`${t}_team`, `${t}_external`], [CORRECTION], KEYS, null);
-    expect(graphitiMock.addEpisodes).toHaveBeenCalledTimes(1);
-    expect(graphitiMock.addEpisodes.mock.calls[0][0]).toBe(`${t}_team`);
-  });
+  // DELETED (PRET-3): "the TIER path keeps today's <slug>_team target" — recomputeArcs' scopeKey
+  // is required now, so a tier-set key is unreachable input; the tier write-back branch it
+  // exercised is dead code slated for PRET-6's purge. Replacement coverage: the g:-era
+  // write-back targeting tests below + the route's 422 refusals.
 
   it("the recorded correction carries the g: scope key it was made in", async () => {
     const { recomputeArcs } = await import("@/lib/graph/arcs");

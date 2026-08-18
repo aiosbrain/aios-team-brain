@@ -43,6 +43,17 @@ export function startIngestScheduler(): void {
     // item the on-push ingest hook missed (non-push ingest paths, a hook failure). Idempotent
     // and cheap when converged; sequenced AFTER bootstrap so the system projects exist. Traced.
     await runContextBackfill(db);
+    // PRET-3 one-time post-activation sweep (rollout-race fix): marker-guarded, no-op forever
+    // after its first successful run on the fleet.
+    {
+      const { runPret3BootSweep } = await import("@/lib/graph/pret3-boot-sweep");
+      const s = await runPret3BootSweep(db);
+      if (s.ran) console.info("[ingest] pret3 post-activation sweep ran (external-row wipe + correction re-key catch-up)");
+      if (s.error) {
+        console.error("[ingest] pret3 post-activation sweep FAILED:", s.error);
+        await recordIngestRun(db, { teamId: null, source: "pret3_sweep", trigger: "scheduler", ok: false, errors: [s.error], startedAt: Date.now() }).catch(() => {});
+      }
+    }
     // PRET-2 auto-flip: move warning-free, un-held, ready permissive teams to enforcing —
     // sequenced AFTER bootstrap+backfill so a team's first eligible tick can flip it. Cheap
     // stages run for every permissive team; at most PRET_FLIP_MAX_PER_TICK drains per pass

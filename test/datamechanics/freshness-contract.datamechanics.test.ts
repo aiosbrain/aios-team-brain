@@ -39,8 +39,9 @@ function arc(id: string): NarrativeArc {
 }
 
 /** getArcs needs a key set; no Graphiti/LLM is reachable here, so every test seeds the cache first. */
-const GROUPS = ["acme_team", "acme_external"];
-const KEY = GROUPS.slice().sort().join(",");
+// PRET-3: every arcs read is partition-scoped; the freshness contract is scope-key-agnostic.
+const GROUPS = ["acme_team"];
+const KEY = "g:acme_team";
 
 /** Backdate a cache row so it is genuinely old in Postgres, rather than faking a clock. */
 async function backdateArcCache(teamId: string, ageMs: number): Promise<string> {
@@ -57,7 +58,7 @@ describe("freshness contract: a cached payload reports when it was COMPUTED (R2/
     const ageMs = ARC_CACHE_TTL_MS + 30 * 60_000;
     const backdatedIso = await backdateArcCache(seed.teamId, ageMs);
 
-    const res = await getArcs(db(), seed.teamId, "acme", "team", GROUPS, {});
+    const res = await getArcs(db(), seed.teamId, "acme", GROUPS, {}, { scopeKey: KEY });
 
     expect(res.arcs.map((a) => a.id)).toEqual(["a1"]); // still serves the real payload
     // The whole point: the reported time is the ROW's, hours back — not the moment of the call.
@@ -71,7 +72,7 @@ describe("freshness contract: a cached payload reports when it was COMPUTED (R2/
     await writeArcCache(db(), seed.teamId, KEY, [arc("a2")], "hash-2");
     const backdatedIso = await backdateArcCache(seed.teamId, 60_000); // 1 min old — well inside 4h
 
-    const res = await getArcs(db(), seed.teamId, "acme", "team", GROUPS, {});
+    const res = await getArcs(db(), seed.teamId, "acme", GROUPS, {}, { scopeKey: KEY });
 
     expect(res.freshness.computedAt).toBe(Date.parse(backdatedIso));
     expect(res.freshness.stale).toBe(false);
