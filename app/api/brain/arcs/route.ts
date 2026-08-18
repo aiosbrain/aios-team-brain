@@ -44,15 +44,19 @@ export async function POST(req: NextRequest) {
   if (!team) return errorResponse("forbidden", "not a member of this team", 403);
   const { data: me } = await rls
     .from("members")
-    .select("id, tier")
+    .select("id, role")
     .eq("team_id", team.id)
     .eq("auth_user_id", user.id)
     .eq("status", "active")
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  const tier = (me as { tier: "team" | "external" }).tier;
   const memberId = (me as { id: string }).id;
+  const meRole = (me as { role: string }).role;
+  // PRET-4 §1a: `tier` downstream (resolveArcScope's permissive arm, the corrections gate) is
+  // POSTURE — everyone-membership — not the members.tier record.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const tier = await resolveViewerPosture(adminClient(), team.id, memberId);
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
 
@@ -146,7 +150,9 @@ export async function POST(req: NextRequest) {
     // consumer reading the old meaning; the panel reads `reason`, not this.
     degraded: wire.degraded || reason === "model_failing",
     reason,
-    note: isRestrictedTier(tier) ? undefined : note,
+    // PRET-4 §1d: the note is OPS detail (internal LLM base URL/model/provider error) — gated
+    // on ROLE now, not posture: only admins see infra internals.
+    note: meRole === "admin" ? note : undefined,
     // WAS `new Date().toISOString()` — a lie. `arc_cache` has a 4h TTL and the SWR branch deliberately
     // serves rows OLDER than that, so this stamped hours-old arcs as current, and destroyed the
     // backdating H11/H12 built to mark an untrustworthy synthesis. Now the row's real time.

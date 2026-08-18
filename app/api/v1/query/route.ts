@@ -143,12 +143,12 @@ export async function POST(req: NextRequest) {
       enforce = { visibleItemIds: ids, principal: "token" };
     } else if (await teamEnforcesAccess(db, teamId)) {
       const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });
-      // PCCC-6: a team-tier member gets the graph leg back over their K-capped ready partitions.
-      // External members and the delegated path above deliberately pass NO graphProjectIds — the
-      // §5.8b omit is unchanged for them. QMIR-1: `principal: "member"` also readmits the
-      // org-structural mirror legs (actors + REPORTS_TO) — for team tier; external members keep
-      // the tier omit inside retrieve.
-      enforce = { visibleItemIds: ids, principal: "member", ...(auth!.memberTier === "team" ? { graphProjectIds: projectIds } : {}) };
+      // PCCC-6, widened by PRET-4 §1b (ruling 2): EVERY member principal gets the graph leg
+      // over their oracle-resolved partitions — an external member's projectIds resolve their
+      // granted projects, so their graph scope is exactly their membership. The delegated path
+      // above still passes NO graphProjectIds (token omit, program §8). QMIR-1's
+      // `principal: "member"` readmits the org-structural mirror legs for every member.
+      enforce = { visibleItemIds: ids, principal: "member", graphProjectIds: projectIds };
     }
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

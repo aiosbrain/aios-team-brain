@@ -238,13 +238,14 @@ export async function GET(req: NextRequest) {
     .order("updated_at", { ascending: true })
     .order("id", { ascending: true })
     .limit(PAGE_SIZE);
-  if (isRestrictedTier(auth.memberTier)) q = q.eq("access", "external"); // legacy-tier conjunct — always
-
-  // Enforced read (Phase B slice 1, spec §5/§11): visibility = oracle ∧ legacy-tier. When the team
-  // is 'enforcing', BOTH member and agent reads intersect with the membership-visible item set
-  // (an agent must never exceed its launcher — slice-B1 Fable HIGH; the agent's Phase-A project_id
-  // proxy is used ONLY under permissive). 'permissive' (default) → member reads unchanged,
-  // byte-identical to today. A flag-read error throws → 500 (fail closed, never a wrong mode).
+  // Enforced read (Phase B slice 1, spec §5/§11; wall re-ruled by PRET-4 §1b): visibility is
+  // MODE-keyed — enforcing → the ORACLE alone (the legacy posture conjunct is gone: an external
+  // member granted a project must see its access='team' rows, ruling 2, and the conjunct was
+  // the only thing blocking that); permissive → the posture wall alone (applied below, after
+  // the mode is known). When the team is 'enforcing', BOTH member and agent reads intersect
+  // with the membership-visible item set (an agent must never exceed its launcher — slice-B1
+  // Fable HIGH; the agent's Phase-A project_id proxy is used ONLY under permissive).
+  // A flag-read error throws → 500 (fail closed, never a wrong mode).
   let enforcing: boolean;
   try {
     const { teamEnforcesAccess } = await import("@/lib/access/enforce");
@@ -272,6 +273,9 @@ export async function GET(req: NextRequest) {
     if (agentProjects.size === 0) return Response.json({ items: [], next_cursor: null });
     q = q.in("project_id", [...agentProjects]);
   }
+  // The two-bucket posture wall — PERMISSIVE mode only (PRET-4 §1b). Under enforcing the
+  // oracle already decided; re-applying the wall would re-block ruling 2.
+  if (!enforcing && isRestrictedTier(auth.memberTier)) q = q.eq("access", "external");
   if (kinds?.length) q = q.in("kind", kinds);
   // On-demand fetch of one skill/deliverable folder: match path by prefix.
   if (pathPrefix) q = q.like("path", `${pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);

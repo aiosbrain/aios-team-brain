@@ -167,10 +167,23 @@ export async function authenticateApiKey(
   // route opts out and persists this marker synchronously as its explicit contract.
   if (recordUsage) void markApiKeyUsed(key.id);
 
+  // PRET-4 §1a: the VALUE every downstream consumer receives as `memberTier` is POSTURE —
+  // membership in the everyone built-in — not the members.tier record. Same vocabulary, so
+  // every consumer survives verbatim; the source is now explicit membership state. A resolver
+  // error fails the request closed (auth returns null → 401), never a silent widen/narrow.
+  let posture: "team" | "external";
+  try {
+    const { resolveViewerPosture } = await import("@/lib/access/posture");
+    posture = await resolveViewerPosture(db, key.team_id, key.member_id);
+  } catch (e) {
+    console.error("[auth] posture resolution failed:", e instanceof Error ? e.message : e);
+    return fail("posture_unresolvable");
+  }
+
   return {
     teamId: key.team_id,
     memberId: key.member_id,
-    memberTier: member.tier,
+    memberTier: posture,
     memberRole: member.role,
     apiKeyId: key.id,
     actorHandle: member.actor_handle,

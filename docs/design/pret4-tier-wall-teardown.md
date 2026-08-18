@@ -243,8 +243,11 @@ retirement:
   item with the triad obligation attached (SR18: the excluded case's destination).
 - **Money/ops**: `app/t/[team]/costs/page.tsx:51` drops its tier gate — the page's EXISTING
   role scoping (`scopeLlmUsage`: admin → team-wide, member → own rows) then delivers ruling 3
-  verbatim ("a client-member sees their own usage, not the company bill") with no new UI;
-  `app/api/v1/costs/route.ts` re-gates the same way (role-scoped, tier gate dropped).
+  verbatim ("a client-member sees their own usage, not the company bill") with no new UI.
+  `app/api/v1/costs/route.ts` — CORRECTED during build (the first draft called it a read): it
+  is the cost-INGEST POST, an OPS WRITE surface, so its gate STAYS with posture as the input
+  (the boundary supplies membership-derived posture; the record is not consulted) — the money
+  READ ruling lands on the page, not the push route.
   `canAccessAdmin` (`lib/auth/admin-access.ts:16`) keeps its two conjuncts with the tier
   conjunct's INPUT becoming posture: `role === "admin" && posture === "team"` — the
   defense-in-depth against a lone bad `role` write survives as a membership check (making a

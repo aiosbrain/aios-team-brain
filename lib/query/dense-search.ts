@@ -60,14 +60,16 @@ export async function denseSearch(
 
     const params: unknown[] = [qv, teamId];
     let where = "c.team_id = $2";
-    if (isRestrictedTier(tier)) where += " and i.access = 'external'";
     if (projectSlug) {
       params.push(projectSlug);
       where += ` and p.slug = $${params.length}`;
     }
+    // Mode-keyed (PRET-4 §1b): enforcing → the oracle set alone; permissive → the posture wall.
     if (visibleIds) {
       params.push(visibleIds);
       where += ` and i.id = any($${params.length}::uuid[])`;
+    } else if (isRestrictedTier(tier)) {
+      where += " and i.access = 'external'";
     }
     params.push(DENSE_MAX_DISTANCE);
     const distIdx = params.length;

@@ -38,9 +38,11 @@ function attrStr(attrs: Record<string, unknown> | null, key: string): string | n
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
-  if (auth.memberTier !== "team") {
-    return errorResponse("forbidden_tier", "the company graph is team-tier only", 403);
-  }
+  // PRET-4 §1d: the org chart is STRUCTURE — every member. Payload deliberately UNCHANGED
+  // (cold-read H4): the ownership[] triple keeps its read (QMIR L4's accepted posture; zero
+  // rows in prod) and the entity read stays type-unfiltered server-side because the ownership
+  // join needs workflow targets — QMIR §3.6's server-side-filter obligation remains recorded,
+  // untouched here.
 
   const db = adminClient();
   if (!(await rateLimit(db, `${auth.apiKeyId}:company-graph:get`, 60))) {

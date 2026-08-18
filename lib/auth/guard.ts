@@ -28,7 +28,12 @@ export async function currentMember(teamId: string): Promise<CurrentMember | nul
     .maybeSingle();
   if (!data) return null;
   const m = data as { id: string; role: CurrentMember["role"]; tier: CurrentMember["tier"] };
-  return { id: m.id, role: m.role, tier: m.tier, userId: user.id };
+  // PRET-4 §1a: `tier` here is POSTURE (everyone-membership), not the members.tier record —
+  // same vocabulary, membership-derived. A resolver error propagates (fail closed at the
+  // boundary), never a silent default.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(db, teamId, m.id);
+  return { id: m.id, role: m.role, tier: posture, userId: user.id };
 }
 
 /**

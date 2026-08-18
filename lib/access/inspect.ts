@@ -20,16 +20,15 @@ function throwOnReadError(error: unknown, what: string): void {
  *
  * CRITICAL — the inspector must AGREE with the ACTUAL enforced read, never a partial re-derivation
  * (spec: divergence is the risk; "an inspector that disagrees with enforcement is worse than none").
- * The enforced read is **legacy-tier ∧ (enforcing ? oracle : allow-all-in-tier)** (`lib/access/enforce`
- * "oracle ∧ legacy-tier"; the oracle conjunct is GATED by `teams.access_enforcement`). So this module
- * applies BOTH conjuncts, mode-aware:
- *   - the TIER conjunct (`canSeeAccess(member.tier, item.access)`) is ALWAYS a factor — it is the
- *     standing app-code invariant with no RLS backstop (CLAUDE.md §5), and a §5.8 leak check that
- *     ignored it would be blind to the very leak class it exists to catch (Fable B6 High);
- *   - the ORACLE conjunct (the project-membership chain) applies ONLY on an `enforcing` team. On a
- *     `permissive` team the member genuinely sees everything in their tier, so an un-granted item is
- *     NOT a leak (serving it is by-design) — reporting it as one would be a false incident (Fable B6
- *     Medium). The returned `mode` tells the admin which semantics the verdict reflects.
+ * Since PRET-4 (docs/design/pret4-tier-wall-teardown.md §1b) the enforced read is MODE-keyed:
+ *   - ENFORCING → the ORACLE alone decides (the legacy tier/posture conjunct is GONE from the
+ *     read paths — an external member granted a project sees its access='team' rows, ruling 2;
+ *     an inspector still applying the old conjunct would report false leaks on exactly those
+ *     reads — cold-read H5);
+ *   - PERMISSIVE → the two-bucket POSTURE wall alone (`canSeeAccess(posture, item.access)`,
+ *     where posture is everyone-membership resolved at this module's boundary — the
+ *     members.tier record is not consulted). An un-granted item is NOT a leak under
+ *     permissive (serving it is by-design). The returned `mode` names the semantics.
  *
  * This is a READ-ONLY diagnostic — it writes nothing.
  */
@@ -38,7 +37,7 @@ function throwOnReadError(error: unknown, what: string): void {
  *  `via:"singleton"` + `grant.addedBy` (the admin who added them); the deferred inspector UI renders
  *  that as "directly added by ⟨admin⟩, not as a group" (§15.6). The presentation is the UI's job —
  *  this module returns the structured facts. */
-export type MembershipVia = "builtin_tier" | "singleton" | "added";
+export type MembershipVia = "builtin" | "singleton" | "added";
 export type GroupKind = "everyone" | "external" | "singleton" | "ordinary";
 export type EnforcementMode = "enforcing" | "permissive";
 
@@ -57,7 +56,7 @@ export interface ItemVisibility {
   mode: EnforcementMode;
   visible: boolean;
   /** The project-grant paths that make the item visible under ENFORCING. Empty when not visible, or
-   *  on a permissive team (no project gate is active — visibility is by tier alone). */
+   *  on a permissive team (no project gate is active — visibility is by posture alone). */
   chains: VisibilityChain[];
   /** Set only when NOT visible — coarse, never names the restricted project (§5.7). */
   reason?: string;
@@ -81,14 +80,14 @@ export async function explainItemVisibility(
   const mode: EnforcementMode = (await teamEnforcesAccess(db, teamId)) ? "enforcing" : "permissive";
 
   const [{ data: member, error: memberErr }, { data: item, error: itemErr }] = await Promise.all([
-    db.from("members").select("kind, is_connector, status, tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+    db.from("members").select("kind, is_connector, status").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
     db.from("items").select("access").eq("team_id", teamId).eq("id", itemId).maybeSingle(),
   ]);
   throwOnReadError(memberErr, "member");
   throwOnReadError(itemErr, "item");
   if (!member) return { itemId, memberId, mode, visible: false, chains: [], reason: "member not found in this team" };
   if (!item) return { itemId, memberId, mode, visible: false, chains: [], reason: "item not found in this team" };
-  const m = member as { kind: string; is_connector: boolean; status: string; tier: string | null };
+  const m = member as { kind: string; is_connector: boolean; status: string };
 
   // A NON-PRINCIPAL (disabled / connector / invited) cannot read anything — the runtime auth + the
   // oracle both reject them. In permissive mode there is no oracle to catch it, so gate it here so
@@ -96,14 +95,15 @@ export async function explainItemVisibility(
   if (!isPrincipal({ kind: m.kind, is_connector: m.is_connector, status: m.status })) {
     return { itemId, memberId, mode, visible: false, chains: [], reason: "member is not an active principal (disabled, connector, or non-active)" };
   }
-  const tier = (m.tier ?? "external") as ViewerTier;
-  const tierOk = canSeeAccess(tier, (item as { access: string | null }).access ?? "team");
-
-  // THE TIER CONJUNCT — always a factor. A tier miss is a hard no in any mode.
-  if (!tierOk) {
-    return { itemId, memberId, mode, visible: false, chains: [], reason: "your access tier cannot see this item's access level" };
+  // PRET-4: POSTURE, not the record — and it is a factor ONLY under permissive (the enforced
+  // read has no wall conjunct anymore; keeping it here would report false leaks on ruling-2
+  // reads — the exact divergence this module's contract forbids).
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = (await resolveViewerPosture(db, teamId, memberId)) as ViewerTier;
+  if (mode === "permissive" && !canSeeAccess(posture, (item as { access: string | null }).access ?? "team")) {
+    return { itemId, memberId, mode, visible: false, chains: [], reason: "your posture cannot see this item's access level (permissive two-bucket wall)" };
   }
-  // Permissive team: enforcement's oracle conjunct is inactive → visible by tier, no project chain.
+  // Permissive team: visible by posture, no project chain.
   if (mode === "permissive") {
     // PRET-2: surface WHY the scheduler hasn't flipped this team (additive; best-effort).
     const { latestAutoFlipDeferral } = await import("@/lib/admin/access-enforcement");
@@ -176,7 +176,9 @@ export async function explainItemVisibility(
   for (const grant of grants) {
     const g = groupById.get(grant.group_id);
     if (!g) continue;
-    const via: MembershipVia = g.is_builtin ? "builtin_tier" : g.person_member_id === memberId ? "singleton" : "added";
+    // PRET-4: the label "builtin_tier" renamed — the derivation it named (tier recompute) is retired;
+    // a builtin row is explicit posture state now.
+    const via: MembershipVia = g.is_builtin ? "builtin" : g.person_member_id === memberId ? "singleton" : "added";
     const gm = gmByGroup.get(grant.group_id);
     const unit = itemProjects.get(grant.project_id)!;
     chains.push({
@@ -195,7 +197,7 @@ export async function explainItemVisibility(
 
 /**
  * The runtime cache-leak check (spec §5.8): given a set of item ids a surface is about to render,
- * return the subset this principal must NOT see under the ACTIVE enforcement — legacy-tier ∧
+ * return the subset this principal must NOT see under the ACTIVE enforcement — mode-keyed (PRET-4):
  * (enforcing ? oracle : allow). Empty = clean FOR THAT MODE. Applies the SAME two conjuncts the read
  * path does, so a reported leak is a real one; and it is NOT blind to the tier-isolation leak class
  * (external reading team content), which the oracle set alone would miss (Fable B6 High).
@@ -210,25 +212,28 @@ export async function auditVisibilityAgainstItemIds(
   const enforcing = await teamEnforcesAccess(db, teamId);
 
   const [{ data: member, error: memberErr }, { data: itemRows, error: itemErr }] = await Promise.all([
-    db.from("members").select("kind, is_connector, status, tier").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
+    db.from("members").select("kind, is_connector, status").eq("team_id", teamId).eq("id", memberId).maybeSingle(),
     db.from("items").select("id, access").eq("team_id", teamId).in("id", ids),
   ]);
   // Throw (→ route 500) on a substrate error rather than returning a wrong leak list: over-reporting
   // false leaks OR under-reporting real ones both violate "every reported leak is real" (Codex B6 Medium).
   throwOnReadError(memberErr, "member");
   throwOnReadError(itemErr, "items");
-  const m = member as { kind: string; is_connector: boolean; status: string; tier: string | null } | null;
+  const m = member as { kind: string; is_connector: boolean; status: string } | null;
   // A non-principal (disabled/connector/invited) may see NOTHING — every id is a leak (Codex B6 Medium).
   if (!m || !isPrincipal({ kind: m.kind, is_connector: m.is_connector, status: m.status })) return ids;
-  const tier = (m.tier ?? "external") as ViewerTier;
+  // PRET-4 §1b mode-keying (must mirror the real read exactly): enforcing → the oracle alone
+  // (the wall conjunct is retired — applying it here would report ruling-2 reads as leaks);
+  // permissive → the posture wall alone.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = (await resolveViewerPosture(db, teamId, memberId)) as ViewerTier;
   const accessById = new Map(((itemRows ?? []) as { id: string; access: string | null }[]).map((r) => [r.id, r.access ?? "team"]));
   const oracleVisible = enforcing ? (await visibleItemIds(db, { teamId, memberId })).ids : null;
 
   return ids.filter((id) => {
     const access = accessById.get(id);
     if (access == null) return true; // unknown item (not in this team) → fail closed → a leak
-    const tierOk = canSeeAccess(tier, access);
-    const oracleOk = oracleVisible ? oracleVisible.has(id) : true; // permissive → oracle not applied
-    return !(tierOk && oracleOk);
+    const ok = oracleVisible ? oracleVisible.has(id) : canSeeAccess(posture, access);
+    return !ok;
   });
 }

@@ -49,9 +49,14 @@ export const resolveTeamContext = cache(async (teamSlug: string): Promise<TeamCo
   const m = ((data ?? []) as MemberWithTeam[]).find((r) => r.teams?.slug === teamSlug);
   if (!m?.teams) return null;
 
+  // PRET-4 §1a: `me.tier` is POSTURE (everyone-membership) — the membership-derived value every
+  // dashboard gate consumes; same vocabulary as the retired record read.
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(db, m.teams.id, m.id);
+
   return {
     team: m.teams,
-    me: { id: m.id, role: m.role, tier: m.tier, displayName: m.display_name, status: m.status },
+    me: { id: m.id, role: m.role, tier: posture, displayName: m.display_name, status: m.status },
     userId: user.id,
   };
 });
