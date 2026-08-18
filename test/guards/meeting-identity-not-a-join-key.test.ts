@@ -85,6 +85,18 @@ describe("guard: the conference link is measured, never joined on", () => {
     expect(offenders, "a conference link must not reach a matching/grouping path").toEqual([]);
   });
 
+  it("the walk actually REACHES components/ and .mjs — coverage nothing currently exercises", () => {
+    // Widening the walk to `components/` and `.mjs` changes no result today, because nothing there
+    // mentions a needle — so the widening is unfalsifiable by outcome and a later narrowing would go
+    // unnoticed. Assert the SCOPE directly instead: these are the two places a join could hide that
+    // the first version of this guard could not see.
+    expect(filesUnder("components").length, "components/ must be walked").toBeGreaterThan(0);
+    expect(
+      filesUnder("scripts").filter((f) => f.endsWith(".mjs")).length,
+      "repair scripts here are .mjs (e.g. scripts/backfill-meeting-attendance.mjs)"
+    ).toBeGreaterThan(0);
+  });
+
   it("the needle list itself is non-vacuous — each pattern matches the text it is meant to catch", () => {
     // A guard whose needles match nothing passes forever. Every pattern is exercised against a line
     // that a real bypass would contain, so a typo in one of them reddens here instead of going quiet.
