@@ -92,6 +92,59 @@ function dedupe(names: string[]): string[] {
   });
 }
 
+
+/** Normalisation shared with `matchAttendees` — lowercase, strip punctuation, collapse whitespace. */
+function norm(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Match ASSERTED names to members — strictly, and never by first name alone.
+ *
+ * WHY NOT `matchAttendees`. That one falls back to "the first word matches and it's the only
+ * candidate", which is right for a MODEL's guess (the transcript says "hey it's just Alex") and wrong
+ * for a name the producer asserted in full. Both reviewers landed on this independently, the second
+ * escalating it: with the loose rule, `participants: "[John Smith]"` against a roster holding
+ * `John Ellison` RECORDS JOHN ELLISON — inventing exactly the plausible-real-teammate attendance this
+ * whole change exists to stop, now sourced from the path we called authoritative. And granola's
+ * participant lists demonstrably carry outsiders (Pete Longworth, Jana, Anusheel Bhushan, Rob White).
+ *
+ * The rule: normalised equality, or one name is a WHOLE-WORD PREFIX of the other. That keeps prod's
+ * real cases (`Chetan Nandakumar` → roster `Chetan`, `Fatma Ghedira` → roster `Fatma`) and rejects
+ * `John Smith` → `John Ellison`, because neither is a prefix of the other.
+ *
+ * Ambiguity resolves to NOTHING, reported. If an asserted name matches two members, or two asserted
+ * names match the same member, the extra is returned as `unresolved` rather than silently collapsed —
+ * the second review's other finding: `[Chetan Nandakumar, Chetan Gupta]` against one `Chetan` used to
+ * yield one id and an EMPTY unresolved list, losing a real participant with no trace.
+ */
+export function matchAsserted(
+  names: string[],
+  roster: RosterPerson[]
+): { memberIds: string[]; unresolved: string[] } {
+  const memberIds: string[] = [];
+  const unresolved: string[] = [];
+  const taken = new Set<string>();
+
+  for (const raw of names) {
+    const n = norm(raw);
+    if (!n) continue;
+    const hits = roster.filter((p) => {
+      const r = norm(p.displayName);
+      return r === n || n.startsWith(r + " ") || r.startsWith(n + " ");
+    });
+    // Zero hits: an outsider, or a spelling we cannot resolve. One hit already claimed by an earlier
+    // asserted name: two distinct people collapsing onto one member — report, do not double-count.
+    if (hits.length !== 1 || taken.has(hits[0].id)) {
+      unresolved.push(raw);
+      continue;
+    }
+    taken.add(hits[0].id);
+    memberIds.push(hits[0].id);
+  }
+  return { memberIds, unresolved };
+}
+
 export interface ResolveAttendanceInput {
   /** Emails from a calendar event's frontmatter (rank 1). Already-resolved member ids. */
   calendarMemberIds?: string[] | null;
@@ -122,22 +175,10 @@ export async function resolveAttendance(input: ResolveAttendanceInput): Promise<
     return { memberIds: dedupe(input.calendarMemberIds ?? []), source: "calendar", unresolved: [] };
   }
 
-  // Rank 2 — the names the producer asserted.
+  // Rank 2 — the names the producer asserted, matched STRICTLY (see `matchAsserted`).
   const names = parseParticipantNames(input.participants);
   if (names.length > 0) {
-    const memberIds = matchAttendees(names, roster);
-    const resolvedNames = new Set(
-      roster.filter((p) => memberIds.includes(p.id)).map((p) => p.displayName.toLowerCase())
-    );
-    const unresolved = names.filter((n) => {
-      const low = n.toLowerCase();
-      // A name counts as resolved if it matched exactly OR its first word did (the roster stores
-      // `Chetan` while granola says `Chetan Nandakumar`, and vice versa for `Fatma` / `Fatma Ghedira`).
-      for (const r of resolvedNames) {
-        if (r === low || low.startsWith(r + " ") || r.startsWith(low + " ")) return false;
-      }
-      return true;
-    });
+    const { memberIds, unresolved } = matchAsserted(names, roster);
     return { memberIds, source: "participants", unresolved };
   }
 

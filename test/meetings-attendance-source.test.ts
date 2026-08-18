@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseParticipantNames, resolveAttendance } from "@/lib/meetings/attendance";
+import { parseParticipantNames, resolveAttendance, matchAsserted } from "@/lib/meetings/attendance";
 import type { RosterPerson } from "@/lib/meetings/llm-extract";
 
 /**
@@ -159,6 +159,52 @@ describe("resolveAttendance — precedence, and the model as a last resort", () 
   it("with no model injected and nothing asserted, reports `none` rather than throwing", async () => {
     const out = await resolveAttendance({ roster: ROSTER });
     expect(out).toEqual({ memberIds: [], source: "none", unresolved: [] });
+  });
+});
+
+/**
+ * The two findings the SECOND reviewer escalated from Medium to High — correctly. A loose first-name
+ * match is defensible for a model's guess; for a name the producer ASSERTED it re-creates the very
+ * bug this change exists to remove, now sourced from the path we call authoritative.
+ */
+describe("matchAsserted — strict, because an asserted name is not a guess", () => {
+  it("does NOT record a member who merely shares a first name with an outside guest", () => {
+    // `[John Smith]` against a roster holding `John Ellison` used to record JOHN ELLISON — inventing
+    // a plausible teammate's attendance from an authoritative source. Granola's lists demonstrably
+    // carry outsiders (Pete Longworth, Jana, Anusheel Bhushan, Rob White).
+    const out = matchAsserted(["John Smith"], ROSTER);
+    expect(out.memberIds).toEqual([]);
+    expect(out.unresolved).toEqual(["John Smith"]);
+  });
+
+  it("still resolves prod's real shape — a fuller asserted name onto a shorter roster entry", () => {
+    const out = matchAsserted(["Chetan Nandakumar", "Fatma Ghedira"], ROSTER);
+    expect(out.memberIds.sort()).toEqual(["m-chetan", "m-fatma"]);
+    expect(out.unresolved).toEqual([]);
+  });
+
+  it("resolves the reverse direction too — a shorter asserted name onto a fuller roster entry", () => {
+    expect(matchAsserted(["Stephan"], ROSTER).memberIds).toEqual(["m-stephan"]);
+  });
+
+  it("two asserted people sharing a first name do NOT silently collapse into one", () => {
+    // `[Chetan Nandakumar, Chetan Gupta]` against one roster `Chetan` used to yield ONE id and an
+    // EMPTY unresolved list — a real participant vanishing with no trace, and possibly the wrong
+    // person retained.
+    const out = matchAsserted(["Chetan Nandakumar", "Chetan Gupta"], ROSTER);
+    expect(out.memberIds).toEqual(["m-chetan"]);
+    expect(out.unresolved).toEqual(["Chetan Gupta"]);
+  });
+
+  it("an asserted name matching TWO members resolves to nobody, and says so", () => {
+    const ambiguous = [...ROSTER, { id: "m-john2", displayName: "John" }];
+    const out = matchAsserted(["John Ellison"], ambiguous);
+    expect(out.memberIds).toEqual([]);
+    expect(out.unresolved).toEqual(["John Ellison"]);
+  });
+
+  it("ignores punctuation and case, like the live matcher", () => {
+    expect(matchAsserted(["  JOHN  ELLISON "], ROSTER).memberIds).toEqual(["m-john"]);
   });
 });
 

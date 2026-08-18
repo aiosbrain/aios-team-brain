@@ -66,23 +66,32 @@ const norm = (s) =>
     .replace(/\s+/g, " ")
     .trim();
 
-/** Mirrors `matchAttendees` in lib/meetings/llm-extract.ts, including `normalizeName` above. */
-function matchAttendees(names, roster) {
-  const byExact = new Map(roster.map((p) => [norm(p.display_name), p.id]));
-  const matched = new Set();
+/**
+ * Mirrors `matchAsserted` in lib/meetings/attendance.ts — the STRICT rule, not `matchAttendees`.
+ *
+ * This must match the live path exactly or --apply deletes rows the product would keep (or keeps
+ * rows it would delete). Strict because an asserted name is not a guess: first-name-only matching
+ * would record `John Smith` as `John Ellison`, and this script WRITES that conclusion.
+ */
+function matchAsserted(names, roster) {
+  const memberIds = [];
+  const unresolved = [];
+  const taken = new Set();
   for (const raw of names) {
     const n = norm(raw);
     if (!n) continue;
-    const exact = byExact.get(n);
-    if (exact) {
-      matched.add(exact);
+    const hits = roster.filter((p) => {
+      const r = norm(p.display_name);
+      return r === n || n.startsWith(r + " ") || r.startsWith(n + " ");
+    });
+    if (hits.length !== 1 || taken.has(hits[0].id)) {
+      unresolved.push(raw);
       continue;
     }
-    const first = n.split(" ")[0];
-    const cands = roster.filter((p) => norm(p.display_name).split(" ")[0] === first);
-    if (cands.length === 1) matched.add(cands[0].id);
+    taken.add(hits[0].id);
+    memberIds.push(hits[0].id);
   }
-  return [...matched];
+  return { memberIds, unresolved };
 }
 
 const db = new pg.Client({ connectionString: url, ssl: url.includes("localhost") ? false : { rejectUnauthorized: false } });
@@ -111,7 +120,8 @@ for (const n of notes) {
   const { rows: roster } = await db.query(
     `select id, display_name from members where team_id=$1 and status='active'`, [n.team_id]
   );
-  const should = new Set(matchAttendees(names, roster));
+  const { memberIds: shouldIds, unresolved } = matchAsserted(names, roster);
+  const should = new Set(shouldIds);
 
   const { rows: current } = await db.query(
     `select member_id from meeting_note_attendees where meeting_note_id=$1`, [n.id]
@@ -127,6 +137,7 @@ for (const n of notes) {
     title: n.title,
     date: n.occurred_at,
     asserted: names.join(", "),
+    unresolved,
     adding: add.map((id) => nameOf.get(id) ?? id),
     removing: remove.map((id) => nameOf.get(id) ?? id),
   });
@@ -151,6 +162,7 @@ for (const r of report) {
   console.log(`      producer asserted: ${r.asserted}`);
   if (r.removing.length) console.log(`      REMOVE: ${r.removing.join(", ")}`);
   if (r.adding.length) console.log(`      ADD:    ${r.adding.join(", ")}`);
+  if (r.unresolved?.length) console.log(`      (not on this team, cannot be recorded: ${r.unresolved.join(", ")})`);
 }
 console.log(
   `\nconsidered ${considered} · changed ${changed} · already correct ${unchanged} · skipped (no assertion / calendar) ${skipped}`
