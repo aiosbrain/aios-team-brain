@@ -300,5 +300,31 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     const notes = await liveNotes(seed);
     expect(notes, "the two recordings became one meeting").toHaveLength(1);
     expect(await submitterIds(notes[0].id), "the calendar pusher survived the second fold").toContain(chetan);
+
+    // AND THE KEY SURVIVED. The merge writes a NEW item that replaces both, and it wrote `{title}`
+    // alone — so the merged meeting lost its event id and a THIRD push of the same event could never
+    // find it: a second visible meeting forever, uncredited, with no refusal counted. Asserting
+    // submitter survival alone left that green by construction, which is how the second reviewer
+    // found it. Note the keyed note here is the one folded AWAY, so the identity has to be carried
+    // from the duplicate, not just the survivor.
+    const { data: survivor } = await db()
+      .from("meeting_notes")
+      .select("source_item_id")
+      .eq("id", notes[0].id)
+      .maybeSingle();
+    const { data: item } = await db()
+      .from("items")
+      .select("frontmatter")
+      .eq("id", (survivor as { source_item_id: string }).source_item_id)
+      .maybeSingle();
+    const fm = ((item as { frontmatter: Record<string, unknown> }).frontmatter ?? {}) as Record<string, unknown>;
+    expect(fm.calendar_event_id, "the merged item still carries the event id").toBe(EVENT_ID);
+
+    // The proof it is reachable, not just present: a third push of the same event links to it.
+    const third = await addMember(seed, "Third", `third-${randomUUID().slice(0, 6)}@acme.com`);
+    await pushCalendarEvent(seed, { asMemberId: third });
+    const third_tick = await tick(seed);
+    expect(third_tick.link.linked, "a later push of the same event still finds the meeting").toBe(1);
+    expect(await submitterIds(notes[0].id)).toContain(third);
   });
 });
