@@ -4,22 +4,18 @@ import type { DbClient } from "@/lib/db/types";
 import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
 
 /**
- * The enforced-read primitive (Phase B slice 1, spec §5/§11). Visibility = **oracle ∧ legacy-tier**:
- * a read applies the oracle's membership filter (this module) AND keeps its existing legacy tier
- * filter, so a bug in either conjunct fails CLOSED. PRET-6: enforcement is unconditional —
+ * The enforced-read primitive (Phase B slice 1, spec §5/§11; PRET-6: the ONLY read model).
+ * Visibility = the ORACLE's membership filter: every caller intersects its item set with
+ * `visibleItemIds(...)` — there is no mode, no flag, and no posture wall (PRET-4 ruling 2:
+ * placement is the sharing act; the retired tier conjunct never overrides it).
  *
- *   'permissive' (default) — this module contributes NOTHING; the read is byte-identical to today.
- *   'enforcing'            — the caller intersects its item set with `visibleItemIds(...)`.
- *
- * SCOPE (through Phase B slice 4): `GET /api/v1/items` (member AND agent keys), the retrieval
- * path (`lib/query/retrieve.ts` → both query routes) for member keys under 'enforcing', delegated
- * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), and the work-timeline read
- * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`).
- * Arcs and the remaining dashboard surfaces are NOT yet enforced — an operator flipping the flag
- * must know that; those are later Phase B slices.
- *
- * Only flip a team to 'enforcing' once its §11 backfill is complete — an un-partitioned item has no
- * membership and would fail closed (vanish). The flag is the fail-open-to-today transition control.
+ * SCOPE: `GET /api/v1/items` (member AND agent keys), the retrieval path
+ * (`lib/query/retrieve.ts` → both query routes — retrieve THROWS without a view), delegated
+ * `aiosd_*` query (ALWAYS attenuated — see `delegatedVisibleItemIds`), the work-timeline read
+ * path (§5.8 visibility-variant cache — see `memberEnforcement` + `lib/dashboard/timeline-cache`),
+ * and the arcs partition scope (`lib/graph/partition-read`). The §11 backfill + the boot
+ * materialization are what make membership state complete — the PRET-6 release's preDeploy
+ * precondition refuses a fleet where they haven't run.
  */
 
 
@@ -109,8 +105,8 @@ export async function delegatedVisibleItemIds(
  * effective-project set, so two members with identical group signatures share one cache row and a
  * group change moves the member to a new key on the next read. This is the CHEAP half (projects
  * only): a cache HIT needs the hash alone, so materializing the item-id set on every read (even a
- * hit) would defeat what the cache is for (Fable B4 Medium). Null = permissive team (serve the
- * plain tier row). Throws on a flag-read error (the caller fails closed — 500/no data).
+ * hit) would defeat what the cache is for (Fable B4 Medium). PRET-6: always resolves (never
+ * null) — a substrate read error throws and the caller fails closed (500/no data).
  */
 export interface MemberVisibility {
   visibleProjectIds: ReadonlySet<string>;
@@ -118,8 +114,7 @@ export interface MemberVisibility {
   visibilityHash: string;
 }
 
-export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility | null> {
-  // PRET-6: enforcing is the only behavior — visibility always resolves.
+export async function memberVisibility(db: DbClient, principal: Principal): Promise<MemberVisibility> {
   const { projectIds } = await visibleProjects(db, principal);
   const visibilityHash = createHash("sha256").update([...projectIds].sort().join(",")).digest("hex").slice(0, 16);
   return { visibleProjectIds: projectIds, visibilityHash };
@@ -155,10 +150,10 @@ export async function resolveTimelineEnforcement(
 
 /**
  * Convenience for DIRECT build paths (no cache layer to shield — e.g. the >7d timeline expansion):
- * resolve the full enforcement in one call. Null on a permissive team. The cache layer does NOT
- * use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
+ * resolve the full enforcement in one call. PRET-6: always resolves for a live principal. The
+ * cache layer does NOT use this — it splits cheap-hash / lazy-items across the hit/miss boundary.
  */
-export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement | null> {
+export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement> {
   const vis = await memberVisibility(db, principal);
-  return vis ? resolveTimelineEnforcement(db, principal.teamId, vis) : null;
+  return resolveTimelineEnforcement(db, principal.teamId, vis);
 }

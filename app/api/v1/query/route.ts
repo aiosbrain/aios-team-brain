@@ -10,7 +10,6 @@ import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import {
   ownsConversation,
-  recentTurns,
   createConversation,
   appendMessage,
 } from "@/lib/chat/store";
@@ -88,12 +87,11 @@ export async function POST(req: NextRequest) {
   }
 
   // Persistent thread, owned by the key's member — same store as the dashboard chat, so a CLI /
-  // Telegram-via-Hermes turn continues the member's existing conversation. Load prior turns BEFORE
-  // recording the current question; the assistant turn is persisted once streaming completes.
-  // Delegated tokens get NO thread: nothing is read or written to the member's conversations.
+  // Telegram-via-Hermes turn continues the member's existing conversation; the assistant turn is
+  // persisted once streaming completes. Delegated tokens get NO thread: nothing is read or
+  // written to the member's conversations.
   const owner = auth ? { teamId: auth.teamId, memberId: auth.memberId } : null;
   let conversationId = owner && conversation_id && (await ownsConversation(db, owner, conversation_id)) ? conversation_id : null;
-  const priorTurns = owner && conversationId ? await recentTurns(db, owner, conversationId) : [];
   let createdNew = false;
   if (owner && !conversationId) {
     const created = await createConversation(db, owner, question);
@@ -155,10 +153,13 @@ export async function POST(req: NextRequest) {
     return errorResponse("internal", "enforcement check failed", 500);
   }
 
-  // Access enforcement (Codex HIGH): prior assistant turns can quote content whose items are no
-  // longer visible to this principal (e.g. after a group change) — omit history under enforcing
-  // until turns are visibility-revalidated. The current turn's answer is freshly retrieval-grounded.
-  const historyTurns = enforce ? [] : priorTurns;
+  // Access enforcement (Codex HIGH; PRET-6 made it unconditional): prior assistant turns can
+  // quote content whose items are no longer visible to this principal (e.g. after a group
+  // change), so the LLM history window is EMPTY for every conversation until turns are
+  // visibility-revalidated — a named backlog item, not an accident (the `recentTurns` load
+  // retired with the permissive arm that consumed it). The thread itself still persists — the
+  // current turn's answer is freshly retrieval-grounded and appended to the conversation.
+  const historyTurns: import("@/lib/query/claude").ChatTurn[] = [];
 
   // Quota integrity (Codex B3 High): write the query_log row BEFORE streaming and UPDATE it on
   // `done` — the daily count and team budget read query_log, and a row written only in the done

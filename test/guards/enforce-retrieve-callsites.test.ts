@@ -71,10 +71,12 @@ describe("arc enforcement wiring in app/api/brain/arcs/route.ts (Phase B slice 5
     const recomputeAt = rc.indexOf("await recomputeArcs(");
     expect(gateAt, "the write gate must precede recomputeArcs").toBeLessThan(recomputeAt);
   });
-  it("both arc routes neutralize the response for an enforcing member whose result is empty (§5.7 — no absent-vs-invisible disclosure)", () => {
-    // main route: the team-wide diagnostic runs ONLY on a permissive team …
-    expect(read("app/api/brain/arcs/route.ts")).toMatch(/if\s*\(arcs\.length === 0 && enforce == null\)/);
-    // … and both routes return a neutral envelope on enforcing-empty.
+  it("both arc routes neutralize the response for a member whose result is empty (§5.7 — no absent-vs-invisible disclosure)", () => {
+    // PRET-6: the team-wide empty-panel DIAGNOSTIC is RETIRED with the permissive mode (it read
+    // unscoped graph/LLM health, which §5.7 forbids serving to a partitioned member) — pin its
+    // ABSENCE, not its gating.
+    expect(read("app/api/brain/arcs/route.ts")).not.toMatch(/no_facts|model_failing|synthesis_empty/);
+    // … and both routes return a neutral envelope on empty.
     expect(read("app/api/brain/arcs/route.ts")).toMatch(/enforce != null && arcs\.length === 0/);
     expect(read("app/api/brain/arcs/recompute/route.ts")).toMatch(/enforcingEmpty\s*=\s*enforce != null && arcs\.length === 0/);
   });

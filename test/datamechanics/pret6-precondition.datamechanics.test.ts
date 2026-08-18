@@ -63,6 +63,17 @@ describe("PRET-6 §2.1 — the refusing precondition, executed from the migratio
     expect(await columnExists("access_enforcement")).toBe(true);
   });
 
+  it("REFUSES a PRE-FLAG-ERA fleet — teams, no marker, the column NEVER existed (diff-review HIGH: a column-gated marker check would skip this class and the whole corpus would go dark at cutover)", async () => {
+    // The fleet installed before 20260811160000 existed: no access_enforcement column, no
+    // builtin rows, real teams. The marker refusal must fire UNCONDITIONALLY.
+    await seedTeam();
+    await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
+    await runSql("alter table teams drop column if exists access_enforcement", []);
+    await runSql("alter table teams drop column if exists autoflip_hold", []);
+    await expect(runSql(migrationSql(), [])).rejects.toThrow(/materialization has not completed/);
+    await restoreColumns();
+  });
+
   it("DROPS both columns on an all-enforcing materialized fleet — and REPLAYS as a no-op (run twice, the idempotence proof)", async () => {
     await restoreColumns();
     const seed = await seedTeam();

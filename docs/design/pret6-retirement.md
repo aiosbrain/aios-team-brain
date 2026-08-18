@@ -87,7 +87,7 @@ direction — it deletes the branches that only ever fired for permissive teams,
 | `lib/access/inspect.ts` permissive mode arm | deletes; the inspector is oracle-only, `mode` field retires from its payload (wire note §0b) |
 | `lib/admin/access-enforcement.ts`, `lib/admin/auto-flip-pass.ts`, `scripts/admin.ts` `set-access-enforcement`/`auto-flip`, the scheduler's `runAutoFlip` slot, `teams.autoflip_hold` | the whole flip subsystem deletes (its terminal state is reached); `assessEnforcementReadiness`'s BLIND-PRINCIPAL scan AND its unpartitioned-items scan both survive, re-homed as the standing health check (`lib/admin/access-health.ts` — the separability is verified: the scan reads `isPrincipal`/`visibleProjects`/`builtinMembershipBySlug` (see `lib/access/oracle.ts`, `lib/access/groups.ts`)/`findUnpartitionedItems`, none flip-machinery) surfaced through the permission inspector; the `tier-no-access-reads` allowlist entry for `BlindPrincipal.tier` moves to the new file path (the allowlist is file-keyed; the M3 tier MIRROR itself — `lib/access/groups.ts` `mirrorTierToPosture` — is untouched by this slice) |
 | `lib/api/version.ts` | CORRECTED (cold-read M4): the reference at `version.ts:33` is a CHANGELOG COMMENT (the 1.19 entry), not a wire field — no capability exists and nothing wire-breaks; the historical line is reworded so AC1's grep passes, stated as exactly that |
-| `docker/bootstrap.mjs` post-seed `auto-flip` spawn (cold-read H3) | replaced by a DIRECT `drainTeamContext` call after seeding (`lib/projects/context/backfill.ts` survives) — the demo team is born enforcing with its seed rows partitioned before first serve, preserving the PRET-2 cold-read-M2 fix; `test/guards/autoflip-callsites.test.ts` deletes WITH the subsystem (re-homing table) |
+| `docker/bootstrap.mjs` post-seed `auto-flip` spawn (cold-read H3) | replaced by a `scripts/admin.ts drain-context` spawn after seeding (→ `drainTeamContext`; `lib/projects/context/backfill.ts` survives) — the demo team is born enforcing with its seed rows partitioned before first serve, preserving the PRET-2 cold-read-M2 fix; `test/guards/autoflip-callsites.test.ts` deletes WITH the subsystem (re-homing table) |
 | `scripts/pret-flip-estimate.mjs` (cold-read M1) | DELETED — it queries the dropped column and would zombie-crash; AC1's grep widens to `scripts/` with no extension filter to catch this class |
 | `lib/ingest/leg-ledger.ts` / `pipeline-health.ts` `auto_flip` rows (cold-read M2) | KEPT as historical-source entries (`auto_flip: null`), commented as such — prod's `ingest_runs` history holds `auto_flip` rows forever, and deleting the threshold entry would re-inherit the 3h default and pin the banner red on a dead leg |
 | `postgres/schema.sql` + the new migration | both columns drop; §2.1's precondition guards the replay |
@@ -109,19 +109,20 @@ So, three coordinated pieces IN THE SAME PR:
    (`20260811160000_access_enforcement_flag.sql`, `20260817120000_autoflip_hold.sql`) — the
    replay-demands-editing rule `postgres/migrations/README.md` already sanctions; their text
    records what they did and points here.
-2. **The new migration's guard is EXISTENCE-gated and only then refusing** — the permissive
-   scan is reachable only while the column exists, and the marker check closes H2's hole:
+2. **The MARKER refusal is UNCONDITIONAL; only the permissive scan + drop are existence-gated**
+   (amended by the diff-review HIGH — the first shape nested the marker check inside the
+   column gate, which silently skipped the PRE-FLAG-ERA fleet class):
 
 ```sql
 do $$ begin
+  if exists (select 1 from teams)
+     and not exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
+    raise exception 'PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.md)';
+  end if;
   if exists (select 1 from information_schema.columns
-             where table_name = 'teams' and column_name = 'access_enforcement') then
+             where table_schema = current_schema() and table_name = 'teams' and column_name = 'access_enforcement') then
     if exists (select 1 from teams where access_enforcement = 'permissive') then
-      raise exception 'PRET-6 refused: permissive team(s) remain — flip them first (see release notes)';
-    end if;
-    if exists (select 1 from teams)
-       and not exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
-      raise exception 'PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet — upgrade through the prior release first';
+      raise exception 'PRET-6 refused: permissive team(s) remain — flip them first (see docs/RELEASE-NOTES-pret6.md)';
     end if;
     alter table teams drop column access_enforcement;
     alter table teams drop column if exists autoflip_hold;
@@ -129,9 +130,12 @@ do $$ begin
 end $$;
 ```
 
-   A replay after the drop takes the outer-`if` false branch — a clean no-op. A from-zero
-   load never creates the column (schema.sql is amended in the same PR), so the branch is
-   false there too.
+   A replay after the drop: the marker exists (never deleted in production), the column gate
+   takes the false branch — a clean no-op. A from-zero load: no teams at the first preDeploy
+   (the marker check short-circuits), the column never exists (schema.sql amended in the same
+   PR), and the boot materialization stamps the marker — even on a zero-team fleet — before a
+   second deploy can meet a created team. The existence gate is schema-qualified so an
+   operator's `backup.teams` copy cannot flip it true post-drop and wedge the replay.
 3. **AC3's dm proof runs the real sequence TWICE** (the omitting-a-flag-isn't-skipping
    lesson): the full loader against a teams-holding enforcing DB, twice, diffing schema state
    — idempotence proven by execution, not asserted.
@@ -141,10 +145,13 @@ end $$;
 run and the scheduler retry block (`lib/ingest/scheduler.ts`, a SEPARATE block from
 `runAutoFlip`) — because they are the self-heal for a restored-from-backup DB or a fleet
 whose sweep failed pre-upgrade, and the §2.1 marker precondition is what makes "explicit
-builtin state everywhere" true rather than assumed. A skipped-ladder fleet (pre-PRET-2, the
-column never existed) passes the existence gate silently and correctly: such a fleet has no
-teams-with-permissive-semantics to vanish — its teams were created by a release whose
-`createMember` writes explicit state.
+builtin state everywhere" true rather than assumed. **The PRE-FLAG-ERA fleet (installed
+before the flag migration existed — the column never on their DB) is covered by the
+UNCONDITIONAL marker refusal**: the first draft waved this class through on the claim that
+its teams were created by an explicit-state `createMember`, which is false — explicit-state
+writes shipped with PRET-4, AFTER the flag column — so such a fleet has no builtin rows and
+would go entirely dark at cutover; it now refuses until it upgrades through the prior
+release (whose boot materializes and stamps the marker).
 
 `pg:schema` is Railway's preDeploy hook — the chain, by repo path (SR16):
 `railway.json` `deploy.preDeployCommand: "npm run pg:schema"` → `package.json` `pg:schema` →

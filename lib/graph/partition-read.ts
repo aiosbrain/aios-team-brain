@@ -159,25 +159,19 @@ export async function resolveArcScope(
     memberId: string;
     tier: "team" | "external";
     /** Pre-resolved enforcement, when the caller already holds it (the arcs routes need it for
-     *  the evidence filter regardless) — avoids a second oracle resolution. `undefined` =
-     *  resolve here; `null` = the caller resolved and the team is permissive. */
+     *  the evidence filter regardless) — avoids a second oracle resolution. Absent/null =
+     *  resolve here (PRET-6: `memberEnforcement` always resolves for a live principal; a
+     *  substrate error throws — the caller's 500, never a widened scope). */
     enforcement?: import("@/lib/access/enforce").TimelineEnforcement | null;
   }
 ): Promise<ArcScope> {
   // PRET-6: enforcing is the only behavior — the member's oracle scope IS the resolution
-  // (the permissive built-in-pointer arm retired with the model). A caller passing
-  // `enforcement: null` gets a fresh resolution rather than a retired branch.
+  // (the permissive built-in-pointer arm retired with the model).
   const { memberEnforcement } = await import("@/lib/access/enforce");
   const enforce =
     args.enforcement != null
       ? args.enforcement
       : await memberEnforcement(db, { teamId: args.teamId, memberId: args.memberId });
-  if (enforce == null) {
-    // memberVisibility is unconditional post-PRET-6; a null here means the member does not
-    // resolve at all — fail closed with the loud empty scope.
-    console.error(`[arcs] resolveArcScope: member ${args.memberId} on team ${args.teamId} resolves NO enforcement`);
-    return { groups: [], arm: false };
-  }
   // Uncapped, same as the arcs GET has since PPARC-3 (Fable 6b Medium 3): arcs need the whole
   // ready scope for coverage and scope-key stability.
   const scope = await selectEnforcedGraphPartitions(db, {

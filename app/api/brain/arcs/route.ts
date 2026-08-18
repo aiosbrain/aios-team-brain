@@ -9,8 +9,6 @@ import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { resolveArcScope } from "@/lib/graph/partition-read";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
-import { getLlmHealth } from "@/lib/query/llm-health";
-import { graphHasFacts } from "@/lib/query/retrieval-health";
 import { freshnessWire, computedNow } from "@/lib/freshness";
 
 export const runtime = "nodejs";
@@ -19,7 +17,6 @@ export const runtime = "nodejs";
 export const maxDuration = 120;
 
 /** Why the arc panel is empty — so the UI shows the actual cause instead of a benign "no arcs yet". */
-type EmptyReason = "no_facts" | "model_failing" | "synthesis_empty" | null;
 
 const schema = z.object({ team: z.string().min(1).max(120) });
 
@@ -51,7 +48,6 @@ export async function POST(req: NextRequest) {
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
   const memberId = (me as { id: string }).id;
-  const meRole = (me as { role: string }).role;
   // PRET-4 §1a: `tier` downstream (resolveArcScope's permissive arm, the corrections gate) is
   // POSTURE — everyone-membership — not the members.tier record.
   const { resolveViewerPosture } = await import("@/lib/access/posture");
@@ -83,45 +79,13 @@ export async function POST(req: NextRequest) {
   // principal-visible by construction, but an item restricted BETWEEN synthesis and read is not.
   const arcs = filterArcsByVisibleItems(allArcs, enforce?.visibleItemIds ?? null);
 
-  // Empty arcs are ambiguous — tell the client the ACTUAL cause so the panel stops showing a benign
-  // "no arcs yet" for what is really a broken graph or a failing model:
-  //   • no facts in the graph        → the projector hasn't populated it (graph/projector issue)
-  //   • facts exist + LLM degraded   → the answering/reasoning model is failing (empty/timeout)
-  //   • facts exist + LLM ok         → synthesis produced nothing this time (usually transient)
-  // §5.7 (Codex B5 High): the diagnostic below reads TEAM-WIDE graph/LLM health (`graphHasFacts`
-  // counts every episode, unscoped), so on an ENFORCING team it would tell a partitioned member
-  // "no_facts" when the team graph is truly empty but "synthesis_empty" when only INVISIBLE facts
-  // exist — disclosing that restricted content is in flight. So compute it ONLY on a permissive team
-  // (no partition to leak); an enforcing member's empty result stays a neutral empty.
-  let reason: EmptyReason = null;
-  let note: string | undefined;
-  if (arcs.length === 0 && enforce == null) {
-    const [hasFacts, llm] = await Promise.all([graphHasFacts(team.id), getLlmHealth(team.id)]);
-    if (!hasFacts) {
-      reason = "no_facts";
-      note =
-        "The knowledge graph has no facts yet, so there's nothing to synthesize. The graph projector may not have run or is failing — an admin can check Admin → Integrations → Retrieval health (Graph memory).";
-      // The ARCS TASK's state, not the leg's (LLMOBS-1). The leg now aggregates every recorded
-      // generation task, so a confirmed `meeting-summary` failure would otherwise tell a user their
-      // arcs are empty because the model is failing — while the reasoning model that actually
-      // synthesises arcs is healthy. A false diagnosis on a user-facing surface, created by widening
-      // the leg; review caught it as an unenumerated consumer.
-    } else if (llm.tasks.some((t) => t.task === "arcs" && t.state === "degraded")) {
-      reason = "model_failing";
-      note =
-        llm.note ??
-        "The answering model recently failed to produce output — check Admin → Integrations and the Active answering model.";
-    } else {
-      reason = "synthesis_empty";
-      note = "The graph has facts but synthesis returned nothing this time — this is usually transient; try again shortly.";
-    }
-  }
-
-  // The diagnostic `note` names internal admin surfaces and — for `model_failing` — embeds the raw
-  // provider error (`llm.note` → internal LLM base URL, model slug, and the provider's error body).
-  // That's team-internal infra detail: redact it for `external`-tier collaborators (who can't act on it
-  // and shouldn't see the config), keeping only the coarse `reason` category. Team tier still gets the
-  // actionable note.
+  // PRET-6: the empty-panel DIAGNOSTIC (the three reason codes + the ops note) is RETIRED with
+  // the permissive mode. It read TEAM-WIDE graph/LLM health, which §5.7
+  // forbids serving to a partitioned member (it discloses that invisible content is in flight),
+  // so it was already computed only on permissive teams — with every read now enforced, the
+  // branch was dead. Every empty panel takes the neutral envelope; the wire keys stay (constant
+  // null/undefined) so no consumer's shape breaks. Diagnosis lives on the admin surfaces
+  // (Retrieval health / generation health), which are role-gated and may read team-wide state.
   const wire = freshnessWire(freshness);
   // §5.7 (Codex B5 Medium): when an ENFORCING member's result is empty, the tier cache's
   // `as_of`/`stale`/`degraded` would leak hidden-corpus refresh/failure activity (they reflect the
@@ -141,17 +105,13 @@ export async function POST(req: NextRequest) {
     // so every client receives the pair (spec M4: an ADDITIVE gain for former tier-path clients).
     coveredPartitions: covered,
     totalPartitions: total,
-    // `degraded` is the ENVELOPE's now (R2/M6): "a leg this payload depended on failed". It subsumes the
-    // old back-compat flag, which was `reason === "model_failing"` — i.e. only ever true when arcs were
-    // EMPTY, since `reason` is computed solely on the empty path. The envelope's is strictly wider and
-    // catches the case that flag structurally could not: a NON-empty arc set synthesized from degraded
-    // inputs (H11), which is the dangerous one because it looks fine. Kept truthy-compatible for any
-    // consumer reading the old meaning; the panel reads `reason`, not this.
-    degraded: wire.degraded || reason === "model_failing",
-    reason,
-    // PRET-4 §1d: the note is OPS detail (internal LLM base URL/model/provider error) — gated
-    // on ROLE now, not posture: only admins see infra internals.
-    note: meRole === "admin" ? note : undefined,
+    // `degraded` is the ENVELOPE's (R2/M6): "a leg this payload depended on failed" — incl. the
+    // dangerous non-empty-but-degraded case (H11). The retired diagnostic's model-failing
+    // contribution died with it (that flag was only ever true on the empty path, which the
+    // envelope subsumes).
+    degraded: wire.degraded,
+    reason: null,
+    note: undefined,
     // WAS `new Date().toISOString()` — a lie. `arc_cache` has a 4h TTL and the SWR branch deliberately
     // serves rows OLDER than that, so this stamped hours-old arcs as current, and destroyed the
     // backdating H11/H12 built to mark an untrustworthy synthesis. Now the row's real time.
