@@ -292,22 +292,32 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
 
     // Workspaces 2 and 3: their OWN projects, each with its own scaffold `TT1` — the live shape, where
     // the owner keeps its link and the newcomers have none.
+    // The anchors are RECORDED here and asserted AFTER the invariant, deliberately. Asserted inline they
+    // abort the scenario first — under the canonical mutant (self-exclusion re-keyed to `row_key`
+    // alone) the scaffold row adopts the owner's issue, `issueCreate` never happens, and the anchor
+    // fires before the invariant assertion is ever evaluated. The invariant would then be caught by a
+    // sibling layer instead of proving itself, which is how a guard ends up decorative.
+    const anchors: { slug: string; mutations: string[]; updated: string[] }[] = [];
     for (const slug of ["ws-two", "ws-three"]) {
       await pushTasks(seed, slug, [{ row_key: "TT1", title: "Example team task", status: "ready" }], slug);
       const scaffold = linearMock({ issues: [FOOTERED_ISSUE] });
       await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", slug), {
         fetchImpl: scaffold.fetchImpl,
       });
-
-      // POSITIVE ANCHOR: this row actually reached the adapter. "The fetch mock was called" would not
-      // do — `projectRows` calls `prepare` before any row projects (project.ts:401), so bootstrap
-      // alone satisfies it even when every row short-circuits at :284.
-      expect(scaffold.mutations, `scaffold ${slug} never reached the adapter`).toContain("issueCreate");
-      expect(scaffold.updated, "it must not write into the owner's issue").not.toContain(OWNED_ISSUE_ID);
+      anchors.push({ slug, mutations: scaffold.mutations, updated: scaffold.updated });
     }
 
+    // THE INVARIANT, first.
     expect(await duplicateGroups(seed.teamId)).toEqual([]);
     expect(await ownedLinkCount(seed.teamId), "three rows must have produced three distinct links").toBe(3);
+
+    // Then the anti-vacuity anchors: each row actually reached the adapter. "The fetch mock was called"
+    // would not do — `projectRows` calls `prepare` before any row projects (project.ts:401), so
+    // bootstrap alone satisfies it even when every row short-circuits at :284.
+    for (const a of anchors) {
+      expect(a.mutations, `scaffold ${a.slug} never reached the adapter`).toContain("issueCreate");
+      expect(a.updated, "it must not write into the owner's issue").not.toContain(OWNED_ISSUE_ID);
+    }
   });
 
   it("RUNG 1 MISSING because the issue was DELETED at the provider, twice in succession", async () => {
@@ -352,9 +362,10 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
       await projectTaskByIdAfterWrite(db(), await taskIdOf(seed.teamId, "TT1", "ws-deleted"), {
         fetchImpl: run.fetchImpl,
       });
+      // Invariant first, anchors second — see the note in the scenario above.
+      expect(await duplicateGroups(seed.teamId), `pass ${pass} produced a duplicate group`).toEqual([]);
       expect(run.mutations.length, `pass ${pass} never reached the adapter`).toBeGreaterThan(0);
       expect(run.updated, `pass ${pass} wrote into the owner's issue`).not.toContain(OWNED_ISSUE_ID);
-      expect(await duplicateGroups(seed.teamId), `pass ${pass} produced a duplicate group`).toEqual([]);
     }
   });
 
@@ -390,11 +401,11 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
       fetchImpl: claimant.fetchImpl,
     });
 
+    expect(await duplicateGroups(seed.teamId)).toEqual([]);
     const claimantLink = await linkOf(seed.teamId, "TT9");
     expect(claimantLink?.provider_resource_id, "the claimant must not end up holding the owner's issue").not.toBe(
       OWNED_ISSUE_ID
     );
     expect(claimant.updated, "and must not have written into it").not.toContain(OWNED_ISSUE_ID);
-    expect(await duplicateGroups(seed.teamId)).toEqual([]);
   });
 });
