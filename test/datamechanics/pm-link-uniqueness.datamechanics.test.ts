@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { projectTaskByIdAfterWrite } from "@/lib/pm-sync";
 import { runInboundForTeam } from "@/lib/pm-sync/inbound";
+import { linearMirrorProject } from "@/lib/ingest/sources/linear-normalize";
 import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/manage";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
@@ -468,6 +469,20 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     ).toBe(OWNED_ISSUE_ID);
     const before = await ownedLinkCount(seed.teamId);
 
+    // Inbound only ADOPTS an issue that already has a mirror task under the deterministic
+    // `linear-<teamKey>` project (inbound.ts:416-428 skips "no mirror task yet"). Without one the leg
+    // skips for an unrelated reason and the scenario proves nothing — a mutation deleting the ownership
+    // filter SURVIVED at this exact step until the mirror was seeded.
+    const mirror = await makeProject(seed, linearMirrorProject("AIO"));
+    await db().from("tasks").insert({
+      team_id: seed.teamId,
+      project_id: mirror,
+      row_key: OWNED_ISSUE.identifier,
+      title: `Native ${OWNED_ISSUE.identifier}`,
+      status: "in_progress",
+      origin: "sync",
+    });
+
     // Now the inbound leg sees that same issue in the Linear team and tries to mirror it in.
     const inbound = linearMock({ issues: [OWNED_ISSUE] });
     const result = await runInboundForTeam(db(), seed.teamId, { fetchImpl: inbound.fetchImpl });
@@ -476,6 +491,11 @@ describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgre
     // POSITIVE ANCHOR: the leg actually ran. `enabled: false` is the silent no-op above.
     expect(result.enabled, "the inbound leg did not run — this scenario would prove nothing").toBe(true);
     expect(result.reason ?? "", "the inbound leg bailed early").toBe("");
+    expect(
+      result.skipped.join(" "),
+      "the issue was skipped for a FIXTURE reason (no mirror task), not because it is owned"
+    ).not.toContain("no mirror task yet");
+    expect(result.adopted, "an owned issue must never be adopted by the mirror").toEqual([]);
     expect(await ownedLinkCount(seed.teamId), "inbound must not have added a link for an owned issue").toBe(
       before
     );
