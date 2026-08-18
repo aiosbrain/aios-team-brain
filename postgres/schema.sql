@@ -156,15 +156,10 @@ create table if not exists teams (
   meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
--- Access-enforcement rollout flag (Phase B, spec §5/§11): 'permissive' (default) = today's
--- legacy-tier-only reads, byte-identical; 'enforcing' = oracle membership filter ∧ legacy tier (GET /api/v1/items only this slice).
--- CHECK lives in the 20260811160000 migration (named, replay-repairable).
-alter table teams add column if not exists access_enforcement text not null default 'permissive';
--- PRET-2: the auto-flip operator-undo hold — set atomically with any downgrade to permissive,
--- cleared by any enforcing flip (sole writer lib/admin/access-enforcement). Control state, NOT
--- audit-derived (Codex PRET-2 High 2: a best-effort audit row cannot enforce an operator
--- safety decision). Mirrored in postgres/migrations/20260817120000_autoflip_hold.sql.
-alter table teams add column if not exists autoflip_hold boolean not null default false;
+-- PRET-6: the access-enforcement rollout flag and the auto-flip hold are RETIRED — enforcing
+-- is the only behavior (docs/design/pret6-retirement.md). A from-zero load never creates the
+-- columns; upgrading fleets drop them via 20260818210000_pret6_retire_access_enforcement.sql
+-- behind its refusing precondition.
 -- Additive columns for existing deployments.
 alter table teams add column if not exists primary_pm_provider text;
 alter table teams add column if not exists answering_provider text;
