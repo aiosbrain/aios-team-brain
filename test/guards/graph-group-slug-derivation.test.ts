@@ -70,7 +70,16 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
     expect(hits).toEqual([]);
   });
 
-  it("every graph read leg resolves through the pointer authority", () => {
+  // WHAT THIS PROVES, EXACTLY: that each leg still REFERENCES the pointer authority. It is a
+  // text-presence check, so it cannot prove the resolved ids are what scope the search — a
+  // refactor could extract the resolution, leave a vestigial call here, scope `/search` from
+  // somewhere else, and this would stay green while the defect returned. Nothing static can close
+  // that; the BEHAVIOURAL guarantee is
+  // test/datamechanics/graph-rename-read-pointer.datamechanics.test.ts, which renames a projected
+  // team against real Postgres and asserts the read set still addresses its episodes. This case
+  // earns its place only as the cheap tripwire for a leg being unwired wholesale — read it as
+  // "the wiring is still named here", not "the wiring is still correct".
+  it("every graph read leg still references the pointer authority (presence, not behaviour)", () => {
     // The legs that were defective. Named individually because "no episodeGroupId" is satisfied
     // vacuously by a leg that stops reading the graph at all.
     const legs = [
