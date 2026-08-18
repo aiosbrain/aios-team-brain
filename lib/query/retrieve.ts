@@ -649,7 +649,7 @@ async function nativeRetrieve(
   const tasksB = visibleTasks(
     db
       .from("tasks")
-      .select("row_key, title, assignee, status, sprint, updated_at, source_item_id, projects(slug)")
+      .select("row_key, title, assignee, status, sprint, updated_at, source_item_id, created_by, projects(slug)")
       .eq("team_id", teamId)
       .order("updated_at", { ascending: false })
       .limit(80),
@@ -873,8 +873,12 @@ async function nativeRetrieve(
   const recencyDecisions: DecisionLine[] = (decisions ?? [])
     // enforcement: a decision whose SOURCE ITEM the principal can't see is dropped (its title/
     // metadata would otherwise leak a restricted item; row-grain membership is Phase D — this
-    // source-item gate is the safe interim). Dashboard-created rows (null source) stay tier-bounded.
-    .filter((d) => (d.source_item_id ?? null) === null ? visibleIds === null : visible(d.source_item_id as string))
+    // source-item gate is the safe interim). A NULL-source decision is dropped DELIBERATELY
+    // (PRET-6, matching the timeline's decision leg): `decisions` has no creation-provenance
+    // column, so a dashboard-created row is indistinguishable from a synced row whose restricted
+    // source was purged (`on delete set null`) — reviving the first would leak the second.
+    // Named backlog: a `decisions.created_by` column re-admits the hand-typed arm safely.
+    .filter((d) => (d.source_item_id ?? null) !== null && visible(d.source_item_id as string))
     .map((d) => ({
     row_key: d.row_key as string,
     decided_at: (d.decided_at as string | null) ?? null,
@@ -887,7 +891,7 @@ async function nativeRetrieve(
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
   const olderMatches = matchedDecisions
     .filter((d) => !recencyKeys.has(d.row_key))
-    .filter((d) => (d.source_item_id ?? null) === null ? visibleIds === null : visible(d.source_item_id)); // enforcement: source-item gate; null-source dropped when enforcing
+    .filter((d) => (d.source_item_id ?? null) !== null && visible(d.source_item_id)); // source-item gate; null-source dropped deliberately (no provenance column — see the recency leg's note)
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
@@ -910,7 +914,17 @@ async function nativeRetrieve(
     "",
     "## Tasks (all statuses, most recently updated first)",
     ...(tasks ?? [])
-      .filter((t) => (t.source_item_id ?? null) === null ? visibleIds === null : visible(t.source_item_id as string))
+      // The timeline's settled provenance rule (PRET-5 H2 / Codex diff-review H2), applied here:
+      // a SOURCED task gates on its source item's visibility; a null-source task survives ONLY
+      // when hand-typed (`created_by` is set solely by the dashboard create path and never by
+      // sync — so a synced task whose restricted source was PURGED stays dropped) and the viewer
+      // is team-posture (no membership axis exists for a hand-typed row, so the audience wall
+      // survives on exactly this branch).
+      .filter((t) =>
+        (t.source_item_id ?? null) !== null
+          ? visible(t.source_item_id as string)
+          : (t.created_by ?? null) !== null && tier === "team"
+      )
       .map((t) => {
       const u = t.updated_at;
       const day = typeof u === "string" ? u.slice(0, 10) : u ? new Date(u).toISOString().slice(0, 10) : "?";

@@ -79,6 +79,24 @@ describe("access health — the re-homed standing scan (PRET-6 AC5)", () => {
     expect(h.blockers.join(" ")).toMatch(/no current project membership/);
   });
 
+  it("a CUSTOM-ONLY human (no builtin, but granted a project through an ordinary group) is a WARNING, not a blind blocker (Codex diff-review Medium)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "co.md", body: "co", access: "team", project: "src" });
+    await converge(seed);
+    const custom = await seedMemberRow(seed); // human, never placed in a builtin
+    const { createGroup, grantProjectToGroup, addMemberToGroup } = await import("@/lib/access/groups");
+    const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: "co-proj", name: "CO", kind: "initiative" }).select("id").single();
+    const g = await createGroup(db(), seed.teamId, "co-g", "CO", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, custom, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, proj!.id as string, g.groupId!, seed.memberId);
+
+    const h = await assessAccessHealth(db(), seed.teamId);
+    expect(h.blindHumans.map((b) => b.memberId), "a member with real grants is NOT blind").not.toContain(custom);
+    expect(h.blockers).toEqual([]);
+    expect(h.healthy).toBe(true);
+    expect(h.warnings.join(" "), "the missing builtin floor is reported").toMatch(/NO builtin group/);
+  });
+
   it("an unplaced AGENT and an active CONNECTOR are warnings, never blockers — the team stays healthy", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "d.md", body: "d", access: "team", project: "src" });

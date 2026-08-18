@@ -170,6 +170,29 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(ctx.sources.map((s) => s.path), "the recency page must be cut over VISIBLE rows").toContain("vis-old.md");
   });
 
+  it("a HAND-TYPED task (created_by set, null source) reaches a team member's digest; a purged-basis synced task never does; external posture gets neither (Codex diff-review H2 — the timeline's provenance rule, applied to retrieve)", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "t.md", body: `t ${TERM}`, access: "team", project: "src" });
+    const srcProj = (await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "src").single()).data!.id;
+    const handErr = (await db().from("tasks").insert({ team_id: seed.teamId, row_key: "ui-1", title: "Hand-typed dashboard task", status: "backlog", origin: "ui", source_item_id: null, created_by: seed.memberId, project_id: srcProj })).error;
+    expect(handErr).toBeNull();
+    const purgedErr = (await db().from("tasks").insert({ team_id: seed.teamId, row_key: "SYNC-9", title: "Purged-basis synced task", status: "in_progress", origin: "sync", source_item_id: null, created_by: null, project_id: srcProj })).error;
+    expect(purgedErr).toBeNull();
+    await backfillTeamContext(db(), seed.teamId);
+    const member = await seedMember(seed);
+
+    const teamView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    const asTeam = await retrieve(db(), seed.teamId, "team", `${TERM} tasks`, null, teamView);
+    expect(asTeam.structured, "the hand-typed task survives for a team member").toContain("Hand-typed dashboard task");
+    expect(asTeam.structured, "a purged-basis synced task stays dropped").not.toContain("Purged-basis synced task");
+
+    const { externalMember } = await import("./helpers");
+    const ext = await externalMember(seed);
+    const extView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: ext })).ids };
+    const asExt = await retrieve(db(), seed.teamId, "external", `${TERM} tasks`, null, extView);
+    expect(asExt.structured, "a hand-typed row has no membership axis — the posture wall holds").not.toContain("Hand-typed dashboard task");
+  });
+
   it("enforcing: a member in NO groups retrieves nothing (fail closed)", async () => {
     const seed = await seedTeam();
     await ingest(seed, { path: "x.md", body: `x ${TERM}`, access: "team", project: "src" });

@@ -91,6 +91,7 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const all = (memberRows ?? []) as MemberRow[];
   const principals = all.filter((m) => isPrincipal({ ...m, tier: m.tier ?? undefined }));
   const blindHumans: BlindPrincipal[] = [];
+  const customOnlyHumans: BlindPrincipal[] = [];
   const unplacedAgents: BlindPrincipal[] = [];
   let humanPrincipals = 0;
   let agentPrincipals = 0;
@@ -112,12 +113,19 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
       // system project — the lockout warning.
       const inEveryone = builtinRows.everyone.has(m.id);
       const inExternal = builtinRows.external.has(m.id);
-      const required = inEveryone
-        ? [generalId, externalSharedId]
-        : inExternal
-          ? [externalSharedId]
-          : [undefined];
-      if (required.some((p) => !p || !projectIds.has(p))) blindHumans.push(identity);
+      if (inEveryone || inExternal) {
+        const required = inEveryone ? [generalId, externalSharedId] : [externalSharedId];
+        if (required.some((p) => !p || !projectIds.has(p))) blindHumans.push(identity);
+      } else if (projectIds.size === 0) {
+        // In NEITHER builtin and the oracle resolves nothing — genuinely blind.
+        blindHumans.push(identity);
+      } else {
+        // Codex diff-review Medium: a human in no builtin but with CUSTOM grants is NOT blind —
+        // they see their granted projects. Flagging them as "see NOTHING" was false. They still
+        // lack the builtin floor (no General/external-shared), which is worth telling the
+        // operator — as a warning, never a blocker.
+        customOnlyHumans.push(identity);
+      }
     } else {
       agentPrincipals++;
       if (projectIds.size === 0) unplacedAgents.push(identity);
@@ -132,6 +140,11 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   if (blindHumans.length > 0) {
     blockers.push(
       `${blindHumans.length} active human member(s) see NOTHING — their groups grant no path to their builtin's system project`
+    );
+  }
+  if (customOnlyHumans.length > 0) {
+    warnings.push(
+      `${customOnlyHumans.length} active human member(s) are in NO builtin group but hold custom grants — they see their granted projects only, with no General/external-shared floor (deliberate cross-enrollment looks like this; a botched removal does too)`
     );
   }
   if (unplacedAgents.length > 0) {
