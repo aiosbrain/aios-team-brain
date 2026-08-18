@@ -116,7 +116,15 @@ export async function createMember(
   try {
     const effectiveTier = input.tier ?? "team";
     const tierChanged = priorTier !== null && priorTier !== effectiveTier;
-    if (priorTier === null || tierChanged) {
+    // Codex diff-review H1: an UNCHANGED upsert still ensures the tier-matching row EXISTS
+    // (add-only, no reconcile) — a crash between a prior upsert's tier write and its
+    // reconcile would otherwise strand the member (retry reads tier==effective, skips, and
+    // nothing repairs: zero rows → permanently external posture, or a stale old-tier row →
+    // record/posture divergence). The add-only repair converges the record to rows without
+    // clobbering a deliberate cross-enrollment (adding the record-matching row is a no-op
+    // when it exists, and for a deliberately-narrowed member it re-asserts the invite
+    // default the record itself still declares).
+    if (priorTier === null || tierChanged || opts.upsert) {
       const { writeInviteDefaultMembership } = await import("@/lib/access/groups");
       const w = await writeInviteDefaultMembership(admin, teamId, data.id, effectiveTier, { reconcile: tierChanged });
       if (!w.ok) {

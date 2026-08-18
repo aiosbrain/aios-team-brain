@@ -292,6 +292,14 @@ export async function createGroup(
  * layer (agent-tokens mint/verify) and Linear provisioning, which read the record live, can
  * never diverge from posture. Tier is a maintained mirror of builtin state, never an
  * independent access input.
+ *
+ * KNOWN BOUNDED RACE (Codex diff-review H2, deferred with the same reason as the adapter's
+ * other unserialized read-then-write diffs): a concurrent createMember upsert writing tier
+ * between this read and the update can be overwritten by the stale mirror. Requires two
+ * concurrent deliberate admin actions on the SAME member (CLI upsert + a builtin move);
+ * converges on the next of either (the upsert path add-only-repairs, the next move
+ * re-mirrors); token/provisioning readers lag posture only inside that window. Serialize
+ * when the adapter grows transactions.
  */
 async function mirrorTierToPosture(db: DbClient, teamId: string, memberId: string): Promise<WriteResult> {
   const { data, error } = await db
