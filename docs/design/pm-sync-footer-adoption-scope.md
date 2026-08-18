@@ -1,6 +1,6 @@
 # Every new workspace's scaffold row hijacks someone else's issue — ADOPTFOOT-1
 
-**Status:** spec, draft 2. Draft 1 was CLEAR to Codex and BLOCKED by Fable — the two disagreed, and
+**Status:** spec, draft 3. Draft 1 was CLEAR to Codex and BLOCKED by Fable — the two disagreed, and
 Fable was right: draft 1's load condition guarded the wrong predicate, so the hijack re-fired through a
 path its own acceptance criteria blessed. · **Date:** 2026-08-17 · **Owner:** Chetan · **Task:** `ADOPTFOOT-1`
 **Follows:** [`pm-sync-declared-issue-adoption.md`](./pm-sync-declared-issue-adoption.md) (`ADOPTDECL-1`,
@@ -89,8 +89,15 @@ The self-exclusion becomes `project_id` **and** `row_key`, matching the link's r
 owner query requires `provider_resource_id` to be non-null (`project.ts:303`) while the load gate
 requires the *projecting* link's to be null, so the projecting link can never appear in the result set.
 The `row_key !== row.row_key` term therefore excludes only OTHER links sharing the key — precisely the
-true owner. Once §1c widens the gate, the projecting link CAN appear, and the self-exclusion becomes
-genuinely load-bearing; keyed on `(project_id, row_key)` it is then correct in both directions.
+true owner. Once §1c widens the gate the projecting link CAN appear in the result set — but **the self-exclusion
+still never changes an outcome, and saying it does was wrong twice.** Every adoption candidate comes from
+the bootstrap indexes; if a candidate's id equalled the projecting link's own resource id, rung 1
+(`issuesById.get`, `linear.ts:340`) would already have resolved it and no adoption rung would run. Even on
+the deleted-issue path the dangling id cannot match a candidate, because it is absent from the listing
+candidates are drawn from. So the exclusion only ever removes an id no candidate can match: keyed on
+`(project_id, row_key)` it is correct and harmless defence, and **no test should be written to "protect"
+an unreachable scenario.** The real defect is the old `row_key !== row.row_key` term, which removed the
+true owner.
 
 Draft 1 claimed this was "a strict widening… nothing that previously adopted stops". **That is false**,
 and §3 now names the loss: a legitimate cross-project move — the same `row_key` migrating from project A's
@@ -133,12 +140,17 @@ consulted") wrote that hole into the acceptance set.
 `project.ts` cannot see the bootstrap, so it cannot know whether rung 1 will resolve. Two layers, each
 with its own property:
 
-1. **Load whenever the adapter could adopt at all** — i.e. for every non-`statusOnly` projection, not
-   only for links that look unlinked. One indexed query (`task_pm_links_team_provider_idx`,
-   `schema.sql:1283`) against ~950 rows, on a sequential per-row loop.
-2. **Fail closed in the adapter.** If `ownedResourceIds` is `undefined`, the footer rung does not adopt
-   an issue it cannot prove is unowned. An optional-chained check that silently passes when the set is
-   missing is how draft 1's hole stayed invisible.
+1. **Load whenever the adapter could adopt at all** — i.e. for every non-`statusOnly` projection that
+   actually REACHES the adapter, not only for links that look unlinked. It sits where the current load
+   sits: inside the `try`, *after* the fingerprint short-circuit (`project.ts:284-287`), so a settled
+   board pays nothing. One indexed query (`task_pm_links_team_provider_idx`, `schema.sql:1283`) against
+   ~950 rows, on a sequential per-row loop.
+2. **Fail closed in the adapter, for BOTH adoption rungs and regardless of the link's shape.** If
+   `ownedResourceIds` is `undefined`, neither the footer rung nor the declared rung adopts an issue it
+   cannot prove is unowned. Stated universally on purpose: a version conditioned on "the link claimed a
+   resource id" would pass every criterion while a FRESH link — the scaffold shape this slice exists for —
+   still adopted an owned match. The declared rung's current `ownedResourceIds?.has(...)`
+   (`linear.ts:365`) carries exactly that optional-chain hole today and is part of this change.
 
 **The per-row load must stay per-row.** It runs after the previous row's `persistSuccess` in the
 sequential loop (`project.ts:400-412`), which is what makes row 2 see row 1's claim. Batching it once per
@@ -179,12 +191,12 @@ named: a row whose footer match is already owned now creates its own issue inste
 - `test/pm-sync-footer-adoption-scope.test.ts` — a row whose `row_key` footer matches an issue ALREADY owned by another link does NOT adopt it: no `issueUpdate` against that issue, and an `issueCreate` instead, driven through `upsertWorkItem` against a fake `fetch`.
 - `test/pm-sync-footer-adoption-scope.test.ts` — the SAME-ROW-KEY case explicitly: the owner link and the projecting row share `row_key` and differ only by `project_id`, the shape that walks through `ADOPTDECL-1`'s filter today.
 - `test/pm-sync-footer-adoption-scope.test.ts` — THE DELETED-ISSUE PATH: a link whose `provider_resource_id` is non-null but resolves to nothing (rung 1 misses) still consults the owner set, and still refuses an owned footer match. Draft 1's criterion blessed this path; it is the one that re-fires the hijack.
-- `test/pm-sync-footer-adoption-scope.test.ts` — FAIL CLOSED: when `ownedResourceIds` is `undefined`, a footer match on a row whose link claimed a resource id is NOT adopted. An optional-chained check that passes on a missing set is how the hole stayed invisible.
+- `test/pm-sync-footer-adoption-scope.test.ts` — FAIL CLOSED, UNIVERSALLY: when `ownedResourceIds` is `undefined`, NEITHER the footer rung nor the declared rung adopts — including for a FRESH link with no resource id, which is the scaffold shape. A version conditioned on "the link claimed a resource id" must fail this.
 - `test/pm-sync-footer-adoption-scope.test.ts` — a REFUSED footer match on a row that ALSO carries a declaration falls to the declared rung and takes its error semantics — it does NOT create, which would discard the declaration and mint the duplicate `ADOPTDECL-1` forbids.
-- `test/pm-sync-footer-adoption-scope.test.ts` — a row whose footer match is NOT owned still adopts, so the widening cannot swallow the ordinary re-resolution the footer rung exists for.
+- `test/pm-sync-footer-adoption-scope.test.ts` — a row whose footer match is NOT owned still adopts — asserted with a DISTRACTOR: at least one unrelated owned link is seeded so the owner set is non-empty but does not contain the candidate. Without it, a mutant refusing whenever the set is merely non-empty stays green while recovery is broken on every real board.
 - `test/pm-sync-footer-adoption-scope.test.ts` — a row whose rung 1 RESOLVES is unaffected: it updates its own issue and never consults the footer rung. Phrased on rung-1 resolution, not on "has a resource id", because those differ exactly where the bug lives.
 - `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts` — with a real link owned by project A, projecting project B's same-keyed row leaves A's `provider_resource_id` untouched and gives B its own, asserted as stored state across two projections.
-- `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts` — RECOVERY, as an outcome rather than an internal: a link whose `provider_resource_id` is nulled, and whose issue no other link owns, re-adopts that issue by footer rather than creating a second one.
+- `test/datamechanics/pm-sync-footer-adoption-scope.datamechanics.test.ts` — RECOVERY, as an outcome rather than an internal: a link whose `provider_resource_id` is nulled, and whose issue no other link owns, re-adopts that issue by footer rather than creating a second one — again with an unrelated owned link present, so the owner set is non-empty.
 - `lib/pm-sync/project.ts` — the owner set is loaded for every non-`statusOnly` projection, and the load stays PER ROW inside the sequential loop so row 2 sees row 1's claim; a batched-once load must fail a test.
 
 ## 3. Scope
@@ -197,8 +209,10 @@ their tests.
 - **A legitimate cross-project move is now refused.** The same `row_key` migrating from project A's board
   to project B previously adopted through the very hole this closes. At the data level that is
   indistinguishable from the hijack, so refusing is the defensible default — but the repair has to be
-  documented rather than left for the first person it bites: delete or null project A's link first, then
-  push B.
+  documented rather than left for the first person it bites: delete or null project A's link, **remove the
+  row from A's board**, and push B *before* A pushes again. The order matters: if A pushes in between it
+  re-adopts by footer (the issue is unowned again) and B is refused anew; and if the row stays on A's
+  board, A's next push mints junk.
 - **The footer becomes permanently ambiguous for a colliding key.** Every refused row creates an issue
   carrying an IDENTICAL footer (`withFooter(body, task.row_key, source)`, `linear.ts:385`), and
   `issuesByExt` is last-write-wins (`linear.ts:187`). So with N same-key footers, recovery for any `TT1`
@@ -212,6 +226,12 @@ their tests.
   links still hold `AIO-444`. Detaching them means those rows create their own issues on the next push —
   junk in someone else's Linear team — so which rows survive is a human call, tracked as `ADOPTUNIQ-1`.
 - **The uniqueness constraint** (`ADOPTUNIQ-1`), which stays blocked until the above is reconciled.
+- **The identical rung in the Plane adapter.** `plane.ts:220-222` resolves
+  `itemsByExt.get(extKey(source, task.row_key))` with no ownership check, and `ownedResourceIds` is not
+  even among its destructured params (`plane.ts:196`) — so a Plane-primary install hijacks exactly the
+  same way, and every criterion here would still pass. Deferred because this install's primary is Linear
+  and Plane holds 1 link against 949 (`ADOPTPLANE-1` tracks the sibling declared-rung defect in the same
+  file), but named here rather than discovered later.
 - **Making the footer project-aware** (§1d) — a format migration with a backfill, not this slice.
 - **The scaffold shipping a colliding `TT1` at all.** Arguably the workspace template should not seed a
   row whose key is guaranteed to collide across workspaces. That is a change in another repo
