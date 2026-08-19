@@ -19,7 +19,7 @@ export default async function MeetingsIndexPage({ params }: { params: Promise<{ 
   const me = await loadViewer(teamId);
   if (!me) return null;
 
-  const notes = await loadMeetingNotes(teamId, { memberId: me.id, tier: me.tier });
+  const notes = await loadMeetingNotes(teamId, me.id, me.tier);
   if (notes.length === 0) return null; // layout shows the empty state
 
   const newest = sortedMeetingNotes(notes)[0];

@@ -24,7 +24,7 @@ import { generalHoldsRestrictedContent } from "@/lib/projects/context/fanout-tar
  *   filter per fact. Enforced reads therefore fail closed on General while
  *   `generalHoldsRestrictedContent` (live row OR unconfirmed self-purge for a substrate-restricted
  *   item) is true. Substrate-discriminated, so the built-in exemption for ROUTINE hygiene below
- *   stands. The permissive union is exempt: no enforcement exists there to protect, and blanking
+ *   stands. (ENFB-3: the probe runs for EVERY resolution — the permissive union it once exempted retired with the model), and blanking
  *   General would go dark for the default mode.
  * - K-CAP (spec ~592-606): the graph stage covers General + the top-(K-1) other eligible
  *   partitions by recency prior (projects.last_synced_at — the router's correctness never matters:

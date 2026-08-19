@@ -31,7 +31,7 @@ export default async function MeetingsLayout({
 
   // ENFB-3: the list is bounded to the viewer's ORACLE set (loadMeetingNotes → the in-query
   // intersect); external posture still gets [] (the coarse wall, unchanged).
-  const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, { memberId: me.id, tier: me.tier }));
+  const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, me.id, me.tier));
   // SPLIT flags (design round 2 M5): Upload keeps the posture bit (ordinary members upload
   // meetings); Import is the repo's admin gate — a member-triggered TEAM-WIDE materialization
   // job whose {created, scanned} counts disclose meetings the caller may not see (D1).

@@ -330,3 +330,50 @@ async function teamPostureFor(db: DbClient, principal: Principal): Promise<boole
   const posture = await resolveViewerPosture(db, principal.teamId, principal.memberId);
   return posture === "team";
 }
+
+/**
+ * ENFB-3 (Fable diff H2 — the adjacent-write-route class, merge edition): merge CANDIDACY is
+ * bounded to SYSTEM-visible sources (an open include into General or external-shared).
+ * Without this, the nightly dedupe (or any member's overlapping upload) could match a
+ * RESTRICTED meeting, write the merged transcript to a fresh merge-owned item, and the inline
+ * reconcile would route that fresh unit into General — silently re-publishing restricted
+ * content to the whole team. External-shared sources stay mergeable (the merge's own access
+ * floor handles the tier math — the M1 arms pin that flow); only initiative-curated sources
+ * leave candidacy. Two restricted copies of one meeting stay separate (fail-closed
+ * over-restriction, stated in the spec). An unbootstrapped team yields the empty set —
+ * nothing is candidate (fail closed).
+ */
+export async function systemVisibleSourceIds(
+  db: DbClient,
+  teamId: string,
+  itemIds: readonly string[]
+): Promise<Set<string>> {
+  if (!itemIds.length) return new Set();
+  const { data: sys } = await db
+    .from("projects")
+    .select("id")
+    .eq("team_id", teamId)
+    .eq("kind", "system");
+  const sysIds = ((sys ?? []) as { id: string }[]).map((p) => p.id);
+  if (!sysIds.length) return new Set();
+  const { data: units } = await db
+    .from("project_context_units")
+    .select("id, source_item_id")
+    .eq("team_id", teamId)
+    .eq("unit_kind", "item")
+    .eq("state", "active")
+    .in("source_item_id", [...itemIds]);
+  const unitRows = (units ?? []) as { id: string; source_item_id: string }[];
+  if (!unitRows.length) return new Set();
+  const { data: mems } = await db
+    .from("project_context_memberships")
+    .select("context_unit_id")
+    .eq("team_id", teamId)
+    .eq("decision", "include")
+    .is("valid_to", null)
+    .in("project_id", sysIds)
+    .in("context_unit_id", unitRows.map((u) => u.id));
+  const included = new Set(((mems ?? []) as { context_unit_id: string }[]).map((m) => m.context_unit_id));
+  return new Set(unitRows.filter((u) => included.has(u.id)).map((u) => u.source_item_id));
+}
+

@@ -349,6 +349,13 @@ export async function pushMeetingTasksAction(
 
   const admin = adminClient();
 
+  // ENFB-3 (Fable diff H1 — this was the ONE transcript action that missed the gate while
+  // three artifacts attested otherwise): the ORACLE gate runs FIRST, before the provider
+  // probe, so a denied noteId refuses with the absent-note shape (§5.7) and never reaches a
+  // provider push — restricted meeting-task titles/bodies must not exit into a PM tool.
+  const note = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
+  if (!note) return { ok: false, error: "meeting note not found" };
+
   const primary = await resolvePrimaryProvider(admin, team.id);
   if (primary.provider === null) {
     return { ok: false, error: primary.reason };

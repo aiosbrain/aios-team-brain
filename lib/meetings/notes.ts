@@ -352,6 +352,9 @@ export async function listMeetingNotesForTeam(
   const { visibleItemIds } = await import("@/lib/access/enforce");
   const vis = await visibleItemIds(db, { teamId, memberId: viewer.memberId });
   if (vis.error) throw new Error("meeting visibility resolution failed");
+  // Scaling note (Fable diff L2): this materializes the viewer's whole visible-item set and
+  // compiles a bind-per-id IN list — the documented enforce.ts deferral (>65k ids errors →
+  // the error boundary, fail closed). The in-query SQL predicate is the lever when it bites.
 
   const { data: notes } = await db
     .from("meeting_notes")

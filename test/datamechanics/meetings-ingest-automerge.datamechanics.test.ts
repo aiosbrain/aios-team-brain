@@ -28,6 +28,7 @@ describe("meetings: auto-merge duplicates on ingest backfill (real Postgres)", (
     await ingest(seed, { ...meta, path: "meetings/2026-07-03-aios-sync-a.md", body: A, frontmatter: { source: "granola", date: DATE } });
     await ingest(seed, { ...meta, path: "meetings/2026-07-03-aios-sync-b.md", body: B, frontmatter: { source: "granola", date: DATE } });
 
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await backfillMeetingNotesFromItems(db(), seed.teamId, {
       keys: {},
       extract: async () => ({ summary: "", attendeeMemberIds: [] }), // no real LLM in this tier
@@ -51,6 +52,7 @@ describe("meetings: auto-merge duplicates on ingest backfill (real Postgres)", (
       body: A,
       frontmatter: { source: "granola", date: DATE },
     });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await backfillMeetingNotesFromItems(db(), seed.teamId, {
       keys: {},
       extract: async () => ({ summary: "", attendeeMemberIds: [] }),

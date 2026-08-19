@@ -10,7 +10,7 @@ import type { NarrativeArc } from "./arcs";
  * reads it serve-stale-while-revalidate. Regenerable cache, never a source of truth — safe to
  * truncate. Sole writer of `arc_cache`.
  *
- * `group_key` is the caller's sorted tier-visible group set (`visibleTierGroupIds`; the same value `arcs.ts` already
+ * `group_key` is the caller's sorted resolved partition set (the arc-scope resolution; the same value `arcs.ts` already
  * uses as its in-memory key), so a row is inherently tier-scoped — an `external` viewer only ever
  * touches the external-group row, with no cross-tier bleed.
  */

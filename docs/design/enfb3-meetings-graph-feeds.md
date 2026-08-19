@@ -178,6 +178,37 @@ meetings line).
   other visibility helper" — false since PRET-6), the SWEEP_RESIDUALS meetings line (schema
   was never the blocker), the guard header's residual roll-call.
 
+## 2b. The Fable diff round (BLOCKED — 2H+2M+2L, all folded)
+
+- **H1 — the push action was the ONE transcript action that missed the gate,** while the
+  spec, a commit message, and the guard's residual roll-call all attested otherwise, and its
+  dm refusal arm was VACUOUSLY green (the missing-PM-provider refusal fired before the note
+  read; the arm asserted only `ok:false`). Folded: `pushMeetingTasksAction` gates through
+  `getMeetingNote` BEFORE the provider probe, and the dm arm asserts the refusal IS the
+  absent-note shape. A three-layer false attestation over a live exfiltration surface — the
+  exact class the two-reviewer loop exists for.
+- **H2 — the duplicate-merge was an ungated adjacent WRITE route in the inverse direction:**
+  the design rounds pinned "a visible survivor never merges into invisibility", but the
+  nightly dedupe (or any overlapping upload) could match a RESTRICTED note, write the merged
+  transcript to a fresh item, and the D2 inline reconcile would route it into General —
+  silently re-publishing restricted content team-wide. Folded: merge CANDIDACY is bounded to
+  SYSTEM-visible sources (`systemVisibleSourceIds` — General ∪ external-shared; the first cut
+  was General-only and broke the M1 external-merge access-floor arms, which is exactly what
+  their pins exist for; only initiative-curated sources leave candidacy), applied at both
+  candidacy sites after the cheap date grouping so the steady-state tick cost is unchanged;
+  two restricted copies of one meeting stay separate (fail-closed over-restriction, stated);
+  dm-pinned both directions; the helper lives in the ACCESS layer (the single-writer guard
+  correctly refused the membership-table read from merge.ts). The merge-abort comment now names the OPERATIVE resurrection protection (the
+  merged item carries no `frontmatter.source`, which the backfill's candidate filter
+  requires).
+- **M1:** the cutover guard now pins the feeds' `k`/`arm: false` ARGUMENTS and the
+  `!generalSuppressed` discriminator, not just call presence. **M2:** `loadMeetingNotes`
+  keys its `cache()` on scalars (the object-literal arg defeated per-request memoization —
+  double oracle materialization per render). **L1:** the stale-prose sweep completed
+  (events header, partition-read's permissive-union exemption, learning/arc-cache "MUST be
+  visibleTierGroupIds", timeline-meetings' no-column framing). **L2:** the meetings list's
+  materialized-IN-list scaling ceiling annotated at the call site.
+
 ## 3. Acceptance criteria (spec-first; exact commands)
 
 1. `npm run test:datamechanics:iso test/datamechanics/enfb3-meetings.datamechanics.test.ts`

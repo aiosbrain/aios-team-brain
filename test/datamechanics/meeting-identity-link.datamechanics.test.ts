@@ -133,6 +133,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
 
     await pushTranscript(seed);
     await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail, responseStatus: "accepted" }] });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await tick(seed);
 
     expect(summary.created, "both items become notes first").toBe(2);
@@ -154,6 +155,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
 
     await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail }] });
     await pushTranscript(seed);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await tick(seed);
 
     expect(summary.link.linked).toBe(1);
@@ -170,6 +172,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     await backfillTeamContext(db(), seed.teamId);
     const cal = await pushCalendarEvent(seed);
     await pushTranscript(seed);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
 
     const { data: folded } = await db()
@@ -185,6 +188,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
 
     // The backfill notes every un-noted meeting item each tick; a folded note must not come back as a
     // second meeting on the next one.
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
     expect(await liveNotes(seed)).toHaveLength(1);
   });
@@ -197,6 +201,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     await backfillTeamContext(db(), seed.teamId);
     await pushCalendarEvent(seed, { body: "  \n\t \n" });
     await pushTranscript(seed);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
 
     const notes = await liveNotes(seed);
@@ -214,10 +219,12 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     await pushTranscript(seed);
     await pushCalendarEvent(seed, { attendees: [{ email: chetanEmail }] });
 
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
     const first = await liveNotes(seed);
     const firstSubs = await submitterIds(first[0].id);
 
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const second = await tick(seed);
     const after = await liveNotes(seed);
     expect(second.link.linked, "nothing left to link").toBe(0);
@@ -234,6 +241,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     await backfillTeamContext(db(), seed.teamId);
     await pushTranscript(seed, { eventId: "" });
     await pushCalendarEvent(seed, { eventId: "" });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await tick(seed);
 
     expect(summary.link.linked).toBe(0);
@@ -248,6 +256,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     await backfillTeamContext(db(), seed.teamId);
     await pushTranscript(seed, { body: "# Design review\n\nAlpha notes about the rollout schedule." });
     await pushTranscript(seed, { body: "# Design review\n\nCompletely different words, zero overlap here." });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await tick(seed);
 
     expect(summary.link.linked).toBe(0);
@@ -265,6 +274,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     const old = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
     await pushTranscript(seed, { date: old });
     await pushCalendarEvent(seed);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const summary = await tick(seed);
 
     expect(summary.link.linked).toBe(0);
@@ -280,6 +290,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     const chetan = await addMember(seed, "Chetan", `chetan-${randomUUID().slice(0, 6)}@acme.com`);
     await pushTranscript(seed);
     await pushCalendarEvent(seed, { asMemberId: chetan });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
 
     const notes = await liveNotes(seed);
@@ -300,12 +311,14 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
 
     // Tick 1 — the EARLIER note, which will become the merge's primary. No event id.
     await pushTranscript(seed, { eventId: "", body: shared });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await tick(seed);
 
     // Tick 2 — a second recording of the same meeting, plus Chetan's calendar event for it. The link
     // folds the calendar event into THIS note (it has the body), crediting Chetan on it...
     await pushTranscript(seed, { body: `${shared} Plus a closing note.` });
     await pushCalendarEvent(seed, { asMemberId: chetan, attendees: [{ email: chetanEmail }] });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const second = await tick(seed);
     expect(second.link.linked, "the calendar event linked to the newer transcript").toBe(1);
 
@@ -337,6 +350,7 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     // The proof it is reachable, not just present: a third push of the same event links to it.
     const third = await addMember(seed, "Third", `third-${randomUUID().slice(0, 6)}@acme.com`);
     await pushCalendarEvent(seed, { asMemberId: third });
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     const third_tick = await tick(seed);
     expect(third_tick.link.linked, "a later push of the same event still finds the meeting").toBe(1);
     expect(await submitterIds(notes[0].id)).toContain(third);

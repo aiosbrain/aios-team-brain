@@ -44,6 +44,33 @@ async function restrictInto(seed: Seed, itemId: string, memberInGroup: string): 
 
 const viewer = (memberId: string, tier: "team" | "external" = "team") => ({ memberId, tier });
 
+describe("ENFB-3 — merge candidacy is bounded to General-visible sources (Fable diff H2)", () => {
+  it("a RESTRICTED meeting is never matched as a duplicate — the nightly dedupe cannot re-publish it into General", async () => {
+    const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId);
+    const insider = await seedMember(seed);
+    const SAME = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november";
+
+    // A restricted note and an overlapping General upload on the SAME date.
+    const secret = await createMeetingNote(db(), seed.teamId, {
+      title: "Q3 acquisition sync", rawText: SAME, submittedByMemberId: insider, occurredAt: "2026-08-18", summary: "", attendeeMemberIds: [],
+    });
+    const { data: sRow } = await db().from("meeting_notes").select("source_item_id").eq("id", secret.noteId).single();
+    await restrictInto(seed, sRow!.source_item_id as string, insider);
+
+    const { findDuplicateMeeting } = await import("@/lib/meetings/merge");
+    const match = await findDuplicateMeeting(db(), seed.teamId, "2026-08-18", SAME);
+    expect(match, "a restricted note must not be a merge candidate").toBeNull();
+
+    // Non-vacuity: the SAME overlap against a General note DOES match.
+    await createMeetingNote(db(), seed.teamId, {
+      title: "Open sync", rawText: SAME, submittedByMemberId: insider, occurredAt: "2026-08-17", summary: "", attendeeMemberIds: [],
+    });
+    const openMatch = await findDuplicateMeeting(db(), seed.teamId, "2026-08-17", SAME);
+    expect(openMatch, "the candidacy filter is visibility, not a blanket wall").not.toBeNull();
+  });
+});
+
 describe("ENFB-3 — the meetings surfaces gate on the item oracle", () => {
   it("a restricted transcript's note: absent from the non-grantee's list, detail null (≡ unknown), grantee gets everything; General serves every everyone-member", async () => {
     const seed = await seedTeam();
@@ -134,6 +161,9 @@ describe("ENFB-3 — the meetings surfaces gate on the item oracle", () => {
     expect(after!.summary, "the denied regenerate wrote nothing").toBe("existing summary");
     const push = await pushMeetingTasksAction(teamSlug, secret.noteId, [randomUUID()]);
     expect(push.ok).toBe(false);
+    // The refusal must be the GATE's (Fable H1: the missing-provider refusal used to fire
+    // first, leaving this arm vacuously green with the gate deleted).
+    expect(push.error, "the push refusal is the absent-note shape, BEFORE the provider probe").toBe("meeting note not found");
 
     // Non-vacuity: the INSIDER's push path resolves the note (it fails later on no PM provider,
     // never on the visibility gate).

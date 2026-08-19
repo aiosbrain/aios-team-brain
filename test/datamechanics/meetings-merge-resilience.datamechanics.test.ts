@@ -43,6 +43,7 @@ describe("merge resilience (real Postgres)", () => {
     });
 
     // A second person uploads their copy via the GUI → merges into the connector-sourced note.
+    await backfillTeamContext(db(), teamId); // ENFB-3 H2: candidacy needs General-converged sources
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     expect(match?.noteId).toBe(noteId);
     await mergeIntoMeetingNote(db(), teamId, match!, {
@@ -74,6 +75,7 @@ describe("merge resilience (real Postgres)", () => {
 
     // And the meetings backfill does NOT resurrect the connector item as a second visible meeting
     // (it's retired with a hidden tombstone note).
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3 H2: merge candidacy needs General-converged sources (prod order: context leg first)
     await backfillMeetingNotesFromItems(db(), teamId, { keys: {} });
     const { data: visible } = await db().from("meeting_notes").select("id").eq("team_id", teamId).is("merged_into", null);
     expect((visible ?? []).length).toBe(1); // still just the survivor
@@ -86,6 +88,7 @@ describe("merge resilience (real Postgres)", () => {
     const ext = await ingest(seed, { project: "acme", path: "client/call.md", kind: "transcript", access: "external", frontmatter: { source: "zoom" }, body: A });
     const { id: noteId } = await createMeetingNoteFromItem(db(), teamId, { sourceItemId: ext.id, title: "Client call", occurredAt: DATE, summary: "", submittedByMemberId: seed.memberId });
 
+    await backfillTeamContext(db(), teamId); // ENFB-3 H2: candidacy needs General-converged sources
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     await mergeIntoMeetingNote(db(), teamId, match!, {
       newRawText: B,
@@ -111,6 +114,7 @@ describe("merge resilience (real Postgres)", () => {
     const { noteId: survivorId } = await createMeetingNote(db(), teamId, { title: "survivor", rawText: A, submittedByMemberId: seed.memberId, occurredAt: DATE });
     await setMeetingNoteMergedInto(db(), hiddenId, survivorId);
 
+    await backfillTeamContext(db(), teamId); // ENFB-3 H2: candidacy needs General-converged sources
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     expect(match).toBeTruthy();
     expect(match!.noteId).toBe(survivorId); // never the hidden one, even though it overlaps B more
@@ -152,6 +156,7 @@ describe("merge resilience (real Postgres)", () => {
       provider_url: "https://linear.app/x/LIN-123",
     });
 
+    await backfillTeamContext(db(), teamId); // ENFB-3 H2: candidacy needs General-converged sources
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     await mergeIntoMeetingNote(db(), teamId, match!, {
       newRawText: B,
@@ -190,6 +195,7 @@ describe("merge resilience (real Postgres)", () => {
     const { teamId } = seed;
     const ext = await ingest(seed, { project: "acme", path: "client/call2.md", kind: "transcript", access: "external", frontmatter: { source: "zoom" }, body: A });
     const { id: noteId } = await createMeetingNoteFromItem(db(), teamId, { sourceItemId: ext.id, title: "Client call", occurredAt: DATE, summary: "", submittedByMemberId: seed.memberId });
+    await backfillTeamContext(db(), teamId); // ENFB-3 H2: candidacy needs General-converged sources
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     await mergeIntoMeetingNote(db(), teamId, match!, {
       newRawText: B,
