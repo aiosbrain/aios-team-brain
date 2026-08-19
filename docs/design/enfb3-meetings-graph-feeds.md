@@ -70,24 +70,42 @@ meetings line).
 **DECIDABLES — defaults stated for the design review to attack:**
 - **D1 — `importPushedMeetingsAction`:** a member-triggered TEAM-WIDE materialization job
   (mints notes for every un-noted transcript, runs LLM extraction per note, returns
-  `{created, scanned}` — a count of meetings the caller may not see). DEFAULT: admin-role
-  gate (it is an ops-shaped job; the scheduler already runs the same backfill for the
-  routine path), with the returned counts therefore team-scoped BY ROLE, not redacted.
+  `{created, scanned}` — a count of meetings the caller may not see). DEFAULT: the repo's
+  admin-access gate (`canAccessAdmin` — admin role ∧ team posture, the established
+  semantics, round-1 M: role alone is not the precedent), it is an ops-shaped
+  materialization job and the scheduler already runs the same backfill routinely; the
+  layout HIDES the import button for non-admins (`canManage` splits from the posture bit);
+  returned counts are team-scoped by the admin gate, not redacted.
 - **D2 — the fresh-upload invisibility window (the slice's grandfathered-pointer class):**
   `createMeetingNote` calls `ingestItem` in-process, which does NOT reconcile context — the
   new transcript has no membership until the ~30-min scheduler sweep, so a naive gate 404s
   the uploader's own meeting right after redirect. DEFAULT: reconcile INLINE in
   `createMeetingNote` (and the merge-owned item path) immediately after `ingestItem` — the
   same `reconcileItemContext` the HTTP items route runs in `after()`; the gate becomes
-  honest at once, no second provenance rule (the survives-anyway arm would re-open the
-  origin-vs-created_by argument ENFB-1 settled), no fail-open arm.
-- **D3 — the feeds' scope semantics:** pass `k: Number.MAX_SAFE_INTEGER` (the
-  graph-query/arcs shape — no silent truncation) and **`arm: false`** (a 60-second poll per
-  open tab must not be an arming heartbeat; note this changes the permissive-union
-  discriminator comment's "only caller" claim — reword it). General restriction-debt
-  suppression is ACCEPTED (a restriction move blanks the feeds for its window — the same
-  fail-closed direction every enforced surface takes; stated in the route + release notes
-  rather than adding a disclosure pair to a wire shape that never had one).
+  honest at once, no second provenance rule, no fail-open arm. **Failure contract (round-1
+  HIGH 1):** a reconcile failure does NOT abort or roll back the upload (the item + note are
+  durable; deletion is the purge path's job) — the action returns `ok:false` with an HONEST
+  message ("uploaded, but not yet visible — it appears within the sync interval"), logs the
+  reconcile error loudly, and the scheduler sweep remains the standing convergence (the
+  window degrades to exactly today's behavior, never silently). **Merge ordering (round-1
+  HIGH 2):** the fresh merge-owned item is reconciled BEFORE `setMeetingNoteSourceItem`
+  re-points the survivor; on reconcile failure the merge ABORTS before mutating
+  `source_item_id`, so a visible survivor can never become invisible by merging — AC-pinned
+  with the ordering asserted, not just the outcome.
+- **D3 — the feeds' scope semantics (REVISED at design round 1's BLOCKER):** pass
+  `k: Number.MAX_SAFE_INTEGER` and `arm: false` — but the round-1 blocker showed the debt
+  probe is COUPLED to `arm` (`partition-read.ts:73-84`: `generalDebtP` runs only when
+  `arm !== false`), so a naive `arm:false` feed would serve General during a restriction
+  move that graph-query/arcs suppress. The coupling is DEAD SEMANTICS: `arm:false` was
+  minted as "the permissive-union discriminator", and post-PRET-6 it has ZERO live callers
+  (`resolveArcScope:169,:185` retired the permissive arm and always returns `arm:true`).
+  MECHANISM CHANGE, in-slice: the General restriction-debt probe DECOUPLES from `arm` and
+  runs for EVERY resolution (it is read-side protection, not an arming side effect); `arm`
+  keeps only the arming-trigger semantic; the stale permissive-union comments retire. The
+  feeds then pass `arm:false` (a 60-second poll per open tab must not be an arming
+  heartbeat) and inherit General-debt suppression — a restriction move blanks the feeds for
+  its window, the same fail-closed direction every enforced surface takes (stated in the
+  route + release notes). dm arm: the debt suppression holds UNDER `arm:false`.
 - **D4 — tombstones:** `getMeetingNote` currently serves `merged_into` rows by direct URL.
   DEFAULT: refuse tombstones at the detail read (the list already hides them; "which ids
   exist" should equal "which ids serve") — the merge survivor is the one canonical note.
@@ -102,7 +120,7 @@ meetings line).
 | `extractMeetingActionItemsAction` / `regenerateMeetingSummaryAction` / `pushMeetingTasksAction` (actions.ts:177,262,311) | posture only; feed the transcript to an LLM / overwrite the summary / push titles+bodies into Linear-Plane | each resolves the note through the SAME gated `getMeetingNote`/probe before any LLM call, summary write, or provider push — a denied `noteId` refuses with the absent-note shape BEFORE content leaves the system; the file-level `tier-ok:` opt-out (the "coarse wall is sufficiency" fallacy, verbatim) is REMOVED and the items read beneath it gated |
 | `importPushedMeetingsAction` (actions.ts:145-71) | posture only; team-wide materialization + `{created, scanned}` disclosure | D1: admin-role gate |
 | `uploadMeetingNoteAction` → `createMeetingNote` (notes.ts:109) | writes item via in-process `ingestItem` — no context reconcile (the 30-min window) | D2: inline `reconcileItemContext` after `ingestItem` (upload + merge-owned item paths) — the create→see round-trip holds immediately |
-| `app/api/brain/events` + `/facts` (:44-57/:48-57) | `visibleTierGroupIds` — the legacy tier pair; serves episode titles, participant names, raw fact text | `selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: oracle set, k: MAX_SAFE_INTEGER, arm: false })` — the one partition read model. Stock-member parity is the measured no-op (the POSITIVE arm); a granted initiative's armed pointer joins the member's feed; non-grantees never see it. The graph-query LOUD-arm discrimination is inherited (visible system project + zero partitions = wiring fault, 500). Deliberately NOT carried: the slug-derived unbootstrapped fallback (the stored path is the one owner; an unbootstrapped team's feeds are empty until the bootstrap tick — the same behavior graph-query/arcs shipped in ENFB-1, stated); `assertDirection`/`assertNoForeignHistory` (direction: inherits PRET-4 ruling 2 — an external member's grants ARE their scope, the settled arcs posture; foreign-history: pointer-only resolution never reaches the slug-reuse state, recorded not assumed) |
+| `app/api/brain/events` + `/facts` (:44-57/:48-57) | `visibleTierGroupIds` — the legacy tier pair; serves episode titles, participant names, raw fact text | `selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: oracle set, k: MAX_SAFE_INTEGER, arm: false })` — the one partition read model. Stock-member parity is the measured no-op (the POSITIVE arm); a granted initiative's armed pointer joins the member's feed; non-grantees never see it. The graph-query LOUD-arm discrimination is inherited (visible system project + zero partitions = wiring fault → 500; the dashboard panels render their EXISTING error card on the non-2xx — a deliberate hard-error contract change for a wiring fault, stated (round-1 M); ordinary resolution failures keep the best-effort degraded-JSON shape the panels already tolerate). Deliberately NOT carried: the slug-derived unbootstrapped fallback (the stored path is the one owner; an unbootstrapped team's feeds are empty until the bootstrap tick — the same behavior graph-query/arcs shipped in ENFB-1, stated); `assertDirection`/`assertNoForeignHistory` (direction: inherits PRET-4 ruling 2 — an external member's grants ARE their scope, the settled arcs posture; foreign-history: pointer-only resolution never reaches the slug-reuse state, recorded not assumed) |
 
 ## 2. Mechanism notes
 
@@ -144,8 +162,12 @@ meetings line).
    exits 0 — the feeds' stubbed graph client receives exactly the member's oracle partitions:
    the stock-member parity arm (the legacy pair — the POSITIVE no-op pin), the granted-in /
    ungranted-out pair, `arm: false` pinned (the resolution must not trigger arming),
-   uncapped `k` pinned, and the loud-arm discrimination (a member seeing a system project
-   with zero resolvable pointers → 500, not empty).
+   uncapped `k` pinned, the loud-arm discrimination (a member seeing a system project
+   with zero resolvable pointers → 500, not empty), the General-debt suppression holding
+   UNDER `arm: false` (the round-1 blocker's regression arm), and a RENAME arm: a renamed
+   team's feed scope still resolves through the stored pointers (round-1 M — the
+   rename-doctrine proof moves with the serving path; the old dm suite keeps proving the
+   surviving tier-invalidation caller).
 4. `npx vitest run test/guards/dashboard-tier-filter.test.ts test/guards/graph-group-slug-derivation.test.ts test/guards/graph-cutover-callsites.test.ts`
    exits 0 with the moved needles + the meetings sweep active; mutation
    `node scripts/mutate.mjs` deleting the list's visible-set application reddens the
