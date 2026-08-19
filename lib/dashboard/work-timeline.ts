@@ -1,5 +1,7 @@
 import "server-only";
 import { ACTIVE_STATUSES } from "@/lib/tasks/activity-policy";
+import { runSql } from "@/lib/db/pg/pool";
+import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 import { resolvePositiveInt } from "@/lib/util/env";
 import type { DbClient } from "@/lib/db/types";
 import { isRestrictedTier, type ViewerTier } from "@/lib/auth/visibility";
@@ -197,8 +199,28 @@ export async function getWorkTimeline(
   // gate on evidence legs (withVis at the call sites; taskVisible/srcVisible on structured
   // rows). Kept as named identities so the call sites keep their one obvious handle.
   const walledItems = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
-  const walledTasks = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
   const walledDecisions = <T extends { in: (col: string, vals: string[]) => T }>(q: T, _t: ViewerTier): T => q;
+  // ENFB-2 §2.2: the capped task/decision windows compile the provenance predicate IN-QUERY
+  // (the id-array twin of `taskVisible`/`rowVisibleByProvenance` — those TS filters stay
+  // downstream as the defense-in-depth layer over the SAME contract), so invisible rows can no
+  // longer starve the TASK_LIMIT/DECISION_LIMIT windows. `{ data, error }` shape mirrors the
+  // builder so the legs' existing error contracts (throw for core, WARN for enrichment) hold.
+  const provCtx = { visibleItemIds: enforce?.visibleItemIds ?? new Set<string>(), teamPosture: tier !== "external" };
+  const provenanceTaskWindow = (opts: { statuses?: readonly string[]; requireRowKey?: boolean }) => {
+    const p = newSqlParams();
+    const conds = [`t.team_id = ${p.add(teamId)}`];
+    if (opts.statuses) conds.push(`t.status = any(${p.add([...opts.statuses])})`);
+    if (opts.requireRowKey) conds.push(`t.row_key is not null`);
+    conds.push(provenanceRowSqlFromIds("t", p, provCtx));
+    return runSql<TaskRow>(
+      `select t.id, t.row_key, t.title, t.status, t.assignee, t.source_item_id, t.created_by
+         from tasks t where ${conds.join(" and ")}
+        order by t.updated_at desc limit ${p.add(TASK_LIMIT)}`,
+      p.values
+    )
+      .then((r) => ({ data: r.rows, error: null as { message: string } | null }))
+      .catch((e) => ({ data: null, error: { message: e instanceof Error ? e.message : String(e) } }));
+  };
   // Clamp to [1, MAX] — the window drives both the DB fetch bound (`sinceIso`) and the in-window filter,
   // so an unbounded caller value can't widen the query past the cost cap.
   const days = Math.max(1, Math.min(Math.floor(windowDays) || WINDOW_DAYS, MAX_WINDOW_DAYS));
@@ -308,17 +330,10 @@ export async function getWorkTimeline(
     ),
     // ACTIVE tasks only — filtered in SQL so a backlog-heavy team can't push active tasks past
     // TASK_LIMIT. NOT window-filtered (evidence may reference a task last touched >7d ago; we need its
-    // title/row_key). Evidence-gated in the grouper.
-    walledTasks(
-      db
-        .from("tasks")
-        .select("id, row_key, title, status, assignee, source_item_id, created_by")
-        .eq("team_id", teamId)
-        .in("status", [...ACTIVE_STATUSES])
-        .order("updated_at", { ascending: false })
-        .limit(TASK_LIMIT),
-      tier
-    ),
+    // title/row_key). Evidence-gated in the grouper. ENFB-2 §2.2: the provenance predicate is
+    // IN-QUERY so invisible rows can't starve the TASK_LIMIT window; `taskVisible` stays in the
+    // grouper as the defense-in-depth TS layer over the same contract.
+    provenanceTaskWindow({ statuses: [...ACTIVE_STATUSES] }),
     // SLACK threads — fetched SEPARATELY (no `member_id` filter, unlike gitRes/otherRes) so a thread
     // whose ROOT author is unmapped or a connector is still processed for its MAPPED repliers: per-
     // participant attribution reads `frontmatter.participants[]`, not the item's single `member_id`.
@@ -348,17 +363,20 @@ export async function getWorkTimeline(
       tier
     ),
     // DECISIONS — the CONTEXT lane (signal, never counted as work). Dated by `decided_at` (a DATE).
-    // Tier-gated by the decision's own `audience` via the §5 choke-point.
-    walledDecisions(
-      db
-        .from("decisions")
-        .select("id, title, decided_by, decided_at, source_item_id, created_by, still_valid, audience")
-        .eq("team_id", teamId)
-        .gte("decided_at", sinceIso.slice(0, 10))
-        .order("decided_at", { ascending: false })
-        .limit(DECISION_LIMIT),
-      tier
-    ),
+    // ENFB-2 §2.2: predicate in-query (the DECISION_LIMIT window fills with visible rows);
+    // the `:658` one-owner TS filter stays as defense-in-depth.
+    (() => {
+      const p = newSqlParams();
+      const sql = `select d.id, d.title, d.decided_by, d.decided_at::text as decided_at, d.source_item_id, d.created_by, d.still_valid, d.audience
+         from decisions d
+        where d.team_id = ${p.add(teamId)}
+          and d.decided_at >= ${p.add(sinceIso.slice(0, 10))}::date
+          and ${provenanceRowSqlFromIds("d", p, provCtx)}
+        order by d.decided_at desc limit ${p.add(DECISION_LIMIT)}`;
+      return runSql<{ id: string; title: string | null; decided_by: string | null; decided_at: string | null; source_item_id: string | null; created_by: string | null; still_valid: boolean | null; audience: string }>(sql, p.values)
+        .then((r) => ({ data: r.rows, error: null as { message: string } | null }))
+        .catch((e) => ({ data: null, error: { message: e instanceof Error ? e.message : String(e) } }));
+    })(),
   ]);
   // THROW on any evidence-query error too — a partial ledger (one of the legs failed) must not
   // be cached/served as complete. See the members-error note above. Slack is best-effort ENRICHMENT
@@ -500,16 +518,8 @@ export async function getWorkTimeline(
   // is always fresh AND a just-shipped ticket can head its own group. (Previously a second, active-only
   // pass drove nesting; that produced "Other · not linked to a task" rows each carrying a chip naming the
   // task they were linked to. Evidence-gating in the grouper is what keeps the backlog out.)
-  const allTaskRes = await walledTasks(
-    db
-      .from("tasks")
-      .select("id, row_key, title, status, assignee, source_item_id, created_by")
-      .eq("team_id", teamId)
-      .not("row_key", "is", null)
-      .order("updated_at", { ascending: false })
-      .limit(TASK_LIMIT),
-    tier
-  );
+  // ENFB-2 §2.2: same in-query predicate as the active-task leg (the chip window starves too).
+  const allTaskRes = await provenanceTaskWindow({ requireRowKey: true });
   // Chips are ENRICHMENT (not a core ledger leg) — a failed read must NOT blank the ledger, but it also
   // must not be silent (the swallowed-error trap this file warns about). WARN, like the Slack leg.
   if (allTaskRes.error) console.warn("[work-timeline] chip-task read failed:", allTaskRes.error.message);

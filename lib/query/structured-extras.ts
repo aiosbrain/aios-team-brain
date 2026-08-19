@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { isRestrictedTier } from "@/lib/auth/visibility";
+import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 
 /**
  * Structured-context helpers that fix the "digests are recency-capped" scaling gaps (Gaps #5, #6).
@@ -61,12 +62,21 @@ export async function matchingDecisions(
   teamId: string,
   tier: "team" | "external",
   orQuery: string,
-  limit = 10
+  limit = 10,
+  // ENFB-2 §2.2: the provenance predicate compiles into THIS window too (the keyword leg was
+  // one of the deferred post-LIMIT sites). Absent ctx (a caller with no enforcement view)
+  // fails CLOSED: an empty visible set admits only nothing-sourced… i.e. no sourced rows.
+  enforce?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
 ): Promise<DecisionMatch[]> {
   if (!orQuery.trim()) return [];
   try {
     const access = isRestrictedTier(tier) ? "and d.audience = 'external'" : "";
-    const params: unknown[] = [orQuery, teamId, limit];
+    const p = newSqlParams([orQuery, teamId, limit]);
+    const prov = provenanceRowSqlFromIds("d", p, {
+      visibleItemIds: enforce?.visibleItemIds ?? new Set(),
+      teamPosture: enforce?.teamPosture ?? false,
+    });
+    const params: unknown[] = p.values;
     const sql = `
       select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, d.created_by, coalesce(p.slug, '') as slug,
              ts_rank(to_tsvector('english', coalesce(d.title,'') || ' ' || coalesce(d.rationale,'')),
@@ -76,6 +86,7 @@ export async function matchingDecisions(
       where d.team_id = $2 ${access}
         and to_tsvector('english', coalesce(d.title,'') || ' ' || coalesce(d.rationale,''))
             @@ websearch_to_tsquery('english', $1)
+        and ${prov}
       order by rank desc, d.decided_at desc
       limit $3`;
     const res = await runSql<{

@@ -1,12 +1,13 @@
 import "server-only";
 import { isOpenStatus } from "@/lib/tasks/activity-policy";
+import { runSql } from "@/lib/db/pg/pool";
+import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 import type { DbClient } from "@/lib/db/types";
 import { rangeDays, type Range } from "./range";
 import { getSpendDailyUsd, getSpendTotalUsdBetween } from "./llm-spend";
 import {
   scopeQueryLog,
   visibleItems,
-  visibleTasks,
   type ViewerTier,
 } from "@/lib/auth/visibility";
 
@@ -152,9 +153,18 @@ export async function getPulseMetrics(
   db: DbClient,
   teamId: string,
   range: Range,
-  viewer: { isAdmin: boolean; memberId: string; tier: ViewerTier }
+  viewer: {
+    isAdmin: boolean;
+    memberId: string;
+    tier: ViewerTier;
+    /** ENFB-2 §2.2: the viewer's oracle ctx — DISPLAYED counts compute over the visible sets
+     *  (per-kind item growth and the task funnel were team-wide volume disclosures). Absent →
+     *  fail closed (empty sets → zero counts). */
+    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean };
+  }
 ): Promise<PulseMetrics> {
   const { isAdmin, tier } = viewer;
+  const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false };
   const days = rangeDays(range);
   const now = new Date();
   const windowStart = new Date(now.getTime() - days * 86_400_000);
@@ -170,11 +180,15 @@ export async function getPulseMetrics(
     // on every 30-min tick, so windowing on it plots re-sync churn (≈all items look "new") rather than
     // real growth. created_at is set once on insert and never bumped. See postgres migration items_created_at.
     // Only the current window is needed (the prior-window delta died with the removed "Items synced" KPI).
+    // ENFB-2 §2.2: growth counts only VISIBLE items (the per-kind team-wide volume was the
+    // disclosure); the posture helper stays a conjunct via the id set (which posture already
+    // scoped upstream).
     visibleItems(
       db
         .from("items")
         .select("kind, created_at")
         .eq("team_id", teamId)
+        .in("id", [...provCtx.visibleItemIds])
         .gte("created_at", windowStart.toISOString())
         .order("created_at", { ascending: false })
         .limit(10_000),
@@ -190,14 +204,21 @@ export async function getPulseMetrics(
         .limit(10_000),
       viewer
     ),
-    visibleTasks(
-      db
-        .from("tasks")
-        .select("status, updated_at")
-        .eq("team_id", teamId)
-        .limit(5_000),
-      tier
-    ),
+    // ENFB-2 §2.2: the funnel counts only provenance-visible tasks, IN-QUERY (a post-filtered
+    // 5,000-row sample would be starvable AND biased; the audience conjunct is preserved).
+    (() => {
+      const p = newSqlParams();
+      const access = tier === "team" ? "" : `and t.audience = 'external'`;
+      return runSql<{ status: string; updated_at: string | Date | null }>(
+        `select t.status, t.updated_at from tasks t
+          where t.team_id = ${p.add(teamId)} ${access}
+            and ${provenanceRowSqlFromIds("t", p, provCtx)}
+          limit 5000`,
+        p.values
+      )
+        .then((r) => ({ data: r.rows, error: null }))
+        .catch(() => ({ data: [] as { status: string; updated_at: string | Date | null }[], error: null }));
+    })(),
   ]);
 
   // Brain SPEND is ALL inference (Q&A + arcs + meetings + timeline + social + titles + cron), read

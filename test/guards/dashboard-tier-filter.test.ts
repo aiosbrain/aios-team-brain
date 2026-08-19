@@ -77,10 +77,13 @@ describe("dashboard tier isolation", () => {
  * ENFB-1 §2.3 — the ORACLE layer: the posture choke-point above is the COARSE wall only; every
  * BODY-SERVING surface must ALSO call the membership oracle (canSeeItem / visibleItemIds /
  * rowVisibleByProvenance). The set is ENUMERATED (not pattern-derived) because body-serving is
- * a property of what a page renders, which no regex over its reads can see. Known ENFB-2
- * residuals (title/metadata surfaces incl. the ungated projects LIST inventory — invisible to
- * the READS_ITEMS regex because `items(count)` embeds don't match it) are deliberately NOT
- * here; they are the next slice's rows, recorded so their absence reads as a decision.
+ * a property of what a page renders, which no regex over its reads can see.
+ * ENFB-2 moved the recorded title/metadata residuals (the projects LIST inventory, the tasks
+ * API, the decisions feed, Pulse counts, deriveProjects) from "recorded" to ENFORCED — see
+ * TITLE_SURFACE_WIRING + the sweep layer below. What REMAINS residual, each with its reason:
+ * social (ENFB-4 — jsonb provenance + the admin-role precedent question), the graph feed
+ * routes events/facts (partition-owner slice — visibleTierGroupIds vs the stored-pointer
+ * path), meetings (ENFB-3 — no audience column yet).
  */
 const ROOT = join(import.meta.dirname, "..", "..");
 /** Per-file APPLICATION patterns (diff-review Medium: presence of a resolution without its
@@ -114,5 +117,114 @@ describe("ENFB-1 — body-serving surfaces APPLY the membership oracle (the coar
     const skillsPat = BODY_SURFACE_WIRING.find(([f]) => f.includes("skills"))![1];
     expect(skillsPat.test('.in("id", [...vis.ids])')).toBe(true);
     expect(skillsPat.test('visibleItems(q, tier)')).toBe(false);
+  });
+});
+
+/**
+ * ENFB-2 §2.8 — the TITLE/COUNT layer. Two parts:
+ *
+ * 1. TITLE_SURFACE_WIRING — per-file APPLICATION patterns (the ENFB-1 discipline from birth):
+ *    each pattern matches the point where the oracle/predicate GATES rows, not where a set is
+ *    merely resolved.
+ * 2. The SWEEP — a TRIPWIRE, not a closure proof (design round 2 M8): every file under
+ *    app/api/**\/route.ts + lib/{sync,metrics,identity,dashboard,social} that reads
+ *    projects/tasks/decisions with a name/title/count-bearing select must be either in the
+ *    wiring sets or on the STATED-RESIDUAL list (each entry with its reason). A new ungated
+ *    list surface tomorrow reddens the build instead of riding the projects-list gap.
+ *    Named non-coverage: select("*"), template-built column lists, raw SQL string reads, and
+ *    variable table names pass this regex — the enumerated APPLICATION patterns and the
+ *    review gate remain the net for those shapes.
+ */
+const TITLE_SURFACE_WIRING: [string, RegExp][] = [
+  ["app/t/[team]/projects/page.tsx", /visibleProjectCards\(/],
+  ["app/t/[team]/projects/[project]/page.tsx", /await canSeeProjectRow\([\s\S]*?notFound\(\)/],
+  ["app/t/[team]/tasks/page.tsx", /boardTaskWindow[<(]/],
+  ["app/t/[team]/tasks/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
+  ["app/t/[team]/decisions/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
+  ["app/t/[team]/page.tsx", /decisionsCardWindow\(team\.id, provCtx/],
+  ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeProjectRow\(/],
+  ["app/api/v1/projects/route.ts", /\.in\("id", \[\.\.\.rows\.ids\]\)/],
+  ["app/api/v1/tasks/route.ts", /taskFeedWindow\(/],
+  // The windows module: each window's OWN predicate application (per-function pins — deleting
+  // the fragment from one window must redden even while a sibling still carries it).
+  ["lib/access/structured-windows.ts", /boardTaskWindow[\s\S]{0,900}?provenanceRowSqlFromIds\("t", p, ctx\)/],
+  ["lib/access/structured-windows.ts", /decisionsCardWindow[\s\S]{0,900}?provenanceRowSqlFromIds\("d", p, ctx\)/],
+  ["lib/access/structured-windows.ts", /taskFeedWindow[\s\S]{0,1600}?provenanceRowSqlFromIds\("t", p, ctx\)/],
+  ["lib/sync/decisions.ts", /provenanceRowSqlFromIds\("d", p, enforce\)/],
+  ["lib/metrics/pulse.ts", /provenanceRowSqlFromIds\("t", p, provCtx\)/],
+  ["lib/metrics/pulse.ts", /\.in\("id", \[\.\.\.provCtx\.visibleItemIds\]\)/],
+  ["lib/identity/context.ts", /provenanceRowSqlFromIds\("t", p, viewerCtx\)/],
+  ["lib/query/retrieve.ts", /provenanceRowSqlFromIds\("d", dParams, provCtx\)/],
+  ["lib/query/retrieve.ts", /provenanceRowSqlFromIds\("t", tParams, provCtx\)/],
+  ["lib/query/structured-extras.ts", /provenanceRowSqlFromIds\("d", p, \{/],
+  ["lib/dashboard/work-timeline.ts", /provenanceRowSqlFromIds\("t", p, provCtx\)/],
+  ["lib/dashboard/work-timeline.ts", /provenanceRowSqlFromIds\("d", p, provCtx\)/],
+];
+
+/** Files the sweep may match WITHOUT a wiring row — each with its reason. An entry here is a
+ *  DECISION on record, not an exemption by silence. */
+const SWEEP_RESIDUALS: [string, string][] = [
+  ["lib/social/", "ENFB-4: jsonb evidence provenance + the admin-role precedent question (spec §0b)"],
+  ["lib/dashboard/home-state.ts", "consumes the deliberate team-total scalar only (ENFB-2 F5)"],
+  ["lib/metrics/codebases.ts", "code-metrics, not curated content — structure ruling (spec §0b)"],
+  ["lib/metrics/maturity", "session-derived, not curated content — structure ruling (spec §0b)"],
+  ["lib/sync/tasks", "projector write path, not a read surface"],
+  ["lib/dashboard/team-work.ts", "consumes the enforced timeline builder's rows, no own read"],
+  ["lib/dashboard/timeline-evidence.ts", "evidence rows ride the enforced timeline build (item legs in-query via withVis)"],
+  ["lib/dashboard/doc-task-infer-run.ts", "ingest-side inference job, not a serving read surface"],
+  ["lib/dashboard/timeline-cache.ts", "cache plumbing keyed per visibility variant; rows come from the enforced builder"],
+  ["app/api/v1/okf-bundle/route.ts", "body surface — enforced + pinned in BODY_SURFACE_WIRING"],
+  ["app/api/v1/items/", "body surface — enforced + pinned in BODY_SURFACE_WIRING"],
+  ["app/api/v1/graph-query/route.ts", "stored-pointer partition scope (ENFB-1), no structured-row read"],
+  ["app/api/brain/events/route.ts", "graph feed residual — partition-owner slice (spec §0b)"],
+  ["app/api/brain/facts/route.ts", "graph feed residual — partition-owner slice (spec §0b)"],
+];
+
+const SWEEP_DIRS = ["app/api", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social"];
+const SWEEP_READ = /from\(\s*["'](projects|tasks|decisions)["']\s*\)/;
+const SWEEP_SERVES = /select\(\s*["'][^"']*(name|title|count|slug)[^"']*["']/;
+
+describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripwire)", () => {
+  it("every title surface's application site is present", () => {
+    const missing = TITLE_SURFACE_WIRING.filter(([f, pat]) => !pat.test(readFileSync(join(ROOT, f), "utf8"))).map(([f, pat]) => `${f} :: ${pat}`);
+    expect(
+      missing,
+      `Title/count surfaces whose oracle/predicate APPLICATION site is gone:\n${missing.join("\n")}`
+    ).toEqual([]);
+  });
+
+  it("sweep: no projects/tasks/decisions title-read outside the wiring + stated residuals", () => {
+    const wired = new Set(TITLE_SURFACE_WIRING.map(([f]) => f));
+    const bodyWired = new Set(BODY_SURFACE_WIRING.map(([f]) => f));
+    const offenders: string[] = [];
+    for (const dir of SWEEP_DIRS) {
+      for (const file of walk(join(ROOT, dir))) {
+        if (!file.endsWith(".ts") && !file.endsWith(".tsx")) continue;
+        if (/\.test\.tsx?$/.test(file)) continue;
+        if (dir === "app/api" && !file.endsWith("route.ts")) continue;
+        const rel = file.slice(file.indexOf(dir));
+        const src = readFileSync(file, "utf8");
+        if (!SWEEP_READ.test(src) || !SWEEP_SERVES.test(src)) continue;
+        if (wired.has(rel) || bodyWired.has(rel)) continue;
+        if (SWEEP_RESIDUALS.some(([prefix]) => rel.startsWith(prefix))) continue;
+        offenders.push(rel);
+      }
+    }
+    expect(
+      offenders.sort(),
+      `Files reading projects/tasks/decisions titles/names/counts that are neither WIRED nor on\n` +
+        `the stated-residual list. Gate the read (visibleProjectRows / provenanceRowSqlFromIds /\n` +
+        `rowVisibleByProvenance) and add the wiring row, or record the residual WITH its reason:\n${offenders.join("\n")}`
+    ).toEqual([]);
+  });
+
+  it("the sweep matchers discriminate (non-vacuity)", () => {
+    expect(SWEEP_READ.test('db.from("projects").select("id, slug, name")')).toBe(true);
+    expect(SWEEP_SERVES.test('.select("id, slug, name, last_synced_at")')).toBe(true);
+    expect(SWEEP_READ.test('db.from("items").select("id")'), "items reads belong to the posture/body layers").toBe(false);
+    expect(SWEEP_SERVES.test('.select("id, status")'), "an id/status-only select serves no title").toBe(false);
+    const projPat = TITLE_SURFACE_WIRING.find(([f]) => f === "app/t/[team]/projects/page.tsx")![1];
+    expect(projPat.test("const cards = await visibleProjectCards(db, principal)")).toBe(true);
+    expect(projPat.test("const rows = await visibleProjectRows(db, principal)"), "the list page must use the CARD read (visible counts), not the bare row set").toBe(false);
   });
 });

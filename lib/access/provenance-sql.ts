@@ -86,3 +86,26 @@ export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSql
     or (${alias}.source_item_id is null and ${alias}.created_by is not null and ${posture})
   )`;
 }
+
+/**
+ * The ID-ARRAY form — the exact SQL twin of `rowVisibleByProvenance(row, visibleItemIds,
+ * tier)` for sites that ALREADY hold the principal's materialized visible-item set (retrieve,
+ * the timeline, the board, both API lists): sourced → the source id is in the set; null-source
+ * → hand-typed at team posture. This form serves EVERY principal correctly (a delegated
+ * token's set is its attenuated set — the semijoin form above would need the granted-project
+ * ctx that tokens deliberately do not carry), and it adds zero substrate reads at sites that
+ * post-filtered with the same set yesterday. The array binds as ONE parameter. The documented
+ * large-corpus deferral (enforce.ts) applies unchanged.
+ */
+export function provenanceRowSqlFromIds(
+  alias: string,
+  p: SqlParams,
+  ctx: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+): string {
+  const ids = p.add([...ctx.visibleItemIds]);
+  const posture = p.add(ctx.teamPosture);
+  return `(
+    (${alias}.source_item_id is not null and ${alias}.source_item_id = any(${ids}::uuid[]))
+    or (${alias}.source_item_id is null and ${alias}.created_by is not null and ${posture})
+  )`;
+}

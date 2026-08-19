@@ -3,7 +3,6 @@ import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
-import { visibleTasks } from "@/lib/auth/visibility";
 
 export const runtime = "nodejs";
 
@@ -90,7 +89,7 @@ export function parseTaskKeys(raw: string | null, mode: TaskFeedMode): TaskKeysP
  * the CI consumer applies, kept on the side that actually knows.
  *
  * A key hidden by the caller's tier is reported as unknown, deliberately: "it exists but you may not
- * see it" is itself a disclosure, and `visibleTasks` is the only enforcement (no RLS).
+ * see it" is itself a disclosure, and the audience conjunct in the feed SQL is the only enforcement (no RLS).
  */
 export function unknownKeysFor(
   requested: string[],
@@ -118,8 +117,9 @@ export function unknownKeysFor(
  *    Linear status + assignee changes back into its markdown. Without it the markdown decays —
  *    the projection is one-way and the writeback feed is dashboard-origin only.
  *
- * Tier isolation (audit H1) applies to every mode: `tasks.audience` is filtered through the
- * `visibleTasks` choke-point, so an external-tier key never reads a team board. There is no RLS.
+ * Tier isolation (audit H1) applies to every mode: the `tasks.audience` conjunct compiles into
+ * the feed SQL (ENFB-2 — with the membership provenance predicate), so an external-tier key
+ * never reads a team board. There is no RLS.
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -175,40 +175,43 @@ export async function GET(req: NextRequest) {
     projectId = (project as { id: string }).id;
   }
 
-  let query = db
-    .from("tasks")
-    .select(
-      "row_key, title, assignee, status, raw_status, sprint, due_date, parent_row_key, labels, priority, origin, updated_at, projects(slug), items:source_item_id(synced_at)",
-    )
-    .eq("team_id", auth.teamId)
-    .gt("updated_at", since)
-    .not("row_key", "is", null);
-  if (projectId) query = query.eq("project_id", projectId);
-  // The by-key filter is what makes absence provable: the result is bounded by what was ASKED for,
-  // not by an arbitrary page of the newest-last table.
-  if (keys) query = query.in("row_key", keys);
-  // Only rows a workspace pushed. Dashboard-origin rows stay the writeback feed's job, so the
-  // two feeds never double-merge the same row.
-  if (mode === "sync-origin") query = query.eq("origin", "sync");
+  // ENFB-2 §2.2: EVERY filter that decides what this window serves — the provenance predicate
+  // AND the per-mode filters (writeback's changed-after-push test lived app-side, post-LIMIT)
+  // — compiles in-query, so the 500-row window fills with rows that will actually serve and
+  // `unknown_keys`/`truncated` describe the SAME set the caller receives (design round 1 F3 +
+  // the draft's by-construction claim made true). Audience conjunct preserved verbatim.
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const vis = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+  if (vis.error) return errorResponse("internal", "visibility resolution failed", 500);
+  const { taskFeedWindow } = await import("@/lib/access/structured-windows");
 
-  const { data, error } = await visibleTasks(
-    query.order("updated_at", { ascending: true }).limit(PAGE),
-    auth.memberTier,
-  );
-  if (error) return errorResponse("internal", error.message, 500);
+  let data: (import("@/lib/access/structured-windows").TaskFeedRow & { projects: { slug: string } | null })[];
+  try {
+    const rows = await taskFeedWindow(
+      auth.teamId,
+      { visibleItemIds: vis.ids, teamPosture: auth.memberTier === "team" },
+      {
+        since,
+        externalAudienceOnly: auth.memberTier !== "team",
+        projectId,
+        // The by-key filter is what makes absence provable: the result is bounded by what was
+        // ASKED for, not by an arbitrary page of the newest-last table.
+        keys,
+        // Only rows a workspace pushed serve sync-origin. The writeback feed serves
+        // dashboard-origin rows plus synced rows changed after their push (the client's echo
+        // guard handles normalization echoes); table serves the whole scoped window.
+        syncOriginOnly: mode === "sync-origin",
+        writebackOnly: !all && mode !== "sync-origin",
+        page: PAGE,
+      }
+    );
+    data = rows.map((r) => ({ ...r, projects: r.project_slug ? { slug: r.project_slug } : null }));
+  } catch (e) {
+    return errorResponse("internal", e instanceof Error ? e.message : "task feed read failed", 500);
+  }
 
-  const selected = (data ?? []).filter((t) => {
-    if (all) return true;
-    // sync-origin rows are already scoped by project + origin in SQL; the writeback feed's
-    // "changed after our push" test does not apply — the point is to surface drift that
-    // accumulated at ANY time, bounded only by the caller's `since` cursor. The client's own
-    // echo guard (raw_status / status equality) decides what is a real change.
-    if (mode === "sync-origin") return true;
-    if (t.origin === "ui") return true;
-    const synced = (t.items as unknown as { synced_at: string } | null)
-      ?.synced_at;
-    return synced ? new Date(t.updated_at) > new Date(synced) : false;
-  });
+  // Every in-window row serves — the mode filters moved into the window above.
+  const selected = data;
 
   const byProject = new Map<
     string,
@@ -218,7 +221,7 @@ export async function GET(req: NextRequest) {
       assignee: string;
       status: string;
       sprint: string;
-      due: string | null;
+      due: string | Date | null; // node-pg returns date columns as Date; JSON serialization is unchanged
       parent: string | null;
       labels: string[];
       priority: string;

@@ -4,7 +4,6 @@ import { ListTodo, ScanLine } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { currentMember } from "@/lib/auth/guard";
-import { visibleTasks } from "@/lib/auth/visibility";
 import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
@@ -42,17 +41,19 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // the pg adapter (the deployed backend) only supports to-many embeds as `(count)`, so a
   // `task_pm_links(provider, ...)` embed silently returns no tasks. A separate named-column query
   // works on both backends and keeps the per-task badge wiring intact.
+  // ENFB-2 §2.2: the 500-row board window compiles the provenance predicate IN-QUERY via the
+  // structured-windows domain service (the post-LIMIT filter below stays as the guard-pinned
+  // defense-in-depth layer over the same contract) — invisible rows can no longer starve
+  // visible ones out of the window. The audience conjunct is preserved inside the window.
+  const { boardTaskWindow } = await import("@/lib/access/structured-windows");
+  const boardTasksP = boardTaskWindow<Task & { source_item_id?: string | null; created_by?: string | null }>(
+    team.id,
+    { visibleItemIds: vis && !vis.error ? vis.ids : new Set<string>(), teamPosture: tier === "team" },
+    tier === "external"
+  ).then((rows) => ({ data: rows }));
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
     await Promise.all([
-      visibleTasks(
-        db
-          .from("tasks")
-          .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body, source_item_id, created_by")
-          .eq("team_id", team.id)
-          .order("updated_at", { ascending: false })
-          .limit(500),
-        tier
-      ),
+      boardTasksP,
       db
         .from("task_pm_links")
         .select("task_id, provider, provider_url, last_synced_status, last_error")
