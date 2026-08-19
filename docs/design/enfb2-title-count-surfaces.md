@@ -21,8 +21,10 @@ un-blocks.
 
 **Measured terrain (prod, read-only, 2026-08-19):**
 - 19 projects: 17 `kind='source'` + 2 `kind='system'` (`general`, `external-shared`).
-  `projects.kind` is free text, default `'source'` (`postgres/schema.sql:963`); no
-  initiative kind exists yet.
+  `projects.kind` is free text, default `'source'` (`postgres/schema.sql:963`); zero
+  `initiative` rows exist yet — but the dashboard create action mints exactly that kind
+  (`app/actions/projects.ts` §11 comment), so the initiative lifecycle is live code, not
+  future speculation.
 - **Group grants cover ONLY the system projects:** `everyone` → 2 system rows, `external` →
   1 system row; zero grants on any source project. So `visibleProjects(...)` for a stock
   member = {general, external-shared}. **Any project-row gate built on direct grants alone
@@ -46,7 +48,9 @@ un-blocks.
 **Ticketing:** row `ENFB-2`; PR carries `AIOS-Work: ENFB-2`.
 **Governing spec:** `docs/specs/project-context-classification-v1.md` §5.7/§5.8; the
 enforcement backlog chain PRET-4 §5 → PRET-6 §5 → `enfb1-body-surfaces-oracle-gate.md` §0b.
-**Deps:** ENFB-1 (#607) merged. **Schema: NONE** (no new columns; the slice is read-side).
+**Deps:** ENFB-1 (#607) merged. **Schema: NONE** (no new columns). The slice is read-side
+plus exactly ONE write-side addition: the D1 creator grant on initiative creation (data
+rows through the existing sole-writer group module, no schema).
 **Build with:** fable / high.
 
 ## 0b. The slice principle, the deferrals, and the decidables
@@ -79,14 +83,18 @@ slice named after its column set.
   (all-team tasks + project names, ungated even by `visibleTasks`) — IS in this slice (§1).
 
 **DECIDABLES — stated for the design review to attack, with my defaults:**
-- **D1 — item-empty, task-empty projects** (3 in prod): under §2.1 they are visible only via
-  direct grant, so they vanish from the list for everyone — including a project's creator in
-  the moment after dashboard creation, before any content or grant exists. DEFAULT: accept
-  (fail closed; the create action's response still navigates the creator to the detail page
-  it can now 404 on — mitigated by D3's grant-or-content arm resolving to the creating
-  member's OWN action being content: it isn't; so the honest consequence is a fresh empty
-  project is invisible until its first item/task lands or a grant is made — stated in the
-  release notes, revisit with a per-creator grant if it bites).
+- **D1 — item-empty, task-empty projects** (3 in prod) — REVISED after design round 1
+  (BLOCKED finding 1: the naive default made project creation a DEAD UI PATH — the button
+  only closes its modal and refreshes the now-hiding list
+  (`components/projects/new-project-button.tsx:26-28`), so a creator would mint "Roadmap"
+  and never see it again anywhere). RESOLUTION: `createProjectAction` (which mints
+  `kind='initiative'`) additionally grants the CREATOR through the existing sole-writer
+  group machinery — `ensurePersonSingleton(creator)` + `grantProjectToGroup`
+  (`lib/access/groups.ts:398,:460`; nothing else may write those tables, build-enforced) —
+  so the create→see round-trip holds by construction and the grant is auditable as a
+  group add (the ENFB-1 data-browser self-grant shape). The 3 pre-existing empty
+  containers have no creator record and stay hidden absent a grant — stated in release
+  notes with their names available to admins via the CLI, not silently.
 - **D2 — the 66 adopted no-provenance tasks** (pm-linked, provider-live): stay hidden.
   Re-surfacing rows whose brain-side basis is unknowable was adjudicated as the leak class
   (Codex B4); the titles remain reachable in the provider (Linear), and the repair is
@@ -106,10 +114,10 @@ slice named after its column set.
 | projects LIST page (`app/t/[team]/projects/page.tsx:31-38`) | **NOTHING** beyond team membership — no `currentMember` call in the file; serves every non-system project's name/slug + `items(count)`/`tasks(count)` + detail links (the guard's recorded ENFB-2 residual, `dashboard-tier-filter.test.ts:76-84`) | rows per §2.1; counts become VISIBLE-content counts computed by the §2.2 predicate (a naive `.in("id", grantedIds)` both empties the page — measured, grants cover only system rows — and leaves the embeds counting invisible items; the embeds are replaced, not filtered) |
 | project DETAIL page (`app/t/[team]/projects/[project]/page.tsx:46-52`) | slug probe: 404 unknown, **200 + name + spine for a member-invisible project**; sub-reads posture-only (`visibleItems`/`visibleDecisions`), decisions select lacks provenance columns | D3: §2.1 row-visibility → the page's EXISTING `notFound()`; the spine intersects the item oracle; the decisions table adds `source_item_id, created_by` and takes the ONE-owner rule; roster stays (structure) |
 | create-form project dropdowns (`app/t/[team]/tasks/page.tsx:57-61`, `app/t/[team]/decisions/page.tsx:58-62`) | ungated `projects.select("id, slug, name")` riding on oracle-gated pages | the §2.1 visible-row set (you file into a container you can see; General is grant-visible to everyone, so the dropdown never empties for a stock member — measured) |
-| tasks API list (`app/api/v1/tasks/route.ts:178-197`) | `visibleTasks` posture only; serves titles + `projects(slug)`; select lacks provenance columns; `?all=1` = stalest-500 window (`:114-118`) | the §2.2 in-query predicate (window fills with VISIBLE rows). `unknown_keys`/`truncated` (`:266-272`) stay consistent BY CONSTRUCTION (the filter is in the query, so `found`/`truncated` describe the same set; a membership-hidden key reports unknown — the `:92-94` ruling extends from tier to membership verbatim) |
-| decisions API (`app/api/v1/decisions/route.ts` → `lib/sync/decisions.ts:40-51`) | posture only; serves titles **+ full `rationale`/`impact` prose** (the missed body surface), 500-cap | the §2.2 in-query predicate (sourced → visible source; null-source → `created_by` ∧ team) |
+| tasks API list (`app/api/v1/tasks/route.ts:178-197`) | `visibleTasks` posture only; serves titles + `projects(slug)`; select lacks provenance columns; `?all=1` = stalest-500 window (`:114-118`) | the §2.2 in-query predicate (window fills with VISIBLE rows). `unknown_keys`/`truncated` (`:266-272`) stay consistent BY CONSTRUCTION (the filter is in the query, so `found`/`truncated` describe the same set; a membership-hidden key reports unknown — the `:92-94` ruling extends from tier to membership verbatim). Design round 1 finding 3: pushing ONLY the access predicate in-query leaves any MODE filter running post-window (visible-but-not-mode rows still starve mode rows) — every mode filter this route applies after its window moves in-query in the same rewrite where SQL can express it, and any residual post-window filter is NAMED at the site + here, never implied dead |
+| decisions API (`app/api/v1/decisions/route.ts` → `lib/sync/decisions.ts:40-51`) | posture only; serves titles **+ full `rationale`/`impact` prose** (the missed body surface), 500-cap; the writeback `uiChanged` filter (`:54`, `updated_at > items.synced_at`) runs POST-window today | the §2.2 in-query predicate AND the `uiChanged` comparison in-query (`items.synced_at` joins in the same raw SQL — round-1 finding 3), so the 500-window fills with rows that will actually SERVE |
 | Pulse decisions card (`app/t/[team]/page.tsx:182-185`) | posture only, `limit(8)`, selects `source_item_id` but NOT `created_by` — a naive post-filter would both starve the card and (lacking `created_by`) hide every hand-typed decision from everyone (the PRET-5 H2 class) | select adds `created_by`; the §2.2 predicate in-query → a full 8 VISIBLE rows |
-| Pulse bootstrap item count (`app/t/[team]/page.tsx:142-143`) + metrics legs (`lib/metrics/pulse.ts:173-200`) | posture only; per-kind item counts + per-status task counts = the volume/shape of restricted work | counts computed over the §2.2-visible sets (items leg: membership semijoin; tasks leg: the provenance predicate) |
+| Pulse bootstrap item count (`app/t/[team]/page.tsx:142-143`) + metrics legs (`lib/metrics/pulse.ts:173-200`) | posture only; per-kind item counts + per-status task counts = the volume/shape of restricted work | DISPLAYED counts compute over the §2.2-visible sets (items leg: membership semijoin; tasks leg: the provenance predicate). The HOME-STATE decision (`pickHomeState`, `lib/dashboard/home-state.ts:11`) keys on a TEAM-TOTAL head count, deliberately NOT visible-only (round-1 finding 5: an ungranted admin over a nonempty restricted corpus must see "no visible content", never the bootstrap/onboarding state — a bare team-has-any-content scalar discloses no title, name, or per-project fact, stated as such) |
 | member-context `deriveProjects` (`lib/identity/context.ts:206-234`) | `canSeeMemberContext` posture, then reads EVERY team task with no choke-point at all and emits project names + per-project open/total counts | tasks through the §2.2 predicate; project names through §2.1; counts over the visible rows |
 | retrieve + timeline capped windows (`lib/query/retrieve.ts:637-643,650-658` + `structured-extras.ts:60-89`; `work-timeline.ts:312-321,352-361,503-512`; tasks board `tasks/page.tsx:45-52`) | ENFB-1's rule applied AFTER LIMIT (the deferral comment at `retrieve.ts:875-879`); `retrieve.ts:927-931` is an INLINE duplicate of the one-owner rule | the §2.2 predicate in-query at every capped site; the inline duplicate dies; the uncapped decisions page keeps its TS post-filter (no window to starve) |
 
@@ -122,9 +130,13 @@ A container project's row (name, slug, existence, counts, dropdown entry) is vis
 1. **granted** — `projectId ∈ visibleProjects(db, principal).projectIds` (covers the system
    rows for everyone today, and any future directly-granted initiative), OR
 2. **content-visible** — the member can see ≥1 item whose `items.project_id = P` (via the
-   §2.2 items predicate), OR ≥1 task in P passes the provenance predicate. (Decisions ride
-   tasks/items: prod decisions are 100% sourced, and a container with only decisions does
-   not exist — if one appears, its decisions' source items are its items arm.)
+   §2.2 items predicate), OR ≥1 task in P passing the provenance predicate, OR ≥1 decision
+   in P passing it. (Design round 1 finding 2 killed the draft's "decisions ride
+   tasks/items" claim: `createDecisionAction` REQUIRES a `projectId` and writes
+   `source_item_id: null, created_by: me.id` (`app/actions/decisions.ts:47,:53`) — a
+   container holding one hand-typed decision and nothing else would be visible on the
+   decisions page yet 404 as a container. The decisions arm is load-bearing, not
+   defensive.)
 
 ONE owner: `visibleProjectRows(db, principal): Promise<ReadonlySet<string>>` beside the
 oracle primitives, computed by one SQL statement (the §2.2 fragment applied to both arms);
@@ -164,9 +176,14 @@ sites). NEW sibling `provenanceSql(alias, p)` returns the parameterized fragment
   that go in-query (retrieve legs, board, timeline structured legs, pulse counts, tasks API,
   decisions API) move to `runSql` with column lists copied verbatim from today's selects.
 - **Agreement pin (the §2.1-of-ENFB-1 discipline):** one dm fixture set runs BOTH forms —
-  every row the SQL window admits satisfies `rowVisibleByProvenance` and vice versa across
-  sourced-granted / sourced-ungranted / hand-typed / no-provenance / external-posture arms.
-  The two owners cannot drift silently.
+  every row the SQL window admits satisfies `rowVisibleByProvenance` (over the equivalent
+  materialized set) and vice versa. Arms (design round 1 finding 4 widened these — the
+  fragment's four membership conjuncts each need their INVERSE fixture, or SQL↔TS drift on
+  that conjunct is invisible): sourced-granted / sourced-ungranted / hand-typed /
+  no-provenance / external-posture, PLUS `decision='exclude'` (excluded ≠ included),
+  `valid_to` set (expired membership invisible), `state<>'active'` (retracted unit
+  invisible), and a non-`item` `unit_kind` row planted against the same source id
+  (must not admit).
 - Posture stays A CONJUNCT, not replaced: existing `audience`/tier arms on these queries are
   preserved verbatim (the predicate ANDs in).
 
@@ -189,9 +206,14 @@ APPLICATION patterns (the ENFB-1 tightening applies from birth): the projects li
 legs, `deriveProjects`, the tasks API, the decisions sync module, and the in-query sites
 (`provenanceSql(` application per file). The `:76-84` residual note moves those rows from
 "recorded" to "enforced" and re-records what remains (social/ENFB-4, graph feeds, meetings/
-ENFB-3). The walk-root stays `app/t` for the pattern sweep; API modules are enumerated rows
-(the ENFB-1 shape). Parallel guards (`member-context-tier-filter`) extend to pin the new
-call, not just the posture gate's position.
+ENFB-3). **Round-1 finding 6 (enumeration is evadable by construction) adds a SWEEP layer:
+the guard walks `app/api/**/route.ts` + `lib/{sync,metrics,identity,dashboard}/**` for
+`.from("projects"|"tasks"|"decisions")` reads whose select carries a name/title or a
+count, and FAILS LOUD on any file that is neither in the wiring set nor on the
+stated-residual list — a new ungated list route tomorrow reddens the build instead of
+riding the gap the projects list rode.** Parallel guards
+(`member-context-tier-filter`) extend to pin the new call, not just the posture gate's
+position.
 
 ## 3. Fail directions, stated
 
@@ -211,9 +233,12 @@ discriminating arm (that is the design, not vacuity).
 1. `npm run test:datamechanics:iso test/datamechanics/enfb2-project-rows.datamechanics.test.ts`
    exits 0 — projects LIST: a stock everyone-member sees every content-bearing container
    (the grants-only-cover-system trap pinned as the POSITIVE arm) including a TASK-ONLY
-   container; a restricted initiative's row/name/counts absent for a non-grantee, present
-   for the grantee; counts equal the VIEWER-visible item/task counts, not the totals; an
-   item-empty task-empty project absent without a grant, present with one (D1 both ways).
+   container AND a decision-only container (round-1 finding 2's arm); a restricted
+   initiative's row/name/counts absent for a non-grantee, present for the grantee; counts
+   equal the VIEWER-visible item/task counts, not the totals; an item-empty task-empty
+   project absent without a grant, present with one; and the D1 round-trip:
+   `createProjectAction` → the CREATOR immediately sees the new initiative on the list, the
+   detail page, and both dropdowns, while a non-creator stock member does not.
 2. Same file — project DETAIL (D3): non-grantee gets `notFound()` for a restricted
    container, byte-indistinguishable from an unknown slug (§5.7); grantee gets the page;
    the spine lists only oracle-visible items; the page's decisions table applies the
@@ -225,12 +250,18 @@ discriminating arm (that is the design, not vacuity).
    exits 0 — the STARVATION class dies: with cap-size invisible rows planted NEWER than a
    visible row, the visible row still serves on the tasks API list, the decisions API, the
    board query, the retrieve recency/keyword/task-digest legs, the timeline structured legs,
-   and the Pulse decisions card (per-site arms); the SQL↔TS agreement pin (§2.2) holds
-   across all five fixture arms; `unknown_keys` reports a membership-hidden row_key as
-   unknown with `truncated:false` when the window genuinely drained (§5.7 for keys).
-5. Same file — counts: Pulse bootstrap/item-kind/task-status counts and `deriveProjects`
+   and the Pulse decisions card (per-site arms); the WRITEBACK arm (round-1 finding 3):
+   cap-size visible-but-not-writeback rows planted ahead of a writeback row still yield the
+   writeback row from the decisions sync window; the SQL↔TS agreement pin (§2.2) holds
+   across ALL its arms including the four inverse-conjunct arms; `unknown_keys` reports a
+   membership-hidden row_key as unknown with `truncated:false` when the window genuinely
+   drained (§5.7 for keys).
+5. Same file — counts: Pulse item-kind/task-status counts and `deriveProjects`
    per-project counts equal the visible-set counts for a non-grantee vs grantee pair; the
-   decisions card serves 8 visible rows when ≥8 visible exist behind ≥8 invisible newer.
+   decisions card serves 8 visible rows when ≥8 visible exist behind ≥8 invisible newer;
+   and the HOME-STATE split (round-1 finding 5): an ungranted member over a nonempty
+   restricted corpus gets the normal home state (team-total scalar) with zero-valued
+   visible counts — never the bootstrap/onboarding state.
 6. `npx vitest run test/guards/dashboard-tier-filter.test.ts test/guards/member-context-tier-filter.test.ts`
    exits 0 with `TITLE_SURFACE_WIRING` active; mutation `node scripts/mutate.mjs` deleting
    the projects-list `visibleProjectRows` application reddens the guard, and deleting the
@@ -249,5 +280,6 @@ jsonb provenance + the admin-role precedent question), codebases/maturity/people
 (structure/code-derived ruling, §0b), any backfill or re-provenance of the 135 no-provenance
 tasks (D2 keeps the ruling; repair is an ops/re-sync question), the `?all=1` stalest-500
 window itself (pre-existing, documented; this slice only makes its filter honest), RPC/
-covering-index moves beyond the §2.2 semijoin, a per-creator auto-grant for fresh projects
-(D1 revisit trigger), UI affordances for "why can't I see this".
+covering-index moves beyond the §2.2 semijoin, retroactive creator grants for the 3
+pre-existing empty containers (admin CLI grants exist; only NEW creations get the D1
+auto-grant), UI affordances for "why can't I see this".
