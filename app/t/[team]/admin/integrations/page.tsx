@@ -15,6 +15,7 @@ import { RetrievalHealthCard } from "@/components/admin/retrieval-health-card";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { PipelineHealthBanner } from "@/components/admin/pipeline-health-banner";
 import { describeAnswering, describeExtraction, describeReasoning, describeSmallExtraction } from "@/lib/query/llm-backend";
+import { smallRoutingEvidence } from "@/lib/llm/small-model-health";
 import { normalizeAnsweringProvider, normalizeExtractionProvider } from "@/lib/query/answering";
 import { describeEmbedding, normalizeEmbeddingProvider } from "@/lib/query/embeddings-backend";
 import { normalizeMeetingTaskStatus } from "@/lib/meetings/target-status";
@@ -111,6 +112,18 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   const reasoning = describeReasoning(llmEnv, answeringKeys);
   const extraction = describeExtraction(llmEnv, answeringKeys);
   const smallExtraction = describeSmallExtraction(llmEnv, answeringKeys);
+  // AIO-983: "configured and resolvable" is not "working". Ask the LEDGER whether the small model
+  // has actually served anything — a configured lever with no evidence of firing must say so, and
+  // must not accuse when there is nothing to judge (`smallRoutingEvidence` is discriminated for
+  // exactly that). Best-effort: this is an indicator, never a reason the page fails to render.
+  const smallRouting = smallExtraction.enabled
+    ? await smallRoutingEvidence(team.id, smallExtraction.model).catch((e: unknown) => {
+        // NOT null (review Low 5): null renders nothing, so an indicator built to expose a silent
+        // failure would itself fail silently. Say the evidence is unavailable.
+        console.error(`[integrations] small-model routing evidence failed for team ${team.id}:`, e);
+        return { state: "unavailable" as const };
+      })
+    : null;
   const answeringModels: Record<"anthropic" | "openai" | "openrouter", string | null> = {
     anthropic: modelOf("anthropic"),
     openai: modelOf("openai"),
@@ -201,6 +214,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
             smallModel: extractionSmallModel,
             smallEnabled: smallExtraction.enabled,
             smallInert: smallExtraction.inert,
+            smallRouting,
           },
         }}
         embedding={{

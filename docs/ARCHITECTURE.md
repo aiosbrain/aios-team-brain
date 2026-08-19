@@ -787,13 +787,12 @@ guard enforces it, it's named.
   variants, every added commit-range path and content block (including merge commits), and commit
   messages. Backreferences are rejected and every matcher has a hard timeout. Push events scan their full
   `before..sha` range too, so add-then-scrub history cannot disappear behind a clean final tree.
-  Matching uses one POSIX ERE engine throughout. Normal output is **redacted to a safe location** and
-  never includes matching text, a term, an index, or the private list size; `--reveal` is disabled in
-  CI. The gate **fails closed** whenever the list or scanner is unavailable, including Dependabot
-  secret withholding. A redacted pass/fail necessarily reveals that some protected pattern matched,
-  but repository writers already have workflows capable of using repository secrets; the important
-  boundary is that an untrusted fork cannot execute code with this secret. ⚠️ **It must be added to
-  `main`'s required status checks and enforced for administrators** — until it is, a
+  Matching uses one POSIX ERE engine throughout. Public CI emits only the unavoidable pass/fail bit:
+  it never includes matching text, locations, counts, a term, an index, or the private list size;
+  `--reveal` is disabled in CI. The gate **fails closed** whenever the list or scanner is unavailable,
+  including Dependabot secret withholding. The trusted local CLI retains location and reveal modes.
+  ⚠️ **It must be added to `main`'s required status checks and enforced for administrators** — until
+  it is, a
   red gate does not block a merge, which is this same defect one level up, and no test can pin
   repository configuration.
   _Guard:_ `test/guards/nda-gate.test.ts` (fails-closed, redaction, term-parse parity, and that the
@@ -863,6 +862,37 @@ guard enforces it, it's named.
   schema loader (`scripts/pg-load-schema.mjs`, the Railway `preDeployCommand`) sets `lock_timeout`
   so a migration fails fast instead of wedging the lock queue behind a stuck reader.
   _Guards:_ `test/pg-pool-config.test.ts` + `test/pg-load-schema.test.ts`.
+- **A cheap graph call is identified by a PROTOCOL CONSTANT, and the lever reports whether it is
+  actually firing.** The proxy decides whether a Graphiti call may be served by the team's cheap
+  model from TWO signals that must agree: the model name the request carries, and our own
+  classification of the prompt (`wantsSmallModel`). The second is non-negotiable — the first alone
+  is forgeable (an operator setting `MODEL_NAME` to the cheap model makes every call wear it,
+  including `extract_nodes`, which is the zero-entities failure a probe caught on a real payload
+  2026-08-04), so **every disagreement routes to the STRONG model**: drift costs money, never graph
+  quality.
+  The first signal used to be a MODEL NAME the brain and the graphiti image had to remember
+  identically — so it changed with every pricing decision, and every divergence was silent (fall
+  back to strong, no error, no indicator, symptom is a bill). Reading a shared env var only closed
+  it where both processes see one environment; **on Railway the app and graphiti are separate
+  services with separate variable scopes.** It is now the sentinel **`aios-small`**
+  (`lib/llm/graph-call-kind.AIOS_SMALL_SENTINEL`) — not a model, never forwarded (the proxy
+  substitutes `target.model` before forwarding), emitted by the image **only when
+  `OPENAI_BASE_URL` ends at the canonical `/api/internal/llm/v1` proxy route** so a
+  direct-to-provider deployment keeps a real model. Even an explicitly configured sentinel is
+  ignored outside that route. The legacy marker is still accepted, so an unmigrated image works.
+  Separately, "configured and resolvable" is **not** "working": `describeSmallExtraction` reported
+  `enabled: true, inert: false` while zero calls were routed. `lib/llm/small-model-health.ts` reads
+  the `llm_usage` ledger for what actually served the recent small-eligible calls, and is
+  DISCRIMINATED so it never accuses without standing evidence (`not_configured` / `unavailable` /
+  `no_traffic` / `inconclusive` / `not_routing` / `routing`) — the AIO-876 + AIO-912 rule. The
+  window starts at `teams.extraction_small_model_set_at`, stamped atomically by a database trigger
+  when the setting changes: calls made BEFORE the operator asked cannot be evidence about whether it
+  works. The audit row remains a best-effort human trail, not the correctness boundary. A missing or
+  unreadable boundary is `unavailable`, never permission to accuse from unbounded history.
+  _Guards:_ `test/small-model-sentinel.test.ts` (the sentinel recognises, and still refuses to
+  downgrade extraction), `test/small-model-health.test.ts` (the absence is reported, and the
+  can't-tell states stay silent), plus the build-time `graphiti/verify-small-model-default.py`,
+  which extracts the SHIPPED expression and evaluates the proxy/provider collision cases.
 - **A graph group id is READ FROM THE POINTER, never re-derived from the live team slug.**
   `projects.graph_group_id` is immutable for the §11 built-ins (General → the team graph,
   external-shared → the external graph), and `lib/graph/project-pointer.ts` deliberately tolerates

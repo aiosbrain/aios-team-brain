@@ -61,11 +61,18 @@ welded into the image as `gpt-4.1-nano`; it now reads from the environment and D
 `gpt-4.1-nano`, so a deployment that sets nothing is byte-identical to before. Two things to know
 before changing it, both verified rather than assumed:
 
-- ⚠️ **The marker coupling is PROXY-ONLY.** `GRAPHITI_SMALL_MODEL` must equal
-  `GRAPHITI_SMALL_MODEL_MARKER` in `lib/llm/graph-call-kind.ts` **only when the brain's LLM proxy is
-  in the path** — that marker is how the proxy recognises a small call. Talking to a provider
-  directly, nothing reads it. Disagreement is silent and costs a mislabelled cost ledger, never
-  broken routing.
+- ⚠️ **Through the proxy you should not set it at all.** When `OPENAI_BASE_URL` points at the
+  brain's LLM proxy, the image sends the sentinel **`aios-small`** and the brain picks the real
+  model (Admin → Integrations). `aios-small` is not a model and never will be — it names the
+  request's *intent*, so it is invariant under pricing decisions and there is nothing to keep in
+  sync. This replaces the old rule that `GRAPHITI_SMALL_MODEL` had to *equal*
+  `GRAPHITI_SMALL_MODEL_MARKER` in the brain: that made two separately-deployed services
+  independently responsible for remembering one string, and it failed silently (every call fell
+  back to the strong model, nothing errored, the only symptom was a bill). Matching env vars only
+  ever worked where both processes shared an environment — on Railway the app and graphiti are
+  separate services with separate variable scopes. An explicit real model still overrides the
+  sentinel; an explicit `aios-small` is ignored outside the canonical proxy route so it cannot be
+  sent to a provider. The brain still accepts the legacy marker, so an unmigrated image works.
 - ⚠️ **A reasoning model needs output headroom.** At `max_tokens=900` a reasoning model spends the
   whole budget on its trace and returns `content=None`, surfacing as `EmptyResponseError` after all
   four tenacity retries. Safe here only because `DEFAULT_MAX_TOKENS` is 16384, which the build
