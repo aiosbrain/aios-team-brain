@@ -74,11 +74,37 @@ ENFB-4 (#615) merged. **Schema: NONE.**
   (prod's ONLY current edges, measured above; bootstrap re-grants idempotently but the window
   is a full substrate outage). The CLI additionally preflights for a friendlier message.
   Round 1 verified: no materializer/bootstrap flow ever legitimately deletes a system edge.
-- **D2b — the writer validates the principal (round 1 H2): whichever actor kind arrives,
-  the referenced member must be an ACTIVE ADMIN of the team, checked inside
-  `revokeProjectFromGroup` with one bounded read.** Revoke can hold this invariant globally
-  precisely because it has zero callers; grant cannot (the creator self-grant is a non-admin
-  member by design, app/actions/projects.ts:98 — the asymmetry is stated, not accidental).
+- **D2b — the writer validates the principal (round 1 H2; SHARPENED at round 2's BLOCKER 2 —
+  role alone is NOT the app's admin predicate): whichever actor kind arrives, the referenced
+  member must pass the SAME admin test the app applies — `role='admin'` AND `status='active'`
+  AND unrestricted (non-external) POSTURE, i.e. the `canAccessAdmin` predicate on the same
+  resolved posture the admin layout and `requireTeamAdmin` use** (admin-access.ts:6-12
+  explicitly denies the representable `role='admin', external`-posture principal; a role-only
+  writer check would accept a principal every app gate rejects). Checked inside
+  `revokeProjectFromGroup` with bounded reads via the existing resolution helpers. Revoke can
+  hold this invariant globally precisely because it has zero callers; grant cannot (the
+  creator self-grant is a non-admin member by design, app/actions/projects.ts:98 — the
+  asymmetry is stated, not accidental).
+- **D2c — CHECK ORDER is part of the contract (round 2 HIGH — an unordered writer turns
+  invalid principals into an existence oracle):** (1) project resolution + `kind='system'`
+  refusal, (2) principal validation, (3) the edge existence probe, (4) delete + audit. An
+  invalid/non-admin principal therefore receives the SAME refusal whether the edge exists or
+  not — the no-op `{ revoked: false }` outcome is reachable ONLY by an authorized principal
+  against a non-system project (pinned both directions in the ACs).
+- **D3b — the audit write is BEST-EFFORT, stated (round 2's BLOCKER 1 corrected the draft's
+  over-promise):** `audit()` never throws and swallows insert failures BY DESIGN
+  (lib/api/audit.ts:16-30) — the repo-wide contract that an audit outage must not break the
+  product act. The draft's "nothing partially applied" claim is therefore SCOPED to the edge
+  write (the one destructive statement); a revoke whose audit insert fails still revokes, in
+  the same failure direction as every audited write in this codebase (act over trail —
+  reversing that tradeoff, or adding a transaction surface, is the recorded F3 adapter work,
+  not this slice). The ACs pin the happy-path trail exactly and this limitation is named in
+  the PR body.
+- **D3c — human-readable attribution (round 2 M, stated):** the admin audit page renders
+  `actor_kind` only (audit/page.tsx:48) — an operator revoke shows "system" in the Actor
+  column, with the authorizing admin in the meta JSON the page already renders. Meta
+  attribution is the MACHINE-READABLE record; surfacing `authorizedBy` as a first-class
+  column is the audit-UI phase's work, named out of scope.
 - **D3 — no-op revokes do not audit.** `revokeProjectFromGroup` today deletes blindly and
   audits UNCONDITIONALLY — revoking a non-existent edge would write an `access.project_revoked`
   row for a revocation that revoked nothing (an over-reporting trail is a lying trail). The
@@ -125,10 +151,11 @@ ENFB-4 (#615) merged. **Schema: NONE.**
   shape. Resolution stays in the CLI (`memberIdByEmail`, admin.ts:103); validation lives in
   the writer (D2b).
 - **Fail directions:** unknown team/group/project/email → die before any read of the writer
-  (existing shapes); non-admin/inactive principal and system project → the WRITER refuses,
-  named errors (the CLI surfaces them; its preflight only improves wording); DB error → die
-  with the writer's error. Nothing partially applied — the only write is the single
-  delete+audit pair.
+  (existing shapes); non-admin/inactive/external-posture principal and system project → the
+  WRITER refuses in the D2c order, named errors (the CLI surfaces them; its preflight only
+  improves wording); DB error on the delete → the writer returns it, nothing deleted. The
+  no-partial-work claim covers the EDGE write; the audit insert is best-effort by the
+  repo-wide contract (D3b).
 - **`meta.authorizedByMemberId` / `meta.via`** ride the existing `meta` argument of
   `auditWrite` — no contract change to the audit writer itself.
 
@@ -146,11 +173,15 @@ ENFB-4 (#615) merged. **Schema: NONE.**
    the no-op arm (D3): revoking an absent edge returns `{ ok: true, revoked: false }` and
    writes NO audit row (count pinned before/after); the double-revoke arm: revoke twice →
    exactly one audit row.
-2. Same file — the WRITER's refusals (D2/D2b), each with the edge PROVEN INTACT after the
-   refusal (the not-invoked pin, round 1 L): revoking a `kind='system'` project refuses with
-   the named error and the edge survives; an operator revoke authorized by a NON-admin, an
-   INACTIVE admin, and an unknown member id each refuse and the edge survives; the
-   `{ kind: "member" }` shape with a non-admin refuses identically. GRANT META (D1b):
+2. Same file — the WRITER's refusals (D2/D2b/D2c), each with the edge PROVEN INTACT after
+   the refusal (the not-invoked pin, round 1 L): revoking a `kind='system'` project refuses
+   with the named error and the edge survives; an operator revoke authorized by a NON-admin,
+   an INACTIVE admin, an EXTERNAL-POSTURE admin (round 2 B2 — the representable
+   role-admin/external principal every app gate denies), and an unknown member id each
+   refuse and the edge survives; the `{ kind: "member" }` shape with a non-admin refuses
+   identically; the ORACLE arm (D2c): an invalid principal receives the SAME refusal
+   whether the edge exists or not (both directions — the no-op shape is unreachable without
+   authority). GRANT META (D1b):
    `grantProjectToGroup` with `authorizedByMemberId` writes it into the grant audit row's meta
    while the audit actor stays `system` and the edge's `added_by` stays NULL (the
    no-laundering pin, all three asserted); without the option, a grant still writes the
@@ -183,4 +214,7 @@ actor-laundering class in the pre-existing `add/remove-group-member` verbs (reco
 1 as live at admin.ts:271 — a follow-up row, not this slice); the EXCLSHADOW-1
 exclude-shadow repair and the TICKSTALL-2 github-stage budget (the scout's other ranked
 candidates — each its own slice); the transactional INSERT…RETURNING form for the probe/act
-races (the recorded F3 deferral, unchanged).
+races (the recorded F3 deferral, unchanged); a transactional delete+audit pair (the audit
+layer is best-effort by repo-wide design, D3b — reversing that is the adapter's transaction
+surface, F3 again); surfacing `meta.authorizedBy` as a first-class Actor column in the admin
+audit page (the audit-UI phase, D3c).
