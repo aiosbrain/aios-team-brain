@@ -589,7 +589,7 @@ async function nativeRetrieve(
   const { query: ftsQuery, terms } = buildFtsQuery(q);
   const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel, visArr);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
-  const specificityP = analyzeTermSpecificity(teamId, tier, terms);
+  const specificityP = analyzeTermSpecificity(teamId, tier, terms, visArr ?? []); // ENFB-1: the visible corpus is the statistic's universe
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
