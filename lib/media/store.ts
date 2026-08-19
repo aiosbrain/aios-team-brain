@@ -84,20 +84,6 @@ export async function listTeamMediaMeta(db: DbClient, teamId: string, limit = 10
   return ((data ?? []) as Record<string, unknown>[]).map(normalize);
 }
 
-/** The image bytes for one asset (team-scoped). Used only by the media-serving route. */
-export async function getMediaBytes(
-  db: DbClient,
-  teamId: string,
-  id: string
-): Promise<{ access: AccessTier; data_base64: string } | null> {
-  const { data } = await db
-    .from("media_assets")
-    .select("access, data_base64")
-    .eq("team_id", teamId)
-    .eq("id", id)
-    .maybeSingle();
-  return (data as { access: AccessTier; data_base64: string }) ?? null;
-}
 
 /** The UTC calendar day (YYYY-MM-DD) that owns `now` — the cost-cap bucket key. */
 function utcDay(now: Date): string {

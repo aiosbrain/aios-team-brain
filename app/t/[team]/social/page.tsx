@@ -124,7 +124,10 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
 
   const analyticsByPublication = new Map(analyticsRows.map((a) => [a.publication_id, a]));
   const publicationsByVariant: Record<string, PublicationView[]> = {};
-  for (const p of pubs.filter((pb) => visibleVariantIds.has(pb.variant_id))) {
+  // ENFB-4 (Fable fold L): ONE filtered set feeds both the per-variant lists and the KPI —
+  // publications inherit by chain (§1), so the count must not run over the unfiltered rows.
+  const visiblePubs = pubs.filter((pb) => visibleVariantIds.has(pb.variant_id));
+  for (const p of visiblePubs) {
     const a = analyticsByPublication.get(p.id);
     (publicationsByVariant[p.variant_id] ??= []).push({
       id: p.id,
@@ -137,7 +140,7 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     });
   }
 
-  const publishedCount = pubs.filter((p) => p.status === "published").length;
+  const publishedCount = visiblePubs.filter((p) => p.status === "published").length;
 
   return (
     <div className="flex flex-col gap-5">

@@ -56,7 +56,9 @@ function normalizeOpportunity(row: Record<string, unknown>): OpportunityRow {
  * most as public as the most-restrictive item this opportunity cites. Looks up the actual
  * `items.access` for every evidence entry that references an item and throws TierLeakError if the
  * request would over-expose. Fail-closed — an evidence id that resolves to no item counts as
- * restrictive. No item-evidence → unconstrained (a manual opportunity may be external).
+ * restrictive. The no-item-evidence case is unreachable here (ENFB-4: `createOpportunity`
+ * refuses evidence-less AND link-less shapes at admission; `evidenceCeiling` floors empty to
+ * team beneath that).
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -103,6 +105,14 @@ export async function createOpportunity(
   // one (measured: prod zero).
   if (!input.evidence || input.evidence.length === 0) {
     throw new Error("createOpportunity: evidence is required (an opportunity must trace to brain items)");
+  }
+  // Same refusal, second shape (Fable diff review M1): a NON-EMPTY evidence array whose entries
+  // carry no itemId has zero verifiable provenance — it would skip the tier ceiling entirely
+  // (assertEvidenceTier early-returns with no ids) and be born dark under the EVERY read rule,
+  // unrepairable by any grant. The dangling-arc refusal killed this class at the arc door;
+  // this closes the store API shape too.
+  if (input.evidence.some((e) => !e.itemId)) {
+    throw new Error("createOpportunity: every evidence entry must reference a brain item (itemId required)");
   }
   if (input.dedupKey) {
     const existing = await db

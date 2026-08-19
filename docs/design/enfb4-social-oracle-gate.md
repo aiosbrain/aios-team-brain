@@ -91,8 +91,12 @@ the re-specification of the pins whose subject dies.
   unresolved-fact prose in a team-tier row renders to any admin whose intersection passes on
   the resolved subset).** `discoverOpportunitiesFromArcs` mints ONLY when every cited fact
   resolved to item-linked evidence (the arcs.ts:416 free-text fallback and the
-  unresolved-episode case both refuse); `createOpportunity` refuses `evidence: []`. Measured:
-  prod has zero evidence-less rows — nothing retro-hides. The pins asserting empty→external
+  unresolved-episode case both refuse); `createOpportunity` refuses `evidence: []` AND (build
+  folds) the class's two sibling shapes: an evidence entry lacking an `itemId` (non-empty but
+  zero verifiable provenance — it would skip the tier ceiling and be born dark; Fable diff M1)
+  and an arc citing a DANGLING item id (unverifiable — the row would be dark for every viewer
+  and unrepairable by any grant; the draft's missing→team floor died with the full-dm sweep).
+  Measured: prod has zero evidence-less rows — nothing retro-hides. The pins asserting empty→external
   (`social-discover-arcs.test.ts:70`, `social-tier.test.ts:31`) re-specify to the refusal.
 - **D1b — the READ quantifier is EVERY, not SOME (round 1's BLOCKER 2):** an opportunity's
   title/summary and its variants' bodies are synthesized over ALL its evidence, so a viewer

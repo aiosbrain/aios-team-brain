@@ -126,6 +126,9 @@ describe("ENFB-4 — admission refusals", () => {
     const insider = await seedAdmin(seed);
     const outsider = await seedAdmin(seed);
     await expect(mkOpp(seed, [])).rejects.toThrow(/evidence is required/);
+    // The D1 class's second shape (Fable diff review M1): non-empty evidence with NO item link
+    // — zero verifiable provenance, would skip the tier ceiling and be born dark. Refused.
+    await expect(mkOpp(seed, [{ note: "free text only" } as unknown as { itemId: string }])).rejects.toThrow(/itemId required/);
 
     // Arc discovery: a partial arc (one linked, one free-text) refuses; a full one mints.
     const item = await ingest(seed, { path: "a.md", body: "arc source", access: "team", project: "src" });

@@ -222,6 +222,18 @@ export async function generatePlanDrafts(
   if (!planRows || planRows.length === 0) throw new Error("generatePlanDrafts: opportunity has no plan");
   const planId = (planRows[0] as { id: string }).id;
 
+  // ENFB-4 (Fable fold L): the EVERY refusal is OPPORTUNITY-level, so refuse the whole call up
+  // front — otherwise each variant's throw lands in the per-variant catch and the stated
+  // refusal degrades into an undifferentiated `failed` count (the action's chain gate refuses
+  // first today; this keeps the lib contract honest for any future direct caller).
+  if (opts.actorVisibleItemIds) {
+    const opp = await getOpportunity(db, teamId, opportunityId);
+    const { opportunityVisible } = await import("@/lib/social/store");
+    if (!opp || !opportunityVisible(opp, opts.actorVisibleItemIds)) {
+      throw new Error("generatePlanDrafts: evidence not fully visible to the acting admin");
+    }
+  }
+
   const variants = await listVariants(db, teamId, planId, "team");
   const summary: PlanDraftsSummary = { generated: 0, blocked: 0, failed: 0, variants: [] };
 

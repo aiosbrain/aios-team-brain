@@ -255,7 +255,11 @@ const SWEEP_RESIDUALS: [string, string][] = [
 // is a tripwire with a hole where the trap sprang.
 const SWEEP_DIRS = ["app/api", "app/t", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social", "lib/meetings"];
 const SWEEP_READ = /from\(\s*["'](projects|tasks|decisions|meeting_notes|social_opportunities|content_plans|content_variants)["']\s*\)/;
-const SWEEP_SERVES = /select\(\s*["'][^"']*(name|title|count|slug)[^"']*["']/;
+// ENFB-4 (Fable diff review M2): `body|summary` joined the serves-conjunct — variant BODIES are
+// the crown-jewel column of the social slice, and a sweep that only recognizes title-shaped
+// columns had a hole exactly that shape (a future `select("id, body")` on a content table would
+// have slipped past the tripwire).
+const SWEEP_SERVES = /select\(\s*["'][^"']*\b(name|title|count|slug|body|summary)\b[^"']*["']/;
 
 describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripwire)", () => {
   it("every title surface's application site is present", () => {
@@ -297,6 +301,8 @@ describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripw
     expect(SWEEP_READ.test('db.from("items").select("id")'), "items reads belong to the posture/body layers").toBe(false);
     expect(SWEEP_SERVES.test('.select("id, status")'), "an id/status-only select serves no title").toBe(false);
     expect(SWEEP_READ.test('db.from("social_opportunities").select("id, title")'), "ENFB-4: the social content tables are swept").toBe(true);
+    expect(SWEEP_SERVES.test('.select("id, plan_id, body")'), "ENFB-4 M2: a body-serving select trips the sweep").toBe(true);
+    expect(SWEEP_SERVES.test('.select("id, embedding")'), "substring must not false-positive (no bare-word match)").toBe(false);
     const projPat = TITLE_SURFACE_WIRING.find(([f]) => f === "app/t/[team]/projects/page.tsx")![1];
     expect(projPat.test("const cards = await visibleProjectCards(db, principal)")).toBe(true);
     expect(projPat.test("const rows = await visibleProjectRows(db, principal)"), "the list page must use the CARD read (visible counts), not the bare row set").toBe(false);
