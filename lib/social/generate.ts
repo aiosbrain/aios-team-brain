@@ -114,6 +114,12 @@ async function loadEvidenceBodies(
 export interface GenerateOptions {
   complete?: Completer;
   brand?: BrandProfileRecord | null;
+  /** ENFB-4 D4: the ACTING admin's oracle set. Generation REFUSES unless every evidence
+   *  item is visible to the actor (the EVERY quantifier — no silent fewer-bodies
+   *  degradation, no prompt whose TOPIC/SUMMARY derive from evidence the actor cannot see).
+   *  Required for action-triggered generation; a future job path takes system semantics,
+   *  decided then, not defaulted now. */
+  actorVisibleItemIds?: ReadonlySet<string>;
 }
 
 /** Generate + gate one variant's draft. Advances the variant status and persists the result. */
@@ -138,6 +144,15 @@ export async function generateVariantText(
   const opp = await getOpportunity(db, teamId, plan.opportunity_id);
   if (!opp) throw new Error(`generateVariantText: opportunity ${plan.opportunity_id} not found`);
 
+  // ENFB-4 (the EVERY quantifier, D1b/M6): the actor must see EVERY evidence item — the
+  // prompt embeds the opportunity title/summary (synthesized over ALL evidence) plus each
+  // body, so partial visibility would generate over hidden sources.
+  if (opts.actorVisibleItemIds) {
+    const { opportunityVisible } = await import("@/lib/social/store");
+    if (!opportunityVisible(opp, opts.actorVisibleItemIds)) {
+      throw new Error("generateVariantText: evidence not fully visible to the acting admin");
+    }
+  }
   const brand = opts.brand !== undefined ? opts.brand : await getBrandProfile(db, teamId);
   const assets = await listBrandAssets(db, teamId);
   const evidence = await loadEvidenceBodies(db, teamId, variant.access, opp.evidence);

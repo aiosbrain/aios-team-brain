@@ -49,6 +49,14 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   // Every read below is independent — all the derived structures are pure JS post-processing done
   // after the awaits — so fire them concurrently instead of in a ~13-deep request waterfall (each
   // round-trip to Railway Postgres has real latency; serial they stacked into most of the render).
+  // ENFB-4: the viewer's ORACLE set — the ONE social read rule (EVERY-visible evidence) and
+  // every downstream chain hang off it. A resolution error is the error boundary, never an
+  // unfiltered render (the ENFB-2 L8 shape).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient: ac } = await import("@/lib/db/admin");
+  const vis = await visibleItemIds(ac(), { teamId: team.id, memberId: me.id });
+  if (vis.error) throw new Error("social visibility resolution failed");
+
   const [
     opportunities,
     plansRes,
@@ -64,13 +72,9 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     analyticsRows,
     analytics,
   ] = await Promise.all([
-    listOpportunities(db, team.id, "team", 100),
-    db.from("content_plans").select("id, opportunity_id").eq("team_id", team.id),
-    db
-      .from("content_variants")
-      .select("id, plan_id, platform, status, body, validation")
-      .eq("team_id", team.id)
-      .order("created_at", { ascending: true }),
+    listOpportunities(db, team.id, "team", 100, vis.ids),
+    Promise.resolve(null), // plans — resolved AFTER the opportunity set (the chain, below)
+    Promise.resolve(null), // variants — resolved after plans (the chain, below)
     listTeamMediaMeta(db, team.id, 200),
     imageBudget(db, team.id),
     getSocialJobsHealth(db, team.id),
@@ -83,8 +87,15 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     teamAnalyticsSummary(db, team.id),
   ]);
 
-  const plans = plansRes.data;
-  const variants = variantsRes.data;
+  // ENFB-4 inheritance: plan → variant → approval/publication/media all descend from the
+  // VISIBLE opportunity set (parent-id chains through the store — the one seam).
+  void plansRes;
+  void variantsRes;
+  const { listPlansForOpportunities, listVariantsForPlans } = await import("@/lib/social/store");
+  const visibleOppIds = new Set(opportunities.map((o) => o.id));
+  const plans = await listPlansForOpportunities(db, team.id, visibleOppIds);
+  const variants = await listVariantsForPlans(db, team.id, new Set(plans.map((p) => p.id)));
+  const visibleVariantIds = new Set(variants.map((v) => v.id));
   const planToOpp = new Map((plans ?? []).map((p: { id: string; opportunity_id: string }) => [p.id, p.opportunity_id]));
 
   const byOpportunity: Record<string, VariantView[]> = {};
@@ -95,14 +106,14 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   }
 
   const mediaByVariant: Record<string, string[]> = {};
-  for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
+  for (const m of media) if (visibleVariantIds.has(m.variant_id)) (mediaByVariant[m.variant_id] ??= []).push(m.id);
 
   const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
   for (const [oppId, vs] of Object.entries(byOpportunity)) {
     const oppTitle = opportunities.find((o) => o.id === oppId)?.title ?? "";
     for (const v of vs) variantCtx[v.id] = { platform: v.platform, body: v.body, oppTitle };
   }
-  const pendingApprovals: PendingApprovalView[] = pendingRows.map((a) => ({
+  const pendingApprovals: PendingApprovalView[] = pendingRows.filter((a) => visibleVariantIds.has(a.variant_id)).map((a) => ({
     id: a.id,
     variantId: a.variant_id,
     access: a.access,
@@ -113,7 +124,7 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
 
   const analyticsByPublication = new Map(analyticsRows.map((a) => [a.publication_id, a]));
   const publicationsByVariant: Record<string, PublicationView[]> = {};
-  for (const p of pubs) {
+  for (const p of pubs.filter((pb) => visibleVariantIds.has(pb.variant_id))) {
     const a = analyticsByPublication.get(p.id);
     (publicationsByVariant[p.variant_id] ??= []).push({
       id: p.id,

@@ -19,11 +19,33 @@ import type { AutonomyLevel } from "@/lib/social/autonomy";
 type DiscoverResult = { ok: boolean; created?: number; skipped?: number; scanned?: number; error?: string };
 
 /** Run content discovery over recent brain knowledge (admins only). */
+/** ENFB-4 (round 1 H4): the action-level parent gate — the target's chain must be
+ *  EVERY-visible to the acting admin, else the action's existing not-found shape. ONE
+ *  resolver (store.actorSeesChain) so the seven actions cannot drift. */
+async function actorChainGate(
+  teamId: string,
+  memberId: string,
+  ref: { opportunityId?: string; planId?: string; variantId?: string; publicationId?: string }
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { actorSeesChain } = await import("@/lib/social/store");
+  const vis = await visibleItemIds(adminClient(), { teamId, memberId });
+  if (vis.error) return { ok: false, error: "visibility resolution failed" };
+  if (!(await actorSeesChain(adminClient(), teamId, ref, vis.ids))) {
+    return { ok: false, error: "not found for team" };
+  }
+  return { ok: true };
+}
+
 export async function discoverNow(teamSlug: string): Promise<DiscoverResult> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    const s = await discoverOpportunities(adminClient(), ctx.teamId, { actor: { memberId: ctx.memberId } });
+    // ENFB-4: the scan is bounded to the acting admin's oracle set (fail closed on error).
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    const vis = await visibleItemIds(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId });
+    if (vis.error) return { ok: false, error: "visibility resolution failed" };
+    const s = await discoverOpportunities(adminClient(), ctx.teamId, { actor: { memberId: ctx.memberId }, visibleItemIds: vis.ids });
     revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, created: s.created, skipped: s.skipped, scanned: s.scanned };
   } catch (e) {
@@ -64,6 +86,8 @@ export async function planNow(
 ): Promise<{ ok: boolean; variants?: number; created?: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const gate = await actorChainGate(ctx.teamId, ctx.memberId, { opportunityId });
+  if (!gate.ok) return gate;
   try {
     const r = await planOpportunity(adminClient(), ctx.teamId, opportunityId, { memberId: ctx.memberId });
     revalidatePath(`/t/${teamSlug}/social`);
@@ -80,8 +104,13 @@ export async function generateDrafts(
 ): Promise<{ ok: boolean; generated?: number; blocked?: number; failed?: number; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const gate = await actorChainGate(ctx.teamId, ctx.memberId, { opportunityId });
+  if (!gate.ok) return gate;
   try {
-    const s = await generatePlanDrafts(adminClient(), ctx.teamId, opportunityId);
+    const { visibleItemIds: vres } = await import("@/lib/access/enforce");
+    const genVis = await vres(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId });
+    if (genVis.error) return { ok: false, error: "visibility resolution failed" };
+    const s = await generatePlanDrafts(adminClient(), ctx.teamId, opportunityId, { actorVisibleItemIds: genVis.ids });
     revalidatePath(`/t/${teamSlug}/social`);
     return { ok: true, generated: s.generated, blocked: s.blocked, failed: s.failed };
   } catch (e) {
@@ -112,6 +141,8 @@ export async function submitApproval(
 ): Promise<{ ok: boolean; outcome?: string; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const gate = await actorChainGate(ctx.teamId, ctx.memberId, { variantId });
+  if (!gate.ok) return gate;
   try {
     const r = await submitForApproval(adminClient(), ctx.teamId, variantId, { memberId: ctx.memberId });
     revalidatePath(`/t/${teamSlug}/social`);
@@ -130,6 +161,16 @@ export async function decideContentApproval(
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  // ENFB-4 H4: the approval's variant chain must be EVERY-visible to the decider.
+  const { data: approvalRow } = await adminClient()
+    .from("content_approvals")
+    .select("variant_id")
+    .eq("team_id", ctx.teamId)
+    .eq("id", approvalId)
+    .maybeSingle();
+  if (!approvalRow) return { ok: false, error: "not found for team" };
+  const decideGate = await actorChainGate(ctx.teamId, ctx.memberId, { variantId: (approvalRow as { variant_id: string }).variant_id });
+  if (!decideGate.ok) return decideGate;
   try {
     await decideApproval(adminClient(), ctx.teamId, approvalId, decision, note, { memberId: ctx.memberId });
     revalidatePath(`/t/${teamSlug}/social`);
@@ -176,6 +217,8 @@ export async function scheduleVariantAction(
 ): Promise<{ ok: boolean; dryRun?: boolean; warning?: string; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const gate = await actorChainGate(ctx.teamId, ctx.memberId, { variantId });
+  if (!gate.ok) return gate;
   try {
     const when = at && at.trim() ? new Date(at) : undefined;
     if (when && Number.isNaN(when.getTime())) return { ok: false, error: "invalid schedule time" };
@@ -200,6 +243,8 @@ export async function cancelPublicationAction(
 ): Promise<{ ok: boolean; cancelled?: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const gate = await actorChainGate(ctx.teamId, ctx.memberId, { publicationId });
+  if (!gate.ok) return gate;
   try {
     const { cancelled } = await cancelScheduledPublication(adminClient(), ctx.teamId, publicationId, {
       memberId: ctx.memberId,
@@ -212,6 +257,8 @@ export async function cancelPublicationAction(
 }
 
 /** Collect/refresh analytics for a publication now (admins only). */
+/** ENFB-4: the ONE stated action exemption (round 2 H5) — analytics refresh moves COUNTS
+ *  only (no title/body leaves or enters), the same metrics ruling as the analytics reads. */
 export async function refreshAnalytics(teamSlug: string, publicationId: string): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
@@ -231,6 +278,8 @@ export async function generateImage(
 ): Promise<{ ok: boolean; remaining?: number; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  const imgGate = await actorChainGate(ctx.teamId, ctx.memberId, { variantId });
+  if (!imgGate.ok) return imgGate;
   try {
     const db = adminClient();
     await generateVariantImage(db, ctx.teamId, variantId, { actor: { memberId: ctx.memberId } });
