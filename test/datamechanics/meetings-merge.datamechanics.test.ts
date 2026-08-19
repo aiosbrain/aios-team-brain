@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createMeetingNote, getMeetingNote } from "@/lib/meetings/notes";
 import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge";
 import { db, seedTeam } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for duplicate-meeting merge on real Postgres. Derived from the scenario: two people upload
@@ -41,9 +42,10 @@ async function secondMember(teamId: string): Promise<string> {
 describe("duplicate meeting merge (real Postgres)", () => {
   it("merges a second upload into the same note, crediting both submitters and unioning content", async () => {
     const { teamId, memberId: chetan } = await seedTeam();
+    await backfillTeamContext(db(), teamId); // ENFB-3: gated reads need a context-bootstrapped team
     const john = await secondMember(teamId);
 
-    const noteId = await createMeetingNote(db(), teamId, {
+    const { noteId: noteId } = await createMeetingNote(db(), teamId, {
       title: "AIOS sync",
       rawText: A,
       submittedByMemberId: chetan,
@@ -67,7 +69,7 @@ describe("duplicate meeting merge (real Postgres)", () => {
     const { count } = await db().from("meeting_notes").select("id", { count: "exact", head: true }).eq("team_id", teamId);
     expect(count).toBe(1);
 
-    const note = await getMeetingNote(db(), teamId, noteId, "team");
+    const note = await getMeetingNote(db(), teamId, noteId, { memberId: chetan, tier: "team" });
     expect(note!.submitters.map((s) => s.id).sort()).toEqual([chetan, john].sort());
     // Merged transcript keeps the base and adds the second person's unique line.
     expect(note!.rawText).toContain("mission control dashboard");
@@ -76,8 +78,9 @@ describe("duplicate meeting merge (real Postgres)", () => {
 
   it("uses the (LLM) merge function to produce the merged transcript body", async () => {
     const { teamId, memberId: chetan } = await seedTeam();
+    await backfillTeamContext(db(), teamId); // ENFB-3: gated reads need a context-bootstrapped team
     const john = await secondMember(teamId);
-    const noteId = await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: chetan, occurredAt: DATE });
+    const { noteId: noteId } = await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: chetan, occurredAt: DATE });
 
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
     // Inject the "LLM" merge — proves the orchestration stores exactly what the merge returns (not
@@ -90,13 +93,14 @@ describe("duplicate meeting merge (real Postgres)", () => {
       mergeTranscript: async () => "MERGED BY LLM: full combined transcript with both perspectives.",
     });
 
-    const note = await getMeetingNote(db(), teamId, noteId, "team");
+    const note = await getMeetingNote(db(), teamId, noteId, { memberId: chetan, tier: "team" });
     expect(note!.rawText).toBe("MERGED BY LLM: full combined transcript with both perspectives.");
     expect(note!.submitters.map((s) => s.id).sort()).toEqual([chetan, john].sort());
   });
 
   it("does not match an unrelated transcript or a different date", async () => {
     const { teamId, memberId } = await seedTeam();
+    await backfillTeamContext(db(), teamId); // ENFB-3: gated reads need a context-bootstrapped team
     await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: memberId, occurredAt: DATE });
 
     expect(await findDuplicateMeeting(db(), teamId, DATE, UNRELATED)).toBeNull(); // low overlap

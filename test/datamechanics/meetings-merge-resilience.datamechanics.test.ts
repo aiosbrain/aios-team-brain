@@ -4,6 +4,7 @@ import { findDuplicateMeeting, mergeIntoMeetingNote } from "@/lib/meetings/merge
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { createMeetingTodoTasks, toExtractedTodoRows } from "@/lib/meetings/extract-todos";
 import { db, seedTeam, ingest } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Regression specs for the merge-subsystem audit findings (2026-07-16):
@@ -28,6 +29,7 @@ const B_UNIQUE = "launch deadline is next Friday";
 describe("merge resilience (real Postgres)", () => {
   it("C1: merge re-points the note off the connector item; a re-sync can't revert it and backfill can't resurrect it", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { teamId } = seed;
 
     // A CLI/connector-synced meeting: a transcript item at a connector-owned path, noted via the import path.
@@ -59,14 +61,14 @@ describe("merge resilience (real Postgres)", () => {
     const { data: mergedItem } = await db().from("items").select("path").eq("id", mergedItemId).maybeSingle();
     expect((mergedItem as { path: string }).path).toBe(`meetings/${noteId}.md`);
 
-    const merged = await getMeetingNote(db(), teamId, noteId, "team");
+    const merged = await getMeetingNote(db(), teamId, noteId, { memberId: seed.memberId, tier: "team" });
     expect(merged!.rawText).toContain(B_UNIQUE); // B's unique line survived
 
     // The connector re-syncs the ORIGINAL file (same path, original single-transcript body).
     await ingest(seed, { project: "acme", path: CONNECTOR_PATH, kind: "transcript", access: "team", frontmatter: { source: "granola" }, body: A });
 
     // The merge is intact — the re-sync hit the connector item, not the note's merge-owned item.
-    const after = await getMeetingNote(db(), teamId, noteId, "team");
+    const after = await getMeetingNote(db(), teamId, noteId, { memberId: seed.memberId, tier: "team" });
     expect(after!.rawText).toContain(B_UNIQUE);
     expect(after!.rawText).toBe(merged!.rawText);
 
@@ -79,6 +81,7 @@ describe("merge resilience (real Postgres)", () => {
 
   it("M1: a team-tier upload merged into an external item yields a team-tier merged item (no widening)", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { teamId } = seed;
     const ext = await ingest(seed, { project: "acme", path: "client/call.md", kind: "transcript", access: "external", frontmatter: { source: "zoom" }, body: A });
     const { id: noteId } = await createMeetingNoteFromItem(db(), teamId, { sourceItemId: ext.id, title: "Client call", occurredAt: DATE, summary: "", submittedByMemberId: seed.memberId });
@@ -100,11 +103,12 @@ describe("merge resilience (real Postgres)", () => {
 
   it("H2: the duplicate detector never matches a folded-away (merged_into) note", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { teamId } = seed;
     // The hidden note is the STRICTLY BETTER match for B (its body is B) — so without the exclusion the
     // detector would pick it (deterministic redness), and folding B into it would make B vanish.
-    const hiddenId = await createMeetingNote(db(), teamId, { title: "old dup", rawText: B, submittedByMemberId: seed.memberId, occurredAt: DATE });
-    const survivorId = await createMeetingNote(db(), teamId, { title: "survivor", rawText: A, submittedByMemberId: seed.memberId, occurredAt: DATE });
+    const { noteId: hiddenId } = await createMeetingNote(db(), teamId, { title: "old dup", rawText: B, submittedByMemberId: seed.memberId, occurredAt: DATE });
+    const { noteId: survivorId } = await createMeetingNote(db(), teamId, { title: "survivor", rawText: A, submittedByMemberId: seed.memberId, occurredAt: DATE });
     await setMeetingNoteMergedInto(db(), hiddenId, survivorId);
 
     const match = await findDuplicateMeeting(db(), teamId, DATE, B);
@@ -115,6 +119,7 @@ describe("merge resilience (real Postgres)", () => {
 
   it("H1: action items survive a re-point merge — moved to the new item, never orphaned or duplicated", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { teamId } = seed;
     const conn = await ingest(seed, { project: "acme", path: CONNECTOR_PATH, kind: "transcript", access: "team", frontmatter: { source: "granola" }, body: A });
     const { id: noteId } = await createMeetingNoteFromItem(db(), teamId, { sourceItemId: conn.id, title: "Standup", occurredAt: DATE, summary: "", submittedByMemberId: seed.memberId });
@@ -181,6 +186,7 @@ describe("merge resilience (real Postgres)", () => {
 
   it("M1: external + external stays external — the floor narrows, never over-narrows", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const { teamId } = seed;
     const ext = await ingest(seed, { project: "acme", path: "client/call2.md", kind: "transcript", access: "external", frontmatter: { source: "zoom" }, body: A });
     const { id: noteId } = await createMeetingNoteFromItem(db(), teamId, { sourceItemId: ext.id, title: "Client call", occurredAt: DATE, summary: "", submittedByMemberId: seed.memberId });

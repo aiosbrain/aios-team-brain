@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, seedTeam, viewFor, type Seed } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { createMeetingNote } from "@/lib/meetings/notes";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 
@@ -54,6 +55,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
   it("credits EVERY attendee — not just whoever pushed it", async () => {
     // The prod bug, reproduced: a 1-1 pushed by one person, attended by two.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const other = await addMember(seed, "Chetan");
     await createMeetingNote(db(), seed.teamId, {
       title: "1-1 with Chetan RE: AIOS next steps",
@@ -82,6 +84,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // `createMeetingNote` also writes a `kind='transcript'` item. If that were admitted as evidence
     // too, the meeting would appear twice — once credited to the pusher, once per attendee.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const other = await addMember(seed, "Chetan");
     await createMeetingNote(db(), seed.teamId, {
       title: "Only once please",
@@ -102,6 +105,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // Sole enforcement — `meeting_notes` has no access/audience column, so no visibility helper can
     // gate it. Mutation-checked by deleting the `canSeeMeetingNotes` call.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     await createMeetingNote(db(), seed.teamId, {
       title: "Internal-only meeting",
       rawText: "body",
@@ -126,6 +130,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // attendees" means "we don't know who was there", not "nobody". Crediting the submitter is the
     // honest floor, but it must be distinguishable from real attendance.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     await createMeetingNote(db(), seed.teamId, {
       title: "Nobody matched",
       rawText: "body",
@@ -146,16 +151,17 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // silently. Written against the real column rather than through the merge helper so it pins the
     // QUERY's behaviour, which is the thing that would regress.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const other = await addMember(seed, "Chetan");
 
-    const targetId = await createMeetingNote(db(), seed.teamId, {
+    const { noteId: targetId } = await createMeetingNote(db(), seed.teamId, {
       title: "The surviving note",
       rawText: "merged body",
       submittedByMemberId: seed.memberId,
       occurredAt: today(),
       attendeeMemberIds: [seed.memberId, other], // the UNION, as merge leaves it
     });
-    const dupId = await createMeetingNote(db(), seed.teamId, {
+    const { noteId: dupId } = await createMeetingNote(db(), seed.teamId, {
       title: "The duplicate recording",
       rawText: "same meeting, second recording",
       submittedByMemberId: seed.memberId,
@@ -176,7 +182,8 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // Criterion 5's other half. With no resolved attendee AND no usable submitter there is no honest
     // person to put it on, so it contributes nothing — it must not fall through to some default.
     const seed = await seedTeam();
-    const noteId = await createMeetingNote(db(), seed.teamId, {
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
+    const { noteId: noteId } = await createMeetingNote(db(), seed.teamId, {
       title: "Orphaned meeting",
       rawText: "body",
       submittedByMemberId: seed.memberId,
@@ -197,6 +204,7 @@ describe("meetings on the timeline, per attendee (real Postgres)", () => {
     // `occurred_at` is a `date` column — no clock time. A meeting must land on the day it happened,
     // and must not carry a bogus midnight timestamp that sorts before every same-day commit.
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
     await createMeetingNote(db(), seed.teamId, {
       title: "Happened two days ago",

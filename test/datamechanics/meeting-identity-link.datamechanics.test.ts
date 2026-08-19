@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { randomUUID as uuid } from "node:crypto";
 import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { ingestItem } from "@/lib/ingest";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { getMeetingNote, listMeetingNotesForTeam } from "@/lib/meetings/notes";
@@ -106,12 +107,15 @@ async function pushCalendarEvent(
 const tick = (seed: Seed) => backfillMeetingNotesFromItems(db(), seed.teamId, { extract: async () => ({ summary: "", attendeeMemberIds: [] }) });
 
 async function liveNotes(seed: Seed) {
-  return listMeetingNotesForTeam(db(), seed.teamId, "team");
+  // ENFB-3: the list is oracle-gated — converge memberships for whatever the fixture just
+  // ingested (prod guarantee: the scheduler's context sweep) before reading.
+  await backfillTeamContext(db(), seed.teamId);
+  return listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
 }
 
 /** The surviving note's transcript text — the list view carries no body, the detail read does. */
 async function bodyOf(seed: Seed, noteId: string): Promise<string> {
-  const detail = await getMeetingNote(db(), seed.teamId, noteId, "team");
+  const detail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "team" });
   return detail?.rawText ?? "";
 }
 
@@ -122,7 +126,8 @@ async function submitterIds(noteId: string): Promise<string[]> {
 
 describe("identity link: one meeting, two pushes (real Postgres)", () => {
   it("folds the calendar event into the TRANSCRIPT and credits the calendar pusher", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
     const chetan = await addMember(seed, "Chetan", chetanEmail);
 
@@ -142,7 +147,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   });
 
   it("produces the same outcome when the calendar event arrives FIRST", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
     const chetan = await addMember(seed, "Chetan", chetanEmail);
 
@@ -160,7 +166,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   });
 
   it("hides the folded note without destroying it, and never resurrects it", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const cal = await pushCalendarEvent(seed);
     await pushTranscript(seed);
     await tick(seed);
@@ -186,7 +193,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     // Pins the caller's `body.trim()`, which the pure rule cannot: `plan()` receives `hasBody` already
     // computed, so without this a producer emitting "\n" for an invite would make the empty note the
     // survivor and hide the real transcript. Found by a surviving mutation, not by review.
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await pushCalendarEvent(seed, { body: "  \n\t \n" });
     await pushTranscript(seed);
     await tick(seed);
@@ -199,7 +207,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   });
 
   it("is idempotent — a second tick changes nothing", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
     await addMember(seed, "Chetan", chetanEmail);
     await pushTranscript(seed);
@@ -221,7 +230,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   it("does NOT link two meetings that share no identifier, even with the same title and date", async () => {
     // The misassociation the operator asked about at team size, asserted as an absence. If this ever
     // reddens, the join has started deciding on a resemblance.
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await pushTranscript(seed, { eventId: "" });
     await pushCalendarEvent(seed, { eventId: "" });
     const summary = await tick(seed);
@@ -234,7 +244,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     // Two recordings of one meeting are the overlap merge's job — it combines their text; this path
     // would hide one. Bodies are deliberately NON-overlapping so the overlap merge does not
     // legitimately fold them either, leaving this path's refusal as the only thing under test.
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await pushTranscript(seed, { body: "# Design review\n\nAlpha notes about the rollout schedule." });
     await pushTranscript(seed, { body: "# Design review\n\nCompletely different words, zero overlap here." });
     const summary = await tick(seed);
@@ -249,7 +260,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   });
 
   it("REFUSES a component whose dates are weeks apart — the undetectable-series case", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const old = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
     await pushTranscript(seed, { date: old });
     await pushCalendarEvent(seed);
@@ -263,7 +275,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
   it("credits the calendar PUSHER as a submitter of the surviving meeting", async () => {
     // The operator's scenario end to end: John records, I push my calendar, and the one meeting that
     // remains says both of us put it there.
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const chetan = await addMember(seed, "Chetan", `chetan-${randomUUID().slice(0, 6)}@acme.com`);
     await pushTranscript(seed);
     await pushCalendarEvent(seed, { asMemberId: chetan });
@@ -279,7 +292,8 @@ describe("identity link: one meeting, two pushes (real Postgres)", () => {
     // the note carrying the ACCUMULATED credit is the one folded AWAY — i.e. the later-created of an
     // overlapping pair, since the merge keeps the earliest as primary. The first version of this test
     // built the opposite direction and passed with the fix reverted; a mutation caught it.
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const chetanEmail = `chetan-${randomUUID().slice(0, 6)}@acme.com`;
     const chetan = await addMember(seed, "Chetan", chetanEmail);
     const shared = "# Design review\n\nWe agreed the rollout and the launch plan in detail today.";

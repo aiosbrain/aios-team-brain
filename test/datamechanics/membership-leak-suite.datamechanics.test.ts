@@ -85,7 +85,8 @@ const ARC = (title: string): NarrativeArc[] => [
 
 /** The full enforcing-team fixture — built PER TEST (the dm harness truncates between tests). */
 async function buildFixture(): Promise<Fixture> {
-  const seed = await seedTeam();
+  const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
   const x = await ingest(seed, { path: "x.md", body: `alpha ${TERM_X}`, access: "team", project: "src" });
   const y = await ingest(seed, { path: "y.md", body: `beta ${TERM_Y}`, access: "team", project: "src" });
   await backfillTeamContext(db(), seed.teamId);

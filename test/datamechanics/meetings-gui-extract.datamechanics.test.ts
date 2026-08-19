@@ -4,6 +4,7 @@ import { extractAndStoreActionItems } from "@/lib/meetings/action-items";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
 import type { ExtractedTodo } from "@/lib/meetings/extract-todos";
 import { db, seedTeam } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for the GUI-upload path materializing action items via the LLM-first extractor (the same one
@@ -13,9 +14,10 @@ import { db, seedTeam } from "./helpers";
  */
 describe("meeting GUI upload → action items (real Postgres, stubbed extractor)", () => {
   it("extracts a prose commitment into a task in the meetings project", async () => {
-    const { teamId, memberId } = await seedTeam();
+    const { teamId, memberId } = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), teamId);
     const rawText = "Chetan and Alex synced. Alex will send the deck by Friday and Chetan will wire up the dashboard.";
-    const noteId = await createMeetingNote(db(), teamId, {
+    const { noteId: noteId } = await createMeetingNote(db(), teamId, {
       title: "Sync",
       rawText,
       submittedByMemberId: memberId,
@@ -49,8 +51,9 @@ describe("meeting GUI upload → action items (real Postgres, stubbed extractor)
 
   /** Seed a meeting note + resolve its transcript item — shared by the re-extract specs. */
   async function seedMeeting(rawText: string): Promise<{ teamId: string; item: { id: string; path: string; access: "team" | "external" } }> {
-    const { teamId, memberId } = await seedTeam();
-    const noteId = await createMeetingNote(db(), teamId, { title: "Sync", rawText, submittedByMemberId: memberId });
+    const { teamId, memberId } = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), teamId);
+    const { noteId: noteId } = await createMeetingNote(db(), teamId, { title: "Sync", rawText, submittedByMemberId: memberId });
     const { data: nr } = await db().from("meeting_notes").select("source_item_id").eq("id", noteId).maybeSingle();
     const { data: item } = await db()
       .from("items").select("id, path, access").eq("id", (nr as { source_item_id: string }).source_item_id).maybeSingle();

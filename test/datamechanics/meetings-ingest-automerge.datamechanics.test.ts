@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { listMeetingNotesForTeam } from "@/lib/meetings/notes";
 import { db, seedTeam, ingest } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec: duplicate-meeting merge is now AUTOMATIC on the CLI/ingest path — the manual "Merge duplicates"
@@ -21,7 +22,8 @@ const B =
 
 describe("meetings: auto-merge duplicates on ingest backfill (real Postgres)", () => {
   it("creates notes for CLI-pushed transcripts AND collapses same-day duplicates into one", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const meta = { access: "team" as const, kind: "transcript" as const };
     await ingest(seed, { ...meta, path: "meetings/2026-07-03-aios-sync-a.md", body: A, frontmatter: { source: "granola", date: DATE } });
     await ingest(seed, { ...meta, path: "meetings/2026-07-03-aios-sync-b.md", body: B, frontmatter: { source: "granola", date: DATE } });
@@ -35,11 +37,13 @@ describe("meetings: auto-merge duplicates on ingest backfill (real Postgres)", (
     expect(summary.created).toBe(2); // a note per transcript item…
     expect(summary.merged).toBe(1); // …then the duplicate is auto-merged
     // Only the survivor is visible (the folded copy is hidden behind merged_into).
-    expect((await listMeetingNotesForTeam(db(), seed.teamId, "team")).length).toBe(1);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    expect((await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" })).length).toBe(1);
   });
 
   it("leaves a single (non-duplicate) pushed meeting alone", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await ingest(seed, {
       access: "team",
       kind: "transcript",
@@ -54,6 +58,7 @@ describe("meetings: auto-merge duplicates on ingest backfill (real Postgres)", (
     });
     expect(summary.created).toBe(1);
     expect(summary.merged).toBe(0);
-    expect((await listMeetingNotesForTeam(db(), seed.teamId, "team")).length).toBe(1);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    expect((await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" })).length).toBe(1);
   });
 });

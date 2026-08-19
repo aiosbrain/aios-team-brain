@@ -8,6 +8,7 @@ import {
 } from "@/lib/meetings/notes";
 import { extractMeetingTodosForTeam } from "@/lib/meetings/extract-todos";
 import { db, seedTeam } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for the meeting-notes single writer on REAL Postgres — the tier isolation (team-tier ONLY,
@@ -36,9 +37,10 @@ async function addAttendee(teamId: string, displayName: string): Promise<string>
 describe("meeting notes (real Postgres)", () => {
   it("persists the note, links attendees, and writes the transcript through ingestItem", async () => {
     const seed = await seedTeam();
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
     const attendeeId = await addAttendee(seed.teamId, "Attendee One");
 
-    const noteId = await createMeetingNote(db(), seed.teamId, {
+    const { noteId: noteId } = await createMeetingNote(db(), seed.teamId, {
       title: "Weekly sync",
       rawText: "We discussed the roadmap.\n- [ ] ship the thing",
       submittedByMemberId: seed.memberId,
@@ -83,29 +85,31 @@ describe("meeting notes (real Postgres)", () => {
 
   it("is team-tier only: an external viewer gets [] / null even though the rows exist", async () => {
     const seed = await seedTeam();
-    const noteId = await createMeetingNote(db(), seed.teamId, {
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
+    const { noteId: noteId } = await createMeetingNote(db(), seed.teamId, {
       title: "Internal-only note",
       rawText: "sensitive discussion",
       submittedByMemberId: seed.memberId,
     });
 
-    const teamView = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    const teamView = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(teamView.map((n) => n.id)).toContain(noteId);
 
-    const externalList = await listMeetingNotesForTeam(db(), seed.teamId, "external");
+    const externalList = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "external" });
     expect(externalList).toEqual([]);
 
-    const externalDetail = await getMeetingNote(db(), seed.teamId, noteId, "external");
+    const externalDetail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "external" });
     expect(externalDetail).toBeNull();
 
-    const teamDetail = await getMeetingNote(db(), seed.teamId, noteId, "team");
+    const teamDetail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "team" });
     expect(teamDetail?.title).toBe("Internal-only note");
     expect(teamDetail?.rawText).toBe("sensitive discussion");
   });
 
   it("surfaces todos extracted from the note's transcript, linked to their created task", async () => {
     const seed = await seedTeam();
-    const noteId = await createMeetingNote(db(), seed.teamId, {
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the gate needs a context-bootstrapped team (prod guarantee: bootstrap/scheduler)
+    const { noteId: noteId } = await createMeetingNote(db(), seed.teamId, {
       title: "Planning",
       rawText: "Notes.\n- [ ] follow up with the vendor",
       submittedByMemberId: seed.memberId,
@@ -116,7 +120,7 @@ describe("meeting notes (real Postgres)", () => {
     });
     expect(extraction.upserted).toBeGreaterThan(0);
 
-    const detail = await getMeetingNote(db(), seed.teamId, noteId, "team");
+    const detail = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "team" });
     expect(detail?.extractedTodos).toHaveLength(1);
     expect(detail?.extractedTodos[0].title).toBe("follow up with the vendor");
     expect(detail?.extractedTodos[0].status).toBe("backlog");
