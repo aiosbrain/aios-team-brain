@@ -46,6 +46,13 @@ defect against current code found the surviving half:
 | `lib/graph/arcs.ts` correction write-back, tier branch | write | slug-derived, **unreachable** |
 | `app/api/brain/arcs/*`, `app/t/[team]/social/actions.ts` | read | already pointer-resolved |
 
+"Already pointer-resolved" was, at first, a **code reading** of `resolveArcScope` — and the arcs
+panel is the one surface the operator actually watched go empty, so leaving that unverified was the
+wrong asymmetry (the nearest existing test covers the reclassification purge door on a renamed team,
+not the arcs read). It is now pinned in the data-mechanics tier: project, rename, resolve the arc
+scope, and assert the scope is unchanged **and** still addresses the episodes. It passes without any
+change to the arcs leg — so the claim is confirmed rather than assumed.
+
 The **query blend** is the one the originating spec flagged as "check before assuming — bigger than
 the panel", and it was correct to: a renamed team lost graph facts from every *answer*, with no
 panel to look empty. The arcs correction write-back was named too; it is slug-derived but the branch
@@ -132,6 +139,22 @@ Callers that can degrade catch and say so honestly (`degraded: true`, a logged e
   against the pre-fix reader on all five cases.
 - An `external` principal resolving the team group, or a team resolving another team's partition
   after slug reuse. Both are cases in that file.
+
+## Known residuals, named rather than left implicit
+
+- **`evictArcMemoryCache(teamSlug)` cannot match a legacy tier mem-cache key after a rename** —
+  `arcKeyBelongsToTeam` prefix-tests `<slug>_`, so entries written under the old slug survive in
+  that process. **Dormant, and provably so:** the only writer is `writeArcCache` via the arcs
+  `scopeKey`, which PRET-3 made a required `g:` key, so no legacy tier entry is created at all any
+  more — and the `g:` half (`evictTeamPartitionArcMemory`) resolves the pointers and is correct
+  across a rename. Left alone deliberately: changing an unreachable branch to chase a
+  theoretically-stale entry is churn, not a fix.
+- **`graphHasFacts` remains team-wide and unscoped**, so it will keep reporting `true` while a
+  scoped surface is empty. That is what MASKED this bug for a day. Not fixed here — per-team fact
+  scoping is its own slice (AIO-912), and conflating the two would hide this change's own
+  regression signal. It is why the tests assert on resolved groups and the episodes in them, never
+  on the diagnostic.
+- **A rename changes `/t/<slug>/…` URLs.** Expected product behaviour, not a defect.
 
 ## Deliberately out of scope
 

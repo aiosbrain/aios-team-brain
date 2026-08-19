@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { episodeGroupId } from "@/lib/graph/group";
 import { visibleTierGroupIds, builtinTierGroupId } from "@/lib/graph/tier-groups";
+import { resolveArcScope } from "@/lib/graph/partition-read";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
@@ -148,6 +149,49 @@ describe("a team slug rename does not orphan the graph (VIB-341)", () => {
     await expect(
       builtinTierGroupId(db(), { teamId: b.teamId, teamSlug: freed, access: "team" })
     ).rejects.toThrow(/holds ANOTHER team's episode history/);
+  });
+
+  it("THE ARCS PANEL: its scope still addresses the team's episodes after a rename", async () => {
+    // The originating report's headline symptom, and the spec's first acceptance criterion. The
+    // arcs leg is NOT changed by this PR — PRET-3 already routes it through `resolveArcScope`,
+    // whose permissive branch reads the stored pointers. But "already fixed" was a CODE READING,
+    // and the nearest existing test covers the reclassification purge door on a renamed team, not
+    // the arcs READ. An unverified claim about the one surface the operator actually watched go
+    // empty is exactly the wrong thing to leave standing, so it is pinned here.
+    const seed = await seedTeam();
+    const fake = new FakeGraphiti();
+    await bootstrapAndProject(seed, fake);
+    const { data: me } = await db()
+      .from("members")
+      .select("id")
+      .eq("team_id", seed.teamId)
+      .eq("id", seed.memberId)
+      .maybeSingle();
+    expect(me).not.toBeNull();
+
+    const before = await resolveArcScope(db(), {
+      teamId: seed.teamId,
+      teamSlug: seed.teamSlug,
+      memberId: seed.memberId,
+      tier: "team",
+    });
+    expect(before.groups.length).toBeGreaterThan(0);
+
+    await renameTeam(seed, RENAMED);
+    const after = await resolveArcScope(db(), {
+      teamId: seed.teamId,
+      teamSlug: RENAMED,
+      memberId: seed.memberId,
+      tier: "team",
+    });
+
+    // Unchanged by the rename, and — the half that matters — still pointing at where the episodes
+    // actually are. A scope that is merely STABLE would be worthless if it named an empty graph.
+    expect(after.groups.slice().sort()).toEqual(before.groups.slice().sort());
+    for (const group of after.groups) expect(await fake.listEpisodes(group)).not.toHaveLength(0);
+
+    // And it is NOT the slug-derived set, which is the group nothing ever wrote to.
+    expect(after.groups).not.toContain(episodeGroupId(RENAMED, "team"));
   });
 
   it("a correction written AFTER a rename targets the group the reader reads", async () => {
