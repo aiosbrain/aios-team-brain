@@ -68,13 +68,18 @@ describe("social opportunity evidence→tier-leak (real Postgres)", () => {
     ).rejects.toBeInstanceOf(TierLeakError);
   });
 
-  it("allows a manual external opportunity with no item evidence", async () => {
+  // ENFB-4 D1 re-specification: the evidence-less shape is UNMINTABLE now — it had no
+  // provenance axis (invisible to every membership gate) yet was born at the PUBLISHABLE
+  // tier. The old arm ("allows a manual external opportunity with no item evidence") pinned
+  // exactly the class the admission refusal kills; the refusal is the new contract.
+  it("refuses a manual opportunity with no item evidence (unmintable — no provenance axis)", async () => {
     const seed = await seedTeam();
-    const opp = await createOpportunity(db(), seed.teamId, {
-      access: "external",
-      sourceType: "manual",
-      title: "Untied public idea",
-    });
-    expect(opp.access).toBe("external");
+    await expect(
+      createOpportunity(db(), seed.teamId, {
+        access: "external",
+        sourceType: "manual",
+        title: "Untied public idea",
+      })
+    ).rejects.toThrow(/evidence is required/);
   });
 });

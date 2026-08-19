@@ -114,6 +114,12 @@ async function loadEvidenceBodies(
 export interface GenerateOptions {
   complete?: Completer;
   brand?: BrandProfileRecord | null;
+  /** ENFB-4 D4: the ACTING admin's oracle set. Generation REFUSES unless every evidence
+   *  item is visible to the actor (the EVERY quantifier — no silent fewer-bodies
+   *  degradation, no prompt whose TOPIC/SUMMARY derive from evidence the actor cannot see).
+   *  Required for action-triggered generation; a future job path takes system semantics,
+   *  decided then, not defaulted now. */
+  actorVisibleItemIds?: ReadonlySet<string>;
 }
 
 /** Generate + gate one variant's draft. Advances the variant status and persists the result. */
@@ -138,6 +144,15 @@ export async function generateVariantText(
   const opp = await getOpportunity(db, teamId, plan.opportunity_id);
   if (!opp) throw new Error(`generateVariantText: opportunity ${plan.opportunity_id} not found`);
 
+  // ENFB-4 (the EVERY quantifier, D1b/M6): the actor must see EVERY evidence item — the
+  // prompt embeds the opportunity title/summary (synthesized over ALL evidence) plus each
+  // body, so partial visibility would generate over hidden sources.
+  if (opts.actorVisibleItemIds) {
+    const { opportunityVisible } = await import("@/lib/social/store");
+    if (!opportunityVisible(opp, opts.actorVisibleItemIds)) {
+      throw new Error("generateVariantText: evidence not fully visible to the acting admin");
+    }
+  }
   const brand = opts.brand !== undefined ? opts.brand : await getBrandProfile(db, teamId);
   const assets = await listBrandAssets(db, teamId);
   const evidence = await loadEvidenceBodies(db, teamId, variant.access, opp.evidence);
@@ -206,6 +221,18 @@ export async function generatePlanDrafts(
     .limit(1);
   if (!planRows || planRows.length === 0) throw new Error("generatePlanDrafts: opportunity has no plan");
   const planId = (planRows[0] as { id: string }).id;
+
+  // ENFB-4 (Fable fold L): the EVERY refusal is OPPORTUNITY-level, so refuse the whole call up
+  // front — otherwise each variant's throw lands in the per-variant catch and the stated
+  // refusal degrades into an undifferentiated `failed` count (the action's chain gate refuses
+  // first today; this keeps the lib contract honest for any future direct caller).
+  if (opts.actorVisibleItemIds) {
+    const opp = await getOpportunity(db, teamId, opportunityId);
+    const { opportunityVisible } = await import("@/lib/social/store");
+    if (!opp || !opportunityVisible(opp, opts.actorVisibleItemIds)) {
+      throw new Error("generatePlanDrafts: evidence not fully visible to the acting admin");
+    }
+  }
 
   const variants = await listVariants(db, teamId, planId, "team");
   const summary: PlanDraftsSummary = { generated: 0, blocked: 0, failed: 0, variants: [] };

@@ -6,7 +6,7 @@ import { scheduleVariant, runPublication, PublishError } from "@/lib/social/publ
 import { getPublication } from "@/lib/social/publications";
 import { runDueJobs } from "@/lib/jobs";
 import type { SocialPublishingProvider } from "@/lib/social/providers/types";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for publishing on real Postgres (M5), provider STUBBED. Derived from intent: scheduling an
@@ -20,7 +20,11 @@ import { db, seedTeam } from "./helpers";
  */
 async function approvedVariant() {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access: "external", sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: the public door needs fully item-linked, external-shared-included evidence.
+  const ev = await ingest(seed, { path: "evidence/pub.md", body: "the evidence body", access: "external", project: "src" });
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  await backfillTeamContext(db(), seed.teamId);
+  const opp = await createOpportunity(db(), seed.teamId, { access: "external", sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   await setVariantGenerationBody(seed.teamId, variants[0].id);
   await setVariantStatus(db(), seed.teamId, variants[0].id, "approved");
@@ -59,7 +63,8 @@ describe("publishing + M0 job (real Postgres, stubbed provider)", () => {
 
   it("refuses to schedule a variant that isn't approved", async () => {
     const seed = await seedTeam();
-    const opp = await createOpportunity(db(), seed.teamId, { access: "team", sourceType: "manual", title: "x" });
+    const ev = await ingest(seed, { path: "evidence/team.md", body: "team evidence", access: "team", project: "src" });
+    const opp = await createOpportunity(db(), seed.teamId, { access: "team", sourceType: "manual", title: "x", evidence: [{ itemId: ev.id }] });
     const { variants } = await planOpportunity(db(), seed.teamId, opp.id);
     await expect(scheduleVariant(db(), seed.teamId, variants[0].id)).rejects.toBeInstanceOf(PublishError);
   });

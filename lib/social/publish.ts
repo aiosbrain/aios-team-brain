@@ -63,6 +63,42 @@ export async function publishRefusalReason(
   if (opts.requirePublishable && !PUBLISHABLE_STATUSES.has(variant.status)) {
     return `variant is no longer scheduled to publish (status '${variant.status}')`;
   }
+  // ENFB-4 (design round 1 BLOCKER 1): the tier ceiling is MEMBERSHIP-BLIND — an
+  // `access='external'` item curated OUT of external-shared into a restricted initiative
+  // passes it. The PUBLIC door therefore requires EVERY evidence item to hold a CURRENT
+  // include in EXTERNAL-SHARED (deliberately NOT systemVisibleSourceIds — that includes
+  // General, and team-scoped content must not pass the public door). No member principal is
+  // needed: the check is team+project-scoped, so the fire-time jobs runner applies it
+  // identically. Living INSIDE publishRefusalReason means schedule-time and fire-time cannot
+  // drift. A mid-flight revocation terminal-cancels — correct: the content became
+  // restricted; the variant recovers via regenerate → re-approve (stated cost).
+  {
+    const { data: plan } = await db.from("content_plans").select("opportunity_id").eq("team_id", teamId).eq("id", variant.plan_id).maybeSingle();
+    const oppId = (plan as { opportunity_id: string } | null)?.opportunity_id;
+    const { data: opp } = oppId
+      ? await db.from("social_opportunities").select("evidence").eq("team_id", teamId).eq("id", oppId).maybeSingle()
+      : { data: null };
+    const evidence = ((opp as { evidence: { itemId?: string }[] } | null)?.evidence ?? []) as { itemId?: string }[];
+    const evidenceIds = evidence.map((e) => e.itemId).filter((id): id is string => !!id);
+    if (evidence.length === 0 || evidenceIds.length !== evidence.length) {
+      return "publish refused: the variant's opportunity has no fully item-linked evidence (no provenance to verify)";
+    }
+    const { data: extShared } = await db
+      .from("projects")
+      .select("id")
+      .eq("team_id", teamId)
+      .eq("kind", "system")
+      .eq("slug", "external-shared")
+      .maybeSingle();
+    if (!extShared) return "publish refused: external-shared project unresolved (team not bootstrapped)";
+    const { visibleItemIdsForProjects } = await import("@/lib/access/enforce");
+    const extVisible = await visibleItemIdsForProjects(db, teamId, new Set([(extShared as { id: string }).id]));
+    if (extVisible.error) return "publish refused: membership resolution failed";
+    const hidden = evidenceIds.filter((id) => !extVisible.ids.has(id));
+    if (hidden.length > 0) {
+      return `publish refused: ${hidden.length} evidence item(s) lack a current external-shared membership — public content must be membership-shared, not just tier-marked`;
+    }
+  }
   const brand = await getBrandProfile(db, teamId);
   const result = validateContent(variant.body, governanceFromBrand(brand));
   if (!result.ok) {

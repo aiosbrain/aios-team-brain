@@ -212,7 +212,10 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
       access: "external",
     });
     await seedChain(seed.teamId, "external", item.id, "opp-read");
-    expect(await listOpportunities(db(), seed.teamId, "external")).toHaveLength(1);
+    // ENFB-4: the viewer set always holds the evidence item, so the TIER CASCADE stays this
+    // arm's only discriminator (the membership gate has its own pins in enfb4-social.dm).
+    const vis: ReadonlySet<string> = new Set([item.id]);
+    expect(await listOpportunities(db(), seed.teamId, "external", 50, vis)).toHaveLength(1);
 
     await ingest(seed, {
       kind: "deliverable",
@@ -222,8 +225,8 @@ describe("social chain follows a narrowed evidence item (real Postgres)", () => 
     });
 
     // The thing that actually matters: an external principal can no longer read the derived text.
-    expect(await listOpportunities(db(), seed.teamId, "external")).toHaveLength(0);
-    expect(await listOpportunities(db(), seed.teamId, "team")).toHaveLength(1); // still there internally
+    expect(await listOpportunities(db(), seed.teamId, "external", 50, vis)).toHaveLength(0);
+    expect(await listOpportunities(db(), seed.teamId, "team", 50, vis)).toHaveLength(1); // still there internally
   });
 
   it("leaves an opportunity citing a DIFFERENT item alone", async () => {

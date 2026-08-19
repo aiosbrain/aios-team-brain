@@ -3,7 +3,7 @@ import { createOpportunity, getVariant, setVariantGeneration } from "@/lib/socia
 import { planOpportunity } from "@/lib/social/plan";
 import { setAutonomy } from "@/lib/social/settings";
 import { submitForApproval, decideApproval, listPendingApprovals, ApprovalError } from "@/lib/social/approvals";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for the approval workflow + autonomy on real Postgres (M4, hardened by audit #1). Derived
@@ -13,7 +13,9 @@ import { db, seedTeam } from "./helpers";
  */
 async function generatedVariant(access: "team" | "external" = "team") {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: an opportunity must trace to items (evidence access matches the fixture's tier).
+  const ev = await ingest(seed, { path: "evidence/appr.md", body: "the evidence body", access, project: "src" });
+  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   const v = variants[0];
   await setVariantGeneration(db(), seed.teamId, v.id, {
@@ -38,12 +40,13 @@ describe("content approvals + autonomy (real Postgres)", () => {
     expect(r.outcome).toBe("pending");
     expect((await getVariant(db(), seed.teamId, variantId))!.status).toBe("awaiting_approval");
 
-    const pending = await listPendingApprovals(db(), seed.teamId);
+    // ENFB-4: the read inherits by the viewer's visible-variant set (in-query, fail closed).
+    const pending = await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]));
     expect(pending.length).toBe(1);
 
     await decideApproval(db(), seed.teamId, pending[0].id, "approved", "looks good", { memberId: seed.memberId });
     expect((await getVariant(db(), seed.teamId, variantId))!.status).toBe("approved");
-    expect((await listPendingApprovals(db(), seed.teamId)).length).toBe(0);
+    expect((await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]))).length).toBe(0);
   });
 
   it("denying sends the variant to rejected", async () => {
@@ -74,7 +77,7 @@ describe("content approvals + autonomy (real Postgres)", () => {
     const a = await submitForApproval(db(), seed.teamId, variantId);
     const b = await submitForApproval(db(), seed.teamId, variantId);
     expect(b.approval.id).toBe(a.approval.id);
-    expect((await listPendingApprovals(db(), seed.teamId)).length).toBe(1);
+    expect((await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]))).length).toBe(1);
 
     await decideApproval(db(), seed.teamId, a.approval.id, "approved", "");
     await expect(decideApproval(db(), seed.teamId, a.approval.id, "denied", "")).rejects.toBeInstanceOf(ApprovalError);

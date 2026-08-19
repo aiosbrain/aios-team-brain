@@ -49,42 +49,48 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
   // Every read below is independent — all the derived structures are pure JS post-processing done
   // after the awaits — so fire them concurrently instead of in a ~13-deep request waterfall (each
   // round-trip to Railway Postgres has real latency; serial they stacked into most of the render).
+  // ENFB-4: the viewer's ORACLE set — the ONE social read rule (EVERY-visible evidence) and
+  // every downstream chain hang off it. A resolution error is the error boundary, never an
+  // unfiltered render (the ENFB-2 L8 shape).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient: ac } = await import("@/lib/db/admin");
+  const vis = await visibleItemIds(ac(), { teamId: team.id, memberId: me.id });
+  if (vis.error) throw new Error("social visibility resolution failed");
+
   const [
     opportunities,
-    plansRes,
-    variantsRes,
-    media,
     budget,
     jobsHealth,
     autonomy,
-    pendingRows,
     tf,
     publishDryRun,
-    pubs,
     analyticsRows,
     analytics,
   ] = await Promise.all([
-    listOpportunities(db, team.id, "team", 100),
-    db.from("content_plans").select("id, opportunity_id").eq("team_id", team.id),
-    db
-      .from("content_variants")
-      .select("id, plan_id, platform, status, body, validation")
-      .eq("team_id", team.id)
-      .order("created_at", { ascending: true }),
-    listTeamMediaMeta(db, team.id, 200),
+    listOpportunities(db, team.id, "team", 100, vis.ids),
     imageBudget(db, team.id),
     getSocialJobsHealth(db, team.id),
     getAutonomy(db, team.id),
-    listPendingApprovals(db, team.id),
     typefullyStatus(db, team.id),
     getPublishDryRun(db, team.id),
-    listPublications(db, team.id, 200),
     listTeamAnalytics(db, team.id, 500),
     teamAnalyticsSummary(db, team.id),
   ]);
 
-  const plans = plansRes.data;
-  const variants = variantsRes.data;
+  // ENFB-4 inheritance: plan → variant → approval/publication/media all descend from the
+  // VISIBLE opportunity set (parent-id chains through the store — the one seam). The three
+  // variant-child reads are bounded IN-QUERY by the visible-variant set (Codex diff fold: a
+  // post-limit filter let newer hidden rows starve visible history out of the capped window).
+  const { listPlansForOpportunities, listVariantsForPlans } = await import("@/lib/social/store");
+  const visibleOppIds = new Set(opportunities.map((o) => o.id));
+  const plans = await listPlansForOpportunities(db, team.id, visibleOppIds);
+  const variants = await listVariantsForPlans(db, team.id, new Set(plans.map((p) => p.id)));
+  const visibleVariantIds = new Set(variants.map((v) => v.id));
+  const [media, pendingRows, pubs] = await Promise.all([
+    listTeamMediaMeta(db, team.id, 200, visibleVariantIds),
+    listPendingApprovals(db, team.id, 50, visibleVariantIds),
+    listPublications(db, team.id, 200, visibleVariantIds),
+  ]);
   const planToOpp = new Map((plans ?? []).map((p: { id: string; opportunity_id: string }) => [p.id, p.opportunity_id]));
 
   const byOpportunity: Record<string, VariantView[]> = {};
@@ -94,6 +100,7 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     if (oppId) (byOpportunity[oppId] ??= []).push(v);
   }
 
+  // The reads above are already chain-bounded in-query; these groupings only shape the views.
   const mediaByVariant: Record<string, string[]> = {};
   for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
 
@@ -126,6 +133,8 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     });
   }
 
+  // ENFB-4: `pubs` is already the chain-visible set (bounded in-query above), so lists and the
+  // KPI count the same rows by construction.
   const publishedCount = pubs.filter((p) => p.status === "published").length;
 
   return (

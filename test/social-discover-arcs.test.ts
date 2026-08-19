@@ -67,7 +67,10 @@ describe("evidenceCeiling (tier safety)", () => {
   it("is team (fail-closed) when any referenced item is missing", () => {
     expect(evidenceCeiling(["external"], 1)).toBe("team");
   });
-  it("is external for an opportunity with no item evidence at all", () => {
-    expect(evidenceCeiling([], 0)).toBe("external");
+  // ENFB-4 re-specification: empty→external DIES (it minted publishable rows with no provenance
+  // axis). Arc admission refuses empty/partial evidence before this is ever consulted; the pure
+  // ceiling floors to team as the defense-in-depth beneath that refusal.
+  it("floors an opportunity with no item evidence at all to team", () => {
+    expect(evidenceCeiling([], 0)).toBe("team");
   });
 });

@@ -7,7 +7,7 @@ import { scheduleVariant, runPublication, cancelScheduledPublication, PublishErr
 import { createPublication, getPublication } from "@/lib/social/publications";
 import { enqueueJob, runDueJobs } from "@/lib/jobs";
 import type { SocialPublishingProvider } from "@/lib/social/providers/types";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for the FAIL-CLOSED publish door (2026-07-16 audit #1/#3/#6). Every safety property is
@@ -31,7 +31,13 @@ function recorder(): SocialPublishingProvider & { calls: number } {
 
 async function approvedVariant(access: "team" | "external", body = "we shipped a durable queue") {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: an opportunity must trace to items, and the PUBLIC door additionally requires every
+  // evidence item's CURRENT external-shared membership — so the external arms ride an ingested
+  // external item (context-backfilled into external-shared); the team arms a team item.
+  const ev = await ingest(seed, { path: "evidence/door.md", body: "the evidence body", access, project: "src" });
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  await backfillTeamContext(db(), seed.teamId);
+  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   const variantId = variants[0].id;
   await setVariantGeneration(db(), seed.teamId, variantId, { body, status: "generated", validation: {} });

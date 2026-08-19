@@ -23,6 +23,11 @@ export interface DiscoverOptions {
   /** Injected clock for deterministic scoring/tests. */
   now?: Date;
   actor?: SocialActor;
+  /** ENFB-4 (scout R8, the write-side admission hole): the items scan is bounded to the
+   *  ACTING admin's oracle set — an admin mints opportunities only from items they can see
+   *  (the arcs path has been actor-scoped since PRET-3; this closes the item path). Absent →
+   *  fail closed (scan nothing). A narrowly-granted admin discovers less: intended (D2a). */
+  visibleItemIds?: ReadonlySet<string>;
 }
 
 export interface DiscoverSummary {
@@ -74,11 +79,14 @@ export async function discoverOpportunities(
   const since = new Date(now.getTime() - sinceHours * 3_600_000).toISOString();
   const limit = opts.limit ?? 100;
 
+  // ENFB-4: fail closed without the actor's set — never the corpus-wide scan.
+  if (!opts.visibleItemIds) return { scanned: 0, created: 0, skipped: 0, opportunities: [] };
   const { data, error } = await db
     .from("items")
     .select("id, kind, access, path, body, frontmatter, updated_at")
     .eq("team_id", teamId)
     .in("kind", [...DISCOVER_KINDS])
+    .in("id", [...opts.visibleItemIds])
     .gte("updated_at", since)
     .order("updated_at", { ascending: false })
     .limit(limit);

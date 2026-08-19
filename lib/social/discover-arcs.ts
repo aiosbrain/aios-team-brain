@@ -114,6 +114,26 @@ export async function discoverOpportunitiesFromArcs(
       continue;
     }
     const evidence = arcEvidence(arc);
+    // ENFB-4 D1 (design rounds 1+3 folded): an arc whose evidence is EMPTY or PARTIAL
+    // (any cited fact without an item link — incl. the parseArcsJson free-text fallback)
+    // REFUSES admission. Its summary is LLM prose synthesized over ALL its facts, so an
+    // opportunity carrying only the resolved subset launders unattributable (possibly
+    // restricted) graph prose behind whatever gate the subset passes. The old behavior —
+    // empty→external (publishable!) and partial→whatever the subset's ceiling said — was
+    // the round-1 blocker pair. Measured: prod holds zero such rows.
+    if (evidence.length === 0 || evidence.length < arc.evidence.length) {
+      summary.skipped++;
+      continue;
+    }
+    // Same refusal, second shape (the spec's missing→team pin re-specification): a cited item
+    // id that resolves to NO items row is unverifiable provenance — the same class as a
+    // link-less fact. The old floor-to-team still minted a row whose prose no membership gate
+    // could ever attribute (a dangling id is in nobody's visible set, so the row would be born
+    // dark AND unrepairable); refuse instead of minting dead weight.
+    if (evidence.some((e) => !e.itemId || !tiers.has(e.itemId))) {
+      summary.skipped++;
+      continue;
+    }
     const access = arcAccess(evidence, tiers);
     const scores = scoreArc(arc, now.getTime());
     const opp = await createOpportunity(

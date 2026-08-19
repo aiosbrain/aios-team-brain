@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createOpportunity } from "@/lib/social/store";
 import { planOpportunity } from "@/lib/social/plan";
 import { generateVariantImage, imageBudget, ImageBudgetError, DAILY_IMAGE_CAP } from "@/lib/media/generate-image";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for image generation + the cost guard on real Postgres, with the provider STUBBED (the
@@ -14,7 +14,9 @@ const stubGen = async () => ({ b64: Buffer.from("fake-png-bytes").toString("base
 
 async function plannedVariant(access: "team" | "external" = "team") {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: an opportunity must trace to items (evidence access matches the fixture's tier).
+  const ev = await ingest(seed, { path: "evidence/media.md", body: "the evidence body", access, project: "src" });
+  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   return { seed, variant: variants[0] };
 }

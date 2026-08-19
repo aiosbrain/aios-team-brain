@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createOpportunity, listVariants } from "@/lib/social/store";
 import { planOpportunity } from "@/lib/social/plan";
 import { saveBrandProfile } from "@/lib/brand/manage";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for planning on real Postgres. Derived from intent: an opportunity becomes a plan + brand-
@@ -13,10 +13,12 @@ describe("content planning (real Postgres)", () => {
   it("plans an opportunity into tier-inherited, brand-aware variants and advances it", async () => {
     const seed = await seedTeam();
     await saveBrandProfile(db(), seed.teamId, { voice: { formality: "formal" }, knowledge: { audiences: ["CTOs"] } }, { memberId: seed.memberId });
+    const ev = await ingest(seed, { path: "evidence/plan.md", body: "the evidence body", access: "team", project: "src" });
     const opp = await createOpportunity(db(), seed.teamId, {
       access: "team",
       sourceType: "manual",
       title: "Shipped the job queue",
+      evidence: [{ itemId: ev.id }],
     });
 
     const r = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
@@ -35,7 +37,8 @@ describe("content planning (real Postgres)", () => {
 
   it("is idempotent — re-planning returns the same plan with no duplicate variants", async () => {
     const seed = await seedTeam();
-    const opp = await createOpportunity(db(), seed.teamId, { access: "team", sourceType: "manual", title: "x" });
+    const ev = await ingest(seed, { path: "evidence/plan2.md", body: "the evidence body", access: "team", project: "src" });
+    const opp = await createOpportunity(db(), seed.teamId, { access: "team", sourceType: "manual", title: "x", evidence: [{ itemId: ev.id }] });
 
     const first = await planOpportunity(db(), seed.teamId, opp.id);
     const second = await planOpportunity(db(), seed.teamId, opp.id);

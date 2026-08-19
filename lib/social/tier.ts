@@ -26,8 +26,9 @@ const RANK: Record<AccessTier, number> = { team: 1, external: 2 };
 /**
  * Does `requested` access exceed what the evidence permits? `evidenceAccess` is the tier of each
  * resolved item-evidence row; `missing` is how many referenced item ids resolved to no row.
- * With no item evidence at all (empty + missing 0) nothing is constrained — a manual opportunity
- * not tied to internal items may be `external`.
+ * ENFB-4: with no item evidence at all the ceiling is `team` (fail-closed) — the old "empty is
+ * unconstrained → external" arm was the publishable-with-no-provenance class the admission
+ * refusal kills; admission refuses the shape outright, so this branch is defense-in-depth.
  */
 export function violatesEvidenceTier(
   requested: AccessTier,
@@ -38,13 +39,16 @@ export function violatesEvidenceTier(
 }
 
 /**
- * The most-public tier an opportunity built from this evidence may hold. `team` if any evidence is
- * team-tier OR any referenced item is missing (fail-closed); `external` only when every cited item
- * resolved and is itself external. Callers that discover from multi-item sources (e.g. narrative
- * arcs, whose evidence spans several items of possibly-mixed tier) use this to pick a tier-SAFE
- * `access` up front, so `createOpportunity` never has to reject them for over-exposure.
+ * The most-public tier an opportunity built from this evidence may hold. `team` if the evidence is
+ * EMPTY (ENFB-4: no provenance proves no externality — admission refuses the shape anyway, this is
+ * the floor beneath the refusal), if any evidence is team-tier, OR if any referenced item is
+ * missing (fail-closed); `external` only when at least one cited item resolved and every one is
+ * itself external. Callers that discover from multi-item sources (e.g. narrative arcs, whose
+ * evidence spans several items of possibly-mixed tier) use this to pick a tier-SAFE `access` up
+ * front, so `createOpportunity` never has to reject them for over-exposure.
  */
 export function evidenceCeiling(evidenceAccess: AccessTier[], missing: number): AccessTier {
-  const anyRestrictive = missing > 0 || evidenceAccess.some((a) => a === "team");
+  const anyRestrictive =
+    evidenceAccess.length === 0 || missing > 0 || evidenceAccess.some((a) => a === "team");
   return anyRestrictive ? "team" : "external";
 }

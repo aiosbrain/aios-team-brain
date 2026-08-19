@@ -28,8 +28,11 @@ describe("violatesEvidenceTier", () => {
     expect(violatesEvidenceTier("team", [], 2)).toBe(false);
   });
 
-  it("does not constrain an opportunity with no item evidence (manual, external allowed)", () => {
-    expect(violatesEvidenceTier("external", [], 0)).toBe(false);
-    expect(violatesEvidenceTier("team", [], 0)).toBe(false);
+  // ENFB-4 re-specification: the old arm here ("no item evidence → external allowed") pinned the
+  // publishable-with-no-provenance class. Admission now refuses evidence-less opportunities
+  // outright (store.createOpportunity); this pure floor is the defense-in-depth beneath it.
+  it("floors an opportunity with no item evidence to team — no provenance proves no externality", () => {
+    expect(violatesEvidenceTier("external", [], 0)).toBe(true);
+    expect(violatesEvidenceTier("team", [], 0)).toBe(false); // the floor is team, not a hard error
   });
 });

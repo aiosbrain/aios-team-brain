@@ -56,7 +56,9 @@ function normalizeOpportunity(row: Record<string, unknown>): OpportunityRow {
  * most as public as the most-restrictive item this opportunity cites. Looks up the actual
  * `items.access` for every evidence entry that references an item and throws TierLeakError if the
  * request would over-expose. Fail-closed — an evidence id that resolves to no item counts as
- * restrictive. No item-evidence → unconstrained (a manual opportunity may be external).
+ * restrictive. The no-item-evidence case is unreachable here (ENFB-4: `createOpportunity`
+ * refuses evidence-less AND link-less shapes at admission; `evidenceCeiling` floors empty to
+ * team beneath that).
  */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -97,6 +99,21 @@ export async function createOpportunity(
   input: CreateOpportunityInput,
   actor: SocialActor = {}
 ): Promise<OpportunityRow> {
+  // ENFB-4 D1: an opportunity with NO evidence has no provenance axis — under the EVERY
+  // read rule it would be dark to every viewer, and historically the empty array resolved
+  // to an EXTERNAL (publishable) ceiling. The API shape closes; no production caller mints
+  // one (measured: prod zero).
+  if (!input.evidence || input.evidence.length === 0) {
+    throw new Error("createOpportunity: evidence is required (an opportunity must trace to brain items)");
+  }
+  // Same refusal, second shape (Fable diff review M1): a NON-EMPTY evidence array whose entries
+  // carry no itemId has zero verifiable provenance — it would skip the tier ceiling entirely
+  // (assertEvidenceTier early-returns with no ids) and be born dark under the EVERY read rule,
+  // unrepairable by any grant. The dangling-arc refusal killed this class at the arc door;
+  // this closes the store API shape too.
+  if (input.evidence.some((e) => !e.itemId)) {
+    throw new Error("createOpportunity: every evidence entry must reference a brain item (itemId required)");
+  }
   if (input.dedupKey) {
     const existing = await db
       .from("social_opportunities")
@@ -159,21 +176,114 @@ export async function getOpportunity(db: DbClient, teamId: string, id: string): 
 }
 
 /** List opportunities visible to `tier` (external → only `access='external'`). Newest first. */
+/**
+ * ENFB-4: the ONE social read rule — an opportunity serves a viewer iff
+ * `evidence.length > 0 && evidence.every(e => vis.has(e.itemId))` (the EVERY quantifier:
+ * title/summary/variant prose are synthesized over ALL evidence, so partial visibility
+ * would leak the hidden sources' derived prose — design round 1 blocker 2). App-side by
+ * design: the jsonb shape defeats the pg builder, arrays are ≤8, the list caps at 100, and
+ * the evidence-less policy branch (dark, legacy-only — admission now refuses them) stays
+ * legible. Posture (`visibleByAccess`) remains the coarse conjunct. `viewerVisibleItemIds`
+ * is REQUIRED — a caller without an oracle set gets nothing (fail closed).
+ */
 export async function listOpportunities(
   db: DbClient,
   teamId: string,
   tier: ViewerTier,
-  limit = 50
+  limit = 50,
+  viewerVisibleItemIds?: ReadonlySet<string>
 ): Promise<OpportunityRow[]> {
+  if (!viewerVisibleItemIds) return [];
   const q = visibleByAccess(
     db.from("social_opportunities").select(OPP_COLS).eq("team_id", teamId),
     tier
   );
   const { data } = await q.order("created_at", { ascending: false }).limit(limit);
-  return ((data ?? []) as Record<string, unknown>[]).map(normalizeOpportunity);
+  return ((data ?? []) as Record<string, unknown>[])
+    .map(normalizeOpportunity)
+    .filter((o) => opportunityVisible(o, viewerVisibleItemIds));
+}
+
+/**
+ * ENFB-4 (design round 1 HIGH 4): the ACTION-level parent gate. Every content-touching
+ * server action resolves its target's chain UP to the opportunity and applies the EVERY
+ * rule against the acting admin's oracle set — a hidden parent is indistinguishable from an
+ * absent one (the caller returns its existing not-found shape). Exactly one of the ids is
+ * given; the chain walks variant → plan → opportunity (all links NOT NULL by schema).
+ */
+export async function actorSeesChain(
+  db: DbClient,
+  teamId: string,
+  ref: { opportunityId?: string; planId?: string; variantId?: string; publicationId?: string },
+  vis: ReadonlySet<string>
+): Promise<boolean> {
+  let planId = ref.planId ?? null;
+  let opportunityId = ref.opportunityId ?? null;
+  let variantId = ref.variantId ?? null;
+  if (ref.publicationId) {
+    const { data } = await db.from("social_publications").select("variant_id").eq("team_id", teamId).eq("id", ref.publicationId).maybeSingle();
+    if (!data) return false;
+    variantId = (data as { variant_id: string }).variant_id;
+  }
+  if (variantId && !planId && !opportunityId) {
+    const { data } = await db.from("content_variants").select("plan_id").eq("team_id", teamId).eq("id", variantId).maybeSingle();
+    if (!data) return false;
+    planId = (data as { plan_id: string }).plan_id;
+  }
+  if (planId && !opportunityId) {
+    const { data } = await db.from("content_plans").select("opportunity_id").eq("team_id", teamId).eq("id", planId).maybeSingle();
+    if (!data) return false;
+    opportunityId = (data as { opportunity_id: string }).opportunity_id;
+  }
+  if (!opportunityId) return false;
+  const opp = await getOpportunity(db, teamId, opportunityId);
+  if (!opp) return false;
+  return opportunityVisible(opp, vis);
+}
+
+/** The EVERY rule as ONE named predicate (the guard's wiring pin + the dm agreement target). */
+export function opportunityVisible(
+  opp: { evidence: Evidence[] },
+  vis: ReadonlySet<string>
+): boolean {
+  return opp.evidence.length > 0 && opp.evidence.every((e) => !!e.itemId && vis.has(e.itemId));
 }
 
 // ── plans ──────────────────────────────────────────────────────────────────────
+
+/** ENFB-4: the page's plan read routes through the store and INHERITS from the visible
+ *  opportunity set (parent-id chain — plans carry no own provenance). */
+export async function listPlansForOpportunities(
+  db: DbClient,
+  teamId: string,
+  opportunityIds: ReadonlySet<string>
+): Promise<{ id: string; opportunity_id: string }[]> {
+  if (opportunityIds.size === 0) return [];
+  const { data } = await db
+    .from("content_plans")
+    .select("id, opportunity_id")
+    .eq("team_id", teamId)
+    .in("opportunity_id", [...opportunityIds]);
+  return (data ?? []) as { id: string; opportunity_id: string }[];
+}
+
+/** ENFB-4: the page's variant read (BODIES — the ENFB-1 class) routes through the store and
+ *  inherits from the visible plan set. */
+export async function listVariantsForPlans(
+  db: DbClient,
+  teamId: string,
+  planIds: ReadonlySet<string>
+): Promise<{ id: string; plan_id: string; platform: string; status: string; body: string; validation: unknown }[]> {
+  if (planIds.size === 0) return [];
+  const { data } = await db
+    .from("content_variants")
+    .select("id, plan_id, platform, status, body, validation")
+    .eq("team_id", teamId)
+    .in("plan_id", [...planIds])
+    .order("created_at", { ascending: true });
+  return (data ?? []) as { id: string; plan_id: string; platform: string; status: string; body: string; validation: unknown }[];
+}
+
 
 /** Create a plan for an opportunity. `access` is inherited from the opportunity (tier propagates). */
 export async function createPlan(
