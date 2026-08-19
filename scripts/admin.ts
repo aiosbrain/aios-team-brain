@@ -72,6 +72,7 @@ const USAGE = `Team Brain admin CLI — commands:
   delete-member <email> [--hard] [--team <id|slug>]   # soft-disable by default; --hard removes
   add-group-member <group-slug> <member-email> [--team <id|slug>]     # deliberate membership action; builtins = the posture move (humans only)
   remove-group-member <group-slug> <member-email> [--team <id|slug>]  # inverse; builtin removal mirrors members.tier
+  grant-project <group-slug> <project-slug> [--team <id|slug>]        # ENFB-2: THE access edge (group → project); a project grant is an item-membership grant — deliberate, audited (null CLI actor)
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
   link-github <member-email> <github-login> [--team <id|slug>] [--force]   # needs GITHUB_TOKEN env
@@ -279,6 +280,36 @@ async function main() {
         `✓ ${cmd === "add-group-member" ? "added" : "removed"} ${email} ${cmd === "add-group-member" ? "to" : "from"} '${groupSlug}'` +
           ((g as { is_builtin: boolean }).is_builtin ? ` (posture move — tier now '${(after as { tier: string }).tier}')` : "")
       );
+      break;
+    }
+    case "grant-project": {
+      // ENFB-2: the operator's grant edge — what makes the restricted-initiative lifecycle
+      // (and the stranded-creator repair the D1 duplicate-arm deliberately does NOT do)
+      // actually operable. Routes through the sole-writer group module, audited there.
+      const groupSlug = positionals[0] || die(`usage: ${cmd} <group-slug> <project-slug> [--team <id|slug>]`);
+      const projectSlug = positionals[1] || die(`usage: ${cmd} <group-slug> <project-slug> [--team <id|slug>]`);
+      const team = await resolveTeam(admin, teamSlug);
+      const { data: g } = await admin
+        .from("groups")
+        .select("id, slug")
+        .eq("team_id", team.id)
+        .eq("slug", groupSlug)
+        .maybeSingle();
+      if (!g) die(`no group '${groupSlug}' on team ${team.slug}`);
+      const { data: proj } = await admin
+        .from("projects")
+        .select("id, slug")
+        .eq("team_id", team.id)
+        .eq("slug", projectSlug)
+        .maybeSingle();
+      if (!proj) die(`no project '${projectSlug}' on team ${team.slug}`);
+      // Grant only: `revokeProjectFromGroup` requires a real member actor for its audit row,
+      // and the CLI runs as an operator, not a member — a revoke verb waits for an actor
+      // story rather than widening the sole-writer's audit contract.
+      const { grantProjectToGroup } = await import("@/lib/access/groups");
+      const r = await grantProjectToGroup(admin, team.id, (proj as { id: string }).id, (g as { id: string }).id, null);
+      if (!r.ok) die(`${cmd} failed: ${r.error}`);
+      console.log(`✓ granted '${projectSlug}' to '${groupSlug}' on ${team.slug}`);
       break;
     }
     case "rename-team": {
