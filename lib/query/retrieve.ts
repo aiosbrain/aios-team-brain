@@ -635,7 +635,7 @@ async function nativeRetrieve(
   // 3. Structured-context query builders (awaited together with the above).
   let decisionsB = db
     .from("decisions")
-    .select("row_key, decided_at, title, decided_by, still_valid, source_item_id, projects(slug)")
+    .select("row_key, decided_at, title, decided_by, still_valid, source_item_id, created_by, projects(slug)")
     .eq("team_id", teamId)
     .order("decided_at", { ascending: false })
     .limit(50);

@@ -19,17 +19,25 @@ export default async function TeamToolsPage({ params }: { params: Promise<{ team
   if (!team) return null;
 
   const me = await currentMember(team.id);
-  // Latest published blueprint for the team; tier-filtered in app code (no RLS in pg mode).
-  const { data } = await visibleItems(
-    db
-      .from("items")
-      .select("body, actor, updated_at, frontmatter")
-      .eq("team_id", team.id)
-      .eq("kind", "blueprint")
-      .order("updated_at", { ascending: false })
-      .limit(1),
-    me?.tier ?? "external"
-  ).maybeSingle();
+  // Latest published blueprint for the team; tier-filtered in app code (no RLS in pg mode) —
+  // and ENFB-1: membership-gated (an invisible latest blueprint yields the next visible or the
+  // empty state; no member resolution → empty, fail closed).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  const { data } = vis && !vis.error && vis.ids.size > 0
+    ? await visibleItems(
+        db
+          .from("items")
+          .select("body, actor, updated_at, frontmatter")
+          .eq("team_id", team.id)
+          .eq("kind", "blueprint")
+          .in("id", [...vis.ids])
+          .order("updated_at", { ascending: false })
+          .limit(1),
+        me!.tier
+      ).maybeSingle()
+    : { data: null };
   const bp = data as BlueprintItem | null;
 
   let connectors: Array<[string, Connector]> = [];

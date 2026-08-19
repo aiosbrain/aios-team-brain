@@ -351,7 +351,7 @@ export async function getWorkTimeline(
     walledDecisions(
       db
         .from("decisions")
-        .select("id, title, decided_by, decided_at, source_item_id, still_valid, audience")
+        .select("id, title, decided_by, decided_at, source_item_id, created_by, still_valid, audience")
         .eq("team_id", teamId)
         .gte("decided_at", sinceIso.slice(0, 10))
         .order("decided_at", { ascending: false })
@@ -648,9 +648,16 @@ export async function getWorkTimeline(
     decided_by: string | null;
     decided_at: string | null;
     source_item_id: string | null;
+    created_by?: string | null;
     still_valid: boolean | null;
   }[]) {
-    if (!srcVisible(d.source_item_id)) continue; // enforcing: source-item gate (null source = purge case) — the title is the leak
+    // The settled provenance rule, decisions edition (ENFB-1 §2.7): a sourced decision gates on
+    // its source item; a null-source one survives ONLY when hand-typed (created_by — the
+    // dashboard action's sole write; a purged restricted basis stays dropped) at team posture.
+    const decisionVisible = d.source_item_id != null
+      ? srcVisible(d.source_item_id)
+      : (d.created_by ?? null) != null && !isRestrictedTier(tier);
+    if (!decisionVisible) continue;
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)

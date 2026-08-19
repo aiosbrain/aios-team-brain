@@ -1364,6 +1364,9 @@ create table if not exists decisions (
   tier smallint,
   audience access_tier not null default 'team',
   still_valid boolean not null default true,
+  -- ENFB-1: creation provenance — set ONLY by the dashboard create action, never by sync
+  -- (non-null proves a hand-typed row; the migration mirror is 20260819100000).
+  created_by uuid references members(id) on delete set null,
   updated_at timestamptz not null default now(),
   unique (team_id, project_id, row_key)
 );

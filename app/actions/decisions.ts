@@ -47,6 +47,10 @@ export async function createDecisionAction(
         team_id: input.teamId,
         project_id: input.projectId,
         source_item_id: null,
+        // ENFB-1 §2.7: creation provenance — this action is the SOLE writer of created_by
+        // (non-null proves hand-typed; sync never sets it), which is what re-admits this row
+        // to the enforced read surfaces.
+        created_by: me.id,
         row_key: uiRowKey(),
         decided_at: input.decidedAt || null,
         title,

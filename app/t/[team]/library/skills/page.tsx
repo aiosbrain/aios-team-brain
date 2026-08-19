@@ -71,16 +71,24 @@ export default async function SkillsPage({ params }: { params: Promise<{ team: s
   if (!team) return null;
 
   const me = await currentMember(team.id);
-  const { data: items } = await visibleItems(
-    db
-      .from("items")
-      .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
-      .eq("team_id", team.id)
-      .eq("kind", "skill")
-      .order("synced_at", { ascending: false })
-      .limit(200),
-    me?.tier ?? "external"
-  );
+  // ENFB-1: the membership oracle gates skill BODIES — the posture helper stays as the coarse
+  // outer wall; no member resolution → empty list (fail closed).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  const { data: items } = vis && !vis.error && vis.ids.size > 0
+    ? await visibleItems(
+        db
+          .from("items")
+          .select("id, path, access, actor, synced_at, frontmatter, body, projects(slug)")
+          .eq("team_id", team.id)
+          .eq("kind", "skill")
+          .in("id", [...vis.ids])
+          .order("synced_at", { ascending: false })
+          .limit(200),
+        me!.tier
+      )
+    : { data: [] };
   const skills = (items ?? []) as unknown as SkillItem[];
 
   return (
