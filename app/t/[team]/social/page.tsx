@@ -59,43 +59,38 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
 
   const [
     opportunities,
-    plansRes,
-    variantsRes,
-    media,
     budget,
     jobsHealth,
     autonomy,
-    pendingRows,
     tf,
     publishDryRun,
-    pubs,
     analyticsRows,
     analytics,
   ] = await Promise.all([
     listOpportunities(db, team.id, "team", 100, vis.ids),
-    Promise.resolve(null), // plans — resolved AFTER the opportunity set (the chain, below)
-    Promise.resolve(null), // variants — resolved after plans (the chain, below)
-    listTeamMediaMeta(db, team.id, 200),
     imageBudget(db, team.id),
     getSocialJobsHealth(db, team.id),
     getAutonomy(db, team.id),
-    listPendingApprovals(db, team.id),
     typefullyStatus(db, team.id),
     getPublishDryRun(db, team.id),
-    listPublications(db, team.id, 200),
     listTeamAnalytics(db, team.id, 500),
     teamAnalyticsSummary(db, team.id),
   ]);
 
   // ENFB-4 inheritance: plan → variant → approval/publication/media all descend from the
-  // VISIBLE opportunity set (parent-id chains through the store — the one seam).
-  void plansRes;
-  void variantsRes;
+  // VISIBLE opportunity set (parent-id chains through the store — the one seam). The three
+  // variant-child reads are bounded IN-QUERY by the visible-variant set (Codex diff fold: a
+  // post-limit filter let newer hidden rows starve visible history out of the capped window).
   const { listPlansForOpportunities, listVariantsForPlans } = await import("@/lib/social/store");
   const visibleOppIds = new Set(opportunities.map((o) => o.id));
   const plans = await listPlansForOpportunities(db, team.id, visibleOppIds);
   const variants = await listVariantsForPlans(db, team.id, new Set(plans.map((p) => p.id)));
   const visibleVariantIds = new Set(variants.map((v) => v.id));
+  const [media, pendingRows, pubs] = await Promise.all([
+    listTeamMediaMeta(db, team.id, 200, visibleVariantIds),
+    listPendingApprovals(db, team.id, 50, visibleVariantIds),
+    listPublications(db, team.id, 200, visibleVariantIds),
+  ]);
   const planToOpp = new Map((plans ?? []).map((p: { id: string; opportunity_id: string }) => [p.id, p.opportunity_id]));
 
   const byOpportunity: Record<string, VariantView[]> = {};
@@ -105,15 +100,16 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     if (oppId) (byOpportunity[oppId] ??= []).push(v);
   }
 
+  // The reads above are already chain-bounded in-query; these groupings only shape the views.
   const mediaByVariant: Record<string, string[]> = {};
-  for (const m of media) if (visibleVariantIds.has(m.variant_id)) (mediaByVariant[m.variant_id] ??= []).push(m.id);
+  for (const m of media) (mediaByVariant[m.variant_id] ??= []).push(m.id);
 
   const variantCtx: Record<string, { platform: string; body: string; oppTitle: string }> = {};
   for (const [oppId, vs] of Object.entries(byOpportunity)) {
     const oppTitle = opportunities.find((o) => o.id === oppId)?.title ?? "";
     for (const v of vs) variantCtx[v.id] = { platform: v.platform, body: v.body, oppTitle };
   }
-  const pendingApprovals: PendingApprovalView[] = pendingRows.filter((a) => visibleVariantIds.has(a.variant_id)).map((a) => ({
+  const pendingApprovals: PendingApprovalView[] = pendingRows.map((a) => ({
     id: a.id,
     variantId: a.variant_id,
     access: a.access,
@@ -124,10 +120,7 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
 
   const analyticsByPublication = new Map(analyticsRows.map((a) => [a.publication_id, a]));
   const publicationsByVariant: Record<string, PublicationView[]> = {};
-  // ENFB-4 (Fable fold L): ONE filtered set feeds both the per-variant lists and the KPI —
-  // publications inherit by chain (§1), so the count must not run over the unfiltered rows.
-  const visiblePubs = pubs.filter((pb) => visibleVariantIds.has(pb.variant_id));
-  for (const p of visiblePubs) {
+  for (const p of pubs) {
     const a = analyticsByPublication.get(p.id);
     (publicationsByVariant[p.variant_id] ??= []).push({
       id: p.id,
@@ -140,7 +133,9 @@ export default async function SocialPage({ params }: { params: Promise<{ team: s
     });
   }
 
-  const publishedCount = visiblePubs.filter((p) => p.status === "published").length;
+  // ENFB-4: `pubs` is already the chain-visible set (bounded in-query above), so lists and the
+  // KPI count the same rows by construction.
+  const publishedCount = pubs.filter((p) => p.status === "published").length;
 
   return (
     <div className="flex flex-col gap-5">

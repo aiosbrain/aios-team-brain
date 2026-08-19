@@ -127,11 +127,20 @@ export async function getPublication(db: DbClient, teamId: string, id: string): 
 }
 
 /** Publications for the team, newest first (for the admin view). */
-export async function listPublications(db: DbClient, teamId: string, limit = 100): Promise<PublicationRow[]> {
+/** ENFB-4 (Codex diff fold): inherits by the viewer's visible-variant set IN-QUERY (a post-limit
+ *  filter let hidden rows starve the window). Required for serving; absent → [] (fail closed). */
+export async function listPublications(
+  db: DbClient,
+  teamId: string,
+  limit = 100,
+  variantIds?: ReadonlySet<string>
+): Promise<PublicationRow[]> {
+  if (!variantIds || variantIds.size === 0) return [];
   const { data } = await db
     .from("social_publications")
     .select(COLS)
     .eq("team_id", teamId)
+    .in("variant_id", [...variantIds])
     .order("created_at", { ascending: false })
     .limit(limit);
   return (data ?? []) as PublicationRow[];

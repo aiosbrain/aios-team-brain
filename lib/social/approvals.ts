@@ -147,12 +147,21 @@ export async function decideApproval(
 }
 
 /** Pending approvals for the team, newest first. */
-export async function listPendingApprovals(db: DbClient, teamId: string, limit = 50): Promise<ApprovalRow[]> {
+/** ENFB-4 (Codex diff fold): inherits by the viewer's visible-variant set IN-QUERY (a post-limit
+ *  filter let hidden rows starve the window). Required for serving; absent → [] (fail closed). */
+export async function listPendingApprovals(
+  db: DbClient,
+  teamId: string,
+  limit = 50,
+  variantIds?: ReadonlySet<string>
+): Promise<ApprovalRow[]> {
+  if (!variantIds || variantIds.size === 0) return [];
   const { data } = await db
     .from("content_approvals")
     .select(COLS)
     .eq("team_id", teamId)
     .eq("status", "pending")
+    .in("variant_id", [...variantIds])
     .order("created_at", { ascending: false })
     .limit(limit);
   return (data ?? []) as ApprovalRow[];

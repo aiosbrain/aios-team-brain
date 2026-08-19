@@ -113,6 +113,33 @@ describe("ENFB-4 — the EVERY read rule + chain inheritance", () => {
     const variantId = insiderVariants[0].id;
     expect(await actorSeesChain(db(), seed.teamId, { variantId }, insiderVis)).toBe(true);
     expect(await actorSeesChain(db(), seed.teamId, { variantId }, outsiderVis), "role does not bypass the chain gate").toBe(false);
+
+    // The variant-child reads inherit IN-QUERY (Codex diff fold: a post-limit filter let hidden
+    // rows starve the window). Raw rows on the SECRET variant; the reads are bounded by each
+    // viewer's visible-variant set — outsider (no visible chain) sees none, insider sees all.
+    await db().from("content_approvals").insert({ team_id: seed.teamId, variant_id: variantId, access: "team" });
+    await db().from("social_publications").insert({ team_id: seed.teamId, variant_id: variantId, access: "team", status: "published" });
+    await db().from("media_assets").insert({ team_id: seed.teamId, variant_id: variantId, access: "team", provider: "stub", model: "m", data_base64: "aGk=" });
+    const { listPendingApprovals } = await import("@/lib/social/approvals");
+    const { listPublications } = await import("@/lib/social/publications");
+    const { listTeamMediaMeta } = await import("@/lib/media/store");
+    const insiderSet = new Set(insiderVariants.map((v) => v.id));
+    const outsiderSet = new Set<string>(); // the outsider's chain resolved no visible variants
+    expect((await listPendingApprovals(db(), seed.teamId, 50, insiderSet)).length).toBe(1);
+    expect((await listPublications(db(), seed.teamId, 200, insiderSet)).length).toBe(1);
+    expect((await listTeamMediaMeta(db(), seed.teamId, 200, insiderSet)).length).toBe(1);
+    expect(await listPendingApprovals(db(), seed.teamId, 50, outsiderSet)).toEqual([]);
+    expect(await listPublications(db(), seed.teamId, 200, outsiderSet)).toEqual([]);
+    expect(await listTeamMediaMeta(db(), seed.teamId, 200, outsiderSet)).toEqual([]);
+    // A NON-EMPTY set that excludes the secret variant still reads nothing — this pins the
+    // in-query `.in("variant_id", …)` itself (the empty-set arms above exit at the fail-closed
+    // early return and would stay green without it).
+    const probe = new Set([randomUUID()]);
+    expect(await listPendingApprovals(db(), seed.teamId, 50, probe)).toEqual([]);
+    expect(await listPublications(db(), seed.teamId, 200, probe)).toEqual([]);
+    expect(await listTeamMediaMeta(db(), seed.teamId, 200, probe)).toEqual([]);
+    // Absent set ≡ fail closed (never the team-wide read).
+    expect(await listPublications(db(), seed.teamId, 200)).toEqual([]);
     // The predicate agreement pin (the one named rule, both owners of the decision):
     expect(opportunityVisible(secretOpp, insiderVis)).toBe(true);
     expect(opportunityVisible(secretOpp, outsiderVis)).toBe(false);

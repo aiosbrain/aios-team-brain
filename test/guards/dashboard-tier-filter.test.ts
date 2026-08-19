@@ -206,6 +206,12 @@ const SOCIAL_SURFACE_WIRING: [string, RegExp][] = [
   // The page routes through the store (viewer set at the list; chain inheritance below it).
   ["app/t/[team]/social/page.tsx", /listOpportunities\(db, team\.id, "team", 100, vis\.ids\)/],
   ["app/t/[team]/social/page.tsx", /listPlansForOpportunities\(db, team\.id, visibleOppIds\)/],
+  // The variant-child reads inherit IN-QUERY (Codex diff fold: a post-limit filter let hidden
+  // rows starve visible history out of the capped window) — page application + module gate.
+  ["app/t/[team]/social/page.tsx", /listPublications\(db, team\.id, 200, visibleVariantIds\)/],
+  ["lib/social/publications.ts", /\.in\("variant_id", \[\.\.\.variantIds\]\)/],
+  ["lib/social/approvals.ts", /\.in\("variant_id", \[\.\.\.variantIds\]\)/],
+  ["lib/media/store.ts", /\.in\("variant_id", \[\.\.\.variantIds\]\)/],
   // The action-level parent gate (round 1 H4): ONE resolver, hidden parent = not found.
   ["app/t/[team]/social/actions.ts", /await actorSeesChain\(adminClient\(\), teamId, ref, vis\.ids\)/],
   // Generation's EVERY refusal (D4): no silent degradation, no prompt over hidden sources.

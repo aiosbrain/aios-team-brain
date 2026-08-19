@@ -74,11 +74,21 @@ export async function addMediaAsset(
 }
 
 /** Metadata for a team's media, newest first (no bytes — for listing/rendering via the route). */
-export async function listTeamMediaMeta(db: DbClient, teamId: string, limit = 100): Promise<MediaAssetMeta[]> {
+/** ENFB-4 (Codex diff fold): the serving read INHERITS by the viewer's visible-variant set
+ *  IN-QUERY — filtering after a team-wide limit let newer hidden rows starve visible history
+ *  out of the window. `variantIds` is required for serving; absent → nothing (fail closed). */
+export async function listTeamMediaMeta(
+  db: DbClient,
+  teamId: string,
+  limit = 100,
+  variantIds?: ReadonlySet<string>
+): Promise<MediaAssetMeta[]> {
+  if (!variantIds || variantIds.size === 0) return [];
   const { data } = await db
     .from("media_assets")
     .select(META_COLS)
     .eq("team_id", teamId)
+    .in("variant_id", [...variantIds])
     .order("created_at", { ascending: false })
     .limit(limit);
   return ((data ?? []) as Record<string, unknown>[]).map(normalize);

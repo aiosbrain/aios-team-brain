@@ -40,12 +40,13 @@ describe("content approvals + autonomy (real Postgres)", () => {
     expect(r.outcome).toBe("pending");
     expect((await getVariant(db(), seed.teamId, variantId))!.status).toBe("awaiting_approval");
 
-    const pending = await listPendingApprovals(db(), seed.teamId);
+    // ENFB-4: the read inherits by the viewer's visible-variant set (in-query, fail closed).
+    const pending = await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]));
     expect(pending.length).toBe(1);
 
     await decideApproval(db(), seed.teamId, pending[0].id, "approved", "looks good", { memberId: seed.memberId });
     expect((await getVariant(db(), seed.teamId, variantId))!.status).toBe("approved");
-    expect((await listPendingApprovals(db(), seed.teamId)).length).toBe(0);
+    expect((await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]))).length).toBe(0);
   });
 
   it("denying sends the variant to rejected", async () => {
@@ -76,7 +77,7 @@ describe("content approvals + autonomy (real Postgres)", () => {
     const a = await submitForApproval(db(), seed.teamId, variantId);
     const b = await submitForApproval(db(), seed.teamId, variantId);
     expect(b.approval.id).toBe(a.approval.id);
-    expect((await listPendingApprovals(db(), seed.teamId)).length).toBe(1);
+    expect((await listPendingApprovals(db(), seed.teamId, 50, new Set([variantId]))).length).toBe(1);
 
     await decideApproval(db(), seed.teamId, a.approval.id, "approved", "");
     await expect(decideApproval(db(), seed.teamId, a.approval.id, "denied", "")).rejects.toBeInstanceOf(ApprovalError);
