@@ -191,6 +191,11 @@ export const GRAPHITI_SMALL_MODEL_MARKER = process.env.GRAPHITI_SMALL_MODEL || "
  */
 export const AIOS_SMALL_SENTINEL = "aios-small";
 
+/** Both protocol generations are accepted at the boundary; every consumer must use one predicate. */
+export function isSmallModelSignal(model: unknown): boolean {
+  return model === AIOS_SMALL_SENTINEL || model === GRAPHITI_SMALL_MODEL_MARKER;
+}
+
 /**
  * The only call kinds we will ever downgrade — the ones Graphiti itself marks `ModelSize.small`.
  * Two on graphiti_core 0.13.2, four on 0.29.3 (the table above spans both).
@@ -231,7 +236,7 @@ export function wantsSmallModel(body: unknown): boolean {
     const model = (body as { model?: unknown }).model;
     // The sentinel is the intended signal; the marker is the legacy one, accepted so a deployment
     // that has not rebuilt its image keeps working. Neither weakens the corroboration below.
-    if (model !== AIOS_SMALL_SENTINEL && model !== GRAPHITI_SMALL_MODEL_MARKER) return false;
+    if (!isSmallModelSignal(model)) return false;
     return SMALL_ELIGIBLE_KINDS.has(classifyGraphCall(body));
   } catch {
     return false;

@@ -14,12 +14,12 @@ const { smallRoutingEvidence } = await import("@/lib/llm/small-model-health");
  * standing evidence, so "nothing to judge" must be a distinct answer from "not working" and must
  * never render as an accusation.
  */
-/** Two reads now: the audit window (when the setting last changed), then the aggregate counts. */
+/** Two reads: the atomic setting boundary, then the aggregate counts. */
 const counts = (eligible: number, servedSmall: number) => ({ rows: [{ eligible, served_small: servedSmall }] });
-const auditAt = (iso: string | null) => ({ rows: iso ? [{ created_at: iso }] : [] });
-/** Default: no recorded change (whole window), then the given counts. */
-function mockReads(eligible: number, servedSmall: number, since: string | null = null) {
-  sql.runSql.mockResolvedValueOnce(auditAt(since)).mockResolvedValueOnce(counts(eligible, servedSmall));
+const boundaryAt = (iso: string | null) => ({ rows: iso ? [{ extraction_small_model_set_at: iso }] : [] });
+/** Default: a standing audit boundary, then the given counts. */
+function mockReads(eligible: number, servedSmall: number, since: string | null = "2026-08-19T12:00:00Z") {
+  sql.runSql.mockResolvedValueOnce(boundaryAt(since)).mockResolvedValueOnce(counts(eligible, servedSmall));
 }
 const SMALL = "qwen/qwen3.7-flash";
 
@@ -92,18 +92,24 @@ describe("smallRoutingEvidence", () => {
     expect(params[4]).toBe("2026-08-19T12:00:00Z"); // the window floor is carried into the SQL
   });
 
-  it("keeps the whole window when the setting has no recorded change", async () => {
-    // A team whose setting predates the audit trail: those rows ARE post-enable, so narrowing
-    // would hide real evidence. Null floor, and the SQL must treat null as 'no lower bound'.
-    mockReads(20, 0, null);
-    expect(await smallRoutingEvidence("t1", SMALL)).toEqual({ state: "not_routing", eligible: 20 });
-    const [query, params] = sql.runSql.mock.calls[1];
-    expect(params[4]).toBeNull();
-    expect(query).toContain("$5::timestamptz is null");
+  it("binds the atomic boundary to the currently configured model", async () => {
+    mockReads(0, 0);
+    await smallRoutingEvidence("t1", SMALL);
+    const [query, params] = sql.runSql.mock.calls[0];
+    expect(query).toContain("extraction_small_model_set_at");
+    expect(query).toContain("extraction_small_model = $2");
+    expect(params).toEqual(["t1", SMALL]);
   });
 
-  it("a failed audit read keeps the full window rather than silently narrowing it", async () => {
-    sql.runSql.mockRejectedValueOnce(new Error("audit boom")).mockResolvedValueOnce(counts(20, 0));
-    expect(await smallRoutingEvidence("t1", SMALL)).toEqual({ state: "not_routing", eligible: 20 });
+  it("cannot accuse when the setting has no recorded audit boundary", async () => {
+    mockReads(20, 0, null);
+    expect(await smallRoutingEvidence("t1", SMALL)).toEqual({ state: "unavailable" });
+    expect(sql.runSql).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed setting-boundary read cannot accuse from unbounded history", async () => {
+    sql.runSql.mockRejectedValueOnce(new Error("boundary boom")).mockResolvedValueOnce(counts(20, 0));
+    expect(await smallRoutingEvidence("t1", SMALL)).toEqual({ state: "unavailable" });
+    expect(sql.runSql).toHaveBeenCalledTimes(1);
   });
 });

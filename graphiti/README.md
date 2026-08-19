@@ -70,8 +70,9 @@ before changing it, both verified rather than assumed:
   independently responsible for remembering one string, and it failed silently (every call fell
   back to the strong model, nothing errored, the only symptom was a bill). Matching env vars only
   ever worked where both processes shared an environment — on Railway the app and graphiti are
-  separate services with separate variable scopes. Setting this explicitly still overrides the
-  sentinel, and the brain still accepts the legacy marker, so an unmigrated image keeps working.
+  separate services with separate variable scopes. An explicit real model still overrides the
+  sentinel; an explicit `aios-small` is ignored outside the canonical proxy route so it cannot be
+  sent to a provider. The brain still accepts the legacy marker, so an unmigrated image works.
 - ⚠️ **A reasoning model needs output headroom.** At `max_tokens=900` a reasoning model spends the
   whole budget on its trace and returns `content=None`, surfacing as `EmptyResponseError` after all
   four tenacity retries. Safe here only because `DEFAULT_MAX_TOKENS` is 16384, which the build

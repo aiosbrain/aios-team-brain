@@ -106,9 +106,10 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 # ⚠️ THE PROXY DETECTION IS WHAT KEEPS THIS SAFE, so do not widen it. A sentinel is only valid
 # because the proxy substitutes the real model before forwarding and therefore never sends it to a
 # provider. Talking to a provider DIRECTLY, `aios-small` would 400 every cheap call — so the
-# real-model default is preserved for exactly that case, and an explicit `GRAPHITI_SMALL_MODEL`
-# still overrides both (the escape hatch, and back-compat for an unmigrated deployment; the brain
-# still accepts the legacy marker).
+# real-model default is preserved for exactly that case. An explicit REAL `GRAPHITI_SMALL_MODEL`
+# still overrides both (the escape hatch and back-compat for an unmigrated deployment), but an
+# explicit `aios-small` is accepted only on the canonical proxy route and otherwise falls back to
+# the real default. Configuration cannot force a protocol sentinel onto a provider-bound request.
 #
 # ⚠️ A REASONING MODEL NEEDS OUTPUT HEADROOM. Verified on `qwen/qwen3.7-flash`: at max_tokens=900 the
 # reasoning trace consumes the whole budget and the API returns content=None, which surfaces as
@@ -122,16 +123,16 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 # assignment is LIVE and still works.)
 RUN F=/app/graph_service/zep_graphiti.py \
  && grep -q 'super().__init__(uri, user, password, llm_client)' "$F" \
- && sed -i 's|from graphiti_core.llm_client import LLMClient  # type: ignore|import os  # type: ignore\nfrom graphiti_core.llm_client import LLMClient  # type: ignore\nfrom graphiti_core.llm_client.config import LLMConfig  # type: ignore\nfrom graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient  # type: ignore|' "$F" \
- && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or ("aios-small" if "/api/internal/llm" in (os.environ.get("OPENAI_BASE_URL") or "") else "gpt-4.1-nano"))))|' "$F" \
- && grep -q 'small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or ("aios-small" if "/api/internal/llm" in (os.environ.get("OPENAI_BASE_URL") or "") else "gpt-4.1-nano")' "$F" \
+ && sed -i 's|from graphiti_core.llm_client import LLMClient  # type: ignore|import os  # type: ignore\nfrom urllib.parse import urlsplit  # type: ignore\nfrom graphiti_core.llm_client import LLMClient  # type: ignore\nfrom graphiti_core.llm_client.config import LLMConfig  # type: ignore\nfrom graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient  # type: ignore|' "$F" \
+ && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model=(os.environ.get("GRAPHITI_SMALL_MODEL") if os.environ.get("GRAPHITI_SMALL_MODEL") not in (None, "", "aios-small") else ("aios-small" if urlsplit(os.environ.get("OPENAI_BASE_URL") or "").path.rstrip("/") == "/api/internal/llm/v1" else "gpt-4.1-nano")))))|' "$F" \
+ && grep -q 'small_model=(os.environ.get("GRAPHITI_SMALL_MODEL") if os.environ.get("GRAPHITI_SMALL_MODEL") not in (None, "", "aios-small") else ("aios-small" if urlsplit(os.environ.get("OPENAI_BASE_URL") or "").path.rstrip("/") == "/api/internal/llm/v1" else "gpt-4.1-nano"))' "$F" \
  && grep -q 'from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient' "$F" \
  && /app/.venv/bin/python -c "import ast; ast.parse(open('/app/graph_service/zep_graphiti.py').read()); print('patch 1 parses')"
 
 # The small-model branch is BEHAVIOURALLY asserted, not just grepped: a `grep -q` proves a string is
 # present, never that the right branch fires — and the wrong branch is silent (a missing sentinel
 # mislabels every cheap call; a stray one 400s against a real provider). This extracts the shipped
-# expression and evaluates it across all four cases.
+# expression and evaluates it across provider/proxy collision cases.
 COPY verify-small-model-default.py /tmp/verify-small-model-default.py
 RUN /app/.venv/bin/python /tmp/verify-small-model-default.py /app/graph_service/zep_graphiti.py
 

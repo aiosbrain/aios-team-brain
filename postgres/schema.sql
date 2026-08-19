@@ -138,6 +138,9 @@ create table if not exists teams (
   -- and key — no small-provider sibling, deliberately: a second provider would reintroduce the
   -- half-swap the extraction branch's WHOLE fallback exists to prevent.
   extraction_small_model text,
+  -- Atomic evidence boundary for AIO-983. A trigger below stamps every value change; the routing
+  -- health read must never use a best-effort audit timestamp to judge pre/post-change traffic.
+  extraction_small_model_set_at timestamptz,
   -- Optional distinct PROVIDER for the extraction model. Null = the answering backend, different model.
   -- `anthropic` is deliberately excluded: Graphiti extracts via OpenAI structured outputs, which
   -- graphChatTarget refuses for Anthropic, so allowing it would 501 every extraction call while Graphiti
@@ -156,6 +159,7 @@ create table if not exists teams (
   meeting_task_status text check (meeting_task_status in ('backlog', 'ready', 'in_progress', 'done')),
   created_at timestamptz not null default now()
 );
+
 -- PRET-6: the access-enforcement rollout flag and the auto-flip hold are RETIRED — enforcing
 -- is the only behavior (docs/design/pret6-retirement.md). A from-zero load never creates the
 -- columns; upgrading fleets drop them via the guarded PRET-6 retirement migration (20260818210000)
@@ -168,6 +172,7 @@ alter table teams add column if not exists reasoning_provider text;
 alter table teams add column if not exists extraction_model text;
 alter table teams add column if not exists extraction_provider text;
 alter table teams add column if not exists extraction_small_model text;
+alter table teams add column if not exists extraction_small_model_set_at timestamptz;
 alter table teams add column if not exists embedding_provider text;
 alter table teams add column if not exists embedding_model text;
 do $$ begin
@@ -187,6 +192,29 @@ do $$ begin
     alter table teams add constraint teams_embedding_provider_check check (embedding_provider in ('openai', 'openrouter'));
   end if;
 end $$;
+
+-- Defined only AFTER every compatibility ALTER above. `schema.sql` runs before migrations during
+-- deploy, including on installations that skipped the original small-model migration entirely;
+-- PostgreSQL rejects an UPDATE OF trigger when its named column does not exist yet.
+create or replace function stamp_extraction_small_model_change()
+returns trigger language plpgsql as $$
+begin
+  if tg_op = 'INSERT' then
+    if new.extraction_small_model is not null then
+      new.extraction_small_model_set_at := now();
+    end if;
+  elsif new.extraction_small_model is distinct from old.extraction_small_model then
+    new.extraction_small_model_set_at := now();
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists teams_extraction_small_model_stamp_insert on teams;
+create trigger teams_extraction_small_model_stamp_insert
+  before insert on teams for each row execute function stamp_extraction_small_model_change();
+drop trigger if exists teams_extraction_small_model_stamp_update on teams;
+create trigger teams_extraction_small_model_stamp_update
+  before update of extraction_small_model on teams for each row execute function stamp_extraction_small_model_change();
 
 create table if not exists members (
   id uuid primary key default gen_random_uuid(),

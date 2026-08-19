@@ -37,10 +37,10 @@ import { SMALL_ELIGIBLE_KINDS } from "./graph-call-kind";
  * — it does not prevent one. On a busy team with 50 eligible rows all predating the change, an
  * admin who enabled the small model and opened this page before the next extraction ran would be
  * told, in amber, that their graph service and brain disagree. Nothing was wrong. So the window is
- * bounded below by the `team.extraction_small_model_set` audit row: calls made before the operator
- * asked for this cannot be evidence about whether it is working. A team whose setting predates the
- * audit trail (or that has never changed it) keeps the whole window, which is the correct default —
- * those rows ARE post-enable.
+ * bounded below by `teams.extraction_small_model_set_at`, stamped atomically by a database trigger
+ * whenever the setting changes. The best-effort audit row remains the human trail, but cannot be
+ * the evidence boundary: a failed audit after a successful setting write would leave a stale row.
+ * Without the atomic boundary we return `unavailable` rather than judging unbounded history.
  *
  * Scoped to ONE team: `extraction_small_model` is per-team config, so another team's traffic must
  * never be evidence about this team's setting.
@@ -52,6 +52,7 @@ const MIN_TO_JUDGE = 10;
 
 export type SmallRoutingEvidence =
   | { state: "not_configured" }
+  | { state: "unavailable" }
   | { state: "no_traffic" }
   | { state: "inconclusive"; eligible: number }
   | { state: "not_routing"; eligible: number }
@@ -70,21 +71,23 @@ export async function smallRoutingEvidence(
   // whole purpose is not saying things it has not checked.
   if (!smallModel.trim()) return { state: "not_configured" };
 
-  // When did the operator last ask for this? Anything older cannot be evidence about it. Best-effort:
-  // if the audit read fails we keep the full window, which is the pre-existing behaviour and errs
-  // toward showing the operator MORE of what actually happened rather than silently narrowing it.
+  // The database stamps this in the SAME row update as the setting. A best-effort audit insert is
+  // not a safe boundary: it may fail after the setting succeeds and leave an older timestamp that
+  // authorizes a false accusation. Also bind the row to the currently configured model.
   let since: string | null = null;
   try {
-    const audit = await runSql<{ created_at: string }>(
-      `select created_at from audit_log
-        where team_id = $1 and action = 'team.extraction_small_model_set'
-        order by created_at desc limit 1`,
-      [teamId]
+    const boundary = await runSql<{ extraction_small_model_set_at: string }>(
+      `select extraction_small_model_set_at
+         from teams
+        where id = $1 and extraction_small_model = $2`,
+      [teamId, smallModel]
     );
-    since = audit.rows[0]?.created_at ?? null;
+    since = boundary.rows[0]?.extraction_small_model_set_at ?? null;
   } catch (e) {
-    console.error(`[small-model-health] audit window read failed for team ${teamId}:`, e);
+    console.error(`[small-model-health] setting boundary read failed for team ${teamId}:`, e);
+    return { state: "unavailable" };
   }
+  if (!since) return { state: "unavailable" };
 
   // The most recent eligible calls, newest first. A VOLUME window rather than a time window: right
   // after the setting is enabled the recent rows are pre-enable history and would read as
@@ -102,7 +105,7 @@ export async function smallRoutingEvidence(
             count(*) filter (where model = $3)::int as served_small
        from (select model from llm_usage
               where team_id = $1 and source = 'graph' and call_kind = any($2)
-                and ($5::timestamptz is null or created_at >= $5::timestamptz)
+                and created_at >= $5::timestamptz
               order by created_at desc
               limit $4) recent`,
     [teamId, [...SMALL_ELIGIBLE_KINDS], smallModel, sample, since]

@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { wantsSmallModel, AIOS_SMALL_SENTINEL, GRAPHITI_SMALL_MODEL_MARKER } from "@/lib/llm/graph-call-kind";
 
 /**
@@ -51,5 +55,53 @@ describe("the small-call sentinel", () => {
   it("ignores an unrelated model name — recognition is not 'anything cheap-looking'", () => {
     expect(wantsSmallModel(body(ELIGIBLE, "gpt-4o"))).toBe(false);
     expect(wantsSmallModel(body(ELIGIBLE, "aios-smallish"))).toBe(false);
+  });
+
+  it("executes the exact Docker expression against provider-boundary cases", () => {
+    const root = join(import.meta.dirname, "..");
+    const docker = readFileSync(join(root, "graphiti", "Dockerfile"), "utf8");
+    const sedStart = docker.indexOf("sed -i");
+    const anchor = "small_model=";
+    const start = docker.indexOf(anchor, sedStart) + anchor.length;
+    expect(sedStart).toBeGreaterThanOrEqual(0);
+    expect(start).toBeGreaterThan(anchor.length - 1);
+
+    let depth = 0;
+    let end = start;
+    for (; end < docker.length; end += 1) {
+      const char = docker[end];
+      if ("([{".includes(char)) depth += 1;
+      else if (")]}".includes(char)) {
+        if (depth === 0) break;
+        depth -= 1;
+      } else if (char === "," && depth === 0) break;
+    }
+    const expression = docker.slice(start, end).trim();
+    const dir = mkdtempSync(join(tmpdir(), "small-sentinel-"));
+    const target = join(dir, "zep_graphiti.py");
+    try {
+      writeFileSync(target, `client = LLMConfig(small_model=${expression})\n`);
+      const out = execFileSync("python3", [join(root, "graphiti", "verify-small-model-default.py"), target], {
+        encoding: "utf8",
+      });
+      expect(out).toMatch(/cases pass on the shipped expression/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("adds legacy teams columns before defining the timestamp trigger", () => {
+    const root = join(import.meta.dirname, "..");
+    const schema = readFileSync(join(root, "postgres", "schema.sql"), "utf8");
+    const legacyColumn = schema.indexOf(
+      "alter table teams add column if not exists extraction_small_model text;"
+    );
+    const boundaryColumn = schema.indexOf(
+      "alter table teams add column if not exists extraction_small_model_set_at timestamptz;"
+    );
+    const trigger = schema.indexOf("create trigger teams_extraction_small_model_stamp_update");
+    expect(legacyColumn).toBeGreaterThanOrEqual(0);
+    expect(boundaryColumn).toBeGreaterThan(legacyColumn);
+    expect(trigger).toBeGreaterThan(boundaryColumn);
   });
 });

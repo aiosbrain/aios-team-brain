@@ -109,4 +109,30 @@ describe("extraction model config (data-mechanics)", () => {
       expect((await resolveAnsweringKeys(db(), seed.teamId)).extractionProvider).toBe(provider);
     }
   });
+
+  it("atomically stamps every small-model value change and not unrelated updates", async () => {
+    const seed = await seedTeam();
+    const readBoundary = async () => {
+      const { data, error } = await db()
+        .from("teams")
+        .select("extraction_small_model_set_at")
+        .eq("id", seed.teamId)
+        .single();
+      expect(error).toBeFalsy();
+      return data?.extraction_small_model_set_at as string | null;
+    };
+
+    expect(await readBoundary()).toBeNull();
+    await db().from("teams").update({ extraction_small_model: "small-a" }).eq("id", seed.teamId);
+    const first = await readBoundary();
+    expect(first).toBeTruthy();
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await db().from("teams").update({ extraction_model: "strong-b" }).eq("id", seed.teamId);
+    expect(await readBoundary()).toBe(first);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await db().from("teams").update({ extraction_small_model: "small-c" }).eq("id", seed.teamId);
+    expect(await readBoundary()).not.toBe(first);
+  });
 });

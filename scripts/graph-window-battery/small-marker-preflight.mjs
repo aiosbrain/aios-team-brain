@@ -24,7 +24,7 @@
  * share to feed the decision function.
  */
 import { readFileSync } from "node:fs";
-import { classifyGraphCall, SMALL_ELIGIBLE_KINDS, GRAPHITI_SMALL_MODEL_MARKER } from "../../lib/llm/graph-call-kind.ts";
+import { classifyGraphCall, SMALL_ELIGIBLE_KINDS, isSmallModelSignal } from "../../lib/llm/graph-call-kind.ts";
 
 /**
  * Tally marker presence per call kind over tap records.
@@ -40,7 +40,7 @@ export function tallyMarkers(records) {
     if (!rec || rec.kind !== "request" || !rec.body) continue;
     requests += 1;
     const kind = classifyGraphCall(rec.body);
-    const marked = rec.body.model === GRAPHITI_SMALL_MODEL_MARKER;
+    const marked = isSmallModelSignal(rec.body.model);
     const cur = byKind.get(kind) ?? { kind, calls: 0, marked: 0 };
     cur.calls += 1;
     if (marked) cur.marked += 1;

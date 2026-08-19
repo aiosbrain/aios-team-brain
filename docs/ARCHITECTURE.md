@@ -874,20 +874,22 @@ guard enforces it, it's named.
   services with separate variable scopes.** It is now the sentinel **`aios-small`**
   (`lib/llm/graph-call-kind.AIOS_SMALL_SENTINEL`) — not a model, never forwarded (the proxy
   substitutes `target.model` before forwarding), emitted by the image **only when
-  `OPENAI_BASE_URL` names this brain's proxy** so a direct-to-provider deployment keeps a real
-  model. The legacy marker is still accepted, so an unmigrated image keeps working.
+  `OPENAI_BASE_URL` ends at the canonical `/api/internal/llm/v1` proxy route** so a
+  direct-to-provider deployment keeps a real model. Even an explicitly configured sentinel is
+  ignored outside that route. The legacy marker is still accepted, so an unmigrated image works.
   Separately, "configured and resolvable" is **not** "working": `describeSmallExtraction` reported
   `enabled: true, inert: false` while zero calls were routed. `lib/llm/small-model-health.ts` reads
   the `llm_usage` ledger for what actually served the recent small-eligible calls, and is
   DISCRIMINATED so it never accuses without standing evidence (`not_configured` / `unavailable` /
   `no_traffic` / `inconclusive` / `not_routing` / `routing`) — the AIO-876 + AIO-912 rule. The
-  window starts at the `team.extraction_small_model_set` audit row: calls made BEFORE the operator
-  asked for this cannot be evidence about whether it works, and without that bound a busy team that
-  had just enabled it would be accused of drift on its own pre-enable history.
+  window starts at `teams.extraction_small_model_set_at`, stamped atomically by a database trigger
+  when the setting changes: calls made BEFORE the operator asked cannot be evidence about whether it
+  works. The audit row remains a best-effort human trail, not the correctness boundary. A missing or
+  unreadable boundary is `unavailable`, never permission to accuse from unbounded history.
   _Guards:_ `test/small-model-sentinel.test.ts` (the sentinel recognises, and still refuses to
   downgrade extraction), `test/small-model-health.test.ts` (the absence is reported, and the
   can't-tell states stay silent), plus the build-time `graphiti/verify-small-model-default.py`,
-  which extracts the SHIPPED expression and evaluates all four branches.
+  which extracts the SHIPPED expression and evaluates the proxy/provider collision cases.
 - **A graph group id is READ FROM THE POINTER, never re-derived from the live team slug.**
   `projects.graph_group_id` is immutable for the §11 built-ins (General → the team graph,
   external-shared → the external graph), and `lib/graph/project-pointer.ts` deliberately tolerates
