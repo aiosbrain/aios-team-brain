@@ -7,7 +7,7 @@ import {
   listOpportunities,
   listVariants,
 } from "@/lib/social/store";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for the Social Brain content domain on real Postgres (M2 foundation). Derived from the
@@ -51,8 +51,10 @@ describe("social content domain (real Postgres)", () => {
   });
 
   it("propagates tier down the chain — a team opportunity yields team plan + variant", async () => {
-    const { teamId } = await seedTeam();
-    const opp = await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "internal only" });
+    const seed = await seedTeam();
+    const { teamId } = seed;
+    const ev = await ingest(seed, { path: "evidence/chain.md", body: "the evidence body", access: "team", project: "src" });
+    const opp = await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "internal only", evidence: [{ itemId: ev.id }] });
     const plan = await createPlan(db(), teamId, opp.id);
     const variant = await addVariant(db(), teamId, plan.id, { platform: "linkedin", format: "text" });
     expect(plan.access).toBe("team");
@@ -60,12 +62,18 @@ describe("social content domain (real Postgres)", () => {
   });
 
   it("isolates tiers — an external viewer never sees a team-sourced opportunity", async () => {
-    const { teamId } = await seedTeam();
-    await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "internal roadmap" });
-    await createOpportunity(db(), teamId, { access: "external", sourceType: "manual", title: "public launch" });
+    const seed = await seedTeam();
+    const { teamId } = seed;
+    const teamEv = await ingest(seed, { path: "evidence/t.md", body: "team evidence", access: "team", project: "src" });
+    const extEv = await ingest(seed, { path: "evidence/e.md", body: "ext evidence", access: "external", project: "src" });
+    await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "internal roadmap", evidence: [{ itemId: teamEv.id }] });
+    await createOpportunity(db(), teamId, { access: "external", sourceType: "manual", title: "public launch", evidence: [{ itemId: extEv.id }] });
 
-    const asTeam = await listOpportunities(db(), teamId, "team");
-    const asExternal = await listOpportunities(db(), teamId, "external");
+    // ENFB-4: the viewer set holds ALL evidence, so the POSTURE TIER stays this arm's only
+    // discriminator (the membership axis has its own pins in enfb4-social.datamechanics).
+    const allEv: ReadonlySet<string> = new Set([teamEv.id, extEv.id]);
+    const asTeam = await listOpportunities(db(), teamId, "team", 50, allEv);
+    const asExternal = await listOpportunities(db(), teamId, "external", 50, allEv);
 
     expect(asTeam.map((o) => o.title).sort()).toEqual(["internal roadmap", "public launch"]);
     // The external principal sees ONLY the external-tier opportunity — no team leak.
@@ -73,8 +81,10 @@ describe("social content domain (real Postgres)", () => {
   });
 
   it("filters variants by tier too", async () => {
-    const { teamId } = await seedTeam();
-    const opp = await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "x" });
+    const seed = await seedTeam();
+    const { teamId } = seed;
+    const ev = await ingest(seed, { path: "evidence/v.md", body: "the evidence body", access: "team", project: "src" });
+    const opp = await createOpportunity(db(), teamId, { access: "team", sourceType: "manual", title: "x", evidence: [{ itemId: ev.id }] });
     const plan = await createPlan(db(), teamId, opp.id);
     await addVariant(db(), teamId, plan.id, { platform: "x", format: "text" });
 
@@ -84,9 +94,11 @@ describe("social content domain (real Postgres)", () => {
   });
 
   it("is idempotent by dedup key", async () => {
-    const { teamId } = await seedTeam();
-    const a = await createOpportunity(db(), teamId, { access: "team", sourceType: "item", title: "dupe", dedupKey: "item:abc" });
-    const b = await createOpportunity(db(), teamId, { access: "team", sourceType: "item", title: "dupe again", dedupKey: "item:abc" });
+    const seed = await seedTeam();
+    const { teamId } = seed;
+    const ev = await ingest(seed, { path: "evidence/dupe.md", body: "the evidence body", access: "team", project: "src" });
+    const a = await createOpportunity(db(), teamId, { access: "team", sourceType: "item", title: "dupe", dedupKey: "item:abc", evidence: [{ itemId: ev.id }] });
+    const b = await createOpportunity(db(), teamId, { access: "team", sourceType: "item", title: "dupe again", dedupKey: "item:abc", evidence: [{ itemId: ev.id }] });
     expect(b.id).toBe(a.id);
     expect((await getOpportunity(db(), teamId, a.id))!.title).toBe("dupe"); // first write wins
   });
@@ -94,7 +106,9 @@ describe("social content domain (real Postgres)", () => {
   it("scopes opportunities to the team", async () => {
     const a = await seedTeam();
     const b = await seedTeam();
-    await createOpportunity(db(), b.teamId, { access: "external", sourceType: "manual", title: "team b public" });
-    expect(await listOpportunities(db(), a.teamId, "team")).toEqual([]);
+    const ev = await ingest(b, { path: "evidence/b.md", body: "the evidence body", access: "external", project: "src" });
+    await createOpportunity(db(), b.teamId, { access: "external", sourceType: "manual", title: "team b public", evidence: [{ itemId: ev.id }] });
+    // A generous viewer set (holding team b's evidence!) still reads nothing across teams.
+    expect(await listOpportunities(db(), a.teamId, "team", 50, new Set([ev.id]))).toEqual([]);
   });
 });

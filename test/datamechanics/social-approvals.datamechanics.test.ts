@@ -3,7 +3,7 @@ import { createOpportunity, getVariant, setVariantGeneration } from "@/lib/socia
 import { planOpportunity } from "@/lib/social/plan";
 import { setAutonomy } from "@/lib/social/settings";
 import { submitForApproval, decideApproval, listPendingApprovals, ApprovalError } from "@/lib/social/approvals";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for the approval workflow + autonomy on real Postgres (M4, hardened by audit #1). Derived
@@ -13,7 +13,9 @@ import { db, seedTeam } from "./helpers";
  */
 async function generatedVariant(access: "team" | "external" = "team") {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: an opportunity must trace to items (evidence access matches the fixture's tier).
+  const ev = await ingest(seed, { path: "evidence/appr.md", body: "the evidence body", access, project: "src" });
+  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   const v = variants[0];
   await setVariantGeneration(db(), seed.teamId, v.id, {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { discoverOpportunities } from "@/lib/social/discover";
-import { db, ingest, seedTeam } from "./helpers";
+import { db, ingest, seedTeam, viewFor } from "./helpers";
 
 /**
  * Spec for content discovery on real Postgres. Derived from the product intent: turn recent brain
@@ -19,7 +19,11 @@ describe("content discovery (real Postgres)", () => {
     await ingest(seed, { kind: "deliverable", access: "team", path: "notes/tiny.md", body: "too short" }); // trivial → skipped
     await ingest(seed, { kind: "transcript", access: "team", path: "calls/standup.md", body: `meeting ${LONG}` }); // not a discover kind
 
-    const first = await discoverOpportunities(db(), seed.teamId);
+    // ENFB-4: the scan is bounded to the acting admin's oracle set (the seed member's real one —
+    // a team-tier viewer sees both the team and the external item, so the KIND/substance filters
+    // stay this arm's discriminators).
+    const { visibleItemIds } = await viewFor(seed);
+    const first = await discoverOpportunities(db(), seed.teamId, { visibleItemIds });
     expect(first.scanned).toBe(3); // the two long + the trivial deliverable (transcript is filtered by kind)
     expect(first.created).toBe(2);
     expect(first.skipped).toBe(1);
@@ -34,7 +38,7 @@ describe("content discovery (real Postgres)", () => {
     expect(oppA.status).toBe("discovered");
 
     // Idempotent: a second run creates nothing new.
-    const second = await discoverOpportunities(db(), seed.teamId);
+    const second = await discoverOpportunities(db(), seed.teamId, { visibleItemIds });
     expect(second.created).toBe(0);
     expect(second.skipped).toBe(3);
 
@@ -48,8 +52,12 @@ describe("content discovery (real Postgres)", () => {
   it("respects the look-back window", async () => {
     const seed = await seedTeam();
     await ingest(seed, { kind: "deliverable", access: "team", path: "notes/d1.md", body: `a note ${LONG}` });
-    // A zero-hour window excludes everything (nothing is newer than "now").
-    const none = await discoverOpportunities(db(), seed.teamId, { sinceHours: 0, now: new Date(Date.now() + 60_000) });
+    // A zero-hour window excludes everything (nothing is newer than "now"). The viewer set is
+    // present and non-empty, so the WINDOW is what excludes — not the ENFB-4 fail-closed scan.
+    const { visibleItemIds } = await viewFor(seed);
+    expect(visibleItemIds.size).toBeGreaterThan(0);
+    const none = await discoverOpportunities(db(), seed.teamId, { sinceHours: 0, now: new Date(Date.now() + 60_000), visibleItemIds });
+    expect(none.scanned).toBe(0);
     expect(none.created).toBe(0);
   });
 });

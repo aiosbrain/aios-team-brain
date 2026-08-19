@@ -5,7 +5,7 @@ import { setPublishDryRun } from "@/lib/social/settings";
 import { scheduleVariant, runPublication } from "@/lib/social/publish";
 import { createPublication, getPublication } from "@/lib/social/publications";
 import type { PublishRequest, SocialPublishingProvider } from "@/lib/social/providers/types";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for the runner-side hardening (2026-07-16 audit #2 idempotency, #5 double-submit), on real
@@ -31,7 +31,11 @@ function recorder(): SocialPublishingProvider & { calls: number; last?: PublishR
 
 async function liveApprovedVariant() {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access: "external", sourceType: "manual", title: "Ship it" });
+  // ENFB-4: the public door needs fully item-linked, external-shared-included evidence.
+  const ev = await ingest(seed, { path: "evidence/runner.md", body: "the evidence body", access: "external", project: "src" });
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  await backfillTeamContext(db(), seed.teamId);
+  const opp = await createOpportunity(db(), seed.teamId, { access: "external", sourceType: "manual", title: "Ship it", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   const variantId = variants[0].id;
   await setVariantGeneration(db(), seed.teamId, variantId, { body: "we shipped a durable queue", status: "generated", validation: {} });

@@ -7,7 +7,7 @@ import { runCollectAnalytics } from "@/lib/social/collect-analytics";
 import { getAnalyticsForPublication, teamAnalyticsSummary } from "@/lib/social/analytics";
 import { runDueJobs } from "@/lib/jobs";
 import type { SocialPublishingProvider } from "@/lib/social/providers/types";
-import { db, seedTeam } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 
 /**
  * Spec for analytics (M6) on real Postgres, provider STUBBED. Derived from intent: after a
@@ -18,7 +18,12 @@ import { db, seedTeam } from "./helpers";
 // External by default — only public content is publishable (audit #1), and analytics ride publishing.
 async function approvedVariant(access: "team" | "external" = "external") {
   const seed = await seedTeam();
-  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue" });
+  // ENFB-4: evidence is required, and the publish path (analytics ride it) needs the external
+  // evidence to hold a current external-shared membership.
+  const ev = await ingest(seed, { path: "evidence/an.md", body: "the evidence body", access, project: "src" });
+  const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+  await backfillTeamContext(db(), seed.teamId);
+  const opp = await createOpportunity(db(), seed.teamId, { access, sourceType: "manual", title: "Shipped the queue", evidence: [{ itemId: ev.id }] });
   const { variants } = await planOpportunity(db(), seed.teamId, opp.id, { memberId: seed.memberId });
   await setVariantGeneration(db(), seed.teamId, variants[0].id, { body: "we shipped", status: "generated", validation: {} });
   await setVariantStatus(db(), seed.teamId, variants[0].id, "approved");
