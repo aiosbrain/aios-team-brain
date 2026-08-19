@@ -65,7 +65,9 @@ describe("guard: the NDA confidentiality gate", () => {
   });
 
   it("reports locations only in a trusted local terminal, and exits 1", () => {
-    const r = run({ NDA_TERMS: "SYNTHETICTERM" });
+    // GitHub exports CI=true for the entire test process. Explicitly model a trusted local shell;
+    // otherwise this test correctly receives the public, location-free output it tests below.
+    const r = run({ NDA_TERMS: "SYNTHETICTERM", CI: "" });
     expect(r.code).toBe(1);
     expect(r.err).toMatch(/BLOCKED/);
     expect(r.err).toMatch(/protected text is withheld/i);
