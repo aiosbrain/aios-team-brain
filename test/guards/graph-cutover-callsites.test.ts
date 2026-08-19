@@ -9,6 +9,29 @@ import { join } from "node:path";
  */
 const ROOT = join(import.meta.dirname, "..", "..");
 const REQUIRED: { file: string; needle: string; why: string }[] = [
+  // ENFB-3 — the graph FEEDS' cutover call sites, with the two load-bearing ARGUMENTS pinned
+  // (Fable diff M1: presence of the call alone left `arm: false` and the uncapped k one silent
+  // edit away — a 60s-polling feed must never become an arming heartbeat or truncate quietly).
+  {
+    file: join("app", "api", "brain", "facts", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER,\n      arm: false,",
+    why: "the facts feed resolves the member's oracle partitions uncapped and NON-arming",
+  },
+  {
+    file: join("app", "api", "brain", "events", "route.ts"),
+    needle: "k: Number.MAX_SAFE_INTEGER,\n      arm: false,",
+    why: "the events feed resolves the member's oracle partitions uncapped and NON-arming",
+  },
+  {
+    file: join("app", "api", "brain", "facts", "route.ts"),
+    needle: "!scope.generalSuppressed",
+    why: "the loud arm must exclude debt-suppressed zeros (a restriction move is a legitimate fail-closed empty, never a 500)",
+  },
+  {
+    file: join("app", "api", "brain", "events", "route.ts"),
+    needle: "!scope.generalSuppressed",
+    why: "same discrimination as facts",
+  },
   {
     file: join("app", "api", "v1", "query", "route.ts"),
     needle: "graphProjectIds: projectIds",

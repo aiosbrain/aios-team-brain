@@ -1,6 +1,7 @@
 import "server-only";
 import { createHash, randomUUID } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
+import { systemVisibleSourceIds } from "@/lib/access/enforce";
 import { ingestItem } from "@/lib/ingest";
 import { audit } from "@/lib/api/audit";
 import { completeTextOrNull } from "@/lib/llm/complete";
@@ -132,7 +133,11 @@ export async function findDuplicateMeeting(
     // Never match a note that's already been folded away (`merged_into` set) — merging into a hidden
     // note makes the upload vanish (it inherits the tombstone and never shows on the Meetings page).
     .is("merged_into", null);
-  const noteRows = (notes ?? []) as { id: string; source_item_id: string; submitted_by: string | null; title: string }[];
+  const allRows = (notes ?? []) as { id: string; source_item_id: string; submitted_by: string | null; title: string }[];
+  if (!allRows.length) return null;
+  // ENFB-3 H2: only SYSTEM-visible sources are merge candidates (see systemVisibleSourceIds).
+  const mergeable = await systemVisibleSourceIds(admin, teamId, allRows.map((n) => n.source_item_id));
+  const noteRows = allRows.filter((n) => mergeable.has(n.source_item_id));
   if (!noteRows.length) return null;
 
   const { data: items } = await admin
@@ -268,6 +273,24 @@ export async function mergeIntoMeetingNote(
     mergedAccess,
     { authorMemberId: author }
   );
+
+  // ENFB-3 D2 (design round-1 HIGH 2, ordering PINNED): the fresh merge-owned item must be
+  // membership-reconciled BEFORE the survivor is re-pointed at it — otherwise a visible
+  // survivor becomes oracle-invisible by merging (its new source has no membership until the
+  // sweep). On reconcile failure the merge ABORTS here: the durable leftover is only the
+  // merge-owned item. The OPERATIVE reason the backfill cannot resurrect it as a meeting is
+  // that the merge writes NO frontmatter.source, and the backfill's candidate filter requires
+  // a MEETING_TRANSCRIPT_SOURCES source (from-items.ts isMeetingTranscript) — do not add a
+  // source key to the merged frontmatter without revisiting this. A retry converges (same
+  // notePath upsert).
+  {
+    const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+    const rec = await reconcileItemContext(admin, teamId, mergedItem.id).catch((e) => ({
+      ok: false as const,
+      error: e instanceof Error ? e.message : String(e),
+    }));
+    if (!rec.ok) throw new Error(`merge aborted before re-point: merged item reconcile failed (${"error" in rec ? rec.error : "unknown"})`);
+  }
 
   // If the survivor was pointing at a foreign (connector-owned) item, move it onto the merge-owned
   // item and RETIRE the old one with a hidden tombstone note — otherwise the meetings backfill, which
@@ -460,7 +483,16 @@ export async function backfillMergeDuplicateMeetings(
   const dupDateGroups = [...byDate.values()].filter((g) => g.length >= 2);
   if (dupDateGroups.length === 0) return summary;
 
-  const candidateItemIds = dupDateGroups.flatMap((g) => g.map((r) => r.source_item_id));
+  let candidateItemIds = dupDateGroups.flatMap((g) => g.map((r) => r.source_item_id));
+  // ENFB-3 H2: initiative-restricted sources leave candidacy HERE (after the cheap date grouping, so the
+  // steady-state tick still loads zero bodies and zero membership rows for dup-free dates).
+  const mergeable = await systemVisibleSourceIds(admin, teamId, candidateItemIds);
+  for (const g of dupDateGroups) {
+    const kept = g.filter((r) => mergeable.has(r.source_item_id));
+    g.length = 0;
+    g.push(...kept);
+  }
+  candidateItemIds = dupDateGroups.flatMap((g) => g.map((r) => r.source_item_id));
   const { data: items } = await admin.from("items").select("id, body, access").in("id", candidateItemIds);
   const itemRows = (items ?? []) as { id: string; body: string; access: "team" | "external" }[];
   const bodyById = new Map(itemRows.map((i) => [i.id, i.body ?? ""]));

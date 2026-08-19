@@ -697,10 +697,12 @@ export async function getWorkTimeline(
   // GUI-uploaded meeting is ingested with `frontmatter: { title }` only — no work-time key matches, so
   // it never leaves SQL. Relaxing the `continue` at the transcript filter would not have admitted it.
   //
-  // TIER: `meeting_notes` has NO access/audience column, so `visibleItems` cannot gate it and neither
-  // can any other visibility helper. Meeting notes are team-tier by construction; this is the sole
-  // enforcement (no RLS backstop, CLAUDE.md §5), routed through the existing predicate so the rule is
-  // spelled once.
+  // TIER + ORACLE (prose corrected in ENFB-3 — the old note claimed "no visibility helper can
+  // gate meeting_notes", which has been false since the enforcement era): the posture bit
+  // below is the coarse wall, and the REAL gate is four lines down — a note's restriction
+  // axis is its source transcript item (`srcVisible`), the same rule the meetings pages now
+  // apply (lib/meetings/notes.ts, ENFB-3). No audience column is needed: source_item_id is
+  // NOT NULL by schema.
   if (canSeeMeetingNotes(tier)) {
     const meetRes = await db
       .from("meeting_notes")

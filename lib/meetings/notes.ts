@@ -95,11 +95,20 @@ export async function setMeetingNoteSourceItem(db: DbClient, noteId: string, sou
  * resolve to a real member is the caller's problem to filter BEFORE calling this — this function
  * trusts its input and just links whatever ids it's given.
  */
+export interface CreateMeetingNoteResult {
+  noteId: string;
+  /** ENFB-3 D2: false when the inline context reconcile failed or was skipped — the note is
+   *  DURABLE but not yet oracle-visible; the scheduler sweep is the standing convergence.
+   *  The client must not navigate to a detail that would 404 (design round 2 blocker: an
+   *  ok:false on a durable write was a duplicate factory). */
+  visible: boolean;
+}
+
 export async function createMeetingNote(
   admin: DbClient,
   teamId: string,
   input: CreateMeetingNoteInput
-): Promise<string> {
+): Promise<CreateMeetingNoteResult> {
   const title = input.title.trim();
   if (!title) throw new Error("meeting note title is required");
   const rawText = input.rawText.trim();
@@ -122,6 +131,20 @@ export async function createMeetingNote(
     "team",
     { authorMemberId: input.submittedByMemberId }
   );
+
+  // ENFB-3 D2: the gate keys on the item's MEMBERSHIP, and in-process ingestItem does not
+  // reconcile context (the HTTP items route does it in after()) — without this, the uploader's
+  // own meeting 404s until the ~30-min scheduler sweep. Failure is LOUD and non-fatal: the
+  // write is durable, visibility converges on the sweep, and the caller gets visible:false.
+  let visible = false;
+  try {
+    const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+    const rec = await reconcileItemContext(admin, teamId, ingestResult.id);
+    visible = rec.ok === true && !("skipped" in rec && rec.skipped);
+    if (!visible) console.error(`[meetings] inline reconcile incomplete for item ${ingestResult.id}:`, JSON.stringify(rec));
+  } catch (e) {
+    console.error(`[meetings] inline reconcile failed for item ${ingestResult.id}:`, e instanceof Error ? e.message : e);
+  }
 
   const { error } = await admin.from("meeting_notes").insert({
     id: noteId,
@@ -152,7 +175,7 @@ export async function createMeetingNote(
     meta: { title, attendees: attendeeIds.length },
   });
 
-  return noteId;
+  return { noteId, visible };
 }
 
 export interface MeetingNoteFromItemInput {
@@ -311,19 +334,34 @@ type NoteRow = {
   created_at: string;
 };
 
-/** Team-tier only (see canSeeMeetingNotes) — returns [] for an external caller rather than erroring. */
+/**
+ * The meetings LIST read (ENFB-3): posture stays the coarse wall, and the MEMBERSHIP oracle
+ * bounds the rows — a note's restriction axis is its source transcript item, so the list
+ * intersects `source_item_id` with the viewer's visible set IN-QUERY, before the cap (the
+ * ENFB-2 starvation discipline). The viewer is a PRINCIPAL, not a caller-supplied tier alone
+ * — a tier-shaped parameter is one refactor from being passed a constant.
+ * Fail directions: external posture → [] (unchanged); oracle resolution ERROR → throws (the
+ * layout surfaces the error boundary — an empty meetings list must mean empty, not broken).
+ */
 export async function listMeetingNotesForTeam(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  viewer: { memberId: string; tier: ViewerTier }
 ): Promise<MeetingNoteSummary[]> {
-  if (!canSeeMeetingNotes(tier)) return [];
+  if (!canSeeMeetingNotes(viewer.tier)) return [];
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const vis = await visibleItemIds(db, { teamId, memberId: viewer.memberId });
+  if (vis.error) throw new Error("meeting visibility resolution failed");
+  // Scaling note (Fable diff L2): this materializes the viewer's whole visible-item set and
+  // compiles a bind-per-id IN list — the documented enforce.ts deferral (>65k ids errors →
+  // the error boundary, fail closed). The in-query SQL predicate is the lever when it bites.
 
   const { data: notes } = await db
     .from("meeting_notes")
     .select("id, source_item_id, submitted_by, title, summary, occurred_at, created_at")
     .eq("team_id", teamId)
     .is("merged_into", null) // hide notes that were merged into another (deduped)
+    .in("source_item_id", [...vis.ids])
     .order("created_at", { ascending: false })
     .limit(200);
   const rows = (notes ?? []) as NoteRow[];
@@ -367,23 +405,34 @@ export async function listMeetingNotesForTeam(
   });
 }
 
-/** Team-tier only (see canSeeMeetingNotes) — returns null for an external caller or a miss. */
+/**
+ * The meetings DETAIL read (ENFB-3): serves the FULL transcript body — the same bytes the
+ * library item page gates behind `canSeeItem` — so it takes the by-id probe here too (the
+ * two surfaces must 404 on the same condition, or differencing them leaks the visibility
+ * state). Tombstones (merged_into) refuse: "which ids exist" equals "which ids the list
+ * shows" — the merge survivor is the one canonical note (D4). Null for denied ≡ null for
+ * unknown (§5.7). The list and this probe share the ENFB-1 predicate (canSeeItem ≡
+ * visibleItemIds.has, dm-pinned there), so list-membership ≡ detail-200 by construction.
+ */
 export async function getMeetingNote(
   db: DbClient,
   teamId: string,
   id: string,
-  tier: ViewerTier
+  viewer: { memberId: string; tier: ViewerTier }
 ): Promise<MeetingNoteDetail | null> {
-  if (!canSeeMeetingNotes(tier)) return null;
+  if (!canSeeMeetingNotes(viewer.tier)) return null;
 
   const { data: note } = await db
     .from("meeting_notes")
-    .select("id, source_item_id, submitted_by, title, summary, occurred_at, created_at")
+    .select("id, source_item_id, submitted_by, title, summary, occurred_at, created_at, merged_into")
     .eq("team_id", teamId)
     .eq("id", id)
     .maybeSingle();
-  const row = note as NoteRow | null;
+  const row = note as (NoteRow & { merged_into: string | null }) | null;
   if (!row) return null;
+  if (row.merged_into) return null; // D4: a tombstone serves nobody — the survivor is canonical
+  const { canSeeItem } = await import("@/lib/access/enforce");
+  if (!(await canSeeItem(db, { teamId, memberId: viewer.memberId }, row.source_item_id))) return null;
 
   const [{ data: item }, { data: attendeeRows }, { data: submitterRows }] = await Promise.all([
     db.from("items").select("body").eq("id", row.source_item_id).maybeSingle(),

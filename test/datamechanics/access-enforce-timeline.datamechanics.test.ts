@@ -58,7 +58,8 @@ async function restrictItem(seed: Seed, itemId: string): Promise<string> {
 
 describe("enforced work-timeline builder (Phase B slice 4)", () => {
   it("enforcing: restricted evidence AND its task header never reach an outsider's ledger; General work still does", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const openItem = await commit(seed, "feat: open thing (AIO-10)");
     const secretItem = await commit(seed, "feat: secret launch codes (AIO-20)");
     await insertTask(seed, openItem.projectId!, { row_key: "AIO-10", title: "Open work", source_item_id: openItem.id });
@@ -78,7 +79,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
   });
 
   it("enforcing: a task with a VISIBLE citing commit but a RESTRICTED source item is dropped (title leak); a decision on a restricted item too", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const openItem = await commit(seed, "feat: visible work citing (AIO-30)");
     const secretItem = await commit(seed, "internal: hidden basis (AIO-99)");
     // The task's own definition doc is restricted, but the citing commit is General — the header
@@ -99,7 +101,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
   });
 
   it("enforcing: a meeting whose source transcript is restricted vanishes; a General meeting keeps its attendee rows", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const openT = await ingest(seed, { kind: "transcript", path: `meetings/${randomUUID()}.md`, access: "team", body: "open standup", frontmatter: { source: "granola", source_ts: recentIso, title: "Open standup" } });
     const secretT = await ingest(seed, { kind: "transcript", path: `meetings/${randomUUID()}.md`, access: "team", body: "board prep", frontmatter: { source: "granola", source_ts: recentIso, title: "Confidential board prep" } });
     const mk = async (itemId: string, title: string) => {
@@ -121,7 +124,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
   });
 
   it("enforcing: a hand-created task (created_by set, null source) still heads its group — a null-source drop would erase every dashboard task for everyone (Fable B4 Medium)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     // The citing commit is General; the task is dashboard-created (created_by set, no source item)
     // in a General-visible project. Under a naive null-source-drop the header vanishes for everyone.
     const commitItem = await commit(seed, "feat: do the UI thing (UI-1)");
@@ -137,7 +141,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
   });
 
   it("enforcing: a SYNCED task whose restricted source was PURGED (source→null) does NOT resurface — created_by null ⇒ dropped", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const commitItem = await commit(seed, "feat: cite the secret (SEC-1)");
     const secretItem = await commit(seed, "internal: secret basis (SEC-1)");
     // A SYNCED task tied to a restricted item (created_by null, like every synced row), then the item
@@ -154,7 +159,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
   });
 
   it("enforcing: an ADOPTED task (origin='ui' but created_by null) whose restricted source was purged does NOT leak — origin is durability, not access provenance (Codex B4 High)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const commitItem = await commit(seed, "feat: cite adopted (ADO-1)");
     const secretItem = await commit(seed, "internal: adopted secret basis (ADO-1)");
     // lib/pm-sync/inbound.ts flips an ADOPTED synced issue to origin='ui' while it still carries an
@@ -177,7 +183,8 @@ describe("enforced work-timeline builder (Phase B slice 4)", () => {
 
 describe("visibility-keyed timeline cache (§5.8)", () => {
   it("enforcing: the read NEVER serves the full-tier row — it builds and persists a vis:<hash> variant", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const item = await commit(seed, "feat: general note (AIO-50)");
     await insertTask(seed, item.projectId!, { row_key: "AIO-50", title: "General note task", source_item_id: item.id });
     const member = await seedMember(seed);
@@ -200,7 +207,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
   });
 
   it("two members with the SAME group signature share one variant row; a third with different groups gets another", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: shared corpus (AIO-60)");
     const a = await seedMember(seed);
     const b = await seedMember(seed);
@@ -227,7 +235,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
   });
 
   it("the tier row's LLM prose is never salvaged into a variant build (same-key salvage only)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     const item = await commit(seed, "feat: salvage probe (AIO-70)");
     await insertTask(seed, item.projectId!, { row_key: "AIO-70", title: "Salvage probe", source_item_id: item.id });
     const member = await seedMember(seed);
@@ -245,7 +254,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
   });
 
   it("purgeTimelineCacheTier removes the tier row AND every vis variant of that tier", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: purge probe (AIO-80)");
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
@@ -267,7 +277,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
   });
 
   it("fail closed: a substrate read error while resolving enforcement THROWS and caches nothing (Codex B4 Medium — an error-empty must not become a fresh shared variant)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await commit(seed, "feat: probe (ERR-1)");
     const member = await seedMember(seed);
     await backfillTeamContext(db(), seed.teamId);
@@ -290,7 +301,8 @@ describe("visibility-keyed timeline cache (§5.8)", () => {
   });
 
   it("fail closed: a timeline read with NO principal throws — the memberId==null arm is always-throw (PRET-6), never the tier row", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await expect(getCachedWorkTimeline(db(), seed.teamId, "team", null)).rejects.toThrow();
   });
 

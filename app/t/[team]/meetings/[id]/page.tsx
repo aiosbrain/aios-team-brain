@@ -17,5 +17,5 @@ export default async function MeetingNotePage({
   const me = await loadViewer(teamId);
   if (!me) return null;
 
-  return <MeetingDetailView teamSlug={teamSlug} teamId={teamId} noteId={id} tier={me.tier} />;
+  return <MeetingDetailView teamSlug={teamSlug} teamId={teamId} noteId={id} viewer={{ memberId: me.id, tier: me.tier }} />;
 }

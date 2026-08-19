@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { db, seedTeam, ingest } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { backfillMeetingNotesFromItems } from "@/lib/meetings/from-items";
 import { refreshMeetingNoteExtraction } from "@/lib/meetings/refresh";
 import { listMeetingNotesForTeam, getMeetingNote } from "@/lib/meetings/notes";
@@ -26,10 +27,12 @@ async function seedBlankNote(seed: Awaited<ReturnType<typeof seedTeam>>, path: s
 
 describe("meeting-notes refresh backfill (data-mechanics)", () => {
   it("fills a blank summary + action items on an existing note, no duplicate — and does NOT touch attendees", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await seedBlankNote(seed, "t/blank.md", "# John / Chetan AIOS\n\nAlex will send the deck Friday.");
 
-    const before = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const before = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(before.length).toBe(1);
     expect(before[0].summary).toBe(""); // the bug victim
 
@@ -42,7 +45,8 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     expect(res.summarized).toBe(1);
     expect(res.actionItems).toBe(1);
 
-    const after = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const after = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(after.length).toBe(1); // NO duplicate note created
     expect(after[0].summary).toBe("- Discussed the roadmap\n- Alex owns the deck");
     // ATTENDANCE IS NOT WRITTEN HERE ANY MORE (MTGATT-1 / AIO-962). This function is driven by
@@ -55,12 +59,14 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     // the change and the unit tier did not: the behaviour only exists at the DB write.
     expect(after[0].attendees).toEqual([]);
 
-    const detail = await getMeetingNote(db(), seed.teamId, after[0].id, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const detail = await getMeetingNote(db(), seed.teamId, after[0].id, { memberId: seed.memberId, tier: "team" });
     expect(detail!.extractedTodos.map((t) => t.title)).toEqual(["Send the deck"]);
   });
 
   it("onlyBlank=true skips notes that already have a summary", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await seedGranola(seed, "t/good.md", "# Standup\n\nnotes");
     await backfillMeetingNotesFromItems(db(), seed.teamId, {
       extract: async () => ({ summary: "- Already good", attendeeMemberIds: [] }),
@@ -72,12 +78,14 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     });
     expect(res.scanned).toBe(0); // the only note already has a summary → skipped entirely
 
-    const notes = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const notes = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(notes[0].summary).toBe("- Already good");
   });
 
   it("skips a note whose transcript body is empty (never fabricates a summary)", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await seedBlankNote(seed, "t/empty.md", "   "); // whitespace-only body
 
     const res = await refreshMeetingNoteExtraction(db(), seed.teamId, {
@@ -85,12 +93,14 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     });
     // Body is blank → note is skipped, or no note was even created for an empty transcript.
     expect(res.summarized).toBe(0);
-    const notes = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const notes = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     if (notes.length) expect(notes[0].summary).toBe("");
   });
 
   it("is idempotent — a second identical run re-writes the same summary", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     await seedBlankNote(seed, "t/idem.md", "# Sync\n\nnotes body here");
 
     const stub = { extract: async () => ({ summary: "- stable summary", attendeeMemberIds: [] }) };
@@ -98,7 +108,8 @@ describe("meeting-notes refresh backfill (data-mechanics)", () => {
     const second = await refreshMeetingNoteExtraction(db(), seed.teamId, stub);
     expect(second.summarized).toBe(1);
 
-    const notes = await listMeetingNotesForTeam(db(), seed.teamId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const notes = await listMeetingNotesForTeam(db(), seed.teamId, { memberId: seed.memberId, tier: "team" });
     expect(notes.length).toBe(1);
     expect(notes[0].summary).toBe("- stable summary");
   });

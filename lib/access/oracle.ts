@@ -47,20 +47,36 @@ function empty(): VisibleSet {
 }
 
 export async function visibleProjects(db: DbClient, principal: Principal): Promise<VisibleSet> {
-  const { data: member } = await db
+  const { set } = await visibleProjectsWithError(db, principal);
+  return set;
+}
+
+/**
+ * The ERROR-VISIBLE oracle read (ENFB-3, design round-2 HIGH 2): `visibleProjects` collapses
+ * substrate read errors into the same empty set a genuinely-grantless member gets — correct
+ * fail-closed serving behavior, but a caller that must DISCRIMINATE (the graph feeds' degraded
+ * arm: "oracle failed" ≠ "nothing visible") reads this variant. The `VisibleItemIds.error`
+ * precedent (lib/access/enforce.ts): error implies empty, never widens.
+ */
+export async function visibleProjectsWithError(
+  db: DbClient,
+  principal: Principal
+): Promise<{ set: VisibleSet; error?: boolean }> {
+  const { data: member, error: mErr } = await db
     .from("members")
     .select("id, kind, is_connector, status")
     .eq("team_id", principal.teamId)
     .eq("id", principal.memberId)
     .maybeSingle();
-  if (!member || !isPrincipal(member)) return empty();
+  if (mErr) return { set: empty(), error: true };
+  if (!member || !isPrincipal(member)) return { set: empty() };
 
   const { data: memberships, error: gmErr } = await db
     .from("group_members")
     .select("group_id, groups(slug, is_builtin)")
     .eq("team_id", principal.teamId)
     .eq("member_id", principal.memberId);
-  if (gmErr) return empty(); // fail closed on read error
+  if (gmErr) return { set: empty(), error: true }; // fail closed on read error
 
   // BUILT-IN membership acceptance — PRET-6: builtin rows are authoritative (the marker-keyed legacy conjunct retired with the
   // permissive model — the release precondition guarantees materialization). PERMANENT checks:
@@ -77,14 +93,14 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
       })
       .map((r) => r.group_id)
   );
-  if (groupIds.size === 0) return empty();
+  if (groupIds.size === 0) return { set: empty() };
 
   const { data: grants, error: pgErr } = await db
     .from("project_groups")
     .select("project_id")
     .eq("team_id", principal.teamId)
     .in("group_id", [...groupIds]);
-  if (pgErr) return empty();
+  if (pgErr) return { set: empty(), error: true };
   let projectIds = new Set(((grants ?? []) as { project_id: string }[]).map((r) => r.project_id));
 
   // Attenuation: intersection only — a scope naming an invisible project contributes nothing.
@@ -92,7 +108,7 @@ export async function visibleProjects(db: DbClient, principal: Principal): Promi
     const scope = new Set(principal.projectScope);
     projectIds = new Set([...projectIds].filter((p) => scope.has(p)));
   }
-  return { projectIds, groupIds };
+  return { set: { projectIds, groupIds } };
 }
 
 /** Convenience predicate over the oracle result. */

@@ -3,7 +3,6 @@ import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { adminClient } from "@/lib/db/admin";
-import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 import { recentFacts } from "@/lib/graph/learning";
 
 export const runtime = "nodejs";
@@ -13,9 +12,10 @@ const LIMIT = 15;
 
 /**
  * Layer 1 of the "What the Brain is Learning" panel: recently-extracted atomic facts from the
- * Graphiti graph (last 24h). Session-authed; the caller's TIER decides which group_ids are visible
- * (`visibleTierGroupIds`, resolved from the built-ins' STORED pointers so a renamed team still
- * reads its own graph) — the sole tier enforcement for the graph (no RLS backstop, CLAUDE.md §5).
+ * Graphiti graph (last 24h). Session-authed; the caller's ORACLE decides the visible partitions
+ * (ENFB-3: `selectEnforcedGraphPartitions` over the member's granted projects' STORED pointers —
+ * the one partition read model; a renamed team still reads its own graph because the pointers,
+ * not slugs, resolve) — the sole enforcement for the graph (no RLS backstop, CLAUDE.md §5).
  * Best-effort: an empty list when Graphiti/Neo4j is unconfigured or unreachable.
  */
 export async function GET(req: NextRequest) {
@@ -38,21 +38,57 @@ export async function GET(req: NextRequest) {
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  // PRET-4/6: the tier lens is POSTURE (everyone-membership) — members.tier is never an
-  // access input (the tier-no-access-reads guard caught this route's raw select in the merge).
-  const { resolveViewerPosture } = await import("@/lib/access/posture");
-  const tier = await resolveViewerPosture(adminClient(), team.id, (me as { id: string }).id);
-  // Pointer-resolved, admin-scoped by teamId (the pointer lives on `projects`, which the member's
-  // RLS view does not cover). A resolution failure degrades HONESTLY — `degraded: true` with no
-  // facts — rather than falling back to a slug-derived id, which on a renamed team is a group that
-  // has never been written to and reads as a benign empty panel.
-  let groups: string[];
-  try {
-    groups = await visibleTierGroupIds(adminClient(), { teamId: team.id, teamSlug, tier });
-  } catch (e) {
-    console.error(`[facts] tier group resolution failed for team ${teamSlug}:`, e);
+  // ENFB-3: the ONE partition read model — the member's ORACLE scope through the STORED
+  // pointers (`selectEnforcedGraphPartitions`, the path graph-query/arcs/retrieve adopted in
+  // ENFB-1), replacing the legacy tier-pair resolution. Measured no-op for a stock member
+  // (the system pointers ARE the legacy pair). arm:false — a 60s-polling feed must not be an
+  // arming heartbeat; k uncapped — no silent truncation. Discrimination (design round 2):
+  //   oracle read ERROR            → degraded JSON (the panels' existing tolerance);
+  //   genuinely-empty scope        → empty feed (incl. General debt-suppressed — fail closed);
+  //   visible system project + zero pointers + NOT suppressed → a WIRING FAULT, loud 500.
+  // Deliberately not carried from the legacy resolver (spec §1): the slug-derived
+  // unbootstrapped fallback (stored path = one owner), assertDirection (PRET-4 ruling 2:
+  // grants ARE the scope), assertNoForeignHistory (pointer-only resolution never reaches the
+  // slug-reuse state).
+  const { visibleProjectsWithError } = await import("@/lib/access/oracle");
+  const { selectEnforcedGraphPartitions } = await import("@/lib/graph/partition-read");
+  const oracle = await visibleProjectsWithError(adminClient(), { teamId: team.id, memberId: (me as { id: string }).id });
+  if (oracle.error) {
+    console.error(`[facts] oracle resolution failed for team ${teamSlug}`);
     return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
   }
+  let groups: string[];
+  try {
+    const scope = await selectEnforcedGraphPartitions(adminClient(), {
+      teamId: team.id,
+      visibleProjectIds: [...oracle.set.projectIds],
+      k: Number.MAX_SAFE_INTEGER,
+      arm: false,
+    });
+    const { data: sysVisible, error: sysErr } = await adminClient()
+      .from("projects")
+      .select("id")
+      .eq("team_id", team.id)
+      .eq("kind", "system")
+      .in("id", [...oracle.set.projectIds])
+      .limit(1);
+    // An ERRORED discriminator input is UNDETERMINABLE, not "no" (Codex diff L2): returning a
+    // benign empty here would mask exactly the wiring fault the loud arm exists to surface.
+    if (sysErr) {
+      console.error(`[feed] system-project discriminator read failed for team ${teamSlug}:`, sysErr.message);
+      return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
+    }
+    const seesSystem = ((sysVisible ?? []) as unknown[]).length > 0;
+    if (scope.groups.length === 0 && seesSystem && !scope.generalSuppressed) {
+      console.error(`[facts] zero partitions for a system-visible member on team ${teamSlug} — stored pointers missing (wiring fault)`);
+      return errorResponse("internal", "graph partition resolution failed", 500);
+    }
+    groups = scope.groups;
+  } catch (e) {
+    console.error(`[facts] partition resolution failed for team ${teamSlug}:`, e);
+    return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
+  }
+
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const { facts, ok } = await recentFacts(groups, since, LIMIT);
 

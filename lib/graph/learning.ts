@@ -4,7 +4,7 @@ import { itemIdFromEpisodeName } from "./episode-name";
 
 /**
  * "What the Brain is Learning" reads over Graphiti's Neo4j graph. Every query is scoped to the
- * caller's TIER-VISIBLE group_ids (`lib/graph/tier-groups.visibleTierGroupIds`) — Graphiti has no tier
+ * caller's resolved partition set (ENFB-3: the feeds pass the member's ORACLE partitions via `selectEnforcedGraphPartitions`) — Graphiti has no tier
  * awareness, so `WHERE x.group_id IN $groups` is the SOLE enforcement stopping an `external` viewer
  * from seeing team facts (no RLS backstop, CLAUDE.md §5). Guarded by test/guards/graph-tier-filter.
  *
@@ -60,7 +60,7 @@ export interface AtomicFact {
 
 /**
  * Layer 1 — recent atomic facts for the given tier-visible groups, newest WORK first (`workTs`, not
- * extraction time). `groups` MUST be the caller's `visibleTierGroupIds(db, {teamId, teamSlug, tier})`
+ * extraction time). `groups` MUST be the caller's RESOLVED partition scope (ENFB-3: the oracle's stored-pointer partitions)
  * — pointer-resolved, never slug-derived (the rename doctrine). `sinceISO` bounds
  * the window (e.g. last 24h of work).
  */

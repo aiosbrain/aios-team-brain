@@ -5,6 +5,7 @@ import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/mana
 import { createMeetingNoteFromItem, getMeetingNote, MEETING_NOTES_PROJECT_SLUG } from "@/lib/meetings/notes";
 import { MEETING_TODO_PROJECT_SLUG } from "@/lib/meetings/extract-todos";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 // Spec: the Meetings-page "extract action items" + "push to Linear" flow, verified to the observable
 // outcome on real Postgres. extractMeetingActionItemsAction materializes tasks in the
@@ -119,7 +120,8 @@ afterEach(() => {
 
 describe("meeting action items → push to Linear", () => {
   it("extracts action items into tasks and pushes only the selected ones to Linear", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     h.memberId = seed.memberId;
     await seedLinearPrimary(seed);
     const { fetchImpl } = linearMock();
@@ -128,6 +130,7 @@ describe("meeting action items → push to Linear", () => {
     const { noteId, itemId } = await seedMeetingNote(seed);
 
     // 1. Extract — materializes both action items as tasks.
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the action rides the gated read
     const extracted = await extractMeetingActionItemsAction(seed.teamSlug, noteId);
     expect(extracted).toMatchObject({ ok: true, extracted: 2 });
 
@@ -154,7 +157,8 @@ describe("meeting action items → push to Linear", () => {
     expect(linkTasks.some((l) => l.task_id === other.id)).toBe(false);
 
     // 4. getMeetingNote reflects the pushed state for the UI.
-    const note = await getMeetingNote(db(), seed.teamId, noteId, "team");
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: converge memberships before the gated read
+    const note = await getMeetingNote(db(), seed.teamId, noteId, { memberId: seed.memberId, tier: "team" });
     const pushedTodo = note!.extractedTodos.find((t) => t.taskId === target.id);
     const unpushedTodo = note!.extractedTodos.find((t) => t.taskId === other.id);
     expect(pushedTodo?.pushed).toMatchObject({ provider: "linear" });
@@ -162,9 +166,11 @@ describe("meeting action items → push to Linear", () => {
   });
 
   it("refuses to push when no PM provider is configured", async () => {
-    const seed = await seedTeam();
+    const seed = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), seed.teamId);
     h.memberId = seed.memberId;
     const { noteId, itemId } = await seedMeetingNote(seed);
+    await backfillTeamContext(db(), seed.teamId); // ENFB-3: the action rides the gated read
     await extractMeetingActionItemsAction(seed.teamSlug, noteId);
     const tasks = await meetingTaskIds(seed.teamId, itemId);
 

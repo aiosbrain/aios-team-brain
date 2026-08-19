@@ -62,10 +62,10 @@ export async function POST(req: NextRequest) {
   let scope: import("@/lib/graph/partition-read").ArcScope;
   try {
     enforce = await memberEnforcement(admin, { teamId: team.id, memberId });
-    // PRET-3 ARCS UNIFICATION (docs/design/pret3-arcs-unification.md): ONE mode-keyed resolution
-    // for EVERY reader class — enforcing teams get the member's oracle scope (uncapped, arm:true,
-    // any tier: ruling 2 makes externals members); permissive teams get the built-in pointer
-    // partitions (arm:false). The tier-row path has no reader after this.
+    // PRET-3 ARCS UNIFICATION (docs/design/pret3-arcs-unification.md), post-PRET-6 shape:
+    // ONE resolution for every reader — the member's oracle scope (uncapped, arm:true, any
+    // tier: ruling 2 makes externals members). The permissive arm this comment once named
+    // retired with the model (resolveArcScope always returns arm:true now).
     scope = await resolveArcScope(admin, { teamId: team.id, teamSlug, memberId, tier, enforcement: enforce });
   } catch {
     return errorResponse("internal", "enforcement check failed", 500);

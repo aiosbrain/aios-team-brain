@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createMeetingNote, listMeetingNotesForTeam } from "@/lib/meetings/notes";
 import { backfillMergeDuplicateMeetings } from "@/lib/meetings/merge";
 import { db, seedTeam } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for the one-time duplicate-merge backfill on real Postgres. Derived from intent: already-
@@ -30,7 +31,8 @@ async function member(teamId: string, name: string): Promise<string> {
 
 describe("backfill: merge duplicate meetings (real Postgres)", () => {
   it("collapses same-date overlapping notes into one, credits both, and leaves unrelated meetings alone", async () => {
-    const { teamId, memberId: chetan } = await seedTeam();
+    const { teamId, memberId: chetan } = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), teamId);
     const john = await member(teamId, "John");
 
     await createMeetingNote(db(), teamId, { title: "AIOS sync", rawText: A, submittedByMemberId: chetan, occurredAt: DATE });
@@ -38,13 +40,15 @@ describe("backfill: merge duplicate meetings (real Postgres)", () => {
     await createMeetingNote(db(), teamId, { title: "Standup", rawText: UNRELATED, submittedByMemberId: chetan, occurredAt: DATE });
 
     // Three separate notes before the backfill.
-    expect((await listMeetingNotesForTeam(db(), teamId, "team")).length).toBe(3);
+    await backfillTeamContext(db(), teamId); // ENFB-3: converge memberships before the gated read
+    expect((await listMeetingNotesForTeam(db(), teamId, { memberId: chetan, tier: "team" })).length).toBe(3);
 
     const summary = await backfillMergeDuplicateMeetings(db(), teamId, { keys: {}, actorMemberId: chetan });
     expect(summary.clusters).toBe(1);
     expect(summary.merged).toBe(1);
 
-    const visible = await listMeetingNotesForTeam(db(), teamId, "team");
+    await backfillTeamContext(db(), teamId);
+    const visible = await listMeetingNotesForTeam(db(), teamId, { memberId: chetan, tier: "team" });
     expect(visible.length).toBe(2); // the merged AIOS note + the untouched standup
 
     const aios = visible.find((n) => n.title === "AIOS sync")!;
@@ -53,7 +57,8 @@ describe("backfill: merge duplicate meetings (real Postgres)", () => {
   });
 
   it("is a no-op when there are no duplicates", async () => {
-    const { teamId, memberId } = await seedTeam();
+    const { teamId, memberId } = await seedTeam(); // ENFB-3: gated reads need a context-bootstrapped team
+    await backfillTeamContext(db(), teamId);
     await createMeetingNote(db(), teamId, { title: "Solo", rawText: A, submittedByMemberId: memberId, occurredAt: DATE });
     const summary = await backfillMergeDuplicateMeetings(db(), teamId, { keys: {}, actorMemberId: memberId });
     expect(summary.merged).toBe(0);

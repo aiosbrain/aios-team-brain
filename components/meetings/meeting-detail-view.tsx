@@ -13,16 +13,17 @@ export async function MeetingDetailView({
   teamSlug,
   teamId,
   noteId,
-  tier,
+  viewer,
 }: {
   teamSlug: string;
   teamId: string;
   noteId: string;
-  tier: ViewerTier;
+  viewer: { memberId: string; tier: ViewerTier };
 }) {
   const db = await serverClient();
-  // getMeetingNote enforces the team-tier gate itself (external → null).
-  const note = await getMeetingNote(db, teamId, noteId, tier);
+  // ENFB-3: getMeetingNote gates on the viewer's ORACLE (canSeeItem on the source transcript)
+  // plus posture — denied, tombstoned, and unknown all take the same notFound (§5.7).
+  const note = await getMeetingNote(db, teamId, noteId, viewer);
   if (!note) notFound();
 
   return (

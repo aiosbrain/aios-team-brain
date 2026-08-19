@@ -20,9 +20,12 @@ export const loadTeamId = cache(async (teamSlug: string): Promise<string | null>
 /** The current member for this team (id/role/tier), memoized per team for the request. */
 export const loadViewer = cache((teamId: string) => currentMember(teamId));
 
-export const loadMeetingNotes = cache(async (teamId: string, tier: ViewerTier): Promise<MeetingNoteSummary[]> => {
+// Keyed on SCALARS (Fable diff M2): `cache()` keys on argument identity, and a fresh
+// `{memberId, tier}` literal per call site defeated the per-request memoization — every
+// meetings index render paid the oracle materialization + the notes/attendee queries twice.
+export const loadMeetingNotes = cache(async (teamId: string, memberId: string, tier: ViewerTier): Promise<MeetingNoteSummary[]> => {
   const db = await serverClient();
-  return listMeetingNotesForTeam(db, teamId, tier);
+  return listMeetingNotesForTeam(db, teamId, { memberId, tier });
 });
 
 /** When the meeting happened, if known, else when it was ingested — the sort key for the list. */

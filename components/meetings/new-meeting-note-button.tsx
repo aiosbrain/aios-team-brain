@@ -49,6 +49,14 @@ export function NewMeetingNoteButton({ teamSlug }: { teamSlug: string }) {
     }
     setOpen(false);
     reset();
+    // ENFB-3 D2: pendingVisibility = the upload is DURABLE but not yet indexed for the
+    // visibility oracle (inline reconcile incomplete) — navigating would 404 until the sync
+    // sweep, and re-submitting would create a duplicate. Close, notify, stay put.
+    if (res.pendingVisibility) {
+      window.alert("Uploaded — your meeting will appear within the next sync interval.");
+      router.refresh();
+      return;
+    }
     if (res.id) router.push(`/t/${teamSlug}/meetings/${res.id}`);
     router.refresh();
   }

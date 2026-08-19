@@ -82,21 +82,16 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
   it("every graph read leg still references the pointer authority (presence, not behaviour)", () => {
     // The legs that were defective. Named individually because "no episodeGroupId" is satisfied
     // vacuously by a leg that stops reading the graph at all.
-    const legs = [
+    // ENFB-3 moved the feed legs to the PARTITION path — their needles moved with them (this
+    // guard reddening on the cutover commit was the designed behavior; the needle and the
+    // wiring travel together). retrieve.ts (PRET-6), graph-query (ENFB-1), and the two feeds
+    // (ENFB-3) are pointer-resolved through `selectEnforcedGraphPartitions` (stored pointers).
+    for (const f of [
+      "lib/query/retrieve.ts",
+      "app/api/v1/graph-query/route.ts",
       "app/api/brain/facts/route.ts",
       "app/api/brain/events/route.ts",
-    ];
-    for (const f of legs) {
-      // `code()`, not raw text — this suite strips comments precisely so a guard cannot be
-      // satisfied by a comment that merely NAMES the thing it is checking for.
-      expect(code(join(ROOT, f)), `${f} must resolve its groups from the pointers`).toContain(
-        "visibleTierGroupIds("
-      );
-    }
-    // retrieve.ts (PRET-6) and graph-query (ENFB-1) are pointer-resolved through the PARTITION
-    // path (`selectEnforcedGraphPartitions` reads stored pointers) — pin that reference, not
-    // the tier-groups helper those cutovers removed from these files.
-    for (const f of ["lib/query/retrieve.ts", "app/api/v1/graph-query/route.ts"]) {
+    ]) {
       expect(code(join(ROOT, f)), `${f} resolves groups via the stored-pointer partition read`).toContain(
         "selectEnforcedGraphPartitions("
       );
