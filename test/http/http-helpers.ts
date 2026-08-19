@@ -66,7 +66,7 @@ export async function issueAdminKey(seed: Seed): Promise<{ key: string }> {
 }
 
 /** Seed a member with a known email + password under the seeded team (for login tests). */
-export async function seedMemberEmail(seed: Seed): Promise<{ email: string; password: string }> {
+export async function seedMemberEmail(seed: Seed): Promise<{ email: string; password: string; memberId: string }> {
   const email = `login-${randomUUID().slice(0, 8)}@test.local`;
   const password = `test-password-${randomUUID().slice(0, 12)}`;
   const { error } = await db()
@@ -85,7 +85,7 @@ export async function seedMemberEmail(seed: Seed): Promise<{ email: string; pass
   const { placeMemberByTier } = await import("../datamechanics/helpers");
   await placeMemberByTier(seed.teamId, (loginRow as { id: string }).id, "team");
   await adminSetPassword(email, password);
-  return { email, password };
+  return { email, password, memberId: (loginRow as { id: string }).id };
 }
 
 /** Standard auth headers for an API-key request. */
