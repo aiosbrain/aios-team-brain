@@ -1,9 +1,9 @@
 import { NextRequest } from "next/server";
 import { serverClient } from "@/lib/db/server";
-import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { visibleGroupIds } from "@/lib/graph/group";
+import { adminClient } from "@/lib/db/admin";
+import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 import { recentFacts } from "@/lib/graph/learning";
 
 export const runtime = "nodejs";
@@ -14,7 +14,8 @@ const LIMIT = 15;
 /**
  * Layer 1 of the "What the Brain is Learning" panel: recently-extracted atomic facts from the
  * Graphiti graph (last 24h). Session-authed; the caller's TIER decides which group_ids are visible
- * (`visibleGroupIds`) — the sole tier enforcement for the graph (no RLS backstop, CLAUDE.md §5).
+ * (`visibleTierGroupIds`, resolved from the built-ins' STORED pointers so a renamed team still
+ * reads its own graph) — the sole tier enforcement for the graph (no RLS backstop, CLAUDE.md §5).
  * Best-effort: an empty list when Graphiti/Neo4j is unconfigured or unreachable.
  */
 export async function GET(req: NextRequest) {
@@ -37,10 +38,21 @@ export async function GET(req: NextRequest) {
     .maybeSingle();
   if (!me) return errorResponse("forbidden", "not a member of this team", 403);
 
-  // PRET-4 §1a: posture, not the record.
+  // PRET-4/6: the tier lens is POSTURE (everyone-membership) — members.tier is never an
+  // access input (the tier-no-access-reads guard caught this route's raw select in the merge).
   const { resolveViewerPosture } = await import("@/lib/access/posture");
   const tier = await resolveViewerPosture(adminClient(), team.id, (me as { id: string }).id);
-  const groups = visibleGroupIds(teamSlug, tier);
+  // Pointer-resolved, admin-scoped by teamId (the pointer lives on `projects`, which the member's
+  // RLS view does not cover). A resolution failure degrades HONESTLY — `degraded: true` with no
+  // facts — rather than falling back to a slug-derived id, which on a renamed team is a group that
+  // has never been written to and reads as a benign empty panel.
+  let groups: string[];
+  try {
+    groups = await visibleTierGroupIds(adminClient(), { teamId: team.id, teamSlug, tier });
+  } catch (e) {
+    console.error(`[facts] tier group resolution failed for team ${teamSlug}:`, e);
+    return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
+  }
   const since = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
   const { facts, ok } = await recentFacts(groups, since, LIMIT);
 

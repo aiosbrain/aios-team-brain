@@ -7,7 +7,8 @@ import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
 import { recentFacts, resolveEpisodeItems, type AtomicFact } from "./learning";
 import { GraphitiClient } from "./graphiti-client";
-import { episodeGroupId, isExternalGroupId, type AccessTier } from "./group";
+import { isExternalGroupId, type AccessTier } from "./group";
+import { builtinTierGroupId } from "./tier-groups";
 import { attributedFactTexts, groundParticipants } from "./arc-attribution";
 import { resolveItemCredit } from "@/lib/attribution/contributor-credit";
 import {
@@ -1467,11 +1468,20 @@ export async function recomputeArcs(
   // BOTH partition namespaces (Fable PPARC-3 High 1: the g: key — the one the enforced recompute
   // actually sends post-cutover — fell through to the TIER branch, landing a restricted arc's
   // correction prose in the Everyone-searchable team group).
+  // The tier branch is POINTER-RESOLVED, not slug-derived (the rename doctrine — see
+  // lib/graph/tier-groups.ts): `episodeGroupId(teamSlug, "team")` names `<live-slug>_team`, which
+  // after a rename is a group the projector never writes and no reader searches, so the correction
+  // would land somewhere nothing reads. That branch is already unreachable in production — PRET-3
+  // made `scopeKey` a required `g:` key and every caller resolves its groups from the pointers via
+  // `resolveArcScope` — but an unanchored slug-derived write target is exactly the kind of thing
+  // that becomes live again on the next refactor, so it follows the pointer too.
   const writebackTarget = key.startsWith("g:")
     ? groups.length === 1 && !isExternalGroupId(groups[0])
       ? groups[0]
       : null
-    : episodeGroupId(teamSlug, "team");
+    : // Best-effort by this block's own doc, and it runs AFTER the correction is persisted — so a
+      // transient pointer-read failure must not 500 a recompute whose edit already landed.
+      await builtinTierGroupId(db, { teamId, teamSlug, access: "team" }).catch(() => null);
   const client = new GraphitiClient();
   if (client.configured && corrections.length && writebackTarget) {
     const now = new Date().toISOString();

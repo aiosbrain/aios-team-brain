@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { episodeGroupId, visibleGroupIds } from "@/lib/graph/group";
+import { episodeGroupId } from "@/lib/graph/group";
 
 describe("graph tier-scoped group ids", () => {
   it("encodes team + tier into the group id", () => {
@@ -20,11 +20,8 @@ describe("graph tier-scoped group ids", () => {
     expect(() => episodeGroupId("bad slug!", "team")).toThrow(/invalid Graphiti group_id/);
   });
 
-  it("a team viewer may search both tiers", () => {
-    expect(visibleGroupIds("acme", "team").sort()).toEqual(["acme_external", "acme_team"]);
-  });
-
-  it("an external viewer may search ONLY the external group (no team leak)", () => {
-    expect(visibleGroupIds("acme", "external")).toEqual(["acme_external"]);
-  });
+  // The tier-fence assertions that used to live here ("a team viewer sees both, an external viewer
+  // sees ONLY external") moved to lib/graph/tier-groups.test.ts with `visibleGroupIds` itself: the
+  // read set is resolved from the built-ins' stored pointers now, not recomputed from the live
+  // slug, because a slug rename made the reader and the projector name different groups.
 });
