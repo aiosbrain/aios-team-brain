@@ -73,10 +73,20 @@ export interface AnsweringState {
     usedFallback: boolean;
     /** Cheaper model for the calls Graphiti marks `ModelSize.small` (teams.extraction_small_model). */
     smallModel: string | null;
-    /** Is that cheap model actually serving those calls right now? */
+    /** Is that cheap model configured for those calls? Runtime evidence is `smallRouting`. */
     smallEnabled: boolean;
     /** Set, but NOT in effect — the extraction role is off or it fell back. A reverted cost control. */
     smallInert: boolean;
+    /** AIO-983: what the LEDGER says the small model actually served. null = not enabled.
+     *  Discriminated so "nothing to judge" can never render as "it isn't working". */
+    smallRouting:
+      | { state: "not_configured" }
+      | { state: "unavailable" }
+      | { state: "no_traffic" }
+      | { state: "inconclusive"; eligible: number }
+      | { state: "not_routing"; eligible: number }
+      | { state: "routing"; servedSmall: number; eligible: number }
+      | null;
   };
 }
 
@@ -648,10 +658,54 @@ export function IntegrationsManager({
             </button>
           </div>
           {answering.extraction.smallEnabled ? (
-            <p className="text-xs text-ink-secondary">
-              Effective: <span className="font-medium text-violet">{answering.extraction.smallModel}</span>
-              <span className="ml-1">· serving the simple graph calls</span>
-            </p>
+            <>
+              <p className="text-xs text-ink-secondary">
+                Effective: <span className="font-medium text-violet">{answering.extraction.smallModel}</span>
+                <span className="ml-1">· configured for the simple graph calls</span>
+              </p>
+              {/* "Configured and resolvable" is not "working" — this line is the difference, and it
+                  is the whole point of AIO-983. It reports the ABSENCE of routing as loudly as the
+                  presence, and stays silent when there is nothing to judge rather than guessing. */}
+              {answering.extraction.smallRouting?.state === "not_routing" ? (
+                <p className="text-xs text-amber-700">
+                  Enabled, but <span className="font-medium">none</span> of the{" "}
+                  {answering.extraction.smallRouting.eligible} simple graph calls since it was set were
+                  actually served by it —
+                  every one went to the extraction model. The graph service and this brain disagree about
+                  which calls are cheap. If the graph service reaches this brain&apos;s LLM proxy, rebuild its
+                  image so the canonical proxy route sends the <code className="font-mono">aios-small</code>{" "}
+                  sentinel.
+                </p>
+              ) : answering.extraction.smallRouting?.state === "routing" ? (
+                /* Neutral, not "confirmed" (review Low 3): 1-of-50 is partial drift — a mixed fleet
+                   where one image migrated and one did not — and a confirmation framing would read
+                   past it. The ratio is shown so an operator can see which it is. */
+                <p className="text-xs text-ink-secondary">
+                  Serving {answering.extraction.smallRouting.servedSmall} of the last{" "}
+                  {answering.extraction.smallRouting.eligible} simple graph calls.
+                </p>
+              ) : answering.extraction.smallRouting?.state === "unavailable" ? (
+                <p className="text-xs text-ink-secondary">
+                  Could not verify routing from the audited usage data, so no routing claim is being made.
+                </p>
+              ) : answering.extraction.smallRouting?.state === "inconclusive" ? (
+                <p className="text-xs text-ink-secondary">
+                  Only {answering.extraction.smallRouting.eligible} recent simple graph calls — not enough to
+                  confirm it is serving them yet.
+                </p>
+              ) : answering.extraction.smallRouting?.state === "no_traffic" ? (
+                <p className="text-xs text-ink-secondary">
+                  No eligible metered graph calls have run since this was set, so there is nothing to check yet.
+                </p>
+              ) : null}
+              {/* These calls cannot change WHICH entities or facts are extracted — that is what makes
+                  downgrading them a different risk class — but they do decide duplicate-fact and
+                  summary quality. Say so where the choice is made, not in a ticket. */}
+              <p className="text-xs text-ink-secondary">
+                These are the simple calls only (de-duplication, summaries). They never affect which
+                entities or facts are extracted, but they do affect duplicate-fact and summary quality.
+              </p>
+            </>
           ) : answering.extraction.smallInert ? (
             <p className="text-xs text-amber-700">
               Saved but NOT in effect — every call is still served by the extraction model. Set an

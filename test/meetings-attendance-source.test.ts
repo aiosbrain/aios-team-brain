@@ -39,12 +39,15 @@ describe("parseParticipantNames — the shapes that actually occur in prod", () 
   });
 
   it("keeps a name containing an apostrophe intact", () => {
-    // `Michael 'Porch' Contreras` occurs in prod — the only intra-name punctuation there is.
-    expect(parseParticipantNames("[John Ellison, Pete Longworth, Jana, Michael 'Porch' Contreras]")).toEqual([
+    // A production participant list carries a name of exactly this shape — an apostrophe-quoted
+    // nickname — and it is the only intra-name punctuation there is, which is what makes this the
+    // regression case. The names here are PLACEHOLDERS (this repo is public); keep the SHAPE if you
+    // ever change them, and do not restore the real ones.
+    expect(parseParticipantNames("[John Ellison, Alex Marchetti, Mira, Daniel 'Dash' Okonkwo]")).toEqual([
       "John Ellison",
-      "Pete Longworth",
-      "Jana",
-      "Michael 'Porch' Contreras",
+      "Alex Marchetti",
+      "Mira",
+      "Daniel 'Dash' Okonkwo",
     ]);
   });
 
@@ -115,11 +118,11 @@ describe("resolveAttendance — precedence, and the model as a last resort", () 
   });
 
   it("AC2: a structured list resolving to NOBODY does not fall through to the model", async () => {
-    // Granola's `[John Ellison, Pete Longworth]` with Pete not on the team. The tempting behaviour is
+    // Granola's `[John Ellison, Alex Marchetti]` with Alex not on the team. The tempting behaviour is
     // "we got nothing useful, ask the model" — which re-opens the original bug precisely on the
     // meetings with the most outside names lying around to mistake for attendees.
     const llm = vi.fn(async () => ["m-abe", "m-fatma"]);
-    const out = await resolveAttendance({ participants: "[Pete Longworth]", roster: ROSTER, llm });
+    const out = await resolveAttendance({ participants: "[Alex Marchetti]", roster: ROSTER, llm });
     expect(out.memberIds).toEqual([]);
     expect(out.source).toBe("participants");
     expect(llm).not.toHaveBeenCalled();
@@ -127,12 +130,12 @@ describe("resolveAttendance — precedence, and the model as a last resort", () 
 
   it("AC2: names that resolved to nobody are REPORTED, not silently dropped", async () => {
     const out = await resolveAttendance({
-      participants: "[John Ellison, Pete Longworth, Rob White]",
+      participants: "[John Ellison, Alex Marchetti, Sam Fielding]",
       roster: ROSTER,
       llm: async () => [],
     });
     expect(out.memberIds).toEqual(["m-john"]);
-    expect(out.unresolved).toEqual(["Pete Longworth", "Rob White"]);
+    expect(out.unresolved).toEqual(["Alex Marchetti", "Sam Fielding"]);
   });
 
   it("resolves granola's fuller name against a shorter roster entry, and vice versa", async () => {
@@ -171,7 +174,7 @@ describe("matchAsserted — strict, because an asserted name is not a guess", ()
   it("does NOT record a member who merely shares a first name with an outside guest", () => {
     // `[John Smith]` against a roster holding `John Ellison` used to record JOHN ELLISON — inventing
     // a plausible teammate's attendance from an authoritative source. Granola's lists demonstrably
-    // carry outsiders (Pete Longworth, Jana, Anusheel Bhushan, Rob White).
+    // carry outsiders (Alex Marchetti, Mira, Priya Raghavan, Sam Fielding).
     const out = matchAsserted(["John Smith"], ROSTER);
     expect(out.memberIds).toEqual([]);
     expect(out.unresolved).toEqual(["John Smith"]);

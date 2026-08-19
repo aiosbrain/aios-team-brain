@@ -18,7 +18,12 @@ import {
   assessSession,
   VERDICT,
 } from "../scripts/graph-window-battery/decision.mjs";
-import { SMALL_ELIGIBLE_KINDS, wantsSmallModel, GRAPHITI_SMALL_MODEL_MARKER } from "@/lib/llm/graph-call-kind";
+import {
+  AIOS_SMALL_SENTINEL,
+  SMALL_ELIGIBLE_KINDS,
+  wantsSmallModel,
+  GRAPHITI_SMALL_MODEL_MARKER,
+} from "@/lib/llm/graph-call-kind";
 import { selectSmallExtractionBackend } from "@/lib/query/llm-backend";
 
 // Spec: docs/design/graph-small-model-activation.md — the acceptance criteria. These pin the metrics
@@ -210,6 +215,18 @@ describe("marker pre-flight — settles 28.7% vs 18.7% before anything is spent"
     expect(t.requests).toBe(3);
     expect(t.kinds.find((k: { kind: string }) => k.kind === "dedupe_edges")).toMatchObject({ calls: 2, marked: 2 });
     expect(t.kinds.find((k: { kind: string }) => k.kind === "extract_nodes")).toMatchObject({ calls: 1, marked: 0 });
+  });
+
+  it("counts both the protocol sentinel and the legacy marker", async () => {
+    const { tallyMarkers } = await import("../scripts/graph-window-battery/small-marker-preflight.mjs");
+    const t = tallyMarkers([
+      req(DEDUPE_EDGES, AIOS_SMALL_SENTINEL),
+      req(DEDUPE_EDGES, GRAPHITI_SMALL_MODEL_MARKER),
+    ]);
+    expect(t.kinds.find((k: { kind: string }) => k.kind === "dedupe_edges")).toMatchObject({
+      calls: 2,
+      marked: 2,
+    });
   });
 
   it("reports the 18.7% case when node_summaries_batch never carries the marker", async () => {

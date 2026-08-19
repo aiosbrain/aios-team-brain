@@ -80,9 +80,11 @@ export function mergeTranscripts(a: string, b: string): string {
  * two became two notes for one meeting — one with exact attendance and no content, one with content
  * and inferred (sometimes invented) attendance.
  *
- * Deliberately token-set based, not string equality. The two producers name the same meeting
- * differently — Google carries the invite subject ("Stephan & John — DSM-Firmenich Demo Prep"),
- * Granola derives its own ("Stephan & John — DSM-Firmenich Demo Prep + AIOS"). Requiring equality
+ * Deliberately token-set based, not string equality. (Titles here are PLACEHOLDERS for real
+ * production meetings — this repo is public. Keep the SHAPE if you change them: one producer's
+ * title must EXTEND the other's, which is the case this exists for.) The two producers name the same meeting
+ * differently — Google carries the invite subject ("Ana & John — Northwind Demo Prep"),
+ * Granola derives its own ("Ana & John — Northwind Demo Prep + AIOS"). Requiring equality
  * would merge almost nothing; requiring a shared token would merge almost everything ("Meeting").
  *
  * ⚠️ DORMANT — it has NO production caller yet. `findDuplicateMeeting` accepts an `incomingTitle`

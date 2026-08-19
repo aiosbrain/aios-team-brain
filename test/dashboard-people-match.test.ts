@@ -82,7 +82,9 @@ describe("decisionActors", () => {
   });
 
   it("contributes NOTHING for an unknown party or an empty string — never a guess", () => {
-    expect(decisionActors("Abdul Bahri", roster)).toEqual([]);
+    // A plausible full name that is NOT on the roster. Placeholder — the original was a real
+    // client contact, and this repo is public.
+    expect(decisionActors("Dana Whitfield", roster)).toEqual([]);
     expect(decisionActors("", roster)).toEqual([]);
     expect(decisionActors("the team", roster)).toEqual([]);
   });

@@ -115,8 +115,9 @@ export interface BackfillSummary {
    * Names the producer ASSERTED as participants that resolve to nobody on this team (MTGATT-1).
    *
    * Counted rather than ignored because it is the honest size of a known gap: attendance rows are a
-   * NOT NULL FK to `members`, so an external guest cannot be recorded at all. Prod examples: Pete
-   * Longworth, Anusheel Bhushan, Rob White. A rising number here means real attendees are being lost
+   * NOT NULL FK to `members`, so an external guest cannot be recorded at all. Prod examples: Alex
+   * Marchetti, Priya Raghavan, Sam Fielding — placeholder names for real production participants,
+   * who are not named here because this repo is public. A rising number here means real attendees are being lost
    * — invisible if nobody counts it.
    */
   unresolvedAttendees: number;
