@@ -172,8 +172,9 @@ export async function memberVisibility(db: DbClient, principal: Principal): Prom
 /**
  * The EXPENSIVE half — the membership-visible item-id set — resolved lazily from a
  * `MemberVisibility` only when a surface actually BUILDS (cache miss / stale rebuild), never on a
- * hit. Structured rows gate on their source item (a null-source UI task is handled by `origin`, not
- * a project lookup — `tasks.project_id` is the INGEST project, not an access-control project).
+ * hit. Structured rows gate on their source item; null-source rows go through the CREATED_BY
+ * provenance rule (`lib/access/provenance`, ENFB-1 — `origin` is durability, never provenance;
+ * `tasks.project_id` is the INGEST project, not an access-control project).
  */
 export interface TimelineEnforcement {
   visibleItemIds: ReadonlySet<string>;

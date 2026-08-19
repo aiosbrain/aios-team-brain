@@ -17,7 +17,8 @@ const schema = z.object({
 /**
  * POST /api/v1/graph-query — natural-language query against the Graphiti graph memory
  * (experiment, alongside `/api/v1/query`). Tier-enforced: results are scoped to the group_ids
- * the caller's tier may see (`visibleGroupIds`) — Graphiti has no tier awareness, so this is the
+ * the member's ORACLE partition scope via the stored pointers (ENFB-1 — visibleProjects →
+ * selectEnforcedGraphPartitions; the legacy tier-suffixed scheme is retired here).
  * SOLE isolation (CLAUDE.md §5). Returns citable facts (text + temporal validity + source).
  */
 export async function POST(req: NextRequest) {

@@ -67,7 +67,7 @@ because it is also the mechanically-shared half.
   need product decisions (does a non-grantee see that a restricted project EXISTS?).
 - **ENFB-3 — meetings:** `meeting_notes` has NO access/audience column (noted at
   `lib/dashboard/work-timeline.ts:685`) — row-level gating needs schema, its own slice.
-- **decisions.created_by** (the PRET-6 named backlog): a schema slice; not here.
+- ~~decisions.created_by~~ — PULLED INTO THIS SLICE by design-review round 2 (§2.7).
 
 ## 1. The surface table (each row: today's sole gate → the gate this slice adds)
 

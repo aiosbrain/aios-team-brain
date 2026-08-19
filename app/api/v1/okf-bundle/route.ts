@@ -87,8 +87,8 @@ export async function GET(req: NextRequest) {
 
   // 2. The page: membership-visible rows only, composite keyset (§2.5). A legacy bare-timestamp
   //    cursor still resumes (strictly-after semantics).
-  const after = cursor ? parseOkfCursor(cursor) : { ts: since, id: null };
-  if (!after) return errorResponse("invalid_payload", "malformed cursor", 422);
+  const after = cursor ? parseOkfCursor(cursor) : (Number.isNaN(Date.parse(since)) ? null : { ts: since, id: null });
+  if (!after) return errorResponse("invalid_payload", "malformed cursor or since", 422);
   let rows;
   try {
     rows = await pageVisibleOkfItems({

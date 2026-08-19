@@ -40,7 +40,7 @@ const MAX_UUID = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 export function parseOkfCursor(raw: string): OkfCursor | null {
   if (!raw) return null;
   const bar = raw.indexOf("|");
-  if (bar === -1) return { ts: raw, id: null };
+  if (bar === -1) return Number.isNaN(Date.parse(raw)) ? null : { ts: raw, id: null }; // legacy bare form — same 422-on-garbage as the composite (review M2)
   const ts = raw.slice(0, bar);
   const id = raw.slice(bar + 1);
   if (!UUID_RE.test(id)) return null; // malformed composite — refuse rather than guess
@@ -49,10 +49,10 @@ export function parseOkfCursor(raw: string): OkfCursor | null {
 }
 
 export function formatOkfCursor(ts: string | Date, id: string): string {
-  // A STRING timestamp passes through VERBATIM (diff-review Medium): the pager selects
-  // `updated_at::text` — full Postgres microseconds — and a Date round-trip truncates to
-  // millis, which re-serves the boundary row every page (and loops forever on a full page
-  // sharing one microsecond timestamp). `::timestamptz` parses the pg text form directly.
+  // A STRING timestamp passes through VERBATIM (Fable M): the pager emits a STABLE
+  // UTC-microsecond form via to_char (Codex M2 — `::text` was DateStyle/TimeZone-dependent),
+  // and a Date round-trip would truncate micros → the boundary row re-serves every page.
+  // `$3::timestamptz` parses the emitted form on any config.
   const iso = ts instanceof Date ? ts.toISOString() : ts;
   return `${iso}|${id}`;
 }
@@ -80,7 +80,7 @@ export async function pageVisibleOkfItems(opts: {
   }
   const r = await runSql<OkfPageRow>(
     `select i.id, i.path, i.kind, i.access, i.frontmatter, i.body, i.content_sha256,
-            i.updated_at::text as updated_at, p.slug
+            to_char(i.updated_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as updated_at, p.slug
        from items i
        join projects p on p.id = i.project_id
       where ${where}

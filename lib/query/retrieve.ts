@@ -872,6 +872,11 @@ async function nativeRetrieve(
   // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
   type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
   const recencyDecisions: DecisionLine[] = (decisions ?? [])
+    // DEFERRED (Codex diff M1, availability not confidentiality): this filter runs AFTER the
+    // 50-row recency cap, so invisible rows can starve visible ones out of the window. Cannot
+    // bite before ENFB-2 (restricted curation is unsupported until then — the slice rule);
+    // ENFB-2 pushes the provenance predicate in-query. Same deferral on the keyword leg, the
+    // tasks digest, the boards, and the timeline decisions leg.
     // Enforcement — the settled provenance rule, decisions edition (ENFB-1 §2.7: the
     // `decisions.created_by` column this slice ships re-admits the hand-typed arm): a SOURCED
     // decision gates on its source item's visibility; a null-source one survives only when
