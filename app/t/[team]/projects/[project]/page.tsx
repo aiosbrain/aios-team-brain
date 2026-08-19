@@ -51,7 +51,16 @@ export default async function ProjectPage({
     .maybeSingle();
   if (!project) notFound();
 
+  // ENFB-2 D3 (§5.7): the container page — its spine is the maximal title inventory — gates
+  // on PROJECT-ROW visibility; membership-denied is byte-indistinguishable from an unknown
+  // slug (the SAME notFound). No member → notFound (fail closed).
   const me = await currentMember(team.id);
+  const { canSeeProjectRow, visibleItemIds } = await import("@/lib/access/enforce");
+  if (!me || !(await canSeeProjectRow(db, { teamId: team.id, memberId: me.id }, project.id))) notFound();
+  // The spine intersects the item ORACLE (posture stays a conjunct via visibleItems); a
+  // resolution error serves an empty spine, never the unfiltered container.
+  const vis = await visibleItemIds((await import("@/lib/db/admin")).adminClient(), { teamId: team.id, memberId: me.id });
+  const visArr = vis.error ? [] : [...vis.ids];
   const [{ data: items }, { data: decisions }, { data: roster }] = await Promise.all([
     visibleItems(
       db
@@ -59,13 +68,14 @@ export default async function ProjectPage({
         .select("id, path, kind, access, actor, frontmatter, synced_at")
         .eq("team_id", team.id)
         .eq("project_id", project.id)
+        .in("id", visArr)
         .order("path"),
       me?.tier ?? "external"
     ),
     visibleDecisions(
       db
         .from("decisions")
-        .select("id, row_key, decided_at, title, decided_by, still_valid")
+        .select("id, row_key, decided_at, title, decided_by, still_valid, source_item_id, created_by")
         .eq("team_id", team.id)
         .eq("project_id", project.id)
         .order("decided_at", { ascending: false }),
@@ -80,7 +90,12 @@ export default async function ProjectPage({
   ]);
 
   const itemRows = (items ?? []) as Item[];
-  const decisionRows = (decisions ?? []) as Decision[];
+  // ENFB-2: the decisions table takes the ONE-owner provenance rule (the page previously
+  // served titles at posture with no provenance columns selected).
+  const { rowVisibleByProvenance } = await import("@/lib/access/provenance");
+  const decisionRows = ((decisions ?? []) as (Decision & { source_item_id?: string | null; created_by?: string | null })[]).filter((d) =>
+    rowVisibleByProvenance(d, vis.error ? null : vis.ids, me?.tier === "external" ? "external" : "team")
+  );
 
   // Spine: group items by top-level directory of path
   const spine = new Map<string, Item[]>();

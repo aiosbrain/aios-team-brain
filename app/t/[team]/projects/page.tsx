@@ -2,20 +2,13 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { FolderKanban } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
+import { currentMember } from "@/lib/auth/guard";
+import { visibleProjectCards } from "@/lib/access/enforce";
 import { EmptyState } from "@/components/empty-state";
 import { NewProjectButton } from "@/components/projects/new-project-button";
 import { timeAgo } from "@/components/format";
 
 export const metadata: Metadata = { title: "Projects" };
-
-type ProjectCard = {
-  id: string;
-  slug: string;
-  name: string;
-  last_synced_at: string | null;
-  items: { count: number }[];
-  tasks: { count: number }[];
-};
 
 export default async function ProjectsPage({ params }: { params: Promise<{ team: string }> }) {
   const { team: teamSlug } = await params;
@@ -28,16 +21,14 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
     .maybeSingle();
   if (!team) return null;
 
-  const { data: projects } = await db
-    .from("projects")
-    .select("id, slug, name, last_synced_at, items(count), tasks(count)")
-    .eq("team_id", team.id)
-    // §11 system containers are access topology, not browsable ingestion projects; the
-    // Part II read model gives them their own surface.
-    .neq("kind", "system")
-    .order("last_synced_at", { ascending: false, nullsFirst: false });
-
-  const rows = (projects ?? []) as unknown as ProjectCard[];
+  // ENFB-2 §2.1: the inventory serves ROW-VISIBLE projects only (granted ∪ content-visible),
+  // with VIEWER-visible counts — the previous ungated read served every initiative's name and
+  // content volume to any team member. No member → empty list (fail closed).
+  const viewer = await currentMember(team.id);
+  const cards = viewer
+    ? await visibleProjectCards(db, { teamId: team.id, memberId: viewer.id })
+    : { rows: [] as Awaited<ReturnType<typeof visibleProjectCards>>["rows"] };
+  const rows = cards.rows;
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5">
@@ -65,10 +56,10 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
               </div>
               <div className="mt-auto flex items-center gap-4 text-xs text-ink-secondary">
                 <span>
-                  <span className="font-semibold text-ink">{p.items?.[0]?.count ?? 0}</span> items
+                  <span className="font-semibold text-ink">{p.visibleItems}</span> items
                 </span>
                 <span>
-                  <span className="font-semibold text-ink">{p.tasks?.[0]?.count ?? 0}</span> tasks
+                  <span className="font-semibold text-ink">{p.visibleTasks}</span> tasks
                 </span>
                 <span className="ml-auto text-ink-tertiary">
                   {p.last_synced_at ? `synced ${timeAgo(p.last_synced_at)}` : "not synced yet"}

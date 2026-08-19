@@ -58,13 +58,67 @@ export async function createProjectAction(input: {
         if (!heal.ok) {
           return { ok: false, error: `a project "${slug}" already exists — and its graph pointer is unhealed: ${heal.error}` };
         }
+        // ENFB-2 D1 (round-2 blocker 4): a create-retry whose first attempt died between the
+        // insert and the grant must CONVERGE, not strand the creator on an invisible row. The
+        // grant re-fires ONLY for a content-EMPTY initiative (round-2 blocker 3: a project
+        // grant is an item-membership grant, so healing must never grant a contentful or
+        // non-initiative existing slug — that row belongs to someone/something else).
+        await grantCreatorIfEmptyInitiative(db, input.teamId, existing as ProjectRow & { kind?: string }, me.id);
       }
       return { ok: false, error: `a project "${slug}" already exists` };
     }
     return { ok: false, error: error?.message ?? "could not create project" };
   }
+  // ENFB-2 D1: the creator grant fires BEFORE the pointer write (round-2 blocker 4 ordering:
+  // a pointer failure must not strand a granted-less row), and only on this fresh-insert path
+  // where the row is BY CONSTRUCTION an empty initiative this member just minted. Without it,
+  // §2.1 row-visibility would hide the new project from its own creator everywhere (the
+  // round-1 dead-UI-path blocker). Grant failure is LOUD: a created-but-ungranted initiative
+  // is invisible to its creator, which is exactly the stranding this exists to prevent.
+  const grant = await grantProjectToCreator(db, input.teamId, (data as ProjectRow).id, me.id);
+  if (!grant.ok) {
+    return { ok: false, error: `project created but the creator grant failed (${grant.error}) — retry the create to converge` };
+  }
   // PCCC-4: every creation path records the project's graph partition pointer.
   const ptr = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (data as ProjectRow).id });
   if (!ptr.ok) return { ok: false, error: ptr.error };
   return { ok: true, project: data as ProjectRow };
+}
+
+/** The D1 grant: creator's person singleton → the project, through the sole-writer group
+ *  module (lib/access/groups is the only legal writer of groups/group_members/project_groups). */
+async function grantProjectToCreator(
+  db: Awaited<ReturnType<typeof serverClient>>,
+  teamId: string,
+  projectId: string,
+  creatorId: string
+): Promise<{ ok: boolean; error?: string }> {
+  const { ensurePersonSingleton, grantProjectToGroup } = await import("@/lib/access/groups");
+  const singleton = await ensurePersonSingleton(db, teamId, creatorId, creatorId);
+  if (!singleton.ok || !singleton.groupId) return { ok: false, error: singleton.error ?? "no singleton" };
+  const granted = await grantProjectToGroup(db, teamId, projectId, singleton.groupId, creatorId);
+  if (!granted.ok) return { ok: false, error: granted.error };
+  return { ok: true };
+}
+
+/** Duplicate-arm convergence: re-fire the creator grant IFF the existing row is a
+ *  content-empty initiative (zero items, tasks, decisions) — an empty initiative's grant
+ *  admits zero items by construction; anything else refuses ungranted. */
+async function grantCreatorIfEmptyInitiative(
+  db: Awaited<ReturnType<typeof serverClient>>,
+  teamId: string,
+  existing: ProjectRow & { kind?: string },
+  creatorId: string
+): Promise<void> {
+  const { data: row } = await db
+    .from("projects")
+    .select("id, kind")
+    .eq("id", existing.id)
+    .maybeSingle();
+  if ((row as { kind?: string } | null)?.kind !== "initiative") return;
+  for (const table of ["items", "tasks", "decisions"] as const) {
+    const { data: any } = await db.from(table).select("id").eq("project_id", existing.id).limit(1);
+    if (((any ?? []) as unknown[]).length > 0) return;
+  }
+  await grantProjectToCreator(db, teamId, existing.id, creatorId);
 }

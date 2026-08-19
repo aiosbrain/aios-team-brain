@@ -2,6 +2,8 @@ import "server-only";
 import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { visibleProjects, effectiveVisibleProjects, type Principal } from "@/lib/access/oracle";
+import { newSqlParams, itemVisibleSql, provenanceRowSql, type ProvenanceSqlCtx } from "@/lib/access/provenance-sql";
+import { runSql } from "@/lib/db/pg/pool";
 
 /**
  * The enforced-read primitive (Phase B slice 1, spec §5/§11; PRET-6: the ONLY read model).
@@ -206,4 +208,118 @@ export async function resolveTimelineEnforcement(
 export async function memberEnforcement(db: DbClient, principal: Principal): Promise<TimelineEnforcement> {
   const vis = await memberVisibility(db, principal);
   return resolveTimelineEnforcement(db, principal.teamId, vis);
+}
+
+/**
+ * PROJECT-ROW visibility (ENFB-2 §2.1): may this principal see that a project EXISTS — its
+ * name, slug, counts, dropdown entry, detail page. A row is visible iff
+ *   granted        — the project is in the oracle's granted set (`visibleProjects`), OR
+ *   content-visible — the member can see ≥1 item WHOSE CONTAINER it is, or ≥1
+ *                     provenance-visible task or decision in it.
+ * The content arms are what keep the source containers visible for a stock member — measured
+ * (2026-08-19): prod grants cover ONLY the two system projects, so a grants-only rule would
+ * empty the projects list, 404 every container page, and blank the create dropdowns.
+ * NOT the same set as `visibleItemIds(...).projectIds` (that is the GRANTED set alone —
+ * design round 2 BLOCKER 1); consumers resolve THIS set.
+ * Fail-closed: no principal / read error → empty set (flagged), `canSeeProjectRow` → false.
+ */
+export interface VisibleProjectRows {
+  ids: ReadonlySet<string>;
+  /** True when empty is the product of a READ ERROR, not a genuinely-empty visible set. */
+  error?: boolean;
+}
+
+function projectRowVisibleSql(teamId: string, granted: readonly string[], teamPosture: boolean) {
+  const p = newSqlParams();
+  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture };
+  const team = p.add(teamId);
+  const grantedPh = p.add([...granted]);
+  const where = `p.team_id = ${team} and (
+      p.id = any(${grantedPh}::uuid[])
+      or exists (select 1 from items i where i.team_id = ${team} and i.project_id = p.id and ${itemVisibleSql("i.id", p, ctx)})
+      or exists (select 1 from tasks t where t.team_id = ${team} and t.project_id = p.id and ${provenanceRowSql("t", p, ctx)})
+      or exists (select 1 from decisions d where d.team_id = ${team} and d.project_id = p.id and ${provenanceRowSql("d", p, ctx)})
+    )`;
+  return { p, where };
+}
+
+export async function visibleProjectRows(db: DbClient, principal: Principal): Promise<VisibleProjectRows> {
+  try {
+    const { projectIds } = await visibleProjects(db, principal);
+    const posture = await teamPostureFor(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const res = await runSql<{ id: string }>(`select p.id from projects p where ${where}`, p.values);
+    return { ids: new Set(res.rows.map((r) => r.id)) };
+  } catch {
+    return { ids: new Set(), error: true }; // fail closed on substrate error
+  }
+}
+
+export async function canSeeProjectRow(db: DbClient, principal: Principal, projectId: string): Promise<boolean> {
+  try {
+    const { projectIds } = await visibleProjects(db, principal);
+    const posture = await teamPostureFor(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const idPh = p.add(projectId);
+    const res = await runSql<{ id: string }>(
+      `select p.id from projects p where p.id = ${idPh} and ${where} limit 1`,
+      p.values
+    );
+    return res.rows.length > 0;
+  } catch {
+    return false; // fail closed
+  }
+}
+
+/** The projects-LIST card read (ENFB-2 §1 row 1): row-visible non-system projects with
+ *  VIEWER-VISIBLE item/task counts — the `items(count)`/`tasks(count)` embeds counted
+ *  per-project TOTALS (invisible content included), so they are replaced, not filtered. */
+export interface ProjectRowCard {
+  id: string;
+  slug: string;
+  name: string;
+  last_synced_at: string | null;
+  visibleItems: number;
+  visibleTasks: number;
+}
+
+export async function visibleProjectCards(
+  db: DbClient,
+  principal: Principal
+): Promise<{ rows: ProjectRowCard[]; error?: boolean }> {
+  try {
+    const { projectIds } = await visibleProjects(db, principal);
+    const posture = await teamPostureFor(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: [...projectIds], teamPosture: posture };
+    const res = await runSql<{ id: string; slug: string; name: string; last_synced_at: string | Date | null; visible_items: number; visible_tasks: number }>(
+      `select p.id, p.slug, p.name, p.last_synced_at,
+              (select count(*) from items i where i.team_id = p.team_id and i.project_id = p.id and ${itemVisibleSql("i.id", p, ctx)})::int as visible_items,
+              (select count(*) from tasks t where t.team_id = p.team_id and t.project_id = p.id and ${provenanceRowSql("t", p, ctx)})::int as visible_tasks
+         from projects p
+        where p.kind <> 'system' and ${where}
+        order by p.last_synced_at desc nulls last`,
+      p.values
+    );
+    return {
+      rows: res.rows.map((r) => ({
+        id: r.id,
+        slug: r.slug,
+        name: r.name,
+        last_synced_at: r.last_synced_at instanceof Date ? r.last_synced_at.toISOString() : r.last_synced_at,
+        visibleItems: r.visible_items,
+        visibleTasks: r.visible_tasks,
+      })),
+    };
+  } catch {
+    return { rows: [], error: true }; // fail closed
+  }
+}
+
+/** The hand-typed arm's audience wall: team posture per the everyone-group resolution —
+ *  the SAME source `resolveViewerPosture` reads, resolved here per-principal. */
+async function teamPostureFor(db: DbClient, principal: Principal): Promise<boolean> {
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  const posture = await resolveViewerPosture(db, principal.teamId, principal.memberId);
+  return posture === "team";
 }

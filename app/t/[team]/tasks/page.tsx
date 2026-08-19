@@ -31,9 +31,12 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // ENFB-1: the board serves task BODIES — the settled provenance rule gates each row (sourced →
   // source item in the viewer's oracle set; null-source → hand-typed at team posture). Resolved
   // once; no member → empty board (fail closed).
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { visibleItemIds, visibleProjectRows } = await import("@/lib/access/enforce");
   const { adminClient } = await import("@/lib/db/admin");
   const vis = viewer ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: viewer.id }) : null;
+  // ENFB-2 §2.1: the create-form dropdown lists only ROW-VISIBLE containers (you file into a
+  // project you can see) — this is the row-visible set, NOT vis.projectIds (the granted set).
+  const projRows = viewer ? await visibleProjectRows(adminClient(), { teamId: team.id, memberId: viewer.id }) : null;
 
   // PM links are fetched as a sibling query and grouped in JS rather than as an embedded resource:
   // the pg adapter (the deployed backend) only supports to-many embeds as `(count)`, so a
@@ -58,6 +61,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
         .from("projects")
         .select("id, slug, name")
         .eq("team_id", team.id)
+        .in("id", projRows && !projRows.error ? [...projRows.ids] : [])
         .order("slug"),
       db
         .from("members")

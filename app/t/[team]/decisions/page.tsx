@@ -40,16 +40,19 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
   // sourced decision needs its source item in the viewer's oracle set; a null-source one
   // survives only when hand-typed (created_by, the dashboard action's sole write) at team
   // posture. Resolved once; no member → empty page (fail closed).
-  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { visibleItemIds, visibleProjectRows } = await import("@/lib/access/enforce");
   const { adminClient } = await import("@/lib/db/admin");
   const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: (me as { id: string }).id }) : null;
+  // ENFB-2 §2.1: the create-form dropdown and the per-row container slug both derive from the
+  // ROW-VISIBLE set (not vis.projectIds — that is the granted set alone).
+  const projRows = me ? await visibleProjectRows(adminClient(), { teamId: team.id, memberId: (me as { id: string }).id }) : null;
 
   const [{ data: decisions }, { data: projects }] = await Promise.all([
     visibleDecisions(
       db
         .from("decisions")
         .select(
-          "id, row_key, decided_at, title, rationale, decided_by, impact, tier, audience, still_valid, source_item_id, created_by, projects(slug)"
+          "id, row_key, decided_at, title, rationale, decided_by, impact, tier, audience, still_valid, source_item_id, created_by, project_id, projects(slug)"
         )
         .eq("team_id", team.id)
         .order("decided_at", { ascending: false }),
@@ -59,11 +62,16 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
       .from("projects")
       .select("id, slug, name")
       .eq("team_id", team.id)
+      .in("id", projRows && !projRows.error ? [...projRows.ids] : [])
       .order("slug"),
   ]);
 
-  const rows = ((decisions ?? []) as unknown as (Decision & { source_item_id?: string | null; created_by?: string | null })[])
-    .filter((d) => rowVisibleByProvenance(d, vis && !vis.error ? vis.ids : null, tier));
+  const rows = ((decisions ?? []) as unknown as (Decision & { source_item_id?: string | null; created_by?: string | null; project_id?: string | null })[])
+    .filter((d) => rowVisibleByProvenance(d, vis && !vis.error ? vis.ids : null, tier))
+    // Round-2 H5's class, decisions edition: an entitled row (cross-project curation) must not
+    // name a container whose ROW the viewer cannot see — the slug renders only for row-visible
+    // containers, absent otherwise (indistinguishable from a container-less decision).
+    .map((d) => (d.project_id && projRows && !projRows.error && projRows.ids.has(d.project_id) ? d : { ...d, projects: null }));
   const canToggle = me?.role === "admin" || me?.role === "lead";
   const projectOptions = (projects ?? []) as { id: string; slug: string; name: string }[];
 
