@@ -309,16 +309,22 @@ describe("PCCC-6 — the landed-gated restriction move", () => {
     // best-effort) — the enforced read must STILL fail closed on General…
     const unconfirmed = await selectEnforcedGraphPartitions(db(), { teamId: seed.teamId, visibleProjectIds: systemIds });
     expect(unconfirmed.groups).not.toContain(homeGroup);
-    // …while the permissive union (no enforcement to protect) keeps General through the window.
+    // …and the debt suppression holds UNDER arm:false too — RE-SPECIFIED at ENFB-3: the
+    // "permissive union keeps General" arm this block used to pin died with its caller (the
+    // permissive model retired at PRET-6; arm:false had ZERO live callers until the graph
+    // feeds adopted it, and a feed read serving General during a restriction move that every
+    // other enforced read suppresses was the ENFB-3 design round-1 BLOCKER). arm now controls
+    // ONLY the arming side effect; the debt probe runs for every resolution.
     const { data: all } = await db().from("projects").select("id").eq("team_id", seed.teamId);
     const allIds = ((all ?? []) as { id: string }[]).map((p) => p.id);
-    const permissive = await selectEnforcedGraphPartitions(db(), {
+    const nonArming = await selectEnforcedGraphPartitions(db(), {
       teamId: seed.teamId,
       visibleProjectIds: allIds,
       arm: false,
       k: Number.MAX_SAFE_INTEGER,
     });
-    expect(permissive.groups).toContain(homeGroup);
+    expect(nonArming.groups, "arm:false readers fail closed on General debt like every other enforced read").not.toContain(homeGroup);
+    expect(nonArming.generalSuppressed, "the suppression is named in the scope (the feeds' loud-arm discriminator)").toBe(true);
 
     // Purge confirms (flag cleared → the parked sentinel): nothing is owed — General returns.
     await runSql(

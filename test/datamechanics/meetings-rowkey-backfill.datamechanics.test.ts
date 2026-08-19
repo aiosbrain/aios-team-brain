@@ -23,7 +23,7 @@ describe("meeting row_key backfill: ordinal → content (real Postgres)", () => 
 
   async function seedMeeting(): Promise<{ teamId: string; itemId: string; projectId: string }> {
     const { teamId, memberId } = await seedTeam();
-    const noteId = await createMeetingNote(db(), teamId, { title: "Sync", rawText: "notes", submittedByMemberId: memberId });
+    const { noteId } = await createMeetingNote(db(), teamId, { title: "Sync", rawText: "notes", submittedByMemberId: memberId });
     const { data: nr } = await db().from("meeting_notes").select("source_item_id").eq("id", noteId).maybeSingle();
     const itemId = (nr as { source_item_id: string }).source_item_id;
     const projectId = await ensureMeetingTodoProject(db(), teamId);
