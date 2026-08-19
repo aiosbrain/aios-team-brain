@@ -59,13 +59,17 @@ jobs:
     name: NDA confidentiality gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # Pinned to a commit SHA, unlike the other jobs in this file. This one gates
+      # CONFIDENTIALITY on a public repo, so a moved tag on a third-party action is a supply-chain
+      # path straight through it. The other 14 unpinned refs here pre-date this change and should
+      # be pinned too — separate concern, separate change.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history: the job scans the PR's COMMITS as well as the final tree. Merge commits are
           # enabled, so a term added in one commit and removed in a later one still lands on `main`
           # permanently, and a term in a commit MESSAGE never appears in any tree at all.
           fetch-depth: 0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "20"
       - name: Scan for confidential identifiers
