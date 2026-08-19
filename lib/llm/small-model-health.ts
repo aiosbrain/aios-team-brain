@@ -24,14 +24,23 @@ import { SMALL_ELIGIBLE_KINDS } from "./graph-call-kind";
  * AIO-912: an age gate, so a fresh install's quiet start is not read as failure). So the return is
  * DISCRIMINATED and carries an explicit can't-tell:
  *
- *   • `no_traffic`     — no eligible calls at all. Says nothing; a quiet team is not a broken one.
- *   • `inconclusive`   — some eligible calls, but too few to distinguish "not routing" from the
- *                        window right after someone enabled the setting, when the recent rows are
- *                        legitimately pre-enable history. Bounded by VOLUME, not time, so it clears
- *                        as soon as real traffic arrives rather than after a fixed wait.
+ *   • `not_configured` — no small model set. Says nothing about traffic, because it never looked.
+ *   • `no_traffic`     — no eligible calls SINCE THE SETTING WAS LAST CHANGED. A quiet team is not
+ *                        a broken one, and neither is one that enabled this a minute ago.
+ *   • `inconclusive`   — some eligible calls, but too few to conclude from.
  *   • `not_routing`    — enough eligible calls, and NONE served by the small model. This is the
  *                        drift, and it is the only state that accuses.
- *   • `routing`        — working, with the count as the evidence.
+ *   • `routing`        — working, with the counts as the evidence.
+ *
+ * THE WINDOW STARTS WHEN THE SETTING DID (review Medium 1). An earlier version counted the most
+ * recent N eligible calls whatever their age, and a VOLUME window only ages a false accusation out
+ * — it does not prevent one. On a busy team with 50 eligible rows all predating the change, an
+ * admin who enabled the small model and opened this page before the next extraction ran would be
+ * told, in amber, that their graph service and brain disagree. Nothing was wrong. So the window is
+ * bounded below by the `team.extraction_small_model_set` audit row: calls made before the operator
+ * asked for this cannot be evidence about whether it is working. A team whose setting predates the
+ * audit trail (or that has never changed it) keeps the whole window, which is the correct default —
+ * those rows ARE post-enable.
  *
  * Scoped to ONE team: `extraction_small_model` is per-team config, so another team's traffic must
  * never be evidence about this team's setting.
@@ -42,6 +51,7 @@ const SAMPLE = 50;
 const MIN_TO_JUDGE = 10;
 
 export type SmallRoutingEvidence =
+  | { state: "not_configured" }
   | { state: "no_traffic" }
   | { state: "inconclusive"; eligible: number }
   | { state: "not_routing"; eligible: number }
@@ -54,7 +64,27 @@ export async function smallRoutingEvidence(
 ): Promise<SmallRoutingEvidence> {
   const sample = opts.sample ?? SAMPLE;
   const minToJudge = opts.minToJudge ?? MIN_TO_JUDGE;
-  if (!smallModel.trim()) return { state: "no_traffic" };
+  // NOT a `no_traffic` (review Medium 2): that state renders as "no extraction has run recently",
+  // which would be a claim about traffic this branch never looked at. Unreachable through today's
+  // caller, but the lie would live in the return value rather than the caller, and this module's
+  // whole purpose is not saying things it has not checked.
+  if (!smallModel.trim()) return { state: "not_configured" };
+
+  // When did the operator last ask for this? Anything older cannot be evidence about it. Best-effort:
+  // if the audit read fails we keep the full window, which is the pre-existing behaviour and errs
+  // toward showing the operator MORE of what actually happened rather than silently narrowing it.
+  let since: string | null = null;
+  try {
+    const audit = await runSql<{ created_at: string }>(
+      `select created_at from audit_log
+        where team_id = $1 and action = 'team.extraction_small_model_set'
+        order by created_at desc limit 1`,
+      [teamId]
+    );
+    since = audit.rows[0]?.created_at ?? null;
+  } catch (e) {
+    console.error(`[small-model-health] audit window read failed for team ${teamId}:`, e);
+  }
 
   // The most recent eligible calls, newest first. A VOLUME window rather than a time window: right
   // after the setting is enabled the recent rows are pre-enable history and would read as
@@ -72,9 +102,10 @@ export async function smallRoutingEvidence(
             count(*) filter (where model = $3)::int as served_small
        from (select model from llm_usage
               where team_id = $1 and source = 'graph' and call_kind = any($2)
+                and ($5::timestamptz is null or created_at >= $5::timestamptz)
               order by created_at desc
               limit $4) recent`,
-    [teamId, [...SMALL_ELIGIBLE_KINDS], smallModel, sample]
+    [teamId, [...SMALL_ELIGIBLE_KINDS], smallModel, sample, since]
   );
 
   const eligible = res.rows[0]?.eligible ?? 0;

@@ -879,8 +879,11 @@ guard enforces it, it's named.
   Separately, "configured and resolvable" is **not** "working": `describeSmallExtraction` reported
   `enabled: true, inert: false` while zero calls were routed. `lib/llm/small-model-health.ts` reads
   the `llm_usage` ledger for what actually served the recent small-eligible calls, and is
-  DISCRIMINATED so it never accuses without standing evidence (`no_traffic` / `inconclusive` /
-  `not_routing` / `routing`) — the AIO-876 + AIO-912 rule.
+  DISCRIMINATED so it never accuses without standing evidence (`not_configured` / `unavailable` /
+  `no_traffic` / `inconclusive` / `not_routing` / `routing`) — the AIO-876 + AIO-912 rule. The
+  window starts at the `team.extraction_small_model_set` audit row: calls made BEFORE the operator
+  asked for this cannot be evidence about whether it works, and without that bound a busy team that
+  had just enabled it would be accused of drift on its own pre-enable history.
   _Guards:_ `test/small-model-sentinel.test.ts` (the sentinel recognises, and still refuses to
   downgrade extraction), `test/small-model-health.test.ts` (the absence is reported, and the
   can't-tell states stay silent), plus the build-time `graphiti/verify-small-model-default.py`,

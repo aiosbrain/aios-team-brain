@@ -118,8 +118,10 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
   // exactly that). Best-effort: this is an indicator, never a reason the page fails to render.
   const smallRouting = smallExtraction.enabled
     ? await smallRoutingEvidence(team.id, smallExtraction.model).catch((e: unknown) => {
+        // NOT null (review Low 5): null renders nothing, so an indicator built to expose a silent
+        // failure would itself fail silently. Say the evidence is unavailable.
         console.error(`[integrations] small-model routing evidence failed for team ${team.id}:`, e);
-        return null;
+        return { state: "unavailable" as const };
       })
     : null;
   const answeringModels: Record<"anthropic" | "openai" | "openrouter", string | null> = {

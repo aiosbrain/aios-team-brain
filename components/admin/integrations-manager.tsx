@@ -80,6 +80,8 @@ export interface AnsweringState {
     /** AIO-983: what the LEDGER says the small model actually served. null = not enabled, or the
      *  read failed. Discriminated so "nothing to judge" can never render as "it isn't working". */
     smallRouting:
+      | { state: "not_configured" }
+      | { state: "unavailable" }
       | { state: "no_traffic" }
       | { state: "inconclusive"; eligible: number }
       | { state: "not_routing"; eligible: number }
@@ -666,17 +668,25 @@ export function IntegrationsManager({
                   presence, and stays silent when there is nothing to judge rather than guessing. */}
               {answering.extraction.smallRouting?.state === "not_routing" ? (
                 <p className="text-xs text-amber-700">
-                  Enabled, but <span className="font-medium">none</span> of the last{" "}
-                  {answering.extraction.smallRouting.eligible} simple graph calls were actually served by it —
+                  Enabled, but <span className="font-medium">none</span> of the{" "}
+                  {answering.extraction.smallRouting.eligible} simple graph calls since it was set were
+                  actually served by it —
                   every one went to the extraction model. The graph service and this brain disagree about
                   which calls are cheap. If the graph service reaches this brain&apos;s LLM proxy, rebuild its
                   image so it sends the <code className="font-mono">aios-small</code> sentinel, or set{" "}
                   <code className="font-mono">GRAPHITI_SMALL_MODEL</code> on BOTH services to the same value.
                 </p>
               ) : answering.extraction.smallRouting?.state === "routing" ? (
+                /* Neutral, not "confirmed" (review Low 3): 1-of-50 is partial drift — a mixed fleet
+                   where one image migrated and one did not — and a confirmation framing would read
+                   past it. The ratio is shown so an operator can see which it is. */
                 <p className="text-xs text-ink-secondary">
-                  Confirmed serving {answering.extraction.smallRouting.servedSmall} of the last{" "}
+                  Serving {answering.extraction.smallRouting.servedSmall} of the last{" "}
                   {answering.extraction.smallRouting.eligible} simple graph calls.
+                </p>
+              ) : answering.extraction.smallRouting?.state === "unavailable" ? (
+                <p className="text-xs text-ink-secondary">
+                  Could not check whether it is actually serving calls — the usage ledger read failed.
                 </p>
               ) : answering.extraction.smallRouting?.state === "inconclusive" ? (
                 <p className="text-xs text-ink-secondary">
@@ -685,7 +695,7 @@ export function IntegrationsManager({
                 </p>
               ) : answering.extraction.smallRouting?.state === "no_traffic" ? (
                 <p className="text-xs text-ink-secondary">
-                  No graph extraction has run recently, so there is nothing to confirm against yet.
+                  No graph extraction has run since this was set, so there is nothing to check against yet.
                 </p>
               ) : null}
               {/* These calls cannot change WHICH entities or facts are extracted — that is what makes

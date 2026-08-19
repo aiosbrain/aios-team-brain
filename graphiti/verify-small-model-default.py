@@ -23,7 +23,13 @@ ANCHOR = 'small_model='
 
 
 def extract(path: str) -> str:
-    """The `small_model=` argument's expression, by balanced parentheses from the anchor."""
+    """The `small_model=` argument's expression, by balanced parentheses from the anchor.
+
+    Not string-literal aware: a future expression carrying a `,` or `)` inside a string at depth 0
+    would truncate here. That fails CLOSED — the truncated expression either does not parse or
+    misses a case, and the build stops with the case named — so it is safe, but read a failure as
+    "the scanner needs widening" before concluding the branch logic is wrong.
+    """
     src = open(path, encoding="utf-8").read()
     hits = [m.start() for m in re.finditer(re.escape(ANCHOR), src)]
     if len(hits) != 1:
