@@ -1,0 +1,118 @@
+name: NDA confidentiality gate
+
+# PRIVILEGE SEPARATION IS THE SECURITY BOUNDARY.
+# `pull_request` executes the workflow and scanner from the PR merge ref. Giving that code NDA_TERMS
+# lets a same-repo branch — or a fork branch a maintainer mirrors — print the private list. This
+# privileged workflow is instead loaded from the base branch, executes only the base branch's
+# scanner, and treats the PR head strictly as Git objects. Never check out or execute the PR tree.
+on:
+  pull_request_target:
+    branches: [main, staging]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  push:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+  statuses: write # publish the trusted verdict onto the validated PR HEAD, not pull_request_target's base SHA
+
+concurrency:
+  group: nda-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nda-gate:
+    name: NDA confidentiality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # On pull_request_target the default ref is the trusted base. Keep it that way. The PR objects
+      # are fetched below, never checked out, imported, built, installed, or executed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "20"
+      - name: Fetch untrusted PR objects as data
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          case "$PR_NUMBER" in (*[!0-9]*|'') echo "invalid pull request number" >&2; exit 2;; esac
+          case "$HEAD_SHA" in (*[!0-9a-f]*|'') echo "invalid pull request head" >&2; exit 2;; esac
+          case "$BASE_SHA" in (*[!0-9a-f]*|'') echo "invalid pull request base" >&2; exit 2;; esac
+          test "${#HEAD_SHA}" -eq 40
+          test "${#BASE_SHA}" -eq 40
+          git fetch --quiet --no-tags origin "+refs/pull/$PR_NUMBER/head:refs/nda-scan/pr-head"
+          test "$(git rev-parse refs/nda-scan/pr-head)" = "$HEAD_SHA"
+          # Scan the PROSPECTIVE MERGE too: two individually clean blobs can form a protected
+          # multiline pattern when base and head touch adjacent lines. GitHub owns this synthetic
+          # ref; validate both parents before treating it as data, and fail closed on conflicts.
+          git fetch --quiet --no-tags origin "+refs/pull/$PR_NUMBER/merge:refs/nda-scan/pr-merge"
+          MERGE_SHA="$(git rev-parse refs/nda-scan/pr-merge)"
+          test "$(git show -s --format=%P "$MERGE_SHA")" = "$BASE_SHA $HEAD_SHA"
+          echo "NDA_MERGE_SHA=$MERGE_SHA" >> "$GITHUB_ENV"
+      - name: Mark PR-head verdict pending
+        if: github.event_name == 'pull_request_target'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case "$HEAD_SHA" in (*[!0-9a-f]*|'') echo "invalid pull request head" >&2; exit 2;; esac
+          test "${#HEAD_SHA}" -eq 40
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending \
+            -f context='NDA confidentiality gate' \
+            -f description='Trusted confidentiality scan is running' >/dev/null
+      - name: Scan for confidential identifiers
+        id: scan
+        env:
+          NDA_TERMS: ${{ secrets.NDA_TERMS }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MERGE_SHA: ${{ env.NDA_MERGE_SHA }}
+          GITHUB_ACTOR_NAME: ${{ github.actor }}
+        run: |
+          if [ -z "${NDA_TERMS:-}" ]; then
+            if [ "$GITHUB_ACTOR_NAME" = "dependabot[bot]" ]; then
+              echo "::error title=NDA gate cannot run for Dependabot::GitHub withholds secrets from this privileged event for Dependabot. The gate did not run, and an unrunnable gate is not a pass."
+              exit 1
+            fi
+            echo "::error title=NDA gate misconfigured::The NDA_TERMS Actions secret is unavailable. The gate fails closed rather than reporting a pass."
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            node scripts/nda-scan.mjs --tree "$MERGE_SHA" --range "$BASE_SHA..$HEAD_SHA"
+          elif [ -n "${BASE_SHA:-}" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            node scripts/nda-scan.mjs --range "$BASE_SHA..$HEAD_SHA"
+          else
+            # Initial/recreated protected branch: there is no `before`, so the final tree alone is
+            # insufficient (add→scrub history would disappear). Scan all reachable history.
+            node scripts/nda-scan.mjs --range "$HEAD_SHA"
+          fi
+      # pull_request_target's own check belongs to the BASE SHA, so branch protection cannot use it
+      # for the PR head. Publish the verdict explicitly, after validating/fetching that exact head.
+      - name: Publish PR-head verdict
+        if: github.event_name == 'pull_request_target' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FETCH_OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          case "$HEAD_SHA" in (*[!0-9a-f]*|'') echo "invalid pull request head" >&2; exit 2;; esac
+          test "${#HEAD_SHA}" -eq 40
+          if [ "$FETCH_OUTCOME" = "success" ]; then
+            STATE=success
+            DESCRIPTION='Trusted confidentiality scan passed'
+          else
+            STATE=failure
+            DESCRIPTION='Trusted confidentiality scan blocked or could not run'
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$STATE" \
+            -f context='NDA confidentiality gate' \
+            -f description="$DESCRIPTION" >/dev/null

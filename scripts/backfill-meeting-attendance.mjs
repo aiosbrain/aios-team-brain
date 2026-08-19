@@ -55,7 +55,9 @@ function parseParticipantNames(raw) {
 /**
  * MUST mirror `normalizeName` in lib/meetings/llm-extract.ts EXACTLY, including the punctuation
  * strip. An earlier version here only lowercased and collapsed whitespace, which diverges on any
- * name carrying punctuation — and `Michael 'Porch' Contreras` is a real prod value. A name that
+ * name carrying punctuation, and a real production value has exactly that shape: an
+ * apostrophe-quoted nickname inside the name. `Daniel 'Dash' Okonkwo` is a PLACEHOLDER standing
+ * in for it — the shape is the evidence, the person is not (this repo is public). A name that
  * resolves in the live path but not here would be DELETED by --apply: the script would "repair" an
  * attendee the product considers correct.
  */

@@ -37,7 +37,7 @@ export interface AttendanceResult {
  * SHAPES THAT ACTUALLY OCCUR (measured across every row in prod carrying the field, 2026-08-17):
  *   granola, 45 rows, STRING:  "[John Ellison]"
  *                              "[John Ellison, Chetan, Stephan Ledain, Fatma Ghedira]"
- *                              "[John Ellison, Pete Longworth, Jana, Michael 'Porch' Contreras]"
+ *                              "[John Ellison, Alex Marchetti, Mira, Daniel 'Dash' Okonkwo]"
  *   slack,   19 rows, ARRAY of objects: [{ author_id: "U0B9…", first_ts: …, last_ts: … }]
  *
  * The Slack shape is the reason this returns `[]` rather than "whatever it can stringify". Those
@@ -74,7 +74,7 @@ export function parseParticipantNames(raw: unknown): string[] {
   // `[A, B]` — the granola shape. Strip ONE layer of brackets, then split on commas.
   //
   // Comma-splitting is exact for every name in prod (the only punctuation inside one is an
-  // apostrophe: `Michael 'Porch' Contreras`). A name containing a real comma would split wrongly and
+  // apostrophe: `Daniel 'Dash' Okonkwo`). A name containing a real comma would split wrongly and
   // then fail to resolve, which drops it — the safe direction: a missing attendee is visible in
   // `unresolved`, an invented one is not.
   const inner = s.startsWith("[") && s.endsWith("]") ? s.slice(1, -1) : s;
@@ -107,7 +107,8 @@ function norm(s: string): string {
  * escalating it: with the loose rule, `participants: "[John Smith]"` against a roster holding
  * `John Ellison` RECORDS JOHN ELLISON — inventing exactly the plausible-real-teammate attendance this
  * whole change exists to stop, now sourced from the path we called authoritative. And granola's
- * participant lists demonstrably carry outsiders (Pete Longworth, Jana, Anusheel Bhushan, Rob White).
+ * participant lists demonstrably carry outsiders (placeholder names: Alex Marchetti, Mira,
+ * Priya Raghavan, Sam Fielding — real people in production, not named here; the repo is public).
  *
  * The rule: normalised equality, or one name is a WHOLE-WORD PREFIX of the other. That keeps prod's
  * real cases (`Chetan Nandakumar` → roster `Chetan`, `Fatma Ghedira` → roster `Fatma`) and rejects
@@ -161,7 +162,7 @@ export interface ResolveAttendanceInput {
  * The precedence: calendar emails → asserted participant names → model.
  *
  * THE RULE THAT MATTERS MOST: a structured list that resolves to NOBODY does not fall through to the
- * model. If granola says `[Pete Longworth]` and Pete is not a member, the answer is "no member
+ * model. If granola says `[Alex Marchetti]` and Alex is not a member, the answer is "no member
  * attendees", not "ask a model who else might have been there". Falling through would re-open the
  * original bug precisely on the meetings most likely to involve outsiders — the ones where the model
  * has the most third-party names lying around to mistake for attendees. The unresolved names are

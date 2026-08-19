@@ -770,6 +770,35 @@ a best-effort `audit_log` entry; the finding event is the atomic audit record.
 Each entry is a real contract or bug, stated as the invariant that must now hold. Where a
 guard enforces it, it's named.
 
+- **No confidential identifier reaches this PUBLIC repo, and the gate does not depend on whose
+  laptop pushed.** A client's name landed on `main` in #586 and sat there until an unrelated push
+  from a different machine tripped a local hook days later. The gate was working as designed; the
+  design was the hole. The forbidden-term list is deliberately PRIVATE (it names the clients it
+  protects, so committing it leaks exactly what it defends) and lives per-machine outside every
+  repo; the hook reading it is installed in the untracked `.git/hooks/`; and `.githooks/pre-push`
+  **skips it silently when absent** — deliberate, so contributors without the list are not blocked.
+  Net effect: one laptop had a gate, nothing else did, and CI had no equivalent at all.
+  **CI is now the gate** (`.github/workflows/nda-gate.yml` → `scripts/nda-scan.mjs`), with the term
+  list arriving as the `NDA_TERMS` secret so it still never enters the repo. The privileged
+  `pull_request_target` workflow executes only the trusted base-branch scanner; it fetches the PR
+  head as Git objects and never checks out, imports, installs, builds, or executes untrusted PR code.
+  It scans the proposed and every intermediate tracked tree (content, filenames, UTF-16/binaries
+  and symlink blobs; new opaque binaries and submodules fail closed), Unicode-normalized/multiline
+  variants, every added commit-range path and content block (including merge commits), and commit
+  messages. Backreferences are rejected and every matcher has a hard timeout. Push events scan their full
+  `before..sha` range too, so add-then-scrub history cannot disappear behind a clean final tree.
+  Matching uses one POSIX ERE engine throughout. Normal output is **redacted to a safe location** and
+  never includes matching text, a term, an index, or the private list size; `--reveal` is disabled in
+  CI. The gate **fails closed** whenever the list or scanner is unavailable, including Dependabot
+  secret withholding. A redacted pass/fail necessarily reveals that some protected pattern matched,
+  but repository writers already have workflows capable of using repository secrets; the important
+  boundary is that an untrusted fork cannot execute code with this secret. ⚠️ **It must be added to
+  `main`'s required status checks and enforced for administrators** — until it is, a
+  red gate does not block a merge, which is this same defect one level up, and no test can pin
+  repository configuration.
+  _Guard:_ `test/guards/nda-gate.test.ts` (fails-closed, redaction, term-parse parity, and that the
+  job is actually wired into CI — a scanner nothing invokes is the same defect with a nicer
+  implementation).
 - **Single-writer for content.** Only `lib/ingest` writes `items`/`item_versions`.
   _Guard:_ `test/guards/single-writer-items.test.ts` (fails the build on any other writer).
 - **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new
