@@ -216,6 +216,38 @@ describe("ENFB-2 AC4 — starvation dies at the capped windows", () => {
     expect(keys.some((k) => k.startsWith("ID-")), "invisible rows never serve").toBe(false);
   });
 
+  it("decisionsCardWindow + boardTaskWindow (M4 pins): the Pulse card serves 8 VISIBLE rows behind 8+ invisible newer; the board window fills with visible rows", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    const { openItem, secretItem, projectId } = await starvationFixture(seed, insider);
+
+    const old = (i: number) => new Date(Date.now() - (i + 1) * 3_600_000).toISOString();
+    // 9 older VISIBLE decisions + 10 newer INVISIBLE ones.
+    const visRows = Array.from({ length: 9 }, (_, i) => ({
+      team_id: seed.teamId, project_id: projectId, row_key: `CV-${i}`, title: `vis ${i}`, rationale: "r", decided_by: "x", impact: "m", source_item_id: openItem.id, decided_at: old(i).slice(0, 10),
+    }));
+    const invRows = Array.from({ length: 10 }, (_, i) => ({
+      team_id: seed.teamId, project_id: projectId, row_key: `CI-${i}`, title: `inv ${i}`, rationale: "r", decided_by: "x", impact: "m", source_item_id: secretItem.id, decided_at: new Date().toISOString().slice(0, 10),
+    }));
+    expect((await db().from("decisions").insert([...visRows, ...invRows])).error).toBeNull();
+
+    const { decisionsCardWindow, boardTaskWindow } = await import("@/lib/access/structured-windows");
+    const card = await decisionsCardWindow(seed.teamId, await ctxFor(seed, outsider), false);
+    expect(card.length, "a full 8 VISIBLE rows serve (a post-filter would have starved to 0)").toBe(8);
+    expect(card.every((d) => d.source_item_id === openItem.id), "no invisible row reaches the card").toBe(true);
+
+    // The board window: 30 newer invisible tasks cannot displace the one visible row.
+    await db().from("tasks").insert({ team_id: seed.teamId, project_id: projectId, row_key: "B-VIS", title: "b", status: "backlog", origin: "sync", source_item_id: openItem.id, updated_at: old(50) });
+    const bulk = Array.from({ length: 30 }, (_, i) => ({
+      team_id: seed.teamId, project_id: projectId, row_key: `B-INV-${i}`, title: `bi ${i}`, status: "backlog", origin: "sync", source_item_id: secretItem.id,
+    }));
+    expect((await db().from("tasks").insert(bulk)).error).toBeNull();
+    const board = await boardTaskWindow<{ row_key: string | null }>(seed.teamId, await ctxFor(seed, outsider), false);
+    expect(board.map((t) => t.row_key), "the visible board row survives").toContain("B-VIS");
+    expect(board.some((t) => (t.row_key ?? "").startsWith("B-INV-")), "no invisible board row serves").toBe(false);
+  });
+
   it("matchingDecisions keyword window: invisible keyword hits cannot starve the visible one", async () => {
     const seed = await seedTeam();
     const insider = await seedMember(seed);

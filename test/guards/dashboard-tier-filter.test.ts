@@ -141,6 +141,15 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
   ["app/t/[team]/tasks/page.tsx", /boardTaskWindow[<(]/],
   ["app/t/[team]/tasks/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
   ["app/t/[team]/decisions/page.tsx", /\.in\("id", projRows && !projRows\.error \? \[\.\.\.projRows\.ids\] : \[\]\)/],
+  // The dropdown RESOLUTION pins (Fable diff M4: the .in patterns alone matched any set with
+  // an `.ids` — substituting the GRANTED set for the row-visible set shipped green; these pin
+  // the §2.1 resolution the round-2 BLOCKER-1 conflation would replace).
+  ["app/t/[team]/tasks/page.tsx", /await visibleProjectRows\(adminClient\(\)/],
+  ["app/t/[team]/decisions/page.tsx", /await visibleProjectRows\(adminClient\(\)/],
+  // The adjacent WRITE routes (Fable diff HIGH 2): filing a hand-typed row into a container
+  // un-hides it (§2.1 content arms), so both create actions gate on the same row visibility.
+  ["app/actions/tasks.ts", /await canSeeProjectRow\(adminClient\(\)/],
+  ["app/actions/decisions.ts", /await canSeeProjectRow\(adminClient\(\)/],
   ["app/t/[team]/page.tsx", /decisionsCardWindow\(team\.id, provCtx/],
   ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeProjectRow\(/],
   ["app/api/v1/projects/route.ts", /\.in\("id", \[\.\.\.rows\.ids\]\)/],
@@ -165,6 +174,7 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
  *  DECISION on record, not an exemption by silence. */
 const SWEEP_RESIDUALS: [string, string][] = [
   ["lib/social/", "ENFB-4: jsonb evidence provenance + the admin-role precedent question (spec §0b)"],
+  ["app/t/[team]/meetings/", "ENFB-3: meetings have no audience column yet; the actions' task reads are id-bounded PM-projection plumbing for one note's extracted tasks, not an inventory"],
   ["lib/dashboard/home-state.ts", "consumes the deliberate team-total scalar only (ENFB-2 F5)"],
   ["lib/metrics/codebases.ts", "code-metrics, not curated content — structure ruling (spec §0b)"],
   ["lib/metrics/maturity", "session-derived, not curated content — structure ruling (spec §0b)"],
@@ -180,7 +190,10 @@ const SWEEP_RESIDUALS: [string, string][] = [
   ["app/api/brain/facts/route.ts", "graph feed residual — partition-owner slice (spec §0b)"],
 ];
 
-const SWEEP_DIRS = ["app/api", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social"];
+// app/t joined the walk at the Fable diff review (M5): the motivating bug — the ungated
+// projects LIST — lived exactly there, and a sweep that skips the class's original habitat
+// is a tripwire with a hole where the trap sprang.
+const SWEEP_DIRS = ["app/api", "app/t", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social"];
 const SWEEP_READ = /from\(\s*["'](projects|tasks|decisions)["']\s*\)/;
 const SWEEP_SERVES = /select\(\s*["'][^"']*(name|title|count|slug)[^"']*["']/;
 

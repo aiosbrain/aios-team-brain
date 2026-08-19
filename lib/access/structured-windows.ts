@@ -82,7 +82,12 @@ export interface TaskFeedRow {
 }
 
 /** `GET /api/v1/tasks`' window — EVERY serving filter (provenance, audience, mode) compiles
- *  in-query, so `unknown_keys`/`truncated` describe the same set the caller receives. */
+ *  in-query, so `unknown_keys`/`truncated` describe the same set the caller receives.
+ *  NAMED CONSEQUENCE (Fable diff M6, deliberate): cursors advance over VISIBLE rows, and a
+ *  grant does not bump `updated_at` — so a row hidden at pull time that is granted later sits
+ *  behind every client cursor until a re-push/edit moves it. That is D2's ruling (repair is
+ *  re-establishing provenance via re-sync), stated here so a stale-markdown report starts at
+ *  this comment instead of a debugging session. */
 export async function taskFeedWindow(teamId: string, ctx: ProvenanceCtx, opts: TaskFeedWindowOpts): Promise<TaskFeedRow[]> {
   const p = newSqlParams();
   const conds = [

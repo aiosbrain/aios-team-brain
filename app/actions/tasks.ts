@@ -77,6 +77,16 @@ export async function createTaskAction(
   if (!me) return { ok: false, error: "not a member of this team" };
 
   const db = await serverClient();
+  // ENFB-2 (Fable diff HIGH 2 — the adjacent-write-route class): a hand-typed row in P makes
+  // P's row CONTENT-VISIBLE to every team-posture member (§2.1's task arm), so filing into a
+  // container you cannot see would un-hide a restricted initiative's name for the whole team.
+  // The dropdown only shapes the UI; a server action is a POST endpoint — the gate lives here.
+  // Same §5.7 refusal as an absent project.
+  const { canSeeProjectRow } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  if (!(await canSeeProjectRow(adminClient(), { teamId: input.teamId, memberId: me.id }, input.projectId))) {
+    return { ok: false, error: "project not found" };
+  }
   // Mint a stable `ui-` row_key so the task is visible to `GET /api/v1/tasks`
   // writeback (which filters `row_key is not null`) and round-trips into tasks.md.
   // Retry once on the (team_id,project_id,row_key) unique constraint.

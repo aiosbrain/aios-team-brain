@@ -71,7 +71,10 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
     // Round-2 H5's class, decisions edition: an entitled row (cross-project curation) must not
     // name a container whose ROW the viewer cannot see — the slug renders only for row-visible
     // containers, absent otherwise (indistinguishable from a container-less decision).
-    .map((d) => (d.project_id && projRows && !projRows.error && projRows.ids.has(d.project_id) ? d : { ...d, projects: null }));
+    // Redaction nulls BOTH the embed and the id (Fable diff M3): rows feed a "use client"
+    // table, so a surviving project_id would serialize the hidden container's uuid into the
+    // RSC payload — byte-distinguishable from a container-less row, and a probe input.
+    .map((d) => (d.project_id && projRows && !projRows.error && projRows.ids.has(d.project_id) ? d : { ...d, projects: null, project_id: null }));
   const canToggle = me?.role === "admin" || me?.role === "lead";
   const projectOptions = (projects ?? []) as { id: string; slug: string; name: string }[];
 

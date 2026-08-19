@@ -96,13 +96,16 @@ slice named after its column set.
   BLOCKER 3):** a project grant is an ITEM-membership grant (it feeds
   `visibleItemIdsForProjects`), so the creator grant fires ONLY on a successful FRESH
   insert of `kind='initiative'` inside this action — never on an adopted/source/system
-  row. **Ordering + the duplicate arm (round 2 BLOCKER 4):** insert row → creator grant →
-  graph-pointer ensure, so a pointer failure can no longer strand a granted-less row; and
-  the duplicate-slug heal arm ALSO ensures the creator grant IFF the existing row is
-  `kind='initiative'` AND content-empty (zero items, tasks, decisions — an empty
-  initiative's grant admits zero items by construction), which makes create-retry converge
-  without ever granting a contentful existing slug; a contentful duplicate returns the
-  existing "already exists" refusal ungranted. The 3 pre-existing empty
+  row. **Ordering (round 2 BLOCKER 4):** insert row → creator grant → graph-pointer ensure, so a
+  pointer failure can no longer strand a granted-less row. **The duplicate arm grants
+  NOTHING (REVISED at the Fable diff review, HIGH 1):** the drafted "converge on an empty
+  initiative" heal keyed the grant on the CALLER, and `projects` records no creator — any
+  member re-submitting a known/guessed name would have self-granted onto a stranger's
+  container. A creator stranded by a crash between insert and grant repairs through the
+  audited admin grant path (rare, stated in release notes). NAMED RESIDUAL (§5.7 class,
+  pre-existing): the "already exists" refusal confirms a slug is taken, which for a
+  restricted initiative is an existence oracle via create-conflict — inherent to unique
+  slugs, deferred with reason. The 3 pre-existing empty
   containers have no creator record and stay hidden absent a grant — stated in release
   notes with their names available to admins via the CLI, not silently.
 - **D2 — the 66 adopted no-provenance tasks** (pm-linked, provider-live): stay hidden.
@@ -168,6 +171,24 @@ whose row the viewer cannot see (cross-project curation). The library item page'
 `canSeeProjectRow` passes; otherwise the page renders WITHOUT the container link/slug —
 indistinguishable from a container-less item (§5.7 for container names), the item's own
 body untouched.
+**The adjacent WRITE routes gate on row visibility (Fable diff HIGH 2 — the
+enforce-the-adjacent-write-route class):** a hand-typed row in P makes P content-visible to
+the whole team through this section's own arms, so `createTaskAction` and
+`createDecisionAction` refuse a `projectId` the caller cannot row-see (the §5.7
+absent-project shape; role does not bypass it — content→membership applies to admins, the
+ENFB-1 data-browser ruling). `updateTaskAction` cannot move `project_id`, so create is the
+only door. Guard-pinned per action file; dm-pinned both directions.
+**Redaction sites are DEFENSE-IN-DEPTH, stated (Fable diff M3 + build-time analysis):** a
+served row's container is row-visible BY CONSTRUCTION (the row itself satisfies a content
+arm), so the item-page/decisions-page container redactions cannot fire on real state under
+the current rule — they exist because the rule has two owners and drift is the named risk,
+and the decisions-page map also nulls `project_id` (the rows feed a "use client" table; a
+surviving uuid would serialize into the RSC payload). A resolution ERROR redacts every
+container name (fail closed).
+**Feed-cursor consequence (Fable diff M6), named:** API cursors advance over VISIBLE rows,
+and a grant does not bump `updated_at` — a row hidden at pull time then granted later sits
+behind every client cursor until a re-push/edit moves it (D2's repair-by-re-sync ruling,
+recorded at the window site).
 **Deleted-author consequence (round 2 HIGH 6), named:** `decisions.created_by` is
 `on delete set null` — deleting a member turns their hand-typed decisions into
 no-provenance rows, which then hide (and can flip a decision-only container invisible).
@@ -290,10 +311,15 @@ discriminating arm (that is the design, not vacuity).
 3. Same file — dropdowns: the board/decisions create-forms list exactly the §2.1 set for
    team-posture members (never empty for a stock member — General pinned present).
 4. `npm run test:datamechanics:iso test/datamechanics/enfb2-inquery-provenance.datamechanics.test.ts`
-   exits 0 — the STARVATION class dies: with cap-size invisible rows planted NEWER than a
-   visible row, the visible row still serves on the tasks API list, the decisions API, the
-   board query, the retrieve recency/keyword/task-digest legs, the timeline structured legs,
-   and the Pulse decisions card (per-site arms); the WRITEBACK arm (round-1 finding 3):
+   exits 0 — the STARVATION class dies, with per-site arms where the site is directly
+   callable: the tasks API route, the decisions API feed, `matchingDecisions`,
+   `boardTaskWindow`, and `decisionsCardWindow`. COVERAGE STATED HONESTLY (Fable diff M4):
+   the retrieve recency/task-digest legs and the timeline's windows are inline in their
+   builders and are pinned INDIRECTLY — by the shared-fragment agreement suite (the same
+   `provenanceRowSqlFromIds` compiles into them), the guard's per-file APPLICATION patterns
+   (dropping the fragment from any of them reddens the build), and the existing
+   access-enforce-retrieve/-timeline enforcement suites; no per-site starvation fixture
+   exists for them. The WRITEBACK arm (round-1 finding 3):
    cap-size visible-but-not-writeback rows planted ahead of a writeback row still yield the
    writeback row from the decisions sync window; the SQL↔TS agreement pin (§2.2) holds
    across ALL its arms including the four inverse-conjunct arms; `unknown_keys` reports a

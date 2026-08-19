@@ -234,11 +234,15 @@ function projectRowVisibleSql(teamId: string, granted: readonly string[], teamPo
   const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture };
   const team = p.add(teamId);
   const grantedPh = p.add([...granted]);
+  // Posture stays a CONJUNCT on every content arm (Fable diff L10): an external-posture
+  // member's row-visibility must not exceed what the container's own surfaces would list for
+  // them (membership ∧ audience, matching the pages' visibleItems/visibleTasks walls).
+  const posture = p.add(teamPosture);
   const where = `p.team_id = ${team} and (
       p.id = any(${grantedPh}::uuid[])
-      or exists (select 1 from items i where i.team_id = ${team} and i.project_id = p.id and ${itemVisibleSql("i.id", p, ctx)})
-      or exists (select 1 from tasks t where t.team_id = ${team} and t.project_id = p.id and ${provenanceRowSql("t", p, ctx)})
-      or exists (select 1 from decisions d where d.team_id = ${team} and d.project_id = p.id and ${provenanceRowSql("d", p, ctx)})
+      or exists (select 1 from items i where i.team_id = ${team} and i.project_id = p.id and (${posture} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})
+      or exists (select 1 from tasks t where t.team_id = ${team} and t.project_id = p.id and (${posture} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})
+      or exists (select 1 from decisions d where d.team_id = ${team} and d.project_id = p.id and (${posture} or d.audience = 'external') and ${provenanceRowSql("d", p, ctx)})
     )`;
   return { p, where };
 }
@@ -289,13 +293,16 @@ export async function visibleProjectCards(
 ): Promise<{ rows: ProjectRowCard[]; error?: boolean }> {
   try {
     const { projectIds } = await visibleProjects(db, principal);
-    const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
-    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: [...projectIds], teamPosture: posture };
+    const posture0 = await teamPostureFor(db, principal);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0);
+    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: [...projectIds], teamPosture: posture0 };
+    // The card counts carry the SAME posture conjuncts as the row rule and the detail page's
+    // walls (Fable diff L10 — counts must never exceed what the container page lists).
+    const posture = p.add(posture0);
     const res = await runSql<{ id: string; slug: string; name: string; last_synced_at: string | Date | null; visible_items: number; visible_tasks: number }>(
       `select p.id, p.slug, p.name, p.last_synced_at,
-              (select count(*) from items i where i.team_id = p.team_id and i.project_id = p.id and ${itemVisibleSql("i.id", p, ctx)})::int as visible_items,
-              (select count(*) from tasks t where t.team_id = p.team_id and t.project_id = p.id and ${provenanceRowSql("t", p, ctx)})::int as visible_tasks
+              (select count(*) from items i where i.team_id = p.team_id and i.project_id = p.id and (${posture} or i.access = 'external') and ${itemVisibleSql("i.id", p, ctx)})::int as visible_items,
+              (select count(*) from tasks t where t.team_id = p.team_id and t.project_id = p.id and (${posture} or t.audience = 'external') and ${provenanceRowSql("t", p, ctx)})::int as visible_tasks
          from projects p
         where p.kind <> 'system' and ${where}
         order by p.last_synced_at desc nulls last`,

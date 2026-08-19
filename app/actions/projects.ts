@@ -58,12 +58,14 @@ export async function createProjectAction(input: {
         if (!heal.ok) {
           return { ok: false, error: `a project "${slug}" already exists — and its graph pointer is unhealed: ${heal.error}` };
         }
-        // ENFB-2 D1 (round-2 blocker 4): a create-retry whose first attempt died between the
-        // insert and the grant must CONVERGE, not strand the creator on an invisible row. The
-        // grant re-fires ONLY for a content-EMPTY initiative (round-2 blocker 3: a project
-        // grant is an item-membership grant, so healing must never grant a contentful or
-        // non-initiative existing slug — that row belongs to someone/something else).
-        await grantCreatorIfEmptyInitiative(db, input.teamId, existing as ProjectRow & { kind?: string }, me.id);
+        // ENFB-2 D1, REVISED at the Fable diff review (HIGH 1): the duplicate arm must grant
+        // NOTHING. The drafted "converge on an empty initiative" heal keyed the grant on the
+        // CALLER, and `projects` records no creator — so ANY member re-submitting a known or
+        // guessed name would have granted THEMSELVES onto a stranger's restricted container
+        // (a project grant is an item-membership grant; everything later curated in would have
+        // served them). A creator stranded by a crash between insert and grant retries into
+        // "already exists" without visibility — rare, and the repair is the deliberate,
+        // audited admin grant path (the ENFB-1 self-grant shape), not a self-service arm.
       }
       return { ok: false, error: `a project "${slug}" already exists` };
     }
@@ -101,24 +103,3 @@ async function grantProjectToCreator(
   return { ok: true };
 }
 
-/** Duplicate-arm convergence: re-fire the creator grant IFF the existing row is a
- *  content-empty initiative (zero items, tasks, decisions) — an empty initiative's grant
- *  admits zero items by construction; anything else refuses ungranted. */
-async function grantCreatorIfEmptyInitiative(
-  db: Awaited<ReturnType<typeof serverClient>>,
-  teamId: string,
-  existing: ProjectRow & { kind?: string },
-  creatorId: string
-): Promise<void> {
-  const { data: row } = await db
-    .from("projects")
-    .select("id, kind")
-    .eq("id", existing.id)
-    .maybeSingle();
-  if ((row as { kind?: string } | null)?.kind !== "initiative") return;
-  for (const table of ["items", "tasks", "decisions"] as const) {
-    const { data: any } = await db.from(table).select("id").eq("project_id", existing.id).limit(1);
-    if (((any ?? []) as unknown[]).length > 0) return;
-  }
-  await grantProjectToCreator(db, teamId, existing.id, creatorId);
-}

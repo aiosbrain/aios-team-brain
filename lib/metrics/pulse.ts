@@ -217,7 +217,12 @@ export async function getPulseMetrics(
         p.values
       )
         .then((r) => ({ data: r.rows, error: null }))
-        .catch(() => ({ data: [] as { status: string; updated_at: string | Date | null }[], error: null }));
+        .catch((e) => {
+          // LOUD on failure (Fable diff L12): the old shape merely didn't check its error;
+          // this one must not make failure unreportable by construction.
+          console.warn("[pulse] task funnel read failed:", e instanceof Error ? e.message : e);
+          return { data: [] as { status: string; updated_at: string | Date | null }[], error: null };
+        });
     })(),
   ]);
 

@@ -28,6 +28,9 @@ export default async function ProjectsPage({ params }: { params: Promise<{ team:
   const cards = viewer
     ? await visibleProjectCards(db, { teamId: team.id, memberId: viewer.id })
     : { rows: [] as Awaited<ReturnType<typeof visibleProjectCards>>["rows"] };
+  // A substrate ERROR is not an empty inventory (Fable diff L8) — surface it to the error
+  // boundary instead of rendering the misleading "No projects yet" onboarding state.
+  if ("error" in cards && cards.error) throw new Error("project visibility resolution failed");
   const rows = cards.rows;
 
   return (

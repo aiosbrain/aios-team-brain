@@ -135,8 +135,8 @@ export default async function TeamHome({
   const memberId = me.id;
   const firstName = me.displayName.trim().split(/\s+/)[0] || "there";
 
-  // Both reads are independent — run them together. itemCount is tier-filtered (there is no
-  // RLS backstop); last_used_at on an active own key proves /me or another authenticated
+  // Both reads are independent — run them together. itemCount is the DELIBERATE team-total
+  // scalar (see the tier-ok note below); last_used_at on an active own key proves /me or another authenticated
   // request actually succeeded. Merely issuing a key is not a completed workstation setup.
   // tier-ok: the ONLY unscoped read here is the head-count scalar below — the deliberate
   // ENFB-2 F5 existence bit (no titles/kinds/projects); every other read on this page is

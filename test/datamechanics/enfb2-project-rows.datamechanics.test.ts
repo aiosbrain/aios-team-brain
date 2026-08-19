@@ -190,12 +190,115 @@ describe("ENFB-2 D1 — createProjectAction grants its creator (round-2 blockers
     const { data: grants } = await db().from("project_groups").select("group_id").eq("project_id", heldRow!.id as string);
     expect((grants ?? []).length, "no grant may land on a contentful existing slug").toBe(0);
 
-    // Empty-initiative duplicate: retry converges — the creator ends granted.
+    // Empty-initiative duplicate: the ORIGINAL creator's grant persists (it landed on the
+    // fresh insert); the duplicate arm itself grants NOTHING (Fable diff HIGH 1 — the drafted
+    // convergence heal keyed on the CALLER and was a self-service grant onto foreign rows).
     const name = `Fresh ${randomUUID().slice(0, 6)}`;
     const first = await createProjectAction({ teamId: seed.teamId, name });
     expect(first.ok, first.error).toBe(true);
     const again = await createProjectAction({ teamId: seed.teamId, name });
     expect(again.ok === false, "duplicate create still refuses (identity is the unique constraint)").toBe(true);
-    expect(await canSeeProjectRow(db(), { teamId: seed.teamId, memberId: creator }, first.project!.id), "creator stays granted after retry").toBe(true);
+    expect(await canSeeProjectRow(db(), { teamId: seed.teamId, memberId: creator }, first.project!.id), "the original creator keeps their fresh-insert grant").toBe(true);
+  });
+
+  it("HIGH-1 pin: a DIFFERENT member's duplicate create grants them nothing — even on an empty initiative", async () => {
+    const seed = await seedTeam();
+    const creator = await seedMember(seed);
+    const prober = await seedMember(seed);
+    await mockSessionAs(creator);
+    const { createProjectAction } = await import("@/app/actions/projects");
+    const name = `Secret ${randomUUID().slice(0, 6)}`;
+    const first = await createProjectAction({ teamId: seed.teamId, name });
+    expect(first.ok, first.error).toBe(true);
+
+    await mockSessionAs(prober);
+    const probe = await createProjectAction({ teamId: seed.teamId, name });
+    expect(probe.ok).toBe(false);
+    expect(await canSeeProjectRow(db(), { teamId: seed.teamId, memberId: prober }, first.project!.id), "a duplicate-name probe must never become a membership grant").toBe(false);
+    expect(await canSeeProjectRow(db(), { teamId: seed.teamId, memberId: creator }, first.project!.id), "the creator's grant is untouched").toBe(true);
+  });
+
+  it("HIGH-2 pin: the WRITE routes gate on row visibility — filing into an unseen container refuses instead of un-hiding it", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    // A restricted initiative only the insider can row-see.
+    const secretItem = await ingest(seed, { path: "w.md", body: "w", access: "team", project: "srcp" });
+    await backfillTeamContext(db(), seed.teamId);
+    const restricted = await mkProject(seed, "initiative");
+    await curateInto(seed, secretItem.id, restricted);
+    await grantTo(seed, restricted, insider);
+
+    const { createTaskAction } = await import("@/app/actions/tasks");
+    const { createDecisionAction } = await import("@/app/actions/decisions");
+
+    // The outsider cannot file into it (both actions refuse with the absent-project shape,
+    // §5.7 — a success would make the container CONTENT-VISIBLE to the whole team). The
+    // outsider is mocked as an ADMIN: role must not bypass the wall (content→membership
+    // applies to admins — the ENFB-1 data-browser ruling).
+    const { currentMember: cm } = await import("@/lib/auth/guard");
+    const { serverClient: sc } = await import("@/lib/db/server");
+    (cm as ReturnType<typeof vi.fn>).mockResolvedValue({ id: outsider, role: "admin", tier: "team" });
+    (sc as ReturnType<typeof vi.fn>).mockResolvedValue(db());
+    const taskRefusal = await createTaskAction({ teamId: seed.teamId, projectId: restricted, title: "junk", assignee: "", sprint: "" } as Parameters<typeof createTaskAction>[0]);
+    expect(taskRefusal.ok).toBe(false);
+    expect(taskRefusal.error).toBe("project not found");
+    const decRefusal = await createDecisionAction({ teamId: seed.teamId, projectId: restricted, title: "junk", rationale: "r", decidedBy: "x", impact: "m", decidedAt: "2026-08-19" } as Parameters<typeof createDecisionAction>[0]);
+    expect(decRefusal.ok).toBe(false);
+    expect(decRefusal.error).toBe("project not found");
+    const rows = await visibleProjectRows(db(), { teamId: seed.teamId, memberId: outsider });
+    expect(rows.ids.has(restricted), "the refused writes left the container hidden").toBe(false);
+
+    // Non-vacuity: the INSIDER can file into it (the gate is visibility, not a blanket wall).
+    // Probed via the decision action — the task action's post-write projection uses Next's
+    // request-scoped `after()`, unreachable in the dm environment; the gate under test is the
+    // same canSeeProjectRow call in both actions (guard-pinned per file).
+    const { currentMember } = await import("@/lib/auth/guard");
+    (currentMember as ReturnType<typeof vi.fn>).mockResolvedValue({ id: insider, role: "admin", tier: "team" });
+    const ok = await createDecisionAction({ teamId: seed.teamId, projectId: restricted, title: "real", rationale: "r", decidedBy: "x", impact: "m", decidedAt: "2026-08-19" } as Parameters<typeof createDecisionAction>[0]);
+    expect(ok.ok, ok.error).toBe(true);
+  });
+
+  it("M4 pins: GET /api/v1/projects serves row-visible rows only, and visibleProjectCards counts the VIEWER-visible content", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    await ingest(seed, { path: "o.md", body: "o", access: "team", project: "srcp" });
+    const secretItem = await ingest(seed, { path: "s.md", body: "s", access: "team", project: "srcp" });
+    await backfillTeamContext(db(), seed.teamId);
+    const restricted = await mkProject(seed, "initiative");
+    await curateInto(seed, secretItem.id, restricted);
+    await grantTo(seed, restricted, insider);
+    const { data: srcProj } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId).eq("slug", "srcp").single();
+
+    // The wire (round-2 BLOCKER 2's surface): a non-grantee's pull omits the restricted slug.
+    const { GET: projectsGET } = await import("@/app/api/v1/projects/route");
+    const { issueApiKey } = await import("@/lib/admin/keys");
+    const wire = async (memberId: string) => {
+      const { key } = await issueApiKey(db(), seed.teamId, memberId, "k");
+      const res = await projectsGET(new Request("http://test/api/v1/projects", { headers: { authorization: `Bearer ${key}` } }) as never);
+      expect(res.status).toBe(200);
+      return ((await res.json()) as { projects: { slug: string }[] }).projects.map((r) => r.slug);
+    };
+    const { data: restrictedRow } = await db().from("projects").select("slug").eq("id", restricted).single();
+    expect(await wire(outsider), "non-grantee wire omits the restricted slug").not.toContain(restrictedRow!.slug);
+    expect(await wire(insider), "grantee wire carries it").toContain(restrictedRow!.slug);
+    expect(await wire(outsider), "the content-bearing source container still serves").toContain(srcProj!.slug);
+
+    // The cards (the LIST page's read): counts are viewer-visible, not totals.
+    const { visibleProjectCards } = await import("@/lib/access/enforce");
+    const outsiderCards = await visibleProjectCards(db(), { teamId: seed.teamId, memberId: outsider });
+    const insiderCards = await visibleProjectCards(db(), { teamId: seed.teamId, memberId: insider });
+    const srcCardOut = outsiderCards.rows.find((r) => r.id === (srcProj!.id as string))!;
+    expect(srcCardOut.visibleItems, "outsider counts only the open item").toBe(1);
+    expect(outsiderCards.rows.some((r) => r.id === restricted), "restricted card absent for the outsider").toBe(false);
+    // Container-count semantic, pinned: the curated item's CONTAINER is still srcp (curation
+    // moves membership, not residence), so the initiative's card counts 0 contained items —
+    // exactly what the previous items(count) embed measured, now visibility-filtered. The
+    // grantee's srcp card counts BOTH contained items (open + the restricted one they hold).
+    const restrictedCard = insiderCards.rows.find((r) => r.id === restricted)!;
+    expect(restrictedCard.visibleItems, "an initiative with curated-in (not contained) content counts 0").toBe(0);
+    const srcCardIn = insiderCards.rows.find((r) => r.id === (srcProj!.id as string))!;
+    expect(srcCardIn.visibleItems, "the grantee counts both contained items").toBe(2);
   });
 });
