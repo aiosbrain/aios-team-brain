@@ -15,8 +15,7 @@ const LIMIT = 30;
 /**
  * Layer 2 of the Brain-Learning panel: recent events (source episodes) with participants + the facts
  * extracted from each, so the panel can group facts by the event that produced them. Session-authed;
- * tier decides the visible group_ids (`visibleTierGroupIds`, sole enforcement — pointer-resolved,
- * so a renamed team still reads its own graph). Best-effort empty.
+ * the member's ORACLE decides the visible partitions (ENFB-3: `selectEnforcedGraphPartitions` over the granted projects' stored pointers — rename-safe by the pointer principle). Best-effort empty.
  */
 export async function GET(req: NextRequest) {
   const rls = await serverClient();
@@ -66,13 +65,19 @@ export async function GET(req: NextRequest) {
       k: Number.MAX_SAFE_INTEGER,
       arm: false,
     });
-    const { data: sysVisible } = await admin
+    const { data: sysVisible, error: sysErr } = await admin
       .from("projects")
       .select("id")
       .eq("team_id", team.id)
       .eq("kind", "system")
       .in("id", [...oracle.set.projectIds])
       .limit(1);
+    // An ERRORED discriminator input is UNDETERMINABLE, not "no" (Codex diff L2): returning a
+    // benign empty here would mask exactly the wiring fault the loud arm exists to surface.
+    if (sysErr) {
+      console.error(`[feed] system-project discriminator read failed for team ${teamSlug}:`, sysErr.message);
+      return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
+    }
     const seesSystem = ((sysVisible ?? []) as unknown[]).length > 0;
     if (scope.groups.length === 0 && seesSystem && !scope.generalSuppressed) {
       console.error(`[events] zero partitions for a system-visible member on team ${teamSlug} — stored pointers missing (wiring fault)`);

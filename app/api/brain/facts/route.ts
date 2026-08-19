@@ -65,13 +65,19 @@ export async function GET(req: NextRequest) {
       k: Number.MAX_SAFE_INTEGER,
       arm: false,
     });
-    const { data: sysVisible } = await adminClient()
+    const { data: sysVisible, error: sysErr } = await adminClient()
       .from("projects")
       .select("id")
       .eq("team_id", team.id)
       .eq("kind", "system")
       .in("id", [...oracle.set.projectIds])
       .limit(1);
+    // An ERRORED discriminator input is UNDETERMINABLE, not "no" (Codex diff L2): returning a
+    // benign empty here would mask exactly the wiring fault the loud arm exists to surface.
+    if (sysErr) {
+      console.error(`[feed] system-project discriminator read failed for team ${teamSlug}:`, sysErr.message);
+      return Response.json({ facts: [], as_of: new Date().toISOString(), stale: false, degraded: true, window_hours: WINDOW_HOURS });
+    }
     const seesSystem = ((sysVisible ?? []) as unknown[]).length > 0;
     if (scope.groups.length === 0 && seesSystem && !scope.generalSuppressed) {
       console.error(`[facts] zero partitions for a system-visible member on team ${teamSlug} — stored pointers missing (wiring fault)`);
