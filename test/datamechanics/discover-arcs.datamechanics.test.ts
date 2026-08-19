@@ -51,15 +51,21 @@ describe("discoverOpportunitiesFromArcs (data-mechanics)", () => {
     // Most-restrictive evidence wins: one team item → the whole opportunity is team-tier.
     expect(s.opportunities[0].access).toBe("team");
 
-    // And an external viewer never sees it.
-    const extVisible = await listOpportunities(db(), seed.teamId, "external", 100);
+    // And an external viewer never sees it. ENFB-4: the viewer set holds BOTH evidence items,
+    // so the posture TIER stays this arm's only discriminator (not the membership gate).
+    const extVisible = await listOpportunities(db(), seed.teamId, "external", 100, new Set([ext.id, team.id]));
     expect(extVisible.map((o) => o.dedup_key)).not.toContain("arc:arc-mixed");
   });
 
-  it("fails closed to TEAM when evidence references a missing item", async () => {
+  // ENFB-4 D1 re-specification: the old arm here pinned missing→team (floor). A dangling item
+  // id is unverifiable provenance — under the EVERY read rule the row would be born dark for
+  // every viewer and unrepairable by any grant; admission now REFUSES it.
+  it("refuses an arc whose evidence references a missing item (unverifiable provenance)", async () => {
     const seed = await seedTeam();
     const s = await run(seed.teamId, seed.teamSlug, [arc("arc-dangling", [randomUUID()])]);
-    expect(s.opportunities[0].access).toBe("team");
+    expect(s.created).toBe(0);
+    expect(s.skipped).toBe(1);
+    expect(s.opportunities).toEqual([]);
   });
 
   it("is idempotent by arc id — a second run creates nothing new", async () => {
@@ -73,7 +79,7 @@ describe("discoverOpportunitiesFromArcs (data-mechanics)", () => {
     expect(second.created).toBe(0);
     expect(second.skipped).toBe(1);
 
-    const all = await listOpportunities(db(), seed.teamId, "team", 100);
+    const all = await listOpportunities(db(), seed.teamId, "team", 100, new Set([ext.id]));
     expect(all.filter((o) => o.dedup_key === "arc:arc-dupe").length).toBe(1);
   });
 });
