@@ -81,9 +81,9 @@ describe("dashboard tier isolation", () => {
  * ENFB-2 moved the recorded title/metadata residuals (the projects LIST inventory, the tasks
  * API, the decisions feed, Pulse counts, deriveProjects) from "recorded" to ENFORCED — see
  * TITLE_SURFACE_WIRING + the sweep layer below. What REMAINS residual, each with its reason:
- * social (ENFB-4 — jsonb provenance + the admin-role precedent question), the graph feed
- * routes events/facts (partition-owner slice — visibleTierGroupIds vs the stored-pointer
- * path), meetings (ENFB-3 — no audience column yet).
+ * social (ENFB-4 — jsonb provenance + the admin-role precedent question) — the LAST one:
+ * ENFB-3 enforced meetings (the item oracle via source_item_id, which was never blocked on
+ * schema) and moved the graph feeds to the stored-pointer partition path.
  */
 const ROOT = join(import.meta.dirname, "..", "..");
 /** Per-file APPLICATION patterns (diff-review Medium: presence of a resolution without its
@@ -102,6 +102,11 @@ const BODY_SURFACE_WIRING: [string, RegExp][] = [
   // in-query. Both halves pinned (resolution without application is the pre-ENFB-1 wall).
   ["app/actions/meeting-todos.ts", /visibleItemIds: \[\.\.\.vis\.ids\]/],
   ["lib/meetings/extract-todos.ts", /q\.in\("id", \[\.\.\.opts\.visibleItemIds\]\)/],
+  // ENFB-3: the meetings serving reads — the list's in-query intersect and the detail's
+  // by-id probe (the detail serves the transcript BODY, the same bytes the library page
+  // gates). Tombstone refusal rides the same detail pin.
+  ["lib/meetings/notes.ts", /\.in\("source_item_id", \[\.\.\.vis\.ids\]\)/],
+  ["lib/meetings/notes.ts", /await canSeeItem\(db, \{ teamId, memberId: viewer\.memberId \}, row\.source_item_id\)/],
   ["app/api/v1/okf-bundle/route.ts", /pageVisibleOkfItems\(/],
 ];
 
@@ -179,7 +184,13 @@ const TITLE_SURFACE_WIRING: [string, RegExp][] = [
  *  DECISION on record, not an exemption by silence. */
 const SWEEP_RESIDUALS: [string, string][] = [
   ["lib/social/", "ENFB-4: jsonb evidence provenance + the admin-role precedent question (spec §0b)"],
-  ["app/t/[team]/meetings/", "ENFB-3: meetings have no audience column yet; the actions' task reads are id-bounded PM-projection plumbing for one note's extracted tasks, not an inventory"],
+  ["app/t/[team]/meetings/", "ENFB-3 ENFORCED the meetings gate (the old residual reason — 'no audience column' — was wrong: source_item_id NOT NULL makes the item oracle directly applicable). The actions ride the gated getMeetingNote; their task reads stay id-bounded PM-projection plumbing"],
+  ["lib/meetings/notes.ts", "the serving reads ARE the gate (wired above in BODY_SURFACE_WIRING); the write/merge/backfill helpers are scheduler-driven, not serving reads"],
+  ["lib/meetings/merge.ts", "scheduler-driven dedupe/merge — not a serving read; its item writes reconcile before re-point (ENFB-3 D2)"],
+  ["lib/meetings/link-notes.ts", "scheduler/ingest-side identity link — not a serving read"],
+  ["lib/meetings/refresh.ts", "operator healing pass — not a serving read"],
+  ["lib/meetings/from-items.ts", "the backfill writer (admin-gated at its action, scheduler otherwise) — not a serving read"],
+  ["lib/meetings/extract-todos.ts", "the scan is oracle-bounded (wired above); the task writers are the materialization path"],
   ["lib/dashboard/home-state.ts", "consumes the deliberate team-total scalar only (ENFB-2 F5)"],
   ["lib/metrics/codebases.ts", "code-metrics, not curated content — structure ruling (spec §0b)"],
   ["lib/metrics/maturity", "session-derived, not curated content — structure ruling (spec §0b)"],
@@ -191,15 +202,15 @@ const SWEEP_RESIDUALS: [string, string][] = [
   ["app/api/v1/okf-bundle/route.ts", "body surface — enforced + pinned in BODY_SURFACE_WIRING"],
   ["app/api/v1/items/", "body surface — enforced + pinned in BODY_SURFACE_WIRING"],
   ["app/api/v1/graph-query/route.ts", "stored-pointer partition scope (ENFB-1), no structured-row read"],
-  ["app/api/brain/events/route.ts", "graph feed residual — partition-owner slice (spec §0b)"],
-  ["app/api/brain/facts/route.ts", "graph feed residual — partition-owner slice (spec §0b)"],
+  ["app/api/brain/events/route.ts", "ENFB-3: oracle partitions via selectEnforcedGraphPartitions (pinned by graph-group-slug-derivation + graph-cutover-callsites); no structured-row read"],
+  ["app/api/brain/facts/route.ts", "ENFB-3: same as events — the partition path is the gate"],
 ];
 
 // app/t joined the walk at the Fable diff review (M5): the motivating bug — the ungated
 // projects LIST — lived exactly there, and a sweep that skips the class's original habitat
 // is a tripwire with a hole where the trap sprang.
-const SWEEP_DIRS = ["app/api", "app/t", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social"];
-const SWEEP_READ = /from\(\s*["'](projects|tasks|decisions)["']\s*\)/;
+const SWEEP_DIRS = ["app/api", "app/t", "lib/sync", "lib/metrics", "lib/identity", "lib/dashboard", "lib/social", "lib/meetings"];
+const SWEEP_READ = /from\(\s*["'](projects|tasks|decisions|meeting_notes)["']\s*\)/;
 const SWEEP_SERVES = /select\(\s*["'][^"']*(name|title|count|slug)[^"']*["']/;
 
 describe("ENFB-2 — title/count surfaces APPLY the oracle (wiring + sweep tripwire)", () => {
