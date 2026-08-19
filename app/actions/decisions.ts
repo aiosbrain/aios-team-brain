@@ -40,6 +40,15 @@ export async function createDecisionAction(
   }
 
   const db = await serverClient();
+  // ENFB-2 (Fable diff HIGH 2): a hand-typed decision in P makes P's row content-visible to
+  // the whole team (§2.1's decisions arm) — the write gates on the same row-visibility the
+  // read surfaces use, or filing into an unseen container un-hides it. Role alone is not the
+  // gate (content→membership applies to admins too, the ENFB-1 data-browser ruling).
+  const { canSeeProjectRow } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  if (!(await canSeeProjectRow(adminClient(), { teamId: input.teamId, memberId: me.id }, input.projectId))) {
+    return { ok: false, error: "project not found" };
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     const { data, error } = await db
       .from("decisions")

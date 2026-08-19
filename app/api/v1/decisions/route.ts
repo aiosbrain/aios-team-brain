@@ -24,7 +24,15 @@ export async function GET(req: NextRequest) {
   const since = new URL(req.url).searchParams.get("since") || "1970-01-01T00:00:00Z";
 
   try {
-    const decisions = await getDecisionWriteback(db, auth.teamId, auth.memberTier, since);
+    // ENFB-2 §2.2: the feed serves rationale/impact prose — the caller's oracle set + posture
+    // compile into the window (fail closed: a resolution error is the catch's 500).
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    const vis = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+    if (vis.error) return errorResponse("internal", "visibility resolution failed", 500);
+    const decisions = await getDecisionWriteback(db, auth.teamId, auth.memberTier, since, {
+      visibleItemIds: vis.ids,
+      teamPosture: auth.memberTier === "team",
+    });
     return Response.json({ decisions, next_cursor: null });
   } catch (e) {
     return errorResponse("internal", e instanceof Error ? e.message : "writeback failed", 500);

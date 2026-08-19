@@ -2,6 +2,8 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { ViewerTier } from "@/lib/auth/visibility";
 import type { WorkingHours } from "@/lib/identity/profile";
+import { runSql } from "@/lib/db/pg/pool";
+import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 
 /**
  * Read side of the identity CONTEXT layer (Phase 2). Folds a member's curated profile,
@@ -105,7 +107,11 @@ export async function getMemberContext(
   db: DbClient,
   teamId: string,
   memberId: string,
-  tier: ViewerTier
+  tier: ViewerTier,
+  // ENFB-2 §2.2: the VIEWER's oracle ctx — the derived-projects read serves restricted
+  // project names + per-project task counts, so it computes over the viewer-visible task
+  // set. Absent → fail closed (no derived projects), never the ungated team-wide read.
+  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
 ): Promise<MemberContext | null> {
   if (!canSeeMemberContext(tier)) return null;
 
@@ -192,23 +198,32 @@ export async function getMemberContext(
     source: r.source,
   }));
 
-  const projects = await deriveProjects(db, teamId, names);
+  const projects = await deriveProjects(db, teamId, names, viewerCtx);
 
   return { profile, timeOff, goals, projects };
 }
 
-/** Distinct projects this member is assigned tasks in, with open/total counts. */
+/** Distinct projects this member is assigned tasks in, with open/total counts — over the
+ *  VIEWER-visible task set (ENFB-2: the previous read consumed every team task with no
+ *  choke-point at all and emitted restricted project names + per-project counts). A project
+ *  surfacing here is row-visible BY CONSTRUCTION: it holds ≥1 provenance-visible task, which
+ *  is §2.1's task arm. */
 async function deriveProjects(
   db: DbClient,
   teamId: string,
-  names: string[]
+  names: string[],
+  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
 ): Promise<ProjectView[]> {
   if (!names.length) return [];
-  const { data: tasks } = await db
-    .from("tasks")
-    .select("project_id, assignee, status")
-    .eq("team_id", teamId);
-  const rows = (tasks ?? []) as Array<{ project_id: string; assignee: string; status: string }>;
+  if (!viewerCtx) return []; // fail closed — never the ungated team-wide read
+  const p = newSqlParams();
+  const res = await runSql<{ project_id: string; assignee: string; status: string }>(
+    `select t.project_id, t.assignee, t.status from tasks t
+      where t.team_id = ${p.add(teamId)}
+        and ${provenanceRowSqlFromIds("t", p, viewerCtx)}`,
+    p.values
+  ).catch(() => ({ rows: [] as { project_id: string; assignee: string; status: string }[] }));
+  const rows = res.rows;
 
   const byProject = new Map<string, { open: number; total: number }>();
   for (const t of rows) {

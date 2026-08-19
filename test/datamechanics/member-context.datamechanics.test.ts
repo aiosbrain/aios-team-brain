@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { setMemberProfile, addTimeOff, setMemberGoal } from "@/lib/identity/profile";
 import { getMemberContext } from "@/lib/identity/context";
-import { db, seedTeam } from "./helpers";
+import { db, seedTeam, type Seed } from "./helpers";
+import { visibleItemIds } from "@/lib/access/enforce";
 
 /**
  * Spec for the identity-context READ fold on real Postgres: getMemberContext returns the
@@ -23,11 +24,19 @@ async function seedTask(
   teamId: string,
   projectId: string,
   assignee: string,
-  status: string
+  status: string,
+  creator: string
 ): Promise<void> {
+  // The real dashboard writer's shape (ENFB-2: deriveProjects computes over the viewer's
+  // provenance-visible task set, so a bare posture-era seed would be invisible).
   await db()
     .from("tasks")
-    .insert({ team_id: teamId, project_id: projectId, title: "t", assignee, status, origin: "sync" });
+    .insert({ team_id: teamId, project_id: projectId, title: "t", assignee, status, origin: "ui", created_by: creator });
+}
+
+async function viewerCtx(seed: Seed) {
+  const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId: seed.memberId });
+  return { visibleItemIds: vis.ids, teamPosture: true };
 }
 
 describe("getMemberContext fold (real Postgres)", () => {
@@ -55,12 +64,12 @@ describe("getMemberContext fold (real Postgres)", () => {
     // seedTeam's member has display_name 'Tester' — assign tasks to that name.
     const apollo = await seedProject(seed.teamId, "apollo", "Apollo");
     const zephyr = await seedProject(seed.teamId, "zephyr", "Zephyr");
-    await seedTask(seed.teamId, apollo, "Tester", "in_progress");
-    await seedTask(seed.teamId, apollo, "Tester, Someone Else", "done");
-    await seedTask(seed.teamId, zephyr, "Tester", "backlog");
-    await seedTask(seed.teamId, apollo, "Unrelated Person", "backlog"); // not theirs
+    await seedTask(seed.teamId, apollo, "Tester", "in_progress", seed.memberId);
+    await seedTask(seed.teamId, apollo, "Tester, Someone Else", "done", seed.memberId);
+    await seedTask(seed.teamId, zephyr, "Tester", "backlog", seed.memberId);
+    await seedTask(seed.teamId, apollo, "Unrelated Person", "backlog", seed.memberId); // not theirs
 
-    const ctx = await getMemberContext(db(), seed.teamId, seed.memberId, "team");
+    const ctx = await getMemberContext(db(), seed.teamId, seed.memberId, "team", await viewerCtx(seed));
     const projects = ctx!.projects;
     expect(projects.map((p) => p.slug)).toEqual(["apollo", "zephyr"]); // apollo (2) before zephyr (1)
     const apolloView = projects.find((p) => p.slug === "apollo")!;

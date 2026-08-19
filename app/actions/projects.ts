@@ -58,13 +58,48 @@ export async function createProjectAction(input: {
         if (!heal.ok) {
           return { ok: false, error: `a project "${slug}" already exists — and its graph pointer is unhealed: ${heal.error}` };
         }
+        // ENFB-2 D1, REVISED at the Fable diff review (HIGH 1): the duplicate arm must grant
+        // NOTHING. The drafted "converge on an empty initiative" heal keyed the grant on the
+        // CALLER, and `projects` records no creator — so ANY member re-submitting a known or
+        // guessed name would have granted THEMSELVES onto a stranger's restricted container
+        // (a project grant is an item-membership grant; everything later curated in would have
+        // served them). A creator stranded by a crash between insert and grant retries into
+        // "already exists" without visibility — rare, and the repair is the deliberate,
+        // audited admin grant path (the ENFB-1 self-grant shape), not a self-service arm.
       }
       return { ok: false, error: `a project "${slug}" already exists` };
     }
     return { ok: false, error: error?.message ?? "could not create project" };
+  }
+  // ENFB-2 D1: the creator grant fires BEFORE the pointer write (round-2 blocker 4 ordering:
+  // a pointer failure must not strand a granted-less row), and only on this fresh-insert path
+  // where the row is BY CONSTRUCTION an empty initiative this member just minted. Without it,
+  // §2.1 row-visibility would hide the new project from its own creator everywhere (the
+  // round-1 dead-UI-path blocker). Grant failure is LOUD: a created-but-ungranted initiative
+  // is invisible to its creator, which is exactly the stranding this exists to prevent.
+  const grant = await grantProjectToCreator(db, input.teamId, (data as ProjectRow).id, me.id);
+  if (!grant.ok) {
+    return { ok: false, error: `project created but the creator grant failed (${grant.error}) — an admin can repair it with: admin.ts grant-project <your-person-group> ${slug}` };
   }
   // PCCC-4: every creation path records the project's graph partition pointer.
   const ptr = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (data as ProjectRow).id });
   if (!ptr.ok) return { ok: false, error: ptr.error };
   return { ok: true, project: data as ProjectRow };
 }
+
+/** The D1 grant: creator's person singleton → the project, through the sole-writer group
+ *  module (lib/access/groups is the only legal writer of groups/group_members/project_groups). */
+async function grantProjectToCreator(
+  db: Awaited<ReturnType<typeof serverClient>>,
+  teamId: string,
+  projectId: string,
+  creatorId: string
+): Promise<{ ok: boolean; error?: string }> {
+  const { ensurePersonSingleton, grantProjectToGroup } = await import("@/lib/access/groups");
+  const singleton = await ensurePersonSingleton(db, teamId, creatorId, creatorId);
+  if (!singleton.ok || !singleton.groupId) return { ok: false, error: singleton.error ?? "no singleton" };
+  const granted = await grantProjectToGroup(db, teamId, projectId, singleton.groupId, creatorId);
+  if (!granted.ok) return { ok: false, error: granted.error };
+  return { ok: true };
+}
+

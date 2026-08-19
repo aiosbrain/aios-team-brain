@@ -92,7 +92,15 @@ export default async function PersonPage({
     );
   }
 
-  const context = await getMemberContext(db, team.id, p.member_id, me.tier);
+  // ENFB-2: the derived-projects panel computes over the VIEWER's oracle set (restricted
+  // project names/counts must not ride the profile page).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const viewerVis = await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id });
+  const context = await getMemberContext(db, team.id, p.member_id, me.tier, {
+    visibleItemIds: viewerVis.error ? new Set() : viewerVis.ids,
+    teamPosture: me.tier === "team",
+  });
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
   const isSelf = me.id === p.member_id;
 

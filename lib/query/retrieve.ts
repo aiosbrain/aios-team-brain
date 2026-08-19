@@ -2,7 +2,9 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
-import { visibleTasks, isRestrictedTier } from "@/lib/auth/visibility";
+import { isRestrictedTier } from "@/lib/auth/visibility";
+import { runSql } from "@/lib/db/pg/pool";
+import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -14,7 +16,6 @@ import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
 import { analyzeTermSpecificity } from "./grounding";
 import { taskStatusCounts, matchingDecisions } from "./structured-extras";
-import { rowVisibleByProvenance } from "@/lib/access/provenance";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -595,7 +596,12 @@ async function nativeRetrieve(
   // cap) + a keyword search over ALL decisions (an old-but-relevant decision survives the 50-row
   // recency window). Both run concurrently; folded into the structured block below.
   const taskCountsP = Promise.resolve({ total: 0, open: 0, byStatus: {} as Record<string, number> }); // PRET-6: the full-corpus aggregate is permanently omitted
-  const matchedDecisionsP = terms.length ? matchingDecisions(teamId, tier, ftsQuery, 10) : Promise.resolve([]);
+  const matchedDecisionsP = terms.length
+    ? matchingDecisions(teamId, tier, ftsQuery, 10, {
+        visibleItemIds: visibleIds ?? new Set(),
+        teamPosture: tier === "team",
+      })
+    : Promise.resolve([]);
 
   // 2. Recency: most recent items (a fallback so fresh content always has a shot). Ordered by the
   //    persisted WORK time, not `synced_at` (R1/M3): every re-sync tick bumps `synced_at`, so ordering
@@ -633,29 +639,52 @@ async function nativeRetrieve(
     if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
   }
 
-  // 3. Structured-context query builders (awaited together with the above).
-  let decisionsB = db
-    .from("decisions")
-    .select("row_key, decided_at, title, decided_by, still_valid, source_item_id, created_by, projects(slug)")
-    .eq("team_id", teamId)
-    .order("decided_at", { ascending: false })
-    .limit(50);
-  if (isRestrictedTier(tier)) decisionsB = decisionsB.eq("audience", "external");
+  // 3. Structured-context queries — ENFB-2 §2.2: the provenance predicate compiles IN-QUERY
+  // (before LIMIT), so the recency-50 and task-80 windows fill with rows THIS principal may
+  // see — the ENFB-1 deferred starvation class (Codex M1) dies here. The id-array fragment is
+  // the exact SQL twin of `rowVisibleByProvenance` (one contract, two owners, dm-pinned to
+  // fixture-level expected truth). Audience conjuncts preserved verbatim.
+  const provCtx = { visibleItemIds: visibleIds ?? new Set<string>(), teamPosture: tier === "team" };
+  const dParams = newSqlParams();
+  const dTeam = dParams.add(teamId);
+  const dAccess = isRestrictedTier(tier) ? `and d.audience = 'external'` : "";
+  const decisionsB = runSql<{
+    row_key: string; decided_at: string | Date | null; title: string; decided_by: string;
+    still_valid: boolean; source_item_id: string | null; created_by: string | null; slug: string;
+  }>(
+    `select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, d.created_by,
+            coalesce(p.slug, '') as slug
+       from decisions d
+       left join projects p on p.id = d.project_id
+      where d.team_id = ${dTeam} ${dAccess}
+        and ${provenanceRowSqlFromIds("d", dParams, provCtx)}
+      order by d.decided_at desc
+      limit 50`,
+    dParams.values
+  ).then((r) => ({ data: r.rows.map((row) => ({ ...row, projects: { slug: row.slug } })) }));
   // ALL statuses (incl. `done`), most-recently-updated first — so "what got completed today?"
   // can ground on finished tasks. `tasks.updated_at` is bumped on every sync upsert (incl. a
   // status→done transition), so recency ordering surfaces today's completions. (Was active-only:
   // `in_progress/blocked/ready`, which structurally hid every completion from the brain.)
   // Tasks carry `audience` (audit H1); an external principal sees only external-tier tasks. Without
   // this filter the external query context leaked every internal task board.
-  const tasksB = visibleTasks(
-    db
-      .from("tasks")
-      .select("row_key, title, assignee, status, sprint, updated_at, source_item_id, created_by, projects(slug)")
-      .eq("team_id", teamId)
-      .order("updated_at", { ascending: false })
-      .limit(80),
-    tier
-  );
+  const tParams = newSqlParams();
+  const tTeam = tParams.add(teamId);
+  const tAccess = isRestrictedTier(tier) ? `and t.audience = 'external'` : "";
+  const tasksB = runSql<{
+    row_key: string; title: string; assignee: string | null; status: string; sprint: string | null;
+    updated_at: string | Date | null; source_item_id: string | null; created_by: string | null; slug: string;
+  }>(
+    `select t.row_key, t.title, t.assignee, t.status, t.sprint, t.updated_at, t.source_item_id, t.created_by,
+            coalesce(p.slug, '') as slug
+       from tasks t
+       left join projects p on p.id = t.project_id
+      where t.team_id = ${tTeam} ${tAccess}
+        and ${provenanceRowSqlFromIds("t", tParams, provCtx)}
+      order by t.updated_at desc
+      limit 80`,
+    tParams.values
+  ).then((r) => ({ data: r.rows.map((row) => ({ ...row, projects: { slug: row.slug } })) }));
   // graph_entities / graph_relationships carry NO tier column, so they can't be audience-filtered.
   // For an external principal we omit them entirely (audit H1) rather than risk leaking internal
   // commitments/actors/reporting lines. `emptyRows` resolves to the same `{ data }` shape.
@@ -871,21 +900,14 @@ async function nativeRetrieve(
   // Decisions: the recency-50 window PLUS any keyword-matched decision that scrolled past it (Gap #6),
   // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
   type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
-  const recencyDecisions: DecisionLine[] = (decisions ?? [])
-    // DEFERRED (Codex diff M1, availability not confidentiality): this filter runs AFTER the
-    // 50-row recency cap, so invisible rows can starve visible ones out of the window. Cannot
-    // bite before ENFB-2 (restricted curation is unsupported until then — the slice rule);
-    // ENFB-2 pushes the provenance predicate in-query. Same deferral on the keyword leg, the
-    // tasks digest, the boards, and the timeline decisions leg.
-    // Enforcement — the settled provenance rule, decisions edition (ENFB-1 §2.7: the
-    // `decisions.created_by` column this slice ships re-admits the hand-typed arm): a SOURCED
-    // decision gates on its source item's visibility; a null-source one survives only when
-    // hand-typed (created_by — the dashboard action's sole write; a purged restricted basis
-    // stays dropped) at team posture. ONE owner: lib/access/provenance.
-    .filter((d) => rowVisibleByProvenance(d as { source_item_id?: string | null; created_by?: string | null }, visibleIds, tier))
-    .map((d) => ({
+  // ENFB-2 §2.2: BOTH decision legs now filter IN-QUERY (the recency window above, the keyword
+  // window inside matchingDecisions) — the post-LIMIT filters this map replaced were the ENFB-1
+  // deferred starvation site. The rule's owners: lib/access/provenance (TS) +
+  // lib/access/provenance-sql (SQL twin), agreement dm-pinned.
+  const recencyDecisions: DecisionLine[] = (decisions ?? []).map((d) => ({
     row_key: d.row_key as string,
-    decided_at: (d.decided_at as string | null) ?? null,
+    decided_at:
+      d.decided_at instanceof Date ? d.decided_at.toISOString().slice(0, 10) : ((d.decided_at as string | null) ?? null),
     title: d.title as string,
     decided_by: d.decided_by as string,
     still_valid: d.still_valid as boolean,
@@ -893,9 +915,7 @@ async function nativeRetrieve(
     slug: (d.projects as unknown as { slug: string })?.slug ?? "",
   }));
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
-  const olderMatches = matchedDecisions
-    .filter((d) => !recencyKeys.has(d.row_key))
-    .filter((d) => rowVisibleByProvenance(d as { source_item_id?: string | null; created_by?: string | null }, visibleIds, tier)); // the same §2.7 rule as the recency leg
+  const olderMatches = matchedDecisions.filter((d) => !recencyKeys.has(d.row_key));
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 
@@ -917,18 +937,10 @@ async function nativeRetrieve(
     ...(olderMatches.length ? ["", "## Older decisions matching this query", ...olderMatches.map(fmtDecision)] : []),
     "",
     "## Tasks (all statuses, most recently updated first)",
+    // ENFB-2 §2.2: the provenance rule (PRET-5 H2's settled rule) moved IN-QUERY into the
+    // task window above — the inline duplicate that lived here was the one-owner drift site
+    // the design review named (round-1 sweep risk 6); the SQL twin is the sole filter now.
     ...(tasks ?? [])
-      // The timeline's settled provenance rule (PRET-5 H2 / Codex diff-review H2), applied here:
-      // a SOURCED task gates on its source item's visibility; a null-source task survives ONLY
-      // when hand-typed (`created_by` is set solely by the dashboard create path and never by
-      // sync — so a synced task whose restricted source was PURGED stays dropped) and the viewer
-      // is team-posture (no membership axis exists for a hand-typed row, so the audience wall
-      // survives on exactly this branch).
-      .filter((t) =>
-        (t.source_item_id ?? null) !== null
-          ? visible(t.source_item_id as string)
-          : (t.created_by ?? null) !== null && tier === "team"
-      )
       .map((t) => {
       const u = t.updated_at;
       const day = typeof u === "string" ? u.slice(0, 10) : u ? new Date(u).toISOString().slice(0, 10) : "?";

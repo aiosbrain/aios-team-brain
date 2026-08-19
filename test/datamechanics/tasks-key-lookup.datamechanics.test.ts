@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { GET as tasksGET } from "@/app/api/v1/tasks/route";
 import { issueApiKey } from "@/lib/admin/keys";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, seedTeam, ingest, placeMemberByTier, type Seed } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for the by-key task lookup (brain-api 1.14).
@@ -48,6 +49,7 @@ async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promise<strin
       .single();
     if (error || !data) throw new Error(`external member seed failed: ${error?.message}`);
     memberId = (data as { id: string }).id;
+    await placeMemberByTier(seed.teamId, memberId, "external");
   }
   const { key } = await issueApiKey(db(), seed.teamId, memberId, `${tier} key`);
   return key;
@@ -70,10 +72,13 @@ async function seedProject(teamId: string, slug: string): Promise<string> {
   return (data as { id: string }).id;
 }
 
-/** One batch insert — `updatedAt` is what decides whether `?all=1` would ever reach the row. */
+/** One batch insert — `updatedAt` is what decides whether `?all=1` would ever reach the row.
+ *  `creator` is the hand-typed provenance the real dashboard writer stamps (ENFB-2: the feed
+ *  compiles the provenance predicate in-query; a created_by-less ui row is unproducible). */
 async function seedTasks(
   teamId: string,
   projectId: string,
+  creator: string,
   rows: { rowKey: string; updatedAt: string; audience?: "team" | "external" }[]
 ): Promise<void> {
   const { error } = await db()
@@ -87,6 +92,7 @@ async function seedTasks(
         status: "in_progress",
         assignee: "",
         origin: "ui",
+        created_by: creator,
         audience: r.audience ?? "team",
         updated_at: r.updatedAt,
       }))
@@ -101,15 +107,13 @@ describe("tasks by-key lookup (real handler, real Postgres)", () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "acme");
     const key = await issueKeyFor(seed, "team");
-    await seedTasks(
-      seed.teamId,
-      proj,
+    await seedTasks(seed.teamId, proj, seed.memberId,
       Array.from({ length: 505 }, (_, i) => ({
         rowKey: `OLD-${i}`,
         updatedAt: new Date(Date.UTC(2020, 0, 1) + i * 60_000).toISOString(),
       }))
     );
-    await seedTasks(seed.teamId, proj, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
+    await seedTasks(seed.teamId, proj, seed.memberId, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
 
     // Proof the fixture is real: the full-table read genuinely cannot see it.
     const table = (await (await get(key, seed.teamSlug, "all=1")).json()) as Feed;
@@ -125,7 +129,7 @@ describe("tasks by-key lookup (real handler, real Postgres)", () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "acme");
     const key = await issueKeyFor(seed, "team");
-    await seedTasks(seed.teamId, proj, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
+    await seedTasks(seed.teamId, proj, seed.memberId, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
 
     const feed = (await (await get(key, seed.teamSlug, "mode=table&keys=AIO-484,AIO-999,AIO-1000")).json()) as Feed;
     expect(rowKeys(feed)).toEqual(["AIO-484"]);
@@ -160,10 +164,20 @@ describe("tasks by-key lookup (real handler, real Postgres)", () => {
     const proj = await seedProject(seed.teamId, "acme");
     const teamKey = await issueKeyFor(seed, "team");
     const extKey = await issueKeyFor(seed, "external");
-    await seedTasks(seed.teamId, proj, [
+    // ENFB-2 re-specification: a hand-typed row is TEAM-ONLY (the PRET-5 H2 audience wall on
+    // the null-source branch — enfb-decision-create pins the same rule), so the external
+    // entitlement arm rides a SOURCED row whose item lives in external-shared, the shape a
+    // real client-shared push produces.
+    await seedTasks(seed.teamId, proj, seed.memberId, [
       { rowKey: "TEAM-1", updatedAt: "2026-07-27T10:00:00Z", audience: "team" },
-      { rowKey: "EXT-1", updatedAt: "2026-07-27T10:00:00Z", audience: "external" },
     ]);
+    const extItem = await ingest(seed, { path: "ext-shared.md", body: "e", access: "external", project: "acme" });
+    await backfillTeamContext(db(), seed.teamId);
+    await db().from("tasks").insert({
+      team_id: seed.teamId, project_id: proj, row_key: "EXT-1", title: "task EXT-1",
+      status: "in_progress", assignee: "", origin: "sync", audience: "external",
+      source_item_id: extItem.id, updated_at: "2026-07-27T10:00:00Z",
+    });
 
     const ext = (await (await get(extKey, seed.teamSlug, "mode=table&keys=TEAM-1,EXT-1")).json()) as Feed;
     expect(rowKeys(ext)).toEqual(["EXT-1"]);
@@ -179,7 +193,7 @@ describe("tasks by-key lookup (real handler, real Postgres)", () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "acme");
     const key = await issueKeyFor(seed, "team");
-    await seedTasks(seed.teamId, proj, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
+    await seedTasks(seed.teamId, proj, seed.memberId, [{ rowKey: "AIO-484", updatedAt: "2026-07-27T10:00:00Z" }]);
 
     for (const qs of ["all=1", "since=1970-01-01T00:00:00Z"]) {
       const body = (await (await get(key, seed.teamSlug, qs)).json()) as Record<string, unknown>;

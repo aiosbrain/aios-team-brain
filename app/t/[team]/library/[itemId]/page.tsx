@@ -26,7 +26,7 @@ export default async function LibraryItemPage({
   const { data: item } = await db
     .from("items")
     .select(
-      "id, path, kind, access, body, content_sha256, actor, synced_at, updated_at, projects(slug), members(display_name), item_versions(count)"
+      "id, path, kind, access, body, content_sha256, actor, synced_at, updated_at, project_id, projects(slug), members(display_name), item_versions(count)"
     )
     .eq("team_id", team.id)
     .eq("id", itemId)
@@ -36,11 +36,19 @@ export default async function LibraryItemPage({
   // non-granted member, indistinguishable from absent, §5.7).
   const me = await currentMember(team.id);
   if (!item || !me || !canSeeAccess(me.tier, item.access as string)) notFound();
-  const { canSeeItem } = await import("@/lib/access/enforce");
+  const { canSeeItem, canSeeProjectRow } = await import("@/lib/access/enforce");
   const { adminClient } = await import("@/lib/db/admin");
   if (!(await canSeeItem(adminClient(), { teamId: team.id, memberId: me.id }, itemId))) notFound();
 
-  const project = item.projects as unknown as { slug: string } | null;
+  // ENFB-2 D3 (design round 2 H5): an entitled item can live in a container whose ROW the
+  // viewer cannot see (cross-project curation) — the container link/slug renders only when
+  // the row is visible, otherwise the page reads as a container-less item (§5.7 for names).
+  const projectEmbed = item.projects as unknown as { slug: string } | null;
+  const containerVisible =
+    projectEmbed?.slug && item.project_id
+      ? await canSeeProjectRow(adminClient(), { teamId: team.id, memberId: me.id }, item.project_id as string)
+      : false;
+  const project = containerVisible ? projectEmbed : null;
   const member = item.members as unknown as { display_name: string } | null;
   const versionCount =
     (item.item_versions as unknown as { count: number }[] | null)?.[0]?.count ?? 0;

@@ -23,6 +23,14 @@ export async function GET(req: NextRequest) {
     return errorResponse("rate_limited", "60 pulls/min per key", 429);
   }
 
+  // ENFB-2 §2.1 (design round 2 BLOCKER 2): the wire serves ROW-VISIBLE projects only — a
+  // non-grantee's pull omits restricted initiative names/slugs, byte-identical shape
+  // otherwise (§5.7 for names). Fail closed: a resolution error is a 500, never the
+  // ungated inventory.
+  const { visibleProjectRows } = await import("@/lib/access/enforce");
+  const rows = await visibleProjectRows(db, { teamId: auth.teamId, memberId: auth.memberId });
+  if (rows.error) return errorResponse("internal", "project visibility resolution failed", 500);
+
   const { data, error } = await db
     .from("projects")
     .select("slug, name, last_synced_at")
@@ -30,6 +38,7 @@ export async function GET(req: NextRequest) {
     // The §11 system containers (general/external-shared) are access topology, not
     // registrable workspaces — a workspace must not mint marker files for them.
     .neq("kind", "system")
+    .in("id", [...rows.ids])
     .order("slug");
   if (error) return errorResponse("internal", error.message, 500);
 

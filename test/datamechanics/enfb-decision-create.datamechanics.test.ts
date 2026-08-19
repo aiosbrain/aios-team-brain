@@ -18,6 +18,11 @@ describe("ENFB-1 — createDecisionAction writes creation provenance", () => {
   it("created_by = the creating member; the row passes the provenance rule at team posture and fails it at external", async () => {
     const seed = await seedTeam();
     const { data: proj } = await db().from("projects").insert({ team_id: seed.teamId, slug: "dc", name: "DC", kind: "initiative" }).select("id").single();
+    // ENFB-2 H2: the create action now gates on row visibility — grant the creator the
+    // fresh initiative the way createProjectAction's D1 grant would have.
+    const { ensurePersonSingleton, grantProjectToGroup } = await import("@/lib/access/groups");
+    const singleton = await ensurePersonSingleton(db(), seed.teamId, seed.memberId, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, (proj as { id: string }).id, singleton.groupId!, seed.memberId);
 
     const { currentMember } = await import("@/lib/auth/guard");
     const { serverClient } = await import("@/lib/db/server");

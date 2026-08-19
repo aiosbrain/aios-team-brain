@@ -3,7 +3,6 @@ import { Suspense } from "react";
 import type { Metadata } from "next";
 import { Rocket, ChevronRight, Loader2 } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
-import { visibleItems, visibleDecisions } from "@/lib/auth/visibility";
 import { resolveTeamContext } from "@/lib/auth/team-context";
 import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { getLlmHealth } from "@/lib/query/llm-health";
@@ -136,11 +135,19 @@ export default async function TeamHome({
   const memberId = me.id;
   const firstName = me.displayName.trim().split(/\s+/)[0] || "there";
 
-  // Both reads are independent — run them together. itemCount is tier-filtered (there is no
-  // RLS backstop); last_used_at on an active own key proves /me or another authenticated
+  // Both reads are independent — run them together. itemCount is the DELIBERATE team-total
+  // scalar (see the tier-ok note below); last_used_at on an active own key proves /me or another authenticated
   // request actually succeeded. Merely issuing a key is not a completed workstation setup.
+  // tier-ok: the ONLY unscoped read here is the head-count scalar below — the deliberate
+  // ENFB-2 F5 existence bit (no titles/kinds/projects); every other read on this page is
+  // oracle-gated in-query and pinned by the guard's TITLE_SURFACE_WIRING row for this file.
+  // ENFB-2 (design round 1 F5): the HOME-STATE decision keys on the TEAM-TOTAL head count —
+  // deliberately NOT visible-only. An ungranted member/admin over a nonempty restricted corpus
+  // must see the normal home state ("no visible content"), never the bootstrap/onboarding
+  // screen. A bare team-has-any-content scalar names no title, project, or per-kind fact.
+  // Every DISPLAYED count below (KPIs, growth, funnel) is visible-only via getPulseMetrics.
   const [{ count: itemCount }, { data: ownKeyRows }] = await Promise.all([
-    visibleItems(db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id), tier),
+    db.from("items").select("id", { count: "exact", head: true }).eq("team_id", team.id),
     db
       .from("api_keys")
       .select("id, key_id, name, created_at, last_used_at, revoked_at")
@@ -177,12 +184,19 @@ export default async function TeamHome({
     );
   }
 
+  // ENFB-2 §2.2: the 8-row decisions card compiles the provenance predicate IN-QUERY — the
+  // card serves 8 VISIBLE rows (a post-filter would starve it to 0-8), and the select now
+  // carries `created_by` so hand-typed decisions survive (the PRET-5 H2 class). The viewer's
+  // oracle set resolves once here and feeds getPulseMetrics too.
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const { decisionsCardWindow } = await import("@/lib/access/structured-windows");
+  const vis = await visibleItemIds(adminClient(), { teamId: team.id, memberId });
+  const provCtx = { visibleItemIds: vis.error ? new Set<string>() : vis.ids, teamPosture: tier === "team" };
+  const decisionsCardP = decisionsCardWindow(team.id, provCtx, tier === "external").then((rows) => ({ data: rows }));
   const [pulse, { data: decisions }, pipelineHealth, llmHealth] = await Promise.all([
-    getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier }),
-    visibleDecisions(
-      db.from("decisions").select("id, title, decided_at, tier, still_valid, source_item_id").eq("team_id", team.id).order("decided_at", { ascending: false }).limit(8),
-      tier,
-    ),
+    getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier, provCtx }),
+    decisionsCardP,
     // Admins see a loud banner here (the landing page) if any ingestion leg is broken — so a wedged
     // pipeline surfaces without digging into Admin. Non-admins don't fetch it.
     isAdmin ? getPipelineHealth(team.id) : Promise.resolve(null),
