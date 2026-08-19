@@ -72,36 +72,10 @@ afterEach(() => {
 });
 
 describe("Graphiti tier scoping (real routes/retrieval, stubbed Graphiti)", () => {
-  it("POST /api/v1/graph-query sends only external group_ids for an external key", async () => {
-    const { POST } = await import("@/app/api/v1/graph-query/route");
-    const seed = await seedTeam();
-    const extKey = await issueKeyFor(seed, "external");
-    const { requests } = stubGraphiti();
-
-    const res = await POST(post(extKey, seed.teamSlug, { query: "who owns payments?", maxFacts: 5 }));
-
-    expect(res.status).toBe(200);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]).toEqual({
-      query: "who owns payments?",
-      group_ids: [`${seed.teamSlug}_external`],
-      max_facts: 5,
-    });
-  });
-
-  it("POST /api/v1/graph-query sends both tier groups for a team key", async () => {
-    const { POST } = await import("@/app/api/v1/graph-query/route");
-    const seed = await seedTeam();
-    const teamKey = await issueKeyFor(seed, "team");
-    const { requests } = stubGraphiti();
-
-    const res = await POST(post(teamKey, seed.teamSlug, { query: "who owns payments?" }));
-
-    expect(res.status).toBe(200);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.group_ids.sort()).toEqual([`${seed.teamSlug}_external`, `${seed.teamSlug}_team`]);
-    expect(requests[0]?.max_facts).toBe(20);
-  });
+  // Deleted WITH their subject (ENFB-1): the two route arms pinned the LEGACY tier-suffixed
+  // partition scheme ("only external group_ids for an external key" / "both tier groups for a
+  // team key") — the route now serves the ORACLE's stored-pointer partitions, and that behavior
+  // incl. the external-member arm is pinned in test/datamechanics/enfb-graph-query-scope.
 
   it("retrieve() blends graph facts but scopes an external MEMBER to their granted partitions only (PRET-6: the oracle, not a tier lens)", async () => {
     const seed = await seedTeam();

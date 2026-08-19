@@ -121,3 +121,19 @@ describe("ENFB-1 AC4 — graph-query serves the oracle's STORED-pointer partitio
     expect(r.status, "missing system pointers must be LOUD").toBe(500);
   });
 });
+
+describe("ENFB-1 AC4 — the external member's scope (the graph-tier route arms' successor)", () => {
+  it("an external-posture member resolves exactly external-shared's grandfathered pointer", async () => {
+    const seed = await seedTeam();
+    await ingest(seed, { path: "e.md", body: "ext", access: "external", project: "src" });
+    expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
+    await backfillTeamContext(db(), seed.teamId);
+    const { externalMember } = await import("./helpers");
+    const ext = await externalMember(seed);
+
+    const r = await post(seed, ext);
+    expect(r.status).toBe(200);
+    expect(r.requests).toHaveLength(1);
+    expect(r.requests[0].group_ids, "exactly the external-shared legacy pointer — never the team partition").toEqual([`${seed.teamSlug}_external`]);
+  });
+});
