@@ -5,6 +5,8 @@ import { isRestrictedTier } from "@/lib/auth/visibility";
 import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { extractLinks, extractTitle, resolveLink } from "@/lib/okf/links";
+import { pageVisibleOkfItems, parseOkfCursor, formatOkfCursor } from "@/lib/okf/page";
+import { visibleItemIds } from "@/lib/access/enforce";
 
 export const runtime = "nodejs";
 
@@ -15,8 +17,11 @@ const PAGE_SIZE = 500;
  * aios-workspace docs/brain-api.md). The link graph is derived on read from
  * stored item bodies (same regex as the CLI); functionally identical to the
  * contract's "denormalized at ingest" note, without a migration or re-ingest
- * dependency. Tier filtering matches GET /items, and links pointing above the
- * caller's tier ceiling are redacted.
+ * dependency. Tier filtering matches GET /items; ENFB-1 adds the MEMBERSHIP oracle: the page
+ * intersects with the caller's visible-id set, and link redaction follows the §2.4 three-state
+ * contract (dangling preserved, membership-invisible redacted like above-tier, visible
+ * preserved). The cursor is the §2.5 composite `<updated_at>|<id>` (legacy bare-timestamp
+ * accepted).
  */
 export async function GET(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -61,47 +66,58 @@ export async function GET(req: NextRequest) {
     projectId = p.id;
   }
 
-  // 1. Path → access map for the whole team, to resolve + redact links.
-  //    (Whole-team is intentional: keys are slug-scoped, and cross-project
-  //    links are preserved as "broken" per contract point 3.)
+  // ENFB-1: the caller's MEMBERSHIP-visible id set, resolved ONCE — gates the page AND feeds
+  // the §2.4 link-redaction contract. Fail closed: a resolution error serves an empty page.
+  const vis = await visibleItemIds(db, { teamId: auth.teamId, memberId: auth.memberId });
+  if (vis.error) return errorResponse("internal", "access resolution failed", 500);
+
+  // 1. Path → {id, access} map for the WHOLE team (deliberately unfiltered — it is an internal
+  //    map that is never serialized, and it is what lets redaction DISCRIMINATE the three §2.4
+  //    target states: absent → preserve; present-but-invisible → redact; visible → preserve).
   const { data: allRows, error: mapErr } = await db
     .from("items")
-    .select("path, access, projects(slug)")
+    .select("id, path, access, projects(slug)")
     .eq("team_id", auth.teamId);
   if (mapErr) return errorResponse("internal", mapErr.message, 500);
-  const accessByPath = new Map<string, string>();
+  const targetByPath = new Map<string, { id: string; access: string }>();
   for (const r of allRows ?? []) {
     const slug = (r.projects as unknown as { slug: string } | null)?.slug ?? "";
-    accessByPath.set(`${slug}::${r.path}`, r.access);
+    targetByPath.set(`${slug}::${r.path}`, { id: r.id as string, access: r.access as string });
   }
 
-  // 2. The page of nodes the caller's tier may see.
-  let q = db
-    .from("items")
-    .select("path, kind, access, frontmatter, body, content_sha256, updated_at, projects(slug)")
-    .eq("team_id", auth.teamId)
-    .gt("updated_at", cursor || since)
-    .order("updated_at", { ascending: true })
-    .order("path", { ascending: true })
-    .limit(PAGE_SIZE);
-  if (isRestrictedTier(effectiveTier)) q = q.eq("access", "external");
-  if (projectId) q = q.eq("project_id", projectId);
-  const { data: rows, error } = await q;
-  if (error) return errorResponse("internal", error.message, 500);
+  // 2. The page: membership-visible rows only, composite keyset (§2.5). A legacy bare-timestamp
+  //    cursor still resumes (strictly-after semantics).
+  const after = cursor ? parseOkfCursor(cursor) : (Number.isNaN(Date.parse(since)) ? null : { ts: since, id: null });
+  if (!after) return errorResponse("invalid_payload", "malformed cursor or since", 422);
+  let rows;
+  try {
+    rows = await pageVisibleOkfItems({
+      teamId: auth.teamId,
+      visibleIds: [...vis.ids],
+      after,
+      projectId,
+      externalOnly: isRestrictedTier(effectiveTier),
+      limit: PAGE_SIZE,
+    });
+  } catch {
+    return errorResponse("internal", "page query failed", 500);
+  }
 
   const tierVisible = (access: string) =>
     effectiveTier === "team" ? true : access === "external";
 
-  const nodes = (rows ?? []).map((r) => {
-    const slug = (r.projects as unknown as { slug: string } | null)?.slug ?? "";
+  const nodes = rows.map((r) => {
+    const slug = r.slug ?? "";
     const body = r.body || "";
     const links = extractLinks(body).filter((link) => {
-      // Redact links whose resolved target is above the caller's tier ceiling.
-      // Broken/unresolved links are preserved (contract point 3).
+      // §2.4: dangling targets are preserved (the author's problem, not access); an existing
+      // target is redacted unless BOTH walls pass — the posture ceiling (as before) and the
+      // caller's membership visibility (ENFB-1). The existence bit a redaction discloses is
+      // the same class today's tier redaction already discloses (§5.7-compatible, stated).
       const target = resolveLink(r.path, link);
-      const targetAccess = accessByPath.get(`${slug}::${target}`);
-      if (targetAccess === undefined) return true; // broken or cross-project — keep
-      return tierVisible(targetAccess);
+      const t = targetByPath.get(`${slug}::${target}`);
+      if (t === undefined) return true; // dangling — keep
+      return tierVisible(t.access) && vis.ids.has(t.id);
     });
     return {
       path: r.path,
@@ -115,7 +131,7 @@ export async function GET(req: NextRequest) {
   });
 
   const next_cursor =
-    (rows?.length ?? 0) === PAGE_SIZE ? rows![rows!.length - 1].updated_at : null;
+    rows.length === PAGE_SIZE ? formatOkfCursor(rows[rows.length - 1].updated_at, rows[rows.length - 1].id) : null;
 
   return Response.json({
     bundle: {

@@ -31,9 +31,14 @@ export default async function LibraryItemPage({
     .eq("team_id", team.id)
     .eq("id", itemId)
     .maybeSingle();
-  // Tier check (no RLS backstop in postgres mode): hide above-tier items as 404.
+  // Tier check (no RLS backstop in postgres mode): hide above-tier items as 404 — and ENFB-1:
+  // the MEMBERSHIP oracle gates the body too (a restricted-initiative item 404s for a
+  // non-granted member, indistinguishable from absent, §5.7).
   const me = await currentMember(team.id);
-  if (!item || !canSeeAccess(me?.tier ?? "external", item.access as string)) notFound();
+  if (!item || !me || !canSeeAccess(me.tier, item.access as string)) notFound();
+  const { canSeeItem } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  if (!(await canSeeItem(adminClient(), { teamId: team.id, memberId: me.id }, itemId))) notFound();
 
   const project = item.projects as unknown as { slug: string } | null;
   const member = item.members as unknown as { display_name: string } | null;

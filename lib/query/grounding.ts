@@ -30,19 +30,27 @@ export interface TermSpecificity {
 export async function analyzeTermSpecificity(
   teamId: string,
   tier: "team" | "external",
-  terms: string[]
+  terms: string[],
+  /** ENFB-1: the caller's membership-visible item ids — the SAME set its sibling legs take.
+   *  The counts are computed over the VISIBLE corpus only, closing the existence oracle (a
+   *  restricted-only term used to flip `grounded=true` and read the answer off the abstain).
+   *  Retrieval always supplies it (a null view throws upstream since PRET-6). */
+  visibleIds: readonly string[]
 ): Promise<TermSpecificity> {
   if (terms.length === 0) return { specificMatching: false, allCommon: true };
+  if (visibleIds.length === 0) return { specificMatching: false, allCommon: true }; // nothing visible → no specific evidence
   try {
     const access = isRestrictedTier(tier) ? "and access = 'external'" : "";
-    // One row per term: corpus total + that term's document frequency, both tier-scoped.
+    // One row per term: VISIBLE-corpus total + that term's document frequency.
+    // Error contract (§2.6): a failure here degrades to the fts-hit fallback, which is ALREADY
+    // vis-scoped — grounding can never widen past visible evidence on this path.
     const sql = `
       select t.term,
-        (select count(*) from items where team_id = $1 ${access}) as total,
-        (select count(*) from items where team_id = $1 ${access}
+        (select count(*) from items where team_id = $1 and id = any($3::uuid[]) ${access}) as total,
+        (select count(*) from items where team_id = $1 and id = any($3::uuid[]) ${access}
            and search @@ websearch_to_tsquery('english', t.term)) as df
       from unnest($2::text[]) as t(term)`;
-    const res = await runSql<{ term: string; total: number | string; df: number | string }>(sql, [teamId, terms]);
+    const res = await runSql<{ term: string; total: number | string; df: number | string }>(sql, [teamId, terms, [...visibleIds]]);
     if (res.rows.length === 0) return { specificMatching: false, allCommon: true };
 
     const total = Number(res.rows[0].total) || 0;

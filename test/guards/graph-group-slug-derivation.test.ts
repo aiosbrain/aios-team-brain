@@ -85,7 +85,6 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
     const legs = [
       "app/api/brain/facts/route.ts",
       "app/api/brain/events/route.ts",
-      "app/api/v1/graph-query/route.ts",
     ];
     for (const f of legs) {
       // `code()`, not raw text — this suite strips comments precisely so a guard cannot be
@@ -94,12 +93,14 @@ describe("guard: nothing re-derives a graph group id from the live team slug (VI
         "visibleTierGroupIds("
       );
     }
-    // retrieve.ts is pointer-resolved through the PARTITION path since PRET-6 (the enforced
-    // read's `selectEnforcedGraphPartitions` reads stored pointers) — pin that reference, not
-    // the tier-groups helper the retirement removed from this file.
-    expect(code(join(ROOT, "lib/query/retrieve.ts")), "retrieve resolves groups via the stored-pointer partition read").toContain(
-      "selectEnforcedGraphPartitions("
-    );
+    // retrieve.ts (PRET-6) and graph-query (ENFB-1) are pointer-resolved through the PARTITION
+    // path (`selectEnforcedGraphPartitions` reads stored pointers) — pin that reference, not
+    // the tier-groups helper those cutovers removed from these files.
+    for (const f of ["lib/query/retrieve.ts", "app/api/v1/graph-query/route.ts"]) {
+      expect(code(join(ROOT, f)), `${f} resolves groups via the stored-pointer partition read`).toContain(
+        "selectEnforcedGraphPartitions("
+      );
+    }
     // The arcs legs resolve through resolveArcScope, which is pointer-resolved already (PRET-3)
     // and is pinned by test/guards/arcs-single-read-path.test.ts.
   });

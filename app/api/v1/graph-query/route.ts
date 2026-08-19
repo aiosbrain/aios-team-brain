@@ -6,7 +6,6 @@ import { rateLimit } from "@/lib/api/rate-limit";
 import { errorResponse } from "@/lib/api/schemas";
 import { audit } from "@/lib/api/audit";
 import { GraphitiClient } from "@/lib/graph/graphiti-client";
-import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 
 export const runtime = "nodejs";
 
@@ -18,8 +17,9 @@ const schema = z.object({
 /**
  * POST /api/v1/graph-query — natural-language query against the Graphiti graph memory
  * (experiment, alongside `/api/v1/query`). Tier-enforced: results are scoped to the group_ids
- * the caller's tier may see (`visibleTierGroupIds` — pointer-resolved, so a renamed team still
- * reads its own graph) — Graphiti has no tier awareness, so this is the
+ * the member's ORACLE partition scope via the stored pointers (ENFB-1 — visibleProjects →
+ * selectEnforcedGraphPartitions, superseding #591's pointer-resolved tier groups on this
+ * route; Graphiti has no tier awareness, so this is the
  * SOLE isolation (CLAUDE.md §5). Returns citable facts (text + temporal validity + source).
  */
 export async function POST(req: NextRequest) {
@@ -45,19 +45,46 @@ export async function POST(req: NextRequest) {
     return errorResponse("not_configured", "graph memory (GRAPHITI_URL) is not configured", 503);
   }
 
-  // Resolve the team slug, then scope to the tiers this caller may see.
+  // ENFB-1: the ORACLE's partition scope via the STORED-pointer path — the same substrate the
+  // retrieve/arcs reads use (design round-1 blocker: the minting helper would have silently
+  // emptied this route; the built-ins carry grandfathered legacy pointers only the stored path
+  // resolves). Uncapped — the route's own maxFacts caps output. Empty scope → empty facts.
   const { data: team } = await db.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
   if (!team) return errorResponse("internal", "team not found", 500);
+  const { visibleProjects } = await import("@/lib/access/oracle");
+  const { selectEnforcedGraphPartitions } = await import("@/lib/graph/partition-read");
+  const { projectIds } = await visibleProjects(db, { teamId: auth.teamId, memberId: auth.memberId });
+  let groupIds: string[] = [];
+  if (projectIds.size > 0) {
+    const scope = await selectEnforcedGraphPartitions(db, {
+      teamId: auth.teamId,
+      visibleProjectIds: [...projectIds],
+      k: Number.MAX_SAFE_INTEGER,
+    });
+    groupIds = scope.groups;
+    // The LOUD arm (design round-2 condition), discriminated: zero partitions is LEGITIMATE for
+    // a member whose only visibility is cold (unarmed) initiatives — but a member who can see a
+    // SYSTEM project (General/external-shared, which bypass readiness and carry grandfathered
+    // pointers) resolving zero partitions means the stored pointers are missing: a wiring
+    // fault, never ordinary empty facts.
+    if (groupIds.length === 0) {
+      const { data: sys } = await db
+        .from("projects")
+        .select("id")
+        .eq("team_id", auth.teamId)
+        .eq("kind", "system")
+        .in("id", [...projectIds]);
+      if (((sys ?? []) as unknown[]).length > 0) {
+        console.error(`[graph-query] member ${auth.memberId} on team ${auth.teamId}: visible SYSTEM project resolved ZERO partitions (missing stored pointers)`);
+        return errorResponse("internal", "graph partition resolution failed", 500);
+      }
+    }
+  }
+  if (groupIds.length === 0) {
+    return Response.json({ facts: [] });
+  }
 
   try {
-    // Inside the try: a pointer-read failure is a 502 like any other backend failure. It must NOT
-    // fall back to a slug-derived id — on a renamed team that names a group nothing ever wrote to,
-    // and this endpoint would answer 200 with zero facts (see lib/graph/tier-groups.ts).
-    const groupIds = await visibleTierGroupIds(db, {
-      teamId: auth.teamId,
-      teamSlug: (team as { slug: string }).slug,
-      tier: auth.memberTier,
-    });
     const facts = await client.search(parsed.data.query, groupIds, parsed.data.maxFacts ?? 20);
     await audit(db, {
       team_id: auth.teamId,

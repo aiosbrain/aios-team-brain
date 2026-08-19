@@ -204,3 +204,41 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     expect(got).toEqual([]);
   });
 });
+
+describe("ENFB-1 AC5 — the grounding existence-oracle closes", () => {
+  it("a restricted-only term abstains for the outsider (grounded=false), grounds for the entitled member, and a statistic FAILURE never widens past the visible legs", async () => {
+    const seed = await seedTeam();
+    const outsider = await seedMember(seed);
+    const insider = await seedMember(seed);
+    // The restricted-only term: present in exactly ONE item, which moves into an initiative
+    // granted to the insider alone. Pre-ENFB-1 the whole-corpus df>=1 flipped grounded=true for
+    // EVERYONE — the answer path's abstain was an existence oracle for the codename.
+    const secret = await ingest(seed, { path: "gr.md", body: "the zephyrquill contract details", access: "team", project: "src" });
+    await ingest(seed, { path: "noise.md", body: "unrelated prose", access: "team", project: "src" });
+    await backfillTeamContext(db(), seed.teamId);
+    const restricted = await db().from("projects").insert({ team_id: seed.teamId, slug: "grv", name: "GRV", kind: "initiative" }).select("id").single();
+    const g = await createGroup(db(), seed.teamId, "grvg", "GRV", seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, restricted.data!.id, g.groupId!, seed.memberId);
+    const { addMemberToGroup } = await import("@/lib/access/groups");
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, insider, seed.memberId);
+    const { data: unit } = await db().from("project_context_units").select("id").eq("source_item_id", secret.id).single();
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() }).eq("context_unit_id", unit!.id);
+    await db().from("project_context_memberships").insert({ team_id: seed.teamId, project_id: restricted.data!.id, context_unit_id: unit!.id, method: "manual" });
+
+    const outsiderView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider })).ids };
+    const asOutsider = await retrieve(db(), seed.teamId, "team", "tell me about zephyrquill", null, outsiderView);
+    expect(asOutsider.grounded, "a restricted-only term must ABSTAIN for the outsider — df over the visible corpus is 0").toBe(false);
+    expect(asOutsider.sources.map((s) => s.path)).not.toContain("gr.md");
+
+    const insiderView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: insider })).ids };
+    const asInsider = await retrieve(db(), seed.teamId, "team", "tell me about zephyrquill", null, insiderView);
+    expect(asInsider.grounded, "the entitled member grounds on the same term").toBe(true);
+    expect(asInsider.sources.map((s) => s.path)).toContain("gr.md");
+
+    // §2.6 error contract, direct: a statistic failure yields the conservative shape, so
+    // grounding falls to the (vis-scoped) fts evidence — never the whole corpus.
+    const { analyzeTermSpecificity } = await import("@/lib/query/grounding");
+    const broken = await analyzeTermSpecificity(seed.teamId, "team", ["zephyrquill"], ["not-a-uuid"]);
+    expect(broken, "a failing statistic degrades conservative").toEqual({ specificMatching: false, allCommon: true });
+  });
+});

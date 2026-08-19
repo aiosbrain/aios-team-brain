@@ -46,6 +46,7 @@ export interface DecisionMatch {
   decided_by: string;
   still_valid: boolean;
   source_item_id: string | null;
+  created_by?: string | null;
   slug: string;
 }
 
@@ -67,7 +68,7 @@ export async function matchingDecisions(
     const access = isRestrictedTier(tier) ? "and d.audience = 'external'" : "";
     const params: unknown[] = [orQuery, teamId, limit];
     const sql = `
-      select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, coalesce(p.slug, '') as slug,
+      select d.row_key, d.decided_at, d.title, d.decided_by, d.still_valid, d.source_item_id, d.created_by, coalesce(p.slug, '') as slug,
              ts_rank(to_tsvector('english', coalesce(d.title,'') || ' ' || coalesce(d.rationale,'')),
                      websearch_to_tsquery('english', $1)) as rank
       from decisions d
@@ -93,6 +94,7 @@ export async function matchingDecisions(
       decided_by: r.decided_by,
       still_valid: r.still_valid,
       source_item_id: r.source_item_id,
+      created_by: (r as { created_by?: string | null }).created_by ?? null,
       slug: r.slug,
     }));
   } catch {

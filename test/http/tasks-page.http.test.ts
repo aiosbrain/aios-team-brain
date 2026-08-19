@@ -5,6 +5,10 @@ import { BASE_URL, db, seedMemberEmail, seedTeam, type Seed } from "./http-helpe
 // Spec (brain-api v1.2 Phase 4): the tasks dashboard server-renders the hierarchy — epics with their
 // children grouped beneath them — and shows each task's primary-provider link + sync status. This is
 // the only tier that proves the real Next server component renders over the wire (HTTP 200 + HTML).
+// ENFB-1: the board serves task BODIES, so each row must carry provenance to render — hand-typed
+// rows are stamped `created_by` by the dashboard action (its sole writer), so the seeds here carry
+// it too; a row with NEITHER source_item_id NOR created_by is invisible by the shared rule
+// (lib/access/provenance), pinned over the wire below.
 
 async function login(email: string, password: string): Promise<string> {
   const res = await fetch(`${BASE_URL}/api/auth/login`, {
@@ -55,12 +59,15 @@ async function seedLink(seed: Seed, projectId: string, taskId: string, rowKey: s
 describe("GET /t/{team}/tasks (HTTP) — hierarchical render", () => {
   it("server-renders epics with their children grouped and shows pm-link + sync status (200)", async () => {
     const seed = await seedTeam();
-    const { email, password } = await seedMemberEmail(seed); // a known-email, team-tier member on this team
+    const { email, password, memberId } = await seedMemberEmail(seed); // a known-email, team-tier member on this team
     const cookie = await login(email, password);
 
     const project = await seedProject(seed.teamId);
-    const epicId = await seedTask(seed.teamId, project, "EPIC-1", { title: "Wave 1 Foundations" });
-    const childId = await seedTask(seed.teamId, project, "SUB-1", { title: "Build the projector", parent_row_key: "EPIC-1", priority: "high", labels: ["integration"] });
+    // Hand-typed provenance (created_by), the shape the dashboard create action writes.
+    const epicId = await seedTask(seed.teamId, project, "EPIC-1", { title: "Wave 1 Foundations", created_by: memberId });
+    const childId = await seedTask(seed.teamId, project, "SUB-1", { title: "Build the projector", parent_row_key: "EPIC-1", priority: "high", labels: ["integration"], created_by: memberId });
+    // No provenance at all (no source item, no created_by) — must NOT render (ENFB-1 wall).
+    await seedTask(seed.teamId, project, "GHOST-1", { title: "Unprovenanced ghost row" });
     await seedLink(seed, project, epicId, "EPIC-1", { provider_resource_id: "li-epic", provider_url: "https://linear.app/issue/EPIC", last_synced_status: "backlog" });
     await seedLink(seed, project, childId, "SUB-1", { provider_resource_id: "li-sub", provider_url: "https://linear.app/issue/SUB", last_synced_status: "backlog" });
 
@@ -68,9 +75,10 @@ describe("GET /t/{team}/tasks (HTTP) — hierarchical render", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    // Both titles render.
+    // Both provenanced titles render; the provenance-less row does not (the inverse pin).
     expect(html).toContain("Wave 1 Foundations");
     expect(html).toContain("Build the projector");
+    expect(html).not.toContain("Unprovenanced ghost row");
     // The child is grouped under its epic (a server-rendered grouping marker, not a flat list).
     expect(html).toContain('data-parent="EPIC-1"');
     expect(html).toContain('data-epic="EPIC-1"');

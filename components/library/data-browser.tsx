@@ -31,7 +31,10 @@ type FeedItem = {
  * Admin → Data (`/t/[team]/admin/data`); `basePath` is where the channel rail + "load more" links
  * resolve, so the same component can be mounted at a different route without hardcoding one. Item
  * detail links still point at `/t/[team]/library/[id]` (that route stays). Tier-filtered via
- * `visibleItems` (belt-and-suspenders — the Admin layout already gates to admin role).
+ * `visibleItems`, and ENFB-1: ORACLE-gated like every content surface — the triad is
+ * content→membership, ops→role, and body previews are CONTENT (the design review overturned a
+ * drafted role-read exemption). An admin needing corpus-wide review self-grants membership
+ * deliberately (the CLI/group machinery — auditable as a group add).
  */
 export async function DataBrowser({
   teamSlug,
@@ -51,6 +54,18 @@ export async function DataBrowser({
 
   const me = await currentMember(team.id);
   const tier = me?.tier ?? "external";
+  // ENFB-1: the viewer's membership-visible set gates BOTH queries; no member → empty (fail closed).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const vis = me ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: me.id }) : null;
+  if (!vis || vis.error || vis.ids.size === 0) {
+    return (
+      <p className="text-sm text-ink-secondary">
+        No data is visible to your memberships yet.
+      </p>
+    );
+  }
+  const visArr = [...vis.ids];
 
   // 1) Channel list — group a bounded recent window of visible items by path prefix.
   let chQuery = db
@@ -62,7 +77,7 @@ export async function DataBrowser({
     .eq("team_id", team.id)
     .order("synced_at", { ascending: false })
     .limit(CHANNEL_SCAN_CAP);
-  chQuery = visibleItems(chQuery, tier); // external viewers never see team/admin content
+  chQuery = visibleItems(chQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
   const { data: chRows } = await chQuery;
   const channels = groupChannels(
     ((chRows ?? []) as { path: string; synced_at: string | Date; frontmatter: Record<string, unknown> | null }[]).map(
@@ -89,7 +104,7 @@ export async function DataBrowser({
       .like("path", `${selected}/%`)
       .order("synced_at", { ascending: false })
       .limit(limit + 1);
-    feedQuery = visibleItems(feedQuery, tier);
+    feedQuery = visibleItems(feedQuery, tier).in("id", visArr); // posture wall + the ENFB-1 oracle gate
     const { data: feed } = await feedQuery;
     // Exact prefix guard: LIKE treats `_` as a wildcard, so confirm the path segment boundary in JS.
     const rows = ((feed ?? []) as FeedItem[]).filter((it) => it.path.startsWith(`${selected}/`));

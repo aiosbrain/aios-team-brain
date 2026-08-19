@@ -8,7 +8,10 @@ import { errorResponse } from "@/lib/api/schemas";
 export const runtime = "nodejs";
 
 // GET /api/v1/items/<id> — fetch a single item on demand (e.g. one deliverable).
-// Tier filtering is re-applied: an external-tier key can only read external items.
+// ENFB-1: the MEMBERSHIP oracle gates the read (the list/by-id disagreement closed — a row the
+// list omits can no longer be fetched by id); the posture arm stays as the coarse outer wall.
+// A membership-denied id returns the SAME 404 as an absent one (§5.7 — absent and invisible
+// are indistinguishable).
 export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const auth = await authenticateApiKey(req);
   if (!auth) return errorResponse("unauthorized", "invalid API key or team", 401);
@@ -19,6 +22,14 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   }
 
   const { id } = await ctx.params;
+
+  const NOT_FOUND = () => errorResponse("not_found", "no such item (or not visible to you)", 404);
+
+  // The by-id membership probe (shared-predicate §2.1) — fail closed BEFORE the row is read.
+  const { canSeeItem } = await import("@/lib/access/enforce");
+  if (!(await canSeeItem(db, { teamId: auth.teamId, memberId: auth.memberId }, id))) {
+    return NOT_FOUND();
+  }
 
   let q = db
     .from("items")
@@ -31,7 +42,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const { data, error } = await q;
   if (error) return errorResponse("internal", error.message, 500);
   const row = data?.[0];
-  if (!row) return errorResponse("not_found", "no such item (or above your tier)", 404);
+  if (!row) return NOT_FOUND();
 
   return Response.json({
     id: row.id,

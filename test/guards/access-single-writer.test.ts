@@ -76,6 +76,9 @@ const READ_EXEMPT = new Set<string>([
   // enforce.ts READS memberships (visibleItemIdsForProjects — the oracle conjunct); its only
   // "write verb" is `createHash(...).update(...)` in the §5.8 visibility hash. Chain-scan clean.
   `${join("lib", "access", "enforce.ts")}:project_context_memberships`,
+  // ENFB-1: canSeeItem READS the item's unit directly (the by-id probe — one unit lookup
+  // instead of materializing the whole visible set); same file, same zero writes.
+  `${join("lib", "access", "enforce.ts")}:project_context_units`,
 ]);
 function mentionsWithWrites(rel: string, source: string, table: string): boolean {
   if (READ_EXEMPT.has(`${rel}:${table}`)) return false;

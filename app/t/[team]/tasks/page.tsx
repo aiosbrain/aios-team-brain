@@ -5,6 +5,7 @@ import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleTasks } from "@/lib/auth/visibility";
+import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
 import { EmptyState } from "@/components/empty-state";
@@ -27,6 +28,12 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   // Tier isolation (audit H1): an external-tier dashboard member must not see internal task boards.
   const viewer = await currentMember(team.id);
   const tier = viewer?.tier ?? "external";
+  // ENFB-1: the board serves task BODIES — the settled provenance rule gates each row (sourced →
+  // source item in the viewer's oracle set; null-source → hand-typed at team posture). Resolved
+  // once; no member → empty board (fail closed).
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient } = await import("@/lib/db/admin");
+  const vis = viewer ? await visibleItemIds(adminClient(), { teamId: team.id, memberId: viewer.id }) : null;
 
   // PM links are fetched as a sibling query and grouped in JS rather than as an embedded resource:
   // the pg adapter (the deployed backend) only supports to-many embeds as `(count)`, so a
@@ -37,7 +44,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
       visibleTasks(
         db
           .from("tasks")
-          .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body")
+          .select("id, row_key, title, assignee, status, sprint, due_date, origin, project_id, updated_at, parent_row_key, labels, priority, body, source_item_id, created_by")
           .eq("team_id", team.id)
           .order("updated_at", { ascending: false })
           .limit(500),
@@ -76,10 +83,13 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
     arr.push(badge);
     linksByTask.set(task_id, arr);
   }
-  const taskRows = ((tasks ?? []) as Task[]).map((t) => ({
-    ...t,
-    task_pm_links: linksByTask.get(t.id) ?? [],
-  }));
+  const taskRows = ((tasks ?? []) as (Task & { source_item_id?: string | null; created_by?: string | null })[])
+    // ENFB-1 provenance rule — the ONE shared owner (lib/access/provenance).
+    .filter((t) => rowVisibleByProvenance(t, vis && !vis.error ? vis.ids : null, tier))
+    .map((t) => ({
+      ...t,
+      task_pm_links: linksByTask.get(t.id) ?? [],
+    }));
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5">
