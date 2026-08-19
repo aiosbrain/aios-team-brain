@@ -19,10 +19,10 @@ repo_root="$(git rev-parse --show-toplevel)"
 # THAT SKIP IS WHY A CLIENT NAME REACHED THIS PUBLIC REPO (#586, AIO-984). It is still the right
 # behaviour here — a contributor without the private list must not be blocked — but it meant the
 # confidentiality gate existed on exactly one laptop, and whether a name leaked depended on whose
-# machine ran `git push`. The backstop is now CI: the `NDA confidentiality gate` job in
-# .github/workflows/ci.yml runs scripts/nda-scan.mjs against the `NDA_TERMS` secret, so a push from
-# an unconfigured machine is caught server-side. Do not treat this local hook as THE gate; it is the
-# fast local signal, CI is the gate.
+# machine ran `git push`. The backstop is now the privileged, trusted-base workflow in
+# .github/workflows/nda-gate.yml. It scans untrusted PR Git objects as data against `NDA_TERMS`, so a
+# push from an unconfigured machine is caught server-side without executing PR code with the secret.
+# Do not treat this local hook as THE gate; it is the fast local signal, CI is the gate.
 # Resolve via --git-common-dir, NOT --git-path (which honors core.hooksPath and
 # would resolve back into .githooks/); skip anything carrying our own marker.
 common_dir="$(git rev-parse --git-common-dir)"
