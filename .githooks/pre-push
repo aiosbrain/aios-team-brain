@@ -15,6 +15,14 @@ repo_root="$(git rev-parse --show-toplevel)"
 # NDA leak-gate `tree` scan) only runs because we chain it here. It runs FIRST
 # so the confidentiality gate can never be masked by a drift failure. Missing/
 # non-executable = skipped (contributors without the private NDA term list).
+#
+# THAT SKIP IS WHY A CLIENT NAME REACHED THIS PUBLIC REPO (#586, AIO-984). It is still the right
+# behaviour here — a contributor without the private list must not be blocked — but it meant the
+# confidentiality gate existed on exactly one laptop, and whether a name leaked depended on whose
+# machine ran `git push`. The backstop is now CI: the `NDA confidentiality gate` job in
+# .github/workflows/ci.yml runs scripts/nda-scan.mjs against the `NDA_TERMS` secret, so a push from
+# an unconfigured machine is caught server-side. Do not treat this local hook as THE gate; it is the
+# fast local signal, CI is the gate.
 # Resolve via --git-common-dir, NOT --git-path (which honors core.hooksPath and
 # would resolve back into .githooks/); skip anything carrying our own marker.
 common_dir="$(git rev-parse --git-common-dir)"
