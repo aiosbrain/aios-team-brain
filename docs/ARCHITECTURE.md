@@ -785,9 +785,13 @@ guard enforces it, it's named.
   disagreement surfaces only when something gets through the weaker. Output is **redacted to
   `file:line`**: these logs are world-readable, so a gate that printed its match would publish the
   thing it defends (the adjacent gitleaks job runs `--redact` for the same reason). It **fails
-  closed** on a missing secret (exit 2, distinct from a real leak's exit 1), and on a fork PR — where
-  GitHub withholds secrets by design — it ANNOUNCES that it could not run rather than passing, because
-  an unrunnable gate is not a passing grade.
+  closed** on a missing secret (exit 2, distinct from a real leak's exit 1) and, equally, wherever it
+  CANNOT run — fork PRs and Dependabot, which GitHub withholds Actions secrets from by design. Those
+  exit non-zero with the remedy named, never a warning-plus-green: a green required check IS a pass
+  in branch-protection terms, so a "reported but passing" gate would make forks and bots the new
+  "whose laptop pushed". ⚠️ **It must be added to `main`'s required status checks** — until it is, a
+  red gate does not block a merge, which is this same defect one level up, and no test can pin
+  repository configuration.
   _Guard:_ `test/guards/nda-gate.test.ts` (fails-closed, redaction, term-parse parity, and that the
   job is actually wired into CI — a scanner nothing invokes is the same defect with a nicer
   implementation).

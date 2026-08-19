@@ -28,11 +28,15 @@
  * behaviour and must only be used on a trusted terminal. (`gitleaks --redact` in the same workflow
  * is the existing precedent for this rule.)
  *
- * ── MATCHING IS DELIBERATELY IDENTICAL TO THE LOCAL GATE ───────────────────────────────────────
+ * ── SAME TERM SEMANTICS AS THE LOCAL GATE; DELIBERATELY STRICTER EVERYWHERE ELSE ────────────────
  *
- * Same ERE alternation over non-comment lines, same `git grep -nEiI`, same path excludes. Two gates
- * that disagree about what counts as a leak are worse than one, because the disagreement is only
- * discovered by a leak getting through the weaker one.
+ * Terms are read and matched the same way — non-comment lines, each an ERE, `git grep -nEiI` — because
+ * two gates that disagree about what a TERM is are worse than one: the disagreement surfaces only when
+ * something gets through the weaker. Two differences are intentional and both make this one stricter:
+ *   • tighter path excludes (see PATHSPEC);
+ *   • a `git grep` HARD error (exit >= 2, e.g. a term that is not valid ERE) throws here and exits 2.
+ *     The local gate's `|| true` swallows it and prints "clean" — it fails OPEN on exactly the input
+ *     most likely to be a typo in the term list. Worth fixing there; it lives outside this repo.
  *
  * FAILS CLOSED, like the local gate: no terms configured is an error, never a pass. The one
  * exception is a fork PR, where GitHub withholds secrets by design — that is reported as
@@ -49,13 +53,20 @@ const argv = process.argv.slice(2);
 const reveal = argv.includes("--reveal");
 const termsFileIdx = argv.indexOf("--terms-file");
 const termsFile = termsFileIdx >= 0 ? argv[termsFileIdx + 1] : null;
+const rangeIdx = argv.indexOf("--range");
+const range = rangeIdx >= 0 ? argv[rangeIdx + 1] : null;
 
-/** Same excludes as the local gate: deps, build output, binaries, LICENSE (the maintainer's name
- *  legitimately appears there), and any file whose PURPOSE is to carry the patterns. */
+/** Excludes: deps, build output, binaries, the root LICENSE (the maintainer's name legitimately
+ *  appears there), and any file whose PURPOSE is to carry the patterns.
+ *
+ *  TIGHTER THAN THE LOCAL GATE, deliberately (review Medium 6). The local gate excludes `*.lock` and
+ *  `LICENSE` at ANY depth, so a stray `notes.lock` or a nested `LICENSE` is a bypass surface. That
+ *  was tolerable when the gate was one person's pre-push convenience; this one is the universal
+ *  check, so the lockfile exclusion names the actual lockfile and LICENSE is root-anchored. */
 const PATHSPEC = [
   ":!node_modules/**", ":!**/node_modules/**", ":!dist/**", ":!**/dist/**",
   ":!.venv/**", ":!**/__pycache__/**", ":!*.png", ":!*.jpg", ":!*.jpeg", ":!*.pdf",
-  ":!*.lock", ":!LICENSE",
+  ":!package-lock.json", ":!/LICENSE",
   ":!leak-gate.sh", ":!**/leak-gate.sh", ":!nda-leak-gate.sh", ":!**/nda-leak-gate.sh",
   ":!**/confidential-terms.txt", ":!**/confidential-terms.local.txt",
   ":!**/confidential-terms.example.txt", ":!confidential-terms.example.txt",
@@ -70,7 +81,7 @@ export function parseTerms(raw) {
 }
 
 /** `file:line` for every hit, plus which term index matched — never the line, never the term. */
-export function scan(terms, { revealLines = false } = {}) {
+export function scan(terms, { revealLines = false, cwd = process.cwd() } = {}) {
   if (terms.length === 0) throw new Error("no active NDA terms — refusing to report a pass");
   const findings = [];
   // One grep per term rather than one alternation, so a hit can be attributed to a term INDEX
@@ -78,7 +89,7 @@ export function scan(terms, { revealLines = false } = {}) {
   terms.forEach((term, i) => {
     let out = "";
     try {
-      out = execFileSync("git", ["grep", "-nEiI", "-e", term, "--", ...PATHSPEC], { encoding: "utf8" });
+      out = execFileSync("git", ["grep", "-nEiI", "-e", term, "--", ...PATHSPEC], { encoding: "utf8", cwd });
     } catch (e) {
       // git grep exits 1 for "no matches" — that is the clean case, not an error.
       if (e.status === 1) return;
@@ -87,10 +98,69 @@ export function scan(terms, { revealLines = false } = {}) {
     for (const line of out.split("\n").filter(Boolean)) {
       const m = /^([^:]+):(\d+):(.*)$/.exec(line);
       if (!m) continue;
-      findings.push({ file: m[1], line: Number(m[2]), termIndex: i, text: revealLines ? m[3] : undefined });
+      // No term index (review Low 8 — a membership oracle). `i` is used only for `--reveal`.
+      findings.push({ file: m[1], line: Number(m[2]), text: revealLines ? m[3] : undefined, term: revealLines ? terms[i] : undefined });
     }
   });
   return findings;
+}
+
+/**
+ * Scan a commit RANGE's patches and messages, not just the final tree (review Medium 5).
+ *
+ * A clean tree is not a clean history. Merge commits are enabled on this repo, so a term added in
+ * one commit of a PR and removed in a later one still lands on `main` permanently — and a term in a
+ * COMMIT MESSAGE never appears in any tree at all. Both are as public as a file. Returns bare
+ * markers rather than file:line, because a patch hunk's "location" is a commit, and naming it is
+ * enough to find it locally.
+ */
+export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process.cwd() } = {}) {
+  if (terms.length === 0) throw new Error("no active NDA terms — refusing to report a pass");
+  const res = [];
+  const regexes = terms.map((t) => new RegExp(t, "i"));
+
+  // ADDED LINES ONLY. A commit that REMOVES a term necessarily contains it on the removed side of
+  // its own patch — so a naive scan fails every scrub commit, including the one that introduced
+  // this gate. A gate that blocks the fix for the thing it guards gets bypassed, and a bypassed
+  // gate is worse than none. Removal is the cure, not the disease; only additions are new exposure.
+  let patch = "";
+  try {
+    patch = execFileSync("git", ["log", "-p", "--no-color", "--format=%x00%H", rangeSpec], {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      cwd,
+    });
+  } catch (e) {
+    if (e.status !== 1) throw e;
+  }
+  let sha = "";
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("\u0000")) { sha = line.slice(1, 13); continue; }
+    if (!line.startsWith("+") || line.startsWith("+++")) continue;
+    const body = line.slice(1);
+    for (const [i, re] of regexes.entries()) {
+      if (re.test(body)) {
+        res.push({ file: `commit ${sha} (added line)`, line: 0, term: revealLines ? terms[i] : undefined, text: revealLines ? body : undefined });
+        break;
+      }
+    }
+  }
+
+  // Commit MESSAGES never appear in any tree, and are as public as a file. Any occurrence counts —
+  // a message cannot be "removed" by a later commit the way a line can.
+  for (const [i, term] of terms.entries()) {
+    let out = "";
+    try {
+      out = execFileSync("git", ["log", "--no-color", "-i", "--grep", term, "--format=%H", rangeSpec], { encoding: "utf8", cwd });
+    } catch (e) {
+      if (e.status === 1) continue;
+      throw e;
+    }
+    for (const m of new Set(out.match(/^[0-9a-f]{40}$/gm) ?? [])) {
+      res.push({ file: `commit ${m.slice(0, 12)} (message)`, line: 0, term: revealLines ? terms[i] : undefined });
+    }
+  }
+  return res;
 }
 
 function main() {
@@ -104,6 +174,8 @@ function main() {
   let findings;
   try {
     findings = scan(terms, { revealLines: reveal });
+    // The tree is what ships; the range is what becomes permanent history. Both, when given one.
+    if (range) findings = findings.concat(scanRange(terms, range, { revealLines: reveal }));
   } catch (e) {
     console.error(`NDA-GATE: BLOCKED — ${e.message}`);
     process.exit(2);
@@ -116,7 +188,7 @@ function main() {
   console.error("NDA-GATE: BLOCKED — confidential identifier(s) detected.");
   console.error(reveal ? "" : "Locations only — the term is withheld because this log may be public.");
   for (const f of findings) {
-    console.error(`  ${f.file}:${f.line}  (term #${f.termIndex + 1})${f.text ? `  ${f.text}` : ""}`);
+    console.error(`  ${f.file}:${f.line}${f.text ? `  ${f.text}` : ""}`);
   }
   console.error("------------------------------------------------------------");
   console.error("Run locally to see what matched:");
