@@ -481,7 +481,11 @@ async function activeAdminError(db: DbClient, teamId: string, memberId: string):
 }
 
 export interface GrantResult extends WriteResult {
-  /** false = the edge already existed → NOTHING was written (audit-on-change), incl. no authorizer meta. */
+  /** false = the edge already existed → NOTHING was written (audit-on-change), incl. no
+   *  authorizer meta. RACE-BOUNDED like the audit itself (the recorded F3 class): two
+   *  concurrent missed-select creators can BOTH report created:true for one edge — an
+   *  over-report of the same ms-apart act, never an under-report, and the no-op path never
+   *  claims creation. The atomic INSERT…RETURNING form is the F3 transaction surface. */
   created?: boolean;
 }
 

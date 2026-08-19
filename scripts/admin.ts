@@ -287,8 +287,8 @@ async function main() {
       // ENFB-2: the operator's grant edge — what makes the restricted-initiative lifecycle
       // (and the stranded-creator repair the D1 duplicate-arm deliberately does NOT do)
       // actually operable. Routes through the sole-writer group module, audited there.
-      const groupSlug = positionals[0] || die(`usage: ${cmd} <group-slug> <project-slug> [--team <id|slug>]`);
-      const projectSlug = positionals[1] || die(`usage: ${cmd} <group-slug> <project-slug> [--team <id|slug>]`);
+      const groupSlug = positionals[0] || die(`usage: ${cmd} <group-slug> <project-slug> [--actor <admin-email>] [--team <id|slug>]`);
+      const projectSlug = positionals[1] || die(`usage: ${cmd} <group-slug> <project-slug> [--actor <admin-email>] [--team <id|slug>]`);
       const team = await resolveTeam(admin, teamSlug);
       const { data: g } = await admin
         .from("groups")

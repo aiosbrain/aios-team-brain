@@ -56,9 +56,9 @@ ENFB-4 (#615) merged. **Schema: NONE.**
   recorded, out of scope). The honest contract records BOTH truths: the writer takes a
   discriminated actor —
   `{ kind: "member", memberId }` (the member themselves performed it — reserved for a future
-  UI action) or `{ kind: "operator", authorizedByMemberId }` (the CLI: the operator ran it on
+  UI action) or `{ kind: "operator", authorizedByMemberId, via }` (the CLI: the operator ran it on
   a named active admin's authority). An operator revoke audits `actor_kind='system'` with
-  `meta.authorizedByMemberId` + `meta.via='cli'`. `--actor <admin-email>` stays REQUIRED on
+  `meta.authorizedByMemberId` + `meta.via` (the caller-declared transport — "cli" from the verb). `--actor <admin-email>` stays REQUIRED on
   the verb (a destructive narrowing still may not be attributed to nobody); no `--actor` →
   usage die BEFORE any read; unknown/inactive/non-admin email → die, named, no partial work.
 - **D1b — grant-project gains OPTIONAL `--actor <admin-email>`, recorded in META ONLY
@@ -131,7 +131,7 @@ ENFB-4 (#615) merged. **Schema: NONE.**
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
-| `revoke-project` CLI verb | ABSENT — `scripts/admin.ts:306-308` records the deferral + reason | `revoke-project <group-slug> <project-slug> --actor <admin-email> [--team …]`: resolve team → group → project (existing die-with-usage shapes), preflight the system-kind refusal for a friendly message (the WRITER holds the invariant, D2), resolve the authorizer, call the sole writer with `{ kind: "operator", authorizedByMemberId }`, report `revoked`/`no grant to revoke` |
+| `revoke-project` CLI verb | ABSENT — `scripts/admin.ts:306-308` records the deferral + reason | `revoke-project <group-slug> <project-slug> --actor <admin-email> [--team …]`: resolve team → group → project (existing die-with-usage shapes), preflight the system-kind refusal for a friendly message (the WRITER holds the invariant, D2), resolve the authorizer, call the sole writer with `{ kind: "operator", authorizedByMemberId, via }`, report `revoked`/`no grant to revoke` |
 | `revokeProjectFromGroup` (lib/access/groups.ts:493-508) | blind delete + UNCONDITIONAL audit; zero callers | takes the discriminated actor (D1); refuses `kind='system'` projects (D2) and non-active-admin principals (D2b) INSIDE the writer; probe-first: absent edge → `{ ok: true, revoked: false }`, no audit (D3); present → delete + audit (`system` actor + `meta.authorizedByMemberId` + `meta.via` for operator revokes; `member` actor for the future UI kind) |
 | `grant-project` CLI verb (scripts/admin.ts:285-313) | hardcodes `null` actor → `actor_kind='system'` audit rows (3 in prod) | optional `--actor <admin-email>` recorded in the audit META only (D1b — never the actor field, never `added_by`); absent → unchanged null path |
 | audit trail (`audit_log` via `auditWrite`) | grants: `system` actor; revokes: none exist | operator revokes: `actor_kind='system'` + `meta.authorizedByMemberId` + `meta.via='cli'` + `meta.groupId`; no row for no-op revokes; the member kind (future UI) audits as `member` |
@@ -146,7 +146,7 @@ ENFB-4 (#615) merged. **Schema: NONE.**
   the invariant to one caller. The CLI verb only resolves names → ids, preflights for message
   quality, and calls the writer.
 - **The discriminated actor** (`{ kind: "member", memberId } | { kind: "operator",
-  authorizedByMemberId }`) keeps the future UI path honest by construction: when an admin
+  authorizedByMemberId, via }`) keeps the future UI path honest by construction: when an admin
   clicks revoke themselves, THEIR action audits as `member`; the CLI can never produce that
   shape. Resolution stays in the CLI (`memberIdByEmail`, admin.ts:103); validation lives in
   the writer (D2b).
