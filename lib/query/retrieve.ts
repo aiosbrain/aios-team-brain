@@ -14,6 +14,7 @@ import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
 import { analyzeTermSpecificity } from "./grounding";
 import { taskStatusCounts, matchingDecisions } from "./structured-extras";
+import { rowVisibleByProvenance } from "@/lib/access/provenance";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -871,14 +872,12 @@ async function nativeRetrieve(
   // deduped by row_key. Recency rows first (fresh context), then the older matches under their own note.
   type DecisionLine = { row_key: string; decided_at: string | null; title: string; decided_by: string; still_valid: boolean; source_item_id: string | null; slug: string };
   const recencyDecisions: DecisionLine[] = (decisions ?? [])
-    // enforcement: a decision whose SOURCE ITEM the principal can't see is dropped (its title/
-    // metadata would otherwise leak a restricted item; row-grain membership is Phase D — this
-    // source-item gate is the safe interim). A NULL-source decision is dropped DELIBERATELY
-    // (PRET-6, matching the timeline's decision leg): `decisions` has no creation-provenance
-    // column, so a dashboard-created row is indistinguishable from a synced row whose restricted
-    // source was purged (`on delete set null`) — reviving the first would leak the second.
-    // Named backlog: a `decisions.created_by` column re-admits the hand-typed arm safely.
-    .filter((d) => (d.source_item_id ?? null) !== null && visible(d.source_item_id as string))
+    // Enforcement — the settled provenance rule, decisions edition (ENFB-1 §2.7: the
+    // `decisions.created_by` column this slice ships re-admits the hand-typed arm): a SOURCED
+    // decision gates on its source item's visibility; a null-source one survives only when
+    // hand-typed (created_by — the dashboard action's sole write; a purged restricted basis
+    // stays dropped) at team posture. ONE owner: lib/access/provenance.
+    .filter((d) => rowVisibleByProvenance(d as { source_item_id?: string | null; created_by?: string | null }, visibleIds, tier))
     .map((d) => ({
     row_key: d.row_key as string,
     decided_at: (d.decided_at as string | null) ?? null,
@@ -891,7 +890,7 @@ async function nativeRetrieve(
   const recencyKeys = new Set(recencyDecisions.map((d) => d.row_key));
   const olderMatches = matchedDecisions
     .filter((d) => !recencyKeys.has(d.row_key))
-    .filter((d) => (d.source_item_id ?? null) !== null && visible(d.source_item_id)); // source-item gate; null-source dropped deliberately (no provenance column — see the recency leg's note)
+    .filter((d) => rowVisibleByProvenance(d as { source_item_id?: string | null; created_by?: string | null }, visibleIds, tier)); // the same §2.7 rule as the recency leg
   const fmtDecision = (d: DecisionLine) =>
     `- #${d.row_key} (${d.decided_at ?? "?"}, ${d.slug}) ${d.title} — by ${d.decided_by}${d.still_valid ? "" : " [SUPERSEDED]"}`;
 

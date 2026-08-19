@@ -83,33 +83,36 @@ describe("dashboard tier isolation", () => {
  * here; they are the next slice's rows, recorded so their absence reads as a decision.
  */
 const ROOT = join(import.meta.dirname, "..", "..");
-const ORACLE = /(canSeeItem|visibleItemIds|rowVisibleByProvenance)\s*\(/;
-const BODY_SURFACES = [
-  "app/t/[team]/library/[itemId]/page.tsx",
-  "app/t/[team]/library/skills/page.tsx",
-  "app/t/[team]/team-tools/page.tsx",
-  "app/t/[team]/tasks/page.tsx",
-  "app/t/[team]/decisions/page.tsx",
-  "components/library/data-browser.tsx",
-  "app/api/v1/items/[id]/route.ts",
-  "app/api/v1/okf-bundle/route.ts",
+/** Per-file APPLICATION patterns (diff-review Medium: presence of a resolution without its
+ *  APPLICATION site survived every layer — a page could resolve the vis set and never filter
+ *  with it). Each pattern matches the point where the oracle result GATES rows. */
+const BODY_SURFACE_WIRING: [string, RegExp][] = [
+  ["app/t/[team]/library/[itemId]/page.tsx", /await canSeeItem\(.*\)\s*notFound\(\)/],
+  ["app/t/[team]/library/skills/page.tsx", /\.in\("id", \[\.\.\.vis\.ids\]\)/],
+  ["app/t/[team]/team-tools/page.tsx", /\.in\("id", \[\.\.\.vis\.ids\]\)/],
+  ["app/t/[team]/tasks/page.tsx", /\.filter\(\(t\) => rowVisibleByProvenance\(/],
+  ["app/t/[team]/decisions/page.tsx", /\.filter\(\(d\) => rowVisibleByProvenance\(/],
+  ["components/library/data-browser.tsx", /\.in\("id", visArr\)/],
+  ["app/api/v1/items/[id]/route.ts", /await canSeeItem\(/],
+  ["app/api/v1/okf-bundle/route.ts", /pageVisibleOkfItems\(/],
 ];
 
-describe("ENFB-1 — body-serving surfaces call the membership oracle (the coarse wall is not sufficiency)", () => {
-  it("every body surface references an oracle primitive", () => {
-    const missing = BODY_SURFACES.filter((f) => !ORACLE.test(readFileSync(join(ROOT, f), "utf8")));
+describe("ENFB-1 — body-serving surfaces APPLY the membership oracle (the coarse wall is not sufficiency)", () => {
+  it("every body surface's oracle APPLICATION site is present", () => {
+    const missing = BODY_SURFACE_WIRING.filter(([f, pat]) => !pat.test(readFileSync(join(ROOT, f), "utf8"))).map(([f]) => f);
     expect(
       missing,
-      `Body-serving surfaces without a membership-oracle call (the posture helpers alone are the\n` +
-        `pre-ENFB-1 coarse wall — a restricted initiative's bodies would serve to every team member):\n${missing.join("\n")}`
+      `Body-serving surfaces whose oracle APPLICATION site is gone (resolving the set without\n` +
+        `applying it is the pre-ENFB-1 coarse wall in disguise):\n${missing.join("\n")}`
     ).toEqual([]);
   });
 
-  it("the oracle matcher discriminates (non-vacuity)", () => {
-    expect(ORACLE.test("await canSeeItem(db, principal, id)")).toBe(true);
-    expect(ORACLE.test("const vis = await visibleItemIds(db, p)")).toBe(true);
-    expect(ORACLE.test("rows.filter((r) => rowVisibleByProvenance(r, ids, tier))")).toBe(true);
-    expect(ORACLE.test("visibleItems(q, tier)")).toBe(false);
-    expect(ORACLE.test("canSeeAccess(tier, access)")).toBe(false);
+  it("the wiring matchers discriminate (non-vacuity: each pattern is an application, not a resolution)", () => {
+    const tasksPat = BODY_SURFACE_WIRING.find(([f]) => f.includes("tasks/page"))![1];
+    expect(tasksPat.test('rows.filter((t) => rowVisibleByProvenance(t, ids, tier))')).toBe(true);
+    expect(tasksPat.test('const vis = await visibleItemIds(db, p)'), "a bare resolution must NOT satisfy the wiring pin").toBe(false);
+    const skillsPat = BODY_SURFACE_WIRING.find(([f]) => f.includes("skills"))![1];
+    expect(skillsPat.test('.in("id", [...vis.ids])')).toBe(true);
+    expect(skillsPat.test('visibleItems(q, tier)')).toBe(false);
   });
 });

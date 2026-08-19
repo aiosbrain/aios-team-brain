@@ -44,11 +44,16 @@ export function parseOkfCursor(raw: string): OkfCursor | null {
   const ts = raw.slice(0, bar);
   const id = raw.slice(bar + 1);
   if (!UUID_RE.test(id)) return null; // malformed composite — refuse rather than guess
+  if (Number.isNaN(Date.parse(ts))) return null; // malformed timestamp half — 422, not a 500 from the cast (diff-review Low)
   return { ts, id };
 }
 
 export function formatOkfCursor(ts: string | Date, id: string): string {
-  const iso = ts instanceof Date ? ts.toISOString() : new Date(ts).toISOString();
+  // A STRING timestamp passes through VERBATIM (diff-review Medium): the pager selects
+  // `updated_at::text` — full Postgres microseconds — and a Date round-trip truncates to
+  // millis, which re-serves the boundary row every page (and loops forever on a full page
+  // sharing one microsecond timestamp). `::timestamptz` parses the pg text form directly.
+  const iso = ts instanceof Date ? ts.toISOString() : ts;
   return `${iso}|${id}`;
 }
 

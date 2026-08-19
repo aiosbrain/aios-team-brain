@@ -23,6 +23,7 @@ import { MIN_CONFIDENCE } from "./doc-task-infer";
 import { resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
 import { slackParticipations, foldProviderId } from "@/lib/ingest/slack-participants";
 import { canSeeMeetingNotes } from "@/lib/meetings/notes";
+import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 
 // Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
@@ -651,13 +652,10 @@ export async function getWorkTimeline(
     created_by?: string | null;
     still_valid: boolean | null;
   }[]) {
-    // The settled provenance rule, decisions edition (ENFB-1 §2.7): a sourced decision gates on
-    // its source item; a null-source one survives ONLY when hand-typed (created_by — the
-    // dashboard action's sole write; a purged restricted basis stays dropped) at team posture.
-    const decisionVisible = d.source_item_id != null
-      ? srcVisible(d.source_item_id)
-      : (d.created_by ?? null) != null && !isRestrictedTier(tier);
-    if (!decisionVisible) continue;
+    // The settled provenance rule, decisions edition (ENFB-1 §2.7) — ONE owner
+    // (lib/access/provenance); srcVisible's extra enforce-null guard is subsumed: enforce is
+    // never null here (the builder throws upstream without a view).
+    if (!rowVisibleByProvenance(d, enforce?.visibleItemIds ?? null, tier === "external" ? "external" : "team")) continue;
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)

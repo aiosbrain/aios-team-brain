@@ -104,6 +104,10 @@ export async function canSeeItem(db: DbClient, principal: Principal, itemId: str
     .select("id, source_item_id, state, unit_kind")
     .eq("team_id", principal.teamId)
     .eq("source_item_id", itemId)
+    // unit_kind in-query: today's CHECK guarantees one item-grain unit per item, but when
+    // Phase D admits non-item units sharing a source, maybeSingle must not error (which would
+    // deny an entitled member and disagree with the list — diff-review Low).
+    .eq("unit_kind", "item")
     .maybeSingle();
   if (uErr || !unitServesItem(unit as UnitRow | null)) return false;
 
