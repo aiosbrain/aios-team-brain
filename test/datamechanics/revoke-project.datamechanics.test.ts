@@ -113,13 +113,13 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
     expect((await visOf(seed, viewer)).has(item2.id)).toBe(true);
 
     // The operator revoke: the observable outcome is the enforced read narrowing.
-    const r1 = await revokeProjectFromGroup(db(), seed.teamId, p1, g1, { kind: "operator", authorizedByMemberId: admin });
+    const r1 = await revokeProjectFromGroup(db(), seed.teamId, p1, g1, { kind: "operator", authorizedByMemberId: admin, via: "cli" });
     expect(r1.ok).toBe(true);
     expect(r1.revoked).toBe(true);
     expect((await visOf(seed, viewer)).has(item.id), "revoked → gone from the enforced read").toBe(false);
 
     // Set semantics (D4): one of TWO grants revoked → still visible through the other.
-    const r2 = await revokeProjectFromGroup(db(), seed.teamId, p2, g2a, { kind: "operator", authorizedByMemberId: admin });
+    const r2 = await revokeProjectFromGroup(db(), seed.teamId, p2, g2a, { kind: "operator", authorizedByMemberId: admin, via: "cli" });
     expect(r2.revoked).toBe(true);
     expect((await visOf(seed, viewer)).has(item2.id), "the second group still grants it").toBe(true);
 
@@ -145,7 +145,7 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
     expect(memberRow!.member_id).toBe(admin);
 
     // No-op (D3): revoking the already-gone edge reports revoked:false and audits NOTHING.
-    const again = await revokeProjectFromGroup(db(), seed.teamId, p1, g1, { kind: "operator", authorizedByMemberId: admin });
+    const again = await revokeProjectFromGroup(db(), seed.teamId, p1, g1, { kind: "operator", authorizedByMemberId: admin, via: "cli" });
     expect(again.ok).toBe(true);
     expect(again.revoked).toBe(false);
     expect((await revokedAuditRows(seed)).length, "a revoke that revoked nothing writes no trail").toBe(3);
@@ -164,7 +164,7 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
     const sysProject = gen!.id as string;
     const sysGroup = everyone!.id as string;
     expect(await edgeExists(seed, sysProject, sysGroup), "bootstrap wired the system edge").toBe(true);
-    const sys = await revokeProjectFromGroup(db(), seed.teamId, sysProject, sysGroup, { kind: "operator", authorizedByMemberId: admin });
+    const sys = await revokeProjectFromGroup(db(), seed.teamId, sysProject, sysGroup, { kind: "operator", authorizedByMemberId: admin, via: "cli" });
     expect(sys.ok).toBe(false);
     expect(sys.error).toMatch(/system/);
     expect(await edgeExists(seed, sysProject, sysGroup), "the substrate edge survives the refusal").toBe(true);
@@ -187,7 +187,7 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
       ["an external-posture admin", externalAdmin],
       ["an unknown id", unknown],
     ] as const) {
-      const viaOperator = await revokeProjectFromGroup(db(), seed.teamId, project, g, { kind: "operator", authorizedByMemberId: principal });
+      const viaOperator = await revokeProjectFromGroup(db(), seed.teamId, project, g, { kind: "operator", authorizedByMemberId: principal, via: "cli" });
       expect(viaOperator.ok, `${label} must not authorize an operator revoke`).toBe(false);
       const viaMember = await revokeProjectFromGroup(db(), seed.teamId, project, g, { kind: "member", memberId: principal });
       expect(viaMember.ok, `${label} must not perform a member revoke`).toBe(false);
@@ -196,9 +196,9 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
 
     // D2c — no existence oracle: an invalid principal gets the SAME refusal against an
     // ABSENT edge as against the present one (the probe runs only after authority).
-    const withEdge = await revokeProjectFromGroup(db(), seed.teamId, project, g, { kind: "operator", authorizedByMemberId: nonAdmin });
+    const withEdge = await revokeProjectFromGroup(db(), seed.teamId, project, g, { kind: "operator", authorizedByMemberId: nonAdmin, via: "cli" });
     const noEdgeProject = await restrictedProject(seed, item.id, [], admin); // no grant at all
-    const withoutEdge = await revokeProjectFromGroup(db(), seed.teamId, noEdgeProject, g, { kind: "operator", authorizedByMemberId: nonAdmin });
+    const withoutEdge = await revokeProjectFromGroup(db(), seed.teamId, noEdgeProject, g, { kind: "operator", authorizedByMemberId: nonAdmin, via: "cli" });
     expect(withEdge.ok).toBe(false);
     expect(withoutEdge.ok).toBe(false);
     expect(withoutEdge.error, "identical refusal — edge presence is not observable without authority").toBe(withEdge.error);
@@ -208,8 +208,9 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
 
     // D1b — the grant flag records the authorizer in META only: system actor, no added_by.
     const g3 = await grp(seed, admin);
-    const r = await grantProjectToGroup(db(), seed.teamId, project, g3, null, { authorizedByMemberId: admin });
+    const r = await grantProjectToGroup(db(), seed.teamId, project, g3, null, { authorizedByMemberId: admin, via: "cli" });
     expect(r.ok).toBe(true);
+    expect(r.created, "a real creation reports created:true (the CLI's honest-output contract)").toBe(true);
     const { data: grantRows } = await db()
       .from("audit_log")
       .select("actor_kind, member_id, meta")
@@ -224,17 +225,24 @@ describe("REVOKE-1 — enforcement narrows, the audit is honest, no-ops do not a
     const { data: edge } = await db().from("project_groups").select("added_by").eq("team_id", seed.teamId).eq("project_id", project).eq("group_id", g3).single();
     expect(edge!.added_by, "the authorizer is NOT laundered into added_by").toBeNull();
 
-    // The unflagged path is unchanged: system actor, no authorizedBy key.
+    // The unflagged path is unchanged — ALL THREE pinned (Fable diff L4): system actor, no
+    // authorizedBy key, NULL added_by.
     const g4 = await grp(seed, admin);
     await grantProjectToGroup(db(), seed.teamId, project, g4, null);
     const { data: plainRows } = await db()
       .from("audit_log")
-      .select("meta")
+      .select("actor_kind, member_id, meta")
       .eq("team_id", seed.teamId)
       .eq("action", "access.project_granted");
-    const plain = ((plainRows ?? []) as { meta: Record<string, unknown> }[]).filter((row) => (row.meta.groupId as string) === g4);
+    const plain = ((plainRows ?? []) as { actor_kind: string; member_id: string | null; meta: Record<string, unknown> }[]).filter(
+      (row) => (row.meta.groupId as string) === g4
+    );
     expect(plain.length).toBe(1);
     expect("authorizedByMemberId" in plain[0].meta).toBe(false);
+    expect(plain[0].actor_kind).toBe("system");
+    expect(plain[0].member_id).toBeNull();
+    const { data: plainEdge } = await db().from("project_groups").select("added_by").eq("team_id", seed.teamId).eq("project_id", project).eq("group_id", g4).single();
+    expect(plainEdge!.added_by).toBeNull();
 
     // A non-admin authorizedBy on the GRANT flag refuses too (the D1b validation arm).
     const g5 = await grp(seed, admin);

@@ -307,15 +307,24 @@ async function main() {
       // REVOKE-1 (D1b): the operator's act audits as system; --actor records a named
       // active-admin authorizer in the audit META only (never the actor field, never
       // added_by — either would attribute the act to a human who merely approved it).
+      // A value-less --actor DIES (Fable diff M1): silently dropping the authorizer is the
+      // exact attribution failure this flag exists to prevent.
+      if (flags.actor === true) die("--actor requires a value (an admin email)");
       const { grantProjectToGroup } = await import("@/lib/access/groups");
       let grantAuthorizer: string | undefined;
       if (typeof flags.actor === "string") {
         grantAuthorizer = (await memberIdByEmail(admin, team.id, flags.actor)) || die(`no member ${flags.actor}`);
       }
       const r = await grantProjectToGroup(admin, team.id, (proj as { id: string }).id, (g as { id: string }).id, null,
-        grantAuthorizer ? { authorizedByMemberId: grantAuthorizer } : {});
+        grantAuthorizer ? { authorizedByMemberId: grantAuthorizer, via: "cli" } : {});
       if (!r.ok) die(`${cmd} failed: ${r.error}`);
-      console.log(`✓ granted '${projectSlug}' to '${groupSlug}' on ${team.slug}${grantAuthorizer ? ` (authorized by ${flags.actor})` : ""}`);
+      // created:false = the edge already existed → NOTHING was written (audit-on-change), so
+      // claiming "(authorized by …)" would be a lie (Fable diff L1).
+      console.log(
+        r.created === false
+          ? `· '${projectSlug}' was already granted to '${groupSlug}' on ${team.slug} — nothing written, no authorizer recorded`
+          : `✓ granted '${projectSlug}' to '${groupSlug}' on ${team.slug}${grantAuthorizer ? ` (authorized by ${flags.actor})` : ""}`
+      );
       break;
     }
     case "revoke-project": {
@@ -324,6 +333,7 @@ async function main() {
       // verb resolves names, preflights for message quality, and requires the authorizer.
       const groupSlug = positionals[0];
       const projectSlug = positionals[1];
+      if (flags.actor === true) die("--actor requires a value (an admin email)");
       const team = await resolveTeam(admin, teamSlug);
       const { runRevokeProjectVerb } = await import("@/lib/access/revoke-verb");
       const { revokeProjectFromGroup } = await import("@/lib/access/groups");
@@ -339,7 +349,7 @@ async function main() {
           },
           resolveMemberIdByEmail: (email) => memberIdByEmail(admin, team.id, email),
           revoke: (projectId, groupId, authorizedByMemberId) =>
-            revokeProjectFromGroup(admin, team.id, projectId, groupId, { kind: "operator", authorizedByMemberId }),
+            revokeProjectFromGroup(admin, team.id, projectId, groupId, { kind: "operator", authorizedByMemberId, via: "cli" }),
         },
         { groupSlug, projectSlug, actorEmail: typeof flags.actor === "string" ? flags.actor : undefined }
       );

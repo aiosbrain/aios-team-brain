@@ -480,17 +480,24 @@ async function activeAdminError(db: DbClient, teamId: string, memberId: string):
   return null;
 }
 
+export interface GrantResult extends WriteResult {
+  /** false = the edge already existed → NOTHING was written (audit-on-change), incl. no authorizer meta. */
+  created?: boolean;
+}
+
 /** Grant a group visibility into a project (THE access edge). REVOKE-1 (D1b): `opts.authorizedByMemberId`
  *  records a named ACTIVE-ADMIN authorizer in the audit META only — never in the actor field and never
- *  in `added_by` (either would attribute the operator's act to a human who merely approved it). */
+ *  in `added_by` (either would attribute the operator's act to a human who merely approved it).
+ *  `opts.via` is the CALLER's transport claim (Fable diff L2: the writer must not hardcode "cli" —
+ *  a future non-CLI operator surface reusing the flag would mint false provenance by construction). */
 export async function grantProjectToGroup(
   db: DbClient,
   teamId: string,
   projectId: string,
   groupId: string,
   actorMemberId: string | null,
-  opts: { authorizedByMemberId?: string } = {}
-): Promise<WriteResult> {
+  opts: { authorizedByMemberId?: string; via?: string } = {}
+): Promise<GrantResult> {
   if (opts.authorizedByMemberId) {
     const bad = await activeAdminError(db, teamId, opts.authorizedByMemberId);
     if (bad) return { ok: false, error: `grant authorizer rejected: ${bad}` };
@@ -510,16 +517,18 @@ export async function grantProjectToGroup(
     .eq("project_id", projectId)
     .eq("group_id", groupId)
     .maybeSingle();
-  if (existing) return { ok: true };
+  if (existing) return { ok: true, created: false };
   const { error } = await db
     .from("project_groups")
     .upsert({ team_id: teamId, project_id: projectId, group_id: groupId, added_by: actorMemberId }, { onConflict: "project_id,group_id" });
   if (error) return { ok: false, error: error.message };
   await auditWrite(db, teamId, actorMemberId, "access.project_granted", projectId, {
     groupId,
-    ...(opts.authorizedByMemberId ? { authorizedByMemberId: opts.authorizedByMemberId, via: "cli" } : {}),
+    ...(opts.authorizedByMemberId
+      ? { authorizedByMemberId: opts.authorizedByMemberId, ...(opts.via ? { via: opts.via } : {}) }
+      : {}),
   });
-  return { ok: true };
+  return { ok: true, created: true };
 }
 
 /**
@@ -532,7 +541,7 @@ export async function grantProjectToGroup(
  */
 export type RevokeActor =
   | { kind: "member"; memberId: string }
-  | { kind: "operator"; authorizedByMemberId: string };
+  | { kind: "operator"; authorizedByMemberId: string; via: string };
 
 export interface RevokeResult extends WriteResult {
   /** true = an edge was deleted (and audited); false = there was nothing to revoke (no audit). */
@@ -603,10 +612,12 @@ export async function revokeProjectFromGroup(
   if (actor.kind === "member") {
     await auditWrite(db, teamId, actor.memberId, "access.project_revoked", projectId, { groupId });
   } else {
+    // `via` comes from the ACTOR — the caller declares its own transport (Fable diff L2:
+    // hardcoding "cli" here would mint false provenance for any future operator surface).
     await auditWrite(db, teamId, null, "access.project_revoked", projectId, {
       groupId,
       authorizedByMemberId: actor.authorizedByMemberId,
-      via: "cli",
+      via: actor.via,
     });
   }
   return { ok: true, revoked: true };
