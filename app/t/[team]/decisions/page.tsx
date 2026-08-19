@@ -3,6 +3,7 @@ import { Gavel } from "lucide-react";
 import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { visibleDecisions } from "@/lib/auth/visibility";
+import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { DecisionsTable, type Decision } from "@/components/decisions-table";
 import { NewDecisionButton } from "@/components/decisions/new-decision-button";
 import { EmptyState } from "@/components/empty-state";
@@ -62,11 +63,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
   ]);
 
   const rows = ((decisions ?? []) as unknown as (Decision & { source_item_id?: string | null; created_by?: string | null })[])
-    .filter((d) =>
-      (d.source_item_id ?? null) !== null
-        ? (vis != null && !vis.error && vis.ids.has(d.source_item_id as string))
-        : (d.created_by ?? null) !== null && tier === "team"
-    );
+    .filter((d) => rowVisibleByProvenance(d, vis && !vis.error ? vis.ids : null, tier));
   const canToggle = me?.role === "admin" || me?.role === "lead";
   const projectOptions = (projects ?? []) as { id: string; slug: string; name: string }[];
 

@@ -5,6 +5,7 @@ import { serverClient } from "@/lib/db/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { currentMember } from "@/lib/auth/guard";
 import { visibleTasks } from "@/lib/auth/visibility";
+import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { Board } from "@/components/kanban/board";
 import { TaskHierarchy } from "@/components/kanban/task-hierarchy";
 import { EmptyState } from "@/components/empty-state";
@@ -83,13 +84,8 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
     linksByTask.set(task_id, arr);
   }
   const taskRows = ((tasks ?? []) as (Task & { source_item_id?: string | null; created_by?: string | null })[])
-    // ENFB-1 provenance rule (the timeline's settled shape): sourced → visible source; null-source
-    // → hand-typed (created_by) at team posture. A purged restricted basis never reaches the board.
-    .filter((t) =>
-      (t.source_item_id ?? null) !== null
-        ? (vis != null && !vis.error && vis.ids.has(t.source_item_id as string))
-        : (t.created_by ?? null) !== null && tier === "team"
-    )
+    // ENFB-1 provenance rule — the ONE shared owner (lib/access/provenance).
+    .filter((t) => rowVisibleByProvenance(t, vis && !vis.error ? vis.ids : null, tier))
     .map((t) => ({
       ...t,
       task_pm_links: linksByTask.get(t.id) ?? [],

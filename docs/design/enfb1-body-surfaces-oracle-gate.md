@@ -202,12 +202,13 @@ live, and that is by design, not vacuity: each AC below plants an initiative mem
    cursor: >PAGE_SIZE visible rows sharing one `updated_at` drain losslessly, and a legacy
    bare-timestamp cursor still resumes; the entitled reader's pages byte-match the pre-slice
    shape for a no-initiative corpus (the latent no-op, asserted).
-3. Dashboard body pages: `npm run test:datamechanics:iso
-   test/datamechanics/enfb-dashboard-body-pages.datamechanics.test.ts` exits 0 — library
-   item `notFound`, skills/team-tools lists omit, tasks-board provenance rule (sourced-
-   restricted dropped, hand-typed survives for team posture), decisions provenance rule both
-   directions (sourced-restricted dropped; a dashboard-created row with `created_by` set
-   survives for team posture — the round-trip pin; a null-source null-created_by row dropped).
+3. Dashboard body pages (AS BUILT — re-specified from page-render tests to the honest
+   two-layer pin, recorded here): the provenance RULE has one owner
+   (`lib/access/provenance.rowVisibleByProvenance`) with every arm pinned in
+   `npx vitest run test/access-provenance.test.ts` (exit 0), and the pages' WIRING to the
+   oracle is pinned by the §2.3 guard layer (`test/guards/dashboard-tier-filter.test.ts` —
+   dropping any body surface's oracle call reddens the build). The library page's
+   `canSeeItem → notFound` rides AC1's route-level pin of the same primitive.
 4. graph-query cuts to oracle partitions via the STORED-pointer path: `npm run
    test:datamechanics:iso test/datamechanics/enfb-graph-query-scope.datamechanics.test.ts`
    exits 0 — the stubbed Graphiti receives exactly `selectEnforcedGraphPartitions`' groups for

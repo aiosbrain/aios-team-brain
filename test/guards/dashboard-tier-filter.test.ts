@@ -72,3 +72,44 @@ describe("dashboard tier isolation", () => {
     expect(CHOKE.test('q.eq("team_id", t)')).toBe(false);
   });
 });
+
+/**
+ * ENFB-1 §2.3 — the ORACLE layer: the posture choke-point above is the COARSE wall only; every
+ * BODY-SERVING surface must ALSO call the membership oracle (canSeeItem / visibleItemIds /
+ * rowVisibleByProvenance). The set is ENUMERATED (not pattern-derived) because body-serving is
+ * a property of what a page renders, which no regex over its reads can see. Known ENFB-2
+ * residuals (title/metadata surfaces incl. the ungated projects LIST inventory — invisible to
+ * the READS_ITEMS regex because `items(count)` embeds don't match it) are deliberately NOT
+ * here; they are the next slice's rows, recorded so their absence reads as a decision.
+ */
+const ROOT = join(import.meta.dirname, "..", "..");
+const ORACLE = /(canSeeItem|visibleItemIds|rowVisibleByProvenance)\s*\(/;
+const BODY_SURFACES = [
+  "app/t/[team]/library/[itemId]/page.tsx",
+  "app/t/[team]/library/skills/page.tsx",
+  "app/t/[team]/team-tools/page.tsx",
+  "app/t/[team]/tasks/page.tsx",
+  "app/t/[team]/decisions/page.tsx",
+  "components/library/data-browser.tsx",
+  "app/api/v1/items/[id]/route.ts",
+  "app/api/v1/okf-bundle/route.ts",
+];
+
+describe("ENFB-1 — body-serving surfaces call the membership oracle (the coarse wall is not sufficiency)", () => {
+  it("every body surface references an oracle primitive", () => {
+    const missing = BODY_SURFACES.filter((f) => !ORACLE.test(readFileSync(join(ROOT, f), "utf8")));
+    expect(
+      missing,
+      `Body-serving surfaces without a membership-oracle call (the posture helpers alone are the\n` +
+        `pre-ENFB-1 coarse wall — a restricted initiative's bodies would serve to every team member):\n${missing.join("\n")}`
+    ).toEqual([]);
+  });
+
+  it("the oracle matcher discriminates (non-vacuity)", () => {
+    expect(ORACLE.test("await canSeeItem(db, principal, id)")).toBe(true);
+    expect(ORACLE.test("const vis = await visibleItemIds(db, p)")).toBe(true);
+    expect(ORACLE.test("rows.filter((r) => rowVisibleByProvenance(r, ids, tier))")).toBe(true);
+    expect(ORACLE.test("visibleItems(q, tier)")).toBe(false);
+    expect(ORACLE.test("canSeeAccess(tier, access)")).toBe(false);
+  });
+});
