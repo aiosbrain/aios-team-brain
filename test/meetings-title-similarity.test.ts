@@ -19,10 +19,12 @@ const BAR = DEFAULT_TITLE_MERGE_THRESHOLD;
 
 describe("titleSimilarity — merges the same meeting, not merely similar-sounding ones", () => {
   it("merges when one producer's title extends the other's — the real shape", () => {
-    // Google keeps the invite subject; Granola derives its own and appends.
+    // Google keeps the invite subject; Granola derives its own and appends. The titles are
+    // PLACEHOLDERS for a real production pair (this repo is public); what matters is that one
+    // EXTENDS the other — do not restore real meeting names.
     const s = titleSimilarity(
-      "Stephan & John — DSM-Firmenich Demo Prep",
-      "Stephan & John — DSM-Firmenich Demo Prep + AIOS"
+      "Ana & John — Northwind Demo Prep",
+      "Ana & John — Northwind Demo Prep + AIOS"
     );
     expect(s).toBeGreaterThanOrEqual(BAR);
   });
@@ -52,8 +54,8 @@ describe("titleSimilarity — merges the same meeting, not merely similar-soundi
   });
 
   it("is symmetric — merge must not depend on which side arrived first", () => {
-    const a = "Stephan & John — DSM-Firmenich Demo Prep";
-    const b = "Stephan & John — DSM-Firmenich Demo Prep + AIOS";
+    const a = "Ana & John — Northwind Demo Prep";
+    const b = "Ana & John — Northwind Demo Prep + AIOS";
     expect(titleSimilarity(a, b)).toBe(titleSimilarity(b, a));
   });
 

@@ -25,7 +25,7 @@ concentrated in exactly the documents with the highest information density per b
 | `gui/server/skill-library/claude-api/…/model-migration.md` | 33.8% |
 | `docs/brain-api.md` | 35.4% |
 | `2-work/weekly-digest-team-2026-07-27…` | 42.6% |
-| `1-inbox/transcripts/2026-07-16-follow-up-re-pikl-b2b-velocity.md` | 53.1% |
+| `1-inbox/transcripts/2026-07-16-follow-up-re-client-b2b-velocity.md` | 53.1% |
 | `2-work/transcripts/2026-07-03-john-chetan-aios.md` | **54.5%** |
 
 The last two are meeting transcripts between the people whose work the graph exists to describe. The

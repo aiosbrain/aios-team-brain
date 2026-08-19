@@ -778,18 +778,21 @@ guard enforces it, it's named.
   repo; the hook reading it is installed in the untracked `.git/hooks/`; and `.githooks/pre-push`
   **skips it silently when absent** — deliberate, so contributors without the list are not blocked.
   Net effect: one laptop had a gate, nothing else did, and CI had no equivalent at all.
-  **CI is now the gate** (`nda-gate` in `.github/workflows/ci.yml` → `scripts/nda-scan.mjs`), with
-  the term list arriving as the `NDA_TERMS` secret so it still never enters the repo. Matching is
-  deliberately IDENTICAL to the local gate (same ERE alternation, `git grep -nEiI`, same path
-  excludes) — two gates that disagree about what counts as a leak are worse than one, because the
-  disagreement surfaces only when something gets through the weaker. Output is **redacted to
-  `file:line`**: these logs are world-readable, so a gate that printed its match would publish the
-  thing it defends (the adjacent gitleaks job runs `--redact` for the same reason). It **fails
-  closed** on a missing secret (exit 2, distinct from a real leak's exit 1) and, equally, wherever it
-  CANNOT run — fork PRs and Dependabot, which GitHub withholds Actions secrets from by design. Those
-  exit non-zero with the remedy named, never a warning-plus-green: a green required check IS a pass
-  in branch-protection terms, so a "reported but passing" gate would make forks and bots the new
-  "whose laptop pushed". ⚠️ **It must be added to `main`'s required status checks** — until it is, a
+  **CI is now the gate** (`.github/workflows/nda-gate.yml` → `scripts/nda-scan.mjs`), with the term
+  list arriving as the `NDA_TERMS` secret so it still never enters the repo. The privileged
+  `pull_request_target` workflow executes only the trusted base-branch scanner; it fetches the PR
+  head as Git objects and never checks out, imports, installs, builds, or executes untrusted PR code.
+  It scans the proposed and every intermediate tracked tree (content, filenames, UTF-16/binaries
+  and symlink blobs; new opaque binaries and submodules fail closed), Unicode-normalized/multiline
+  variants, every added commit-range path and content block (including merge commits), and commit
+  messages. Backreferences are rejected and every matcher has a hard timeout. Push events scan their full
+  `before..sha` range too, so add-then-scrub history cannot disappear behind a clean final tree.
+  Matching uses one POSIX ERE engine throughout. Public CI emits only the unavoidable pass/fail bit:
+  it never includes matching text, locations, counts, a term, an index, or the private list size;
+  `--reveal` is disabled in CI. The gate **fails closed** whenever the list or scanner is unavailable,
+  including Dependabot secret withholding. The trusted local CLI retains location and reveal modes.
+  ⚠️ **It must be added to `main`'s required status checks and enforced for administrators** — until
+  it is, a
   red gate does not block a merge, which is this same defect one level up, and no test can pin
   repository configuration.
   _Guard:_ `test/guards/nda-gate.test.ts` (fails-closed, redaction, term-parse parity, and that the
