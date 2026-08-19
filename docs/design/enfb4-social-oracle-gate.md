@@ -51,7 +51,8 @@ page's inline reads routed back through `lib/social/store.ts`), **the ACTION-lev
 gates (round 1 HIGH 4): every content-touching server action — plan, generate, submit/decide
 approval, schedule, cancel, generate-image — resolves its parent chain through the SAME gated
 read, so a hidden parent is "not found" (today they gate admin posture then resolve by bare
-id)**, the threaded principal into `loadEvidenceBodies` with the EVERY refusal, **the publish
+id); `refreshAnalytics` is the stated EXEMPTION (round 2 HIGH 5) — it moves counts, no
+title/body, the same metrics ruling as the analytics reads**, the threaded principal into `loadEvidenceBodies` with the EVERY refusal, **the publish
 door's external-shared membership conjunct (round 1 BLOCKER 1 — pulled IN; the slice may now
 honestly claim last-residual closure)**, the media route's wall repair INCLUDING parent
 inheritance (round 1 HIGH 5: image bytes derive from `opp.title` — the route inherits
@@ -73,8 +74,14 @@ the re-specification of the pins whose subject dies.
   `items.access`, so an `access='external'` item curated OUT of external-shared into a
   restricted initiative still passes the tier door — the one PUBLIC egress would have shipped
   membership-blind. The door (schedule-time AND the fire-time re-verify) now requires EVERY
-  evidence item to hold a current include in EXTERNAL-SHARED (via the enforce primitives —
-  the public-scope membership analogue of the external ceiling). A revocation between
+  evidence item to hold a current include in EXTERNAL-SHARED — implemented as: resolve the
+  team's `external-shared` system project id, then `visibleItemIdsForProjects(db, teamId,
+  {externalSharedId})` ⊇ evidence ids (round 2 HIGH 4: NOT `systemVisibleSourceIds`, which
+  includes General by design and would let team-general content pass the PUBLIC door; no
+  member principal is needed at fire time — the check is team+project-scoped). A refused fire
+  terminal-cancels; the variant is NOT dead — `rejected` is regeneratable → re-approvable →
+  re-schedulable (round 2 M6: an ACCIDENTAL revocation costs a regenerate/reapprove cycle,
+  stated as the operational price of failing closed on public egress). A revocation between
   schedule and fire correctly terminal-cancels: the content BECAME restricted, and cancelling
   a post of restricted content is the point, not the race hazard the draft feared.
 
@@ -128,11 +135,11 @@ the re-specification of the pins whose subject dies.
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
-| opportunities list (`listOpportunities` ← page.tsx:67) | `visibleByAccess(q,"team")` = NOTHING; admin wall only | the ONE read rule: `evidence.some(e => vis.ids.has(e.itemId))` app-side (arrays ≤8, cap 100 — ~800 comparisons; mirrors the cascade's own in-JS precedent, store.ts:363-67); evidence-less LEGACY rows (0 in prod) go dark, stated |
+| opportunities list (`listOpportunities` ← page.tsx:67) | `visibleByAccess(q,"team")` = NOTHING; admin wall only | the ONE read rule: `evidence.length > 0 && evidence.every(e => vis.ids.has(e.itemId))` app-side (the EVERY quantifier, D1b) (arrays ≤8, cap 100 — ~800 comparisons; mirrors the cascade's own in-JS precedent, store.ts:363-67); evidence-less LEGACY rows (0 in prod) go dark, stated |
 | plans + variants + pending approvals + publications (page.tsx:68-84) | inline reads BYPASS the store; variants/approvals render BODIES; publications disclose `external_url` | all four route through `lib/social/store.ts`/their modules and INHERIT by parent-id chains from the filtered opportunity set (opportunity → plan → variant → approval/publication) — ONE seam, wiring-pinned; the inline reads die |
 | `loadEvidenceBodies` (generate.ts:99-112) | `visibleByAccess(q, variant.access)` — the row's OWN tier, no membership axis, unscoped system read | intersects with the ACTING admin's visible set (D4) |
 | `discoverNow` items scan (discover.ts:77-84) | corpus-wide, ungated (R8 — the write-side admission hole; the arcs path was already actor-scoped at PRET-3) | actor-scoped: `.in("id", [...actorVis])` — an admin mints opportunities only from items they can see |
-| `discoverOpportunitiesFromArcs` (discover-arcs.ts:116-27) | evidence-less arcs mint `external` publishable rows (R2); partial provenance under-counts `missing` (R3) | D1: refuse evidence-less; `external` ceiling requires FULL resolution; else floor `team` |
+| `discoverOpportunitiesFromArcs` (discover-arcs.ts:116-27) | evidence-less arcs mint `external` publishable rows (R2); partial provenance under-counts `missing` (R3) | D1: REFUSE evidence-less AND partial-provenance arcs at admission (no floor — round 2 caught the stale floor text; the dm pin at discover-arcs:59 asserting missing→team re-specifies to the refusal) |
 | media route (route.ts:16-24) | bare `role==='admin'` (no posture), untenanted by-id read, 404/403 split; serves bytes derived from `opp.title` with no chain gate | D3: `canAccessAdmin`, tenanted, uniform 404, AND the asset inherits through its chain to the opportunity's EVERY-visible evidence (round 1 HIGH 5) |
 | publish door (publish.ts:54-72, 186-204) | tier-doored (external-only + governance + dry-run + fire-time re-verify), NO membership conjunct — and the tier ceiling is membership-BLIND (round 1 BLOCKER 1's counterexample: an external-access item curated out of external-shared passes it) | schedule-time AND fire-time require EVERY evidence item to hold a current external-shared include; a mid-flight revocation terminal-cancels (correct: the content became restricted) |
 | analytics reads (analytics.ts:73,92) | admin wall only | UNCHANGED (counts, no title/body — the metrics ruling), recorded with reason |
@@ -154,7 +161,12 @@ the re-specification of the pins whose subject dies.
   page's route-through-store, `loadEvidenceBodies`' threaded ids, discover's actor scope) +
   per-file residual reasons for brand/settings/jobs/analytics. The stated non-coverage note
   stands (raw SQL, select("*")).
-- **Re-specified pins, enumerated:** `social-discover-arcs.test.ts:70` + `social-tier.test.ts:31`
+- **Re-specified pins, enumerated (round 2 M7 completed the list):** the
+  `social-publish`/`social-publish-door` happy-path fixtures build on manual EVIDENCE-LESS
+  opportunities — they rebuild around INGESTED external evidence + context backfill (the
+  refusal makes their old shape unmintable); `social-generate:82` re-specifies from
+  "drop the hidden body and continue" to "refuse generation" (the EVERY quantifier);
+  `discover-arcs` dm :59 (missing→team) re-specifies to the refusal. Plus: `social-discover-arcs.test.ts:70` + `social-tier.test.ts:31`
   (empty→external DIES — the refusal/floor is the new contract, both directions pinned);
   `social-content:62,75` + `social-tier-cascade:206` (the `"external"` reader has no
   production caller — the arms re-specify onto the MEMBERSHIP reader: a non-grantee admin
@@ -174,9 +186,9 @@ the re-specification of the pins whose subject dies.
    a hidden parent each refuse with the not-found shape, and succeed for the grantee.
 2. Same file — ADMISSION: `discoverNow`-shape scan scoped to the actor (an item outside the
    acting admin's set mints nothing; inside, it mints — both directions); an arc with
-   zero item-linked evidence mints NOTHING (D1 refusal); an arc with partial resolution
-   floors to `team`, full external resolution stays `external`; `createOpportunity` refuses
-   `evidence: []`.
+   zero item-linked evidence mints NOTHING, and an arc with PARTIAL resolution mints NOTHING
+   (both directions of the D1 refusal; a fully-resolved arc mints, non-vacuity);
+   `createOpportunity` refuses `evidence: []`.
 3. Same file — GENERATION: `generatePlanDrafts` REFUSES for an actor who cannot see every
    evidence item (no silent degradation) and proceeds for the grantee with all bodies (the
    EVERY quantifier, both directions). PUBLISH: the door refuses an external variant whose
@@ -198,7 +210,7 @@ the re-specification of the pins whose subject dies.
 ## 4. Out of scope, named
 
 A membership-change cascade for stored social rows (the computed gate makes it unnecessary —
-§0b), the publish door's membership conjunct (deliberately absent, §0b), brand/settings/jobs/
+§0b), brand/settings/jobs/
 analytics gates beyond admin-role (ops/metrics rulings), a member-facing social surface (none
 exists), backfill of the zero measured legacy rows, `revoke-project` (still the audit-actor
 story).
