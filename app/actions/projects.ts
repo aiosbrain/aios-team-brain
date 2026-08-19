@@ -79,7 +79,7 @@ export async function createProjectAction(input: {
   // is invisible to its creator, which is exactly the stranding this exists to prevent.
   const grant = await grantProjectToCreator(db, input.teamId, (data as ProjectRow).id, me.id);
   if (!grant.ok) {
-    return { ok: false, error: `project created but the creator grant failed (${grant.error}) — retry the create to converge` };
+    return { ok: false, error: `project created but the creator grant failed (${grant.error}) — an admin can repair it with: admin.ts grant-project <your-person-group> ${slug}` };
   }
   // PCCC-4: every creation path records the project's graph partition pointer.
   const ptr = await ensureProjectGraphPointer(db, { teamId: input.teamId, projectId: (data as ProjectRow).id });

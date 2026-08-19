@@ -97,6 +97,11 @@ const BODY_SURFACE_WIRING: [string, RegExp][] = [
   ["app/t/[team]/decisions/page.tsx", /\.filter\(\(d\) => rowVisibleByProvenance\(/],
   ["components/library/data-browser.tsx", /\.in\("id", visArr\)/],
   ["app/api/v1/items/[id]/route.ts", /await canSeeItem\(/],
+  // ENFB-2 (Codex diff H2): the member-driven meeting-todo scan serves item BODIES back to
+  // the caller — the action passes the caller's oracle set, and the helper applies it
+  // in-query. Both halves pinned (resolution without application is the pre-ENFB-1 wall).
+  ["app/actions/meeting-todos.ts", /visibleItemIds: \[\.\.\.vis\.ids\]/],
+  ["lib/meetings/extract-todos.ts", /q\.in\("id", \[\.\.\.opts\.visibleItemIds\]\)/],
   ["app/api/v1/okf-bundle/route.ts", /pageVisibleOkfItems\(/],
 ];
 

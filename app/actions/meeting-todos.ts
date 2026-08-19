@@ -54,11 +54,11 @@ async function resolveTeam(teamSlug: string) {
   return (team as { id: string; slug: string } | null) ?? null;
 }
 
-async function authorizeTeamMember(teamId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+async function authorizeTeamMember(teamId: string): Promise<{ ok: true; memberId: string } | { ok: false; error: string }> {
   const me = await currentMember(teamId);
   if (!me) return { ok: false, error: "not a member of this team" };
   if (me.tier !== "team") return { ok: false, error: "team-tier membership required" };
-  return { ok: true };
+  return { ok: true, memberId: me.id };
 }
 
 export async function scanMeetingTodosAction(input: z.input<typeof scanSchema>): Promise<{
@@ -76,11 +76,19 @@ export async function scanMeetingTodosAction(input: z.input<typeof scanSchema>):
   if (!auth.ok) return auth;
 
   const db = await serverClient();
+  // ENFB-2 (Codex diff HIGH 2): the scan serves item BODIES/titles back to the caller, so it
+  // is bounded to THEIR oracle-visible set — a restricted transcript's todos are not
+  // scannable by a non-grantee. Fail closed on a resolution error.
+  const { visibleItemIds } = await import("@/lib/access/enforce");
+  const { adminClient: ac } = await import("@/lib/db/admin");
+  const vis = await visibleItemIds(ac(), { teamId: team.id, memberId: auth.memberId });
+  if (vis.error) return { ok: false, error: "visibility resolution failed" };
   const scan = await scanMeetingTodosForTeam(db, team.id, {
     sourceProject: parsed.data.sourceProject || undefined,
     pathPrefix: parsed.data.pathPrefix || undefined,
     since: parsed.data.since || undefined,
     limit: parsed.data.limit,
+    visibleItemIds: [...vis.ids],
   });
 
   const { data: project } = await db

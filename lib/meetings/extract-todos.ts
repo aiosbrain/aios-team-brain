@@ -32,6 +32,11 @@ export interface ExtractMeetingTodosOptions {
   since?: string;
   limit?: number;
   dryRun?: boolean;
+  /** ENFB-2 (Codex diff HIGH 2): a MEMBER-driven scan reads item BODIES, so it must be
+   *  bounded to the caller's oracle-visible set — posture alone let a non-grantee read a
+   *  restricted transcript through the scan. Operator/cron callers (scripts/brain-tasks)
+   *  run as the system over the whole corpus and omit it deliberately. */
+  visibleItemIds?: readonly string[];
 }
 
 export interface ExtractMeetingTodosResult {
@@ -193,6 +198,8 @@ export async function scanMeetingTodosForTeam(
     .limit(opts.limit ?? 1000);
   if (opts.pathPrefix) q = q.like("path", `${opts.pathPrefix.replace(/[%_\\]/g, "\\$&")}%`);
   if (opts.since) q = q.gte("updated_at", opts.since);
+  // ENFB-2: the member-scan wall — in-query, before the limit (the starvation discipline).
+  if (opts.visibleItemIds) q = q.in("id", [...opts.visibleItemIds]);
 
   const { data: items, error: itemsErr } = await q;
   if (itemsErr) throw new Error(`items read failed: ${itemsErr.message}`);

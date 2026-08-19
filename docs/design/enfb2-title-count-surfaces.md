@@ -64,6 +64,15 @@ slice named after its column set.
 
 **DEFERRED, named:**
 - **ENFB-3 — meetings** (`meeting_notes` has no audience column; `work-timeline.ts:685`).
+  AMENDED at the Codex diff review (its HIGH 2): the meetings PAGES stay deferred, but the
+  member-driven meeting-todo SCAN reads item BODIES — items already have the oracle — so its
+  read is bounded to the caller's visible set NOW (`app/actions/meeting-todos.ts` →
+  `scanMeetingTodosForTeam({ visibleItemIds })`, in-query, guard-pinned both halves,
+  dm-pinned both directions). Operator/cron callers (`scripts/brain-tasks`) run as the
+  system over the whole corpus, deliberately unbounded. The stranded-creator repair now has
+  its TOOL: `scripts/admin.ts grant-project <group-slug> <project-slug>` (grant-only —
+  revoke waits for a real audit-actor story), and the create action's grant-failure message
+  names it instead of promising a retry that cannot converge.
 - **ENFB-4 — social:** `social_opportunities` has NO `source_item_id` — provenance lives in
   the `evidence` jsonb array (`schema.sql:2704`), the pg builder throws on jsonb expressions
   (`lib/db/pg/query-builder.ts:70`), and the page is admin-role-walled today

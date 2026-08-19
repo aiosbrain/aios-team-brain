@@ -268,6 +268,28 @@ describe("ENFB-2 AC4 — starvation dies at the capped windows", () => {
   });
 });
 
+describe("ENFB-2 — the meeting-todo scan is bounded to the caller's oracle set (Codex diff H2)", () => {
+  it("a restricted transcript's todos are not scannable by a non-grantee; the grantee scans them", async () => {
+    const seed = await seedTeam();
+    const insider = await seedMember(seed);
+    const outsider = await seedMember(seed);
+    const transcript = await ingest(seed, {
+      path: "meetings/planning.md", body: "notes\n- [ ] rotate the restricted key", access: "team", project: "mt", kind: "transcript",
+    });
+    await backfillTeamContext(db(), seed.teamId);
+    await restrictInto(seed, transcript.id, insider);
+
+    const { scanMeetingTodosForTeam } = await import("@/lib/meetings/extract-todos");
+    const outsiderVis = await ctxFor(seed, outsider);
+    const insiderVis = await ctxFor(seed, insider);
+    const outsiderScan = await scanMeetingTodosForTeam(db(), seed.teamId, { visibleItemIds: [...outsiderVis.visibleItemIds] });
+    const insiderScan = await scanMeetingTodosForTeam(db(), seed.teamId, { visibleItemIds: [...insiderVis.visibleItemIds] });
+    const texts = (r: { rows: { title: string }[] }) => r.rows.map((x) => x.title).join(" ");
+    expect(texts(outsiderScan), "the restricted transcript's todo never reaches a non-grantee").not.toContain("rotate the restricted key");
+    expect(texts(insiderScan), "the grantee scans it (non-vacuity)").toContain("rotate the restricted key");
+  });
+});
+
 describe("ENFB-2 AC5 — counts compute over the visible sets", () => {
   it("deriveProjects (member context) and the Pulse funnel: non-grantee vs grantee", async () => {
     const seed = await seedTeam();
