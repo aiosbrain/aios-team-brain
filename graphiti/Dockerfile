@@ -87,11 +87,28 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 # graph extraction, and the strong model (`MODEL_NAME`) was already an env var. This closes the
 # inconsistency: both halves of the routing pair are now configuration.
 #
-# ⚠️ WHEN USING THE BRAIN'S LLM PROXY, this value MUST equal `GRAPHITI_SMALL_MODEL_MARKER` in
-# `lib/llm/graph-call-kind.ts` — that marker is how the proxy recognises a small call and bills it to
-# the right `call_kind`. They disagree silently: routing still works, the ledger just mislabels every
-# small call as a strong one. Not applicable when Graphiti talks to a provider directly (no proxy in
-# the path, nothing reading the marker).
+# ── THE SENTINEL: WHEN THE PROXY IS IN THE PATH, THE SMALL MODEL IS NOT A MODEL NAME ──────────────
+#
+# The value above used to have to MATCH `GRAPHITI_SMALL_MODEL_MARKER` in the brain's
+# `lib/llm/graph-call-kind.ts`, because that is how the proxy recognised a cheap call. That made two
+# separately-deployed systems responsible for independently remembering the same string — and the
+# string was a MODEL NAME, so it changed every time anyone made a pricing decision. Every divergence
+# was SILENT: the call fell back to the strong model, nothing errored, no indicator moved, and the
+# only symptom was a bill. Matching env vars narrowed it to deployments where both processes see the
+# same environment; on Railway the app and graphiti are separate services with separate variable
+# scopes, so that is not a fix, it is a coincidence.
+#
+# So when `OPENAI_BASE_URL` points at the brain's proxy, this sends the SENTINEL `aios-small`
+# instead. It is not a model and never will be — it names the request's INTENT ("graphiti asked for
+# its cheap model here"), which is invariant under every pricing decision anyone will ever make.
+# There is nothing left to keep in sync, because there is nothing that changes.
+#
+# ⚠️ THE PROXY DETECTION IS WHAT KEEPS THIS SAFE, so do not widen it. A sentinel is only valid
+# because the proxy substitutes the real model before forwarding and therefore never sends it to a
+# provider. Talking to a provider DIRECTLY, `aios-small` would 400 every cheap call — so the
+# real-model default is preserved for exactly that case, and an explicit `GRAPHITI_SMALL_MODEL`
+# still overrides both (the escape hatch, and back-compat for an unmigrated deployment; the brain
+# still accepts the legacy marker).
 #
 # ⚠️ A REASONING MODEL NEEDS OUTPUT HEADROOM. Verified on `qwen/qwen3.7-flash`: at max_tokens=900 the
 # reasoning trace consumes the whole budget and the API returns content=None, which surfaces as
@@ -106,10 +123,17 @@ RUN /app/.venv/bin/python -m ensurepip --upgrade \
 RUN F=/app/graph_service/zep_graphiti.py \
  && grep -q 'super().__init__(uri, user, password, llm_client)' "$F" \
  && sed -i 's|from graphiti_core.llm_client import LLMClient  # type: ignore|import os  # type: ignore\nfrom graphiti_core.llm_client import LLMClient  # type: ignore\nfrom graphiti_core.llm_client.config import LLMConfig  # type: ignore\nfrom graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient  # type: ignore|' "$F" \
- && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or "gpt-4.1-nano")))|' "$F" \
- && grep -q 'small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or "gpt-4.1-nano"' "$F" \
+ && sed -i 's|super().__init__(uri, user, password, llm_client)|super().__init__(uri, user, password, llm_client or OpenAIGenericClient(config=LLMConfig(temperature=0, small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or ("aios-small" if "/api/internal/llm" in (os.environ.get("OPENAI_BASE_URL") or "") else "gpt-4.1-nano"))))|' "$F" \
+ && grep -q 'small_model=os.environ.get("GRAPHITI_SMALL_MODEL") or ("aios-small" if "/api/internal/llm" in (os.environ.get("OPENAI_BASE_URL") or "") else "gpt-4.1-nano")' "$F" \
  && grep -q 'from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient' "$F" \
  && /app/.venv/bin/python -c "import ast; ast.parse(open('/app/graph_service/zep_graphiti.py').read()); print('patch 1 parses')"
+
+# The small-model branch is BEHAVIOURALLY asserted, not just grepped: a `grep -q` proves a string is
+# present, never that the right branch fires — and the wrong branch is silent (a missing sentinel
+# mislabels every cheap call; a stray one 400s against a real provider). This extracts the shipped
+# expression and evaluates it across all four cases.
+COPY verify-small-model-default.py /tmp/verify-small-model-default.py
+RUN /app/.venv/bin/python /tmp/verify-small-model-default.py /app/graph_service/zep_graphiti.py
 
 # ── PATCH 2: teach OpenAIGenericClient about ModelSize.small ───────────────────────────────────────
 #

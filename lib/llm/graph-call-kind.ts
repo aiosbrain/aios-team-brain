@@ -154,16 +154,42 @@ export function classifyGraphCall(body: unknown): string {
  * request tells us which it is. Verified against
  * zepai/graphiti@sha256:76d14f30afc65d2f914637d67d0c0631a7e779e2740be1ae99b9dc0c5876d2da.
  *
- * READS THE SAME ENV THE IMAGE DOES. The graphiti image's small model used to be welded in as
- * `gpt-4.1-nano`, so a literal here could not drift from it. It is now `GRAPHITI_SMALL_MODEL`
- * (graphiti/Dockerfile PATCH 1), and the two MUST agree or the proxy stops recognising a small
- * call — which fails SILENTLY: routing is unaffected, the cost ledger just books every small call
- * as a strong one. Resolving from the same variable removes the coupling instead of documenting
- * it, and the default keeps a deployment that sets nothing byte-identical to before. The brain and
- * the graphiti container share an env in the deployments where this matters; where they do not,
- * the value is still the image's own default.
+ * LEGACY SIGNAL — superseded by `AIOS_SMALL_SENTINEL` below, kept for deployments that have not
+ * adopted it. It reads the same `GRAPHITI_SMALL_MODEL` the image does, which closes the drift ONLY
+ * where the brain process and the graphiti container share an environment. On Railway they do not:
+ * the app and graphiti are separate services with separate variable scopes, which is why matching
+ * env vars was never the real fix.
  */
 export const GRAPHITI_SMALL_MODEL_MARKER = process.env.GRAPHITI_SMALL_MODEL || "gpt-4.1-nano";
+
+/**
+ * THE SMALL-CALL SENTINEL — a PROTOCOL CONSTANT, deliberately not configuration.
+ *
+ * The defect this replaces: the brain recognised a cheap call by matching the model NAME graphiti
+ * sent against a value the brain also had to hold. That made two separately-deployed systems
+ * responsible for independently remembering the same string — and the string was a MODEL NAME, so
+ * it changed every time someone made a pricing decision. Every divergence was silent: the call
+ * fell back to the strong model, nothing errored, no indicator moved, and the only symptom was a
+ * bill. Reading a shared env var (AIO-967) narrowed it to "deployments where both processes see the
+ * same environment", which Railway is not.
+ *
+ * `aios-small` is not a model and never will be. It names the REQUEST'S INTENT — "graphiti asked for
+ * its cheap model here" — so it is invariant under every pricing decision anyone will ever make.
+ * There is nothing to keep in sync, because there is nothing that changes. The coupling does not
+ * get documented or monitored; it stops existing.
+ *
+ * SAFE BECAUSE THE PROXY NEVER FORWARDS IT. The proxy substitutes `target.model` on every request
+ * before forwarding (`forwardBody`), so the value graphiti names is a signal that is always
+ * discarded — a sentinel can never reach a provider. It is therefore only valid when the proxy IS
+ * in the path, which is exactly when the image sends it: `graphiti/Dockerfile` PATCH 1 emits the
+ * sentinel only when `OPENAI_BASE_URL` points at this brain's proxy, and keeps the real-model
+ * default otherwise. A self-hoster calling a provider directly is unaffected.
+ *
+ * THE TWO-SIGNAL PROPERTY IS UNCHANGED. `wantsSmallModel` still requires our OWN classification to
+ * agree, so a forged sentinel on `extract_nodes` routes to the STRONG model exactly as a forged
+ * marker did. Drift costs money; it never degrades the graph.
+ */
+export const AIOS_SMALL_SENTINEL = "aios-small";
 
 /**
  * The only call kinds we will ever downgrade — the ones Graphiti itself marks `ModelSize.small`.
@@ -203,7 +229,9 @@ export function wantsSmallModel(body: unknown): boolean {
   try {
     if (typeof body !== "object" || body === null) return false;
     const model = (body as { model?: unknown }).model;
-    if (model !== GRAPHITI_SMALL_MODEL_MARKER) return false;
+    // The sentinel is the intended signal; the marker is the legacy one, accepted so a deployment
+    // that has not rebuilt its image keeps working. Neither weakens the corroboration below.
+    if (model !== AIOS_SMALL_SENTINEL && model !== GRAPHITI_SMALL_MODEL_MARKER) return false;
     return SMALL_ELIGIBLE_KINDS.has(classifyGraphCall(body));
   } catch {
     return false;

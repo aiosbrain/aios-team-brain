@@ -859,6 +859,32 @@ guard enforces it, it's named.
   schema loader (`scripts/pg-load-schema.mjs`, the Railway `preDeployCommand`) sets `lock_timeout`
   so a migration fails fast instead of wedging the lock queue behind a stuck reader.
   _Guards:_ `test/pg-pool-config.test.ts` + `test/pg-load-schema.test.ts`.
+- **A cheap graph call is identified by a PROTOCOL CONSTANT, and the lever reports whether it is
+  actually firing.** The proxy decides whether a Graphiti call may be served by the team's cheap
+  model from TWO signals that must agree: the model name the request carries, and our own
+  classification of the prompt (`wantsSmallModel`). The second is non-negotiable — the first alone
+  is forgeable (an operator setting `MODEL_NAME` to the cheap model makes every call wear it,
+  including `extract_nodes`, which is the zero-entities failure a probe caught on a real payload
+  2026-08-04), so **every disagreement routes to the STRONG model**: drift costs money, never graph
+  quality.
+  The first signal used to be a MODEL NAME the brain and the graphiti image had to remember
+  identically — so it changed with every pricing decision, and every divergence was silent (fall
+  back to strong, no error, no indicator, symptom is a bill). Reading a shared env var only closed
+  it where both processes see one environment; **on Railway the app and graphiti are separate
+  services with separate variable scopes.** It is now the sentinel **`aios-small`**
+  (`lib/llm/graph-call-kind.AIOS_SMALL_SENTINEL`) — not a model, never forwarded (the proxy
+  substitutes `target.model` before forwarding), emitted by the image **only when
+  `OPENAI_BASE_URL` names this brain's proxy** so a direct-to-provider deployment keeps a real
+  model. The legacy marker is still accepted, so an unmigrated image keeps working.
+  Separately, "configured and resolvable" is **not** "working": `describeSmallExtraction` reported
+  `enabled: true, inert: false` while zero calls were routed. `lib/llm/small-model-health.ts` reads
+  the `llm_usage` ledger for what actually served the recent small-eligible calls, and is
+  DISCRIMINATED so it never accuses without standing evidence (`no_traffic` / `inconclusive` /
+  `not_routing` / `routing`) — the AIO-876 + AIO-912 rule.
+  _Guards:_ `test/small-model-sentinel.test.ts` (the sentinel recognises, and still refuses to
+  downgrade extraction), `test/small-model-health.test.ts` (the absence is reported, and the
+  can't-tell states stay silent), plus the build-time `graphiti/verify-small-model-default.py`,
+  which extracts the SHIPPED expression and evaluates all four branches.
 - **A graph group id is READ FROM THE POINTER, never re-derived from the live team slug.**
   `projects.graph_group_id` is immutable for the §11 built-ins (General → the team graph,
   external-shared → the external graph), and `lib/graph/project-pointer.ts` deliberately tolerates
