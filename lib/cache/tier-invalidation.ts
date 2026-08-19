@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { visibleGroupIds, episodeGroupId } from "@/lib/graph/group";
+import { episodeGroupId } from "@/lib/graph/group";
+import { visibleTierGroupIds } from "@/lib/graph/tier-groups";
 import { EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 import { purgeArcCacheKey, purgePartitionArcCache, purgeExternalShapedPartitionRows, staleArcCache } from "@/lib/graph/arc-cache";
 import { bustTeamTimeline, purgeTimelineCacheTier } from "@/lib/dashboard/timeline-cache";
@@ -45,8 +46,25 @@ export async function purgeExternalTierCaches(
   // theirs until their own TTL; that per-process bound is the documented design limit.
   evictArcMemoryCache(teamSlug);
   await evictTeamPartitionArcMemory(db, teamId); // PPARC-2: g: keys carry only the group id
-  const externalArcKey = visibleGroupIds(teamSlug, "external").slice().sort().join(",");
-  await purgeArcCacheKey(db, teamId, externalArcKey);
+  // POINTER-RESOLVED for the same reason the `g:` purge below is: the legacy tier `arc_cache` rows
+  // are keyed by the group id set that was current WHEN THEY WERE WRITTEN, and a renamed team's
+  // external built-in keeps its pointer frozen under the old slug. A slug-derived key deletes
+  // nothing and leaves the row a viewer is actually served alive — in a purge door, that is the
+  // unsafe direction. A resolution failure sweeps wider rather than narrower, same doctrine as the
+  // partition purge's error branch below.
+  try {
+    const externalArcKey = (await visibleTierGroupIds(db, { teamId, teamSlug, tier: "external" })).slice().sort().join(",");
+    await purgeArcCacheKey(db, teamId, externalArcKey);
+  } catch (e) {
+    // There is no broad purge for LEGACY tier-key rows (only `purgeArcCacheKey`, which needs the
+    // exact key), so the widen-on-error move available to the partition purge below has no
+    // equivalent here. Purge the slug-derived key — correct for any team that never renamed,
+    // harmless when wrong (deleting a regenerable cache row that isn't there) — and let the
+    // unconditional `staleArcCache` backstop at the end bound anything that survived to a single
+    // TTL. Loud, because a quiet fallback here is what this change exists to end.
+    console.error(`[tier-invalidation] external tier key resolution failed for team ${teamId} — falling back to the slug-derived key; the staleArcCache backstop bounds the residual:`, e);
+    await purgeArcCacheKey(db, teamId, episodeGroupId(teamSlug, "external"));
+  }
   // PRET-3 H3: the external PARTITION row too — external members are served from `g:<ext>` after
   // the arcs unification, and a stale-mark is not enough there (SWR hands the stale row to the
   // next reader; `purgeArcCacheKey`'s own doc). While only team-tier members read g: rows this

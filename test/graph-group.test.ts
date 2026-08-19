@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { projectGroupId, graphGroupIdsForVisibleProjects, episodeGroupId, visibleGroupIds } from "@/lib/graph/group";
+import { projectGroupId, graphGroupIdsForVisibleProjects, episodeGroupId } from "@/lib/graph/group";
 
 // Phase C slice 1 (spec §6) — the per-project graph partition-key scheme. The load-bearing proofs:
 // the key is charset-valid (Graphiti's validate_group_id gotcha) and compact; it's collision-free per
@@ -74,11 +74,17 @@ describe("graphGroupIdsForVisibleProjects (oracle → searchable graphs)", () =>
   });
 });
 
-describe("the tier scheme is UNCHANGED (additive slice)", () => {
-  it("episodeGroupId / visibleGroupIds still produce the tier-suffixed ids", () => {
+describe("the tier MINT is unchanged", () => {
+  it("episodeGroupId still produces the tier-suffixed ids", () => {
     expect(episodeGroupId("acme", "team")).toBe("acme_team");
     expect(episodeGroupId("acme", "external")).toBe("acme_external");
-    expect(visibleGroupIds("acme", "team")).toEqual(["acme_team", "acme_external"]);
-    expect(visibleGroupIds("acme", "external")).toEqual(["acme_external"]);
+  });
+
+  // `visibleGroupIds` was the tier-visible READ set and is DELETED: it recomputed from the live
+  // slug while the projector follows the immutable pointer, so a rename silently disjoined them.
+  // Structural, not advisory — there is no symbol left to import (see lib/graph/tier-groups.ts).
+  it("visibleGroupIds is gone from the module — the read set is pointer-resolved now", async () => {
+    const mod = await import("@/lib/graph/group");
+    expect(Object.keys(mod)).not.toContain("visibleGroupIds");
   });
 });
