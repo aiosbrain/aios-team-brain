@@ -47,25 +47,38 @@ ENFB-4 (#615) merged. **Schema: NONE.**
 
 ## 0b. Decidables — defaults stated for the design review to attack
 
-- **D1 — the actor story: `--actor <member-email>` is REQUIRED on `revoke-project`, and must
-  resolve to an ACTIVE member with `role='admin'` on the target team.** The operator names the
-  human who authorized the narrowing; the audit row carries `actor_kind='member'` + that real
-  member id (+ `meta.via='cli'` so the transport is not laundered). No `--actor` → usage die
-  BEFORE any read (fail closed; the verb never fabricates or nulls an actor). Rationale: the
-  recorded objection was to a destructive act attributed to nobody — the answer is to supply
-  the real principal, not to widen `revokeProjectFromGroup`'s non-nullable contract. A
-  non-admin or inactive or unknown email dies with a distinct message (no partial work).
-- **D1b — grant-project gains OPTIONAL `--actor <member-email>` symmetry** (same resolution,
-  same admin requirement when provided): the grant trail's `actor_kind='system'` rows are a
-  recorded weakness of the ENFB-2 verb; when the operator knows the authorizing human they can
-  now record them. Absent → today's null/system behavior stands (grants are additive — the
-  contract question was only ever about the destructive direction). The usage line drops its
-  "(null CLI actor)" claim only for the flagged path.
-- **D2 — SYSTEM projects are unrevokable through this verb.** `kind='system'` project →
-  refuse with a named error before any write. Prod's ONLY current edges are the system wiring
-  (measured above); the builtin materializer owns them, and severing general/external-shared
-  from Everyone/External breaks every enforced read at once. An operator who genuinely needs
-  that surgery is doing something this verb should not make easy.
+- **D1 — the actor story (REVISED at design round 1's BLOCKER — the draft LAUNDERED
+  authority): a CLI revoke is audited as what it IS — an operator-run act with a named
+  authorizer — never as the named admin's own act.** The draft had `--actor <email>` writing
+  `actor_kind='member'` + that id, i.e. the audit would record an admin as having performed a
+  destructive act they may never have seen (`auditWrite` maps ANY non-null id → `member`,
+  groups.ts:74-84; the same class already live at `add/remove-group-member`, admin.ts:271 —
+  recorded, out of scope). The honest contract records BOTH truths: the writer takes a
+  discriminated actor —
+  `{ kind: "member", memberId }` (the member themselves performed it — reserved for a future
+  UI action) or `{ kind: "operator", authorizedByMemberId }` (the CLI: the operator ran it on
+  a named active admin's authority). An operator revoke audits `actor_kind='system'` with
+  `meta.authorizedByMemberId` + `meta.via='cli'`. `--actor <admin-email>` stays REQUIRED on
+  the verb (a destructive narrowing still may not be attributed to nobody); no `--actor` →
+  usage die BEFORE any read; unknown/inactive/non-admin email → die, named, no partial work.
+- **D1b — grant-project gains OPTIONAL `--actor <admin-email>`, recorded in META ONLY
+  (REVISED with the BLOCKER): the flag writes `meta.authorizedByMemberId` on the grant's audit
+  row — it does NOT become the audit actor and does NOT go into the edge's `added_by` column**
+  (both would be the same laundering: a name in an actor field for an act the operator
+  performed). Absent → today's null/system behavior stands unchanged. The validation arm
+  (active admin) applies when the flag is present.
+- **D2 — SYSTEM projects are unrevokable, enforced IN THE WRITER (REVISED at round 1 H1):**
+  `revokeProjectFromGroup` itself refuses `projects.kind='system'` with a named error before
+  any write — the single-writer guard exists so invariants live in `lib/access/groups.ts`,
+  and a CLI-only check would leave any future lib caller able to sever general/external-shared
+  (prod's ONLY current edges, measured above; bootstrap re-grants idempotently but the window
+  is a full substrate outage). The CLI additionally preflights for a friendlier message.
+  Round 1 verified: no materializer/bootstrap flow ever legitimately deletes a system edge.
+- **D2b — the writer validates the principal (round 1 H2): whichever actor kind arrives,
+  the referenced member must be an ACTIVE ADMIN of the team, checked inside
+  `revokeProjectFromGroup` with one bounded read.** Revoke can hold this invariant globally
+  precisely because it has zero callers; grant cannot (the creator self-grant is a non-admin
+  member by design, app/actions/projects.ts:98 — the asymmetry is stated, not accidental).
 - **D3 — no-op revokes do not audit.** `revokeProjectFromGroup` today deletes blindly and
   audits UNCONDITIONALLY — revoking a non-existent edge would write an `access.project_revoked`
   row for a revocation that revoked nothing (an over-reporting trail is a lying trail). The
@@ -75,37 +88,49 @@ ENFB-4 (#615) merged. **Schema: NONE.**
   today — the return-shape move is free. The bounded probe/act race mirrors the grant's
   recorded one (two concurrent revokes can both probe-hit and both audit — the trail
   over-reports the same ms-apart act, never under-reports; deferred with the same F3 reason).
-- **D4 — effect and repair story, stated:** revocation is COMPUTED into effect on the next
-  read (`visibilityHash` changes → every cache variant re-keys; no cascade, no sweep, nothing
-  stored to repair — the ENFB-4 precedent). Content already curated into the revoked project
-  stays where it is; members holding it through ANOTHER group keep seeing it (set semantics,
-  no precedence question). A wrong revoke is repaired by `grant-project` — the two verbs now
-  form the closed loop the program promised.
+- **D4 — effect and repair story, stated PER MECHANISM (round 1 M corrected the draft's
+  false "every cache keys on visibilityHash" claim):** revocation is COMPUTED into effect on
+  the next read through two distinct mechanisms — the timeline/vis-variant caches key on
+  `visibilityHash` (sha256 of the sorted effective project set, enforce.ts:170;
+  timeline-cache.ts:289/326), which a revoke changes; the ARC/graph reads do NOT use that hash
+  — they resolve the member's `visibleProjectIds` into graph partition groups per read
+  (partition-read.ts:183 → arc-fusion.ts:97), so a revoke shrinks the partition list BEFORE
+  fusion. Both fail toward less visibility; no cascade, no sweep, nothing stored to repair
+  (the ENFB-4 precedent). Content already curated into the revoked project stays where it is;
+  members holding it through ANOTHER group keep seeing it (set semantics, no precedence
+  question). A wrong revoke is repaired by `grant-project` — the two verbs now form the
+  closed loop the program promised.
 
 ## 1. The surface table
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
-| `revoke-project` CLI verb | ABSENT — `scripts/admin.ts:306-308` records the deferral + reason | `revoke-project <group-slug> <project-slug> --actor <admin-email> [--team …]`: resolve team → group → project (existing die-with-usage shapes), REFUSE `kind='system'` (D2), resolve + validate the actor (D1), call the sole writer, report `revoked`/`no grant to revoke` |
-| `revokeProjectFromGroup` (lib/access/groups.ts:493-508) | blind delete + UNCONDITIONAL audit; zero callers | probe-first: absent edge → `{ ok: true, revoked: false }`, no audit; present → delete + audit with the real actor (D3). Signature keeps `actorMemberId: string` (non-nullable — the point) |
-| `grant-project` CLI verb (scripts/admin.ts:285-313) | hardcodes `null` actor → `actor_kind='system'` audit rows (3 in prod) | optional `--actor <admin-email>` (D1b); absent → unchanged null path |
-| audit trail (`audit_log` via `auditWrite`) | grants: `system` actor; revokes: none exist | revokes always `actor_kind='member'` with a real admin id + `meta.via='cli'` + `{ groupId }`; no row for no-op revokes |
-| enforcement/caches | `visibilityHash` from the sorted project set (enforce.ts:170) | UNCHANGED — the computed gate is the mechanism; stated, not built (D4) |
+| `revoke-project` CLI verb | ABSENT — `scripts/admin.ts:306-308` records the deferral + reason | `revoke-project <group-slug> <project-slug> --actor <admin-email> [--team …]`: resolve team → group → project (existing die-with-usage shapes), preflight the system-kind refusal for a friendly message (the WRITER holds the invariant, D2), resolve the authorizer, call the sole writer with `{ kind: "operator", authorizedByMemberId }`, report `revoked`/`no grant to revoke` |
+| `revokeProjectFromGroup` (lib/access/groups.ts:493-508) | blind delete + UNCONDITIONAL audit; zero callers | takes the discriminated actor (D1); refuses `kind='system'` projects (D2) and non-active-admin principals (D2b) INSIDE the writer; probe-first: absent edge → `{ ok: true, revoked: false }`, no audit (D3); present → delete + audit (`system` actor + `meta.authorizedByMemberId` + `meta.via` for operator revokes; `member` actor for the future UI kind) |
+| `grant-project` CLI verb (scripts/admin.ts:285-313) | hardcodes `null` actor → `actor_kind='system'` audit rows (3 in prod) | optional `--actor <admin-email>` recorded in the audit META only (D1b — never the actor field, never `added_by`); absent → unchanged null path |
+| audit trail (`audit_log` via `auditWrite`) | grants: `system` actor; revokes: none exist | operator revokes: `actor_kind='system'` + `meta.authorizedByMemberId` + `meta.via='cli'` + `meta.groupId`; no row for no-op revokes; the member kind (future UI) audits as `member` |
+| enforcement/caches | timeline keys on `visibilityHash`; arcs resolve partition groups per read | UNCHANGED — both computed mechanisms narrow on next read; stated per mechanism, not built (D4) |
 
 ## 2. Mechanism notes
 
-- **One writer, one file.** All edge writes stay in `lib/access/groups.ts` (the
-  access-chain single-writer guard, `test/guards/access-single-writer.test.ts`, keeps every
-  other file refusable). The CLI verb only resolves names → ids and calls the writer.
-- **Actor resolution in the CLI, validation at the seam:** the verb resolves the email via the
-  existing `memberIdByEmail` helper (admin.ts:103) and then validates role+status with one
-  bounded read; the writer keeps trusting its non-nullable `actorMemberId` (its contract —
-  callers supply a real principal — is exactly what D1 preserves).
-- **Fail directions:** unknown team/group/project/email → die before any write (existing
-  shapes); non-admin/inactive actor → die, named; system project → die, named; DB error from
-  the writer → die with the writer's error. Nothing partially applied — the only write is the
-  single delete+audit pair.
-- **`meta.via='cli'`** rides the existing `meta` argument of `auditWrite` — no contract change.
+- **One writer, one file, invariants IN the writer (round 1 H1/H2).** All edge writes stay in
+  `lib/access/groups.ts` (the access-chain single-writer guard,
+  `test/guards/access-single-writer.test.ts`, keeps every other file refusable), and so do the
+  system-kind refusal and the active-admin principal validation — a CLI-only check would bind
+  the invariant to one caller. The CLI verb only resolves names → ids, preflights for message
+  quality, and calls the writer.
+- **The discriminated actor** (`{ kind: "member", memberId } | { kind: "operator",
+  authorizedByMemberId }`) keeps the future UI path honest by construction: when an admin
+  clicks revoke themselves, THEIR action audits as `member`; the CLI can never produce that
+  shape. Resolution stays in the CLI (`memberIdByEmail`, admin.ts:103); validation lives in
+  the writer (D2b).
+- **Fail directions:** unknown team/group/project/email → die before any read of the writer
+  (existing shapes); non-admin/inactive principal and system project → the WRITER refuses,
+  named errors (the CLI surfaces them; its preflight only improves wording); DB error → die
+  with the writer's error. Nothing partially applied — the only write is the single
+  delete+audit pair.
+- **`meta.authorizedByMemberId` / `meta.via`** ride the existing `meta` argument of
+  `auditWrite` — no contract change to the audit writer itself.
 
 ## 3. Acceptance criteria (spec-first; exact commands)
 
@@ -114,21 +139,34 @@ ENFB-4 (#615) merged. **Schema: NONE.**
    a granted group loses it from `visibleItemIds` after `revokeProjectFromGroup` (grant →
    visible → revoke → gone; both directions, real Postgres); a member holding the same item
    through a SECOND granted group still sees it after one group's revoke (set semantics, D4);
-   the audit arm: the revoke writes exactly one `audit_log` row with `action='access.project_revoked'`,
-   `actor_kind='member'`, the real actor id, and `meta.groupId`; the no-op arm (D3): revoking
-   an absent edge returns `{ ok: true, revoked: false }` and writes NO audit row (count
-   pinned before/after); the double-revoke arm: revoke twice → exactly one audit row.
-2. Same file — `grantProjectToGroup` with a real actor writes `actor_kind='member'` (D1b's
-   lib half is already true — pinned so the CLI flag has a contract to ride); with null it
-   stays `system` (the existing contract, both directions).
+   the audit arm (D1): an operator revoke writes exactly one `audit_log` row with
+   `action='access.project_revoked'`, `actor_kind='system'`, `member_id` NULL,
+   `meta.authorizedByMemberId` = the named admin, `meta.via='cli'`, `meta.groupId` — and a
+   `{ kind: "member" }` revoke writes `actor_kind='member'` with that id (both kinds pinned);
+   the no-op arm (D3): revoking an absent edge returns `{ ok: true, revoked: false }` and
+   writes NO audit row (count pinned before/after); the double-revoke arm: revoke twice →
+   exactly one audit row.
+2. Same file — the WRITER's refusals (D2/D2b), each with the edge PROVEN INTACT after the
+   refusal (the not-invoked pin, round 1 L): revoking a `kind='system'` project refuses with
+   the named error and the edge survives; an operator revoke authorized by a NON-admin, an
+   INACTIVE admin, and an unknown member id each refuse and the edge survives; the
+   `{ kind: "member" }` shape with a non-admin refuses identically. GRANT META (D1b):
+   `grantProjectToGroup` with `authorizedByMemberId` writes it into the grant audit row's meta
+   while the audit actor stays `system` and the edge's `added_by` stays NULL (the
+   no-laundering pin, all three asserted); without the option, a grant still writes the
+   existing shape — `system` actor, no `authorizedByMemberId` key in meta, NULL `added_by`
+   (all three pinned, so the flag's absence is proven to change nothing).
 3. `npx vitest run test/admin-cli-revoke.test.ts` exits 0 — the CLI verb's pure decision
-   layer, extracted as a testable helper: system-project refusal (D2), missing `--actor`
-   usage refusal (D1), non-admin/inactive/unknown actor refusals — each a distinct message,
-   asserted by shape (the admin.ts case-arm stays thin wiring like every other verb).
-4. Mutations, verdicts verbatim in the PR: (a) delete the D2 system-kind refusal → the unit
-   suite reddens; (b) delete the D3 probe (restore the blind audit) → the no-op dm arm
-   reddens; (c) delete the revoke's `.delete()` leg → the enforcement dm arm reddens (the
-   edge survives and visibility never narrows).
+   layer, extracted as a testable helper: missing `--actor` usage refusal (D1) and the
+   slug/email resolution failures each die with a distinct message BEFORE any writer call
+   (pinned with a spy/thrown-sentinel writer — the not-invoked half of round 1 L); the
+   system-kind preflight message names the substrate (the admin.ts case-arm stays thin wiring
+   like every other verb).
+4. Mutations, verdicts verbatim in the PR: (a) delete the WRITER's system-kind refusal → the
+   dm refusal arm reddens (the edge is severed); (b) delete the D3 probe (restore the blind
+   audit) → the no-op dm arm reddens; (c) delete the revoke's `.delete()` leg → the
+   enforcement dm arm reddens (the edge survives and visibility never narrows); (d) delete
+   the WRITER's admin validation → the non-admin dm arm reddens.
 5. Full tiers green: `npm test` · dm iso (sole tolerated reds: the pre-named TZ artifact +
    the known 5s-timeout flake class on heavy-seed suites, both probed green standalone) ·
    `npm run check:docs` · lint · tsc. ARCHITECTURE's access rows name the revoke verb + the
@@ -137,10 +175,12 @@ ENFB-4 (#615) merged. **Schema: NONE.**
 ## 4. Out of scope, named
 
 The dashboard grant/revoke UI (the access-UI phase, recorded at pret6-retirement.md §221 —
-the CLI is the operator surface until that phase is scheduled); revoking builtin GROUP
-membership or system-project wiring (the materializer owns those; D2 refuses); a
-`revoke-project --force` for system projects (raw SQL remains the deliberate barrier);
-group deletion lifecycle; the EXCLSHADOW-1 exclude-shadow repair and the TICKSTALL-2
-github-stage budget (the scout's other ranked candidates — each its own slice); the
-transactional INSERT…RETURNING form for the probe/act races (the recorded F3 deferral,
-unchanged).
+the CLI is the operator surface until that phase is scheduled; the `{ kind: "member" }` actor
+shape is its ready seam); revoking builtin GROUP membership or system-project wiring (the
+materializer owns those; the WRITER refuses); a `revoke-project --force` for system projects
+(raw SQL remains the deliberate barrier); group deletion lifecycle; repairing the SAME
+actor-laundering class in the pre-existing `add/remove-group-member` verbs (recorded by round
+1 as live at admin.ts:271 — a follow-up row, not this slice); the EXCLSHADOW-1
+exclude-shadow repair and the TICKSTALL-2 github-stage budget (the scout's other ranked
+candidates — each its own slice); the transactional INSERT…RETURNING form for the probe/act
+races (the recorded F3 deferral, unchanged).
