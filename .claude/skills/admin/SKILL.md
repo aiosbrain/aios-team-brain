@@ -37,6 +37,12 @@ railway run -s Postgres bash -lc \
 - `issue-key <member-email> [--name <n>] [--team <slug>]` — prints the key **once**
 - `revoke-key <api-key-uuid> [--team <slug>]`
 - `list-members [--team <slug>]` · `list-keys [--team <slug>]`
+- `grant-project <group-slug> <project-slug> [--actor <admin-email>] [--team <slug>]` — THE access
+  edge (audited as system; `--actor` records a named admin authorizer in the audit meta)
+- `revoke-project <group-slug> <project-slug> --actor <admin-email> [--team <slug>]` — the
+  destructive half (REVOKE-1): `--actor` is REQUIRED and must be an active team-posture admin;
+  system projects refuse (the general/external-shared wiring is the substrate); a no-op revoke
+  reports "nothing revoked" and writes no audit row; takes effect on the next read
 - `pg:schema` — load `postgres/schema.sql` (idempotent)
 
 Default team is `demo`.

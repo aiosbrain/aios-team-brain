@@ -72,7 +72,8 @@ const USAGE = `Team Brain admin CLI — commands:
   delete-member <email> [--hard] [--team <id|slug>]   # soft-disable by default; --hard removes
   add-group-member <group-slug> <member-email> [--team <id|slug>]     # deliberate membership action; builtins = the posture move (humans only)
   remove-group-member <group-slug> <member-email> [--team <id|slug>]  # inverse; builtin removal mirrors members.tier
-  grant-project <group-slug> <project-slug> [--team <id|slug>]        # ENFB-2: THE access edge (group → project); a project grant is an item-membership grant — deliberate, audited (null CLI actor)
+  grant-project <group-slug> <project-slug> [--actor <admin-email>] [--team <id|slug>]   # ENFB-2: THE access edge (group → project); audited as system — --actor records a named admin authorizer in the audit META (REVOKE-1 D1b)
+  revoke-project <group-slug> <project-slug> --actor <admin-email> [--team <id|slug>]    # REVOKE-1: the destructive half — --actor REQUIRED (an active team-posture admin); system projects refuse; no-op revokes report + audit nothing
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
   link-github <member-email> <github-login> [--team <id|slug>] [--force]   # needs GITHUB_TOKEN env
@@ -303,13 +304,51 @@ async function main() {
         .eq("slug", projectSlug)
         .maybeSingle();
       if (!proj) die(`no project '${projectSlug}' on team ${team.slug}`);
-      // Grant only: `revokeProjectFromGroup` requires a real member actor for its audit row,
-      // and the CLI runs as an operator, not a member — a revoke verb waits for an actor
-      // story rather than widening the sole-writer's audit contract.
+      // REVOKE-1 (D1b): the operator's act audits as system; --actor records a named
+      // active-admin authorizer in the audit META only (never the actor field, never
+      // added_by — either would attribute the act to a human who merely approved it).
       const { grantProjectToGroup } = await import("@/lib/access/groups");
-      const r = await grantProjectToGroup(admin, team.id, (proj as { id: string }).id, (g as { id: string }).id, null);
+      let grantAuthorizer: string | undefined;
+      if (typeof flags.actor === "string") {
+        grantAuthorizer = (await memberIdByEmail(admin, team.id, flags.actor)) || die(`no member ${flags.actor}`);
+      }
+      const r = await grantProjectToGroup(admin, team.id, (proj as { id: string }).id, (g as { id: string }).id, null,
+        grantAuthorizer ? { authorizedByMemberId: grantAuthorizer } : {});
       if (!r.ok) die(`${cmd} failed: ${r.error}`);
-      console.log(`✓ granted '${projectSlug}' to '${groupSlug}' on ${team.slug}`);
+      console.log(`✓ granted '${projectSlug}' to '${groupSlug}' on ${team.slug}${grantAuthorizer ? ` (authorized by ${flags.actor})` : ""}`);
+      break;
+    }
+    case "revoke-project": {
+      // REVOKE-1: the destructive half of the access edge. The WRITER holds the invariants
+      // (system-kind refusal, the app's admin predicate, check order — spec D2/D2b/D2c); this
+      // verb resolves names, preflights for message quality, and requires the authorizer.
+      const groupSlug = positionals[0];
+      const projectSlug = positionals[1];
+      const team = await resolveTeam(admin, teamSlug);
+      const { runRevokeProjectVerb } = await import("@/lib/access/revoke-verb");
+      const { revokeProjectFromGroup } = await import("@/lib/access/groups");
+      const outcome = await runRevokeProjectVerb(
+        {
+          resolveGroupId: async (slug) => {
+            const { data } = await admin.from("groups").select("id").eq("team_id", team.id).eq("slug", slug).maybeSingle();
+            return (data as { id: string } | null)?.id ?? null;
+          },
+          resolveProject: async (slug) => {
+            const { data } = await admin.from("projects").select("id, kind").eq("team_id", team.id).eq("slug", slug).maybeSingle();
+            return (data as { id: string; kind: string } | null) ?? null;
+          },
+          resolveMemberIdByEmail: (email) => memberIdByEmail(admin, team.id, email),
+          revoke: (projectId, groupId, authorizedByMemberId) =>
+            revokeProjectFromGroup(admin, team.id, projectId, groupId, { kind: "operator", authorizedByMemberId }),
+        },
+        { groupSlug, projectSlug, actorEmail: typeof flags.actor === "string" ? flags.actor : undefined }
+      );
+      if (!outcome.ok) die(outcome.error);
+      console.log(
+        outcome.revoked
+          ? `✓ revoked '${projectSlug}' from '${groupSlug}' on ${team.slug} (authorized by ${flags.actor}; takes effect on the next read)`
+          : `· no grant of '${projectSlug}' to '${groupSlug}' on ${team.slug} — nothing revoked, nothing audited`
+      );
       break;
     }
     case "rename-team": {
