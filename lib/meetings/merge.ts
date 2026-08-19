@@ -269,6 +269,21 @@ export async function mergeIntoMeetingNote(
     { authorMemberId: author }
   );
 
+  // ENFB-3 D2 (design round-1 HIGH 2, ordering PINNED): the fresh merge-owned item must be
+  // membership-reconciled BEFORE the survivor is re-pointed at it — otherwise a visible
+  // survivor becomes oracle-invisible by merging (its new source has no membership until the
+  // sweep). On reconcile failure the merge ABORTS here: the durable leftover is only the
+  // merge-owned item (no note points at it; the backfill will not resurrect it as a meeting
+  // because the survivor still holds the ORIGINAL source), and a retry converges.
+  {
+    const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
+    const rec = await reconcileItemContext(admin, teamId, mergedItem.id).catch((e) => ({
+      ok: false as const,
+      error: e instanceof Error ? e.message : String(e),
+    }));
+    if (!rec.ok) throw new Error(`merge aborted before re-point: merged item reconcile failed (${"error" in rec ? rec.error : "unknown"})`);
+  }
+
   // If the survivor was pointing at a foreign (connector-owned) item, move it onto the merge-owned
   // item and RETIRE the old one with a hidden tombstone note — otherwise the meetings backfill, which
   // notes every un-noted transcript item, would resurrect the original as a separate meeting.

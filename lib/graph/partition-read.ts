@@ -40,6 +40,10 @@ export interface EnforcedGraphScope {
    *  the disclosure pair ("graph expansion covered N of M projects"). */
   covered: number;
   total: number;
+  /** ENFB-3: true when General was DROPPED by the restriction-debt probe — so a zero-group
+   *  resolution for a member who can see General is a LEGITIMATE fail-closed empty, never a
+   *  wiring fault (the feeds' loud-arm discriminator consumes this). */
+  generalSuppressed: boolean;
 }
 
 export async function selectEnforcedGraphPartitions(
@@ -47,7 +51,7 @@ export async function selectEnforcedGraphPartitions(
   args: { teamId: string; visibleProjectIds: readonly string[]; k?: number; arm?: boolean }
 ): Promise<EnforcedGraphScope> {
   const k = args.k ?? GRAPH_EXPANSION_K;
-  if (args.visibleProjectIds.length === 0) return { groups: [], covered: 0, total: 0 };
+  if (args.visibleProjectIds.length === 0) return { groups: [], covered: 0, total: 0, generalSuppressed: false };
 
   const { data, error } = await db
     .from("projects")
@@ -70,12 +74,13 @@ export async function selectEnforcedGraphPartitions(
 
   const initiatives = projects.filter((p) => p.kind === "initiative");
   const generalProject = projects.find((p) => p.kind === "system" && p.slug === "general");
-  // Restriction-debt probe (header: RESTRICTION DEBT) — ENFORCED reads only, concurrent with the
-  // arm/latch chain. arm:false IS the permissive-union discriminator (the only caller passing it),
-  // and permissive readers may see the moved content anyway — suppressing would blank the default
-  // mode's primary partition for zero protection.
+  // Restriction-debt probe (header: RESTRICTION DEBT) — runs for EVERY resolution (ENFB-3
+  // design blocker: it was coupled to `arm`, whose false arm was the retired permissive-union
+  // discriminator with ZERO live callers post-PRET-6 — an arm:false reader would have served
+  // General during a restriction move that every other enforced read suppresses). The probe is
+  // READ-SIDE protection; `arm` below keeps only the arming-trigger semantic.
   const generalDebtP: Promise<boolean> =
-    args.arm !== false && generalProject != null
+    generalProject != null
       ? generalHoldsRestrictedContent({
           teamId: args.teamId,
           generalProjectId: generalProject.id,
@@ -83,8 +88,9 @@ export async function selectEnforcedGraphPartitions(
         })
       : Promise.resolve(false);
 
-  // arm defaults ON (an enforcing principal read IS the arming trigger); the permissive union path
-  // passes arm:false — no reader-signal there, and cold initiatives must never extract for it.
+  // arm defaults ON (an enforcing principal read IS the arming trigger). arm:false = a read
+  // that must not be an arming heartbeat (ENFB-3: the 60s-polling graph feeds) — it changes
+  // ONLY the arming side effect, never the scope or the debt suppression.
   if (args.arm !== false) {
     await armProjectsForPrincipal(db, { teamId: args.teamId, projectIds: initiatives.map((p) => p.id) });
   }
@@ -126,7 +132,7 @@ export async function selectEnforcedGraphPartitions(
     );
   const picked = [...general, ...rest].slice(0, Math.max(1, k));
 
-  return { groups: picked.map((p) => p.graph_group_id), covered: picked.length, total };
+  return { groups: picked.map((p) => p.graph_group_id), covered: picked.length, total, generalSuppressed: generalOwesRestriction && generalProject != null };
 }
 
 /**

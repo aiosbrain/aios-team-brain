@@ -53,7 +53,7 @@ async function resolveTeam(teamSlug: string): Promise<{ id: string; slug: string
  */
 export async function uploadMeetingNoteAction(
   input: z.input<typeof uploadSchema>
-): Promise<{ ok: boolean; error?: string; id?: string; merged?: boolean }> {
+): Promise<{ ok: boolean; error?: string; id?: string; merged?: boolean; pendingVisibility?: boolean }> {
   const parsed = uploadSchema.safeParse(input);
   if (!parsed.success) return { ok: false, error: parsed.error.issues[0]?.message ?? "invalid upload" };
 
@@ -102,8 +102,9 @@ export async function uploadMeetingNoteAction(
   }
 
   let noteId: string;
+  let visible = true;
   try {
-    noteId = await createMeetingNote(admin, team.id, {
+    const created = await createMeetingNote(admin, team.id, {
       title: parsed.data.title,
       rawText: parsed.data.rawText,
       submittedByMemberId: me.id,
@@ -111,6 +112,8 @@ export async function uploadMeetingNoteAction(
       summary: extraction.summary,
       attendeeMemberIds: extraction.attendeeMemberIds,
     });
+    noteId = created.noteId;
+    visible = created.visible;
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not save the meeting note" };
   }
@@ -137,7 +140,10 @@ export async function uploadMeetingNoteAction(
   }
 
   revalidatePath(`/t/${team.slug}/meetings`);
-  return { ok: true, id: noteId };
+  // ENFB-3 D2: pendingVisibility means the write is DURABLE but the inline reconcile did not
+  // complete — the client must not navigate (the detail would 404 until the sweep) and must
+  // not retry (a retry mints a duplicate; design round-2 blocker).
+  return { ok: true, id: noteId, pendingVisibility: !visible || undefined };
 }
 
 // NOTE: the manual "Merge duplicates" action/button was removed — duplicate-meeting merge now runs
@@ -156,7 +162,12 @@ export async function importPushedMeetingsAction(
 
   const me = await currentMember(team.id);
   if (!me) return { ok: false, error: "not a member of this team" };
-  if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+  // ENFB-3 D1: a member-triggered TEAM-WIDE materialization job — it mints notes for every
+  // un-noted transcript, runs an LLM extraction per note, and its {created, scanned} counts
+  // disclose meetings the caller may not see. Ops-shaped → the repo's admin gate (role ∧
+  // posture), matching the scheduler that runs the same backfill routinely.
+  const { canAccessAdmin } = await import("@/lib/auth/admin-access");
+  if (!canAccessAdmin(me)) return { ok: false, error: "admin access required" };
 
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
@@ -195,7 +206,7 @@ export async function extractMeetingActionItemsAction(
 
   // Resolve the note → its transcript item (id/path/access + body). getMeetingNote enforces the
   // team-tier gate and confirms the note belongs to this team.
-  const note = await getMeetingNote(admin, team.id, noteId, me.tier);
+  const note = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
   if (!note) return { ok: false, error: "meeting note not found" };
 
   const { data: noteRow } = await admin
@@ -207,9 +218,11 @@ export async function extractMeetingActionItemsAction(
   const sourceItemId = (noteRow as { source_item_id: string } | null)?.source_item_id;
   if (!sourceItemId) return { ok: false, error: "meeting note not found" };
 
-  // tier-ok: meeting notes are team-tier-only content (canSeeMeetingNotes) and this action is gated
-  // on it above; the item id is resolved from a meeting_note the viewer can already see, and only
-  // its path/access are read (to derive stable todo row_keys) — never surfaced to an external tier.
+  // tier-ok: this items read is id-bounded BEHIND the ORACLE gate above — getMeetingNote
+  // resolved the note through canSeeItem on its source transcript (ENFB-3), so this id is one
+  // the viewer is already entitled to; only path/access are read (stable todo row_keys).
+  // (The pre-ENFB-3 wording justified this from posture alone — the coarse-wall-as-
+  // sufficiency fallacy the enforcement program retired.)
   const { data: item } = await admin
     .from("items")
     .select("id, path, access")
@@ -243,7 +256,7 @@ export async function extractMeetingActionItemsAction(
     // Revalidate so a later navigation shows fresh data, AND return the freshly-stored items so the
     // client can render them in place — no router.refresh() / full-route reload on the current view.
     revalidatePath(`/t/${team.slug}/meetings/${noteId}`);
-    const fresh = await getMeetingNote(admin, team.id, noteId, me.tier);
+    const fresh = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
     return { ok: true, extracted, items: fresh?.extractedTodos ?? [] };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "extraction failed" };
@@ -267,7 +280,7 @@ export async function regenerateMeetingSummaryAction(
   if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
 
   const admin = adminClient();
-  const note = await getMeetingNote(admin, team.id, noteId, me.tier);
+  const note = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
   if (!note) return { ok: false, error: "meeting note not found" };
 
   const [{ data: rosterRows }, keys] = await Promise.all([

@@ -29,9 +29,15 @@ export default async function MeetingsLayout({
   const me = await loadViewer(teamId);
   if (!me) return null;
 
-  // loadMeetingNotes enforces the team-tier gate itself (external → []).
-  const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, me.tier));
-  const canManage = me.tier === "team";
+  // ENFB-3: the list is bounded to the viewer's ORACLE set (loadMeetingNotes → the in-query
+  // intersect); external posture still gets [] (the coarse wall, unchanged).
+  const sorted = sortedMeetingNotes(await loadMeetingNotes(teamId, { memberId: me.id, tier: me.tier }));
+  // SPLIT flags (design round 2 M5): Upload keeps the posture bit (ordinary members upload
+  // meetings); Import is the repo's admin gate — a member-triggered TEAM-WIDE materialization
+  // job whose {created, scanned} counts disclose meetings the caller may not see (D1).
+  const canUpload = me.tier === "team";
+  const { canAccessAdmin } = await import("@/lib/auth/admin-access");
+  const canImport = canAccessAdmin(me);
 
   return (
     <div className="flex flex-col gap-5">
@@ -42,11 +48,11 @@ export default async function MeetingsLayout({
             Pick a meeting to read its summary and open the full transcript.
           </p>
         </div>
-        {canManage ? (
+        {canUpload ? (
           <div className="flex items-center gap-2">
             {/* Duplicate-meeting merge is now automatic on ingest (backfillMeetingNotesFromItems →
                 backfillMergeDuplicateMeetings) — the manual "Merge duplicates" button was removed. */}
-            <ImportPushedMeetingsButton teamSlug={teamSlug} />
+            {canImport ? <ImportPushedMeetingsButton teamSlug={teamSlug} /> : null}
             <NewMeetingNoteButton teamSlug={teamSlug} />
           </div>
         ) : null}

@@ -20,9 +20,9 @@ export const loadTeamId = cache(async (teamSlug: string): Promise<string | null>
 /** The current member for this team (id/role/tier), memoized per team for the request. */
 export const loadViewer = cache((teamId: string) => currentMember(teamId));
 
-export const loadMeetingNotes = cache(async (teamId: string, tier: ViewerTier): Promise<MeetingNoteSummary[]> => {
+export const loadMeetingNotes = cache(async (teamId: string, viewer: { memberId: string; tier: ViewerTier }): Promise<MeetingNoteSummary[]> => {
   const db = await serverClient();
-  return listMeetingNotesForTeam(db, teamId, tier);
+  return listMeetingNotesForTeam(db, teamId, viewer);
 });
 
 /** When the meeting happened, if known, else when it was ingested — the sort key for the list. */
