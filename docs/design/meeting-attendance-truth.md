@@ -70,8 +70,8 @@ Exactly right — and overridden by a guess. Present on **42 of 63** granola tra
 | meeting | granola says | we recorded |
 |---|---|---|
 | Content creation strategy | John | **+ Abe, + Fatma** |
-| Meet with Pete & Jana | John, Pete, Jana, Michael | **John only** |
-| John + Anusheel | John, Anusheel | **John only** |
+| Meet with Alex & Mira | John, Alex, Mira, Daniel | **John only** |
+| John + Priya | John, Priya | **John only** |
 | Onboarding Stephan | John, Chetan, Stephan, Fatma | **John, Stephan** |
 | Aios Event at home | John, Fatma | **John, + Chetan, − Fatma** |
 
@@ -124,7 +124,7 @@ Ranks 1 and 2 are facts the producer asserted. Rank 3 is a guess and is now clea
 last resort rather than the default.
 
 **A structured list that resolves to nobody does NOT fall through to the model.** If Granola says
-`[Pete Longworth]` and Pete is not a member, the answer is "no member attendees recorded", not "ask a
+`[Alex Marchetti]` and Alex is not a member, the answer is "no member attendees recorded", not "ask a
 model who else might have been there". Falling through would reintroduce exactly the failure this
 fixes, on the meetings most likely to involve outsiders.
 
@@ -219,6 +219,6 @@ and pinned by `test/guards/meeting-attendance-write-routes.test.ts`.
 ## 5. Deliberately not in this slice
 
 - **Non-member attendees.** `meeting_note_attendees.member_id` is NOT NULL and FKs to `members`, so
-  Pete, Anusheel and Rob cannot be recorded at all. That is the reason real attendees vanish, and it
+  Alex, Priya and Sam cannot be recorded at all. That is the reason real attendees vanish, and it
   is a schema change with its own blast radius — named here, not folded in.
 - Any change to how transcripts are ingested or chunked.

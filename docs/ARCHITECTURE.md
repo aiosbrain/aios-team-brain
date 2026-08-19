@@ -770,6 +770,27 @@ a best-effort `audit_log` entry; the finding event is the atomic audit record.
 Each entry is a real contract or bug, stated as the invariant that must now hold. Where a
 guard enforces it, it's named.
 
+- **No confidential identifier reaches this PUBLIC repo, and the gate does not depend on whose
+  laptop pushed.** A client's name landed on `main` in #586 and sat there until an unrelated push
+  from a different machine tripped a local hook days later. The gate was working as designed; the
+  design was the hole. The forbidden-term list is deliberately PRIVATE (it names the clients it
+  protects, so committing it leaks exactly what it defends) and lives per-machine outside every
+  repo; the hook reading it is installed in the untracked `.git/hooks/`; and `.githooks/pre-push`
+  **skips it silently when absent** — deliberate, so contributors without the list are not blocked.
+  Net effect: one laptop had a gate, nothing else did, and CI had no equivalent at all.
+  **CI is now the gate** (`nda-gate` in `.github/workflows/ci.yml` → `scripts/nda-scan.mjs`), with
+  the term list arriving as the `NDA_TERMS` secret so it still never enters the repo. Matching is
+  deliberately IDENTICAL to the local gate (same ERE alternation, `git grep -nEiI`, same path
+  excludes) — two gates that disagree about what counts as a leak are worse than one, because the
+  disagreement surfaces only when something gets through the weaker. Output is **redacted to
+  `file:line`**: these logs are world-readable, so a gate that printed its match would publish the
+  thing it defends (the adjacent gitleaks job runs `--redact` for the same reason). It **fails
+  closed** on a missing secret (exit 2, distinct from a real leak's exit 1), and on a fork PR — where
+  GitHub withholds secrets by design — it ANNOUNCES that it could not run rather than passing, because
+  an unrunnable gate is not a passing grade.
+  _Guard:_ `test/guards/nda-gate.test.ts` (fails-closed, redaction, term-parse parity, and that the
+  job is actually wired into CI — a scanner nothing invokes is the same defect with a nicer
+  implementation).
 - **Single-writer for content.** Only `lib/ingest` writes `items`/`item_versions`.
   _Guard:_ `test/guards/single-writer-items.test.ts` (fails the build on any other writer).
 - **Ingest is idempotent by `content_sha256`.** Identical re-push → `unchanged`, no new

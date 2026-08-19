@@ -39,6 +39,43 @@ jobs:
       - run: npm run typecheck
       - run: npm run check:errors
 
+  # Required gate: no confidential identifier reaches this PUBLIC repo.
+  #
+  # This exists because one did. A client's name landed on `main` in #586 and was only noticed days
+  # later, by an unrelated push from a different machine. The pre-existing gate is a PER-MACHINE hook
+  # reading a private term list, and `.githooks/pre-push` skips it silently when absent (deliberately
+  # — contributors do not have the list). So whether a client name reached a public repo depended on
+  # whose laptop ran `git push`, and nothing here checked at all.
+  #
+  # The term list stays OUT of the repo (it names the clients it protects) and arrives as the
+  # `NDA_TERMS` secret. The output is REDACTED to file:line — these logs are world-readable, so a
+  # gate that printed what it matched would publish the thing it defends (same reason the gitleaks
+  # job below runs with `--redact`).
+  nda-gate:
+    name: NDA confidentiality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+      - name: Scan tracked tree for confidential identifiers
+        env:
+          NDA_TERMS: ${{ secrets.NDA_TERMS }}
+          # GitHub withholds secrets from fork PRs by design, so this gate CANNOT run there. That is
+          # reported, never silently passed — an unrunnable gate is not a passing grade.
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork || 'false' }}
+        run: |
+          if [ -z "${NDA_TERMS:-}" ]; then
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::warning title=NDA gate could not run::Fork PR — GitHub withholds secrets from forks, so the confidentiality gate did NOT run. A maintainer must run it before merge: NDA_TERMS=\"\$(cat ~/.config/aios-nda/terms.txt)\" node scripts/nda-scan.mjs"
+              exit 0
+            fi
+            echo "::error title=NDA gate misconfigured::NDA_TERMS secret is not set on this repository. The gate fails closed rather than reporting a pass."
+            exit 1
+          fi
+          node scripts/nda-scan.mjs
+
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
