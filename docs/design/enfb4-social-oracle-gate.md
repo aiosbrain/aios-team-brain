@@ -44,14 +44,20 @@ PRET-4 §5 → PRET-6 §5 → ENFB-1/2/3 §0b. **Deps:** ENFB-3 (#614) merged. *
 
 ## 0b. Slice principle, deferrals, decidables
 
-**IN:** the admission gates (discovery scoped to the acting admin's oracle set; evidence-less
-arc opportunities refused), the read gate (ONE app-side rule at the opportunity — evidence ∩
-the viewer's visible set — with everything downstream inheriting by parent-id chains through
-the store, the page's inline reads routed back through `lib/social/store.ts`), the threaded
-principal into `loadEvidenceBodies`, the media route's wall repair, the guard extension
-(SWEEP_READ gains the social tables; wiring pins at the store seam), and the re-specification
-of the four pins whose subject dies (the empty-evidence-external arms + the phantom external
-reader arms).
+**IN:** the admission gates (discovery scoped to the acting admin's oracle set;
+evidence-less/partial arc opportunities refused), the read gate (ONE app-side EVERY rule at
+the opportunity, everything downstream inheriting by parent-id chains through the store, the
+page's inline reads routed back through `lib/social/store.ts`), **the ACTION-level parent
+gates (round 1 HIGH 4): every content-touching server action — plan, generate, submit/decide
+approval, schedule, cancel, generate-image — resolves its parent chain through the SAME gated
+read, so a hidden parent is "not found" (today they gate admin posture then resolve by bare
+id)**, the threaded principal into `loadEvidenceBodies` with the EVERY refusal, **the publish
+door's external-shared membership conjunct (round 1 BLOCKER 1 — pulled IN; the slice may now
+honestly claim last-residual closure)**, the media route's wall repair INCLUDING parent
+inheritance (round 1 HIGH 5: image bytes derive from `opp.title` — the route inherits
+asset → chain → evidence), the guard extension (SWEEP_READ gains the social tables; wiring
+pins at the store seam; explicit residual reasons for non-serving helpers — round 1 M8), and
+the re-specification of the pins whose subject dies.
 
 **DEFERRED, named:**
 - `brand_profiles`/`brand_assets`/`social_settings`/`social_jobs` — team config/ops, no
@@ -62,23 +68,38 @@ reader arms).
   MEMBERSHIP-change cascade sibling is deliberately NOT built: the read gate is COMPUTED
   (evidence ∩ live oracle at read time), so revocations take effect on the next read with no
   stored state to repair — the strongest argument for the computed shape (scout R6).
-- The publish fire-time door gains NO membership conjunct (scout R4): with D1's admission
-  refusal, an `external` variant's evidence is external-shared-visible by the tier ceiling
-  (`violatesEvidenceTier`) BY CONSTRUCTION — the ceiling is the membership-safe invariant, and
-  a fire-time member-shaped check would terminal-cancel legitimate scheduled posts on the
-  scheduler's system principal. Stated, not silent.
+- ~~The publish door gains no membership conjunct~~ — **REVERSED at design round 1 (its
+  BLOCKER 1): the deferral's invariant was FALSE.** `violatesEvidenceTier` checks only
+  `items.access`, so an `access='external'` item curated OUT of external-shared into a
+  restricted initiative still passes the tier door — the one PUBLIC egress would have shipped
+  membership-blind. The door (schedule-time AND the fire-time re-verify) now requires EVERY
+  evidence item to hold a current include in EXTERNAL-SHARED (via the enforce primitives —
+  the public-scope membership analogue of the external ceiling). A revocation between
+  schedule and fire correctly terminal-cancels: the content BECAME restricted, and cancelling
+  a post of restricted content is the point, not the race hazard the draft feared.
 
 **DECIDABLES — defaults stated for the design review to attack:**
-- **D1 — evidence-less opportunities are REFUSED AT ADMISSION.** `discoverOpportunitiesFromArcs`
-  drops an arc whose evidence has no item-linked entries (the arcs.ts:416 free-text fallback
-  and the unresolved-episode case) instead of minting an `external`, publishable,
-  provenance-invisible row. Additionally (scout R3, partial provenance): an arc-derived
-  opportunity's ceiling counts UNRESOLVED facts as missing — `external` requires EVERY cited
-  fact to resolve to item-linked evidence AND all evidence external; anything less floors to
-  `team`. Measured: prod has zero evidence-less rows — nothing retro-hides; the two unit pins
-  asserting empty→external (`social-discover-arcs.test.ts:70`, `social-tier.test.ts:31`)
-  re-specify to the refusal/floor. `createOpportunity` itself refuses `evidence: []` (no
-  production caller exists; the API shape closes).
+- **D1 — evidence-less AND partial-provenance arc opportunities are REFUSED AT ADMISSION
+  (REVISED at round 1's BLOCKER 3: the draft's "floor partial to team" still leaked —
+  unresolved-fact prose in a team-tier row renders to any admin whose intersection passes on
+  the resolved subset).** `discoverOpportunitiesFromArcs` mints ONLY when every cited fact
+  resolved to item-linked evidence (the arcs.ts:416 free-text fallback and the
+  unresolved-episode case both refuse); `createOpportunity` refuses `evidence: []`. Measured:
+  prod has zero evidence-less rows — nothing retro-hides. The pins asserting empty→external
+  (`social-discover-arcs.test.ts:70`, `social-tier.test.ts:31`) re-specify to the refusal.
+- **D1b — the READ quantifier is EVERY, not SOME (round 1's BLOCKER 2):** an opportunity's
+  title/summary and its variants' bodies are synthesized over ALL its evidence, so a viewer
+  who can see one of two evidence items would still read prose derived from the hidden one.
+  The rule everywhere: `evidence.length > 0 && evidence.every(e => vis.ids.has(e.itemId))`.
+  At prod's measured shape (avg 1.3 evidence) EVERY ≡ SOME for most rows; mixed-evidence rows
+  become visible only to viewers holding ALL their sources — fail-closed, stated. GENERATION
+  takes the same quantifier (round 1 M6): `generatePlanDrafts` REFUSES when the acting admin
+  cannot see every evidence item — no silent fewer-bodies degradation, no summary-over-hidden
+  prompt.
+- **D2a — actor-scoped discovery is an INTENDED product change (round 1 M7):** a
+  narrowly-granted admin discovers fewer opportunities than a corpus-wide one — discovery
+  mines what its operator may see, exactly as the arcs path has since PRET-3. No cron path
+  discovers (verified: jobs run publish/analytics only), so the actor always exists.
 - **D2 — the admin-role precedent: ENFB-1's ruling applies verbatim (content→membership,
   ops→role).** The read gate is per-viewer: an admin sees the opportunities whose evidence
   intersects THEIR oracle set; role exempts nothing. The approval-stranding case (scout R1) is
@@ -112,8 +133,8 @@ reader arms).
 | `loadEvidenceBodies` (generate.ts:99-112) | `visibleByAccess(q, variant.access)` — the row's OWN tier, no membership axis, unscoped system read | intersects with the ACTING admin's visible set (D4) |
 | `discoverNow` items scan (discover.ts:77-84) | corpus-wide, ungated (R8 — the write-side admission hole; the arcs path was already actor-scoped at PRET-3) | actor-scoped: `.in("id", [...actorVis])` — an admin mints opportunities only from items they can see |
 | `discoverOpportunitiesFromArcs` (discover-arcs.ts:116-27) | evidence-less arcs mint `external` publishable rows (R2); partial provenance under-counts `missing` (R3) | D1: refuse evidence-less; `external` ceiling requires FULL resolution; else floor `team` |
-| media route (route.ts:16-24) | bare `role==='admin'` (no posture), untenanted by-id read, 404/403 split | D3: `canAccessAdmin`, tenanted, uniform 404 |
-| publish door (publish.ts:54-72, 186-204) | tier-doored (external-only + governance + dry-run + fire-time re-verify), NO membership conjunct | UNCHANGED by design (§0b deferral): D1 makes the tier ceiling membership-safe by construction; stated at the door |
+| media route (route.ts:16-24) | bare `role==='admin'` (no posture), untenanted by-id read, 404/403 split; serves bytes derived from `opp.title` with no chain gate | D3: `canAccessAdmin`, tenanted, uniform 404, AND the asset inherits through its chain to the opportunity's EVERY-visible evidence (round 1 HIGH 5) |
+| publish door (publish.ts:54-72, 186-204) | tier-doored (external-only + governance + dry-run + fire-time re-verify), NO membership conjunct — and the tier ceiling is membership-BLIND (round 1 BLOCKER 1's counterexample: an external-access item curated out of external-shared passes it) | schedule-time AND fire-time require EVERY evidence item to hold a current external-shared include; a mid-flight revocation terminal-cancels (correct: the content became restricted) |
 | analytics reads (analytics.ts:73,92) | admin wall only | UNCHANGED (counts, no title/body — the metrics ruling), recorded with reason |
 
 ## 2. Mechanism notes
@@ -145,17 +166,23 @@ reader arms).
 1. `npm run test:datamechanics:iso test/datamechanics/enfb4-social.datamechanics.test.ts`
    exits 0 — the READ gate: an opportunity evidenced by a restricted item (with its plan,
    variant, pending approval, and publication) is absent from a non-grantee ADMIN's page
-   reads (all five chains) and present for a grantee admin (non-vacuity); role does not
-   bypass; an evidence-less legacy row is dark for everyone; the ERROR arm (oracle failure →
-   throw, never unfiltered).
+   reads (all five chains) and present for a grantee admin (non-vacuity); the EVERY arm: a
+   MIXED-evidence row (restricted + general) is absent for the general-only viewer and
+   present for the all-holding viewer; role does not bypass; an evidence-less legacy row is
+   dark for everyone; the ERROR arm (oracle failure → throw, never unfiltered); the
+   ACTION arms (round 1 H4): plan/generate/approve/decide/schedule/cancel/generate-image on
+   a hidden parent each refuse with the not-found shape, and succeed for the grantee.
 2. Same file — ADMISSION: `discoverNow`-shape scan scoped to the actor (an item outside the
    acting admin's set mints nothing; inside, it mints — both directions); an arc with
    zero item-linked evidence mints NOTHING (D1 refusal); an arc with partial resolution
    floors to `team`, full external resolution stays `external`; `createOpportunity` refuses
    `evidence: []`.
-3. Same file — GENERATION: `loadEvidenceBodies` with the threaded actor set excludes a
-   restricted evidence body from the prompt inputs for a non-grantee actor and includes it
-   for the grantee (the ENFB-2 scan-pattern pin, both halves).
+3. Same file — GENERATION: `generatePlanDrafts` REFUSES for an actor who cannot see every
+   evidence item (no silent degradation) and proceeds for the grantee with all bodies (the
+   EVERY quantifier, both directions). PUBLISH: the door refuses an external variant whose
+   evidence lacks a current external-shared include (the round-1 counterexample pinned:
+   external-ACCESS but initiative-curated), at schedule AND at fire; a fully
+   external-shared-included one passes (non-vacuity).
 4. Media route (D3): unknown id and denied viewer take the SAME 404; an external-posture
    admin is refused; the read is team-scoped — dm arms via the route handler.
 5. `npx vitest run test/guards/dashboard-tier-filter.test.ts` exits 0 with the social sweep
