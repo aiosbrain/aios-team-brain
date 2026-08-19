@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { getPulseMetrics } from "@/lib/metrics/pulse";
 import { recordLlmUsage } from "@/lib/costs/llm-usage";
-import { db, seedTeam, ingest } from "./helpers";
+import { db, seedTeam, ingest, placeMemberByTier } from "./helpers";
 
 /**
  * Spec for the dashboard "pulse" metrics on REAL Postgres. The deployed pg adapter returns
@@ -44,6 +44,28 @@ async function seedSpend(
   });
 }
 
+import { visibleItemIds } from "@/lib/access/enforce";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
+import { randomUUID } from "node:crypto";
+
+/** ENFB-2 §2.2: displayed counts compute over the viewer's oracle ctx — resolve it like the
+ *  Pulse page does (after a backfill so the fixtures' items carry memberships). */
+async function pulseCtx(seed: { teamId: string }, memberId: string, teamPosture: boolean) {
+  await backfillTeamContext(db(), seed.teamId);
+  const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId });
+  return { visibleItemIds: vis.ids, teamPosture };
+}
+
+async function externalViewer(seed: { teamId: string }): Promise<string> {
+  const { data } = await db()
+    .from("members")
+    .insert({ team_id: seed.teamId, email: `${randomUUID()}@t.local`, display_name: "Ext", actor_handle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external", status: "active" })
+    .select("id")
+    .single();
+  await placeMemberByTier(seed.teamId, data!.id as string, "external");
+  return data!.id as string;
+}
+
 describe("getPulseMetrics (real Postgres date windowing)", () => {
   it("counts freshly-synced items and recent queries as CURRENT (not prior)", async () => {
     const seed = await seedTeam();
@@ -63,6 +85,7 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
       isAdmin: true,
       memberId: seed.memberId,
       tier: "team",
+      provCtx: await pulseCtx(seed, seed.memberId, true),
     });
 
     const kpi = (key: string) => pulse.kpis.find((k) => k.key === key);
@@ -106,6 +129,7 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
       isAdmin: true,
       memberId: seed.memberId,
       tier: "team",
+      provCtx: await pulseCtx(seed, seed.memberId, true),
     });
 
     // It's still within the 30d window (created 10d ago), so exactly one item lands in knowledge growth…
@@ -144,10 +168,14 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
       rows: [{ row_key: "C-1", title: "client task", status: "in_progress" }],
     });
 
+    // ENFB-2: the external arm resolves a REAL external member's oracle set (external-shared
+    // curations) — posture is no longer a bare parameter.
+    const ext = await externalViewer(seed);
     const external = await getPulseMetrics(db(), seed.teamId, "30d", {
       isAdmin: false,
-      memberId: seed.memberId,
+      memberId: ext,
       tier: "external",
+      provCtx: await pulseCtx(seed, ext, false),
     });
     // Knowledge growth: only the one external deliverable is visible (the task item also has
     // access='external', so it counts too) — the internal deliverable + internal task item must not.
@@ -167,6 +195,7 @@ describe("getPulseMetrics (real Postgres date windowing)", () => {
       isAdmin: true,
       memberId: seed.memberId,
       tier: "team",
+      provCtx: await pulseCtx(seed, seed.memberId, true),
     });
     const teamKnowledge = team.knowledge.reduce(
       (s, p) => s + p.deliverable + p.transcript + p.decision + p.task + p.artifact + p.skill,

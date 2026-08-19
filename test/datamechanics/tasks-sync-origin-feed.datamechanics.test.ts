@@ -3,7 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { GET as tasksGET } from "@/app/api/v1/tasks/route";
 import { issueApiKey } from "@/lib/admin/keys";
-import { db, seedTeam, type Seed } from "./helpers";
+import { db, seedTeam, ingest, placeMemberByTier, type Seed } from "./helpers";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
 /**
  * Spec for AIO-537 (brain-api 1.13) — the task-writeback RETURN LEG.
@@ -42,6 +43,7 @@ async function issueKeyFor(seed: Seed, tier: "team" | "external"): Promise<strin
       .single();
     if (error || !data) throw new Error(`external member seed failed: ${error?.message}`);
     memberId = (data as { id: string }).id;
+    await placeMemberByTier(seed.teamId, memberId, "external");
   }
   const { key } = await issueApiKey(db(), seed.teamId, memberId, `${tier} key`);
   return key;
@@ -77,6 +79,20 @@ async function seedProject(teamId: string, slug: string): Promise<string> {
   return (data as { id: string }).id;
 }
 
+/** ONE membership-visible source item per (team, access) — sync rows point at it, the way
+ *  ingest stamps `source_item_id` on every pushed row (ENFB-2: the feed gates on provenance,
+ *  so a source-less sync seed is a shape no real writer produces). */
+const provSources = new Map<string, string>();
+async function provSource(seed: Seed, access: "team" | "external" = "team"): Promise<string> {
+  const cacheKey = `${seed.teamId}:${access}`;
+  const hit = provSources.get(cacheKey);
+  if (hit) return hit;
+  const item = await ingest(seed, { path: `prov-${access}.md`, body: access, access, project: "provsrc" });
+  await backfillTeamContext(db(), seed.teamId);
+  provSources.set(cacheKey, item.id);
+  return item.id;
+}
+
 async function seedTask(args: {
   teamId: string;
   projectId: string;
@@ -86,6 +102,9 @@ async function seedTask(args: {
   rawStatus?: string | null;
   assignee?: string;
   audience?: "team" | "external";
+  /** provenance: sync rows carry their source item; ui rows carry their creator. */
+  sourceItemId?: string;
+  createdBy?: string;
 }): Promise<void> {
   const { error } = await db()
     .from("tasks")
@@ -99,6 +118,8 @@ async function seedTask(args: {
       assignee: args.assignee ?? "",
       origin: args.origin,
       audience: args.audience ?? "team",
+      source_item_id: args.sourceItemId ?? null,
+      created_by: args.createdBy ?? null,
       updated_at: "2026-07-01T10:00:00Z",
     });
   if (error) throw new Error(`task seed failed: ${error.message}`);
@@ -109,8 +130,8 @@ describe("tasks sync-origin return leg (real handler, real Postgres)", () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "acme");
     const key = await issueKeyFor(seed, "team");
-    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-01", origin: "sync", status: "done" });
-    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-UI", origin: "ui", status: "ready" });
+    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-01", origin: "sync", status: "done", sourceItemId: await provSource(seed) });
+    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-UI", origin: "ui", status: "ready", createdBy: seed.memberId });
 
     // Old client (no `mode`): sync-origin row stays invisible; the UI row still comes through.
     const legacy = (await (await get(key, seed.teamSlug, "since=1970-01-01T00:00:00Z")).json()) as Feed;
@@ -131,8 +152,8 @@ describe("tasks sync-origin return leg (real handler, real Postgres)", () => {
     const mine = await seedProject(seed.teamId, "mine");
     const theirs = await seedProject(seed.teamId, "theirs");
     const key = await issueKeyFor(seed, "team");
-    await seedTask({ teamId: seed.teamId, projectId: mine, rowKey: "M-1", origin: "sync" });
-    await seedTask({ teamId: seed.teamId, projectId: theirs, rowKey: "X-1", origin: "sync" });
+    await seedTask({ teamId: seed.teamId, projectId: mine, rowKey: "M-1", origin: "sync", sourceItemId: await provSource(seed) });
+    await seedTask({ teamId: seed.teamId, projectId: theirs, rowKey: "X-1", origin: "sync", sourceItemId: await provSource(seed) });
 
     const feed = (await (await get(key, seed.teamSlug, "mode=sync-origin&project=mine")).json()) as Feed;
     expect(rowsOf(feed).map((r) => r.row_key)).toEqual(["M-1"]);
@@ -147,8 +168,8 @@ describe("tasks sync-origin return leg (real handler, real Postgres)", () => {
   it("never leaks a team-audience row to an external-tier key in sync-origin mode", async () => {
     const seed = await seedTeam();
     const proj = await seedProject(seed.teamId, "acme");
-    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-INTERNAL", origin: "sync", audience: "team" });
-    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-SHARED", origin: "sync", audience: "external" });
+    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-INTERNAL", origin: "sync", audience: "team", sourceItemId: await provSource(seed, "team") });
+    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-SHARED", origin: "sync", audience: "external", sourceItemId: await provSource(seed, "external") });
 
     const ext = await issueKeyFor(seed, "external");
     const extFeed = (await (await get(ext, seed.teamSlug, "mode=sync-origin&project=acme")).json()) as Feed;
@@ -174,8 +195,9 @@ describe("tasks sync-origin return leg (real handler, real Postgres)", () => {
       status: "backlog",
       rawStatus: "todo",
       assignee: "riley",
+      sourceItemId: await provSource(seed),
     });
-    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-UI", origin: "ui", status: "ready" });
+    await seedTask({ teamId: seed.teamId, projectId: proj, rowKey: "T-UI", origin: "ui", status: "ready", createdBy: seed.memberId });
 
     const feed = (await (await get(key, seed.teamSlug, "mode=sync-origin&project=acme")).json()) as Feed;
     expect(rowsOf(feed)[0]).toMatchObject({ raw_status: "todo", assignee: "riley", status: "backlog" });
