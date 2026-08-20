@@ -469,10 +469,14 @@ export function normalizeTier(tier: string): "team" | "external" | null {
   return null;
 }
 
+// The canonical task status set (brain-api §"Task rows"; postgres `task_status` enum). ORDER IS
+// PART OF THE CONTRACT — it is the board's left-to-right order and the enum's sort order.
+// `in_review` joined at brain-api v1.21 (AIO-950), between `in_progress` and `blocked`.
 export const TASK_STATUSES = [
   "backlog",
   "ready",
   "in_progress",
+  "in_review",
   "blocked",
   "done",
 ] as const;
@@ -679,6 +683,11 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
               backlog: z.string().min(1).max(80),
               ready: z.string().min(1).max(80),
               in_progress: z.string().min(1).max(80),
+              // brain-api v1.21: OPTIONAL, unlike its five siblings. This map is an operator's saved
+              // per-List configuration; making the new member required would `.strict()`-invalidate
+              // every config saved before 1.21 and fail-close its whole ClickUp import. Absent = this
+              // List simply has no In Review state, exactly as before the bump.
+              in_review: z.string().min(1).max(80).optional(),
               blocked: z.string().min(1).max(80),
               done: z.string().min(1).max(80),
             })

@@ -141,6 +141,7 @@ const FUNNEL_ORDER: { status: string; label: string }[] = [
   { status: "backlog", label: "Backlog" },
   { status: "ready", label: "Ready" },
   { status: "in_progress", label: "In progress" },
+  { status: "in_review", label: "In review" },
   { status: "blocked", label: "Blocked" },
   { status: "done", label: "Done" },
 ];
@@ -346,7 +347,7 @@ export async function getPulseMetrics(
       delta: null,
       spark: taskSpark,
       hint: blocked > 0 ? `${blocked} blocked` : "none blocked",
-      help: "Open tasks that are actively moving — those in Ready, In progress, or Blocked (Backlog and Done are excluded). The number is a live snapshot across all the team's tasks, so the date range doesn't change it (only the sparkline, which tracks recent task activity per day, does). \"N blocked\" calls out how many of these are stuck.",
+      help: "Open tasks that are actively moving — those in Ready, In progress, In review, or Blocked (Backlog and Done are excluded). The number is a live snapshot across all the team's tasks, so the date range doesn't change it (only the sparkline, which tracks recent task activity per day, does). \"N blocked\" calls out how many of these are stuck.",
       accent: "cyan",
     },
     {

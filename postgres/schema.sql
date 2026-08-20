@@ -44,8 +44,14 @@ exception when duplicate_object then null; end $$;
 alter type item_kind add value if not exists 'fact';
 alter type item_kind add value if not exists 'stakeholder_mention';
 do $$ begin
-  create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');
+  create type task_status as enum ('backlog', 'ready', 'in_progress', 'in_review', 'blocked', 'done');
 exception when duplicate_object then null; end $$;
+-- brain-api v1.21 (AIO-950): `in_review` between `in_progress` and `blocked`. The `create type`
+-- above is a no-op on an EXISTING database (the duplicate_object guard swallows it), so an already-
+-- deployed brain needs this widening explicitly — same pattern as `item_kind` above. `before
+-- 'blocked'` keeps the enum's sort order equal to the contract's canonical order, which is what any
+-- `order by status` sorts on. Mirrored by postgres/migrations/20260819180000_task_status_in_review.sql.
+alter type task_status add value if not exists 'in_review' before 'blocked';
 do $$ begin
   create type task_origin as enum ('sync', 'ui');
 exception when duplicate_object then null; end $$;
@@ -1295,7 +1301,7 @@ create table if not exists task_pm_links (
   provider_seen_status text,
   -- Inbound conflict baseline (brain-api v1.4): the EXACT brain `tasks.status` at the last
   -- successful outbound projection / adoption / inbound apply. The provider-group fingerprint
-  -- alone cannot decide "brain unchanged" — in_progress and blocked both hash to group 'started',
+  -- alone cannot decide "brain unchanged" — in_progress, in_review and blocked all hash to 'started',
   -- so a same-group brain edit would be silently overwritten without this exact baseline.
   last_projected_brain_status text,
   created_at timestamptz not null default now(),
