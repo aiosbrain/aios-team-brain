@@ -9,10 +9,7 @@ import {
 import { buildIdentityMap } from "@/lib/identity/resolve";
 import { ingestItem } from "@/lib/ingest";
 import type { ClickUpTaskRecord } from "@/lib/ingest/sources/clickup";
-import {
-  normalizeClickUpTaskDocs,
-  type ClickUpStatusMap,
-} from "@/lib/ingest/sources/clickup-normalize";
+import { normalizeClickUpTaskDocs } from "@/lib/ingest/sources/clickup-normalize";
 import { db, seedTeam, type Seed } from "./helpers";
 
 /**
@@ -25,14 +22,6 @@ import { db, seedTeam, type Seed } from "./helpers";
  * lookup, which is this tier's job (CLAUDE §4). The bug shipped green precisely because no test ever
  * crossed from the normalizer into a resolver backed by a real roster.
  */
-
-const STATUS_MAP: ClickUpStatusMap = {
-  backlog: "backlog",
-  ready: "to do",
-  in_progress: "in progress",
-  blocked: "blocked",
-  done: "complete",
-};
 
 function record(assignees: Array<{ id: number | string; username?: string; email?: string }>): ClickUpTaskRecord {
   return {
@@ -70,7 +59,7 @@ async function addConnector(teamId: string): Promise<string> {
 
 /** Drive the route's own path: normalize → derive attribution opts → ingest → read the stored owner. */
 async function ingestDoc(seed: Seed, pusherId: string, records: ClickUpTaskRecord[]): Promise<string | null> {
-  const [doc] = normalizeClickUpTaskDocs({ workspaceId: 9001, records, statusMaps: { "101": STATUS_MAP } });
+  const [doc] = normalizeClickUpTaskDocs({ workspaceId: 9001, records });
   const { opts } = await attributeIncomingItem(db(), seed.teamId, doc, pusherId);
   const res = await ingestItem(
     db(),
@@ -142,7 +131,6 @@ describe("ClickUp task documents → stored items.member_id (real Postgres)", ()
 
     const [doc] = normalizeClickUpTaskDocs({
       workspaceId: 9001,
-      statusMaps: { "101": STATUS_MAP },
       records: [record([{ id: 7, username: "Alex" }, { id: 9, username: "Robin" }])],
     });
     const [map, connectors] = await Promise.all([

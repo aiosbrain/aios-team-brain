@@ -668,33 +668,20 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
   // `listIds` is the task selection; `docIds`/`docParent*` select Docs. A half-configured integration
   // stays savable (same stance as notion) — the runner reports what's missing.
   //
-  // `statusMaps` is an ARRAY keyed by an INNER `listId` field, deliberately not a
-  // `Record<listId, …>`: the secret-key scan below walks nested object KEYS, so a List id in key
-  // position would be scanned as a config key — the same hazard `github.repoHistory` documents.
+  // There is deliberately NO per-List status map. Status normalization is `clickUpStatus`
+  // (lib/ingest/sources/clickup-normalize.ts) — name-first, then the review-name heuristic, then
+  // ClickUp's own `status.type`, fail-open — the same configuration-free shape Linear and Plane use.
+  // The removed `statusMaps` key demanded a bijective 6-to-6 map that no List with 3 or 9 statuses
+  // could satisfy, failed CLOSED (one unmapped status aborted the whole workspace payload from
+  // inside `rows.map`), and had no writer at all: `lib/integrations/build-config.ts` never emitted
+  // it, so it was absent for every List in practice and the first task of ANY ClickUp workspace
+  // threw. `.strict()` now rejects it, which is the intended outcome — no saved config can contain
+  // it, since none could ever be authored, and the schema is only applied on WRITE
+  // (`validateIntegrationConfig`, reached from `lib/integrations/manage.ts` upsert), never on read.
   clickup: z
     .object({
       workspaceId: z.string().max(64).optional(),
       listIds: z.array(z.string().min(1).max(64)).max(200).default([]),
-      statusMaps: z
-        .array(
-          z
-            .object({
-              listId: z.string().min(1).max(64),
-              backlog: z.string().min(1).max(80),
-              ready: z.string().min(1).max(80),
-              in_progress: z.string().min(1).max(80),
-              // brain-api v1.21: OPTIONAL, unlike its five siblings. This map is an operator's saved
-              // per-List configuration; making the new member required would `.strict()`-invalidate
-              // every config saved before 1.21 and fail-close its whole ClickUp import. Absent = this
-              // List simply has no In Review state, exactly as before the bump.
-              in_review: z.string().min(1).max(80).optional(),
-              blocked: z.string().min(1).max(80),
-              done: z.string().min(1).max(80),
-            })
-            .strict()
-        )
-        .max(200)
-        .optional(),
       docIds: z.array(z.string().min(1).max(64)).max(200).optional(),
       docParentType: z.enum(["SPACE", "FOLDER", "LIST", "EVERYTHING", "WORKSPACE"]).optional(),
       docParentId: z.string().max(64).optional(),

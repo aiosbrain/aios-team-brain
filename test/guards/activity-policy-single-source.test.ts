@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { ACTIVE_STATUSES, OPEN_STATUSES } from "@/lib/tasks/activity-policy";
+import { TASK_STATUSES } from "@/lib/api/schemas";
 
 /**
  * Single-source guard for "is this task active" (CLAUDE.md §2, Pass-1 review H6).
@@ -33,6 +34,8 @@ const OWNER = join("lib", "tasks", "activity-policy.ts");
  * bracketed list. Two is the threshold because a single `=== "done"` comparison is a legitimate,
  * readable check; a LIST of statuses is a policy, and policies belong in one place.
  */
+// Must list EVERY member of `TASK_STATUSES` (lib/api/schemas.ts). A status missing here is a hole in
+// the guard, not a smaller guard: a drifted `["in_review", "in_progress"]` set would go unseen.
 const STATUS = "(?:backlog|ready|in_progress|in_review|blocked|done)";
 const QUOTED = `(?:"${STATUS}"|'${STATUS}'|\`${STATUS}\`)`;
 // `\s` spans newlines, so a set written one status per line is caught too. Backticks are included
@@ -107,6 +110,25 @@ describe("guard: one activity policy", () => {
     // Composing FROM the policy is the encouraged pattern, not drift.
     const composed = `new Set([...ACTIVE_STATUSES, "ready"])`;
     expect([...composed.matchAll(STATUS_LIST_RE)]).toHaveLength(0);
+  });
+
+  it("the scanner's status vocabulary covers every canonical status", () => {
+    // The regex above is a hand-written copy of TASK_STATUSES. When the canonical set grew by
+    // `in_review`, a stale copy would have kept the guard green while a drifted
+    // `["in_review", "in_progress"]` set walked in unseen — the exact silent-hole failure this
+    // whole guard exists to prevent, reintroduced one level up.
+    for (const status of TASK_STATUSES) {
+      expect(new RegExp(`^${STATUS}$`).test(status), `${status} is not in the guard's STATUS list`).toBe(true);
+    }
+  });
+
+  it("in_review counts as active work (it inherited in_progress's surfaces)", () => {
+    // Before `in_review` existed, a Linear "In Review" state normalized to `in_progress` and so
+    // appeared on Home / Pulse in-flight / the work timeline. Splitting the status out without
+    // adding it to ACTIVE_STATUSES would quietly remove every awaiting-review task from those
+    // surfaces — a regression that no other test in this repo would have gone red on.
+    expect(ACTIVE_STATUSES.has("in_review")).toBe(true);
+    expect(OPEN_STATUSES.has("in_review")).toBe(true);
   });
 
   it("keeps the two sets in the relationship the doc claims (OPEN ⊃ ACTIVE, and ready is the only delta)", () => {
