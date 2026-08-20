@@ -166,6 +166,22 @@ async function repairExcludeShadow(
     decided_by: args.decidedBy ?? null,
   });
   if (error) {
+    // CONCURRENT-REPAIRER convergence (Codex diff M1 — the second-order bug in the first
+    // fold): two reconcilers can both read the same auto exclude; the loser's close matches
+    // zero rows WITHOUT error, its insert then collides with the winner's include, and
+    // returning ok:false here reported a CONVERGED membership as a batch-stopping failure.
+    // Same discipline as the plain path's race loser: re-probe, converge ONLY on an include.
+    const { data: winner } = await db
+      .from("project_context_memberships")
+      .select("decision")
+      .eq("team_id", teamId)
+      .eq("project_id", args.projectId)
+      .eq("context_unit_id", args.contextUnitId)
+      .is("valid_to", null)
+      .maybeSingle();
+    if ((winner as { decision?: string } | null)?.decision === "include") {
+      return { ok: true, created: false };
+    }
     // Half-repair fail direction (spec §2): the exclude is closed and the include absent —
     // the item is now a plain no-current-include candidate, completed by the next pass.
     return { ok: false, error: `exclude-shadow repair: close succeeded, include insert failed (${error.message}) — next pass completes` };

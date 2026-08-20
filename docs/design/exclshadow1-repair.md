@@ -120,11 +120,18 @@ records exactly this.
 - **History preserved:** the closed exclude row stays (with its `valid_to`), the repair
   include carries its own `method` — the table is its own audit trail, consistent with every
   other membership transition.
-- **Fail directions:** `projects.kind` read error → no repair, the plain insert path runs
-  and fails loudly on the index (never a silent skip); close succeeds but insert fails → the
-  exclude is gone and the include is absent — the item is now ARM-2-selectable by the
-  candidate predicate (no current include in target), so the next pass completes the repair;
-  stated, not silent.
+- **Fail directions:** a `projects.kind` read error (or a non-system/non-auto state) → the
+  loud `ok:false` refusal, nothing written (corrected at the second-model review — an earlier
+  draft claimed the error path fell through to an index failure; it does not); close succeeds
+  but insert fails → the exclude is gone and the include absent — the item is a plain ARM-2
+  candidate the next pass completes; a LOSING concurrent repairer (its close matches zero
+  rows, its insert collides with the winner's include) re-probes and reports CONVERGED, never
+  a batch-stopping failure (Codex diff M1). ACCEPTED WINDOW, stated with its real blast
+  radius (Codex diff M2): between the close and the insert the item has NO current include —
+  a concurrent graph read classifies its General episode as restriction debt and suppresses
+  the General partition for that read (fail-closed, milliseconds when healthy); a crash in
+  the window extends the suppression until the next sweep pass heals the half-repair. The
+  atomic form is the recorded F3 transaction surface, deliberately not this slice.
 - **No cascade, no backfill:** prod has zero rows in the state; nothing retro-changes.
 
 ## 3. Acceptance criteria (spec-first; exact commands)

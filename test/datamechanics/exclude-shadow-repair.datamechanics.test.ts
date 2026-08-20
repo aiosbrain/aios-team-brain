@@ -163,6 +163,51 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
     const finalRows = await currentRows(seed, general, unit);
     expect(finalRows.length).toBe(1);
     expect(finalRows[0].decision, "the planted exclude survives the race").toBe("exclude");
+
+    // CONCURRENT-REPAIRER convergence (Codex diff M1): the LOSING repairer — its probe read
+    // the auto exclude, but the winner repaired first (close matched 0 rows, insert collides)
+    // — must report CONVERGED, not a batch-stopping failure. Simulated deterministically: the
+    // real state is already repaired; a wrapping client feeds the writer the STALE exclude row.
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId).eq("project_id", general).eq("context_unit_id", unit).is("valid_to", null);
+    const { data: winnerRow, error: winErr } = await db().from("project_context_memberships").insert({
+      team_id: seed.teamId, project_id: general, context_unit_id: unit,
+      decision: "include", mode: "auto", method: "exclude_shadow_repair",
+    }).select("id").single();
+    expect(winErr).toBeNull();
+    void winnerRow;
+    const { data: staleExclude } = await db().from("project_context_memberships")
+      .select("id").eq("team_id", seed.teamId).eq("project_id", general).eq("context_unit_id", unit)
+      .eq("decision", "exclude").order("created_at", { ascending: false }).limit(1).single();
+    let fed = false;
+    const staleDb = {
+      from(table: string) {
+        const chain = real.from(table);
+        if (table === "project_context_memberships" && !fed) {
+          const origSelect = chain.select.bind(chain);
+          return {
+            ...chain,
+            select: (...args: unknown[]) => {
+              fed = true;
+              void (origSelect as (...a: unknown[]) => unknown)(...args);
+              const stub = {
+                eq: () => stub,
+                is: () => stub,
+                maybeSingle: async () => ({ data: { id: staleExclude!.id as string, decision: "exclude", mode: "auto" }, error: null }),
+              };
+              return stub;
+            },
+          };
+        }
+        return chain;
+      },
+    } as unknown as DbClient;
+    const stale = await ensureIncludeMembership(staleDb, seed.teamId, { projectId: general, contextUnitId: unit });
+    expect(stale.ok, "a losing repairer against a converged include reports CONVERGED, never a failure").toBe(true);
+    expect(stale.created).toBe(false);
+    const converged = await currentRows(seed, general, unit);
+    expect(converged.length).toBe(1);
+    expect(converged[0].decision).toBe("include");
   });
 
   it("the sweep: auto shadows are selected and healed; force shadows and retracted units stay carved out and counted (strict zero when clean)", async () => {
