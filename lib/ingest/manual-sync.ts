@@ -52,7 +52,8 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
     safe(runSlackIngestion({ teamId })),
     safe(runPlaneIngestion({ teamId })),
     safe(runLinearIngestion({ teamId })),
-    safe(runGithubIngestion({ teamId })),
+    // TICKFIT-1 D2f: a manual "sync now" promises a REAL pass — bypass the watermark.
+    safe(runGithubIngestion({ teamId, force: true })),
   ]);
 
   // Inbound Linear→brain apply/adopt (brain-api v1.4): runs AFTER the Linear ingest leg above has

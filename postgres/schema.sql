@@ -2690,6 +2690,20 @@ create table if not exists ingest_runs (
 create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
 create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
 
+-- TICKFIT-1: per-repo remote sync watermarks (docs/design/tickfit1-github-watermark.md D1/D2).
+-- The remote's OWN values ({pushedAt, updatedAt, defaultBranch, configHash} for github), compared
+-- by EQUALITY — never our clock — so a quiet tick proves a repo unchanged in one probe call
+-- instead of a full re-scan. Written ONLY by lib/ingest/cursors (single writer); the cursor
+-- advances only after a fully-successful pass, and any absence/mismatch/probe-error runs the
+-- full pass (fail toward freshness). Mirrored in postgres/migrations/20260820100000.
+create table if not exists connector_cursors (
+  team_id uuid not null references teams(id) on delete cascade,
+  key text not null,
+  cursor jsonb not null default '{}',
+  updated_at timestamptz not null default now(),
+  primary key (team_id, key)
+);
+
 -- ── Social Brain durable job/outbox (M0) ─────────────────────────────────────
 -- The one durable async primitive: work that survives a redeploy and retries on failure
 -- (media renders, provider polling, scheduled publishing, publish/analytics retries). The

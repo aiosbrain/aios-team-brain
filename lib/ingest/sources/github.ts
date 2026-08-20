@@ -24,6 +24,29 @@ export function githubHeaders(token?: string | null): Record<string, string> {
 
 const API = GITHUB_API;
 
+/**
+ * TICKFIT-1: the ONE-call repo probe behind the change watermark — the remote's own
+ * `pushed_at` / `updated_at` / `default_branch`, stored verbatim and compared by equality
+ * (lib/ingest/github-watermark). Throws on any non-OK response: a probe FAILURE must surface
+ * as "run the full pass" (fail toward freshness), never as a fabricated value.
+ */
+export async function fetchGithubRepoProbe(opts: {
+  owner: string;
+  repo: string;
+  token?: string | null;
+  fetchImpl?: typeof fetch;
+}): Promise<{ pushedAt: string | null; updatedAt: string | null; defaultBranch: string | null }> {
+  const fetchImpl = opts.fetchImpl ?? timeoutFetch;
+  const res = await fetchImpl(`${API}/repos/${opts.owner}/${opts.repo}`, { headers: githubHeaders(opts.token) });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`GitHub GET repo probe failed (${res.status}): ${text.slice(0, 200)}`);
+  }
+  const body = (await res.json()) as { pushed_at?: unknown; updated_at?: unknown; default_branch?: unknown };
+  const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  return { pushedAt: str(body.pushed_at), updatedAt: str(body.updated_at), defaultBranch: str(body.default_branch) };
+}
+
 export interface FetchedGithubRepo {
   owner: string;
   repo: string;
