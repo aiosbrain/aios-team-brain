@@ -30,8 +30,11 @@ This is latent-hole closure, not incident response.
 **Ticketing:** row `EXCLSHADOW-1`; PR carries `AIOS-Work: EXCLSHADOW-1`.
 **Governing records:** the TICKSTALL-2 slice-A spec (the carve-out + counters);
 `docs/specs/project-context-classification-v1.md` §11 (the system partition is the access
-substrate). **Deps:** none. **Schema: NONE** (the partial unique index
-`(team_id, project_id, context_unit_id) where valid_to is null` is the mechanism, untouched).
+substrate). **Deps:** none. **Schema: ONE constraint-widening migration** (design round B1: the
+`method` CHECK on `project_context_memberships` must admit `'exclude_shadow_repair'` — a
+named drop-and-re-add migration + the `schema.sql` mirror + the `MembershipMethod` union;
+WIDENING, so the #251 replay-narrowing class does not apply. The partial unique index stays
+untouched — it is the close-first mechanism).
 **Build with:** fable / high. **Review adaptation, named:** Codex is unavailable until
 Aug 22 (usage window, its own error output) — the spec's adversarial cold read falls to
 FABLE (the CLAUDE.md plan review), and the diff gets the Fable adversarial review; the PR
@@ -39,58 +42,74 @@ records exactly this.
 
 ## 0b. Decidables — defaults stated for the design review to attack
 
-- **D1 — the RULING: nothing may exclude an item from its audience's SYSTEM project; a
-  current exclude there is an ILLEGAL state that reconcile REPAIRS.** The system partition
-  (general/external-shared) is the access substrate — a current include there is what makes
-  an item readable by ANYONE (`enforce.ts`); "excluded from the substrate" does not mean
-  "curated out of a collection", it means invisible-to-everyone-forever. Phase-D exclusion
-  semantics, whenever they ship, operate on INITIATIVE projects (curation); the substrate is
-  not a curation surface. So `ensureIncludeMembership` repairs: on finding a current
-  EXCLUDE for `(project, unit)` where the target project is `kind='system'`, it CLOSES the
-  exclude (`valid_to = now` — the partial unique index forces exactly this close-first
-  order) and inserts the include with `method: 'exclude_shadow_repair'` (the repair is
-  legible in the table's own history — no separate audit write, matching reconcile's
-  existing behavior). An exclude in a NON-system project is NOT touched (D1c).
-- **D1b — the probe stops lying regardless: the existence check gains
-  `.eq("decision", "include")`.** Two distinct properties, deliberately separate: the probe
-  filter makes an exclude UNABLE to masquerade as convergence (even if the repair leg were
-  deleted, reconcile would now attempt the insert and FAIL LOUDLY on the partial index
-  instead of reporting `created:false` success — a red error beats a silent hole); the
-  repair leg (D1) then makes the loud failure unnecessary. Each layer gets its own pin and
-  its own mutation.
-- **D1c — the repair is writer-held and KIND-scoped:** the `kind='system'` condition lives
-  INSIDE `ensureIncludeMembership` (one bounded read of `projects.kind` — the sole caller
-  today targets system projects, but the invariant must not depend on caller discipline;
-  the REVOKE-1 precedent). A future initiative-targeting caller finding an initiative
-  exclude gets today's behavior — probe-filtered, so a loud index failure, never a silent
-  success and never an uninvited repair of a deliberate curation decision.
+- **D1 — the RULING (SCOPED at the design round's B2 — the draft violated classification
+  invariant 3): an AUTOMATIC (`mode='auto'`) current exclude in the item's target SYSTEM
+  project is an ILLEGAL state that reconcile REPAIRS; an EXPLICIT (any force/manual mode)
+  exclude is an operator's recorded decision and is NEVER auto-repaired.** The governing
+  spec's own words decide the row's product question: "Manual include/exclude decisions are
+  never overwritten by an automatic run" (invariant 3) and "deliberate invisibility exists
+  but only as an explicit act" — Phase D's recorded restricted-content intent (force-exclude
+  from General + include in a restricted project) MUST survive this sweep; the draft's
+  unscoped repair would have silently re-published restricted content team-wide (the
+  widening direction, no DB backstop). So: explicit exclusion OUTRANKS the system partition;
+  an automatic/orphan exclude — which no automatic writer can legitimately produce (the
+  single writer only inserts includes) — does not, and is repaired close-first
+  (`valid_to = now`, index-forced order) with `method: 'exclude_shadow_repair'` (the table
+  is its own audit trail — no separate audit write). Force excludes stay CARVED OUT of the
+  candidate set and COUNTED (selecting an unrepairable state is the slice-A
+  burn-a-tick-forever failure). An exclude in a NON-system project is NOT touched (D1c).
+- **D1b — the probe stops lying, at hot-path-neutral cost (RESHAPED at the round's M1):**
+  the existence probe selects `id, decision, mode` WITHOUT a decision filter (safe: the
+  partial index guarantees ≤1 current row per pair) and BRANCHES — `include` → converged
+  (today's cost, unchanged); an exclude is explicitly branched, NEVER returned as
+  convergence. The rare exclude branch then reads `projects.kind` (+ the mode test) and
+  either repairs (D1) or returns a LOUD `ok:false` refusal — no per-call kind read taxes
+  the hot path the TICKSTALL work just bounded. Two distinct layers, each with its own pin
+  and mutation: the branch (an exclude can never masquerade as convergence) and the repair.
+- **D1c — the repair is writer-held, KIND- and MODE-scoped:** both conditions live INSIDE
+  `ensureIncludeMembership` (the sole caller targets system projects, but the invariant
+  must not depend on caller discipline — the REVOKE-1 precedent). A non-system or non-auto
+  exclude gets the loud `ok:false`, never a silent success and never an uninvited repair of
+  a deliberate curation decision. THE RACE-LOSER PROBE takes the same branch discipline
+  (the round's H2 — an unfiltered re-probe after an index collision would resurrect the
+  silent masquerade through the back door for exactly the scoped-out states): the loser
+  returns converged ONLY on a current INCLUDE; a current exclude there is the same loud
+  refusal. Pinned + mutated in its own right.
 - **D2 — RETRACTED units are NOT repaired, stated:** `state != 'active'` units stay
-  invisible AND unrepaired by this slice — the removal path (`lib/ingest/purge` + the
-  rules layer) owns `state`, and auto-reactivating a retracted unit would resurrect removed
+  invisible AND unrepaired by this slice — the removal path WILL own `state` (nothing writes `retracted` today — verified; the
+  deferral is latent-class bookkeeping, not a pointer to an existing owner), and auto-reactivating a retracted unit would resurrect removed
   content (the recorded tombstones-are-alive asymmetry). Still counted
   (`meta.retractedUnits`), still EXCLSHADOW-class in the ledger, its repair belongs to the
   removal path's own story.
-- **D3 — the candidate carve-out INVERTS for the exclude-shadow:** now that reconcile can
-  repair it, the shadow becomes SELECTABLE (the slice-A carve-out existed precisely because
-  it was not). The retracted-unit carve-out STAYS (D2 — still unrepairable by design). The
-  `excludeShadows` counter keeps counting at detection (pre-repair), so the healthy
-  end-state is: a planted shadow is counted once, repaired in the same pass, and the next
-  pass counts zero — the counter's drain IS the observable convergence.
-- **D4 — order of gates inside `ensureIncludeMembership` is contract:** (1) the no-widening
-  tier gate (unchanged, FIRST — a repair must never widen a team-audience unit into an
-  external-visible project; the repair leg sits behind it), (2) the include-filtered probe,
-  (3) the kind-scoped exclude repair (close, then insert), (4) the plain insert + the
-  existing race-loser convergence. The race-loser probe (the pcm_current_idx catch) also
-  gains the include filter — a racing exclude must not read as a satisfied include.
+- **D3 — the carve-out inverts for AUTO shadows only, and the observable is stated
+  HONESTLY (the round's H3 corrected the draft):** the candidate SQL selects `mode='auto'`
+  target-system excludes; force excludes and retracted units stay carved out and counted.
+  The scheduler counts AFTER the pass, so prod never renders a "counted once then drained"
+  blip — the honest observables are: (1) `meta.excludeShadows` holds at 0 in the healthy
+  state and counts only UNREPAIRABLE (force / retracted-overlap) shadows, and (2) repairs
+  are legible as `method='exclude_shadow_repair'` rows in the table itself. A
+  retracted∧shadowed item stays in the count indefinitely (unrepairable by design — the
+  caveat stated, D2).
+- **D4 — order of gates inside `ensureIncludeMembership` is contract:** (1) the
+  no-widening tier gate (unchanged, FIRST — a repair must never widen a team-audience unit
+  into an external-visible project), (2) the unfiltered probe + BRANCH (D1b), (3) the
+  kind+mode scoped repair (close, then insert) or the loud refusal, (4) the plain insert +
+  the race-loser convergence with the same branch discipline (D1c). RECORDED ASYMMETRY
+  (the round's M3): the pre-existing `closeMembershipInto` opposite-project close is
+  decision- and mode-blind — a tier flip already auto-closes even a force exclude on the
+  OPPOSITE side. Benign for visibility (closing an exclude serves nothing) but it erases a
+  recorded manual decision's row; ACCEPTED here as pre-existing behavior, named as a
+  follow-up candidate rather than silently grazed.
 
 ## 1. The surface table
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
-| `ensureIncludeMembership` (lib/projects/context/memberships.ts:55-95) | probe has no decision filter → a current exclude reads as `created:false` convergence | D4's gate order: include-filtered probe; kind-scoped close-then-insert repair (`method: 'exclude_shadow_repair'`); race-loser probe include-filtered too |
-| the candidate predicate (lib/projects/context/backfill-candidates.ts, `CANDIDATE_SQL`) | the exclude-shadow is carved OUT (+ counted) | the carve-out INVERTS — the shadow is selected; the retracted carve-out stays; counters unchanged at detection |
-| `meta.excludeShadows` / `meta.retractedUnits` | detection only | unchanged meaning; the shadow count now DRAINS (counted → repaired same pass → zero next pass) |
+| `ensureIncludeMembership` (lib/projects/context/memberships.ts:55-95) | probe has no decision filter → a current exclude reads as `created:false` convergence | D4's gate order: unfiltered probe + BRANCH (include → converged; exclude → the rare branch reads `projects.kind` + tests `mode`); auto+system → close-then-insert repair (`method: 'exclude_shadow_repair'`); anything else → loud `ok:false`; the race-loser probe converges ONLY on a current include |
+| the candidate predicate (lib/projects/context/backfill-candidates.ts, `CANDIDATE_SQL`) | the exclude-shadow is carved OUT (+ counted) | the carve-out narrows to `mode='auto'` target-system excludes (now selected); force excludes + retracted units stay carved out; counters count only what stays UNREPAIRABLE |
+| `meta.excludeShadows` / `meta.retractedUnits` | detection only | unchanged null-when-unreadable contract; healthy prod value is 0 (the scheduler counts post-pass — no "drain blip" is rendered); repairs legible as `method` rows |
 | enforced reads (`lib/access/enforce.ts`) | `decision='include'` only | UNCHANGED — the repair makes the substrate satisfy the read, never the reverse |
+| schema | the `method` CHECK rejects the repair value | a named drop-and-re-add WIDENING migration + schema.sql mirror + the `MembershipMethod` union |
 
 ## 2. Mechanism notes
 
@@ -111,35 +130,48 @@ records exactly this.
 ## 3. Acceptance criteria (spec-first; exact commands)
 
 1. `npm run test:datamechanics:iso test/datamechanics/exclude-shadow-repair.datamechanics.test.ts`
-   exits 0 — real Postgres, raw-SQL-planted shadows (legal from tests; the writer cannot mint
-   them): the ROUND TRIP — an item whose target-system-project membership is a current
-   exclude is ABSENT from `visibleItemIds` for a team member (the observable hole), one
-   `reconcileItemContext` pass repairs it (exclude closed with `valid_to` set, a current
-   include with `method='exclude_shadow_repair'` exists, the partial index holds exactly one
-   current row), and the item RETURNS to the enforced read (grant → dark → repair → visible);
-   idempotency — a second pass changes nothing; the INITIATIVE arm — a planted exclude on an
-   initiative-project membership is NOT repaired and NOT closed by a reconcile of the same
-   item; the ORDER arm — inserting an include while the exclude is current violates the
-   partial index (the close-first mechanism proven, not assumed); the no-widening gate still
-   refuses BEFORE any repair (a team-audience unit + external-visible target).
-2. Same file — the SWEEP: the candidate predicate SELECTS the planted shadow (it was carved
-   out before); `countUnrepairable`/`meta.excludeShadows` counts it at detection and counts
-   ZERO on the pass after the repair (the drain); a retracted unit is still NOT selected and
-   still counted.
-3. Mutations, verdicts verbatim in the PR: (a) drop the probe's new `decision:'include'`
-   filter → the round-trip dm arm reddens (the exclude reads as convergence again); (b) drop
-   the repair leg (keep the filter) → the round-trip arm reddens differently (the loud index
-   failure — D1b's layer proven distinct); (c) widen the repair past `kind='system'` → the
-   initiative arm reddens.
-4. Full tiers green: `npm test` · dm iso (tolerated: the pre-named TZ artifact + the known
+   exits 0 — real Postgres, raw-SQL-planted shadows (the writer cannot mint them): the ROUND
+   TRIP — an item whose target-system-project membership is a current `mode='auto'` exclude
+   is ABSENT from `visibleItemIds` for a team member, one `reconcileItemContext` pass repairs
+   it (exclude closed with `valid_to` set; a current include with
+   `method='exclude_shadow_repair'`; exactly one current row on the pair), and the item
+   RETURNS to the enforced read (grant → dark → repair → visible); idempotency — a second
+   pass changes nothing; the FORCE arm — a planted `mode='force_exclude'`-style exclude in
+   the SAME position is NOT repaired, stays counted, and the reconcile returns a loud
+   `ok:false` (never `created:false` success — classification invariant 3 honored); the
+   ORDER arm — inserting an include while the exclude is current violates the partial index
+   (close-first proven, not assumed); the no-widening gate still refuses BEFORE any repair.
+2. Same file — the WRITER-DIRECT arms (the round's H1 — through `reconcileItemContext` the
+   target is always a system project, so the kind scope is unreachable and its mutation
+   would be vacuous): `ensureIncludeMembership` called DIRECTLY with an initiative-project
+   target holding a current exclude → no repair, no close, loud `ok:false`; and the
+   RACE-LOSER arm (H2): with a current exclude planted and the plain-insert path forced into
+   the index collision, the loser returns the loud refusal — never `created:false`
+   convergence.
+3. Same file — the SWEEP: the candidate predicate SELECTS the planted auto shadow and does
+   NOT select the force shadow or a retracted unit; `countUnrepairable` counts the force
+   shadow and the retracted unit, reports STRICTLY `{ excludeShadows: 0 }` (exact zero,
+   never an error-null satisfying the assertion) once only repairable-and-repaired states
+   remain.
+4. Mutations, verdicts verbatim in the PR: (a) revert the probe branch (restore the
+   unfiltered converged-on-any-row return) → the round-trip arm reddens (the exclude reads
+   as convergence again); (b) drop the repair leg (keep the branch) → the round-trip arm
+   reddens differently (the loud failure instead of the repair — D1b's layer distinct);
+   (c) drop the `kind='system'` condition → the writer-direct initiative arm reddens;
+   (d) drop the `mode='auto'` condition → the FORCE arm reddens; (e) revert the race-loser
+   branch → the race-loser arm reddens.
+5. Full tiers green: `npm test` · dm iso (tolerated: the pre-named TZ artifact + the known
    timeout-flake class, standalone-probed) · `npm run test:http:local` · `npm run check:docs`
-   · lint · tsc; ARCHITECTURE's context-partition row gains the repair sentence; the
-   TICKSTALL-2 slice-A spec's carve-out paragraph gains a pointer to this slice.
+   · lint · tsc; migration replay proven by `npm run db:test:up` (the CHECK widened in both
+   paths, from-zero + replay); ARCHITECTURE's context-partition row gains the repair
+   sentence; the TICKSTALL-2 slice-A spec's carve-out paragraph gains a pointer here.
 
 ## 4. Out of scope, named
 
-Phase-D exclusion semantics themselves (initiative-project curation — this slice only
-guarantees they can never brick the substrate when they arrive); retracted-unit repair (D2 —
+Phase-D exclusion semantics themselves (this slice guarantees an AUTOMATIC/orphan exclude
+can never brick the substrate, and that an EXPLICIT one survives every automatic run —
+invariant 3); the `closeMembershipInto` opposite-close mode-blindness (pre-existing,
+RECORDED in D4 as an accepted asymmetry — a follow-up candidate); retracted-unit repair (D2 —
 the removal path owns `state`); the head-of-line `ok:false` blocker the slice-A spec named
 (retry-not-skip is deliberate; a permanently-failing candidate is its recorded shape); any
 UI; ADOPTUNIQ-1/ADOPTPLANE-1 and the stale-row hygiene pass (separate records).
