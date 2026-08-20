@@ -90,7 +90,10 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // reconcileItemUnit never writes `state`. Selecting either would hold `scanned` off zero forever.
     // Same currency term, same reason: a CLOSED exclude must not shadow an item forever. EXCLSHADOW-1's
     // repair is precisely what will start minting closed excludes in the target project.
-    expect(sql).toMatch(/and not exists \([\s\S]*m\.valid_to is null and m\.decision = 'exclude' and m\.project_id = s\.target_id/);
+    // EXCLSHADOW-1 narrowed this carve-out to EXPLICIT excludes: an auto exclude is now
+    // repairable (the writer's shadow branch), so only force/manual shadows stay unselectable.
+    // The mode term is load-bearing — dropping it would re-hide repairable shadows forever.
+    expect(sql).toMatch(/and not exists \([\s\S]*m\.valid_to is null and m\.decision = 'exclude' and m\.mode <> 'auto' and m\.project_id = s\.target_id/);
     expect(sql, "a retracted unit is unrepairable too").toMatch(/u\.state <> 'active'/);
   });
 

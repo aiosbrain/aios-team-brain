@@ -83,19 +83,20 @@ select s.id
         and m.valid_to is null and m.project_id = s.opposite_id
    )
  )
- -- EXCLUDE-SHADOW EXCLUSION. A current exclude in the target project makes reconcile a silent
- -- no-op (ensureIncludeMembership matches any current row regardless of decision), so selecting
- -- such an item would burn ~1.3 s of reconcile every tick forever and keep scanned off zero —
- -- poisoning the only signal that says the sweep has caught up. Detection instead of repair: the
- -- count below, and EXCLSHADOW-1 owns the fix.
- -- KNOWN EDGE, stated not buried: a shadow that ALSO has an opposite-project membership keeps that
- -- membership, because we skip the whole item. That is EXCLSHADOW-1's territory too.
+ -- EXCLUDE-SHADOW EXCLUSION — NARROWED to EXPLICIT excludes (EXCLSHADOW-1). An AUTOMATIC
+ -- (mode='auto') exclude in the target project is now REPAIRABLE (ensureIncludeMembership
+ -- branches on the row and repairs close-first), so auto shadows are SELECTED and healed.
+ -- An explicit (force_*) exclude is an operator's recorded decision the sweep must never
+ -- overwrite (classification invariant 3) AND cannot repair — selecting it would burn ~1.3s
+ -- of reconcile every tick forever and keep scanned off zero. Excluded and counted.
+ -- KNOWN EDGE, stated not buried: a force-shadowed item that ALSO has an opposite-project
+ -- membership keeps that membership, because we skip the whole item.
  and not exists (
    select 1 from project_context_units u
      join project_context_memberships m
        on m.team_id = u.team_id and m.context_unit_id = u.id
     where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
-      and m.valid_to is null and m.decision = 'exclude' and m.project_id = s.target_id
+      and m.valid_to is null and m.decision = 'exclude' and m.mode <> 'auto' and m.project_id = s.target_id
  )
  -- RETRACTED-UNIT EXCLUSION, same class as the shadow above and found by the same review.
  -- Enforced reads require state='active' (lib/access/enforce), but reconcileItemUnit never WRITES
@@ -146,7 +147,7 @@ with sys as (
 )
 select
   count(distinct i.id) filter (
-    where m.id is not null and m.valid_to is null and m.decision = 'exclude'
+    where m.id is not null and m.valid_to is null and m.decision = 'exclude' and m.mode <> 'auto'
       and m.project_id = (case when i.access = 'external' then sys.external_id else sys.general_id end)
   )::int as exclude_shadows,
   count(distinct i.id) filter (where u.state <> 'active')::int as retracted_units

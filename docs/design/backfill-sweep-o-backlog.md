@@ -150,8 +150,10 @@ tests proving both selection directions plus the shadow, transition and error-pa
 on the SQL shape.
 
 **Cut, each with the reason:**
-- **The exclude-shadow REPAIR → `EXCLSHADOW-1`** (filed). Detection ships here; the fix decides a
-  product question about explicit exclusions.
+- **The exclude-shadow REPAIR → `EXCLSHADOW-1`** (filed; **since BUILT** —
+  `docs/design/exclshadow1-repair.md`: auto excludes repair close-first, explicit excludes
+  outrank the substrate per classification invariant 3, and this spec's carve-out narrowed to
+  explicit shadows only). Detection shipped here; the fix decided the product question.
 - **The chain-level problem — `github` at 18.6 min average, and the tick's ~42 min of total average
   work against a 30-minute interval.** This slice removes ~13.5 average minutes of reconcile and still
   does not make the chain fit. Named, measured, left to its own spec.
