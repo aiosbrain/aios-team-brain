@@ -22,7 +22,7 @@ reopening of the named remainder.
   recent run reports **0 created / 0 updated / 644 unchanged**. ~14 hours of chain wall-time
   per day spent re-discovering an unchanged corpus.
 - The corpus: **3 repos** (`aios-team-brain`, `aios-workspace`, `aios-alpha.github.io`) — the
-  watermark's leverage is total: a quiet tick becomes ~4 probe calls.
+  watermark's leverage is total: a quiet tick's github stage becomes ~12 cheap calls (per repo: 1 probe + 1 issues list + the metadata pair) instead of hundreds of tree/content/commit fetches.
 - The rest of the chain TODAY (24h avgs): `graph_project` 10.5 (its own cadence, 27 runs/day),
   `dense` 0.4, `slack` 0.4, `linear` 0.2, `context_backfill` **0.1** (slice A healed it — the
   3-day window's 60-min tail was pre-slice runs; the Aug-18 record's backfill numbers are
@@ -73,7 +73,10 @@ table** (D1). **Build with:** fable / high.
   `reattributeItems` re-points ITEMS only — so on a quiet repo a new alias mapping would
   freeze `code_contributions` attribution forever behind a `pushed_at`-equal skip. An alias
   change busts the hash → full pass → the scan re-resolves. Over-triggering is the safe
-  direction; alias edits are rare. THE HASH MUST BE DETERMINISTIC (round 2 M): the identity
+  direction; alias edits are rare. The hash also carries `GITHUB_CURSOR_VERSION` (Fable diff M1) — bumped when the WATERMARKED
+  legs' behavior changes (default globs, normalization, attribution rules), so a quiet repo
+  cannot stay pinned to superseded code behind an equal cursor. THE HASH MUST BE
+  DETERMINISTIC (round 2 M): the identity
   map is built in DB result order with no ORDER BY — the hash serializes SORTED entries, and
   a unit arm proves shuffled-equivalent inputs hash identically (a nondeterministic hash
   would make the watermark silently never skip — the vacuity failure).
@@ -119,7 +122,7 @@ table** (D1). **Build with:** fable / high.
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
-| `runGithubIngestion` per-repo loop (lib/ingest/run.ts:598-660) | three unconditional full passes per repo per tick | probe-first: resolve the repo's remote watermark (+1 issues probe); equality on ALL parts + configHash → record the skip and continue; any inequality/absence/error → today's full passes, then write the cursor |
+| `runGithubIngestion` per-repo loop (lib/ingest/run.ts:598-660) | three unconditional full passes per repo per tick | probe-first: ONE `GET /repos` per repo; equality on all cursor parts + configHash → SKIP the files pass and the scan's commit pagination (the issues pass and the metadata leg still run — D2/D2d) and record the skip; any inequality/absence/error → today's full passes, then write the cursor after full success |
 | the cursor store | ABSENT | `connector_cursors` (D1), single-writer = the github stage; read/write via one small module (`lib/ingest/cursors.ts`) |
 | run summary / `ingest_runs` | `unchanged` conflates "diff-synced, no change" with everything | `meta.skippedRepos`; counts untouched for real passes (D4) |
 | ingest health card / staleness readers | reads run rows | verified against the skip shape (a skipped-quiet tick is healthy) — checked, changed only if a reader misreads skips as stalls |
@@ -134,8 +137,9 @@ table** (D1). **Build with:** fable / high.
 - **Force-pushes/rebases** bump `pushed_at` → full pass (correct). **Issue edits/comments**
   bump the probe's `updated_at` → issues pass runs. **Repo renames/transfers** change the
   cursor key → absent cursor → full pass.
-- **Rate-limit accounting:** the probes cost 2 API calls per repo per tick (~96/repo/day),
-  replacing hundreds of tree/content/commit calls — strictly cheaper in every regime.
+- **Rate-limit accounting:** a quiet tick costs ~4 cheap calls per repo (the probe, the issues
+  list, the metadata pair — ~192/repo/day), replacing hundreds of tree/content/commit calls —
+  strictly cheaper in every regime.
 - **One writer:** `lib/ingest/cursors.ts` is the only writer of `connector_cursors`
   (guarded the usual way if a guard is warranted — a real contract: the probe's correctness
   depends on the cursor only advancing after full success).

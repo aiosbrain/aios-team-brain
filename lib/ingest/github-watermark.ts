@@ -17,6 +17,15 @@
 import { createHash } from "node:crypto";
 import type { IdentityMap } from "@/lib/identity/resolve";
 
+/**
+ * Bump when the BEHAVIOR of the watermarked legs changes (Fable diff M1): a new default
+ * glob set, a normalizeGithubFiles fix, a changed attribution rule — anything that would
+ * produce different rows from the SAME remote state. Without this, a quiet repo keeps
+ * skipping on an equal cursor and never receives the corrected behavior until its next
+ * push/config/roster change — a silent pin to superseded code.
+ */
+export const GITHUB_CURSOR_VERSION = 1;
+
 /** Flatten the identity map to stable strings (sorted by the hash below) — every channel the
  *  files/commit legs resolve authors through, so an alias/roster change busts the cursor. */
 export function identityMapEntries(map: IdentityMap): string[] {
@@ -78,6 +87,7 @@ export function githubRepoConfigHash(parts: {
   return createHash("sha256")
     .update(
       JSON.stringify({
+        v: GITHUB_CURSOR_VERSION,
         globs,
         history: parts.historySinceIso ?? null,
         historyDays: parts.historyDays ?? null,

@@ -53,3 +53,17 @@ describe("githubRepoConfigHash — deterministic, and sensitive to every part", 
     expect(githubRepoConfigHash({ ...base, identityEntries: [...base.identityEntries, "email:new@x=m3"] })).not.toBe(h);
   });
 });
+
+describe("fetchGithubRepoProbe — the real parser (Fable diff L2)", () => {
+  it("coerces missing/empty fields to null and throws on non-OK", async () => {
+    const { fetchGithubRepoProbe } = await import("@/lib/ingest/sources/github");
+    const ok = await fetchGithubRepoProbe({
+      owner: "a", repo: "b",
+      fetchImpl: (async () => new Response(JSON.stringify({ pushed_at: "2026-08-20T00:00:00Z", default_branch: "" }), { status: 200 })) as typeof fetch,
+    });
+    expect(ok).toEqual({ pushedAt: "2026-08-20T00:00:00Z", updatedAt: null, defaultBranch: null });
+    await expect(
+      fetchGithubRepoProbe({ owner: "a", repo: "b", fetchImpl: (async () => new Response("nope", { status: 403 })) as typeof fetch })
+    ).rejects.toThrow(/probe failed \(403\)/);
+  });
+});

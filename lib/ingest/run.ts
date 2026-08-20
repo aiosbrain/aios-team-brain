@@ -648,7 +648,11 @@ export async function runGithubIngestion(opts: { teamId?: string; force?: boolea
               const stored = await readConnectorCursor(db, auth.teamId, githubCursorKey(owner, repo));
               skipDeep = shouldSkipGithubRepo(stored, probe, configHash);
             }
-          } catch {
+          } catch (err) {
+            // Fail toward freshness — but LOUDLY (Fable diff L1): a persistently failing
+            // probe silently reverts the stage to its full 19-min cost, and the operator
+            // needs the why, not just the duration.
+            console.warn(`[ingest] github probe failed for ${full} (full pass): ${err instanceof Error ? err.message : String(err)}`);
             probe = null;
             skipDeep = false;
           }
