@@ -40,24 +40,30 @@ re-scope; round 2 attacks it.
 
 ## 0b. Decidables — defaults stated for round 2 to attack
 
-- **D1 — the batched read is a pure FETCH-SHAPE change:** for each existing item page (the
-  untouched `GRAPH_PROJECT_LIMIT`=500 pagination on `items_team_synced_idx`), ONE
-  `graph_episodes` select over the page's `source_id`s (team + source_table scoped, the
-  chunked-IN idiom from `lib/db/batch.ts` — the probe's unique key is
-  `(team_id, source_table, source_id, group_id)`, so an item can hold MULTIPLE rows
-  (fan-out groups) and the batch result is grouped by `source_id` in JS). The per-row loop
-  consumes the prefetched rows exactly where it read the probe result before
-  (`project.ts:824-829` is the ONLY site that changes). Every decision, counter, write, and
-  error path is byte-identical — the existing projection dm suites must stay green
-  UNCHANGED, which is now a real claim (nothing semantic moves), not an aspiration.
-- **D2 — per-leg timing lands in the run meta:** `meta.legMs = { walk, reconcile }`
-  (wall-clock per leg, per team summed) — the instrumentation gap both TICKFIT specs named.
-  The REVISIT TRIGGER is stated with it: if post-deploy `walk` still exceeds ~60s on quiet
-  runs, §5's candidate predicate is the recorded next design.
-- **D3 — observability is UNCHANGED:** `scanned`/`skipped`/`episodes` and every
-  no-silent-caps signal (`saturatedGroups`, `partialItems`, `pendingCleanups`,
-  `requeueThrottled`, `fanoutThrottled`) keep their exact meanings and producers. The only
-  meta addition is D2's `legMs`.
+- **D1 — the batched read, under an EXPLICIT page-snapshot contract (round 2 killed the
+  "byte-identical" claim — round 1's own inherited mistake, its words):** for each existing
+  item page, ONE `graph_episodes` select over the page's `source_id`s (+ `source_id` in the
+  select list for grouping; the seven consumed columns verified complete by round 2),
+  grouped by `source_id` BY REFERENCE (no array clones — memory is page-bounded in ITEM
+  count, not ledger bytes), rows DETERMINIZED by `group_id` before the loop consumes them.
+  Two semantic deltas, owned rather than denied: (1) SNAPSHOT TIMING — the page's ledger
+  state is read once before the loop, so a row armed mid-page (`armDeferredRowsForGroups`)
+  is seen stale-deferred and heals on the NEXT pass (eventual convergence, one-interval
+  delay, stated); (2) ORDERING — today's fan-out budget spends in UNDEFINED result order;
+  the group_id sort FIXES that undefined behavior deliberately (pinned by a capped
+  two-group ordering test). The batch select completes BEFORE the loop starts, so the D5
+  fallback always begins from an unprocessed page. `project.ts:820-829` is the only
+  read-site that changes; every write/decision path is untouched.
+- **D2 — per-leg timing lands FLAT in the run meta:** `meta.walkMs` + `meta.reconcileMs`
+  (flat numbers — the runs panel renders values via `String(v)`, an object would show
+  `[object Object]`; round 2 M), summed per team inside `finally` so failed legs retain
+  their elapsed time (walk = the page loop, reconcile = its call — round 2 verified the
+  boundaries). The REVISIT TRIGGER stated: quiet-run `walkMs` > ~60s → §5's recorded
+  predicate design.
+- **D3 — observability is UNCHANGED except the three NEW meta keys** (`walkMs`,
+  `reconcileMs`, `probeFallbackPages` — the draft's "only legMs" wording contradicted D5;
+  round 2 L): `scanned`/`skipped`/`episodes` and every no-silent-caps signal keep their
+  exact meanings and producers.
 - **D4 — the reconcile leg and the SATURATED GROUP stay OUT, named loudly:** reconcile
   still does its own O(ledger) SELECT + one 5,000-episode `listEpisodes` per group, and a
   saturated group still heals NOTHING (`reconcile.ts:286-289` — ~2,757 of ~2,761 rows with
@@ -65,17 +71,22 @@ re-scope; round 2 attacks it.
   per-name endpoint). Filed as **GRAPHSAT-1** with the evidence; this slice's claim is the
   projector WALK's round-trip term only — "drops to the reconcile leg's cost" is NOT
   claimed as O(delta) or per-run-flat (the round-1 correction, accepted).
-- **D5 — fail direction:** a batched-read error for a page → that page falls back to the
-  per-row probe path (today's behavior, page-scoped — bounded, and the fallback is VISIBLE:
-  `meta.probeFallbackPages` counts it, so a permanently failing batch read can never
-  silently re-become the 10.5-minute stage).
+- **D5 — fail direction, DURABLY visible (round 2's recording-gate HIGH):** a batched-read
+  error for a page → that page falls back to the per-row probe path (page-scoped; the batch
+  read precedes the loop, so the fallback always starts clean). `probeFallbackPages` rides
+  (1) the summary, (2) the ABORT path's partial summary + the runner's manual field merge
+  (`run.ts:218` — an aborted run must still report its fallbacks), and (3) the CALLER's
+  recording gate: a run with `probeFallbackPages > 0` (or a quiet-run `walkMs` over the
+  revisit threshold) is ALWAYS recorded to `ingest_runs`, even when the scheduler's
+  quiet-run gating would otherwise skip the row — a permanently failing batch read must
+  never be invisible. AC-pinned at the caller gate, not just the input builder.
 
 ## 1. The surface table
 
 | Surface | Today (file:line) | This slice |
 |---|---|---|
 | the per-row ledger probe (project.ts:824-829) | one sequential round trip per item, 2,826/run | one chunked-IN select per 500-item page, grouped by source_id; the loop reads the prefetch map; page-scoped per-row fallback on error (D5) |
-| run meta (projection-run.ts) | no per-leg timing | + `legMs.walk` / `legMs.reconcile`, + `probeFallbackPages` |
+| run meta (projection-run.ts + the scheduler's recording gate) | no per-leg timing; quiet runs may skip the durable row | + flat `walkMs`/`reconcileMs` + `probeFallbackPages`; fallback/slow-walk runs ALWAYS recorded; abort-path merge carries the counter |
 | everything else (eligibility query, per-row decisions, counters, reconcile, schema) | — | UNTOUCHED |
 
 ## 2. Mechanism notes
@@ -92,19 +103,24 @@ re-scope; round 2 attacks it.
 ## 3. Acceptance criteria (spec-first; exact commands)
 
 1. `npm run test:datamechanics:iso test/datamechanics/graph-batched-probe.datamechanics.test.ts`
-   exits 0 — real Postgres, a counting/wrapping db client: a converged multi-item corpus
-   run performs **≤ ceil(items/500) + K** `graph_episodes` reads in the walk (K = the
-   page-count constant, pinned exactly), not one per item — the ROUND-TRIP pin, the slice's
-   whole claim; a multi-group (fan-out) item's prefetched rows reach the loop identically
-   to the probe path (both groups' rows consumed — the grouped-map pin); the D5 arm — a
-   batch-read failure on one page falls back to per-row probes for THAT page only,
-   completes correctly, and reports `probeFallbackPages ≥ 1`.
+   exits 0 — real Postgres, a counting/wrapping db client: the ROUND-TRIP pin with K pinned
+   EXACTLY (the walk's `graph_episodes` reads = the number of item pages — one batched
+   select per page, zero per-item probes; reconcile's reads and write-path RETURNING
+   queries excluded from the count by scoping the counter to the walk); the multi-group
+   (fan-out) item's prefetched rows reach the loop grouped and SORTED by group_id (the
+   determinized-order pin: a capped two-group budget arm proves which group receives scarce
+   budget is now deterministic); the D5 arm — a batch-read failure on one page falls back
+   to per-row probes for THAT page only, completes correctly, and `probeFallbackPages ≥ 1`
+   survives BOTH the success path and a forced ABORT (the partial-summary merge pin); the
+   TRACE-EQUIVALENCE arm (round 2 L): on a stable converged corpus, a batched pass and a
+   forced-fallback pass produce identical summaries (minus the fallback counter).
 2. Existing projection dm suites (`graph-project`, `graph-tier-move`, `graph-redaction`,
    fan-out, reconcile — the full graph set) green **UNCHANGED** — the byte-identical-
    semantics claim is the review contract, and their existing `skipped`/counter pins are
    the proof it holds.
-3. `meta.legMs` present in the recorded run (dm-pinned shape: both legs, numbers ≥ 0);
-   `probeFallbackPages` absent/0 on the happy path.
+3. `meta.walkMs`/`meta.reconcileMs` present and ≥ 0 in the recorded run; the CALLER-GATE
+   arm: a run with fallbacks (or a slow quiet walk) writes a durable `ingest_runs` row even
+   under quiet-run gating; `probeFallbackPages` absent/0 on the happy path.
 4. Mutations, verdicts verbatim in the PR: (a) revert the batched read to the per-row probe
    → the round-trip pin reddens; (b) drop a group's rows from the prefetch grouping → the
    multi-group arm reddens; (c) disable the D5 fallback → its arm reddens.
