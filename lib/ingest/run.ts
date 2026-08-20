@@ -17,7 +17,9 @@ import { normalizePlaneProject, normalizePlaneDocs } from "./sources/plane-norma
 import type { PlaneConnection } from "@/lib/pm-sync/plane-client";
 import { fetchLinearTeam } from "./sources/linear";
 import { normalizeLinearTeam, normalizeLinearDocs } from "./sources/linear-normalize";
-import { fetchGithubRepoIssues } from "./sources/github";
+import { fetchGithubRepoIssues, fetchGithubRepoProbe } from "./sources/github";
+import { githubCursorKey, readConnectorCursor, writeConnectorCursor } from "@/lib/ingest/cursors";
+import { githubRepoConfigHash, identityMapEntries, shouldSkipGithubRepo } from "@/lib/ingest/github-watermark";
 import { normalizeGithubRepo } from "./sources/github-normalize";
 import { fetchGithubRepoFiles } from "./sources/github-files";
 import { normalizeGithubFiles } from "./sources/github-files-normalize";
@@ -325,6 +327,9 @@ export interface PlaneIngestSummary {
   items: number;
   errors: string[];
   skipped?: boolean;
+  /** TICKFIT-1 (github only): repos whose files+commit legs the watermark proved unchanged
+   *  and skipped this run. NOT counted into `unchanged` — a skip diff-syncs nothing. */
+  skippedRepos?: string[];
 }
 
 /** Distinct teams with at least one enabled Plane integration. */
@@ -565,13 +570,24 @@ let githubRunning = false;
  * an integration's `config.repos` is imported into its own brain project (`github-<owner>-<repo>`) as
  * one kind="task" item. GitHub is not a pm-sync provider, so idempotency is the stable row_key + sha.
  */
-export async function runGithubIngestion(opts: { teamId?: string } = {}): Promise<ImportSummary> {
+/**
+ * TICKFIT-1 (docs/design/tickfit1-github-watermark.md): the FILES and COMMIT-PAGINATION legs
+ * sit behind a per-repo remote watermark — one probe call proves a repo unchanged and skips
+ * the ~19-min re-scan of an idle corpus. The ISSUES pass and the scan's METADATA leg run
+ * every tick (issues deliberately un-watermarked — round 2: `updated_at` semantics unproven
+ * for assignee changes; metadata needs no watermark — it's two cheap calls). `force: true`
+ * (both manual "sync now" paths) bypasses the watermark: the button promises a real pass.
+ * If a scheduler run is already in flight, a forced manual run still returns
+ * `skipped: true` — "could not start, already running" (stated, accepted).
+ */
+export async function runGithubIngestion(opts: { teamId?: string; force?: boolean } = {}): Promise<ImportSummary> {
   if (githubRunning) return { ...emptyImportSummary(), skipped: true };
   githubRunning = true;
   try {
     const db = adminClient();
     const teamIds = opts.teamId ? [opts.teamId] : await teamsWithType(db, "github");
     const summary = emptyImportSummary();
+    summary.skippedRepos = [];
     for (const teamId of teamIds) {
       let integrations;
       try {
@@ -607,7 +623,44 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
             continue;
           }
           summary.projects++;
-          // Issues → tasks (one kind=task item, diff-synced).
+
+          // TICKFIT-1: the probe-first watermark. ONE `GET /repos` yields the remote's own
+          // pushed_at/updated_at/default_branch; equality with the stored cursor (+ an
+          // unchanged config/identity hash) proves the FILES tree and COMMIT history
+          // unchanged — those change only via a push or a branch switch — and skips the two
+          // expensive legs below. Probe error → full pass (fail toward freshness). The probe
+          // runs even under `force` so a manual pass still refreshes the cursor; `force`
+          // only bypasses the SKIP decision. The hash covers the window's stored IDENTITY
+          // (anchor + days), never a resolved instant — the default window's `now − 90d`
+          // slides every tick and would make the cursor never match (the vacuity failure).
+          const idMap = await buildIdentityMap(db, auth.teamId);
+          const configHash = githubRepoConfigHash({
+            fileGlobs,
+            historySinceIso: history?.sinceIso ?? null,
+            historyDays: history?.days ?? null,
+            identityEntries: identityMapEntries(idMap),
+          });
+          let probe: Awaited<ReturnType<typeof fetchGithubRepoProbe>> | null = null;
+          let skipDeep = false;
+          try {
+            probe = await fetchGithubRepoProbe({ owner, repo, token });
+            if (!opts.force) {
+              const stored = await readConnectorCursor(db, auth.teamId, githubCursorKey(owner, repo));
+              skipDeep = shouldSkipGithubRepo(stored, probe, configHash);
+            }
+          } catch (err) {
+            // Fail toward freshness — but LOUDLY (Fable diff L1): a persistently failing
+            // probe silently reverts the stage to its full 19-min cost, and the operator
+            // needs the why, not just the duration.
+            console.warn(`[ingest] github probe failed for ${full} (full pass): ${err instanceof Error ? err.message : String(err)}`);
+            probe = null;
+            skipDeep = false;
+          }
+          const errorsBefore = summary.errors.length;
+
+          // Issues → tasks (one kind=task item, diff-synced). ALWAYS runs — deliberately NOT
+          // watermarked (TICKFIT-1 design round 2: issue `updated_at` is not proven to bump
+          // for every normalized field, e.g. assignees, and this is the cheap leg).
           try {
             const fetched = await fetchGithubRepoIssues({ owner, repo, token, sinceIso: history?.sinceIso });
             const payload = normalizeGithubRepo(fetched);
@@ -623,36 +676,53 @@ export async function runGithubIngestion(opts: { teamId?: string } = {}): Promis
           // attributed to its last-commit author (resolved via the identity map by git email, then
           // login), NOT the ingesting connector — else arcs/events built on repo docs name no human.
           // Unresolved author → authorMemberId:null (honestly unattributed), never the connector.
-          try {
-            const fetched = await fetchGithubRepoFiles({ owner, repo, token, globs: fileGlobs });
-            const payloads = normalizeGithubFiles(fetched);
-            summary.items += payloads.length;
-            const idMap = await buildIdentityMap(db, auth.teamId);
-            for (const payload of payloads) {
-              const fm = payload.frontmatter ?? {};
-              const authorMemberId = resolveMember(idMap, {
-                email: typeof fm.author_email === "string" ? fm.author_email : undefined,
-                key: typeof fm.author_login === "string" ? fm.author_login : undefined,
-              });
-              const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
-              if (res.status === "created") summary.created++;
-              else if (res.status === "updated") summary.updated++;
-              else summary.unchanged++;
+          // Behind the watermark: the tree can change only via push/branch-switch, both probed.
+          if (!skipDeep) {
+            try {
+              const fetched = await fetchGithubRepoFiles({ owner, repo, token, globs: fileGlobs });
+              const payloads = normalizeGithubFiles(fetched);
+              summary.items += payloads.length;
+              for (const payload of payloads) {
+                const fm = payload.frontmatter ?? {};
+                const authorMemberId = resolveMember(idMap, {
+                  email: typeof fm.author_email === "string" ? fm.author_email : undefined,
+                  key: typeof fm.author_login === "string" ? fm.author_login : undefined,
+                });
+                const res = await ingestItem(db, auth, payload, "team", { authorMemberId });
+                if (res.status === "created") summary.created++;
+                else if (res.status === "updated") summary.updated++;
+                else summary.unchanged++;
+              }
+            } catch (err) {
+              summary.errors.push(`${full} files: ${err instanceof Error ? err.message : "import failed"}`);
             }
-          } catch (err) {
-            summary.errors.push(`${full} files: ${err instanceof Error ? err.message : "import failed"}`);
           }
           // Contributions + commit volume → codebases + code_contributions via the GitHub API
           // (no checkout). Auto-populates the per-person + commit-volume graphs on link. No-op for
           // a repo a real `aios-ingest scan` already owns (the scanner's rows are richer).
+          // The METADATA leg always runs (two cheap calls — star/language/branch freshness is
+          // untouched by the watermark); only the commit PAGINATION sits behind it.
           try {
             // The cutoff is RESOLVED here, once, from the stored anchor (AIO-807) — never re-derived
             // downstream from `days`. `days: 0` ("No history") means no BACKFILL, not "no contributor
             // graphs ever": a window recomputed as `now − 0` each tick left every commit pushed
             // between two ticks outside both windows, forever. Absent entry → null → 90d, as before.
-            await ingestGithubApiScan(db, auth, { owner, repo, slug: repo, token: token ?? "", sinceIso: commitSinceIso(history, Date.now()) });
+            await ingestGithubApiScan(db, auth, {
+              owner, repo, slug: repo, token: token ?? "",
+              sinceIso: commitSinceIso(history, Date.now()),
+              skipCommits: skipDeep,
+            });
           } catch (err) {
             summary.errors.push(`${full} contributions: ${err instanceof Error ? err.message : "sync failed"}`);
+          }
+
+          if (skipDeep) {
+            summary.skippedRepos!.push(full);
+          } else if (probe && summary.errors.length === errorsBefore) {
+            // Advance the watermark ONLY after a fully-successful pass over THIS repo — a failed
+            // pass must not orphan the delta behind an advanced cursor (spec D2).
+            const w = await writeConnectorCursor(db, auth.teamId, githubCursorKey(owner, repo), { ...probe, configHash });
+            if (!w.ok) console.error(`[ingest] github cursor write failed for ${full}: ${w.error}`);
           }
         }
       }

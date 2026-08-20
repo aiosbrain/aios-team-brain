@@ -232,7 +232,8 @@ export async function syncGithubNow(
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
   try {
-    const s = await runGithubIngestion({ teamId: ctx.teamId });
+    // TICKFIT-1 D2f: the admin "Run now" button promises a REAL pass — bypass the watermark.
+    const s = await runGithubIngestion({ teamId: ctx.teamId, force: true });
     if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
     revalidatePath(`/t/${teamSlug}/admin/integrations`);
     return {
