@@ -80,7 +80,10 @@ describe("codebaseScanPayloadSchema — coverage denominator (1.22)", () => {
     for (const key of ["tests_passed", "tests_skipped", "tests_failed"] as const) {
       const r = codebaseScanPayloadSchema.safeParse(payload({ tests_total: 10, [key]: 11 }));
       expect(r.success, `${key} > tests_total must be rejected`).toBe(false);
-      expect(r.success ? "" : r.error.issues[0]?.message).toMatch(new RegExp(key));
+      // `toContain`, not `new RegExp(key)`: building a pattern from a variable is a real
+      // footgun (an unescaped metacharacter silently changes what is matched) and the
+      // assertion here is plain substring containment anyway.
+      expect(r.success ? "" : (r.error.issues[0]?.message ?? "")).toContain(key);
     }
   });
 
