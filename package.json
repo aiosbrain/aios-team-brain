@@ -38,6 +38,8 @@
     "db:test:up": "bash scripts/db-test-up.sh",
     "db:test:down": "docker compose -f compose.test.yml down -v",
     "test:datamechanics": "vitest run --config vitest.datamechanics.config.ts",
+    "test:migrate-from-existing": "node scripts/migrate-from-existing.mjs --mirror-check",
+    "test:migrate-from-existing:sweep": "node scripts/migrate-from-existing.mjs --deletion-sweep-only",
     "test:datamechanics:local": "DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.datamechanics.config.ts",
     "test:datamechanics:iso": "bash scripts/dm-isolated.sh",
     "db:test:iso:down": "bash scripts/dm-isolated.sh --down",

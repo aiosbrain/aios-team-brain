@@ -1,0 +1,48 @@
+name: Migration mirror sweep (nightly)
+
+# The exhaustive form of the mirror-check that runs per-PR in the `datamechanics-tests` lane:
+# rebuild the schema from zero once per migration, each time omitting exactly ONE migration, and
+# assert the catalog fingerprint never moves. That is the machine-checkable form of the
+# `postgres/migrations/README.md` rule "Mirror the change into postgres/schema.sql" — an object
+# only a migration creates makes a from-zero database and a deployed one disagree forever.
+#
+# It is 76 full schema loads, but MEASURED at ~18-26s locally (~1min at a runner penalty) — cheap,
+# not slow. It is nightly rather than per-PR because the per-PR `npm run test:migrate-from-existing`
+# already catches the same class in seconds by comparing schema.sql alone against schema.sql +
+# migrations; this job exists for the residue that cheap comparison cannot see (e.g. two migrations
+# that happen to produce the same object). If a red nightly ever goes unread — it is not a required
+# check and GitHub disables schedules after 60 days of repo inactivity — promote this into the
+# per-PR `datamechanics-tests` job and delete this workflow. The cost is not the obstacle.
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily
+  workflow_dispatch:
+
+jobs:
+  mirror-sweep:
+    name: Deletion-observability sweep (every migration mirrored)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # prior schema states come from git tags, not fixture files
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run test:migrate-from-existing:sweep
