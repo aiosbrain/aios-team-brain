@@ -12,6 +12,8 @@ from pathlib import Path
 from aios_ingest.analyzers.codebase import (
     _detect_scaffolding,
     _entries_under,
+    _resolve_in_repo,
+    _tracked_entries,
     _read_coverage,
     analyze_history,
     analyze_repo,
@@ -46,18 +48,21 @@ def _init(tmp_path):
 
 
 def test_entries_under_excludes_doc_files(tmp_path):
-    tracked = [
-        ".claude/skills/foo/SKILL.md",
-        ".claude/skills/bar/SKILL.md",
-        ".claude/skills/README.md",
-        ".claude/skills/INDEX.md",
-        ".claude/commands/deploy.md",
-        "pkg/.claude/skills/nested/SKILL.md",
+    entries = [
+        ("100644", "0" * 40, f)
+        for f in (
+            ".claude/skills/foo/SKILL.md",
+            ".claude/skills/bar/SKILL.md",
+            ".claude/skills/README.md",
+            ".claude/skills/INDEX.md",
+            ".claude/commands/deploy.md",
+            "pkg/.claude/skills/nested/SKILL.md",
+        )
     ]
     # skills: real dirs only (README.md / INDEX.md excluded), incl. nested .claude
-    assert _entries_under(tmp_path, tracked, "skills") == {"foo", "bar", "nested"}
+    assert _entries_under(entries, tmp_path, "skills") == {"foo", "bar", "nested"}
     # commands are single .md files — counted (only README/INDEX are excluded)
-    assert _entries_under(tmp_path, tracked, "commands") == {"deploy.md"}
+    assert _entries_under(entries, tmp_path, "commands") == {"deploy.md"}
 
 
 def _write_skill(repo: Path, rel: str) -> None:
@@ -139,7 +144,7 @@ def test_skills_count_pack_source_layout(tmp_path):
     repo = _init(tmp_path)
     for name in ("ast-grep", "code-review", "git-master"):
         _write_skill(repo, f"skills/{name}")
-    (repo / "skills" / "README.md").write_text("index, not a skill")
+    (repo / "skills" / "README.md").write_text("index, not a skill")  # no SKILL.md
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "init")
 
@@ -166,8 +171,29 @@ def test_pack_source_needs_the_skill_md_marker(tmp_path):
     assert _detect_scaffolding(repo)["skills_count"] == 0
 
 
+def test_resolve_in_repo_rejects_every_escape():
+    """The containment invariant, asserted on the unit.
+
+    Asserting it only through `skills_count` would pass for the wrong reason: an
+    out-of-repo prefix matches nothing in `git ls-files` output either way, so the
+    count is over-determined and the check could be deleted with the suite green.
+    """
+    # in-repo targets resolve, relative to the LINK's directory
+    assert _resolve_in_repo(".claude/skills", "../.agents/skills") == ".agents/skills"
+    assert _resolve_in_repo(".claude/skills", "../skills") == "skills"
+    assert _resolve_in_repo("pkg/.claude/skills", "../skills") == "pkg/skills"
+    assert _resolve_in_repo("pkg/.claude/skills", "../../skills") == "skills"
+    assert _resolve_in_repo(".claude/skills", "./sub") == ".claude/sub"
+    # …and every way out of the checkout is refused
+    assert _resolve_in_repo(".claude/skills", "/etc/passwd") is None
+    assert _resolve_in_repo(".claude/skills", "../../outside/skills") is None
+    assert _resolve_in_repo(".claude/skills", "../../../../../../tmp") is None
+    assert _resolve_in_repo(".claude/skills", "C:/windows") is None
+    assert _resolve_in_repo(".claude/skills", "") is None
+
+
 def test_symlink_escaping_the_repo_is_ignored(tmp_path):
-    """A link out of the checkout must not be followed (or crash the scan)."""
+    """End-to-end: a link out of the checkout contributes nothing and doesn't crash."""
     outside = tmp_path / "outside"
     _write_skill(outside, "skills/leaked")
     repo = _init(tmp_path / "repo")
@@ -179,6 +205,61 @@ def test_symlink_escaping_the_repo_is_ignored(tmp_path):
     s = _detect_scaffolding(repo)
     assert s["skills_count"] == 1
     assert s["commands_count"] == 0  # the escaping link contributes nothing
+
+
+def test_symlink_layout_survives_a_core_symlinks_false_checkout(tmp_path):
+    """`core.symlinks=false` writes the link as a REGULAR FILE holding its target.
+
+    That is git's default on Windows without Developer Mode, and any clone made with
+    `-c core.symlinks=false`. A filesystem `is_symlink()` gate reads False there and
+    the symlinked layout silently reverts to counting ZERO — the original bug, back.
+    """
+    origin = _init(tmp_path / "origin")
+    for name in ("applicant-pipeline", "event-launch"):
+        _write_skill(origin, f".agents/skills/{name}")
+    (origin / ".claude").mkdir()
+    (origin / ".claude" / "skills").symlink_to(Path("..") / ".agents" / "skills")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-m", "init")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "-c", "core.symlinks=false", str(origin), str(clone)],
+        check=True,
+        capture_output=True,
+    )
+    assert not (clone / ".claude" / "skills").is_symlink()  # a plain file on disk
+    assert (clone / ".claude" / "skills").read_text().strip() == "../.agents/skills"
+    assert _detect_scaffolding(clone)["skills_count"] == 2
+
+
+def test_non_ascii_skill_names_are_counted(tmp_path):
+    """git C-quotes non-ASCII paths unless `core.quotePath=false`.
+
+    Left on, `git ls-files` emits `"skills/caf\303\251/SKILL.md"` — leading quote
+    included — and every prefix match downstream misses it.
+    """
+    repo = _init(tmp_path)
+    _write_skill(repo, "skills/café")
+    _write_skill(repo, "skills/日本語")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert all(not p.startswith('"') for _, _, p in _tracked_entries(repo))
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_pack_root_accepts_a_suffixed_skills_dir(tmp_path):
+    """`optional-skills/` is a real pack root in the wild; `test/` is not."""
+    repo = _init(tmp_path)
+    _write_skill(repo, "skills/core")
+    _write_skill(repo, "optional-skills/finance")
+    _write_skill(repo, "test/skill-scan-fixtures/dummy")  # a FIXTURE, not a skill
+    _write_skill(repo, "gui/server/pretend")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert _detect_scaffolding(repo)["skills_count"] == 2
 
 
 def test_agents_md_basename_no_false_positive(tmp_path):
