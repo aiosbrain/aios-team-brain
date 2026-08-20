@@ -175,25 +175,101 @@ def _analyze_git(
     }
 
 
-def _entries_under(tracked: list[str], subdir: str) -> set[str]:
-    """Top-level entry names directly under any `.claude/<subdir>/` directory.
+_SKILL_MANIFEST = "skill.md"  # marker file that makes a directory a skill
+_ENTRY_SKIP = {"readme.md", "index.md"}  # documentation, not a skill/command
 
-    Handles both a root-level `.claude/skills/foo/...` and a nested
-    `pkg/.claude/skills/foo` — `str.find` locates the marker wherever it sits, so
-    a root path (index 0) no longer trips the leading-slash assumption that the
-    earlier split-based logic crashed on.
+
+def _resolve_in_repo(repo: Path, rel: str) -> str | None:
+    """Repo-relative path `rel` with symlinks resolved, or None if it escapes the repo.
+
+    The repo root is resolved too, because a checkout can itself sit under a symlinked
+    parent (macOS `/tmp` → `/private/tmp` is the common case) — comparing an unresolved
+    root against a resolved child would read every link as an escape.
+    """
+    try:
+        root = repo.resolve()
+        target = (root / rel).resolve()
+        return target.relative_to(root).as_posix()
+    except (OSError, ValueError, RuntimeError):
+        return None  # ValueError == outside the repo; RuntimeError == symlink loop
+
+
+def _heads_under(tracked: list[str], prefix: str) -> set[str]:
+    """First path segment of every tracked file under `prefix/`, docs excluded."""
+    names: set[str] = set()
+    marker = prefix.rstrip("/") + "/"
+    for f in tracked:
+        if not f.startswith(marker):
+            continue
+        head = f[len(marker):].split("/", 1)[0]
+        if head and head.lower() not in _ENTRY_SKIP:
+            names.add(head)
+    return names
+
+
+def _entries_under(repo: Path, tracked: list[str], subdir: str) -> set[str]:
+    """Names of the skills/commands a repo ships, across the three real layouts.
+
+    Returns entry NAMES, never paths, and that is load-bearing: a symlinked
+    `.claude/skills` and its target both resolve to the same names, so the set
+    dedupes them for free. Counting paths (or summing per-layout counts) would
+    double-count `aios-marketing`, where `.claude/skills` → `.agents/skills` and
+    BOTH are visible to `git ls-files`. It also keeps the pre-existing collapse of a
+    root and a nested skill sharing a name (e.g. `aios-workspace` ships `evolve` both
+    at the root and under `scaffold/`) — widening that is a separate decision.
+
+    The three layouts:
+
+    1. **Plain** — `.claude/<subdir>/<name>/...`, at the root or nested under a
+       package (`str.find` locates the marker wherever it sits).
+    2. **Symlinked dir** — `.claude/skills` is a symlink to an in-tree directory
+       (`aios-marketing` points it at `.agents/skills`). `git ls-files` emits the
+       symlink as ONE entry with no trailing path, so a prefix match never fires;
+       we readlink it and enumerate the tracked files under the resolved target.
+       A link pointing outside the repo is ignored (`_resolve_in_repo`).
+    3. **Pack source** — a top-level `skills/<name>/**/SKILL.md`, used by repos that
+       ARE the skill pack (`aios-engineering-harness`); those skills are deliberately
+       not under `.claude/`. Gated on the `SKILL.md` marker so an ordinary source
+       directory called `skills/` can't inflate the count, and restricted to the repo
+       root so a vendored/nested `skills/` can't either. There is no equivalent marker
+       for commands, so this layout is recognised for skills only.
     """
     marker = f".claude/{subdir}/"
-    skip = {"readme.md", "index.md"}  # documentation, not a skill/command
     names: set[str] = set()
+
+    # (1) plain — a tracked file somewhere under `.claude/<subdir>/`
     for f in tracked:
         idx = f.find(marker)
         if idx == -1:
             continue
-        rest = f[idx + len(marker):]
-        head = rest.split("/", 1)[0]
-        if head and head.lower() not in skip:
+        head = f[idx + len(marker):].split("/", 1)[0]
+        if head and head.lower() not in _ENTRY_SKIP:
             names.add(head)
+
+    # (2) symlinked `.claude/<subdir>` — one tracked entry, no trailing path
+    link = f".claude/{subdir}"
+    for f in tracked:
+        if f != link and not f.endswith(f"/{link}"):
+            continue
+        if not (repo / f).is_symlink():
+            continue
+        target = _resolve_in_repo(repo, f)
+        if not target or target == f:
+            continue
+        names |= _heads_under(tracked, target)
+
+    # (3) pack source — top-level `skills/<name>/**/SKILL.md`
+    if subdir == "skills":
+        for f in tracked:
+            if not f.startswith("skills/"):
+                continue
+            parts = f[len("skills/"):].split("/")
+            if len(parts) < 2 or parts[-1].lower() != _SKILL_MANIFEST:
+                continue
+            head = parts[0]
+            if head and head.lower() not in _ENTRY_SKIP:
+                names.add(head)
+
     return names
 
 
@@ -205,8 +281,8 @@ def _detect_scaffolding(repo: Path) -> dict[str, Any]:
         "has_claude_md": (repo / "CLAUDE.md").is_file(),
         "has_agents_md": len(agents) > 0,
         "agents_md_count": len(agents),
-        "skills_count": len(_entries_under(tracked, "skills")),
-        "commands_count": len(_entries_under(tracked, "commands")),
+        "skills_count": len(_entries_under(repo, tracked, "skills")),
+        "commands_count": len(_entries_under(repo, tracked, "commands")),
         "files": len(tracked),
         "loc": _count_loc(repo, tracked),
     }

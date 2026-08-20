@@ -32,13 +32,20 @@ def _git(repo, *args, when: str | None = None):
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
 
 
+def _git_out(repo, *args) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+
+
 def _init(tmp_path):
+    Path(tmp_path).mkdir(parents=True, exist_ok=True)
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "branch", "-m", "main")
     return tmp_path
 
 
-def test_entries_under_excludes_doc_files():
+def test_entries_under_excludes_doc_files(tmp_path):
     tracked = [
         ".claude/skills/foo/SKILL.md",
         ".claude/skills/bar/SKILL.md",
@@ -48,9 +55,130 @@ def test_entries_under_excludes_doc_files():
         "pkg/.claude/skills/nested/SKILL.md",
     ]
     # skills: real dirs only (README.md / INDEX.md excluded), incl. nested .claude
-    assert _entries_under(tracked, "skills") == {"foo", "bar", "nested"}
+    assert _entries_under(tmp_path, tracked, "skills") == {"foo", "bar", "nested"}
     # commands are single .md files — counted (only README/INDEX are excluded)
-    assert _entries_under(tracked, "commands") == {"deploy.md"}
+    assert _entries_under(tmp_path, tracked, "commands") == {"deploy.md"}
+
+
+def _write_skill(repo: Path, rel: str) -> None:
+    d = repo / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("---\nname: x\n---\nbody\n")
+
+
+# ── AIO-996: the three real skill layouts ────────────────────────────────────
+# Each fixture asserts the counted total equals the number of distinct SKILL.md
+# files the repo actually ships. Layout 1 is the pre-existing behaviour and is
+# pinned here so a fix for 2/3 can't silently move it.
+
+
+def test_skills_count_plain_claude_layout(tmp_path):
+    """Layout 1 — `.claude/skills/<name>/SKILL.md`."""
+    repo = _init(tmp_path)
+    for name in ("alpha", "beta", "gamma"):
+        _write_skill(repo, f".claude/skills/{name}")
+    (repo / ".claude" / "skills" / "README.md").write_text("docs, not a skill")
+    (repo / ".claude" / "commands").mkdir()
+    (repo / ".claude" / "commands" / "deploy.md").write_text("cmd")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    s = _detect_scaffolding(repo)
+    assert len(list(repo.rglob("SKILL.md"))) == 3
+    assert s["skills_count"] == 3
+    assert s["commands_count"] == 1
+
+
+def test_skills_count_symlinked_claude_dir(tmp_path):
+    """Layout 2 — `.claude/skills` is a symlink to an in-tree `.agents/skills`.
+
+    `git ls-files` emits the symlink as ONE entry with no trailing path, so the
+    prefix match never fires and these skills used to count as ZERO
+    (aios-marketing: 2 real skills, read as 0).
+    """
+    repo = _init(tmp_path)
+    for name in ("applicant-pipeline", "event-launch"):
+        _write_skill(repo, f".agents/skills/{name}")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "skills").symlink_to(Path("..") / ".agents" / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    tracked = _git_out(repo, "ls-files").split()
+    assert ".claude/skills" in tracked  # the symlink, tracked as a lone entry
+    assert len(list((repo / ".agents").rglob("SKILL.md"))) == 2
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_symlinked_skills_are_not_double_counted(tmp_path):
+    """The symlink AND its target are both visible to `git ls-files`.
+
+    A naive fix (summing per-layout counts, or keying on path) reports 4 here.
+    The correct answer is 2 — there are only two SKILL.md files on disk.
+    """
+    repo = _init(tmp_path)
+    for name in ("one", "two"):
+        _write_skill(repo, f"skills/{name}")  # pack-source layout AND link target
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "skills").symlink_to(Path("..") / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    tracked = _git_out(repo, "ls-files").split()
+    assert ".claude/skills" in tracked
+    assert "skills/one/SKILL.md" in tracked  # both views tracked simultaneously
+    assert len(list(repo.rglob("SKILL.md"))) == 2
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_skills_count_pack_source_layout(tmp_path):
+    """Layout 3 — top-level `skills/<name>/SKILL.md`, no `.claude/` at all.
+
+    The repo IS the skill pack (aios-engineering-harness: 18 skills, read as 0).
+    """
+    repo = _init(tmp_path)
+    for name in ("ast-grep", "code-review", "git-master"):
+        _write_skill(repo, f"skills/{name}")
+    (repo / "skills" / "README.md").write_text("index, not a skill")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert len(list(repo.rglob("SKILL.md"))) == 3
+    assert _detect_scaffolding(repo)["skills_count"] == 3
+
+
+def test_pack_source_needs_the_skill_md_marker(tmp_path):
+    """An ordinary source dir called `skills/` must NOT inflate the count.
+
+    Without the SKILL.md gate, any CLI with a `skills/` package would read as
+    agentic — the false positive that makes the metric meaningless.
+    """
+    repo = _init(tmp_path)
+    for name in ("parse", "render"):
+        d = repo / "skills" / name
+        d.mkdir(parents=True)
+        (d / "index.ts").write_text("export const x = 1;\n")
+    # nested/vendored pack sources are out of scope too — root-level only
+    _write_skill(repo, "vendor/pkg/skills/borrowed")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert _detect_scaffolding(repo)["skills_count"] == 0
+
+
+def test_symlink_escaping_the_repo_is_ignored(tmp_path):
+    """A link out of the checkout must not be followed (or crash the scan)."""
+    outside = tmp_path / "outside"
+    _write_skill(outside, "skills/leaked")
+    repo = _init(tmp_path / "repo")
+    _write_skill(repo, ".claude/skills/real")
+    (repo / ".claude" / "commands").symlink_to(Path("..") / ".." / "outside" / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    s = _detect_scaffolding(repo)
+    assert s["skills_count"] == 1
+    assert s["commands_count"] == 0  # the escaping link contributes nothing
 
 
 def test_agents_md_basename_no_false_positive(tmp_path):
