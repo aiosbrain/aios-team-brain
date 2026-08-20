@@ -49,26 +49,60 @@ table** (D1). **Build with:** fable / high.
   `ingest_runs.meta` (per-run log, not state). Additive migration + schema.sql mirror (the
   ADD-COLUMN rule does not apply — new table). Lowest-shared-layer: any future connector can
   use the same store.
-- **D2 — the cursor stores the REMOTE's own values, compared by EQUALITY — never our clock.**
-  For github: `{ pushedAt, issuesUpdatedAt, configHash }`. Skip the files+commits passes iff
-  the repo's current `pushed_at` (one `GET /repos/{owner}/{repo}`) equals the stored
-  `pushedAt`; skip the issues pass iff the newest issue `updated_at` (one
-  `GET …/issues?state=all&sort=updated&direction=desc&per_page=1`) equals the stored
-  `issuesUpdatedAt`. Remote-value equality is clock-skew-free; any inequality, absence, or
-  probe ERROR → run the FULL pass (fail toward freshness, never toward staleness). The cursor
-  is written ONLY after a fully-successful pass over that repo (a failed pass must not
-  advance the watermark and orphan the delta).
-- **D2b — `configHash` busts the cursor on config change:** the hash covers the repo's
-  `fileGlobs` + resolved history window. A changed glob or window means a different item set
-  even at an identical `pushed_at`; hash mismatch → full pass. (The identity map is NOT in
-  the hash: author re-mapping is reconcile-side, not re-ingest.)
+- **D2 — the cursor stores the REMOTE's own values, compared by EQUALITY — never our clock
+  (REVISED at design round 1: the repo probe carries THREE values, and the metadata refresh
+  rides the probe itself).** For github: `{ pushedAt, updatedAt, defaultBranch,
+  issuesUpdatedAt, configHash }`. ONE `GET /repos/{owner}/{repo}` yields `pushed_at`,
+  `updated_at`, AND `default_branch` (plus description/language/stars — see D2d); the
+  files+commits SKIP requires equality on ALL THREE (round 1 H1: a default-branch switch or
+  settings change does not bump `pushed_at` — `updated_at`/`default_branch` catch it). The
+  issues pass skips iff the newest `/issues?state=all&sort=updated&direction=desc&per_page=1`
+  `updated_at` equals the stored `issuesUpdatedAt`. That probe surface includes PRs (a
+  SUPERSET of the normalized issues-only set) — deliberately: a superset watermark can only
+  produce FALSE POSITIVES (PR churn runs a redundant issues pass — fail toward freshness,
+  cheap), never a miss, because `updated_at` is a now-stamp — any later change strictly
+  exceeds the prior maximum (round 1's miss scenario requires a backdated update, which user
+  actions cannot produce). NAMED BOUNDED RACE: an update landing in the SAME SECOND as the
+  cursor's value after the pass's fetch keeps equality and is missed until the next real
+  change — accepted and documented (the F3-style over/under bound: heals on any subsequent
+  activity; the window is one clock second per pass). Any inequality, absence, or probe
+  ERROR → the FULL pass. The cursor is written ONLY after a fully-successful pass over that
+  repo (a failed pass must not advance the watermark and orphan the delta).
+- **D2b — `configHash` busts the cursor on config OR IDENTITY change (round 1 H2):** the
+  hash covers the repo's `fileGlobs` + resolved history window + an IDENTITY-MAP hash. Both
+  the files pass and the commit scan resolve authors at scan time
+  (`buildIdentityMap`/`resolveMember`; `code_contributions.member_id`), and
+  `reattributeItems` re-points ITEMS only — so on a quiet repo a new alias mapping would
+  freeze `code_contributions` attribution forever behind a `pushed_at`-equal skip. An alias
+  change busts the hash → full pass → the scan re-resolves. Over-triggering is the safe
+  direction; alias edits are rare.
+- **D2d — the probe IS the metadata refresh (round 1 H1's second half, folded as a WIN):**
+  `ingestGithubApiScan` writes repo metadata (description, homepage, language, stars, forks,
+  archive status, default_branch) that `pushed_at` does not track. The probe response
+  ALREADY CARRIES all of it — so the metadata upsert runs from the probe body EVERY tick at
+  zero extra API cost, and only the expensive legs (tree walk, file fetches, commit
+  pagination) sit behind the watermark. Star/metadata freshness is therefore BETTER than
+  today's, not worse.
+- **D2e — cursor LIFECYCLE (round 1 M): unlinking a repo DELETES its cursor row** (the
+  unlink path already prunes `integrations.config.repoHistory` — it gains the cursor delete).
+  The scenario that makes this load-bearing: unlink purges the repo's items (the
+  `lib/ingest/purge` removal path); a relink with an unchanged remote would otherwise skip
+  over an EMPTY corpus and never re-ingest until the remote changes. Orphan rows from
+  pre-delete eras are harmless (absent config → the repo is never iterated) but the delete
+  is the contract. 
+- **D2f — manual "sync now" BYPASSES the watermark (round 1 M, decided):**
+  `runGithubIngestion` gains `force?: boolean`; the manual-sync path passes `force: true`
+  (an operator clicking sync expects a real pass — probe-verified "up to date" is not what
+  the button promises); the scheduler path uses the watermark. Pinned both directions.
 - **D3 — the stored history ANCHOR is untouched, stated as a hard constraint.** The issues
   pass, when it RUNS, still fetches the full stored window verbatim (`history?.sinceIso`) and
   diff-syncs exactly as today — the recorded plan-review blocker (a recomputed window
   diff-deletes imported issues as they age out, guard-pinned) is not grazed. The watermark
   only decides WHETHER the pass runs, never what window it covers.
-- **D4 — run-summary honesty:** a skipped repo is reported as skipped (`meta.skippedRepos`,
-  names), not silently absent — and NOT counted into `unchanged` (which counts diff-synced
+- **D4 — run-summary honesty:** a skipped repo is reported as skipped (`meta.skippedRepos`
+  = count + `meta.skippedRepoNames` = a comma-joined string — the admin Recent Runs panel
+  renders generic meta via `String(v)`, so both shapes display legibly; round 1 L), not
+  silently absent — and NOT counted into `unchanged` (which counts diff-synced
   rows; a skip diff-syncs nothing). The `0/0/644` shape becomes `0/0/0 + skipped:3` on a
   quiet tick; dashboards/queries reading `unchanged` as "how much was scanned" see the
   honest new number. The ingest health card's staleness logic must be checked against the
