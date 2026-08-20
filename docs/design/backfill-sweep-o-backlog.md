@@ -144,14 +144,15 @@ Not changed here; named so a reviewer does not have to rediscover it.
 
 ## Scope
 
-**In:** the corrected candidate predicate keyed on `items.access` and its `runSql` query; the
-`meta.excludeShadows` count; removal of the convergence short-circuit and its `shortCircuit` metric;
+**In:** the corrected candidate predicate keyed on `items.access` and its `runSql` query; the `meta.excludeShadows` count (EXCLSHADOW-1 later NARROWED the carve-out + this count to EXPLICIT excludes — auto shadows are now selected and healed); removal of the convergence short-circuit and its `shortCircuit` metric;
 tests proving both selection directions plus the shadow, transition and error-path properties; a guard
 on the SQL shape.
 
 **Cut, each with the reason:**
-- **The exclude-shadow REPAIR → `EXCLSHADOW-1`** (filed). Detection ships here; the fix decides a
-  product question about explicit exclusions.
+- **The exclude-shadow REPAIR → `EXCLSHADOW-1`** (filed; **since BUILT** —
+  `docs/design/exclshadow1-repair.md`: auto excludes repair close-first, explicit excludes
+  outrank the substrate per classification invariant 3, and this spec's carve-out narrowed to
+  explicit shadows only). Detection shipped here; the fix decided the product question.
 - **The chain-level problem — `github` at 18.6 min average, and the tick's ~42 min of total average
   work against a 30-minute interval.** This slice removes ~13.5 average minutes of reconcile and still
   does not make the chain fit. Named, measured, left to its own spec.
@@ -166,10 +167,11 @@ on the SQL shape.
    `items.access` by raw update and deliberately LEAVE `project_context_units.audience` stale, because
    a fixture that tidies the unit first lets a predicate keyed on the wrong audience pass — the
    permanent-tier-leak state, and the one my first two drafts would have skipped.
-3. **data-mechanics** — an item whose only current membership in the target project is
-   `decision = 'exclude'` is NOT selected: `scanned === 0` and the shadow item is untouched. The
-   load-bearing assertion is `scanned`/no-side-effects, NOT `drained`, which is true either way
-   because it only means "the page came back short".
+3. **data-mechanics** — (RE-SPECIFIED at EXCLSHADOW-1, which split this contract) an item whose
+   only current membership in the target project is an EXPLICIT (`mode <> 'auto'`) exclude is
+   NOT selected and untouched; an AUTOMATIC (`mode='auto'`) exclude IS selected and healed by
+   the sweep (`scanned === 1`, the include restored with `method='exclude_shadow_repair'`).
+   The load-bearing assertion remains `scanned`/side-effects, NOT `drained`.
 4. **data-mechanics** — a converged corpus reports `scanned: 0` **with the convergence short-circuit
    removed**, so the result is attributable to the predicate rather than to a heuristic that never ran.
 5. **data-mechanics** — the TICKSTALL-1 contract survives: a candidate set larger than one batch

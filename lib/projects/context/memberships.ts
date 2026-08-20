@@ -16,7 +16,11 @@ export type MembershipMethod =
   | "rule"
   | "embedding"
   | "llm"
-  | "manual";
+  | "manual"
+  // EXCLSHADOW-1: the repair include written when reconcile closes an AUTOMATIC exclude
+  // found in the item's target SYSTEM project (the table is its own audit trail — this value
+  // is how a repair stays legible). CHECK-widened by migration 20260820150000.
+  | "exclude_shadow_repair";
 
 export interface EnsureIncludeArgs {
   projectId: string;
@@ -68,15 +72,23 @@ export async function ensureIncludeMembership(
     return { ok: false, refused: true, error: "no-widening: a team-audience unit cannot enter an external-visible project" };
   }
 
+  // EXCLSHADOW-1 D1b: the probe is UNFILTERED (the partial unique index guarantees ≤1
+  // current row per pair) and BRANCHES — an exclude is never returned as convergence. The
+  // hot path (include found / nothing found) costs exactly what it did before; only the
+  // rare exclude branch pays the extra reads.
   const { data: existing } = await db
     .from("project_context_memberships")
-    .select("id")
+    .select("id, decision, mode")
     .eq("team_id", teamId)
     .eq("project_id", args.projectId)
     .eq("context_unit_id", args.contextUnitId)
     .is("valid_to", null)
     .maybeSingle();
-  if (existing) return { ok: true, created: false };
+  const current = existing as { id: string; decision: string; mode: string } | null;
+  if (current) {
+    if (current.decision === "include") return { ok: true, created: false };
+    return repairExcludeShadow(db, teamId, args, current);
+  }
 
   const { error } = await db.from("project_context_memberships").insert({
     team_id: teamId,
@@ -91,14 +103,88 @@ export async function ensureIncludeMembership(
     // Race loser on pcm_current_idx: another writer created the current row first — converge.
     const { data: winner } = await db
       .from("project_context_memberships")
-      .select("id")
+      .select("id, decision")
       .eq("team_id", teamId)
       .eq("project_id", args.projectId)
       .eq("context_unit_id", args.contextUnitId)
       .is("valid_to", null)
       .maybeSingle();
-    if (winner) return { ok: true, created: false };
+    // EXCLSHADOW-1 D1c: the race-loser takes the SAME branch discipline — converged ONLY on
+    // a current INCLUDE. An unfiltered "any current row = converged" here would resurrect
+    // the silent exclude masquerade through the back door for exactly the states the repair
+    // is scoped out of (explicit/force excludes, non-system projects).
+    const w = winner as { decision?: string } | null;
+    if (w && w.decision === "include") return { ok: true, created: false };
+    if (w) return { ok: false, error: "current membership is a non-include row (exclude) — not converged" };
     return { ok: false, error: error.message };
+  }
+  return { ok: true, created: true };
+}
+
+/**
+ * EXCLSHADOW-1: repair an AUTOMATIC exclude found in the target SYSTEM project — the state
+ * that made an item invisible to every enforced read (`enforce` serves only includes) while
+ * reading as `created:false` convergence. THE SCOPE IS THE RULING (spec D1, from
+ * classification invariant 3): an explicit (any non-auto mode) exclude is an operator's
+ * recorded decision and is NEVER auto-repaired; a non-system project is a curation surface
+ * this repair must not touch. Both conditions live HERE, in the writer — not in any caller.
+ * Close-first is index-forced: the partial unique index refuses a second current row, so the
+ * exclude's `valid_to` must be stamped before the include can exist.
+ */
+async function repairExcludeShadow(
+  db: DbClient,
+  teamId: string,
+  args: EnsureIncludeArgs,
+  row: { id: string; mode: string }
+): Promise<WriteResult> {
+  if (row.mode !== "auto") {
+    return { ok: false, error: "current membership is an explicit exclude — never auto-repaired (classification invariant 3)" };
+  }
+  const { data: proj } = await db
+    .from("projects")
+    .select("kind")
+    .eq("team_id", teamId)
+    .eq("id", args.projectId)
+    .maybeSingle();
+  if (!proj || (proj as { kind: string }).kind !== "system") {
+    return { ok: false, error: "current membership is an exclude in a non-system project — not repaired (a curation surface, not the substrate)" };
+  }
+  const { error: closeErr } = await db
+    .from("project_context_memberships")
+    .update({ valid_to: new Date().toISOString() })
+    .eq("team_id", teamId)
+    .eq("id", row.id)
+    .is("valid_to", null);
+  if (closeErr) return { ok: false, error: `exclude-shadow close failed: ${closeErr.message}` };
+  const { error } = await db.from("project_context_memberships").insert({
+    team_id: teamId,
+    project_id: args.projectId,
+    context_unit_id: args.contextUnitId,
+    decision: "include",
+    mode: "auto",
+    method: "exclude_shadow_repair",
+    decided_by: args.decidedBy ?? null,
+  });
+  if (error) {
+    // CONCURRENT-REPAIRER convergence (Codex diff M1 — the second-order bug in the first
+    // fold): two reconcilers can both read the same auto exclude; the loser's close matches
+    // zero rows WITHOUT error, its insert then collides with the winner's include, and
+    // returning ok:false here reported a CONVERGED membership as a batch-stopping failure.
+    // Same discipline as the plain path's race loser: re-probe, converge ONLY on an include.
+    const { data: winner } = await db
+      .from("project_context_memberships")
+      .select("decision")
+      .eq("team_id", teamId)
+      .eq("project_id", args.projectId)
+      .eq("context_unit_id", args.contextUnitId)
+      .is("valid_to", null)
+      .maybeSingle();
+    if ((winner as { decision?: string } | null)?.decision === "include") {
+      return { ok: true, created: false };
+    }
+    // Half-repair fail direction (spec §2): the exclude is closed and the include absent —
+    // the item is now a plain no-current-include candidate, completed by the next pass.
+    return { ok: false, error: `exclude-shadow repair: close succeeded, include insert failed (${error.message}) — next pass completes` };
   }
   return { ok: true, created: true };
 }

@@ -1188,8 +1188,11 @@ create table if not exists project_context_memberships (
   context_unit_id uuid not null,
   decision text not null default 'include' check (decision in ('include','exclude')),
   mode text not null default 'auto' check (mode in ('auto','force_include','force_exclude')),
+  -- 'exclude_shadow_repair' (EXCLSHADOW-1): the include written when reconcile closes an
+  -- AUTOMATIC exclude in the target system project. Widened by migration 20260820150000
+  -- (from-zero gets it here; an existing DB gets it from the migration's drop-and-re-add).
   method text not null default 'ingestion_project'
-    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual')),
+    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual','exclude_shadow_repair')),
   decided_by uuid,
   valid_from timestamptz not null default now(),
   valid_to timestamptz,
