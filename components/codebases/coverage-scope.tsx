@@ -1,4 +1,7 @@
 import { AlertTriangle } from "lucide-react";
+import { isUnscopedCoverage } from "@/lib/codebases/score";
+
+export { isUnscopedCoverage };
 
 /**
  * Coverage rendered WITH the scope it was measured over (brain-api 1.22 / AIO-995).
@@ -7,25 +10,21 @@ import { AlertTriangle } from "lucide-react";
  * instrumented. `99% (436 / 3,140 lines)` is. One component so the card and the detail
  * breakdown state the scope the same way and can't drift into two different stories.
  *
- * Three states, and the middle one is the one that matters:
- *   • scope known and broad   → the percentage, with its counts, plain.
- *   • scope known and NARROW  → the same, visually marked. Not an error, not a penalty; a
+ * **The scope is not optional furniture.** An earlier version of this file rendered the counts
+ * when they existed and nothing when they didn't, which left a repo with no denominator showing
+ * exactly the bare `99%` this feature was built to abolish — and that is the state of EVERY row
+ * until its next scan, so the common case was the unfixed one. Unknown scope now renders as
+ * "scope unknown", explicitly. The three states are:
+ *
+ *   • scope known and broad   → the percentage with its counts, plain.
+ *   • scope known and NARROW  → the same, visually marked. Not an error and not a penalty; a
  *                               reader who skims the number needs to see that it covers a
  *                               fraction of the repo before they compare it to anything.
- *   • scope UNKNOWN           → the percentage alone, and NO scope furniture at all. Every scan
- *                               taken before 1.22 is in this state and can never leave it, so
- *                               "unknown" must render as silence, never as a zero, a dash in a
- *                               denominator slot, or an implied "whole repo".
+ *   • scope UNKNOWN           → the percentage plus an explicit "scope unknown" marker. Never
+ *                               a zero, never a dash in a denominator slot, and never silence —
+ *                               silence is what let the number read as a whole-repo claim.
  */
 
-/**
- * Below this share of the repository, a coverage figure is marked as narrow in the UI.
- *
- * A DISPLAY threshold only — it feeds no score, and nothing downstream branches on it. Half the
- * repository is the honest reading of "this number describes most of the code"; the value is a
- * judgement call and is meant to be tuned once a full scan cycle has populated real breadth
- * across the fleet (see `coverageBreadthPct` in lib/codebases/score.ts).
- */
 export const NARROW_BREADTH_PCT = 50;
 
 export function isNarrowCoverage(breadthPct: number | null): boolean {
@@ -36,7 +35,13 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-/** The scope suffix — `(436 / 3,140 lines)`. Renders nothing when the denominator is unknown. */
+/**
+ * The scope suffix — `(436 / 3,140 lines)`, or an explicit `scope unknown`.
+ *
+ * Renders SOMETHING in every case where a percentage is shown. `loc = 0` counts as unknown:
+ * there is no denominator to divide by, and a repo with no counted lines cannot have a
+ * meaningful breadth.
+ */
 export function CoverageScope({
   linesInstrumented,
   loc,
@@ -48,7 +53,16 @@ export function CoverageScope({
   breadthPct: number | null;
   className?: string;
 }) {
-  if (linesInstrumented == null || loc == null || loc <= 0) return null;
+  if (linesInstrumented == null || loc == null || loc <= 0) {
+    return (
+      <span
+        title="This scan did not report how many lines the coverage run measured, so the percentage above could describe the whole repository or a small corner of it. Re-scan with a current scanner to record the scope."
+        className={`font-mono text-[10px] text-ink-tertiary italic ${className}`}
+      >
+        (scope unknown)
+      </span>
+    );
+  }
   const narrow = isNarrowCoverage(breadthPct);
   // The counts and the ratio are separate props, so a caller can supply the pair without the
   // percentage. Say "N of M lines" then, rather than interpolating a literal "null%".

@@ -155,6 +155,25 @@ export function coverageBreadthPct(i: ScanInputs): number | null {
 }
 
 /**
+ * True when a scan reported a coverage percentage but no denominator to read it against.
+ *
+ * Lives here rather than beside the component that renders it because it is a fact about the
+ * DATA, not the presentation, and both the dashboard components and the server-side team KPI
+ * need the same answer. `loc <= 0` counts as unscoped: there is no denominator to divide by.
+ *
+ * This is the predicate behind the change's headline requirement — a percentage in this state
+ * must never render as though its scope were known, which is what every pre-1.22 row does
+ * until its next scan.
+ */
+export function isUnscopedCoverage(
+  coveragePct: number | null,
+  linesInstrumented: number | null,
+  loc: number | null
+): boolean {
+  return coveragePct != null && (linesInstrumented == null || loc == null || loc <= 0);
+}
+
+/**
  * The counts a test-result report yields. A narrow input (not the full {@link ScanInputs}) so the
  * read paths in `lib/metrics/codebases.ts` can call {@link scanPartial} on a `code_metrics` row
  * directly, instead of re-deriving the rule and letting the two drift.
@@ -183,6 +202,12 @@ export function scanPartial(i: RunIntegrity): boolean | null {
   // Positive evidence first: a reported skip or failure makes the run partial no matter what
   // else is missing. Knowing 91 cases were skipped is enough, even if the total never arrived.
   if ((i.tests_skipped ?? 0) > 0 || (i.tests_failed ?? 0) > 0) return true;
+  // A run that executed NOTHING is the most degraded run there is, and it is the one shape
+  // that slips through a skip/fail check — nothing was skipped because nothing was collected.
+  // It reaches here from a filter that matched no files, a runner that crashed before
+  // collection, or a config pointed at the wrong directory, and it still ships a coverage
+  // percentage. Zero tests is not a clean bill of health.
+  if (i.tests_total === 0) return true;
   // `false` is the strong claim "this run was complete", so it needs the evidence to say it:
   // BOTH counts explicitly reported as zero. Defaulting a null to 0 here and returning false
   // would let the UI print "none skipped" on the strength of a field that was never sent —

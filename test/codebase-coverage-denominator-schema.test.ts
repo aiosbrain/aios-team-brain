@@ -87,6 +87,86 @@ describe("codebaseScanPayloadSchema — coverage denominator (1.22)", () => {
     }
   });
 
+  it("rejects run parts that only fit the total INDIVIDUALLY", () => {
+    // Three separate `part <= tests_total` checks accept thirty outcomes in a ten-test run.
+    const r = codebaseScanPayloadSchema.safeParse(
+      payload({ tests_total: 10, tests_passed: 10, tests_skipped: 10, tests_failed: 10 })
+    );
+    expect(r.success).toBe(false);
+    expect(r.success ? "" : (r.error.issues[0]?.message ?? "")).toContain("tests_total");
+
+    // Summing exactly to the total is fine; under-summing is unallocated, not contradictory.
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({ tests_total: 10, tests_passed: 5, tests_skipped: 3, tests_failed: 2 })
+      ).success
+    ).toBe(true);
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({ tests_total: 10, tests_passed: 5, tests_skipped: 3, tests_failed: 1 })
+      ).success
+    ).toBe(true);
+    // The KNOWN parts alone already exceed the total. Requiring all three to be present before
+    // summing would have waved this through — 9 passed and 9 failed is impossible in a ten-test
+    // run whatever the skip count turns out to be.
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({ tests_total: 10, tests_passed: 9, tests_skipped: null, tests_failed: 9 })
+      ).success
+    ).toBe(false);
+    // …but a known part that leaves room is fine with the rest unknown.
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({ tests_total: 10, tests_passed: 4, tests_skipped: null, tests_failed: null })
+      ).success
+    ).toBe(true);
+  });
+
+  it("rejects a percentage that contradicts the counts beside it", () => {
+    // The two arrive by different routes — lcov recomputes `pct` from its own LH/LF sums, while
+    // Istanbul trusts the tool's `pct` and reads covered/total separately — so nothing upstream
+    // forces them to agree. 99% over 0-of-100 covered lines is two incompatible claims.
+    const r = codebaseScanPayloadSchema.safeParse(
+      payload({
+        test_coverage_pct: 99,
+        test_coverage_lines_total: 100,
+        test_coverage_lines_covered: 0,
+      })
+    );
+    expect(r.success).toBe(false);
+    expect(r.success ? "" : (r.error.issues[0]?.message ?? "")).toContain("test_coverage_pct");
+
+    // Agreement passes, and rounding is not a contradiction (tolerance is a full point).
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({
+          test_coverage_pct: 99,
+          test_coverage_lines_total: 100,
+          test_coverage_lines_covered: 99,
+        })
+      ).success
+    ).toBe(true);
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({
+          test_coverage_pct: 99.08,
+          test_coverage_lines_total: 436,
+          test_coverage_lines_covered: 432,
+        })
+      ).success
+    ).toBe(true);
+    // A zero denominator has no implied percentage to check against.
+    expect(
+      codebaseScanPayloadSchema.safeParse(
+        payload({
+          test_coverage_pct: 99,
+          test_coverage_lines_total: 0,
+          test_coverage_lines_covered: 0,
+        })
+      ).success
+    ).toBe(true);
+  });
+
   it("a half-known pair is NOT an incoherence — unknown contradicts nothing", () => {
     // The coherence checks must only fire when both sides are present, or an upgraded scanner
     // that reports skips but not a total would start failing at the boundary.

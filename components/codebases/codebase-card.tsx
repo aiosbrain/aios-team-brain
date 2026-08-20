@@ -4,7 +4,7 @@ import type { CodebaseSummary } from "@/lib/metrics/codebases";
 import { timeAgo } from "@/components/format";
 import { Sparkline } from "@/components/sparkline";
 import { ScoreRing } from "./score-ring";
-import { CoverageScope, PartialRunBadge, isNarrowCoverage } from "./coverage-scope";
+import { CoverageScope, PartialRunBadge, isNarrowCoverage, isUnscopedCoverage } from "./coverage-scope";
 
 export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseSummary }) {
   return (
@@ -34,12 +34,17 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <span>
             <span className="font-semibold text-ink">{cb.health_score}</span> health
           </span>
-          {/* Coverage never renders alone when its scope is known: a percentage over a small
-              slice of the repo has to look different from one over all of it (AIO-995). */}
+          {/* Coverage NEVER renders alone (AIO-995). A percentage over a small slice of the
+              repo must look different from one over all of it — and a percentage whose scope
+              nobody recorded must say so, rather than borrowing the authority of one that did. */}
           <span className="inline-flex items-baseline gap-1">
             <span
               className={`font-semibold ${
-                isNarrowCoverage(cb.coverage_breadth_pct) ? "text-amber-500/90" : "text-ink"
+                isNarrowCoverage(cb.coverage_breadth_pct)
+                  ? "text-amber-500/90"
+                  : isUnscopedCoverage(cb.test_coverage_pct, cb.test_coverage_lines_total, cb.loc)
+                    ? "text-ink-secondary"
+                    : "text-ink"
               }`}
             >
               {cb.test_coverage_pct == null ? "—" : `${cb.test_coverage_pct}%`}

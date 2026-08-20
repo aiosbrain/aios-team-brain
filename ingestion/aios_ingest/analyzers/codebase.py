@@ -402,7 +402,7 @@ def _count_loc(repo: Path, tracked: list[str]) -> int:
 
 
 def _read_coverage(repo: Path) -> dict[str, float | None]:
-    """Read a committed coverage report if present (Istanbul json or lcov).
+    """Read a coverage report from the working tree if present (Istanbul json or lcov).
 
     Returns {"lines", "functions", "branches"} percentages, each None when that
     dimension isn't reported (or no report exists at all), plus ``lines_total`` /
@@ -512,7 +512,7 @@ _TEST_REPORT_JUNIT = (
 
 
 def _read_test_results(repo: Path) -> dict[str, int | None]:
-    """Read a committed test-result report if present (Vitest/Jest JSON, or JUnit XML).
+    """Read a test-result report from the working tree if present (Vitest/Jest JSON, or JUnit XML).
 
     Returns ``{"total", "passed", "skipped", "failed"}`` counts, each None when no report
     exists (brain-api 1.22, AIO-995).
@@ -576,8 +576,12 @@ def _junit_suite_totals(root: Any) -> dict[str, int] | None:
     ``testsuite`` with the parent carrying rolled-up counts, so summing every descendant counts
     each case twice — inflating the totals and able to make a clean run report as partial.
     """
-    all_suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    suites = [s for s in all_suites if s.find("testsuite") is None]
+    # Match on the LOCAL name. ElementTree renders a namespaced element's tag as
+    # `{urn:junit}testsuite`, so an equality test against "testsuite" silently matches nothing
+    # and a perfectly good `<testsuites xmlns="urn:junit">` report becomes "no report" — the
+    # exact silent degradation these fields exist to surface.
+    all_suites = [el for el in root.iter() if _local_name(el.tag) == "testsuite"]
+    suites = [el for el in all_suites if not _has_child_suite(el)]
     agg = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
     seen = False
     for suite in suites:
@@ -595,7 +599,7 @@ def _junit_suite_totals(root: Any) -> dict[str, int] | None:
 def _read_test_results_junit(repo: Path) -> dict[str, int | None] | None:
     """JUnit XML. None when no parseable report is there.
 
-    Parsed with ``defusedxml``: a scanned repo's committed report is not necessarily a file we
+    Parsed with ``defusedxml``: a scanned repo's report is not necessarily a file we
     wrote (``aios-ingest scan`` runs against whatever checkout it is pointed at), and the stdlib
     ``xml.etree.ElementTree`` is vulnerable to XXE and entity-expansion attacks. A malformed
     document degrades to unknown; it must never abort a scan.
@@ -717,6 +721,13 @@ def analyze_repo(
 
     git = _analyze_git(repo, window_days)
     scaff = _detect_scaffolding(repo)
+    # Coverage and test-result reports are read from the WORKING TREE, not from HEAD. They are
+    # build artefacts — `coverage/` is gitignored in most repos here — so requiring them to be
+    # committed would mean they could essentially never be populated. The consequence, which
+    # brain-api.md states normatively: two scans of the SAME commit can legitimately disagree
+    # (a CI runner that just ran the suite vs. a clean clone), and since a metrics point is
+    # keyed (codebase_id, head_sha), the later push replaces the earlier. That is not new in
+    # 1.22 — `test_coverage_pct` has always worked this way — but 1.22 makes it visible.
     coverage = _read_coverage(repo)
     tests = _read_test_results(repo)
     readiness = score_readiness(repo, rubric_path)
@@ -749,18 +760,27 @@ def _codebase_block(slug: str, full_name: str, meta: dict[str, Any]) -> dict[str
 
 
 def _coherent_pair(total: int | None, part: int | None) -> tuple[int | None, int | None]:
-    """Drop a numerator/denominator pair to UNKNOWN when the numerator doesn't fit inside it.
+    """Drop a numerator/denominator pair to UNKNOWN unless it is a coherent pair of counts.
 
     The brain rejects an incoherent pair at the boundary (422) — and that 422 kills the WHOLE
-    scan, contributions and GitHub issues included, not just the offending field. One malformed
-    committed report would therefore take a repo's entire analytics offline, which is a worse
-    version of the silent-degradation failure this feature exists to prevent.
+    scan, contributions and GitHub issues included, not just the offending field. It also
+    returns before `recordIngestRun`, so the failure is absent from the ingest run log. One
+    malformed report would therefore take a repo's entire analytics offline, silently. That is
+    a worse version of the degradation this feature exists to expose.
 
-    So the scanner never ships a pair it knows is wrong. Incoherent means the report was parsed
-    wrong or written wrong; "we don't know" is the honest reading of that, and it is the one
-    state the rest of this change is built to represent safely.
+    So the scanner never ships a group the brain will refuse. Two ways a group can be wrong,
+    and the second is the one that got away the first time:
+
+    * a numerator that doesn't fit its denominator (``covered > total``), and
+    * **a NEGATIVE count.** The brain's schema is `int().nonnegative()`, and `-2 > -1` is
+      false — so an ordering test alone waves negatives straight through. A count below zero
+      is not a small error in a real measurement; it means the file was not the report we
+      thought it was.
+
+    Incoherent means the report was parsed wrong or written wrong, and "we don't know" is the
+    honest reading of that — the one state the rest of this change is built to represent safely.
     """
-    if total is not None and part is not None and part > total:
+    if _is_incoherent_group(total, [part]):
         return None, None
     return total, part
 
@@ -768,16 +788,71 @@ def _coherent_pair(total: int | None, part: int | None) -> tuple[int | None, int
 def _coherent_run(
     total: int | None, passed: int | None, skipped: int | None, failed: int | None
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    """Same rule for the test-run counts: any part exceeding the total voids the whole group.
+    """Same rule for the test-run counts, plus one the pairwise form cannot express.
 
     Voided as a GROUP rather than per-field, because the counts are only meaningful together —
     keeping `skipped` from a report whose `total` we just disbelieved would let the dashboard
     call a run partial on evidence we rejected.
+
+    The extra rule: the parts must FIT TOGETHER inside the total, not merely each fit
+    individually. `{total: 10, passed: 10, skipped: 10, failed: 10}` passes three separate
+    `part <= total` checks and still describes thirty outcomes in a ten-test run.
     """
-    parts = [p for p in (passed, skipped, failed) if p is not None]
-    if total is not None and any(p > total for p in parts):
+    parts = [passed, skipped, failed]
+    if _is_incoherent_group(total, parts):
+        return None, None, None, None
+    # Summed over the parts that are KNOWN, not only when all three are: passed/skipped/failed
+    # are disjoint outcomes, so the known ones alone can never legitimately exceed the total —
+    # an unknown part can only add more. Requiring all three first missed
+    # `{total: 10, passed: 9, failed: 9}`, already impossible without knowing the skips.
+    # Under-summing stays legal: an unallocated remainder is not a contradiction.
+    known = [p for p in parts if p is not None]
+    if total is not None and known and sum(known) > total:
         return None, None, None, None
     return total, passed, skipped, failed
+
+
+def _local_name(tag: Any) -> str:
+    """`{urn:junit}testsuite` -> `testsuite`. A plain tag passes through unchanged."""
+    text = str(tag)
+    return text.rsplit("}", 1)[-1] if text.startswith("{") else text
+
+
+def _has_child_suite(element: Any) -> bool:
+    """True when this suite wraps another — i.e. it is a rollup, not a leaf. Namespace-agnostic."""
+    return any(_local_name(child.tag) == "testsuite" for child in element)
+
+
+def _coherent_coverage(
+    pct: float | None, total: int | None, covered: int | None
+) -> tuple[int | None, int | None]:
+    """Void the coverage COUNTS when they contradict the percentage reported beside them.
+
+    The two arrive by different routes and nothing upstream forces them to agree: the lcov path
+    recomputes `pct` from the same LH/LF sums it reports, so it is self-consistent by
+    construction, but the Istanbul path trusts whatever `pct` the tool wrote and reads
+    `covered`/`total` independently. A tool that reports 99% next to 0-of-100 covered lines is
+    making two incompatible claims, and the brain refuses the pair at the boundary — which
+    costs the whole scan.
+
+    The COUNTS are what gets dropped, never the percentage: `test_coverage_pct` is the
+    pre-1.22 headline that every existing row and consumer already depends on, so the safe
+    degradation is back to exactly what this repo reported yesterday — a percentage of unknown
+    scope, now rendered as such. Tolerance matches the brain's (1 point) so the two cannot
+    disagree about what counts as a contradiction.
+    """
+    if pct is None or total is None or covered is None or total <= 0:
+        return total, covered
+    implied = (100.0 * covered) / total
+    return (None, None) if abs(implied - pct) > 1 else (total, covered)
+
+
+def _is_incoherent_group(total: int | None, parts: list[int | None]) -> bool:
+    """True when a count group cannot be a real measurement: any negative, or a part > total."""
+    for value in (total, *parts):
+        if value is not None and value < 0:
+            return True
+    return total is not None and any(p is not None and p > total for p in parts)
 
 
 def _metrics_block(
@@ -799,6 +874,7 @@ def _metrics_block(
     # report either, and `.get` on {} yields None = unknown, which is exactly right.
     t = tests or {}
     cov_lines, cov_covered = _coherent_pair(c.get("lines_total"), c.get("lines_covered"))
+    cov_lines, cov_covered = _coherent_coverage(c.get("lines"), cov_lines, cov_covered)
     t_total, t_passed, t_skipped, t_failed = _coherent_run(
         t.get("total"), t.get("passed"), t.get("skipped"), t.get("failed")
     )

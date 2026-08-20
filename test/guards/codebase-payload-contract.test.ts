@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 
 /**
- * Server-side conformance guard for the Brain API 1.15 codebase-scan payload
+ * Server-side conformance guard for the Brain API 1.22 codebase-scan payload
  * (POST /api/v1/codebases, incl. the optional provenance-only `metrics.codebase_health`
  * object — AIO-609). Mirror of aios-workspace/test/codebase-payload-contract.test.mjs,
  * run against vendored copies of the shared contract artifacts
@@ -28,23 +28,23 @@ import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 const CONTRACT_DIR = join(import.meta.dirname, "..", "fixtures", "contract");
 
 const PINNED = {
-  "codebase-payload-1.15.schema.json":
-    "239905d2245db871181759ef70c2de4e72ac51fec9f3cbdd4bb92476ae30e168",
-  "codebase-payload-1.15-fixtures.json":
-    "ea328673822f30439b94448f5a5aeb02746f6bbc682fefbc32bc5b0bc22ca4b8",
+  "codebase-payload-1.22.schema.json":
+    "f6c7ab22b7fa25e8bb581bc7ca7863e5228835d4830cf6946dbc8c63af0afb95",
+  "codebase-payload-1.22-fixtures.json":
+    "8f6c964ae91d7a64baabb28c721aff002223b3c5e43994808209f6b7f1d31f2d",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
 
 const fixtures = JSON.parse(
-  readFileSync(join(CONTRACT_DIR, "codebase-payload-1.15-fixtures.json"), "utf8"),
+  readFileSync(join(CONTRACT_DIR, "codebase-payload-1.22-fixtures.json"), "utf8"),
 ) as {
   readonly version: string;
   readonly valid: readonly { readonly name: string; readonly payload: unknown }[];
   readonly invalid: readonly { readonly name: string; readonly payload: unknown }[];
 };
 
-describe("brain-api 1.15 codebase-payload conformance", () => {
+describe("brain-api 1.22 codebase-payload conformance", () => {
   it("vendored contract artifacts are byte-identical to the pinned canonical revision", () => {
     for (const [file, sha] of Object.entries(PINNED)) {
       const bytes = readFileSync(join(CONTRACT_DIR, file));
@@ -52,8 +52,8 @@ describe("brain-api 1.15 codebase-payload conformance", () => {
     }
   });
 
-  it("fixtures file tracks the 1.15 contract revision, both buckets populated", () => {
-    expect(fixtures.version).toBe("1.15");
+  it("fixtures file tracks the 1.22 contract revision, both buckets populated", () => {
+    expect(fixtures.version).toBe("1.22");
     expect(fixtures.valid.length).toBeGreaterThanOrEqual(3);
     expect(fixtures.invalid.length).toBeGreaterThanOrEqual(3);
   });

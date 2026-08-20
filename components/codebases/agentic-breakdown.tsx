@@ -133,7 +133,10 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
               {b.tests_total ? ` of ${b.tests_total} tests` : ""}
             </span>
           </span>
-        ) : b.scan_partial === false && b.tests_total ? (
+        ) : b.scan_partial === false && b.tests_total != null ? (
+          // `!= null`, not truthiness: `tests_total === 0` is falsy, and a zero-test run used
+          // to silently render nothing at all. `scanPartial` now flags zero as partial so this
+          // branch can't see it, but the guard states the intent rather than relying on that.
           <Check2 ok label={`${b.tests_total} tests, none skipped`} />
         ) : null}
       </div>

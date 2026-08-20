@@ -10,8 +10,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aios_ingest.analyzers.codebase import (
+    _coherent_coverage,
     _coherent_pair,
     _coherent_run,
+    _int_or_none,
     _detect_scaffolding,
     _entries_under,
     _read_coverage,
@@ -356,7 +358,7 @@ def test_no_github_token_means_no_issues(tmp_path, monkeypatch):
     payload = analyze_repo(str(repo), slug="x", full_name="org/x")
     assert payload["issues"] == []
     m = payload["metrics"]
-    assert m["test_coverage_pct"] is None  # no committed report
+    assert m["test_coverage_pct"] is None  # no report on disk
     assert m["test_coverage_functions_pct"] is None
     assert m["test_coverage_branches_pct"] is None
 
@@ -520,6 +522,103 @@ def test_junit_nested_rollup_suites_are_not_double_counted(tmp_path):
         "</testsuites>"
     )
     assert _read_test_results(tmp_path) == {"total": 10, "passed": 8, "skipped": 2, "failed": 0}
+
+
+def test_negative_counts_are_voided_to_unknown_not_shipped():
+    """A count below zero must never reach the brain — it 422s the payload and drops the scan.
+
+    An ordering test alone waves negatives through, because `-2 > -1` is false. That is how the
+    first version of this guard shipped: it closed the collection-error path and left the class
+    open. The route returns before `recordIngestRun`, so the loss would not even reach the run
+    log.
+    """
+    assert _coherent_pair(-1, -2) == (None, None)
+    assert _coherent_pair(100, -1) == (None, None)
+    assert _coherent_pair(-1, None) == (None, None)
+    assert _coherent_run(10, -1, 0, 0) == (None, None, None, None)
+    assert _coherent_run(-5, None, None, None) == (None, None, None, None)
+    assert _int_or_none(-5) == -5, "the raw reader stays literal; the choke point is the normalizer"
+
+
+def test_run_parts_must_fit_inside_the_total_together():
+    """`{total:10, passed:10, skipped:10, failed:10}` passes three pairwise checks and is absurd."""
+    assert _coherent_run(10, 10, 10, 10) == (None, None, None, None)
+    assert _coherent_run(10, 5, 3, 2) == (10, 5, 3, 2)  # sums exactly
+    assert _coherent_run(10, 5, 3, 1) == (10, 5, 3, 1)  # under-sums: unallocated, not contradictory
+    # The KNOWN parts alone already exceed the total: 9 passed + 9 failed is impossible in a
+    # ten-test run whatever the skip count turns out to be. Summing only when all three are
+    # present would have shipped this.
+    assert _coherent_run(10, 9, None, 9) == (None, None, None, None)
+    # A known part that leaves room is fine with the rest unknown.
+    assert _coherent_run(10, 4, None, None) == (10, 4, None, None)
+
+
+def test_coverage_counts_are_voided_when_they_contradict_the_percentage():
+    """99% next to 0-of-100 covered lines is two incompatible claims; the brain 422s the pair.
+
+    The COUNTS drop, never the percentage — degrading back to exactly what this repo reported
+    before 1.22 (a percentage of unknown scope), rather than losing the whole scan.
+    """
+    assert _coherent_coverage(99.0, 100, 0) == (None, None)
+    assert _coherent_coverage(99.0, 100, 99) == (100, 99)
+    # Rounding is not a contradiction: tools round to 2dp and the tolerance is a full point.
+    assert _coherent_coverage(99.0, 3, 3) == (3, 3)
+    # Nothing to compare against.
+    assert _coherent_coverage(None, 100, 99) == (100, 99)
+    assert _coherent_coverage(99.0, 0, 0) == (0, 0)
+
+
+def test_namespaced_junit_is_read_not_silently_dropped(tmp_path):
+    """ElementTree renders a namespaced tag as `{urn:junit}testsuite`.
+
+    An equality test against "testsuite" matches nothing, so a perfectly good report became
+    "no report" — the exact silent degradation these fields exist to surface.
+    """
+    (tmp_path / "junit.xml").write_text(
+        '<testsuites xmlns="urn:junit">'
+        '<testsuite tests="229" skipped="91" failures="0" errors="0"/>'
+        "</testsuites>"
+    )
+    assert _read_test_results(tmp_path) == {
+        "total": 229,
+        "passed": 138,
+        "skipped": 91,
+        "failed": 0,
+    }
+
+
+def test_namespaced_junit_rollups_are_still_leaf_only(tmp_path):
+    """The leaf rule must survive the namespace fix — both use the local name."""
+    (tmp_path / "junit.xml").write_text(
+        '<testsuites xmlns="urn:junit">'
+        '<testsuite name="all" tests="10" skipped="2" failures="0">'
+        '<testsuite name="a" tests="6" skipped="2" failures="0"/>'
+        '<testsuite name="b" tests="4" skipped="0" failures="0"/>'
+        "</testsuite>"
+        "</testsuites>"
+    )
+    assert _read_test_results(tmp_path) == {"total": 10, "passed": 8, "skipped": 2, "failed": 0}
+
+
+def test_a_negative_report_ships_as_unknown_end_to_end(tmp_path):
+    """The whole point: a malformed report costs the SCOPE, never the scan."""
+    repo = _init(tmp_path)
+    (repo / "a.ts").write_text("const a = 1;\n" * 40)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1")
+    cov = repo / "coverage"
+    cov.mkdir()
+    (cov / "coverage-summary.json").write_text(
+        '{"total": {"lines": {"pct": 99.0, "total": -1, "covered": -2}}}'
+    )
+    m = analyze_repo(str(repo), slug="x")["metrics"]
+    # The headline percentage survives — that is the pre-1.22 behaviour and it is not in doubt.
+    assert m["test_coverage_pct"] == 99.0
+    # The counts do not, because the brain would refuse them and take the whole payload with it.
+    assert m["test_coverage_lines_total"] is None
+    assert m["test_coverage_lines_covered"] is None
+    # And the rest of the scan is intact.
+    assert m["loc"] == 40 and m["commits_window"] == 1
 
 
 def test_incoherent_counts_are_voided_to_unknown_not_shipped():

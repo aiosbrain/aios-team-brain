@@ -4,7 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
-import { scanPartial } from "@/lib/codebases/score";
+import { isUnscopedCoverage, scanPartial } from "@/lib/codebases/score";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
@@ -217,6 +217,15 @@ function avg(nums: number[]): number {
 
 function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   const cov = s.map((c) => c.test_coverage_pct).filter((v): v is number => v != null);
+  // How many of the averaged percentages arrived without a denominator (AIO-995). The mean of a
+  // set of percentages measured over wildly different fractions of their repos is not a team
+  // coverage figure — a repo measuring 436 lines contributes exactly as much as one measuring
+  // 10,647. We keep the average (it is the number people have been reading, and dropping it
+  // would be its own distortion) but the hint now says how much of it is unscoped, so nobody
+  // reads it as a claim about the team's code rather than about a bag of unlike numbers.
+  const unscoped = s.filter((c) =>
+    isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc)
+  ).length;
   return [
     {
       key: "agentic",
@@ -242,7 +251,11 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
       value: cov.length ? `${avg(cov)}%` : "—",
       delta: null,
       spark: [],
-      hint: cov.length ? `${cov.length} reporting` : "no reports",
+      hint: cov.length
+        ? unscoped > 0
+          ? `${cov.length} reporting · ${unscoped} without scope`
+          : `${cov.length} reporting`
+        : "no reports",
       accent: "cyan",
     },
     {

@@ -3,6 +3,7 @@ import {
   computeScores,
   coverageScore,
   coverageBreadthPct,
+  isUnscopedCoverage,
   scanPartial,
   aiCommitRatio,
   scaffoldingScore,
@@ -248,10 +249,46 @@ describe("test-run integrity (brain-api 1.22 / AIO-995)", () => {
     expect(scanPartial({ tests_total: 229, tests_skipped: 3, tests_failed: 0 })).toBe(true);
   });
 
+  it("a run that executed ZERO tests is partial, not clean", () => {
+    // The one degraded shape a skip/fail check cannot see: nothing was skipped because nothing
+    // was collected. It arrives from a filter that matched no files, a runner that died before
+    // collection, or a config pointed at the wrong directory — and it still ships a coverage
+    // percentage. Previously this returned false and the UI then suppressed even the "clean"
+    // text, because 0 is falsy: zero tests, no warning, coverage still on screen.
+    expect(scanPartial({ tests_total: 0, tests_skipped: 0, tests_failed: 0 })).toBe(true);
+    // Distinct from "no report at all", which stays unknown.
+    expect(scanPartial({ tests_total: null, tests_skipped: null, tests_failed: null })).toBeNull();
+  });
+
   it("a partial run does not change any score — it changes what the number means", () => {
     const clean = computeScores(FULLY_AGENTIC);
     const halfSkipped = computeScores({ ...FULLY_AGENTIC, tests_skipped: 91, tests_passed: 109 });
     expect(halfSkipped.agentic_score).toBe(clean.agentic_score);
     expect(halfSkipped.health_score).toBe(clean.health_score);
+  });
+});
+
+describe("unscoped coverage — the headline requirement (AIO-995)", () => {
+  // The change is named for one property: a coverage percentage must not be readable without
+  // the scope it was measured over. The first cut satisfied that only when a denominator
+  // existed — which is NO row until its next scan, so the common case was the unfixed one.
+  it("a percentage with no denominator is UNSCOPED, and says so", () => {
+    expect(isUnscopedCoverage(99, null, 3_140)).toBe(true);
+    expect(isUnscopedCoverage(99, 436, 3_140)).toBe(false);
+  });
+
+  it("loc = 0 is unscoped — there is no denominator to divide by", () => {
+    // A docs-only repo counts zero code lines. Breadth over that is not 100%, it is undefined.
+    expect(isUnscopedCoverage(99, 436, 0)).toBe(true);
+    expect(isUnscopedCoverage(99, 436, null)).toBe(true);
+    expect(coverageBreadthPct({ ...FULLY_AGENTIC, test_coverage_lines_total: 436, loc: 0 })).toBeNull();
+  });
+
+  it("no coverage report at all is not 'unscoped' — there is no number to qualify", () => {
+    expect(isUnscopedCoverage(null, null, 3_140)).toBe(false);
+  });
+
+  it("a measured zero-line denominator is still unscoped, not a scope of zero", () => {
+    expect(isUnscopedCoverage(0, null, 3_140)).toBe(true);
   });
 });

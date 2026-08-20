@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { getCodebaseDetail, getCodebaseSummaries } from "@/lib/metrics/codebases";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
+import { isUnscopedCoverage } from "@/lib/codebases/score";
 import { db, seedTeam } from "./helpers";
 import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
@@ -138,6 +139,32 @@ describe("coverage denominator + run integrity persistence (real Postgres)", () 
     expect(detail?.breakdown?.scan_partial).toBe(true);
     expect(detail?.breakdown?.tests_skipped).toBe(91);
     expect(detail?.breakdown?.tests_total).toBe(229);
+  });
+
+  it("a legacy row reads back as UNSCOPED — the state every existing row is in", async () => {
+    // The headline requirement, asserted at the read layer rather than only in the pure
+    // function: a percentage whose scope nobody recorded must be identifiable as such by every
+    // surface that renders it. This is the common case, not the edge case — no row in
+    // code_metrics has a denominator until its next scan.
+    const seed = await seedTeam();
+    const slug = `unscoped-${randomUUID().slice(0, 6)}`;
+    await push(seed, scan(slug, { test_coverage_pct: 99 }));
+
+    const { codebases, kpis } = await getCodebaseSummaries(db(), seed.teamId, "90d", "team");
+    const summary = codebases.find((c) => c.slug === slug);
+    expect(summary?.test_coverage_pct).toBe(99);
+    expect(
+      isUnscopedCoverage(
+        summary?.test_coverage_pct ?? null,
+        summary?.test_coverage_lines_total ?? null,
+        summary?.loc ?? null
+      )
+    ).toBe(true);
+
+    // …and the team KPI says how much of its average is unscoped, so the number is not read as
+    // a claim about the team's code rather than about a bag of unlike percentages.
+    const coverageKpi = kpis.find((k) => k.key === "coverage");
+    expect(coverageKpi?.hint).toContain("without scope");
   });
 
   it("the DB rejects a negative count — a bad parse can't become permanent analytics", async () => {

@@ -338,6 +338,56 @@ export const codebaseScanPayloadSchema = z
         });
       }
     }
+
+    // The parts must fit inside the total TOGETHER, not merely each on its own. Three separate
+    // `part <= tests_total` checks accept `{total: 10, passed: 10, skipped: 10, failed: 10}` —
+    // thirty outcomes in a ten-test run.
+    //
+    // Summed over the parts that are KNOWN, not only when all three are. passed/skipped/failed
+    // are disjoint outcomes, so the known ones alone can never legitimately exceed the total —
+    // an unknown part can only add more. Requiring all three first would have missed
+    // `{total: 10, passed: 9, failed: 9}`, which is already impossible without knowing the
+    // skips. Under-summing stays legal: that is an unallocated remainder, not a contradiction.
+    const runParts = [m.tests_passed, m.tests_skipped, m.tests_failed];
+    const knownParts = runParts.filter((p): p is number => p != null);
+    if (m.tests_total != null && knownParts.length > 0) {
+      const sum = knownParts.reduce((total, p) => total + p, 0);
+      if (sum > m.tests_total) {
+        context.addIssue({
+          code: "custom",
+          path: ["metrics", "tests_total"],
+          message: "tests_passed + tests_skipped + tests_failed must be <= tests_total",
+        });
+      }
+    }
+
+    // The percentage and the counts must describe the SAME measurement. They arrive by
+    // different routes — the lcov path recomputes `pct` from the LH/LF sums it also reports,
+    // while the Istanbul path trusts the `pct` the tool wrote and reads `covered`/`total`
+    // beside it — so nothing upstream forces them to agree, and a mismatch means the parser
+    // stitched together two different reports. `99%` next to `0 of 100 lines covered` is not a
+    // rounding disagreement; it is two incompatible claims, and persisting either would be
+    // inventing a measurement.
+    //
+    // The tolerance is deliberately loose (1 percentage point, and only when there is a
+    // denominator to divide by): coverage tools round to 2dp, some emit `pct` for a subset of
+    // what they count, and this check exists to catch contradictions, not to referee rounding.
+    if (
+      m.test_coverage_pct != null &&
+      m.test_coverage_lines_total != null &&
+      m.test_coverage_lines_covered != null &&
+      m.test_coverage_lines_total > 0
+    ) {
+      const implied = (100 * m.test_coverage_lines_covered) / m.test_coverage_lines_total;
+      if (Math.abs(implied - m.test_coverage_pct) > 1) {
+        context.addIssue({
+          code: "custom",
+          path: ["metrics", "test_coverage_pct"],
+          message:
+            "test_coverage_pct must agree with test_coverage_lines_covered / test_coverage_lines_total",
+        });
+      }
+    }
   });
 export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;
 
