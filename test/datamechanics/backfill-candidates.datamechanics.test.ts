@@ -116,6 +116,11 @@ describe("backfill candidate predicate (data-mechanics)", () => {
     expect(r.scanned, "exactly the auto shadow was reconciled").toBe(1);
     expect(await currentMemberships(seed, uid), "the auto shadow HEALED to an include")
       .toContainEqual({ project_id: p.general, decision: "include" });
+    // The method pin (review LOW): the heal must be THE REPAIR, not any hypothetical
+    // delete-and-reinsert path — this arm stays able to tell them apart on its own.
+    const { data: healed } = await db().from("project_context_memberships")
+      .select("method").eq("team_id", seed.teamId).eq("context_unit_id", uid).eq("project_id", p.general).is("valid_to", null).single();
+    expect(healed!.method).toBe("exclude_shadow_repair");
     expect(await currentMemberships(seed, fuid), "the explicit shadow left untouched")
       .toContainEqual({ project_id: p.general, decision: "exclude" });
   });
