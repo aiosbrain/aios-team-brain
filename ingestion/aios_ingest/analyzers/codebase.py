@@ -53,8 +53,27 @@ _MAX_BACKFILL_POINTS = 60  # bound on historical trend points per scan
 
 
 def _git(repo: Path, *args: str) -> str:
+    """Run git in `repo` and return stdout.
+
+    `errors="surrogateescape"` because a filename is a byte string, not text: git
+    happily indexes a path that is not valid UTF-8, and once `core.quotePath=false`
+    stops C-quoting the stream (see `_tracked_entries`), strict decoding would raise
+    `UnicodeDecodeError` and abort the WHOLE scan over one undecodable name. Not
+    `errors="replace"`: surrogates round-trip back to the filesystem, which
+    `_count_loc`'s `open(repo / rel)` depends on.
+
+    `GIT_NO_LAZY_FETCH=1` keeps a partial (`--filter=blob:none`) clone from turning
+    an object read — `cat-file blob` on a symlink — into an unbounded network fetch
+    inside the scanner.
+    """
     out = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
     )
     return out.stdout
 
@@ -288,9 +307,11 @@ def _entries_under(
        symlink as ONE entry with no trailing path, so a prefix match never fires;
        we read the link target out of its git blob and enumerate the tracked files
        under it. A target escaping the checkout is ignored (`_resolve_in_repo`).
-    3. **Pack source** — `skills/<name>/**/SKILL.md` (or `<x>-skills/...`) at the
+    3. **Pack source** — `skills/**/<name>/SKILL.md` (or `<x>-skills/...`) at the
        repo ROOT, for repos that ARE the skill pack (`aios-engineering-harness`);
-       those skills are deliberately not under `.claude/`.
+       those skills are deliberately not under `.claude/`. The skill is the directory
+       holding the manifest, so a CATEGORISED pack (`skills/comms/slack-cli/`) counts
+       its skills rather than its categories.
 
     **Arms 1 and 2 need no `SKILL.md` marker; arm 3 does.** That asymmetry is the
     point, not an oversight: `.claude/skills` is a *declaration* — the repo has said
@@ -331,14 +352,19 @@ def _entries_under(
             continue
         names |= _heads_under(paths, target)
 
-    # (3) pack source — `skills/<name>/**/SKILL.md` at the repo root
+    # (3) pack source — `<pack-root>/**/<name>/SKILL.md` at the repo root
     if subdir == "skills":
         for f in paths:
             parts = f.split("/")
             if len(parts) < 3 or parts[-1].lower() != _SKILL_MANIFEST:
                 continue
             if _is_pack_root(parts[0]):
-                names.add(parts[1])
+                # The skill is the directory HOLDING the manifest, which is not
+                # necessarily the second segment: a pack root may be CATEGORISED
+                # (`optional-skills/comms/slack-cli/SKILL.md`). Keying on segment 2
+                # there reports the number of categories under a field labelled a
+                # skill count — hermes-agent read 26 for 97 real skills.
+                names.add(parts[-2])
 
     return names
 

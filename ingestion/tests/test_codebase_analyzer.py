@@ -249,6 +249,54 @@ def test_non_ascii_skill_names_are_counted(tmp_path):
     assert _detect_scaffolding(repo)["skills_count"] == 2
 
 
+def test_categorised_pack_root_counts_skills_not_categories(tmp_path):
+    """`skills/<category>/<name>/SKILL.md` — the skill is the manifest's DIRECTORY.
+
+    Keying on the second path segment reports the number of CATEGORIES under a field
+    labelled a skill count: hermes-agent read 26 for 97 real skills.
+    """
+    repo = _init(tmp_path)
+    for rel in (
+        "skills/comms/slack-cli",
+        "skills/comms/voice-and-rules",
+        "skills/eng/refactor",
+        "skills/flat-one",  # a flat pack root still works alongside a categorised one
+    ):
+        _write_skill(repo, rel)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert len(list(repo.rglob("SKILL.md"))) == 4
+    assert _detect_scaffolding(repo)["skills_count"] == 4
+
+
+def test_undecodable_filename_does_not_abort_the_scan(tmp_path):
+    """A filename that is not valid UTF-8 must not blow up the whole scan.
+
+    git indexes such paths happily; `core.quotePath=false` stops the C-quoting that
+    used to keep the stream ASCII, so strict decoding would raise UnicodeDecodeError
+    out of `_detect_scaffolding` → `analyze_repo` and lose the entire repo's metrics
+    over one bad name. Staged via the index because APFS rejects the bytes on disk.
+    """
+    repo = _init(tmp_path)
+    (repo / "a.txt").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=repo, input=b"---\nname: x\n---\n", capture_output=True, check=True,
+    ).stdout.decode().strip()
+    bad_name = b"skills/\xff\xfebad/SKILL.md".decode("utf-8", "surrogateescape")
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo", "100644", blob, bad_name],
+        cwd=repo, capture_output=True, check=True,
+    )
+
+    s = _detect_scaffolding(repo)  # must not raise
+    assert s["skills_count"] == 1  # the undecodable name still counts
+    assert s["files"] == 2
+
+
 def test_pack_root_accepts_a_suffixed_skills_dir(tmp_path):
     """`optional-skills/` is a real pack root in the wild; `test/` is not."""
     repo = _init(tmp_path)
