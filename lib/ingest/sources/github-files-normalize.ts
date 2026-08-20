@@ -41,6 +41,8 @@ function safeSegment(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+// TICKFIT-1: a behavior change here changes what the files pass produces from the same remote
+// state — bump GITHUB_CURSOR_VERSION (lib/ingest/github-watermark) or quiet repos never see it.
 export function normalizeGithubFiles(input: NormalizeGithubFilesInput): ItemPayload[] {
   const ownerSeg = safeSegment(input.owner) || "owner";
   const repoSeg = safeSegment(input.repo) || "repo";

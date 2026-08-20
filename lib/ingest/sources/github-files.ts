@@ -11,6 +11,9 @@ import type { GithubFileRaw } from "./github-files-normalize";
  * repos; a PAT (the integration secret) lifts rate limits and reaches private repos.
  */
 
+// TICKFIT-1: changing these defaults changes what the files pass PRODUCES from the same
+// remote state — bump GITHUB_CURSOR_VERSION (lib/ingest/github-watermark) so quiet repos
+// pick the change up instead of skipping on an equal cursor.
 export const DEFAULT_FILE_GLOBS = ["*.md", "*.mdx"];
 
 // Max decoded file size to import (skip large/generated files; the item body column caps at 1MB).

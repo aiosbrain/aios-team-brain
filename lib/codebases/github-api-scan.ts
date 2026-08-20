@@ -210,7 +210,17 @@ export interface GithubApiScanResult {
 export async function ingestGithubApiScan(
   db: DbClient,
   auth: { teamId: string; memberId: string },
-  params: { owner: string; repo: string; slug: string; token: string; sinceIso?: string }
+  params: {
+    owner: string;
+    repo: string;
+    slug: string;
+    token: string;
+    sinceIso?: string;
+    /** TICKFIT-1: the change watermark proved the commit history unchanged — run the cheap
+     *  METADATA leg only (fetchRepoMeta + the codebases upsert, so star/language/branch
+     *  freshness is untouched) and skip the commit pagination + contribution upserts. */
+    skipCommits?: boolean;
+  }
 ): Promise<GithubApiScanResult> {
   // `sinceIso` is the RESOLVED instant, owned by the caller (`commitSinceIso` — AIO-807). This used
   // to be `windowDays`, re-derived here as `now − days`: at the panel's "No history" (`days: 0`) that
@@ -241,7 +251,9 @@ export async function ingestGithubApiScan(
   const meta = await fetchRepoMeta(owner, repo, token);
   const sinceIso =
     params.sinceIso ?? new Date(Date.now() - DEFAULT_COMMIT_WINDOW_DAYS * 86_400_000).toISOString();
-  const commits = await fetchCommitsSince(owner, repo, token, sinceIso);
+  // TICKFIT-1: behind the watermark the commit history is proven unchanged — skip the
+  // pagination and the contribution upserts; the metadata upsert below still runs.
+  const commits = params.skipCommits ? [] : await fetchCommitsSince(owner, repo, token, sinceIso);
   const contributions = aggregateContributions(commits).slice(0, 5000);
 
   // Upsert identity. NOTE: last_scan_at is intentionally omitted — this is a sync, not a code

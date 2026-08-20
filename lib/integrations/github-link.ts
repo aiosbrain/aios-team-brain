@@ -223,6 +223,17 @@ export async function unlinkGithubRepo(
   // Prune history entries for repos no longer linked, so the array can't outgrow the config cap.
   const history = currentRepoHistory(row).filter((e) => linked.has(e.repo.toLowerCase()));
   await writeRepos(db, auth, row, repos, history);
+  // TICKFIT-1 D2e: cursor state must not outlive the config that owns it — lifecycle hygiene
+  // (unlink never purges items, so a relink-then-skip would serve the still-present corpus,
+  // which is correct; the delete just keeps the store honest). Best-effort by the module.
+  // The cursor key was written from the CONFIG's spelling of the repo, so resolve that
+  // spelling (removeRepo matches case-insensitively) before deriving the key.
+  const storedFull = currentRepos(row).find((r) => r.toLowerCase() === repoInput.trim().toLowerCase()) ?? repoInput.trim();
+  const [owner, repo] = storedFull.split("/", 2);
+  if (owner && repo) {
+    const { deleteConnectorCursor, githubCursorKey } = await import("@/lib/ingest/cursors");
+    await deleteConnectorCursor(db, auth.teamId, githubCursorKey(owner, repo));
+  }
   return repos;
 }
 
