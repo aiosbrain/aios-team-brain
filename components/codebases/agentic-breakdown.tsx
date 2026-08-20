@@ -2,6 +2,7 @@ import { Check, X } from "lucide-react";
 import type { AgenticBreakdown as Breakdown } from "@/lib/metrics/codebases";
 import { AGENTIC_WEIGHTS } from "@/lib/codebases/score";
 import { ScoreRing } from "./score-ring";
+import { CoverageScope, PartialRunBadge, isNarrowCoverage } from "./coverage-scope";
 
 const BARS: { key: keyof typeof AGENTIC_WEIGHTS; label: string; score: keyof Breakdown }[] = [
   { key: "test_coverage_score", label: "Test coverage", score: "test_coverage_score" },
@@ -84,10 +85,26 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
         <Check2 ok={b.has_agents_md} label="AGENTS.md" />
         <Check2 ok={b.skills_count > 0} label={`${b.skills_count} skills`} />
         <Check2 ok={b.commands_count > 0} label={`${b.commands_count} commands`} />
-        <Check2
-          ok={b.test_coverage_pct != null}
-          label={b.test_coverage_pct == null ? "no coverage report" : `${b.test_coverage_pct}% lines`}
-        />
+        {/* The line-coverage check carries its DENOMINATOR (AIO-995). `ok` still tracks only
+            whether a report exists — a narrow measurement is a real measurement, not a failed
+            one; the amber tint and the scope suffix say how much of the repo it speaks for. */}
+        <span className="inline-flex items-center gap-1.5">
+          <Check2
+            ok={b.test_coverage_pct != null}
+            label={
+              b.test_coverage_pct == null
+                ? "no coverage report"
+                : `${b.test_coverage_pct}% lines${isNarrowCoverage(b.coverage_breadth_pct) ? " — narrow" : ""}`
+            }
+          />
+          {b.test_coverage_pct == null ? null : (
+            <CoverageScope
+              linesInstrumented={b.test_coverage_lines_total}
+              loc={b.loc}
+              breadthPct={b.coverage_breadth_pct}
+            />
+          )}
+        </span>
         <Check2
           ok={b.test_coverage_functions_pct != null}
           label={b.test_coverage_functions_pct == null ? "no fn coverage" : `${b.test_coverage_functions_pct}% functions`}
@@ -96,6 +113,32 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
           ok={b.test_coverage_branches_pct != null}
           label={b.test_coverage_branches_pct == null ? "no branch coverage" : `${b.test_coverage_branches_pct}% branches`}
         />
+        {/* Run integrity. Absent (no test-result report) renders nothing at all — an unknown
+            is not a clean bill of health, and must not be drawn as one. */}
+        {b.scan_partial === true ? (
+          <span className="inline-flex items-center gap-1.5 text-xs text-ink-secondary">
+            <PartialRunBadge
+              partial={b.scan_partial}
+              skipped={b.tests_skipped}
+              failed={b.tests_failed}
+              total={b.tests_total}
+            />
+            <span className="text-ink-tertiary">
+              {[
+                b.tests_skipped ? `${b.tests_skipped} skipped` : null,
+                b.tests_failed ? `${b.tests_failed} failed` : null,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              {b.tests_total ? ` of ${b.tests_total} tests` : ""}
+            </span>
+          </span>
+        ) : b.scan_partial === false && b.tests_total != null ? (
+          // `!= null`, not truthiness: `tests_total === 0` is falsy, and a zero-test run used
+          // to silently render nothing at all. `scanPartial` now flags zero as partial so this
+          // branch can't see it, but the guard states the intent rather than relying on that.
+          <Check2 ok label={`${b.tests_total} tests, none skipped`} />
+        ) : null}
       </div>
     </section>
   );

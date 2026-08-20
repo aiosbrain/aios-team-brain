@@ -26,7 +26,9 @@ projection path) — that's the workflow we're testing.
 ## Shared caveats for parallel runs
 
 - **Worktrees:** name each uniquely — `../aios-team-brain-<epic>` (e.g. `-f3`, `-w1.1`).
-- **Shared test Postgres:** `npm run db:test:up` **resets** the shared DB on port 5434. Don't run it
+- **Shared test Postgres:** `npm run db:test:up` **resets** the shared DB on port 5434 — always, and
+  unconditionally (it does the `down -v` for you, so it is re-runnable against a dirty DB; a failed
+  schema load removes the container rather than leaving it up half-loaded). Don't run it
   concurrently from two agents. Either (a) one agent brings it up and others just run
   `npm run test:datamechanics:local`, or (b) give an agent its own DB:
   `docker compose -f compose.test.yml -p <epic> up -d` on a different port. Data-mechanics tests seed

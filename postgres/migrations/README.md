@@ -25,3 +25,47 @@ Rules:
 - **Mirror the change into `postgres/schema.sql`** so a from-zero load still produces the
   same shape — the file here is only what an *existing* DB needs to catch up.
 - This is the Railway rollout path; `postgres/migrations/` is the only migrations directory.
+
+## What actually checks the two rules above
+
+Nothing a **fresh** database does can check them. `pg:schema` loads `schema.sql` first, and on an
+empty DB that already creates every object in its final shape — so every migration replayed after it
+is a no-op. `npm run db:test:up` runs exactly that path. Delete an additive migration and the whole
+suite stays green; the fresh-DB load literally cannot observe it.
+
+`scripts/migrate-from-existing.mjs` closes that. It loads a PRIOR schema state — a real released tag,
+read straight out of git (`git show v0.7.0:postgres/schema.sql`), so there are no fixture files to
+keep current — applies the current `schema.sql` + every migration forward exactly as a deploy does,
+and asserts the resulting **catalog fingerprint** (columns/types/defaults/nullability, indexes,
+constraints by name, enum labels *in enum sort order*, functions, triggers) is identical to a
+from-zero build. Each build gets its own scratch database, created and dropped by the script.
+
+Scope, stated plainly: those scratch databases are **empty**, so this checks a migration's
+**structural** effect and not its **data** behaviour. A backfill's `update` touches no rows here, and
+a row-dependent precondition never fires — `20260818210000_pret6_retire_access_enforcement.sql`
+aborts a real rollout against a populated database and is green in this lane every time. Seeding a
+fixture set that satisfies every migration's preconditions is real work and is not claimed.
+
+```bash
+DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:migrate-from-existing
+DATABASE_TEST_URL=… npm run test:migrate-from-existing:sweep   # nightly, exhaustive
+```
+
+Practical consequences when you add a migration:
+
+- **Add a column to `schema.sql` and forget the migration → the lane goes red**, naming the column.
+  That is the failure mode the fresh-DB path is blind to, and it is why this runs per-PR.
+- **Add a migration and forget to mirror it into `schema.sql` → `--mirror-check` goes red.**
+  Five objects predate the guard and are allowlisted in `MIRROR_EXCEPTIONS` with their reasons: three
+  indexes (`chat_messages_search_idx`, `graph_episodes_pending_delete_idx`, `items_team_work_at_idx`)
+  that do not live in `schema.sql`, because it runs BEFORE the migrations and a bare
+  `create index if not exists` on a column the migration has not added yet is a hard error, not a
+  skip (mirrorable if you also add the column with `alter table … add column if not exists`, the
+  idiom `schema.sql` already uses 66 times — a choice, not an impossibility); and two named CHECKs (`members_kind_check`, `projects_kind_check`) deliberately owned by
+  their migration so widening them stays replay-repairable. Anything NOT on that list is a red build.
+- **Redefining a function an earlier migration also defines is fine but load-bearing.** The last
+  writer wins on every deploy, so `schema.sql` must carry that same final body. The nightly sweep
+  reports these chains by name. This is not hypothetical: `gateway_resolution_lease_protect()` was
+  declared with `policy_version` immutable in `schema.sql` and re-created WITHOUT it by
+  `20260714090000` on every rollout, so the stated invariant never held in any deployed database —
+  found by this lane, fixed by `20260820120000_gateway_lease_policy_version_immutable.sql`.

@@ -158,8 +158,10 @@ release (whose boot materializes and stamps the marker).
 `scripts/pg-load-schema.mjs` (which applies `postgres/schema.sql` then every
 `postgres/migrations/*.sql` in filename order and exits non-zero on a raised exception) — so
 a refused migration HALTS the release; the old code keeps serving, nothing flips blind. The same guard makes the migration replay-safe on a
-from-zero load (a fresh DB has no teams). CI's from-zero replay (`db:test:up`) passes by
-construction.
+from-zero load (a fresh DB has no teams). The from-zero replay passes by construction — in CI that
+is `npm run pg:schema` against the workflow's fresh service Postgres (`.github/workflows/ci.yml`),
+and locally `npm run db:test:up`, which resets the container first precisely so its replay really
+is from zero (`scripts/db-test-up.sh`).
 
 ### 2.2 The supported upgrade path (release notes, verbatim obligation)
 

@@ -197,7 +197,10 @@ describe("the schema loaders wire the guard into the injection path", () => {
   // moves it after the DB connection), this fails the build.
   const scriptsDir = join(import.meta.dirname, "..", "..", "scripts");
 
-  for (const file of ["pg-load-schema.mjs", "pg-load-vector.mjs"]) {
+  // migrate-from-existing.mjs is here for a sharper reason than the other two: it is the only script
+  // in the repo that issues CREATE DATABASE / DROP DATABASE, so an unguarded DATABASE_URL would mean
+  // unsupervised DDL on whatever cluster the shell happens to point at.
+  for (const file of ["pg-load-schema.mjs", "pg-load-vector.mjs", "migrate-from-existing.mjs"]) {
     it(`${file} calls assertServiceIdentity before constructing the pg Client`, () => {
       const src = readFileSync(join(scriptsDir, file), "utf8");
       expect(src).toMatch(/import\s*\{\s*assertServiceIdentity\s*\}\s*from\s*["']\.\/service-guard\.mjs["']/);

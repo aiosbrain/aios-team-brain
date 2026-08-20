@@ -7,6 +7,16 @@
 # strictly stronger than a lint: `npm run pg:schema` replays schema.sql + every migration
 # from zero on each deploy, the migrations-numbering guard pins the directory's shape, and
 # the data-mechanics tier loads the full schema into a real Postgres on every CI run.
+#
+# ingestion/tests/ is excluded because Codacy runs Bandit over it, and Bandit's threat model
+# is a running service, not a test suite. Every one of the 26 findings it raised on PR #623
+# was B101 ("use of assert detected — removed under -O") or B603/B607 (subprocess with a
+# partial executable path) — i.e. "this pytest file uses `assert`" and "this fixture shells
+# out to `git`", which are the two things a pytest file is supposed to do. There is no
+# per-rule switch in this config format, so the whole path is excluded rather than leaving a
+# red check that means nothing; any Python test change would trip it identically. The tests
+# themselves are gated by the `Ingestion tests (pytest)` CI job, which actually runs them.
 ---
 exclude_paths:
   - "postgres/**"
+  - "ingestion/tests/**"

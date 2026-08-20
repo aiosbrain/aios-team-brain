@@ -44,8 +44,14 @@ exception when duplicate_object then null; end $$;
 alter type item_kind add value if not exists 'fact';
 alter type item_kind add value if not exists 'stakeholder_mention';
 do $$ begin
-  create type task_status as enum ('backlog', 'ready', 'in_progress', 'blocked', 'done');
+  create type task_status as enum ('backlog', 'ready', 'in_progress', 'in_review', 'blocked', 'done');
 exception when duplicate_object then null; end $$;
+-- brain-api v1.21 (AIO-950): `in_review` between `in_progress` and `blocked`. The `create type`
+-- above is a no-op on an EXISTING database (the duplicate_object guard swallows it), so an already-
+-- deployed brain needs this widening explicitly — same pattern as `item_kind` above. `before
+-- 'blocked'` keeps the enum's sort order equal to the contract's canonical order, which is what any
+-- `order by status` sorts on. Mirrored by postgres/migrations/20260819180000_task_status_in_review.sql.
+alter type task_status add value if not exists 'in_review' before 'blocked';
 do $$ begin
   create type task_origin as enum ('sync', 'ui');
 exception when duplicate_object then null; end $$;
@@ -790,6 +796,10 @@ create trigger gateway_audit_log_protect
   before update or delete on gateway_audit_log
   for each row execute function gateway_audit_protect();
 
+-- Clause ORDER below mirrors 20260716120000_gateway_approval_admin.sql, which `create or replace`s
+-- this same function AFTER schema.sql on every deploy. The predicate set is identical either way,
+-- but a function's SOURCE TEXT is what pg stores, so keeping the two in step is what lets the
+-- migrate-from-existing mirror-check assert schema.sql is the canonical shape, not a stale draft.
 create or replace function gateway_execution_protect()
 returns trigger language plpgsql as $$
 begin
@@ -808,6 +818,10 @@ begin
     or new.tool is distinct from old.tool
     or new.request_hash is distinct from old.request_hash
     or new.encrypted_request_envelope is distinct from old.encrypted_request_envelope
+    or new.decision is distinct from old.decision
+    or new.policy_version is distinct from old.policy_version
+    or new.policy_rule_id is distinct from old.policy_rule_id
+    or new.created_at is distinct from old.created_at
     or new.actor_snapshot is distinct from old.actor_snapshot
     or new.role_snapshot is distinct from old.role_snapshot
     or new.tier_snapshot is distinct from old.tier_snapshot
@@ -815,11 +829,7 @@ begin
     or new.request_envelope_hash is distinct from old.request_envelope_hash
     or (old.resume_fingerprint is not null and new.resume_fingerprint is distinct from old.resume_fingerprint)
     or (old.claim_idempotency_key is not null and new.claim_idempotency_key is distinct from old.claim_idempotency_key)
-    or (old.claimed_credential_id is not null and new.claimed_credential_id is distinct from old.claimed_credential_id)
-    or new.decision is distinct from old.decision
-    or new.policy_version is distinct from old.policy_version
-    or new.policy_rule_id is distinct from old.policy_rule_id
-    or new.created_at is distinct from old.created_at then
+    or (old.claimed_credential_id is not null and new.claimed_credential_id is distinct from old.claimed_credential_id) then
     raise exception 'gateway execution identity/request fields are immutable';
   end if;
   return new;
@@ -1295,7 +1305,7 @@ create table if not exists task_pm_links (
   provider_seen_status text,
   -- Inbound conflict baseline (brain-api v1.4): the EXACT brain `tasks.status` at the last
   -- successful outbound projection / adoption / inbound apply. The provider-group fingerprint
-  -- alone cannot decide "brain unchanged" — in_progress and blocked both hash to group 'started',
+  -- alone cannot decide "brain unchanged" — in_progress, in_review and blocked all hash to 'started',
   -- so a same-group brain edit would be silently overwritten without this exact baseline.
   last_projected_brain_status text,
   created_at timestamptz not null default now(),
@@ -1642,6 +1652,17 @@ create table if not exists code_metrics (
   test_coverage_pct numeric(5,2),                 -- null = no coverage report found (lines %)
   test_coverage_functions_pct numeric(5,2),       -- null = not reported
   test_coverage_branches_pct numeric(5,2),        -- null = not reported
+  -- brain-api 1.22 (AIO-995): the DENOMINATOR the percentage above was measured over, plus the
+  -- integrity of the run that produced it. All nullable — null = UNKNOWN, never zero and never
+  -- "fully covered" (every row written before 1.22 has no denominator and cannot acquire one).
+  -- Catch-up delta: postgres/migrations/20260820140000_code_metrics_coverage_denominator.sql
+  test_coverage_lines_total integer,              -- instrumented lines the report measured
+  test_coverage_lines_covered integer,            -- of those, how many were hit
+  tests_total integer,                            -- test-result report counts; null = no report
+  tests_passed integer,
+  tests_skipped integer,                          -- >0 = a partial run; NOT a failure, but not full evidence
+  tests_failed integer,
+  coverage_breadth_pct numeric(5,2),              -- derived: 100*min(1, lines_total/loc); null = unknown
   recent_commits jsonb not null default '[]',     -- [{sha,author,ai,additions,deletions,committed_at,message}]
   -- explicit scaffolding inputs (named, not vague JSON → testable scoring)
   has_claude_md boolean not null default false,
@@ -1668,7 +1689,15 @@ create table if not exists code_metrics (
   -- persisted verbatim (closed scalar object incl. measured_at); null = not scored
   codebase_health jsonb,
   created_at timestamptz not null default now(),
-  unique (codebase_id, head_sha)
+  unique (codebase_id, head_sha),
+  constraint code_metrics_coverage_denominator_nonneg check (
+    (test_coverage_lines_total is null or test_coverage_lines_total >= 0)
+    and (test_coverage_lines_covered is null or test_coverage_lines_covered >= 0)
+    and (tests_total is null or tests_total >= 0)
+    and (tests_passed is null or tests_passed >= 0)
+    and (tests_skipped is null or tests_skipped >= 0)
+    and (tests_failed is null or tests_failed >= 0)
+  )
 );
 
 -- Durable, redacted finding state derived from codebase_health v2 snapshots (AIO-785).

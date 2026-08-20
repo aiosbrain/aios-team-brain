@@ -4,6 +4,7 @@ import type { CodebaseSummary } from "@/lib/metrics/codebases";
 import { timeAgo } from "@/components/format";
 import { Sparkline } from "@/components/sparkline";
 import { ScoreRing } from "./score-ring";
+import { CoverageScope, PartialRunBadge, isNarrowCoverage, isUnscopedCoverage } from "./coverage-scope";
 
 export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseSummary }) {
   return (
@@ -33,12 +34,36 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <span>
             <span className="font-semibold text-ink">{cb.health_score}</span> health
           </span>
-          <span>
-            <span className="font-semibold text-ink">
+          {/* Coverage NEVER renders alone (AIO-995). A percentage over a small slice of the
+              repo must look different from one over all of it — and a percentage whose scope
+              nobody recorded must say so, rather than borrowing the authority of one that did. */}
+          <span className="inline-flex items-baseline gap-1">
+            <span
+              className={`font-semibold ${
+                isNarrowCoverage(cb.coverage_breadth_pct)
+                  ? "text-amber-500/90"
+                  : isUnscopedCoverage(cb.test_coverage_pct, cb.test_coverage_lines_total, cb.loc)
+                    ? "text-ink-secondary"
+                    : "text-ink"
+              }`}
+            >
               {cb.test_coverage_pct == null ? "—" : `${cb.test_coverage_pct}%`}
             </span>{" "}
             cov
+            {cb.test_coverage_pct == null ? null : (
+              <CoverageScope
+                linesInstrumented={cb.test_coverage_lines_total}
+                loc={cb.loc}
+                breadthPct={cb.coverage_breadth_pct}
+              />
+            )}
           </span>
+          <PartialRunBadge
+            partial={cb.scan_partial}
+            skipped={cb.tests_skipped}
+            failed={cb.tests_failed}
+            total={cb.tests_total}
+          />
           {cb.readiness_level ? (
             <span
               title={`AEM agent-readiness${cb.readiness_pct == null ? "" : ` — ${cb.readiness_pct}% of checks`}`}

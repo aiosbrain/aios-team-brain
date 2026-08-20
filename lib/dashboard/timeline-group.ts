@@ -82,7 +82,7 @@ export interface EvidenceWithMember extends EvidenceItem {
 /** Display info for a referenced task, resolved once per in-window task (id → this). */
 export interface TaskInfo {
   title: string;
-  status: string; // task_status (the task's status, e.g. in_progress / blocked / done)
+  status: string; // task_status (the task's status, e.g. in_progress / in_review / blocked / done)
   source: string; // pm source slug: linear | plane | tasks
   /** The task's ASSIGNEE as a member id, or null when unassigned/unresolvable. Carried so a card can
    *  say WHOSE task it is. Without it, work you did on a teammate's ticket is indistinguishable from

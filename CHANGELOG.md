@@ -4,7 +4,7 @@ All notable changes to AIOS Team Brain are documented here. Dates are ISO-8601.
 
 The Brain API sync contract (`docs/brain-api.md` in aios-workspace) is versioned
 separately. The current member-facing major remains **v1**, at additive document
-revision **v1.17**.
+revision **v1.22**.
 
 ## [Unreleased]
 
@@ -31,6 +31,19 @@ revision **v1.17**.
   `admin.ts set-access-enforcement --dry-run`, and the flip stays a manual decision.
 
 ### Added
+
+- **Coverage arrives with its denominator (AIO-995, Brain API 1.22).** `test_coverage_pct` was a
+  bare percentage carrying 40% of `health_score` and 25% of `agentic_score`, so a repo measuring
+  436 lines and one measuring 10,647 were indistinguishable in every composite. The scan payload
+  gains six optional, nullable raw measures — `test_coverage_lines_total` /
+  `test_coverage_lines_covered` (the denominator) and `tests_total` / `tests_passed` /
+  `tests_skipped` / `tests_failed` (run integrity) — and the brain derives, persists and displays
+  `coverage_breadth_pct`. Coverage now renders with its scope (`99% (436 / 3,140 lines)`), a
+  narrow measurement is visually distinct, and a run with skipped or failed cases is flagged
+  partial. **No score changes**: breadth is disclosed, not weighted, because every pre-1.22 row
+  has a null denominator and a factor applied today would rank re-scanned repos against
+  un-rescanned ones under two different formulas. Null means unknown throughout — never zero,
+  never full scope.
 
 - **Code Maintenance Loop Phase 0 (AIO-610)** — Brain API 1.17 accepts the backward-compatible
   codebase-health v2 snapshot with repository profile identity, explicit evidence completeness,

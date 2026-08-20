@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { normalizeLinearTeam, normalizeLinearDocs, linearWorkedAt, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
+import { normalizeLinearTeam, normalizeLinearDocs, linearWorkedAt, linearStatus, linearStatusOrNull, type NormalizeLinearInput } from "@/lib/ingest/sources/linear-normalize";
+import { desiredStateForStatus } from "@/lib/pm-sync/provider";
 import { itemPayloadSchema, taskRowSchema } from "@/lib/api/schemas";
 import { withFooter } from "@/lib/pm-sync/linear-client";
 
@@ -67,6 +68,34 @@ describe("normalizeLinearTeam", () => {
     expect(row.priority).toBe("high"); // priority int 2
     expect(row.labels).toEqual(["api"]);
     expect(row.assignee).toBe("Alex");
+  });
+
+  it("keeps a Linear 'In Review' state as in_review instead of flattening it into in_progress", () => {
+    // The END-TO-END shape of the regression, one level above the `linearStatus` unit assertions
+    // below: the AIOS team's own Linear board carries a workflow state named "In Review" of type
+    // `started`. `linearStatus` is name-first, so before `in_review` was a canonical status the name
+    // simply didn't resolve and it fell through to TYPE_TO_STATUS.started -> `in_progress`. Every
+    // existing test stayed green because none of them fed the NORMALIZER a state name outside the
+    // five, which is why this drives `normalizeLinearTeam`/`normalizeLinearDocs` rather than the
+    // mapper.
+    const p = normalizeLinearTeam({
+      ...base,
+      issues: [
+        { id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } },
+        // Same TYPE, different name — proving the name is what discriminates, not the type. If this
+        // pair ever collapses to one value again, the fidelity is gone and this goes red.
+        { id: "u2", identifier: "ENG-8", title: "Being written", state: { name: "In Progress", type: "started" } },
+      ],
+    });
+    const rows = p.rows as Array<Record<string, unknown>>;
+    expect(rows.map((r) => r.status)).toEqual(["in_review", "in_progress"]);
+    // Native fidelity is preserved alongside the canonical value, as it is for every Linear state —
+    // the doc frontmatter carries the `state`/`state_type`/`status` triple, not just the fold.
+    const docs = normalizeLinearDocs({
+      ...base,
+      issues: [{ id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } }],
+    });
+    expect(docs[0].frontmatter).toMatchObject({ state: "In Review", state_type: "started", status: "in_review" });
   });
 
   it("de-dupes brain round-trippers: issues carrying the aios-ext footer are skipped", () => {
@@ -200,5 +229,56 @@ describe("normalizeLinearDocs (searchable issue text)", () => {
       ],
     });
     expect(docs.map((d) => d.frontmatter.identifier)).toEqual(["ENG-1"]);
+  });
+});
+
+// ── brain-api v1.21 (AIO-950): a Linear state NAMED "In Review" ───────────────────────────────────
+//
+// Linear ships "In Review" as a state of TYPE `started`. Before 1.21 the name match failed (there was
+// no `in_review` brain status), so it fell through to its type and was read as `in_progress` — the
+// review/progress distinction was silently discarded, and because the adapter canonicalizes BEFORE
+// ingest, `raw_status` was written NULL, so the fidelity was not even recoverable. 1.21 gives the name
+// somewhere to land. The type-based fallback for states with no name match must be untouched.
+describe("linearStatus — 'In Review' (brain-api v1.21)", () => {
+  it("a state named 'In Review' resolves by NAME to in_review, not by type to in_progress", () => {
+    expect(linearStatus("In Review", "started")).toBe("in_review");
+    expect(linearStatusOrNull("In Review", "started")).toBe("in_review");
+    expect(linearStatus("in-review", "started")).toBe("in_review");
+    expect(linearStatus("IN REVIEW", "unstarted")).toBe("in_review");
+  });
+
+  it("keeps the type-based fallback for states with NO name match", () => {
+    expect(linearStatus("Peer Feedback", "started")).toBe("in_progress");
+    expect(linearStatus("Triage", "backlog")).toBe("backlog");
+    expect(linearStatus("Shipped", "completed")).toBe("done");
+    expect(linearStatus("Won't do", "canceled")).toBe("done");
+    expect(linearStatus("Up Next", "unstarted")).toBe("ready");
+  });
+
+  it("keeps the strict variant's NULL for a state that matches neither name nor type", () => {
+    expect(linearStatusOrNull("Peer Feedback", "wat")).toBeNull();
+    expect(linearStatus("Peer Feedback", "wat")).toBe("backlog");
+  });
+
+  it("still lets a state literally named like another brain status win over its type", () => {
+    expect(linearStatus("Blocked", "started")).toBe("blocked");
+    expect(linearStatus("Done", "started")).toBe("done");
+  });
+});
+
+// The projection leg has to be able to express the new status outward, or a brain-side move to
+// `in_review` would project as `backlog` (the switch default) and silently demote the issue.
+describe("desiredStateForStatus — in_review (brain-api v1.21)", () => {
+  it("projects in_review onto the started group, preferring a state named 'In Review'", () => {
+    expect(desiredStateForStatus("in_review")).toEqual({ group: "started", preferredName: "In Review" });
+  });
+
+  it("leaves every other status's projection untouched", () => {
+    expect(desiredStateForStatus("backlog")).toEqual({ group: "backlog", preferredName: "Backlog" });
+    expect(desiredStateForStatus("ready")).toEqual({ group: "unstarted", preferredName: "Todo" });
+    expect(desiredStateForStatus("in_progress")).toEqual({ group: "started", preferredName: "In Progress" });
+    expect(desiredStateForStatus("blocked")).toEqual({ group: "started", preferredName: "Blocked" });
+    expect(desiredStateForStatus("done")).toEqual({ group: "completed", preferredName: "Done" });
+    expect(desiredStateForStatus("nonsense")).toEqual({ group: "backlog", preferredName: "Backlog" });
   });
 });

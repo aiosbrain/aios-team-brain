@@ -182,7 +182,7 @@ async function persistSuccess(
   result: UpsertWorkItemResult,
   fingerprint: string,
   // Exact brain `tasks.status` this projection wrote from — the inbound conflict baseline
-  // (brain-api v1.4). The group-granular fingerprint can't distinguish in_progress vs blocked.
+  // (brain-api v1.4). The group-granular fingerprint can't distinguish in_progress / in_review / blocked.
   brainStatus: string
 ) {
   const now = new Date().toISOString();

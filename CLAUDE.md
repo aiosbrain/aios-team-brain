@@ -222,7 +222,7 @@ npm test               # vitest (unit tier)
 npm run check:docs     # docs drift guard (also runs in CI + pre-push)
 npm run lint           # eslint
 npm run pg:schema      # load postgres/schema.sql (canonical) into DATABASE_URL — also the prod rollout step
-npm run db:test:up     # ephemeral test Postgres + load schema (migrate-from-zero = replay guard)
+npm run db:test:up     # RESET + start the test Postgres, then load schema (migrate-from-zero = replay guard)
 npm run test:datamechanics  # real-Postgres tier: persistence + tier isolation
 npm run test:datamechanics:iso  # SAME tier, PER-WORKTREE isolated container (see below)
 bash scripts/e2e.sh    # system-level integration: seed → push → materialize → 422 → pull → live query
@@ -237,6 +237,19 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   container on a **docker-assigned** port (so two worktrees can't pick the same "free" port) —
   created + schema-loaded on first use and reused after; `npm run db:test:iso:down` removes it.
   Prefer `:iso` whenever another worktree might be running dm.
+
+- **`db:test:up` is a RESET, and is re-runnable against any state.** It runs
+  `scripts/db-test-up.sh`: `docker compose down -v` → `up -d --wait` → `pg:schema`. Compose `up`
+  on an already-running container is a no-op, so without the explicit reset the schema replayed
+  onto whatever the last run left behind — not the from-zero replay proof this command exists for,
+  and able to abort part-way on the PRET-6 production guard (`PRET-6 refused: permissive team(s)
+  remain`) because the dm tier's PRET-6 test re-adds the retired `teams.access_enforcement` column
+  at its `'permissive'` default and the harness truncates ROWS, not DDL. **The guard is correct and
+  unchanged** — it protects a real fleet (docs/RELEASE-NOTES-pret6.md); what changed is that a
+  local test DB no longer takes a production-upgrade path with no way back to clean. Two things
+  follow: the reset is **destructive to the shared :5434 DB** (use `:iso` if someone else may be
+  running against it), and a failed schema load now **removes the container** instead of leaving it
+  up half-loaded.
 
 - **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
   prod rollout step against Railway). Additive deltas live in `postgres/migrations/` (the only

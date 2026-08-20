@@ -1,6 +1,10 @@
 name: aios-brain-test
 # Local test Postgres for the data-mechanics tier.
-# tmpfs → wiped every `up`; offset port 5434 so a local dev DB never collides
+# tmpfs → wiped whenever the container is RECREATED. That is not the same as "wiped every `up`":
+# `docker compose up` on a running container is a no-op, so the bring-up goes through
+# `scripts/db-test-up.sh` (`npm run db:test:up`), which tears this service down (`down -v`) before
+# starting it — the only way the schema load is a true from-zero replay and the command is
+# re-runnable against a dirty DB. Offset port 5434 so a local dev DB never collides
 # (5433 is taken by another project's test DB on this machine).
 # No Redis: the brain has no queue.
 services:

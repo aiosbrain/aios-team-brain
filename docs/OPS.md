@@ -350,7 +350,7 @@ chooses to adopt.
 ## 7. Upgrading across a brain-api contract bump
 
 The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (currently
-**v1.8**) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
+**v1.21**) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
 item kinds, new optional fields) stay within the current major _only if both directions degrade
@@ -361,9 +361,9 @@ that an older brain doesn't yet serve.
 
 | File                                                       | Role                                                                                                                                                                  |
 | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.17**`) and carries a dated _Revisions_ changelog for every additive change. |
-| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.17"`.                                                                  |
-| `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION = "1.17"` — the single server-side declaration of which contract version this codebase targets.                                        |
+| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.21**`) and carries a dated _Revisions_ changelog for every additive change. |
+| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.21"`.                                                                  |
+| `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION = "1.21"` — the single server-side declaration of which contract version this codebase targets.                                        |
 | `test/guards/contract-version.test.ts`                     | Fails the build if `BRAIN_API_VERSION` and the `ARCHITECTURE.md` prose claim drift apart — forces both to move together.                                              |
 | `aios-workspace/docs/contract/brain-contract.json`         | Canonical conformance fixture (`version`, `tierAliases`, `sse.frames`, `provisioningTools`, `contentHash`).                                                           |
 | `test/fixtures/contract/brain-contract.json` (this repo)   | A vendored **copy** of the file above — must match byte-for-byte (`contentHash` pins the content) or `test/guards/contract-conformance.test.ts` fails.                |
@@ -378,14 +378,41 @@ that an older brain doesn't yet serve.
 2. **Re-vendor the fixture into this repo**: copy the updated `brain-contract.json` into
    `test/fixtures/contract/brain-contract.json` verbatim so the `contentHash` matches.
 3. **Bump `lib/api/version.ts`**'s `BRAIN_API_VERSION` to the new value.
-4. **Update the prose claim in `docs/ARCHITECTURE.md`** ("...implements brain-api v1.9...") to
-   the new version — `test/guards/contract-version.test.ts` matches that exact sentence.
+4. **Update the prose claim in `docs/ARCHITECTURE.md`** — the one sentence of the form
+   `This server **implements brain-api v<OLD>**` — to the new version;
+   `test/guards/contract-version.test.ts` matches that exact sentence.
 5. **Implement the actual endpoint/field change** in this codebase (new route, new optional
    field, etc.), keeping old behavior intact if the bump is additive.
-6. **Run the guards before opening the PR**: `npm test` (covers both
+6. **Ask what the change costs the SCHEMA, and write the migration if it costs anything.** If the
+   contract change touches a persisted vocabulary or shape — an enum value, a column, a
+   constraint — editing `postgres/schema.sql` alone is **not enough**. That file expresses its
+   objects with `create ... if not exists` (and guarded `do $$ ... $$` blocks), so it is a silent
+   no-op against an already-deployed database; the catch-up delta belongs under
+   `postgres/migrations/`. Read `postgres/migrations/README.md` for the rules that directory
+   enforces (idempotence, replay order, the CHECK-widening trap) rather than guessing.
+   - **The worked example is v1.21 itself (AIO-950).** `tasks.status` is the Postgres ENUM
+     `task_status`, created in `schema.sql` inside a
+     `do $$ ... exception when duplicate_object then null $$` guard. On every already-deployed
+     brain that type already exists, so adding a value to the `create type` line does **nothing**,
+     `npm run pg:schema` still runs green, and the failure surfaces only at the first write of the
+     new value, as `invalid input value for enum task_status`. The fix was **both** files, as the
+     README's mirroring rule requires: the widened `create type` in `schema.sql` for a from-zero
+     load, plus the catch-up delta
+     `postgres/migrations/20260819180000_task_status_in_review.sql` for every DB that already
+     exists.
+   - **Enum ordering is part of the change.** Where the new value has a natural position, pin it
+     (`alter type ... add value ... before 'blocked'`). `order by status` sorts on the enum's own
+     sort order, so appending at the end silently re-orders every status-sorted surface.
+   - **Migrations self-apply — do not plan a manual prod step.** `scripts/pg-load-schema.mjs` is
+     Railway's `preDeployCommand` (§4), so a deploy applies pending migrations *before* the new
+     app version goes live, and a failure there aborts the release instead of shipping code ahead
+     of its schema. **Never** run `npm run pg:schema` by hand as a rollout step — locally the
+     loader targets whatever `DATABASE_URL` your shell holds, which in a worktree is the dev/test
+     database, not prod.
+7. **Run the guards before opening the PR**: `npm test` (covers both
    `contract-version.test.ts` and `contract-conformance.test.ts`) and `npm run check:docs`
    (the drift guard for enumerable surfaces).
-7. **Ship both repos in the same change window.** Because clients are required to tolerate a
+8. **Ship both repos in the same change window.** Because clients are required to tolerate a
    `404` on endpoints an older brain doesn't yet serve, an additive bump can deploy the brain
    first; but keep the version bump in `aios-workspace` and `aios-team-brain` as close together
    as possible so `docs/brain-api.md` never describes a contract neither side has actually shipped.
