@@ -6,10 +6,13 @@ name: Migration mirror sweep (nightly)
 # `postgres/migrations/README.md` rule "Mirror the change into postgres/schema.sql" — an object
 # only a migration creates makes a from-zero database and a deployed one disagree forever.
 #
-# Nightly rather than per-PR because it is ~76 full schema loads. It is not the fast feedback path;
-# the per-PR `npm run test:migrate-from-existing` already catches the same class in ~4s by comparing
-# schema.sql alone against schema.sql + migrations. This job exists to catch the residue that the
-# cheap comparison cannot see (e.g. two migrations that happen to produce the same object).
+# It is 76 full schema loads, but MEASURED at ~18-26s locally (~1min at a runner penalty) — cheap,
+# not slow. It is nightly rather than per-PR because the per-PR `npm run test:migrate-from-existing`
+# already catches the same class in seconds by comparing schema.sql alone against schema.sql +
+# migrations; this job exists for the residue that cheap comparison cannot see (e.g. two migrations
+# that happen to produce the same object). If a red nightly ever goes unread — it is not a required
+# check and GitHub disables schedules after 60 days of repo inactivity — promote this into the
+# per-PR `datamechanics-tests` job and delete this workflow. The cost is not the obstacle.
 
 on:
   schedule:

@@ -110,14 +110,16 @@ jobs:
       - run: npm ci
       # migrate-from-zero into the service DB (also the replay guard)
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
+      - run: npm run test:gateway-approval
+      - run: npm run test:datamechanics
       # migrate-from-EXISTING: the from-zero load above cannot observe an additive migration at all
       # (schema.sql already builds every object in its final shape, so every migration after it is a
       # no-op). This step loads each released tag's schema state into its own scratch database, rolls
       # the current deploy forward over it, and asserts the catalog fingerprint matches a from-zero
       # build — which is what fails when someone edits schema.sql and forgets the migration.
+      # LAST on purpose: it takes ~10s, and running it first would let a red fingerprint abort the
+      # job and suppress the data-mechanics output for that run. Both signals on every run.
       - run: npm run test:migrate-from-existing
-      - run: npm run test:gateway-approval
-      - run: npm run test:datamechanics
 
   http-tests:
     name: Integration tests (HTTP)

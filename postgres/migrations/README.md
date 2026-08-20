@@ -40,6 +40,12 @@ and asserts the resulting **catalog fingerprint** (columns/types/defaults/nullab
 constraints by name, enum labels *in enum sort order*, functions, triggers) is identical to a
 from-zero build. Each build gets its own scratch database, created and dropped by the script.
 
+Scope, stated plainly: those scratch databases are **empty**, so this checks a migration's
+**structural** effect and not its **data** behaviour. A backfill's `update` touches no rows here, and
+a row-dependent precondition never fires — `20260818210000_pret6_retire_access_enforcement.sql`
+aborts a real rollout against a populated database and is green in this lane every time. Seeding a
+fixture set that satisfies every migration's preconditions is real work and is not claimed.
+
 ```bash
 DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test npm run test:migrate-from-existing
 DATABASE_TEST_URL=… npm run test:migrate-from-existing:sweep   # nightly, exhaustive
@@ -52,9 +58,10 @@ Practical consequences when you add a migration:
 - **Add a migration and forget to mirror it into `schema.sql` → `--mirror-check` goes red.**
   Five objects predate the guard and are allowlisted in `MIRROR_EXCEPTIONS` with their reasons: three
   indexes (`chat_messages_search_idx`, `graph_episodes_pending_delete_idx`, `items_team_work_at_idx`)
-  that *cannot* live in `schema.sql`, because `schema.sql` runs BEFORE the migrations and a bare
+  that do not live in `schema.sql`, because it runs BEFORE the migrations and a bare
   `create index if not exists` on a column the migration has not added yet is a hard error, not a
-  skip; and two named CHECKs (`members_kind_check`, `projects_kind_check`) deliberately owned by
+  skip (mirrorable if you also add the column with `alter table … add column if not exists`, the
+  idiom `schema.sql` already uses 66 times — a choice, not an impossibility); and two named CHECKs (`members_kind_check`, `projects_kind_check`) deliberately owned by
   their migration so widening them stays replay-repairable. Anything NOT on that list is a red build.
 - **Redefining a function an earlier migration also defines is fine but load-bearing.** The last
   writer wins on every deploy, so `schema.sql` must carry that same final body. The nightly sweep

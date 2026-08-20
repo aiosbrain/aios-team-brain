@@ -12,9 +12,17 @@
  * The fix is not one more per-migration guard. It is to load a PRIOR schema state (a real released
  * tag, straight out of git — no fixture files to maintain), apply the CURRENT `schema.sql` + all
  * migrations forward exactly as a deploy would, and assert the result is structurally identical to
- * a from-zero build. That single assertion covers every migration at once, including the ~14
- * backfill/data migrations no static guard can ever reach, and it fails when someone forgets a
- * migration entirely — which is the real failure mode.
+ * a from-zero build. That single assertion covers every migration at once, and it fails when
+ * someone forgets a migration entirely — which is the real failure mode.
+ *
+ * WHAT THIS DOES *NOT* COVER — read before trusting it further than it goes. Every scratch database
+ * is created EMPTY, so a migration is only ever exercised against zero rows. That means its
+ * STRUCTURAL effect is checked and its DATA behaviour is not: a backfill's `update` touches nothing,
+ * and a row-dependent precondition never fires. `20260818210000_pret6_retire_access_enforcement.sql`
+ * is the live proof — against a populated database it aborts the rollout with "PRET-6 refused:
+ * permissive team(s) remain", and against this lane it is green every time. Closing that would mean
+ * seeding a fixture row set that satisfies 76 migrations' preconditions; it is a real piece of work
+ * and deliberately not claimed here.
  *
  * MODES
  *   (default)        upgrade every `--tags` release state forward; assert == from-zero. Also
@@ -22,9 +30,10 @@
  *   --mirror-check   assert `schema.sql` ALONE already produces the from-zero fingerprint, i.e.
  *                    every migration is mirrored into `schema.sql` as `postgres/migrations/README.md`
  *                    requires. Any object only a migration creates is a red build.
- *   --deletion-sweep the exhaustive form of --mirror-check: rebuild from zero 75 times, each time
- *                    omitting ONE migration, and assert the fingerprint never moves. ~4 minutes, so
- *                    this one is NIGHTLY, not per-PR.
+ *   --deletion-sweep the exhaustive form of --mirror-check: rebuild from zero once per migration, each
+ *                    time omitting ONE, and assert the fingerprint never moves. MEASURED at ~18-26s
+ *                    for 76 rebuilds (not the minutes you would guess) — it is wired nightly, but it
+ *                    is cheap enough to promote into the per-PR lane if the nightly ever goes unread.
  *
  * SCRATCH DATABASES, NOT SCRATCH SCHEMAS
  * `create schema` + `set search_path` is not enough here. `schema.sql` opens with
@@ -46,6 +55,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { fingerprint, diffFingerprints } from "./schema-fingerprint.mjs";
+import { assertServiceIdentity } from "./service-guard.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -58,12 +68,16 @@ export const DEFAULT_TAGS = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"];
  * commented at the corresponding site in schema.sql), not a place to park a real drift: anything not
  * listed here that only a migration creates is a red build.
  *
- * Three of these are structurally unmirrorable, and it is the same mechanism every time.
- * `pg-load-schema.mjs` runs schema.sql BEFORE the migrations. On an existing database the
- * `create table if not exists` is a no-op, so the column a migration adds does not exist yet when
- * schema.sql runs — and a bare `create index if not exists` on a not-yet-existing column is a hard
- * error, not a skip. So the index can only live in the migration that adds its column first. The
- * two CHECK constraints are a different, deliberate call: the migrations README requires an
+ * Three of these are indexes, and it is the same mechanism every time. `pg-load-schema.mjs` runs
+ * schema.sql BEFORE the migrations. On an existing database the `create table if not exists` is a
+ * no-op, so the column a migration adds does not exist yet when schema.sql runs — and a BARE
+ * `create index if not exists` on a not-yet-existing column is a hard error, not a skip. Each is
+ * documented at its site in schema.sql. Note this is a CHOICE, not an impossibility: schema.sql
+ * already uses `alter table … add column if not exists` 66 times, and adding the column that way
+ * ahead of the index would make all three mirrorable. Nobody should cite these as precedent for a
+ * new exception without re-making that argument.
+ *
+ * The two CHECK constraints are a different, deliberate call: the migrations README requires an
  * enumerated CHECK to be a NAMED drop-and-re-add so it stays replay-repairable (the 2026-07-13
  * `integrations_type_check` incident), and that named form belongs in exactly one place.
  *
@@ -114,9 +128,27 @@ export function sourcesAtTag(tag) {
   };
 }
 
+/**
+ * This is the only script in the repo that issues `CREATE DATABASE` / `DROP DATABASE`, so it takes
+ * BOTH of the repo's existing precautions rather than neither.
+ *
+ * 1. `DATABASE_TEST_URL` only — no `DATABASE_URL` fallback. The data-mechanics tier already refuses
+ *    to run without it ("never fall back to a prod/dev URL", vitest.datamechanics.config.ts), and a
+ *    shell with `DATABASE_URL` pointed at prod is completely routine. Falling back would mean
+ *    unsupervised DDL churn on a production cluster from a command that reads as a test.
+ * 2. `assertServiceIdentity` BEFORE the first connection — the 2026-06-27 cross-project guard that
+ *    `pg-load-schema.mjs` and `pg-load-vector.mjs` carry. `test/guards/service-guard.test.ts`
+ *    enforces the call/ordering structurally, and this file is now in that list.
+ */
 function adminUrl() {
-  const url = process.env.DATABASE_TEST_URL || process.env.DATABASE_URL;
-  if (!url) throw new Error("DATABASE_TEST_URL (or DATABASE_URL) is required");
+  assertServiceIdentity("create scratch databases for the migrate-from-existing lane");
+  const url = process.env.DATABASE_TEST_URL;
+  if (!url) {
+    throw new Error(
+      "DATABASE_TEST_URL is required (the dedicated test Postgres). This lane CREATEs and DROPs " +
+      "databases, so it deliberately does not fall back to DATABASE_URL.",
+    );
+  }
   return url;
 }
 
@@ -133,6 +165,43 @@ async function withAdmin(fn) {
   try { return await fn(client); } finally { await client.end(); }
 }
 
+/**
+ * Scratch databases are named `mfe_<label>_<8 hex>` and created in-process, so this can only ever
+ * drop one of its own. Two safety nets beyond the `finally` in withScratchDb, which a signal skips:
+ * SIGINT/SIGTERM drop whatever is currently live, and a startup reap clears residue from a run that
+ * was killed outright (`kill -9`, a crashed container) so nobody has to hand-clean a shared server.
+ */
+const live = new Set();
+let reaped = false;
+
+async function dropScratch(name) {
+  try {
+    await withAdmin(async (admin) => {
+      await admin.query(`drop database if exists "${name}" with (force)`);
+    });
+  } catch { /* best effort: the server may be gone, which is not this script's problem */ }
+  live.delete(name);
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    for (const name of [...live]) await dropScratch(name);
+    process.exit(130);
+  });
+}
+
+/** Drop `mfe_*` databases older than an hour — residue from a run that was killed outright. */
+async function reapOrphans() {
+  if (reaped) return;
+  reaped = true;
+  const { rows } = await withAdmin((admin) => admin.query(
+    `select datname from pg_database
+      where datname like 'mfe\\_%'
+        and (pg_stat_file('base/' || oid::text, true)).modification < now() - interval '1 hour'`,
+  )).catch(() => ({ rows: [] }));
+  for (const row of rows) await dropScratch(row.datname);
+}
+
 const scratchName = (label) =>
   `mfe_${label.replace(/[^a-z0-9]+/gi, "_").toLowerCase().slice(0, 24)}_${randomBytes(4).toString("hex")}`;
 
@@ -141,15 +210,15 @@ const scratchName = (label) =>
  * @param {string} label @param {(url: string) => Promise<any>} fn
  */
 async function withScratchDb(label, fn, { keep = false } = {}) {
+  await reapOrphans();
   const name = scratchName(label);
   await withAdmin(async (admin) => { await admin.query(`create database "${name}"`); });
+  live.add(name);
   try {
     return await fn(urlForDatabase(adminUrl(), name));
   } finally {
-    if (keep) console.log(`  (kept scratch database ${name})`);
-    else await withAdmin(async (admin) => {
-      await admin.query(`drop database if exists "${name}" with (force)`);
-    });
+    if (keep) { live.delete(name); console.log(`  (kept scratch database ${name})`); }
+    else await dropScratch(name);
   }
 }
 
@@ -186,8 +255,15 @@ async function fingerprintDb(url) {
   return withClient(url, (client) => fingerprint(client));
 }
 
-/** True when a fingerprint line is NOT covered by a documented mirror exception. */
-const excepted = (line) => !Object.keys(MIRROR_EXCEPTIONS).some((k) => line.startsWith(k));
+/** The `kind\tident` key of a fingerprint line, without its definition. */
+const identOf = (line) => line.split("\t").slice(0, 2).join("\t");
+
+/**
+ * True when a fingerprint line is NOT covered by a documented mirror exception. Matched on the WHOLE
+ * `kind\tident` field, never as a prefix: a `startsWith` would silently excuse a future
+ * `members_kind_check_v2` on the strength of an allowlist entry written for `members_kind_check`.
+ */
+const excepted = (line) => !Object.hasOwn(MIRROR_EXCEPTIONS, identOf(line));
 
 const ms = (t) => `${((Date.now() - t) / 1000).toFixed(1)}s`;
 
@@ -279,7 +355,6 @@ async function runDeletionSweep(baseline, opts) {
   const notes = [];
   const started = Date.now();
   const schemaOnly = new Set(await buildFromZero({ ...opts, schemaOnly: true }));
-  const identOf = (line) => line.split("\t").slice(0, 2).join("\t");
   // Idents whose CURRENT definition schema.sql already produces on its own — mirrored, by definition.
   const mirrored = new Set([...schemaOnly].filter((l) => baseline.includes(l)).map(identOf));
 
@@ -320,8 +395,19 @@ export async function main(argv = process.argv.slice(2)) {
     ? []
     : value("tags", DEFAULT_TAGS.join(",")).split(",").filter(Boolean);
 
-  const known = new Set(git(["tag"]).split("\n").filter(Boolean));
-  for (const tag of tags) if (!known.has(tag)) throw new Error(`unknown git tag: ${tag}`);
+  const known = git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean);
+  const knownSet = new Set(known);
+  for (const tag of tags) if (!knownSet.has(tag)) throw new Error(`unknown git tag: ${tag}`);
+  // A hardcoded tag list rots SILENTLY — after v0.11.0 ships, the lane would keep upgrading from an
+  // ever-staler state and stay green, which is the exact failure shape this file exists to remove.
+  // Whenever a release is cut, add it to DEFAULT_TAGS.
+  const newest = known.find((t) => /^v\d+\.\d+\.\d+$/.test(t));
+  if (tags.length && newest && !tags.includes(newest)) {
+    throw new Error(
+      `DEFAULT_TAGS is stale: ${newest} is the newest release tag but is not in the upgrade set ` +
+      `(${tags.join(", ")}). Add it, so the lane keeps testing an upgrade from the CURRENT release.`,
+    );
+  }
 
   const t0 = Date.now();
   const baseline = await buildFromZero(opts);
