@@ -203,7 +203,17 @@ export function startIngestScheduler(): void {
               channels: s.channels,
               ...(s.deleted ? { deleted: s.deleted } : {}),
             }
-          : { integrations: s.integrations, items: s.items, projects: s.projects };
+          : {
+              integrations: s.integrations,
+              items: s.items,
+              projects: s.projects,
+              // TICKFIT-1 D4: watermark-skipped repos are REPORTED, not silent — and not
+              // folded into `unchanged` (a skip diff-syncs nothing). Count + a joined string
+              // so the Recent Runs panel's String(v) rendering stays legible.
+              ...("skippedRepos" in s && s.skippedRepos?.length
+                ? { skippedRepos: s.skippedRepos.length, skippedRepoNames: s.skippedRepos.join(", ") }
+                : {}),
+            };
       const removed = "channels" in s ? s.deleted : 0;
       if (s.created || s.updated || removed || s.errors.length) {
         const detail = "channels" in s ? `${s.channels} channels` : `${s.items} items, ${s.projects} projects`;
