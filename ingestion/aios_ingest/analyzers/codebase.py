@@ -405,12 +405,31 @@ def _read_coverage(repo: Path) -> dict[str, float | None]:
     """Read a committed coverage report if present (Istanbul json or lcov).
 
     Returns {"lines", "functions", "branches"} percentages, each None when that
-    dimension isn't reported (or no report exists at all). `lines` is the headline
-    number; functions/branches are surfaced alongside it on the dashboard.
+    dimension isn't reported (or no report exists at all), plus ``lines_total`` /
+    ``lines_covered`` — the COUNTS behind ``lines`` (brain-api 1.22, AIO-995).
+
+    The counts are the denominator ``lines`` was measured over. Without them a report that
+    instrumented 436 lines and one that instrumented 10,647 send an identical-looking
+    percentage, and coverage carries 40% of the brain's ``health_score``. **LINES, not files,
+    is the unit** for three reasons: both formats carry line counts natively in the totals they
+    already parse below (Istanbul ``total.lines.total``/``.covered``; the ``LF:``/``LH:`` sums
+    this function already accumulates), so nothing new is computed or globbed; the repo-side
+    denominator the brain divides by (``loc``) is itself a line count, so the ratio is
+    unit-consistent; and a file count would have to be compared against ``files``, which counts
+    every tracked file — README, SVG, lockfile — and is therefore a different census entirely.
+
+    Every value stays None when unreported. None means UNKNOWN all the way to the brain, which
+    persists it as a null column: not zero instrumented lines, and not "the whole repo".
     """
     import json
 
-    empty: dict[str, float | None] = {"lines": None, "functions": None, "branches": None}
+    empty: dict[str, float | None] = {
+        "lines": None,
+        "functions": None,
+        "branches": None,
+        "lines_total": None,
+        "lines_covered": None,
+    }
 
     for rel in ("coverage/coverage-summary.json", "coverage-summary.json"):
         p = repo / rel
@@ -422,8 +441,19 @@ def _read_coverage(repo: Path) -> dict[str, float | None]:
                     v = total.get(key, {}).get("pct")
                     return float(v) if isinstance(v, (int, float)) else None
 
+                def _count(key: str) -> float | None:
+                    v = total.get("lines", {}).get(key)
+                    # bool is an int subclass — exclude it so a stray `true` isn't read as 1.
+                    return int(v) if isinstance(v, int) and not isinstance(v, bool) else None
+
                 if _pct("lines") is not None:
-                    return {"lines": _pct("lines"), "functions": _pct("functions"), "branches": _pct("branches")}
+                    return {
+                        "lines": _pct("lines"),
+                        "functions": _pct("functions"),
+                        "branches": _pct("branches"),
+                        "lines_total": _count("total"),
+                        "lines_covered": _count("covered"),
+                    }
             except (ValueError, OSError):
                 pass
 
@@ -451,10 +481,141 @@ def _read_coverage(repo: Path) -> dict[str, float | None]:
                 return round(100 * hit / found, 2) if found else None
 
             if counts["L"][1]:  # lines found → a real report
-                return {"lines": _ratio("L"), "functions": _ratio("FN"), "branches": _ratio("BR")}
+                return {
+                    "lines": _ratio("L"),
+                    "functions": _ratio("FN"),
+                    "branches": _ratio("BR"),
+                    # LF/LH are exactly the denominator and numerator of `lines` above — the
+                    # same sums, now reported instead of divided away.
+                    "lines_total": counts["L"][1],
+                    "lines_covered": counts["L"][0],
+                }
         except (ValueError, OSError):
             pass
     return empty
+
+
+# Test-result reports the scanner will read, in preference order. Both are one reporter flag
+# away in every runner this fleet uses, and neither is required — a repo with no report simply
+# reports None (unknown), which is NOT the same as "nothing was skipped".
+_TEST_REPORT_JSON = (
+    "coverage/test-results.json",
+    "test-results.json",
+    "test-results/results.json",
+)
+_TEST_REPORT_JUNIT = (
+    "coverage/junit.xml",
+    "junit.xml",
+    "test-results.xml",
+    "test-results/junit.xml",
+)
+
+
+def _read_test_results(repo: Path) -> dict[str, int | None]:
+    """Read a committed test-result report if present (Vitest/Jest JSON, or JUnit XML).
+
+    Returns ``{"total", "passed", "skipped", "failed"}`` counts, each None when no report
+    exists (brain-api 1.22, AIO-995).
+
+    **Why this is worth a parser.** Skipped tests are not failures, so nothing goes red — but
+    coverage moves anyway, and the number it lands on is perfectly plausible. On aios-devtools a
+    single unset ``AIOS_TOOLKIT_DIR`` skipped 91 of 229 tests *by design* and swung coverage 29
+    points (48.93% -> 77.68%); on aios-workspace-gui the same variable produced 27 failures plus
+    58 skips, which would have wiped the report and left the dashboard reading "no report" while
+    every gate stayed green. A degraded run has to announce itself.
+
+    **None means UNKNOWN.** A repo that publishes no test-result report gets None, never 0 — the
+    brain must not read "no report" as "nothing was skipped". Same rule as `_read_coverage`.
+    """
+    import json
+
+    empty: dict[str, int | None] = {"total": None, "passed": None, "skipped": None, "failed": None}
+
+    def _int(v: Any) -> int | None:
+        return int(v) if isinstance(v, int) and not isinstance(v, bool) else None
+
+    for rel in _TEST_REPORT_JSON:
+        p = repo / rel
+        if not p.is_file():
+            continue
+        try:
+            doc = json.loads(p.read_text())
+        except (ValueError, OSError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        total = _int(doc.get("numTotalTests"))
+        if total is None:
+            continue  # not a Vitest/Jest JSON report — keep looking
+        return {
+            "total": total,
+            "passed": _int(doc.get("numPassedTests")),
+            # Jest/Vitest split "not run" across pending (it.skip / it.todo).
+            "skipped": _sum_or_none(_int(doc.get("numPendingTests")), _int(doc.get("numTodoTests"))),
+            "failed": _int(doc.get("numFailedTests")),
+        }
+
+    # The input is a file the repo committed to its own tree, but it is still untrusted-shaped
+    # input: a malformed document must fall through to "unknown", never raise out of a scan.
+    import xml.etree.ElementTree as ET
+
+    for rel in _TEST_REPORT_JUNIT:
+        p = repo / rel
+        if not p.is_file():
+            continue
+        try:
+            root = ET.parse(p).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        # A JUnit file is either a single <testsuite> or a <testsuites> wrapper — and aggregated
+        # files (Ant, some Karma/Gradle merges) NEST <testsuite> inside <testsuite>, with the
+        # parent carrying rolled-up counts. Summing every descendant would count those tests
+        # twice, inflating the totals and making a clean run report as partial. So sum LEAF
+        # suites only: a suite that contains another <testsuite> is a rollup of the ones below it.
+        all_suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+        suites = [s for s in all_suites if s.find("testsuite") is None]
+        if not suites:
+            continue
+        agg = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
+        seen = False
+        for suite in suites:
+            if suite.get("tests") is None:
+                continue
+            seen = True
+            for key in agg:
+                try:
+                    agg[key] += int(suite.get(key) or 0)
+                except ValueError:
+                    pass
+        if not seen:
+            continue
+        # `errors` are counted as failures — a fixture/collection error is a case that did not
+        # pass, and a scanner that dropped them would report a clean run for a broken one.
+        failed = agg["failures"] + agg["errors"]
+        # …but several runners count an error WITHOUT incrementing `tests` (pytest emits
+        # `<testsuite tests="0" errors="1"/>` for a collection error). Taking `tests` at face
+        # value there yields failed > total, which the brain rejects at the boundary — losing the
+        # ENTIRE scan, contributions and issues included, over one degraded report. The total is
+        # therefore at least the sum of its parts.
+        total = max(agg["tests"], agg["skipped"] + failed)
+        return {
+            "total": total,
+            "passed": max(0, total - agg["skipped"] - failed),
+            "skipped": agg["skipped"],
+            "failed": failed,
+        }
+
+    return empty
+
+
+def _sum_or_none(*values: int | None) -> int | None:
+    """Sum the values that were reported; None only when NONE of them were.
+
+    A reporter that emits `numPendingTests` but not `numTodoTests` still knows something about
+    skips, and that partial knowledge is worth more than discarding the field.
+    """
+    present = [v for v in values if v is not None]
+    return sum(present) if present else None
 
 
 def _github_enrich(full_name: str, token: str | None) -> dict[str, Any]:
@@ -535,13 +696,16 @@ def analyze_repo(
     git = _analyze_git(repo, window_days)
     scaff = _detect_scaffolding(repo)
     coverage = _read_coverage(repo)
+    tests = _read_test_results(repo)
     readiness = score_readiness(repo, rubric_path)
     gh = _github_enrich(full_name, github_token or os.environ.get("GITHUB_TOKEN"))
     meta = gh.get("meta", {})
 
     return {
         "codebase": _codebase_block(slug, full_name, meta),
-        "metrics": _metrics_block(git, scaff, coverage, _head_sha(repo), window_days, readiness=readiness),
+        "metrics": _metrics_block(
+            git, scaff, coverage, _head_sha(repo), window_days, readiness=readiness, tests=tests
+        ),
         "contributions": git["contributions"],
         "issues": gh.get("issues", []),
     }
@@ -562,6 +726,38 @@ def _codebase_block(slug: str, full_name: str, meta: dict[str, Any]) -> dict[str
     }
 
 
+def _coherent_pair(total: int | None, part: int | None) -> tuple[int | None, int | None]:
+    """Drop a numerator/denominator pair to UNKNOWN when the numerator doesn't fit inside it.
+
+    The brain rejects an incoherent pair at the boundary (422) — and that 422 kills the WHOLE
+    scan, contributions and GitHub issues included, not just the offending field. One malformed
+    committed report would therefore take a repo's entire analytics offline, which is a worse
+    version of the silent-degradation failure this feature exists to prevent.
+
+    So the scanner never ships a pair it knows is wrong. Incoherent means the report was parsed
+    wrong or written wrong; "we don't know" is the honest reading of that, and it is the one
+    state the rest of this change is built to represent safely.
+    """
+    if total is not None and part is not None and part > total:
+        return None, None
+    return total, part
+
+
+def _coherent_run(
+    total: int | None, passed: int | None, skipped: int | None, failed: int | None
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Same rule for the test-run counts: any part exceeding the total voids the whole group.
+
+    Voided as a GROUP rather than per-field, because the counts are only meaningful together —
+    keeping `skipped` from a report whose `total` we just disbelieved would let the dashboard
+    call a run partial on evidence we rejected.
+    """
+    parts = [p for p in (passed, skipped, failed) if p is not None]
+    if total is not None and any(p > total for p in parts):
+        return None, None, None, None
+    return total, passed, skipped, failed
+
+
 def _metrics_block(
     git: dict[str, Any],
     scaff: dict[str, Any],
@@ -570,12 +766,20 @@ def _metrics_block(
     window_days: int,
     scanned_at: str | None = None,
     readiness: dict[str, Any] | None = None,
+    tests: dict[str, int | None] | None = None,
 ) -> dict[str, Any]:
     # Single normalizer for the readiness fields: a scored dict OR None (scorer failure /
     # historical backfill) both yield the brain's schema-safe shape — level/pct/version
     # nullable, pillars defaults to {} (NOT nullable). Keeps the two paths byte-identical.
     r = readiness or {}
     c = coverage or {}  # history backfill passes None (no coverage at past SHAs)
+    # Same posture for the 1.22 run-integrity counts: a historical snapshot has no test-result
+    # report either, and `.get` on {} yields None = unknown, which is exactly right.
+    t = tests or {}
+    cov_lines, cov_covered = _coherent_pair(c.get("lines_total"), c.get("lines_covered"))
+    t_total, t_passed, t_skipped, t_failed = _coherent_run(
+        t.get("total"), t.get("passed"), t.get("skipped"), t.get("failed")
+    )
     block = {
         "head_sha": head_sha,
         "window_days": window_days,
@@ -588,6 +792,15 @@ def _metrics_block(
         "test_coverage_pct": c.get("lines"),
         "test_coverage_functions_pct": c.get("functions"),
         "test_coverage_branches_pct": c.get("branches"),
+        # brain-api 1.22 (AIO-995) — the denominator behind test_coverage_pct, and whether the
+        # run that produced it was complete. None = unknown; the brain stores it as a null
+        # column and reads it as "no scope reported", never as zero.
+        "test_coverage_lines_total": cov_lines,
+        "test_coverage_lines_covered": cov_covered,
+        "tests_total": t_total,
+        "tests_passed": t_passed,
+        "tests_skipped": t_skipped,
+        "tests_failed": t_failed,
         "recent_commits": git["recent_commits"],
         "has_claude_md": scaff["has_claude_md"],
         "has_agents_md": scaff["has_agents_md"],

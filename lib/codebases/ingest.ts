@@ -57,6 +57,15 @@ export async function ingestCodebaseScan(
     commits_window: m.commits_window,
     ai_commits_window: m.ai_commits_window,
     test_coverage_pct: m.test_coverage_pct,
+    // brain-api 1.22 — the coverage denominator + run integrity. Passed through as-is:
+    // `null` is the wire's "unknown" and must stay null all the way into the score, never
+    // become a 0 that reads as a measurement (AIO-995).
+    test_coverage_lines_total: m.test_coverage_lines_total,
+    test_coverage_lines_covered: m.test_coverage_lines_covered,
+    tests_total: m.tests_total,
+    tests_passed: m.tests_passed,
+    tests_skipped: m.tests_skipped,
+    tests_failed: m.tests_failed,
     has_claude_md: m.has_claude_md,
     has_agents_md: m.has_agents_md,
     agents_md_count: m.agents_md_count,
@@ -88,6 +97,14 @@ export async function ingestCodebaseScan(
         test_coverage_pct: m.test_coverage_pct,
         test_coverage_functions_pct: m.test_coverage_functions_pct,
         test_coverage_branches_pct: m.test_coverage_branches_pct,
+        // Raw 1.22 measures, persisted verbatim. Nullable columns: an omitting scanner writes
+        // null (= unknown), which is what every pre-1.22 row already holds.
+        test_coverage_lines_total: m.test_coverage_lines_total,
+        test_coverage_lines_covered: m.test_coverage_lines_covered,
+        tests_total: m.tests_total,
+        tests_passed: m.tests_passed,
+        tests_skipped: m.tests_skipped,
+        tests_failed: m.tests_failed,
         // jsonb ARRAY column: the pg adapter only auto-casts plain objects to
         // ::jsonb, not arrays — stringify so Postgres parses it as jsonb (this
         // feature is postgres-only). Empty + non-empty both round-trip correctly.

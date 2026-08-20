@@ -4,6 +4,7 @@ import type { DbClient } from "@/lib/db/types";
 import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
+import { scanPartial } from "@/lib/codebases/score";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
@@ -27,6 +28,21 @@ export interface CodebaseSummary {
   agentic_score: number;
   health_score: number;
   test_coverage_pct: number | null;
+  /**
+   * The scope `test_coverage_pct` was measured over (brain-api 1.22 / AIO-995). Rendering the
+   * percentage without it lets a 436-line measurement and a 10,647-line one read as the same
+   * claim. `coverage_breadth_pct` is null for every scan taken before 1.22 — unknown scope, not
+   * full scope — so the card must be able to show a percentage with no scope attached.
+   */
+  test_coverage_lines_total: number | null;
+  coverage_breadth_pct: number | null;
+  /** Repository lines counted by the last scan — the denominator breadth is measured against. */
+  loc: number | null;
+  /** null = no test-result report (completeness unknown); true = the run skipped or failed cases. */
+  scan_partial: boolean | null;
+  tests_skipped: number | null;
+  tests_failed: number | null;
+  tests_total: number | null;
   ai_commit_ratio: number;
   readiness_level: string | null; // AEM agent-readiness level (L0..L5), null = not scored
   readiness_pct: number | null;
@@ -87,6 +103,13 @@ type MetricRow = {
   agentic_score: number | string;
   health_score: number | string;
   test_coverage_pct: number | string | null;
+  // brain-api 1.22 (AIO-995) — nullable on every row written before the columns existed.
+  test_coverage_lines_total: number | string | null;
+  coverage_breadth_pct: number | string | null;
+  loc: number | string | null;
+  tests_total: number | string | null;
+  tests_skipped: number | string | null;
+  tests_failed: number | string | null;
   ai_commit_ratio: number | string;
   readiness_level: string | null;
   readiness_pct: number | string | null;
@@ -114,7 +137,11 @@ export async function getCodebaseSummaries(
     // series in JS. DESC + limit keeps the NEWEST points (ascending+limit would drop them at scale).
     db
       .from("code_metrics")
-      .select("codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, ai_commit_ratio, readiness_level, readiness_pct")
+      .select(
+        "codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, " +
+          "test_coverage_lines_total, coverage_breadth_pct, loc, tests_total, tests_skipped, tests_failed, " +
+          "ai_commit_ratio, readiness_level, readiness_pct"
+      )
       .eq("team_id", teamId)
       .order("scanned_at", { ascending: false })
       .limit(10_000),
@@ -153,6 +180,23 @@ export async function getCodebaseSummaries(
       agentic_score: num(latest?.agentic_score),
       health_score: num(latest?.health_score),
       test_coverage_pct: latest?.test_coverage_pct == null ? null : num(latest.test_coverage_pct),
+      test_coverage_lines_total:
+        latest?.test_coverage_lines_total == null ? null : num(latest.test_coverage_lines_total),
+      coverage_breadth_pct:
+        latest?.coverage_breadth_pct == null ? null : num(latest.coverage_breadth_pct),
+      loc: latest?.loc == null ? null : num(latest.loc),
+      tests_total: latest?.tests_total == null ? null : num(latest.tests_total),
+      tests_skipped: latest?.tests_skipped == null ? null : num(latest.tests_skipped),
+      tests_failed: latest?.tests_failed == null ? null : num(latest.tests_failed),
+      // Derived here rather than stored: the raw counts are the durable fact, and one rule for
+      // "partial" (lib/codebases/score.scanPartial) keeps the card and the detail page in step.
+      scan_partial: latest
+        ? scanPartial({
+            tests_total: latest.tests_total == null ? null : num(latest.tests_total),
+            tests_skipped: latest.tests_skipped == null ? null : num(latest.tests_skipped),
+            tests_failed: latest.tests_failed == null ? null : num(latest.tests_failed),
+          })
+        : null,
       ai_commit_ratio: num(latest?.ai_commit_ratio),
       readiness_level: latest?.readiness_level ?? null,
       readiness_pct: latest?.readiness_pct == null ? null : num(latest.readiness_pct),
@@ -304,6 +348,19 @@ export interface AgenticBreakdown {
   test_coverage_pct: number | null;
   test_coverage_functions_pct: number | null;
   test_coverage_branches_pct: number | null;
+  // brain-api 1.22 (AIO-995) — the coverage denominator + the integrity of the run behind it.
+  // All null on a pre-1.22 scan: unknown scope and unknown completeness, never zero.
+  test_coverage_lines_total: number | null;
+  test_coverage_lines_covered: number | null;
+  coverage_breadth_pct: number | null;
+  /** Repository lines counted by the scanner — the denominator `coverage_breadth_pct` is over. */
+  loc: number;
+  tests_total: number | null;
+  tests_passed: number | null;
+  tests_skipped: number | null;
+  tests_failed: number | null;
+  /** null = completeness unknown (no test-result report); true = cases skipped or failed. */
+  scan_partial: boolean | null;
   readiness_level: string | null;
   readiness_pct: number | null;
   readiness_pillars: Record<string, { passed: number; total: number }>;
@@ -459,6 +516,8 @@ export async function getCodebaseDetail(
     "scaffolding_score, skill_breadth_score, cadence_score, issue_health, has_claude_md, " +
     "has_agents_md, agents_md_count, skills_count, commands_count, test_coverage_pct, " +
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
+    "test_coverage_lines_total, test_coverage_lines_covered, coverage_breadth_pct, loc, " +
+    "tests_total, tests_passed, tests_skipped, tests_failed, " +
     "readiness_level, readiness_pct, readiness_pillars, codebase_health";
 
   const [
@@ -570,6 +629,19 @@ export async function getCodebaseDetail(
           latest.test_coverage_functions_pct == null ? null : num(latest.test_coverage_functions_pct as number),
         test_coverage_branches_pct:
           latest.test_coverage_branches_pct == null ? null : num(latest.test_coverage_branches_pct as number),
+        test_coverage_lines_total: numOrNull(latest.test_coverage_lines_total as number | null),
+        test_coverage_lines_covered: numOrNull(latest.test_coverage_lines_covered as number | null),
+        coverage_breadth_pct: numOrNull(latest.coverage_breadth_pct as number | null),
+        loc: num(latest.loc as number),
+        tests_total: numOrNull(latest.tests_total as number | null),
+        tests_passed: numOrNull(latest.tests_passed as number | null),
+        tests_skipped: numOrNull(latest.tests_skipped as number | null),
+        tests_failed: numOrNull(latest.tests_failed as number | null),
+        scan_partial: scanPartial({
+          tests_total: numOrNull(latest.tests_total as number | null),
+          tests_skipped: numOrNull(latest.tests_skipped as number | null),
+          tests_failed: numOrNull(latest.tests_failed as number | null),
+        }),
         readiness_level: (latest.readiness_level as string | null) ?? null,
         readiness_pct: latest.readiness_pct == null ? null : num(latest.readiness_pct as number),
         readiness_pillars:

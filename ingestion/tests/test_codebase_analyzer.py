@@ -10,11 +10,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aios_ingest.analyzers.codebase import (
+    _coherent_pair,
+    _coherent_run,
     _detect_scaffolding,
     _entries_under,
+    _read_coverage,
+    _read_test_results,
     _resolve_in_repo,
     _tracked_entries,
-    _read_coverage,
     analyze_history,
     analyze_repo,
 )
@@ -359,26 +362,233 @@ def test_no_github_token_means_no_issues(tmp_path, monkeypatch):
 
 
 def test_read_coverage_istanbul_all_three(tmp_path):
-    """Istanbul coverage-summary.json yields lines/functions/branches percentages."""
+    """Istanbul coverage-summary.json yields lines/functions/branches percentages + counts."""
     cov = tmp_path / "coverage"
     cov.mkdir()
     (cov / "coverage-summary.json").write_text(
-        '{"total": {"lines": {"pct": 31.67}, "functions": {"pct": 34.33}, "branches": {"pct": 25.7}}}'
+        '{"total": {"lines": {"pct": 31.67, "total": 9752, "covered": 3088},'
+        ' "functions": {"pct": 34.33}, "branches": {"pct": 25.7}}}'
     )
-    assert _read_coverage(tmp_path) == {"lines": 31.67, "functions": 34.33, "branches": 25.7}
+    assert _read_coverage(tmp_path) == {
+        "lines": 31.67,
+        "functions": 34.33,
+        "branches": 25.7,
+        "lines_total": 9752,
+        "lines_covered": 3088,
+    }
+
+
+def test_read_coverage_istanbul_counts_optional(tmp_path):
+    """An Istanbul report with pct but no counts still yields the pct — counts fall to None.
+
+    A percentage without a denominator is exactly the state AIO-995 exists to expose, so it
+    must remain readable rather than being rejected as malformed.
+    """
+    cov = tmp_path / "coverage"
+    cov.mkdir()
+    (cov / "coverage-summary.json").write_text('{"total": {"lines": {"pct": 31.67}}}')
+    got = _read_coverage(tmp_path)
+    assert got["lines"] == 31.67
+    assert got["lines_total"] is None and got["lines_covered"] is None
 
 
 def test_read_coverage_lcov_all_three(tmp_path):
-    """LCOV lcov.info yields lines/functions/branches computed from hit/found totals."""
+    """LCOV lcov.info yields percentages AND the LF/LH sums they were divided from."""
     cov = tmp_path / "coverage"
     cov.mkdir()
     (cov / "lcov.info").write_text("\n".join(["LF:200", "LH:100", "FNF:40", "FNH:30", "BRF:50", "BRH:20", "end_of_record"]))
-    assert _read_coverage(tmp_path) == {"lines": 50.0, "functions": 75.0, "branches": 40.0}
+    assert _read_coverage(tmp_path) == {
+        "lines": 50.0,
+        "functions": 75.0,
+        "branches": 40.0,
+        "lines_total": 200,
+        "lines_covered": 100,
+    }
 
 
 def test_read_coverage_none_when_absent(tmp_path):
-    """No report → all three None (so the scanner pushes nulls, not zeros)."""
-    assert _read_coverage(tmp_path) == {"lines": None, "functions": None, "branches": None}
+    """No report → every field None (so the scanner pushes nulls, not zeros)."""
+    assert _read_coverage(tmp_path) == {
+        "lines": None,
+        "functions": None,
+        "branches": None,
+        "lines_total": None,
+        "lines_covered": None,
+    }
+
+
+def test_read_test_results_none_when_absent(tmp_path):
+    """No test-result report → all None.
+
+    NOT zeros. `{"skipped": 0}` is the claim "this run skipped nothing", which a repo with no
+    report has not made and the brain must not infer (AIO-995).
+    """
+    assert _read_test_results(tmp_path) == {
+        "total": None,
+        "passed": None,
+        "skipped": None,
+        "failed": None,
+    }
+
+
+def test_read_test_results_vitest_json(tmp_path):
+    """Vitest/Jest JSON reporter counts, with pending + todo summed into `skipped`."""
+    cov = tmp_path / "coverage"
+    cov.mkdir()
+    (cov / "test-results.json").write_text(
+        json.dumps(
+            {
+                "numTotalTests": 229,
+                "numPassedTests": 135,
+                "numPendingTests": 88,
+                "numTodoTests": 3,
+                "numFailedTests": 3,
+            }
+        )
+    )
+    assert _read_test_results(tmp_path) == {
+        "total": 229,
+        "passed": 135,
+        "skipped": 91,
+        "failed": 3,
+    }
+
+
+def test_read_test_results_junit_sums_suites(tmp_path):
+    """JUnit XML: suites are summed, and errors count as failures.
+
+    The aios-workspace-gui shape — a run with both failures and skips, which coverage alone
+    reports as a plausible percentage with nothing red.
+    """
+    (tmp_path / "junit.xml").write_text(
+        '<testsuites>'
+        '<testsuite tests="200" skipped="30" failures="20" errors="2"/>'
+        '<testsuite tests="251" skipped="28" failures="5" errors="0"/>'
+        "</testsuites>"
+    )
+    assert _read_test_results(tmp_path) == {
+        "total": 451,
+        "passed": 451 - 58 - 27,
+        "skipped": 58,
+        "failed": 27,
+    }
+
+
+def test_read_test_results_junit_bare_testsuite(tmp_path):
+    """A JUnit file whose root is a single <testsuite> (no <testsuites> wrapper) still parses."""
+    (tmp_path / "test-results.xml").write_text('<testsuite tests="10" skipped="1" failures="0"/>')
+    assert _read_test_results(tmp_path) == {
+        "total": 10,
+        "passed": 9,
+        "skipped": 1,
+        "failed": 0,
+    }
+
+
+def test_read_test_results_malformed_xml_is_unknown_not_a_crash(tmp_path):
+    """A malformed report degrades to UNKNOWN — it must never abort a scan or report zeros."""
+    (tmp_path / "junit.xml").write_text("<testsuites><testsuite tests=")
+    assert _read_test_results(tmp_path)["total"] is None
+
+
+def test_junit_errors_outside_tests_do_not_produce_failed_gt_total(tmp_path):
+    """pytest emits `<testsuite tests="0" errors="1"/>` for a collection error.
+
+    Taken at face value that is failed=1, total=0 — which the brain rejects at the boundary,
+    losing the ENTIRE scan (contributions and issues included) over one degraded report. The
+    total must be at least the sum of its parts.
+    """
+    (tmp_path / "junit.xml").write_text('<testsuite tests="0" errors="1" failures="0" skipped="0"/>')
+    got = _read_test_results(tmp_path)
+    assert got["failed"] == 1
+    assert got["total"] >= got["failed"], "failed must never exceed total"
+    assert got["passed"] == 0
+
+
+def test_junit_nested_rollup_suites_are_not_double_counted(tmp_path):
+    """Aggregated JUnit files nest <testsuite> inside <testsuite> with rolled-up parent counts.
+
+    Summing every descendant counts each test twice — inflating the totals and able to make a
+    clean run report as partial.
+    """
+    (tmp_path / "junit.xml").write_text(
+        "<testsuites>"
+        '<testsuite name="all" tests="10" skipped="2" failures="0">'
+        '<testsuite name="a" tests="6" skipped="2" failures="0"/>'
+        '<testsuite name="b" tests="4" skipped="0" failures="0"/>'
+        "</testsuite>"
+        "</testsuites>"
+    )
+    assert _read_test_results(tmp_path) == {"total": 10, "passed": 8, "skipped": 2, "failed": 0}
+
+
+def test_incoherent_counts_are_voided_to_unknown_not_shipped():
+    """The scanner must never emit a pair the brain will 422 the whole payload over."""
+    # Coherent pairs pass through untouched, including equality.
+    assert _coherent_pair(100, 100) == (100, 100)
+    assert _coherent_pair(100, None) == (100, None)
+    assert _coherent_pair(None, 40) == (None, 40)
+    # A numerator that doesn't fit its denominator voids BOTH — the report was parsed wrong.
+    assert _coherent_pair(100, 101) == (None, None)
+
+    assert _coherent_run(10, 5, 3, 2) == (10, 5, 3, 2)
+    assert _coherent_run(None, 5, 3, 2) == (None, 5, 3, 2)
+    # Voided as a group: keeping `skipped` from a report whose total we disbelieved would let
+    # the dashboard call a run partial on evidence we just rejected.
+    assert _coherent_run(10, 5, 11, 2) == (None, None, None, None)
+
+
+def test_scan_payload_carries_the_coverage_denominator(tmp_path):
+    """End to end: analyze_repo emits the six 1.22 fields, null when there is no report.
+
+    The contract rule this pins: an omitting scan sends nulls for all six, so a pre-1.22-shaped
+    repo produces a payload the brain reads as "scope unknown" rather than "scope zero".
+    """
+    repo = _init(tmp_path)
+    (repo / "a.ts").write_text("const a = 1;\n" * 40)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1")
+
+    m = analyze_repo(str(repo), slug="x")["metrics"]
+    for key in (
+        "test_coverage_lines_total",
+        "test_coverage_lines_covered",
+        "tests_total",
+        "tests_passed",
+        "tests_skipped",
+        "tests_failed",
+    ):
+        assert key in m, f"{key} missing from the scan payload"
+        assert m[key] is None
+
+    cov = repo / "coverage"
+    cov.mkdir()
+    (cov / "coverage-summary.json").write_text(
+        '{"total": {"lines": {"pct": 99.0, "total": 20, "covered": 20}}}'
+    )
+    (cov / "test-results.json").write_text(
+        json.dumps({"numTotalTests": 8, "numPassedTests": 6, "numPendingTests": 2, "numFailedTests": 0})
+    )
+    m2 = analyze_repo(str(repo), slug="x")["metrics"]
+    assert m2["test_coverage_pct"] == 99.0
+    # 20 instrumented lines against 40 counted lines: the percentage covers half the repo, and
+    # that fact now rides along with it.
+    assert m2["test_coverage_lines_total"] == 20
+    assert m2["loc"] == 40
+    assert m2["tests_skipped"] == 2 and m2["tests_total"] == 8
+
+
+def test_history_backfill_leaves_the_1_22_fields_unknown(tmp_path):
+    """A historical snapshot has no coverage or test report at that SHA — six nulls, no crash."""
+    repo = _init(tmp_path)
+    (repo / "a.ts").write_text("const a = 1;\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "c1")
+    points = analyze_history(str(repo), slug="x", weeks=2)
+    assert points, "expected at least one historical point"
+    for point in points:
+        assert point["metrics"]["test_coverage_lines_total"] is None
+        assert point["metrics"]["tests_skipped"] is None
 
 
 def test_live_scan_carries_scored_readiness(tmp_path):

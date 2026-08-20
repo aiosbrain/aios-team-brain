@@ -62,8 +62,21 @@
  *        which is why the workspace's own `CANONICAL_TASK_STATUSES` mirror moved in the same window.
  *        NEEDS A MIGRATION: `tasks.status` is the `task_status` ENUM
  *        (postgres/migrations/20260819180000_task_status_in_review.sql).
+ * 1.22 — ADDITIVE: POST /api/v1/codebases `metrics` gains six optional, nullable raw measures so
+ *        a coverage percentage arrives with the scope it was measured over and a degraded test
+ *        run announces itself (AIO-995). `test_coverage_lines_total` /
+ *        `test_coverage_lines_covered` are the coverage denominator (instrumented lines, and how
+ *        many were hit); `tests_total` / `tests_passed` / `tests_skipped` / `tests_failed` are the
+ *        run-integrity counts. Every one defaults to null, so a pre-1.22 scanner is byte-for-byte
+ *        unaffected and an older brain ignores the unknown keys. NULL MEANS UNKNOWN, NEVER ZERO —
+ *        the same rule `test_coverage_pct` already carries. The brain derives and persists
+ *        `coverage_breadth_pct` from `test_coverage_lines_total / loc`; it is displayed and
+ *        deliberately NOT folded into agentic_score/health_score yet (rationale in
+ *        lib/codebases/score.ts).
+ *        NEEDS A MIGRATION: seven new columns on `code_metrics`
+ *        (postgres/migrations/20260820140000_code_metrics_coverage_denominator.sql).
  */
-export const BRAIN_API_VERSION = "1.21";
+export const BRAIN_API_VERSION = "1.22";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

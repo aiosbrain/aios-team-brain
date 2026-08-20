@@ -4,6 +4,7 @@ import type { CodebaseSummary } from "@/lib/metrics/codebases";
 import { timeAgo } from "@/components/format";
 import { Sparkline } from "@/components/sparkline";
 import { ScoreRing } from "./score-ring";
+import { CoverageScope, PartialRunBadge, isNarrowCoverage } from "./coverage-scope";
 
 export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseSummary }) {
   return (
@@ -33,12 +34,31 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <span>
             <span className="font-semibold text-ink">{cb.health_score}</span> health
           </span>
-          <span>
-            <span className="font-semibold text-ink">
+          {/* Coverage never renders alone when its scope is known: a percentage over a small
+              slice of the repo has to look different from one over all of it (AIO-995). */}
+          <span className="inline-flex items-baseline gap-1">
+            <span
+              className={`font-semibold ${
+                isNarrowCoverage(cb.coverage_breadth_pct) ? "text-amber-500/90" : "text-ink"
+              }`}
+            >
               {cb.test_coverage_pct == null ? "—" : `${cb.test_coverage_pct}%`}
             </span>{" "}
             cov
+            {cb.test_coverage_pct == null ? null : (
+              <CoverageScope
+                linesInstrumented={cb.test_coverage_lines_total}
+                loc={cb.loc}
+                breadthPct={cb.coverage_breadth_pct}
+              />
+            )}
           </span>
+          <PartialRunBadge
+            partial={cb.scan_partial}
+            skipped={cb.tests_skipped}
+            failed={cb.tests_failed}
+            total={cb.tests_total}
+          />
           {cb.readiness_level ? (
             <span
               title={`AEM agent-readiness${cb.readiness_pct == null ? "" : ` — ${cb.readiness_pct}% of checks`}`}

@@ -1652,6 +1652,17 @@ create table if not exists code_metrics (
   test_coverage_pct numeric(5,2),                 -- null = no coverage report found (lines %)
   test_coverage_functions_pct numeric(5,2),       -- null = not reported
   test_coverage_branches_pct numeric(5,2),        -- null = not reported
+  -- brain-api 1.22 (AIO-995): the DENOMINATOR the percentage above was measured over, plus the
+  -- integrity of the run that produced it. All nullable — null = UNKNOWN, never zero and never
+  -- "fully covered" (every row written before 1.22 has no denominator and cannot acquire one).
+  -- Catch-up delta: postgres/migrations/20260820140000_code_metrics_coverage_denominator.sql
+  test_coverage_lines_total integer,              -- instrumented lines the report measured
+  test_coverage_lines_covered integer,            -- of those, how many were hit
+  tests_total integer,                            -- test-result report counts; null = no report
+  tests_passed integer,
+  tests_skipped integer,                          -- >0 = a partial run; NOT a failure, but not full evidence
+  tests_failed integer,
+  coverage_breadth_pct numeric(5,2),              -- derived: 100*min(1, lines_total/loc); null = unknown
   recent_commits jsonb not null default '[]',     -- [{sha,author,ai,additions,deletions,committed_at,message}]
   -- explicit scaffolding inputs (named, not vague JSON → testable scoring)
   has_claude_md boolean not null default false,
@@ -1678,7 +1689,15 @@ create table if not exists code_metrics (
   -- persisted verbatim (closed scalar object incl. measured_at); null = not scored
   codebase_health jsonb,
   created_at timestamptz not null default now(),
-  unique (codebase_id, head_sha)
+  unique (codebase_id, head_sha),
+  constraint code_metrics_coverage_denominator_nonneg check (
+    (test_coverage_lines_total is null or test_coverage_lines_total >= 0)
+    and (test_coverage_lines_covered is null or test_coverage_lines_covered >= 0)
+    and (tests_total is null or tests_total >= 0)
+    and (tests_passed is null or tests_passed >= 0)
+    and (tests_skipped is null or tests_skipped >= 0)
+    and (tests_failed is null or tests_failed >= 0)
+  )
 );
 
 -- Durable, redacted finding state derived from codebase_health v2 snapshots (AIO-785).
