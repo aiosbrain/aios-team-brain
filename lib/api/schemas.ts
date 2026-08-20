@@ -195,6 +195,22 @@ export const codeMetricsSchema = z.object({
     .nullable()
     .optional()
     .default(null),
+  // brain-api 1.22 (AIO-995) — the DENOMINATOR `test_coverage_pct` was measured over, and the
+  // integrity of the run that produced it. All optional and defaulting to null, so a pre-1.22
+  // scanner's payload is byte-for-byte unchanged.
+  //
+  // `null` MEANS UNKNOWN, NOT ZERO. That distinction is the whole point of the field: a payload
+  // with no `test_coverage_lines_total` must never be read as "nothing was instrumented", and
+  // one with no `tests_skipped` must never be read as "nothing was skipped". Same posture as
+  // `test_coverage_pct` itself, whose null already means "no report" rather than a measured 0%.
+  // These are `int().nonnegative()` rather than percentages because they are COUNTS — the ratio
+  // is derived in lib/codebases/score.ts, where the repo-size denominator (`loc`) also lives.
+  test_coverage_lines_total: z.number().int().nonnegative().nullable().optional().default(null),
+  test_coverage_lines_covered: z.number().int().nonnegative().nullable().optional().default(null),
+  tests_total: z.number().int().nonnegative().nullable().optional().default(null),
+  tests_passed: z.number().int().nonnegative().nullable().optional().default(null),
+  tests_skipped: z.number().int().nonnegative().nullable().optional().default(null),
+  tests_failed: z.number().int().nonnegative().nullable().optional().default(null),
   recent_commits: z.array(z.record(z.string(), z.unknown())),
   // explicit scaffolding inputs (required)
   has_claude_md: z.boolean(),
@@ -292,6 +308,85 @@ export const codebaseScanPayloadSchema = z
         path: ["metrics", "codebase_health", "head_sha"],
         message: "codebase health head_sha must match metrics head_sha",
       });
+    }
+
+    // brain-api 1.22 coherence (AIO-995). A count can only be a denominator if the numerator
+    // fits inside it; the same rule `readiness_pillars` already enforces with `passed <= total`.
+    // Rejected at the boundary rather than clamped downstream, because an incoherent pair means
+    // the scanner parsed the wrong file — and a clamped value would become permanent analytics
+    // that looks measured. Each check fires only when BOTH sides are present: null is unknown,
+    // and unknown never contradicts anything.
+    const m = payload.metrics;
+    if (
+      m.test_coverage_lines_covered != null &&
+      m.test_coverage_lines_total != null &&
+      m.test_coverage_lines_covered > m.test_coverage_lines_total
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["metrics", "test_coverage_lines_covered"],
+        message: "test_coverage_lines_covered must be <= test_coverage_lines_total",
+      });
+    }
+    for (const key of ["tests_passed", "tests_skipped", "tests_failed"] as const) {
+      const part = m[key];
+      if (part != null && m.tests_total != null && part > m.tests_total) {
+        context.addIssue({
+          code: "custom",
+          path: ["metrics", key],
+          message: `${key} must be <= tests_total`,
+        });
+      }
+    }
+
+    // The parts must fit inside the total TOGETHER, not merely each on its own. Three separate
+    // `part <= tests_total` checks accept `{total: 10, passed: 10, skipped: 10, failed: 10}` —
+    // thirty outcomes in a ten-test run.
+    //
+    // Summed over the parts that are KNOWN, not only when all three are. passed/skipped/failed
+    // are disjoint outcomes, so the known ones alone can never legitimately exceed the total —
+    // an unknown part can only add more. Requiring all three first would have missed
+    // `{total: 10, passed: 9, failed: 9}`, which is already impossible without knowing the
+    // skips. Under-summing stays legal: that is an unallocated remainder, not a contradiction.
+    const runParts = [m.tests_passed, m.tests_skipped, m.tests_failed];
+    const knownParts = runParts.filter((p): p is number => p != null);
+    if (m.tests_total != null && knownParts.length > 0) {
+      const sum = knownParts.reduce((total, p) => total + p, 0);
+      if (sum > m.tests_total) {
+        context.addIssue({
+          code: "custom",
+          path: ["metrics", "tests_total"],
+          message: "tests_passed + tests_skipped + tests_failed must be <= tests_total",
+        });
+      }
+    }
+
+    // The percentage and the counts must describe the SAME measurement. They arrive by
+    // different routes — the lcov path recomputes `pct` from the LH/LF sums it also reports,
+    // while the Istanbul path trusts the `pct` the tool wrote and reads `covered`/`total`
+    // beside it — so nothing upstream forces them to agree, and a mismatch means the parser
+    // stitched together two different reports. `99%` next to `0 of 100 lines covered` is not a
+    // rounding disagreement; it is two incompatible claims, and persisting either would be
+    // inventing a measurement.
+    //
+    // The tolerance is deliberately loose (1 percentage point, and only when there is a
+    // denominator to divide by): coverage tools round to 2dp, some emit `pct` for a subset of
+    // what they count, and this check exists to catch contradictions, not to referee rounding.
+    if (
+      m.test_coverage_pct != null &&
+      m.test_coverage_lines_total != null &&
+      m.test_coverage_lines_covered != null &&
+      m.test_coverage_lines_total > 0
+    ) {
+      const implied = (100 * m.test_coverage_lines_covered) / m.test_coverage_lines_total;
+      if (Math.abs(implied - m.test_coverage_pct) > 1) {
+        context.addIssue({
+          code: "custom",
+          path: ["metrics", "test_coverage_pct"],
+          message:
+            "test_coverage_pct must agree with test_coverage_lines_covered / test_coverage_lines_total",
+        });
+      }
     }
   });
 export type CodebaseScanPayload = z.infer<typeof codebaseScanPayloadSchema>;

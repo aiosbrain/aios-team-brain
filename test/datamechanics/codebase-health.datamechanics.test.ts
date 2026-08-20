@@ -12,7 +12,7 @@ import { db, seedTeam, type Seed } from "./helpers";
 // OPTIONAL `metrics.codebase_health` object — scored scanner-side, persisted VERBATIM
 // (provenance-only, never recomputed), rejected 422 when sparse or malformed, team-tier
 // only. Verified here against the REAL route handler + real Postgres, using the vendored
-// canonical fixtures (test/fixtures/contract/codebase-payload-1.15-fixtures.json) so the
+// canonical fixtures (test/fixtures/contract/codebase-payload-1.22-fixtures.json) so the
 // wire payloads under test are exactly the contract's.
 
 const CB_URL = "http://test/api/v1/codebases";
@@ -20,7 +20,7 @@ const CB_URL = "http://test/api/v1/codebases";
 type Fixture = { name: string; payload: { codebase: { slug: string }; metrics: Record<string, unknown> } };
 const fixtures = JSON.parse(
   readFileSync(
-    join(import.meta.dirname, "..", "fixtures", "contract", "codebase-payload-1.15-fixtures.json"),
+    join(import.meta.dirname, "..", "fixtures", "contract", "codebase-payload-1.22-fixtures.json"),
     "utf8",
   ),
 ) as { valid: Fixture[]; invalid: Fixture[] };
