@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { ItemPayload } from "@/lib/api/schemas";
+import { normalizeTaskStatus, type ItemPayload } from "@/lib/api/schemas";
+import type { TaskStatusValue } from "@/lib/pm-sync/provider";
 import type {
   ClickUpDoc,
   ClickUpDocPage,
@@ -9,40 +10,11 @@ import type {
   ClickUpTaskRecord,
 } from "@/lib/ingest/sources/clickup";
 
-export type ClickUpBrainStatus = "backlog" | "ready" | "in_progress" | "in_review" | "blocked" | "done";
-
-export interface ClickUpStatusMap {
-  backlog: string;
-  ready: string;
-  in_progress: string;
-  /**
-   * brain-api v1.21 (AIO-950). OPTIONAL where its siblings are required: this map is an operator's
-   * SAVED configuration, and every config written before 1.21 lacks the key. Requiring it would make
-   * `invertStatusMap` throw and fail-close the entire ClickUp workspace import on upgrade. Absent
-   * simply means this List has no In Review state — the pre-1.21 behaviour, unchanged.
-   */
-  in_review?: string;
-  blocked: string;
-  done: string;
-}
-
 export interface NormalizeClickUpTasksInput {
   workspaceId: ClickUpId;
   records: ClickUpTaskRecord[];
-  /** Selected List id -> configured reversible AIOS-to-ClickUp status map. */
-  statusMaps: Record<string, ClickUpStatusMap>;
 }
 
-export class ClickUpNormalizationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ClickUpNormalizationError";
-  }
-}
-
-const BRAIN_STATUSES: ClickUpBrainStatus[] = ["backlog", "ready", "in_progress", "in_review", "blocked", "done"];
-/** The one member of BRAIN_STATUSES a saved status map may omit — see `ClickUpStatusMap.in_review`. */
-const OPTIONAL_BRAIN_STATUSES: ReadonlySet<ClickUpBrainStatus> = new Set(["in_review"]);
 const PRIORITY_BY_ID: Record<string, string> = { "1": "urgent", "2": "high", "3": "medium", "4": "low" };
 
 /**
@@ -166,57 +138,113 @@ function assigneeName(task: ClickUpTask): string {
   return assignee.username?.trim() || assignee.email?.trim() || String(assignee.id);
 }
 
-function invertStatusMap(listId: string, map: ClickUpStatusMap): Map<string, ClickUpBrainStatus> {
-  const inverse = new Map<string, ClickUpBrainStatus>();
-  for (const status of BRAIN_STATUSES) {
-    const native = map[status]?.trim().toLowerCase();
-    if (!native) {
-      if (OPTIONAL_BRAIN_STATUSES.has(status)) continue;
-      throw new ClickUpNormalizationError(`ClickUp List ${listId} is missing its ${status} status mapping`);
-    }
-    if (inverse.has(native)) {
-      throw new ClickUpNormalizationError(`ClickUp List ${listId} has a non-bijective status mapping`);
-    }
-    inverse.set(native, status);
-  }
-  return inverse;
+/**
+ * ClickUp `status.type` → brain status. ClickUp's type vocabulary is a small closed set — `open`
+ * (not started), `custom` (anything a List author invented between start and finish), `done` and
+ * `closed` (both terminal) — exactly the shape `linearStatus`'s TYPE_TO_STATUS and `planeStatus`'s
+ * GROUP_TO_STATUS map from.
+ *
+ * `open → ready`, NOT `backlog`. ClickUp has one not-started type and no separate backlog concept,
+ * so mapping it to `backlog` would put every ClickUp workspace's entire not-started column outside
+ * `OPEN_STATUSES` (lib/tasks/activity-policy.ts) and therefore invisible to Home, Pulse in-flight
+ * and the timeline. A List that genuinely has a backlog column still gets it, by name.
+ */
+// `Object.create(null)` rather than a bare literal: `statusType` is untrusted JSON from ClickUp, and
+// on a normal object literal a type of `"constructor"` or `"__proto__"` resolves through the
+// PROTOTYPE — returning a Function or Object as the task's status, which `?? null` never screens
+// because it is not nullish. A null-prototype table has no inherited keys to reach.
+const TYPE_TO_STATUS: Record<string, TaskStatusValue> = Object.assign(Object.create(null), {
+  open: "ready",
+  custom: "in_progress",
+  done: "done",
+  closed: "done",
+} as Record<string, TaskStatusValue>);
+
+/**
+ * The one heuristic in this mapper, deliberately tiny and deliberately ClickUp-only.
+ *
+ * ClickUp collapses EVERY status between "not started" and "finished" into the single `custom`
+ * type, so unlike Linear (where a review state is at least typed `started` and usually NAMED
+ * "In Review", which the name-first rule already catches) the type carries no review signal at all.
+ * A ClickUp approval loop — "team approval", "client approval", "ready for review" — is therefore
+ * indistinguishable from active work by type alone, and would land on `in_progress`, which is the
+ * fidelity loss `in_review` was added to stop.
+ *
+ * Word-boundary anchored on purpose: the past-tense forms "reviewed" and "client approved" mean the
+ * work has come BACK from review and is active again, so they must NOT match — `\b` after `review`
+ * fails against the trailing "ed". `s?` admits the plural column names "Reviews"/"Approvals" without
+ * admitting the past tense.
+ *
+ * BOUNDED BY CONSTRUCTION, and the bound is where it is for a reason. Being a display-name guess it
+ * is fallible, so it runs only AFTER the exact-name match and only on a status ClickUp did NOT type
+ * as terminal (see `clickUpStatusOrNull`). Within those bounds the worst case is one row on
+ * `in_review` instead of `in_progress` — both ACTIVE and OPEN, so no surface gains or loses it. Let
+ * it outrank a `done`/`closed` type and the worst case is far worse: a FINISHED task ("Review
+ * Complete", "Approval Done") reading as active on Home, Pulse in-flight and the work timeline
+ * permanently, because `in_review` is in ACTIVE_STATUSES and nothing would ever move it out.
+ *
+ * Deliberately NOT extended to blocked-flavoured names ("On Hold", "Waiting on client"): those land
+ * on `in_progress`, which is active and open just as `blocked` is, so the guess would buy nothing
+ * and could only be wrong.
+ */
+const REVIEW_NAME_RE = /\b(review|approval)s?\b/;
+
+/**
+ * PRECEDENCE: a ClickUp status literally NAMED like a brain status wins (so a List with a "Blocked"
+ * or "Backlog" column gets it exactly); then ClickUp's own `type` when that type is TERMINAL; then
+ * the review-name heuristic; then the remaining types.
+ *
+ * FAIL-OPEN to `backlog`, mirroring `linearStatus`/`planeStatus`. It never throws: the predecessor
+ * threw from inside `rows.map`, so a single unrecognised status aborted the ENTIRE workspace
+ * payload and every per-task document with it. A status the brain can't place is one row landing in
+ * intake, not an unimportable workspace — and the native string survives verbatim in
+ * `native_status`/`native_status_type` regardless (see `taskMetadata`).
+ */
+export function clickUpStatus(statusName: string | undefined, statusType: string | undefined): TaskStatusValue {
+  return clickUpStatusOrNull(statusName, statusType) ?? "backlog";
 }
 
-function resolveStatus(record: ClickUpTaskRecord, statusMaps: Record<string, ClickUpStatusMap>): ClickUpBrainStatus {
-  const taskId = String(record.task.id);
-  const native = record.task.status?.status?.trim().toLowerCase();
-  if (!native) throw new ClickUpNormalizationError(`ClickUp task ${taskId} has no status name`);
+/**
+ * Strict variant, mirroring `linearStatusOrNull`. Returns null when neither the name, the review
+ * heuristic nor the type resolves — the semantics a future ClickUp inbound-apply needs, where an
+ * unresolvable native status is a CONFLICT rather than a silent default. Unused by ingest today;
+ * exported so the write path (§4 of docs/design/task-status-model.md) inherits it rather than
+ * inventing a second, subtly different mapper.
+ */
+export function clickUpStatusOrNull(statusName: string | undefined, statusType: string | undefined): TaskStatusValue | null {
+  const name = (statusName ?? "").trim();
+  // `raw_status === null` is the ONLY correct match test, and it is exact: `normalizeTaskStatus`
+  // returns `{status: "backlog", raw_status: null}` for a real "Backlog" and
+  // `{status: "backlog", raw_status: <input>}` for anything it could not place.
+  //
+  // DIVERGENCE FROM `linearStatusOrNull`, on purpose. That function additionally requires
+  // `byName.status !== "backlog"` before trusting a name, deferring a "Backlog"-named state to its
+  // type. Harmless there — Linear HAS a `backlog` state type to fall into. ClickUp does not: its
+  // only not-started type is `open`, which this file maps to `ready`. Mirroring the extra clause
+  // line-for-line therefore sent a List's literal "Backlog" column to `ready`, which is precisely
+  // the case docs/design/task-status-model.md §3(b) claims the name-first rule rescues ("a list
+  // that genuinely has a backlog column gets it from the name-first rule"). Naming the column is
+  // the ONLY way a ClickUp List can express intake, so the name has to be believed here.
+  const byName = normalizeTaskStatus(name);
+  if (name && byName.raw_status === null) return byName.status as TaskStatusValue;
 
-  const homeListId = record.task.list?.id === undefined ? undefined : String(record.task.list.id);
-  // A selected home List is authoritative for the task's native status. Only fall back to observed
-  // TIML Lists when the home List itself is outside the configured selection.
-  const listIds = homeListId && statusMaps[homeListId] ? [homeListId] : record.observedListIds;
-  const candidateListIds = listIds
-    .filter((value): value is string => Boolean(value))
-    .filter((value, index, all) => all.indexOf(value) === index)
-    .filter((listId) => Boolean(statusMaps[listId]));
-  const resolved = new Set<ClickUpBrainStatus>();
-  for (const listId of candidateListIds) {
-    const status = invertStatusMap(listId, statusMaps[listId]).get(native);
-    if (status) resolved.add(status);
-  }
+  const byType = TYPE_TO_STATUS[(statusType ?? "").trim().toLowerCase()];
+  // A TERMINAL type outranks the review-name guess, and this ordering is load-bearing. `done` and
+  // `closed` are the only two things ClickUp tells us unambiguously; the name heuristic below is
+  // inference from a display string. Run the guess first and a finished column named "Review
+  // Complete" or "Approval Done" — ordinary in the client-approval pipelines this mapper exists to
+  // support — resolves to `in_review`, which is in ACTIVE_STATUSES, so the task reads as in-flight
+  // on Home, Pulse and the work timeline FOREVER. Nothing downstream would ever correct it.
+  // Consistent with `native_status_type` being stamped in `taskMetadata` precisely so terminality
+  // never has to be re-derived by regexing a display name.
+  if (byType === "done") return byType;
 
-  // FAIL-CLOSED is deliberate: a status the brain cannot interpret must not be guessed into one.
-  // The blast radius is the whole workspace payload (this runs inside `rows.map`), so the message has
-  // to name the status and the Lists that were consulted — otherwise "one new custom status stopped
-  // every ClickUp task importing" is a bug report with nothing in it to act on.
-  const consulted = candidateListIds.length > 0 ? candidateListIds.join(", ") : "none";
-  if (resolved.size === 0) {
-    throw new ClickUpNormalizationError(
-      `ClickUp task ${taskId} status "${record.task.status?.status ?? ""}" is not mapped by an observed List (consulted: ${consulted})`
-    );
-  }
-  if (resolved.size > 1) {
-    throw new ClickUpNormalizationError(
-      `ClickUp task ${taskId} status "${record.task.status?.status ?? ""}" maps ambiguously across observed Lists (consulted: ${consulted})`
-    );
-  }
-  return [...resolved][0];
+  if (name && REVIEW_NAME_RE.test(name.toLowerCase())) return "in_review";
+  return byType ?? null;
+}
+
+function resolveStatus(record: ClickUpTaskRecord): TaskStatusValue {
+  return clickUpStatus(record.task.status?.status, record.task.status?.type);
 }
 
 function listIdsFor(record: ClickUpTaskRecord): string[] {
@@ -253,7 +281,12 @@ function taskMetadata(record: ClickUpTaskRecord, workspaceId: ClickUpId): Record
     list_name: task.list?.name ?? "",
     list_ids: listIdsFor(record),
     parent_id: task.parent === null || task.parent === undefined ? "" : String(task.parent),
+    // The fidelity layer. `status` (canonical) collapses a List's approval loop; these two keep the
+    // native pair verbatim and searchable, mirroring Linear's `state`/`state_type`/`status` triple.
+    // `native_status_type` is here so a downstream gate never has to regex a display name to find
+    // out whether a status was terminal — the mistake `clickUpStatus`'s heuristic has to make.
     native_status: task.status?.status ?? "",
+    native_status_type: task.status?.type ?? "",
     native_priority: task.priority?.priority ?? "",
     assignee_ids: (task.assignees ?? []).map((assignee) => String(assignee.id)).sort((a, b) => a.localeCompare(b)),
     assignee_emails: (task.assignees ?? [])
@@ -345,7 +378,7 @@ export function normalizeClickUpTasks(input: NormalizeClickUpTasksInput): ItemPa
       // permits names longer than the strict row schema accepts (a List name may run to 255, `sprint`
       // stops at 200), and one over-long field rejects the ENTIRE workspace payload at ingest.
       title: capped(task.name?.trim() || "(untitled)", TITLE_MAX),
-      status: resolveStatus(record, input.statusMaps),
+      status: resolveStatus(record),
       priority: nativePriority(task),
       labels: tagsFor(task),
       assignee: capped(assigneeName(task), ASSIGNEE_MAX),
@@ -433,7 +466,7 @@ export function normalizeClickUpTaskDocs(input: NormalizeClickUpTasksInput): Ite
         // Read by `parseAuthorRefs` branch #1 — see `authorRefsFor`. Must stay AFTER the spread so a
         // future `taskMetadata` key can never shadow the one signal attribution depends on.
         authors: authorRefsFor(task),
-        status: resolveStatus(record, input.statusMaps),
+        status: resolveStatus(record),
         source_ts: clickUpWorkedAt(task),
       },
       body,
