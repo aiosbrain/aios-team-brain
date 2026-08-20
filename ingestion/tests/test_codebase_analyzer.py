@@ -12,6 +12,8 @@ from pathlib import Path
 from aios_ingest.analyzers.codebase import (
     _detect_scaffolding,
     _entries_under,
+    _resolve_in_repo,
+    _tracked_entries,
     _read_coverage,
     analyze_history,
     analyze_repo,
@@ -32,25 +34,280 @@ def _git(repo, *args, when: str | None = None):
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, env=env)
 
 
+def _git_out(repo, *args) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout
+
+
 def _init(tmp_path):
+    Path(tmp_path).mkdir(parents=True, exist_ok=True)
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "branch", "-m", "main")
     return tmp_path
 
 
-def test_entries_under_excludes_doc_files():
-    tracked = [
-        ".claude/skills/foo/SKILL.md",
-        ".claude/skills/bar/SKILL.md",
-        ".claude/skills/README.md",
-        ".claude/skills/INDEX.md",
-        ".claude/commands/deploy.md",
-        "pkg/.claude/skills/nested/SKILL.md",
+def test_entries_under_excludes_doc_files(tmp_path):
+    entries = [
+        ("100644", "0" * 40, f)
+        for f in (
+            ".claude/skills/foo/SKILL.md",
+            ".claude/skills/bar/SKILL.md",
+            ".claude/skills/README.md",
+            ".claude/skills/INDEX.md",
+            ".claude/commands/deploy.md",
+            "pkg/.claude/skills/nested/SKILL.md",
+        )
     ]
     # skills: real dirs only (README.md / INDEX.md excluded), incl. nested .claude
-    assert _entries_under(tracked, "skills") == {"foo", "bar", "nested"}
+    assert _entries_under(entries, tmp_path, "skills") == {"foo", "bar", "nested"}
     # commands are single .md files — counted (only README/INDEX are excluded)
-    assert _entries_under(tracked, "commands") == {"deploy.md"}
+    assert _entries_under(entries, tmp_path, "commands") == {"deploy.md"}
+
+
+def _write_skill(repo: Path, rel: str) -> None:
+    d = repo / rel
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("---\nname: x\n---\nbody\n")
+
+
+# ── AIO-996: the three real skill layouts ────────────────────────────────────
+# Each fixture asserts the counted total equals the number of distinct SKILL.md
+# files the repo actually ships. Layout 1 is the pre-existing behaviour and is
+# pinned here so a fix for 2/3 can't silently move it.
+
+
+def test_skills_count_plain_claude_layout(tmp_path):
+    """Layout 1 — `.claude/skills/<name>/SKILL.md`."""
+    repo = _init(tmp_path)
+    for name in ("alpha", "beta", "gamma"):
+        _write_skill(repo, f".claude/skills/{name}")
+    (repo / ".claude" / "skills" / "README.md").write_text("docs, not a skill")
+    (repo / ".claude" / "commands").mkdir()
+    (repo / ".claude" / "commands" / "deploy.md").write_text("cmd")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    s = _detect_scaffolding(repo)
+    assert len(list(repo.rglob("SKILL.md"))) == 3
+    assert s["skills_count"] == 3
+    assert s["commands_count"] == 1
+
+
+def test_skills_count_symlinked_claude_dir(tmp_path):
+    """Layout 2 — `.claude/skills` is a symlink to an in-tree `.agents/skills`.
+
+    `git ls-files` emits the symlink as ONE entry with no trailing path, so the
+    prefix match never fires and these skills used to count as ZERO
+    (aios-marketing: 2 real skills, read as 0).
+    """
+    repo = _init(tmp_path)
+    for name in ("applicant-pipeline", "event-launch"):
+        _write_skill(repo, f".agents/skills/{name}")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "skills").symlink_to(Path("..") / ".agents" / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    tracked = _git_out(repo, "ls-files").split()
+    assert ".claude/skills" in tracked  # the symlink, tracked as a lone entry
+    assert len(list((repo / ".agents").rglob("SKILL.md"))) == 2
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_symlinked_skills_are_not_double_counted(tmp_path):
+    """The symlink AND its target are both visible to `git ls-files`.
+
+    A naive fix (summing per-layout counts, or keying on path) reports 4 here.
+    The correct answer is 2 — there are only two SKILL.md files on disk.
+    """
+    repo = _init(tmp_path)
+    for name in ("one", "two"):
+        _write_skill(repo, f"skills/{name}")  # pack-source layout AND link target
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "skills").symlink_to(Path("..") / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    tracked = _git_out(repo, "ls-files").split()
+    assert ".claude/skills" in tracked
+    assert "skills/one/SKILL.md" in tracked  # both views tracked simultaneously
+    assert len(list(repo.rglob("SKILL.md"))) == 2
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_skills_count_pack_source_layout(tmp_path):
+    """Layout 3 — top-level `skills/<name>/SKILL.md`, no `.claude/` at all.
+
+    The repo IS the skill pack (aios-engineering-harness: 18 skills, read as 0).
+    """
+    repo = _init(tmp_path)
+    for name in ("ast-grep", "code-review", "git-master"):
+        _write_skill(repo, f"skills/{name}")
+    (repo / "skills" / "README.md").write_text("index, not a skill")  # no SKILL.md
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert len(list(repo.rglob("SKILL.md"))) == 3
+    assert _detect_scaffolding(repo)["skills_count"] == 3
+
+
+def test_pack_source_needs_the_skill_md_marker(tmp_path):
+    """An ordinary source dir called `skills/` must NOT inflate the count.
+
+    Without the SKILL.md gate, any CLI with a `skills/` package would read as
+    agentic — the false positive that makes the metric meaningless.
+    """
+    repo = _init(tmp_path)
+    for name in ("parse", "render"):
+        d = repo / "skills" / name
+        d.mkdir(parents=True)
+        (d / "index.ts").write_text("export const x = 1;\n")
+    # nested/vendored pack sources are out of scope too — root-level only
+    _write_skill(repo, "vendor/pkg/skills/borrowed")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert _detect_scaffolding(repo)["skills_count"] == 0
+
+
+def test_resolve_in_repo_rejects_every_escape():
+    """The containment invariant, asserted on the unit.
+
+    Asserting it only through `skills_count` would pass for the wrong reason: an
+    out-of-repo prefix matches nothing in `git ls-files` output either way, so the
+    count is over-determined and the check could be deleted with the suite green.
+    """
+    # in-repo targets resolve, relative to the LINK's directory
+    assert _resolve_in_repo(".claude/skills", "../.agents/skills") == ".agents/skills"
+    assert _resolve_in_repo(".claude/skills", "../skills") == "skills"
+    assert _resolve_in_repo("pkg/.claude/skills", "../skills") == "pkg/skills"
+    assert _resolve_in_repo("pkg/.claude/skills", "../../skills") == "skills"
+    assert _resolve_in_repo(".claude/skills", "./sub") == ".claude/sub"
+    # …and every way out of the checkout is refused
+    assert _resolve_in_repo(".claude/skills", "/etc/passwd") is None
+    assert _resolve_in_repo(".claude/skills", "../../outside/skills") is None
+    assert _resolve_in_repo(".claude/skills", "../../../../../../tmp") is None
+    assert _resolve_in_repo(".claude/skills", "C:/windows") is None
+    assert _resolve_in_repo(".claude/skills", "") is None
+
+
+def test_symlink_escaping_the_repo_is_ignored(tmp_path):
+    """End-to-end: a link out of the checkout contributes nothing and doesn't crash."""
+    outside = tmp_path / "outside"
+    _write_skill(outside, "skills/leaked")
+    repo = _init(tmp_path / "repo")
+    _write_skill(repo, ".claude/skills/real")
+    (repo / ".claude" / "commands").symlink_to(Path("..") / ".." / "outside" / "skills")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    s = _detect_scaffolding(repo)
+    assert s["skills_count"] == 1
+    assert s["commands_count"] == 0  # the escaping link contributes nothing
+
+
+def test_symlink_layout_survives_a_core_symlinks_false_checkout(tmp_path):
+    """`core.symlinks=false` writes the link as a REGULAR FILE holding its target.
+
+    That is git's default on Windows without Developer Mode, and any clone made with
+    `-c core.symlinks=false`. A filesystem `is_symlink()` gate reads False there and
+    the symlinked layout silently reverts to counting ZERO — the original bug, back.
+    """
+    origin = _init(tmp_path / "origin")
+    for name in ("applicant-pipeline", "event-launch"):
+        _write_skill(origin, f".agents/skills/{name}")
+    (origin / ".claude").mkdir()
+    (origin / ".claude" / "skills").symlink_to(Path("..") / ".agents" / "skills")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-m", "init")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "-c", "core.symlinks=false", str(origin), str(clone)],
+        check=True,
+        capture_output=True,
+    )
+    assert not (clone / ".claude" / "skills").is_symlink()  # a plain file on disk
+    assert (clone / ".claude" / "skills").read_text().strip() == "../.agents/skills"
+    assert _detect_scaffolding(clone)["skills_count"] == 2
+
+
+def test_non_ascii_skill_names_are_counted(tmp_path):
+    """git C-quotes non-ASCII paths unless `core.quotePath=false`.
+
+    Left on, `git ls-files` emits `"skills/caf\303\251/SKILL.md"` — leading quote
+    included — and every prefix match downstream misses it.
+    """
+    repo = _init(tmp_path)
+    _write_skill(repo, "skills/café")
+    _write_skill(repo, "skills/日本語")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert all(not p.startswith('"') for _, _, p in _tracked_entries(repo))
+    assert _detect_scaffolding(repo)["skills_count"] == 2
+
+
+def test_categorised_pack_root_counts_skills_not_categories(tmp_path):
+    """`skills/<category>/<name>/SKILL.md` — the skill is the manifest's DIRECTORY.
+
+    Keying on the second path segment reports the number of CATEGORIES under a field
+    labelled a skill count: hermes-agent read 26 for 97 real skills.
+    """
+    repo = _init(tmp_path)
+    for rel in (
+        "skills/comms/slack-cli",
+        "skills/comms/voice-and-rules",
+        "skills/eng/refactor",
+        "skills/flat-one",  # a flat pack root still works alongside a categorised one
+    ):
+        _write_skill(repo, rel)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert len(list(repo.rglob("SKILL.md"))) == 4
+    assert _detect_scaffolding(repo)["skills_count"] == 4
+
+
+def test_undecodable_filename_does_not_abort_the_scan(tmp_path):
+    """A filename that is not valid UTF-8 must not blow up the whole scan.
+
+    git indexes such paths happily; `core.quotePath=false` stops the C-quoting that
+    used to keep the stream ASCII, so strict decoding would raise UnicodeDecodeError
+    out of `_detect_scaffolding` → `analyze_repo` and lose the entire repo's metrics
+    over one bad name. Staged via the index because APFS rejects the bytes on disk.
+    """
+    repo = _init(tmp_path)
+    (repo / "a.txt").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=repo, input=b"---\nname: x\n---\n", capture_output=True, check=True,
+    ).stdout.decode().strip()
+    bad_name = b"skills/\xff\xfebad/SKILL.md".decode("utf-8", "surrogateescape")
+    subprocess.run(
+        ["git", "update-index", "--add", "--cacheinfo", "100644", blob, bad_name],
+        cwd=repo, capture_output=True, check=True,
+    )
+
+    s = _detect_scaffolding(repo)  # must not raise
+    assert s["skills_count"] == 1  # the undecodable name still counts
+    assert s["files"] == 2
+
+
+def test_pack_root_accepts_a_suffixed_skills_dir(tmp_path):
+    """`optional-skills/` is a real pack root in the wild; `test/` is not."""
+    repo = _init(tmp_path)
+    _write_skill(repo, "skills/core")
+    _write_skill(repo, "optional-skills/finance")
+    _write_skill(repo, "test/skill-scan-fixtures/dummy")  # a FIXTURE, not a skill
+    _write_skill(repo, "gui/server/pretend")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+
+    assert _detect_scaffolding(repo)["skills_count"] == 2
 
 
 def test_agents_md_basename_no_false_positive(tmp_path):

@@ -24,7 +24,7 @@ import re
 import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .readiness import score_readiness
@@ -53,8 +53,27 @@ _MAX_BACKFILL_POINTS = 60  # bound on historical trend points per scan
 
 
 def _git(repo: Path, *args: str) -> str:
+    """Run git in `repo` and return stdout.
+
+    `errors="surrogateescape"` because a filename is a byte string, not text: git
+    happily indexes a path that is not valid UTF-8, and once `core.quotePath=false`
+    stops C-quoting the stream (see `_tracked_entries`), strict decoding would raise
+    `UnicodeDecodeError` and abort the WHOLE scan over one undecodable name. Not
+    `errors="replace"`: surrogates round-trip back to the filesystem, which
+    `_count_loc`'s `open(repo / rel)` depends on.
+
+    `GIT_NO_LAZY_FETCH=1` keeps a partial (`--filter=blob:none`) clone from turning
+    an object read — `cat-file blob` on a symlink — into an unbounded network fetch
+    inside the scanner.
+    """
     out = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+        encoding="utf-8",
+        errors="surrogateescape",
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
     )
     return out.stdout
 
@@ -175,38 +194,192 @@ def _analyze_git(
     }
 
 
-def _entries_under(tracked: list[str], subdir: str) -> set[str]:
-    """Top-level entry names directly under any `.claude/<subdir>/` directory.
+_SKILL_MANIFEST = "skill.md"  # marker file that makes a directory a skill
+_ENTRY_SKIP = {"readme.md", "index.md"}  # documentation, not a skill/command
+_GIT_SYMLINK_MODE = "120000"
 
-    Handles both a root-level `.claude/skills/foo/...` and a nested
-    `pkg/.claude/skills/foo` — `str.find` locates the marker wherever it sits, so
-    a root path (index 0) no longer trips the leading-slash assumption that the
-    earlier split-based logic crashed on.
+
+def _tracked_entries(repo: Path) -> list[tuple[str, str, str]]:
+    """`(mode, object_sha, path)` for every tracked file.
+
+    `-z` + `core.quotePath=false` because git otherwise C-quotes any path with a
+    non-ASCII byte (`"skills/caf\303\251/SKILL.md"`, leading quote included), which
+    silently breaks every prefix match downstream — a skill named in a non-Latin
+    script would just not exist as far as this scanner is concerned.
     """
-    marker = f".claude/{subdir}/"
-    skip = {"readme.md", "index.md"}  # documentation, not a skill/command
-    names: set[str] = set()
-    for f in tracked:
-        idx = f.find(marker)
-        if idx == -1:
+    raw = _git(repo, "-c", "core.quotePath=false", "ls-files", "-sz")
+    out: list[tuple[str, str, str]] = []
+    for rec in raw.split("\0"):
+        if not rec:
             continue
-        rest = f[idx + len(marker):]
-        head = rest.split("/", 1)[0]
-        if head and head.lower() not in skip:
+        meta, _, path = rec.partition("\t")
+        cols = meta.split(" ")
+        if not path or len(cols) < 2:
+            continue
+        out.append((cols[0], cols[1], path))
+    return out
+
+
+def _link_target(repo: Path, sha: str) -> str:
+    """The path a tracked symlink points at — read from the git OBJECT, not the disk.
+
+    A symlink's target is the blob's contents. Reading it from git rather than
+    `os.readlink` makes this work on a checkout where git did not materialise the
+    link at all: `core.symlinks=false` (git's DEFAULT on Windows without Developer
+    Mode, and anything cloned with `-c core.symlinks=false`) writes the target path
+    into a REGULAR FILE. A filesystem `is_symlink()` gate reads False there and the
+    layout silently reverts to counting zero — the exact bug this arm exists to fix.
+    """
+    try:
+        return _git(repo, "cat-file", "blob", sha).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _resolve_in_repo(link_path: str, target: str) -> str | None:
+    """Resolve a symlink target to a repo-relative path, or None if it escapes.
+
+    Purely lexical — no filesystem access — so it behaves identically on a
+    non-symlink checkout, and can't be fooled by the repo itself sitting under a
+    symlinked parent (macOS `/tmp` → `/private/tmp`, which the historical-snapshot
+    path in `_scaffolding_at` hits on every scan).
+
+    An absolute target, or one that climbs above the repo root, returns None: a
+    scanner must never follow a link out of the checkout it was handed.
+    """
+    if not target or target.startswith("/") or ":" in target.split("/", 1)[0]:
+        return None  # absolute posix path, or a windows drive/UNC target
+    parts: list[str] = []
+    for seg in (PurePosixPath(link_path).parent / target).parts:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                return None  # climbed above the repo root
+            parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts) or None
+
+
+def _heads_under(paths: list[str], prefix: str) -> set[str]:
+    """First path segment of every tracked file under `prefix/`, docs excluded."""
+    names: set[str] = set()
+    marker = prefix.rstrip("/") + "/"
+    for f in paths:
+        if not f.startswith(marker):
+            continue
+        head = f[len(marker):].split("/", 1)[0]
+        if head and head.lower() not in _ENTRY_SKIP:
             names.add(head)
     return names
 
 
+def _is_pack_root(top: str) -> bool:
+    """Is a top-level directory name a plausible skill-pack root?
+
+    `skills/` or `<something>-skills/` only. Deliberately narrow: see arm 3.
+    """
+    low = top.lower()
+    return low == "skills" or low.endswith("-skills")
+
+
+def _entries_under(
+    entries: list[tuple[str, str, str]], repo: Path, subdir: str
+) -> set[str]:
+    """Names of the skills/commands a repo ships, across the three real layouts.
+
+    Returns entry NAMES, never paths, and that is load-bearing: a symlinked
+    `.claude/skills` and its target both resolve to the same names, so the set
+    dedupes them for free. Counting paths (or summing per-layout counts) would
+    double-count `aios-marketing`, where `.claude/skills` → `.agents/skills` and
+    BOTH are visible to `git ls-files`. It also preserves the pre-existing collapse
+    of a root and a nested skill sharing a name (`aios-workspace` ships `evolve`
+    both at the root and under `scaffold/`) — widening that is a separate decision,
+    and it is what holds that repo at its existing 50 rather than moving it to 52.
+
+    The three layouts:
+
+    1. **Plain** — `.claude/<subdir>/<name>/...`, at the root or nested under a
+       package (`str.find` locates the marker wherever it sits).
+    2. **Symlinked dir** — `.claude/skills` is a symlink to an in-tree directory
+       (`aios-marketing` points it at `.agents/skills`). `git ls-files` emits the
+       symlink as ONE entry with no trailing path, so a prefix match never fires;
+       we read the link target out of its git blob and enumerate the tracked files
+       under it. A target escaping the checkout is ignored (`_resolve_in_repo`).
+    3. **Pack source** — `skills/**/<name>/SKILL.md` (or `<x>-skills/...`) at the
+       repo ROOT, for repos that ARE the skill pack (`aios-engineering-harness`);
+       those skills are deliberately not under `.claude/`. The skill is the directory
+       holding the manifest, so a CATEGORISED pack (`skills/comms/slack-cli/`) counts
+       its skills rather than its categories.
+
+    **Arms 1 and 2 need no `SKILL.md` marker; arm 3 does.** That asymmetry is the
+    point, not an oversight: `.claude/skills` is a *declaration* — the repo has said
+    that directory holds its skills, whether the entries are stored there or linked
+    in — whereas a bare `skills/` is an *inference*, and the marker is the only thing
+    separating a real pack from an ordinary source directory. The root restriction
+    does the same job one level up: across ~40 local repos, allowing nested pack
+    roots would have counted `test/skill-scan-fixtures`, `gui/server`, and vendored
+    `plugins/*` as shipped skills.
+
+    Known under-count, accepted deliberately: a `SKILL.md` outside a recognised
+    skills root is not counted (`aios-engineering-harness` keeps 3 more under
+    `modules/`). The marker alone cannot tell a shipped skill from a test fixture or
+    a vendored plugin, and the false positives that rule buys are worse than the miss.
+    """
+    paths = [p for _, _, p in entries]
+    marker = f".claude/{subdir}/"
+    names: set[str] = set()
+
+    # (1) plain — a tracked file somewhere under `.claude/<subdir>/`
+    for f in paths:
+        idx = f.find(marker)
+        if idx == -1:
+            continue
+        head = f[idx + len(marker):].split("/", 1)[0]
+        if head and head.lower() not in _ENTRY_SKIP:
+            names.add(head)
+
+    # (2) symlinked `.claude/<subdir>` — one tracked entry, no trailing path
+    link = f".claude/{subdir}"
+    for mode, sha, f in entries:
+        if mode != _GIT_SYMLINK_MODE:
+            continue
+        if f != link and not f.endswith(f"/{link}"):
+            continue
+        target = _resolve_in_repo(f, _link_target(repo, sha))
+        if not target or target == f:
+            continue
+        names |= _heads_under(paths, target)
+
+    # (3) pack source — `<pack-root>/**/<name>/SKILL.md` at the repo root
+    if subdir == "skills":
+        for f in paths:
+            parts = f.split("/")
+            if len(parts) < 3 or parts[-1].lower() != _SKILL_MANIFEST:
+                continue
+            if _is_pack_root(parts[0]):
+                # The skill is the directory HOLDING the manifest, which is not
+                # necessarily the second segment: a pack root may be CATEGORISED
+                # (`optional-skills/comms/slack-cli/SKILL.md`). Keying on segment 2
+                # there reports the number of categories under a field labelled a
+                # skill count — hermes-agent read 26 for 97 real skills.
+                names.add(parts[-2])
+
+    return names
+
+
 def _detect_scaffolding(repo: Path) -> dict[str, Any]:
-    tracked = _git(repo, "ls-files").splitlines()
+    entries = _tracked_entries(repo)
+    tracked = [p for _, _, p in entries]
     # Match the AGENTS.md basename only — `endswith` would catch e.g. managed-agents.md.
     agents = [f for f in tracked if Path(f).name.lower() == "agents.md"]
     return {
         "has_claude_md": (repo / "CLAUDE.md").is_file(),
         "has_agents_md": len(agents) > 0,
         "agents_md_count": len(agents),
-        "skills_count": len(_entries_under(tracked, "skills")),
-        "commands_count": len(_entries_under(tracked, "commands")),
+        "skills_count": len(_entries_under(entries, repo, "skills")),
+        "commands_count": len(_entries_under(entries, repo, "commands")),
         "files": len(tracked),
         "loc": _count_loc(repo, tracked),
     }
