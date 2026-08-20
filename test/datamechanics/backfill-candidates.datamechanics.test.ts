@@ -85,32 +85,38 @@ describe("backfill candidate predicate (data-mechanics)", () => {
     expect(now.map((m) => m.project_id), "closed in the opposite").not.toContain(p.ext);
   });
 
-  it("does NOT select an exclude-shadow, and counts it instead", async () => {
-    // Criterion 3. reconcile cannot repair this state (ensureIncludeMembership no-ops on ANY current
-    // row), so selecting it would burn ~1.3 s of reconcile every tick forever and keep `scanned` off
-    // zero — poisoning the only signal that says the sweep has caught up.
-    //
-    // The load-bearing assertion is `scanned`/no-side-effects, NOT `drained`: `drained` only means
-    // "the page came back short" and is true either way. An earlier spec draft argued the opposite and
-    // was wrong against the code.
+  // EXCLSHADOW-1 RE-SPECIFICATION: this arm pinned "an exclude-shadow is unrepairable, so it
+  // is never selected" — that contract SPLIT. An EXPLICIT (force/manual mode) exclude keeps
+  // exactly the old behavior (unselectable + counted + untouched — classification invariant
+  // 3); an AUTOMATIC one is now repairable and IS selected and healed by the sweep. Both
+  // directions pinned; the deep repair mechanics live in exclude-shadow-repair.dm.
+  it("selects and HEALS an auto exclude-shadow; an explicit one stays unselected, counted, untouched", async () => {
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "c.md", body: "c", access: "team", project: "src" });
+    const forcedItem = await ingest(seed, { path: "c2.md", body: "c2", access: "team", project: "src" });
     await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
     const uid = (await unitId(seed, item.id))!;
+    const fuid = (await unitId(seed, forcedItem.id))!;
     const p = await projectIds(seed);
-    // Manufacture the shadow with raw SQL: `decision='exclude'` is unwritable through app code today
-    // (memberships.ts only ever inserts 'include'), which is why this is a latent hole and not a live one.
+    // Manufacture both shadows with raw SQL (`decision='exclude'` is unwritable through app code).
     await db().from("project_context_memberships")
-      .update({ decision: "exclude" })
+      .update({ decision: "exclude" }) // mode stays 'auto' — the repairable class
       .eq("team_id", seed.teamId).eq("context_unit_id", uid).eq("project_id", p.general).is("valid_to", null);
+    await db().from("project_context_memberships")
+      .update({ decision: "exclude", mode: "force_exclude" })
+      .eq("team_id", seed.teamId).eq("context_unit_id", fuid).eq("project_id", p.general).is("valid_to", null);
 
-    expect(await candidates(seed), "an unrepairable state must NOT be a candidate").not.toContain(item.id);
-    expect((await countUnrepairable(seed.teamId))?.excludeShadows, "…but it must be COUNTED, or the hole is silent").toBe(1);
+    const selected = await candidates(seed);
+    expect(selected, "the AUTO shadow is repairable → selected").toContain(item.id);
+    expect(selected, "the EXPLICIT shadow is an operator's decision → never selected").not.toContain(forcedItem.id);
+    expect((await countUnrepairable(seed.teamId))?.excludeShadows, "only the unrepairable one is counted").toBe(1);
 
     const r = await backfillTeamContext(db(), seed.teamId, { createdBefore: FAR_FUTURE() });
     expect(r.ok, r.error).toBe(true);
-    expect(r.scanned, "the shadow must not be reconciled").toBe(0);
-    expect(await currentMemberships(seed, uid), "and must be left untouched")
+    expect(r.scanned, "exactly the auto shadow was reconciled").toBe(1);
+    expect(await currentMemberships(seed, uid), "the auto shadow HEALED to an include")
+      .toContainEqual({ project_id: p.general, decision: "include" });
+    expect(await currentMemberships(seed, fuid), "the explicit shadow left untouched")
       .toContainEqual({ project_id: p.general, decision: "exclude" });
   });
 
