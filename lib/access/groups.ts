@@ -456,14 +456,56 @@ export async function ensurePersonSingleton(
   return { ok: true, groupId };
 }
 
-/** Grant a group visibility into a project (THE access edge). */
+/**
+ * REVOKE-1: the writer-held admin predicate — the APP's real one (role AND active status AND
+ * non-external POSTURE), not role alone: `role='admin', external-posture` is representable and
+ * every app gate (`canAccessAdmin`, the admin layout, `requireTeamAdmin`) denies it, so the
+ * access writer must too (design round 2 B2). Posture via the ONE resolver (dynamic import —
+ * posture.ts imports EVERYONE_SLUG from this file, so a static import would cycle).
+ */
+async function activeAdminError(db: DbClient, teamId: string, memberId: string): Promise<string | null> {
+  const { data } = await db
+    .from("members")
+    .select("role, status")
+    .eq("team_id", teamId)
+    .eq("id", memberId)
+    .maybeSingle();
+  const m = data as { role: string; status: string } | null;
+  if (!m) return "principal is not a member of this team";
+  if (m.role !== "admin" || m.status !== "active") return "principal must be an ACTIVE ADMIN of this team";
+  const { resolveViewerPosture } = await import("@/lib/access/posture");
+  if ((await resolveViewerPosture(db, teamId, memberId)) !== "team") {
+    return "principal must hold unrestricted (team) posture — an external-posture admin is denied everywhere the app gates admin access";
+  }
+  return null;
+}
+
+export interface GrantResult extends WriteResult {
+  /** false = the edge already existed → NOTHING was written (audit-on-change), incl. no
+   *  authorizer meta. RACE-BOUNDED like the audit itself (the recorded F3 class): two
+   *  concurrent missed-select creators can BOTH report created:true for one edge — an
+   *  over-report of the same ms-apart act, never an under-report, and the no-op path never
+   *  claims creation. The atomic INSERT…RETURNING form is the F3 transaction surface. */
+  created?: boolean;
+}
+
+/** Grant a group visibility into a project (THE access edge). REVOKE-1 (D1b): `opts.authorizedByMemberId`
+ *  records a named ACTIVE-ADMIN authorizer in the audit META only — never in the actor field and never
+ *  in `added_by` (either would attribute the operator's act to a human who merely approved it).
+ *  `opts.via` is the CALLER's transport claim (Fable diff L2: the writer must not hardcode "cli" —
+ *  a future non-CLI operator surface reusing the flag would mint false provenance by construction). */
 export async function grantProjectToGroup(
   db: DbClient,
   teamId: string,
   projectId: string,
   groupId: string,
-  actorMemberId: string | null
-): Promise<WriteResult> {
+  actorMemberId: string | null,
+  opts: { authorizedByMemberId?: string; via?: string } = {}
+): Promise<GrantResult> {
+  if (opts.authorizedByMemberId) {
+    const bad = await activeAdminError(db, teamId, opts.authorizedByMemberId);
+    if (bad) return { ok: false, error: `grant authorizer rejected: ${bad}` };
+  }
   // Select-first: audit ONLY on creation (the audit-on-change pattern).
   // The bootstrap re-runs this every scheduler tick; an unconditional upsert+audit minted 3
   // audit rows/team/tick forever and re-clobbered added_by — drowning the grant trail the
@@ -479,23 +521,91 @@ export async function grantProjectToGroup(
     .eq("project_id", projectId)
     .eq("group_id", groupId)
     .maybeSingle();
-  if (existing) return { ok: true };
+  if (existing) return { ok: true, created: false };
   const { error } = await db
     .from("project_groups")
     .upsert({ team_id: teamId, project_id: projectId, group_id: groupId, added_by: actorMemberId }, { onConflict: "project_id,group_id" });
   if (error) return { ok: false, error: error.message };
-  await auditWrite(db, teamId, actorMemberId, "access.project_granted", projectId, { groupId });
-  return { ok: true };
+  await auditWrite(db, teamId, actorMemberId, "access.project_granted", projectId, {
+    groupId,
+    ...(opts.authorizedByMemberId
+      ? { authorizedByMemberId: opts.authorizedByMemberId, ...(opts.via ? { via: opts.via } : {}) }
+      : {}),
+  });
+  return { ok: true, created: true };
 }
 
-/** Revoke a group's visibility into a project. */
+/**
+ * REVOKE-1 (D1): the revoke principal, discriminated so the audit can only ever tell the
+ * truth — `member` is the member's OWN act (a future UI action; audits as that member);
+ * `operator` is a CLI/operator act on a named active admin's authority (audits as `system`
+ * with `meta.authorizedByMemberId` — the round-1 blocker was the draft writing the authorizer
+ * into the actor field, recording an admin as having performed a destructive act the operator
+ * ran).
+ */
+export type RevokeActor =
+  | { kind: "member"; memberId: string }
+  | { kind: "operator"; authorizedByMemberId: string; via: string };
+
+export interface RevokeResult extends WriteResult {
+  /** true = an edge was deleted (and audited); false = there was nothing to revoke (no audit). */
+  revoked?: boolean;
+}
+
+/**
+ * Revoke a group's visibility into a project — the destructive half of THE access edge, so the
+ * invariants live HERE, not in any caller (design round 1 H1/H2):
+ *
+ * CHECK ORDER IS CONTRACT (D2c — an unordered writer turns invalid principals into an
+ * edge-existence oracle): (1) project resolution + the `kind='system'` refusal (severing
+ * general/external-shared from the builtins is a substrate outage; bootstrap only ever
+ * re-grants), (2) principal validation (the app's admin predicate — role AND status AND
+ * posture), (3) the existence probe — so `{ revoked: false }` is reachable ONLY by an
+ * authorized principal against a non-system project, (4) delete + audit.
+ *
+ * D3: no-op revokes do NOT audit (a trail recording revocations that revoked nothing
+ * over-reports). The audit insert itself is best-effort by the repo-wide contract
+ * (lib/api/audit — an audit outage must not break the act; stated in the spec as the same
+ * act-over-trail direction every audited write here takes). Bounded probe/act race as on the
+ * grant side: two concurrent revokes can both probe-hit and both audit the same ms-apart act
+ * (over-report, never under-report; the F3 transaction surface owns the atomic form).
+ */
 export async function revokeProjectFromGroup(
   db: DbClient,
   teamId: string,
   projectId: string,
   groupId: string,
-  actorMemberId: string
-): Promise<WriteResult> {
+  actor: RevokeActor
+): Promise<RevokeResult> {
+  // (1) The system wiring is unrevokable through this writer.
+  const { data: proj } = await db
+    .from("projects")
+    .select("kind")
+    .eq("team_id", teamId)
+    .eq("id", projectId)
+    .maybeSingle();
+  if (!proj) return { ok: false, error: "project not found for team" };
+  if ((proj as { kind: string }).kind === "system") {
+    return { ok: false, error: "refusing to revoke a system project's grant — the general/external-shared wiring is the access substrate (raw SQL is the deliberate barrier)" };
+  }
+
+  // (2) The principal — whichever kind — must pass the app's admin predicate.
+  const principalId = actor.kind === "member" ? actor.memberId : actor.authorizedByMemberId;
+  const bad = await activeAdminError(db, teamId, principalId);
+  if (bad) return { ok: false, error: `revoke principal rejected: ${bad}` };
+
+  // (3) Probe — only an authorized principal learns whether there was anything to revoke.
+  const { data: existing, error: probeErr } = await db
+    .from("project_groups")
+    .select("project_id")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId)
+    .eq("group_id", groupId)
+    .maybeSingle();
+  if (probeErr) return { ok: false, error: probeErr.message };
+  if (!existing) return { ok: true, revoked: false };
+
+  // (4) Delete + audit (audit only a real deletion — D3).
   const { error } = await db
     .from("project_groups")
     .delete()
@@ -503,8 +613,18 @@ export async function revokeProjectFromGroup(
     .eq("project_id", projectId)
     .eq("group_id", groupId);
   if (error) return { ok: false, error: error.message };
-  await auditWrite(db, teamId, actorMemberId, "access.project_revoked", projectId, { groupId });
-  return { ok: true };
+  if (actor.kind === "member") {
+    await auditWrite(db, teamId, actor.memberId, "access.project_revoked", projectId, { groupId });
+  } else {
+    // `via` comes from the ACTOR — the caller declares its own transport (Fable diff L2:
+    // hardcoding "cli" here would mint false provenance for any future operator surface).
+    await auditWrite(db, teamId, null, "access.project_revoked", projectId, {
+      groupId,
+      authorizedByMemberId: actor.authorizedByMemberId,
+      via: actor.via,
+    });
+  }
+  return { ok: true, revoked: true };
 }
 
 /**
