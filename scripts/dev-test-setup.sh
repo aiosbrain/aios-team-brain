@@ -7,6 +7,11 @@
 # `npm run dev` (port 3000) both up, with `npm run dev` pointed at the SAME test DB
 # (DATABASE_URL=postgres://app:app@localhost:5434/app_test) — never a real/prod DB.
 #
+# NOTE: the reset path below runs `npm run db:test:up`, which DESTROYS and recreates the container
+# (scripts/db-test-up.sh) — so an already-running `npm run dev` loses every pooled connection and
+# reconnects. That is normally invisible (node-postgres evicts dead clients), but if the dev server
+# is mid-request you may see one transient error. `--no-reset` skips it.
+#
 # Usage:
 #   npm run test:setup            # full reset + seed + spoke
 #   npm run test:setup -- --no-reset   # keep existing data, just re-mint key + spoke

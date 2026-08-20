@@ -77,6 +77,20 @@ Notes:
   `test:datamechanics` unless the env var is already set.
 - `npm run db:test:down` tears the container down. The container can stop between sessions — if a
   data-mechanics run prints `ECONNREFUSED ...:5434`, just re-run `npm run db:test:up`.
+- **`npm run db:test:up` always starts FROM ZERO** (`scripts/db-test-up.sh`: `down -v`, then `up`,
+  then load the schema). It is therefore safe to re-run against any prior state — you no longer
+  have to remember `db:test:down` first. Two consequences worth knowing:
+  - it is **destructive to the shared :5434 DB**, by design. If another agent/session is mid-run
+    against it, you have just wiped their data — give your worktree its own container with
+    `npm run test:datamechanics:iso` instead.
+  - if the schema load fails, the command **removes the container** rather than leaving it up with
+    a half-applied schema (which used to surface as confusing `relation "…" does not exist` errors
+    instead of a clean connection refusal). Fix the failure and re-run.
+  This matters because a data-mechanics run leaves DDL behind — the PRET-6 test re-adds the retired
+  `teams.access_enforcement` column at its historical `'permissive'` default, and the harness
+  truncates rows, not DDL. Replaying the migrations onto that state hit the (correct, production)
+  PRET-6 guard: `PRET-6 refused: permissive team(s) remain`. The guard is unchanged; the bring-up
+  no longer routes a local test DB through a production-upgrade replay it cannot get out of.
 
 ## Deploy / schema rollout
 
