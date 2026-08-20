@@ -527,12 +527,22 @@ def _read_test_results(repo: Path) -> dict[str, int | None]:
     **None means UNKNOWN.** A repo that publishes no test-result report gets None, never 0 — the
     brain must not read "no report" as "nothing was skipped". Same rule as `_read_coverage`.
     """
+    return _read_test_results_json(repo) or _read_test_results_junit(repo) or {
+        "total": None,
+        "passed": None,
+        "skipped": None,
+        "failed": None,
+    }
+
+
+def _int_or_none(value: Any) -> int | None:
+    """An int, or None. `bool` is an int subclass — exclude it so `true` isn't read as 1."""
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _read_test_results_json(repo: Path) -> dict[str, int | None] | None:
+    """Vitest/Jest JSON reporter. None (not a zero-filled dict) when no such report is there."""
     import json
-
-    empty: dict[str, int | None] = {"total": None, "passed": None, "skipped": None, "failed": None}
-
-    def _int(v: Any) -> int | None:
-        return int(v) if isinstance(v, int) and not isinstance(v, bool) else None
 
     for rel in _TEST_REPORT_JSON:
         p = repo / rel
@@ -544,58 +554,71 @@ def _read_test_results(repo: Path) -> dict[str, int | None]:
             continue
         if not isinstance(doc, dict):
             continue
-        total = _int(doc.get("numTotalTests"))
+        total = _int_or_none(doc.get("numTotalTests"))
         if total is None:
             continue  # not a Vitest/Jest JSON report — keep looking
         return {
             "total": total,
-            "passed": _int(doc.get("numPassedTests")),
-            # Jest/Vitest split "not run" across pending (it.skip / it.todo).
-            "skipped": _sum_or_none(_int(doc.get("numPendingTests")), _int(doc.get("numTodoTests"))),
-            "failed": _int(doc.get("numFailedTests")),
+            "passed": _int_or_none(doc.get("numPassedTests")),
+            # Jest/Vitest split "not run" across pending (it.skip) and todo (it.todo).
+            "skipped": _sum_or_none(
+                _int_or_none(doc.get("numPendingTests")), _int_or_none(doc.get("numTodoTests"))
+            ),
+            "failed": _int_or_none(doc.get("numFailedTests")),
         }
+    return None
 
-    # The input is a file the repo committed to its own tree, but it is still untrusted-shaped
-    # input: a malformed document must fall through to "unknown", never raise out of a scan.
-    import xml.etree.ElementTree as ET
+
+def _junit_suite_totals(root: Any) -> dict[str, int] | None:
+    """Sum the LEAF ``testsuite`` elements under a parsed JUnit root.
+
+    Leaves only: aggregated files (Ant, some Karma/Gradle merges) nest ``testsuite`` inside
+    ``testsuite`` with the parent carrying rolled-up counts, so summing every descendant counts
+    each case twice — inflating the totals and able to make a clean run report as partial.
+    """
+    all_suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+    suites = [s for s in all_suites if s.find("testsuite") is None]
+    agg = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
+    seen = False
+    for suite in suites:
+        if suite.get("tests") is None:
+            continue
+        seen = True
+        for key in agg:
+            try:
+                agg[key] += int(suite.get(key) or 0)
+            except ValueError:
+                pass
+    return agg if seen else None
+
+
+def _read_test_results_junit(repo: Path) -> dict[str, int | None] | None:
+    """JUnit XML. None when no parseable report is there.
+
+    Parsed with ``defusedxml``: a scanned repo's committed report is not necessarily a file we
+    wrote (``aios-ingest scan`` runs against whatever checkout it is pointed at), and the stdlib
+    ``xml.etree.ElementTree`` is vulnerable to XXE and entity-expansion attacks. A malformed
+    document degrades to unknown; it must never abort a scan.
+    """
+    from defusedxml.ElementTree import ParseError, parse
 
     for rel in _TEST_REPORT_JUNIT:
         p = repo / rel
         if not p.is_file():
             continue
         try:
-            root = ET.parse(p).getroot()
-        except (ET.ParseError, OSError):
+            agg = _junit_suite_totals(parse(p).getroot())
+        except (ParseError, OSError, ValueError):
             continue
-        # A JUnit file is either a single <testsuite> or a <testsuites> wrapper — and aggregated
-        # files (Ant, some Karma/Gradle merges) NEST <testsuite> inside <testsuite>, with the
-        # parent carrying rolled-up counts. Summing every descendant would count those tests
-        # twice, inflating the totals and making a clean run report as partial. So sum LEAF
-        # suites only: a suite that contains another <testsuite> is a rollup of the ones below it.
-        all_suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-        suites = [s for s in all_suites if s.find("testsuite") is None]
-        if not suites:
+        if agg is None:
             continue
-        agg = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
-        seen = False
-        for suite in suites:
-            if suite.get("tests") is None:
-                continue
-            seen = True
-            for key in agg:
-                try:
-                    agg[key] += int(suite.get(key) or 0)
-                except ValueError:
-                    pass
-        if not seen:
-            continue
-        # `errors` are counted as failures — a fixture/collection error is a case that did not
-        # pass, and a scanner that dropped them would report a clean run for a broken one.
+        # `errors` count as failures — a fixture or collection error is a case that did not pass,
+        # and a scanner that dropped them would report a clean run for a broken one.
         failed = agg["failures"] + agg["errors"]
-        # …but several runners count an error WITHOUT incrementing `tests` (pytest emits
-        # `<testsuite tests="0" errors="1"/>` for a collection error). Taking `tests` at face
-        # value there yields failed > total, which the brain rejects at the boundary — losing the
-        # ENTIRE scan, contributions and issues included, over one degraded report. The total is
+        # …but several runners count an error WITHOUT incrementing `tests` (pytest emits a suite
+        # reporting zero tests and one error for a collection error). Taking `tests` at face value
+        # there yields failed > total, which the brain rejects at the boundary — losing the ENTIRE
+        # scan, contributions and issues included, over one degraded report. The total is
         # therefore at least the sum of its parts.
         total = max(agg["tests"], agg["skipped"] + failed)
         return {
@@ -604,8 +627,7 @@ def _read_test_results(repo: Path) -> dict[str, int | None]:
             "skipped": agg["skipped"],
             "failed": failed,
         }
-
-    return empty
+    return None
 
 
 def _sum_or_none(*values: int | None) -> int | None:

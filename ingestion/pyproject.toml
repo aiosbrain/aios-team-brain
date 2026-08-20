@@ -13,6 +13,11 @@ dependencies = [
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "apscheduler>=3.10",
+  # JUnit test-result parsing (analyzers/codebase.py, brain-api 1.22). The stdlib
+  # `xml.etree.ElementTree` is vulnerable to XXE and entity-expansion ("XML bomb") attacks, and
+  # a scanned repo's committed report is not necessarily a file we wrote — `aios-ingest scan`
+  # runs against whatever checkout it is pointed at. Pure-Python and dependency-free itself.
+  "defusedxml>=0.7",
 ]
 
 # Reader/parsers are heavy and license-varied, so they are opt-in extras.
