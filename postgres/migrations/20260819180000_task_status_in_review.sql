@@ -18,4 +18,13 @@
 --
 -- NOT a data migration: no existing row changes. Rows a pre-1.21 push folded into `in_progress`
 -- stay `in_progress` until their next sync/inbound apply re-reads the provider state.
+--
+-- TWO deploy consequences worth knowing before you run it:
+--  1. ONE-WAY. Postgres cannot drop an enum value. Rolling the CODE back to 1.20 while `in_review`
+--     rows exist leaves those rows rendering in the kanban's Backlog column (the board falls back to
+--     `map.backlog` for an unknown status) — and dragging one there PERSISTS backlog. Roll forward.
+--  2. The FIRST sync after deploy flips every Linear/Plane ticket sitting in an "In Review"-named
+--     state from `in_progress` to `in_review`. That is a real persisted change, so it bumps
+--     `tasks.updated_at` on all of them at once; tickets with no provider `worked_at` will therefore
+--     read as "worked on today" in the work timeline for one window. Expected, and self-correcting.
 alter type task_status add value if not exists 'in_review' before 'blocked';

@@ -139,8 +139,19 @@ export interface PmAdapter {
   fetchSeenStates?(input: FetchSeenStatesInput): Promise<Map<string, SeenState>>;
 }
 
-// status → desired provider state. Both providers share five workflow groups; `blocked` has no
-// native group, so it maps to `started` unless a state literally named "Blocked" exists (UX caveat).
+// status → desired provider state. Both providers share five workflow groups.
+//
+// UX CAVEAT, and since brain-api v1.21 it applies to TWO statuses, not one: neither `blocked` nor
+// `in_review` has a native workflow GROUP, so both ride `started` and are distinguished only by the
+// state NAME. If the provider board has no state with that name, `resolveStateByGroup` falls back to
+// the first `started` state — in practice "In Progress" — and the distinction is lost OUTBOUND; the
+// inbound leg then reads `in_progress` back and, its brain-unchanged baseline being satisfied,
+// overwrites `tasks.status`. Net: a workspace-authored `in_review` can decay to `in_progress` on a
+// board that has no "In Review" state. `in_review` is the one that matters in practice, because the
+// v1.21 contract invites clients to author it — an operator who wants it preserved must add an
+// "In Review" state to the board. Fixing the fallback itself (leave the provider state untouched +
+// record a divergence) is a change to `blocked`'s long-standing behaviour too, so it is deliberately
+// NOT bundled with the contract bump.
 export interface DesiredState {
   group: StateGroup;
   preferredName: string;

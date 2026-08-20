@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam } from "./helpers";
 
 /**
@@ -84,6 +87,39 @@ describe("task status `in_review` (brain-api v1.21, real Postgres)", () => {
     expect(await readTask(seed.teamId, "S-near")).toEqual({
       status: "backlog",
       raw_status: "in reviewing",
+    });
+  });
+
+  // The static half of the migration's protection lives in test/guards/task-status-vocabulary.test.ts
+  // (a fresh `db:test:up` loads schema.sql, whose create-type list already has the value, so no
+  // DB-backed test can notice a DELETED migration). What a real database CAN prove is the other two
+  // properties the deploy depends on, and they are asserted here against live Postgres.
+  it("the migration file is a clean NO-OP when replayed on an already-widened database", async () => {
+    // postgres/migrations/ is replayed IN FULL on every deploy with no applied-tracking table, so
+    // "runs twice without error" is not a nicety — it is the rollout contract for this directory.
+    const sql = readFileSync(
+      join(import.meta.dirname, "..", "..", "postgres", "migrations", "20260819180000_task_status_in_review.sql"),
+      "utf8"
+    );
+    await expect(runSql(sql)).resolves.toBeDefined();
+    await expect(runSql(sql)).resolves.toBeDefined();
+  });
+
+  it("the enum's SORT order is the contract's canonical order, not append-at-the-end", () => {
+    // `order by status` sorts on enumsortorder, so a missing `before 'blocked'` would silently
+    // re-order every status-sorted surface while every membership assertion stayed green.
+    return runSql<{ enumlabel: string }>(
+      `select e.enumlabel from pg_enum e join pg_type t on t.oid = e.enumtypid
+        where t.typname = 'task_status' order by e.enumsortorder`
+    ).then((r) => {
+      expect(r.rows.map((x) => x.enumlabel)).toEqual([
+        "backlog",
+        "ready",
+        "in_progress",
+        "in_review",
+        "blocked",
+        "done",
+      ]);
     });
   });
 });

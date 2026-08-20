@@ -487,3 +487,45 @@ describe("ClickUp Doc normalization", () => {
     expect(after.content_sha256).not.toBe(before.content_sha256);
   });
 });
+
+// ── brain-api v1.21 (AIO-950): `in_review` in the reversible List status map ──────────────────────
+//
+// `in_review` is the ONE optional member of `ClickUpStatusMap`. That asymmetry is deliberate and it
+// needs proving in BOTH directions, because each direction has its own way to break:
+//   • OMITTED — every status map saved before 1.21 lacks the key. `invertStatusMap` is fail-closed and
+//     throws on a missing mapping, and `resolveStatus` runs inside `rows.map`, so a required key would
+//     not degrade gracefully: it would take down the ENTIRE ClickUp workspace import on upgrade.
+//   • PRESENT — if the optionality were implemented by skipping the member outright rather than by
+//     skipping it only when absent, a List that DOES define an In Review state would silently never
+//     resolve onto `in_review`, and the fail-closed branch would reject those tasks instead.
+describe("ClickUp status map — the optional in_review member (brain-api v1.21)", () => {
+  const listId = "101";
+  const taskWithStatus = (status: string): ClickUpTaskRecord => ({
+    task: { ...records[0].task, id: "5150", status: { status } } as ClickUpTask,
+    observedListIds: [listId],
+  });
+  const run = (map: ClickUpStatusMap, status: string) =>
+    normalizeClickUpTasks({ workspaceId: 9001, records: [taskWithStatus(status)], statusMaps: { [listId]: map } });
+
+  it("a map that OMITS in_review still imports — the pre-1.21 saved config keeps working", () => {
+    const payload = run(list101Map, "in progress");
+    expect((payload.rows as Array<Record<string, unknown>>)[0].status).toBe("in_progress");
+  });
+
+  it("a map that DEFINES in_review resolves its native status onto in_review", () => {
+    const withReview: ClickUpStatusMap = { ...list101Map, in_review: "in review" };
+    const payload = run(withReview, "In Review");
+    expect((payload.rows as Array<Record<string, unknown>>)[0].status).toBe("in_review");
+  });
+
+  it("stays FAIL-CLOSED: with in_review unmapped, an In Review task is rejected, never guessed", () => {
+    // The important half of the omitted case — "degrades gracefully" must not mean "guesses".
+    expect(() => run(list101Map, "in review")).toThrow(ClickUpNormalizationError);
+  });
+
+  it("a required member is still required — omitting `blocked` still throws", () => {
+    const noBlocked = { ...list101Map } as Partial<ClickUpStatusMap>;
+    delete noBlocked.blocked;
+    expect(() => run(noBlocked as ClickUpStatusMap, "in progress")).toThrow(/missing its blocked status mapping/);
+  });
+});

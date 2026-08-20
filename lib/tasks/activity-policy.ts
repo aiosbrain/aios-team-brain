@@ -32,10 +32,16 @@ import type { TaskStatusValue } from "@/lib/pm-sync/provider";
 /** Being worked right now — including `blocked` (underway and stuck), excluding `ready` (queued). */
 export const ACTIVE_STATUSES: ReadonlySet<TaskStatusValue> = new Set<TaskStatusValue>([
   "in_progress",
-  // brain-api v1.21 (AIO-950). This is behaviour PRESERVATION, not a new opinion: before 1.21 a
-  // Linear "In Review" state (type `started`) normalized to `in_progress` and was therefore ACTIVE.
-  // Leaving it out here would make the contract bump silently DROP work-in-review off every
-  // "what is the team working through" surface — a regression dressed as a new status.
+  // brain-api v1.21 (AIO-950). Honest about which half is which:
+  //   • PROVIDER path — pure preservation. A Linear/Plane "In Review" state (type `started`) already
+  //     normalized to `in_progress` and was therefore ACTIVE. Leaving `in_review` out here would make
+  //     the contract bump silently DROP that work off every "what is the team working through"
+  //     surface — a regression dressed up as a new status.
+  //   • PUSH path — a real behaviour CHANGE, deliberately taken. A markdown cell reading "In Review"
+  //     used to fold to `backlog` + `raw_status`, i.e. neither ACTIVE nor OPEN. Those rows now enter
+  //     the work timeline, the Pulse in-flight count, "on your plate" and arc eligibility. That is the
+  //     correct outcome — a ticket in review IS being worked — but it is a change, not a no-op, and
+  //     the first sync after the 1.21 deploy is where it shows up.
   "in_review",
   "blocked",
 ]);
