@@ -1,4 +1,6 @@
-export const TASK_STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"] as const;
+// Mirrors the canonical `TASK_STATUSES` in lib/api/schemas.ts (postgres `task_status`); the array
+// ORDER is the board's column order. `in_review` joined at brain-api v1.21 (AIO-950).
+export const TASK_STATUSES = ["backlog", "ready", "in_progress", "in_review", "blocked", "done"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 // Canonical priority words (postgres `task_priority`); mirrors normalizeTaskPriority's output set.
@@ -9,6 +11,7 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   backlog: "Backlog",
   ready: "Ready",
   in_progress: "In progress",
+  in_review: "In review",
   blocked: "Blocked",
   done: "Done",
 };

@@ -33,7 +33,7 @@ const OWNER = join("lib", "tasks", "activity-policy.ts");
  * bracketed list. Two is the threshold because a single `=== "done"` comparison is a legitimate,
  * readable check; a LIST of statuses is a policy, and policies belong in one place.
  */
-const STATUS = "(?:backlog|ready|in_progress|blocked|done)";
+const STATUS = "(?:backlog|ready|in_progress|in_review|blocked|done)";
 const QUOTED = `(?:"${STATUS}"|'${STATUS}'|\`${STATUS}\`)`;
 // `\s` spans newlines, so a set written one status per line is caught too. Backticks are included
 // because a template literal is just as much a second definition and no other guard would see it.

@@ -4,6 +4,7 @@ import {
   itemPayloadSchema,
   normalizeTier,
   normalizeTaskStatus,
+  TASK_STATUSES,
   taskRowSchema,
 } from "@/lib/api/schemas";
 
@@ -36,6 +37,47 @@ describe("normalizeTaskStatus", () => {
     expect(normalizeTaskStatus("waiting on legal")).toEqual({
       status: "backlog",
       raw_status: "waiting on legal",
+    });
+  });
+
+  // brain-api v1.21 (AIO-950): `in_review` joins the canonical set, between `in_progress` and
+  // `blocked`. The WIRE shape is unchanged — `status` is still a free string the server folds —
+  // so this adds a normalization TARGET; it rejects nothing that used to be accepted.
+  describe("in_review (brain-api v1.21)", () => {
+    it("folds every spelling of In Review onto in_review, clearing raw_status", () => {
+      for (const spelling of ["in_review", "In Review", "in-review", "IN REVIEW", "  In  Review  "]) {
+        expect(normalizeTaskStatus(spelling)).toEqual({ status: "in_review", raw_status: null });
+      }
+    });
+
+    it("sits between in_progress and blocked in the canonical order", () => {
+      expect([...TASK_STATUSES]).toEqual([
+        "backlog",
+        "ready",
+        "in_progress",
+        "in_review",
+        "blocked",
+        "done",
+      ]);
+    });
+
+    it("leaves the other five statuses exactly as they were", () => {
+      for (const s of ["backlog", "ready", "in_progress", "blocked", "done"]) {
+        expect(normalizeTaskStatus(s)).toEqual({ status: s, raw_status: null });
+        expect(normalizeTaskStatus(s.replace(/_/g, " ").toUpperCase())).toEqual({
+          status: s,
+          raw_status: null,
+        });
+      }
+    });
+
+    it("an unknown status still behaves exactly as before (backlog + raw_status)", () => {
+      expect(normalizeTaskStatus("in reviewing")).toEqual({
+        status: "backlog",
+        raw_status: "in reviewing",
+      });
+      expect(normalizeTaskStatus("todo")).toEqual({ status: "backlog", raw_status: "todo" });
+      expect(normalizeTaskStatus("")).toEqual({ status: "backlog", raw_status: "" });
     });
   });
 });

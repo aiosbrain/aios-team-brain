@@ -8,7 +8,7 @@ export type PmProvider = "plane" | "linear";
 
 // Canonical task status values (postgres `task_status` enum). The projection engine maps these
 // onto provider workflow-state "groups" (Plane state `group` / Linear state `type`).
-export type TaskStatusValue = "backlog" | "ready" | "in_progress" | "blocked" | "done";
+export type TaskStatusValue = "backlog" | "ready" | "in_progress" | "in_review" | "blocked" | "done";
 export type StateGroup = "backlog" | "unstarted" | "started" | "completed" | "cancelled";
 
 export interface TaskPmLink {
@@ -31,7 +31,7 @@ export interface TaskPmLink {
   provider_seen_status?: string | null;
   // Exact brain `tasks.status` at the last successful projection/adopt/inbound apply — the
   // inbound conflict baseline (brain-api v1.4). The fingerprint hashes the provider state GROUP,
-  // so it cannot distinguish same-group statuses (in_progress vs blocked); this can.
+  // so it cannot distinguish same-group statuses (in_progress / in_review / blocked); this can.
   last_projected_brain_status?: string | null;
 }
 
@@ -152,6 +152,11 @@ export function desiredStateForStatus(status: string): DesiredState {
       return { group: "unstarted", preferredName: "Todo" };
     case "in_progress":
       return { group: "started", preferredName: "In Progress" };
+    // brain-api v1.21 (AIO-950). Like `blocked`, `in_review` has no native workflow GROUP in either
+    // provider, so it rides `started` and is distinguished only by the state NAME — which is exactly
+    // how the inbound leg reads it back (`linearStatus`/`planeStatus` match by name first).
+    case "in_review":
+      return { group: "started", preferredName: "In Review" };
     case "blocked":
       return { group: "started", preferredName: "Blocked" };
     case "done":

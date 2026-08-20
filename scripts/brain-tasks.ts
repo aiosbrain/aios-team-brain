@@ -24,7 +24,7 @@
  *   extract-meeting-todos --team <slug|id> [--source-project <slug>] [--path-prefix <p>]
  *          [--since <iso>] [--limit <n>] [--dry-run] [--project-to-linear]
  *
- * status:   backlog | ready | in_progress | blocked | done   (default backlog)
+ * status:   backlog | ready | in_progress | in_review | blocked | done   (default backlog)
  * priority: none | low | medium | high | urgent              (default none)
  */
 import { readFileSync } from "node:fs";
@@ -45,7 +45,7 @@ type ResolvePage = {
   team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { id: string; identifier: string; url: string }[] } } | null;
 };
 
-const STATUSES = ["backlog", "ready", "in_progress", "blocked", "done"];
+const STATUSES = ["backlog", "ready", "in_progress", "in_review", "blocked", "done"];
 
 function parseArgs(argv: string[]): { cmd: string; positionals: string[]; flags: Flags } {
   const [cmd = "help", ...rest] = argv;

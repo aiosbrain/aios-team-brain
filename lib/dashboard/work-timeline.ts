@@ -28,8 +28,9 @@ import { canSeeMeetingNotes } from "@/lib/meetings/notes";
 import { rowVisibleByProvenance } from "@/lib/access/provenance";
 import { isCalendarEvent } from "@/lib/meetings/from-calendar";
 
-// Only ACTIVE tasks are considered work "in progress" — Linear In Progress/In Review both normalize to
-// `in_progress`; `blocked` is active-but-stuck. Backlog/ready/done are context, excluded from the timeline.
+// Only ACTIVE tasks are considered work "in progress". Since brain-api v1.21 (AIO-950) a Linear
+// "In Review" state normalizes to its own `in_review` rather than collapsing into `in_progress`;
+// both are ACTIVE, as is `blocked` (active-but-stuck). Backlog/ready/done are context, excluded here.
 
 
 /**

@@ -9,6 +9,7 @@ const STATUS_COLOR: Record<string, string> = {
   backlog: "color-mix(in srgb, var(--aios-fg) 30%, transparent)",
   ready: PRISM.cyan,
   in_progress: PRISM.violet,
+  in_review: PRISM.amber,
   blocked: PRISM.red,
   done: PRISM.emerald,
 };
@@ -25,7 +26,7 @@ export function TaskFunnel({ data }: { data: FunnelPoint[] }) {
           <span className="font-medium text-ink">What this is</span>
           <br />
           Every task the brain knows about, grouped by its current status — Backlog, Ready, In
-          progress, Blocked, Done.
+          progress, In review, Blocked, Done.
           <br />
           <br />
           This is a <span className="font-medium text-ink">live snapshot</span>, not a windowed

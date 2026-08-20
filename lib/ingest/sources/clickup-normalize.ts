@@ -9,12 +9,19 @@ import type {
   ClickUpTaskRecord,
 } from "@/lib/ingest/sources/clickup";
 
-export type ClickUpBrainStatus = "backlog" | "ready" | "in_progress" | "blocked" | "done";
+export type ClickUpBrainStatus = "backlog" | "ready" | "in_progress" | "in_review" | "blocked" | "done";
 
 export interface ClickUpStatusMap {
   backlog: string;
   ready: string;
   in_progress: string;
+  /**
+   * brain-api v1.21 (AIO-950). OPTIONAL where its siblings are required: this map is an operator's
+   * SAVED configuration, and every config written before 1.21 lacks the key. Requiring it would make
+   * `invertStatusMap` throw and fail-close the entire ClickUp workspace import on upgrade. Absent
+   * simply means this List has no In Review state — the pre-1.21 behaviour, unchanged.
+   */
+  in_review?: string;
   blocked: string;
   done: string;
 }
@@ -33,7 +40,9 @@ export class ClickUpNormalizationError extends Error {
   }
 }
 
-const BRAIN_STATUSES: ClickUpBrainStatus[] = ["backlog", "ready", "in_progress", "blocked", "done"];
+const BRAIN_STATUSES: ClickUpBrainStatus[] = ["backlog", "ready", "in_progress", "in_review", "blocked", "done"];
+/** The one member of BRAIN_STATUSES a saved status map may omit — see `ClickUpStatusMap.in_review`. */
+const OPTIONAL_BRAIN_STATUSES: ReadonlySet<ClickUpBrainStatus> = new Set(["in_review"]);
 const PRIORITY_BY_ID: Record<string, string> = { "1": "urgent", "2": "high", "3": "medium", "4": "low" };
 
 /**
@@ -161,7 +170,10 @@ function invertStatusMap(listId: string, map: ClickUpStatusMap): Map<string, Cli
   const inverse = new Map<string, ClickUpBrainStatus>();
   for (const status of BRAIN_STATUSES) {
     const native = map[status]?.trim().toLowerCase();
-    if (!native) throw new ClickUpNormalizationError(`ClickUp List ${listId} is missing its ${status} status mapping`);
+    if (!native) {
+      if (OPTIONAL_BRAIN_STATUSES.has(status)) continue;
+      throw new ClickUpNormalizationError(`ClickUp List ${listId} is missing its ${status} status mapping`);
+    }
     if (inverse.has(native)) {
       throw new ClickUpNormalizationError(`ClickUp List ${listId} has a non-bijective status mapping`);
     }

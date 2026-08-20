@@ -32,6 +32,11 @@ import type { TaskStatusValue } from "@/lib/pm-sync/provider";
 /** Being worked right now — including `blocked` (underway and stuck), excluding `ready` (queued). */
 export const ACTIVE_STATUSES: ReadonlySet<TaskStatusValue> = new Set<TaskStatusValue>([
   "in_progress",
+  // brain-api v1.21 (AIO-950). This is behaviour PRESERVATION, not a new opinion: before 1.21 a
+  // Linear "In Review" state (type `started`) normalized to `in_progress` and was therefore ACTIVE.
+  // Leaving it out here would make the contract bump silently DROP work-in-review off every
+  // "what is the team working through" surface — a regression dressed as a new status.
+  "in_review",
   "blocked",
 ]);
 

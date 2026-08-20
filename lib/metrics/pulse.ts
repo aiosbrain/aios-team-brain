@@ -141,6 +141,7 @@ const FUNNEL_ORDER: { status: string; label: string }[] = [
   { status: "backlog", label: "Backlog" },
   { status: "ready", label: "Ready" },
   { status: "in_progress", label: "In progress" },
+  { status: "in_review", label: "In review" },
   { status: "blocked", label: "Blocked" },
   { status: "done", label: "Done" },
 ];

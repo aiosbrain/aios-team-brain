@@ -36,7 +36,7 @@ import { adminClient } from "@/lib/db/admin";
  *
  * "Brain unchanged" is TWO checks, both required (round-3 review, binding):
  *   1. exact-status baseline — `task_pm_links.last_projected_brain_status === tasks.status`.
- *      The projection fingerprint hashes the provider state GROUP, and in_progress/blocked both
+ *      The projection fingerprint hashes the provider state GROUP, and in_progress/in_review/blocked all
  *      hash to `started`, so the fingerprint alone would silently overwrite a same-group brain
  *      edit. The baseline is written by outbound projection success, adopt, and inbound apply.
  *   2. fingerprint equality — `projection_fingerprint === projectionFingerprint(task, parent)`.

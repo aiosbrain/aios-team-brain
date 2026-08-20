@@ -1,0 +1,21 @@
+-- brain-api v1.21 (AIO-950): the canonical task status set gains `in_review`, between
+-- `in_progress` and `blocked`.
+--
+-- Why a migration at all: `tasks.status` is the postgres ENUM `task_status`, and `schema.sql`
+-- creates it inside a `do $$ … exception when duplicate_object then null $$` guard — which is a
+-- silent NO-OP on any database where the type already exists. Every deployed brain is in exactly
+-- that state, so without this file `pg:schema` would run green and an `in_review` write would still
+-- fail with `invalid input value for enum task_status`.
+--
+-- `before 'blocked'` pins the enum's SORT order to the contract's canonical order (backlog, ready,
+-- in_progress, in_review, blocked, done) — `order by status` reads that order, so appending at the
+-- end would silently re-order every status-sorted surface.
+--
+-- Idempotent (`if not exists`) and therefore safe under this directory's replay-on-every-deploy
+-- rule. `alter type … add value` is not a CHECK constraint, so the enumerated-CHECK replay guard
+-- (test/guards/enum-check-replay.test.ts) does not apply; there is no narrower earlier definition
+-- to widen in lockstep.
+--
+-- NOT a data migration: no existing row changes. Rows a pre-1.21 push folded into `in_progress`
+-- stay `in_progress` until their next sync/inbound apply re-reads the provider state.
+alter type task_status add value if not exists 'in_review' before 'blocked';
