@@ -62,11 +62,27 @@ flowchart TD
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
 | `docs-drift`          | `node scripts/check-docs-drift.mjs` — validates routes, tables, sources against `docs/ARCHITECTURE.md` markers                                                   | Yes           |
 | `brain-tests`         | `npm test` — vitest unit tests (pure logic, parse/format, contract guards)                                                                                       | Yes           |
-| `datamechanics-tests` | `npm run test:datamechanics` against real Postgres 16 (port 5434) — RLS, persistence, access control                                                             | Yes           |
+| `datamechanics-tests` | `npm run test:migrate-from-existing` + `npm run test:datamechanics` against real Postgres 16 (port 5434) — schema upgrade-from-a-released-tag, RLS, persistence, access control | Yes           |
 | `http-tests`          | `npm run build` + `npm run test:http` — the API over a real socket against Postgres 16: TCP fetch, the Next.js route runtime (cookies/headers), JSON wire format | No (advisory) |
 | `ingestion-tests`     | `pytest -q` inside `ingestion/` — Python ingest pipeline                                                                                                         | Yes           |
 
 The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`) must pass for a PR to merge (enforced via branch protection). `http-tests` runs `continue-on-error` (advisory) until it proves stable — see Branch Protection below.
+
+### `migration-mirror-nightly.yml` — deletion-observability sweep (nightly, advisory)
+
+`npm run test:migrate-from-existing:sweep` — rebuilds the schema from zero once per migration, each
+time omitting exactly ONE migration, and asserts the catalog fingerprint never moves. That is the
+machine-checkable form of the `postgres/migrations/README.md` rule *"mirror the change into
+postgres/schema.sql"*. Scheduled (03:17 UTC) plus `workflow_dispatch`, not per-PR: it is ~76 full
+schema loads. The cheap per-PR approximation (`--mirror-check`, in `datamechanics-tests`) compares
+`schema.sql` alone against `schema.sql` + every migration and catches the same class in seconds.
+
+Why the pair exists at all: `npm run pg:schema` on a FRESH database loads `schema.sql` first, which
+already creates every object in its final shape, so every migration replayed after it is a no-op.
+A from-zero build therefore cannot observe an additive migration — delete one and the suite stays
+green. The migrate-from-existing lane loads a real released tag's schema state instead (straight out
+of git; no fixture files), rolls the current deploy forward over it, and compares. Both jobs need
+`fetch-depth: 0` on checkout, because the prior states are git tags.
 
 ### `pr-review-gate.yml` — the review gate (REQUIRED)
 

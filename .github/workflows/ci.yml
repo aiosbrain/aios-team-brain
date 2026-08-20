@@ -97,6 +97,12 @@ jobs:
       DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The migrate-from-existing lane reads prior schema states straight out of git
+          # (`git show v0.7.0:postgres/schema.sql`) instead of maintaining fixture files, so it
+          # needs the full history and the TAGS. The default shallow, tagless checkout would make
+          # it fail with "unknown git tag" rather than silently pass.
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
@@ -104,6 +110,12 @@ jobs:
       - run: npm ci
       # migrate-from-zero into the service DB (also the replay guard)
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
+      # migrate-from-EXISTING: the from-zero load above cannot observe an additive migration at all
+      # (schema.sql already builds every object in its final shape, so every migration after it is a
+      # no-op). This step loads each released tag's schema state into its own scratch database, rolls
+      # the current deploy forward over it, and asserts the catalog fingerprint matches a from-zero
+      # build — which is what fails when someone edits schema.sql and forgets the migration.
+      - run: npm run test:migrate-from-existing
       - run: npm run test:gateway-approval
       - run: npm run test:datamechanics
 

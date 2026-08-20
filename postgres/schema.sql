@@ -796,6 +796,10 @@ create trigger gateway_audit_log_protect
   before update or delete on gateway_audit_log
   for each row execute function gateway_audit_protect();
 
+-- Clause ORDER below mirrors 20260716120000_gateway_approval_admin.sql, which `create or replace`s
+-- this same function AFTER schema.sql on every deploy. The predicate set is identical either way,
+-- but a function's SOURCE TEXT is what pg stores, so keeping the two in step is what lets the
+-- migrate-from-existing mirror-check assert schema.sql is the canonical shape, not a stale draft.
 create or replace function gateway_execution_protect()
 returns trigger language plpgsql as $$
 begin
@@ -814,6 +818,10 @@ begin
     or new.tool is distinct from old.tool
     or new.request_hash is distinct from old.request_hash
     or new.encrypted_request_envelope is distinct from old.encrypted_request_envelope
+    or new.decision is distinct from old.decision
+    or new.policy_version is distinct from old.policy_version
+    or new.policy_rule_id is distinct from old.policy_rule_id
+    or new.created_at is distinct from old.created_at
     or new.actor_snapshot is distinct from old.actor_snapshot
     or new.role_snapshot is distinct from old.role_snapshot
     or new.tier_snapshot is distinct from old.tier_snapshot
@@ -821,11 +829,7 @@ begin
     or new.request_envelope_hash is distinct from old.request_envelope_hash
     or (old.resume_fingerprint is not null and new.resume_fingerprint is distinct from old.resume_fingerprint)
     or (old.claim_idempotency_key is not null and new.claim_idempotency_key is distinct from old.claim_idempotency_key)
-    or (old.claimed_credential_id is not null and new.claimed_credential_id is distinct from old.claimed_credential_id)
-    or new.decision is distinct from old.decision
-    or new.policy_version is distinct from old.policy_version
-    or new.policy_rule_id is distinct from old.policy_rule_id
-    or new.created_at is distinct from old.created_at then
+    or (old.claimed_credential_id is not null and new.claimed_credential_id is distinct from old.claimed_credential_id) then
     raise exception 'gateway execution identity/request fields are immutable';
   end if;
   return new;
