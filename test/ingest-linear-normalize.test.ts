@@ -70,6 +70,34 @@ describe("normalizeLinearTeam", () => {
     expect(row.assignee).toBe("Alex");
   });
 
+  it("keeps a Linear 'In Review' state as in_review instead of flattening it into in_progress", () => {
+    // The END-TO-END shape of the regression, one level above the `linearStatus` unit assertions
+    // below: the AIOS team's own Linear board carries a workflow state named "In Review" of type
+    // `started`. `linearStatus` is name-first, so before `in_review` was a canonical status the name
+    // simply didn't resolve and it fell through to TYPE_TO_STATUS.started -> `in_progress`. Every
+    // existing test stayed green because none of them fed the NORMALIZER a state name outside the
+    // five, which is why this drives `normalizeLinearTeam`/`normalizeLinearDocs` rather than the
+    // mapper.
+    const p = normalizeLinearTeam({
+      ...base,
+      issues: [
+        { id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } },
+        // Same TYPE, different name — proving the name is what discriminates, not the type. If this
+        // pair ever collapses to one value again, the fidelity is gone and this goes red.
+        { id: "u2", identifier: "ENG-8", title: "Being written", state: { name: "In Progress", type: "started" } },
+      ],
+    });
+    const rows = p.rows as Array<Record<string, unknown>>;
+    expect(rows.map((r) => r.status)).toEqual(["in_review", "in_progress"]);
+    // Native fidelity is preserved alongside the canonical value, as it is for every Linear state —
+    // the doc frontmatter carries the `state`/`state_type`/`status` triple, not just the fold.
+    const docs = normalizeLinearDocs({
+      ...base,
+      issues: [{ id: "u1", identifier: "ENG-7", title: "Awaiting review", state: { name: "In Review", type: "started" } }],
+    });
+    expect(docs[0].frontmatter).toMatchObject({ state: "In Review", state_type: "started", status: "in_review" });
+  });
+
   it("de-dupes brain round-trippers: issues carrying the aios-ext footer are skipped", () => {
     const p = normalizeLinearTeam({
       ...base,
