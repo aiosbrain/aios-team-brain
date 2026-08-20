@@ -62,6 +62,15 @@ export interface GraphProjectionSummary {
    * Graphiti is wedged rather than that N workers crashed. Non-zero for several runs in a row is an
    * incident, not noise. */
   requeueThrottled: number;
+  /** TICKFIT-2: pages whose batched ledger read failed and fell back to per-item probes —
+   *  durably visible (the recording gate keys on it) so a permanently failing batch read can
+   *  never silently re-become the 10.5-minute stage. */
+  probeFallbackPages: number;
+  /** TICKFIT-2: per-leg wall time (flat numbers — the runs panel Strings values). `walkMs` is
+   *  the page loop; `reconcileMs` the reconcile call; summed across teams, accumulated in
+   *  finally so failed legs keep their elapsed time. The revisit trigger reads walkMs. */
+  walkMs: number;
+  reconcileMs: number;
   errors: string[];
 }
 
@@ -132,6 +141,9 @@ async function runGraphProjectionInner(opts?: {
     partialItems: 0,
     partialDetail: { sample: [], elided: 0, namesElided: 0 },
     requeueThrottled: 0,
+    probeFallbackPages: 0,
+    walkMs: 0,
+    reconcileMs: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -153,6 +165,10 @@ async function runGraphProjectionInner(opts?: {
       // most of a mass arming at once, which is exactly what the budget exists to smooth. Same seam
       // GRAPH_REQUEUE_MAX_PER_PASS's comment names for reconcile.
       let fanoutBudgetLeft = opts?.fanoutPushBudget ?? FANOUT_PUSH_MAX_PER_PASS;
+      // TICKFIT-2: the walk leg's clock — accumulated in finally so an aborted walk keeps its
+      // elapsed time (the revisit trigger reads this number).
+      const walkStart = Date.now();
+      try {
       for (let batch = 0; batch < MAX_BATCHES; batch++) {
         const s = await projectItemsToGraph(db, {
           teamId: t.id,
@@ -163,6 +179,7 @@ async function runGraphProjectionInner(opts?: {
           fanoutPushBudget: fanoutBudgetLeft,
         });
         fanoutBudgetLeft = Math.max(0, fanoutBudgetLeft - s.fanoutPushed);
+        summary.probeFallbackPages += s.probeFallbackPages;
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.episodes += s.episodes;
@@ -176,10 +193,19 @@ async function runGraphProjectionInner(opts?: {
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
       }
+      } finally {
+        summary.walkMs += Date.now() - walkStart;
+      }
 
       // Reconcile after paging (audit H3, Option B): confirm this team's recorded episodes actually
       // landed, and re-queue any that a crashed worker never got to. Off the hot push path.
-      const r = await reconcileProjectedEpisodes(db, client, t.id);
+      const reconcileStart = Date.now();
+      let r: Awaited<ReturnType<typeof reconcileProjectedEpisodes>>;
+      try {
+        r = await reconcileProjectedEpisodes(db, client, t.id);
+      } finally {
+        summary.reconcileMs += Date.now() - reconcileStart;
+      }
       summary.reconciled += r.confirmed;
       summary.requeued += r.reQueued;
       summary.cleaned += r.cleaned;
@@ -225,6 +251,9 @@ async function runGraphProjectionInner(opts?: {
         summary.skipped += e.partial.skipped;
         summary.fanoutThrottled += e.partial.fanoutThrottled;
         summary.restrictionMovesPending += e.partial.restrictionMovesPending;
+        // TICKFIT-2: an aborted run must still report its fallbacks (the durable-visibility
+        // contract — under-reporting here would hide a failing batch read behind any abort).
+        summary.probeFallbackPages += e.partial.probeFallbackPages;
       }
     }
   }

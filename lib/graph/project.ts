@@ -423,6 +423,10 @@ export interface ProjectSummary {
   /** `synced_at` of the last row scanned this batch — the cursor the runner pages forward from
    * (audit H2). `undefined` when the batch was empty (nothing left to scan). */
   lastSyncedAt?: string;
+  /** TICKFIT-2: 1 when this page's batched ledger read failed and the page fell back to the
+   *  per-item probe path (today's shape, page-scoped). Durably surfaced — a permanently
+   *  failing batch read must never silently re-become the 10.5-minute stage. */
+  probeFallbackPages: number;
 }
 
 /**
@@ -791,7 +795,47 @@ export async function projectItemsToGraph(
     fanoutPushed,
     fanoutThrottled,
     restrictionMovesPending,
+    probeFallbackPages,
   });
+
+  // TICKFIT-2: ONE batched ledger read for the whole page replaces the per-item probe that was
+  // the stage's entire measured cost (2,826 sequential round trips ≈ the full 10.5 minutes on a
+  // corpus projecting nothing). Page-snapshot semantics, owned in the spec: the ledger state is
+  // read once before the loop, so a row armed MID-page is seen stale-deferred and heals next
+  // pass (eventual convergence, one interval). Grouped by source_id BY REFERENCE; a page is
+  // ≤ GRAPH_PROJECT_LIMIT ids, under the IN-clause batch bound, so one select suffices. A read
+  // FAILURE falls back to the per-item probe for THIS page only — visible via
+  // `probeFallbackPages`, never silent.
+  type LedgerRow = {
+    content_sha256: string;
+    group_id: string;
+    pending_delete_group_id: string | null;
+    chunk_shas: string[] | null;
+    chunk_config: string | null;
+    deferred: boolean;
+    episode_uuid: string | null;
+  };
+  let probeFallbackPages = 0;
+  let prefetch: Map<string, LedgerRow[]> | null = null;
+  if (rows.length > 0) {
+    const { data: batchData, error: batchErr } = await db
+      .from("graph_episodes")
+      .select("source_id, content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
+      .eq("team_id", args.teamId)
+      .eq("source_table", SOURCE_TABLE)
+      .in("source_id", rows.map((r) => r.id));
+    if (batchErr) {
+      console.warn(`[graph] batched ledger read failed (page falls back to per-item probes): ${batchErr.message}`);
+      probeFallbackPages = 1;
+    } else {
+      prefetch = new Map();
+      for (const raw of (batchData ?? []) as (LedgerRow & { source_id: string })[]) {
+        const list = prefetch.get(raw.source_id);
+        if (list) list.push(raw);
+        else prefetch.set(raw.source_id, [raw]);
+      }
+    }
+  }
   for (const item of rows) {
     const episodes = kinds.includes(item.kind) ? toEpisodes(item) : [];
     // Idempotency key = the FULL body (chunk boundaries derive deterministically from it), so an
@@ -821,25 +865,27 @@ export async function projectItemsToGraph(
     // and this adapter's maybeSingle returns rows[0] SILENTLY on multiple rows — under fan-out that
     // reads an arbitrary group's ledger, and a sha-match against the wrong group skips extraction
     // into a group that never got the content (a silently-empty project graph).
-    const { data: existingData, error: ledgerReadErr } = await db
-      .from("graph_episodes")
-      .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
-      .eq("team_id", args.teamId)
-      .eq("source_table", SOURCE_TABLE)
-      .eq("source_id", item.id);
-    if (ledgerReadErr) {
-      throw new ProjectionAbortError(`project: ledger read failed for item ${item.id}: ${ledgerReadErr.message}`, partialSummary());
+    let rowsForItem: LedgerRow[];
+    if (prefetch) {
+      rowsForItem = prefetch.get(item.id) ?? [];
+    } else {
+      // The page's batch read failed — per-item probe, today's exact shape (fail toward the
+      // old cost, never toward a skip).
+      const { data: existingData, error: ledgerReadErr } = await db
+        .from("graph_episodes")
+        .select("content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
+        .eq("team_id", args.teamId)
+        .eq("source_table", SOURCE_TABLE)
+        .eq("source_id", item.id);
+      if (ledgerReadErr) {
+        throw new ProjectionAbortError(`project: ledger read failed for item ${item.id}: ${ledgerReadErr.message}`, partialSummary());
+      }
+      rowsForItem = (existingData ?? []) as LedgerRow[];
     }
-    type LedgerRow = {
-      content_sha256: string;
-      group_id: string;
-      pending_delete_group_id: string | null;
-      chunk_shas: string[] | null;
-      chunk_config: string | null;
-      deferred: boolean;
-      episode_uuid: string | null;
-    };
-    const rowsForItem = (existingData ?? []) as LedgerRow[];
+    // TICKFIT-2: DETERMINIZED order (both paths). Fan-out budget spends in row order, which was
+    // Postgres-arbitrary before — with scarce budget, WHICH group received content was undefined.
+    // The sort fixes that undefined behavior deliberately (spec D1; pinned by the two-group arm).
+    rowsForItem = [...rowsForItem].sort((a, b) => (a.group_id < b.group_id ? -1 : a.group_id > b.group_id ? 1 : 0));
     // PARTITION (PCCC-5): the home machinery below (tier moves, purges, delta) must see ONLY the
     // home world — the current home group and the OTHER home candidate (a tier flip moves between
     // exactly those two). Fan-out rows (deferred, or in a known initiative group) are a separate
@@ -1560,7 +1606,7 @@ export async function projectItemsToGraph(
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, restrictionMovesPending, lastSyncedAt };
+  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, restrictionMovesPending, lastSyncedAt, probeFallbackPages };
 }
 
 /** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */

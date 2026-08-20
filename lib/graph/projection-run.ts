@@ -54,6 +54,11 @@ export function projectionRunInput(
       // Re-queues declined because a mass disappearance reads as a wedged Graphiti (H7). Recorded so a
       // throttle that persists across runs is visible rather than inferred from logs.
       requeueThrottled: summary.requeueThrottled,
+      // TICKFIT-2: per-leg wall time (flat numbers — the runs panel Strings values; the revisit
+      // trigger reads walkMs from these rows) + the durable batch-read fallback counter.
+      walkMs: summary.walkMs,
+      reconcileMs: summary.reconcileMs,
+      ...(summary.probeFallbackPages ? { probeFallbackPages: summary.probeFallbackPages } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,
       // which is exactly the position that made this hole invisible for so long. Counted only; no
