@@ -44,6 +44,24 @@ is LOST, and re-pushing it cannot duplicate queued work. A never-landed row newe
 watermark may still be queued: HOLD it, as today. No counters, no schema, no K, no age — and the
 rule is correct for a backlog of any length, because the watermark moves only when the queue does.
 
+**The topology this rests on, and how it is held (Codex design round 2 BLOCKER).** The
+watermark is sound only if there is ONE queue: one graphiti replica, one worker task, one
+`asyncio.Queue`, one job per message. Measured: the current graphiti deployment's logs show exactly
+one `Started server process`; Railway injects no replica variables into the service; the image's
+`CMD` starts one uvicorn with no `--workers` (`graphiti/Dockerfile:388`). Upstream's
+`routers/ingest.py` constructs one module-level `AsyncWorker()` and one `create_task` — but that file
+lives in the base image, not the repo, so this slice adds a BUILD-TIME verifier
+(`graphiti/verify-single-worker.py`, the `verify-small-model-default.py` discipline): it parses the
+shipped `ingest.py` and asserts exactly one `AsyncWorker` instantiation, exactly one
+`asyncio.create_task` of its worker, a single `asyncio.Queue`, and one `queue.put` per message in
+the `/messages` handler — a base-image bump that changes any of those fails the graphiti BUILD.
+Deploy overlap (a graphiti redeploy runs old and new containers for minutes) is TWO queues for that
+window: a job queued on the dying container is lost when it is killed (so a "lost" verdict is
+correct or about to be), and the one false-positive shape — the old container finishes a job after
+the brain re-queued it — yields ONE duplicate, bounded by the overlap minutes and by the throttle;
+stated, and GRAPHDEPLOY-1 is what makes those restarts rare. Single-replica is recorded as a
+deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the graphiti service).
+
 ## 0b. Decidables — defaults stated for the design round to attack
 
 - **D1 — the rule.** On the lookup path (saturated group, oracle held) a never-landed row past
@@ -56,11 +74,14 @@ rule is correct for a backlog of any length, because the watermark moves only wh
   two items projected in the same page can have accept order and `projected_at` order differ by
   the push latency; 10 min is two orders of magnitude above that, and costs only that a row must be
   10 min older than the newest landing to be judged — nothing structural.
-- **D2 — the watermark is a LANDING, not a push.** It is built only from rows the pass CONFIRMED
-  (a uuid found — REST or lookup), never from rows merely pushed; a pass that confirms nothing has
-  no watermark and re-queues nothing. A row confirmed this pass whose `projected_at` is the newest
-  anchors it; `projected_at` is bumped on every re-push, so a confirmed row's stamp is the time of
-  the push that landed — exactly the accept time the queue ordered by.
+- **D2 — the watermark is a LANDING, not a push — and it is collected BEFORE the grace check
+  (round 2 M1).** Today's loop skips rows younger than `LANDED_GRACE_MS` before looking them up;
+  the watermark needs exactly those fresh landings (minutes old). So phase 1 records a watermark
+  anchor for EVERY ledger row whose uuid is present in the pass's listing/lookup — fresh or mature —
+  while `confirmed`, the uuid backfill and `partialItems` keep their grace gate unchanged. The
+  anchor is the row's `projected_at` (bumped on every re-push, so a present row's stamp is the time
+  of the push that landed — the accept time the queue ordered by). A pass in which no ledger row is
+  present anywhere has no watermark and re-queues nothing on the lookup path.
 - **D3 — what still holds from GRAPHSAT-1 / RECONULL-1, beneath this.** The REST-window oracle
   (a lookup missing a window-confirmed item → unjudged), the unreachable rule (a failed listing →
   unjudged), the never-pushed discriminator, the `REQUEUE_MAX_PER_PASS` throttle, the flag as the
@@ -74,8 +95,14 @@ rule is correct for a backlog of any length, because the watermark moves only wh
   ride summary → meta → log; `requeueEligible > 0` with the flag OFF is a recording-gate signal
   (level-triggered: every pass records while work waits on a human — the "measurement mode is
   loud" rule, stated). The structured sample/elided stay for at-a-glance identity.
-- **D5 — REST-path verdicts are untouched.** Small groups re-queue after the grace as they always
-  have (the listing IS the truth for them). Only the lookup path's held/re-queue decision changes.
+- **D5 — REST-path verdicts are untouched; parked rows are excluded on the lookup path (round 2
+  HIGH).** Small groups re-queue after the grace as they always have (the listing IS the truth for
+  them). A row already on the `''` sentinel (re-queued, awaiting the projector's re-push) is
+  re-judged by today's never-landed branch every pass until re-pushed — a pre-existing no-op
+  re-write + `reQueued++` on the REST path, harmless because the walk precedes reconcile in every
+  tick. On the LOOKUP path this slice makes the exclusion explicit: a parked row (`content_sha256
+  === ''`) is neither eligible, nor held-counted, nor written, nor throttle-consuming — it is
+  already queued for re-push. The REST path's accounting is left as it is (named, not changed).
 - **D6 — the prod rollout.** Deploy (no schema). The next judged pass reports `requeueEligible`
   — expected ≈ 247 immediately, because General's newest landings are minutes old and the 247 are
   days old. A human decision, recorded on the ticket: set `GRAPH_DEEP_REQUEUE=true`; the 247
@@ -91,16 +118,20 @@ rule is correct for a backlog of any length, because the watermark moves only wh
 |---|---|
 | `lib/graph/reconcile.ts` | two-phase landed leg: phase 1 judges every group and collects confirmations + candidate absences (no re-queue writes); phase 2 computes `landedWatermark`, then applies the REST-path re-queues (unchanged) and the lookup-path D1 rule; `requeueEligible`; `LANDED_WATERMARK_MARGIN_MS` |
 | `lib/graph/run.ts`, `projection-run.ts`, `scheduler.ts` | `requeueEligible` → summary → meta (when non-zero) → log; `requeueEligible && !deepRequeueEnabled` joins the gate |
-| `docs/ARCHITECTURE.md`, `.env.example` | the rule, the margin, the rollout |
+| `graphiti/verify-single-worker.py` (new) + `graphiti/Dockerfile` | build-time proof of the single-queue shape in the shipped `ingest.py` (one `AsyncWorker()`, one `create_task`, one `asyncio.Queue`, one `put` per message); a unit test runs the verifier against a fixture copy of upstream's file and against mutated copies |
+| `docs/ARCHITECTURE.md`, `.env.example`, `docs/RAILWAY-TEMPLATE.md` | the rule, the margin, the rollout; single-replica as a deployment invariant |
 | Schema | **NONE** |
 
 ## 2. Mechanism notes
 
-- Two phases because the watermark must see every group's confirmations before any lookup-path
+- Two phases because the watermark must see every group's present rows before any lookup-path
   verdict is applied (the external group's fresh landing can prove General's old rows lost). Phase 1
-  is today's loop minus the two re-queue writes (which become deferred decisions in a list);
-  phase 2 replays those decisions with the watermark known. The uuid backfill and `partialItems`
-  stay in phase 1 (they do not depend on the watermark). The lease (#629) serializes passes.
+  is today's loop with BOTH paths' re-queue decisions (REST and lookup, both branches) recorded on
+  ONE ordered tape in traversal order instead of written; phase 2 replays the tape in that same
+  order with the watermark known — so REST-path rows keep their throttle priority and verdict
+  order exactly as today (round 2 M3: deferring only the lookup writes would let later REST groups
+  jump the throttle queue). The uuid backfill and `partialItems` stay in phase 1. The lease (#629)
+  serializes passes.
 - The held/eligible split on the lookup path: `hold()` becomes
   `hold(row) = !deep ? false : (!deepRequeue || row.projected_at + MARGIN >= watermark)`; an
   eligible-but-flag-off row is counted in BOTH `deepRequeueHeld` and `requeueEligible`.
@@ -117,15 +148,25 @@ rule is correct for a backlog of any length, because the watermark moves only wh
    (a) two never-landed rows, one OLDER than a confirmed row by more than the margin, one NEWER
    → the older is RE-QUEUED (`content_sha256 ''`, `first_seen_at` preserved), the newer is HELD;
    `requeueEligible 1`, `deepRequeueHeld 1`; (b) the same fixture with the flag OFF → both HELD,
-   `requeueEligible 1` (the count is reported either way), and the gate records it; (c) a pass
-   that confirms NOTHING in any group (everything absent) → no watermark → every row HELD,
-   `requeueEligible 0` — a wiped-and-restarted graph cannot trigger a mass re-push by itself;
+   `requeueEligible 1` (the count is reported either way), and the gate records it; (c) a judged
+   lookup pass in which NO ledger row is present anywhere (listing saturated with foreign filler,
+   lookup returns nothing for the team's items, oracle vacuous) → no watermark → every row HELD,
+   `requeueEligible 0`; (c2) a WIPED graph (every listing empty) is a different path: not
+   saturated → `emptyListingGroups` fires and the REST path heals it bounded, exactly as today
+   (RECONULL-1 AC1(d)) — pinned so the two are not confused; (c3) a FRESH landing (younger than
+   the grace) anchors the watermark: the only present row is 5 minutes old → an old absent row is
+   eligible, while `confirmed` does not count the fresh row (the grace gate is unchanged);
+   (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
+   held-counted nor re-written across a second reconcile before the projector re-pushes it;
    (d) the watermark is TEAM-wide: the only confirmation is in the EXTERNAL group (REST-judged),
    newer than General's old absent row → that row is eligible; (e) the margin: an absent row
    older than the newest landing by LESS than the margin is HELD; (f) a re-queued row, once
    re-pushed by the projector and then confirmed on a later pass, is an ordinary confirmed row
    (no residue); (g) an UNREACHABLE listing pass (RECONULL-1) and a MISMATCH pass form no
-   watermark from that group and re-queue nothing; (h) REST-path (small group) re-queue behaviour
+   watermark from that group and re-queue nothing; (g2) ORDER: a REST-path group traversed AFTER a
+   lookup-path group still takes its throttle slots first when it was traversed first — with
+   `maxRequeuePerPass 1` and a REST absent row traversed before a lookup-eligible row, the REST
+   row is the one re-queued (tape order preserved); (h) REST-path (small group) re-queue behaviour
    is today's (a never-landed row past the grace re-queues regardless of any watermark) — this
    fence excludes nothing: the REST path is already shipped and pinned.
 2. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts` exits 0:
@@ -133,11 +174,17 @@ rule is correct for a backlog of any length, because the watermark moves only wh
    from a quiet row; the margin env parse (unset/0/garbage → 10 min, `"600000"` → itself).
 3. Existing graph dm suites green UNCHANGED (`graph-project`, `graph-saturated-heal`,
    `graph-unreachable-listing`, reconcile suites) — D3/D5.
+3b. `npx vitest run test/guards/graphiti-single-worker.test.ts` exits 0: the verifier accepts a
+   fixture copy of upstream's `ingest.py` (committed under `test/fixtures/graphiti/`), and rejects
+   copies with two `AsyncWorker()` instantiations, two `create_task`s, a bounded/second queue, or
+   a handler that `put`s once per request instead of per message — each with its named reason.
 4. Mutations, verdicts verbatim in the PR: (a) drop the watermark term (re-queue any held row
    when the flag is on) → AC1(a)'s "newer is HELD" and AC1(c) redden; (b) build the watermark
    from PUSHED rows instead of CONFIRMED rows → AC1(c) reddens; (c) scope the watermark to the
    group instead of the team → AC1(d) reddens; (d) drop the margin → AC1(e) reddens; (e) apply the
-   rule to the REST path → AC1(h) reddens.
+   rule to the REST path → AC1(h) reddens; (f) count a parked row as eligible → AC1(c4) reddens;
+   (g) collect anchors after the grace check → AC1(c3) reddens; (h) replay lookup writes before
+   REST writes → AC1(g2) reddens.
 5. Full tiers green (`npm test`, dm iso graph set, `npm run test:http:local`, `npm run
    check:docs`); ARCHITECTURE + `.env.example` updated; the rollout (D6) written on the ticket.
 
@@ -149,8 +196,9 @@ rule is correct for a backlog of any length, because the watermark moves only wh
 - Duplicate-episode cleanup inside General (a re-pushed item whose original landed late after all
   — impossible under FIFO+drop, but a future concurrent worker would change that; GRAPHSAT-1 §4
   names the cleanup slice).
-- The persisted consecutive-absence schema — DECLINED; if a future graphiti worker is not
-  FIFO-serial, the watermark assumption must be re-derived first (a guard pins the assumption in
-  prose on `patch-resilient-worker.py`'s single-consumer loop; it cannot be pinned in code from
-  the brain).
+- The persisted consecutive-absence schema — DECLINED. The single-queue assumption is pinned at
+  graphiti BUILD time (the verifier) and as a deployment invariant (single replica); a future
+  multi-worker graphiti fails its own build before it can ship under this rule.
+- Horizontal scaling of the graphiti service — forbidden by this design; an install that needs it
+  needs a durable accept sequence first (a different spec).
 - A lookup-based cleanup for the cleanup leg — still its own future slice (RECONULL-1 §4).
