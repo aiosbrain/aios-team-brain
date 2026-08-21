@@ -25,6 +25,7 @@ const base: GraphProjectionSummary = {
   partialItems: 0,
   partialDetail: { sample: [], elided: 0, namesElided: 0 },
   deepResolvedGroups: 0,
+  lookupMismatchGroups: 0,
   deepRequeueHeld: 0,
   deepRequeueHeldByGroup: {},
   deepRequeueSample: [],

@@ -51,9 +51,9 @@ describe("lookupItemEpisodes — batch atomicity, chunking, scope", () => {
     expect(ITEM_EPISODES_CYPHER).toMatch(/STARTS WITH \$prefix/);
   });
 
-  it("drops malformed rows (a uuid or name that is not a string) instead of poisoning the presence set", async () => {
+  it("a MALFORMED row (a uuid or name that is not a string) REJECTS the lookup — a dropped row would be a partial view (Fable diff review M2)", async () => {
     const read: BatchRead = async () => [{ uuid: "u", name: "items:a" }, { uuid: null, name: "items:b" } as unknown as { uuid: string; name: string }];
-    expect(await lookupItemEpisodes("g", ["a", "b"], read, () => true)).toEqual([{ uuid: "u", name: "items:a" }]);
+    await expect(lookupItemEpisodes("g", ["a", "b"], read, () => true)).rejects.toThrow(/malformed Episodic row/);
   });
 });
 

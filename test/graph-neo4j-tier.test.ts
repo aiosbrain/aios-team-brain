@@ -6,12 +6,12 @@ import { lookupItemEpisodes, LOOKUP_BATCH } from "@/lib/graph/episode-lookup";
 
 /**
  * Tier-isolation proof for the direct Neo4j reads behind the Brain-Learning panel. Graphiti has no
- * tier awareness — tier is encoded in `group_id`
- * (NB: `recentFacts` returns `{ facts, ok }` since the learning panel's ok-discriminator landed; this
- * tier is not in CI and had rotted against the old array return — repaired in passing by GRAPHSAT-1.)
- *, and `WHERE group_id IN $groups` is the SOLE thing
+ * tier awareness — tier is encoded in `group_id`, and `WHERE group_id IN $groups` is the SOLE thing
  * stopping an `external` viewer from reading team facts (no RLS backstop, CLAUDE.md §5). Self-skips
  * unless NEO4J_TEST is set (needs a real Neo4j): `npm run db:test:neo4j:up && npm run test:neo4j`.
+ *
+ * NB: `recentFacts` returns `{ facts, ok }` since the learning panel's ok-discriminator landed; this
+ * tier is not in CI and had rotted against the old array return — repaired in passing by GRAPHSAT-1.
  */
 
 const live = process.env.NEO4J_TEST ? describe : describe.skip;

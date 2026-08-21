@@ -131,6 +131,11 @@ export interface ReconcileSummary {
   saturatedGroups: number;
   /** GRAPHSAT-1: groups past the REST window that WERE judged via the per-item Neo4j lookup. */
   deepResolvedGroups: number;
+  /** GRAPHSAT-1 (Fable diff review M1): saturated groups whose lookup returned a result that MISSED an
+   * item the REST window itself confirms — a structurally broken lookup (wrong graph, renamed
+   * property). Counted under `saturatedGroups` too (unjudged) and separately here so the operator can
+   * tell "Neo4j down" from "Neo4j is the wrong one". */
+  lookupMismatchGroups: number;
   /** GRAPHSAT-1: never-landed rows on the lookup path that would have been re-queued but were HELD
    * because `deepRequeue` is off (measurement mode). Always a recording-gate signal. */
   deepRequeueHeld: number;
@@ -290,6 +295,7 @@ export async function reconcileProjectedEpisodes(
       requeueThrottled: 0,
       saturatedGroups: 0,
       deepResolvedGroups: 0,
+      lookupMismatchGroups: 0,
       deepRequeueHeld: 0,
       deepRequeueHeldByGroup: {},
       deepRequeueSample: [],
@@ -338,6 +344,7 @@ export async function reconcileProjectedEpisodes(
   const partialFound: { itemId: string; missing: string[] }[] = [];
   let saturatedGroups = 0;
   let deepResolvedGroups = 0;
+  let lookupMismatchGroups = 0;
   let deepRequeueHeld = 0;
   const deepRequeueHeldByGroup: Record<string, number> = {};
   const heldRefs: DeepRequeueRef[] = [];
@@ -366,6 +373,29 @@ export async function reconcileProjectedEpisodes(
       });
       if (lookedUp === null) {
         saturatedGroups++;
+        continue;
+      }
+      // THE REST WINDOW IS A FREE TRUTH ORACLE (Fable diff review M1): the 5,000 newest episodes we
+      // already hold are a guaranteed SUBSET of what the lookup must return for this group's items.
+      // A lookup that misses any item the window confirms is structurally broken — a reachable
+      // Neo4j that is not the one Graphiti writes, a renamed property, a future store cutover —
+      // and would otherwise read as "everything never landed" (an EMPTY result is not an error).
+      // Degrade it to unjudged, by construction, before any verdict is formed. An episode deleted
+      // between the two reads trips this for one pass in the safe direction (skip, retry next tick).
+      const ledgerIds = new Set(itemIds);
+      const restConfirmed = new Set<string>();
+      for (const e of episodes) {
+        const id = itemIdFromEpisodeName(e.name);
+        if (id && ledgerIds.has(id)) restConfirmed.add(id);
+      }
+      const lookupConfirmed = presenceFrom(lookedUp).uuidByItemId;
+      const missed = [...restConfirmed].filter((id) => !lookupConfirmed.has(id));
+      if (missed.length > 0) {
+        console.warn(
+          `[graph] reconcile: per-item lookup for ${groupId} missed ${missed.length} item(s) the REST window confirms — treating the lookup as broken, group stays unjudged`
+        );
+        saturatedGroups++;
+        lookupMismatchGroups++;
         continue;
       }
       refs = lookedUp;
@@ -610,6 +640,7 @@ export async function reconcileProjectedEpisodes(
     requeueThrottled,
     saturatedGroups,
     deepResolvedGroups,
+    lookupMismatchGroups,
     deepRequeueHeld,
     deepRequeueHeldByGroup,
     deepRequeueSample: boundDeepRequeueSample(heldRefs),
@@ -622,7 +653,8 @@ export async function reconcileProjectedEpisodes(
 /** OLDEST `projectedAt` first, bounded at PARTIAL_DETAIL_LIMIT — a deterministic order so two passes'
  *  samples are comparable. Used by reconcile per team and by the runner to re-bound across teams. */
 export function boundDeepRequeueSample(refs: readonly DeepRequeueRef[]): DeepRequeueRef[] {
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   return [...refs]
-    .sort((a, b) => (a.projectedAt < b.projectedAt ? -1 : a.projectedAt > b.projectedAt ? 1 : a.itemId < b.itemId ? -1 : 1))
+    .sort((a, b) => cmp(a.projectedAt, b.projectedAt) || cmp(a.itemId, b.itemId) || cmp(a.groupId, b.groupId) || cmp(a.teamId, b.teamId))
     .slice(0, PARTIAL_DETAIL_LIMIT);
 }

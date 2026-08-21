@@ -9,8 +9,11 @@ import neo4j, { type Driver } from "neo4j-driver";
  * `lib/graph/extraction-health` (the stall probe's census/liveness) and `lib/graph/episode-lookup`
  * (GRAPHSAT-1: reconcile's per-item landed check for a saturated group). The list used to say
  * "learning only" while extraction-health already held Cypher; GRAPHSAT-1 widened it explicitly
- * rather than adding a silent third violator, and `test/guards/graph-tier-filter.test.ts` scans the
- * owned modules for the group-scope term every query must carry. See docs/design/brain-learning-panel.md.
+ * rather than adding a silent third violator. `test/guards/graph-tier-filter.test.ts` scans
+ * `learning` (`group_id IN $groups`) and `episode-lookup` (`e.group_id = $g`) for the scope term every
+ * query must carry; `extraction-health` is NOT scanned — its queries are count/liveness reads that
+ * drive no tier-visible output, one of them is a deliberate cross-group read (`NOT w.group_id IN $g`),
+ * and they are double-quoted strings the backtick matcher cannot see. See docs/design/brain-learning-panel.md.
  *
  * Best-effort: `neo4jConfigured()` is false unless `NEO4J_URL` is set; `runRead` throws on a
  * transport error so callers degrade (the panel shows empty rather than 500ing).

@@ -70,6 +70,9 @@ export interface GraphProjectionSummary {
   /** GRAPHSAT-1: groups past the REST window JUDGED via the per-item Neo4j lookup (meta; a gate
    *  signal only while `deepRequeueEnabled` is false — measurement mode is loud). */
   deepResolvedGroups: number;
+  /** GRAPHSAT-1: saturated groups whose lookup MISSED a REST-confirmed item (a broken lookup, degraded
+   *  to unjudged). A gate signal — "Neo4j is the wrong one" must reach the dashboard. */
+  lookupMismatchGroups: number;
   /** GRAPHSAT-1: never-landed rows on the lookup path HELD because re-queue is off. Always a gate
    *  signal. `deepRequeueSample` is re-bounded across teams, oldest first. */
   deepRequeueHeld: number;
@@ -169,6 +172,7 @@ async function runGraphProjectionInner(opts?: {
     requeueThrottled: 0,
     probeFallbackPages: 0,
     deepResolvedGroups: 0,
+    lookupMismatchGroups: 0,
     deepRequeueHeld: 0,
     deepRequeueHeldByGroup: {},
     deepRequeueSample: [],
@@ -275,6 +279,7 @@ async function runGraphProjectionInner(opts?: {
       // GRAPHSAT-1: merge, then RE-BOUND the held sample across teams (oldest first) — the same rule
       // as partialDetail, so N teams cannot multiply the blob.
       summary.deepResolvedGroups += r.deepResolvedGroups;
+      summary.lookupMismatchGroups += r.lookupMismatchGroups;
       summary.deepRequeueHeld += r.deepRequeueHeld;
       for (const [g, n] of Object.entries(r.deepRequeueHeldByGroup)) {
         summary.deepRequeueHeldByGroup[g] = (summary.deepRequeueHeldByGroup[g] ?? 0) + n;
