@@ -1,35 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 
 /**
  * GUARD: a token must never obtain MEMBER provenance semantics (AUDITFIX-1 AC9).
  *
- * WHY THIS SHAPE. The first version of this guard counted references to a shared "member context"
- * helper. Review round 3 killed it in one line: a token-capable path can write
- * `principal: "member"` inline and never touch the helper, so the guard measured a spelling rather
- * than the security property. This one enumerates every place the discriminator can be MANUFACTURED.
+ * Two layers, because they answer two different questions:
  *
- * The property: the two TOKEN-CAPABLE files may only FORWARD `enforce.principal`. They may not
- * contain a member literal at all — that is the exact edit that would reopen the reproduced leak, in
- * which an empty-scoped token received every hand-typed task and decision in the team.
+ *   1. **The two TOKEN-CAPABLE files** — `lib/query/retrieve.ts`, `lib/query/structured-extras.ts` —
+ *      may only ever FORWARD `enforce.principal`. This is an authorization boundary, so it is checked
+ *      STRUCTURALLY, against the TypeScript AST. See the walk below for why it is not a regex.
+ *   2. **The rest of the tree** — a member literal is legal only at a listed member-only boundary, so
+ *      the allow-list doubles as the inventory of "who is asserting memberhood, and on what
+ *      authority". This layer stays text-based: it spans ~700 files, it is a coverage inventory
+ *      rather than a wall, and its failure mode is a stale allow-list entry, not an escalation.
  *
- * Everywhere else, a member literal is legal only at a listed member-only boundary, so the allow-list
- * doubles as the inventory of "who is asserting memberhood, and on what authority".
- *
- * ⚠️ WHAT THIS GUARD DOES NOT CLOSE, stated rather than implied. It reads text, so a ctx obtained
- * WHOLESALE from another module — `const provCtx = buildMemberProvCtx(ids, tier)`, with the factory
- * exported from an allow-listed file — is invisible to every scan here. That gap is accepted, not
- * overlooked, on three grounds: (a) it requires adding an exported ctx factory and importing it into
- * a token path, which is a visible, reviewable act rather than a one-word edit; (b) the guard's job
- * is to make the CHEAP mistakes impossible, and the cheap mistakes are the literal, the constant,
- * the alias, the shorthand and the omission — all now caught; (c) the data-mechanics tier catches
- * the OUTCOME regardless. I verified (c) rather than assuming it: planting
- * `principal = "member"` in retrieve.ts reddens
- * `token-structured-attenuation.datamechanics.test.ts` on the real leak, both arms.
- *
- * So this guard is the fast, build-failing layer over a tier that independently proves the outcome.
- * Do not read it as the only thing standing between a token and the hand-typed rows.
+ * The defect behind all of it: an empty-scoped delegated token received every hand-typed task and
+ * decision in the team, reproduced against real Postgres.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -42,6 +30,9 @@ const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
  * `*iter() { const principal = "member"; }` vanished entirely, which is a hiding place, and in the
  * FAIL-OPEN direction. A jsdoc continuation is `*` followed by whitespace or end-of-line, or `*​/`;
  * a generator is `*` followed immediately by an identifier. Only the former is stripped.
+ *
+ * This is layer 2 only. Layer 1 does not use it: the parser owns comments and strings, which is
+ * precisely one of the reasons layer 1 is a parser.
  */
 const codeOnly = (src: string): string =>
   src
@@ -92,149 +83,203 @@ function filesUnder(dir: string): string[] {
   return out;
 }
 
+/* ─────────────────────────── LAYER 1 — the token-capable files, structurally ─────────────────── */
+
 /**
- * A member literal being MANUFACTURED, in either shape it can take:
- *   · an object property — `principal: "member"`;
- *   · the TS twin's positional 4th argument — `rowVisibleByProvenance(row, ids, tier, "member")`.
+ * Regexes lost this arms race three times, so this layer stopped being one.
  *
- * The negative lookahead excludes TYPE positions (`principal: "member" | "token"`), which are
- * declarations rather than assertions — the first version of this guard flagged three of them and
- * would have taught the next reader to widen the allow-list instead of tightening the needle.
+ *   · Spec round 3 killed the version that counted references to a shared helper: a token path can
+ *     write the value inline and never touch the helper.
+ *   · Fable's diff review defeated the literal version with `const principal = "member" as
+ *     ProvenancePrincipal` plus a shorthand property. I planted it and confirmed the guard passed
+ *     6/6 while the dm token tests reddened on the real leak.
+ *   · Codex's diff review then listed six more that still passed: a computed key
+ *     `{ ["principal"]: "member" }`, a later `...spread` overwriting the forwarded value,
+ *     `enforce!.principal = "member"`, `||=`, `Reflect.set`, `Object.defineProperty`. It also showed
+ *     the hand-rolled brace scanner mis-pairing on a nested object, a brace inside a string, or a
+ *     destructuring pattern, and `codeOnly` still discarding real code after a block-comment
+ *     terminator.
+ *
+ * Each of those is a new SPELLING of one act, and a text matcher can only enumerate spellings. All of
+ * them are syntax, and syntax is what the parser owns — so this walks the tree instead. The
+ * brace/comment/string hazards disappear with it.
+ *
+ * The property, in the two token-capable files:
+ *   1. every `principal` property is initialised to EXACTLY `enforce?.principal` — no literal,
+ *      constant, alias, computed key, shorthand, or conditional;
+ *   2. no object literal carrying `visibleItemIds` may contain a SPREAD, which could overwrite it;
+ *   3. nothing ASSIGNS to a `.principal` property, in any assignment operator;
+ *   4. `Reflect.set` / `Object.defineProperty` may not target `principal`;
+ *   5. every object literal carrying `visibleItemIds` also carries `principal` — the M13 property,
+ *      which exists because deleting a forward reddened nothing: it fails closed for a token and
+ *      silently drops a MEMBER's hand-typed rows, and no fixture separates that leg from its twin.
+ *
+ * ⚠️ WHAT THIS STILL DOES NOT CLOSE, stated rather than implied: a ctx obtained wholesale from
+ * another module (`const provCtx = buildMemberProvCtx(ids, tier)`) is not analysable without type
+ * resolution across files. That gap is accepted on three grounds — it requires adding an exported ctx
+ * factory and importing it into a token path, which is a visible reviewable act rather than a
+ * one-word edit; the cheap mistakes are all now impossible; and the data-mechanics tier catches the
+ * OUTCOME regardless. I verified the third rather than assuming it: planting
+ * `principal = "member"` in retrieve.ts reddens
+ * `test/datamechanics/token-structured-attenuation.datamechanics.test.ts` on the real leak, both
+ * arms. Read this guard as the fast build-failing layer over a tier that independently proves the
+ * outcome — not as the only thing between a token and the hand-typed rows.
+ */
+function astViolations(code: string, rel = "inline.ts"): string[] {
+  const src = ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const bad: string[] = [];
+  const at = (n: ts.Node) => `${rel}:${src.getLineAndCharacterOfPosition(n.getStart(src)).line + 1}`;
+
+  /** The ONE permitted initialiser, matched on shape: `enforce?.principal` or `enforce.principal`. */
+  const isForwarded = (e: ts.Expression): boolean => {
+    const inner = ts.isNonNullExpression(e) ? e.expression : e;
+    if (!ts.isPropertyAccessExpression(inner)) return false;
+    return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "principal";
+  };
+
+  /** A property's name, resolving a literal COMPUTED key — the spelling Codex demonstrated. */
+  const nameOf = (p: ts.ObjectLiteralElementLike): string | null => {
+    if (ts.isSpreadAssignment(p)) return null;
+    const n = p.name;
+    if (!n) return null;
+    if (ts.isIdentifier(n) || ts.isStringLiteral(n)) return n.text;
+    if (ts.isComputedPropertyName(n) && ts.isStringLiteralLike(n.expression)) return n.expression.text;
+    return null;
+  };
+
+  const visit = (node: ts.Node): void => {
+    // (3) an assignment INTO a `.principal` property, in any assignment operator (`=`, `||=`, `??=`).
+    if (
+      ts.isBinaryExpression(node) &&
+      ts.isPropertyAccessExpression(node.left) &&
+      node.left.name.text === "principal" &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      bad.push(`${at(node)} assigns to .principal — this file may only FORWARD it`);
+    }
+
+    // (4) reaching it reflectively.
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const callee = `${node.expression.expression.getText(src)}.${node.expression.name.text}`;
+      if (callee === "Reflect.set" || callee === "Object.defineProperty") {
+        if (node.arguments.some((a) => ts.isStringLiteralLike(a) && a.text === "principal")) {
+          bad.push(`${at(node)} sets .principal via ${callee}`);
+        }
+      }
+    }
+
+    if (ts.isObjectLiteralExpression(node)) {
+      const names = node.properties.map(nameOf);
+
+      for (const [i, prop] of node.properties.entries()) {
+        if (names[i] !== "principal") continue;
+        if (ts.isShorthandPropertyAssignment(prop)) {
+          // Shorthand carries no initialiser to inspect, so it can only be hiding a local binding.
+          bad.push(`${at(prop)} shorthand \`{ principal }\` — forwarding cannot be spelled that way`);
+        } else if (ts.isPropertyAssignment(prop) && !isForwarded(prop.initializer)) {
+          // A TYPE position never reaches here: an interface member parses as a PropertySignature,
+          // not a PropertyAssignment. The regex version needed an explicit carve-out for that.
+          bad.push(`${at(prop)} principal is \`${prop.initializer.getText(src)}\`, not enforce?.principal`);
+        }
+      }
+
+      if (names.includes("visibleItemIds")) {
+        const spread = node.properties.find(ts.isSpreadAssignment);
+        // (2) a spread can silently overwrite the forwarded value with one from another module.
+        if (spread) bad.push(`${at(spread)} spread into a provenance ctx can overwrite principal`);
+        // (5) the M13 property — carry it, don't merely be able to.
+        if (!names.includes("principal")) bad.push(`${at(node)} provenance ctx omits principal`);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(src);
+  return bad;
+}
+
+/* ─────────────────────────── LAYER 2 — the tree-wide coverage inventory ──────────────────────── */
+
+/**
+ * A member literal being MANUFACTURED, in the shapes it takes across the tree:
+ *   · an object property — `principal: "member"`;
+ *   · the TS twin's positional 4th argument — `rowVisibleByProvenance(row, ids, tier, "member")`;
+ *   · a named constant — `const MEMBER_ONLY_SURFACE = "member" as const`.
+ *
+ * This layer is an INVENTORY, not a wall — see the header. Its job is to keep the allow-list honest
+ * about who asserts memberhood, so a new assertion has to be justified in review.
  */
 // The whitespace lives INSIDE the lookahead: `\s*(?!\|)` backtracks to zero width and passes on
 // `principal: "member" | "token"`, which is how the first spelling flagged three type declarations.
 const MEMBER_PROP = /principal\s*:\s*["'`]member["'`](?!\s*\|)/;
 // `[^)]*` stopped at the first `)`, so a twin call containing a nested call
-// (`rowVisibleByProvenance(d, getIds(), tier, "member")`) escaped the tree-wide scan. `[^;]*?` admits
-// the nested call while still being unable to leave the statement: an argument list contains no `;`.
+// (`rowVisibleByProvenance(d, getIds(), tier, "member")`) escaped this scan. `[^;]*?` admits the
+// nested call while being unable to leave the statement: an argument list contains no `;`.
 // (Plain `[\s\S]*?` did leave it — I checked — matching a `"member"` string many lines later in an
 // unrelated statement. Only a false POSITIVE, but a guard that cries wolf gets its allow-list widened.)
 const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([^;]*?["'`]member["'`]\s*\)/;
-/**
- * …and the shape a NAMED CONSTANT takes — `const MEMBER_ONLY_SURFACE = "member" as const`.
- *
- * This third needle exists because the guard failed its own test: `lib/access/enforce.ts` names the
- * value once instead of repeating a literal, and the two needles above scored that file clean. The
- * escalation it left open is the dangerous one — `import { MEMBER_ONLY_SURFACE }` into a
- * token-capable file and write `principal: MEMBER_ONLY_SURFACE`, and nothing here fires. Round 3
- * killed the FIRST version of this guard for measuring a spelling; naming a constant is just
- * another spelling.
- */
-// The lookbehind matters: without it this fires on `enforce?.principal === "member"`, a
-// COMPARISON — which retrieve.ts legitimately performs (`serveOrgStructural`) and which asserts
-// nothing. Reading a discriminator is not manufacturing one.
-// No TAIL requirement. The first spelling demanded `as const` or `;`, and Fable's diff review
-// defeated it in one line: `const principal = "member" as ProvenancePrincipal;` — a different cast,
-// so the needle missed, and the guard passed 6/6 with a hardcoded member principal in retrieve.ts.
-// I planted that exact code and confirmed it BOTH evaded the guard AND reddened the dm token tests,
-// so the guard was failing at the one job its header claims. Over-matching a binding is the safe
-// direction: the tree-wide scan already excludes comparisons via the lookbehind.
 // Scoped to a VARIABLE DECLARATION. Dropping the tail requirement outright over-matched two things
 // that assert nothing: the type alias `type ProvenancePrincipal = "member" | "token"` and the SQL
 // string `a.target_type = 'member'` in lib/auth/welcome-context.ts. Requiring `const|let|var <name>`
-// keeps the bypass caught (`const principal = "member" as ProvenancePrincipal`) and both of those out.
+// keeps a cast-bearing binding caught and both of those out. The lookbehind excludes comparisons.
 const MEMBER_BINDING = /(?:const|let|var)\s+\w+\s*(?::[^=;]*)?=\s*["'`]member["'`]/;
-
-/**
- * …and the SHORTHAND property, which has no colon and was therefore invisible to every scan above:
- * `const provCtx = { visibleItemIds, teamPosture, principal }`. This is the second half of the same
- * bypass, and it is the shape an author naturally reaches for the moment the guard reddens on
- * `principal: "member"` — extract to a variable until green. A guard that teaches its own evasion is
- * worse than none, so shorthand is forbidden outright in the token-capable files: those may only
- * forward, and forwarding cannot be spelled as shorthand.
- */
-const MEMBER_SHORTHAND = /[{,]\s*principal\s*[,}]/;
 const MEMBER_LITERAL = {
   test: (src: string) => MEMBER_PROP.test(src) || MEMBER_TWIN_ARG.test(src) || MEMBER_BINDING.test(src),
 };
 
-/**
- * The spelling-INDEPENDENT half, for the two files that see a token: every `principal` in a VALUE
- * position must be the forwarded expression, whatever it is spelled as. A literal, a named constant,
- * an imported alias and a re-derivation from `tier` all fail this — the needles above can only catch
- * the shapes someone thought to enumerate.
- *
- * Type positions are excluded because they are declarations, not assertions: a union (`"member" |
- * "token"`) or a type name (`ProvenancePrincipal`, uppercase by TS convention).
- */
-/**
- * …and the OTHER half of the property: a ctx that never mentions `principal` at all.
- *
- * Found by mutation, not by review. Deleting retrieve's forward to `matchingDecisions` reddened
- * NOTHING: an absent discriminator closes the hand-typed arm, so a token's outcome is identical and
- * every token assertion still passes. What silently changes is the MEMBER's — that leg stops serving
- * their hand-typed decisions — and no test separates it from the recency window that serves the same
- * rows. A surviving mutation means the suite proves nothing there, so the property moves here:
- * in a token-capable file, every provenance ctx must CARRY the discriminator, not merely be able to.
- *
- * Returns the ctx literals that omit it, by their opening line.
- */
-function ctxLiteralsMissingPrincipal(code: string): string[] {
-  const out: string[] = [];
-  // Shorthand counts too (`{ visibleItemIds, teamPosture }`) — anchoring on the colon alone let a
-  // whole construction shape through, which is the same class round 3 twice killed this guard for.
-  for (const m of code.matchAll(/visibleItemIds\s*[,:}]/g)) {
-    // Walk back to the `{` that opens this object literal, then forward to its match.
-    let open = m.index!;
-    while (open > 0 && code[open] !== "{") open--;
-    let depth = 0;
-    let close = open;
-    for (; close < code.length; close++) {
-      if (code[close] === "{") depth++;
-      else if (code[close] === "}" && --depth === 0) break;
-    }
-    const literal = code.slice(open, close + 1);
-    // A TYPE declaration (`{ visibleItemIds: ReadonlySet<string>; ... }`) states the shape and is
-    // not a construction; it is excluded the same way the assignment scan excludes unions.
-    if (/ReadonlySet<|readonly string\[\]/.test(literal)) continue;
-    if (!/principal\s*[,:}]/.test(literal)) out.push(literal.split("\n")[1]?.trim() ?? literal.slice(0, 60));
-  }
-  return out;
-}
-
-const FORWARDED = /^enforce\??\.principal$/;
-function unforwardedPrincipalAssignments(code: string): string[] {
-  const out: string[] = [];
-  for (const m of code.matchAll(/principal\s*\??\s*:\s*([^,;\n}]+)/g)) {
-    const rhs = m[1].trim();
-    if (rhs.includes("|")) continue; // a union type declaration
-    // A TYPE name is PascalCase (`ProvenancePrincipal`). A CONSTANT is SCREAMING_SNAKE
-    // (`MEMBER_ONLY_SURFACE`) — and a bare `/^[A-Z]/` skipped both, which let the exact escalation
-    // this function exists to catch walk straight through it.
-    if (/^[A-Z][a-zA-Z0-9]*$/.test(rhs) && /[a-z]/.test(rhs)) continue;
-    if (FORWARDED.test(rhs)) continue; // the one permitted shape
-    out.push(rhs);
-  }
-  return out;
-}
-
 describe("guard: a token can never acquire member provenance semantics", () => {
-  it("the token-capable files contain NO member literal — they may only forward", () => {
+  it("STRUCTURAL: the token-capable files only ever forward, per the TypeScript AST", () => {
     for (const rel of TOKEN_CAPABLE) {
-      const code = codeOnly(read(rel));
-      expect(MEMBER_LITERAL.test(code), `${rel} must forward enforce.principal, never assert "member"`).toBe(false);
-      expect(
-        MEMBER_SHORTHAND.test(code),
-        `${rel} may not use shorthand \`{ principal }\` — forwarding cannot be spelled that way, so it can only be hiding a local binding`
-      ).toBe(false);
-      expect(code, `${rel} must actually forward the discriminator`).toMatch(/principal:\s*enforce\?\.principal/);
+      const bad = astViolations(read(rel), rel);
+      expect(bad, `${rel}:\n  ${bad.join("\n  ")}`).toEqual([]);
+      // …and they must actually DO the forwarding, or a file with no ctx at all would pass above.
+      expect(read(rel), `${rel} must forward the discriminator`).toMatch(/principal:\s*enforce\?\.principal/);
     }
   });
 
-  it("…and every principal they ASSIGN is the forwarded expression — no literal, constant or alias", () => {
-    // The property, not the spelling. `principal: MEMBER_ONLY_SURFACE` passes all three needles
-    // above and reopens the leak; it fails here.
-    for (const rel of TOKEN_CAPABLE) {
-      const bad = unforwardedPrincipalAssignments(codeOnly(read(rel)));
-      expect(bad, `${rel} may only ever assign enforce?.principal — found: ${bad.join(", ")}`).toEqual([]);
+  it("…and the AST walk rejects every spelling the two diff reviews found — non-vacuity", () => {
+    // Each of these passed the regex guard at some point in this slice's history. They are kept as
+    // negative controls so a future simplification of the walk reddens here rather than silently
+    // reopening the hole.
+    const FORWARD = "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };";
+    const EVASIONS: [string, string][] = [
+      ["literal", 'const ctx = { visibleItemIds, teamPosture, principal: "member" };'],
+      ["named constant", "const ctx = { visibleItemIds, teamPosture, principal: MEMBER_ONLY_SURFACE };"],
+      [
+        "local binding + shorthand (Fable's HIGH)",
+        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, principal };',
+      ],
+      ["computed key", 'const ctx = { visibleItemIds, teamPosture, ["principal"]: "member" };'],
+      [
+        "spread override",
+        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, principal: enforce?.principal, ...o };',
+      ],
+      ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
+      ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
+      ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
+      ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
+      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, principal: tier === "team" ? "member" : "token" };'],
+      ["omitted entirely (M13)", "const ctx = { visibleItemIds, teamPosture };"],
+      ["as-const literal", 'const ctx = { visibleItemIds, principal: "member" as const };'],
+    ];
+    for (const [name, code] of EVASIONS) {
+      expect(astViolations(code).length, `the AST walk must REJECT: ${name}`).toBeGreaterThan(0);
     }
-  });
 
-  it("…and every provenance ctx they BUILD carries the discriminator — none may omit it", () => {
-    for (const rel of TOKEN_CAPABLE) {
-      const missing = ctxLiteralsMissingPrincipal(codeOnly(read(rel)));
-      expect(missing, `${rel} builds a provenance ctx with no principal: ${missing.join(" | ")}`).toEqual([]);
-    }
+    // …and it must ACCEPT the one legal shape, or it is a check that always fails.
+    expect(astViolations(FORWARD), "forwarding must pass").toEqual([]);
+    expect(astViolations("const ctx = { visibleItemIds, teamPosture, principal: enforce.principal };")).toEqual([]);
+    // The three shapes that broke the hand-rolled scanner, all now handled by the parser.
+    expect(
+      astViolations('interface E { visibleItemIds: ReadonlySet<string>; principal?: "member" | "token" }'),
+      "an interface declares, it does not construct"
+    ).toEqual([]);
+    expect(astViolations("const { visibleItemIds } = enforce;"), "destructuring is not a construction").toEqual([]);
+    expect(
+      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, principal: enforce?.principal };'),
+      "a brace inside a string no longer misleads anything"
+    ).toEqual([]);
   });
 
   it("every member literal in the tree sits at a listed member-only boundary", () => {
@@ -244,42 +289,22 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     expect(offenders, "a new member literal must be justified by an authenticated member boundary").toEqual([]);
   });
 
-  it("the needle matches what it claims to — non-vacuity", () => {
+  it("the tree-wide needle matches what it claims to — non-vacuity", () => {
     // A guard whose regex matches nothing passes forever.
     expect(MEMBER_LITERAL.test('const c = { principal: "member" };')).toBe(true);
     expect(MEMBER_LITERAL.test("const c = { principal: 'member' };")).toBe(true);
     expect(MEMBER_LITERAL.test('principal:"member"')).toBe(true);
     expect(MEMBER_LITERAL.test('rowVisibleByProvenance(d, ids, tier, "member")')).toBe(true);
-    // Forwarding is the permitted shape, and a TYPE declaration is not an assertion.
-    expect(MEMBER_LITERAL.test("principal: enforce?.principal")).toBe(false);
-    expect(MEMBER_LITERAL.test('principal: "member" | "token";')).toBe(false);
-    expect(MEMBER_LITERAL.test('principal: "member" | "token" | undefined')).toBe(false);
-    expect(MEMBER_LITERAL.test('principal: "member" as const')).toBe(true);
-    // The named-constant shape the first two needles missed — the reason this one exists.
+    expect(MEMBER_LITERAL.test('rowVisibleByProvenance(d, getIds(), tier, "member")'), "nested call").toBe(true);
     expect(MEMBER_LITERAL.test('const MEMBER_ONLY_SURFACE = "member" as const;')).toBe(true);
-    expect(MEMBER_LITERAL.test("const M = 'member';")).toBe(true);
-    // …but a COMPARISON is a read, not an assertion — retrieve.ts does exactly this, legally.
-    expect(MEMBER_LITERAL.test('const ok = enforce?.principal === "member";')).toBe(false);
-    expect(MEMBER_LITERAL.test('if (p !== "member") return;')).toBe(false);
-    // …and the forwarding check that catches it wherever it is IMPORTED rather than declared.
-    expect(unforwardedPrincipalAssignments("principal: MEMBER_ONLY_SURFACE,")).toEqual(["MEMBER_ONLY_SURFACE"]);
-    expect(unforwardedPrincipalAssignments('principal: tier === "team" ? "member" : "token",'))
-      .toEqual(['tier === "team" ? "member" : "token"']);
-    expect(unforwardedPrincipalAssignments("principal: enforce?.principal,")).toEqual([]);
-    expect(unforwardedPrincipalAssignments('principal: "member" | "token";'), "a union is a declaration").toEqual([]);
-    expect(unforwardedPrincipalAssignments("principal?: ProvenancePrincipal"), "a type name is a declaration").toEqual([]);
-    // THE BYPASS Fable demonstrated, pinned in both halves so it cannot come back.
     expect(MEMBER_LITERAL.test('const principal = "member" as ProvenancePrincipal;')).toBe(true);
-    expect(MEMBER_LITERAL.test('const principal = "member"')).toBe(true);
-    expect(MEMBER_SHORTHAND.test("const c = { visibleItemIds, teamPosture, principal };")).toBe(true);
-    expect(MEMBER_SHORTHAND.test("const c = { principal };")).toBe(true);
-    expect(MEMBER_SHORTHAND.test("principal: enforce?.principal,"), "forwarding is not shorthand").toBe(false);
-    // …and the shorthand omission the colon-anchored scan could not see.
-    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds,\n  teamPosture,\n})").length).toBe(1);
-    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds,\n  teamPosture,\n  principal,\n})")).toEqual([]);
-    // …and a twin call with a nested call in its arguments.
-    expect(MEMBER_LITERAL.test('rowVisibleByProvenance(d, getIds(), tier, "member")')).toBe(true);
-    // …but it must NOT reach across a statement boundary into an unrelated string.
+    // …and the shapes that assert NOTHING and must not be flagged.
+    expect(MEMBER_LITERAL.test("principal: enforce?.principal"), "forwarding").toBe(false);
+    expect(MEMBER_LITERAL.test('principal: "member" | "token";'), "a union declares").toBe(false);
+    expect(MEMBER_LITERAL.test('export type P = "member" | "token";'), "a type alias declares").toBe(false);
+    expect(MEMBER_LITERAL.test('const ok = enforce?.principal === "member";'), "a comparison reads").toBe(false);
+    expect(MEMBER_LITERAL.test('if (p !== "member") return;'), "so does this one").toBe(false);
+    expect(MEMBER_LITERAL.test("a.target_type = 'member' and a.action"), "a SQL string").toBe(false);
     expect(
       MEMBER_LITERAL.test('rowVisibleByProvenance(d, ids, tier, principal);\nconst x = 1;\nlog("member")'),
       "the twin needle must stay inside its own statement"
@@ -287,17 +312,9 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // …and codeOnly must not swallow a generator method, which would be a hiding place.
     expect(codeOnly('class C {\n  *iter() { const principal = "member"; }\n}')).toContain("principal");
     expect(codeOnly(" * a jsdoc continuation line"), "prose is still stripped").not.toContain("jsdoc");
-    // The omission scan: a ctx with no discriminator at all — the shape a surviving mutation found.
-    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  teamPosture: true,\n})").length).toBe(1);
-    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  principal: enforce?.principal,\n})")).toEqual([]);
-    expect(
-      ctxLiteralsMissingPrincipal("interface X {\n  visibleItemIds: ReadonlySet<string>;\n}"),
-      "a type declaration is not a construction"
-    ).toEqual([]);
   });
 
   it("the allow-list is honest — every listed boundary really does assert memberhood", () => {
-    // A stale allow-list entry is permission granted to a file that no longer needs it.
     const stale = [...MEMBER_BOUNDARIES].filter((rel) => !MEMBER_LITERAL.test(codeOnly(read(rel))));
     expect(
       stale,

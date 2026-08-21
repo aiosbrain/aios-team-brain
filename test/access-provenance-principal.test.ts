@@ -79,31 +79,42 @@ describe("all three owners agree — against expected truth, not against each ot
     { name: "unsourced + unauthored", row: { source_item_id: null, created_by: null }, member: false, token: false },
   ] as const;
 
-  // AC7 says the table crosses all FIVE principal inputs against all THREE owners. It used to cross
-  // three inputs against one owner, and Fable's diff review caught the sentence being false rather
-  // than the coverage being wrong. Both are now what AC7 says.
+  // Only the TS twin can be asked about a ROW at unit level — the SQL owners return text, and the
+  // row is applied by Postgres. So the row x principal cross belongs to the twin, and the SQL owners
+  // are asserted on the two things they CAN be asserted on here (below): the arm's presence per
+  // principal, and the arm's structure.
+  //
+  // A previous version of this loop built both SQL strings INSIDE the row loop and asserted them
+  // there. Codex's diff review caught it: neither string referenced `r`, so 15 of those 20
+  // assertions were the same 5 assertions repeated — and the trailing
+  // `if (unsourced && created_by === null) expect(expected).toBe(false)` re-asserted a constant
+  // written twenty lines above in ROWS. A tautology reads exactly like coverage.
   for (const r of ROWS) {
     for (const [principal, admitted] of PRINCIPALS) {
       const expected = admitted ? r.member : r.token;
-      it(`${r.name}, principal=${String(principal)} → ${expected}`, () => {
-        // Owner 1 — the TS twin, which answers per row.
+      it(`TS twin — ${r.name}, principal=${String(principal)} → ${expected}`, () => {
         expect(rowVisibleByProvenance(r.row, ids, "team", principal as undefined)).toBe(expected);
-
-        // Owners 2 and 3 — the SQL forms answer with an ARM, not a boolean, so the observable is
-        // whether the unsourced disjunct exists. Only the unsourced rows can distinguish them.
-        const unsourced = r.row.source_item_id === null;
-        for (const [label, sql] of [
-          ["id-array", provenanceRowSqlFromIds("t", newSqlParams(), { visibleItemIds: ids, teamPosture: true, principal: principal as undefined })],
-          ["semijoin", provenanceRowSql("t", newSqlParams(), { teamId: "t1", grantedProjectIds: ["p1"], teamPosture: true, principal: principal as undefined })],
-        ] as const) {
-          expect(sql.includes("created_by is not null"), `${label}, principal=${String(principal)}`).toBe(admitted);
-          // …and an unsourced-and-UNAUTHORED row is denied by every owner regardless, because the
-          // arm the SQL emits still requires `created_by is not null`.
-          if (unsourced && r.row.created_by === null) expect(expected).toBe(false);
-        }
       });
     }
   }
+
+  it("the SQL owners' hand-typed arm carries the SAME two conditions the twin applies", () => {
+    // The structural half of "one contract, three owners": the twin admits an unsourced row only
+    // when `created_by` is non-null, so the SQL the owners emit must test exactly that, on exactly
+    // the null-source branch. Asserted ONCE — it does not vary by row, and pretending otherwise is
+    // what made the previous version look like 20 cases of coverage.
+    for (const [label, sql] of [
+      ["id-array", provenanceRowSqlFromIds("t", newSqlParams(), { visibleItemIds: ids, teamPosture: true, principal: "member" })],
+      ["semijoin", provenanceRowSql("t", newSqlParams(), { teamId: "t1", grantedProjectIds: ["p1"], teamPosture: true, principal: "member" })],
+    ] as const) {
+      expect(sql, `${label}: the arm must require BOTH null source and an author`).toMatch(
+        /source_item_id is null and t\.created_by is not null/
+      );
+    }
+    // Row-level truth for the SQL owners lives where a database can apply it: the agreement suite
+    // in test/datamechanics/enfb2-inquery-provenance.datamechanics.test.ts, which runs both forms
+    // against fixtures and compares them to the twin.
+  });
 
   it("the TS twin and the id-array SQL agree on whether the unsourced arm exists at all", () => {
     for (const [principal, admitted] of PRINCIPALS) {

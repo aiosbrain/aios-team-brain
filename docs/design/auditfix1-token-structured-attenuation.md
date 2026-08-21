@@ -365,6 +365,61 @@ was clean. Both were wrong, in opposite directions:
 
 **19 mutations total: 18 reddened only their intended test; 1 survived, was fixed, and now reddens.**
 
+## 5h. Codex's diff review — no BLOCKER, no HIGH, and it ended the guard's arms race
+
+The second model on the diff, after Fable. Its verdict on the production fix was clean: *"The
+production fix closes the reported token disclosure, and I found no current token-reachable call site
+that omits or manufactures the discriminator."* It independently re-derived the consumer inventory and
+confirmed the SQL parameter numbering (`matchingDecisions` pre-seeds `$1–$3` through the same
+`SqlParams` instance, so emitting one fewer bound parameter shifts nothing). Three MEDIUMs and a LOW.
+
+**MEDIUM 1 — six more guard evasions, and the right conclusion.** A computed key
+`{ ["principal"]: "member" }`, a later `...spread` overwriting the forwarded value,
+`enforce!.principal = "member"`, `||=`, `Reflect.set`, `Object.defineProperty`. Plus: the hand-rolled
+brace scanner mis-pairs on a nested object, a brace inside a string, or a destructuring pattern, and
+`codeOnly` still discards real code after a block-comment terminator.
+
+That is the third review to defeat this guard, and the pattern is the finding: **each defeat was a new
+SPELLING of one act, and a text matcher can only ever enumerate spellings.** Codex's recommendation
+was to stop matching text. So the token-capable half is now a **TypeScript AST walk** — every
+`principal` property must be initialised to exactly `enforce?.principal`; no spread may enter a
+provenance ctx; nothing may assign to `.principal` in any assignment operator; `Reflect.set` and
+`Object.defineProperty` may not target it; and every ctx carrying `visibleItemIds` must carry it. The
+brace, comment and string hazards vanish because the parser owns them. **All twelve historical
+evasions are kept as negative controls**, so a future simplification reddens rather than silently
+reopening the hole. The tree-wide member-literal scan stays regex-based and is relabelled for what it
+is: a coverage inventory over ~700 files whose failure mode is a stale allow-list entry.
+
+**MEDIUM 3 — a footgun the type system endorsed.** `visibleProjectRows`, `canSeeProjectRow` and
+`visibleProjectCards` took a `Principal` — whose `projectScope` makes it token-shaped — while
+asserting memberhood unconditionally inside. A future token route could call them, get the hand-typed
+arm opened, and redden nothing, since the member literal lives in an allow-listed file and the new
+caller need contain none. They now take **`MemberPrincipal`** (`projectScope?: never`), so a
+token-shaped value is a compile error at the call site. Verified both directions: the token call fails
+`tsc` with `Type 'string[]' is not assignable to type 'undefined'`; the member call still compiles.
+The comment above them claimed the parameterisation itself was the safety property — it wasn't, and
+that sentence is corrected rather than deleted.
+
+**MEDIUM 2 — my truth table was mostly decoration, and it was right.** Neither SQL string in the
+`4 rows x 5 principals` loop referenced the row, so 15 of 20 SQL assertions were the same 5 repeated;
+and the trailing `if (unsourced && created_by === null) expect(expected).toBe(false)` re-asserted a
+constant written twenty lines above in the fixture table. **A tautology reads exactly like coverage.**
+The row x principal cross now belongs to the TS twin, which is the only owner that can answer about a
+row at unit level; the SQL owners are asserted once on arm presence and once on arm STRUCTURE — and
+that structural assertion is a full-conjunction regex, not a substring, because Codex pointed out that
+`source_item_id is null OR created_by is not null` also contains `"created_by is not null"`. Row-level
+truth for the SQL owners lives where a database can apply it: the dm agreement suite.
+
+**LOW — a helper that did not resemble its call site.** `pulseCtx()` in the dm tier supplied
+`teamPosture: true` with no principal — a shape the type permits and a real caller could copy, and one
+that silently drops every hand-entered task out of the funnel. There was no production regression (the
+one caller passes an explicit member ctx, and the absent-ctx fallback pins `teamPosture: false`), but
+nothing asserted it either, because every fixture in that suite is sourced. Both are fixed: the helper
+threads the discriminator, and a new test seeds a hand-entered task and asserts a member's funnel
+counts it. Reverting the helper reddens exactly that test.
+
+**24 mutations total: 23 reddened only their intended test; 1 survived, was fixed, and now reddens.**
+
 Round 1 also **confirmed the core rule is right and not over-correction**: a hand-typed row
 deliberately has no membership axis, and `tasks.project_id` is an ingestion project, not an access
 project (`enforce.ts:174`) — so admitting unsourced rows to tokens by project would invent a second
