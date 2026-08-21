@@ -30,6 +30,7 @@ const quiet: GraphProjectionSummary = {
   partialItems: 0,
   partialDetail: { sample: [], elided: 0, namesElided: 0 },
   probeFallbackPages: 0,
+  lockedOut: 0,
   walkMs: 0,
   reconcileMs: 0,
   errors: [],
@@ -49,6 +50,15 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     expect(shouldRecordProjectionRun({ ...quiet, walkMs: SLOW_WALK_RECORD_MS })).toBe(false);
   });
 
+  it("a locked-out team ALONE earns a durable row (a deploy overlap once is expected; every run is a wedged holder)", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, lockedOut: 1 })).toBe(true);
+  });
+
+  it("the two stall signals both inline gates had dropped record on their own (Codex diff review M1)", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, fanoutThrottled: 1 })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, restrictionMovesPending: 1 })).toBe(true);
+  });
+
   it("every pre-existing signal still records on its own", () => {
     for (const key of ["projected", "requeued", "cleaned", "pendingCleanups", "saturatedGroups", "requeueThrottled", "partialItems"] as const) {
       expect(shouldRecordProjectionRun({ ...quiet, [key]: 1 }), key).toBe(true);
@@ -63,6 +73,15 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     expect("probeFallbackPages" in q).toBe(false);
     const loud = projectionRunInput({ ...quiet, probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 }, "scheduler", 1, 2).meta as Record<string, unknown>;
     expect(loud).toMatchObject({ probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 });
+    expect("lockedOut" in q).toBe(false);
+    expect(projectionRunInput({ ...quiet, lockedOut: 1 }, "scheduler", 1, 2).meta).toMatchObject({ lockedOut: 1 });
+  });
+
+  it("a TEAM-SCOPED run (the admin button) is recorded under its team; the scheduler aggregate stays instance-wide (Codex diff review H2)", () => {
+    expect(projectionRunInput(quiet, "manual", 1, 2, "team-a").teamId).toBe("team-a");
+    expect(projectionRunInput(quiet, "scheduler", 1, 2).teamId).toBeUndefined();
+    const action = readFileSync("app/t/[team]/admin/integrations/actions.ts", "utf8");
+    expect(action).toMatch(/projectionRunInput\(s, "manual", startedAt, Date\.now\(\), ctx\.teamId\)/);
   });
 
   it("BOTH callers route through the shared gate — the scheduler tick and the admin button (call-site pin)", () => {

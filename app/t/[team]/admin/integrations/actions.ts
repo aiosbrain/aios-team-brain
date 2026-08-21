@@ -457,12 +457,15 @@ export async function projectToGraphNow(
     // scheduler's and would have been blind to a failing batched ledger read and a slow walk — the
     // durable-visibility contract held for one of the two callers. One shared predicate now.
     if (shouldRecordProjectionRun(s)) {
-      await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now()));
+      await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now(), ctx.teamId));
     }
     if (!s.configured) {
       return { ok: false, error: "Graph memory is not configured (set GRAPHITI_URL on the brain)." };
     }
     if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
+    if (s.lockedOut) {
+      return { ok: false, error: "Another brain instance is projecting this team right now (deploy overlap) — try again in a minute." };
+    }
     revalidatePath(`/t/${teamSlug}/admin/integrations`);
     return {
       ok: true,

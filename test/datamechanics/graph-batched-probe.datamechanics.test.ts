@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { runSql } from "@/lib/db/pg/pool";
+import { runSql, getPool } from "@/lib/db/pg/pool";
+import { GRAPH_PROJECTION_LOCK_NS } from "@/lib/graph/walk-lock";
 import { projectItemsToGraph, ProjectionAbortError } from "@/lib/graph/project";
 import { runGraphProjection } from "@/lib/graph/run";
 import { FakeGraphiti, client } from "./fake-graphiti";
@@ -150,6 +151,41 @@ describe("TICKFIT-2 — the batched ledger read (real Postgres, mocked Graphiti)
       expect(s.fanoutThrottled).toBeGreaterThanOrEqual(1);
       // Reset g-aaa to stale so the next attempt replays the same contest.
       await db().from("graph_episodes").update({ content_sha256: "stale" }).eq("team_id", seed.teamId).eq("source_id", item.id).eq("group_id", "g-aaa");
+    }
+  });
+
+  it("a team whose projection lease another instance holds is SKIPPED and COUNTED, nothing walked; once released the same run projects (Codex diff review H1 — the deploy-overlap twin)", async () => {
+    const seed = await seedTeam();
+    await seedCorpus(seed, 3);
+    const fake = new FakeGraphiti();
+    // The "other instance": a separate session holding the team's advisory lease.
+    const twin = await getPool().connect();
+    try {
+      const { rows } = await twin.query<{ ok: boolean }>("select pg_try_advisory_lock($1::int, hashtext($2::text)) as ok", [GRAPH_PROJECTION_LOCK_NS, seed.teamId]);
+      expect(rows[0].ok).toBe(true);
+
+      const lockedOut = await runGraphProjection({ teamId: seed.teamId, client: client(fake) });
+      expect(lockedOut.lockedOut, "the lock-out is counted, never silent").toBe(1);
+      expect(lockedOut.scanned, "nothing walked under a held lease").toBe(0);
+      expect(lockedOut.projected).toBe(0);
+      expect(fake.pushes.length, "NO push can race the holder — that is the whole point").toBe(0);
+      expect(lockedOut.ok).toBe(true); // a lock-out is a skip, not an error
+
+      await twin.query("select pg_advisory_unlock($1::int, hashtext($2::text))", [GRAPH_PROJECTION_LOCK_NS, seed.teamId]);
+    } finally {
+      twin.release();
+    }
+    const after = await runGraphProjection({ teamId: seed.teamId, client: client(fake) });
+    expect(after.lockedOut).toBe(0);
+    expect(after.projected, "released → the same corpus projects").toBe(3);
+    // And the runner RELEASED its own lease: the twin can take it again.
+    const probe = await getPool().connect();
+    try {
+      const { rows } = await probe.query<{ ok: boolean }>("select pg_try_advisory_lock($1::int, hashtext($2::text)) as ok", [GRAPH_PROJECTION_LOCK_NS, seed.teamId]);
+      expect(rows[0].ok, "the runner's lease is released after the pass (a leaked session lock would lock the team out forever)").toBe(true);
+      await probe.query("select pg_advisory_unlock($1::int, hashtext($2::text))", [GRAPH_PROJECTION_LOCK_NS, seed.teamId]);
+    } finally {
+      probe.release();
     }
   });
 

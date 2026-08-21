@@ -54,10 +54,18 @@ re-scope; round 2 attacks it.
   (Fable diff review M5; within a page there is NO cross-item staleness, every in-loop
   ledger write is `source_id`-scoped to the current item — verified). Each of those writers
   converges on the NEXT pass by its existing mechanism (eventual convergence, one-interval
-  delay, stated); the one pre-existing hole they share — a tombstone written mid-window and
-  then overwritten by the final upsert, whose remedy is an optimistic
-  `.eq("content_sha256", <prefetched>)` on that upsert — is out of this slice and named;
-  (2) ORDERING — today's fan-out budget spends in UNDEFINED result order;
+  delay, stated) — EXCEPT the deploy-overlap twin projector, which the snapshot would have
+  turned from a per-item race into a page-wide DUPLICATE-PUSH race (Codex diff review H1: the
+  `''` reservation sentinel is read as "re-push" BY DESIGN, so the ledger cannot stop two
+  walkers; Graphiti does not dedupe; the duplicates and their extraction spend are permanent).
+  That class predates this slice and is CLOSED here rather than merely un-widened: each team's
+  pass (walk + reconcile) runs under a Postgres SESSION advisory lease on a dedicated pooled
+  client (`lib/graph/walk-lock.ts`; dies with the holder's backend — no expiry bookkeeping); a
+  locked-out team is skipped this tick and counted (`lockedOut` → meta → the recording gate;
+  the admin button reports it). The one remaining same-item hole — a purge tombstone written
+  mid-window by a NON-projector writer and overwritten by the final upsert, whose remedy is an
+  optimistic `.eq("content_sha256", <prefetched>)` on that upsert — is out of this slice and
+  named; (2) ORDERING — today's fan-out budget spends in UNDEFINED result order;
   the group_id sort FIXES that undefined behavior deliberately (pinned by a capped
   two-group ordering test). The batch select completes BEFORE the loop starts, so the D5
   fallback always begins from an unprocessed page. `project.ts:820-829` is the only
@@ -130,23 +138,37 @@ re-scope; round 2 attacks it.
    TRACE-EQUIVALENCE arm (round 2 L): on a stable converged corpus, a batched pass and a
    forced-fallback pass produce identical summaries (minus the fallback counter).
 2. Existing projection dm suites (`graph-project`, `graph-tier-move`, `graph-redaction`,
-   fan-out, reconcile — the full graph set) green **UNCHANGED** — the byte-identical-
-   semantics claim is the review contract, and their existing `skipped`/counter pins are
-   the proof it holds.
+   fan-out, reconcile — the full graph set) green **UNCHANGED** — the page-snapshot contract
+   (D1: identical decisions for every item whose ledger did not move during the page; the
+   two owned deltas are ordering and snapshot timing, NOT "byte-identical" — Codex diff
+   review L3) is the review contract, and their existing `skipped`/counter pins are the
+   proof it holds.
 3. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts`
    exits 0: `meta.walkMs`/`meta.reconcileMs` present and ≥ 0 in the recorded run; the
    CALLER-GATE arm: `shouldRecordProjectionRun` is false for a quiet converged summary,
    true with ONLY `probeFallbackPages: 1`, true with ONLY `walkMs` strictly past
    `SLOW_WALK_RECORD_MS` (false AT it), true for every pre-existing signal alone;
-   `probeFallbackPages` absent from meta at 0; and BOTH call sites (scheduler tick, admin
-   button) pinned at the source level to call the shared predicate with no inline copy.
+   `probeFallbackPages` absent from meta at 0; `lockedOut`, `fanoutThrottled` and
+   `restrictionMovesPending` each record ALONE (Codex diff review M1 — both stall signals
+   were in the summary and meta but in neither inline gate); a team-scoped manual run is
+   recorded under its `team_id` (Codex H2 — it used to land instance-wide: visible to every
+   team's admin panel, excluded from its own Costs denominator); and BOTH call sites
+   (scheduler tick, admin button) pinned at the source level to call the shared predicate
+   with no inline copy.
+3b. The LEASE arm (dm, same file as AC1): with another session holding the team's advisory
+   lease, `runGraphProjection` walks NOTHING for that team (`scanned 0`, zero pushes),
+   reports `lockedOut 1` with `ok true`; after the holder unlocks, the same corpus projects;
+   and the runner's own lease is released after the pass (a twin can take it again —
+   a leaked session lock on a pooled connection would lock the team out forever).
 4. Mutations, verdicts verbatim in the PR: (a) ignore the prefetch (`if (prefetch)` →
    `if (!prefetch)`) → the probe-count pin reddens (the batch count alone would NOT — the
    round-trip pin counts per-item probes separately, Fable diff review M3); (b) remove the
    group_id sort → the multi-group arm reddens on both attempts (the test serves the batch
    rows in DESCENDING group order, so the planner cannot rescue the mutant — M4);
    (c) disable the D5 fallback counter merge → its arm reddens; (d) drop the
-   `probeFallbackPages` clause from the gate → the gate suite reddens.
+   `probeFallbackPages` clause from the gate → the gate suite reddens; (e) make the lease
+   acquirer ignore a held lock (always proceed) → the lease arm reddens; (f) drop the
+   runner's lease release → the lease arm's re-acquire pin reddens.
 5. Full tiers green: `npm test` · dm iso (tolerated: the pre-named TZ artifact + the known
    timeout-flake class, standalone-probed) · `npm run test:http:local` · `npm run check:docs`
    · ARCHITECTURE's graph-leg prose (:115) updated in the same PR; GRAPHSAT-1 filed.

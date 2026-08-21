@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
+import { acquireProjectionLease, type ProjectionLease } from "./walk-lock";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } from "./project";
 import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
@@ -66,6 +67,10 @@ export interface GraphProjectionSummary {
    *  durably visible (the recording gate keys on it) so a permanently failing batch read can
    *  never silently re-become the 10.5-minute stage. */
   probeFallbackPages: number;
+  /** TICKFIT-2 (Codex diff review H1): teams SKIPPED this run because another brain instance holds
+   *  their projection lease (`lib/graph/walk-lock.ts` — a deploy overlap). Expected once per deploy;
+   *  persistent across runs means a wedged holder. Durably visible (meta + the recording gate). */
+  lockedOut: number;
   /** TICKFIT-2: per-leg wall time (flat numbers — the runs panel Strings values). `walkMs` is
    *  the page loop; `reconcileMs` the reconcile call; summed across teams, accumulated in
    *  finally so failed legs keep their elapsed time. The revisit trigger reads walkMs. */
@@ -104,6 +109,8 @@ export async function runGraphProjection(opts?: {
   limit?: number;
   /** Per-team fan-out budget for this RUN (default GRAPH_FANOUT_PUSH_MAX_PER_PASS); test override. */
   fanoutPushBudget?: number;
+  /** Cross-instance lease acquirer (default: the Postgres advisory lease); test override. */
+  lease?: (teamId: string) => Promise<ProjectionLease | null>;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
   inFlight = runGraphProjectionInner(opts);
@@ -120,8 +127,10 @@ async function runGraphProjectionInner(opts?: {
   db?: DbClient;
   limit?: number;
   fanoutPushBudget?: number;
+  lease?: (teamId: string) => Promise<ProjectionLease | null>;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
+  const acquireLease = opts?.lease ?? acquireProjectionLease;
   const summary: GraphProjectionSummary = {
     ok: true,
     configured: client.configured,
@@ -142,6 +151,7 @@ async function runGraphProjectionInner(opts?: {
     partialDetail: { sample: [], elided: 0, namesElided: 0 },
     requeueThrottled: 0,
     probeFallbackPages: 0,
+    lockedOut: 0,
     walkMs: 0,
     reconcileMs: 0,
     errors: [],
@@ -154,6 +164,22 @@ async function runGraphProjectionInner(opts?: {
   summary.teams = teams.length;
 
   for (const t of teams) {
+    // TICKFIT-2 (Codex diff review H1): one instance per team per pass. The in-process `inFlight`
+    // above cannot see a deploy-overlap twin, and two walkers over the same unconverged page both
+    // push (the `''` reservation reads as "re-push" by design). A locked-out team is skipped THIS
+    // tick and counted, never silently; the lease dies with the holder's backend.
+    let lease: ProjectionLease | null = null;
+    try {
+      lease = await acquireLease(t.id);
+    } catch (e) {
+      summary.ok = false;
+      summary.errors.push(`${t.slug}: projection lease failed: ${e instanceof Error ? e.message : String(e)}`);
+      continue;
+    }
+    if (!lease) {
+      summary.lockedOut += 1;
+      continue;
+    }
     try {
       // Page forward through this team's whole backlog: advance the `since` cursor by the last
       // synced_at scanned until a batch comes back short (fewer rows than the limit = tail reached).
@@ -255,6 +281,8 @@ async function runGraphProjectionInner(opts?: {
         // contract — under-reporting here would hide a failing batch read behind any abort).
         summary.probeFallbackPages += e.partial.probeFallbackPages;
       }
+    } finally {
+      await lease.release();
     }
   }
   return summary;

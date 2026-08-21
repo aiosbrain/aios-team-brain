@@ -47,6 +47,7 @@ export function startGraphScheduler(): void {
             (s.partialItems ? ` ${s.partialItems} partially-landed item(s)` : "") +
             (s.requeueThrottled ? ` ${s.requeueThrottled} re-queue(s) throttled — Graphiti may be wedged` : "") +
             (s.probeFallbackPages ? ` ${s.probeFallbackPages} page(s) fell back to per-item ledger probes` : "") +
+            (s.lockedOut ? ` ${s.lockedOut} team(s) skipped — another instance holds the projection lease` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }

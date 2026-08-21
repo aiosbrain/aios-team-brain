@@ -25,6 +25,7 @@ const base: GraphProjectionSummary = {
   partialItems: 0,
   partialDetail: { sample: [], elided: 0, namesElided: 0 },
   probeFallbackPages: 0,
+  lockedOut: 0,
   walkMs: 1234,
   reconcileMs: 56,
   errors: [],
