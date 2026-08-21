@@ -62,6 +62,12 @@ describe("Neo4j tier wiring — one mutation arm per invariant (non-vacuity)", (
     ["run step made conditional", "run-step-conditional", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st.if = "false"; }],
     ["run step continue-on-error", "run-step-continue-on-error", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st["continue-on-error"] = true; }],
     ["run step env blanks the sentinel", "run-step-sentinel-override", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st.env = { NEO4J_TIER_REQUIRED: "" }; }],
+    // Codex diff review M1/M2/L1 — the remaining false-green paths.
+    ["job has needs (a skipped prerequisite skips this job, which reports SUCCESS)", "job-needs", (o) => { (job(o) as { needs?: unknown }).needs = ["docs-drift"]; }],
+    ["workflow-level shell override", "workflow-shell-override", (o) => { (o.ci as { defaults?: unknown }).defaults = { run: { shell: "bash -c 'bash \"$1\" || true' _ {0}" } }; }],
+    ["job-level shell override", "job-shell-override", (o) => { (job(o) as { defaults?: unknown }).defaults = { run: { shell: "bash -c 'bash \"$1\" || true' _ {0}" } }; }],
+    ["run step shell override", "run-step-shell-override", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st.shell = "bash -c 'bash \"$1\" || true' _ {0}"; }],
+    ["health cmd commented out behind `true #`", "health-cmd-drift", (o) => { const s = (job(o) as { services: { neo4j: { options: string } } }).services.neo4j; s.options = s.options.replace('--health-cmd "', '--health-cmd "true # '); }],
     // Fable diff review M2 — the six branches that had no arm.
     ["compose service missing", "compose-service-missing", (o) => { delete (o.compose as { services: Record<string, unknown> }).services.neo4j; }],
     ["npm script missing", "script-missing", (o) => { delete (o.pkg as { scripts: Record<string, string> }).scripts["test:neo4j"]; }],

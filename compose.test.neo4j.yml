@@ -1,7 +1,7 @@
 name: aios-brain-test-neo4j
 # Throwaway Neo4j for the Graphiti-graph read tests (lib/graph/neo4j + learning). Bolt on 7688 /
 # HTTP on 7475 to avoid colliding with a local dev Neo4j (7687/7474). Used by
-# `npm run db:test:neo4j:up` + `test:neo4j`; the test self-skips unless NEO4J_TEST is set.
+# `npm run db:test:neo4j:up` + `test:neo4j`; the test self-skips unless NEO4J_TEST=1 (and in CI the neo4j-tier-tests job makes that skip a failure).
 services:
   neo4j:
     image: neo4j:5.26.2

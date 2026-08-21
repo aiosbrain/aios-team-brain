@@ -62,12 +62,21 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
   if (job.name !== CHECK_NAME) v.push("check-name");
   // A job that cannot FAIL is not a gate (Fable diff review M1): `if`, `continue-on-error`, or a
   // step-level env blanking the sentinel all leave "it's in CI" true on paper and false in effect.
+  // A job skipped through `needs` (a skipped prerequisite) reports SUCCESS to branch protection —
+  // even when required — so the tier could never run while merges stay possible (Codex diff review
+  // M1). This job needs nothing; any dependency is a false-green path.
+  if (job.needs !== undefined) v.push("job-needs");
+  // Custom shells can swallow the runner's exit (`bash -c 'bash "$1" || true' _ {0}`) at workflow,
+  // job or step scope (Codex diff review M2). The default shell propagates failure; reject overrides.
+  if (ci?.defaults?.run?.shell !== undefined) v.push("workflow-shell-override");
+  if (job.defaults?.run?.shell !== undefined) v.push("job-shell-override");
   if (job.if !== undefined) v.push("job-conditional");
   if (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false) v.push("job-continue-on-error");
   const steps = Array.isArray(job.steps) ? job.steps : [];
   const runStep = steps.find((s) => typeof s?.run === "string" && s.run.trim() === RUN_STEP);
   if (!runStep) v.push("run-step-missing");
   else {
+    if (runStep.shell !== undefined) v.push("run-step-shell-override");
     if (runStep.if !== undefined) v.push("run-step-conditional");
     if (runStep["continue-on-error"] !== undefined && runStep["continue-on-error"] !== false) v.push("run-step-continue-on-error");
     if (runStep.env && Object.prototype.hasOwnProperty.call(runStep.env, SENTINEL)) v.push("run-step-sentinel-override");
@@ -87,7 +96,10 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
     if (!(svc.ports ?? []).map(String).includes(String(refBolt))) v.push("port-drift");
     const h = parseHealthOptions(svc.options);
     const probe = composeProbe(ref.healthcheck);
-    if (!h.cmd || !probe || !h.cmd.includes(probe.replace(/\s*\|\|\s*exit 1$/, ""))) v.push("health-cmd-drift");
+    // EQUALITY after whitespace normalization, not `includes` (Codex diff review L1: `true #
+    // cypher-shell …` would have passed `includes` while /bin/sh commented the probe out).
+    const norm = (x) => String(x ?? "").trim().replace(/\s+/g, " ");
+    if (!h.cmd || !probe || norm(h.cmd) !== norm(probe)) v.push("health-cmd-drift");
     for (const k of ["interval", "timeout", "retries"]) {
       if (String(h[k] ?? "") !== String(ref.healthcheck?.[k] ?? "")) v.push(`health-${k}-drift`);
     }

@@ -14,8 +14,8 @@ gpt-5.6-sol on the spec and the diff; Fable on the diff.
 `test/graph-neo4j-tier.test.ts` is the ONLY behavioural proof that graph tier isolation holds:
 Graphiti has no tier awareness, `group_id` in the Cypher is the sole enforcement, and there is no
 RLS backstop (CLAUDE.md §5). Since GRAPHSAT-1 it is also the only real-database proof of the
-per-item episode lookup that now drives ledger mutations. It self-skips unless `NEO4J_TEST` is set
-(`test/graph-neo4j-tier.test.ts:13`), `npm test` therefore reports it as skipped, and no job in
+per-item episode lookup that now drives ledger mutations. It self-skips unless `NEO4J_TEST=1`
+(`test/graph-neo4j-tier.test.ts`), `npm test` therefore reports it as skipped, and no job in
 `.github/workflows/ci.yml` sets the variable or starts a Neo4j — so it runs only when a developer
 remembers `npm run db:test:neo4j:up && npm run test:neo4j`.
 
@@ -86,7 +86,13 @@ what the module returns. Only the real tier can.
   mutate the PARSED objects, ONE per invariant (round 2 M5): job deleted; check name changed; run
   step removed; service removed; image drift; `NEO4J_AUTH` drift; port drift; health cmd drift;
   health retries drift; sentinel removed; script URL duplicated/pointed elsewhere; `NEO4J_TEST`
-  dropped; user/password drift; filter changed — each yields exactly its named violation.
+  dropped; user/password drift; filter changed — each yields exactly its named violation. Folded
+  from the two diff reviews: the validator ALSO rejects what turns the job green without running
+  or without mattering — job/step `if`, job/step `continue-on-error`, a step env blanking the
+  sentinel (Fable M1), `needs` (a skipped prerequisite makes this job report SUCCESS to branch
+  protection — Codex M1), and a `shell` override at workflow/job/step scope (Codex M2); the
+  health command is compared by normalized EQUALITY, not `includes` (Codex L1: `true # probe`).
+  31+ arms in total, one per violation code; two compound arms assert their full code sets.
 - **D4 — the tier's own cleanliness.** The tier's `beforeAll` wipes the graph (`MATCH (n) DETACH
   DELETE n`) — fine against a throwaway service container, and the job must never be pointed at
   anything else: the guard asserts the npm script's URL is `bolt://localhost:` (D3(f)). No change
@@ -122,9 +128,10 @@ what the module returns. Only the real tier can.
 
 1. `npx vitest run test/guards/neo4j-tier-wiring.test.ts` exits 0: the real `ci.yml` +
    `compose.test.neo4j.yml` + `package.json` validate with ZERO violations against D3(a)–(f); and
-   eight non-vacuity arms over the parsed objects (job deleted; run step removed; service removed;
-   image drift; port drift; health options removed; sentinel removed; `NEO4J_TEST=1` dropped)
-   each yield exactly their named violation and nothing else.
+   one non-vacuity arm per violation code over the parsed objects (job/step conditionals and
+   continue-on-error, needs, shell overrides at three scopes, sentinel removal/override, service
+   image/auth/port/health drifts incl. a commented-out probe, every npm-script field incl. a
+   duplicated URL) — each yields exactly its named code(s) and nothing else.
 1b. `NEO4J_TIER_REQUIRED=1 npx vitest run graph-neo4j-tier` (NO `NEO4J_TEST`) exits NON-zero with
    the collection error naming both variables — the fail-on-skip contract (D1b); and plain
    `npx vitest run graph-neo4j-tier` (neither set) exits 0 with 15 skipped (a developer without
