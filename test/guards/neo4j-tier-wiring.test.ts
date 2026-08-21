@@ -56,15 +56,30 @@ describe("Neo4j tier wiring — one mutation arm per invariant (non-vacuity)", (
     ["script NEO4J_TEST dropped", "script-neo4j_test", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_TEST=1 ", ""); }],
     ["script password drift", "script-neo4j_password", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_PASSWORD=testtest1", "NEO4J_PASSWORD=x"); }],
     ["script filter changed", "script-cmd", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("graph-neo4j-tier", "graph"); }],
+    // Fable diff review M1 — a job that cannot fail is not a gate.
+    ["job made conditional (if: false)", "job-conditional", (o) => { (job(o) as { if?: unknown }).if = false; }],
+    ["job continue-on-error", "job-continue-on-error", (o) => { (job(o) as Record<string, unknown>)["continue-on-error"] = true; }],
+    ["run step made conditional", "run-step-conditional", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st.if = "false"; }],
+    ["run step continue-on-error", "run-step-continue-on-error", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st["continue-on-error"] = true; }],
+    ["run step env blanks the sentinel", "run-step-sentinel-override", (o) => { const st = (job(o) as { steps: Record<string, unknown>[] }).steps.find((x) => x.run === "npm run test:neo4j")!; st.env = { NEO4J_TIER_REQUIRED: "" }; }],
+    // Fable diff review M2 — the six branches that had no arm.
+    ["compose service missing", "compose-service-missing", (o) => { delete (o.compose as { services: Record<string, unknown> }).services.neo4j; }],
+    ["npm script missing", "script-missing", (o) => { delete (o.pkg as { scripts: Record<string, string> }).scripts["test:neo4j"]; }],
+    ["health interval drift", "health-interval-drift", (o) => { const s = (job(o) as { services: { neo4j: { options: string } } }).services.neo4j; s.options = s.options.replace(/--health-interval \S+/, "--health-interval 30s"); }],
+    ["health timeout drift", "health-timeout-drift", (o) => { const s = (job(o) as { services: { neo4j: { options: string } } }).services.neo4j; s.options = s.options.replace(/--health-timeout \S+/, "--health-timeout 1s"); }],
+    ["script URL points elsewhere (single value)", "script-neo4j_url", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("bolt://localhost:7688", "bolt://neo4j.railway.internal:7687"); }],
+    ["script user drift", "script-neo4j_user", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_USER=neo4j", "NEO4J_USER=admin"); }],
   ];
   /** Compound mutations legitimately trip more than one invariant (no health options = cmd + all
    *  three timings; a second URL also breaks the exact-URL check). They assert containment. */
-  const compound = new Set(["health options removed entirely", "script URL duplicated, second one elsewhere (the destructive-cleanup hazard)"]);
+  const compound: Record<string, string[]> = {
+    "health options removed entirely": ["health-cmd-drift", "health-interval-drift", "health-timeout-drift", "health-retries-drift"],
+    "script URL duplicated, second one elsewhere (the destructive-cleanup hazard)": ["script-env-duplicate", "script-neo4j_url"],
+  };
   for (const [label, code, mut] of arms) {
-    it(`${label} → ${compound.has(label) ? "includes" : "exactly"} [${code}]`, () => {
-      const v = violationsAfter(mut);
-      if (compound.has(label)) expect(v).toContain(code);
-      else expect(v).toEqual([code]);
+    const want = compound[label] ?? [code];
+    it(`${label} → exactly [${want.join(", ")}]`, () => {
+      expect(violationsAfter(mut)).toEqual(want);
     });
   }
 });

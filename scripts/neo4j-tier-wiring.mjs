@@ -60,8 +60,18 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
   const job = ci?.jobs?.[JOB_ID];
   if (!job) return ["job-missing"];
   if (job.name !== CHECK_NAME) v.push("check-name");
+  // A job that cannot FAIL is not a gate (Fable diff review M1): `if`, `continue-on-error`, or a
+  // step-level env blanking the sentinel all leave "it's in CI" true on paper and false in effect.
+  if (job.if !== undefined) v.push("job-conditional");
+  if (job["continue-on-error"] !== undefined && job["continue-on-error"] !== false) v.push("job-continue-on-error");
   const steps = Array.isArray(job.steps) ? job.steps : [];
-  if (!steps.some((s) => typeof s?.run === "string" && s.run.trim() === RUN_STEP)) v.push("run-step-missing");
+  const runStep = steps.find((s) => typeof s?.run === "string" && s.run.trim() === RUN_STEP);
+  if (!runStep) v.push("run-step-missing");
+  else {
+    if (runStep.if !== undefined) v.push("run-step-conditional");
+    if (runStep["continue-on-error"] !== undefined && runStep["continue-on-error"] !== false) v.push("run-step-continue-on-error");
+    if (runStep.env && Object.prototype.hasOwnProperty.call(runStep.env, SENTINEL)) v.push("run-step-sentinel-override");
+  }
   if (String(job.env?.[SENTINEL] ?? "") !== "1") v.push("sentinel-missing");
 
   const svc = job.services?.neo4j;

@@ -157,8 +157,8 @@ jobs:
   # The real-Neo4j tier — the ONLY behavioural proof that graph tier isolation holds (group_id is
   # the sole enforcement, no RLS backstop) and, since GRAPHSAT-1, of the per-item episode lookup
   # that drives ledger mutations. NEO4JCI-1: this tier was in no CI job and rotted unseen for ~4
-  # weeks (a green `npm test` reported it skipped). The service mirrors compose.test.neo4j.yml
-  # exactly; NEO4J_TIER_REQUIRED makes an unset NEO4J_TEST a collection error instead of a silent
+  # weeks (a green `npm test` reported it skipped). The service's image/auth/bolt port/health contract
+  # = compose.test.neo4j.yml (the validator pins exactly those); NEO4J_TIER_REQUIRED makes an unset NEO4J_TEST a collection error instead of a silent
   # skip. The wiring is pinned by test/guards/neo4j-tier-wiring.test.ts.
   neo4j-tier-tests:
     name: Graph Neo4j tier (real Neo4j)
