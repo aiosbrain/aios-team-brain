@@ -33,7 +33,7 @@ transcript ingestion or chunking.
 ## 0. The bug, reproduced on live data
 
 The owner reported that "Content creation strategy session" (2026-08-11) lists **Fatma** and **Abe
-Isleem** as attendees when neither was there. Confirmed, and the mechanism is exact.
+Doe** as attendees when neither was there. Confirmed, and the mechanism is exact.
 
 `lib/meetings/llm-extract.ts` asks a model for *"the full names of every person who appears to have
 attended or spoken"*, then `matchAttendees` keeps only names that resolve against the member roster.
@@ -51,7 +51,7 @@ The transcript's only speaker label is `**John Ellison:**`.
 1. **The roster filter concentrates the error onto real teammates.** Carol, Pranita, Yana and Chayton
    are mentioned too and were dropped for not being members. So every false attendee is, necessarily,
    someone who plausibly *could* have been there.
-2. **Stefan escaped by one letter.** Mentioned three times; the roster spells him `Stephan Ledain`, so
+2. **Stefan escaped by one letter.** Mentioned three times; the roster spells him `Stephan Doe`, so
    `matchAttendees`'s first-name fallback compared `stefan` ≠ `stephan`. A spelling coincidence is the
    only reason there were two false attendees rather than three.
 
@@ -193,7 +193,7 @@ agrees with what is already recorded, it is doing something other than what it c
 | AC5 the reported bug | ✅ **at unit level** (`resolveAttendance` with the shipped hallucination mocked). The spec asked for data-mechanics; **not built** |
 | AC6 calendar + transcript → one note | ❌ **not delivered — the merge is DORMANT** |
 | AC7 merge never crosses dates / merged notes | ❌ deferred with AC6 |
-| AC8 backfill corrects the bad meeting, leaves correct ones | ✅ **proven on prod, dry-run**: 17 changed, **22 already correct**, and exactly `REMOVE: Abe Isleem, Fatma` on the reported meeting |
+| AC8 backfill corrects the bad meeting, leaves correct ones | ✅ **proven on prod, dry-run**: 17 changed, **22 already correct**, and exactly `REMOVE: Abe Doe, Fatma` on the reported meeting |
 
 **AC6/AC7 are not delivered, and the first review is why this says so.** The title comparator was
 built and tested, and I wrote in `docs/ARCHITECTURE.md` and the commit message that a calendar event

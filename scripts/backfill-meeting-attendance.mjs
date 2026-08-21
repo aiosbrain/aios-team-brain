@@ -4,7 +4,7 @@
  *
  * The fix in `lib/meetings/attendance.ts` only governs notes created from now on. The notes already
  * on the Meetings page carry the old inference, including the reported one: "Content creation
- * strategy session" (2026-08-11) lists Abe Isleem and Fatma, neither of whom attended, while its item
+ * strategy session" (2026-08-11) lists Abe Doe and Fatma, neither of whom attended, while its item
  * says `participants: "[John Ellison]"`.
  *
  * DRY RUN BY DEFAULT. This removes named people from meetings the owner has already read, so it

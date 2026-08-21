@@ -1,9 +1,9 @@
-# Nothing enforces the invariant the two adoption fixes exist to protect — ADOPTINV-1
+# Nothing enforces the invariant the two adoption fixes exist to protect — ADOPT-TASK-8
 
 **Status:** spec, draft 3 (built). Draft 1 was BLOCKED by both reviewers. The sharpest finding was that draft 1's
 own mutation criterion **could not go red** — it named the wrong file, and the mutant it described makes
 the adapter refuse *everything*, so no duplicate forms and the test stays green. · **Date:** 2026-08-18 ·
-**Owner:** Chetan · **Task:** `ADOPTINV-1`
+**Owner:** Chetan · **Task:** `ADOPT-TASK-8`
 **Follows:** [`pm-sync-declared-issue-adoption.md`](./pm-sync-declared-issue-adoption.md) (`ADOPTDECL-1`,
 #581) and [`pm-sync-footer-adoption-scope.md`](./pm-sync-footer-adoption-scope.md) (`ADOPTFOOT-1`, #588).
 **Unblocks:** `ADOPTUNIQ-1` — proves the code cannot violate the constraint *before* the constraint is added.
