@@ -4,9 +4,12 @@ access: team
 
 # GRAPHSAT-1 — the saturated group heals again (a direct per-name episode lookup, no sidecar change)
 
-Deps: none (TICKFIT-2 / PR #629 touches `run.ts`/`projection-run.ts` too — a textual merge, not a
-dependency; whichever lands second rebases). Build-with: fable / high (the failure direction is a
-metered re-push loop). Reviewers: Codex gpt-5.6-sol on the spec and the diff; Fable on the diff.
+Deps: **TICKFIT-2 (PR #629)** — this slice STACKS on `chetan/tickfit2-graph-delta` (PR base = that
+branch until it merges, then retargeted to `main`): the counters ride the ONE recording gate
+`shouldRecordProjectionRun` and `meta.reconcileMs` that #629 introduces (Codex design round 1 M3:
+"Deps: none" was false — AC4 named a suite that exists only on #629). Build-with: fable / high (the
+failure direction is a metered re-push loop). Reviewers: Codex gpt-5.6-sol on the spec and the
+diff; Fable on the diff.
 
 ## 0. What and why
 
@@ -47,37 +50,57 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 
 ## 0b. Decidables — defaults stated for the design round to attack
 
-- **D1 — the lookup is a FALLBACK for the saturated case only; the REST path is untouched.** For
-  each group, reconcile lists via REST exactly as today. If the window is NOT full → today's code,
-  unchanged (every existing pin stays green by construction). If the window IS full → instead of
-  `continue`, resolve the group's expected episode names via `lookupEpisodesByName(groupId, names)`
-  (a direct Cypher read, `MATCH (e:Episodic) WHERE e.group_id = $g AND e.name IN $names RETURN
-  e.uuid AS uuid, e.name AS name`, names chunked at `LOOKUP_NAME_BATCH = 500`), and feed the result
-  into the SAME `presentNames` set + FIRST-WINS `uuidByItemId` map the REST path builds
-  (`reconcile.ts:292-301`) — so confirmation, uuid backfill, `partialItems`, and both re-queue
-  branches run on identical downstream code. The expected names for the group are
-  `expectedEpisodeNames(row.source_id, row.chunk_shas.length)` over the group's ledger rows
-  (`landed-state.ts:39`, the single owner of the name convention), PLUS the bare `items:<id>` form
-  for multi-chunk rows (a legacy single-episode landing — the "hole-by-renaming" class
-  `reconcile.ts:312-318` names stays uncounted exactly as today, but a legacy landing must still
-  CONFIRM the item rather than be re-queued as never-landed). Alternative considered and rejected:
-  always-Cypher (drop REST listing). Rejected because it makes Neo4j a HARD dependency of a leg that
-  today has one, and because the REST path's existing dm pins (`test/datamechanics/graph-project.datamechanics.test.ts`
+- **D1 — the lookup is a FALLBACK for the saturated case only, and it resolves by ITEM IDENTITY,
+  not by current expected names (Codex design round 1 BLOCKER).** For each group, reconcile lists
+  via REST exactly as today. If the window is NOT full → today's code, unchanged (every existing
+  pin stays green by construction). If the window IS full → instead of `continue`, resolve the
+  group's ledger items via `lookupItemEpisodes(groupId, itemIds)`: a direct Cypher read
+  `MATCH (e:Episodic) WHERE e.group_id = $g AND e.name STARTS WITH 'items:' AND
+  split(e.name, '#')[0] IN $itemNames RETURN e.uuid AS uuid, e.name AS name` with
+  `$itemNames = itemIds.map((id) => \`items:${id}\`)`, chunked at `LOOKUP_BATCH = 500` ids. This
+  returns EVERY present chunk of every ledger item — `items:x`, `items:x#0`, `items:x#7`, a legacy
+  single-episode landing, a pre-shrink `#0..#2` set — exactly the population the REST path sees for
+  those items, and it is fed into the SAME `presentNames` set + FIRST-WINS `uuidByItemId` map the
+  REST path builds (`reconcile.ts:292-301`, extracted into one helper both paths call), so
+  confirmation, uuid backfill, `partialItems`, the documented hole-by-renaming under-count
+  (`reconcile.ts:312-318` — a shrunk doc still CONFIRMS through its legacy `#0`, exactly as today),
+  and both re-queue branches run on identical downstream code. WHY NOT expected names: a doc that
+  shrank 3→1 chunks has `chunk_shas.length 1` and expects `items:x`, but delta projection never
+  wrote that name — the REST path confirms it via `itemIdFromEpisodeName("items:x#0")`; a
+  name-based lookup would have judged it never-landed and (flag on) re-pushed a landed row. The
+  flag would only have postponed that wrong verdict. Pinned by explicit shrink 3→1, grow 1→N and
+  chunk-config-transition arms (AC1). Prefix is `STARTS WITH 'items:'` (`ITEM_EPISODE_PREFIX`)
+  so `correction:<arc_id>` writebacks are never considered; the item term is EXACT equality on the
+  pre-`#` stem, so `items:abc` can never confirm `items:abcd`. Alternative considered and rejected:
+  always-Cypher (drop REST listing) — it makes Neo4j a HARD dependency of a leg that today has one,
+  and the REST path's existing dm pins (`test/datamechanics/graph-project.datamechanics.test.ts`
   §reconcile) are the proof the unchanged 99% stays unchanged.
 - **D2 — every failure degrades to TODAY, never to "none landed".** `NEO4J_URL` unset → today's
   skip-and-count; driver/transport error or a query throw → today's skip-and-count; a chunk of the
   name lookup failing → the WHOLE group is skipped-and-counted for this pass (a partial name set
   would read absent-because-unfetched as never-landed — the fail-toward-re-push direction this must
-  never take, the same rule TICKFIT-2 L1 applied to the batched ledger read). Pinned: a lookup that
-  throws on the 2nd chunk yields `saturatedGroups 1, reQueued 0, confirmed 0`.
-- **D3 — visibility splits the counter rather than overloading it.** `saturatedGroups` keeps
-  its meaning: groups past the window that were NOT judged this pass (lookup unavailable/failed).
-  New: `deepResolvedGroups` — groups past the window that WERE judged via the lookup. Both ride
-  `ReconcileSummary` → `GraphProjectionSummary` → `ingest_runs.meta` → the recording gate
-  (`shouldRecordProjectionRun` gains `deepResolvedGroups`? NO — a healthy deep-resolved pass over a
-  converged group is QUIET; a gate clause would record a row every hour forever. `saturatedGroups`
-  stays a gate signal because it now means "a group is not being judged"; `deepResolvedGroups` is
-  meta-only). The scheduler log line names deep-resolved groups when non-zero.
+  never take, the same rule TICKFIT-2 L1 applied to the batched ledger read). Pinned at BOTH
+  layers (round 1 M1): a UNIT test on `lib/graph/episode-lookup.ts` mocks the per-batch `runRead`,
+  returns matches for batch 1 and throws on batch 2, and asserts the exported lookup REJECTS
+  without yielding any rows (an implementation that swallowed batch 2 and returned batch 1 would
+  be the partial-set bug); and a dm arm where the injected lookup throws yields today's verdict
+  (`saturatedGroups 1, reQueued 0, confirmed 0`, ledger untouched).
+- **D3 — visibility splits the counter, and MEASUREMENT MODE IS LOUD (round 1 H1).**
+  `saturatedGroups` keeps its meaning: groups past the window that were NOT judged this pass
+  (lookup unconfigured/failed) — still a gate signal. New: `deepResolvedGroups` (groups past the
+  window judged via the lookup), `deepRequeueHeld` (rows the lookup judged never-landed that the
+  flag held back), `deepRequeueSample` (≤5 held item ids, OLDEST `projected_at` first — a
+  deterministic order so two passes' samples are comparable). Gate rule, on the ONE shared
+  predicate `shouldRecordProjectionRun`: `deepRequeueHeld > 0` ALWAYS records (work is being
+  held — that is a signal); and while `GRAPH_DEEP_REQUEUE` is OFF, `deepResolvedGroups > 0` ALSO
+  records — the rollout phase is the measurement phase, and a "lookup succeeded, zero held" result
+  must be a durable row the operator can read, not an absence they must infer. Once the flag is
+  ON, a quiet deep-resolved pass is quiet (meta-only), like any other converged pass. The
+  predicate therefore takes the flag as an input (`{ deepRequeueEnabled }`), pinned per clause.
+  The scheduler log line names deep-resolved/held counts when non-zero. Round 1 also asked that
+  the durable path be proven end to end, not just the mapper: AC4 pins the predicate AND the
+  projection-run meta AND (dm) an actual `ingest_runs` row written by the scheduler-equivalent
+  call path for a held-only summary.
 - **D4 — the first deployment MEASURES before it RE-QUEUES (the RECONCILE-1 pattern).** On the
   first judged pass over General the lookup will confirm most of 2,833 rows, backfill 648 uuids,
   and count `partialItems` — and find some number N of rows whose names are ALL absent. Each such
@@ -88,17 +111,40 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   until noticed. So: `GRAPH_DEEP_REQUEUE` (env, default **false**) gates ONLY the two re-queue
   branches on the lookup path — confirmation, uuid backfill, and `partialItems` run regardless;
   rows that WOULD have been re-queued are counted as `deepRequeueHeld` (meta, durable) instead.
-  The revisit trigger is explicit: read `deepRequeueHeld` and `partialItems` from `ingest_runs`
-  after the first prod passes; if `deepRequeueHeld` is small and its sample (a bounded
-  `deepRequeueSample` of ≤5 item ids, same shape as `partialDetail`) checks out by hand, flip
-  the flag. Alternative rejected: shipping re-queue ON with the 20/pass throttle as the only
+  **Enabling the flag is an OPERATIONAL INVESTIGATION, not "a small count looks plausible"
+  (round 1 H2):** `LANDED_GRACE_MS` is one projection interval (1h), but graphiti's worker is
+  SERIAL at ~1 episode/minute and prod's own first ingest hour queued 175 items
+  (`extraction-health.ts:581`) — so a row older than the cutoff can be QUEUED, not lost, and a
+  per-name absence cannot tell the two apart. The enable criteria, all required and written
+  here so they are not re-derived under pressure: (1) `deepRequeueHeld` stable (not growing) and
+  its ordered sample IDENTICAL across ≥3 consecutive recorded passes spanning longer than the
+  worker's current queue lag; (2) Episodic liveness (`extraction-health`'s `newestEpisodicAt`)
+  recent during those passes — the worker is alive, so absence is not a backlog; (3) the sample's
+  items hand-checked absent in the group via the admin graph surfaces. Structural follow-up,
+  NOT this slice (schema): persist "judged absent since" per row so re-queue requires K
+  consecutive absent passes by construction — filed if the measurement shows held rows are
+  common. Alternative rejected: shipping re-queue ON with the 20/pass throttle as the only
   bound — the throttle bounds the RATE, not the DIRECTION, and a wrong direction at 480/day is
   the cost-explosion class GRAPHCOST-* spent a month removing.
 - **D5 — isolation and congruence.** `group_id = $g` is the SOLE isolation term (no RLS backstop
   — CLAUDE.md §5); the lookup is group-scoped by the ledger's `graph_episodes.group_id`, the same
   ids the extraction-health census already proves congruent with Neo4j's `group_id`
-  (`extraction-health.ts:555-557`). Names are exact-match (`IN`), never prefix — `items:abc` must
-  not confirm `items:abc#3`'s item through a different row.
+  (`extraction-health.ts:555-557`). The item term is exact equality on the pre-`#` stem. Because
+  this lookup DRIVES POSTGRES MUTATIONS (uuid backfill, re-queue), the source-level tier guard
+  `test/guards/graph-tier-filter.test.ts` — which today scans only `lib/graph/learning.ts` for
+  `group_id IN $groups` — is widened to an owned-module list that includes
+  `lib/graph/episode-lookup.ts`, requiring `e.group_id = $g` in every Cypher block there
+  (round 1 M5). `NEO4J_URL`/`NEO4J_USER`/`NEO4J_PASSWORD` are SET on the prod brain service
+  (observed via `railway variables`, 2026-08-21 — not inferred from the template).
+- **D5b — the flag's contract.** `GRAPH_DEEP_REQUEUE` enables re-queue on the lookup path iff
+  `process.env.GRAPH_DEEP_REQUEUE === "true"` (exact; `"false"`, `"1"`, `"yes"`, unset → OFF —
+  a truthiness check would make `=false` enable it, round 1 M4). `reconcileProjectedEpisodes`
+  takes ONE options object `{ lookup?, deepRequeue? }` whose defaults are the Neo4j lookup and
+  the env parse; tests inject both. Parse pinned for unset/"false"/"true"/arbitrary.
+- **D5c — the dm tier is hermetic to Neo4j.** `vitest.datamechanics.config.ts` sets
+  `process.env.NEO4J_URL = ""` before module load (it already blanks every LLM transport); a
+  dev shell exporting a real URL can no longer flip the saturated pin by deep-resolving against
+  unrelated local state (round 1 M2).
 - **D6 — the Cypher lives in a NEW owner module**, `lib/graph/episode-lookup.ts` (new file), not in
   `lib/graph/learning.ts`: the `lib/graph/neo4j.ts:8` rule ("all Cypher lives in `lib/graph/learning`") is already
   stale (`lib/graph/extraction-health.ts` holds Cypher), so this slice widens the rule EXPLICITLY in the
@@ -111,10 +157,12 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 
 | Surface | Change |
 |---|---|
-| `lib/graph/episode-lookup.ts` (new file, to create) | `lookupEpisodesByName(groupId, names)` over `runRead`, chunked; returns `null` when `!neo4jConfigured()`; throws on transport/query error (the caller owns the degrade) |
-| `lib/graph/reconcile.ts` | the saturated branch: lookup → same downstream; `deepResolvedGroups`, `deepRequeueHeld`, `deepRequeueSample`; `GRAPH_DEEP_REQUEUE` flag; injectable lookup |
-| `lib/graph/run.ts`, `lib/graph/projection-run.ts`, `lib/graph/scheduler.ts` | the three counters ride summary → meta → log line; `saturatedGroups` stays the gate signal |
-| `lib/graph/neo4j.ts` | header: the Cypher-ownership rule widened explicitly |
+| `lib/graph/episode-lookup.ts` (new file, to create) | `lookupItemEpisodes(groupId, itemIds)` over `runRead`, chunked at 500 ids; returns `null` when `!neo4jConfigured()`; REJECTS (no partial rows) on any batch error — the caller owns the degrade |
+| `lib/graph/reconcile.ts` | the saturated branch: lookup → the SAME presence-map helper → same downstream; `deepResolvedGroups`, `deepRequeueHeld`, `deepRequeueSample`; options `{ lookup?, deepRequeue? }` |
+| `lib/graph/run.ts`, `lib/graph/projection-run.ts`, `lib/graph/scheduler.ts` | the counters ride summary → meta → log line; `shouldRecordProjectionRun` gains `deepRequeueHeld` + the measurement-mode clause (takes `deepRequeueEnabled`) |
+| `lib/graph/neo4j.ts` | header: the Cypher-ownership rule widened explicitly to the owned-module list |
+| `test/guards/graph-tier-filter.test.ts` | owned-module list: `learning.ts` (`group_id IN $groups`) + `episode-lookup.ts` (`group_id = $g`) |
+| `vitest.datamechanics.config.ts` | `NEO4J_URL = ""` |
 | `test/datamechanics/fake-graphiti.ts` | unchanged (the lookup is injected, not a client method) |
 | `docs/ARCHITECTURE.md:115` | saturation prose added (it has NONE today — a live drift gap TICKFIT-2 promised to close) |
 | Schema | **NONE** |
@@ -124,13 +172,19 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 - The lookup returns `{uuid, name}[]`; building `presentNames`/`uuidByItemId` from it is the same
   loop as `reconcile.ts:296-301` over a different source — extracted into one helper used by both
   paths so the two cannot drift.
-- Expected names per group are computed ONCE per group from its ledger rows; a row with
-  `chunk_shas = []` contributes nothing (it is the never-pushed discriminator, `reconcile.ts:354`,
-  and `landedState` reports `none` for it without a lookup).
-- Name-list size for General ≈ 6,915 + 2,833 legacy forms ≈ 9.7k names → ~20 chunks of 500 per
-  pass, each a group-index scan + property filter. Payload: the RESULT set only (present names +
-  uuids), not the whole group — strictly less transfer than the 5,000-episode REST window it
-  replaces for this group.
+- The lookup's input is the group's ledger ITEM ids (2,833 for General → 6 chunks of 500), each
+  chunk a group-index scan + `split()` property filter over ~7k+ Episodic nodes (no `name` index —
+  stated). Payload: the RESULT set only (present names + uuids, ~7k rows for General on a healthy
+  pass) — comparable to the 5,000-episode REST window it replaces, and EXACT rather than truncated.
+- The first judged pass over General issues up to 648 row-scoped `episode_uuid` updates
+  (`reconcile.ts:322`) — each independent, retry-safe (a null uuid is simply backfilled next pass),
+  no lock interaction; `meta.reconcileMs` (from #629) records what it cost, so the "first pass" is
+  measured, not assumed (round 1 L2). A bulk `update … from (values …)` is the named optimization
+  if that number matters.
+- Prod measurement for the BLOCKER's class: 0 pre-chunking multi-chunk rows (every pre-2026-07-17
+  row is single-chunk); 3 chunk configs in use (`2500x16` 2,073 · `cdc1-2500-1250-4000-80` 652 ·
+  `2500x40` 112) — config transitions are real in prod, so the shrink/grow/transition arms are not
+  hypothetical. First uuid-less row: 2026-08-04 — the saturation date.
 - The tier-cleanup leg (`reconcile.ts:388-501`, `GROUP_SCAN_DEPTH` 100,000, its own `saturated`
   flag that blocks only the flag-CLEAR) and `deleteItemEpisodes` (`project.ts:651`) stay on REST —
   out of scope, named in §4.
@@ -138,39 +192,55 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 ## 3. Acceptance criteria (spec-first; exact commands)
 
 1. `npm run test:datamechanics:iso test/datamechanics/graph-saturated-heal.datamechanics.test.ts`
-   exits 0 — real Postgres, `FakeGraphiti` filled past `LANDED_SCAN_DEPTH`, an INJECTED lookup:
-   (a) the saturated group is JUDGED — `deepResolvedGroups 1`, `saturatedGroups 0`, a landed row
-   `confirmed` with its `episode_uuid` backfilled, a row missing one of three chunks counted in
-   `partialItems` with the missing name in `partialDetail`; (b) a never-landed row past the grace
-   with the flag OFF is HELD — `deepRequeueHeld 1`, its id in `deepRequeueSample`, `reQueued 0`,
-   `content_sha256` untouched; (c) the same row with `GRAPH_DEEP_REQUEUE=true` (injected option)
-   is re-queued — `reQueued 1`, `content_sha256 = ''`, `first_seen_at` preserved (STALLSCOPE-1);
-   (d) D2: a lookup that returns `null` (unconfigured) → today's verdict exactly
-   (`saturatedGroups 1, reQueued 0, confirmed 0`, ledger untouched); a lookup that THROWS on its
-   second chunk → the same; (e) D5: the lookup is called with the ledger's `group_id` and names
-   that are EXACT (`items:<id>`, `items:<id>#k`), never a prefix; a present name for a DIFFERENT
-   item does not confirm this one.
+   exits 0 — real Postgres, `FakeGraphiti` filled past `LANDED_SCAN_DEPTH`, an INJECTED lookup
+   (`{ lookup, deepRequeue }` options): (a) the saturated group is JUDGED — `deepResolvedGroups 1`,
+   `saturatedGroups 0`, a landed row `confirmed` with its `episode_uuid` backfilled, a row missing
+   one of three chunks counted in `partialItems` with the missing name in `partialDetail`;
+   (b) ITEM IDENTITY: a row that SHRANK 3→1 (ledger `chunk_shas.length 1`, graph holds only
+   `items:x#0..#2`) CONFIRMS and is neither held nor re-queued; a row that GREW 1→3 (ledger
+   expects `#0..#2`, graph holds only the legacy bare `items:x`) CONFIRMS and is NOT counted
+   partial — `landedState` reports `none` inside the confirmed branch, the documented
+   hole-by-renaming under-count (`reconcile.ts:312-318`) — and the arm PROVES it is today's
+   verdict by running the same fixture through the REST path (unsaturated) first and asserting
+   the two summaries agree; a chunk-config transition (same count, different `chunk_config`)
+   confirms; (c) a never-landed
+   row past the grace with `deepRequeue: false` is HELD — `deepRequeueHeld 1`, its id in
+   `deepRequeueSample`, `reQueued 0`, `content_sha256` untouched; (d) the same row with
+   `deepRequeue: true` is re-queued — `reQueued 1`, `content_sha256 = ''`, `first_seen_at`
+   preserved (STALLSCOPE-1); (e) D2: a lookup returning `null` → today's verdict
+   (`saturatedGroups 1, reQueued 0, confirmed 0`, ledger untouched); a lookup that THROWS → the
+   same; (f) D5: the lookup is called with the ledger's `group_id` and ITEM ids; a present
+   episode for a DIFFERENT item (`items:abcd` when the ledger holds `abc`) does not confirm.
 2. `npm run test:datamechanics:iso test/datamechanics/graph-project.datamechanics.test.ts` exits 0
    with ONE consciously revised pin: the existing saturated-group arm (`:801-820`) keeps
    `reQueued 0` and the ledger row, and its `saturatedGroups 1` assertion now runs with the
-   default lookup UNCONFIGURED (`NEO4J_URL` unset in the dm tier) — i.e. it becomes the D2 pin for
-   the real default, not a fake. The cleanup-leg saturation pin (`:844-874`) and the throttle pin
+   default lookup UNCONFIGURED (D5c pins `NEO4J_URL = ""` in the tier) — it becomes the D2 pin
+   for the real default. The cleanup-leg saturation pin (`:844-874`) and the throttle pin
    (`:779-799`) stay green UNCHANGED.
 3. `npm run test:neo4j` (after `npm run db:test:neo4j:up`; self-skips without `NEO4J_TEST`) exits 0
    with a new arm in `test/graph-neo4j-tier.test.ts`: real `(:Episodic {uuid, name, group_id})`
-   nodes in two groups; `lookupEpisodesByName(groupA, [...])` returns ONLY group A's matches, with
-   their uuids, for exact names; a name present only in group B is absent; >500 names chunk
-   correctly (the same names resolve across the chunk boundary).
-4. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts` exits 0:
-   `meta.deepResolvedGroups`, `meta.deepRequeueHeld`, `meta.deepRequeueSample` reach the durable
-   row; `shouldRecordProjectionRun` is FALSE for a quiet deep-resolved pass
-   (`deepResolvedGroups 1`, all else zero) and TRUE for `saturatedGroups 1` alone (unchanged).
+   nodes in two groups; `lookupItemEpisodes(groupA, [ids])` returns ONLY group A's chunks
+   (`items:x`, `items:x#0`, `items:x#1` all present for one id), with uuids; a node in group B
+   for the same id is absent; `items:abcd` is absent when asking for `abc`; `correction:<id>` is
+   never returned; >500 ids chunk correctly (an id in the second chunk resolves).
+4. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts
+   test/graph-episode-lookup.test.ts` exits 0: `meta.deepResolvedGroups`, `meta.deepRequeueHeld`,
+   `meta.deepRequeueSample` reach the durable row; `shouldRecordProjectionRun` is TRUE for
+   `deepRequeueHeld 1` alone (either flag state), TRUE for `deepResolvedGroups 1` alone with
+   `deepRequeueEnabled: false`, FALSE for `deepResolvedGroups 1` alone with `true`, TRUE for
+   `saturatedGroups 1` alone (unchanged); the env parse: unset/`"false"`/`"1"`/`"yes"` → false,
+   `"true"` → true; the lookup unit: batch 1 returns rows, batch 2 throws → the promise REJECTS and
+   no rows are surfaced. Plus (dm, in AC1's file) an actual `ingest_runs` row exists after
+   `recordIngestRun(projectionRunInput(summary))` for a held-only summary gated by the predicate —
+   the end-to-end durable path, not just the mapper.
 5. Mutations, verdicts verbatim in the PR: (a) make the saturated branch `continue` again (ignore
-   the lookup) → AC1(a) reddens; (b) drop the partial-chunk failure → whole-group skip (use the
-   partial name set) → AC1(d) reddens; (c) invert the `GRAPH_DEEP_REQUEUE` gate → AC1(b) reddens;
-   (d) change the Cypher `=` group term to `IN $g`-less / drop it → AC3's cross-group arm reddens;
-   (e) prefix-match names (`STARTS WITH`) → AC1(e)/AC3 reddens.
-6. Full tiers green: `npm test` · dm iso (the graph set) · `npm run test:http:local` ·
+   the lookup) → AC1(a) reddens; (b) swallow the second batch's error in the lookup → AC4's unit
+   reddens; (c) invert the `deepRequeue` gate → AC1(c) reddens; (d) drop the Cypher group term →
+   AC3's cross-group arm AND the widened tier guard redden; (e) match by current expected names
+   instead of the item stem → AC1(b)'s shrink arm reddens; (f) truthiness parse of the env →
+   AC4's `"false"` arm reddens; (g) drop `deepRequeueHeld` from the gate → AC4 reddens.
+6. Full tiers green: `npm test` · dm iso (the graph set) · `npm run test:http:local` (the stacked
+   PR runs only the gate workflows — the http tier is run locally and commented on the PR) ·
    `npm run check:docs` · `docs/ARCHITECTURE.md:115` gains the saturation + lookup prose.
 
 ## 4. Out of scope, named
@@ -181,8 +251,8 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   builds partition suppression on `pending_delete` staying set while a scan is inconclusive).
 - The hole-by-renaming class (`reconcile.ts:312-318`) — still uncounted, deliberately.
 - Flipping `GRAPH_DEEP_REQUEUE` on — a human decision after reading the first passes' meta (D4).
-- The admin button's inline recording gate — already unified in TICKFIT-2 (#629, pending merge);
-  this slice does not touch it. If #629 merges first, `deepResolvedGroups` is NOT added to the
-  shared gate (D3); if this merges first, the same ruling applies to the scheduler's gate.
+- Persisting a per-row "judged absent since" so re-queue needs K consecutive absent passes by
+  construction (schema) — the structural successor to D4's flag, filed only if measurement shows
+  held rows are common.
 - Duplicate-episode cleanup inside General (the amplification the stall already caused) — a
   different slice, needs the measurement this one restores.
