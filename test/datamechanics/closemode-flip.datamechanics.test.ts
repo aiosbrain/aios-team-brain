@@ -5,6 +5,8 @@ import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { countUnrepairable } from "@/lib/projects/context/backfill-candidates";
 import { closeMembershipInto } from "@/lib/projects/context/memberships";
 import { canSeeItem } from "@/lib/access/enforce";
+import { projectItemsToGraph } from "@/lib/graph/project";
+import { FakeGraphiti, client } from "./fake-graphiti";
 
 // CLOSEMODE-1 ACs (docs/design/closemode1-mode-aware-close.md §3): the audience flip spares a
 // human's standing exclusion (non-auto exclude) on the opposite system project; the return leg's
@@ -75,6 +77,10 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
     // AC1(e2): the standing state is NOT re-visited (the target carve-out) and IS counted as an
     // unrepairable exclude-shadow — operator-attention semantics, not a failed repair.
     const p = await backfillTeamContext(db(), seed.teamId);
+    // DISCRIMINATING (Codex diff review M): without ok, deleting the target carve-out would select the
+    // item, the reconcile would REFUSE before scanned++ — and scanned 0 would stay green while the
+    // pass went red. ok:true proves "not visited", not "visited and failed".
+    expect(p.ok).toBe(true);
     expect(p.scanned, "no repeated backfill visit after the refused flip").toBe(0);
     const unrepairable = await countUnrepairable(seed.teamId);
     expect(unrepairable?.excludeShadows, "the standing exclusion counts — intended, permanent").toBe(1);
@@ -153,5 +159,45 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
     const r = await backfillTeamContext(db(), seed.teamId);
     expect(r.scanned).toBe(1);
     expect(r.spared, "the backfill's own pass counted the spare").toBe(1);
+  });
+
+  it("AC1(g) THE GRAPH LEG: in the standing state a projector pass moves the episodes OUT of the external graph group", async () => {
+    const seed = await seedTeam();
+    const { data: team } = await db().from("teams").select("slug").eq("id", seed.teamId).single();
+    const slug = (team as { slug: string }).slug;
+    const item = await ingest(seed, { kind: "deliverable", path: "docs/g.md", body: "graph-visible sensitive", access: "external" });
+    await backfillTeamContext(db(), seed.teamId);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    const extGroup = `${slug}_external`;
+    expect([...(fake.store.get(extGroup)?.values() ?? [])].some((e) => e.name.startsWith(`items:${item.id}`)), "starts in the external graph group").toBe(true);
+
+    // The standing state: force_exclude on external-shared, flip out (General include, exclusion spared),
+    // flip back refused — access stays 'external'.
+    const ext = await systemProject(seed, "external-shared");
+    const unit = await unitOf(seed, item.id);
+    await plant(seed, ext, unit, "exclude", "force_exclude");
+    await flipAccess(seed, item.id, "team");
+    await flipAccess(seed, item.id, "external"); // refused; access committed by the caller in prod — mirror that:
+    await db().from("items").update({ access: "external" }).eq("id", item.id).eq("team_id", seed.teamId);
+
+    const res = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect(res.externalGroupVacated, "the move out of the external partition is counted").toBeGreaterThanOrEqual(1);
+    const { data: rows } = await db().from("graph_episodes").select("group_id, pending_delete_group_id, content_sha256").eq("team_id", seed.teamId).eq("source_id", item.id);
+    const ledger = (rows ?? []) as { group_id: string; pending_delete_group_id: string | null; content_sha256: string }[];
+    expect(ledger.some((r) => r.group_id === `${slug}_team` && r.content_sha256 !== ""), "the General group holds the content").toBe(true);
+    expect(ledger.some((r) => r.pending_delete_group_id === extGroup), "the external copy is pending-delete").toBe(true);
+  });
+
+  it("AC1(h) FAIL-OPEN: an external item with NO substrate unit homes in the external group exactly as today", async () => {
+    const seed = await seedTeam();
+    const { data: team } = await db().from("teams").select("slug").eq("id", seed.teamId).single();
+    const slug = (team as { slug: string }).slug;
+    const item = await ingest(seed, { kind: "deliverable", path: "docs/h.md", body: "no unit yet", access: "external" });
+    // Simulate the pre-backfill race: delete the unit the ingest hook created (memberships cascade).
+    await db().from("project_context_units").delete().eq("team_id", seed.teamId).eq("source_item_id", item.id);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    expect([...(fake.store.get(`${slug}_external`)?.values() ?? [])].some((e) => e.name.startsWith(`items:${item.id}`)), "homes external — a substrate race never demotes").toBe(true);
   });
 });

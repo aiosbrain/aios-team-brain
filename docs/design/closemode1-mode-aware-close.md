@@ -86,6 +86,25 @@ round 1), preserves the human's authority, and makes the round trip compose with
   `reconcileItemContext`. dm pins the first two hops; the scheduler's nested meta writer is
   pinned by a source-shape assertion (it is not callable from dm). NO recording-gate claim:
   sparing is the quiet, correct direction. Zero new schema.
+- **D6 — THE GRAPH LEG follows the membership (Codex diff review BLOCKER).** The projector homed
+  an item by RAW `items.access` (`project.ts:865`) and explicitly exempted external items from
+  membership-aware home removal (the "external-shared analogue is 6b/follow-up territory" note) —
+  so this slice's own designed standing state (`access='external'`, a standing exclusion,
+  General-only membership) would keep the item's episodes in the EXTERNAL graph group, which
+  external principals query wholesale: item reads refused, graph facts served. Pre-existing for
+  hand-planted excludes; this slice made it deterministically reachable, so it lands now:
+  `resolveFanoutTargets` gains `inExternalShared` (items whose unit holds a current
+  external-shared include; rule-1 fail-open — no unit or unbootstrapped external-shared reads as
+  included, so a substrate race can never demote a healthy external item), and the home selection
+  uses `effectiveExternal = access='external' AND (inExternalShared OR NOT inGeneral)` — the
+  demotion applies ONLY in the standing-exclusion state (excluded from external-shared AND
+  included in General, where the substrate serves the item via General); an external item in
+  NEITHER system project (restricted into an initiative) keeps access-based homing, because
+  PCCC-6's restriction semantics own that shape (the fan-out home dm arm pinned this — the
+  blanket form would have homed restricted content in the team group). In the standing state the
+  EXISTING tier-move machinery (copy, pending-delete, reconcile purge, `externalGroupVacated`
+  cache invalidation) pulls the content out of the external partition; the purge window until
+  reconcile confirms is the same accepted window every access flip already has.
 - **D5 — out of scope, named:** force-include semantics on system projects (reject / suspend /
   override-event — a Phase D design decision, recorded in round 1's terms); dual-system graph
   projection; the curation UI's own audited close; restoring already-ended authority (prod has
@@ -136,12 +155,17 @@ round 1), preserves the human's authority, and makes the round trip compose with
    include survives, and `excludeShadows` counts the standing target-side exclusion (pinned as
    intended, not a failed repair); (f) `spared` reaches `reconcileItemContext`'s result and
    `BackfillResult`/`TeamBackfillOutcome` (dm), and the scheduler's meta writer names it
-   (source-shape assertion).
+   (source-shape assertion); (g) THE GRAPH LEG: in the standing state a projector pass moves the
+   item's episodes OUT of the external graph group (the General group gains the content, the
+   external ledger row carries `pending_delete`, `externalGroupVacated` counts it); (h) FAIL-OPEN:
+   an external item whose unit is absent homes in the external group exactly as today.
 2. Existing dm suites green UNCHANGED (`exclude-shadow-repair`, `context-reconcile-item`,
    backfill, enforcement suites).
 3. Mutations, verdicts verbatim in the PR: (a) close spared excludes again (drop the mode/decision
    exception) → AC1(a) reddens; (b) spare auto excludes too → AC1(b) reddens; (c) spare forced
-   includes → AC1(c) reddens; (d) drop the candidate-predicate exception → AC1(e) reddens.
+   includes → AC1(c) reddens; (d) drop the candidate-predicate exception → AC1(e) reddens;
+   (e) home by raw access again (drop `effectiveExternal`) → AC1(g) reddens; (f) drop the
+   rule-1 fail-open (treat no-unit as excluded) → AC1(h) reddens.
 4. Full tiers green (`npm test`, dm iso, `npm run test:http:local`, `npm run check:docs`);
    ARCHITECTURE updated.
 
