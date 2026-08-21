@@ -45,11 +45,14 @@ describe("RECONULL-1 — a failed group listing is counted, nothing is written o
     const f = await fixture();
     f.fake.failListFor.add(f.teamGroup);
     const before = await rows(f.seed.teamId, f.teamGroup);
+    const calls: string[] = [];
+    // A COUNTING lookup (a throwing one would be defeated by a stray `.catch`): the pin is calls === 0.
     for (const lookup of [
-      (async () => { throw new Error("the lookup must not be called on the unreachable branch"); }) as EpisodeLookup,
-      (async () => null) as EpisodeLookup,
+      (async (g: string) => { calls.push(g); return []; }) as EpisodeLookup,
+      (async (g: string) => { calls.push(g); return null; }) as EpisodeLookup,
     ]) {
       const res = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId, { lookup, deepRequeue: true });
+      expect(calls, "the lookup must never be called on the unreachable branch").toEqual([]);
       expect(res.unreachableGroups).toBe(1);
       expect(res.saturatedGroups).toBe(0);
       expect(res.deepResolvedGroups).toBe(0);
