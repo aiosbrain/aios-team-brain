@@ -29,6 +29,7 @@ const base: GraphProjectionSummary = {
   deepRequeueHeld: 0,
   deepRequeueHeldByGroup: {},
   deepRequeueSample: [],
+  deepRequeueElided: 0,
   deepRequeueEnabled: false,
   probeFallbackPages: 0,
   lockedOut: 0,

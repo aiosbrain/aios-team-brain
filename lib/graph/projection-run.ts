@@ -112,7 +112,7 @@ export function projectionRunInput(
       // about the mode that produced it.
       ...(summary.deepResolvedGroups ? { deepResolvedGroups: summary.deepResolvedGroups, deepRequeueEnabled: summary.deepRequeueEnabled } : {}),
       ...(summary.lookupMismatchGroups ? { lookupMismatchGroups: summary.lookupMismatchGroups } : {}),
-      ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample } : {}),
+      ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample, deepRequeueElided: summary.deepRequeueElided } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,
       // which is exactly the position that made this hole invisible for so long. Counted only; no

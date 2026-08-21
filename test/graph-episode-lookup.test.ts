@@ -67,3 +67,30 @@ describe("GRAPH_DEEP_REQUEUE — exact parse (D5b)", () => {
     expect(deepRequeueEnabledFromEnv({ GRAPH_DEEP_REQUEUE: "true" })).toBe(true);
   });
 });
+
+import { boundDeepRequeueSample, DEEP_REQUEUE_SAMPLE_LIMIT, type DeepRequeueRef } from "@/lib/graph/reconcile";
+
+// Codex diff review M2: D4's enable criterion needs EVERY held candidate enumerable; a fixed oldest-5
+// could never show a stable sixth row. Up to the inspectable bound every identity rides; past it the
+// caller reports `deepRequeueElided` instead of silently truncating.
+describe("boundDeepRequeueSample — enumerable up to the inspectable bound, total order", () => {
+  const ref = (i: number, extra: Partial<DeepRequeueRef> = {}): DeepRequeueRef => ({
+    teamId: "t", groupId: "g", itemId: `i${String(i).padStart(3, "0")}`, projectedAt: `2020-01-01T00:00:${String(i % 60).padStart(2, "0")}Z`, ...extra,
+  });
+  it("six held rows → all six identities (oldest first), none elided", () => {
+    const six = [5, 3, 1, 4, 2, 0].map((i) => ref(i));
+    const out = boundDeepRequeueSample(six);
+    expect(out.map((r) => r.itemId)).toEqual(["i000", "i001", "i002", "i003", "i004", "i005"]);
+  });
+  it("past the bound exactly DEEP_REQUEUE_SAMPLE_LIMIT ride; the caller's elided = held − sample", () => {
+    const many = Array.from({ length: DEEP_REQUEUE_SAMPLE_LIMIT + 7 }, (_, i) => ref(i, { projectedAt: "2020-01-01T00:00:00Z" }));
+    const out = boundDeepRequeueSample(many);
+    expect(out).toHaveLength(DEEP_REQUEUE_SAMPLE_LIMIT);
+    expect(many.length - out.length).toBe(7);
+  });
+  it("a total order: same projectedAt + itemId in two groups/teams sorts deterministically, not by input order", () => {
+    const a = ref(1, { groupId: "g-b" }), b = ref(1, { groupId: "g-a" });
+    expect(boundDeepRequeueSample([a, b]).map((r) => r.groupId)).toEqual(["g-a", "g-b"]);
+    expect(boundDeepRequeueSample([b, a]).map((r) => r.groupId)).toEqual(["g-a", "g-b"]);
+  });
+});

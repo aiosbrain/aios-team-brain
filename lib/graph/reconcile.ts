@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
-import { landedState, boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
+import { landedState, boundPartialDetail } from "./landed-state";
 import {
   GROUP_SCAN_DEPTH,
   IN_CLAUSE_BATCH,
@@ -140,9 +140,14 @@ export interface ReconcileSummary {
    * because `deepRequeue` is off (measurement mode). Always a recording-gate signal. */
   deepRequeueHeld: number;
   deepRequeueHeldByGroup: Record<string, number>;
-  /** ≤ PARTIAL_DETAIL_LIMIT held rows as STRUCTURED identities, OLDEST first — an item id alone is
-   * not identifiable across groups/teams (Codex design round 2 H2). */
+  /** Held rows as STRUCTURED identities, OLDEST first — an item id alone is not identifiable across
+   * groups/teams (Codex design round 2 H2). EVERY held identity rides up to DEEP_REQUEUE_SAMPLE_LIMIT
+   * (the "individually inspectable" bound D4's enable criterion needs — Codex diff review M2: a
+   * fixed oldest-5 could never enumerate a sixth stable row); past it, `deepRequeueElided` counts the
+   * rest and the population is declared NON-enumerable (flag-ineligible) rather than silently
+   * truncated. */
   deepRequeueSample: DeepRequeueRef[];
+  deepRequeueElided: number;
   /** The re-queue mode this pass EXECUTED on the lookup path — the recording gate reads it from here
    * rather than re-parsing the env (one resolution, in the runner). */
   deepRequeueEnabled: boolean;
@@ -299,6 +304,7 @@ export async function reconcileProjectedEpisodes(
       deepRequeueHeld: 0,
       deepRequeueHeldByGroup: {},
       deepRequeueSample: [],
+      deepRequeueElided: 0,
       deepRequeueEnabled: deepRequeue,
     };
 
@@ -644,17 +650,24 @@ export async function reconcileProjectedEpisodes(
     deepRequeueHeld,
     deepRequeueHeldByGroup,
     deepRequeueSample: boundDeepRequeueSample(heldRefs),
+    deepRequeueElided: Math.max(0, heldRefs.length - DEEP_REQUEUE_SAMPLE_LIMIT),
     deepRequeueEnabled: deepRequeue,
     partialItems,
     partialDetail: boundPartialDetail(partialFound),
   };
 }
 
-/** OLDEST `projectedAt` first, bounded at PARTIAL_DETAIL_LIMIT — a deterministic order so two passes'
- *  samples are comparable. Used by reconcile per team and by the runner to re-bound across teams. */
+/** The "individually inspectable" bound: up to this many held identities ride the durable row, so an
+ *  operator can check EVERY candidate before enabling re-queue (spec D4(a)). Past it the population is
+ *  non-enumerable from ingest_runs and the flag stays ineligible — stated, not truncated. */
+export const DEEP_REQUEUE_SAMPLE_LIMIT = 50;
+
+/** OLDEST `projectedAt` first (total order: projectedAt, itemId, groupId, teamId), bounded at
+ *  DEEP_REQUEUE_SAMPLE_LIMIT — deterministic so two passes' samples are comparable. Used by reconcile
+ *  per team and by the runner to re-bound across teams. */
 export function boundDeepRequeueSample(refs: readonly DeepRequeueRef[]): DeepRequeueRef[] {
   const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   return [...refs]
     .sort((a, b) => cmp(a.projectedAt, b.projectedAt) || cmp(a.itemId, b.itemId) || cmp(a.groupId, b.groupId) || cmp(a.teamId, b.teamId))
-    .slice(0, PARTIAL_DETAIL_LIMIT);
+    .slice(0, DEEP_REQUEUE_SAMPLE_LIMIT);
 }

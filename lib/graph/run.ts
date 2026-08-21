@@ -78,6 +78,9 @@ export interface GraphProjectionSummary {
   deepRequeueHeld: number;
   deepRequeueHeldByGroup: Record<string, number>;
   deepRequeueSample: DeepRequeueRef[];
+  /** Held identities NOT in the sample (past DEEP_REQUEUE_SAMPLE_LIMIT, across teams) — non-zero
+   *  means the population is not enumerable from ingest_runs and the flag is ineligible. */
+  deepRequeueElided: number;
   /** The re-queue mode this run EXECUTED (resolved ONCE here from `GRAPH_DEEP_REQUEUE === "true"`, or
    *  the injected option) — the recording gate reads it from the summary, never from the env. */
   deepRequeueEnabled: boolean;
@@ -176,6 +179,7 @@ async function runGraphProjectionInner(opts?: {
     deepRequeueHeld: 0,
     deepRequeueHeldByGroup: {},
     deepRequeueSample: [],
+    deepRequeueElided: 0,
     deepRequeueEnabled: opts?.deepRequeue ?? deepRequeueEnabledFromEnv(),
     lockedOut: 0,
     walkMs: 0,
@@ -285,6 +289,9 @@ async function runGraphProjectionInner(opts?: {
         summary.deepRequeueHeldByGroup[g] = (summary.deepRequeueHeldByGroup[g] ?? 0) + n;
       }
       summary.deepRequeueSample = boundDeepRequeueSample([...summary.deepRequeueSample, ...r.deepRequeueSample]);
+      // Elided = everything held that is not in the (re-bounded) sample — recomputed from the totals so
+      // a cross-team re-bound cannot under-report what fell off.
+      summary.deepRequeueElided = summary.deepRequeueHeld - summary.deepRequeueSample.length;
 
       // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches
       // when it healed `items.access`, but arcs are synthesized from the external Graphiti group, which

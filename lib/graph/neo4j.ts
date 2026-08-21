@@ -67,9 +67,22 @@ function plain(v: unknown): unknown {
   return v;
 }
 
+/** GRAPHSAT-1 (Codex diff review H1): every read carries a FINITE server-side transaction deadline.
+ *  `runRead` now runs INSIDE the projector's per-team lease and process single-flight (reconcile's
+ *  saturated-group lookup), where the Graphiti REST calls have a 30 s abort and a bare `executeRead`
+ *  had none — a stalled Neo4j would have stranded the lease and stopped projection for every later
+ *  team. `connectionAcquisitionTimeout` covers pool checkout only. Env-overridable; `0`/blank →
+ *  the default, never "no deadline". */
+export const NEO4J_READ_TIMEOUT_MS_DEFAULT = 30_000;
+export function readTxConfig(env: NodeJS.ProcessEnv = process.env): { timeout: number } {
+  const raw = Number(env.NEO4J_READ_TIMEOUT_MS);
+  return { timeout: Number.isFinite(raw) && raw > 0 ? raw : NEO4J_READ_TIMEOUT_MS_DEFAULT };
+}
+
 /**
  * Run a read-only Cypher query; returns records as plain objects. Uses a READ session (routed to a
- * follower in a cluster). Throws on transport error — callers wrap best-effort.
+ * follower in a cluster) under a finite transaction deadline (`readTxConfig`). Throws on transport
+ * error or deadline — callers wrap best-effort.
  */
 export async function runRead<T = Record<string, unknown>>(
   cypher: string,
@@ -77,7 +90,7 @@ export async function runRead<T = Record<string, unknown>>(
 ): Promise<T[]> {
   const session = getDriver().session({ defaultAccessMode: neo4j.session.READ });
   try {
-    const res = await session.executeRead((tx) => tx.run(cypher, params));
+    const res = await session.executeRead((tx) => tx.run(cypher, params), readTxConfig());
     return res.records.map((r) => plain(r.toObject()) as T);
   } finally {
     await session.close();

@@ -203,6 +203,30 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
     expect(ok.deepRequeueHeld).toBe(4);
   });
 
+  it("AC1(h) SIX stable never-landed rows are ALL enumerated in the durable sample (Codex diff review M2), oldest first, none elided", async () => {
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const teamGroup = `${slug}_team`;
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.push((await ingest(seed, { kind: "deliverable", path: `docs/n${i}.md`, body: `never ${i}`, access: "team" })).id);
+    const fake = new FakeGraphiti();
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    fake.store.clear(); // nothing landed
+    for (let i = 0; i < 6; i++) {
+      await db().from("graph_episodes").update({ projected_at: `2020-01-0${i + 1}T00:00:00Z` }).eq("team_id", seed.teamId).eq("source_id", ids[i]);
+    }
+    await fake.addEpisodes(teamGroup, Array.from({ length: LANDED_SCAN_DEPTH }, (_, i) => ep(`items:filler-${i}`)));
+    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, { lookup: lookupFromFake(fake), deepRequeue: false });
+    expect(res.deepRequeueHeld).toBe(6);
+    expect(res.deepRequeueElided).toBe(0);
+    expect(res.deepRequeueSample.map((r) => r.itemId), "every identity, oldest first").toEqual(ids);
+    // Through the runner + meta too (the surface the operator reads).
+    const summary = await runGraphProjection({ teamId: seed.teamId, client: client(fake), lookup: lookupFromFake(fake), deepRequeue: false });
+    expect(summary.deepRequeueSample.map((r) => r.itemId)).toEqual(ids);
+    expect(summary.deepRequeueElided).toBe(0);
+    expect(projectionRunInput(summary, "scheduler", 1, 2).meta).toMatchObject({ deepRequeueHeld: 6, deepRequeueElided: 0 });
+  });
+
   it("AC4 (end to end) a held-only run reaches ingest_runs through the runner + the shared gate, with the structured sample in meta", async () => {
     const f = await fixture();
     await saturate(f);
