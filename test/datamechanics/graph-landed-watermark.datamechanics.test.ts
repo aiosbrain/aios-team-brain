@@ -234,7 +234,10 @@ describe("GRAPHSAT-2 — the landed watermark (real Postgres, mocked Graphiti, i
 
   it("AC1(j) a TOMBSTONED-but-still-present row ('' + pending flag after a failed delete) does not anchor", async () => {
     const f = await fixture();
-    await db().from("graph_episodes").update({ content_sha256: "", pending_delete_group_id: f.teamGroup, pending_delete_at: new Date().toISOString(), projected_at: new Date().toISOString() }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.landed);
+    // A row CREATED and tombstoned within the slack (a just-ingested item purged before its delete
+    // succeeded): only the sha/pending guard stands between it and anchoring.
+    const now = new Date().toISOString();
+    await db().from("graph_episodes").update({ content_sha256: "", pending_delete_group_id: f.teamGroup, pending_delete_at: now, projected_at: now, first_seen_at: now }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.landed);
     const r = await rec(f);
     expect(r.requeueEligible, "the tombstone's fresh stamp must not anchor").toBe(0);
     expect(r.reQueued).toBe(0);
