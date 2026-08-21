@@ -41,6 +41,8 @@ const quiet: GraphProjectionSummary = {
   unreachableGroups: 0,
   unreachableCleanupGroups: 0,
   emptyListingGroups: 0,
+  requeueEligible: 0,
+  watermarkAnchors: 0,
   walkMs: 0,
   reconcileMs: 0,
   errors: [],
@@ -85,6 +87,25 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     const q = projectionRunInput(quiet, "scheduler", 1, 2).meta as Record<string, unknown>;
     for (const k of ["unreachableGroups", "unreachableCleanupGroups", "emptyListingGroups"]) expect(k in q, k).toBe(false);
     expect(projectionRunInput({ ...quiet, unreachableGroups: 2, emptyListingGroups: 1 }, "scheduler", 1, 2).meta).toMatchObject({ unreachableGroups: 2, emptyListingGroups: 1 });
+  });
+
+  it("GRAPHSAT-2: rows proven lost record while the flag is OFF (waiting on a human); with the flag ON they are re-queued work, not a separate signal", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, requeueEligible: 1, deepRequeueEnabled: false })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, requeueEligible: 1, deepRequeueEnabled: true })).toBe(false);
+    expect("requeueEligible" in (projectionRunInput(quiet, "scheduler", 1, 2).meta as Record<string, unknown>)).toBe(false);
+    expect(projectionRunInput({ ...quiet, requeueEligible: 3 }, "scheduler", 1, 2).meta).toMatchObject({ requeueEligible: 3 });
+  });
+
+  it("GRAPHSAT-2: the watermark margin and first-push slack are positive finite defaults (env parse is resolvePositiveInt)", async () => {
+    const { LANDED_WATERMARK_MARGIN_MS, FIRST_PUSH_SLACK_MS } = await import("@/lib/graph/reconcile");
+    expect(LANDED_WATERMARK_MARGIN_MS).toBe(10 * 60_000);
+    expect(FIRST_PUSH_SLACK_MS).toBe(60_000);
+    expect(LANDED_WATERMARK_MARGIN_MS).toBeGreaterThan(FIRST_PUSH_SLACK_MS); // the proof's one inequality
+    const { resolvePositiveInt } = await import("@/lib/util/env");
+    expect(resolvePositiveInt(undefined, 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("0", 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("soon", 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("900000", 600_000)).toBe(900_000);
   });
 
   it("every pre-existing signal still records on its own", () => {

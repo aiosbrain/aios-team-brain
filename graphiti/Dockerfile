@@ -370,6 +370,15 @@ RUN F=/app/graph_service/routers/ingest.py \
  && /app/.venv/bin/python /tmp/patch-resilient-worker.py "$F" \
  && grep -q 'PATCH-RESILIENT-WORKER' "$F"
 
+# ── GRAPHSAT-2: prove the shipped router is ONE queue ──────────────────────────────────────────────
+# The brain's landed-watermark re-queue rule (lib/graph/reconcile.ts) rests on this router being one
+# serial FIFO consumer: one AsyncWorker singleton, one worker task, one unbounded asyncio.Queue, one
+# queued job per message. A base-image bump that changes any of those would silently break the proof
+# that "a later-accepted episode landed ⇒ an earlier one is landed or gone". Asserted against the
+# PATCHED bytes (after PATCH 6) — the shape that ships is the shape under test.
+COPY verify-single-worker.py /tmp/verify-single-worker.py
+RUN /app/.venv/bin/python /tmp/verify-single-worker.py /app/graph_service/routers/ingest.py
+
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
 #
 # The base image's CMD is `uv run uvicorn …`, and **`uv run` SYNCS the venv against /app/uv.lock
