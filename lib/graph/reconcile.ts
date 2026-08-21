@@ -127,6 +127,23 @@ export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCA
  */
 export const LANDED_WATERMARK_MARGIN_MS = resolvePositiveInt(process.env.GRAPH_LANDED_WATERMARK_MARGIN_MS, 10 * 60_000);
 
+/**
+ * An ANCHOR must be a row whose presence proves the push stamped at `projected_at` landed (Fable diff
+ * review BLOCKER). That is NOT every present row: on a retaining source an edit re-pushes WITHOUT
+ * deleting the old episodes (`addEpisodes` does not overwrite by name), so an edited item is present
+ * under its OLD episodes while its stamp is the NEW, still-queued push — an anchor later than any
+ * landed accept, which would judge a whole backlog lost. Tombstones (`''` + a pending flag after a
+ * best-effort delete) are the same inversion. So only a FIRST push into a group anchors: a real sha,
+ * no pending flag, and `projected_at` within this slack of `first_seen_at` (the row's set-once
+ * creation = the reservation written right before that first push). No older same-named episode can
+ * exist for a first push, so presence is that push. Re-pushed, re-queued, armed and tombstoned rows
+ * never anchor — conservative; new items arrive constantly, so anchors are never scarce for long.
+ * Residual, named: the straggler-after-verified-empty shape (an item purged then re-created while a
+ * leftover old episode survives) — rare, and bounded by the throttle. The exact successor is a
+ * brain-chosen episode uuid per push recorded in the ledger (`/messages` accepts a client `uuid`).
+ */
+export const FIRST_PUSH_SLACK_MS = 10 * 60_000;
+
 export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : undefined;
@@ -196,9 +213,11 @@ export interface ReconcileSummary {
    * (REQUEUE_MAX_PER_PASS) proceeds exactly as before; this makes the event LOUD. A gate signal. */
   emptyListingGroups: number;
   /** GRAPHSAT-2: never-landed rows on the lookup path that the landed watermark proves LOST (older
-   * than the newest present landing by more than the margin) — re-queued when `deepRequeue` is on,
-   * held otherwise. Reported either way; with the flag OFF it is a recording-gate signal: work is
-   * proven ready and waits on a human. */
+   * than the newest present FIRST-PUSH landing by more than the margin) — re-queued when `deepRequeue`
+   * is on, held otherwise. Reported either way; with the flag OFF it is a recording-gate signal: work
+   * is proven ready and waits on a human. With the flag ON, eligible rows past the throttle cap land in
+   * `requeueThrottled` (not held, not sampled): the lookup population that pass is
+   * deepRequeueHeld + reQueued + requeueThrottled. */
   requeueEligible: number;
   /** RECONULL-1: errors this pass could not represent as a counter (the pending-cleanup count re-read
    * failing). The runner merges them into the run's errors; every other counter and this pass's
@@ -269,6 +288,7 @@ type EpisodeRow = {
   pending_delete_group_id: string | null;
   pending_delete_at: string | null;
   chunk_shas: string[] | null;
+  first_seen_at: string;
 };
 
 /**
@@ -372,7 +392,7 @@ export async function reconcileProjectedEpisodes(
   const { data, error: ledgerErr } = await db
     .from("graph_episodes")
     .select(
-      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas"
+      "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas, first_seen_at"
     )
     .eq("team_id", teamId)
     // DEFERRED rows are exempt from every judgement here (PCCC-5, design §2.5): they carry the ''
@@ -520,10 +540,15 @@ export async function reconcileProjectedEpisodes(
     // the verdict). RECONCILE-1 (measurement only): `presentNames` lets a row's chunks be checked
     // individually and is read for counting and nothing else. ONE helper for both paths (D1).
     const { uuidByItemId, presentNames } = presenceFrom(refs);
-    // GRAPHSAT-2: every PRESENT row anchors the watermark — fresh or mature (the grace gate below
-    // governs confirmation/backfill/partial counting only, never the watermark).
+    // GRAPHSAT-2: a present FIRST PUSH anchors the watermark — fresh or mature (the grace gate below
+    // governs confirmation/backfill/partial counting only, never the watermark). See FIRST_PUSH_SLACK_MS
+    // for why only first pushes: presence must prove THIS stamp's push landed.
     for (const row of groupRows) {
-      if (uuidByItemId.has(row.source_id)) watermarkMs = Math.max(watermarkMs, new Date(row.projected_at).getTime());
+      if (!uuidByItemId.has(row.source_id)) continue;
+      if (row.content_sha256 === "" || row.pending_delete_group_id) continue;
+      const projectedAtMs = new Date(row.projected_at).getTime();
+      if (projectedAtMs - new Date(row.first_seen_at).getTime() > FIRST_PUSH_SLACK_MS) continue;
+      watermarkMs = Math.max(watermarkMs, projectedAtMs);
     }
 
     for (const row of groupRows) {

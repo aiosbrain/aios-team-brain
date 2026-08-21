@@ -24,7 +24,7 @@ that will own the deployment.
 - `neo4j` — `neo4j:5.26.2`, internal-only, with a persistent `/data` volume.
 - `graphiti` — source `https://github.com/aiosbrain/aios-team-brain` with root directory `graphiti/`,
   internal-only on port 8000. It uses the repository's patched Dockerfile and no custom start command.
-  **Single replica, by design (GRAPHSAT-2):** the brain's landed-watermark re-queue rule assumes ONE graphiti queue. Do not horizontally scale the graphiti service; the image's build asserts the single-worker router shape (`graphiti/verify-single-worker.py`). A redeploy's old/new overlap is a bounded window (a job finishing on the dying container after the brain re-queued it = one duplicate), which GRAPHDEPLOY-1's watch paths make rare.
+  **Single replica, by design (GRAPHSAT-2):** the brain's landed-watermark re-queue rule assumes ONE graphiti queue. Do not horizontally scale the graphiti service; the image's build asserts the single-worker router shape (`graphiti/verify-single-worker.py`). A redeploy's old/new overlap is a bounded window (duplicates ≤ `REQUEUE_MAX_PER_PASS` per reconcile pass while both containers run, ~1 after SIGTERM), which GRAPHDEPLOY-1's watch paths make rare.
 
 ## App variables
 

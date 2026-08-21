@@ -95,6 +95,17 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     expect(projectionRunInput({ ...quiet, requeueEligible: 3 }, "scheduler", 1, 2).meta).toMatchObject({ requeueEligible: 3 });
   });
 
+  it("GRAPHSAT-2: the watermark margin and first-push slack are positive finite defaults (env parse is resolvePositiveInt)", async () => {
+    const { LANDED_WATERMARK_MARGIN_MS, FIRST_PUSH_SLACK_MS } = await import("@/lib/graph/reconcile");
+    expect(LANDED_WATERMARK_MARGIN_MS).toBe(10 * 60_000);
+    expect(FIRST_PUSH_SLACK_MS).toBe(10 * 60_000);
+    const { resolvePositiveInt } = await import("@/lib/util/env");
+    expect(resolvePositiveInt(undefined, 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("0", 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("soon", 600_000)).toBe(600_000);
+    expect(resolvePositiveInt("900000", 600_000)).toBe(900_000);
+  });
+
   it("every pre-existing signal still records on its own", () => {
     for (const key of ["projected", "requeued", "cleaned", "pendingCleanups", "saturatedGroups", "requeueThrottled", "partialItems"] as const) {
       expect(shouldRecordProjectionRun({ ...quiet, [key]: 1 }), key).toBe(true);

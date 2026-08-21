@@ -56,10 +56,12 @@ shipped `ingest.py` and asserts exactly one `AsyncWorker` instantiation, exactly
 `asyncio.create_task` of its worker, a single `asyncio.Queue`, and one `queue.put` per message in
 the `/messages` handler — a base-image bump that changes any of those fails the graphiti BUILD.
 Deploy overlap (a graphiti redeploy runs old and new containers for minutes) is TWO queues for that
-window: a job queued on the dying container is lost when it is killed (so a "lost" verdict is
-correct or about to be), and the one false-positive shape — the old container finishes a job after
-the brain re-queued it — yields ONE duplicate, bounded by the overlap minutes and by the throttle;
-stated, and GRAPHDEPLOY-1 is what makes those restarts rare. Single-replica is recorded as a
+window: new POSTs land on the empty new container and advance the watermark while the old one
+keeps draining; every old-container-queued row older than the margin that the throttle reaches is
+re-pushed AND completes on the old container — so the duplicate bound is **≤ `REQUEUE_MAX_PER_PASS`
+per reconcile pass during the overlap**, and ~1 (the in-flight job) after SIGTERM, when upstream's
+`stop()` cancels the task and drains the queue (Fable diff review M1 corrected the earlier "one
+duplicate" claim). Stated; GRAPHDEPLOY-1 is what makes those restarts rare. Single-replica is recorded as a
 deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the graphiti service).
 
 ## 0b. Decidables — defaults stated for the design round to attack
@@ -74,14 +76,25 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
   two items projected in the same page can have accept order and `projected_at` order differ by
   the push latency; 10 min is two orders of magnitude above that, and costs only that a row must be
   10 min older than the newest landing to be judged — nothing structural.
-- **D2 — the watermark is a LANDING, not a push — and it is collected BEFORE the grace check
-  (round 2 M1).** Today's loop skips rows younger than `LANDED_GRACE_MS` before looking them up;
-  the watermark needs exactly those fresh landings (minutes old). So phase 1 records a watermark
-  anchor for EVERY ledger row whose uuid is present in the pass's listing/lookup — fresh or mature —
-  while `confirmed`, the uuid backfill and `partialItems` keep their grace gate unchanged. The
-  anchor is the row's `projected_at` (bumped on every re-push, so a present row's stamp is the time
-  of the push that landed — the accept time the queue ordered by). A pass in which no ledger row is
-  present anywhere has no watermark and re-queues nothing on the lookup path.
+- **D2 — an anchor is a present FIRST PUSH, collected before the grace check (Fable diff review
+  BLOCKER; round 2 M1).** "Present" does NOT mean the push stamped at `projected_at` landed: on a
+  retaining source (everything but Slack) an edit re-pushes WITHOUT deleting the old episodes
+  (`addEpisodes` does not overwrite by name — `project.ts:1408`), so an edited item stays present
+  under its OLD episodes while its stamp is the NEW, still-queued push — an anchor later than any
+  landed accept, which would judge a whole backlog lost (140 queued rows "proven lost" by one
+  edited `tasks.md`). Tombstones (`''` + a pending flag written after a best-effort delete) invert
+  the same way. So an anchor is a row whose presence can ONLY come from the push it is stamped
+  with: a FIRST push into its group — real sha, no pending flag, and `projected_at` within
+  `FIRST_PUSH_SLACK_MS` (10 min) of `first_seen_at` (the row's set-once creation, the reservation
+  written right before that first push). Re-pushed, re-queued, armed and tombstoned rows never
+  anchor — conservative, and new items arrive constantly so anchors are not scarce. Residual, named:
+  the straggler-after-verified-empty shape (an item purged and re-created while a leftover old
+  episode survives) — rare, throttle-bounded. The EXACT successor is a brain-chosen episode uuid per
+  push recorded in the ledger (`/messages` accepts a client `uuid`; `episode_uuid` already exists) —
+  its own slice. Anchors are collected from present first pushes regardless of the grace (a
+  5-minute-old landing is exactly the evidence) while `confirmed`, the uuid backfill and
+  `partialItems` keep their grace gate unchanged. A pass with no present first push anywhere has no
+  watermark and re-queues nothing on the lookup path.
 - **D3 — what still holds from GRAPHSAT-1 / RECONULL-1, beneath this.** The REST-window oracle
   (a lookup missing a window-confirmed item → unjudged), the unreachable rule (a failed listing →
   unjudged), the never-pushed discriminator, the `REQUEUE_MAX_PER_PASS` throttle, the flag as the
@@ -156,10 +169,14 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    lookup returns nothing for the team's items, oracle vacuous) → no watermark → every row HELD,
    `requeueEligible 0`; (c2) a WIPED graph (every listing empty) is a different path: not
    saturated → `emptyListingGroups` fires and the REST path heals it bounded, exactly as today
-   (RECONULL-1 AC1(d)) — pinned so the two are not confused; (c3) a FRESH landing (younger than
-   the grace) anchors the watermark: the only present row is 5 minutes old → an old absent row is
+   (RECONULL-1 AC1(d)) — pinned so the two are not confused; (c3) a FRESH first-push landing (younger
+   than the grace) anchors the watermark: the only present row is 5 minutes old → an old absent row is
    eligible, while `confirmed` does not count the fresh row (the grace gate is unchanged);
-   (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
+   (i) THE BLOCKER arm: an EDITED retaining item (created long ago, re-pushed minutes ago, present
+   under its old episodes) does NOT anchor — with it as the only present row nothing is proven lost
+   and a queued row stays held; adding a genuine first push that landed restores the verdict for
+   the truly old row only; (j) a TOMBSTONED-but-present row (`''` + pending flag, fresh stamp) does
+   not anchor; (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
    held-counted nor re-written across a second reconcile before the projector re-pushes it;
    (d) the watermark is TEAM-wide: the only confirmation is in the EXTERNAL group (REST-judged),
    newer than General's old absent row → that row is eligible; (e) the margin: an absent row
@@ -190,6 +207,8 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    from PUSHED rows instead of CONFIRMED rows → AC1(c) reddens; (c) scope the watermark to the
    group instead of the team → AC1(d) reddens; (d) drop the margin → AC1(e) reddens; (e) apply the
    rule to the REST path → AC1(h) reddens; (f) count a parked row as eligible → AC1(c4) reddens;
+   (i2) anchor on ANY present row (drop the first-push slack) → AC1(i) reddens; (j2) anchor a
+   tombstone → AC1(j) reddens;
    (g) collect anchors after the grace check → AC1(c3) reddens; (h) replay lookup writes before
    REST writes → AC1(g2) reddens.
 5. Full tiers green (`npm test`, dm iso graph set, `npm run test:http:local`, `npm run

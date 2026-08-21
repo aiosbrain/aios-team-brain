@@ -35,8 +35,15 @@ async function row(teamId: string, itemId: string) {
   const { data } = await db().from("graph_episodes").select("content_sha256, first_seen_at, episode_uuid").eq("team_id", teamId).eq("source_id", itemId).single();
   return data as { content_sha256: string; first_seen_at: string; episode_uuid: string | null };
 }
-async function stamp(teamId: string, itemId: string, agoMs: number) {
-  await db().from("graph_episodes").update({ projected_at: new Date(Date.now() - agoMs).toISOString(), episode_uuid: null }).eq("team_id", teamId).eq("source_id", itemId);
+/** Stamp a row as a FIRST push `agoMs` ago: projected_at and first_seen_at a second apart (the reservation
+ *  precedes the push), uuid cleared so backfill is observable. `firstSeenAgoMs` overrides first_seen_at for
+ *  rows that must read as RE-pushes (created long before their latest push). */
+async function stamp(teamId: string, itemId: string, agoMs: number, firstSeenAgoMs = agoMs + 1_000) {
+  await db().from("graph_episodes").update({
+    projected_at: new Date(Date.now() - agoMs).toISOString(),
+    first_seen_at: new Date(Date.now() - firstSeenAgoMs).toISOString(),
+    episode_uuid: null,
+  }).eq("team_id", teamId).eq("source_id", itemId);
 }
 async function removeFromGraph(fake: FakeGraphiti, groupId: string, itemId: string) {
   const g = fake.store.get(groupId);
@@ -202,6 +209,35 @@ describe("GRAPHSAT-2 — the landed watermark (real Postgres, mocked Graphiti, i
     expect(r.requeueThrottled).toBe(1);
     expect((await row(seed.teamId, ext.id)).content_sha256, "the REST row, traversed first, took the one slot").toBe("");
     expect((await row(seed.teamId, teamIds[1])).content_sha256, "the lookup-eligible row was throttled, not moved ahead").not.toBe("");
+  });
+
+  it("AC1(i) THE BLOCKER: an EDITED retaining item (old episodes present, new push still queued) does NOT anchor — a queued row newer than the real landing stays HELD", async () => {
+    const f = await fixture();
+    // `landed` is re-pushed 5 min ago (stamp fresh) but was CREATED 2 days ago: its presence is its OLD
+    // episodes; its new push is queued. `fresh` (absent, projected 2h−1min ago) is a queued row that a
+    // naive "newest present stamp" watermark (5 min) would have judged lost.
+    await stamp(f.seed.teamId, f.ids.landed, 5 * 60_000, 48 * H);
+    const r = await rec(f);
+    // The only first-push anchor left is none (landed is a re-push) → no watermark → `old` held too.
+    expect(r.requeueEligible, "no first-push anchor → nothing proven lost").toBe(0);
+    expect(r.reQueued).toBe(0);
+    expect((await row(f.seed.teamId, f.ids.fresh)).content_sha256).not.toBe("");
+    // Add a genuine FIRST push that landed 2h ago → `old` (3 days) is proven lost, `fresh` (2h−1min) is not.
+    const anchor = await ingest(f.seed, { kind: "deliverable", path: "docs/anchor.md", body: "anchor doc", access: "team" });
+    await projectItemsToGraph(db(), { teamId: f.seed.teamId, teamSlug: f.slug, client: client(f.fake) });
+    await stamp(f.seed.teamId, anchor.id, 2 * H);
+    const r2 = await rec(f);
+    expect(r2.requeueEligible).toBe(1);
+    expect((await row(f.seed.teamId, f.ids.old)).content_sha256).toBe("");
+    expect((await row(f.seed.teamId, f.ids.fresh)).content_sha256).not.toBe("");
+  });
+
+  it("AC1(j) a TOMBSTONED-but-still-present row ('' + pending flag after a failed delete) does not anchor", async () => {
+    const f = await fixture();
+    await db().from("graph_episodes").update({ content_sha256: "", pending_delete_group_id: f.teamGroup, pending_delete_at: new Date().toISOString(), projected_at: new Date().toISOString() }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.landed);
+    const r = await rec(f);
+    expect(r.requeueEligible, "the tombstone's fresh stamp must not anchor").toBe(0);
+    expect(r.reQueued).toBe(0);
   });
 
   it("AC1(h) REST-path (small group) re-queue is today's: past the grace, absent → re-queued regardless of any watermark", async () => {
