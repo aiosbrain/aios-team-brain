@@ -274,8 +274,15 @@ export class ClickUpClient {
   }
 
   private async waitForRateWindow(): Promise<void> {
-    const delay = this.blockedUntilMs - this.now();
-    if (delay > 0) await this.sleep(Math.min(delay, this.maxRetryDelayMs));
+    // Re-check after every nap: a single capped sleep wakes early whenever the reset window exceeds
+    // maxRetryDelayMs, and a request fired into a window this client itself observed earns exactly
+    // the 429 the block exists to avoid. Each individual sleep stays capped so an injected clock —
+    // or a corrected `blockedUntilMs` — is consulted at least once per cap interval.
+    for (;;) {
+      const delay = this.blockedUntilMs - this.now();
+      if (delay <= 0) return;
+      await this.sleep(Math.min(delay, this.maxRetryDelayMs));
+    }
   }
 
   private observeRateLimit(response: Response): void {
@@ -370,6 +377,7 @@ export class ClickUpClient {
   async getTasksForList(listId: ClickUpId): Promise<ClickUpTask[]> {
     const id = encodeURIComponent(String(listId));
     const tasks: ClickUpTask[] = [];
+    let previousPageIds: string | undefined;
 
     for (let page = 0; page < this.maxPages; page += 1) {
       const query = new URLSearchParams({
@@ -388,6 +396,15 @@ export class ClickUpClient {
         idValue(value.id, "task");
         return value;
       });
+      // Mirror of the Docs repeated-cursor guard. A server that ignores `page` and keeps returning
+      // the same full page (with no `last_page`) never trips either termination check below, so it
+      // used to be walked for all maxPages (default 10,000) requests — accumulating up to 1M tasks
+      // in memory before the page-cap error finally fired. Detect the repeat on page two instead.
+      const pageIds = pageTasks.map((task) => String(task.id)).join("\n");
+      if (pageTasks.length > 0 && pageIds === previousPageIds) {
+        throw new ClickUpClientError("ClickUp task pagination repeated a page", "pagination");
+      }
+      previousPageIds = pageIds;
       tasks.push(...pageTasks);
 
       if (payload.last_page === true || pageTasks.length === 0) return tasks;

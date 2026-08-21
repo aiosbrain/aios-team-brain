@@ -53,6 +53,27 @@ describe("ClickUpClient task reads", () => {
     }
   });
 
+  it("fails closed when task pagination repeats a page instead of buffering toward maxPages", async () => {
+    // The Docs reader already guards a repeated cursor; the task reader had no equivalent. A server
+    // that ignores `page` and keeps returning the same full 100-task page (no `last_page`) used to be
+    // walked for all maxPages (default 10,000) requests — up to 1M tasks accumulated in memory before
+    // the page-cap error finally fired. The repeat must be detected on the SECOND page, not the cap.
+    let calls = 0;
+    const fullPage = {
+      tasks: Array.from({ length: 100 }, (_, index) => ({ id: `task-${index}`, name: `Task ${index}` })),
+    };
+    const transport: ClickUpTransport = async () => {
+      calls += 1;
+      return jsonResponse(fullPage);
+    };
+    const client = new ClickUpClient({ token: "test-clickup-token", transport, maxPages: 50 });
+
+    await expect(client.getTasksForList("101")).rejects.toThrow(
+      "ClickUp task pagination repeated a page"
+    );
+    expect(calls).toBe(2);
+  });
+
   it("supports string and integer task ids without using custom ids as identity", async () => {
     const transport: ClickUpTransport = async (input, init) => {
       expect(init.method).toBe("GET");
@@ -255,6 +276,38 @@ describe("ClickUpClient retry and rate-limit handling", () => {
     await client.getAuthorizedUser();
     await client.getAuthorizedUser();
     expect(sleeps).toEqual([2000]);
+  });
+
+  it("re-checks the rate window after a capped sleep instead of firing early into it", async () => {
+    // A reset window LONGER than maxRetryDelayMs used to be slept exactly once, capped — the waiter
+    // woke with the window still in force and fired anyway, earning precisely the 429 the block
+    // exists to avoid. It must keep sleeping (each nap still capped) until the window has passed.
+    let now = 1_000_000;
+    const sleeps: number[] = [];
+    const requestTimes: number[] = [];
+    const client = new ClickUpClient({
+      token: "test-clickup-token",
+      transport: async () => {
+        requestTimes.push(now);
+        // Reset epoch 150s ahead of the first request — 2.5x the 60s sleep cap below.
+        return jsonResponse({ user: { id: 7 } }, 200, {
+          "X-RateLimit-Remaining": "0",
+          "X-RateLimit-Reset": "1150",
+        });
+      },
+      maxRetryDelayMs: 60_000,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+    });
+
+    await client.getAuthorizedUser();
+    await client.getAuthorizedUser();
+
+    expect(requestTimes[1]).toBeGreaterThanOrEqual(1_150_000);
+    expect(sleeps).toEqual([60_000, 60_000, 30_000]);
   });
 
   it("retries transient GET failures with bounded exponential delay", async () => {
