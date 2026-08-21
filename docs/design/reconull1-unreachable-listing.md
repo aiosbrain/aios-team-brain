@@ -114,7 +114,7 @@ times out right when the lookup path matters most.
 | `lib/graph/run.ts`, `projection-run.ts`, `scheduler.ts` | `unreachableGroups`, `unreachableCleanupGroups`, `emptyListingGroups` ride summary → meta (when non-zero) → log; all three are recording-gate signals; `r.errors` merged into the run's errors (the cleanup one too — round 1 M1: the pending count it relied on can silently read zero) |
 | `test/datamechanics/fake-graphiti.ts` | `failListFor: Set<groupId>` — `listEpisodes` throws for those groups (the double has `failDeletes`; this is the read-side sibling) |
 | `.env.example` | `GRAPH_LANDED_LIST_TIMEOUT_MS`; the `GRAPH_LANDED_SCAN_DEPTH=1000`-with-Neo4j recommendation |
-| `docs/ARCHITECTURE.md` | graph row: the unreachable/empty-listing signals, observe mode, the depth recommendation; deploy notes: GRAPHDEPLOY-1 |
+| `docs/ARCHITECTURE.md` | graph row: the unreachable/empty-listing signals, the depth recommendation; deploy notes: GRAPHDEPLOY-1 |
 | Schema | **NONE** |
 
 ## 2. Mechanism notes
@@ -124,7 +124,7 @@ times out right when the lookup path matters most.
 - Body validation lives in the client so EVERY caller (landed leg, cleanup leg,
   `deleteItemEpisodes`) gets the same contract; a malformed body is a thrown `Error` naming the
   shape, which each caller's existing `.catch` turns into its skip — now counted.
-- Cleanup leg: no observe mode (it resolves uuids to DELETE; nothing to observe safely); it keeps
+- Cleanup leg: no lookup of any kind (it resolves uuids to DELETE); it keeps
   its skip and gains the count. The final `pendingCleanups` re-read's `error` is no longer
   ignored: on error the summary carries `pendingCleanups: -1`? NO — a sentinel number in a count
   is the `[object Object]` class of legibility bug. On error the pass pushes an entry to
