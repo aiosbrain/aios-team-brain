@@ -46,6 +46,10 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
     const ext = await systemProject(seed, "external-shared");
     const gen = await systemProject(seed, "general");
     const unit = await unitOf(seed, item.id);
+    // POSITIVE CONTROL (non-vacuity): before the exclusion, the external principal CAN see the item —
+    // so the final false is the exclusion's doing, not a broken viewer.
+    const externalViewer = await externalMember(seed);
+    expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: externalViewer }, item.id)).toBe(true);
     // The human's decision: exclude this from the external tier.
     await plant(seed, ext, unit, "exclude", "force_exclude");
 
@@ -64,8 +68,7 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
     expect(await currentRows(seed, ext, unit)).toEqual([{ decision: "exclude", mode: "force_exclude" }]);
     expect(await currentRows(seed, gen, unit)).toEqual([{ decision: "include", mode: "auto" }]);
 
-    // The enforced read: an external principal does NOT see the item.
-    const externalViewer = await externalMember(seed);
+    // The enforced read: the same principal that COULD see it now does NOT.
     expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: externalViewer }, item.id)).toBe(false);
   });
 
