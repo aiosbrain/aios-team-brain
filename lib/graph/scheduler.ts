@@ -2,7 +2,9 @@ import "server-only";
 import { GraphitiClient } from "./graphiti-client";
 import { PROJECTION_INTERVAL_MS, PROJECTION_MINUTES } from "./project";
 import { runGraphProjection } from "./run";
-import { projectionRunInput } from "./projection-run";
+import { projectionRunInput, shouldRecordProjectionRun } from "./projection-run";
+
+export { shouldRecordProjectionRun, SLOW_WALK_RECORD_MS } from "./projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { adminClient } from "@/lib/db/admin";
 
@@ -32,7 +34,10 @@ export function startGraphScheduler(): void {
     const startedAt = Date.now();
     try {
       const s = await runGraphProjection();
-      if (s.projected || s.errors.length || s.pendingCleanups || s.saturatedGroups || s.requeueThrottled || s.partialItems) {
+      // Same predicate as the durable record below: a third inline copy here had already dropped
+      // `probeFallbackPages`, which made the fallback clause of this very line unreachable on a
+      // quiet fallback-only tick (caught by the call-site pin in test/graph-recording-gate.test.ts).
+      if (shouldRecordProjectionRun(s)) {
         console.info(
           `[graph] projected +${s.projected} =${s.skipped} (${s.scanned} scanned, ${s.teams} teams)` +
             (s.cleaned || s.pendingCleanups
@@ -41,6 +46,8 @@ export function startGraphScheduler(): void {
             (s.saturatedGroups ? ` ${s.saturatedGroups} group(s) past the reconcile scan window` : "") +
             (s.partialItems ? ` ${s.partialItems} partially-landed item(s)` : "") +
             (s.requeueThrottled ? ` ${s.requeueThrottled} re-queue(s) throttled — Graphiti may be wedged` : "") +
+            (s.probeFallbackPages ? ` ${s.probeFallbackPages} page(s) fell back to per-item ledger probes` : "") +
+            (s.lockedOut ? ` ${s.lockedOut} team(s) skipped — another instance holds the projection lease` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }
@@ -48,7 +55,7 @@ export function startGraphScheduler(): void {
       // cleanup) to ingest_runs so a silently-failing projector — e.g. Graphiti 422'ing every write, or
       // a tier cleanup that never converges — is visible on the dashboard, not just in ephemeral logs.
       // A cleanup-only tick used to record nothing at all. recordIngestRun is best-effort.
-      if (s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups || s.saturatedGroups || s.requeueThrottled || s.partialItems) {
+      if (shouldRecordProjectionRun(s)) {
         await recordIngestRun(adminClient(), projectionRunInput(s, "scheduler", startedAt, Date.now()));
       }
     } catch (err) {

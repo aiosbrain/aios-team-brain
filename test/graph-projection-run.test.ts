@@ -24,6 +24,10 @@ const base: GraphProjectionSummary = {
   requeueThrottled: 0,
   partialItems: 0,
   partialDetail: { sample: [], elided: 0, namesElided: 0 },
+  probeFallbackPages: 0,
+  lockedOut: 0,
+  walkMs: 1234,
+  reconcileMs: 56,
   errors: [],
 };
 
@@ -52,7 +56,11 @@ describe("projectionRunInput", () => {
       partialDetail: { sample: [], elided: 0, namesElided: 0 },
       fanoutThrottled: 0,
       restrictionMovesPending: 0,
+      // TICKFIT-2 — and it drifted a THIRD time in the PR that added these (Fable diff review M1).
+      walkMs: 1234,
+      reconcileMs: 56,
     });
+    expect("probeFallbackPages" in (run.meta as Record<string, unknown>)).toBe(false); // omitted at 0
     expect(run.startedAt).toBe(1000);
     expect(run.finishedAt).toBe(2000);
   });

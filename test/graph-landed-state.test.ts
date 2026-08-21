@@ -1,3 +1,4 @@
+import type { GraphProjectionSummary } from "@/lib/graph/run";
 import { describe, it, expect } from "vitest";
 import {
   expectedEpisodeNames,
@@ -97,17 +98,21 @@ describe("AC5 — the measurement reaches the DURABLE row, not just the return v
     // count alone cannot separate a real hole from the index-shift false positive, which is the whole
     // question the metric exists to answer.
     const { projectionRunInput } = await import("@/lib/graph/projection-run");
-    const summary = {
+    // COMPLETE typed literal (TICKFIT-2 Codex diff review L2: the double cast hid a fixture missing
+    // the timing keys, so `meta.walkMs` was `undefined` here — a state no real summary can produce).
+    const summary: GraphProjectionSummary = {
       ok: true, configured: true, teams: 1, scanned: 1, projected: 0, episodes: 0,
       episodesByGroup: {}, fanoutThrottled: 0, restrictionMovesPending: 0, skipped: 0,
-      reconciled: 1, requeued: 0, cleaned: 0, cleanedExternal: 0, pendingCleanups: 0,
+      reconciled: 1, requeued: 0, cleaned: 0, pendingCleanups: 0,
       saturatedGroups: 0, requeueThrottled: 0,
       partialItems: 2,
       partialDetail: { sample: [{ itemId: "abc", missing: ["items:abc#3"], missingCount: 1 }], elided: 1, namesElided: 0 },
+      probeFallbackPages: 0, lockedOut: 0, walkMs: 10, reconcileMs: 5,
       errors: [],
-    } as unknown as Parameters<typeof projectionRunInput>[0];
+    };
 
     const row = projectionRunInput(summary, "scheduler", 0, 1);
+    expect(row.meta).toMatchObject({ walkMs: 10, reconcileMs: 5 });
     expect(row.meta?.partialItems).toBe(2);
     expect(row.meta?.partialDetail).toEqual({
       sample: [{ itemId: "abc", missing: ["items:abc#3"], missingCount: 1 }],

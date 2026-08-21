@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { adminClient } from "@/lib/db/admin";
+import { acquireProjectionLease, type ProjectionLease } from "./walk-lock";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } from "./project";
 import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
@@ -62,6 +63,19 @@ export interface GraphProjectionSummary {
    * Graphiti is wedged rather than that N workers crashed. Non-zero for several runs in a row is an
    * incident, not noise. */
   requeueThrottled: number;
+  /** TICKFIT-2: pages whose batched ledger read failed and fell back to per-item probes —
+   *  durably visible (the recording gate keys on it) so a permanently failing batch read can
+   *  never silently re-become the 10.5-minute stage. */
+  probeFallbackPages: number;
+  /** TICKFIT-2 (Codex diff review H1): teams SKIPPED this run because another brain instance holds
+   *  their projection lease (`lib/graph/walk-lock.ts` — a deploy overlap). Expected once per deploy;
+   *  persistent across runs means a wedged holder. Durably visible (meta + the recording gate). */
+  lockedOut: number;
+  /** TICKFIT-2: per-leg wall time (flat numbers — the runs panel Strings values). `walkMs` is
+   *  the page loop; `reconcileMs` the reconcile call; summed across teams, accumulated in
+   *  finally so failed legs keep their elapsed time. The revisit trigger reads walkMs. */
+  walkMs: number;
+  reconcileMs: number;
   errors: string[];
 }
 
@@ -95,6 +109,8 @@ export async function runGraphProjection(opts?: {
   limit?: number;
   /** Per-team fan-out budget for this RUN (default GRAPH_FANOUT_PUSH_MAX_PER_PASS); test override. */
   fanoutPushBudget?: number;
+  /** Cross-instance lease acquirer (default: the Postgres advisory lease); test override. */
+  lease?: (teamId: string) => Promise<ProjectionLease | null>;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
   inFlight = runGraphProjectionInner(opts);
@@ -111,8 +127,10 @@ async function runGraphProjectionInner(opts?: {
   db?: DbClient;
   limit?: number;
   fanoutPushBudget?: number;
+  lease?: (teamId: string) => Promise<ProjectionLease | null>;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
+  const acquireLease = opts?.lease ?? acquireProjectionLease;
   const summary: GraphProjectionSummary = {
     ok: true,
     configured: client.configured,
@@ -132,6 +150,10 @@ async function runGraphProjectionInner(opts?: {
     partialItems: 0,
     partialDetail: { sample: [], elided: 0, namesElided: 0 },
     requeueThrottled: 0,
+    probeFallbackPages: 0,
+    lockedOut: 0,
+    walkMs: 0,
+    reconcileMs: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
@@ -142,6 +164,22 @@ async function runGraphProjectionInner(opts?: {
   summary.teams = teams.length;
 
   for (const t of teams) {
+    // TICKFIT-2 (Codex diff review H1): one instance per team per pass. The in-process `inFlight`
+    // above cannot see a deploy-overlap twin, and two walkers over the same unconverged page both
+    // push (the `''` reservation reads as "re-push" by design). A locked-out team is skipped THIS
+    // tick and counted, never silently; the lease dies with the holder's backend.
+    let lease: ProjectionLease | null = null;
+    try {
+      lease = await acquireLease(t.id);
+    } catch (e) {
+      summary.ok = false;
+      summary.errors.push(`${t.slug}: projection lease failed: ${e instanceof Error ? e.message : String(e)}`);
+      continue;
+    }
+    if (!lease) {
+      summary.lockedOut += 1;
+      continue;
+    }
     try {
       // Page forward through this team's whole backlog: advance the `since` cursor by the last
       // synced_at scanned until a batch comes back short (fewer rows than the limit = tail reached).
@@ -153,6 +191,10 @@ async function runGraphProjectionInner(opts?: {
       // most of a mass arming at once, which is exactly what the budget exists to smooth. Same seam
       // GRAPH_REQUEUE_MAX_PER_PASS's comment names for reconcile.
       let fanoutBudgetLeft = opts?.fanoutPushBudget ?? FANOUT_PUSH_MAX_PER_PASS;
+      // TICKFIT-2: the walk leg's clock — accumulated in finally so an aborted walk keeps its
+      // elapsed time (the revisit trigger reads this number).
+      const walkStart = Date.now();
+      try {
       for (let batch = 0; batch < MAX_BATCHES; batch++) {
         const s = await projectItemsToGraph(db, {
           teamId: t.id,
@@ -163,6 +205,7 @@ async function runGraphProjectionInner(opts?: {
           fanoutPushBudget: fanoutBudgetLeft,
         });
         fanoutBudgetLeft = Math.max(0, fanoutBudgetLeft - s.fanoutPushed);
+        summary.probeFallbackPages += s.probeFallbackPages;
         summary.scanned += s.scanned;
         summary.projected += s.projected;
         summary.episodes += s.episodes;
@@ -176,10 +219,19 @@ async function runGraphProjectionInner(opts?: {
         if (s.scanned < limit || !s.lastSyncedAt || s.lastSyncedAt === since) break;
         since = s.lastSyncedAt;
       }
+      } finally {
+        summary.walkMs += Date.now() - walkStart;
+      }
 
       // Reconcile after paging (audit H3, Option B): confirm this team's recorded episodes actually
       // landed, and re-queue any that a crashed worker never got to. Off the hot push path.
-      const r = await reconcileProjectedEpisodes(db, client, t.id);
+      const reconcileStart = Date.now();
+      let r: Awaited<ReturnType<typeof reconcileProjectedEpisodes>>;
+      try {
+        r = await reconcileProjectedEpisodes(db, client, t.id);
+      } finally {
+        summary.reconcileMs += Date.now() - reconcileStart;
+      }
       summary.reconciled += r.confirmed;
       summary.requeued += r.reQueued;
       summary.cleaned += r.cleaned;
@@ -225,7 +277,12 @@ async function runGraphProjectionInner(opts?: {
         summary.skipped += e.partial.skipped;
         summary.fanoutThrottled += e.partial.fanoutThrottled;
         summary.restrictionMovesPending += e.partial.restrictionMovesPending;
+        // TICKFIT-2: an aborted run must still report its fallbacks (the durable-visibility
+        // contract — under-reporting here would hide a failing batch read behind any abort).
+        summary.probeFallbackPages += e.partial.probeFallbackPages;
       }
+    } finally {
+      await lease.release();
     }
   }
   return summary;

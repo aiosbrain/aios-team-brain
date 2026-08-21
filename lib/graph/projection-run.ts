@@ -11,13 +11,51 @@ import type { GraphProjectionSummary } from "./run";
  * `source: "graph_project"` is the stable ledger key for this leg. `ok` is false whenever a team
  * errored — that's what turns the row red in the panel.
  */
+/** TICKFIT-2: a quiet walk slower than this records a durable run row anyway — the spec's
+ *  revisit trigger reads `walkMs` from ingest_runs, and an ephemeral log cannot drive that
+ *  decision. */
+export const SLOW_WALK_RECORD_MS = 60_000;
+
+/**
+ * Which projection ticks earn a durable `ingest_runs` row — the ONE gate for BOTH callers (the
+ * scheduler tick and the admin "Project to graph" button; the button used to carry its own inline
+ * copy that had drifted five signals behind). Every clause is a SIGNAL (the no-silent-caps rule);
+ * TICKFIT-2 added the last two — a failing batched ledger read and a slow quiet walk must reach
+ * the dashboard, not just logs, or the 10.5-minute stage could silently return. Pure, so the gate
+ * itself is unit-pinned (test/graph-recording-gate.test.ts pins each clause AND both call sites).
+ * `walkMs` is summed across teams (run.ts), so a multi-team instance whose quick walks add up past
+ * the threshold records an extra quiet row — a false positive that costs one row, accepted.
+ */
+export function shouldRecordProjectionRun(s: {
+  projected: number; errors: string[]; requeued: number; cleaned: number;
+  pendingCleanups: number; saturatedGroups: number; requeueThrottled: number;
+  partialItems: number; fanoutThrottled: number; restrictionMovesPending: number;
+  probeFallbackPages: number; lockedOut: number; walkMs: number;
+}): boolean {
+  return Boolean(
+    s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
+    s.saturatedGroups || s.requeueThrottled || s.partialItems ||
+    // Codex diff review M1: both were already in the summary AND the meta as stall signals (a
+    // budget that never clears; a restriction move that never lands) but neither inline gate had
+    // them — a persistent stall of either kind disappeared at the gate.
+    s.fanoutThrottled || s.restrictionMovesPending ||
+    s.probeFallbackPages || s.lockedOut || s.walkMs > SLOW_WALK_RECORD_MS
+  );
+}
+
 export function projectionRunInput(
   summary: GraphProjectionSummary,
   trigger: IngestTrigger,
   startedAt: number,
-  finishedAt: number
+  finishedAt: number,
+  /** The team a TEAM-SCOPED run belongs to (the admin button). Omitted for the scheduler's
+   *  instance-wide aggregate, which stays `team_id = null`. Codex diff review H2: manual rows used
+   *  to land null-team — visible to EVERY team's admin panel and excluded from the owning team's
+   *  Costs denominator. */
+  teamId?: string
 ): IngestRunInput {
   return {
+    ...(teamId ? { teamId } : {}),
     source: "graph_project",
     trigger,
     ok: summary.errors.length === 0,
@@ -54,6 +92,12 @@ export function projectionRunInput(
       // Re-queues declined because a mass disappearance reads as a wedged Graphiti (H7). Recorded so a
       // throttle that persists across runs is visible rather than inferred from logs.
       requeueThrottled: summary.requeueThrottled,
+      // TICKFIT-2: per-leg wall time (flat numbers — the runs panel Strings values; the revisit
+      // trigger reads walkMs from these rows) + the durable batch-read fallback counter.
+      walkMs: summary.walkMs,
+      reconcileMs: summary.reconcileMs,
+      ...(summary.probeFallbackPages ? { probeFallbackPages: summary.probeFallbackPages } : {}),
+      ...(summary.lockedOut ? { lockedOut: summary.lockedOut } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,
       // which is exactly the position that made this hole invisible for so long. Counted only; no
