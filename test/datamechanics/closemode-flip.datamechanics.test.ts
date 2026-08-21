@@ -194,7 +194,10 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
     const { data: team } = await db().from("teams").select("slug").eq("id", seed.teamId).single();
     const slug = (team as { slug: string }).slug;
     const item = await ingest(seed, { kind: "deliverable", path: "docs/h.md", body: "no unit yet", access: "external" });
-    // Simulate the pre-backfill race: delete the unit the ingest hook created (memberships cascade).
+    // Bootstrap FIRST (system projects exist), then delete the unit — this exercises the NO-UNIT
+    // fail-open, not the unbootstrapped one (mutation (f) survived the earlier version, which never
+    // bootstrapped and so never reached the branch under test).
+    await backfillTeamContext(db(), seed.teamId);
     await db().from("project_context_units").delete().eq("team_id", seed.teamId).eq("source_item_id", item.id);
     const fake = new FakeGraphiti();
     await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
