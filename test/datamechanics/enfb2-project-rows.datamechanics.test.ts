@@ -315,7 +315,7 @@ describe("ENFB-2 D1 — createProjectAction grants its creator (round-2 blockers
     const { data: proj } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "cardp").single();
 
     const handTyped = await db().from("tasks").insert({
-      team_id: seed.teamId, row_key: `CARD-${Math.random().toString(36).slice(2, 8)}`,
+      team_id: seed.teamId, row_key: `CARD-${randomUUID().slice(0, 6)}`,
       title: "hand typed, no source item", status: "in_progress",
       source_item_id: null, created_by: member, audience: "team", project_id: (proj as { id: string }).id, origin: "ui",
     });
