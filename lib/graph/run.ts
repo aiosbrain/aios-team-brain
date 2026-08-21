@@ -10,8 +10,11 @@ import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 /**
  * Graph-projection runner — the on-ramp that actually drives `projectSlackToGraph` (which is
  * otherwise just a library function nobody calls). Mirrors `lib/ingest/run.ts`: resolve the
- * team(s), then project each. Two callers: the admin "Project to graph" action (on-demand) and
- * `lib/graph/scheduler.ts` (interval). Inert when Graphiti isn't configured (no GRAPHITI_URL) — it
+ * team(s), then project each. THREE non-test callers, enumerated because a stale count of them was
+ * load-bearing once: the admin "Project to graph" action (on-demand), `lib/graph/scheduler.ts`
+ * (interval), and `scripts/graph-window-battery/run-projection.ts` (manual battery). This docstring
+ * said "two" until STAGING-1 counted them — and the count matters because `GRAPH_PROJECT_ENABLED=false`
+ * gates only the scheduler, so the configured-gate below is the sole boundary the other two respect. Inert when Graphiti isn't configured (no GRAPHITI_URL) — it
  * returns a clean `configured:false` skip instead of throwing, so prod (where the graph is off)
  * is a cheap no-op.
  */

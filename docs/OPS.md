@@ -249,9 +249,13 @@ railway run -s Postgres bash -lc \
   service.
 - `--no-owner` avoids failing on role/owner mismatches between the environment the dump was taken
   in and the one being restored into (Railway-managed Postgres roles can differ across projects).
-- After a restore, run `npm run pg:schema` (`DATABASE_URL=$DATABASE_PUBLIC_URL npm run pg:schema`
-  in a Railway shell, or the CLI's own `pg:schema` subcommand — see §6) once more to reapply any
-  migration that postdates the dump. `postgres/schema.sql` and every file in `postgres/migrations/`
+- After a restore, run `npm run pg:schema` once more to reapply any migration that postdates the
+  dump — **from a plain shell with `DATABASE_URL` set to the target's public URL, NOT through
+  `railway run`.** This bullet used to say "in a Railway shell" and that is wrong: `railway run -s
+  Postgres` injects `RAILWAY_SERVICE_NAME=Postgres` plus the project marker, and
+  `assertServiceIdentity` (`scripts/service-guard.mjs`) then **refuses before opening the database**
+  (§4, Runtime backstop). Off-Railway the same guard no-ops, so the plain shell is the working path.
+  Corrected while building the staging refresh (§11), which hit it. `postgres/schema.sql` and every file in `postgres/migrations/`
   are idempotent by design (`create table if not exists`, `alter table … add column if not
 exists` — see `postgres/migrations/README.md`), so re-running it after a restore is always safe.
 
@@ -631,9 +635,33 @@ why production can never have one, and why `pg_restore --clean` (which drops onl
 contains) leaves it standing.
 
 ```bash
-psql "$STAGING_REFRESH_TARGET_URL" -c \
+env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD \
+    -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
+  psql -X "$STAGING_REFRESH_TARGET_URL" -c \
   "create table if not exists staging_marker (note text primary key)"
 ```
+
+⚠️ **Run it with the scrub above, exactly as written.** `PGHOSTADDR` in your shell redirects a libpq
+connection while the URL still reads as staging — verified: a URL naming a nonexistent host connects
+to `127.0.0.1` when `PGHOSTADDR=127.0.0.1` is set. Plant the marker through a redirected connection
+and it lands on **production**, after which the refresh's marker check passes and `--clean` follows it
+there. The script scrubs the same variables for every call it makes; this one-time command is the only
+libpq call the runbook asks a human to make, so it carries the same armour. The refresh also refuses a
+URL carrying connection parameters outside a small allowlist, `hostaddr` among them.
+
+**Then read it back on PRODUCTION, and expect nothing.** The declare above is the only libpq call this
+runbook asks a human to make, and the moment it can be misdirected the marker becomes a liability
+rather than a guard — a production database that quietly acquired one would make every later target
+check pass for a swapped pair:
+
+```bash
+env -u PGHOST -u PGHOSTADDR -u PGSERVICE psql -X "$PROD_URL" -tAc \
+  "select to_regclass('public.staging_marker')"    # must print an EMPTY line
+```
+
+If that prints `staging_marker`, stop: production is marked, and `drop table staging_marker` on prod is
+the fix. The refresh also refuses when the **source** carries the marker, which catches the swapped pair
+from the other side — but a human read-back costs one command and does not depend on the script.
 
 ⚠️ **Never add `staging_marker` to `postgres/schema.sql` or `postgres/migrations/`.** The moment it
 ships to prod it enters the dump archive, the restore drops it, and the marker guard dies silently. A
@@ -671,6 +699,11 @@ STAGING_REFRESH_TARGET_URL="<staging DATABASE_PUBLIC_URL>" \
 
 Neither URL has a default, on purpose: a default source is a second silent opinion about which
 database production is, and a default target is the URL a `--clean` restore destroys.
+
+The dump is written to a private temp file and **deleted on every exit path** — it contains production
+items, member email addresses and API-key hashes, and a copy of production with no expiry date is not
+something to leave in `/tmp`. Set `STAGING_REFRESH_DUMP=/path/to/file` to keep it (useful when debugging
+a failed restore); it is then yours to delete.
 
 `PG_BIN=/opt/homebrew/opt/postgresql@18/bin` pins the client binaries. The script refuses when
 `pg_dump`'s major is **below** the server's — `pg_dump` cannot dump a newer server, and a mismatched

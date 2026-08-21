@@ -35,22 +35,58 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECIDE="$REPO_ROOT/scripts/staging-refresh-decision.mjs"
 
+# Every libpq call goes through this. `PGHOSTADDR` redirects a connection with the URL untouched —
+# measured: a URL naming a nonexistent host connected to 127.0.0.1 with PGHOSTADDR set — so an ambient
+# variable in the operator's shell could send a `--clean` restore to production while every refusal
+# above read the innocent hostname. `psql -X` for the same reason one level up: a `\c other_db` in
+# ~/.psqlrc would move the session after the marker was read. The list is exported by the decision
+# module so the guard can prove the script scrubs exactly what the module declares.
+PG_SCRUB=(env)
+while IFS= read -r pg_var; do
+  [ -n "$pg_var" ] && PG_SCRUB+=(-u "$pg_var")
+done < <(node "$DECIDE" scrubbed-env)
+if [ ${#PG_SCRUB[@]} -le 1 ]; then
+  echo "staging-refresh REFUSED: the libpq environment scrub list came back EMPTY." >&2
+  echo "  Without it, PGHOSTADDR/PGSERVICE can point this run at a database no refusal here inspected." >&2
+  exit 1
+fi
+
 # No defaults, on purpose (spec criterion 6). The `:-` below is an EMPTY fallback so `set -u` does not
 # abort before the refusal can be printed with its explanation — it is not a default value, and a
 # guard asserts that these two never acquire one.
 SOURCE_URL="${STAGING_REFRESH_SOURCE_URL:-}"
 TARGET_URL="${STAGING_REFRESH_TARGET_URL:-}"
 
+# A decision is only an approval when it SAYS SO. Exit 0 alone is not enough: the decision CLI once
+# no-opped entirely — printing nothing, exiting 0 — whenever it ran from a symlinked path or one with a
+# space in it, because its entry guard compared unresolved path strings. Every refusal was dead and this
+# script would have read the silence as a green light. Requiring a positive token means any future
+# spelling of that bug stops the refresh instead of waving it through.
+decide() {
+  local out
+  if ! out="$(node "$DECIDE" "$@")"; then
+    return 1
+  fi
+  case "$out" in
+    *"staging-refresh: DECISION OK"*) return 0 ;;
+    *)
+      echo "staging-refresh REFUSED: the decision step produced no verdict (exit 0, no ack)." >&2
+      echo "  Refusing rather than treating silence as approval." >&2
+      return 1
+      ;;
+  esac
+}
+
 # ── Layer 1: connection-free refusals ───────────────────────────────────────────────────────────
 # Missing URLs and same-host must die BEFORE a socket is opened: the copy-paste case is both URLs
 # pointing at production, and "we refused, but only after logging into prod" is a worse story.
-node "$DECIDE" preflight --source "$SOURCE_URL" --target "$TARGET_URL"
+decide preflight --source "$SOURCE_URL" --target "$TARGET_URL"
 
 # ── Readings the remaining refusals need ────────────────────────────────────────────────────────
 # `psql` from PATH is fine for reading a version: only pg_dump refuses a newer server.
 read_server_major() {
   local url="$1"
-  psql "$url" -tAc "select current_setting('server_version_num')::int / 10000" 2>/dev/null | tr -d '[:space:]'
+  "${PG_SCRUB[@]}" psql -X "$url" -tAc "select current_setting('server_version_num')::int / 10000" 2>/dev/null | tr -d '[:space:]'
 }
 
 SOURCE_MAJOR="$(read_server_major "$SOURCE_URL" || true)"
@@ -75,23 +111,34 @@ if [[ -n "$PG_DUMP" && -x "$PG_DUMP" ]]; then
   CLIENT_MAJOR="$("$PG_DUMP" --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
 fi
 
-# Does the target carry the staging marker? An error reads as UNKNOWN, and unknown is a refusal.
+# Does a database carry the staging marker? An error reads as UNKNOWN, and unknown is a refusal.
 # The `[[ … ]] && VAR=…` pairs below look like the classic `set -e` footgun and are not: bash exempts
 # every member of an && list except the one after the final `&&`, so a false test assigns nothing and
-# the script continues to the refusal. Verified by running it, not by reading the manual — a silent
-# exit here would swallow the very refusal that names the remedy.
-MARKER="unknown"
-if MARKER_RAW="$(psql "$TARGET_URL" -tAc "select to_regclass('public.staging_marker') is not null" 2>/dev/null)"; then
-  MARKER_RAW="$(echo "$MARKER_RAW" | tr -d '[:space:]')"
-  [[ "$MARKER_RAW" == "t" ]] && MARKER="true"
-  [[ "$MARKER_RAW" == "f" ]] && MARKER="false"
-fi
+# the function returns its default. Verified by running it, not by reading the manual — a silent exit
+# here would swallow the very refusal that names the remedy.
+read_marker() {
+  local url="$1" raw answer="unknown"
+  if raw="$("${PG_SCRUB[@]}" psql -X "$url" -tAc "select to_regclass('public.staging_marker') is not null" 2>/dev/null)"; then
+    raw="$(echo "$raw" | tr -d '[:space:]')"
+    [[ "$raw" == "t" ]] && answer="true"
+    [[ "$raw" == "f" ]] && answer="false"
+  fi
+  echo "$answer"
+}
+
+MARKER="$(read_marker "$TARGET_URL")"
+# Read it on the SOURCE too. A production database that once acquired the marker by accident (an
+# operator with the target variable mis-set while declaring it) would make the target check pass for a
+# swapped pair forever, and nothing else in this repo would ever notice. The source of a legitimate
+# refresh is production, which has no marker — so a marked source means the two urls are swapped.
+SOURCE_MARKER="$(read_marker "$SOURCE_URL")"
 
 # ── Layer 2: the full decision ──────────────────────────────────────────────────────────────────
-node "$DECIDE" check \
+decide check \
   --source "$SOURCE_URL" \
   --target "$TARGET_URL" \
   --marker "$MARKER" \
+  --source-marker "$SOURCE_MARKER" \
   --client-major "${CLIENT_MAJOR:-0}" \
   --server-major "${SOURCE_MAJOR:-0}"
 
@@ -101,7 +148,24 @@ if [[ -n "$TARGET_MAJOR" && -n "$SOURCE_MAJOR" && "$TARGET_MAJOR" != "$SOURCE_MA
 fi
 
 # ── Dump ────────────────────────────────────────────────────────────────────────────────────────
-DUMP_FILE="${STAGING_REFRESH_DUMP:-$(mktemp -t staging-refresh-XXXXXX).dump}"
+# The dump holds prod items, member emails and api-key hashes. It is written to a private temp file and
+# REMOVED on every exit path — leaving it in /tmp is a copy of production sitting on a laptop with no
+# expiry. `STAGING_REFRESH_DUMP` keeps it deliberately (for debugging a failed restore) and is then the
+# operator's to delete; that is documented in docs/OPS.md §11 rather than left as folklore.
+if [[ -n "${STAGING_REFRESH_DUMP:-}" ]]; then
+  DUMP_FILE="$STAGING_REFRESH_DUMP"
+  KEEP_DUMP=1
+else
+  # `mktemp` creates the file it names; naming the dump `<that>.dump` would leave the original behind
+  # empty. Use the file mktemp actually made.
+  DUMP_FILE="$(mktemp -t staging-refresh)"
+  KEEP_DUMP=0
+fi
+cleanup() {
+  [[ "$KEEP_DUMP" -eq 0 && -f "$DUMP_FILE" ]] && rm -f "$DUMP_FILE"
+  return 0
+}
+trap cleanup EXIT
 
 # A while-read loop, not `mapfile`: macOS ships bash 3.2, where `mapfile`/`readarray` do not exist.
 # This script's own operator is on that bash, so the convenient spelling would have aborted here —
@@ -119,14 +183,18 @@ fi
 
 echo "staging-refresh: dumping source → $DUMP_FILE"
 echo "staging-refresh: excluding table DATA: ${EXCLUDE_ARGS[*]}"
-"$PG_DUMP" --format=custom --no-owner "${EXCLUDE_ARGS[@]}" --file "$DUMP_FILE" "$SOURCE_URL"
+"${PG_SCRUB[@]}" "$PG_DUMP" --format=custom --no-owner "${EXCLUDE_ARGS[@]}" --file "$DUMP_FILE" "$SOURCE_URL"
 
 # ── Restore ─────────────────────────────────────────────────────────────────────────────────────
 # Flags per docs/OPS.md §Restore. `--no-owner` because Railway roles differ across environments.
 # The staging marker survives this because pg_restore drops only what the archive contains, and the
 # marker exists in no archive — which is why it must never be added to postgres/schema.sql.
+# `--single-transaction`: without it a restore that fails halfway leaves staging LIVE with a half-dropped,
+# half-restored database — the drops have already committed. Wrapped, a failure rolls back to whatever
+# staging had before, which is a working environment rather than a broken one. It implies
+# --exit-on-error, which is the direction we want: a partial success must not read as a refresh.
 echo "staging-refresh: restoring into target (destructive to the target's copies of dumped objects)"
-"$PG_RESTORE" --clean --if-exists --no-owner --dbname "$TARGET_URL" "$DUMP_FILE"
+"${PG_SCRUB[@]}" "$PG_RESTORE" --single-transaction --clean --if-exists --no-owner --dbname "$TARGET_URL" "$DUMP_FILE"
 
 # ── Replay migrations that postdate the dump ────────────────────────────────────────────────────
 # From a PLAIN SHELL, never through the Railway CLI: scripts/pg-load-schema.mjs calls
