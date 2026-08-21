@@ -201,7 +201,10 @@ echo "staging-refresh: restoring into target (destructive to the target's copies
 # assertServiceIdentity before it connects, which no-ops off-Railway but REFUSES under a Railway shell
 # (that injects a non-AIOS service name plus the project marker). docs/OPS.md §Restore says to use a
 # Railway shell and is wrong for this case.
+# Scrubbed too, though this one goes through node-postgres rather than libpq (so `PGHOSTADDR` would not
+# route it anyway) and runs AFTER the destructive step. Uniformity is the point: an exception here would
+# make the guard's silence mean "everything except that one", which is how exceptions become holes.
 echo "staging-refresh: replaying schema + migrations against the target"
-DATABASE_URL="$TARGET_URL" npm --prefix "$REPO_ROOT" run pg:schema
+DATABASE_URL="$TARGET_URL" "${PG_SCRUB[@]}" npm --prefix "$REPO_ROOT" run pg:schema
 
 node "$DECIDE" completion
