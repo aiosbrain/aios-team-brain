@@ -159,10 +159,11 @@ Put a spec-derived test in the tier that catches _its_ failure mode:
 | **unit** (`vitest.config.ts`)                                  | nothing (pure)                                                                                    | parse/format boundaries, pure logic, **all drift/contract guards**                          |
 | **data-mechanics** (`vitest.datamechanics.config.ts`)          | **real Postgres, stubbed model**                                                                  | persistence & access: write→store→read, dedup, diff-sync, tier isolation                    |
 | **integration** (`vitest.http.config.ts`, `npm run test:http`) | the API over a **real socket** (`next start` + real Postgres) + the system-level `scripts/e2e.sh` | routing, auth, tier-422, cookies/headers, the JSON wire format, the cross-process sync loop |
+| **neo4j** (`npm run test:neo4j`, CI job _Graph Neo4j tier_)   | **real Neo4j** (service container = `compose.test.neo4j.yml`)                                     | graph tier isolation (`group_id` is the SOLE enforcement) + the per-item episode lookup — Cypher/shape/driver drift the source guard cannot see; self-skips without `NEO4J_TEST=1`, and the CI job's `NEO4J_TIER_REQUIRED=1` turns that skip into a collection error |
 | **eval** _(not built)_                                         | real model API                                                                                    | model judgment (grounded-answer quality) — exercised live in `e2e.sh` step 9                |
 
 Mental model: **unit = parse/guards · data-mechanics = persistence + access · integration =
-routing/auth · eval = model judgment.** Don't let a tier that stubs the model + clean inputs give
+routing/auth · neo4j = the graph's tier wall against a real graph · eval = model judgment.** Don't let a tier that stubs the model + clean inputs give
 false confidence for a data-pipeline change — put that test in data-mechanics.
 
 **Why the real-DB tier matters:** the legacy in-memory `lib/ingest/fake-supabase.ts` is fast and fine
