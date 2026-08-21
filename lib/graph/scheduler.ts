@@ -2,7 +2,9 @@ import "server-only";
 import { GraphitiClient } from "./graphiti-client";
 import { PROJECTION_INTERVAL_MS, PROJECTION_MINUTES } from "./project";
 import { runGraphProjection } from "./run";
-import { projectionRunInput } from "./projection-run";
+import { projectionRunInput, shouldRecordProjectionRun } from "./projection-run";
+
+export { shouldRecordProjectionRun, SLOW_WALK_RECORD_MS } from "./projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { adminClient } from "@/lib/db/admin";
 
@@ -13,30 +15,6 @@ import { adminClient } from "@/lib/db/admin";
  * GRAPHITI_URL is set, so a deploy with the graph off never schedules anything. Opt out explicitly
  * with GRAPH_PROJECT_ENABLED=false.
  */
-
-/** TICKFIT-2: a quiet walk slower than this records a durable run row anyway — the spec's
- *  revisit trigger reads `walkMs` from ingest_runs, and an ephemeral log cannot drive that
- *  decision. */
-export const SLOW_WALK_RECORD_MS = 60_000;
-
-/**
- * Which projection ticks earn a durable `ingest_runs` row. Every clause is a SIGNAL (the
- * no-silent-caps rule); TICKFIT-2 added the last two — a failing batched ledger read and a
- * slow quiet walk must reach the dashboard, not just logs, or the 10.5-minute stage could
- * silently return. Exported pure so the gate itself is testable (the round-2 review's
- * caller-gate requirement — the AC pins THIS function, not just the meta builder).
- */
-export function shouldRecordProjectionRun(s: {
-  projected: number; errors: string[]; requeued: number; cleaned: number;
-  pendingCleanups: number; saturatedGroups: number; requeueThrottled: number;
-  partialItems: number; probeFallbackPages: number; walkMs: number;
-}): boolean {
-  return Boolean(
-    s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
-    s.saturatedGroups || s.requeueThrottled || s.partialItems ||
-    s.probeFallbackPages || s.walkMs > SLOW_WALK_RECORD_MS
-  );
-}
 
 let started = false;
 
@@ -56,7 +34,10 @@ export function startGraphScheduler(): void {
     const startedAt = Date.now();
     try {
       const s = await runGraphProjection();
-      if (s.projected || s.errors.length || s.pendingCleanups || s.saturatedGroups || s.requeueThrottled || s.partialItems) {
+      // Same predicate as the durable record below: a third inline copy here had already dropped
+      // `probeFallbackPages`, which made the fallback clause of this very line unreachable on a
+      // quiet fallback-only tick (caught by the call-site pin in test/graph-recording-gate.test.ts).
+      if (shouldRecordProjectionRun(s)) {
         console.info(
           `[graph] projected +${s.projected} =${s.skipped} (${s.scanned} scanned, ${s.teams} teams)` +
             (s.cleaned || s.pendingCleanups

@@ -11,6 +11,33 @@ import type { GraphProjectionSummary } from "./run";
  * `source: "graph_project"` is the stable ledger key for this leg. `ok` is false whenever a team
  * errored — that's what turns the row red in the panel.
  */
+/** TICKFIT-2: a quiet walk slower than this records a durable run row anyway — the spec's
+ *  revisit trigger reads `walkMs` from ingest_runs, and an ephemeral log cannot drive that
+ *  decision. */
+export const SLOW_WALK_RECORD_MS = 60_000;
+
+/**
+ * Which projection ticks earn a durable `ingest_runs` row — the ONE gate for BOTH callers (the
+ * scheduler tick and the admin "Project to graph" button; the button used to carry its own inline
+ * copy that had drifted five signals behind). Every clause is a SIGNAL (the no-silent-caps rule);
+ * TICKFIT-2 added the last two — a failing batched ledger read and a slow quiet walk must reach
+ * the dashboard, not just logs, or the 10.5-minute stage could silently return. Pure, so the gate
+ * itself is unit-pinned (test/graph-recording-gate.test.ts pins each clause AND both call sites).
+ * `walkMs` is summed across teams (run.ts), so a multi-team instance whose quick walks add up past
+ * the threshold records an extra quiet row — a false positive that costs one row, accepted.
+ */
+export function shouldRecordProjectionRun(s: {
+  projected: number; errors: string[]; requeued: number; cleaned: number;
+  pendingCleanups: number; saturatedGroups: number; requeueThrottled: number;
+  partialItems: number; probeFallbackPages: number; walkMs: number;
+}): boolean {
+  return Boolean(
+    s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
+    s.saturatedGroups || s.requeueThrottled || s.partialItems ||
+    s.probeFallbackPages || s.walkMs > SLOW_WALK_RECORD_MS
+  );
+}
+
 export function projectionRunInput(
   summary: GraphProjectionSummary,
   trigger: IngestTrigger,

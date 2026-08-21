@@ -15,7 +15,7 @@ import { selectLlmBackend, type AnsweringProvider } from "@/lib/query/llm-backen
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
 import { runGraphProjection } from "@/lib/graph/run";
-import { projectionRunInput } from "@/lib/graph/projection-run";
+import { projectionRunInput, shouldRecordProjectionRun } from "@/lib/graph/projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import {
   linkGithubRepo,
@@ -444,7 +444,7 @@ export async function projectToGraphNow(
   const startedAt = Date.now();
   try {
     const s = await runGraphProjection({ teamId: ctx.teamId });
-    // Record the run, exactly as the scheduler does. This button pushes episodes that BURN metered
+    // Record the run through the SAME gate as the scheduler (`shouldRecordProjectionRun`). This button pushes episodes that BURN metered
     // extraction calls, so a run that leaves no `ingest_runs` row gives the Costs page's
     // calls-per-episode ratio a numerator with no denominator — and the admin most likely to click it
     // is the one diagnosing extraction, who would then read a spuriously high ratio caused by their
@@ -452,8 +452,11 @@ export async function projectToGraphNow(
     // `partialItems` joins the condition (RECONCILE-1): a manual run that projects nothing but
     // OBSERVES partially-landed items carries the one signal this measurement exists to capture, and
     // dropping it here would make the metric queryable from the scheduler but not from the button an
-    // admin actually clicks while diagnosing extraction.
-    if (s.projected || s.errors.length || s.partialItems) {
+    // admin actually clicks while diagnosing extraction. TICKFIT-2 (Fable diff review M2): this button
+    // used to carry its OWN inline condition, which had already drifted five signals behind the
+    // scheduler's and would have been blind to a failing batched ledger read and a slow walk — the
+    // durable-visibility contract held for one of the two callers. One shared predicate now.
+    if (shouldRecordProjectionRun(s)) {
       await recordIngestRun(adminClient(), projectionRunInput(s, "manual", startedAt, Date.now()));
     }
     if (!s.configured) {

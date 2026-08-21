@@ -1,0 +1,78 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { projectionRunInput, shouldRecordProjectionRun, SLOW_WALK_RECORD_MS } from "@/lib/graph/projection-run";
+import type { GraphProjectionSummary } from "@/lib/graph/run";
+
+// TICKFIT-2 AC3 / D5 — the CALLER-GATE pin (Fable diff review H1: the gate shipped with zero tests
+// behind it; a one-line revert to the old inline condition reddened nothing). Every clause of the
+// recording gate is a SIGNAL; the two TICKFIT-2 clauses are what keep a permanently failing batched
+// ledger read, or a slow quiet walk, from living only in ephemeral logs. And the predicate itself
+// can be green and unwired (the "pin the call site, not just the function" lesson), so BOTH callers
+// are pinned at the source level.
+
+const quiet: GraphProjectionSummary = {
+  ok: true,
+  configured: true,
+  teams: 1,
+  scanned: 2826,
+  projected: 0,
+  episodes: 0,
+  episodesByGroup: {},
+  fanoutThrottled: 0,
+  restrictionMovesPending: 0,
+  skipped: 2826,
+  reconciled: 4,
+  requeued: 0,
+  cleaned: 0,
+  pendingCleanups: 0,
+  saturatedGroups: 0,
+  requeueThrottled: 0,
+  partialItems: 0,
+  partialDetail: { sample: [], elided: 0, namesElided: 0 },
+  probeFallbackPages: 0,
+  walkMs: 0,
+  reconcileMs: 0,
+  errors: [],
+};
+
+describe("shouldRecordProjectionRun — the one durable-visibility gate", () => {
+  it("a quiet converged run records nothing (the no-silent-caps rule's other half: quiet rows stay quiet)", () => {
+    expect(shouldRecordProjectionRun(quiet)).toBe(false);
+  });
+
+  it("a failing batched ledger read ALONE earns a durable row (D5 — never silent)", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, probeFallbackPages: 1 })).toBe(true);
+  });
+
+  it("a slow quiet walk ALONE earns a durable row — strictly past SLOW_WALK_RECORD_MS, not at it", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, walkMs: SLOW_WALK_RECORD_MS + 1 })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, walkMs: SLOW_WALK_RECORD_MS })).toBe(false);
+  });
+
+  it("every pre-existing signal still records on its own", () => {
+    for (const key of ["projected", "requeued", "cleaned", "pendingCleanups", "saturatedGroups", "requeueThrottled", "partialItems"] as const) {
+      expect(shouldRecordProjectionRun({ ...quiet, [key]: 1 }), key).toBe(true);
+    }
+    expect(shouldRecordProjectionRun({ ...quiet, errors: ["boom"] })).toBe(true);
+  });
+
+  it("the meta carries walkMs/reconcileMs always, and probeFallbackPages only when non-zero (flat numbers — the runs panel Strings values)", () => {
+    const q = projectionRunInput(quiet, "scheduler", 1, 2).meta as Record<string, unknown>;
+    expect(q.walkMs).toBe(0);
+    expect(q.reconcileMs).toBe(0);
+    expect("probeFallbackPages" in q).toBe(false);
+    const loud = projectionRunInput({ ...quiet, probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 }, "scheduler", 1, 2).meta as Record<string, unknown>;
+    expect(loud).toMatchObject({ probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 });
+  });
+
+  it("BOTH callers route through the shared gate — the scheduler tick and the admin button (call-site pin)", () => {
+    const scheduler = readFileSync("lib/graph/scheduler.ts", "utf8");
+    const action = readFileSync("app/t/[team]/admin/integrations/actions.ts", "utf8");
+    expect(scheduler).toMatch(/if \(shouldRecordProjectionRun\(s\)\) \{\s*\n\s*await recordIngestRun\(/);
+    expect(action).toMatch(/if \(shouldRecordProjectionRun\(s\)\) \{\s*\n\s*await recordIngestRun\(/);
+    // And neither keeps an inline copy that could drift (the button's did, five signals behind).
+    for (const src of [scheduler, action]) {
+      expect(src).not.toMatch(/if \(s\.projected \|\| s\.errors\.length/);
+    }
+  });
+});

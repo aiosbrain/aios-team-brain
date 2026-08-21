@@ -13,12 +13,26 @@ import type { DbClient } from "@/lib/db/types";
 // the previously-undefined fan-out budget order); a failed batch read falls back per-page,
 // VISIBLY, and the counter survives the abort merge.
 
-/** Wrap the db so graph_episodes selects are observable/controllable: `mode.countBatch`
- *  counts page-batch reads (the `.in("source_id", …)` shape); `mode.failBatch` fails them;
- *  `mode.failProbeFor` fails the PER-ROW probe (`.eq("source_id", id)`) for one item. */
-function wrapDb(mode: { countBatch?: { n: number }; failBatch?: boolean; failProbeFor?: string }): DbClient {
+type Counts = { batches: number; probes: number };
+
+/** Wrap the db so graph_episodes selects are observable/controllable: `mode.count` counts
+ *  page-batch reads (the `.in("source_id", …)` shape) AND per-item probes (the `.eq("source_id",
+ *  id)` shape) separately — "zero per-item probes" must be ASSERTED, not implied by the batch count
+ *  (Fable diff review M3: ignoring the prefetch and probing anyway left the batch count at 1);
+ *  `mode.failBatch` fails batch reads; `mode.failProbeFor` fails the per-row probe for one item;
+ *  `mode.descBatch` serves the batch's rows in DESCENDING group_id order, so the projector's own
+ *  group_id sort is the ONLY thing that can make the lexicographically-first group win (M4: with
+ *  rows served in whatever order the planner picks, removing the sort could survive). */
+function wrapDb(mode: { count?: Counts; failBatch?: boolean; failProbeFor?: string; descBatch?: boolean }): DbClient {
   const real = db();
   const failThenable = { then: (res: (v: unknown) => void) => res({ data: null, error: { message: "induced ledger read failure" } }) };
+  const descThenable = (chain: Record<string, unknown>) => ({
+    then: (res: (v: unknown) => void, rej?: (e: unknown) => void) =>
+      (chain as unknown as PromiseLike<{ data: { group_id: string }[] | null; error: unknown }>).then((r) => {
+        const data = r.data ? [...r.data].sort((a, b) => (a.group_id < b.group_id ? 1 : a.group_id > b.group_id ? -1 : 0)) : r.data;
+        res({ ...r, data });
+      }, rej),
+  });
   const proxyChain = (chain: Record<string, unknown>): unknown =>
     new Proxy(chain, {
       get(target, prop, receiver) {
@@ -26,14 +40,18 @@ function wrapDb(mode: { countBatch?: { n: number }; failBatch?: boolean; failPro
           return (col: string, vals: unknown[]) => {
             if (col === "source_id") {
               if (mode.failBatch) return failThenable;
-              if (mode.countBatch) mode.countBatch.n++;
+              if (mode.count) mode.count.batches++;
+              if (mode.descBatch) return descThenable((target.in as (c: string, v: unknown[]) => Record<string, unknown>)(col, vals));
             }
             return proxyChain((target.in as (c: string, v: unknown[]) => Record<string, unknown>)(col, vals));
           };
         }
         if (prop === "eq") {
           return (col: string, val: unknown) => {
-            if (col === "source_id" && mode.failProbeFor && val === mode.failProbeFor) return failThenable;
+            if (col === "source_id") {
+              if (mode.failProbeFor && val === mode.failProbeFor) return failThenable;
+              if (mode.count) mode.count.probes++;
+            }
             return proxyChain((target.eq as (c: string, v: unknown) => Record<string, unknown>)(col, val));
           };
         }
@@ -72,17 +90,21 @@ describe("TICKFIT-2 — the batched ledger read (real Postgres, mocked Graphiti)
     expect(first.projected).toBe(5);
     expect(first.probeFallbackPages).toBe(0);
 
-    // Converged page, batched: exactly ONE graph_episodes batch read for 5 items.
-    const counter = { n: 0 };
-    const counted = await projectItemsToGraph(wrapDb({ countBatch: counter }), { teamId: seed.teamId, teamSlug: "t", client: client(fake) });
+    // Converged page, batched: exactly ONE graph_episodes batch read for 5 items, and ZERO
+    // per-item probes (both halves asserted — AC1).
+    const count: Counts = { batches: 0, probes: 0 };
+    const counted = await projectItemsToGraph(wrapDb({ count }), { teamId: seed.teamId, teamSlug: "t", client: client(fake) });
     expect(counted.scanned).toBe(5);
     expect(counted.skipped).toBe(5);
-    expect(counter.n, "the ROUND-TRIP pin: one batched read per page, zero per-item probes").toBe(1);
+    expect(count.batches, "the ROUND-TRIP pin: one batched read per page").toBe(1);
+    expect(count.probes, "…and zero per-item probes").toBe(0);
 
-    // Forced fallback: the batch read fails → per-item probes complete the page correctly,
-    // visibly, and the summary is otherwise identical (the trace-equivalence pin).
-    const fallback = await projectItemsToGraph(wrapDb({ failBatch: true }), { teamId: seed.teamId, teamSlug: "t", client: client(fake) });
+    // Forced fallback: the batch read fails → per-item probes (one per item) complete the page
+    // correctly, visibly, and the summary is otherwise identical (the trace-equivalence pin).
+    const fbCount: Counts = { batches: 0, probes: 0 };
+    const fallback = await projectItemsToGraph(wrapDb({ failBatch: true, count: fbCount }), { teamId: seed.teamId, teamSlug: "t", client: client(fake) });
     expect(fallback.probeFallbackPages, "the fallback is counted, never silent").toBe(1);
+    expect(fbCount.probes, "the fallback is today's exact shape: one probe per item").toBe(5);
     const strip = (s: Record<string, unknown>) => {
       const { probeFallbackPages, ...rest } = s;
       void probeFallbackPages;
@@ -117,9 +139,11 @@ describe("TICKFIT-2 — the batched ledger read (real Postgres, mocked Graphiti)
         content_sha256: "stale", chunk_shas: [], chunk_config: "2500x40", deferred: false,
       });
     }
+    // The batch rows are served g-bbb FIRST (descBatch): only the projector's sort can make
+    // g-aaa win, so removing the sort is guaranteed red on BOTH attempts regardless of the planner.
     for (const attempt of [1, 2]) {
       const pushesBefore = fake.pushes.filter((p) => groups.includes(p.groupId)).length;
-      const s = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: "t", client: client(fake), fanoutPushBudget: 1 });
+      const s = await projectItemsToGraph(wrapDb({ descBatch: true }), { teamId: seed.teamId, teamSlug: "t", client: client(fake), fanoutPushBudget: 1 });
       const newPushes = fake.pushes.filter((p) => groups.includes(p.groupId)).slice(pushesBefore);
       expect(newPushes.length, `attempt ${attempt}: budget 1 serves exactly one group`).toBeGreaterThanOrEqual(1);
       expect(newPushes[0].groupId, `attempt ${attempt}: the sorted-first group wins, deterministically`).toBe("g-aaa");

@@ -47,9 +47,17 @@ re-scope; round 2 attacks it.
   grouped by `source_id` BY REFERENCE (no array clones — memory is page-bounded in ITEM
   count, not ledger bytes), rows DETERMINIZED by `group_id` before the loop consumes them.
   Two semantic deltas, owned rather than denied: (1) SNAPSHOT TIMING — the page's ledger
-  state is read once before the loop, so a row armed mid-page (`armDeferredRowsForGroups`)
-  is seen stale-deferred and heals on the NEXT pass (eventual convergence, one-interval
-  delay, stated); (2) ORDERING — today's fan-out budget spends in UNDEFINED result order;
+  state is read once before the loop, so ANY concurrent ledger writer — arming
+  (`armDeferredRowsForGroups`), purge/retire (`retireEpisodesForItems`), reconcile's
+  never-landed re-queue, a deploy-overlap second projector — is seen at page-start state
+  instead of item-start state: the race window widens from milliseconds to page-seconds
+  (Fable diff review M5; within a page there is NO cross-item staleness, every in-loop
+  ledger write is `source_id`-scoped to the current item — verified). Each of those writers
+  converges on the NEXT pass by its existing mechanism (eventual convergence, one-interval
+  delay, stated); the one pre-existing hole they share — a tombstone written mid-window and
+  then overwritten by the final upsert, whose remedy is an optimistic
+  `.eq("content_sha256", <prefetched>)` on that upsert — is out of this slice and named;
+  (2) ORDERING — today's fan-out budget spends in UNDEFINED result order;
   the group_id sort FIXES that undefined behavior deliberately (pinned by a capped
   two-group ordering test). The batch select completes BEFORE the loop starts, so the D5
   fallback always begins from an unprocessed page. `project.ts:820-829` is the only
@@ -79,7 +87,14 @@ re-scope; round 2 attacks it.
   recording gate: a run with `probeFallbackPages > 0` (or a quiet-run `walkMs` over the
   revisit threshold) is ALWAYS recorded to `ingest_runs`, even when the scheduler's
   quiet-run gating would otherwise skip the row — a permanently failing batch read must
-  never be invisible. AC-pinned at the caller gate, not just the input builder.
+  never be invisible. AC-pinned at the caller gate, not just the input builder — and there
+  are TWO callers (the scheduler tick and the admin "Project to graph" button, which carried
+  its own inline copy that had already drifted five signals behind — Fable diff review M2);
+  both route through the one exported predicate `shouldRecordProjectionRun`
+  (`lib/graph/projection-run.ts`), pinned per clause AND per call site in
+  `test/graph-recording-gate.test.ts`. The `walkMs` clause is summed across teams, so a
+  multi-team instance can cross the threshold with no slow team — one extra quiet row,
+  accepted and stated.
 
 ## 1. The surface table
 
@@ -118,12 +133,20 @@ re-scope; round 2 attacks it.
    fan-out, reconcile — the full graph set) green **UNCHANGED** — the byte-identical-
    semantics claim is the review contract, and their existing `skipped`/counter pins are
    the proof it holds.
-3. `meta.walkMs`/`meta.reconcileMs` present and ≥ 0 in the recorded run; the CALLER-GATE
-   arm: a run with fallbacks (or a slow quiet walk) writes a durable `ingest_runs` row even
-   under quiet-run gating; `probeFallbackPages` absent/0 on the happy path.
-4. Mutations, verdicts verbatim in the PR: (a) revert the batched read to the per-row probe
-   → the round-trip pin reddens; (b) drop a group's rows from the prefetch grouping → the
-   multi-group arm reddens; (c) disable the D5 fallback → its arm reddens.
+3. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts`
+   exits 0: `meta.walkMs`/`meta.reconcileMs` present and ≥ 0 in the recorded run; the
+   CALLER-GATE arm: `shouldRecordProjectionRun` is false for a quiet converged summary,
+   true with ONLY `probeFallbackPages: 1`, true with ONLY `walkMs` strictly past
+   `SLOW_WALK_RECORD_MS` (false AT it), true for every pre-existing signal alone;
+   `probeFallbackPages` absent from meta at 0; and BOTH call sites (scheduler tick, admin
+   button) pinned at the source level to call the shared predicate with no inline copy.
+4. Mutations, verdicts verbatim in the PR: (a) ignore the prefetch (`if (prefetch)` →
+   `if (!prefetch)`) → the probe-count pin reddens (the batch count alone would NOT — the
+   round-trip pin counts per-item probes separately, Fable diff review M3); (b) remove the
+   group_id sort → the multi-group arm reddens on both attempts (the test serves the batch
+   rows in DESCENDING group order, so the planner cannot rescue the mutant — M4);
+   (c) disable the D5 fallback counter merge → its arm reddens; (d) drop the
+   `probeFallbackPages` clause from the gate → the gate suite reddens.
 5. Full tiers green: `npm test` · dm iso (tolerated: the pre-named TZ artifact + the known
    timeout-flake class, standalone-probed) · `npm run test:http:local` · `npm run check:docs`
    · ARCHITECTURE's graph-leg prose (:115) updated in the same PR; GRAPHSAT-1 filed.

@@ -802,9 +802,10 @@ export async function projectItemsToGraph(
   // the stage's entire measured cost (2,826 sequential round trips ≈ the full 10.5 minutes on a
   // corpus projecting nothing). Page-snapshot semantics, owned in the spec: the ledger state is
   // read once before the loop, so a row armed MID-page is seen stale-deferred and heals next
-  // pass (eventual convergence, one interval). Grouped by source_id BY REFERENCE; a page is
-  // ≤ GRAPH_PROJECT_LIMIT ids, under the IN-clause batch bound, so one select suffices. A read
-  // FAILURE falls back to the per-item probe for THIS page only — visible via
+  // pass (eventual convergence, one interval). Grouped by source_id BY REFERENCE; the ids are
+  // chunked at IN_CLAUSE_BATCH like every sibling call site (GRAPH_PROJECT_LIMIT is an env
+  // number, so "one select" is true by construction only when chunked — Fable diff review L1).
+  // A read FAILURE falls back to the per-item probe for THIS page only — visible via
   // `probeFallbackPages`, never silent.
   type LedgerRow = {
     content_sha256: string;
@@ -818,22 +819,33 @@ export async function projectItemsToGraph(
   let probeFallbackPages = 0;
   let prefetch: Map<string, LedgerRow[]> | null = null;
   if (rows.length > 0) {
-    const { data: batchData, error: batchErr } = await db
-      .from("graph_episodes")
-      .select("source_id, content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
-      .eq("team_id", args.teamId)
-      .eq("source_table", SOURCE_TABLE)
-      .in("source_id", rows.map((r) => r.id));
+    const fetched = new Map<string, LedgerRow[]>();
+    let batchErr: { message: string } | null = null;
+    for (const ids of chunk(rows.map((r) => r.id), IN_CLAUSE_BATCH)) {
+      const { data: batchData, error } = await db
+        .from("graph_episodes")
+        .select("source_id, content_sha256, group_id, pending_delete_group_id, chunk_shas, chunk_config, deferred, episode_uuid")
+        .eq("team_id", args.teamId)
+        .eq("source_table", SOURCE_TABLE)
+        .in("source_id", ids);
+      if (error) {
+        batchErr = error;
+        break;
+      }
+      for (const raw of (batchData ?? []) as (LedgerRow & { source_id: string })[]) {
+        const list = fetched.get(raw.source_id);
+        if (list) list.push(raw);
+        else fetched.set(raw.source_id, [raw]);
+      }
+    }
     if (batchErr) {
+      // Any chunk failing disqualifies the WHOLE page's prefetch (a partial map would read as
+      // "no ledger rows" for the unfetched items — the fail-toward-skip direction this must never
+      // take). Fall back to per-item probes for every item on the page.
       console.warn(`[graph] batched ledger read failed (page falls back to per-item probes): ${batchErr.message}`);
       probeFallbackPages = 1;
     } else {
-      prefetch = new Map();
-      for (const raw of (batchData ?? []) as (LedgerRow & { source_id: string })[]) {
-        const list = prefetch.get(raw.source_id);
-        if (list) list.push(raw);
-        else prefetch.set(raw.source_id, [raw]);
-      }
+      prefetch = fetched;
     }
   }
   for (const item of rows) {
