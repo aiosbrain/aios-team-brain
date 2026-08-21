@@ -98,7 +98,8 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
   it("GRAPHSAT-2: the watermark margin and first-push slack are positive finite defaults (env parse is resolvePositiveInt)", async () => {
     const { LANDED_WATERMARK_MARGIN_MS, FIRST_PUSH_SLACK_MS } = await import("@/lib/graph/reconcile");
     expect(LANDED_WATERMARK_MARGIN_MS).toBe(10 * 60_000);
-    expect(FIRST_PUSH_SLACK_MS).toBe(10 * 60_000);
+    expect(FIRST_PUSH_SLACK_MS).toBe(60_000);
+    expect(LANDED_WATERMARK_MARGIN_MS).toBeGreaterThan(FIRST_PUSH_SLACK_MS); // the proof's one inequality
     const { resolvePositiveInt } = await import("@/lib/util/env");
     expect(resolvePositiveInt(undefined, 600_000)).toBe(600_000);
     expect(resolvePositiveInt("0", 600_000)).toBe(600_000);

@@ -138,11 +138,22 @@ export const LANDED_WATERMARK_MARGIN_MS = resolvePositiveInt(process.env.GRAPH_L
  * creation = the reservation written right before that first push). No older same-named episode can
  * exist for a first push, so presence is that push. Re-pushed, re-queued, armed and tombstoned rows
  * never anchor — conservative; new items arrive constantly, so anchors are never scarce for long.
+ *
+ * THE BOUND, stated so it can be checked rather than believed: a row passing this filter has SOME
+ * landed push accepted no earlier than `projected_at − slack` (its first accept is at or after
+ * `first_seen_at`, and presence proves a push landed). A candidate is judged lost only if older than
+ * `projected_at − margin`. With `margin > slack` every such candidate was accepted strictly before
+ * that landed accept, so the FIFO processed it — even if the anchor row was edited and re-pushed
+ * inside the slack. Measured gap for first pushes in prod (2026-08-21): p50 0.36 s, p95 0.95 s,
+ * p99 1.1 s, none between 1 and 10 min — 60 s excludes nothing real. `margin > slack` is pinned.
  * Residual, named: the straggler-after-verified-empty shape (an item purged then re-created while a
  * leftover old episode survives) — rare, and bounded by the throttle. The exact successor is a
  * brain-chosen episode uuid per push recorded in the ledger (`/messages` accepts a client `uuid`).
  */
-export const FIRST_PUSH_SLACK_MS = 10 * 60_000;
+export const FIRST_PUSH_SLACK_MS = 60_000;
+if (!(LANDED_WATERMARK_MARGIN_MS > FIRST_PUSH_SLACK_MS)) {
+  throw new Error(`GRAPH_LANDED_WATERMARK_MARGIN_MS (${LANDED_WATERMARK_MARGIN_MS}) must exceed the first-push slack (${FIRST_PUSH_SLACK_MS}) — the landed-watermark proof requires margin > slack`);
+}
 
 export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);

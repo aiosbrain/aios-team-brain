@@ -85,8 +85,13 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
   edited `tasks.md`). Tombstones (`''` + a pending flag written after a best-effort delete) invert
   the same way. So an anchor is a row whose presence can ONLY come from the push it is stamped
   with: a FIRST push into its group — real sha, no pending flag, and `projected_at` within
-  `FIRST_PUSH_SLACK_MS` (10 min) of `first_seen_at` (the row's set-once creation, the reservation
-  written right before that first push). Re-pushed, re-queued, armed and tombstoned rows never
+  `FIRST_PUSH_SLACK_MS` (**60 s**) of `first_seen_at` (the row's set-once creation, the reservation
+  written right before that first push; measured gap in prod: p50 0.36 s, p95 0.95 s, p99 1.1 s,
+  none between 1 and 10 min). THE BOUND: such a row has a landed push accepted no earlier than
+  `projected_at − slack`; a candidate is judged lost only if older than `projected_at − margin`;
+  with `margin > slack` (pinned — the module throws otherwise) every such candidate was accepted
+  strictly before a landed accept, so the FIFO processed it — this holds even if the anchor row was
+  edited and re-pushed inside the slack, which closes the "edited within the slack" residual. Re-pushed, re-queued, armed and tombstoned rows never
   anchor — conservative, and new items arrive constantly so anchors are not scarce. Residual, named:
   the straggler-after-verified-empty shape (an item purged and re-created while a leftover old
   episode survives) — rare, throttle-bounded. The EXACT successor is a brain-chosen episode uuid per
