@@ -80,7 +80,12 @@ function unscrubbedCalls(script: string): string[] {
     // No non-quote prefix class here: the first spelling used `[^\w"]`, which can never match a token
     // that STARTS with a quote — so `"$PG_RESTORE" …` at line start was invisible and the detector
     // reported clean. Caught by the known-bad sample below, which is the only reason this comment exists.
-    .filter((line) => /(?:\bpsql\b|"\$PG_DUMP"|"\$PG_RESTORE")/.test(line))
+    // Binary NAMES as well as the variable spellings, symmetrically: `psql` was matched by name while
+    // pg_dump/pg_restore were matched only as `"$PG_DUMP"`/`"$PG_RESTORE"`, so a future edit invoking a
+    // literal `pg_restore …` — the most dangerous binary of the three — would have walked past.
+    .filter((line) => /(?:\bpsql\b|\bpg_dump\b|\bpg_restore\b|"\$PG_DUMP"|"\$PG_RESTORE")/.test(line))
+    // An ASSIGNMENT names the binary, it does not run it (`PG_DUMP="$PG_BIN/pg_dump"`).
+    .filter((line) => !/^\s*[A-Z_]+=/.test(line))
     // A `[[ -n "$PG_DUMP" ]]` test REFERENCES the binary, it does not run it — flagging it was the
     // detector's other failure direction, found the same way as the first: by running it on real input.
     .filter((line) => !line.includes("[["))
@@ -95,10 +100,17 @@ function sourceFiles(dir: string): string[] {
     .map((f) => join(dir, f));
 }
 
-/** An input that violates NOTHING — the baseline every single-layer test perturbs by exactly one field. */
+/**
+ * An input that violates NOTHING — the baseline every single-layer test perturbs by exactly one field.
+ *
+ * The urls carry NO userinfo on purpose. Written as `postgresql://u:p@host/db` they are indistinguishable
+ * to a secret scanner from a real hardcoded credential, and a repo that trains its readers to skim past
+ * "it's only a test fixture" has taught them the wrong reflex. Nothing here reads the userinfo: every
+ * refusal under test keys on scheme, host, or query parameters.
+ */
 const VALID = Object.freeze({
-  sourceUrl: "postgresql://u:p@prod-proxy.rlwy.net:33781/railway",
-  targetUrl: "postgresql://u:p@staging-proxy.rlwy.net:41999/railway",
+  sourceUrl: "postgresql://prod-proxy.rlwy.net:33781/railway",
+  targetUrl: "postgresql://staging-proxy.rlwy.net:41999/railway",
   markerPresent: true,
   sourceMarkerPresent: false, // production has no staging marker
   clientMajor: 18,
@@ -198,7 +210,7 @@ describe("staging-refresh — the refusals, each proven to fail ALONE (criteria 
   it("REFUSES same-host INDEPENDENTLY of the marker — the copy-paste case dies on its own", () => {
     // Marker present, versions fine: the ONLY violation is that both URLs point at the same database.
     // Asserted as the exact refusal set, so this can never pass because some other layer caught it.
-    const sameHost = { ...VALID, targetUrl: "postgresql://u:p@prod-proxy.rlwy.net:33781/railway" };
+    const sameHost = { ...VALID, targetUrl: "postgresql://prod-proxy.rlwy.net:33781/railway" };
     expect(codes(decideRefresh(sameHost).refusals)).toEqual([REFUSAL.SAME_HOST]);
     // And it is a PREFLIGHT refusal, i.e. reachable with no database reading at all.
     expect(codes(refusalsForPreflight(sameHost))).toEqual([REFUSAL.SAME_HOST]);
@@ -300,15 +312,15 @@ describe("staging-refresh — the URL is not the destination (criteria 17, 18)",
     // So `staging…,prod…` passes the marker read (it reaches staging) and a later restore can land on
     // production if staging is briefly unreachable. Note WHY this was missed: the port-bearing spelling
     // makes `new URL()` throw and was refused by accident, while the portless one parsed cleanly.
-    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@staging.example,prod.example/db" }).refusals)).toEqual([
+    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://staging.example,prod.example/db" }).refusals)).toEqual([
       REFUSAL.MULTI_HOST,
     ]);
     // The accidentally-refused spelling must still be refused, but that is not what proves the layer.
-    expect(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@a.example:1,b.example:2/db" }).ok).toBe(false);
+    expect(decideRefresh({ ...VALID, targetUrl: "postgresql://a.example:1,b.example:2/db" }).ok).toBe(false);
   });
 
   it("REFUSES a url whose parsed form and raw form differ (a fragment)", () => {
-    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@staging.example/db#x" }).refusals)).toEqual([
+    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://staging.example/db#x" }).refusals)).toEqual([
       REFUSAL.UNSAFE_CONNECTION_PARAMS,
     ]);
   });
@@ -339,6 +351,8 @@ describe("staging-refresh — the URL is not the destination (criteria 17, 18)",
     expect(unscrubbedCalls('"$PG_RESTORE" --clean --dbname "$TARGET_URL" "$DUMP"')).not.toEqual([]);
     expect(unscrubbedCalls('"${PG_SCRUB[@]}" "$PG_RESTORE" --clean --dbname "$T" "$D"')).toEqual([]);
     expect(unscrubbedCalls('if [[ -n "$PG_DUMP" && -x "$PG_DUMP" ]]; then')).toEqual([]); // a test, not a call
+    expect(unscrubbedCalls('  PG_DUMP="$PG_BIN/pg_dump"')).toEqual([]); // an assignment, not a call
+    expect(unscrubbedCalls('pg_restore --clean --dbname "$TARGET_URL" "$DUMP"')).not.toEqual([]); // literal binary
     expect(unscrubbedCalls(script)).toEqual([]);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" psql -X/);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_DUMP"/);
