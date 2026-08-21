@@ -613,3 +613,95 @@ The graph cleanup finishes asynchronously: the ledger row survives as a
 `pending_delete_group_id` tombstone so `reconcileProjectedEpisodes` can retry a Graphiti blip, and
 drops only once the group is verified empty. When Graphiti isn't configured the row is dropped
 outright — nothing was ever pushed, so there is nothing to retry.
+
+## 11. Staging refresh — prod-shaped data in staging (`scripts/staging-refresh.sh`)
+
+Copies **production's** Postgres into **staging's own** Postgres so a branch can be looked at against
+real data. Design + the reasoning behind every refusal: `docs/design/staging-prod-shaped-data.md`
+(STAGING-1). Staging URL: `https://aios-team-brain-staging.up.railway.app`.
+
+**The dangerous direction is the reverse one.** `pg_restore --clean` drops what it is about to
+recreate, so a target pointed at production destroys production. Read the refusals below before
+reaching for a manual `pg_dump`.
+
+### One-time: declare the target a staging database
+
+The script refuses any target that does not carry a `staging_marker` table. That table exists **only**
+in staging — it is deliberately absent from `postgres/schema.sql` and from every migration, which is
+why production can never have one, and why `pg_restore --clean` (which drops only what the archive
+contains) leaves it standing.
+
+```bash
+psql "$STAGING_REFRESH_TARGET_URL" -c \
+  "create table if not exists staging_marker (note text primary key)"
+```
+
+⚠️ **Never add `staging_marker` to `postgres/schema.sql` or `postgres/migrations/`.** The moment it
+ships to prod it enters the dump archive, the restore drops it, and the marker guard dies silently. A
+build-failing guard enforces this (`test/guards/staging-refresh.test.ts`).
+
+### One-time: the staging variable set
+
+Apply these on the staging `aios-team-brain` service, then **read them back** with
+`railway variables -s aios-team-brain -e staging` — a push that reported ok is not proof the value
+moved. This table is machine-checked against `STAGING_VARIABLES` in
+`scripts/staging-refresh-decision.mjs`; the check is a documentation-drift guard, not a check on
+Railway's real state, which is why the read-back is a required step and not a nicety.
+
+| variable | expected | why |
+|---|---|---|
+| `GRAPHITI_URL` | unset | **The load-bearing one.** The refresh empties `graph_episodes`, so every restored item looks unprojected. `GRAPH_PROJECT_ENABLED=false` does **not** stop projection — it gates the interval poller only, while the admin "Project to graph now" button calls `runGraphProjection` directly. Unset, the projector returns before it opens the database. Set, one click bills real entity extraction across the whole restored corpus. |
+| `NEO4J_URL` | unset | staging's own Neo4j holds demo-seed data; wired up it would render *demo* facts beside *prod-shaped* content. Cosmetic honesty, not safety — re-wiring this alone is safe. |
+| `RESEND_API_KEY` | unset | staging's key is the same as production's, with a verified sender domain: an invite or magic-link triggered in staging reaches a **real person**. |
+| `SMTP_URL` | unset | the invariant is "no mail **provider**": `deliver()` falls through Resend to SMTP, so unsetting one is a boundary only while the other happens to be empty. |
+| `SENTRY_DSN` | unset | staging and production share the identical DSN; staging errors would land in prod's alerting. |
+| `NEXT_PUBLIC_SENTRY_DSN` | unset | same, for browser events. |
+| `SENTRY_AUTH_TOKEN` | unset | the DSNs are only the runtime half — releases and source maps upload at **build** time under this token (`next.config.ts`), into the same Sentry project prod uses. Deploy verification reads the running app's release tag, so staging releases degrade that signal. |
+| `INGEST_POLL_ENABLED` | `false` | no second scheduler. |
+| `GRAPH_PROJECT_ENABLED` | `false` | defence in depth — **not** the projection boundary (see `GRAPHITI_URL`). |
+| `AUTO_FLIP_ENABLED` | `false` | nothing in staging flips a real team's access enforcement. |
+| `SEED_DEMO` | `false` | no demo rows on top of prod-shaped data. |
+
+### Running it
+
+```bash
+STAGING_REFRESH_SOURCE_URL="<prod DATABASE_PUBLIC_URL>" \
+STAGING_REFRESH_TARGET_URL="<staging DATABASE_PUBLIC_URL>" \
+  bash scripts/staging-refresh.sh
+```
+
+Neither URL has a default, on purpose: a default source is a second silent opinion about which
+database production is, and a default target is the URL a `--clean` restore destroys.
+
+`PG_BIN=/opt/homebrew/opt/postgresql@18/bin` pins the client binaries. The script refuses when
+`pg_dump`'s major is **below** the server's — `pg_dump` cannot dump a newer server, and a mismatched
+client is how a *partially* restored archive gets made. The refusal names the remedy.
+
+### What the dump deliberately leaves out
+
+Table **data** excluded (the tables themselves are created, empty):
+
+- `integrations`, `member_secrets`, `gateway_connections` — every table carrying a `*_ciphertext`
+  column, i.e. **reversible secrets**. Not a hand-kept list: a guard scans `postgres/schema.sql` plus
+  the migrations for `*_ciphertext` columns and fails the build when one is missing from the exclusion
+  set. `member_secrets` in particular holds write-capable Slack **user** tokens that
+  `GET /api/v1/me/slack-token` hands back to an authenticated caller.
+- `graph_episodes` — the graph activity ledger. Copied against staging's empty graph it drives the
+  extraction verdict to "stalled", and the resulting synthetic `graph_extract` leg is the one
+  **confirmation-exempt** leg in the system: no staleness threshold could ever clear it. A permanently
+  red "graph extraction is broken" banner, manufactured by our own refresh.
+
+Kept deliberately: `auth_users` / `auth_tokens` / `api_keys` / `agent_tokens` (hashes, not reversible
+secrets — dropping them leaves nobody able to log into staging), `members`, and `ingest_runs` (its
+legs go stale in staging, but that alarm is *thresholded* and *true*).
+
+### After a refresh
+
+- Staging renders prod-shaped **Postgres**. Graph-backed surfaces — the learning panel, `graph-query`,
+  the semantic retrieval leg — render **empty by design**. Narrative arcs show prod's cached arcs for
+  4h, then linger up to 48h before blanking.
+- **The residual hazard, which no code here closes:** the emptied `graph_episodes` ledger means that if
+  `GRAPHITI_URL` is ever set on staging, the whole restored corpus looks unprojected and projection
+  starts billing real extraction. Three non-test entrypoints reach it — the scheduler, the admin
+  button, and `scripts/graph-window-battery/run-projection.ts`.
+- Staging is **disposable**: anything created there is destroyed by the next refresh.

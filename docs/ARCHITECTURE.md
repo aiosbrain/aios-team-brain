@@ -1175,6 +1175,13 @@ guard enforces it, it's named.
   fork, and `scripts/migrate-from-existing.mjs` requires the release tag to be DECLARED in
   `DEFAULT_TAGS` before it is cut (`nextTagPolicy`) — the lane runs on every PR, so getting that
   order wrong reds the whole repo.
+- **Copy production data anywhere** (e.g. refreshing staging) → `scripts/staging-refresh.sh` is the
+  only sanctioned path, and its refusals are pure + unit-tested in
+  `scripts/staging-refresh-decision.mjs`. The dump EXCLUDES the data of every table carrying a
+  `*_ciphertext` column (reversible secrets, found by a scan over `postgres/schema.sql` — not a
+  hand-kept list) plus `graph_episodes`, whose copied rows would manufacture a permanently
+  unclearable `graph_extract` alarm in an environment that does not run the graph. Runbook +
+  the staging variable set: `docs/OPS.md` §11. Design: `docs/design/staging-prod-shaped-data.md`.
 - **Cross the module boundary** → `lib/` is the backend domain layer (never imports `app/`), and
   `app/` reaches the DB only through the data-client factories (`lib/db/server|admin`), never
   `lib/db/pg` internals. Both directions are enforced by `import/no-restricted-paths` in
