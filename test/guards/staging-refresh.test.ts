@@ -84,8 +84,11 @@ function unscrubbedCalls(script: string): string[] {
     // pg_dump/pg_restore were matched only as `"$PG_DUMP"`/`"$PG_RESTORE"`, so a future edit invoking a
     // literal `pg_restore …` — the most dangerous binary of the three — would have walked past.
     .filter((line) => /(?:\bpsql\b|\bpg_dump\b|\bpg_restore\b|"\$PG_DUMP"|"\$PG_RESTORE")/.test(line))
-    // An ASSIGNMENT names the binary, it does not run it (`PG_DUMP="$PG_BIN/pg_dump"`).
-    .filter((line) => !/^\s*[A-Z_]+=/.test(line))
+    // An ASSIGNMENT names the binary, it does not run it (`PG_DUMP="$PG_BIN/pg_dump"`) — but only when
+    // the line is NOTHING BUT an assignment. `VAR=x psql …` is a command with an env prefix, and the
+    // first spelling of this filter (`^\s*[A-Z_]+=`) swallowed exactly that shape: a hole opened by the
+    // fix for a false positive, which is the usual way one arrives.
+    .filter((line) => !/^\s*[A-Z_]+=("[^"]*"|\S*)\s*$/.test(line))
     // A `[[ -n "$PG_DUMP" ]]` test REFERENCES the binary, it does not run it — flagging it was the
     // detector's other failure direction, found the same way as the first: by running it on real input.
     .filter((line) => !line.includes("[["))
@@ -353,10 +356,18 @@ describe("staging-refresh — the URL is not the destination (criteria 17, 18)",
     expect(unscrubbedCalls('if [[ -n "$PG_DUMP" && -x "$PG_DUMP" ]]; then')).toEqual([]); // a test, not a call
     expect(unscrubbedCalls('  PG_DUMP="$PG_BIN/pg_dump"')).toEqual([]); // an assignment, not a call
     expect(unscrubbedCalls('pg_restore --clean --dbname "$TARGET_URL" "$DUMP"')).not.toEqual([]); // literal binary
+    expect(unscrubbedCalls('DATABASE_URL="$T" psql -X -c "select 1"')).not.toEqual([]); // env prefix is not an assignment
     expect(unscrubbedCalls(script)).toEqual([]);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" psql -X/);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_DUMP"/);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_RESTORE"/);
+  });
+
+  it("scrubs the post-restore schema replay too, so the guard has no exception", () => {
+    // node-postgres ignores PGHOSTADDR and this runs after the destructive step, so it is uniformity
+    // rather than a fix — but an unpinned uniformity change is one silent edit from being an exception,
+    // and an exception makes the guard's silence mean "everything except that one".
+    expect(shellCode(SCRIPT)).toMatch(/DATABASE_URL="\$TARGET_URL" "\$\{PG_SCRUB\[@\]\}" npm/);
   });
 
   it("REFUSES if the scrub list itself comes back empty", () => {
