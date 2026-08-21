@@ -67,7 +67,7 @@ export default async function DecisionsPage({ params }: { params: Promise<{ team
   ]);
 
   const rows = ((decisions ?? []) as unknown as (Decision & { source_item_id?: string | null; created_by?: string | null; project_id?: string | null })[])
-    .filter((d) => rowVisibleByProvenance(d, vis && !vis.error ? vis.ids : null, tier))
+    .filter((d) => rowVisibleByProvenance(d, vis && !vis.error ? vis.ids : null, tier, "member"))
     // Round-2 H5's class, decisions edition: an entitled row (cross-project curation) must not
     // name a container whose ROW the viewer cannot see — the slug renders only for row-visible
     // containers, absent otherwise (indistinguishable from a container-less decision).

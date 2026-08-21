@@ -49,11 +49,16 @@ import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { randomUUID } from "node:crypto";
 
 /** ENFB-2 §2.2: displayed counts compute over the viewer's oracle ctx — resolve it like the
- *  Pulse page does (after a backfill so the fixtures' items carry memberships). */
+ *  Pulse page does (after a backfill so the fixtures' items carry memberships).
+ *
+ *  AUDITFIX-1: `principal` is threaded, matching what app/t/[team]/page.tsx actually passes. Codex's
+ *  diff review caught this helper supplying `teamPosture: true` with NO principal — a shape the type
+ *  permits and a legal caller could copy, and one that silently drops every hand-entered task out of
+ *  the funnel. The helper resembling the real call site is the whole point of it existing. */
 async function pulseCtx(seed: { teamId: string }, memberId: string, teamPosture: boolean) {
   await backfillTeamContext(db(), seed.teamId);
   const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId });
-  return { visibleItemIds: vis.ids, teamPosture };
+  return { visibleItemIds: vis.ids, teamPosture, principal: "member" as const };
 }
 
 async function externalViewer(seed: { teamId: string }): Promise<string> {
@@ -67,6 +72,41 @@ async function externalViewer(seed: { teamId: string }): Promise<string> {
 }
 
 describe("getPulseMetrics (real Postgres date windowing)", () => {
+  it("AUDITFIX-1: a MEMBER's funnel still counts a hand-entered task (no source item)", async () => {
+    // The regression half. AUDITFIX-1 made the hand-typed arm conditional on an explicit member
+    // principal, so every ctx that omits it silently drops these rows. Nothing here asserted that
+    // before — the suite's fixtures are all sourced — which is why Codex flagged the helper rather
+    // than a failing test. This is the failing test it would have needed.
+    const seed = await seedTeam();
+    // A hand-entered task still needs a container: `tasks.project_id` is not-null. It is an
+    // INGESTION project, deliberately not an access axis — which is exactly why an unsourced row
+    // has no membership to test a token's scope against (spec §3).
+    await ingest(seed, { path: "pulse/anchor.md", body: "anchor", access: "team", project: "pulseproj" });
+    const { data: proj } = await db()
+      .from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "pulseproj").single();
+    const t = await db().from("tasks").insert({
+      team_id: seed.teamId,
+      project_id: (proj as { id: string }).id,
+      row_key: `PULSE-${randomUUID().slice(0, 6)}`,
+      title: "hand entered, no source item",
+      status: "in_progress",
+      source_item_id: null,
+      created_by: seed.memberId,
+      audience: "team",
+      origin: "ui",
+    });
+    expect(t.error, t.error?.message).toBeFalsy();
+
+    const pulse = await getPulseMetrics(db(), seed.teamId, "30d", {
+      isAdmin: false,
+      memberId: seed.memberId,
+      tier: "team",
+      provCtx: await pulseCtx(seed, seed.memberId, true),
+    });
+    const counted = pulse.funnel.reduce((a, r) => a + r.count, 0);
+    expect(counted, "a member's funnel counts their hand-entered task").toBeGreaterThan(0);
+  });
+
   it("counts freshly-synced items and recent queries as CURRENT (not prior)", async () => {
     const seed = await seedTeam();
     // Three items ingested now → synced_at = now(), squarely inside the 30d window.

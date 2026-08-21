@@ -46,7 +46,9 @@ async function restrictInto(seed: Seed, itemId: string, memberInGroup?: string):
 async function ctxFor(seed: Seed, memberId: string, posture = true) {
   const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId });
   expect(vis.error, "oracle resolution must not error").toBeFalsy();
-  return { visibleItemIds: vis.ids, teamPosture: posture };
+  // AUDITFIX-1: `principal` is threaded EXPLICITLY. Every assertion in this file states MEMBER
+  // behaviour, and an omitted discriminator is `undefined`, which CLOSES the hand-typed arm.
+  return { visibleItemIds: vis.ids, teamPosture: posture, principal: "member" as const };
 }
 
 describe("ENFB-2 §2.2 — the SQL owner and the TS owner agree with fixture-level EXPECTED TRUTH", () => {
@@ -119,7 +121,7 @@ describe("ENFB-2 §2.2 — the SQL owner and the TS owner agree with fixture-lev
         expect(sqlVisible.has(key), `SQL owner: viewer=${name} row=${key}`).toBe(want);
         const row = (allRows ?? []).find((r) => r.row_key === key)!;
         expect(
-          rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, ctx.visibleItemIds, posture ? "team" : "external"),
+          rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, ctx.visibleItemIds, posture ? "team" : "external", "member"),
           `TS owner: viewer=${name} row=${key}`
         ).toBe(want);
       }

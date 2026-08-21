@@ -229,9 +229,46 @@ export interface VisibleProjectRows {
   error?: boolean;
 }
 
-function projectRowVisibleSql(teamId: string, granted: readonly string[], teamPosture: boolean) {
+/**
+ * AUDITFIX-1 §2b. The three project-row helpers below (`visibleProjectRows`, `canSeeProjectRow`,
+ * `visibleProjectCards`) are member-only, and as of Codex's diff review they are member-only BY
+ * TYPE rather than only by call-site enumeration.
+ *
+ * The review's point was sharp: they took a `Principal`, whose `projectScope` makes it token-shaped,
+ * while unconditionally asserting memberhood inside. That combination is a footgun the type system
+ * endorsed — a future token route could legitimately call `visibleProjectRows(db, tokenPrincipal)`,
+ * get the hand-typed arm opened for it, and redden nothing, because the member literal lives in this
+ * allow-listed file and the new caller need not contain one. So the parameter is now
+ * `MemberPrincipal`, which cannot carry a scope, and the assertion inside is true by construction.
+ *
+ * The value is still named once, HERE, rather than spelled at each call site — a bare `"member"`
+ * literal scattered through the file is the shape a future token path would copy.
+ */
+const MEMBER_ONLY_SURFACE = "member" as const;
+
+/**
+ * A principal that CANNOT be a delegated token. `projectScope?: never` makes a token-shaped value a
+ * compile error at the call site rather than a silent widening inside. Do not infer member-vs-token
+ * from `projectScope` being absent at runtime — an UNATTENUATED token also has a null scope, which
+ * is exactly why this is a type constraint on the caller and not a check in here.
+ */
+export type MemberPrincipal = Principal & { projectScope?: never };
+
+/**
+ * The discriminator is a parameter of this SQL builder so the policy stays in one place
+ * (`admitsUnsourced`), and its three callers below all pass `MEMBER_ONLY_SURFACE` — which is honest
+ * only because they now take a `MemberPrincipal` that cannot be a token. An earlier version of this
+ * comment claimed the parameterisation itself was the safety property; it was not, and Codex's diff
+ * review caught the claim before the type made it true.
+ */
+function projectRowVisibleSql(
+  teamId: string,
+  granted: readonly string[],
+  teamPosture: boolean,
+  principal: "member" | "token" | undefined
+) {
   const p = newSqlParams();
-  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture };
+  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture, principal };
   const team = p.add(teamId);
   const grantedPh = p.add([...granted]);
   // Posture stays a CONJUNCT on every content arm (Fable diff L10): an external-posture
@@ -247,11 +284,11 @@ function projectRowVisibleSql(teamId: string, granted: readonly string[], teamPo
   return { p, where };
 }
 
-export async function visibleProjectRows(db: DbClient, principal: Principal): Promise<VisibleProjectRows> {
+export async function visibleProjectRows(db: DbClient, principal: MemberPrincipal): Promise<VisibleProjectRows> {
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
     const res = await runSql<{ id: string }>(`select p.id from projects p where ${where}`, p.values);
     return { ids: new Set(res.rows.map((r) => r.id)) };
   } catch {
@@ -259,11 +296,11 @@ export async function visibleProjectRows(db: DbClient, principal: Principal): Pr
   }
 }
 
-export async function canSeeProjectRow(db: DbClient, principal: Principal, projectId: string): Promise<boolean> {
+export async function canSeeProjectRow(db: DbClient, principal: MemberPrincipal, projectId: string): Promise<boolean> {
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
     const idPh = p.add(projectId);
     const res = await runSql<{ id: string }>(
       `select p.id from projects p where p.id = ${idPh} and ${where} limit 1`,
@@ -289,13 +326,22 @@ export interface ProjectRowCard {
 
 export async function visibleProjectCards(
   db: DbClient,
-  principal: Principal
+  principal: MemberPrincipal
 ): Promise<{ rows: ProjectRowCard[]; error?: boolean }> {
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture0 = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0);
-    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: [...projectIds], teamPosture: posture0 };
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0, MEMBER_ONLY_SURFACE);
+    // AUDITFIX-1: the count ctx takes the SAME discriminator as the row rule above. Omitting it here
+    // is not fail-safe — it silently CLOSES the hand-typed arm for a member, so a card would report
+    // fewer tasks than the project page lists. That is a member-visible regression, and this slice
+    // narrows tokens only (§1). Pinned by the visibleTasks assertion in enfb2-project-rows.
+    const ctx: ProvenanceSqlCtx = {
+      teamId: principal.teamId,
+      grantedProjectIds: [...projectIds],
+      teamPosture: posture0,
+      principal: MEMBER_ONLY_SURFACE,
+    };
     // The card counts carry the SAME posture conjuncts as the row rule and the detail page's
     // walls (Fable diff L10 — counts must never exceed what the container page lists).
     const posture = p.add(posture0);

@@ -189,7 +189,10 @@ export async function GET(req: NextRequest) {
   try {
     const rows = await taskFeedWindow(
       auth.teamId,
-      { visibleItemIds: vis.ids, teamPosture: auth.memberTier === "team" },
+      // Member-only route (AUDITFIX-1 §2a): `authenticateApiKey` accepts `aios_` member keys only —
+      // an `aiosd_` delegated token cannot authenticate here (lib/api/auth.ts). Omitting this closes
+      // the hand-typed arm and drops every UI-origin task out of the writeback feed.
+      { visibleItemIds: vis.ids, teamPosture: auth.memberTier === "team", principal: "member" as const },
       {
         since,
         externalAudienceOnly: auth.memberTier !== "team",

@@ -248,6 +248,22 @@ history; enforcement is the only behavior) — and stateless: `conversation_id` 
 and rate limits/query_log/cost metering attribute to the launching member. Everything else still
 rejects the prefix; `aios_*` member keys are byte-for-byte unchanged.
 
+> ⚠️ **That "ALWAYS attenuated" sentence was FALSE for the STRUCTURED legs until AUDITFIX-1**
+> (`docs/design/auditfix1-token-structured-attenuation.md`). Retrieval's tasks/decisions windows
+> admitted a row with `source_item_id is null` on **team posture alone**, never consulting
+> `visibleItemIds` — and every valid token is team-tier by construction, so an empty-scoped token
+> received every hand-entered task and decision in the team. Reproduced against real Postgres; found
+> by the Phase A audit, not by the suite (the existing token test asserted `ctx.sources` only).
+> **The rule now:** the hand-typed arm is emitted only on the POSITIVE test
+> `principal === "member" && teamPosture === true` (`lib/access/provenance-sql.admitsUnsourced`), so
+> a token, an absent value and any foreign value all close. All THREE owners of the contract take the
+> discriminator — `provenanceRowSqlFromIds`, `provenanceRowSql`, and the TS twin
+> `rowVisibleByProvenance`. The two token-capable consumers (`lib/query/retrieve.ts`,
+> `lib/query/structured-extras.ts`) may only FORWARD `enforce.principal`; deriving it from `tier` or
+> posture would relabel every token as a member, and `test/guards/provenance-principal-callsites.test.ts`
+> fails the build on a member literal in either file. A token still cannot see hand-entered rows in
+> projects it IS granted — those legs carry item ids only, and widening them is AUDITFIX-7.
+
 Brain API 1.18 was ADDITIVE: delegated agent tokens (`aiosd_*`, spec §10) on the Phase A surface
 only — `GET /api/v1/items` accepts them oracle-filtered, everything else rejects the prefix;
 `aios_*` member keys unchanged, so an old server needs no negotiation (it 401s the unknown prefix).

@@ -43,7 +43,7 @@ export async function getDecisionWriteback(
   teamId: string,
   tier: ViewerTier,
   since: string,
-  enforce: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+  enforce: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" }
 ): Promise<DecisionWritebackGroup[]> {
   void db; // the feed reads through the shared pool (raw SQL); kept for signature stability
   const p = newSqlParams();

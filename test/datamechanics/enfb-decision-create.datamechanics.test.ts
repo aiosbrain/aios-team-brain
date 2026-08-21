@@ -52,7 +52,7 @@ describe("ENFB-1 — createDecisionAction writes creation provenance", () => {
 
     // The round-trip: the row the action wrote passes the rule for team posture with ANY vis
     // set (null-source arm needs no items), and fails for external posture.
-    expect(rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, new Set(), "team")).toBe(true);
-    expect(rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, new Set(), "external")).toBe(false);
+    expect(rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, new Set(), "team", "member")).toBe(true);
+    expect(rowVisibleByProvenance(row as { source_item_id: string | null; created_by: string | null }, new Set(), "external", "member")).toBe(false);
   });
 });

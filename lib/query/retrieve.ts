@@ -600,6 +600,10 @@ async function nativeRetrieve(
     ? matchingDecisions(teamId, tier, ftsQuery, 10, {
         visibleItemIds: visibleIds ?? new Set(),
         teamPosture: tier === "team",
+        // FORWARDED, never re-derived (AUDITFIX-1 §2a). This leg is token-reachable, and the
+        // discriminator is the only thing standing between a scoped token and every hand-typed
+        // decision in the team. Deriving it here from `tier` would say "member" for every token.
+        principal: enforce?.principal,
       })
     : Promise.resolve([]);
 
@@ -642,9 +646,15 @@ async function nativeRetrieve(
   // 3. Structured-context queries — ENFB-2 §2.2: the provenance predicate compiles IN-QUERY
   // (before LIMIT), so the recency-50 and task-80 windows fill with rows THIS principal may
   // see — the ENFB-1 deferred starvation class (Codex M1) dies here. The id-array fragment is
-  // the exact SQL twin of `rowVisibleByProvenance` (one contract, two owners, dm-pinned to
+  // the exact SQL twin of `rowVisibleByProvenance` (one contract, THREE owners, dm-pinned to
   // fixture-level expected truth). Audience conjuncts preserved verbatim.
-  const provCtx = { visibleItemIds: visibleIds ?? new Set<string>(), teamPosture: tier === "team" };
+  // `principal` is FORWARDED from the caller's enforcement view — see AUDITFIX-1 §2a. Absent
+  // enforcement yields `undefined`, which CLOSES the hand-typed arm; it must never become "member".
+  const provCtx = {
+    visibleItemIds: visibleIds ?? new Set<string>(),
+    teamPosture: tier === "team",
+    principal: enforce?.principal,
+  };
   const dParams = newSqlParams();
   const dTeam = dParams.add(teamId);
   const dAccess = isRestrictedTier(tier) ? `and d.audience = 'external'` : "";

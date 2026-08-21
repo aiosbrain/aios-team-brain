@@ -48,7 +48,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   const { boardTaskWindow } = await import("@/lib/access/structured-windows");
   const boardTasksP = boardTaskWindow<Task & { source_item_id?: string | null; created_by?: string | null }>(
     team.id,
-    { visibleItemIds: vis && !vis.error ? vis.ids : new Set<string>(), teamPosture: tier === "team" },
+    { visibleItemIds: vis && !vis.error ? vis.ids : new Set<string>(), teamPosture: tier === "team", principal: "member" as const },
     tier === "external"
   ).then((rows) => ({ data: rows }));
   const [{ data: tasks }, { data: links }, { data: projects }, { data: members }, { data: me }] =
@@ -90,7 +90,7 @@ export default async function TasksPage({ params }: { params: Promise<{ team: st
   }
   const taskRows = ((tasks ?? []) as (Task & { source_item_id?: string | null; created_by?: string | null })[])
     // ENFB-1 provenance rule — the ONE shared owner (lib/access/provenance).
-    .filter((t) => rowVisibleByProvenance(t, vis && !vis.error ? vis.ids : null, tier))
+    .filter((t) => rowVisibleByProvenance(t, vis && !vis.error ? vis.ids : null, tier, "member"))
     .map((t) => ({
       ...t,
       task_pm_links: linksByTask.get(t.id) ?? [],

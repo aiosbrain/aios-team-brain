@@ -161,10 +161,15 @@ export async function getPulseMetrics(
     /** ENFB-2 §2.2: the viewer's oracle ctx — DISPLAYED counts compute over the visible sets
      *  (per-kind item growth and the task funnel were team-wide volume disclosures). Absent →
      *  fail closed (empty sets → zero counts). */
-    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean };
+    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" };
   }
 ): Promise<PulseMetrics> {
   const { isAdmin, tier } = viewer;
+  // The FALLBACK synthesises nothing (AUDITFIX-1 §2d): an absent ctx yields an absent principal,
+  // which closes the hand-typed arm. It is inert today only because the fallback also pins
+  // `teamPosture: false` — and relying on that would mean a later "fix" to the default posture
+  // silently opens the arm for a caller that supplied no view at all. The real ctx, carrying an
+  // explicit "member", comes from the session-authenticated page (app/t/[team]/page.tsx).
   const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false };
   const days = rangeDays(range);
   const now = new Date();
