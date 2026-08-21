@@ -106,7 +106,7 @@ only (`lib/access/enforce.ts`); an absent row and a current exclude row are visi
    forced INCLUDE on external-shared: the row closes, `overriddenForcedIncludes 1`, loud; the
    external principal stops seeing the item; (d) WIDENING with a forced include on General: the
    row survives (`spared 1`) and team members still see the unit through it; (e) plain flips with
-   only auto rows are byte-identical to today (`closed 1, spared 0`, counters zero); (f) the
+   only auto rows behave exactly as today (`closed 1, spared 0`, counters zero — this fence excludes nothing: the auto path is already shipped and pinned by the exclshadow and reconcile-item suites); (f) the
    counters reach the ingest meta and `overriddenForcedIncludes 1` alone records.
 2. Existing dm suites green UNCHANGED (`exclshadow*`, `context-reconcile-item`, backfill,
    enforcement suites) — D5.
