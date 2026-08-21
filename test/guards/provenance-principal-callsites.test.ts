@@ -110,6 +110,39 @@ const MEMBER_LITERAL = {
  * Type positions are excluded because they are declarations, not assertions: a union (`"member" |
  * "token"`) or a type name (`ProvenancePrincipal`, uppercase by TS convention).
  */
+/**
+ * …and the OTHER half of the property: a ctx that never mentions `principal` at all.
+ *
+ * Found by mutation, not by review. Deleting retrieve's forward to `matchingDecisions` reddened
+ * NOTHING: an absent discriminator closes the hand-typed arm, so a token's outcome is identical and
+ * every token assertion still passes. What silently changes is the MEMBER's — that leg stops serving
+ * their hand-typed decisions — and no test separates it from the recency window that serves the same
+ * rows. A surviving mutation means the suite proves nothing there, so the property moves here:
+ * in a token-capable file, every provenance ctx must CARRY the discriminator, not merely be able to.
+ *
+ * Returns the ctx literals that omit it, by their opening line.
+ */
+function ctxLiteralsMissingPrincipal(code: string): string[] {
+  const out: string[] = [];
+  for (const m of code.matchAll(/visibleItemIds\s*:/g)) {
+    // Walk back to the `{` that opens this object literal, then forward to its match.
+    let open = m.index!;
+    while (open > 0 && code[open] !== "{") open--;
+    let depth = 0;
+    let close = open;
+    for (; close < code.length; close++) {
+      if (code[close] === "{") depth++;
+      else if (code[close] === "}" && --depth === 0) break;
+    }
+    const literal = code.slice(open, close + 1);
+    // A TYPE declaration (`{ visibleItemIds: ReadonlySet<string>; ... }`) states the shape and is
+    // not a construction; it is excluded the same way the assignment scan excludes unions.
+    if (/ReadonlySet<|readonly string\[\]/.test(literal)) continue;
+    if (!/principal\s*:/.test(literal)) out.push(literal.split("\n")[1]?.trim() ?? literal.slice(0, 60));
+  }
+  return out;
+}
+
 const FORWARDED = /^enforce\??\.principal$/;
 function unforwardedPrincipalAssignments(code: string): string[] {
   const out: string[] = [];
@@ -144,6 +177,13 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     }
   });
 
+  it("…and every provenance ctx they BUILD carries the discriminator — none may omit it", () => {
+    for (const rel of TOKEN_CAPABLE) {
+      const missing = ctxLiteralsMissingPrincipal(codeOnly(read(rel)));
+      expect(missing, `${rel} builds a provenance ctx with no principal: ${missing.join(" | ")}`).toEqual([]);
+    }
+  });
+
   it("every member literal in the tree sits at a listed member-only boundary", () => {
     const offenders = [...filesUnder("lib"), ...filesUnder("app"), ...filesUnder("scripts")]
       .filter((rel) => !MEMBER_BOUNDARIES.has(rel))
@@ -175,6 +215,13 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     expect(unforwardedPrincipalAssignments("principal: enforce?.principal,")).toEqual([]);
     expect(unforwardedPrincipalAssignments('principal: "member" | "token";'), "a union is a declaration").toEqual([]);
     expect(unforwardedPrincipalAssignments("principal?: ProvenancePrincipal"), "a type name is a declaration").toEqual([]);
+    // The omission scan: a ctx with no discriminator at all — the shape a surviving mutation found.
+    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  teamPosture: true,\n})").length).toBe(1);
+    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  principal: enforce?.principal,\n})")).toEqual([]);
+    expect(
+      ctxLiteralsMissingPrincipal("interface X {\n  visibleItemIds: ReadonlySet<string>;\n}"),
+      "a type declaration is not a construction"
+    ).toEqual([]);
   });
 
   it("the allow-list is honest — every listed boundary really does assert memberhood", () => {

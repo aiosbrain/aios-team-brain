@@ -272,6 +272,23 @@ loop's value is exactly this — the rounds narrow the design, the tiers judge t
   `enforce?.principal === "member"` — a comparison, not an assertion — and swallowed SCREAMING_SNAKE
   constants under a PascalCase-means-type heuristic; both are fixed and pinned as non-vacuity cases.
 
+### 5e. And one mutation SURVIVED — reported as such
+
+**M13: deleting retrieve's forward to `matchingDecisions` reddened nothing.** All four
+data-mechanics assertions and every unit test still passed. The reason is worth stating precisely,
+because "it fails closed so it doesn't matter" is the wrong conclusion: an absent discriminator
+CLOSES the hand-typed arm, so a **token's** outcome does not change at all and every token assertion
+still holds — what silently changes is the **member's**, whose keyword-matched hand-typed decisions stop
+being served, and no test separates that leg from the recency window that serves the same rows.
+
+A surviving mutation means the suite proves nothing there. Rather than build a fixture that can
+distinguish two overlapping legs, the property moved to AC9's guard: in a token-capable file, every
+provenance ctx must **carry** the discriminator, not merely be able to. M13 re-run now reddens, and
+so do the two sibling omissions (M14, M15) that were equally unpinned.
+
+**15 mutations: 14 reddened only their intended test on the first pass; 1 survived, was fixed, and
+now reddens.**
+
 Round 1 also **confirmed the core rule is right and not over-correction**: a hand-typed row
 deliberately has no membership axis, and `tasks.project_id` is an ingestion project, not an access
 project (`enforce.ts:174`) — so admitting unsourced rows to tokens by project would invent a second
