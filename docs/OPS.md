@@ -635,13 +635,17 @@ why production can never have one, and why `pg_restore --clean` (which drops onl
 contains) leaves it standing.
 
 ```bash
+node scripts/staging-refresh-decision.mjs check-url --url "$STAGING_REFRESH_TARGET_URL" && \
 env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD \
     -u PGPASSFILE -u PGSERVICE -u PGSERVICEFILE -u PGOPTIONS \
   psql -X "$STAGING_REFRESH_TARGET_URL" -c \
   "create table if not exists staging_marker (note text primary key)"
 ```
 
-⚠️ **Run it with the scrub above, exactly as written.** `PGHOSTADDR` in your shell redirects a libpq
+⚠️ **Run it exactly as written — the `check-url &&` prefix included.** This is the only libpq call the
+runbook asks a human to make, so it is the only one the script cannot wrap; the prefix applies the same
+url-shape refusals the refresh uses (no `hostaddr`, no multi-host list, no unknown parameter), and `&&`
+makes it fail closed. `PGHOSTADDR` in your shell redirects a libpq
 connection while the URL still reads as staging — verified: a URL naming a nonexistent host connects
 to `127.0.0.1` when `PGHOSTADDR=127.0.0.1` is set. Plant the marker through a redirected connection
 and it lands on **production**, after which the refresh's marker check passes and `--clean` follows it

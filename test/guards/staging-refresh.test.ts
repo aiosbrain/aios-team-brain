@@ -69,6 +69,25 @@ function tsCode(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, "\n").replace(/(^|\s)\/\/.*$/gm, "$1");
 }
 
+/**
+ * Lines invoking a libpq client WITHOUT the environment scrub in front of it. Written as a function so
+ * the test can prove it fires on a known-bad sample before trusting its silence on the real script.
+ */
+function unscrubbedCalls(script: string): string[] {
+  return script
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    // No non-quote prefix class here: the first spelling used `[^\w"]`, which can never match a token
+    // that STARTS with a quote — so `"$PG_RESTORE" …` at line start was invisible and the detector
+    // reported clean. Caught by the known-bad sample below, which is the only reason this comment exists.
+    .filter((line) => /(?:\bpsql\b|"\$PG_DUMP"|"\$PG_RESTORE")/.test(line))
+    // A `[[ -n "$PG_DUMP" ]]` test REFERENCES the binary, it does not run it — flagging it was the
+    // detector's other failure direction, found the same way as the first: by running it on real input.
+    .filter((line) => !line.includes("[["))
+    .filter((line) => !line.includes("PG_SCRUB[@]"))
+    .map((line) => line.trim());
+}
+
 /** Every .ts/.tsx file under a directory, recursively. */
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir, { recursive: true, encoding: "utf8" })
@@ -275,6 +294,37 @@ describe("staging-refresh — the URL is not the destination (criteria 17, 18)",
     ).toEqual([REFUSAL.SAME_HOST]);
   });
 
+  it("REFUSES a multi-host url — the half the query-param allowlist does not touch", () => {
+    // libpq tries a comma-separated host list in order, verified:
+    //   psql "postgresql://u@nonexistent-host-xyz.invalid,127.0.0.1/db" → fell through to 127.0.0.1
+    // So `staging…,prod…` passes the marker read (it reaches staging) and a later restore can land on
+    // production if staging is briefly unreachable. Note WHY this was missed: the port-bearing spelling
+    // makes `new URL()` throw and was refused by accident, while the portless one parsed cleanly.
+    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@staging.example,prod.example/db" }).refusals)).toEqual([
+      REFUSAL.MULTI_HOST,
+    ]);
+    // The accidentally-refused spelling must still be refused, but that is not what proves the layer.
+    expect(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@a.example:1,b.example:2/db" }).ok).toBe(false);
+  });
+
+  it("REFUSES a url whose parsed form and raw form differ (a fragment)", () => {
+    expect(codes(decideRefresh({ ...VALID, targetUrl: "postgresql://u:p@staging.example/db#x" }).refusals)).toEqual([
+      REFUSAL.UNSAFE_CONNECTION_PARAMS,
+    ]);
+  });
+
+  it("gives the runbook's one-time marker command the same url armour, chained to fail closed", () => {
+    const decision = join(ROOT, "scripts", "staging-refresh-decision.mjs");
+    const poisoned = spawnSync(process.execPath, [decision, "check-url", "--url", "postgresql://staging.example/db?hostaddr=1.2.3.4"], { encoding: "utf8" });
+    expect(poisoned.status).toBe(1);
+    expect(poisoned.stdout).not.toContain(DECISION_ACK);
+    const clean = spawnSync(process.execPath, [decision, "check-url", "--url", "postgresql://staging.example/db"], { encoding: "utf8" });
+    expect(clean.status).toBe(0);
+    const ops = readFileSync(join(ROOT, "docs", "OPS.md"), "utf8");
+    const section = ops.slice(ops.indexOf("## 11. Staging refresh"));
+    expect(section).toMatch(/check-url --url "\$STAGING_REFRESH_TARGET_URL" && \\/);
+  });
+
   it("scrubs the libpq environment for every call, and the script uses the module's list", () => {
     // PGHOSTADDR redirects with the URL untouched, so the allowlist above is only half the fix.
     expect(SCRUBBED_PG_ENV).toContain("PGHOSTADDR");
@@ -282,9 +332,14 @@ describe("staging-refresh — the URL is not the destination (criteria 17, 18)",
     const script = shellCode(SCRIPT);
     expect(script).toMatch(/scrubbed-env/); // the list comes FROM the module — one owner, no drift
     // Every libpq invocation goes through the scrub: no bare psql/pg_dump/pg_restore call.
-    for (const m of script.matchAll(/^\s*(?:if\s+\w+="\$\()?"?(psql|\$PG_DUMP|\$PG_RESTORE)/gm)) {
-      throw new Error(`unscrubbed libpq invocation: ${m[0].trim()}`);
-    }
+    // The detector is applied to a KNOWN-BAD sample first. A scan that matches nothing reports a clean
+    // bill of health identically to a scan that found nothing wrong, and this repo has shipped that
+    // exact failure before — so the pattern proves it can fire before it is trusted to say "clean".
+    expect(unscrubbedCalls('  raw="$(psql -X "$url" -tAc "select 1")"')).not.toEqual([]);
+    expect(unscrubbedCalls('"$PG_RESTORE" --clean --dbname "$TARGET_URL" "$DUMP"')).not.toEqual([]);
+    expect(unscrubbedCalls('"${PG_SCRUB[@]}" "$PG_RESTORE" --clean --dbname "$T" "$D"')).toEqual([]);
+    expect(unscrubbedCalls('if [[ -n "$PG_DUMP" && -x "$PG_DUMP" ]]; then')).toEqual([]); // a test, not a call
+    expect(unscrubbedCalls(script)).toEqual([]);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" psql -X/);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_DUMP"/);
     expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_RESTORE"/);
