@@ -93,7 +93,11 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // EXCLSHADOW-1 narrowed this carve-out to EXPLICIT excludes: an auto exclude is now
     // repairable (the writer's shadow branch), so only force/manual shadows stay unselectable.
     // The mode term is load-bearing — dropping it would re-hide repairable shadows forever.
-    expect(sql).toMatch(/and not exists \([\s\S]*m\.valid_to is null and m\.decision = 'exclude' and m\.mode <> 'auto' and m\.project_id = s\.target_id/);
+    // CLOSEMODE-1: the carve-out text lives in the shared PROTECTED_EXCLUDE_SQL constant (also used
+    // by ARM 3's exception and the unrepairable counter — one definition, three sites).
+    expect(sql).toMatch(/and not exists \([\s\S]*m\.valid_to is null and \$\{PROTECTED_EXCLUDE_SQL\} and m\.project_id = s\.target_id/);
+    expect(src).toContain(`export const PROTECTED_EXCLUDE_SQL = "m.decision = 'exclude' and m.mode <> 'auto'";`);
+    expect(sql, "ARM 3 must not fire on a row the close SPARES (CLOSEMODE-1)").toMatch(/m\.project_id = s\.opposite_id[\s\S]{0,80}and not \(\$\{PROTECTED_EXCLUDE_SQL\}\)/);
     expect(sql, "a retracted unit is unrepairable too").toMatch(/u\.state <> 'active'/);
   });
 
@@ -110,7 +114,9 @@ describe("guard: the candidate predicate's SQL shape", () => {
     expect(sql).toMatch(/i\.id > \$4/); // keyset paging preserved
     expect(sql).toMatch(/order by s\.id/);
     expect(sql).toMatch(/limit \$6/);
-    // Any `${` inside the SQL would mean a value was interpolated rather than bound.
-    expect(sql, "SQL must be fully parameterised").not.toContain("${");
+    // Any `${` inside the SQL would mean a value was interpolated rather than bound — with ONE
+    // allowed static fragment (CLOSEMODE-1): PROTECTED_EXCLUDE_SQL, the shared spare-rule text,
+    // whose exact definition is pinned above. Everything else stays banned.
+    expect(sql.replaceAll("${PROTECTED_EXCLUDE_SQL}", ""), "SQL must be fully parameterised (no interpolation beyond the shared static fragment)").not.toContain("${");
   });
 });
