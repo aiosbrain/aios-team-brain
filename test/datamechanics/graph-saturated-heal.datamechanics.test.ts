@@ -98,10 +98,12 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
     expect(rest.confirmed).toBe(4); // landed, shrink, grow, partial
     expect(rest.partialItems).toBe(1); // partial only — grow's all-missing is the documented under-count
     expect(rest.reQueued).toBe(1); // REST path re-queues `never` (no hold there — unchanged behaviour)
-    // Reset what the REST pass wrote so the deep pass judges the same fixture.
+    // Reset what the REST pass wrote so the deep pass judges the same fixture. GRAPHSAT-2 D5: a row
+    // PARKED ('') by the REST pass is invisible to the lookup path (it awaits its re-push), so `never`
+    // gets its real sha back here to be judged as a never-landed row again.
     await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z", episode_uuid: null }).eq("team_id", f.seed.teamId);
-    const neverRow = await ledgerRow(f.seed.teamId, f.ids.never);
-    expect(neverRow.content_sha256).toBe(""); // parked by the REST pass; still judged never-landed (chunk ledger non-empty)
+    expect((await ledgerRow(f.seed.teamId, f.ids.never)).content_sha256).toBe(""); // parked by the REST pass
+    await db().from("graph_episodes").update({ content_sha256: "real" }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.never);
 
     await saturate(f);
     const calls: { groupId: string; itemIds: string[] }[] = [];
@@ -134,8 +136,9 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
   it("AC1(d) with deepRequeue ON the held row is re-queued: sentinel written, first_seen_at preserved (STALLSCOPE-1)", async () => {
     const f = await fixture();
     await saturate(f);
-    // Give `never` a real sha so the re-queue is observable as a write.
-    await db().from("graph_episodes").update({ content_sha256: "real" }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.never);
+    // Give `never` a real sha so the re-queue is observable as a write — and (GRAPHSAT-2) make it OLDER
+    // than the landed rows by more than the watermark margin, so the queue is proven to have passed it.
+    await db().from("graph_episodes").update({ content_sha256: "real", projected_at: "2019-01-01T00:00:00Z" }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.never);
     const before = await ledgerRow(f.seed.teamId, f.ids.never);
     const res = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId, { lookup: lookupFromFake(f.fake), deepRequeue: true });
     expect(res.deepRequeueEnabled).toBe(true);

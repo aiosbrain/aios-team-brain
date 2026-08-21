@@ -442,7 +442,11 @@ export async function reconcileProjectedEpisodes(
   let watermarkMs = Number.NEGATIVE_INFINITY;
   const tape: { row: EpisodeRow; groupId: string; deep: boolean }[] = [];
 
-  for (const [groupId, groupRows] of byGroup) {
+  // GRAPHSAT-2: DETERMINISTIC group traversal (sorted group_id). Throttle priority across groups was
+  // Postgres heap order before — with a scarce budget, WHICH group's rows were re-queued first was
+  // undefined (the same class TICKFIT-2 fixed for fan-out). The tape replays in this order.
+  for (const groupId of [...byGroup.keys()].sort()) {
+    const groupRows = byGroup.get(groupId)!;
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
     // treating "couldn't check" as "never landed" and re-pushing everything. RECONULL-1: COUNTED and
     // logged (it was silent), and NOTHING else — no lookup, no write: without a REST window there is

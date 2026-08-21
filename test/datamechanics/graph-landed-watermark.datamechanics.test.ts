@@ -179,24 +179,29 @@ describe("GRAPHSAT-2 — the landed watermark (real Postgres, mocked Graphiti, i
     expect(r2.reQueued).toBe(0);
   });
 
-  it("AC1(g2) ORDER: with one throttle slot, a REST-path absent row traversed first takes it; the lookup-eligible row is throttled, not reordered ahead", async () => {
-    const f = await fixture();
-    // A small (REST) group: an external item whose episode is missing, projected long ago. Group traversal
-    // is ledger insertion order by group (Map order) — the team group was inserted first by the
-    // projector, so to put the REST group FIRST we add a second team whose…  simpler: use the same team's
-    // external group and assert the tape honours whichever came first via the throttle outcome.
-    const ext = await ingest(f.seed, { kind: "deliverable", path: "docs/x.md", body: "external doc", access: "external" });
-    await projectItemsToGraph(db(), { teamId: f.seed.teamId, teamSlug: f.slug, client: client(f.fake) });
-    await removeFromGraph(f.fake, `${f.slug}_external`, ext.id);
-    await stamp(f.seed.teamId, ext.id, 72 * H);
-    const r = await rec(f, { maxRequeuePerPass: 1 });
-    // Exactly one row was parked; the other was throttled — and the parked one is the FIRST on the
-    // traversal tape (the team group is judged first here, so its lookup-eligible `old` row wins).
+  it("AC1(g2) ORDER: with one throttle slot, a REST-path absent row traversed FIRST takes it; the lookup-eligible row is throttled, not reordered ahead", async () => {
+    // Build the REST group FIRST so its ledger rows precede the team group's in traversal order.
+    const seed = await seedTeam();
+    const slug = await teamSlugFor(seed.teamId);
+    const fake = new FakeGraphiti();
+    const ext = await ingest(seed, { kind: "deliverable", path: "docs/x.md", body: "external doc", access: "external" });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    const teamIds: string[] = [];
+    for (const k of ["landed", "old"]) teamIds.push((await ingest(seed, { kind: "deliverable", path: `docs/${k}.md`, body: `${k} doc`, access: "team" })).id);
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    const teamGroup = `${slug}_team`;
+    await removeFromGraph(fake, `${slug}_external`, ext.id); // REST-path absent row
+    await removeFromGraph(fake, teamGroup, teamIds[1]); // lookup-path absent row
+    await stamp(seed.teamId, ext.id, 72 * H);
+    await stamp(seed.teamId, teamIds[0], 2 * H);
+    await stamp(seed.teamId, teamIds[1], 72 * H);
+    await fake.addEpisodes(teamGroup, Array.from({ length: LANDED_SCAN_DEPTH }, (_, i) => ep(`items:filler-${i}`)));
+    const r = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, { lookup: lookupFromFake(fake), deepRequeue: true, watermarkMarginMs: MARGIN, maxRequeuePerPass: 1 });
+    expect(r.groupsChecked).toBe(2);
     expect(r.reQueued).toBe(1);
     expect(r.requeueThrottled).toBe(1);
-    const oldParked = (await row(f.seed.teamId, f.ids.old)).content_sha256 === "";
-    const extParked = (await row(f.seed.teamId, ext.id)).content_sha256 === "";
-    expect([oldParked, extParked].filter(Boolean)).toHaveLength(1);
+    expect((await row(seed.teamId, ext.id)).content_sha256, "the REST row, traversed first, took the one slot").toBe("");
+    expect((await row(seed.teamId, teamIds[1])).content_sha256, "the lookup-eligible row was throttled, not moved ahead").not.toBe("");
   });
 
   it("AC1(h) REST-path (small group) re-queue is today's: past the grace, absent → re-queued regardless of any watermark", async () => {

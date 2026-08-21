@@ -124,6 +124,9 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
 
 ## 2. Mechanism notes
 
+- Group traversal is DETERMINISTIC (sorted `group_id`) — it was Postgres heap order, so throttle
+  priority across groups was undefined (the TICKFIT-2 fan-out class); the tape replays in that
+  order, and AC1(g2) pins it with the lexicographically-first group.
 - Two phases because the watermark must see every group's present rows before any lookup-path
   verdict is applied (the external group's fresh landing can prove General's old rows lost). Phase 1
   is today's loop with BOTH paths' re-queue decisions (REST and lookup, both branches) recorded on
@@ -172,8 +175,12 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
 2. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts` exits 0:
    `requeueEligible 1` with the flag OFF records alone; with the flag ON it is meta-only; absent
    from a quiet row; the margin env parse (unset/0/garbage → 10 min, `"600000"` → itself).
-3. Existing graph dm suites green UNCHANGED (`graph-project`, `graph-saturated-heal`,
-   `graph-unreachable-listing`, reconcile suites) — D3/D5.
+3. Existing graph dm suites green with TWO consciously revised GRAPHSAT-1 arms
+   (`graph-saturated-heal` AC1(a,b,c): the REST pass parks `never`, and a parked row is now invisible
+   to the lookup path by D5 — the fixture restores its sha before the deep pass; AC1(d): every row
+   shared one `projected_at`, so nothing was proven lost — `never` is now older than the landings by
+   more than the margin). Everything else (`graph-project`, `graph-unreachable-listing`, reconcile
+   suites) UNCHANGED — D3/D5.
 3b. `npx vitest run test/guards/graphiti-single-worker.test.ts` exits 0: the verifier accepts a
    fixture copy of upstream's `ingest.py` (committed under `test/fixtures/graphiti/`), and rejects
    copies with two `AsyncWorker()` instantiations, two `create_task`s, a bounded/second queue, or
