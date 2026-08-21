@@ -3,7 +3,7 @@ import type { GraphEpisode } from "@/lib/graph/graphiti-client";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { reconcileProjectedEpisodes, LANDED_SCAN_DEPTH } from "@/lib/graph/reconcile";
 import type { EpisodeLookup, EpisodeRefLite } from "@/lib/graph/episode-lookup";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam } from "./helpers";
 import { FakeGraphiti, client } from "./fake-graphiti";
 
 // GRAPHSAT-2 ACs (docs/design/graphsat2-consecutive-absence.md §3): on the lookup path a never-landed
