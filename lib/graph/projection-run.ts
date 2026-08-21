@@ -33,6 +33,7 @@ export function shouldRecordProjectionRun(s: {
   probeFallbackPages: number; lockedOut: number; walkMs: number;
   deepResolvedGroups: number; lookupMismatchGroups: number; deepRequeueHeld: number; deepRequeueEnabled: boolean;
   unreachableGroups: number; unreachableCleanupGroups: number; emptyListingGroups: number;
+  requeueEligible: number;
 }): boolean {
   return Boolean(
     s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
@@ -50,7 +51,11 @@ export function shouldRecordProjectionRun(s: {
     s.deepRequeueHeld || s.lookupMismatchGroups || (s.deepResolvedGroups && !s.deepRequeueEnabled) ||
     // RECONULL-1: a group that was never judged (listing threw), a cleanup that could not run, or a
     // listing that came back empty over real claims — each is the class the gate exists for.
-    s.unreachableGroups || s.unreachableCleanupGroups || s.emptyListingGroups
+    s.unreachableGroups || s.unreachableCleanupGroups || s.emptyListingGroups ||
+    // GRAPHSAT-2: rows proven lost and waiting on the flag — level-triggered, every pass, until a
+    // human acts (the "measurement mode is loud" rule). With the flag on they are re-queued, which
+    // `requeued` already records.
+    (s.requeueEligible && !s.deepRequeueEnabled)
   );
 }
 
@@ -119,6 +124,7 @@ export function projectionRunInput(
       ...(summary.unreachableGroups ? { unreachableGroups: summary.unreachableGroups } : {}),
       ...(summary.unreachableCleanupGroups ? { unreachableCleanupGroups: summary.unreachableCleanupGroups } : {}),
       ...(summary.emptyListingGroups ? { emptyListingGroups: summary.emptyListingGroups } : {}),
+      ...(summary.requeueEligible ? { requeueEligible: summary.requeueEligible } : {}),
       ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample, deepRequeueElided: summary.deepRequeueElided } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,

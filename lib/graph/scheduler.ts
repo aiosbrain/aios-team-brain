@@ -53,6 +53,7 @@ export function startGraphScheduler(): void {
             (s.unreachableGroups ? ` ${s.unreachableGroups} group(s) UNJUDGED — listing failed (timeout/unreachable/malformed)` : "") +
             (s.unreachableCleanupGroups ? ` ${s.unreachableCleanupGroups} cleanup listing(s) failed (flags kept)` : "") +
             (s.emptyListingGroups ? ` ${s.emptyListingGroups} group(s) listed EMPTY over mature rows — mass disappearance?` : "") +
+            (s.requeueEligible ? ` ${s.requeueEligible} lost row(s) proven by the landed watermark${s.deepRequeueEnabled ? "" : " — waiting on GRAPH_DEEP_REQUEUE"}` : "") +
             (s.lookupMismatchGroups ? ` ${s.lookupMismatchGroups} group(s) with a BROKEN per-item lookup (missed REST-confirmed items — is NEO4J_URL the graph Graphiti writes?)` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );

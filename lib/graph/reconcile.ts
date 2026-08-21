@@ -114,6 +114,19 @@ export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCA
  * deliberate pause, stated. The default stays 5,000 because an install WITHOUT Neo4j would lose
  * judging for every 1k–5k group.
  */
+/**
+ * GRAPHSAT-2 — THE LANDED WATERMARK. graphiti's worker is ONE serial `asyncio.Queue` consumer that
+ * drops a failing job and never re-queues (graphiti/patch-resilient-worker.py; pinned at build time
+ * by graphiti/verify-single-worker.py), so for two episodes accepted A then B: if B has landed, A is
+ * landed or GONE — never still queued. The ledger records accept order as `projected_at` (written
+ * right after the accepted POST). On a judged lookup pass, a never-landed row older than the newest
+ * PRESENT row's `projected_at` by more than this margin was passed over by the queue: lost, safe to
+ * re-push. The margin must exceed the one inversion the ordering allows — a row accepted before
+ * another but stamped later by up to one POST latency (the client aborts at 30 s); 10 min is two
+ * orders of magnitude above that. Env-tunable; `0`/blank/garbage → the default.
+ */
+export const LANDED_WATERMARK_MARGIN_MS = resolvePositiveInt(process.env.GRAPH_LANDED_WATERMARK_MARGIN_MS, 10 * 60_000);
+
 export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : undefined;
@@ -182,6 +195,11 @@ export interface ReconcileSummary {
    * (a current projection claim past the grace) — the mass-disappearance shape. The bounded re-queue
    * (REQUEUE_MAX_PER_PASS) proceeds exactly as before; this makes the event LOUD. A gate signal. */
   emptyListingGroups: number;
+  /** GRAPHSAT-2: never-landed rows on the lookup path that the landed watermark proves LOST (older
+   * than the newest present landing by more than the margin) — re-queued when `deepRequeue` is on,
+   * held otherwise. Reported either way; with the flag OFF it is a recording-gate signal: work is
+   * proven ready and waits on a human. */
+  requeueEligible: number;
   /** RECONULL-1: errors this pass could not represent as a counter (the pending-cleanup count re-read
    * failing). The runner merges them into the run's errors; every other counter and this pass's
    * mutations are retained. */
@@ -210,6 +228,8 @@ export interface ReconcileOptions {
   /** GRAPHSAT-1: whether never-landed rows judged on the LOOKUP path may be re-queued. Default
    * false — measurement mode; the runner resolves `GRAPH_DEEP_REQUEUE === "true"` once and passes it. */
   deepRequeue?: boolean;
+  /** GRAPHSAT-2 test seam: the watermark margin (default LANDED_WATERMARK_MARGIN_MS). */
+  watermarkMarginMs?: number;
 }
 
 /** GRAPHSAT-1: the ONE place the env flag is parsed. Exact `"true"` — a truthiness check would make
@@ -322,6 +342,7 @@ export async function reconcileProjectedEpisodes(
   const maxRequeuePerPass = options.maxRequeuePerPass ?? REQUEUE_MAX_PER_PASS;
   const lookup = options.lookup ?? neo4jEpisodeLookup;
   const deepRequeue = options.deepRequeue ?? false;
+  const watermarkMarginMs = options.watermarkMarginMs ?? LANDED_WATERMARK_MARGIN_MS;
   if (!client.configured)
     return {
       groupsChecked: 0,
@@ -344,6 +365,7 @@ export async function reconcileProjectedEpisodes(
       unreachableGroups: 0,
       unreachableCleanupGroups: 0,
       emptyListingGroups: 0,
+      requeueEligible: 0,
       errors: [],
     };
 
@@ -369,7 +391,7 @@ export async function reconcileProjectedEpisodes(
       cleaned: 0, cleanedExternal: 0, pendingCleanups: 0, requeueThrottled: 0, saturatedGroups: 0,
       deepResolvedGroups: 0, lookupMismatchGroups: 0, deepRequeueHeld: 0, deepRequeueHeldByGroup: {},
       deepRequeueSample: [], deepRequeueElided: 0, deepRequeueEnabled: deepRequeue,
-      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0,
+      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0, requeueEligible: 0,
       errors: [`reconcile: ledger read failed: ${ledgerErr.message}`],
     };
   }
@@ -410,7 +432,15 @@ export async function reconcileProjectedEpisodes(
   let requeueThrottled = 0;
   let unreachableGroups = 0;
   let emptyListingGroups = 0;
+  let requeueEligible = 0;
   const listTimeoutMs = landedListTimeoutMs();
+  // GRAPHSAT-2: the landed watermark — the newest `projected_at` among rows PRESENT in this pass's
+  // listings/lookups, team-wide, collected BEFORE the grace check (a fresh landing is exactly the
+  // evidence). Re-queue decisions from BOTH paths are recorded on ONE ordered tape and replayed after
+  // every group has been judged, so the watermark sees every landing and REST rows keep their
+  // throttle priority in traversal order.
+  let watermarkMs = Number.NEGATIVE_INFINITY;
+  const tape: { row: EpisodeRow; groupId: string; deep: boolean }[] = [];
 
   for (const [groupId, groupRows] of byGroup) {
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
@@ -486,17 +516,11 @@ export async function reconcileProjectedEpisodes(
     // the verdict). RECONCILE-1 (measurement only): `presentNames` lets a row's chunks be checked
     // individually and is read for counting and nothing else. ONE helper for both paths (D1).
     const { uuidByItemId, presentNames } = presenceFrom(refs);
-    // GRAPHSAT-1 D4: on the lookup path a never-landed verdict is HELD unless deepRequeue is on —
-    // `LANDED_GRACE_MS` (1h) cannot tell a row QUEUED behind the serial worker from one that was
-    // lost, and a wrong direction here is a metered re-push per row per pass. Held rows are counted
-    // and sampled (durable) so the population is enumerable; they consume no throttle budget.
-    const hold = (row: EpisodeRow): boolean => {
-      if (!deep || deepRequeue) return false;
-      deepRequeueHeld++;
-      deepRequeueHeldByGroup[groupId] = (deepRequeueHeldByGroup[groupId] ?? 0) + 1;
-      heldRefs.push({ teamId, groupId, itemId: row.source_id, projectedAt: row.projected_at });
-      return true;
-    };
+    // GRAPHSAT-2: every PRESENT row anchors the watermark — fresh or mature (the grace gate below
+    // governs confirmation/backfill/partial counting only, never the watermark).
+    for (const row of groupRows) {
+      if (uuidByItemId.has(row.source_id)) watermarkMs = Math.max(watermarkMs, new Date(row.projected_at).getTime());
+    }
 
     for (const row of groupRows) {
       if (new Date(row.projected_at).getTime() > cutoff) continue; // too recent, still may be processing
@@ -532,15 +556,7 @@ export async function reconcileProjectedEpisodes(
         // grace window). Writing and counting it every pass would inflate `requeued` in the logs and
         // the ingest_runs meta with work that isn't happening.
         if (row.content_sha256 !== "") {
-          if (hold(row)) continue;
-          // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Checked here rather than above the branch so a
-          // row already on the sentinel doesn't consume budget it isn't using.
-          if (reQueued >= maxRequeuePerPass) {
-            requeueThrottled++;
-            continue;
-          }
-          await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
-          reQueued++;
+          tape.push({ row, groupId, deep }); // decided in phase 2 (GRAPHSAT-2)
         }
       } else {
         // NEVER-PUSHED rows are the PROJECTOR's to converge, not this judge's to delete (review-2
@@ -551,13 +567,13 @@ export async function reconcileProjectedEpisodes(
         // open forever. A row that EVER pushed keeps its chunk_shas (the re-queue resets only the
         // sha), so the empty ledger is the honest discriminator.
         if ((row.chunk_shas ?? []).length === 0 && row.content_sha256 === "") continue;
-        if (hold(row)) continue;
-        // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports
-        // the remainder; the rows are untouched and come round again next pass.
-        if (reQueued >= maxRequeuePerPass) {
-          requeueThrottled++;
-          continue;
-        }
+        // GRAPHSAT-2 D5: on the LOOKUP path a row already parked on the sentinel is awaiting the
+        // projector's re-push — neither eligible, nor held, nor written, nor throttle-consuming. (The
+        // REST path keeps its historical re-judge of parked rows — named, unchanged.)
+        if (deep && row.content_sha256 === "") continue;
+        tape.push({ row, groupId, deep }); // decided in phase 2 (GRAPHSAT-2)
+        continue;
+        // The historical write, kept below for the record of WHY it parks rather than deletes:
         // PARK ON THE SENTINEL RATHER THAN DELETE (STALLSCOPE-1, found by both code reviewers).
         //
         // This used to `delete()` the row, which has the same re-queue effect — the branch above says
@@ -574,10 +590,39 @@ export async function reconcileProjectedEpisodes(
         // Keeping the row is also the more correct post-PCCC-3 behaviour on its own terms: the row IS
         // the `(item, group)` reservation, and re-pushing is what a reservation is for. The delta path
         // is skipped for a sentinel sha, so the next pass pushes the whole item exactly as before.
-        await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
-        reQueued++;
       }
     }
+  }
+
+  // ── PHASE 2 (GRAPHSAT-2): replay the tape in traversal order with the watermark known ──────────
+  // REST-path rows: today's verdict (throttle → park). Lookup-path rows: the landed-watermark rule —
+  // proven LOST (older than the newest present landing by more than the margin) → eligible; eligible
+  // AND the flag on → park like REST; otherwise HELD (counted, sampled, no budget consumed).
+  const hold = (row: EpisodeRow, groupId: string): void => {
+    deepRequeueHeld++;
+    deepRequeueHeldByGroup[groupId] = (deepRequeueHeldByGroup[groupId] ?? 0) + 1;
+    heldRefs.push({ teamId, groupId, itemId: row.source_id, projectedAt: row.projected_at });
+  };
+  for (const { row, groupId, deep } of tape) {
+    if (deep) {
+      const lost = Number.isFinite(watermarkMs) && new Date(row.projected_at).getTime() + watermarkMarginMs < watermarkMs;
+      if (lost) requeueEligible++;
+      if (!lost || !deepRequeue) {
+        hold(row, groupId);
+        continue;
+      }
+    }
+    // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports the
+    // remainder; the rows are untouched and come round again next pass. Held rows never reach here,
+    // so they consume no budget.
+    if (reQueued >= maxRequeuePerPass) {
+      requeueThrottled++;
+      continue;
+    }
+    // PARK on the '' sentinel (STALLSCOPE-1: never delete — `first_seen_at` is the stall probe's
+    // set-once clock). The pending-delete variant keeps its flag by the same write (only the sha moves).
+    await db.from("graph_episodes").update({ content_sha256: "" }).eq("id", row.id);
+    reQueued++;
   }
 
   // Tier-reclassification cleanup (audit M6 durability, Pass-1 review B2). A row with
@@ -745,6 +790,7 @@ export async function reconcileProjectedEpisodes(
     unreachableGroups,
     unreachableCleanupGroups,
     emptyListingGroups,
+    requeueEligible,
     errors,
     partialItems,
     partialDetail: boundPartialDetail(partialFound),

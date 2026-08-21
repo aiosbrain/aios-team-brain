@@ -36,6 +36,7 @@ const base: GraphProjectionSummary = {
   unreachableGroups: 0,
   unreachableCleanupGroups: 0,
   emptyListingGroups: 0,
+  requeueEligible: 0,
   walkMs: 1234,
   reconcileMs: 56,
   errors: [],

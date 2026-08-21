@@ -90,6 +90,9 @@ export interface GraphProjectionSummary {
   unreachableGroups: number;
   unreachableCleanupGroups: number;
   emptyListingGroups: number;
+  /** GRAPHSAT-2: lookup-path never-landed rows the landed watermark proves LOST this run — re-queued
+   *  when the flag is on, held otherwise; a gate signal while the flag is off (work waits on a human). */
+  requeueEligible: number;
   /** TICKFIT-2 (Codex diff review H1): teams SKIPPED this run because another brain instance holds
    *  their projection lease (`lib/graph/walk-lock.ts` — a deploy overlap). Expected once per deploy;
    *  persistent across runs means a wedged holder. Durably visible (meta + the recording gate). */
@@ -189,6 +192,7 @@ async function runGraphProjectionInner(opts?: {
     unreachableGroups: 0,
     unreachableCleanupGroups: 0,
     emptyListingGroups: 0,
+    requeueEligible: 0,
     deepRequeueEnabled: opts?.deepRequeue ?? deepRequeueEnabledFromEnv(),
     lockedOut: 0,
     walkMs: 0,
@@ -307,6 +311,7 @@ async function runGraphProjectionInner(opts?: {
       summary.unreachableGroups += r.unreachableGroups;
       summary.unreachableCleanupGroups += r.unreachableCleanupGroups;
       summary.emptyListingGroups += r.emptyListingGroups;
+      summary.requeueEligible += r.requeueEligible;
       if (r.errors.length) {
         summary.ok = false;
         for (const e of r.errors) summary.errors.push(`${t.slug}: ${e}`);
