@@ -61,8 +61,14 @@ export function parseScript(script) {
 export function parseHealthOptions(options) {
   const o = String(options ?? "");
   const cmd = /--health-cmd\s+"([^"]*)"/.exec(o)?.[1] ?? /--health-cmd\s+'([^']*)'/.exec(o)?.[1] ?? null;
-  const pick = (k) => new RegExp(`--health-${k}\\s+(\\S+)`).exec(o)?.[1] ?? null;
-  return { cmd, interval: pick("interval"), timeout: pick("timeout"), retries: pick("retries") };
+  // Literal regexes (not a RegExp built from a template) — the static-analysis rule against
+  // non-literal RegExp construction is right even when the interpolated value is a constant.
+  return {
+    cmd,
+    interval: /--health-interval\s+(\S+)/.exec(o)?.[1] ?? null,
+    timeout: /--health-timeout\s+(\S+)/.exec(o)?.[1] ?? null,
+    retries: /--health-retries\s+(\S+)/.exec(o)?.[1] ?? null,
+  };
 }
 
 /** Compose's healthcheck `test` is `["CMD-SHELL", "<cmd>"]` or a string. */
