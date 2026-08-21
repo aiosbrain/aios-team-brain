@@ -1,4 +1,13 @@
 import "server-only";
+
+/**
+ * CLOSEMODE-1 — the one textual definition of "a human's standing exclusion", used by ARM 3's
+ * exception AND the target-project shadow carve-out below, and mirrored (in TS) by
+ * `closeMembershipInto`'s spare rule in memberships.ts. The three must not drift: a row the close
+ * SPARES must not make ARM 3 fire (it would be visited and re-spared forever — the burn-a-tick
+ * class), and a row the close CLOSES must not be carved out here.
+ */
+export const PROTECTED_EXCLUDE_SQL = "m.decision = 'exclude' and m.mode <> 'auto'";
 import { runSql } from "@/lib/db/pg/pool";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
@@ -73,14 +82,16 @@ select s.id
         and m.valid_to is null and m.decision = 'include' and m.project_id = s.target_id
    )
    -- ARM 3 — still a current membership in the OPPOSITE system project: a tier flip that was never
-   -- moved. ANY decision, because reconcile's closeMembershipInto closes regardless of decision;
-   -- narrowing this to 'include' would leave a stale exclude behind.
+   -- moved. Any decision EXCEPT a human's standing exclusion (CLOSEMODE-1): closeMembershipInto now
+   -- SPARES a non-auto exclude, so selecting it here would visit-and-re-spare forever (burn a tick);
+   -- an AUTO exclude still fires (the close closes it — narrowing to 'include' would strand it).
    or exists (
      select 1 from project_context_units u
        join project_context_memberships m
          on m.team_id = u.team_id and m.context_unit_id = u.id
       where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
         and m.valid_to is null and m.project_id = s.opposite_id
+        and not (${PROTECTED_EXCLUDE_SQL})
    )
  )
  -- EXCLUDE-SHADOW EXCLUSION — NARROWED to EXPLICIT excludes (EXCLSHADOW-1). An AUTOMATIC
@@ -96,7 +107,7 @@ select s.id
      join project_context_memberships m
        on m.team_id = u.team_id and m.context_unit_id = u.id
     where u.team_id = $1 and u.source_item_id = s.id and u.unit_kind = 'item'
-      and m.valid_to is null and m.decision = 'exclude' and m.mode <> 'auto' and m.project_id = s.target_id
+      and m.valid_to is null and ${PROTECTED_EXCLUDE_SQL} and m.project_id = s.target_id
  )
  -- RETRACTED-UNIT EXCLUSION, same class as the shadow above and found by the same review.
  -- Enforced reads require state='active' (lib/access/enforce), but reconcileItemUnit never WRITES
@@ -147,7 +158,7 @@ with sys as (
 )
 select
   count(distinct i.id) filter (
-    where m.id is not null and m.valid_to is null and m.decision = 'exclude' and m.mode <> 'auto'
+    where m.id is not null and m.valid_to is null and ${PROTECTED_EXCLUDE_SQL}
       and m.project_id = (case when i.access = 'external' then sys.external_id else sys.general_id end)
   )::int as exclude_shadows,
   count(distinct i.id) filter (where u.state <> 'active')::int as retracted_units

@@ -199,27 +199,40 @@ async function repairExcludeShadow(
  * membership except the target" would, once the Part II curation UI lets a unit belong to
  * initiatives too, silently delete those legitimate initiative assignments on every reconcile.
  * The move only ever swaps between the two system projects, so it closes exactly the other one.
+ *
+ * CLOSEMODE-1: the close SPARES a human's standing exclusion (`decision='exclude' AND
+ * mode <> 'auto'`). Closing it ended the decision's continuing authority, and the round trip then
+ * re-included content a human had explicitly excluded from the external tier (the outbound flip
+ * deleted the very row invariant 3's return-leg refusal needs). Sparing an exclude is
+ * visibility-NEUTRAL — every serving reader filters `decision='include'`, so a current exclude and
+ * absence serve identically — and the candidate predicate's ARM 3 carries the same exception
+ * (`PROTECTED_EXCLUDE_SQL` in backfill-candidates.ts — keep the two rules textually in step).
+ * Includes of ANY mode still close: force-include semantics on system projects are Phase D design
+ * (a General survivor would widen for a General-scoped delegated token and diverge from the
+ * graph's single-home model — CLOSEMODE-1 design round 1).
  */
 export async function closeMembershipInto(
   db: DbClient,
   teamId: string,
   contextUnitId: string,
   projectId: string
-): Promise<{ ok: boolean; error?: string; closed: number }> {
+): Promise<{ ok: boolean; error?: string; closed: number; spared: number }> {
   const { data: current } = await db
     .from("project_context_memberships")
-    .select("id")
+    .select("id, decision, mode")
     .eq("team_id", teamId)
     .eq("context_unit_id", contextUnitId)
     .eq("project_id", projectId)
     .is("valid_to", null);
-  const rows = (current ?? []) as { id: string }[];
-  if (rows.length === 0) return { ok: true, closed: 0 };
+  const rows = (current ?? []) as { id: string; decision: string; mode: string }[];
+  const toClose = rows.filter((m) => !(m.decision === "exclude" && m.mode !== "auto"));
+  const spared = rows.length - toClose.length;
+  if (toClose.length === 0) return { ok: true, closed: 0, spared };
   const { error } = await db
     .from("project_context_memberships")
     .update({ valid_to: new Date().toISOString() })
     .eq("team_id", teamId)
-    .in("id", rows.map((m) => m.id));
-  if (error) return { ok: false, error: error.message, closed: 0 };
-  return { ok: true, closed: rows.length };
+    .in("id", toClose.map((m) => m.id));
+  if (error) return { ok: false, error: error.message, closed: 0, spared };
+  return { ok: true, closed: toClose.length, spared };
 }

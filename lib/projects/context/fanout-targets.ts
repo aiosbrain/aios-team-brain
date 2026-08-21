@@ -20,6 +20,13 @@ export interface FanoutResolution {
    *  RESTRICTED out of General is absent here — the projector's landed-gated move purges its home
    *  row once a landed initiative copy exists; spec rule 2, restriction-moves-not-copies). */
   inGeneral: Set<string>;
+  /** CLOSEMODE-1 (graph leg): items whose unit holds a CURRENT include in external-shared. The
+   *  projector homes an `access='external'` item in the external graph group ONLY when it is here —
+   *  a standing exclusion (or a closed include) pulls the content out of the partition external
+   *  principals query, via the existing tier-move machinery. Same rule-1 default as `inGeneral`:
+   *  an item with NO substrate rows (or an unbootstrapped external-shared) reads as included, so a
+   *  substrate race can never silently demote a healthy external item. */
+  inExternalShared: Set<string>;
 }
 
 export async function resolveFanoutTargets(
@@ -32,14 +39,20 @@ export async function resolveFanoutTargets(
     /** The General built-in's project id (null when unbootstrapped — every item then reads as
      *  in-General, which disables the restriction move: fail open to today's behavior). */
     generalProjectId?: string | null;
+    /** The external-shared built-in's project id (null when unbootstrapped — every item then reads
+     *  as in-external-shared: fail open to access-based homing, today's behavior). */
+    externalSharedProjectId?: string | null;
   }
 ): Promise<FanoutResolution> {
   const targets = new Map<string, Set<string>>();
   const inGeneral = new Set<string>();
+  const inExternalShared = new Set<string>();
   const itemsWithUnits = new Set<string>();
   const generalDisabled = !args.generalProjectId;
+  const externalDisabled = !args.externalSharedProjectId;
   if (generalDisabled) for (const id of args.itemIds) inGeneral.add(id);
-  if (args.itemIds.length === 0) return { targets, inGeneral };
+  if (externalDisabled) for (const id of args.itemIds) inExternalShared.add(id);
+  if (args.itemIds.length === 0) return { targets, inGeneral, inExternalShared };
 
   for (const idBatch of chunk([...args.itemIds], IN_CLAUSE_BATCH)) {
     const { data: unitData, error: unitErr } = await db
@@ -69,6 +82,10 @@ export async function resolveFanoutTargets(
           inGeneral.add(itemId);
           continue;
         }
+        if (!externalDisabled && m.project_id === args.externalSharedProjectId) {
+          inExternalShared.add(itemId);
+          continue;
+        }
         const group = args.initiativeGroupByProject.get(m.project_id);
         if (!group) continue; // non-initiative or pointerless target — not a fan-out surface
         const set = targets.get(itemId) ?? new Set<string>();
@@ -87,7 +104,10 @@ export async function resolveFanoutTargets(
   if (!generalDisabled) {
     for (const id of args.itemIds) if (!itemsWithUnits.has(id)) inGeneral.add(id);
   }
-  return { targets, inGeneral };
+  if (!externalDisabled) {
+    for (const id of args.itemIds) if (!itemsWithUnits.has(id)) inExternalShared.add(id);
+  }
+  return { targets, inGeneral, inExternalShared };
 }
 
 /**

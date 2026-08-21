@@ -25,6 +25,8 @@ export interface BackfillResult {
   scanned: number;
   unitsCreated: number;
   membershipsCreated: number;
+  /** CLOSEMODE-1: opposite-project rows left standing across the pass (a human's non-auto excludes). */
+  spared: number;
   /** The last item id processed — pass as `afterId` to resume; null when the corpus is drained. */
   cursor: string | null;
 }
@@ -42,10 +44,10 @@ export async function backfillTeamContext(
 
   // The system projects + grants must exist before we can point memberships at them.
   const boot = await ensureAccessBootstrap(db, teamId);
-  if (!boot.ok) return { ok: false, error: `bootstrap: ${boot.error}`, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
+  if (!boot.ok) return { ok: false, error: `bootstrap: ${boot.error}`, scanned: 0, unitsCreated: 0, membershipsCreated: 0, spared: 0, cursor: opts.afterId ?? null };
 
   const projectId = await resolveSystemProjectIds(db, teamId);
-  if (!projectId.ok) return { ok: false, error: projectId.error, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
+  if (!projectId.ok) return { ok: false, error: projectId.error, scanned: 0, unitsCreated: 0, membershipsCreated: 0, spared: 0, cursor: opts.afterId ?? null };
 
   // CANDIDATES ONLY (TICKSTALL-2). This used to select every item and lean on reconcile being
   // idempotent — ~1.3 s per item to re-confirm 2,672 finished ones in order to fix 6. The predicate
@@ -65,12 +67,13 @@ export async function backfillTeamContext(
     ids = page.ids;
   } catch (e) {
     const msg = e instanceof Error ? e.message : "candidate query failed";
-    return { ok: false, error: msg, scanned: 0, unitsCreated: 0, membershipsCreated: 0, cursor: opts.afterId ?? null };
+    return { ok: false, error: msg, scanned: 0, unitsCreated: 0, membershipsCreated: 0, spared: 0, cursor: opts.afterId ?? null };
   }
 
   const items: ItemRow[] = ids.map((id) => ({ id }));
   let unitsCreated = 0;
   let membershipsCreated = 0;
+  let spared = 0;
   let scanned = 0;
   // On failure the cursor is the last item that FULLY succeeded (or the incoming afterId if the
   // first item fails), so a resume RETRIES the failed item rather than skipping past it —
@@ -82,16 +85,17 @@ export async function backfillTeamContext(
     // Per-item reconcile+route+move — the SAME core the ingest hook uses (spec §11.2), so the
     // one-time sweep and the on-push path can never diverge in how they partition an item.
     const r = await reconcileItemContext(db, teamId, item.id, projectId);
-    if (!r.ok) return { ok: false, error: `${item.id}: ${r.error}`, scanned, unitsCreated, membershipsCreated, cursor: lastGood };
+    if (!r.ok) return { ok: false, error: `${item.id}: ${r.error}`, scanned, unitsCreated, membershipsCreated, spared, cursor: lastGood };
     if (r.unitCreated) unitsCreated++;
     if (r.membershipCreated) membershipsCreated++;
+    spared += r.spared ?? 0;
     scanned++;
     lastGood = item.id;
   }
 
   // Drained when the batch came back short.
   const cursor = items.length === batchSize ? items[items.length - 1].id : null;
-  return { ok: true, scanned, unitsCreated, membershipsCreated, cursor };
+  return { ok: true, scanned, unitsCreated, membershipsCreated, spared, cursor };
 }
 
 async function resolveSystemProjectIds(
@@ -174,6 +178,8 @@ export interface TeamBackfillOutcome {
   scanned: number;
   unitsCreated: number;
   membershipsCreated: number;
+  /** CLOSEMODE-1: opposite-project rows left standing across this turn (a human's non-auto excludes). */
+  spared: number;
   truncated: boolean;
   drained: boolean;
   /** Wall-clock this team's turn consumed — the per-team number the aggregate `duration_ms` cannot
@@ -255,6 +261,7 @@ async function backfillOneTeamTurn(
     scanned: 0,
     unitsCreated: 0,
     membershipsCreated: 0,
+    spared: 0,
     truncated: false,
     drained: false,
     elapsedMs: 0,
@@ -280,6 +287,7 @@ async function backfillOneTeamTurn(
       let scanned = 0;
       let unitsCreated = 0;
       let membershipsCreated = 0;
+      let spared = 0;
       for (let guard = 0; guard < MAX_BATCHES; guard++) {
         const r: BackfillResult = await backfillTeamContext(db, t.id, {
           afterId: cursor,
@@ -289,11 +297,12 @@ async function backfillOneTeamTurn(
         scanned += r.scanned;
         unitsCreated += r.unitsCreated;
         membershipsCreated += r.membershipsCreated;
+        spared += r.spared;
         if (!r.ok) {
           // A failure keeps the cursor at the last FULLY-succeeded item so the next pass RETRIES the
           // offending item instead of stepping over it — skipping would leave a unit with no
           // membership, i.e. content visible to nobody under an enforced read.
-          return { ...base, elapsedMs: o.now() - turnStartedAt, ok: false, error: r.error ?? "unknown", scanned, unitsCreated, membershipsCreated, cursor: r.cursor };
+          return { ...base, elapsedMs: o.now() - turnStartedAt, ok: false, error: r.error ?? "unknown", scanned, unitsCreated, membershipsCreated, spared, cursor: r.cursor };
         }
         if (r.cursor === null) {
           drained = true;
@@ -312,13 +321,13 @@ async function backfillOneTeamTurn(
         // would otherwise report as covered (Fable M1). Distinct from `truncated`, which is a
         // deliberate stop with a resumable cursor.
         return {
-          ...base, ok: false, scanned, unitsCreated, membershipsCreated, cursor,
+          ...base, ok: false, scanned, unitsCreated, membershipsCreated, spared, cursor,
           error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled`,
         };
       }
       // Reset on drain. Without it, an item the on-push hook misses whose id sorts BELOW the final
       // cursor is never swept again — the silent-forever direction.
-      return { ...base, elapsedMs: o.now() - turnStartedAt, scanned, unitsCreated, membershipsCreated, truncated, drained, cursor: drained ? null : cursor };
+      return { ...base, elapsedMs: o.now() - turnStartedAt, scanned, unitsCreated, membershipsCreated, spared, truncated, drained, cursor: drained ? null : cursor };
     } catch (e) {
       return { ...base, elapsedMs: o.now() - turnStartedAt, ok: false, error: e instanceof Error ? e.message : "threw" };
     }

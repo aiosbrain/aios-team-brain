@@ -32,6 +32,8 @@ export interface ReconcileItemResult {
   unitId?: string;
   unitCreated?: boolean;
   membershipCreated?: boolean;
+  /** CLOSEMODE-1: opposite-project rows left standing (a human's non-auto exclude). */
+  spared?: number;
 }
 
 /**
@@ -92,5 +94,5 @@ export async function reconcileItemContext(
   const closed = await closeMembershipInto(db, teamId, unit.unitId, other);
   if (!closed.ok) return { ok: false, error: `move: ${closed.error}` };
 
-  return { ok: true, unitId: unit.unitId, unitCreated: unit.created, membershipCreated: m.created };
+  return { ok: true, unitId: unit.unitId, unitCreated: unit.created, membershipCreated: m.created, spared: closed.spared };
 }

@@ -383,6 +383,9 @@ export function startIngestScheduler(): void {
           errors: o.ok ? undefined : [o.error ?? "unknown"],
           meta: {
             scanned: o.scanned,
+            // CLOSEMODE-1: opposite-project rows left standing (a human's non-auto excludes) — quiet
+            // and correct, so only present when non-zero.
+            ...(o.spared ? { spared: o.spared } : {}),
             unitsCreated: o.unitsCreated,
             membershipsCreated: o.membershipsCreated,
             truncated: o.truncated,

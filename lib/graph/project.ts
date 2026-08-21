@@ -768,11 +768,13 @@ export async function projectItemsToGraph(
     partitionPurgeState.set(groupId, ok);
     return ok;
   };
-  const { targets: fanoutTargetsByItem, inGeneral } = await resolveFanoutTargets(db, {
+  const externalSharedProject = pointers.find((p) => p.kind === "system" && p.slug === "external-shared") ?? null;
+  const { targets: fanoutTargetsByItem, inGeneral, inExternalShared } = await resolveFanoutTargets(db, {
     teamId: args.teamId,
     itemIds: rows.map((r) => r.id),
     initiativeGroupByProject,
     generalProjectId: generalProject?.id ?? null,
+    externalSharedProjectId: externalSharedProject?.id ?? null,
   });
 
   let projected = 0;
@@ -862,13 +864,26 @@ export async function projectItemsToGraph(
     // that row falls out of homeWorld and the item re-projects into the new-slug group (duplicate
     // extraction; the old row waits for PCCC-6's ownerless-row sweep). Ruled acceptable: it needs
     // a failed pointer write AND a rename, and the scheduler-tick bootstrap closes the window.
+    // CLOSEMODE-1 (graph leg): the home follows the MEMBERSHIP, not raw access. An external item
+    // whose unit is known and holds NO current external-shared include (a human's standing
+    // exclusion — the substrate serves it via General only) homes on the TEAM side; the existing
+    // tier-move machinery then copies it there and pending-deletes the external copy, pulling the
+    // content out of the partition external principals query. `inExternalShared` fails open to
+    // access-based homing (no unit / unbootstrapped), so a substrate race can never demote a
+    // healthy external item.
+    // NARROW (the fan-out home arm caught the blanket form): demote ONLY when the unit is excluded
+    // from external-shared AND currently included in General (the standing-exclusion state, where
+    // the substrate serves the item via General). An external item in NEITHER system project (e.g.
+    // restricted into an initiative) keeps access-based homing — PCCC-6's restriction semantics own
+    // that shape, and the external-restriction analogue stays the named 6b residual.
+    const effectiveExternal = item.access === "external" && (inExternalShared.has(item.id) || !inGeneral.has(item.id));
     const groupId =
-      (item.access === "external" ? externalHome : generalHome) ?? episodeGroupId(args.teamSlug, item.access);
+      (effectiveExternal ? externalHome : generalHome) ?? episodeGroupId(args.teamSlug, effectiveExternal ? "external" : "team");
     // BOTH home candidates, for partitioning the item's ledger rows: a tier flip moves between
     // these two; everything else in the ledger is fan-out (or an orphan PCCC-6 will own).
     const otherHome =
-      (item.access === "external" ? generalHome : externalHome) ??
-      episodeGroupId(args.teamSlug, item.access === "external" ? "team" : "external");
+      (effectiveExternal ? generalHome : externalHome) ??
+      episodeGroupId(args.teamSlug, effectiveExternal ? "team" : "external");
 
     // Read the ledger BEFORE the "nothing to project" skip: an item that stops projecting still owns
     // episodes we put in the graph, and they have to come back out (see the branch below).
