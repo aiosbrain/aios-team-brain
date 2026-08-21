@@ -20,6 +20,10 @@ export class FakeGraphiti {
   failDeletes = false;
   // Records the `lastN` each listEpisodes call requested, so a test can assert the deep scan (B2).
   listCalls: { groupId: string; lastN?: number }[] = [];
+  // RECONULL-1: groups whose listing THROWS (unreachable / timeout / malformed body, as the strict
+  // client now does) and groups whose listing returns EMPTY regardless of the store.
+  failListFor = new Set<string>();
+  emptyListFor = new Set<string>();
   readonly configured = true;
 
   async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
@@ -38,6 +42,8 @@ export class FakeGraphiti {
    *  cleanup depends on (a shallow window hides an item; a full window is inconclusive) is untestable. */
   async listEpisodes(groupId: string, lastN?: number): Promise<GraphEpisodeRef[]> {
     this.listCalls.push({ groupId, lastN });
+    if (this.failListFor.has(groupId)) throw new Error(`simulated listing failure for ${groupId}`);
+    if (this.emptyListFor.has(groupId)) return [];
     const all = [...(this.store.get(groupId)?.values() ?? [])]; // insertion order = oldest → newest
     return typeof lastN === "number" && lastN >= 0 ? all.slice(Math.max(0, all.length - lastN)) : all;
   }

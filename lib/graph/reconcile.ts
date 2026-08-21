@@ -99,6 +99,26 @@ const CLEANUP_GRACE_MS = 60 * 60_000;
  */
 export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCAN_DEPTH, 5000);
 
+/**
+ * RECONULL-1: the landed listing's own deadline — an OPERATOR ESCAPE HATCH, not a new default. Unset
+ * → the client's default (30 s). Prod measured a 5,000-episode listing at ~8 s warm and past 30 s on
+ * a cold Neo4j page cache (after a graphiti restart); a longer deadline holds #629's lease and the
+ * process single-flight for that long per slow group, so the cheaper lever on an install WITH
+ * `NEO4J_URL` is a smaller `GRAPH_LANDED_SCAN_DEPTH` (1,000 — the lookup judges the rest, the
+ * REST-window oracle stays a valid subset) — IN THIS ORDER (Codex diff review H1): lower the depth
+ * while `GRAPH_DEEP_REQUEUE` is OFF (the 1k–5k groups move onto the lookup path and their never-landed
+ * rows are HELD), inspect every held candidate with `deepRequeueElided 0` (GRAPHSAT-1 D4), THEN enable.
+ * Lowering the depth AFTER enabling would put groups onto the mutating path whose candidates were never
+ * audited at that depth, with an oracle covering only the newest 1,000 episodes. With the flag off and
+ * the depth lowered, those groups stop healing until the audit completes (Fable diff review M1) — a
+ * deliberate pause, stated. The default stays 5,000 because an install WITHOUT Neo4j would lose
+ * judging for every 1k–5k group.
+ */
+export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : undefined;
+}
+
 export interface ReconcileSummary {
   groupsChecked: number;
   confirmed: number;
@@ -151,6 +171,21 @@ export interface ReconcileSummary {
   /** The re-queue mode this pass EXECUTED on the lookup path — the recording gate reads it from here
    * rather than re-parsing the env (one resolution, in the runner). */
   deepRequeueEnabled: boolean;
+  /** RECONULL-1: groups whose LANDED listing threw (unreachable, non-2xx, the deadline, a malformed
+   * body) — skipped unjudged, as before, but now COUNTED: a pass in which the largest group was never
+   * judged used to be indistinguishable from a healthy quiet pass. A recording-gate signal. */
+  unreachableGroups: number;
+  /** RECONULL-1: pending-delete OLD groups whose cleanup listing threw — flags kept, retry next pass,
+   * now counted. A gate signal too: the `pendingCleanups` re-read this leg relied on can itself fail. */
+  unreachableCleanupGroups: number;
+  /** RECONULL-1: groups whose listing came back EMPTY while the ledger holds mature non-sentinel rows
+   * (a current projection claim past the grace) — the mass-disappearance shape. The bounded re-queue
+   * (REQUEUE_MAX_PER_PASS) proceeds exactly as before; this makes the event LOUD. A gate signal. */
+  emptyListingGroups: number;
+  /** RECONULL-1: errors this pass could not represent as a counter (the pending-cleanup count re-read
+   * failing). The runner merges them into the run's errors; every other counter and this pass's
+   * mutations are retained. */
+  errors: string[];
 }
 
 export interface DeepRequeueRef {
@@ -306,9 +341,13 @@ export async function reconcileProjectedEpisodes(
       deepRequeueSample: [],
       deepRequeueElided: 0,
       deepRequeueEnabled: deepRequeue,
+      unreachableGroups: 0,
+      unreachableCleanupGroups: 0,
+      emptyListingGroups: 0,
+      errors: [],
     };
 
-  const { data } = await db
+  const { data, error: ledgerErr } = await db
     .from("graph_episodes")
     .select(
       "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas"
@@ -320,6 +359,20 @@ export async function reconcileProjectedEpisodes(
     // next pass, and the loop would churn forever while reading as healthy self-healing.
     .eq("deferred", false);
   const rawRows = (data ?? []) as EpisodeRow[];
+  // RECONULL-1 (Fable diff review M2): a failed ledger read used to become an EMPTY ledger — groupsChecked 0,
+  // every counter 0, ok:true, the gate quiet: the same silent-healthy shape as the pending-count read.
+  // Nothing can be judged without the ledger; report the error and return the empty summary.
+  if (ledgerErr) {
+    return {
+      groupsChecked: 0, confirmed: 0, reQueued: 0, partialItems: 0,
+      partialDetail: { sample: [], elided: 0, namesElided: 0 },
+      cleaned: 0, cleanedExternal: 0, pendingCleanups: 0, requeueThrottled: 0, saturatedGroups: 0,
+      deepResolvedGroups: 0, lookupMismatchGroups: 0, deepRequeueHeld: 0, deepRequeueHeldByGroup: {},
+      deepRequeueSample: [], deepRequeueElided: 0, deepRequeueEnabled: deepRequeue,
+      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0,
+      errors: [`reconcile: ledger read failed: ${ledgerErr.message}`],
+    };
+  }
 
   // ── Orphan repair, BEFORE anything else judges these rows ────────────────────────────────────
   // A ledger row whose ITEM is gone is an orphan, and an orphan's episodes are content the brain no
@@ -355,12 +408,32 @@ export async function reconcileProjectedEpisodes(
   const deepRequeueHeldByGroup: Record<string, number> = {};
   const heldRefs: DeepRequeueRef[] = [];
   let requeueThrottled = 0;
+  let unreachableGroups = 0;
+  let emptyListingGroups = 0;
+  const listTimeoutMs = landedListTimeoutMs();
 
   for (const [groupId, groupRows] of byGroup) {
     // Graphiti unreachable this pass — leave these rows alone and try again next tick, rather than
-    // treating "couldn't check" as "never landed" and re-pushing everything.
-    const episodes = await client.listEpisodes(groupId, LANDED_SCAN_DEPTH).catch(() => null);
-    if (episodes === null) continue;
+    // treating "couldn't check" as "never landed" and re-pushing everything. RECONULL-1: COUNTED and
+    // logged (it was silent), and NOTHING else — no lookup, no write: without a REST window there is
+    // no oracle, and a uuid backfilled from a wrong graph feeds the arming latch and the
+    // restriction-move `landedCopy` (the declined fall-through).
+    const episodes = await client.listEpisodes(groupId, LANDED_SCAN_DEPTH, { timeoutMs: listTimeoutMs }).catch((err: unknown) => {
+      console.warn(`[graph] reconcile: listing ${groupId} failed (group stays unjudged this pass): ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
+    if (episodes === null) {
+      unreachableGroups++;
+      continue;
+    }
+    // RECONULL-1: an EMPTY listing over a ledger that holds mature, current projection claims is the
+    // mass-disappearance shape (a wiped graph — or a transient empty body). The REST path below has
+    // no hold, so it re-queues up to the cap, as it always did and must (a genuinely wiped graph
+    // has to heal); this makes the event loud instead of a quiet trickle of re-queues.
+    if (episodes.length === 0 && groupRows.some((r) => r.content_sha256 !== "" && new Date(r.projected_at).getTime() <= cutoff)) {
+      emptyListingGroups++;
+      console.warn(`[graph] reconcile: listing ${groupId} is EMPTY while the ledger holds mature projected rows — mass disappearance? (bounded re-queue proceeds)`);
+    }
     // A FULL window is inconclusive the same way an unreachable Graphiti is: an item's chunks may sit
     // just beyond it, and reading that as "never landed" would re-push the ENTIRE group every pass —
     // growing the group, pushing more rows out of the window, re-pushing more next pass. That
@@ -514,6 +587,7 @@ export async function reconcileProjectedEpisodes(
   // clear the flag. Independent of the landed-check above (that confirms the NEW group).
   let cleaned = 0;
   let cleanedExternal = 0;
+  let unreachableCleanupGroups = 0;
   const pendingByGroup = new Map<string, EpisodeRow[]>();
   const pendingByGroup2 = pendingByGroup; // (alias keeps the diff minimal below)
   for (const row of rows) {
@@ -554,8 +628,16 @@ export async function reconcileProjectedEpisodes(
   for (const [oldGroup, groupRows] of pendingByGroup) {
     // List the old group once (deep — a large group must not hide the item's episodes past the default
     // window). Graphiti unreachable → leave the flags set and retry next tick.
-    const episodes = await client.listEpisodes(oldGroup, GROUP_SCAN_DEPTH).catch(() => null);
-    if (episodes === null) continue;
+    // The per-call deadline applies here too (Fable diff review L2): a 100k-deep listing on a cold
+    // graph is MORE likely to blow the default than the landed one.
+    const episodes = await client.listEpisodes(oldGroup, GROUP_SCAN_DEPTH, { timeoutMs: listTimeoutMs }).catch((err: unknown) => {
+      console.warn(`[graph] reconcile: cleanup listing ${oldGroup} failed (flags kept, retry next pass): ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    });
+    if (episodes === null) {
+      unreachableCleanupGroups++;
+      continue;
+    }
     // If the scan hit the cap, the item's episodes MIGHT be beyond the window — treat "not found" as
     // inconclusive and never clear the flag on a saturated scan (else we'd false-clear while old-tier
     // episodes still exist — the very bug this fixes, just at a larger N). The flag then stays set +
@@ -630,11 +712,19 @@ export async function reconcileProjectedEpisodes(
   // Outstanding cleanups AFTER this pass — the tier-isolation signal worth alerting on (old-tier
   // episodes that are purgeable but not yet verified purged). Re-read rather than derived from the
   // in-memory rows so a concurrent projector's new flags are counted. Uses the partial index.
-  const { data: pendingRows } = await db
+  const { data: pendingRows, error: pendingErr } = await db
     .from("graph_episodes")
     .select("id")
     .eq("team_id", teamId)
     .not("pending_delete_group_id", "is", null);
+  // RECONULL-1: this count is the durable tier-isolation signal (outstanding old-tier purges); a
+  // swallowed error here read as ZERO — the one value that erases the signal. It is now a run error
+  // (the pass's counters and mutations are all retained).
+  const errors: string[] = [];
+  if (pendingErr) errors.push(`reconcile: pending-cleanup count failed: ${pendingErr.message}`);
+  // On a failed re-read the count is what THIS pass knows (the pending rows it loaded minus the
+  // ones it verified clean) — never a false zero beside the error (Codex diff review M1).
+  const knownPending = Math.max(0, [...pendingByGroup.values()].reduce((n, g) => n + g.length, 0) - cleaned);
 
   return {
     groupsChecked: byGroup.size,
@@ -642,7 +732,7 @@ export async function reconcileProjectedEpisodes(
     reQueued,
     cleaned,
     cleanedExternal,
-    pendingCleanups: (pendingRows ?? []).length,
+    pendingCleanups: pendingErr ? knownPending : (pendingRows ?? []).length,
     requeueThrottled,
     saturatedGroups,
     deepResolvedGroups,
@@ -652,6 +742,10 @@ export async function reconcileProjectedEpisodes(
     deepRequeueSample: boundDeepRequeueSample(heldRefs),
     deepRequeueElided: Math.max(0, heldRefs.length - DEEP_REQUEUE_SAMPLE_LIMIT),
     deepRequeueEnabled: deepRequeue,
+    unreachableGroups,
+    unreachableCleanupGroups,
+    emptyListingGroups,
+    errors,
     partialItems,
     partialDetail: boundPartialDetail(partialFound),
   };

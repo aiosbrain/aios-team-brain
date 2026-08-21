@@ -50,6 +50,9 @@ export function startGraphScheduler(): void {
             (s.lockedOut ? ` ${s.lockedOut} team(s) skipped — another instance holds the projection lease` : "") +
             (s.deepResolvedGroups ? ` ${s.deepResolvedGroups} saturated group(s) judged via per-item lookup` : "") +
             (s.deepRequeueHeld ? ` ${s.deepRequeueHeld} re-queue(s) HELD (GRAPH_DEEP_REQUEUE off)` : "") +
+            (s.unreachableGroups ? ` ${s.unreachableGroups} group(s) UNJUDGED — listing failed (timeout/unreachable/malformed)` : "") +
+            (s.unreachableCleanupGroups ? ` ${s.unreachableCleanupGroups} cleanup listing(s) failed (flags kept)` : "") +
+            (s.emptyListingGroups ? ` ${s.emptyListingGroups} group(s) listed EMPTY over mature rows — mass disappearance?` : "") +
             (s.lookupMismatchGroups ? ` ${s.lookupMismatchGroups} group(s) with a BROKEN per-item lookup (missed REST-confirmed items — is NEO4J_URL the graph Graphiti writes?)` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );

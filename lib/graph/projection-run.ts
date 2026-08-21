@@ -32,6 +32,7 @@ export function shouldRecordProjectionRun(s: {
   partialItems: number; fanoutThrottled: number; restrictionMovesPending: number;
   probeFallbackPages: number; lockedOut: number; walkMs: number;
   deepResolvedGroups: number; lookupMismatchGroups: number; deepRequeueHeld: number; deepRequeueEnabled: boolean;
+  unreachableGroups: number; unreachableCleanupGroups: number; emptyListingGroups: number;
 }): boolean {
   return Boolean(
     s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
@@ -46,7 +47,10 @@ export function shouldRecordProjectionRun(s: {
     // zero held" is a durable row the operator can read, not an absence they must infer. Once the
     // flag is on, a quiet deep-resolved pass is quiet. The mode is the EXECUTED one (from the
     // summary), never a second env parse.
-    s.deepRequeueHeld || s.lookupMismatchGroups || (s.deepResolvedGroups && !s.deepRequeueEnabled)
+    s.deepRequeueHeld || s.lookupMismatchGroups || (s.deepResolvedGroups && !s.deepRequeueEnabled) ||
+    // RECONULL-1: a group that was never judged (listing threw), a cleanup that could not run, or a
+    // listing that came back empty over real claims — each is the class the gate exists for.
+    s.unreachableGroups || s.unreachableCleanupGroups || s.emptyListingGroups
   );
 }
 
@@ -112,6 +116,9 @@ export function projectionRunInput(
       // about the mode that produced it.
       ...(summary.deepResolvedGroups ? { deepResolvedGroups: summary.deepResolvedGroups, deepRequeueEnabled: summary.deepRequeueEnabled } : {}),
       ...(summary.lookupMismatchGroups ? { lookupMismatchGroups: summary.lookupMismatchGroups } : {}),
+      ...(summary.unreachableGroups ? { unreachableGroups: summary.unreachableGroups } : {}),
+      ...(summary.unreachableCleanupGroups ? { unreachableCleanupGroups: summary.unreachableCleanupGroups } : {}),
+      ...(summary.emptyListingGroups ? { emptyListingGroups: summary.emptyListingGroups } : {}),
       ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample, deepRequeueElided: summary.deepRequeueElided } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,

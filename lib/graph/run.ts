@@ -84,6 +84,12 @@ export interface GraphProjectionSummary {
   /** The re-queue mode this run EXECUTED (resolved ONCE here from `GRAPH_DEEP_REQUEUE === "true"`, or
    *  the injected option) — the recording gate reads it from the summary, never from the env. */
   deepRequeueEnabled: boolean;
+  /** RECONULL-1: landed listings that threw (group unjudged, counted), cleanup listings that threw
+   *  (flags kept, counted), and EMPTY listings over mature ledger rows (mass-disappearance shape).
+   *  All three are recording-gate signals. */
+  unreachableGroups: number;
+  unreachableCleanupGroups: number;
+  emptyListingGroups: number;
   /** TICKFIT-2 (Codex diff review H1): teams SKIPPED this run because another brain instance holds
    *  their projection lease (`lib/graph/walk-lock.ts` — a deploy overlap). Expected once per deploy;
    *  persistent across runs means a wedged holder. Durably visible (meta + the recording gate). */
@@ -180,6 +186,9 @@ async function runGraphProjectionInner(opts?: {
     deepRequeueHeldByGroup: {},
     deepRequeueSample: [],
     deepRequeueElided: 0,
+    unreachableGroups: 0,
+    unreachableCleanupGroups: 0,
+    emptyListingGroups: 0,
     deepRequeueEnabled: opts?.deepRequeue ?? deepRequeueEnabledFromEnv(),
     lockedOut: 0,
     walkMs: 0,
@@ -292,6 +301,16 @@ async function runGraphProjectionInner(opts?: {
       // Elided = everything held that is not in the (re-bounded) sample — recomputed from the totals so
       // a cross-team re-bound cannot under-report what fell off.
       summary.deepRequeueElided = summary.deepRequeueHeld - summary.deepRequeueSample.length;
+      // RECONULL-1: the listing signals, and reconcile's own errors merged WITHOUT discarding r —
+      // every counter above is already summed; a failed pending-count read makes the run red while
+      // the pass's work stays reported.
+      summary.unreachableGroups += r.unreachableGroups;
+      summary.unreachableCleanupGroups += r.unreachableCleanupGroups;
+      summary.emptyListingGroups += r.emptyListingGroups;
+      if (r.errors.length) {
+        summary.ok = false;
+        for (const e of r.errors) summary.errors.push(`${t.slug}: ${e}`);
+      }
 
       // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches
       // when it healed `items.access`, but arcs are synthesized from the external Graphiti group, which

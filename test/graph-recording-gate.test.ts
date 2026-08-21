@@ -38,6 +38,9 @@ const quiet: GraphProjectionSummary = {
   deepRequeueEnabled: false,
   probeFallbackPages: 0,
   lockedOut: 0,
+  unreachableGroups: 0,
+  unreachableCleanupGroups: 0,
+  emptyListingGroups: 0,
   walkMs: 0,
   reconcileMs: 0,
   errors: [],
@@ -73,6 +76,15 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     expect(shouldRecordProjectionRun({ ...quiet, deepResolvedGroups: 1, deepRequeueEnabled: true })).toBe(false);
     // Fable diff review M1: a BROKEN lookup (missed REST-confirmed items) is always a signal.
     expect(shouldRecordProjectionRun({ ...quiet, lookupMismatchGroups: 1, deepRequeueEnabled: true })).toBe(true);
+  });
+
+  it("RECONULL-1: an unjudged group (listing failed), a failed cleanup listing, and an empty listing over mature rows each record ALONE", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, unreachableGroups: 1 })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, unreachableCleanupGroups: 1 })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, emptyListingGroups: 1 })).toBe(true);
+    const q = projectionRunInput(quiet, "scheduler", 1, 2).meta as Record<string, unknown>;
+    for (const k of ["unreachableGroups", "unreachableCleanupGroups", "emptyListingGroups"]) expect(k in q, k).toBe(false);
+    expect(projectionRunInput({ ...quiet, unreachableGroups: 2, emptyListingGroups: 1 }, "scheduler", 1, 2).meta).toMatchObject({ unreachableGroups: 2, emptyListingGroups: 1 });
   });
 
   it("every pre-existing signal still records on its own", () => {
