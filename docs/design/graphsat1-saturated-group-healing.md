@@ -89,14 +89,23 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   `saturatedGroups` keeps its meaning: groups past the window that were NOT judged this pass
   (lookup unconfigured/failed) — still a gate signal. New: `deepResolvedGroups` (groups past the
   window judged via the lookup), `deepRequeueHeld` (rows the lookup judged never-landed that the
-  flag held back), `deepRequeueSample` (≤5 held item ids, OLDEST `projected_at` first — a
-  deterministic order so two passes' samples are comparable). Gate rule, on the ONE shared
+  flag held back), `deepRequeueHeldByGroup` (`{ [groupId]: n }` — per-group counts, so the
+  population is enumerable), `deepRequeueSample` (≤5 held rows as STRUCTURED identities
+  `{ teamId, groupId, itemId, projectedAt }` — an item id alone is not operationally
+  identifiable across groups/teams, round 2 H2 — OLDEST `projectedAt` first, merged and
+  re-bounded across teams in the runner the way `partialDetail` is). The admin runs panel's
+  `RunMeta` renders object values as compact JSON instead of `String(v)` (which printed
+  `[object Object]` for `partialDetail` already — fixed in passing, pinned). Gate rule, on the ONE shared
   predicate `shouldRecordProjectionRun`: `deepRequeueHeld > 0` ALWAYS records (work is being
   held — that is a signal); and while `GRAPH_DEEP_REQUEUE` is OFF, `deepResolvedGroups > 0` ALSO
   records — the rollout phase is the measurement phase, and a "lookup succeeded, zero held" result
   must be a durable row the operator can read, not an absence they must infer. Once the flag is
   ON, a quiet deep-resolved pass is quiet (meta-only), like any other converged pass. The
-  predicate therefore takes the flag as an input (`{ deepRequeueEnabled }`), pinned per clause.
+  flag is resolved ONCE in `runGraphProjection` (env parse, or the injected option), passed into
+  reconcile as the mode it executes, and RETURNED on `GraphProjectionSummary.deepRequeueEnabled`
+  — the gate reads the EXECUTED mode from the summary it is already given (round 2 M1: the
+  predicate stays pure, both call sites stay `shouldRecordProjectionRun(s)`, and no second env
+  parse can disagree with the mode reconcile actually ran).
   The scheduler log line names deep-resolved/held counts when non-zero. Round 1 also asked that
   the durable path be proven end to end, not just the mapper: AC4 pins the predicate AND the
   projection-run meta AND (dm) an actual `ingest_runs` row written by the scheduler-equivalent
@@ -111,19 +120,22 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   until noticed. So: `GRAPH_DEEP_REQUEUE` (env, default **false**) gates ONLY the two re-queue
   branches on the lookup path — confirmation, uuid backfill, and `partialItems` run regardless;
   rows that WOULD have been re-queued are counted as `deepRequeueHeld` (meta, durable) instead.
-  **Enabling the flag is an OPERATIONAL INVESTIGATION, not "a small count looks plausible"
-  (round 1 H2):** `LANDED_GRACE_MS` is one projection interval (1h), but graphiti's worker is
-  SERIAL at ~1 episode/minute and prod's own first ingest hour queued 175 items
-  (`extraction-health.ts:581`) — so a row older than the cutoff can be QUEUED, not lost, and a
-  per-name absence cannot tell the two apart. The enable criteria, all required and written
-  here so they are not re-derived under pressure: (1) `deepRequeueHeld` stable (not growing) and
-  its ordered sample IDENTICAL across ≥3 consecutive recorded passes spanning longer than the
-  worker's current queue lag; (2) Episodic liveness (`extraction-health`'s `newestEpisodicAt`)
-  recent during those passes — the worker is alive, so absence is not a backlog; (3) the sample's
-  items hand-checked absent in the group via the admin graph surfaces. Structural follow-up,
-  NOT this slice (schema): persist "judged absent since" per row so re-queue requires K
-  consecutive absent passes by construction — filed if the measurement shows held rows are
-  common. Alternative rejected: shipping re-queue ON with the 20/pass throttle as the only
+  **This slice ships MEASUREMENT-ONLY; the flag is the mechanism, not a promise that it is
+  safe to flip (round 1 H2, round 2 H1).** `LANDED_GRACE_MS` is one projection interval (1h), but
+  graphiti's worker is SERIAL at ~1 episode/minute and prod's own first ingest hour queued 175
+  items (`extraction-health.ts:581`) — so a row older than the cutoff can be QUEUED, not lost, and
+  a per-item absence cannot tell the two apart. Round 2 killed the first enable protocol
+  (a stable oldest-5 sample does NOT govern the held SET — unseen rows can churn at equal
+  cardinality; worker liveness proves the worker is alive, NOT that these absences are outside
+  its backlog — `extraction-health.ts:578` treats live work elsewhere as evidence of queue depth).
+  What governs enabling, honestly: EITHER (a) `deepRequeueHeld` is small enough that EVERY held
+  candidate is checked individually (the structured sample + per-group counts make the
+  population enumerable from `ingest_runs` over successive passes; "small" means every id
+  inspected, not a sample), OR (b) the structural successor ships first: a persisted per-row
+  "judged absent since / consecutive absent passes" so re-queue requires K consecutive absences
+  by construction (schema — NOT this slice, filed as GRAPHSAT-2 if measurement shows held rows
+  are common). Until one of those holds, the flag stays off and the spec says so.
+  Alternative rejected: shipping re-queue ON with the 20/pass throttle as the only
   bound — the throttle bounds the RATE, not the DIRECTION, and a wrong direction at 480/day is
   the cost-explosion class GRAPHCOST-* spent a month removing.
 - **D5 — isolation and congruence.** `group_id = $g` is the SOLE isolation term (no RLS backstop
@@ -134,13 +146,18 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   `test/guards/graph-tier-filter.test.ts` — which today scans only `lib/graph/learning.ts` for
   `group_id IN $groups` — is widened to an owned-module list that includes
   `lib/graph/episode-lookup.ts`, requiring `e.group_id = $g` in every Cypher block there
-  (round 1 M5). `NEO4J_URL`/`NEO4J_USER`/`NEO4J_PASSWORD` are SET on the prod brain service
+  (round 1 M5) — and the guard STRIPS Cypher comments (`//…` and `/*…*/`) before matching for
+  BOTH modules, since a comment containing the term satisfied the old regex (round 2 M3); each
+  owned module must contain ≥1 block (non-vacuity per module). `NEO4J_URL`/`NEO4J_USER`/`NEO4J_PASSWORD` are SET on the prod brain service
   (observed via `railway variables`, 2026-08-21 — not inferred from the template).
 - **D5b — the flag's contract.** `GRAPH_DEEP_REQUEUE` enables re-queue on the lookup path iff
   `process.env.GRAPH_DEEP_REQUEUE === "true"` (exact; `"false"`, `"1"`, `"yes"`, unset → OFF —
   a truthiness check would make `=false` enable it, round 1 M4). `reconcileProjectedEpisodes`
-  takes ONE options object `{ lookup?, deepRequeue? }` whose defaults are the Neo4j lookup and
-  the env parse; tests inject both. Parse pinned for unset/"false"/"true"/arbitrary.
+  takes ONE options object `{ lookup?, deepRequeue?, maxRequeuePerPass? }` — the existing
+  positional `maxRequeuePerPass` seam moves INTO it (round 2 M2: the throttle pin at
+  `graph-project.datamechanics.test.ts:757` passes an explicit cap and must keep working) —
+  whose defaults are the Neo4j lookup, OFF, and `REQUEUE_MAX_PER_PASS`; the runner passes the
+  resolved flag; tests inject all three. Parse pinned for unset/"false"/"true"/arbitrary.
 - **D5c — the dm tier is hermetic to Neo4j.** `vitest.datamechanics.config.ts` sets
   `process.env.NEO4J_URL = ""` before module load (it already blanks every LLM transport); a
   dev shell exporting a real URL can no longer flip the saturated pin by deep-resolving against
@@ -158,8 +175,8 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 | Surface | Change |
 |---|---|
 | `lib/graph/episode-lookup.ts` (new file, to create) | `lookupItemEpisodes(groupId, itemIds)` over `runRead`, chunked at 500 ids; returns `null` when `!neo4jConfigured()`; REJECTS (no partial rows) on any batch error — the caller owns the degrade |
-| `lib/graph/reconcile.ts` | the saturated branch: lookup → the SAME presence-map helper → same downstream; `deepResolvedGroups`, `deepRequeueHeld`, `deepRequeueSample`; options `{ lookup?, deepRequeue? }` |
-| `lib/graph/run.ts`, `lib/graph/projection-run.ts`, `lib/graph/scheduler.ts` | the counters ride summary → meta → log line; `shouldRecordProjectionRun` gains `deepRequeueHeld` + the measurement-mode clause (takes `deepRequeueEnabled`) |
+| `lib/graph/reconcile.ts` | the saturated branch: lookup → the SAME presence-map helper → same downstream; `deepResolvedGroups`, `deepRequeueHeld`, `deepRequeueSample`; options `{ lookup?, deepRequeue?, maxRequeuePerPass? }` |
+| `lib/graph/run.ts`, `lib/graph/projection-run.ts`, `lib/graph/scheduler.ts` | the counters ride summary → meta → log line; `shouldRecordProjectionRun` gains `deepRequeueHeld` + the measurement-mode clause (reads `s.deepRequeueEnabled`, resolved once in the runner) |
 | `lib/graph/neo4j.ts` | header: the Cypher-ownership rule widened explicitly to the owned-module list |
 | `test/guards/graph-tier-filter.test.ts` | owned-module list: `learning.ts` (`group_id IN $groups`) + `episode-lookup.ts` (`group_id = $g`) |
 | `vitest.datamechanics.config.ts` | `NEO4J_URL = ""` |
@@ -225,7 +242,9 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
    never returned; >500 ids chunk correctly (an id in the second chunk resolves).
 4. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts
    test/graph-episode-lookup.test.ts` exits 0: `meta.deepResolvedGroups`, `meta.deepRequeueHeld`,
-   `meta.deepRequeueSample` reach the durable row; `shouldRecordProjectionRun` is TRUE for
+   `meta.deepRequeueHeldByGroup`, `meta.deepRequeueSample` (structured) and
+   `meta.deepRequeueEnabled` reach the durable row; `RunMeta` renders an object value as compact
+   JSON (unit, `components/admin/ingest-runs-panel`); `shouldRecordProjectionRun` is TRUE for
    `deepRequeueHeld 1` alone (either flag state), TRUE for `deepResolvedGroups 1` alone with
    `deepRequeueEnabled: false`, FALSE for `deepResolvedGroups 1` alone with `true`, TRUE for
    `saturatedGroups 1` alone (unchanged); the env parse: unset/`"false"`/`"1"`/`"yes"` → false,
@@ -242,6 +261,11 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 6. Full tiers green: `npm test` · dm iso (the graph set) · `npm run test:http:local` (the stacked
    PR runs only the gate workflows — the http tier is run locally and commented on the PR) ·
    `npm run check:docs` · `docs/ARCHITECTURE.md:115` gains the saturation + lookup prose.
+   **Merge condition (round 2 L1):** after #629 merges, this PR is retargeted to `main` and the
+   FULL required CI must run green on the retargeted head before the merge word — local http
+   evidence is adequate while stacked, not as final merge evidence.
+7. `npx vitest run test/guards/graph-tier-filter.test.ts` exits 0 with the comment-stripping arm:
+   a block whose only `group_id` term sits inside a `//` or `/* */` comment is reported missing.
 
 ## 4. Out of scope, named
 
