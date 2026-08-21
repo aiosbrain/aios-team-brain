@@ -35,14 +35,21 @@ import { join } from "node:path";
 const ROOT = join(import.meta.dirname, "..", "..");
 const read = (rel: string) => readFileSync(join(ROOT, rel), "utf8");
 
-/** Code only — a guard that reads its own prose fires on documentation. */
+/**
+ * Code only — a guard that reads its own prose fires on documentation.
+ *
+ * The `*` rule is narrow ON PURPOSE. `startsWith("*")` alone deleted GENERATOR METHODS —
+ * `*iter() { const principal = "member"; }` vanished entirely, which is a hiding place, and in the
+ * FAIL-OPEN direction. A jsdoc continuation is `*` followed by whitespace or end-of-line, or `*​/`;
+ * a generator is `*` followed immediately by an identifier. Only the former is stripped.
+ */
 const codeOnly = (src: string): string =>
   src
     .split("\n")
     .map((l) => l.replace(/\/\*.*?\*\//g, " "))
     .filter((l) => {
       const t = l.trim();
-      return !(t.startsWith("*") || t.startsWith("//") || t.startsWith("/*"));
+      return !(/^\*(\s|$)/.test(t) || t.startsWith("*/") || t.startsWith("//") || t.startsWith("/*"));
     })
     .join("\n");
 
@@ -98,9 +105,11 @@ function filesUnder(dir: string): string[] {
 // `principal: "member" | "token"`, which is how the first spelling flagged three type declarations.
 const MEMBER_PROP = /principal\s*:\s*["'`]member["'`](?!\s*\|)/;
 // `[^)]*` stopped at the first `)`, so a twin call containing a nested call
-// (`rowVisibleByProvenance(d, getIds(), tier, "member")`) escaped the tree-wide scan. `[\s\S]*?`
-// is lazy, so it still cannot run past the call it is matching.
-const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([\s\S]*?["'`]member["'`]\s*\)/;
+// (`rowVisibleByProvenance(d, getIds(), tier, "member")`) escaped the tree-wide scan. `[^;]*?` admits
+// the nested call while still being unable to leave the statement: an argument list contains no `;`.
+// (Plain `[\s\S]*?` did leave it — I checked — matching a `"member"` string many lines later in an
+// unrelated statement. Only a false POSITIVE, but a guard that cries wolf gets its allow-list widened.)
+const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([^;]*?["'`]member["'`]\s*\)/;
 /**
  * …and the shape a NAMED CONSTANT takes — `const MEMBER_ONLY_SURFACE = "member" as const`.
  *
@@ -270,6 +279,14 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds,\n  teamPosture,\n  principal,\n})")).toEqual([]);
     // …and a twin call with a nested call in its arguments.
     expect(MEMBER_LITERAL.test('rowVisibleByProvenance(d, getIds(), tier, "member")')).toBe(true);
+    // …but it must NOT reach across a statement boundary into an unrelated string.
+    expect(
+      MEMBER_LITERAL.test('rowVisibleByProvenance(d, ids, tier, principal);\nconst x = 1;\nlog("member")'),
+      "the twin needle must stay inside its own statement"
+    ).toBe(false);
+    // …and codeOnly must not swallow a generator method, which would be a hiding place.
+    expect(codeOnly('class C {\n  *iter() { const principal = "member"; }\n}')).toContain("principal");
+    expect(codeOnly(" * a jsdoc continuation line"), "prose is still stripped").not.toContain("jsdoc");
     // The omission scan: a ctx with no discriminator at all — the shape a surviving mutation found.
     expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  teamPosture: true,\n})").length).toBe(1);
     expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  principal: enforce?.principal,\n})")).toEqual([]);

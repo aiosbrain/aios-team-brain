@@ -349,6 +349,22 @@ wholesale from an exported factory is invisible to a text guard. The grounds are
 visible, reviewable act rather than a one-word edit, and that the dm tier proves the outcome
 independently — which I verified rather than assumed.
 
+### 5g. Two more found by testing the guard's own helpers
+
+Folding Fable's HIGH meant rewriting two matchers, so I probed them rather than assuming the rewrite
+was clean. Both were wrong, in opposite directions:
+
+- **`codeOnly` deleted GENERATOR METHODS.** It stripped any line whose trimmed form starts with `*`,
+  which is a jsdoc continuation — and also `*iter() { … }`. A member literal inside a generator
+  vanished before any needle ran: a hiding place, in the FAIL-OPEN direction. The rule is now narrow
+  (`*` followed by whitespace, end-of-line, or `/`), and a generator body is pinned as surviving.
+- **The twin needle's `[\s\S]*?` left its own statement.** Lazy or not, it matched a `"member"`
+  string many lines later in unrelated code. Only a false POSITIVE — but a guard that cries wolf gets
+  its allow-list widened, which is how a guard dies. `[^;]*?` admits the nested call that motivated
+  the change while being unable to cross a statement boundary.
+
+**19 mutations total: 18 reddened only their intended test; 1 survived, was fixed, and now reddens.**
+
 Round 1 also **confirmed the core rule is right and not over-correction**: a hand-typed row
 deliberately has no membership axis, and `tasks.project_id` is an ingestion project, not an access
 project (`enforce.ts:174`) — so admitting unsourced rows to tokens by project would invent a second
