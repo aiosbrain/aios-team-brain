@@ -117,10 +117,14 @@ export class GraphitiClient {
     }
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<T> {
     if (!this.configured) throw new Error("GRAPHITI_URL not set — Graphiti graph memory is not configured.");
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    // Per-call override (RECONULL-1: reconcile's group listing is a different call from a push);
+    // the default stays for every other caller. A deadline ALWAYS exists — the projector's lease
+    // must never be stranded by a hung Graphiti.
+    const deadline = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.timeoutMs;
+    const t = setTimeout(() => ctrl.abort(), deadline);
     try {
       const res = await this.fetch(`${this.base}${path}`, {
         method,
@@ -187,16 +191,40 @@ export class GraphitiClient {
    * confirm a previously-pushed episode actually landed (the reconcile pass — audit H3/M6, since
    * `/messages` is async and returns neither a uuid nor a name back).
    */
-  async listEpisodes(groupId: string, lastN = 1000): Promise<GraphEpisodeRef[]> {
-    const out = await this.request<{ episodes?: GraphEpisodeRef[] } | GraphEpisodeRef[]>(
-      "GET",
-      `/episodes/${encodeURIComponent(groupId)}?last_n=${lastN}`
-    );
-    return Array.isArray(out) ? out : (out.episodes ?? []);
+  async listEpisodes(groupId: string, lastN = 1000, opts?: { timeoutMs?: number }): Promise<GraphEpisodeRef[]> {
+    const out = await this.request<unknown>("GET", `/episodes/${encodeURIComponent(groupId)}?last_n=${lastN}`, undefined, opts?.timeoutMs);
+    return parseEpisodeListing(out, groupId);
   }
 
   /** Delete one episode by its Graphiti uuid (audit M6 — tier-reclassification cleanup). */
   async deleteEpisode(uuid: string): Promise<void> {
     await this.request("DELETE", `/episode/${encodeURIComponent(uuid)}`);
   }
+}
+
+/**
+ * STRICT listing-body validation (RECONULL-1, Codex design round 1 HIGH). The old tolerant read
+ * turned `{}`, a scalar, or `{episodes: undefined}` into `[]` — and an EMPTY listing for a group with
+ * thousands of confirmed rows takes reconcile's REST path, which has no hold: every row past the
+ * grace reads never-landed and re-queues up to the cap, every pass. A malformed body is now an
+ * ERROR (the caller's existing `.catch` turns it into its counted skip). Both real shapes the server
+ * has returned — a bare array and `{ episodes: [...] }` — stay accepted; every ref must carry a
+ * string `uuid` and `name`.
+ */
+export function parseEpisodeListing(out: unknown, groupId: string): GraphEpisodeRef[] {
+  const arr = Array.isArray(out)
+    ? out
+    : out !== null && typeof out === "object" && Array.isArray((out as { episodes?: unknown }).episodes)
+      ? ((out as { episodes: unknown[] }).episodes)
+      : null;
+  if (arr === null) {
+    throw new Error(`graphiti GET /episodes/${groupId}: malformed listing body (${out === null ? "null" : Array.isArray(out) ? "array" : typeof out}) — expected an array or { episodes: [...] }`);
+  }
+  return arr.map((r, i) => {
+    const ref = r as { uuid?: unknown; name?: unknown };
+    if (typeof ref?.uuid !== "string" || typeof ref?.name !== "string") {
+      throw new Error(`graphiti GET /episodes/${groupId}: malformed episode ref at index ${i} (uuid=${typeof ref?.uuid}, name=${typeof ref?.name})`);
+    }
+    return { uuid: ref.uuid, name: ref.name };
+  });
 }
