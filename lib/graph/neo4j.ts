@@ -5,14 +5,19 @@ import neo4j, { type Driver } from "neo4j-driver";
  * Read-only Neo4j client for the Graphiti graph. The "What the Brain is Learning" panel reads the
  * graph DIRECTLY (the getzep REST server only exposes /search + /episodes — not "recent typed facts
  * by time" or a windowed node/edge dump). This module owns nothing but the pooled driver + a read
- * helper; ALL Cypher lives in `lib/graph/learning`. See docs/design/brain-learning-panel.md.
+ * helper; Cypher lives ONLY in the OWNED MODULES — `lib/graph/learning` (the panel),
+ * `lib/graph/extraction-health` (the stall probe's census/liveness) and `lib/graph/episode-lookup`
+ * (GRAPHSAT-1: reconcile's per-item landed check for a saturated group). The list used to say
+ * "learning only" while extraction-health already held Cypher; GRAPHSAT-1 widened it explicitly
+ * rather than adding a silent third violator, and `test/guards/graph-tier-filter.test.ts` scans the
+ * owned modules for the group-scope term every query must carry. See docs/design/brain-learning-panel.md.
  *
  * Best-effort: `neo4jConfigured()` is false unless `NEO4J_URL` is set; `runRead` throws on a
  * transport error so callers degrade (the panel shows empty rather than 500ing).
  *
  * Env: NEO4J_URL (bolt://host:7687) · NEO4J_USER (default 'neo4j') · NEO4J_PASSWORD.
  * ⚠️ Coupling: we depend on Graphiti's internal Neo4j schema — pin the zepai/graphiti image tag and
- * keep every query in `lib/graph/learning` so a schema change on upgrade is caught in one place.
+ * keep every query in the owned modules above so a schema change on upgrade is caught in few places.
  */
 
 let driver: Driver | undefined;

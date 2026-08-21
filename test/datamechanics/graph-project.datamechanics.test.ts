@@ -754,7 +754,7 @@ describe("tier reclassification cleanup is durable across a failed inline delete
       .update({ projected_at: "2020-01-01T00:00:00Z" })
       .eq("team_id", seed.teamId);
 
-    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, cap);
+    const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId, { maxRequeuePerPass: cap });
     expect(res.reQueued).toBe(cap);
     expect(res.requeueThrottled).toBe(overBy); // reported, not silently dropped
     // STALLSCOPE-1: a re-queue now PARKS the row on the `''` sentinel instead of deleting it (deleting
@@ -813,8 +813,12 @@ describe("tier reclassification cleanup is durable across a failed inline delete
     await fake.addEpisodes(teamGroup, Array.from({ length: LANDED_SCAN_DEPTH }, (_, i) => ep(`items:filler-${i}`)));
     await backdateCleanup(seed.teamId); // past the landed grace, so only saturation can hold the verdict
 
+    // GRAPHSAT-1: this is now the D2 pin for the REAL default — the dm tier blanks NEO4J_URL, so the
+    // default per-item lookup is UNCONFIGURED and the group stays unjudged exactly as before. A
+    // configured lookup judges it instead (test/datamechanics/graph-saturated-heal.*).
     const res = await reconcileProjectedEpisodes(db(), client(fake), seed.teamId);
     expect(res.saturatedGroups).toBe(1);
+    expect(res.deepResolvedGroups).toBe(0);
     expect(res.reQueued).toBe(0); // NOT judged "never landed"
     const { data } = await db().from("graph_episodes").select("id").eq("team_id", seed.teamId);
     expect((data ?? []).length).toBe(1); // and the ledger row survives

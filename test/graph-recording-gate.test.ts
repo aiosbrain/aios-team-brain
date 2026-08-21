@@ -29,6 +29,11 @@ const quiet: GraphProjectionSummary = {
   requeueThrottled: 0,
   partialItems: 0,
   partialDetail: { sample: [], elided: 0, namesElided: 0 },
+  deepResolvedGroups: 0,
+  deepRequeueHeld: 0,
+  deepRequeueHeldByGroup: {},
+  deepRequeueSample: [],
+  deepRequeueEnabled: false,
   probeFallbackPages: 0,
   lockedOut: 0,
   walkMs: 0,
@@ -59,6 +64,13 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     expect(shouldRecordProjectionRun({ ...quiet, restrictionMovesPending: 1 })).toBe(true);
   });
 
+  it("GRAPHSAT-1 D3: held re-queues ALWAYS record; a deep-resolved pass records only while re-queue is OFF (measurement mode is loud)", () => {
+    expect(shouldRecordProjectionRun({ ...quiet, deepRequeueHeld: 1 })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, deepRequeueHeld: 1, deepRequeueEnabled: true })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, deepResolvedGroups: 1, deepRequeueEnabled: false })).toBe(true);
+    expect(shouldRecordProjectionRun({ ...quiet, deepResolvedGroups: 1, deepRequeueEnabled: true })).toBe(false);
+  });
+
   it("every pre-existing signal still records on its own", () => {
     for (const key of ["projected", "requeued", "cleaned", "pendingCleanups", "saturatedGroups", "requeueThrottled", "partialItems"] as const) {
       expect(shouldRecordProjectionRun({ ...quiet, [key]: 1 }), key).toBe(true);
@@ -74,6 +86,12 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     const loud = projectionRunInput({ ...quiet, probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 }, "scheduler", 1, 2).meta as Record<string, unknown>;
     expect(loud).toMatchObject({ probeFallbackPages: 2, walkMs: 61_000, reconcileMs: 400 });
     expect("lockedOut" in q).toBe(false);
+    // GRAPHSAT-1: the measurement keys are ALWAYS present (a row is self-describing about its mode);
+    // the per-group map + structured sample ride only when something is held.
+    expect(q).toMatchObject({ deepResolvedGroups: 0, deepRequeueHeld: 0, deepRequeueEnabled: false });
+    expect("deepRequeueSample" in q).toBe(false);
+    const held = projectionRunInput({ ...quiet, deepResolvedGroups: 1, deepRequeueHeld: 2, deepRequeueHeldByGroup: { g: 2 }, deepRequeueSample: [{ teamId: "t", groupId: "g", itemId: "i", projectedAt: "2020-01-01T00:00:00Z" }] }, "scheduler", 1, 2).meta as Record<string, unknown>;
+    expect(held).toMatchObject({ deepRequeueHeldByGroup: { g: 2 }, deepRequeueSample: [{ teamId: "t", groupId: "g", itemId: "i", projectedAt: "2020-01-01T00:00:00Z" }] });
     expect(projectionRunInput({ ...quiet, lockedOut: 1 }, "scheduler", 1, 2).meta).toMatchObject({ lockedOut: 1 });
   });
 
