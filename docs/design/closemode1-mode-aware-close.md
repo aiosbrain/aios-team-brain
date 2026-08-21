@@ -53,20 +53,39 @@ round 1), preserves the human's authority, and makes the round trip compose with
   semantics on system projects are undefined until Phase D — closing one is today's shipped
   behaviour, kept); auto excludes (the shadow-repair class) close as today. Returns
   `{ ok, closed, spared }`.
-- **D2 — a spared exclude is NOT a backfill candidate (round 1 BLOCKER 1).** The candidate
-  predicate (`backfill-candidates.ts`) currently treats any current opposite-project membership as
-  a reason to visit; it learns the same exception: an opposite-project row that the close rule
-  would spare (`decision='exclude' and mode <> 'auto'`) is not a candidate-maker. Pinned by a
-  survivor→not-a-candidate dm arm (two consecutive passes: the second visits nothing).
-- **D3 — the return leg is the EXISTING guard, unchanged.** The dm round-trip arm proves the legs
-  compose: force-exclude on external-shared → flip out (`spared 1`, the row current) → flip back →
-  invariant 3 refuses → no current include in external-shared → the ENFORCED READ (`canSeeItem`)
-  for an external principal does not serve the item.
-- **D4 — counters, honestly plumbed.** `spared` rides the `closeMembershipInto` result into
-  `reconcile-item`'s result; the scheduler backfill path (the one place with `ingest_runs.meta`
-  plumbing — `lib/ingest/scheduler.ts:376`) sums it into its existing meta; the immediate
-  reclassify path logs it (`console.info`, non-zero only). NO recording-gate claim: sparing is the
-  quiet, correct direction; nothing is being overridden. Zero new schema.
+- **D2 — a spared exclude is NOT a candidate-maker, scoped to ARM 3 (round 1 BLOCKER 1; round 2
+  H1).** The exception narrows exactly the arm that fires on "an opposite-project membership
+  exists" (ARM 3) — never a global per-item exclusion, which would suppress ARM 2 when the TARGET
+  include is genuinely missing. One shared SQL expression `is_protected_exclude`
+  (`decision='exclude' and mode <> 'auto'`) is defined once and used twice: ARM 3 becomes
+  `opposite AND NOT is_protected_exclude`; the existing target-project carve-out is the same
+  expression on the target side. The two cannot match the same row (different project ids); a
+  missing target include still activates ARM 2 (pinned). Survivor→not-a-candidate is pinned by
+  two consecutive `backfillTeamContext` passes both returning `scanned: 0` for the settled unit
+  (round 2 L: deleting the ARM-3 exception makes both return `scanned: 1` — reconcile succeeds
+  while re-sparing forever, the burn-a-tick shape).
+- **D3 — the return leg is the EXISTING guard, and the STANDING-REFUSAL state it produces is
+  intended and pinned (round 2 H2).** Target placement precedes the opposite close
+  (`reconcile-item.ts:87`), so on the flip back `ensureIncludeMembership(external-shared)` meets
+  the spared exclude and invariant 3 refuses → `reconcileItemContext` returns `ok:false` — and
+  that is the DESIGNED terminal state, not an error to converge away: the human said no; the unit
+  keeps its (now team-only) General include from the outbound leg; the immediate reclassify path
+  warns best-effort; the backfill does NOT retry (the existing target-exclude carve-out). The dm
+  round-trip arm pins all four: `ok:false` on the return flip, the surviving General include, no
+  repeated backfill visit, and `canSeeItem` for an external principal NOT serving the item.
+  ACKNOWLEDGED (round 2 M2): after the flip back the survivor is a TARGET-project explicit
+  exclusion and counts in `excludeShadows` every pass — consistent with EXCLSHADOW-1's
+  operator-attention semantics ("a human decision is standing here"), pinned so a permanently
+  non-zero count is not misread as a failed repair.
+- **D4 — counters, honestly plumbed (round 2 M1 corrected the carriers).** `spared` rides
+  `closeMembershipInto` → `reconcileItemContext`'s result → `BackfillResult` →
+  `TeamBackfillOutcome` → the scheduler backfill's existing meta (when non-zero); the backfill
+  DOES exercise the close (it reconciles every selected candidate — `backfill.ts:81`), so the
+  plumbing is real, not decorative. The immediate path's log lives in `settleReclassification`
+  (`lib/ingest/reclassify.ts`), the reclassify-specific caller — not inside the shared
+  `reconcileItemContext`. dm pins the first two hops; the scheduler's nested meta writer is
+  pinned by a source-shape assertion (it is not callable from dm). NO recording-gate claim:
+  sparing is the quiet, correct direction. Zero new schema.
 - **D5 — out of scope, named:** force-include semantics on system projects (reject / suspend /
   override-event — a Phase D design decision, recorded in round 1's terms); dual-system graph
   projection; the curation UI's own audited close; restoring already-ended authority (prod has
@@ -77,9 +96,11 @@ round 1), preserves the human's authority, and makes the round trip compose with
 | Surface | Change |
 |---|---|
 | `lib/projects/context/memberships.ts` `closeMembershipInto` | selects `id, decision, mode`; spares non-auto excludes; returns `{ ok, closed, spared, error? }` |
-| `lib/projects/context/backfill-candidates.ts` | the candidate predicate excludes spared-class opposite rows (D2) |
-| `lib/projects/context/reconcile-item.ts` | threads `spared`; logs when non-zero on the immediate path |
-| `lib/ingest/scheduler.ts` (backfill leg) | sums `spared` into its existing meta (when non-zero) |
+| `lib/projects/context/backfill-candidates.ts` | ARM 3 gains `NOT is_protected_exclude` via one shared expression (D2) |
+| `lib/projects/context/reconcile-item.ts` | threads `spared` |
+| `lib/projects/context/backfill.ts` | `spared` summed into `BackfillResult`/`TeamBackfillOutcome` |
+| `lib/ingest/reclassify.ts` `settleReclassification` | logs `spared` non-zero on the immediate path |
+| `lib/ingest/scheduler.ts` (backfill leg) | `spared` into its existing meta (when non-zero); source-shape pinned |
 | `test/datamechanics/closemode-flip.datamechanics.test.ts` (new) | §3 arms |
 | `docs/ARCHITECTURE.md` | the context-substrate row's flip prose |
 | Schema | **NONE** |
@@ -108,10 +129,14 @@ round 1), preserves the human's authority, and makes the round trip compose with
    (c) a forced INCLUDE on the opposite side closes exactly as today (`closed 1` — kept
    behaviour, Phase D owns its semantics); (d) plain auto flips behave exactly as today — this
    fence excludes nothing: the auto path is already shipped and pinned by the exclshadow and
-   reconcile-item suites; (e) D2: with the spared exclude standing, the backfill candidate pass
-   visits NOTHING for that unit on the next run (two consecutive passes; the second is empty),
-   and the spared row is never closed by it; (f) `spared` reaches reconcile-item's result and the
-   scheduler backfill leg's meta (when non-zero).
+   reconcile-item suites; (e) D2: with the spared exclude standing, TWO consecutive
+   `backfillTeamContext` passes both return `scanned: 0` for the settled unit and the spared row
+   stays current; a unit with a genuinely MISSING target include still gets visited (ARM 2 not
+   suppressed); (e2) D3: the return flip returns `ok:false` (the standing refusal), the General
+   include survives, and `excludeShadows` counts the standing target-side exclusion (pinned as
+   intended, not a failed repair); (f) `spared` reaches `reconcileItemContext`'s result and
+   `BackfillResult`/`TeamBackfillOutcome` (dm), and the scheduler's meta writer names it
+   (source-shape assertion).
 2. Existing dm suites green UNCHANGED (`exclude-shadow-repair`, `context-reconcile-item`,
    backfill, enforcement suites).
 3. Mutations, verdicts verbatim in the PR: (a) close spared excludes again (drop the mode/decision
