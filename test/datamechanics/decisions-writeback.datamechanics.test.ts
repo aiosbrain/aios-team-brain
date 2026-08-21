@@ -17,7 +17,9 @@ async function wctx(seed: Seed, tier: "team" | "external", memberId?: string) {
   const id = memberId ?? seed.memberId;
   const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId: id });
   expect(vis.error, "ctx resolution must not error").toBeFalsy();
-  return { visibleItemIds: vis.ids, teamPosture: tier === "team" };
+  // AUDITFIX-1: `principal` is threaded EXPLICITLY. Every assertion in this file states MEMBER
+  // behaviour, and an omitted discriminator is `undefined`, which CLOSES the hand-typed arm.
+  return { visibleItemIds: vis.ids, teamPosture: tier === "team", principal: "member" as const };
 }
 
 async function externalMemberId(seed: Seed): Promise<string> {

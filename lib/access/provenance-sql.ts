@@ -36,8 +36,31 @@ export function newSqlParams(initial: readonly unknown[] = []): SqlParams {
   };
 }
 
+/**
+ * WHO is asking. The unsourced (hand-typed) arm is admitted for a MEMBER at team posture and for
+ * nobody else — see `admitsUnsourced`.
+ *
+ * A delegated token's authority is its attenuated scope; a row with no `source_item_id` cannot be
+ * tested against that scope, so it can never be shown to one. Absent/foreign values close.
+ */
+export type ProvenancePrincipal = "member" | "token" | undefined;
+
+/**
+ * THE POLICY, in one place, expressed POSITIVELY (AUDITFIX-1).
+ *
+ * Positive on purpose: `principal !== "token"` would admit `undefined`, `null` and any foreign value
+ * — and those are real runtime states here, because `tsconfig.json` excludes `test/`, so an omitted
+ * discriminator never fails typecheck. Written this way, everything that is not an explicit member at
+ * team posture closes.
+ */
+export function admitsUnsourced(ctx: { principal?: ProvenancePrincipal; teamPosture: boolean }): boolean {
+  return ctx.principal === "member" && ctx.teamPosture === true;
+}
+
 export interface ProvenanceSqlCtx {
   teamId: string;
+  /** WHO is asking (AUDITFIX-1). Absent closes the hand-typed arm — never synthesise "member". */
+  principal?: ProvenancePrincipal;
   /** The oracle's granted project set (`visibleProjects(...).projectIds`) — NOT the §2.1
    *  row-visible set; the semijoin derives item visibility from grants + curations. */
   grantedProjectIds: readonly string[];
@@ -80,32 +103,38 @@ export function itemVisibleSql(expr: string, p: SqlParams, ctx: ProvenanceSqlCtx
  * decisions by ENFB-2 design round 2 H6).
  */
 export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSqlCtx): string {
-  const posture = p.add(ctx.teamPosture);
+  const sourced = `(${alias}.source_item_id is not null and ${itemVisibleSql(`${alias}.source_item_id`, p, ctx)})`;
+  // The arm is OMITTED, not parameterised false — a token's SQL simply has no hand-typed disjunct.
+  if (!admitsUnsourced(ctx)) return `(${sourced})`;
   return `(
-    (${alias}.source_item_id is not null and ${itemVisibleSql(`${alias}.source_item_id`, p, ctx)})
-    or (${alias}.source_item_id is null and ${alias}.created_by is not null and ${posture})
+    ${sourced}
+    or (${alias}.source_item_id is null and ${alias}.created_by is not null)
   )`;
 }
 
 /**
- * The ID-ARRAY form — the exact SQL twin of `rowVisibleByProvenance(row, visibleItemIds,
- * tier)` for sites that ALREADY hold the principal's materialized visible-item set (retrieve,
- * the timeline, the board, both API lists): sourced → the source id is in the set; null-source
- * → hand-typed at team posture. This form serves EVERY principal correctly (a delegated
- * token's set is its attenuated set — the semijoin form above would need the granted-project
- * ctx that tokens deliberately do not carry), and it adds zero substrate reads at sites that
- * post-filtered with the same set yesterday. The array binds as ONE parameter. The documented
- * large-corpus deferral (enforce.ts) applies unchanged.
+ * The ID-ARRAY form — the exact SQL twin of `rowVisibleByProvenance` for sites that ALREADY hold the
+ * principal's materialized visible-item set (retrieve, the timeline, the board, both API lists):
+ * sourced → the source id is in the set; null-source → hand-typed, and ONLY for a member at team
+ * posture (`admitsUnsourced`).
+ *
+ * ⚠️ THIS DOCSTRING USED TO CLAIM the form "serves EVERY principal correctly (a delegated token's set
+ * is its attenuated set)". That was false and it was the whole bug: the null-source arm never
+ * consulted `visibleItemIds` at all, so an empty-scoped token received every hand-typed task and
+ * decision in the team. Reproduced against real Postgres before this was written (AUDITFIX-1).
+ *
+ * The array binds as ONE parameter. The documented large-corpus deferral (enforce.ts) is unchanged.
  */
 export function provenanceRowSqlFromIds(
   alias: string,
   p: SqlParams,
-  ctx: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+  ctx: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: ProvenancePrincipal }
 ): string {
   const ids = p.add([...ctx.visibleItemIds]);
-  const posture = p.add(ctx.teamPosture);
+  const sourced = `(${alias}.source_item_id is not null and ${alias}.source_item_id = any(${ids}::uuid[]))`;
+  if (!admitsUnsourced(ctx)) return `(${sourced})`;
   return `(
-    (${alias}.source_item_id is not null and ${alias}.source_item_id = any(${ids}::uuid[]))
-    or (${alias}.source_item_id is null and ${alias}.created_by is not null and ${posture})
+    ${sourced}
+    or (${alias}.source_item_id is null and ${alias}.created_by is not null)
   )`;
 }

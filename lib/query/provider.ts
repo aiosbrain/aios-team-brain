@@ -37,7 +37,7 @@ export type RetrievedContext = {
   grounded: boolean;
   /** PCCC-6 (spec's expansion budget): how many of the principal's visible projects the K-capped
    * graph stage actually covered — the deliberate own-scope disclosure exception to §5.7. Absent
-   * when the graph leg didn't run partitioned (permissive tier path, external omit, no graph). */
+   * when the graph leg didn't run partitioned (no enforcement view, external omit, no graph). */
   graphScope?: { covered: number; total: number };
 };
 
@@ -53,7 +53,10 @@ export interface RetrievalRequest {
    *  K-capped ready partitions (the PCCC-6 read cutover); absent keeps the §5.8b omit (external
    *  principals, delegated tokens). `principal` discriminates the org-structural mirror legs
    *  (QMIR-1) — "member" regains actors + REPORTS_TO; anything else is token semantics.
-   *  Absent/null enforce = permissive. */
+   *  Absent/null enforce does NOT mean permissive — PRET-6 retired that model. `retrieve()`'s
+   *  public entry throws without it, and this seam (independently callable) yields
+   *  `principal: undefined`, which CLOSES the hand-typed structured arm (AUDITFIX-1 §2d).
+   *  Never synthesise "member" here: that is the sentence that would reopen the leak. */
   enforce?: { visibleItemIds: ReadonlySet<string>; graphProjectIds?: readonly string[]; principal: "member" | "token" } | null;
 }
 

@@ -301,4 +301,29 @@ describe("ENFB-2 D1 — createProjectAction grants its creator (round-2 blockers
     const srcCardIn = insiderCards.rows.find((r) => r.id === (srcProj!.id as string))!;
     expect(srcCardIn.visibleItems, "the grantee counts both contained items").toBe(2);
   });
+
+  it("AUDITFIX-1 regression half: a card's task count still includes a MEMBER's hand-typed task", async () => {
+    // The card counts build their OWN provenance ctx, separate from the row rule. When AUDITFIX-1
+    // made the hand-typed arm conditional on `principal === "member"`, that second ctx silently
+    // omitted the discriminator and the arm closed — dropping hand-typed tasks out of every
+    // member's card count while the project page still listed them. Nothing caught it: the M4 test
+    // above asserts `visibleItems` only and never seeds an unsourced row. This is that assertion.
+    const seed = await seedTeam();
+    const member = await seedMember(seed);
+    await ingest(seed, { path: "cards.md", body: "c", access: "team", project: "cardp" });
+    await backfillTeamContext(db(), seed.teamId);
+    const { data: proj } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "cardp").single();
+
+    const handTyped = await db().from("tasks").insert({
+      team_id: seed.teamId, row_key: `CARD-${Math.random().toString(36).slice(2, 8)}`,
+      title: "hand typed, no source item", status: "in_progress",
+      source_item_id: null, created_by: member, audience: "team", project_id: (proj as { id: string }).id, origin: "ui",
+    });
+    expect(handTyped.error, handTyped.error?.message).toBeFalsy();
+
+    const { visibleProjectCards } = await import("@/lib/access/enforce");
+    const cards = await visibleProjectCards(db(), { teamId: seed.teamId, memberId: member });
+    const card = cards.rows.find((r) => r.id === (proj as { id: string }).id)!;
+    expect(card.visibleTasks, "a member's card counts their hand-typed task (ENFB-2 rule, unchanged by AUDITFIX-1)").toBe(1);
+  });
 });

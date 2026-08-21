@@ -100,6 +100,9 @@ export default async function PersonPage({
   const context = await getMemberContext(db, team.id, p.member_id, me.tier, {
     visibleItemIds: viewerVis.error ? new Set() : viewerVis.ids,
     teamPosture: me.tier === "team",
+    // Member-only surface (AUDITFIX-1 §2a): session-authenticated profile page. This ctx reaches
+    // the provenance predicate via deriveProjects (lib/identity/context.ts).
+    principal: "member" as const,
   });
   const canEdit = !!context && (me.id === p.member_id || me.role === "admin");
   const isSelf = me.id === p.member_id;

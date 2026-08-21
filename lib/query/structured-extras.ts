@@ -1,7 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { isRestrictedTier } from "@/lib/auth/visibility";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, type ProvenancePrincipal } from "@/lib/access/provenance-sql";
 
 /**
  * Structured-context helpers that fix the "digests are recency-capped" scaling gaps (Gaps #5, #6).
@@ -66,7 +66,7 @@ export async function matchingDecisions(
   // ENFB-2 §2.2: the provenance predicate compiles into THIS window too (the keyword leg was
   // one of the deferred post-LIMIT sites). Absent ctx (a caller with no enforcement view)
   // fails CLOSED: an empty visible set admits only nothing-sourced… i.e. no sourced rows.
-  enforce?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+  enforce?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: ProvenancePrincipal }
 ): Promise<DecisionMatch[]> {
   if (!orQuery.trim()) return [];
   try {
@@ -75,6 +75,9 @@ export async function matchingDecisions(
     const prov = provenanceRowSqlFromIds("d", p, {
       visibleItemIds: enforce?.visibleItemIds ?? new Set(),
       teamPosture: enforce?.teamPosture ?? false,
+      // Absent enforcement closes the hand-typed arm (undefined), preserving this function's
+      // existing fail-closed default rather than synthesising a member (AUDITFIX-1 §2d).
+      principal: enforce?.principal,
     });
     const params: unknown[] = p.values;
     const sql = `

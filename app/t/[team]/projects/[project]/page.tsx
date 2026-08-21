@@ -94,7 +94,7 @@ export default async function ProjectPage({
   // served titles at posture with no provenance columns selected).
   const { rowVisibleByProvenance } = await import("@/lib/access/provenance");
   const decisionRows = ((decisions ?? []) as (Decision & { source_item_id?: string | null; created_by?: string | null })[]).filter((d) =>
-    rowVisibleByProvenance(d, vis.error ? null : vis.ids, me?.tier === "external" ? "external" : "team")
+    rowVisibleByProvenance(d, vis.error ? null : vis.ids, me?.tier === "external" ? "external" : "team", "member")
   );
 
   // Spine: group items by top-level directory of path

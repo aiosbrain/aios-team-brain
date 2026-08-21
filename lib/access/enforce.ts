@@ -229,9 +229,32 @@ export interface VisibleProjectRows {
   error?: boolean;
 }
 
-function projectRowVisibleSql(teamId: string, granted: readonly string[], teamPosture: boolean) {
+/**
+ * AUDITFIX-1 §2b. The three project-row helpers below (`visibleProjectRows`, `canSeeProjectRow`,
+ * `visibleProjectCards`) are member-only BY CONSTRUCTION, not by convention: every one of their eight
+ * call sites is a session-authenticated page or an `aios_` member route, and `authenticateApiKey`
+ * (lib/api/auth.ts) rejects an `aiosd_` bearer, so a delegated token cannot reach them.
+ *
+ * The value is named once, HERE, rather than spelled at each call site — a bare `"member"` literal
+ * scattered through the file is exactly what AC9's guard forbids, because it is the shape a future
+ * token path would copy. If any of these ever becomes token-reachable, this constant is the single
+ * place that must change, and the guard will point at it.
+ */
+const MEMBER_ONLY_SURFACE = "member" as const;
+
+/**
+ * The discriminator is a PARAMETER, not a hardcoded "member". These helpers take a
+ * `Principal`, and that type permits `projectScope` — i.e. a token-shaped value — so baking in
+ * "member" here would open the hand-typed arm for any future internal token caller.
+ */
+function projectRowVisibleSql(
+  teamId: string,
+  granted: readonly string[],
+  teamPosture: boolean,
+  principal: "member" | "token" | undefined
+) {
   const p = newSqlParams();
-  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture };
+  const ctx: ProvenanceSqlCtx = { teamId, grantedProjectIds: granted, teamPosture, principal };
   const team = p.add(teamId);
   const grantedPh = p.add([...granted]);
   // Posture stays a CONJUNCT on every content arm (Fable diff L10): an external-posture
@@ -251,7 +274,7 @@ export async function visibleProjectRows(db: DbClient, principal: Principal): Pr
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
     const res = await runSql<{ id: string }>(`select p.id from projects p where ${where}`, p.values);
     return { ids: new Set(res.rows.map((r) => r.id)) };
   } catch {
@@ -263,7 +286,7 @@ export async function canSeeProjectRow(db: DbClient, principal: Principal, proje
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture);
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture, MEMBER_ONLY_SURFACE);
     const idPh = p.add(projectId);
     const res = await runSql<{ id: string }>(
       `select p.id from projects p where p.id = ${idPh} and ${where} limit 1`,
@@ -294,8 +317,17 @@ export async function visibleProjectCards(
   try {
     const { projectIds } = await visibleProjects(db, principal);
     const posture0 = await teamPostureFor(db, principal);
-    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0);
-    const ctx: ProvenanceSqlCtx = { teamId: principal.teamId, grantedProjectIds: [...projectIds], teamPosture: posture0 };
+    const { p, where } = projectRowVisibleSql(principal.teamId, [...projectIds], posture0, MEMBER_ONLY_SURFACE);
+    // AUDITFIX-1: the count ctx takes the SAME discriminator as the row rule above. Omitting it here
+    // is not fail-safe — it silently CLOSES the hand-typed arm for a member, so a card would report
+    // fewer tasks than the project page lists. That is a member-visible regression, and this slice
+    // narrows tokens only (§1). Pinned by the visibleTasks assertion in enfb2-project-rows.
+    const ctx: ProvenanceSqlCtx = {
+      teamId: principal.teamId,
+      grantedProjectIds: [...projectIds],
+      teamPosture: posture0,
+      principal: MEMBER_ONLY_SURFACE,
+    };
     // The card counts carry the SAME posture conjuncts as the row rule and the detail page's
     // walls (Fable diff L10 — counts must never exceed what the container page lists).
     const posture = p.add(posture0);

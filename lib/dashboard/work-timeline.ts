@@ -206,7 +206,8 @@ export async function getWorkTimeline(
   // downstream as the defense-in-depth layer over the SAME contract), so invisible rows can no
   // longer starve the TASK_LIMIT/DECISION_LIMIT windows. `{ data, error }` shape mirrors the
   // builder so the legs' existing error contracts (throw for core, WARN for enrichment) hold.
-  const provCtx = { visibleItemIds: enforce?.visibleItemIds ?? new Set<string>(), teamPosture: tier !== "external" };
+  // Member-only surface (AUDITFIX-1 §2a): the timeline is session-authenticated.
+  const provCtx = { visibleItemIds: enforce?.visibleItemIds ?? new Set<string>(), teamPosture: tier !== "external", principal: "member" as const };
   const provenanceTaskWindow = (opts: { statuses?: readonly string[]; requireRowKey?: boolean }) => {
     const p = newSqlParams();
     const conds = [`t.team_id = ${p.add(teamId)}`];
@@ -666,7 +667,7 @@ export async function getWorkTimeline(
     // The settled provenance rule, decisions edition (ENFB-1 §2.7) — ONE owner
     // (lib/access/provenance); srcVisible's extra enforce-null guard is subsumed: enforce is
     // never null here (the builder throws upstream without a view).
-    if (!rowVisibleByProvenance(d, enforce?.visibleItemIds ?? null, tier === "external" ? "external" : "team")) continue;
+    if (!rowVisibleByProvenance(d, enforce?.visibleItemIds ?? null, tier === "external" ? "external" : "team", "member")) continue;
     if (!d.decided_at) continue; // no day to place it on (mirrors the undated-work drop)
     const by = (d.decided_by ?? "").trim();
     if (!by) continue; // empty / group-level decided_by → dropped (a later team-signal lane's job)

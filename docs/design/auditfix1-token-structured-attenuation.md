@@ -29,7 +29,7 @@ a full-visibility principal legitimately sees the same row, so the fixture was n
 | prod members in `external` built-in | **0** (all 10 in `everyone`) |
 | hand-entered rows reachable by the arm (`source_item_id is null and created_by is not null`) | tasks **1**, decisions **0** |
 | routes accepting an `aiosd_` bearer | exactly **2**: `app/api/v1/items/route.ts`, `app/api/v1/query/route.ts` |
-| ctx construction sites feeding the id-array predicate | **7** — retrieve, timeline, pulse, identity/context, structured-windows, structured-extras, **and `lib/sync/decisions.ts:41`** (missed in round 1; already enumerated by `test/guards/dashboard-tier-filter.test.ts:173`) |
+| ctx construction sites feeding the id-array predicate | **9** — retrieve, timeline, pulse, identity/context, structured-windows, structured-extras, `lib/sync/decisions.ts:41` (missed in round 1), **`app/api/v1/tasks/route.ts:192`** and **`app/t/[team]/people/[handle]/page.tsx:100`** (see §5d) |
 | owners of the provenance contract | **3** — `provenanceRowSqlFromIds` (id-array SQL), `provenanceRowSql` (semijoin SQL), `rowVisibleByProvenance` (TS twin) |
 
 **What that means:** severity is CRITICAL by contract violation, not by current data loss. One task row
@@ -68,7 +68,7 @@ const admitUnsourced = ctx.principal === "member" && ctx.teamPosture === true;
 ```
 
 Absent, `null`, `"token"`, and any foreign value all fail this and therefore **close**. This is the
-idiom the codebase already uses for the org-structural legs (`retrieve.ts:533`,
+idiom the codebase already uses for the org-structural legs (`lib/query/retrieve.ts:533`,
 `serveOrgStructural = enforce?.principal === "member"`), so it is a consistency fix, not a new pattern.
 
 **All THREE owners take the discriminator, not just the one the exploit runs through.** The module
@@ -200,7 +200,7 @@ the sentence that would justify re-adding a permissive default.
   site**: any literal `principal: "member"` (or equivalent) in a provenance ctx must appear in an
   allow-list of member-only boundaries, and the two token-capable files (`lib/query/retrieve.ts`,
   `lib/query/structured-extras.ts`) must contain **no** member literal — they may only forward.
-  Mutation-verified by planting a member literal in `retrieve.ts` and confirming THIS test reddens.
+  Mutation-verified by planting a member literal in `lib/query/retrieve.ts` and confirming THIS test reddens.
 - **AC8 — typecheck (honest scope):** `npx tsc --noEmit` covers **production** sources only
   (`tsconfig.json:25` excludes `test/`), so omission is caught in `lib/` and `app/` but **not** in test
   helpers. Recorded as a production-source check with that limitation stated, not as a durable
@@ -245,6 +245,32 @@ rule is not implemented, whatever the tests say.
   specific files named.
 - **MEDIUM: the provider seam still documents "permissive"** — folded into §2d.
 - **MEDIUM: AC7 said four inputs where AC6 has five** — enumerated.
+
+## 5d. What the TEST TIERS found that four review rounds did not
+
+Three defects survived every review round and were caught by running things. Recorded because the
+loop's value is exactly this — the rounds narrow the design, the tiers judge the result.
+
+- **The inventory said 7 consumers; there are 9.** `app/api/v1/tasks/route.ts:192` and
+  `app/t/[team]/people/[handle]/page.tsx:100` both build a provenance ctx and neither was listed.
+  Both are member-only boundaries (`authenticateApiKey` rejects `aiosd_`; a session page), so
+  omitting the discriminator CLOSED the hand-typed arm for members: the tasks writeback feed
+  silently dropped every UI-origin task, which reddened `tasks-sync-origin-feed` in the dm tier.
+  A read of §0 alone would have shipped that. **Both are now on the AC9 guard's allow-list, so the
+  inventory is enforced rather than asserted.**
+- **`visibleProjectCards` builds a SECOND ctx for its counts** (`lib/access/enforce.ts:337`), separate from the
+  row rule, and it too omitted the discriminator — a member's project card would have reported fewer
+  tasks than the project page listed. Nothing caught it: the existing card test asserts `visibleItems`
+  only and never seeds an unsourced row. A `visibleTasks` assertion was added with it.
+- **AC9's guard scored my own code clean.** `lib/access/enforce.ts` names the value once
+  (`MEMBER_ONLY_SURFACE = "member" as const`) rather than repeating a literal, and all of the guard's
+  needles were literal-shaped — so `import { MEMBER_ONLY_SURFACE }` into a token-capable file and
+  `principal: MEMBER_ONLY_SURFACE` would have passed. Round 3 killed the FIRST guard for measuring a
+  spelling; naming a constant is just another spelling. The guard now asserts the
+  spelling-INDEPENDENT property too: in the two token-capable files, every `principal` in a value
+  position must BE the forwarded expression. Its first draft then flagged
+  `enforce?.principal === "member"` — a comparison, not an assertion — and swallowed SCREAMING_SNAKE
+  constants under a PascalCase-means-type heuristic; both are fixed and pinned as non-vacuity cases.
 
 Round 1 also **confirmed the core rule is right and not over-correction**: a hand-typed row
 deliberately has no membership axis, and `tasks.project_id` is an ingestion project, not an access

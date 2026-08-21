@@ -32,6 +32,9 @@ export async function GET(req: NextRequest) {
     const decisions = await getDecisionWriteback(db, auth.teamId, auth.memberTier, since, {
       visibleItemIds: vis.ids,
       teamPosture: auth.memberTier === "team",
+      // Member-only route (AUDITFIX-1 §2a): authenticateApiKey accepts `aios_` member keys only —
+      // an `aiosd_` delegated token cannot authenticate here (lib/api/auth.ts).
+      principal: "member" as const,
     });
     return Response.json({ decisions, next_cursor: null });
   } catch (e) {

@@ -161,11 +161,12 @@ export async function getPulseMetrics(
     /** ENFB-2 §2.2: the viewer's oracle ctx — DISPLAYED counts compute over the visible sets
      *  (per-kind item growth and the task funnel were team-wide volume disclosures). Absent →
      *  fail closed (empty sets → zero counts). */
-    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean };
+    provCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" };
   }
 ): Promise<PulseMetrics> {
   const { isAdmin, tier } = viewer;
-  const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false };
+  // Member-only surface (AUDITFIX-1 §2a): the Pulse dashboard is session-authenticated.
+  const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false, principal: "member" as const };
   const days = rangeDays(range);
   const now = new Date();
   const windowStart = new Date(now.getTime() - days * 86_400_000);

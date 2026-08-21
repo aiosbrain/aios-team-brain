@@ -36,7 +36,9 @@ async function seedTask(
 
 async function viewerCtx(seed: Seed) {
   const vis = await visibleItemIds(db(), { teamId: seed.teamId, memberId: seed.memberId });
-  return { visibleItemIds: vis.ids, teamPosture: true };
+  // AUDITFIX-1: `principal` is threaded EXPLICITLY. Every assertion in this file states MEMBER
+  // behaviour, and an omitted discriminator is `undefined`, which CLOSES the hand-typed arm.
+  return { visibleItemIds: vis.ids, teamPosture: true, principal: "member" as const };
 }
 
 describe("getMemberContext fold (real Postgres)", () => {

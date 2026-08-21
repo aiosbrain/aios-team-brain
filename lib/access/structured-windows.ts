@@ -13,6 +13,8 @@ import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-s
 export interface ProvenanceCtx {
   visibleItemIds: ReadonlySet<string>;
   teamPosture: boolean;
+  /** WHO is asking (AUDITFIX-1). These windows serve session/aios_ MEMBERS only. */
+  principal?: "member" | "token";
 }
 
 /** The tasks BOARD's 500-row window (app/t/[team]/tasks) — column list matches the board's

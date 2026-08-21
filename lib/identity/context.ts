@@ -111,7 +111,7 @@ export async function getMemberContext(
   // ENFB-2 §2.2: the VIEWER's oracle ctx — the derived-projects read serves restricted
   // project names + per-project task counts, so it computes over the viewer-visible task
   // set. Absent → fail closed (no derived projects), never the ungated team-wide read.
-  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" }
 ): Promise<MemberContext | null> {
   if (!canSeeMemberContext(tier)) return null;
 
@@ -212,7 +212,7 @@ async function deriveProjects(
   db: DbClient,
   teamId: string,
   names: string[],
-  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean }
+  viewerCtx?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: "member" | "token" }
 ): Promise<ProjectView[]> {
   if (!names.length) return [];
   if (!viewerCtx) return []; // fail closed — never the ungated team-wide read

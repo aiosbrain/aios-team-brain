@@ -181,14 +181,16 @@ describe("enforced retrieval (Phase B slice 2)", () => {
     await backfillTeamContext(db(), seed.teamId);
     const member = await seedMember(seed);
 
-    const teamView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids };
+    // AUDITFIX-1: the discriminator is threaded EXPLICITLY — this test asserts the MEMBER
+    // hand-typed rule, and an omitted `principal` is `undefined`, which closes that arm.
+    const teamView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: member })).ids, principal: "member" as const };
     const asTeam = await retrieve(db(), seed.teamId, "team", `${TERM} tasks`, null, teamView);
     expect(asTeam.structured, "the hand-typed task survives for a team member").toContain("Hand-typed dashboard task");
     expect(asTeam.structured, "a purged-basis synced task stays dropped").not.toContain("Purged-basis synced task");
 
     const { externalMember } = await import("./helpers");
     const ext = await externalMember(seed);
-    const extView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: ext })).ids };
+    const extView = { visibleItemIds: (await visibleItemIds(db(), { teamId: seed.teamId, memberId: ext })).ids, principal: "member" as const };
     const asExt = await retrieve(db(), seed.teamId, "external", `${TERM} tasks`, null, extView);
     expect(asExt.structured, "a hand-typed row has no membership axis — the posture wall holds").not.toContain("Hand-typed dashboard task");
   });

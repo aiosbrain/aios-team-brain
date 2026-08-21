@@ -192,7 +192,8 @@ export default async function TeamHome({
   const { adminClient } = await import("@/lib/db/admin");
   const { decisionsCardWindow } = await import("@/lib/access/structured-windows");
   const vis = await visibleItemIds(adminClient(), { teamId: team.id, memberId });
-  const provCtx = { visibleItemIds: vis.error ? new Set<string>() : vis.ids, teamPosture: tier === "team" };
+  // Member-only surface (AUDITFIX-1 §2a): session-authenticated dashboard.
+  const provCtx = { visibleItemIds: vis.error ? new Set<string>() : vis.ids, teamPosture: tier === "team", principal: "member" as const };
   const decisionsCardP = decisionsCardWindow(team.id, provCtx, tier === "external").then((rows) => ({ data: rows }));
   const [pulse, { data: decisions }, pipelineHealth, llmHealth] = await Promise.all([
     getPulseMetrics(db, team.id, range, { isAdmin, memberId, tier, provCtx }),
