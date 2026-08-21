@@ -108,8 +108,9 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   flag held back), `deepRequeueHeldByGroup` (`{ [groupId]: n }` — per-group counts, so the
   population is enumerable), `deepRequeueSample` (≤5 held rows as STRUCTURED identities
   `{ teamId, groupId, itemId, projectedAt }` — an item id alone is not operationally
-  identifiable across groups/teams, round 2 H2 — OLDEST `projectedAt` first, merged and
-  re-bounded across teams in the runner the way `partialDetail` is). The admin runs panel's
+  identifiable across groups/teams, round 2 H2 — OLDEST `projectedAt` first, EVERY identity up to
+  `DEEP_REQUEUE_SAMPLE_LIMIT` (50), merged and re-bounded across teams in the runner, with
+  `deepRequeueElided` = held − sample recomputed from the totals after the re-bound). The admin runs panel's
   `RunMeta` renders object values as compact JSON instead of `String(v)` (which printed
   `[object Object]` for `partialDetail` already — fixed in passing, pinned). The keys ride the meta
   only when they say something (like `probeFallbackPages`/`lockedOut`): a deep-resolved row carries
@@ -149,9 +150,11 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   cardinality; worker liveness proves the worker is alive, NOT that these absences are outside
   its backlog — `extraction-health.ts:578` treats live work elsewhere as evidence of queue depth).
   What governs enabling, honestly: EITHER (a) `deepRequeueHeld` is small enough that EVERY held
-  candidate is checked individually (the structured sample + per-group counts make the
-  population enumerable from `ingest_runs` over successive passes; "small" means every id
-  inspected, not a sample), OR (b) the structural successor ships first: a persisted per-row
+  candidate is checked individually — and "small" is now a NUMBER the row itself certifies
+  (Codex diff review M2: a fixed oldest-5 sample could never enumerate a stable sixth row):
+  every held identity rides the durable row up to `DEEP_REQUEUE_SAMPLE_LIMIT = 50`; past it
+  `deepRequeueElided > 0` declares the population NON-enumerable from `ingest_runs` and the flag
+  ineligible, stated rather than truncated — OR (b) the structural successor ships first: a persisted per-row
   "judged absent since / consecutive absent passes" so re-queue requires K consecutive absences
   by construction (schema — NOT this slice, filed as GRAPHSAT-2 if measurement shows held rows
   are common). Until one of those holds, the flag stays off and the spec says so.
@@ -178,6 +181,20 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   `graph-project.datamechanics.test.ts:757` passes an explicit cap and must keep working) —
   whose defaults are the Neo4j lookup, OFF, and `REQUEUE_MAX_PER_PASS`; the runner passes the
   resolved flag; tests inject all three. Parse pinned for unset/"false"/"true"/arbitrary.
+- **D5d — every bolt read has a FINITE deadline (Codex diff review H1).** The lookup runs INSIDE
+  #629's per-team lease and the process single-flight; the Graphiti REST calls there carry a 30 s
+  abort, and a bare `executeRead` carried none — a stalled Neo4j would have stranded the lease
+  and stopped projection for every later team on that instance while twins locked out forever.
+  `lib/graph/neo4j.ts` `runRead` now passes a server-side transaction timeout
+  (`NEO4J_READ_TIMEOUT_MS`, default 30 s; `0`/blank/garbage → the default, never "no deadline"),
+  pinned at the config AND the call site (a mocked driver captures `executeRead`'s config). This
+  hardens the pre-existing learning/extraction-health reads too.
+- **D5e — the Integrations panel stays source-diverse (Codex diff review L3).** While the flag is
+  off a saturated healthy group records an instance-wide row hourly; `listRecentIngestRuns`
+  merges null-team rows into every team's 30-row panel, so ~30 quiet hours could have buried an
+  older connector failure that used to stay visible. `diversifyBySource` caps any one `source`
+  at half the panel while other sources still have rows (the cap lifts once they are exhausted;
+  newest-first order preserved), unit-pinned. The raw hourly rows D4 needs are untouched.
 - **D5c — the dm tier is hermetic to Neo4j.** `vitest.datamechanics.config.ts` sets
   `process.env.NEO4J_URL = ""` before module load (it already blanks every LLM transport); a
   dev shell exporting a real URL can no longer flip the saturated pin by deep-resolving against
@@ -197,7 +214,8 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
 | `lib/graph/episode-lookup.ts` (new file, to create) | `lookupItemEpisodes(groupId, itemIds)` over `runRead`, chunked at 500 ids; returns `null` when `!neo4jConfigured()`; REJECTS (no partial rows) on any batch error — the caller owns the degrade |
 | `lib/graph/reconcile.ts` | the saturated branch: lookup → the SAME presence-map helper → same downstream; `deepResolvedGroups`, `deepRequeueHeld`, `deepRequeueSample`; options `{ lookup?, deepRequeue?, maxRequeuePerPass? }` |
 | `lib/graph/run.ts`, `lib/graph/projection-run.ts`, `lib/graph/scheduler.ts` | the counters ride summary → meta → log line; `shouldRecordProjectionRun` gains `deepRequeueHeld` + the measurement-mode clause (reads `s.deepRequeueEnabled`, resolved once in the runner) |
-| `lib/graph/neo4j.ts` | header: the Cypher-ownership rule widened explicitly to the owned-module list |
+| `lib/graph/neo4j.ts` | header: the Cypher-ownership rule widened explicitly; `runRead` under a finite transaction deadline (`readTxConfig`) |
+| `lib/ingest/runs.ts` | `diversifyBySource` in `listRecentIngestRuns` (pure, unit-pinned) |
 | `test/guards/graph-tier-filter.test.ts` | owned-module list: `learning.ts` (`group_id IN $groups`) + `episode-lookup.ts` (`group_id = $g`) |
 | `vitest.datamechanics.config.ts` | `NEO4J_URL = ""` |
 | `test/datamechanics/fake-graphiti.ts` | unchanged (the lookup is injected, not a client method) |
@@ -283,14 +301,19 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
    instead of the item stem → AC1(b)'s shrink arm reddens; (f) truthiness parse of the env →
    AC4's `"false"` arm reddens; (g) drop `deepRequeueHeld` from the gate → AC4 reddens;
    (h) disable the REST-window oracle → AC1(g) reddens; (i) drop a malformed row instead of
-   throwing → the lookup unit reddens.
+   throwing → the lookup unit reddens; (j) drop the deadline from `executeRead` → the read-timeout
+   call-site pin reddens; (k) cap the sample at 5 again → the six-row arm reddens; (l) remove the
+   per-source cap → the diversify unit reddens.
 6. Full tiers green: `npm test` · dm iso (the graph set) · `npm run test:http:local` (the stacked
    PR runs only the gate workflows — the http tier is run locally and commented on the PR) ·
    `npm run check:docs` · `docs/ARCHITECTURE.md:115` gains the saturation + lookup prose.
    **Merge condition (round 2 L1):** after #629 merges, this PR is retargeted to `main` and the
    FULL required CI must run green on the retargeted head before the merge word — local http
    evidence is adequate while stacked, not as final merge evidence.
-7. `npx vitest run test/guards/graph-tier-filter.test.ts` exits 0 with the comment-stripping arm:
+7. `npx vitest run test/graph-neo4j-read-timeout.test.ts test/ingest-runs-diversify.test.ts`
+   exits 0: the deadline default/override/garbage arms + the `executeRead` call-site pin; the
+   panel's per-source cap, its lift, and the single-source no-op.
+8. `npx vitest run test/guards/graph-tier-filter.test.ts` exits 0 with the comment-stripping arm:
    a block whose only `group_id` term sits inside a `//` or `/* */` comment is reported missing.
 
 ## 4. Out of scope, named
