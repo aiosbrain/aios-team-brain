@@ -43,7 +43,10 @@ what the module returns. Only the real tier can.
 - **D1b — the dedicated job FAILS ON SKIP (Codex design round 1 HIGH).** A static guard can
   prove a job exists and a script has a string; it cannot prove the tier RAN. So the dedicated
   job sets a sentinel, `NEO4J_TIER_REQUIRED=1`, and the tier file throws AT COLLECTION when the
-  sentinel is set but `NEO4J_TEST !== "1"` — a behavioural red, not a source-regex red. `npm test`
+  sentinel is set but the tier is not enabled — a behavioural red, not a source-regex red. ONE
+  predicate, `neo4jTierEnabled = process.env.NEO4J_TEST === "1"`, drives BOTH the `describe`
+  selection and the throw (round 2 M1: today's truthiness check would have let `NEO4J_TEST=0`
+  run the tier while the sentinel rejected it). `npm test`
   / `npm run coverage` (the `brain-tests` job, deliberately without Neo4j) never set the sentinel
   and keep the silent `describe.skip`; a developer without Neo4j still sees a green `npm test`.
   The wiring guard asserts the job sets the sentinel (D3).
@@ -55,7 +58,7 @@ what the module returns. Only the real tier can.
   PR body carries the step, the ticket row stays `in_progress` until the required-check list has
   been read back with the new name in it, and only then closes. Precedent followed, then
   documented stale: ARCHITECTURE:795 still says the NDA gate "must be added" while today's list
-  shows it IS — that sentence is corrected in this slice. Until the step lands the job runs and
+  shows it IS — noted, not corrected here (round 2 L1: unrelated). Until the step lands the job runs and
   reports; it cannot block.
 - **D3 — the wiring is GUARDED, because "it's in CI" is the claim that rotted last time.** A unit
   guard `test/guards/neo4j-tier-wiring.test.ts` parses `ci.yml` AND `compose.test.neo4j.yml`
@@ -69,13 +72,21 @@ what the module returns. Only the real tier can.
   (real Neo4j)`; (b) a step whose `run` is exactly `npm run test:neo4j`; (c) `services.neo4j`
   exists and its `image`, `NEO4J_AUTH` and the bolt port mapping EQUAL compose's (read from the
   compose object — the service contract is more than the image, Codex round 1 M2: auth/port drift
-  reads as a red tier, but a deleted health check reads as a timing flake); (d) the service
-  `options` contain the authenticated `cypher-shell` probe with interval/timeout/retries; (e) the
-  job's `env` sets `NEO4J_TIER_REQUIRED: "1"` (D1b); (f) `package.json` `scripts["test:neo4j"]`
-  contains `NEO4J_TEST=1`, `bolt://localhost:`, `NEO4J_USER=neo4j`, `NEO4J_PASSWORD=testtest1`,
-  `graph-neo4j-tier`. Non-vacuity arms mutate the PARSED objects: job deleted; run step removed;
-  service removed; image drift; port drift; health options removed; sentinel removed;
-  `NEO4J_TEST=1` dropped from the script — each yields exactly its named violation.
+  reads as a red tier, but a deleted health check reads as a timing flake); (d) the health
+  contract is NORMALIZED, not equated (round 2 M2 — compose has a `healthcheck` object, Actions
+  has Docker flags in `options`): the `options` string must carry `--health-cmd` containing
+  compose's probe command (`cypher-shell -u neo4j -p testtest1 'RETURN 1'`) and
+  `--health-interval`/`--health-timeout`/`--health-retries` equal to compose's `interval`/`timeout`/
+  `retries` values; (e) the job's `env` sets `NEO4J_TIER_REQUIRED: "1"` (D1b); (f) the npm script
+  is checked EXACTLY (round 2 HIGH: the tier's `beforeAll` is destructive, so "contains
+  `bolt://localhost:`" would pass a script with a second, later `NEO4J_URL=` assignment pointing
+  elsewhere): the validator parses the script's leading `KEY=value` words and requires exactly one
+  `NEO4J_URL` = `bolt://localhost:7688`, `NEO4J_TEST` = `1`, `NEO4J_USER` = `neo4j`,
+  `NEO4J_PASSWORD` = `testtest1`, and the command `vitest run graph-neo4j-tier`. Non-vacuity arms
+  mutate the PARSED objects, ONE per invariant (round 2 M5): job deleted; check name changed; run
+  step removed; service removed; image drift; `NEO4J_AUTH` drift; port drift; health cmd drift;
+  health retries drift; sentinel removed; script URL duplicated/pointed elsewhere; `NEO4J_TEST`
+  dropped; user/password drift; filter changed — each yields exactly its named violation.
 - **D4 — the tier's own cleanliness.** The tier's `beforeAll` wipes the graph (`MATCH (n) DETACH
   DELETE n`) — fine against a throwaway service container, and the job must never be pointed at
   anything else: the guard asserts the npm script's URL is `bolt://localhost:` (D3(f)). No change
@@ -90,7 +101,7 @@ what the module returns. Only the real tier can.
 | `test/graph-neo4j-tier.test.ts` | throws at collection when `NEO4J_TIER_REQUIRED=1` and `NEO4J_TEST !== "1"`; header comment corrected |
 | `scripts/neo4j-tier-wiring.mjs` (new file, to create) | `validateNeo4jTierWiring(ci, compose, pkg)` — pure, returns violations |
 | `test/guards/neo4j-tier-wiring.test.ts` (new file, to create) | parses the real files with `yaml`, asserts zero violations; mutation arms over the parsed objects |
-| `package.json` | `yaml` as a direct devDependency |
+| `package.json` + `package-lock.json` | `yaml` as a direct devDependency, lockfile updated by `npm install` (round 2 M3: it is only Vite's optional peer today; `npm ci` rejects a package/lock mismatch) |
 | `docs/ARCHITECTURE.md` | CLAUDE.md §4's tier table is in CLAUDE.md; ARCHITECTURE's test-tier prose gains the Neo4j tier row + "runs in CI" |
 | `CLAUDE.md` §4 | the tier table gains the **neo4j** tier (real Neo4j; catches Cypher/shape/driver drift) |
 | Schema | **NONE** |
@@ -126,15 +137,18 @@ what the module returns. Only the real tier can.
 4. Mutations, verdicts verbatim in the PR (via `scripts/mutate.mjs`): (a) make the validator skip
    the run-step check → the guard's mutation arm reddens; (b) make the tier's collection throw
    conditional on nothing (never throw) → AC1b's red arm goes green = the guard for it reddens
-   (pinned by a unit that spawns vitest with the sentinel set and asserts non-zero exit);
+   (pinned by a unit that spawns the local vitest entrypoint on the exact tier path with a
+   CONSTRUCTED env — `NEO4J_TIER_REQUIRED=1`, `NEO4J_TEST` explicitly DELETED, not inherited from
+   a developer's shell (round 2 M4) — with a timeout, asserting non-zero exit AND the
+   collection-error text);
    (c) drop `NEO4J_TEST=1` from the npm script → the real-file validation reddens.
 5. `npm test` · `npm run check:docs` green; CLAUDE.md §4 + ARCHITECTURE updated in the same PR.
 6. Post-merge operator step, stated in the PR body AND tracked on the ticket (it stays
    `in_progress` until closed): add `Graph Neo4j tier (real Neo4j)` to `main`'s required status
    checks once it has run green on `main`, then READ BACK the required-check list
    (`gh api repos/…/branches/main/protection/required_status_checks`) and record the name in the
-   ticket. ARCHITECTURE:795's stale "must be added" sentence about the NDA gate is corrected to
-   "added — verified in the required list 2026-08-21".
+   ticket. (The stale NDA sentence at ARCHITECTURE:795 is NOT this slice's — round 2 L1; noted
+   for a docs cleanup.)
 
 ## 4. Out of scope, named
 
