@@ -126,8 +126,8 @@ rule is correct for a backlog of any length, because the watermark moves only wh
    re-pushed by the projector and then confirmed on a later pass, is an ordinary confirmed row
    (no residue); (g) an UNREACHABLE listing pass (RECONULL-1) and a MISMATCH pass form no
    watermark from that group and re-queue nothing; (h) REST-path (small group) re-queue behaviour
-   is byte-identical to today (a never-landed row past the grace re-queues regardless of any
-   watermark).
+   is today's (a never-landed row past the grace re-queues regardless of any watermark) — this
+   fence excludes nothing: the REST path is already shipped and pinned.
 2. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts` exits 0:
    `requeueEligible 1` with the flag OFF records alone; with the flag ON it is meta-only; absent
    from a quiet row; the margin env parse (unset/0/garbage → 10 min, `"600000"` → itself).
