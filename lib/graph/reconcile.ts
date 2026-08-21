@@ -2,7 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient } from "./graphiti-client";
 import { itemIdFromEpisodeName } from "./episode-name";
-import { landedState, boundPartialDetail } from "./landed-state";
+import { landedState, boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
 import {
   GROUP_SCAN_DEPTH,
   IN_CLAUSE_BATCH,
@@ -13,6 +13,7 @@ import {
 import { isExternalGroupId } from "./group";
 import { purgePartitionArcCache, sweepStaleScopedArcCache, sweepOrphanedPartitionArcCache } from "./arc-cache";
 import { evictPartitionArcMemory } from "./arcs";
+import { neo4jEpisodeLookup, type EpisodeLookup, type EpisodeRefLite } from "./episode-lookup";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -123,10 +124,73 @@ export interface ReconcileSummary {
    * hole from the index-shift false positive (an edited doc re-chunks, so an expected `#k` may never
    * have existed). `elided` is how many were dropped from the sample. */
   partialDetail: { sample: { itemId: string; missing: string[]; missingCount: number }[]; elided: number; namesElided: number };
-  /** Groups whose episode list came back FULL, so nothing in them could be judged this pass. Reported
-   * rather than swallowed: it means the group has outgrown the scan window and self-healing has
-   * quietly stopped for it (raise `GRAPH_LANDED_SCAN_DEPTH`). */
+  /** Groups whose episode list came back FULL AND could not be judged by the per-item lookup this pass
+   * (Neo4j unconfigured or the lookup failed). Reported rather than swallowed: self-healing is
+   * stopped for such a group. GRAPHSAT-1 narrowed this from "past the window" to "past the window
+   * and unjudged" — a saturated group with a working lookup counts under `deepResolvedGroups`. */
   saturatedGroups: number;
+  /** GRAPHSAT-1: groups past the REST window that WERE judged via the per-item Neo4j lookup. */
+  deepResolvedGroups: number;
+  /** GRAPHSAT-1: never-landed rows on the lookup path that would have been re-queued but were HELD
+   * because `deepRequeue` is off (measurement mode). Always a recording-gate signal. */
+  deepRequeueHeld: number;
+  deepRequeueHeldByGroup: Record<string, number>;
+  /** ≤ PARTIAL_DETAIL_LIMIT held rows as STRUCTURED identities, OLDEST first — an item id alone is
+   * not identifiable across groups/teams (Codex design round 2 H2). */
+  deepRequeueSample: DeepRequeueRef[];
+  /** The re-queue mode this pass EXECUTED on the lookup path — the recording gate reads it from here
+   * rather than re-parsing the env (one resolution, in the runner). */
+  deepRequeueEnabled: boolean;
+}
+
+export interface DeepRequeueRef {
+  teamId: string;
+  groupId: string;
+  itemId: string;
+  projectedAt: string;
+}
+
+export interface ReconcileOptions {
+  /**
+   * Re-queue budget for THIS pass, defaulting to the per-team constant. An option rather than a bare
+   * module constant for two reasons: it lets a test exercise the throttle at a size it can actually
+   * seed (depending on the env-derived value means the fixture grows with the knob), and it is the seam
+   * a future global budget would use to spend one allowance across `runGraphProjection`'s team loop —
+   * the LIMITATION named on `REQUEUE_MAX_PER_PASS`.
+   */
+  maxRequeuePerPass?: number;
+  /** GRAPHSAT-1: the per-item episode lookup used when a group's REST listing saturates. Default:
+   * the Neo4j one (`null` when unconfigured). Tests inject. */
+  lookup?: EpisodeLookup;
+  /** GRAPHSAT-1: whether never-landed rows judged on the LOOKUP path may be re-queued. Default
+   * false — measurement mode; the runner resolves `GRAPH_DEEP_REQUEUE === "true"` once and passes it. */
+  deepRequeue?: boolean;
+}
+
+/** GRAPHSAT-1: the ONE place the env flag is parsed. Exact `"true"` — a truthiness check would make
+ *  `GRAPH_DEEP_REQUEUE=false` enable it. */
+export function deepRequeueEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GRAPH_DEEP_REQUEUE === "true";
+}
+
+/**
+ * Build the presence view reconcile judges against from a list of episode refs — the SAME helper for
+ * the REST listing and the per-item lookup, so the two paths cannot drift (GRAPHSAT-1 D1).
+ * `uuidByItemId` is FIRST-WINS (it decides the verdict, as it always has); `presentNames` is read
+ * for the per-chunk count and nothing else.
+ */
+export function presenceFrom(refs: readonly EpisodeRefLite[]): {
+  uuidByItemId: Map<string, string>;
+  presentNames: Set<string>;
+} {
+  const uuidByItemId = new Map<string, string>();
+  const presentNames = new Set<string>();
+  for (const e of refs) {
+    if (e.name) presentNames.add(e.name);
+    const itemId = itemIdFromEpisodeName(e.name);
+    if (itemId && !uuidByItemId.has(itemId)) uuidByItemId.set(itemId, e.uuid);
+  }
+  return { uuidByItemId, presentNames };
 }
 
 type EpisodeRow = {
@@ -208,15 +272,11 @@ export async function reconcileProjectedEpisodes(
   db: DbClient,
   client: GraphitiClient,
   teamId: string,
-  /**
-   * Re-queue budget for THIS pass, defaulting to the per-team constant. A parameter rather than a bare
-   * module constant for two reasons: it lets a test exercise the throttle at a size it can actually
-   * seed (depending on the env-derived value means the fixture grows with the knob), and it is the seam
-   * a future global budget would use to spend one allowance across `runGraphProjection`'s team loop —
-   * the LIMITATION named on `REQUEUE_MAX_PER_PASS`.
-   */
-  maxRequeuePerPass: number = REQUEUE_MAX_PER_PASS
+  options: ReconcileOptions = {}
 ): Promise<ReconcileSummary> {
+  const maxRequeuePerPass = options.maxRequeuePerPass ?? REQUEUE_MAX_PER_PASS;
+  const lookup = options.lookup ?? neo4jEpisodeLookup;
+  const deepRequeue = options.deepRequeue ?? false;
   if (!client.configured)
     return {
       groupsChecked: 0,
@@ -229,6 +289,11 @@ export async function reconcileProjectedEpisodes(
       pendingCleanups: 0,
       requeueThrottled: 0,
       saturatedGroups: 0,
+      deepResolvedGroups: 0,
+      deepRequeueHeld: 0,
+      deepRequeueHeldByGroup: {},
+      deepRequeueSample: [],
+      deepRequeueEnabled: deepRequeue,
     };
 
   const { data } = await db
@@ -272,6 +337,10 @@ export async function reconcileProjectedEpisodes(
   let partialItems = 0;
   const partialFound: { itemId: string; missing: string[] }[] = [];
   let saturatedGroups = 0;
+  let deepResolvedGroups = 0;
+  let deepRequeueHeld = 0;
+  const deepRequeueHeldByGroup: Record<string, number> = {};
+  const heldRefs: DeepRequeueRef[] = [];
   let requeueThrottled = 0;
 
   for (const [groupId, groupRows] of byGroup) {
@@ -282,23 +351,43 @@ export async function reconcileProjectedEpisodes(
     // A FULL window is inconclusive the same way an unreachable Graphiti is: an item's chunks may sit
     // just beyond it, and reading that as "never landed" would re-push the ENTIRE group every pass —
     // growing the group, pushing more rows out of the window, re-pushing more next pass. That
-    // self-amplifying loop is worse than not healing, so a saturated group is skipped and counted.
+    // self-amplifying loop is worse than not healing. GRAPHSAT-1: instead of skipping the group, judge
+    // it through the per-ITEM lookup (`lib/graph/episode-lookup.ts`) — EXACT, so "absent" means not
+    // in the group, not "beyond the window", and the hazard above does not apply. The lookup is the
+    // only source of refs on this path; if it is unavailable (`null`) or FAILS, the group is skipped
+    // and counted exactly as before — never judged on a partial view.
+    let refs: readonly EpisodeRefLite[] = episodes;
+    let deep = false;
     if (episodes.length >= LANDED_SCAN_DEPTH) {
-      saturatedGroups++;
-      continue;
+      const itemIds = [...new Set(groupRows.map((r) => r.source_id))];
+      const lookedUp = await lookup(groupId, itemIds).catch((err: unknown) => {
+        console.warn(`[graph] reconcile: per-item lookup failed for ${groupId} (group stays unjudged): ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      });
+      if (lookedUp === null) {
+        saturatedGroups++;
+        continue;
+      }
+      refs = lookedUp;
+      deep = true;
+      deepResolvedGroups++;
     }
     // An item is projected as one OR MANY chunk episodes (`items:<id>` / `items:<id>#k`) — it "landed"
-    // if ANY of its chunks is present. Map each item id → one of its episode uuids.
-    const uuidByItemId = new Map<string, string>();
-    // RECONCILE-1 (measurement only): the full set of episode names present, so a row's chunks can be
-    // checked individually. The uuid map above stays FIRST-WINS and keeps deciding the verdict — this
-    // set is read for counting and nothing else, so this pass behaves identically to before.
-    const presentNames = new Set<string>();
-    for (const e of episodes) {
-      if (e.name) presentNames.add(e.name);
-      const itemId = itemIdFromEpisodeName(e.name);
-      if (itemId && !uuidByItemId.has(itemId)) uuidByItemId.set(itemId, e.uuid);
-    }
+    // if ANY of its chunks is present. Map each item id → one of its episode uuids (FIRST-WINS, decides
+    // the verdict). RECONCILE-1 (measurement only): `presentNames` lets a row's chunks be checked
+    // individually and is read for counting and nothing else. ONE helper for both paths (D1).
+    const { uuidByItemId, presentNames } = presenceFrom(refs);
+    // GRAPHSAT-1 D4: on the lookup path a never-landed verdict is HELD unless deepRequeue is on —
+    // `LANDED_GRACE_MS` (1h) cannot tell a row QUEUED behind the serial worker from one that was
+    // lost, and a wrong direction here is a metered re-push per row per pass. Held rows are counted
+    // and sampled (durable) so the population is enumerable; they consume no throttle budget.
+    const hold = (row: EpisodeRow): boolean => {
+      if (!deep || deepRequeue) return false;
+      deepRequeueHeld++;
+      deepRequeueHeldByGroup[groupId] = (deepRequeueHeldByGroup[groupId] ?? 0) + 1;
+      heldRefs.push({ teamId, groupId, itemId: row.source_id, projectedAt: row.projected_at });
+      return true;
+    };
 
     for (const row of groupRows) {
       if (new Date(row.projected_at).getTime() > cutoff) continue; // too recent, still may be processing
@@ -334,6 +423,7 @@ export async function reconcileProjectedEpisodes(
         // grace window). Writing and counting it every pass would inflate `requeued` in the logs and
         // the ingest_runs meta with work that isn't happening.
         if (row.content_sha256 !== "") {
+          if (hold(row)) continue;
           // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Checked here rather than above the branch so a
           // row already on the sentinel doesn't consume budget it isn't using.
           if (reQueued >= maxRequeuePerPass) {
@@ -352,6 +442,7 @@ export async function reconcileProjectedEpisodes(
         // open forever. A row that EVER pushed keeps its chunk_shas (the re-queue resets only the
         // sha), so the empty ledger is the honest discriminator.
         if ((row.chunk_shas ?? []).length === 0 && row.content_sha256 === "") continue;
+        if (hold(row)) continue;
         // Throttled (H7) — see REQUEUE_MAX_PER_PASS. Past the cap the pass stops judging and reports
         // the remainder; the rows are untouched and come round again next pass.
         if (reQueued >= maxRequeuePerPass) {
@@ -518,7 +609,20 @@ export async function reconcileProjectedEpisodes(
     pendingCleanups: (pendingRows ?? []).length,
     requeueThrottled,
     saturatedGroups,
+    deepResolvedGroups,
+    deepRequeueHeld,
+    deepRequeueHeldByGroup,
+    deepRequeueSample: boundDeepRequeueSample(heldRefs),
+    deepRequeueEnabled: deepRequeue,
     partialItems,
     partialDetail: boundPartialDetail(partialFound),
   };
+}
+
+/** OLDEST `projectedAt` first, bounded at PARTIAL_DETAIL_LIMIT — a deterministic order so two passes'
+ *  samples are comparable. Used by reconcile per team and by the runner to re-bound across teams. */
+export function boundDeepRequeueSample(refs: readonly DeepRequeueRef[]): DeepRequeueRef[] {
+  return [...refs]
+    .sort((a, b) => (a.projectedAt < b.projectedAt ? -1 : a.projectedAt > b.projectedAt ? 1 : a.itemId < b.itemId ? -1 : 1))
+    .slice(0, PARTIAL_DETAIL_LIMIT);
 }

@@ -72,9 +72,15 @@ export function IngestRunsPanel({ runs }: { runs: IngestRunRow[] }) {
 }
 
 /** Render the small set of meta keys we record, compactly. */
+/** Objects/arrays render as compact JSON — `String(v)` printed `[object Object]` for
+ *  `partialDetail`, and GRAPHSAT-1's `deepRequeueSample` is a list of structured identities. */
+export function formatMetaValue(v: unknown): string {
+  return typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+}
+
 function RunMeta({ meta }: { meta: Record<string, unknown> }) {
   const parts = Object.entries(meta)
     .filter(([, v]) => v !== null && v !== undefined && v !== "")
-    .map(([k, v]) => `${k}: ${String(v)}`);
+    .map(([k, v]) => `${k}: ${formatMetaValue(v)}`);
   return <span>{parts.join(" · ") || "—"}</span>;
 }

@@ -5,7 +5,7 @@ import { acquireProjectionLease, type ProjectionLease } from "./walk-lock";
 import { GraphitiClient } from "./graphiti-client";
 import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } from "./project";
 import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
-import { reconcileProjectedEpisodes } from "./reconcile";
+import { reconcileProjectedEpisodes, deepRequeueEnabledFromEnv, boundDeepRequeueSample, type DeepRequeueRef, type ReconcileOptions } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
 /**
@@ -67,6 +67,17 @@ export interface GraphProjectionSummary {
    *  durably visible (the recording gate keys on it) so a permanently failing batch read can
    *  never silently re-become the 10.5-minute stage. */
   probeFallbackPages: number;
+  /** GRAPHSAT-1: groups past the REST window JUDGED via the per-item Neo4j lookup (meta; a gate
+   *  signal only while `deepRequeueEnabled` is false — measurement mode is loud). */
+  deepResolvedGroups: number;
+  /** GRAPHSAT-1: never-landed rows on the lookup path HELD because re-queue is off. Always a gate
+   *  signal. `deepRequeueSample` is re-bounded across teams, oldest first. */
+  deepRequeueHeld: number;
+  deepRequeueHeldByGroup: Record<string, number>;
+  deepRequeueSample: DeepRequeueRef[];
+  /** The re-queue mode this run EXECUTED (resolved ONCE here from `GRAPH_DEEP_REQUEUE === "true"`, or
+   *  the injected option) — the recording gate reads it from the summary, never from the env. */
+  deepRequeueEnabled: boolean;
   /** TICKFIT-2 (Codex diff review H1): teams SKIPPED this run because another brain instance holds
    *  their projection lease (`lib/graph/walk-lock.ts` — a deploy overlap). Expected once per deploy;
    *  persistent across runs means a wedged holder. Durably visible (meta + the recording gate). */
@@ -111,6 +122,9 @@ export async function runGraphProjection(opts?: {
   fanoutPushBudget?: number;
   /** Cross-instance lease acquirer (default: the Postgres advisory lease); test override. */
   lease?: (teamId: string) => Promise<ProjectionLease | null>;
+  /** GRAPHSAT-1 test seams: the per-item lookup and the re-queue mode (default: env `GRAPH_DEEP_REQUEUE === "true"`). */
+  lookup?: ReconcileOptions["lookup"];
+  deepRequeue?: boolean;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
   inFlight = runGraphProjectionInner(opts);
@@ -128,6 +142,9 @@ async function runGraphProjectionInner(opts?: {
   limit?: number;
   fanoutPushBudget?: number;
   lease?: (teamId: string) => Promise<ProjectionLease | null>;
+  /** GRAPHSAT-1 test seams: the per-item lookup and the re-queue mode (default: env `GRAPH_DEEP_REQUEUE === "true"`). */
+  lookup?: ReconcileOptions["lookup"];
+  deepRequeue?: boolean;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
   const acquireLease = opts?.lease ?? acquireProjectionLease;
@@ -151,6 +168,11 @@ async function runGraphProjectionInner(opts?: {
     partialDetail: { sample: [], elided: 0, namesElided: 0 },
     requeueThrottled: 0,
     probeFallbackPages: 0,
+    deepResolvedGroups: 0,
+    deepRequeueHeld: 0,
+    deepRequeueHeldByGroup: {},
+    deepRequeueSample: [],
+    deepRequeueEnabled: opts?.deepRequeue ?? deepRequeueEnabledFromEnv(),
     lockedOut: 0,
     walkMs: 0,
     reconcileMs: 0,
@@ -228,7 +250,10 @@ async function runGraphProjectionInner(opts?: {
       const reconcileStart = Date.now();
       let r: Awaited<ReturnType<typeof reconcileProjectedEpisodes>>;
       try {
-        r = await reconcileProjectedEpisodes(db, client, t.id);
+        r = await reconcileProjectedEpisodes(db, client, t.id, {
+          lookup: opts?.lookup,
+          deepRequeue: summary.deepRequeueEnabled,
+        });
       } finally {
         summary.reconcileMs += Date.now() - reconcileStart;
       }
@@ -247,6 +272,14 @@ async function runGraphProjectionInner(opts?: {
       summary.partialDetail.elided += r.partialDetail.elided;
       summary.partialDetail.namesElided += r.partialDetail.namesElided;
       summary.requeueThrottled += r.requeueThrottled;
+      // GRAPHSAT-1: merge, then RE-BOUND the held sample across teams (oldest first) — the same rule
+      // as partialDetail, so N teams cannot multiply the blob.
+      summary.deepResolvedGroups += r.deepResolvedGroups;
+      summary.deepRequeueHeld += r.deepRequeueHeld;
+      for (const [g, n] of Object.entries(r.deepRequeueHeldByGroup)) {
+        summary.deepRequeueHeldByGroup[g] = (summary.deepRequeueHeldByGroup[g] ?? 0) + n;
+      }
+      summary.deepRequeueSample = boundDeepRequeueSample([...summary.deepRequeueSample, ...r.deepRequeueSample]);
 
       // A NARROWING only finishes leaving the graph HERE. `lib/ingest` purged the external-tier caches
       // when it healed `items.access`, but arcs are synthesized from the external Graphiti group, which
