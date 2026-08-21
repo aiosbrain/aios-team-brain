@@ -1,6 +1,8 @@
 # A membership move that did not move must not report success — AUDITFIX-4
 
-**Status:** spec, **revised after round 1 BLOCKED** — §7 records it. Round 1's decisive finding: all
+**Status:** spec, **revised twice**. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
+error-check slice: round 2 established it is a **concurrency-correctness** slice, and the honest name
+for it is *make the membership transition sound*. §8 records it. Round 1's decisive finding: all
 seven of my acceptance criteria were satisfied by an implementation that still lets a move silently
 not-move, because capturing the SELECT error does nothing about the UPDATE. The design below is the
 reviewer's, not my original.
@@ -86,6 +88,42 @@ order means a crash or failure between the two leaves the item **still externall
 This is the direction-aware transition round 1 asked for, and it is the part that actually removes
 the exposure rather than reporting on it.
 
+### 3a2. A COMPARE-AND-SET on the unit's audience — round 2's BLOCKER
+
+Direction-aware ordering does not help against a **stale reconciler that arrives late**:
+
+1. Stale reconciler **S** reads `items.access = 'external'`.
+2. The item flips to `team`; reconciler **N** reads `team`.
+3. N writes the unit's audience `team`.
+4. **S overwrites it back to `external`** — the update at `lib/projects/context/units.ts:59-68` is
+   keyed `.eq("id").eq("team_id")` with **no predicate on `audience`**.
+5. N closes external-shared, rereads it absent, reports success. N opens General.
+6. S calls `ensureIncludeMembership(external-shared)`; the gate rereads the unit, sees S's stale
+   `external`, and **permits** the write.
+
+Final state: current includes in **both** system projects, both reconciles reporting success — the
+exact exposure §4 claims the gate prevents, reached without any read failing.
+
+**Fix:** the unit-audience update becomes a CAS — `.eq("audience", <the value this reconciler read>)`
+— so a stale writer's overwrite matches zero rows and fails instead of winning. Expressible with the
+current adapter; no transaction surface needed. A zero-row CAS means the world moved: the reconciler
+must **re-read and restart**, never proceed on the audience it thought it had.
+
+This is the "bind the placement to the audience version that authorized it" requirement, and it is
+the part that makes the rest sound. Without it, every other guarantee here holds only in the absence
+of a concurrent reconciler.
+
+### 3a3. Preflight the gate BEFORE the destructive close
+
+Round 2's second-order finding on §3a: with close-first ordering, a `project_groups` read failure
+*after* a successful close leaves the item in **neither** project — a metadata-read outage turned into
+destructive denial. And a persistent failure pins the backfill cursor
+(`lib/projects/context/backfill.ts:78,301`), making it a team-wide head-of-line block.
+
+So on a narrowing move, the target's reachability is **determined before** the close is issued.
+Preflight is still TOCTOU on its own — §3a2's CAS is what makes the sequence sound; the preflight is
+what stops a pure outage from being destructive.
+
 ### 3b. The return type is a discriminated union
 
 `{ ok: true; closed: number; spared: number } | { ok: false; error: string }`. On failure the counts
@@ -130,8 +168,11 @@ error, leave the unverified id-based UPDATE alone* — so the criteria below are
 
 - **AC1 — the A→B replacement race (dm):** read classifies row A as closable; a concurrent actor
   closes A and installs current row B for the same (unit, project); the update matches **zero** rows.
-  `closeMembershipInto` must **not** return `{ok:true, closed:1}`. *This is the case that defeated
-  every previous criterion.*
+  The reread finds B **still closable**, and `closeMembershipInto` must return **`ok:false`**.
+  ⚠️ *Round 2 caught that my first version of this criterion said only "must not return
+  `{ok:true, closed:1}`" — which `{ok:true, closed:0}` satisfies while B stays current and the caller
+  proceeds as though the move succeeded. The criterion was literally weaker than the rule it was
+  meant to enforce. Stated as the outcome now.*
 - **AC2 — the protected-exclusion race (dm):** a row that is closable at read time becomes
   `exclude`/non-auto before the write. It **survives**, and is reported as `spared` — because the
   UPDATE reasserts the predicate rather than matching by id.
@@ -156,9 +197,22 @@ error, leave the unverified id-based UPDATE alone* — so the criteria below are
   with `backfill-candidates`' SQL. *Stated narrowly:* this pins the STATIC agreement of the two
   predicates. Round 1 was right that it cannot pin agreement across the two-statement race, and AC2 is
   what covers the race.
+- **AC9b — the stale-writer interleaving (dm):** two reconcilers, one holding a stale
+  `items.access`. The stale one's unit-audience write must **fail the CAS** and must not produce a
+  current include in the opposite system project. Asserted on the final membership set, and this is
+  the case no read-error test reaches.
+- **AC9c — the reread's OWN error (dm):** with the zero-update **reread** stubbed to error
+  (distinct from AC4's initial-read injection), the call returns `ok:false` with no counts — it must
+  not absorb the error as "row absent". Round 2: AC4 said "the SELECT" and an implementation can
+  handle the first read while ignoring the one this design newly introduces.
+- **AC9d — preflight, not destructive denial (dm):** on a narrowing move with the `project_groups`
+  read faulted, the item is **not** left in neither project — the close is not issued, because
+  reachability was undetermined before it.
 - **AC10 — mutation:** reverting the UPDATE's predicate reassertion reddens AC2; reverting the
-  RETURNING-based count reddens AC1/AC3; reverting the error capture reddens AC4 — and none of them
-  reddens AC8. Each mutation must redden its own criterion only.
+  RETURNING-based count reddens AC1/AC3; reverting the error capture reddens AC4; **reverting the
+  unit-audience CAS reddens AC9b**; reverting the reread's error check reddens AC9c; reverting the
+  preflight reddens AC9d — and none of them reddens AC8. Each mutation must redden its own criterion
+  only.
 - **AC11:** `npx tsc --noEmit`, `npm run lint`, `npm test`, the dm tier, `npm run check:docs` green.
 
 **Falsifier:** if `closeMembershipInto` can return success when the intended final state was not
@@ -192,3 +246,39 @@ Also folded:
 **What round 1 confirmed rather than changed:** `closed` has no production consumer today
 (`lib/projects/context/reconcile-item.ts` ignores it), and `spared` is only read after `ok`, so the counts do not currently
 contaminate a caller — the type change is hygiene, not a live bug.
+
+
+## 8. Round 2 — BLOCKED, and the slice's real name changed
+
+**2 BLOCKER, 2 HIGH.** Attacking the round-1 fold found that the fold was still not sufficient.
+
+- **BLOCKER — a stale reconciler recreates the external grant even when everything succeeds.** The
+  unit-audience write has no compare-and-set, so a late writer overwrites a newer audience and the
+  gate then permits a placement against it. Direction-aware ordering cannot fix a *later* stale open.
+  Folded as §3a2 (CAS + restart-on-zero-rows) and AC9b. **This is what turns the slice from an
+  error-check into a concurrency-correctness change**, and the spec's status line now says so.
+- **BLOCKER — AC1 was literally weaker than the rule it enforced.** It forbade `{ok:true, closed:1}`;
+  `{ok:true, closed:0}` passed it while the replacement row stayed current. **This is the fifth time
+  in this program that an acceptance criterion of mine blessed the implementation the rule forbids** —
+  the pattern is now the most reliable defect generator in my own work, and the mitigation that
+  actually works is stating criteria as *outcomes* rather than as return shapes.
+- **HIGH — the reread introduced an unspecified failure path** (AC9c). A design that adds a read must
+  fault-inject *that* read, not only the one it inherited.
+- **HIGH — close-first turned a metadata outage into destructive denial** (§3a3, AC9d).
+
+**What round 2 checked and CLEARED**, which is worth as much as what it found:
+
+- **No shipped invariant requires target-before-close.** The partial unique index is per
+  `(team, project, unit)` so the two system projects cannot conflict (`postgres/schema.sql:1204`);
+  ARM 2 repairs a missing target and ARM 3 an opposite survivor; graph homing already defines the
+  neither-project case (`lib/graph/project.ts:867`). CLOSEMODE-1's target-before-close is load-bearing
+  only for the protected-exclusion **return**, which is a *widening* move and stays open-first.
+- **The predicate reassertion is not a semantic change.** `decision`/`mode` are non-null
+  (`postgres/schema.sql:1189`) and the predicate matches `PROTECTED_EXCLUDE_SQL`
+  (`lib/projects/context/backfill-candidates.ts:10`). A closable→closable race may fail the equality
+  and retry — conservative availability loss, not a CLOSEMODE semantic change.
+- **The reread cannot promise durable state**, only an observation at one snapshot. Success is
+  therefore defined at that linearization point, and §3a2's CAS — not more rereading — is what owns
+  concurrent stale writers. Repeated rereading would livelock.
+
+**Nothing is built. No code exists for this slice.**
