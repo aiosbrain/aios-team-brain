@@ -40,31 +40,57 @@ what the module returns. Only the real tier can.
   tests start only against a ready server. Separate job because the dm job is already the long
   pole and a Neo4j boot (~20 s) must not lengthen it, and because a red Neo4j job must read as
   "the graph tier broke", not "dm broke".
+- **D1b — the dedicated job FAILS ON SKIP (Codex design round 1 HIGH).** A static guard can
+  prove a job exists and a script has a string; it cannot prove the tier RAN. So the dedicated
+  job sets a sentinel, `NEO4J_TIER_REQUIRED=1`, and the tier file throws AT COLLECTION when the
+  sentinel is set but `NEO4J_TEST !== "1"` — a behavioural red, not a source-regex red. `npm test`
+  / `npm run coverage` (the `brain-tests` job, deliberately without Neo4j) never set the sentinel
+  and keep the silent `describe.skip`; a developer without Neo4j still sees a green `npm test`.
+  The wiring guard asserts the job sets the sentinel (D3).
 - **D2 — the job is REQUIRED.** `main`'s required status checks gain `Graph Neo4j tier (real
   Neo4j)`. A required-check change is a repo setting (outward-facing, reversible) — it is made
-  AFTER the PR merges and the job has run green once on `main`, and it is stated in the PR as the
-  operator's follow-through, not assumed. Until then the job runs and reports; it cannot block.
+  AFTER the PR merges and the job has run green once on `main`. An in-repo test cannot
+  self-enforce branch protection (reading it needs admin scope, and a check not itself required is
+  bypassable — the honest ceiling is operator action plus VERIFIED closure, Codex round 1 M3): the
+  PR body carries the step, the ticket row stays `in_progress` until the required-check list has
+  been read back with the new name in it, and only then closes. Precedent followed, then
+  documented stale: ARCHITECTURE:795 still says the NDA gate "must be added" while today's list
+  shows it IS — that sentence is corrected in this slice. Until the step lands the job runs and
+  reports; it cannot block.
 - **D3 — the wiring is GUARDED, because "it's in CI" is the claim that rotted last time.** A unit
-  guard `test/guards/neo4j-tier-wiring.test.ts` parses `ci.yml` and asserts: a job exists whose
-  steps run `npm run test:neo4j`; that job declares a `neo4j:` service whose image equals the one
-  in `compose.test.neo4j.yml` (read from the file, not restated); and `package.json`'s
-  `test:neo4j` script still sets `NEO4J_TEST=1` and targets `graph-neo4j-tier`. Non-vacuity: each
-  assertion is shown to redden on a mutated copy of the workflow text (a job with the service but
-  no run step; a run step with no service; an image drift). Also: the tier file's `describe.skip`
-  fallback stays (a developer without Neo4j must not see a red `npm test`), and the guard asserts
-  the skip is keyed on `NEO4J_TEST` exactly as the npm script sets it — the two halves of the
-  contract pinned together so they cannot drift apart silently again.
+  guard `test/guards/neo4j-tier-wiring.test.ts` parses `ci.yml` AND `compose.test.neo4j.yml`
+  STRUCTURALLY with `yaml` (declared as a direct devDependency — it is in the tree only
+  transitively today, and a guard must not ride another package's dependency graph; Codex round 1
+  M1 — a regex over the whole workflow cannot associate a service and a run step with the SAME
+  job and mishandles multiline `run`, reordered fields and duplicate strings). The validator is a
+  PURE function over the two parsed objects + `package.json` (`validateNeo4jTierWiring(ci,
+  compose, pkg)` → a list of violations), so it is mutation-tested as data, not by editing files.
+  It asserts: (a) `jobs["neo4j-tier-tests"]` exists with the exact check name `Graph Neo4j tier
+  (real Neo4j)`; (b) a step whose `run` is exactly `npm run test:neo4j`; (c) `services.neo4j`
+  exists and its `image`, `NEO4J_AUTH` and the bolt port mapping EQUAL compose's (read from the
+  compose object — the service contract is more than the image, Codex round 1 M2: auth/port drift
+  reads as a red tier, but a deleted health check reads as a timing flake); (d) the service
+  `options` contain the authenticated `cypher-shell` probe with interval/timeout/retries; (e) the
+  job's `env` sets `NEO4J_TIER_REQUIRED: "1"` (D1b); (f) `package.json` `scripts["test:neo4j"]`
+  contains `NEO4J_TEST=1`, `bolt://localhost:`, `NEO4J_USER=neo4j`, `NEO4J_PASSWORD=testtest1`,
+  `graph-neo4j-tier`. Non-vacuity arms mutate the PARSED objects: job deleted; run step removed;
+  service removed; image drift; port drift; health options removed; sentinel removed;
+  `NEO4J_TEST=1` dropped from the script — each yields exactly its named violation.
 - **D4 — the tier's own cleanliness.** The tier's `beforeAll` wipes the graph (`MATCH (n) DETACH
   DELETE n`) — fine against a throwaway service container, and the job must never be pointed at
-  anything else: the guard also asserts the job's `NEO4J_URL` (via the npm script) is a
-  `localhost` bolt URL. No change to the tier's assertions in this slice.
+  anything else: the guard asserts the npm script's URL is `bolt://localhost:` (D3(f)). No change
+  to the tier's ASSERTIONS in this slice; its header comment ("this tier is not in CI") becomes
+  false and is rewritten (Codex round 1 L2).
 
 ## 1. The surface table
 
 | Surface | Change |
 |---|---|
-| `.github/workflows/ci.yml` | new job `neo4j-tier-tests` ("Graph Neo4j tier (real Neo4j)"): neo4j service, `npm ci`, `npm run test:neo4j` |
-| `test/guards/neo4j-tier-wiring.test.ts` (new file, to create) | the wiring guard (D3/D4), with mutation arms over workflow text |
+| `.github/workflows/ci.yml` | new job `neo4j-tier-tests` ("Graph Neo4j tier (real Neo4j)"): neo4j service (image/auth/port/health = compose), `env.NEO4J_TIER_REQUIRED: "1"`, `npm ci`, `npm run test:neo4j` |
+| `test/graph-neo4j-tier.test.ts` | throws at collection when `NEO4J_TIER_REQUIRED=1` and `NEO4J_TEST !== "1"`; header comment corrected |
+| `scripts/neo4j-tier-wiring.mjs` (new file, to create) | `validateNeo4jTierWiring(ci, compose, pkg)` — pure, returns violations |
+| `test/guards/neo4j-tier-wiring.test.ts` (new file, to create) | parses the real files with `yaml`, asserts zero violations; mutation arms over the parsed objects |
+| `package.json` | `yaml` as a direct devDependency |
 | `docs/ARCHITECTURE.md` | CLAUDE.md §4's tier table is in CLAUDE.md; ARCHITECTURE's test-tier prose gains the Neo4j tier row + "runs in CI" |
 | `CLAUDE.md` §4 | the tier table gains the **neo4j** tier (real Neo4j; catches Cypher/shape/driver drift) |
 | Schema | **NONE** |
@@ -83,23 +109,32 @@ what the module returns. Only the real tier can.
 
 ## 3. Acceptance criteria (spec-first; exact commands)
 
-1. `npx vitest run test/guards/neo4j-tier-wiring.test.ts` exits 0: (a) `ci.yml` has a job whose
-   `steps[].run` includes `npm run test:neo4j`; (b) that job's `services.neo4j.image` equals the
-   image in `compose.test.neo4j.yml`; (c) `package.json` `scripts["test:neo4j"]` contains
-   `NEO4J_TEST=1`, a `bolt://localhost:` URL, and `graph-neo4j-tier`; (d) the tier file keys its
-   skip on `process.env.NEO4J_TEST`; (e) non-vacuity arms: a workflow text with the run step but
-   no service → red; with the service but no run step → red; with a different image → red.
+1. `npx vitest run test/guards/neo4j-tier-wiring.test.ts` exits 0: the real `ci.yml` +
+   `compose.test.neo4j.yml` + `package.json` validate with ZERO violations against D3(a)–(f); and
+   eight non-vacuity arms over the parsed objects (job deleted; run step removed; service removed;
+   image drift; port drift; health options removed; sentinel removed; `NEO4J_TEST=1` dropped)
+   each yield exactly their named violation and nothing else.
+1b. `NEO4J_TIER_REQUIRED=1 npx vitest run graph-neo4j-tier` (NO `NEO4J_TEST`) exits NON-zero with
+   the collection error naming both variables — the fail-on-skip contract (D1b); and plain
+   `npx vitest run graph-neo4j-tier` (neither set) exits 0 with 15 skipped (a developer without
+   Neo4j is not reddened).
 2. `npm run test:neo4j` (after `npm run db:test:neo4j:up`) exits 0 locally — 15/15 (unchanged
    assertions).
 3. CI on the PR shows the new job **`Graph Neo4j tier (real Neo4j)`** green with 15 passed, 0
-   skipped (the job's vitest output is the proof the tier RAN, not merely that the job exists — a
-   `NEO4J_TEST` unset in the job would show 11 skipped and green; AC1(c) plus this line catch it).
-4. Mutations, verdicts verbatim in the PR: (a) delete the run step from the job → AC1(a) reddens;
-   (b) change the service image tag → AC1(b) reddens; (c) drop `NEO4J_TEST=1` from the npm script
-   → AC1(c) reddens.
+   skipped — and by D1b a job that somehow ran without `NEO4J_TEST` would be RED (collection
+   error), not green-with-15-skipped.
+4. Mutations, verdicts verbatim in the PR (via `scripts/mutate.mjs`): (a) make the validator skip
+   the run-step check → the guard's mutation arm reddens; (b) make the tier's collection throw
+   conditional on nothing (never throw) → AC1b's red arm goes green = the guard for it reddens
+   (pinned by a unit that spawns vitest with the sentinel set and asserts non-zero exit);
+   (c) drop `NEO4J_TEST=1` from the npm script → the real-file validation reddens.
 5. `npm test` · `npm run check:docs` green; CLAUDE.md §4 + ARCHITECTURE updated in the same PR.
-6. Post-merge operator step, stated in the PR body: add `Graph Neo4j tier (real Neo4j)` to
-   `main`'s required status checks once it has run green on `main`.
+6. Post-merge operator step, stated in the PR body AND tracked on the ticket (it stays
+   `in_progress` until closed): add `Graph Neo4j tier (real Neo4j)` to `main`'s required status
+   checks once it has run green on `main`, then READ BACK the required-check list
+   (`gh api repos/…/branches/main/protection/required_status_checks`) and record the name in the
+   ticket. ARCHITECTURE:795's stale "must be added" sentence about the NDA gate is corrected to
+   "added — verified in the required list 2026-08-21".
 
 ## 4. Out of scope, named
 
