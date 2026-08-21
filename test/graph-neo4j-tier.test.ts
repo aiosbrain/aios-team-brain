@@ -8,13 +8,24 @@ import { lookupItemEpisodes, LOOKUP_BATCH } from "@/lib/graph/episode-lookup";
  * Tier-isolation proof for the direct Neo4j reads behind the Brain-Learning panel. Graphiti has no
  * tier awareness — tier is encoded in `group_id`, and `WHERE group_id IN $groups` is the SOLE thing
  * stopping an `external` viewer from reading team facts (no RLS backstop, CLAUDE.md §5). Self-skips
- * unless NEO4J_TEST is set (needs a real Neo4j): `npm run db:test:neo4j:up && npm run test:neo4j`.
+ * unless NEO4J_TEST=1 (needs a real Neo4j): `npm run db:test:neo4j:up && npm run test:neo4j`.
  *
- * NB: `recentFacts` returns `{ facts, ok }` since the learning panel's ok-discriminator landed; this
- * tier is not in CI and had rotted against the old array return — repaired in passing by GRAPHSAT-1.
+ * IN CI (NEO4JCI-1): the `neo4j-tier-tests` job runs this file against a neo4j service container and
+ * sets NEO4J_TIER_REQUIRED=1 — with that sentinel, an unset NEO4J_TEST is a COLLECTION ERROR, not a
+ * silent skip. This tier rotted unseen for ~4 weeks when `recentFacts` grew `{ facts, ok }`
+ * (2026-07-26 → 2026-08-21): a green `npm test` had been reporting it as skipped the whole time. The
+ * wiring (job, service, script, sentinel) is pinned by test/guards/neo4j-tier-wiring.test.ts.
  */
 
-const live = process.env.NEO4J_TEST ? describe : describe.skip;
+/** ONE predicate for both halves (the `describe` selection and the sentinel throw), so `NEO4J_TEST=0`
+ *  cannot run the tier while the sentinel rejects it. */
+const neo4jTierEnabled = process.env.NEO4J_TEST === "1";
+if (process.env.NEO4J_TIER_REQUIRED === "1" && !neo4jTierEnabled) {
+  throw new Error(
+    "graph-neo4j-tier: NEO4J_TIER_REQUIRED=1 but NEO4J_TEST is not '1' — this job must RUN the tier, not skip it (run via `npm run test:neo4j`)"
+  );
+}
+const live = neo4jTierEnabled ? describe : describe.skip;
 
 live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
   const TEAM = "acme_team";
