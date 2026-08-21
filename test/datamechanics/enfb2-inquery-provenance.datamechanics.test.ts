@@ -158,7 +158,7 @@ describe("ENFB-2 AC4 — starvation dies at the capped windows", () => {
     await db().from("tasks").insert({ team_id: seed.teamId, project_id: projectId, row_key: "VIS-1", title: "visible", status: "backlog", origin: "sync", source_item_id: openItem.id, updated_at: old });
     // 500 newer INVISIBLE rows (restricted source) — the full window size.
     const bulk = Array.from({ length: 500 }, (_, i) => ({
-      team_id: seed.teamId, project_id: projectId, row_key: `INV-${i}`, title: `inv ${i}`, status: "backlog", origin: "sync", source_item_id: secretItem.id,
+      team_id: seed.teamId, project_id: projectId, row_key: `HID-${i}`, title: `inv ${i}`, status: "backlog", origin: "sync", source_item_id: secretItem.id,
     }));
     const { error } = await db().from("tasks").insert(bulk);
     expect(error, "bulk fixture insert").toBeNull();
@@ -171,18 +171,18 @@ describe("ENFB-2 AC4 — starvation dies at the capped windows", () => {
     const body = (await res.json()) as { tasks: { project: string; rows: { row_key: string }[] }[] };
     const served = body.tasks.flatMap((g) => g.rows.map((r) => r.row_key));
     expect(served, "the visible row survives 500 newer invisible rows").toContain("VIS-1");
-    expect(served.some((k2) => k2.startsWith("INV-")), "no invisible row serves").toBe(false);
+    expect(served.some((k2) => k2.startsWith("HID-")), "no invisible row serves").toBe(false);
 
     // unknown_keys: a membership-hidden key reports unknown, truncated:false (§5.7 for keys).
-    const keyRes = await tasksGET(req("mode=table&keys=VIS-1,INV-3,NOPE-1"));
+    const keyRes = await tasksGET(req("mode=table&keys=VIS-1,HID-3,NOPE-1"));
     const keyBody = (await keyRes.json()) as { unknown_keys: string[] | null };
-    expect(keyBody.unknown_keys, "hidden and absent keys are indistinguishable").toEqual(["INV-3", "NOPE-1"]);
+    expect(keyBody.unknown_keys, "hidden and absent keys are indistinguishable").toEqual(["HID-3", "NOPE-1"]);
 
     // The insider sees the restricted rows (non-vacuity of the wall).
     const { key: insiderKey } = await issueApiKey(db(), seed.teamId, insider, "k2");
     const inRes = await tasksGET(new Request(`http://test/api/v1/tasks?all=1`, { headers: { authorization: `Bearer ${insiderKey}` } }) as unknown as NextRequest);
     const inBody = (await inRes.json()) as { tasks: { rows: { row_key: string }[] }[] };
-    expect(inBody.tasks.flatMap((g) => g.rows.map((r) => r.row_key)).filter((k3) => k3.startsWith("INV-")).length).toBeGreaterThan(0);
+    expect(inBody.tasks.flatMap((g) => g.rows.map((r) => r.row_key)).filter((k3) => k3.startsWith("HID-")).length).toBeGreaterThan(0);
   });
 
   it("decisions writeback window: visible-but-NOT-writeback rows cannot starve a writeback row (round-1 F3), and invisible rows cannot starve visible ones", async () => {

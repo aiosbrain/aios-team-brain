@@ -5,7 +5,7 @@
  * WHY THIS EXISTS. Attendance used to be inferred by asking an LLM to name "every person who appears
  * to have attended or spoken", then keeping whatever matched the roster. That has no representation
  * of PRESENT versus DISCUSSED, so on 2026-08-11's "Content creation strategy session" it recorded
- * Abe Isleem and Fatma — both named only in the third person, and explicitly as absent ("one day to
+ * Abe Doe and Fatma — both named only in the third person, and explicitly as absent ("one day to
  * get Abe, who's in Germany… can we get him on Zoom?"). Meanwhile the item's own frontmatter said
  * `participants: "[John Ellison]"`, which was exactly right, and was ignored.
  *
@@ -36,7 +36,7 @@ export interface AttendanceResult {
  *
  * SHAPES THAT ACTUALLY OCCUR (measured across every row in prod carrying the field, 2026-08-17):
  *   granola, 45 rows, STRING:  "[John Ellison]"
- *                              "[John Ellison, Chetan, Stephan Ledain, Fatma Ghedira]"
+ *                              "[John Ellison, Chetan, Stephan Doe, Fatma Doe]"
  *                              "[John Ellison, Alex Marchetti, Mira, Daniel 'Dash' Okonkwo]"
  *   slack,   19 rows, ARRAY of objects: [{ author_id: "U0B9…", first_ts: …, last_ts: … }]
  *
@@ -111,7 +111,7 @@ function norm(s: string): string {
  * Priya Raghavan, Sam Fielding — real people in production, not named here; the repo is public).
  *
  * The rule: normalised equality, or one name is a WHOLE-WORD PREFIX of the other. That keeps prod's
- * real cases (`Chetan Nandakumar` → roster `Chetan`, `Fatma Ghedira` → roster `Fatma`) and rejects
+ * real cases (`Chetan Nandakumar` → roster `Chetan`, `Fatma Doe` → roster `Fatma`) and rejects
  * `John Smith` → `John Ellison`, because neither is a prefix of the other.
  *
  * Ambiguity resolves to NOTHING, reported. If an asserted name matches two members, or two asserted
