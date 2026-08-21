@@ -115,6 +115,9 @@ export async function settleReclassification(
     const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
     const r = await reconcileItemContext(db, change.teamId, change.itemId);
     if (!r.ok) console.warn(`[access] context re-partition after reclassification of ${change.itemId} failed: ${r.error}`);
+    // CLOSEMODE-1: a human's standing exclusion survived the flip — quiet by design, but named in the
+    // log so the reclassify trail shows the decision held.
+    else if (r.spared) console.info(`[access] reclassification of ${change.itemId}: ${r.spared} standing exclusion(s) spared on the opposite system project`);
   } catch (e) {
     console.warn(`[access] context re-partition threw for ${change.itemId}: ${e instanceof Error ? e.message : e}`);
   }
