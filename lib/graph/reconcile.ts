@@ -104,9 +104,11 @@ export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCA
  * → the client's default (30 s). Prod measured a 5,000-episode listing at ~8 s warm and past 30 s on
  * a cold Neo4j page cache (after a graphiti restart); a longer deadline holds #629's lease and the
  * process single-flight for that long per slow group, so the cheaper lever on an install WITH
- * `NEO4J_URL` is a smaller `GRAPH_LANDED_SCAN_DEPTH` (1,000 — the lookup judges the rest, the
- * REST-window oracle stays a valid subset). The default depth stays 5,000 because an install WITHOUT
- * Neo4j would lose judging for every 1k–5k group.
+ * `NEO4J_URL` AND re-queue enabled (`GRAPH_DEEP_REQUEUE=true`, or once GRAPHSAT-2 lands) is a smaller
+ * `GRAPH_LANDED_SCAN_DEPTH` (1,000 — the lookup judges the rest, the REST-window oracle stays a valid
+ * subset). With the flag OFF the lookup path HOLDS never-landed verdicts, so lowering the depth would
+ * stop 1k–5k groups from healing (Fable diff review M1). The default stays 5,000 because an install
+ * WITHOUT Neo4j would lose judging for every 1k–5k group.
  */
 export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);
@@ -341,7 +343,7 @@ export async function reconcileProjectedEpisodes(
       errors: [],
     };
 
-  const { data } = await db
+  const { data, error: ledgerErr } = await db
     .from("graph_episodes")
     .select(
       "id, source_id, source_table, group_id, content_sha256, projected_at, episode_uuid, pending_delete_group_id, pending_delete_at, chunk_shas"
@@ -353,6 +355,20 @@ export async function reconcileProjectedEpisodes(
     // next pass, and the loop would churn forever while reading as healthy self-healing.
     .eq("deferred", false);
   const rawRows = (data ?? []) as EpisodeRow[];
+  // RECONULL-1 (Fable diff review M2): a failed ledger read used to become an EMPTY ledger — groupsChecked 0,
+  // every counter 0, ok:true, the gate quiet: the same silent-healthy shape as the pending-count read.
+  // Nothing can be judged without the ledger; report the error and return the empty summary.
+  if (ledgerErr) {
+    return {
+      groupsChecked: 0, confirmed: 0, reQueued: 0, partialItems: 0,
+      partialDetail: { sample: [], elided: 0, namesElided: 0 },
+      cleaned: 0, cleanedExternal: 0, pendingCleanups: 0, requeueThrottled: 0, saturatedGroups: 0,
+      deepResolvedGroups: 0, lookupMismatchGroups: 0, deepRequeueHeld: 0, deepRequeueHeldByGroup: {},
+      deepRequeueSample: [], deepRequeueElided: 0, deepRequeueEnabled: deepRequeue,
+      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0,
+      errors: [`reconcile: ledger read failed: ${ledgerErr.message}`],
+    };
+  }
 
   // ── Orphan repair, BEFORE anything else judges these rows ────────────────────────────────────
   // A ledger row whose ITEM is gone is an orphan, and an orphan's episodes are content the brain no
@@ -608,7 +624,9 @@ export async function reconcileProjectedEpisodes(
   for (const [oldGroup, groupRows] of pendingByGroup) {
     // List the old group once (deep — a large group must not hide the item's episodes past the default
     // window). Graphiti unreachable → leave the flags set and retry next tick.
-    const episodes = await client.listEpisodes(oldGroup, GROUP_SCAN_DEPTH).catch((err: unknown) => {
+    // The per-call deadline applies here too (Fable diff review L2): a 100k-deep listing on a cold
+    // graph is MORE likely to blow the default than the landed one.
+    const episodes = await client.listEpisodes(oldGroup, GROUP_SCAN_DEPTH, { timeoutMs: listTimeoutMs }).catch((err: unknown) => {
       console.warn(`[graph] reconcile: cleanup listing ${oldGroup} failed (flags kept, retry next pass): ${err instanceof Error ? err.message : String(err)}`);
       return null;
     });

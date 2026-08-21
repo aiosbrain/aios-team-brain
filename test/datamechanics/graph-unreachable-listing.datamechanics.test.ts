@@ -147,6 +147,39 @@ describe("RECONULL-1 — a failed group listing is counted, nothing is written o
     expect(summary.reconciled).toBe(3);
   });
 
+  it("AC1(e3) the LEDGER read fails → a run error, nothing judged, no listing called (it used to read as an empty ledger: groupsChecked 0, ok:true)", async () => {
+    const f = await fixture(1);
+    const real = db();
+    const wrapped = {
+      from(table: string) {
+        const chain = real.from(table);
+        if (table !== "graph_episodes") return chain;
+        return new Proxy(chain as unknown as Record<string, unknown>, {
+          get(target, prop, receiver) {
+            if (prop !== "select") return Reflect.get(target, prop, receiver);
+            return (...a: unknown[]) => {
+              // Fail RECONCILE's ledger read only (its select starts `id, source_id, source_table, …`) — not the
+              // projector's batch read (`source_id, content_sha256, …`) and not the pending count (`id`).
+              if (String(a[0]).startsWith("id, source_id, source_table")) {
+                const failing = { then: (res: (v: unknown) => void) => res({ data: null, error: { message: "induced ledger failure" } }) };
+                return new Proxy(failing, { get: (t, p) => (p === "then" ? t.then : () => new Proxy(failing, { get: (t2, p2) => (p2 === "then" ? t2.then : () => failing) })) });
+              }
+              return (target.select as (...x: unknown[]) => unknown)(...a);
+            };
+          },
+        });
+      },
+    } as unknown as DbClient;
+    const res = await reconcileProjectedEpisodes(wrapped, client(f.fake), f.seed.teamId);
+    expect(res.errors).toEqual(["reconcile: ledger read failed: induced ledger failure"]);
+    expect(res.groupsChecked).toBe(0);
+    expect(res.confirmed).toBe(0);
+    expect(f.fake.listCalls.filter((c) => c.groupId === f.teamGroup)).toHaveLength(0);
+    const summary = await runGraphProjection({ teamId: f.seed.teamId, client: client(f.fake), db: wrapped });
+    expect(summary.ok).toBe(false);
+    expect(summary.errors.some((e) => e.endsWith("reconcile: ledger read failed: induced ledger failure"))).toBe(true);
+  });
+
   it("AC1(f) a listing that SUCCEEDS (small group) is today's REST verdict with every new counter zero", async () => {
     const f = await fixture(2);
     const res = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId);

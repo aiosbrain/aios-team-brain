@@ -82,11 +82,13 @@ times out right when the lookup path matters most.
   `{ timeoutMs }` override; reconcile passes `LANDED_LIST_TIMEOUT_MS` = env
   `GRAPH_LANDED_LIST_TIMEOUT_MS` or the client default (30 s). The cheaper lever is depth:
   `GRAPH_LANDED_SCAN_DEPTH` lower (1,000) makes the listing ~5× cheaper and the oracle still a
-  valid (smaller) subset — but ONLY on an install with `NEO4J_URL` configured, because below the
-  depth a group is judged by REST and above it by the lookup, and an install WITHOUT Neo4j would
-  lose judging for every 1k–5k-episode group. So the default stays 5,000 (no silent regression for
-  self-hosters without Neo4j), and ARCHITECTURE + `.env.example` record the recommendation:
-  "with `NEO4J_URL` set, `GRAPH_LANDED_SCAN_DEPTH=1000` is the better steady state". The 100 /
+  valid (smaller) subset — but ONLY on an install with `NEO4J_URL` configured AND re-queue enabled
+  (`GRAPH_DEEP_REQUEUE=true`, or GRAPHSAT-2): below the depth a group is judged by REST (bounded
+  re-queue heals it), above it by the lookup path, which with the flag OFF **holds** never-landed
+  verdicts — so lowering the depth today would stop 1k–5k groups from healing (Fable diff review
+  M1), and an install WITHOUT Neo4j would lose judging for them entirely. So the default stays
+  5,000, and ARCHITECTURE + `.env.example` record the lever with both conditions — "cheaper
+  lever", not "better steady state". The 100 /
   1,000 / 5,000 latency measurement Codex asked for cannot be taken from a laptop (Graphiti is
   internal-only); `reconcileMs` on the next passes after an operator lowers it IS that measurement.
 - **D4 — no change to the REST saturation semantics or to the lookup.** A listing that SUCCEEDS
@@ -109,7 +111,7 @@ times out right when the lookup path matters most.
 
 | Surface | Change |
 |---|---|
-| `lib/graph/reconcile.ts` | throw branch → `unreachableGroups++`, warn, `continue` (no lookup, no writes); empty listing over a once-confirmed ledger → `emptyListingGroups++`, warn; cleanup leg throw → `unreachableCleanupGroups++`, warn, `continue`; the final pending-cleanups count query's error handled LOUDLY (it silently read as zero — round 1 M1); `LANDED_LIST_TIMEOUT_MS` passed per call |
+| `lib/graph/reconcile.ts` | the LEDGER read's error → `errors` (it read as an empty ledger); throw branch → `unreachableGroups++`, warn, `continue` (no lookup, no writes); the cleanup listing gets the per-call deadline too; empty listing over a once-confirmed ledger → `emptyListingGroups++`, warn; cleanup leg throw → `unreachableCleanupGroups++`, warn, `continue`; the final pending-cleanups count query's error handled LOUDLY (it silently read as zero — round 1 M1); `LANDED_LIST_TIMEOUT_MS` passed per call |
 | `lib/graph/graphiti-client.ts` | `listEpisodes(groupId, lastN, opts?: { timeoutMs })` — per-call override; STRICT body validation (bare array or `{episodes: array}`, string `uuid`/`name` per ref) else throw |
 | `lib/graph/run.ts`, `projection-run.ts`, `scheduler.ts` | `unreachableGroups`, `unreachableCleanupGroups`, `emptyListingGroups` ride summary → meta (when non-zero) → log; all three are recording-gate signals; `r.errors` merged into the run's errors (the cleanup one too — round 1 M1: the pending count it relied on can silently read zero) |
 | `test/datamechanics/fake-graphiti.ts` | `failListFor: Set<groupId>` — `listEpisodes` throws for those groups (the double has `failDeletes`; this is the read-side sibling) |
@@ -151,12 +153,13 @@ times out right when the lookup path matters most.
    `cleaned 0`, `pendingCleanups 1`, flag intact; (e2) the final pending-count re-read FAILS (a
    wrapping db client) → `errors` carries `reconcile: pending-cleanup count failed: …`, every
    other counter retained, and through the runner `ok:false` with the team-prefixed text while
-   `reconciled`/`deepResolvedGroups` keep their values; (f) a listing that SUCCEEDS (small group) yields
+   `reconciled`/`deepResolvedGroups` keep their values; (e3) the LEDGER read fails → `errors`
+   carries `reconcile: ledger read failed: …`, nothing judged, no listing called (Fable diff
+   review M2: it used to read as an empty ledger — groupsChecked 0, ok:true, gate quiet); (f) a listing that SUCCEEDS (small group) yields
    today's REST verdict with every new counter 0/absent.
 2. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts
    test/graphiti-client-listing.test.ts` exits 0: `unreachableGroups 1`, `unreachableCleanupGroups 1`
-   and `emptyListingGroups 1` each record ALONE; observe counters are meta-only (not gate
-   signals); all absent from a quiet row; the client: body validation arms (bare array ok,
+   and `emptyListingGroups 1` each record ALONE; all absent from a quiet row; (no observe counters exist — dropped at design round 2); the client: body validation arms (bare array ok,
    `{episodes:[…]}` ok, `{}` throws, scalar throws, `{episodes:"x"}` throws, `{episodes: undefined}`
    throws, ref without string uuid throws, ref without string name throws); the per-call timeout: an ABORT-AWARE fetch mock (rejects from the signal's
    `abort` listener) + fake timers advanced asynchronously → the call rejects at the override
@@ -169,7 +172,8 @@ times out right when the lookup path matters most.
    (c) drop `unreachableGroups` from the gate → AC2 reddens; (d) make the client tolerant again
    (`{}` → `[]`) → AC1(c) reddens; (e) ignore the per-call timeout → AC2's abort arm reddens;
    (f) drop the cleanup-leg count → AC1(e) reddens; (g) drop the empty-listing signal → AC1(d)
-   reddens; (h) swallow the pending-count error again → AC1(e2) reddens.
+   reddens; (h) swallow the pending-count error again → AC1(e2) reddens; (i) swallow the ledger-read error
+   again → AC1(e3) reddens.
 5. `npm test` · dm iso (graph set) · `npm run test:http:local` · `npm run check:docs` green;
    ARCHITECTURE + `.env.example` updated; GRAPHDEPLOY-1 filed on the board.
 
