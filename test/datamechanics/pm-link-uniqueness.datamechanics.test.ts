@@ -6,7 +6,7 @@ import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/mana
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
- * ADOPTINV-1 — the OUTCOME the adoption fixes exist to produce, asserted on the table.
+ * ADOPT-TASK-8 — the OUTCOME the adoption fixes exist to produce, asserted on the table.
  *
  * `ADOPTDECL-1` (#581) and `ADOPTFOOT-1` (#588) shipped a suite of tests between them and every one pins a
  * RUNG'S DECISION: the footer rung's scope, the declared rung's error, the ownership refusal, the
@@ -290,7 +290,7 @@ async function ownedLinkCount(teamId: string): Promise<number> {
   return (data ?? []).length;
 }
 
-describe("ADOPTINV-1 — no two links in a team share one PM issue (real Postgres)", () => {
+describe("ADOPT-TASK-8 — no two links in a team share one PM issue (real Postgres)", () => {
   it("THE DETECTOR WORKS: two links deliberately sharing one issue are REPORTED", async () => {
     // The inverse control. Draft 1 of the spec proposed "the query returns zero rows on a team with no
     // links", which proves the opposite of what it claimed — that the query passes on nothing, which IS

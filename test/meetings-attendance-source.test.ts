@@ -8,7 +8,7 @@ import type { RosterPerson } from "@/lib/meetings/llm-extract";
  * MTGATT-1 / AIO-962 — attendance comes from what the producer asserted, and a model is the LAST
  * resort rather than the default.
  *
- * The bug this pins: "Content creation strategy session" (2026-08-11) recorded Abe Isleem and Fatma
+ * The bug this pins: "Content creation strategy session" (2026-08-11) recorded Abe Doe and Fatma
  * as attendees. Both appear in the transcript only in the third person and explicitly as ABSENT,
  * while the item's own frontmatter said `participants: "[John Ellison]"`.
  *
@@ -17,10 +17,10 @@ import type { RosterPerson } from "@/lib/meetings/llm-extract";
  */
 const ROSTER: RosterPerson[] = [
   { id: "m-john", displayName: "John Ellison" },
-  { id: "m-abe", displayName: "Abe Isleem" },
+  { id: "m-abe", displayName: "Abe Doe" },
   { id: "m-fatma", displayName: "Fatma" },
   { id: "m-chetan", displayName: "Chetan" },
-  { id: "m-stephan", displayName: "Stephan Ledain" },
+  { id: "m-stephan", displayName: "Stephan Doe" },
 ];
 
 describe("parseParticipantNames — the shapes that actually occur in prod", () => {
@@ -30,11 +30,11 @@ describe("parseParticipantNames — the shapes that actually occur in prod", () 
   });
 
   it("parses the multi-name granola shape", () => {
-    expect(parseParticipantNames("[John Ellison, Chetan, Stephan Ledain, Fatma Ghedira]")).toEqual([
+    expect(parseParticipantNames("[John Ellison, Chetan, Stephan Doe, Fatma Doe]")).toEqual([
       "John Ellison",
       "Chetan",
-      "Stephan Ledain",
-      "Fatma Ghedira",
+      "Stephan Doe",
+      "Fatma Doe",
     ]);
   });
 
@@ -139,9 +139,9 @@ describe("resolveAttendance — precedence, and the model as a last resort", () 
   });
 
   it("resolves granola's fuller name against a shorter roster entry, and vice versa", async () => {
-    // Prod says `Chetan Nandakumar` / `Fatma Ghedira`; the roster says `Chetan` / `Fatma`.
+    // Prod says `Chetan Nandakumar` / `Fatma Doe`; the roster says `Chetan` / `Fatma`.
     const out = await resolveAttendance({
-      participants: "[Chetan Nandakumar, Fatma Ghedira]",
+      participants: "[Chetan Nandakumar, Fatma Doe]",
       roster: ROSTER,
       llm: async () => [],
     });
@@ -181,7 +181,7 @@ describe("matchAsserted — strict, because an asserted name is not a guess", ()
   });
 
   it("still resolves prod's real shape — a fuller asserted name onto a shorter roster entry", () => {
-    const out = matchAsserted(["Chetan Nandakumar", "Fatma Ghedira"], ROSTER);
+    const out = matchAsserted(["Chetan Nandakumar", "Fatma Doe"], ROSTER);
     expect(out.memberIds.sort()).toEqual(["m-chetan", "m-fatma"]);
     expect(out.unresolved).toEqual([]);
   });
