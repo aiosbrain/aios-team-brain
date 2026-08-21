@@ -80,7 +80,8 @@ describe("guard: the candidate predicate's SQL shape", () => {
     // done, the item is invisible under enforce (which requires it) and never selected — the silent
     // skip this slice exists to prevent. Nothing killed this before; a mutation proved it.
     expect(sql).toMatch(/m\.valid_to is null and m\.decision = 'include' and m\.project_id = s\.target_id/);
-    // Arm 3: still a current membership in the OPPOSITE project, of ANY decision — closeMembershipInto
+    // Arm 3: still a current membership in the OPPOSITE project — any decision EXCEPT a spared
+    // standing exclusion (CLOSEMODE-1; the exception is pinned below).
     // closes regardless, so narrowing this to include would strand a stale exclude.
     expect(sql).toMatch(/m\.valid_to is null and m\.project_id = s\.opposite_id/);
   });

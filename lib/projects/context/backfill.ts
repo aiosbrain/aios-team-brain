@@ -321,7 +321,7 @@ async function backfillOneTeamTurn(
         // would otherwise report as covered (Fable M1). Distinct from `truncated`, which is a
         // deliberate stop with a resumable cursor.
         return {
-          ...base, ok: false, scanned, unitsCreated, membershipsCreated, cursor,
+          ...base, ok: false, scanned, unitsCreated, membershipsCreated, spared, cursor,
           error: `guard exhausted at cursor ${cursor} — corpus not fully backfilled`,
         };
       }

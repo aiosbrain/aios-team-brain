@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, externalMember, type Seed } from "./helpers";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
+import { countUnrepairable } from "@/lib/projects/context/backfill-candidates";
 import { closeMembershipInto } from "@/lib/projects/context/memberships";
 import { canSeeItem } from "@/lib/access/enforce";
 
@@ -70,6 +71,13 @@ describe("CLOSEMODE-1 — the audience flip spares a human's standing exclusion 
 
     // The enforced read: the same principal that COULD see it now does NOT.
     expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: externalViewer }, item.id)).toBe(false);
+
+    // AC1(e2): the standing state is NOT re-visited (the target carve-out) and IS counted as an
+    // unrepairable exclude-shadow — operator-attention semantics, not a failed repair.
+    const p = await backfillTeamContext(db(), seed.teamId);
+    expect(p.scanned, "no repeated backfill visit after the refused flip").toBe(0);
+    const unrepairable = await countUnrepairable(seed.teamId);
+    expect(unrepairable?.excludeShadows, "the standing exclusion counts — intended, permanent").toBe(1);
   });
 
   it("AC1(b) an AUTO exclude on the opposite side closes exactly as today", async () => {
