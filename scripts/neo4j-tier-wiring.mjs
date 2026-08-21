@@ -15,13 +15,30 @@ export const JOB_ID = "neo4j-tier-tests";
 export const CHECK_NAME = "Graph Neo4j tier (real Neo4j)";
 export const RUN_STEP = "npm run test:neo4j";
 export const SENTINEL = "NEO4J_TIER_REQUIRED";
-export const EXPECTED_SCRIPT_ENV = {
-  NEO4J_TEST: "1",
-  NEO4J_URL: "bolt://localhost:7688",
-  NEO4J_USER: "neo4j",
-  NEO4J_PASSWORD: "testtest1",
-};
 export const EXPECTED_SCRIPT_CMD = "vitest run graph-neo4j-tier";
+
+/** The npm script's expected env, DERIVED from compose (the single owner of the test server's
+ *  auth and bolt port) — never restated here: a literal copy is a second owner that can drift,
+ *  and static analysis rightly flags a password literal wherever it appears. */
+export function expectedScriptEnv(compose) {
+  const ref = compose?.services?.neo4j;
+  const auth = String(composeAuth(ref) ?? "");
+  const slash = auth.indexOf("/");
+  const bolt = (ref?.ports ?? []).map(String).find((p) => p.endsWith(":7687"));
+  return {
+    NEO4J_TEST: "1",
+    NEO4J_URL: bolt ? `bolt://localhost:${bolt.split(":")[0]}` : "",
+    NEO4J_USER: slash === -1 ? "" : auth.slice(0, slash),
+    NEO4J_PASSWORD: slash === -1 ? "" : auth.slice(slash + 1),
+  };
+}
+
+function composeAuth(ref) {
+  const env = ref?.environment;
+  if (!env) return undefined;
+  if (Array.isArray(env)) return env.map(String).find((e) => e.startsWith("NEO4J_AUTH="))?.slice("NEO4J_AUTH=".length);
+  return env.NEO4J_AUTH;
+}
 
 /** Parse a `KEY=v KEY2=v2 cmd args…` shell line into leading assignments + the command. Duplicate
  *  keys are reported, not last-wins — a second `NEO4J_URL=` pointing elsewhere is exactly the
@@ -90,7 +107,7 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
     v.push("service-missing");
   } else if (ref) {
     if (svc.image !== ref.image) v.push("image-drift");
-    const refAuth = ref.environment?.NEO4J_AUTH ?? (Array.isArray(ref.environment) ? ref.environment.find((e) => String(e).startsWith("NEO4J_AUTH="))?.slice("NEO4J_AUTH=".length) : undefined);
+    const refAuth = composeAuth(ref);
     if (String(svc.env?.NEO4J_AUTH ?? "") !== String(refAuth ?? "")) v.push("auth-drift");
     const refBolt = (ref.ports ?? []).map(String).find((p) => p.endsWith(":7687"));
     if (!(svc.ports ?? []).map(String).includes(String(refBolt))) v.push("port-drift");
@@ -111,7 +128,7 @@ export function validateNeo4jTierWiring(ci, compose, pkg) {
   } else {
     const { env, dupes, cmd } = parseScript(script);
     if (dupes.length) v.push("script-env-duplicate");
-    for (const [k, want] of Object.entries(EXPECTED_SCRIPT_ENV)) {
+    for (const [k, want] of Object.entries(expectedScriptEnv(compose))) {
       if (env[k] !== want) v.push(`script-${k.toLowerCase()}`);
     }
     if (cmd !== EXPECTED_SCRIPT_CMD) v.push("script-cmd");

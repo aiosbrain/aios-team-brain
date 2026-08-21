@@ -54,7 +54,7 @@ describe("Neo4j tier wiring — one mutation arm per invariant (non-vacuity)", (
     ["health options removed entirely", "health-cmd-drift", (o) => { delete (job(o) as { services: { neo4j: { options?: string } } }).services.neo4j.options; }],
     ["script URL duplicated, second one elsewhere (the destructive-cleanup hazard)", "script-env-duplicate", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_USER=", "NEO4J_URL=bolt://prod.internal:7687 NEO4J_USER="); }],
     ["script NEO4J_TEST dropped", "script-neo4j_test", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_TEST=1 ", ""); }],
-    ["script password drift", "script-neo4j_password", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("NEO4J_PASSWORD=testtest1", "NEO4J_PASSWORD=x"); }],
+    ["script password drift", "script-neo4j_password", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace(/NEO4J_PASSWORD=\S+/, "NEO4J_PASSWORD=x"); }],
     ["script filter changed", "script-cmd", (o) => { const s = (o.pkg as { scripts: Record<string, string> }).scripts; s["test:neo4j"] = s["test:neo4j"].replace("graph-neo4j-tier", "graph"); }],
     // Fable diff review M1 — a job that cannot fail is not a gate.
     ["job made conditional (if: false)", "job-conditional", (o) => { (job(o) as { if?: unknown }).if = false; }],
@@ -79,6 +79,8 @@ describe("Neo4j tier wiring — one mutation arm per invariant (non-vacuity)", (
   /** Compound mutations legitimately trip more than one invariant (no health options = cmd + all
    *  three timings; a second URL also breaks the exact-URL check). They assert containment. */
   const compound: Record<string, string[]> = {
+    // No compose service = nothing to derive the script's expected URL/user/password from either.
+    "compose service missing": ["compose-service-missing", "script-neo4j_url", "script-neo4j_user", "script-neo4j_password"],
     "health options removed entirely": ["health-cmd-drift", "health-interval-drift", "health-timeout-drift", "health-retries-drift"],
     "script URL duplicated, second one elsewhere (the destructive-cleanup hazard)": ["script-env-duplicate", "script-neo4j_url"],
   };
