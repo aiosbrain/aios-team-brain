@@ -482,6 +482,20 @@ set; a `docs/OPS.md` runbook section; tests for each guard layer separately.
     only the percent-encoding half). The durable half is a positive ACK token the shell requires, so any
     future spelling of that bug stops the refresh instead of waving it through.
 
+23. **unit** — a connection url naming MORE THAN ONE HOST is refused. libpq tries a comma-separated
+    host list in order (verified: `psql "postgresql://u@nonexistent-host-xyz.invalid,127.0.0.1/db"` fell
+    through to 127.0.0.1), so a target of `staging…,prod…` passes every check here — the marker read
+    reaches staging and finds its marker — and a restore run while staging is briefly unreachable lands
+    on PRODUCTION. This was a second-order miss inside the fix for the query-parameter half, and the
+    reason it hid is worth keeping: the port-bearing spelling (`a:1,b:2`) makes `new URL()` throw and was
+    refused **by accident**, while the portless spelling parsed cleanly and was accepted. A shape refused
+    by accident is not a layer. A url whose parsed and raw forms differ (a `#` fragment) is refused for
+    the same reason: this script validates a parse while libpq dials the string.
+24. **unit** — the runbook's one-time marker command carries the same url armour, chained with `&&` so
+    it fails closed (`check-url`). It is the only libpq call this design asks a human to make, and a
+    poisoned url there plants the marker on production — after which the target-marker refusal passes
+    forever and nothing in this repo would notice.
+
 ## What would falsify this
 
 - **A refresh that writes to prod** — the catastrophic direction. Nothing else on this list matters as

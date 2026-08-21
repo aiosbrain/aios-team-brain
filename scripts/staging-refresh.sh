@@ -108,7 +108,7 @@ fi
 
 CLIENT_MAJOR=""
 if [[ -n "$PG_DUMP" && -x "$PG_DUMP" ]]; then
-  CLIENT_MAJOR="$("$PG_DUMP" --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
+  CLIENT_MAJOR="$("${PG_SCRUB[@]}" "$PG_DUMP" --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
 fi
 
 # Does a database carry the staging marker? An error reads as UNKNOWN, and unknown is a refusal.

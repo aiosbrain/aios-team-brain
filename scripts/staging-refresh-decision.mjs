@@ -34,6 +34,7 @@ export const REFUSAL = Object.freeze({
   MISSING_SOURCE: "missing-source-url",
   MISSING_TARGET: "missing-target-url",
   UNSUPPORTED_SCHEME: "unsupported-scheme",
+  MULTI_HOST: "multi-host-url",
   UNSAFE_CONNECTION_PARAMS: "unsafe-connection-params",
   SAME_HOST: "same-host",
   NO_MARKER: "no-staging-marker",
@@ -305,6 +306,30 @@ function refusalsForUrlShape(url, label) {
       reason: `${label} uses the "${scheme}" scheme; only postgres:// and postgresql:// are accepted. A URL this script cannot reason about is a URL it must not hand to pg_restore.`,
     });
   }
+  // MULTI-HOST FAILOVER — the half of the routing attack the query-param allowlist does not touch,
+  // and a second-order miss in the fix for the first half. libpq accepts a comma-separated host list in
+  // the AUTHORITY and tries each in turn until one connects. Verified:
+  //   psql "postgresql://u@nonexistent-host-xyz.invalid,127.0.0.1/db"  → fell through to 127.0.0.1
+  // A target of `staging…,prod…` therefore passes every check here (the marker read reaches staging and
+  // finds its marker) and then, if staging is unreachable when the restore runs, `pg_restore --clean`
+  // lands on PRODUCTION. Note the asymmetry that hid it: the port-bearing spelling
+  // (`a:1,b:2`) makes `new URL()` throw, so it was already refused as unparseable — while the PORTLESS
+  // spelling parses cleanly and was accepted. One shape refused by accident is not a layer.
+  if (parsed.hostname.includes(",")) {
+    out.push({
+      code: REFUSAL.MULTI_HOST,
+      reason: `${label} lists more than one host (${parsed.hostname}). libpq tries them in order, so the database this script INSPECTS need not be the one it WRITES. Exactly one host, or no refusal here means anything.`,
+    });
+  }
+  // Our parser and libpq's must see the same string. A fragment is dropped by `new URL()` and handed to
+  // libpq as part of the connection string — not a routing risk today, but a divergence between what is
+  // validated and what is dialled, which is precisely the class of bug this function exists for.
+  if (parsed.hash) {
+    out.push({
+      code: REFUSAL.UNSAFE_CONNECTION_PARAMS,
+      reason: `${label} contains a "#" fragment. This script validates a parsed url while libpq dials the raw string; anything the two read differently is refused rather than reasoned about.`,
+    });
+  }
   const allowed = new Set(ALLOWED_URL_PARAMS);
   const offending = [...parsed.searchParams.keys()].filter((k) => !allowed.has(k.toLowerCase()));
   if (offending.length > 0) {
@@ -511,6 +536,15 @@ function main(argv) {
       }).refusals
     );
   }
+  if (cmd === "check-url") {
+    // For the runbook's one-time marker command: the human's psql call is the only libpq invocation this
+    // design cannot wrap, and a poisoned url there plants the marker on PRODUCTION — after which the
+    // target-marker refusal passes forever. Chained with `&&`, this makes that step fail closed too.
+    return print(refusalsForUrlShape(arg("url"), "the url") .concat(hostOf(arg("url")) ? [] : [{
+      code: REFUSAL.MISSING_TARGET,
+      reason: "the url is unset or unparseable.",
+    }]));
+  }
   if (cmd === "scrubbed-env") {
     console.log(SCRUBBED_PG_ENV.join("\n"));
     return 0;
@@ -523,7 +557,7 @@ function main(argv) {
     console.log(completionMessage());
     return 0;
   }
-  console.error("usage: staging-refresh-decision.mjs <preflight|check|exclude-args|scrubbed-env|completion>");
+  console.error("usage: staging-refresh-decision.mjs <preflight|check|check-url|exclude-args|scrubbed-env|completion>");
   return 2;
 }
 
