@@ -165,8 +165,12 @@ export async function getPulseMetrics(
   }
 ): Promise<PulseMetrics> {
   const { isAdmin, tier } = viewer;
-  // Member-only surface (AUDITFIX-1 §2a): the Pulse dashboard is session-authenticated.
-  const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false, principal: "member" as const };
+  // The FALLBACK synthesises nothing (AUDITFIX-1 §2d): an absent ctx yields an absent principal,
+  // which closes the hand-typed arm. It is inert today only because the fallback also pins
+  // `teamPosture: false` — and relying on that would mean a later "fix" to the default posture
+  // silently opens the arm for a caller that supplied no view at all. The real ctx, carrying an
+  // explicit "member", comes from the session-authenticated page (app/t/[team]/page.tsx).
+  const provCtx = viewer.provCtx ?? { visibleItemIds: new Set<string>(), teamPosture: false };
   const days = rangeDays(range);
   const now = new Date();
   const windowStart = new Date(now.getTime() - days * 86_400_000);

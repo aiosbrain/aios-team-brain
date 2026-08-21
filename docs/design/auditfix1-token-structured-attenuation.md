@@ -137,6 +137,13 @@ examples, to be updated as part of this slice rather than discovered as a myster
 `enfb2-inquery-provenance.datamechanics.test.ts:49`. The inventory covers every test context passed to
 `retrieve`, `matchingDecisions`, either SQL owner, the structured windows and the TS twin.
 
+**Correction (Fable diff review): that list was over-inclusive, in the direction that invites a
+pointless edit.** Two of the named files were NOT touched and must not be —
+`access-agent-tokens…:373` asserts `ctx.sources` paths only, and `graph-read-cutover…:237` asserts
+graph search calls. Neither exercises the hand-typed arm, so an absent `principal` closes an arm they
+never assert. Recorded here so the next reader does not "fix" a file that is already correct. The
+files that DID need updating are the six the dm tier actually reddened, plus `test/access-provenance.test.ts`.
+
 ### 2d. Absent enforcement closes — and the stale "permissive" doc goes with it
 
 `retrieve()`'s public entry already throws when enforcement is absent (`retrieve.ts:1025-1031`), but
@@ -288,6 +295,59 @@ so do the two sibling omissions (M14, M15) that were equally unpinned.
 
 **15 mutations: 14 reddened only their intended test on the first pass; 1 survived, was fixed, and
 now reddens.**
+
+## 5f. Fable's diff review — BLOCKED, and it defeated the guard in one line
+
+The first read by a DIFFERENT model, after four Codex spec rounds. Its HIGH was a working bypass of
+the guard those rounds had shaped twice:
+
+```ts
+const principal = "member" as ProvenancePrincipal;          // a cast the needle did not expect
+const provCtx = { visibleItemIds, teamPosture, principal }; // shorthand — no colon, so every scan blind
+```
+
+**All five checks stayed green.** I planted that exact code in `lib/query/retrieve.ts` and confirmed
+both halves before folding: the guard passed **6/6**, and the same code reddened
+`test/datamechanics/token-structured-attenuation.datamechanics.test.ts` on the real leak — so it was not a cosmetic
+evasion, it was the reproduced disclosure walking back in past its own guard.
+
+Why it matters more than its blast radius: this is *the shape an author reaches for the moment the
+guard reddens on `principal: "member"`* — extract to a variable until green. A guard that teaches its
+own evasion is worse than none. Folded: the binding needle drops its tail requirement (scoped to a
+variable declaration, so the type alias `type ProvenancePrincipal = "member" | "token"` and the SQL
+string `a.target_type = 'member'` — both of which the first loosening over-matched — stay out), a
+shorthand needle forbids `{ …, principal }` in the token-capable files outright, the omission scan
+accepts shorthand, and the twin needle's `[^)]*` becomes lazy so a nested call no longer hides it.
+The bypass is pinned as a non-vacuity case and re-planting it now reddens two tests.
+
+Its other findings, all folded:
+
+- **The omission scan saw only explicit-colon literals** — a whole construction shape, the same class
+  round 3 twice killed this guard for.
+- **The allow-list honesty check named the wrong repair.** If a boundary silently LOSES its member
+  literal — a member regression — the only message said "remove boundaries that no longer manufacture
+  a member literal", i.e. delete the entry and ship it. It now states both causes, tempting one first.
+- **`lib/metrics/pulse.ts`'s absent-ctx fallback synthesised `principal: "member"`** — the exact thing §2d
+  forbids. Inert only because the same fallback pins `teamPosture: false`, which is a dependency on a
+  neighbouring value rather than a rule. It now synthesises nothing and leaves the allow-list.
+- **AC7's sentence was false, not its coverage:** it claimed five principal inputs across three
+  owners; the table crossed three inputs against one. Now it is what the sentence says.
+- **"member-only BY CONSTRUCTION" overstated call-site enumeration** (`lib/access/enforce.ts`) — that is
+  convention plus a guard, which is exactly how §2b already framed it. Two words, corrected.
+- **§2c's update list was over-inclusive**, naming two files that are already correct and need no
+  change at all (this excludes no work: there is nothing to do in them, in this slice or any later
+  one) — recorded above so the next reader doesn't "fix" correct code.
+
+**What it checked and found sound**, which is worth as much as the findings: it re-derived the
+consumer inventory independently and found no production ctx omitting the discriminator; confirmed
+both token routes are closed (`/api/v1/items` has no structured leg); and confirmed the SQL parameter
+numbering is safe — `matchingDecisions` is the only mixed raw-`$N`/`p.add` consumer, and its `$1–$3`
+are pre-seeded before the fragment adds params, so emitting one fewer parameter shifts nothing.
+
+**One residual gap is ACCEPTED, not closed, and is written into the guard's header:** a ctx obtained
+wholesale from an exported factory is invisible to a text guard. The grounds are that it requires a
+visible, reviewable act rather than a one-word edit, and that the dm tier proves the outcome
+independently — which I verified rather than assumed.
 
 Round 1 also **confirmed the core rule is right and not over-correction**: a hand-typed row
 deliberately has no membership axis, and `tasks.project_id` is an ingestion project, not an access

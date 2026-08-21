@@ -79,13 +79,30 @@ describe("all three owners agree — against expected truth, not against each ot
     { name: "unsourced + unauthored", row: { source_item_id: null, created_by: null }, member: false, token: false },
   ] as const;
 
+  // AC7 says the table crosses all FIVE principal inputs against all THREE owners. It used to cross
+  // three inputs against one owner, and Fable's diff review caught the sentence being false rather
+  // than the coverage being wrong. Both are now what AC7 says.
   for (const r of ROWS) {
-    it(`${r.name}: member=${r.member} token=${r.token}`, () => {
-      expect(rowVisibleByProvenance(r.row, ids, "team", "member")).toBe(r.member);
-      expect(rowVisibleByProvenance(r.row, ids, "team", "token")).toBe(r.token);
-      // The closed cases behave as a token does.
-      expect(rowVisibleByProvenance(r.row, ids, "team", undefined)).toBe(r.token);
-    });
+    for (const [principal, admitted] of PRINCIPALS) {
+      const expected = admitted ? r.member : r.token;
+      it(`${r.name}, principal=${String(principal)} → ${expected}`, () => {
+        // Owner 1 — the TS twin, which answers per row.
+        expect(rowVisibleByProvenance(r.row, ids, "team", principal as undefined)).toBe(expected);
+
+        // Owners 2 and 3 — the SQL forms answer with an ARM, not a boolean, so the observable is
+        // whether the unsourced disjunct exists. Only the unsourced rows can distinguish them.
+        const unsourced = r.row.source_item_id === null;
+        for (const [label, sql] of [
+          ["id-array", provenanceRowSqlFromIds("t", newSqlParams(), { visibleItemIds: ids, teamPosture: true, principal: principal as undefined })],
+          ["semijoin", provenanceRowSql("t", newSqlParams(), { teamId: "t1", grantedProjectIds: ["p1"], teamPosture: true, principal: principal as undefined })],
+        ] as const) {
+          expect(sql.includes("created_by is not null"), `${label}, principal=${String(principal)}`).toBe(admitted);
+          // …and an unsourced-and-UNAUTHORED row is denied by every owner regardless, because the
+          // arm the SQL emits still requires `created_by is not null`.
+          if (unsourced && r.row.created_by === null) expect(expected).toBe(false);
+        }
+      });
+    }
   }
 
   it("the TS twin and the id-array SQL agree on whether the unsourced arm exists at all", () => {

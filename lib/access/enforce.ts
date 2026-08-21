@@ -231,7 +231,9 @@ export interface VisibleProjectRows {
 
 /**
  * AUDITFIX-1 §2b. The three project-row helpers below (`visibleProjectRows`, `canSeeProjectRow`,
- * `visibleProjectCards`) are member-only BY CONSTRUCTION, not by convention: every one of their eight
+ * `visibleProjectCards`) are member-only by CONVENTION PLUS A GUARD — not by type, and not by
+ * construction: the `Principal` they take permits `projectScope`, i.e. a token-shaped value. What
+ * makes the convention true today is call-site enumeration: every one of their eight
  * call sites is a session-authenticated page or an `aios_` member route, and `authenticateApiKey`
  * (lib/api/auth.ts) rejects an `aiosd_` bearer, so a delegated token cannot reach them.
  *

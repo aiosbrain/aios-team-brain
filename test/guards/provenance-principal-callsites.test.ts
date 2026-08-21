@@ -16,6 +16,20 @@ import { join } from "node:path";
  *
  * Everywhere else, a member literal is legal only at a listed member-only boundary, so the allow-list
  * doubles as the inventory of "who is asserting memberhood, and on what authority".
+ *
+ * ⚠️ WHAT THIS GUARD DOES NOT CLOSE, stated rather than implied. It reads text, so a ctx obtained
+ * WHOLESALE from another module — `const provCtx = buildMemberProvCtx(ids, tier)`, with the factory
+ * exported from an allow-listed file — is invisible to every scan here. That gap is accepted, not
+ * overlooked, on three grounds: (a) it requires adding an exported ctx factory and importing it into
+ * a token path, which is a visible, reviewable act rather than a one-word edit; (b) the guard's job
+ * is to make the CHEAP mistakes impossible, and the cheap mistakes are the literal, the constant,
+ * the alias, the shorthand and the omission — all now caught; (c) the data-mechanics tier catches
+ * the OUTCOME regardless. I verified (c) rather than assuming it: planting
+ * `principal = "member"` in retrieve.ts reddens
+ * `token-structured-attenuation.datamechanics.test.ts` on the real leak, both arms.
+ *
+ * So this guard is the fast, build-failing layer over a tier that independently proves the outcome.
+ * Do not read it as the only thing standing between a token and the hand-typed rows.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -44,7 +58,8 @@ const MEMBER_BOUNDARIES = new Set([
   // The named constant (`MEMBER_ONLY_SURFACE`) feeding the three project-row helpers. Its authority
   // is call-site enumeration: every caller is a session page or an `aios_` member route.
   "lib/access/enforce.ts",
-  "lib/metrics/pulse.ts", // session-authenticated Pulse dashboard
+  // NOT lib/metrics/pulse.ts: its absent-ctx fallback used to synthesise "member", which §2d
+  // forbids outright. It now synthesises nothing and the real ctx arrives from the page below.
   "lib/dashboard/work-timeline.ts", // session-authenticated timeline
   "app/api/v1/decisions/route.ts", // aios_ member key; authenticateApiKey rejects aiosd_
   // Both found by the dm tier, NOT by the spec's §0 inventory, which said "exactly 7 consumers"
@@ -82,7 +97,10 @@ function filesUnder(dir: string): string[] {
 // The whitespace lives INSIDE the lookahead: `\s*(?!\|)` backtracks to zero width and passes on
 // `principal: "member" | "token"`, which is how the first spelling flagged three type declarations.
 const MEMBER_PROP = /principal\s*:\s*["'`]member["'`](?!\s*\|)/;
-const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([^)]*["'`]member["'`]\s*\)/;
+// `[^)]*` stopped at the first `)`, so a twin call containing a nested call
+// (`rowVisibleByProvenance(d, getIds(), tier, "member")`) escaped the tree-wide scan. `[\s\S]*?`
+// is lazy, so it still cannot run past the call it is matching.
+const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([\s\S]*?["'`]member["'`]\s*\)/;
 /**
  * …and the shape a NAMED CONSTANT takes — `const MEMBER_ONLY_SURFACE = "member" as const`.
  *
@@ -96,7 +114,27 @@ const MEMBER_TWIN_ARG = /rowVisibleByProvenance\([^)]*["'`]member["'`]\s*\)/;
 // The lookbehind matters: without it this fires on `enforce?.principal === "member"`, a
 // COMPARISON — which retrieve.ts legitimately performs (`serveOrgStructural`) and which asserts
 // nothing. Reading a discriminator is not manufacturing one.
-const MEMBER_BINDING = /(?<![=!<>])=\s*["'`]member["'`]\s*(?:as\s+const)?\s*;/;
+// No TAIL requirement. The first spelling demanded `as const` or `;`, and Fable's diff review
+// defeated it in one line: `const principal = "member" as ProvenancePrincipal;` — a different cast,
+// so the needle missed, and the guard passed 6/6 with a hardcoded member principal in retrieve.ts.
+// I planted that exact code and confirmed it BOTH evaded the guard AND reddened the dm token tests,
+// so the guard was failing at the one job its header claims. Over-matching a binding is the safe
+// direction: the tree-wide scan already excludes comparisons via the lookbehind.
+// Scoped to a VARIABLE DECLARATION. Dropping the tail requirement outright over-matched two things
+// that assert nothing: the type alias `type ProvenancePrincipal = "member" | "token"` and the SQL
+// string `a.target_type = 'member'` in lib/auth/welcome-context.ts. Requiring `const|let|var <name>`
+// keeps the bypass caught (`const principal = "member" as ProvenancePrincipal`) and both of those out.
+const MEMBER_BINDING = /(?:const|let|var)\s+\w+\s*(?::[^=;]*)?=\s*["'`]member["'`]/;
+
+/**
+ * …and the SHORTHAND property, which has no colon and was therefore invisible to every scan above:
+ * `const provCtx = { visibleItemIds, teamPosture, principal }`. This is the second half of the same
+ * bypass, and it is the shape an author naturally reaches for the moment the guard reddens on
+ * `principal: "member"` — extract to a variable until green. A guard that teaches its own evasion is
+ * worse than none, so shorthand is forbidden outright in the token-capable files: those may only
+ * forward, and forwarding cannot be spelled as shorthand.
+ */
+const MEMBER_SHORTHAND = /[{,]\s*principal\s*[,}]/;
 const MEMBER_LITERAL = {
   test: (src: string) => MEMBER_PROP.test(src) || MEMBER_TWIN_ARG.test(src) || MEMBER_BINDING.test(src),
 };
@@ -124,7 +162,9 @@ const MEMBER_LITERAL = {
  */
 function ctxLiteralsMissingPrincipal(code: string): string[] {
   const out: string[] = [];
-  for (const m of code.matchAll(/visibleItemIds\s*:/g)) {
+  // Shorthand counts too (`{ visibleItemIds, teamPosture }`) — anchoring on the colon alone let a
+  // whole construction shape through, which is the same class round 3 twice killed this guard for.
+  for (const m of code.matchAll(/visibleItemIds\s*[,:}]/g)) {
     // Walk back to the `{` that opens this object literal, then forward to its match.
     let open = m.index!;
     while (open > 0 && code[open] !== "{") open--;
@@ -138,7 +178,7 @@ function ctxLiteralsMissingPrincipal(code: string): string[] {
     // A TYPE declaration (`{ visibleItemIds: ReadonlySet<string>; ... }`) states the shape and is
     // not a construction; it is excluded the same way the assignment scan excludes unions.
     if (/ReadonlySet<|readonly string\[\]/.test(literal)) continue;
-    if (!/principal\s*:/.test(literal)) out.push(literal.split("\n")[1]?.trim() ?? literal.slice(0, 60));
+    if (!/principal\s*[,:}]/.test(literal)) out.push(literal.split("\n")[1]?.trim() ?? literal.slice(0, 60));
   }
   return out;
 }
@@ -164,6 +204,10 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     for (const rel of TOKEN_CAPABLE) {
       const code = codeOnly(read(rel));
       expect(MEMBER_LITERAL.test(code), `${rel} must forward enforce.principal, never assert "member"`).toBe(false);
+      expect(
+        MEMBER_SHORTHAND.test(code),
+        `${rel} may not use shorthand \`{ principal }\` — forwarding cannot be spelled that way, so it can only be hiding a local binding`
+      ).toBe(false);
       expect(code, `${rel} must actually forward the discriminator`).toMatch(/principal:\s*enforce\?\.principal/);
     }
   });
@@ -215,6 +259,17 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     expect(unforwardedPrincipalAssignments("principal: enforce?.principal,")).toEqual([]);
     expect(unforwardedPrincipalAssignments('principal: "member" | "token";'), "a union is a declaration").toEqual([]);
     expect(unforwardedPrincipalAssignments("principal?: ProvenancePrincipal"), "a type name is a declaration").toEqual([]);
+    // THE BYPASS Fable demonstrated, pinned in both halves so it cannot come back.
+    expect(MEMBER_LITERAL.test('const principal = "member" as ProvenancePrincipal;')).toBe(true);
+    expect(MEMBER_LITERAL.test('const principal = "member"')).toBe(true);
+    expect(MEMBER_SHORTHAND.test("const c = { visibleItemIds, teamPosture, principal };")).toBe(true);
+    expect(MEMBER_SHORTHAND.test("const c = { principal };")).toBe(true);
+    expect(MEMBER_SHORTHAND.test("principal: enforce?.principal,"), "forwarding is not shorthand").toBe(false);
+    // …and the shorthand omission the colon-anchored scan could not see.
+    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds,\n  teamPosture,\n})").length).toBe(1);
+    expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds,\n  teamPosture,\n  principal,\n})")).toEqual([]);
+    // …and a twin call with a nested call in its arguments.
+    expect(MEMBER_LITERAL.test('rowVisibleByProvenance(d, getIds(), tier, "member")')).toBe(true);
     // The omission scan: a ctx with no discriminator at all — the shape a surviving mutation found.
     expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  teamPosture: true,\n})").length).toBe(1);
     expect(ctxLiteralsMissingPrincipal("f({\n  visibleItemIds: ids,\n  principal: enforce?.principal,\n})")).toEqual([]);
@@ -227,6 +282,12 @@ describe("guard: a token can never acquire member provenance semantics", () => {
   it("the allow-list is honest — every listed boundary really does assert memberhood", () => {
     // A stale allow-list entry is permission granted to a file that no longer needs it.
     const stale = [...MEMBER_BOUNDARIES].filter((rel) => !MEMBER_LITERAL.test(codeOnly(read(rel))));
-    expect(stale, "remove boundaries that no longer manufacture a member literal").toEqual([]);
+    expect(
+      stale,
+      "TWO possible causes, and the wrong one is the tempting one: EITHER this file LOST a member " +
+        "assertion it needs — a silent member regression, since an absent discriminator closes the " +
+        "hand-typed arm — OR the file genuinely no longer needs the entry. Check which before " +
+        "deleting the allow-list line."
+    ).toEqual([]);
   });
 });
