@@ -31,7 +31,7 @@ export function shouldRecordProjectionRun(s: {
   pendingCleanups: number; saturatedGroups: number; requeueThrottled: number;
   partialItems: number; fanoutThrottled: number; restrictionMovesPending: number;
   probeFallbackPages: number; lockedOut: number; walkMs: number;
-  deepResolvedGroups: number; deepRequeueHeld: number; deepRequeueEnabled: boolean;
+  deepResolvedGroups: number; lookupMismatchGroups: number; deepRequeueHeld: number; deepRequeueEnabled: boolean;
 }): boolean {
   return Boolean(
     s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
@@ -46,7 +46,7 @@ export function shouldRecordProjectionRun(s: {
     // zero held" is a durable row the operator can read, not an absence they must infer. Once the
     // flag is on, a quiet deep-resolved pass is quiet. The mode is the EXECUTED one (from the
     // summary), never a second env parse.
-    s.deepRequeueHeld || (s.deepResolvedGroups && !s.deepRequeueEnabled)
+    s.deepRequeueHeld || s.lookupMismatchGroups || (s.deepResolvedGroups && !s.deepRequeueEnabled)
   );
 }
 
@@ -107,10 +107,12 @@ export function projectionRunInput(
       ...(summary.lockedOut ? { lockedOut: summary.lockedOut } : {}),
       // GRAPHSAT-1: the saturated-group measurement, durable. `deepRequeueEnabled` rides so a row
       // is self-describing about the mode that produced it.
-      deepResolvedGroups: summary.deepResolvedGroups,
-      deepRequeueHeld: summary.deepRequeueHeld,
-      deepRequeueEnabled: summary.deepRequeueEnabled,
-      ...(summary.deepRequeueHeld ? { deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample } : {}),
+      // Like their siblings, the keys ride only when they say something (Fable diff review L3): a
+      // quiet unsaturated team's row is not padded with zeros. A deep-resolved row is self-describing
+      // about the mode that produced it.
+      ...(summary.deepResolvedGroups ? { deepResolvedGroups: summary.deepResolvedGroups, deepRequeueEnabled: summary.deepRequeueEnabled } : {}),
+      ...(summary.lookupMismatchGroups ? { lookupMismatchGroups: summary.lookupMismatchGroups } : {}),
+      ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,
       // which is exactly the position that made this hole invisible for so long. Counted only; no

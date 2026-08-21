@@ -60,7 +60,13 @@ export async function lookupItemEpisodes(
     // with it — never returned.
     const rows = await read(ITEM_EPISODES_CYPHER, { g: groupId, prefix: ITEM_EPISODE_PREFIX, itemNames });
     for (const r of rows) {
-      if (typeof r.uuid === "string" && typeof r.name === "string") out.push({ uuid: r.uuid, name: r.name });
+      // A malformed row is a SCHEMA surprise, and a dropped row is a partial view — the
+      // absent-because-unfetched direction this module must never take. Loud, not lenient
+      // (Fable diff review M2).
+      if (typeof r.uuid !== "string" || typeof r.name !== "string") {
+        throw new Error(`episode lookup: malformed Episodic row in ${groupId} (uuid=${typeof r.uuid}, name=${typeof r.name})`);
+      }
+      out.push({ uuid: r.uuid, name: r.name });
     }
   }
   return out;

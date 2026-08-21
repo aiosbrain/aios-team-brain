@@ -68,13 +68,29 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   shrank 3→1 chunks has `chunk_shas.length 1` and expects `items:x`, but delta projection never
   wrote that name — the REST path confirms it via `itemIdFromEpisodeName("items:x#0")`; a
   name-based lookup would have judged it never-landed and (flag on) re-pushed a landed row. The
-  flag would only have postponed that wrong verdict. Pinned by explicit shrink 3→1, grow 1→N and
-  chunk-config-transition arms (AC1). Prefix is `STARTS WITH 'items:'` (`ITEM_EPISODE_PREFIX`)
+  flag would only have postponed that wrong verdict. Pinned by explicit shrink 3→1 and grow 1→N arms (AC1). (A
+  "chunk-config-transition" arm was claimed in an earlier draft and STRUCK: reconcile never reads
+  `chunk_config`, so the arm would have been green by construction — a config transition is
+  observable only as a chunk-COUNT change, which the shrink/grow arms ARE. Fable diff review M3.)
+  Prefix is `STARTS WITH 'items:'` (`ITEM_EPISODE_PREFIX`)
   so `correction:<arc_id>` writebacks are never considered; the item term is EXACT equality on the
   pre-`#` stem, so `items:abc` can never confirm `items:abcd`. Alternative considered and rejected:
   always-Cypher (drop REST listing) — it makes Neo4j a HARD dependency of a leg that today has one,
   and the REST path's existing dm pins (`test/datamechanics/graph-project.datamechanics.test.ts`
   §reconcile) are the proof the unchanged 99% stays unchanged.
+- **D2b — THE REST-WINDOW ORACLE (Fable diff review M1).** The 5,000 newest episodes reconcile
+  already holds are a guaranteed SUBSET of what the lookup must return for the group's ledger
+  items. Before any verdict, every item the window confirms must be confirmed by the lookup; if any
+  is missed, the lookup is structurally broken (a reachable Neo4j that is not the one Graphiti
+  writes — the graphiti-restart-rebuild incident shape; a renamed property; a future store
+  cutover) and the group is degraded to UNJUDGED (`saturatedGroups++` AND `lookupMismatchGroups++`,
+  a gate signal, a loud log line naming `NEO4J_URL`). An EMPTY result is not an error, so without
+  this a wrong graph reads as "everything never landed" — loud with the flag off (held 2,833), a
+  rate-bounded self-amplifying re-push with it on. Now that class dies by construction, not by a
+  human reading `deepRequeueHeld`. The check is subset, not equality (the lookup legitimately sees
+  MORE than the window); an episode deleted between the two reads trips it for one pass in the safe
+  direction. When the window confirms none of the group's items the oracle is vacuous and the
+  lookup is trusted — stated.
 - **D2 — every failure degrades to TODAY, never to "none landed".** `NEO4J_URL` unset → today's
   skip-and-count; driver/transport error or a query throw → today's skip-and-count; a chunk of the
   name lookup failing → the WHOLE group is skipped-and-counted for this pass (a partial name set
@@ -95,7 +111,11 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
   identifiable across groups/teams, round 2 H2 — OLDEST `projectedAt` first, merged and
   re-bounded across teams in the runner the way `partialDetail` is). The admin runs panel's
   `RunMeta` renders object values as compact JSON instead of `String(v)` (which printed
-  `[object Object]` for `partialDetail` already — fixed in passing, pinned). Gate rule, on the ONE shared
+  `[object Object]` for `partialDetail` already — fixed in passing, pinned). The keys ride the meta
+  only when they say something (like `probeFallbackPages`/`lockedOut`): a deep-resolved row carries
+  `deepResolvedGroups` + `deepRequeueEnabled` (self-describing about its mode), a held row adds the
+  count/map/sample, a mismatch row `lookupMismatchGroups`; a quiet unsaturated team's row is not
+  padded with zeros (Fable diff review L3). Gate rule, on the ONE shared
   predicate `shouldRecordProjectionRun`: `deepRequeueHeld > 0` ALWAYS records (work is being
   held — that is a signal); and while `GRAPH_DEEP_REQUEUE` is OFF, `deepResolvedGroups > 0` ALSO
   records — the rollout phase is the measurement phase, and a "lookup succeeded, zero held" result
@@ -219,15 +239,18 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
    partial — `landedState` reports `none` inside the confirmed branch, the documented
    hole-by-renaming under-count (`reconcile.ts:312-318`) — and the arm PROVES it is today's
    verdict by running the same fixture through the REST path (unsaturated) first and asserting
-   the two summaries agree; a chunk-config transition (same count, different `chunk_config`)
-   confirms; (c) a never-landed
+   the two summaries agree (no chunk-config arm — struck, see D1); (c) a never-landed
    row past the grace with `deepRequeue: false` is HELD — `deepRequeueHeld 1`, its id in
    `deepRequeueSample`, `reQueued 0`, `content_sha256` untouched; (d) the same row with
    `deepRequeue: true` is re-queued — `reQueued 1`, `content_sha256 = ''`, `first_seen_at`
    preserved (STALLSCOPE-1); (e) D2: a lookup returning `null` → today's verdict
    (`saturatedGroups 1, reQueued 0, confirmed 0`, ledger untouched); a lookup that THROWS → the
    same; (f) D5: the lookup is called with the ledger's `group_id` and ITEM ids; a present
-   episode for a DIFFERENT item (`items:abcd` when the ledger holds `abc`) does not confirm.
+   episode for a DIFFERENT item (`items:abcd` when the ledger holds `abc`) does not confirm;
+   (g) D2b: a lookup returning NOTHING for an item the REST window confirms →
+   `lookupMismatchGroups 1`, `saturatedGroups 1`, `deepResolvedGroups 0`, `reQueued 0` EVEN WITH
+   `deepRequeue: true`, ledger untouched; a lookup consistent with the window but silent about
+   other items is judged (subset, not equality).
 2. `npm run test:datamechanics:iso test/datamechanics/graph-project.datamechanics.test.ts` exits 0
    with ONE consciously revised pin: the existing saturated-group arm (`:801-820`) keeps
    `reQueued 0` and the ledger row, and its `saturatedGroups 1` assertion now runs with the
@@ -242,8 +265,9 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
    never returned; >500 ids chunk correctly (an id in the second chunk resolves).
 4. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts
    test/graph-episode-lookup.test.ts` exits 0: `meta.deepResolvedGroups`, `meta.deepRequeueHeld`,
-   `meta.deepRequeueHeldByGroup`, `meta.deepRequeueSample` (structured) and
-   `meta.deepRequeueEnabled` reach the durable row; `RunMeta` renders an object value as compact
+   `meta.deepRequeueHeldByGroup`, `meta.deepRequeueSample` (structured),
+   `meta.lookupMismatchGroups` and `meta.deepRequeueEnabled` reach the durable row when non-zero
+   (absent from a quiet row); `shouldRecordProjectionRun` is TRUE for `lookupMismatchGroups 1` alone; `RunMeta` renders an object value as compact
    JSON (unit, `components/admin/ingest-runs-panel`); `shouldRecordProjectionRun` is TRUE for
    `deepRequeueHeld 1` alone (either flag state), TRUE for `deepResolvedGroups 1` alone with
    `deepRequeueEnabled: false`, FALSE for `deepResolvedGroups 1` alone with `true`, TRUE for
@@ -257,7 +281,9 @@ apply to the lookup path. The guard stays for the REST path, byte-for-byte.
    reddens; (c) invert the `deepRequeue` gate → AC1(c) reddens; (d) drop the Cypher group term →
    AC3's cross-group arm AND the widened tier guard redden; (e) match by current expected names
    instead of the item stem → AC1(b)'s shrink arm reddens; (f) truthiness parse of the env →
-   AC4's `"false"` arm reddens; (g) drop `deepRequeueHeld` from the gate → AC4 reddens.
+   AC4's `"false"` arm reddens; (g) drop `deepRequeueHeld` from the gate → AC4 reddens;
+   (h) disable the REST-window oracle → AC1(g) reddens; (i) drop a malformed row instead of
+   throwing → the lookup unit reddens.
 6. Full tiers green: `npm test` · dm iso (the graph set) · `npm run test:http:local` (the stacked
    PR runs only the gate workflows — the http tier is run locally and commented on the PR) ·
    `npm run check:docs` · `docs/ARCHITECTURE.md:115` gains the saturation + lookup prose.

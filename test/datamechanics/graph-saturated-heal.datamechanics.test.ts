@@ -168,12 +168,39 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
   it("AC1(f) a present episode for a DIFFERENT item stem does not confirm this one", async () => {
     const f = await fixture();
     await saturate(f);
-    // The lookup returns a ref whose stem is `items:<never-id>d` — a longer id sharing the prefix.
-    const lookup: EpisodeLookup = async () => [{ uuid: "u-other", name: `items:${f.ids.never}d` }];
+    // The lookup returns the fake's real refs PLUS a ref whose stem is `items:<never-id>d` — a longer
+    // id sharing the prefix. (Real refs included so the REST-window oracle below holds; the foreign
+    // stem must not confirm `never`.)
+    const real = lookupFromFake(f.fake);
+    const lookup: EpisodeLookup = async (g, ids) => [...((await real(g, ids)) ?? []), { uuid: "u-other", name: `items:${f.ids.never}d` }];
     const res = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId, { lookup, deepRequeue: false });
     expect(res.deepResolvedGroups).toBe(1);
+    expect(res.confirmed).toBe(4);
+    expect(res.deepRequeueHeld, "`never` stays held — not confirmed through the foreign stem").toBe(1);
+  });
+
+  it("AC1(g) THE REST-WINDOW ORACLE (Fable diff review M1): a reachable-but-WRONG graph (lookup returns nothing for items the REST window confirms) is degraded to unjudged — never 'everything never landed'", async () => {
+    const f = await fixture();
+    // Keep `landed` INSIDE the REST window by adding filler BEFORE it: saturate, then re-push landed so
+    // it is among the newest 5,000 and REST confirms it.
+    await saturate(f);
+    await setGraphEpisodes(f.fake, f.teamGroup, f.ids.landed, [`items:${f.ids.landed}`]);
+    const wrongGraph: EpisodeLookup = async () => []; // reachable, empty — the wrong-DB shape
+    const res = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId, { lookup: wrongGraph, deepRequeue: true });
+    expect(res.lookupMismatchGroups).toBe(1);
+    expect(res.saturatedGroups, "unjudged, counted").toBe(1);
+    expect(res.deepResolvedGroups).toBe(0);
+    expect(res.reQueued, "NOTHING re-pushed even with the flag ON").toBe(0);
     expect(res.confirmed).toBe(0);
-    expect(res.deepRequeueHeld, "every row judged never-landed and held — none confirmed through the foreign stem").toBe(5);
+    expect((await ledgerRow(f.seed.teamId, f.ids.never)).content_sha256).not.toBe("");
+    // And a lookup that agrees with the window for `landed` but is silent about the rest is NOT
+    // flagged (the oracle is a subset check, not equality): it judges, and holds the rest.
+    const partialButConsistent: EpisodeLookup = async () => [{ uuid: "u-l", name: `items:${f.ids.landed}` }];
+    const ok = await reconcileProjectedEpisodes(db(), client(f.fake), f.seed.teamId, { lookup: partialButConsistent, deepRequeue: false });
+    expect(ok.lookupMismatchGroups).toBe(0);
+    expect(ok.deepResolvedGroups).toBe(1);
+    expect(ok.confirmed).toBe(1);
+    expect(ok.deepRequeueHeld).toBe(4);
   });
 
   it("AC4 (end to end) a held-only run reaches ingest_runs through the runner + the shared gate, with the structured sample in meta", async () => {
@@ -187,15 +214,18 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
     expect(shouldRecordProjectionRun(summary), "held work is a gate signal").toBe(true);
     const startedAt = Date.now() - 5;
     await recordIngestRun(db(), projectionRunInput(summary, "scheduler", startedAt, Date.now()));
-    const { data } = await db()
+    // Select THIS run's row by its own identity (the held group), not "newest" — another worktree's
+    // scheduler row on a shared container must not win (Fable diff review L2).
+    const { data: rows } = await db()
       .from("ingest_runs")
       .select("meta")
       .eq("source", "graph_project")
       .gte("started_at", new Date(startedAt - 1).toISOString())
       .order("finished_at", { ascending: false })
-      .limit(1)
-      .single();
-    const meta = (data as { meta: Record<string, unknown> }).meta;
+      .limit(20);
+    const mine = ((rows ?? []) as { meta: Record<string, unknown> }[]).find((r) => (r.meta.deepRequeueHeldByGroup as Record<string, number> | undefined)?.[f.teamGroup] === 1);
+    expect(mine, "the held-only run's durable row exists").toBeTruthy();
+    const meta = mine!.meta;
     expect(meta).toMatchObject({
       deepResolvedGroups: 1,
       deepRequeueHeld: 1,
