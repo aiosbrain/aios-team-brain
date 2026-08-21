@@ -72,8 +72,11 @@ times out right when the lookup path matters most.
   abort that failed, not a fit to one observation — and with D2 in place a timeout is no longer a
   lost pass, so the constant is a latency knob, not a correctness one.
 - **D4 — no change to the REST saturation semantics or to the lookup.** A listing that SUCCEEDS
-  behaves byte-for-byte as after GRAPHSAT-1 (small → REST verdict; full → lookup with the oracle).
-  Only the throw branch changes.
+  behaves as it does after GRAPHSAT-1 (small → REST verdict; full → lookup with the oracle). Only
+  the throw branch changes. This fence excludes nothing that needs a home: every behaviour it
+  keeps is already shipped and pinned (`graph-project`, `graph-saturated-heal` dm suites); the two
+  things deliberately not touched — a lookup-based cleanup and a smaller listing window — are
+  listed in §4 with where they go.
 - **D5 — graphiti redeploy-on-merge is NAMED, not fixed here.** The graphiti service rebuilding on
   every brain merge is a Railway root-directory/watch-path configuration, not code; it is recorded
   (ARCHITECTURE deploy notes) as the cause of the cold-cache restarts and left to an operator
@@ -113,7 +116,7 @@ times out right when the lookup path matters most.
    branch counts `unreachableGroups 1` and judges nothing — today's verdict plus the count;
    (d) the cleanup leg: a pending-delete row whose OLD-group listing throws → `unreachableCleanupGroups 1`,
    `cleaned 0`, `pendingCleanups 1`, the flag intact (today's behaviour, now counted); (e) a listing
-   that SUCCEEDS (small group) is byte-identical to before: `unreachableGroups 0`, the REST verdict.
+   that SUCCEEDS (small group) yields today's REST verdict with `unreachableGroups 0`.
 2. `npx vitest run test/graph-recording-gate.test.ts test/graph-projection-run.test.ts
    test/graphiti-client-timeout.test.ts` exits 0: `unreachableGroups 1` alone records;
    `unreachableCleanupGroups` rides meta when non-zero and is NOT a gate signal (the cleanup leg
