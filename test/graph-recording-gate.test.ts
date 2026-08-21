@@ -42,6 +42,7 @@ const quiet: GraphProjectionSummary = {
   unreachableCleanupGroups: 0,
   emptyListingGroups: 0,
   requeueEligible: 0,
+  watermarkAnchors: 0,
   walkMs: 0,
   reconcileMs: 0,
   errors: [],

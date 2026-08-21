@@ -80,8 +80,10 @@ async function fixture(): Promise<Fixture> {
   await setGraphEpisodes(fake, teamGroup, ids.partial, [`items:${ids.partial}#0`, `items:${ids.partial}#1`]);
   // NEVER LANDED: pushed (chunk ledger non-empty) but nothing in the graph.
   await setGraphEpisodes(fake, teamGroup, ids.never, []);
-  // Past the landed grace; uuids cleared so the backfill is observable.
-  await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z", episode_uuid: null }).eq("team_id", seed.teamId);
+  // Past the landed grace; uuids cleared so the backfill is observable. GRAPHSAT-2: first_seen_at set a
+  // second BEFORE the stamp so these read as genuine first pushes (a later first_seen_at = a
+  // migration-backfilled row, which never anchors the watermark).
+  await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z", first_seen_at: "2019-12-31T23:59:59Z", episode_uuid: null }).eq("team_id", seed.teamId);
   return { seed, slug, teamGroup, fake, ids };
 }
 
@@ -101,7 +103,7 @@ describe("GRAPHSAT-1 — the saturated group heals again (real Postgres, mocked 
     // Reset what the REST pass wrote so the deep pass judges the same fixture. GRAPHSAT-2 D5: a row
     // PARKED ('') by the REST pass is invisible to the lookup path (it awaits its re-push), so `never`
     // gets its real sha back here to be judged as a never-landed row again.
-    await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z", episode_uuid: null }).eq("team_id", f.seed.teamId);
+    await db().from("graph_episodes").update({ projected_at: "2020-01-01T00:00:00Z", first_seen_at: "2019-12-31T23:59:59Z", episode_uuid: null }).eq("team_id", f.seed.teamId);
     expect((await ledgerRow(f.seed.teamId, f.ids.never)).content_sha256).toBe(""); // parked by the REST pass
     await db().from("graph_episodes").update({ content_sha256: "real" }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.never);
 

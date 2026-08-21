@@ -252,6 +252,32 @@ describe("GRAPHSAT-2 — the landed watermark (real Postgres, mocked Graphiti, i
     expect(r.reQueued).toBe(0);
   });
 
+  it("AC1(l) CLOCK SKEW (Postgres 20 min ahead of the app): a true first push still anchors; a re-push whose raw delta is 0 does not (the correction, both directions)", async () => {
+    const X = 20 * 60_000;
+    const f = await fixture();
+    // As the DB would record under a +X skew: a TRUE first push at T0 has projected_at(app)=T0 and
+    // first_seen_at(db)=T0+X — raw delta −X (wrongly excluded without the correction).
+    const T0 = Date.now() - 2 * H;
+    await db().from("graph_episodes").update({ projected_at: new Date(T0).toISOString(), first_seen_at: new Date(T0 + X).toISOString(), episode_uuid: null }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.landed);
+    const r = await rec(f, { clockSkewMs: X });
+    expect(r.watermarkAnchors, "the true first push anchors once skew is corrected").toBe(1);
+    expect(r.requeueEligible).toBe(1); // `old` (3 days) proven lost against the T0 anchor
+    // Codex's shape: reserved at T0 (first_seen db = T0+X), EDITED and re-pushed at app time T0+X →
+    // projected_at = T0+X → raw delta 0 → would anchor at a queued push; corrected delta = X → excluded.
+    await db().from("graph_episodes").update({ projected_at: new Date(T0 + X).toISOString(), first_seen_at: new Date(T0 + X).toISOString(), episode_uuid: null, content_sha256: "edited" }).eq("team_id", f.seed.teamId).eq("source_id", f.ids.landed);
+    const r2 = await rec(f, { clockSkewMs: X });
+    expect(r2.watermarkAnchors, "the re-push does not anchor").toBe(0);
+    // (the parked `old` row is excluded from the lookup path; nothing else is eligible)
+    expect(r2.requeueEligible).toBe(0);
+  });
+
+  it("AC1(m) a failed skew probe (NaN) yields no anchors — conservative, nothing eligible", async () => {
+    const f = await fixture();
+    const r = await rec(f, { clockSkewMs: Number.NaN });
+    expect(r.watermarkAnchors).toBe(0);
+    expect(r.requeueEligible).toBe(0);
+  });
+
   it("AC1(h) REST-path (small group) re-queue is today's: past the grace, absent → re-queued regardless of any watermark", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);

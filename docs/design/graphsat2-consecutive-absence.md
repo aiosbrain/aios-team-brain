@@ -95,7 +95,13 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
   filter is TWO-SIDED (Codex diff review BLOCKER): a NEGATIVE delta (`first_seen_at` later than the
   stamp — the 2026-08-16 migration backfilled `first_seen_at` at migration time for 2,301 prod
   rows) means the "first accept ≥ `first_seen_at`" premise is fictional, so those rows never
-  anchor; new rows do. Re-pushed, re-queued, armed and tombstoned rows never
+  anchor; new rows do. And the delta is CLOCK-CORRECTED (Codex targeted re-check): `first_seen_at`
+  is the DATABASE clock (an INSERT default) while `projected_at` is the APP clock, so a constant
+  skew shifts the delta — and a Postgres-ahead skew can cancel against row age on a later re-push.
+  Reconcile measures the skew once per pass (`select now()` vs `Date.now()`) and brings
+  `first_seen_at` onto the app clock before comparing; a failed probe means no anchors that pass
+  (conservative, logged). `watermarkAnchors` rides meta on every deep-resolved pass so "held N,
+  eligible 0" is legible as "no valid anchor" vs "an older anchor". Re-pushed, re-queued, armed and tombstoned rows never
   anchor — conservative, and new items arrive constantly so anchors are not scarce. Residual, named:
   the straggler-after-verified-empty shape (an item purged and re-created while a leftover old
   episode survives) — rare, throttle-bounded. The EXACT successor is a brain-chosen episode uuid per
@@ -186,7 +192,9 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    and a queued row stays held; adding a genuine first push that landed restores the verdict for
    the truly old row only; (j) a TOMBSTONED-but-present row (`''` + pending flag, fresh stamp) does
    not anchor; (k) a MIGRATION-BACKFILLED row (`first_seen_at` later than its stamp) never
-   anchors; (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
+   anchors; (l) CLOCK SKEW (+20 min Postgres-ahead, injected): a true first push still anchors
+   after correction; a re-push whose RAW delta is 0 does not; (m) a failed skew probe → no
+   anchors, nothing eligible; (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
    held-counted nor re-written across a second reconcile before the projector re-pushes it;
    (d) the watermark is TEAM-wide: the only confirmation is in the EXTERNAL group (REST-judged),
    newer than General's old absent row → that row is eligible; (e) the margin: an absent row
@@ -218,7 +226,7 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    group instead of the team → AC1(d) reddens; (d) drop the margin → AC1(e) reddens; (e) apply the
    rule to the REST path → AC1(h) reddens; (f) count a parked row as eligible → AC1(c4) reddens;
    (i2) anchor on ANY present row (drop the first-push slack) → AC1(i) reddens; (j2) anchor a
-   tombstone → AC1(j) reddens; (k2) accept a negative delta → AC1(k) reddens;
+   tombstone → AC1(j) reddens; (k2) accept a negative delta → AC1(k) reddens; (l2) drop the skew correction → AC1(l) reddens;
    (g) collect anchors after the grace check → AC1(c3) reddens; (h) replay lookup writes before
    REST writes → AC1(g2) reddens.
 5. Full tiers green (`npm test`, dm iso graph set, `npm run test:http:local`, `npm run

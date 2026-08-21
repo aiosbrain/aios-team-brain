@@ -14,6 +14,7 @@ import { isExternalGroupId } from "./group";
 import { purgePartitionArcCache, sweepStaleScopedArcCache, sweepOrphanedPartitionArcCache } from "./arc-cache";
 import { evictPartitionArcMemory } from "./arcs";
 import { neo4jEpisodeLookup, type EpisodeLookup, type EpisodeRefLite } from "./episode-lookup";
+import { runSql } from "@/lib/db/pg/pool";
 
 /**
  * Reconcile pass for the brain→Graphiti seam (audit H3, Option B — chosen over blocking-confirm
@@ -225,6 +226,9 @@ export interface ReconcileSummary {
    * (a current projection claim past the grace) — the mass-disappearance shape. The bounded re-queue
    * (REQUEUE_MAX_PER_PASS) proceeds exactly as before; this makes the event LOUD. A gate signal. */
   emptyListingGroups: number;
+  /** GRAPHSAT-2: rows that ANCHORED the landed watermark this pass (present first pushes). Zero with
+   * present rows means "no valid anchor" — distinguishable from "an older valid anchor". */
+  watermarkAnchors: number;
   /** GRAPHSAT-2: never-landed rows on the lookup path that the landed watermark proves LOST (older
    * than the newest present FIRST-PUSH landing by more than the margin) — re-queued when `deepRequeue`
    * is on, held otherwise. Reported either way; with the flag OFF it is a recording-gate signal: work
@@ -262,6 +266,8 @@ export interface ReconcileOptions {
   deepRequeue?: boolean;
   /** GRAPHSAT-2 test seam: the watermark margin (default LANDED_WATERMARK_MARGIN_MS). */
   watermarkMarginMs?: number;
+  /** GRAPHSAT-2 test seam: the db−app clock skew in ms (default: measured once per pass via `select now()`). */
+  clockSkewMs?: number;
 }
 
 /** GRAPHSAT-1: the ONE place the env flag is parsed. Exact `"true"` — a truthiness check would make
@@ -398,6 +404,7 @@ export async function reconcileProjectedEpisodes(
       unreachableGroups: 0,
       unreachableCleanupGroups: 0,
       emptyListingGroups: 0,
+      watermarkAnchors: 0,
       requeueEligible: 0,
       errors: [],
     };
@@ -424,7 +431,7 @@ export async function reconcileProjectedEpisodes(
       cleaned: 0, cleanedExternal: 0, pendingCleanups: 0, requeueThrottled: 0, saturatedGroups: 0,
       deepResolvedGroups: 0, lookupMismatchGroups: 0, deepRequeueHeld: 0, deepRequeueHeldByGroup: {},
       deepRequeueSample: [], deepRequeueElided: 0, deepRequeueEnabled: deepRequeue,
-      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0, requeueEligible: 0,
+      unreachableGroups: 0, unreachableCleanupGroups: 0, emptyListingGroups: 0, watermarkAnchors: 0, requeueEligible: 0,
       errors: [`reconcile: ledger read failed: ${ledgerErr.message}`],
     };
   }
@@ -473,7 +480,23 @@ export async function reconcileProjectedEpisodes(
   // every group has been judged, so the watermark sees every landing and REST rows keep their
   // throttle priority in traversal order.
   let watermarkMs = Number.NEGATIVE_INFINITY;
+  let watermarkAnchors = 0;
   const tape: { row: EpisodeRow; groupId: string; deep: boolean }[] = [];
+  // `first_seen_at` is the DATABASE clock (an INSERT default); `projected_at` is the APP clock. The
+  // first-push delta compares the two, so a constant skew would shift it — and a Postgres-ahead skew
+  // can cancel against row age on a later re-push (Codex targeted re-check). Measure the skew once
+  // per pass and correct for it; a failed read means no anchors this pass (conservative), reported.
+  let clockSkewMs = options.clockSkewMs ?? Number.NaN;
+  if (options.clockSkewMs === undefined) {
+    try {
+      const appNow = Date.now();
+      const r = await runSql<{ now: string }>("select now() as now", []);
+      clockSkewMs = new Date(r.rows[0].now).getTime() - appNow; // db − app
+    } catch (err) {
+      console.warn(`[graph] reconcile: clock-skew probe failed — no watermark anchors this pass: ${err instanceof Error ? err.message : String(err)}`);
+      clockSkewMs = Number.NaN;
+    }
+  }
 
   // GRAPHSAT-2: DETERMINISTIC group traversal (sorted group_id). Throttle priority across groups was
   // Postgres heap order before — with a scarce budget, WHICH group's rows were re-queued first was
@@ -560,12 +583,15 @@ export async function reconcileProjectedEpisodes(
       if (!uuidByItemId.has(row.source_id)) continue;
       if (row.content_sha256 === "" || row.pending_delete_group_id) continue;
       const projectedAtMs = new Date(row.projected_at).getTime();
-      const delta = projectedAtMs - new Date(row.first_seen_at).getTime();
+      // first_seen_at brought onto the APP clock before the comparison.
+      const delta = projectedAtMs - (new Date(row.first_seen_at).getTime() - clockSkewMs);
+      if (!Number.isFinite(delta)) continue;
       // TWO-SIDED (Codex diff review BLOCKER): a NEGATIVE delta is not "safe, too low" — it means
       // `first_seen_at` is not this row's creation (the 2026-08-16 migration backfilled it at
       // migration time, later than old pushes), so the "first accept ≥ first_seen_at" bound is
       // fictional and the stamp may be a later, still-queued re-push. Such rows never anchor.
       if (delta < 0 || delta > FIRST_PUSH_SLACK_MS) continue;
+      watermarkAnchors++;
       watermarkMs = Math.max(watermarkMs, projectedAtMs);
     }
 
@@ -837,6 +863,7 @@ export async function reconcileProjectedEpisodes(
     unreachableGroups,
     unreachableCleanupGroups,
     emptyListingGroups,
+    watermarkAnchors,
     requeueEligible,
     errors,
     partialItems,

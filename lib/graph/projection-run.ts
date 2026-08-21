@@ -125,6 +125,8 @@ export function projectionRunInput(
       ...(summary.unreachableCleanupGroups ? { unreachableCleanupGroups: summary.unreachableCleanupGroups } : {}),
       ...(summary.emptyListingGroups ? { emptyListingGroups: summary.emptyListingGroups } : {}),
       ...(summary.requeueEligible ? { requeueEligible: summary.requeueEligible } : {}),
+      // Rides with any deep-resolved pass so "held N, eligible 0" is legible (anchors 0 vs an old anchor).
+      ...(summary.deepResolvedGroups ? { watermarkAnchors: summary.watermarkAnchors } : {}),
       ...(summary.deepRequeueHeld ? { deepRequeueHeld: summary.deepRequeueHeld, deepRequeueHeldByGroup: summary.deepRequeueHeldByGroup, deepRequeueSample: summary.deepRequeueSample, deepRequeueElided: summary.deepRequeueElided } : {}),
       // RECONCILE-1 measurement: items with SOME chunks landed and some missing. Durable because the
       // whole question is whether this is real in prod — a log line would leave the rate unknowable,
