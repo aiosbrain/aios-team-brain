@@ -39,8 +39,14 @@ function sha256(value: string): string {
 }
 
 function pathSegment(value: ClickUpId): string {
-  const segment = String(value).replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  return segment || sha256(String(value)).slice(0, 16);
+  const raw = String(value);
+  const segment = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  // Sanitizing is LOSSY: 'a.b' and 'a-b' both collapse to 'a-b', and `items` is unique on
+  // (team_id, project_id, path) — so two colliding ids meant one item silently overwrote the other.
+  // A sanitized id therefore carries a short digest of the raw id; an already-clean id returns
+  // unchanged, keeping every historical path stable.
+  if (segment === raw) return segment;
+  return segment ? `${segment}-${sha256(raw).slice(0, 8)}` : sha256(raw).slice(0, 16);
 }
 
 function projectFor(workspaceId: ClickUpId): string {

@@ -80,7 +80,7 @@ rounds of one model are correlated rather than additive. When one is
 unavailable, name which, and say so in the PR.
 
 ```
-codex exec --sandbox read-only -m gpt-5.5 "<prompt>" < /dev/null
+codex exec --sandbox read-only -m gpt-5.6-sol "<prompt>" < /dev/null
 ```
 
 Prompt discipline (same shape as the diff reviews, aimed at the design):
@@ -219,14 +219,17 @@ background) on the branch diff. The prompt shape that works:
 
 ## 4. Codex adversarial review
 
-`codex exec --sandbox read-only -m gpt-5.5 "<prompt>"` in the background. Same prompt
+`codex exec --sandbox read-only -m gpt-5.6-sol "<prompt>"` in the background. Same prompt
 discipline as step 2, plus:
 
-- **`gpt-5.5`, not `gpt-5.6`, on a ChatGPT-login account.** `-m gpt-5.6` fails the whole
-  run with `400 invalid_request_error: The 'gpt-5.6' model is not supported when using
-  Codex with a ChatGPT account` — and it fails AFTER the prompt is sent, so it burns a
-  round trip and reads like a hang if you are not watching the output. This step said
-  `gpt-5.6` and cost exactly that on GRAPHSMALL-1. Update the id when the account's
+- **`gpt-5.6-sol` (probe-verified supported on this account; previously `gpt-5.5`).** Bare `gpt-5.6`
+  failed on a ChatGPT-login account with `400 invalid_request_error: The 'gpt-5.6' model is
+  not supported when using Codex with a ChatGPT account` — and such failures land AFTER the
+  prompt is sent, burning a round trip and reading like a hang (this step said `gpt-5.6`
+  and cost exactly that on GRAPHSMALL-1). ALSO: quota exhaustion is a real state — the
+  account's rolling window ran dry 2026-08-20→22 mid-loop; when that happens, name the
+  missing reviewer in the PR rather than substituting a correlated same-model round and
+  calling it replication. Update the id when the account's
   supported set actually changes, and verify with a one-line probe before a long review.
 
 - Tell it what Fable found and what was folded (including refuted claims), and

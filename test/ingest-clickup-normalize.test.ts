@@ -266,6 +266,27 @@ describe("ClickUp task normalization", () => {
     });
   });
 
+  it("keeps native ids that sanitize identically on distinct item paths", () => {
+    // `pathSegment` collapses every non-[A-Za-z0-9_-] run to '-', so 'ID.7' and 'ID-7' landed on the
+    // SAME path — and `items` is unique on (team_id, project_id, path), so one task document silently
+    // overwrote the other. A sanitized id now carries a short digest of the raw id; an already-clean
+    // id keeps its historical path, so nothing re-imports under a new name.
+    const collisionRecords: ClickUpTaskRecord[] = [
+      { task: { id: "ID.7", name: "Dotted" }, observedListIds: ["101"] },
+      { task: { id: "ID-7", name: "Dashed" }, observedListIds: ["101"] },
+    ];
+    const docs = normalizeClickUpTaskDocs({ workspaceId: 9001, records: collisionRecords });
+
+    const paths = docs.map((doc) => doc.path);
+    expect(new Set(paths).size).toBe(2);
+    // The clean id is untouched; only the sanitized one is disambiguated.
+    expect(paths).toContain("clickup/9001/tasks/ID-7.md");
+    // Deterministic: the same raw id maps to the same path on every import.
+    const dotted = docs.find((doc) => doc.frontmatter.native_id === "ID.7")!;
+    const again = normalizeClickUpTaskDocs({ workspaceId: 9001, records: [collisionRecords[0]] });
+    expect(again[0].path).toBe(dotted.path);
+  });
+
   it("emits authors[] that the source-agnostic attribution resolver actually reads", () => {
     // AIO-924. `taskMetadata` stamps `assignee_ids`/`assignee_emails` (PLURAL), but nothing consumes
     // them: `parseAuthorRefs` handles `assignee_id` (SINGULAR) for linear/plane only, and there is no
