@@ -56,9 +56,11 @@ against these rather than asserted:
 Two separate paths, and conflating them is what produced a false safety argument:
 
 - **BOLT (the app → Neo4j): read-only, verified.** `lib/graph/neo4j.ts`'s `runRead` is the only
-  driver use in the app; it opens `session({ defaultAccessMode: neo4j.session.READ })` and calls
-  `executeRead`. There is no write helper, and `lib/graph/group.ts` — the only other bolt module —
-  contains no write verbs. This *would have* made reading prod's Neo4j directly safe. **It is
+  `neo4j-driver` use in the app; it opens `session({ defaultAccessMode: neo4j.session.READ })` and calls
+  `executeRead`. There is no write helper. (An earlier draft called `lib/graph/group` "the only other
+  bolt module" — **wrong in both directions**, found in code review: that module holds no bolt at all, and
+  the other bolt *call sites* are `lib/graph/learning.ts` and `lib/graph/extraction-health.ts`, both
+  through `runRead`. The read-only conclusion survives; the supporting sentence did not.) This *would have* made reading prod's Neo4j directly safe. **It is
   historical context only: this design no longer reads prod's Neo4j at all** (Decision 4), so nothing
   below rests on it — recorded so the killed shared-graph argument cannot be re-imported by a later
   reader who finds the verified half and assumes the conclusion.
@@ -379,7 +381,13 @@ set; a `docs/OPS.md` runbook section; tests for each guard layer separately.
    pattern cannot report "nothing missing" and read as a clean bill of health.
 3. **unit** — the guard REFUSES when the target lacks the staging marker, and names the marker.
 4. **unit** — the guard REFUSES when source and target resolve to the same host, independently of the
-   marker, so the copy-paste case dies before any connection is opened.
+   marker, so the copy-paste case dies before any connection is opened. Host comparison normalises a
+   trailing dot (`example.net.` and `example.net` are one DNS name): the marker layer would also catch
+   that pair, and a layer that only works with help is not a layer (criterion 5). **Refuted in review,
+   with the reason recorded:** a suggestion to compare `host:port` instead was declined — Railway's
+   proxy domains are regional and could one day be shared port-distinguished, but host-only comparison
+   fails in the SAFE direction (it refuses a legitimate refresh) while `host:port` would let a genuinely
+   same-host pair through. If it ever fires wrongly, the answer is not to weaken it.
 5. **unit** — each guard layer is asserted to fail ALONE, so a defence-in-depth stack cannot rot behind
    a sibling that happens to catch everything.
 6. **unit** — a guard fails the build if the script gains a DEFAULT for either URL, or ever passes
@@ -439,6 +447,40 @@ set; a `docs/OPS.md` runbook section; tests for each guard layer separately.
 16. **unit** — an EMPTY exclusion list is a REFUSAL, not an empty set of `--exclude-table-data` flags.
     An empty list produces a perfectly valid `pg_dump` invocation that copies every reversible-secret
     table, so "nothing to exclude" and "the exclusion step broke" must not be the same observable.
+
+17. **unit** — a connection URL is accepted only with a `postgres`/`postgresql` scheme and query
+    parameters from a small ALLOWLIST. **Verified by running it, not inferred:** libpq honours
+    `hostaddr` from a URI query string, so `postgresql://staging-proxy…/db?hostaddr=<prod-ip>` reads as
+    staging and connects to production — which defeats the same-host refusal (the parsed hosts differ)
+    **and** the marker refusal, because the operator's one-time `create table staging_marker` runs
+    through the same libpq and would plant the marker on prod. An allowlist, because a denylist would
+    have to enumerate every redirecting parameter forever.
+18. **unit** — every libpq invocation runs with the libpq ENVIRONMENT scrubbed and `psql -X`. Measured:
+    `PGHOSTADDR=127.0.0.1` sent a connection whose URL named a nonexistent host to 127.0.0.1, with the
+    URL untouched — so criterion 17 alone is half a fix. The scrub list has ONE owner (the decision
+    module; the shell reads it from there), and the runbook's one-time marker command carries the same
+    armour, since it is the only libpq call this design asks a human to make.
+19. **unit** — the restore runs in a SINGLE TRANSACTION. Without it, a restore that fails halfway has
+    already committed its drops: staging serves a half-dropped, half-restored database and the
+    completion warning never prints. Rolled back, staging keeps the environment it had.
+
+20. **unit** — the refresh REFUSES when the SOURCE carries the staging marker. The target-marker check
+    cannot see a swapped pair: if production ever acquired a marker (an operator declaring staging with
+    the target variable mis-set — the one moment they are juggling both urls), it keeps it forever and
+    every later swapped run passes. Reading the marker from the other side catches it, and the runbook
+    adds a human read-back against prod that does not depend on this script.
+21. **unit** — the exclusion set covers the FK-dependent CLOSURE of every excluded table, computed
+    transitively from the schema. Excluding a parent's data while dumping a child's is a restore that
+    fails at constraint creation. Measured: `gateway_connections` has three dependents and
+    `gateway_approvals` hangs off one of THEM — the one-level check read clean until the three were
+    added. All five hold zero rows in prod today, which is precisely why it is computed and not
+    remembered.
+22. **unit** — the decision CLI cannot approve by SILENCE. Its entry guard compared
+    `` `file://${process.argv[1]}` `` to `import.meta.url`, so from a symlinked path or one containing a
+    space it printed nothing and exited **0** — every refusal dead, with the shell reading exit 0 as
+    approval. Verified as a live bug, then fixed by realpathing both sides (`pathToFileURL` alone fixes
+    only the percent-encoding half). The durable half is a positive ACK token the shell requires, so any
+    future spelling of that bug stops the refresh instead of waving it through.
 
 ## What would falsify this
 

@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
   EXCLUDED_TABLE_DATA,
   REFUSAL,
   STAGING_MARKER_TABLE,
+  DECISION_ACK,
+  SCRUBBED_PG_ENV,
+  ALLOWED_URL_PARAMS,
+  fkDependents,
+  missingFkClosure,
   STAGING_VARIABLES,
   ciphertextTables,
   completionMessage,
@@ -74,6 +81,7 @@ const VALID = Object.freeze({
   sourceUrl: "postgresql://u:p@prod-proxy.rlwy.net:33781/railway",
   targetUrl: "postgresql://u:p@staging-proxy.rlwy.net:41999/railway",
   markerPresent: true,
+  sourceMarkerPresent: false, // production has no staging marker
   clientMajor: 18,
   serverMajor: 18,
 });
@@ -104,8 +112,12 @@ describe("staging-refresh — the exclusion CATEGORY (criteria 1, 2, 10)", () =>
   });
 
   it("finds a ciphertext column added by ALTER TABLE, not just one declared inside CREATE TABLE", () => {
-    // `integrations.secret_ciphertext` is added this way in the real schema. A scanner that only read
-    // create-table bodies would miss it and pass, while copying live connector credentials.
+    // The real schema uses BOTH shapes for `integrations.secret_ciphertext` — declared in the create-table
+    // body AND re-applied by an `alter … add column if not exists` (the migration-mirror pattern), so a
+    // create-only scanner would not miss THAT one. The gap this closes is the next column that arrives by
+    // migration alone, which is the documented way to add a column to an existing table in this repo.
+    // (An earlier version of this comment claimed the create-only scanner would miss `integrations`
+    // today. It would not; the claim was wrong and the test is still worth having.)
     const sql = `create table if not exists plain (id uuid primary key);\nalter table widgets add column if not exists secret_ciphertext text;`;
     expect(ciphertextTables(sql)).toEqual(["widgets"]);
   });
@@ -133,7 +145,7 @@ describe("staging-refresh — the exclusion CATEGORY (criteria 1, 2, 10)", () =>
     // neither vacuous (it matches one thing today) nor noisy (refactoring the derived path cannot red
     // it). If a second exemption appears, whoever added it must answer whether the ledger feeding it
     // also needs excluding from the staging dump.
-    const hits = sourceFiles(join(ROOT, "lib"))
+    const hits = [...sourceFiles(join(ROOT, "lib")), ...sourceFiles(join(ROOT, "app"))]
       .map((f) => ({ file: f, src: tsCode(readFileSync(f, "utf8")) }))
       .filter((f) => /failureClass:\s*"confirmed"/.test(f.src));
     expect(hits.map((h) => h.file.replace(`${ROOT}/`, ""))).toEqual(["lib/ingest/pipeline-health.ts"]);
@@ -198,16 +210,182 @@ describe("staging-refresh — the refusals, each proven to fail ALONE (criteria 
   });
 
   it("reports EVERY violated layer at once, so one layer cannot mask another", () => {
-    const allBad = { sourceUrl: "", targetUrl: "", markerPresent: null, clientMajor: 14, serverMajor: 18 };
+    const allBad = { sourceUrl: "", targetUrl: "", markerPresent: null, sourceMarkerPresent: null, clientMajor: 14, serverMajor: 18 };
     expect(codes(decideRefresh(allBad).refusals)).toEqual(
-      [REFUSAL.MISSING_SOURCE, REFUSAL.MISSING_TARGET, REFUSAL.MARKER_UNKNOWN, REFUSAL.PG_CLIENT_TOO_OLD].sort()
+      [
+        REFUSAL.MISSING_SOURCE,
+        REFUSAL.MISSING_TARGET,
+        REFUSAL.MARKER_UNKNOWN,
+        REFUSAL.MARKER_UNKNOWN, // target and source are separate readings, separately unknown
+        REFUSAL.PG_CLIENT_TOO_OLD,
+      ].sort()
     );
   });
 
   it("keeps the connected layers reachable on their own", () => {
-    expect(codes(refusalsForConnected({ markerPresent: true, clientMajor: 14, serverMajor: 18 }))).toEqual([
-      REFUSAL.PG_CLIENT_TOO_OLD,
+    expect(
+      codes(refusalsForConnected({ markerPresent: true, sourceMarkerPresent: false, clientMajor: 14, serverMajor: 18 }))
+    ).toEqual([REFUSAL.PG_CLIENT_TOO_OLD]);
+  });
+});
+
+describe("staging-refresh — the URL is not the destination (criteria 17, 18)", () => {
+  // VERIFIED BY RUNNING IT, not inferred: libpq honours `hostaddr` from a URI query string AND from
+  // the ambient environment, so a URL reading `staging-proxy…` can open a socket to production.
+  //   psql "postgresql://u@nonexistent-host-xyz.invalid:5432/db"                 → DNS failure
+  //   psql "postgresql://u@nonexistent-host-xyz.invalid:5432/db?hostaddr=127.0.0.1" → reached 127.0.0.1
+  //   PGHOSTADDR=127.0.0.1 psql "postgresql://u@nonexistent-host-xyz.invalid…"     → reached 127.0.0.1
+  // That defeats same-host (the parsed hosts differ) and the marker (the one-time create runs through
+  // the same libpq, so the marker gets planted on prod). Two layers, one bypass.
+  it("REFUSES a url carrying hostaddr — the parameter that moves the socket", () => {
+    const poisoned = { ...VALID, targetUrl: `${VALID.targetUrl}?hostaddr=10.0.0.9` };
+    expect(codes(decideRefresh(poisoned).refusals)).toEqual([REFUSAL.UNSAFE_CONNECTION_PARAMS]);
+    expect(decideRefresh(poisoned).refusals[0].reason).toMatch(/hostaddr/);
+  });
+
+  it("is an ALLOWLIST: an unknown parameter is refused even though it is not hostaddr", () => {
+    // The direction is the point. A denylist would have to enumerate every libpq parameter that can
+    // redirect a connection, forever; this refuses anything not known-inert.
+    expect(codes(decideRefresh({ ...VALID, sourceUrl: `${VALID.sourceUrl}?service=prod` }).refusals)).toEqual([
+      REFUSAL.UNSAFE_CONNECTION_PARAMS,
     ]);
+    expect(codes(decideRefresh({ ...VALID, sourceUrl: `${VALID.sourceUrl}?options=-csearch_path%3Devil` }).refusals)).toEqual([
+      REFUSAL.UNSAFE_CONNECTION_PARAMS,
+    ]);
+  });
+
+  it("ACCEPTS the inert parameters an operator actually needs — a refusal that fires on everything is not a check", () => {
+    expect(ALLOWED_URL_PARAMS).toContain("sslmode");
+    expect(decideRefresh({ ...VALID, targetUrl: `${VALID.targetUrl}?sslmode=require&connect_timeout=10` }).ok).toBe(true);
+  });
+
+  it("REFUSES a non-postgres scheme", () => {
+    expect(codes(decideRefresh({ ...VALID, targetUrl: "https://evil.example/db" }).refusals)).toEqual([
+      REFUSAL.UNSUPPORTED_SCHEME,
+    ]);
+    expect(decideRefresh({ ...VALID, targetUrl: "postgres://u:p@staging.example/db" }).ok).toBe(true);
+  });
+
+  it("treats a TRAILING DOT as the same host — the same-host layer must work alone", () => {
+    // `example.net.` and `example.net` are one DNS name. The marker layer would also catch this pair,
+    // which is exactly why it needed its own test: a layer that only works with help is not a layer.
+    expect(hostOf("postgresql://h.example.net./db")).toBe("h.example.net");
+    expect(
+      codes(refusalsForPreflight({ sourceUrl: "postgresql://h.example.net/db", targetUrl: "postgresql://h.example.net./db" }))
+    ).toEqual([REFUSAL.SAME_HOST]);
+  });
+
+  it("scrubs the libpq environment for every call, and the script uses the module's list", () => {
+    // PGHOSTADDR redirects with the URL untouched, so the allowlist above is only half the fix.
+    expect(SCRUBBED_PG_ENV).toContain("PGHOSTADDR");
+    expect(SCRUBBED_PG_ENV).toContain("PGSERVICE");
+    const script = shellCode(SCRIPT);
+    expect(script).toMatch(/scrubbed-env/); // the list comes FROM the module — one owner, no drift
+    // Every libpq invocation goes through the scrub: no bare psql/pg_dump/pg_restore call.
+    for (const m of script.matchAll(/^\s*(?:if\s+\w+="\$\()?"?(psql|\$PG_DUMP|\$PG_RESTORE)/gm)) {
+      throw new Error(`unscrubbed libpq invocation: ${m[0].trim()}`);
+    }
+    expect(script).toMatch(/PG_SCRUB\[@\]\}" psql -X/);
+    expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_DUMP"/);
+    expect(script).toMatch(/PG_SCRUB\[@\]\}" "\$PG_RESTORE"/);
+  });
+
+  it("REFUSES if the scrub list itself comes back empty", () => {
+    expect(shellCode(SCRIPT)).toMatch(/scrub list came back EMPTY/);
+  });
+
+  it("asks the one-time marker command in the runbook to carry the same armour", () => {
+    // The marker is created by a HUMAN running psql. If that call can be redirected, the marker lands
+    // on production and every later refusal reads a database it never inspected.
+    const ops = readFileSync(join(ROOT, "docs", "OPS.md"), "utf8");
+    const section = ops.slice(ops.indexOf("## 11. Staging refresh"));
+    const marker = section.slice(section.indexOf("create table if not exists staging_marker") - 600, section.indexOf("create table if not exists staging_marker") + 200);
+    expect(marker).toMatch(/-u PGHOSTADDR/);
+    expect(marker).toMatch(/psql -X/);
+  });
+
+  it("restores inside ONE transaction, so a failure leaves staging as it was", () => {
+    // Without it, a restore that dies halfway has already committed its drops: staging serves a
+    // half-dropped, half-restored database and the completion warning never prints.
+    expect(shellCode(SCRIPT)).toMatch(/--single-transaction\s+--clean\s+--if-exists\s+--no-owner/);
+  });
+});
+
+describe("staging-refresh — the swapped pair and the FK closure (criteria 20, 21)", () => {
+  it("REFUSES when the SOURCE carries the staging marker — the swap the target check cannot see", () => {
+    // If production ever acquired the marker by accident (an operator declaring staging with the target
+    // variable mis-set), the target check passes for a swapped pair FOREVER and nothing notices. Read
+    // the marker from the other side: a legitimate source is production, and production has no marker.
+    const swapped = { ...VALID, sourceMarkerPresent: true };
+    expect(codes(decideRefresh(swapped).refusals)).toEqual([REFUSAL.SOURCE_IS_STAGING]);
+    expect(decideRefresh(swapped).refusals[0].reason).toMatch(/swapped/);
+  });
+
+  it("REFUSES when the SOURCE marker is unreadable — unknown is a refusal on both sides", () => {
+    expect(codes(decideRefresh({ ...VALID, sourceMarkerPresent: null }).refusals)).toEqual([
+      REFUSAL.MARKER_UNKNOWN,
+    ]);
+  });
+
+  it("excludes the FK-dependent CLOSURE of every excluded table, transitively", () => {
+    // Excluding a parent's data while dumping a child's is not a subset — it is a restore that fails at
+    // constraint creation. Measured: gateway_connections has three dependents and gateway_approvals
+    // hangs off one of THEM, so a one-level check reported clean until the three were added.
+    expect(missingFkClosure(ALL_SQL)).toEqual([]);
+  });
+
+  it("is NON-VACUOUS about the closure: dropping one dependent reports it", () => {
+    const partial = EXCLUDED_TABLE_DATA.filter((t) => t !== "gateway_executions");
+    expect(missingFkClosure(ALL_SQL, partial)).toContain("gateway_executions");
+    expect(fkDependents(ALL_SQL, "gateway_connections")).toContain("gateway_executions");
+  });
+
+  it("does not claim a dependency that is not there", () => {
+    // graph_episodes deliberately has NO foreign key to items (docs/OPS.md §10 depends on that), so a
+    // scanner reporting one would be inventing edges.
+    expect(fkDependents(ALL_SQL, "graph_episodes")).toEqual([]);
+  });
+});
+
+describe("staging-refresh — the decision CLI cannot approve by silence (criterion 22)", () => {
+  it("refuses from a symlinked path and a path containing a space", () => {
+    // VERIFIED as a live bug before it was fixed: the entry guard compared `file://${process.argv[1]}`
+    // to import.meta.url, so from /tmp (a symlink to /private/tmp) or a directory with a space, main()
+    // never ran — no output, exit 0 — and the shell reads exit 0 as approval. Realpath BOTH sides:
+    // pathToFileURL alone fixes only the percent-encoding half.
+    const dir = mkdtempSync(join(tmpdir(), "staging refresh guard "));
+    const copy = join(dir, "decision.mjs");
+    copyFileSync(join(ROOT, "scripts", "staging-refresh-decision.mjs"), copy);
+    const res = spawnSync(process.execPath, [copy, "preflight", "--source", "", "--target", ""], {
+      encoding: "utf8",
+    });
+    expect(res.status).toBe(1);
+    expect(res.stderr).toMatch(/REFUSED/);
+    expect(res.stdout).not.toContain(DECISION_ACK);
+  });
+
+  it("prints a positive ack when it allows, and the shell REQUIRES that ack", () => {
+    const res = spawnSync(
+      process.execPath,
+      [
+        join(ROOT, "scripts", "staging-refresh-decision.mjs"),
+        "preflight",
+        "--source",
+        "postgresql://a.example/db",
+        "--target",
+        "postgresql://b.example/db",
+      ],
+      { encoding: "utf8" }
+    );
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain(DECISION_ACK);
+    // The shell must not treat exit 0 alone as approval — silence is the failure this pins.
+    const script = shellCode(SCRIPT);
+    expect(script).toContain(DECISION_ACK);
+    expect(script).toMatch(/produced no verdict/);
+    // …and every decision call goes through the ack-checking wrapper, not bare `node "$DECIDE"`.
+    const bare = [...script.matchAll(/^\s*node "\$DECIDE" (preflight|check)/gm)];
+    expect(bare).toEqual([]);
   });
 });
 
@@ -222,6 +400,8 @@ describe("staging-refresh — what the SCRIPT may and may not contain (criteria 
       const defaults = [...code.matchAll(new RegExp(`\\$\\{${name}:-([^}]*)\\}`, "g"))].map((m) => m[1]);
       expect(defaults.length).toBeGreaterThan(0); // it IS read — otherwise this test guards nothing
       expect(defaults.every((d) => d.trim() === "")).toBe(true);
+      // `:=` ASSIGNS a default and would sail past the check above, which only reads the `:-` form.
+      expect(code).not.toMatch(new RegExp(`\\$\\{${name}:=`));
     }
   });
 
@@ -229,6 +409,7 @@ describe("staging-refresh — what the SCRIPT may and may not contain (criteria 
     // `--create` drops and recreates the target database, which takes the staging marker with it —
     // and the marker is the only thing distinguishing a legal target from production.
     expect(code).not.toMatch(/--create\b/);
+    expect(code).not.toMatch(/\s-C\b/); // the short spelling does the same thing and read as clean
   });
 
   it("uses exactly the restore flags docs/OPS.md §Restore documents", () => {
@@ -275,6 +456,13 @@ describe("staging-refresh — what the SCRIPT may and may not contain (criteria 
     expect(code).toMatch(/REFUSED: the exclusion list came back EMPTY/);
   });
 
+  it("removes the dump on every exit path", () => {
+    // The dump holds prod items, member emails and api-key hashes. Left in /tmp it is a copy of
+    // production with no expiry, created by a script whose whole subject is not leaking production.
+    expect(code).toMatch(/trap cleanup EXIT/);
+    expect(code).toMatch(/rm -f "\$DUMP_FILE"/);
+  });
+
   it("prints a completion message naming the hazard no code here can close", () => {
     const msg = completionMessage();
     expect(msg).toMatch(/GRAPHITI_URL/);
@@ -299,13 +487,22 @@ describe("staging-refresh — the durable marker and the runbook (criteria 7, 13
     // dropping out of the prose while the design still depends on it.
     const ops = readFileSync(join(ROOT, "docs", "OPS.md"), "utf8");
     const section = ops.slice(ops.indexOf("## 11. Staging refresh"));
-    const documented = new Map<string, string>();
+    // Parse EVERY env-var row, not only the well-formed ones. A Map built from matches alone can
+    // equal the declared set while a second, contradictory row for the same variable sits beside it —
+    // the human reads the wrong one and the guard is still green.
     // `[A-Z0-9_]+`, with the digits: the first spelling of this pattern was `[A-Z_]+` and silently
-    // skipped `NEO4J_URL` — the row's absence read as agreement rather than as drift. The
-    // exact-set comparison below is what turned that into a failure instead of a quiet pass.
-    for (const m of section.matchAll(/^\|\s*`([A-Z0-9_]+)`\s*\|\s*(unset|`false`)\s*\|/gm)) {
-      documented.set(m[1], m[2] === "unset" ? "unset" : "false");
+    // skipped `NEO4J_URL` — the row's absence read as agreement rather than as drift.
+    const rows = [...section.matchAll(/^\|\s*`([A-Z0-9_]+)`\s*\|([^|]*)\|/gm)].map((m) => ({
+      name: m[1],
+      expected: m[2].trim(),
+    }));
+    expect(rows.length).toBe(STAGING_VARIABLES.length);
+    const names = rows.map((r) => r.name);
+    expect(names).toEqual([...new Set(names)]); // no variable documented twice
+    for (const row of rows) {
+      expect(["unset", "`false`"]).toContain(row.expected); // no free-text expectation
     }
+    const documented = new Map(rows.map((r) => [r.name, r.expected === "unset" ? "unset" : "false"]));
     const declared = new Map(STAGING_VARIABLES.map((v) => [v.name, v.expected]));
     expect([...documented.entries()].sort()).toEqual([...declared.entries()].sort());
   });

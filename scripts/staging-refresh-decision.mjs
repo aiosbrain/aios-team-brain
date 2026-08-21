@@ -26,13 +26,19 @@
  * to gather a value for a hundred boring reasons; none of them should end with a `--clean` restore.
  */
 
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 /** Refusal codes. Exported so tests name the layer they are pinning instead of matching prose. */
 export const REFUSAL = Object.freeze({
   MISSING_SOURCE: "missing-source-url",
   MISSING_TARGET: "missing-target-url",
+  UNSUPPORTED_SCHEME: "unsupported-scheme",
+  UNSAFE_CONNECTION_PARAMS: "unsafe-connection-params",
   SAME_HOST: "same-host",
   NO_MARKER: "no-staging-marker",
   MARKER_UNKNOWN: "staging-marker-unknown",
+  SOURCE_IS_STAGING: "source-carries-staging-marker",
   PG_CLIENT_TOO_OLD: "pg-client-too-old",
   PG_VERSION_UNKNOWN: "pg-version-unknown",
 });
@@ -67,7 +73,11 @@ export const STAGING_MARKER_REMEDY = `psql "$STAGING_REFRESH_TARGET_URL" -c 'cre
  *      red "graph extraction is broken" banner, manufactured by our own refresh.
  */
 export const EXCLUDED_TABLE_DATA = Object.freeze([
+  "gateway_approvals",
+  "gateway_audit_log",
   "gateway_connections",
+  "gateway_executions",
+  "gateway_resolution_leases",
   "graph_episodes",
   "integrations",
   "member_secrets",
@@ -160,22 +170,170 @@ export function missingCiphertextExclusions(sql, excluded = EXCLUDED_TABLE_DATA)
   return ciphertextTables(sql).filter((t) => !set.has(t));
 }
 
+const REFERENCES_RE = /\breferences\s+(?:"?public"?\.)?"?([a-z0-9_]+)"?/i;
+
+/**
+ * Tables holding a FOREIGN KEY to `table`. Excluding a parent's DATA while dumping a child's is not a
+ * tidy subset — it is a restore that FAILS: `pg_restore` loads the child rows and then cannot create
+ * the constraint. With `--single-transaction` the whole refresh rolls back, so the failure is loud
+ * rather than corrupting, but staging simply never refreshes again once the child table has a row.
+ *
+ * Measured 2026-08-20: `gateway_connections` has three dependents (`gateway_executions`,
+ * `gateway_resolution_leases`, `gateway_audit_log`) and every one of them holds ZERO rows in prod
+ * today — which is exactly why this is computed rather than remembered. A latent break that waits for
+ * the gateway subsystem to be used is the kind this spec has already been caught by once.
+ */
+export function fkDependents(sql, table) {
+  const lines = stripSqlComments(sql).split("\n");
+  const target = String(table).toLowerCase();
+  const out = new Set();
+  let current = null;
+  for (const line of lines) {
+    const created = CREATE_TABLE_RE.exec(line);
+    if (created) current = created[1].toLowerCase();
+    const altered = ALTER_TABLE_RE.exec(line);
+    if (altered) current = altered[1].toLowerCase();
+    const ref = REFERENCES_RE.exec(line);
+    if (ref && ref[1].toLowerCase() === target && current && current !== target) out.add(current);
+  }
+  return [...out].sort();
+}
+
+/**
+ * Dependents of an excluded table that are NOT themselves excluded — i.e. the restore breakage.
+ *
+ * TRANSITIVE, and that is not theoretical: excluding `gateway_connections` pulls in `gateway_executions`,
+ * and `gateway_approvals` hangs off THAT. A one-level check reported a clean closure right up until the
+ * three direct dependents were added, and then found a fourth. Walk it to a fixed point or the answer
+ * depends on how many rounds someone happened to run.
+ */
+export function missingFkClosure(sql, excluded = EXCLUDED_TABLE_DATA) {
+  const set = new Set(excluded.map((t) => t.toLowerCase()));
+  const missing = new Set();
+  const queue = [...set];
+  const seen = new Set(queue);
+  while (queue.length > 0) {
+    const table = queue.shift();
+    for (const dep of fkDependents(sql, table)) {
+      if (!set.has(dep)) missing.add(dep);
+      if (!seen.has(dep)) {
+        seen.add(dep);
+        queue.push(dep);
+      }
+    }
+  }
+  return [...missing].sort();
+}
+
 /** `--exclude-table-data=` arguments, in a stable order so the guard can compare them literally. */
 export function excludeTableDataArgs(excluded = EXCLUDED_TABLE_DATA) {
   return [...excluded].sort().map((t) => `--exclude-table-data=${t}`);
 }
 
 /**
+ * Query parameters a connection URL may carry. An ALLOWLIST, not a denylist, and that direction is the
+ * whole point.
+ *
+ * ── The attack this closes, verified by running it ──────────────────────────────────────────────
+ * libpq accepts connection PARAMETERS in a URI's query string, including `hostaddr` — which overrides
+ * where the socket actually goes while leaving the hostname for authentication. Measured:
+ *
+ *     psql "postgresql://u@nonexistent-host-xyz.invalid:5432/db"
+ *       → could not translate host name "nonexistent-host-xyz.invalid"
+ *     psql "postgresql://u@nonexistent-host-xyz.invalid:5432/db?hostaddr=127.0.0.1"
+ *       → connection to server at "127.0.0.1" … role "u" does not exist
+ *
+ * So a target URL reading `staging-proxy.rlwy.net` can connect to production. That defeats the
+ * same-host refusal (the parsed hosts differ) AND the marker refusal — because the operator's one-time
+ * `create table staging_marker` runs through the same libpq and would plant the marker ON PRODUCTION,
+ * after which a `pg_restore --clean` follows it there. Two layers, one bypass, and the outcome is the
+ * catastrophic direction this whole script exists to prevent.
+ *
+ * A denylist would have to enumerate every libpq parameter that can redirect a connection, forever. The
+ * allowlist inverts the default: anything not known-inert is a refusal.
+ */
+export const ALLOWED_URL_PARAMS = Object.freeze([
+  "application_name",
+  "connect_timeout",
+  "sslcert",
+  "sslkey",
+  "sslmode",
+  "sslrootcert",
+]);
+
+/**
+ * The libpq environment variables that can redirect or re-authenticate a connection independently of
+ * the URL — `PGHOSTADDR` does it with the URL untouched, measured the same way as above. The shell
+ * scrubs every one of these before invoking psql/pg_dump/pg_restore; this list is exported so the
+ * script and its guard cannot drift apart.
+ */
+export const SCRUBBED_PG_ENV = Object.freeze([
+  "PGHOST",
+  "PGHOSTADDR",
+  "PGPORT",
+  "PGDATABASE",
+  "PGUSER",
+  "PGPASSWORD",
+  "PGPASSFILE",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGOPTIONS",
+  "PGTARGETSESSIONATTRS",
+  "PGREQUIRESSL",
+  "PGSSLMODE",
+]);
+
+/**
+ * Refusals about the SHAPE of one connection URL: an unsupported scheme, or any query parameter
+ * outside the allowlist above. Returns [] for a URL that cannot be parsed at all — that case is
+ * `hostOf`'s missing-url refusal, and reporting both would be one fault wearing two hats.
+ */
+function refusalsForUrlShape(url, label) {
+  const raw = String(url ?? "").trim();
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return [];
+  }
+  const out = [];
+  const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
+  if (scheme !== "postgres" && scheme !== "postgresql") {
+    out.push({
+      code: REFUSAL.UNSUPPORTED_SCHEME,
+      reason: `${label} uses the "${scheme}" scheme; only postgres:// and postgresql:// are accepted. A URL this script cannot reason about is a URL it must not hand to pg_restore.`,
+    });
+  }
+  const allowed = new Set(ALLOWED_URL_PARAMS);
+  const offending = [...parsed.searchParams.keys()].filter((k) => !allowed.has(k.toLowerCase()));
+  if (offending.length > 0) {
+    out.push({
+      code: REFUSAL.UNSAFE_CONNECTION_PARAMS,
+      reason: `${label} carries connection parameter(s) this script will not accept: ${offending.join(", ")}. libpq lets a query parameter such as hostaddr send the connection somewhere other than the hostname says — which would defeat both the same-host and the staging-marker refusals. Allowed: ${ALLOWED_URL_PARAMS.join(", ")}.`,
+    });
+  }
+  return out;
+}
+
+/**
  * The host a connection string points at, lowercased, or null when it cannot be parsed. Null is NOT
  * "different from everything": `refusalsForPreflight` treats an unparseable URL as a refusal, because
  * "I could not tell whether these are the same database" must never read as "they differ".
+ *
+ * A TRAILING DOT is stripped: `example.net.` and `example.net` are the same DNS name, and without this
+ * the same-host layer would let that pair through — the marker layer would still catch it, but a
+ * defence-in-depth stack whose layers only work together is one this spec explicitly refuses.
+ *
+ * What this is NOT: proof of the TCP destination. That guarantee comes from `ALLOWED_URL_PARAMS` plus
+ * the shell's `SCRUBBED_PG_ENV`; without those two, the hostname is a label rather than an address.
  */
 export function hostOf(url) {
   const raw = String(url ?? "").trim();
   if (!raw) return null;
   try {
     const parsed = new URL(raw);
-    const host = parsed.hostname.toLowerCase();
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
     return host || null;
   } catch {
     return null;
@@ -207,6 +365,8 @@ export function refusalsForPreflight(input) {
         "STAGING_REFRESH_TARGET_URL is unset or unparseable. There is deliberately no default: this URL is the one a `pg_restore --clean` destroys.",
     });
   }
+  out.push(...refusalsForUrlShape(input?.sourceUrl, "the SOURCE url"));
+  out.push(...refusalsForUrlShape(input?.targetUrl, "the TARGET url"));
   if (sourceHost && targetHost && sourceHost === targetHost) {
     out.push({
       code: REFUSAL.SAME_HOST,
@@ -235,6 +395,23 @@ export function refusalsForConnected(input) {
     out.push({
       code: REFUSAL.NO_MARKER,
       reason: `the target database has no "${STAGING_MARKER_TABLE}" table, so it has not been declared a staging database. Production does not have this table and never will (it is absent from postgres/schema.sql by design), which is exactly what makes its absence a refusal. To declare a target: ${STAGING_MARKER_REMEDY}`,
+    });
+  }
+  // The SWAPPED PAIR, which the target-marker check alone cannot see. If the operator once declared a
+  // database staging while their shell pointed at production, prod carries the marker permanently and
+  // nothing in this repo would ever notice — so a later `--source staging --target prod` passes both
+  // the host check (they differ) and the marker check. Reading the marker on the SOURCE catches it from
+  // the other side: the source of a legitimate refresh is production, and production has no marker.
+  const sourceMarker = input?.sourceMarkerPresent;
+  if (sourceMarker === true) {
+    out.push({
+      code: REFUSAL.SOURCE_IS_STAGING,
+      reason: `the SOURCE database carries the "${STAGING_MARKER_TABLE}" table, so it is a staging database. This refresh copies production INTO staging; a staging source means the two urls are swapped, and continuing would restore over the database you meant to read.`,
+    });
+  } else if (sourceMarker !== false) {
+    out.push({
+      code: REFUSAL.MARKER_UNKNOWN,
+      reason: `could not determine whether the SOURCE has the "${STAGING_MARKER_TABLE}" table. Unknown is a refusal, not a pass.`,
     });
   }
   out.push(...pgVersionRefusals(input?.clientMajor, input?.serverMajor));
@@ -308,7 +485,10 @@ function main(argv) {
     return i >= 0 ? argv[i + 1] : undefined;
   };
   const print = (refusals) => {
-    if (refusals.length === 0) return 0;
+    if (refusals.length === 0) {
+      console.log(DECISION_ACK);
+      return 0;
+    }
     for (const r of refusals) console.error(`staging-refresh REFUSED [${r.code}]: ${r.reason}`);
     return 1;
   };
@@ -317,17 +497,23 @@ function main(argv) {
     return print(refusalsForPreflight({ sourceUrl: arg("source"), targetUrl: arg("target") }));
   }
   if (cmd === "check") {
-    const markerRaw = arg("marker");
-    const marker = markerRaw === "true" ? true : markerRaw === "false" ? false : null;
+    const asBool = (v) => (v === "true" ? true : v === "false" ? false : null);
+    const marker = asBool(arg("marker"));
+    const sourceMarker = asBool(arg("source-marker"));
     return print(
       decideRefresh({
         sourceUrl: arg("source"),
         targetUrl: arg("target"),
         markerPresent: marker,
+        sourceMarkerPresent: sourceMarker,
         clientMajor: Number(arg("client-major")),
         serverMajor: Number(arg("server-major")),
       }).refusals
     );
+  }
+  if (cmd === "scrubbed-env") {
+    console.log(SCRUBBED_PG_ENV.join("\n"));
+    return 0;
   }
   if (cmd === "exclude-args") {
     console.log(excludeTableDataArgs().join("\n"));
@@ -337,8 +523,35 @@ function main(argv) {
     console.log(completionMessage());
     return 0;
   }
-  console.error("usage: staging-refresh-decision.mjs <preflight|check|exclude-args|completion>");
+  console.error("usage: staging-refresh-decision.mjs <preflight|check|exclude-args|scrubbed-env|completion>");
   return 2;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) process.exit(main(process.argv));
+/**
+ * Realpath both sides, not a template string. `file://${process.argv[1]}` silently fails to match whenever
+ * the path is symlinked or contains a character a URL percent-encodes — node resolves `argv[1]` without
+ * realpath while `import.meta.url` follows symlinks and encodes. VERIFIED: run from `/tmp/…` (a symlink
+ * to `/private/tmp`) or from a directory with a SPACE in its name, this file printed nothing and exited
+ * **0** — every refusal above dead, and the shell reads exit 0 as approval.
+ *
+ * The comparison is the fix; `ACK` is the reason it cannot silently break again. The shell requires the
+ * ack token on stdout, so a CLI that no-ops for ANY future reason produces no token and the refresh
+ * stops. "Unknown is a refusal" has to hold at the process boundary too, not only inside it.
+ */
+export const DECISION_ACK = "staging-refresh: DECISION OK";
+
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    // BOTH sides realpath'd. `pathToFileURL` alone fixes the percent-encoding half and NOT the symlink
+    // half — measured: from `/tmp/…` (a symlink to `/private/tmp`) the encoded urls still differ, so the
+    // CLI kept no-opping. Two distinct causes, one symptom; fixing the visible one would have looked
+    // like a fix and left the refusals dead.
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) process.exit(main(process.argv));
