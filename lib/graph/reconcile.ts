@@ -146,6 +146,8 @@ export const LANDED_WATERMARK_MARGIN_MS = resolvePositiveInt(process.env.GRAPH_L
  * that landed accept, so the FIFO processed it — even if the anchor row was edited and re-pushed
  * inside the slack. Measured gap for first pushes in prod (2026-08-21): p50 0.36 s, p95 0.95 s,
  * p99 1.1 s, none between 1 and 10 min — 60 s excludes nothing real. `margin > slack` is pinned.
+ * The filter is TWO-SIDED: rows whose `first_seen_at` post-dates their stamp (the migration backfill)
+ * never anchor, because for them the bound's premise does not hold.
  * Residual, named: the straggler-after-verified-empty shape (an item purged then re-created while a
  * leftover old episode survives) — rare, and bounded by the throttle. The exact successor is a
  * brain-chosen episode uuid per push recorded in the ledger (`/messages` accepts a client `uuid`).
@@ -227,8 +229,8 @@ export interface ReconcileSummary {
    * than the newest present FIRST-PUSH landing by more than the margin) — re-queued when `deepRequeue`
    * is on, held otherwise. Reported either way; with the flag OFF it is a recording-gate signal: work
    * is proven ready and waits on a human. With the flag ON, eligible rows past the throttle cap land in
-   * `requeueThrottled` (not held, not sampled): the lookup population that pass is
-   * deepRequeueHeld + reQueued + requeueThrottled. */
+   * `requeueThrottled` (not held, not sampled) — `reQueued`/`requeueThrottled` mix both paths, so the
+   * ELIGIBLE count is this field and the per-path disposition is not reconstructible from meta. */
   requeueEligible: number;
   /** RECONULL-1: errors this pass could not represent as a counter (the pending-cleanup count re-read
    * failing). The runner merges them into the run's errors; every other counter and this pass's
@@ -558,7 +560,12 @@ export async function reconcileProjectedEpisodes(
       if (!uuidByItemId.has(row.source_id)) continue;
       if (row.content_sha256 === "" || row.pending_delete_group_id) continue;
       const projectedAtMs = new Date(row.projected_at).getTime();
-      if (projectedAtMs - new Date(row.first_seen_at).getTime() > FIRST_PUSH_SLACK_MS) continue;
+      const delta = projectedAtMs - new Date(row.first_seen_at).getTime();
+      // TWO-SIDED (Codex diff review BLOCKER): a NEGATIVE delta is not "safe, too low" — it means
+      // `first_seen_at` is not this row's creation (the 2026-08-16 migration backfilled it at
+      // migration time, later than old pushes), so the "first accept ≥ first_seen_at" bound is
+      // fictional and the stamp may be a later, still-queued re-push. Such rows never anchor.
+      if (delta < 0 || delta > FIRST_PUSH_SLACK_MS) continue;
       watermarkMs = Math.max(watermarkMs, projectedAtMs);
     }
 

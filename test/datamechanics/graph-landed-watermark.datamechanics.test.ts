@@ -243,6 +243,15 @@ describe("GRAPHSAT-2 — the landed watermark (real Postgres, mocked Graphiti, i
     expect(r.reQueued).toBe(0);
   });
 
+  it("AC1(k) a MIGRATION-BACKFILLED row (first_seen_at later than projected_at) never anchors — its stamp could be a queued re-push", async () => {
+    const f = await fixture();
+    // `landed` present, stamped 2h ago, but first_seen_at 1h ago (backfilled later than the push).
+    await stamp(f.seed.teamId, f.ids.landed, 2 * H, 1 * H);
+    const r = await rec(f);
+    expect(r.requeueEligible, "no valid anchor → nothing proven lost").toBe(0);
+    expect(r.reQueued).toBe(0);
+  });
+
   it("AC1(h) REST-path (small group) re-queue is today's: past the grace, absent → re-queued regardless of any watermark", async () => {
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);

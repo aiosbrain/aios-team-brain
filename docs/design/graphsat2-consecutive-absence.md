@@ -91,7 +91,11 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
   `projected_at − slack`; a candidate is judged lost only if older than `projected_at − margin`;
   with `margin > slack` (pinned — the module throws otherwise) every such candidate was accepted
   strictly before a landed accept, so the FIFO processed it — this holds even if the anchor row was
-  edited and re-pushed inside the slack, which closes the "edited within the slack" residual. Re-pushed, re-queued, armed and tombstoned rows never
+  edited and re-pushed inside the slack, which closes the "edited within the slack" residual. The
+  filter is TWO-SIDED (Codex diff review BLOCKER): a NEGATIVE delta (`first_seen_at` later than the
+  stamp — the 2026-08-16 migration backfilled `first_seen_at` at migration time for 2,301 prod
+  rows) means the "first accept ≥ `first_seen_at`" premise is fictional, so those rows never
+  anchor; new rows do. Re-pushed, re-queued, armed and tombstoned rows never
   anchor — conservative, and new items arrive constantly so anchors are not scarce. Residual, named:
   the straggler-after-verified-empty shape (an item purged and re-created while a leftover old
   episode survives) — rare, throttle-bounded. The EXACT successor is a brain-chosen episode uuid per
@@ -181,7 +185,8 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    under its old episodes) does NOT anchor — with it as the only present row nothing is proven lost
    and a queued row stays held; adding a genuine first push that landed restores the verdict for
    the truly old row only; (j) a TOMBSTONED-but-present row (`''` + pending flag, fresh stamp) does
-   not anchor; (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
+   not anchor; (k) a MIGRATION-BACKFILLED row (`first_seen_at` later than its stamp) never
+   anchors; (c4) a PARKED row (`''`, chunk ledger non-empty) on the lookup path is neither eligible nor
    held-counted nor re-written across a second reconcile before the projector re-pushes it;
    (d) the watermark is TEAM-wide: the only confirmation is in the EXTERNAL group (REST-judged),
    newer than General's old absent row → that row is eligible; (e) the margin: an absent row
@@ -213,7 +218,7 @@ deployment invariant in `docs/RAILWAY-TEMPLATE.md` (no horizontal scaling of the
    group instead of the team → AC1(d) reddens; (d) drop the margin → AC1(e) reddens; (e) apply the
    rule to the REST path → AC1(h) reddens; (f) count a parked row as eligible → AC1(c4) reddens;
    (i2) anchor on ANY present row (drop the first-push slack) → AC1(i) reddens; (j2) anchor a
-   tombstone → AC1(j) reddens;
+   tombstone → AC1(j) reddens; (k2) accept a negative delta → AC1(k) reddens;
    (g) collect anchors after the grace check → AC1(c3) reddens; (h) replay lookup writes before
    REST writes → AC1(g2) reddens.
 5. Full tiers green (`npm test`, dm iso graph set, `npm run test:http:local`, `npm run
