@@ -2,12 +2,16 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import neo4j, { type Driver } from "neo4j-driver";
 import { recentFacts, recentEvents } from "@/lib/graph/learning";
 import { closeNeo4j } from "@/lib/graph/neo4j";
+import { lookupItemEpisodes, LOOKUP_BATCH } from "@/lib/graph/episode-lookup";
 
 /**
  * Tier-isolation proof for the direct Neo4j reads behind the Brain-Learning panel. Graphiti has no
  * tier awareness — tier is encoded in `group_id`, and `WHERE group_id IN $groups` is the SOLE thing
  * stopping an `external` viewer from reading team facts (no RLS backstop, CLAUDE.md §5). Self-skips
  * unless NEO4J_TEST is set (needs a real Neo4j): `npm run db:test:neo4j:up && npm run test:neo4j`.
+ *
+ * NB: `recentFacts` returns `{ facts, ok }` since the learning panel's ok-discriminator landed; this
+ * tier is not in CI and had rotted against the old array return — repaired in passing by GRAPHSAT-1.
  */
 
 const live = process.env.NEO4J_TEST ? describe : describe.skip;
@@ -51,7 +55,7 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
   });
 
   it("returns facts for a tier's visible group, and carries the type + episodes", async () => {
-    const facts = await recentFacts([TEAM], since);
+    const facts = (await recentFacts([TEAM], since)).facts;
     expect(facts.map((f) => f.fact)).toContain("Alice owns Payments");
     const team = facts.find((f) => f.id === "f-team")!;
     expect(team.subjectType).toBe("person"); // subject entity label → badge
@@ -60,12 +64,57 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
   });
 
   it("an external viewer NEVER sees team facts (sole tier enforcement)", async () => {
-    const facts = await recentFacts([EXT], since);
+    const facts = (await recentFacts([EXT], since)).facts;
     expect(facts.map((f) => f.fact)).toEqual(["Bob owns PublicSite"]);
   });
 
+  // ── GRAPHSAT-1 AC3: the per-item episode lookup reconcile uses for a SATURATED group ──────────
+  describe("lookupItemEpisodes (real Cypher, real Neo4j)", () => {
+    const G = "sat_team";
+    const OTHER = "sat_other";
+    beforeAll(async () => {
+      const s = driver.session();
+      try {
+        await s.run(
+          `CREATE (:Episodic {uuid:'x-bare', name:'items:x', group_id:$g})
+           CREATE (:Episodic {uuid:'x-0', name:'items:x#0', group_id:$g})
+           CREATE (:Episodic {uuid:'x-1', name:'items:x#1', group_id:$g})
+           CREATE (:Episodic {uuid:'xd', name:'items:xd', group_id:$g})
+           CREATE (:Episodic {uuid:'corr', name:'correction:x', group_id:$g})
+           CREATE (:Episodic {uuid:'x-other', name:'items:x', group_id:$o})
+           CREATE (:Episodic {uuid:'far', name:'items:far-id#3', group_id:$g})`,
+          { g: G, o: OTHER }
+        );
+      } finally {
+        await s.close();
+      }
+    });
+
+    it("returns EVERY present chunk of a ledger item in the asked group — bare, #0, #1 — with uuids; never the same id in another group, a longer stem, or a correction episode", async () => {
+      const out = await lookupItemEpisodes(G, ["x"]);
+      expect(out).not.toBeNull();
+      expect(out!.map((r) => r.name).sort()).toEqual(["items:x", "items:x#0", "items:x#1"]);
+      expect(out!.map((r) => r.uuid).sort()).toEqual(["x-0", "x-1", "x-bare"]);
+    });
+
+    it("group scope is the SOLE isolation: asking OTHER for the same id returns only OTHER's node", async () => {
+      const out = await lookupItemEpisodes(OTHER, ["x"]);
+      expect(out!.map((r) => r.uuid)).toEqual(["x-other"]);
+    });
+
+    it("an id with no episodes resolves to nothing (absent means absent, not beyond a window)", async () => {
+      expect(await lookupItemEpisodes(G, ["nope"])).toEqual([]);
+    });
+
+    it(">LOOKUP_BATCH ids chunk correctly — an id in the second chunk resolves", async () => {
+      const filler = Array.from({ length: LOOKUP_BATCH }, (_, i) => `f${i}`);
+      const out = await lookupItemEpisodes(G, [...filler, "far-id"]);
+      expect(out!.map((r) => r.uuid)).toEqual(["far"]);
+    });
+  });
+
   it("empty visible-groups returns nothing (fail closed)", async () => {
-    expect(await recentFacts([], since)).toEqual([]);
+    expect((await recentFacts([], since)).facts).toEqual([]);
   });
 
   // Noise filter (measured ~1/3 of a real team's edges): Graphiti records entity-dedup as a
@@ -82,7 +131,7 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
          CREATE (a1)-[:RELATES_TO {uuid:'f-named', name:'MENTORS', fact:'Alice mentors Bob', created_at:datetime(), group_id:$team, episodes:['ep1']}]->(b1)`,
         { team: TEAM }
       );
-      const facts = await recentFacts([TEAM], since);
+      const facts = (await recentFacts([TEAM], since)).facts;
       const texts = facts.map((f) => f.fact);
       expect(texts).toContain("Alice owns Payments"); // real fact survives (no name property)
       // A named, non-expired edge MUST survive — guards against an over-broad filter (e.g. dropping
@@ -119,9 +168,9 @@ live("Graphiti Neo4j tier isolation (real Neo4j)", () => {
   const future = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
 
   it("facts: falls back to most-recent-N when the window is empty (still tier-scoped)", async () => {
-    const facts = await recentFacts([TEAM], future);
+    const facts = (await recentFacts([TEAM], future)).facts;
     expect(facts.map((f) => f.fact)).toContain("Alice owns Payments"); // stale fact surfaces
-    const ext = await recentFacts([EXT], future);
+    const ext = (await recentFacts([EXT], future)).facts;
     expect(ext.map((f) => f.fact)).toEqual(["Bob owns PublicSite"]); // external still scoped
     expect(ext.map((f) => f.fact)).not.toContain("Alice owns Payments");
   });
@@ -171,7 +220,7 @@ live("Brain-Learning work-time ordering (real Neo4j)", () => {
   });
 
   it("orders by WORK time (valid_at), returns it as `at`, falls back to created_at, clamps a future valid_at", async () => {
-    const facts = await recentFacts([WT], null);
+    const facts = (await recentFacts([WT], null)).facts;
     expect(facts.map((f) => f.fact)).toEqual(["fact D", "fact A", "fact B", "fact C"]); // work-order, not created-order (A,B,D,C)
     expect(facts.find((f) => f.fact === "fact A")!.at).toMatch(/^2026-06-04/); // valid_at (not created 2026-06-10)
     expect(facts.find((f) => f.fact === "fact C")!.at).toMatch(/^2026-06-02/); // no valid_at → created_at fallback
@@ -194,7 +243,7 @@ live("Brain-Learning work-time ordering (real Neo4j)", () => {
     } finally {
       await s.close();
     }
-    const facts = await recentFacts([WW], new Date(Date.now() - 86400_000).toISOString());
+    const facts = (await recentFacts([WW], new Date(Date.now() - 86400_000).toISOString())).facts;
     expect(facts.map((f) => f.fact)).toContain("fresh work");
     expect(facts.map((f) => f.fact)).not.toContain("reprojected old"); // worked 8d ago → outside the 24h WORK window
   });

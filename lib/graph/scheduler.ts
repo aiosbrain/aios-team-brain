@@ -48,6 +48,9 @@ export function startGraphScheduler(): void {
             (s.requeueThrottled ? ` ${s.requeueThrottled} re-queue(s) throttled — Graphiti may be wedged` : "") +
             (s.probeFallbackPages ? ` ${s.probeFallbackPages} page(s) fell back to per-item ledger probes` : "") +
             (s.lockedOut ? ` ${s.lockedOut} team(s) skipped — another instance holds the projection lease` : "") +
+            (s.deepResolvedGroups ? ` ${s.deepResolvedGroups} saturated group(s) judged via per-item lookup` : "") +
+            (s.deepRequeueHeld ? ` ${s.deepRequeueHeld} re-queue(s) HELD (GRAPH_DEEP_REQUEUE off)` : "") +
+            (s.lookupMismatchGroups ? ` ${s.lookupMismatchGroups} group(s) with a BROKEN per-item lookup (missed REST-confirmed items — is NEO4J_URL the graph Graphiti writes?)` : "") +
             (s.errors.length ? ` errors: ${s.errors.join("; ")}` : "")
         );
       }

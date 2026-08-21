@@ -98,7 +98,37 @@ export async function listRecentIngestRuns(
     db.from("ingest_runs").select(cols).eq("team_id", teamId).order("finished_at", { ascending: false }).limit(limit),
     db.from("ingest_runs").select(cols).is("team_id", null).order("finished_at", { ascending: false }).limit(limit),
   ]);
-  return [...((own.data ?? []) as IngestRunRow[]), ...((aggregate.data ?? []) as IngestRunRow[])]
-    .sort((a, b) => (a.finished_at < b.finished_at ? 1 : a.finished_at > b.finished_at ? -1 : 0))
-    .slice(0, limit);
+  const merged = [...((own.data ?? []) as IngestRunRow[]), ...((aggregate.data ?? []) as IngestRunRow[])]
+    .sort((a, b) => (a.finished_at < b.finished_at ? 1 : a.finished_at > b.finished_at ? -1 : 0));
+  return diversifyBySource(merged, limit);
+}
+
+/**
+ * Source-diverse top-N (GRAPHSAT-1, Codex diff review L3): a chatty source — the graph projector in
+ * measurement mode records an instance-wide row every hour — must not push every other source's
+ * history off a 30-row panel, hiding an older connector failure that used to stay visible. No single
+ * `source` takes more than `ceil(limit/2)` slots while other sources still have rows; once the others
+ * are exhausted the cap lifts and the newest remaining rows fill the panel. Pure; order within a
+ * source is preserved (newest first, as sorted by the caller).
+ */
+export function diversifyBySource<T extends { source: string }>(sorted: readonly T[], limit: number): T[] {
+  const cap = Math.ceil(limit / 2);
+  const perSource = new Map<string, number>();
+  const picked: T[] = [];
+  const overflow: T[] = [];
+  for (const row of sorted) {
+    if (picked.length >= limit) break;
+    const n = perSource.get(row.source) ?? 0;
+    if (n >= cap) {
+      overflow.push(row);
+      continue;
+    }
+    perSource.set(row.source, n + 1);
+    picked.push(row);
+  }
+  for (const row of overflow) {
+    if (picked.length >= limit) break;
+    picked.push(row);
+  }
+  return picked.sort((a, b) => sorted.indexOf(a) - sorted.indexOf(b));
 }

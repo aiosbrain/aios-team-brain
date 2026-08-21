@@ -23,6 +23,10 @@ process.env.DB_BACKEND = "postgres";
 // OpenAI otherwise). Tests inject their own extractors or rely on the deterministic fallbacks.
 process.env.LLM_BASE_URL = "";
 process.env.OPENAI_API_KEY = "";
+// GRAPHSAT-1: no Neo4j in this tier either — reconcile's saturated-group lookup must resolve to
+// "unconfigured" (today's skip-and-count) so a dev shell exporting NEO4J_URL cannot flip the
+// saturated pin by deep-resolving against unrelated local state. Tests inject their own lookup.
+process.env.NEO4J_URL = "";
 process.env.ANTHROPIC_API_KEY = "";
 process.env.NEXT_PUBLIC_DB_BACKEND = "postgres";
 process.env.DATABASE_URL = databaseTestUrl;

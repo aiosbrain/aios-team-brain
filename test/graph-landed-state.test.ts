@@ -107,6 +107,7 @@ describe("AC5 — the measurement reaches the DURABLE row, not just the return v
       saturatedGroups: 0, requeueThrottled: 0,
       partialItems: 2,
       partialDetail: { sample: [{ itemId: "abc", missing: ["items:abc#3"], missingCount: 1 }], elided: 1, namesElided: 0 },
+      deepResolvedGroups: 0, lookupMismatchGroups: 0, deepRequeueHeld: 0, deepRequeueHeldByGroup: {}, deepRequeueSample: [], deepRequeueElided: 0, deepRequeueEnabled: false,
       probeFallbackPages: 0, lockedOut: 0, walkMs: 10, reconcileMs: 5,
       errors: [],
     };
