@@ -82,13 +82,15 @@ times out right when the lookup path matters most.
   `{ timeoutMs }` override; reconcile passes `LANDED_LIST_TIMEOUT_MS` = env
   `GRAPH_LANDED_LIST_TIMEOUT_MS` or the client default (30 s). The cheaper lever is depth:
   `GRAPH_LANDED_SCAN_DEPTH` lower (1,000) makes the listing ~5× cheaper and the oracle still a
-  valid (smaller) subset — but ONLY on an install with `NEO4J_URL` configured AND re-queue enabled
-  (`GRAPH_DEEP_REQUEUE=true`, or GRAPHSAT-2): below the depth a group is judged by REST (bounded
-  re-queue heals it), above it by the lookup path, which with the flag OFF **holds** never-landed
-  verdicts — so lowering the depth today would stop 1k–5k groups from healing (Fable diff review
-  M1), and an install WITHOUT Neo4j would lose judging for them entirely. So the default stays
-  5,000, and ARCHITECTURE + `.env.example` record the lever with both conditions — "cheaper
-  lever", not "better steady state". The 100 /
+  valid (smaller) subset — on an install with `NEO4J_URL`, and IN THIS ORDER (Codex diff review
+  H1): lower the depth while `GRAPH_DEEP_REQUEUE` is OFF — the 1k–5k groups move onto the lookup
+  path, whose never-landed verdicts are HELD (so they pause healing; Fable diff review M1) —
+  inspect every held candidate with `deepRequeueElided 0` (GRAPHSAT-1 D4), THEN enable. Lowering
+  the depth AFTER enabling would move groups onto the mutating path whose candidates were never
+  audited at that depth, behind an oracle that covers only the newest 1,000 episodes — the
+  cost-explosion class D4 exists to prevent. An install WITHOUT Neo4j would lose judging for
+  those groups entirely, so the default stays 5,000; ARCHITECTURE + `.env.example` record the
+  lever with its ORDER — "cheaper lever", not "better steady state". The 100 /
   1,000 / 5,000 latency measurement Codex asked for cannot be taken from a laptop (Graphiti is
   internal-only); `reconcileMs` on the next passes after an operator lowers it IS that measurement.
 - **D4 — no change to the REST saturation semantics or to the lookup.** A listing that SUCCEEDS
@@ -128,10 +130,13 @@ times out right when the lookup path matters most.
   shape, which each caller's existing `.catch` turns into its skip — now counted.
 - Cleanup leg: no lookup of any kind (it resolves uuids to DELETE); it keeps
   its skip and gains the count. The final `pendingCleanups` re-read's `error` is no longer
-  ignored: on error the summary carries `pendingCleanups: -1`? NO — a sentinel number in a count
-  is the `[object Object]` class of legibility bug. On error the pass pushes an entry to
-  `errors` (`reconcile: pending-cleanup count failed: …`), which already turns the run red and
-  records it; the count stays the in-memory value from this pass.
+  ignored: `ReconcileSummary` gains `errors: string[]`; on that error it carries
+  `reconcile: pending-cleanup count failed: <message>` and `pendingCleanups` is the pass's KNOWN
+  value — the pending rows it loaded minus the ones it verified clean — never a false zero beside
+  the error and never a sentinel number (Codex design round 2 M2, diff review M1; pinned with an
+  existing pending row). The runner MERGES `r.errors` into `GraphProjectionSummary.errors`
+  (team-prefixed like every other error) WITHOUT discarding `r`'s counters or the pass's
+  mutations — `ok:false`, the exact text, every other counter retained.
 
 ## 3. Acceptance criteria (spec-first; exact commands)
 
@@ -185,6 +190,9 @@ times out right when the lookup path matters most.
   faster window + the oracle may be the better steady state) — an operator knob today; revisit
   with the timing data this slice makes visible.
 - The graphiti redeploy-on-merge configuration → GRAPHDEPLOY-1 (D5).
+- The ledger-read early return also skips the two arc-cache SWEEPS (storage janitors that do not
+  depend on the ledger) for that pass — deferred (Codex diff review L1): one suspended sweep is
+  harmless; moving them ahead of the ledger read reorders a leg for no functional gain.
 - Any write on the unreachable path (the declined D2) — if an independent oracle for the
   lookup ever exists without a REST window, it is its own spec.
 - GRAPHSAT-2 (persisted consecutive-absence) — unchanged, still the gate for enabling re-queue.

@@ -138,8 +138,14 @@ describe("RECONULL-1 — a failed group listing is counted, nothing is written o
         });
       },
     } as unknown as DbClient;
+    // An EXISTING pending row (its old-group listing fails too, so it stays pending) — the count beside
+    // the error must be the pass's known value, never a false zero (Codex diff review M1).
+    const [pendingRow] = await rows(f.seed.teamId, f.teamGroup);
+    await real.from("graph_episodes").update({ pending_delete_group_id: "old_group", pending_delete_at: "2020-01-01T00:00:00Z" }).eq("team_id", f.seed.teamId).eq("source_id", pendingRow.source_id);
+    f.fake.failListFor.add("old_group");
     const res = await reconcileProjectedEpisodes(wrapped, client(f.fake), f.seed.teamId);
     expect(res.errors).toEqual(["reconcile: pending-cleanup count failed: induced count failure"]);
+    expect(res.pendingCleanups, "the known pending count, not a false zero").toBe(1);
     expect(res.confirmed, "the pass's work is retained").toBe(3);
     const summary = await runGraphProjection({ teamId: f.seed.teamId, client: client(f.fake), db: wrapped });
     expect(summary.ok).toBe(false);

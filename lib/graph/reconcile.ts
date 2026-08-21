@@ -104,11 +104,15 @@ export const LANDED_SCAN_DEPTH = resolvePositiveInt(process.env.GRAPH_LANDED_SCA
  * → the client's default (30 s). Prod measured a 5,000-episode listing at ~8 s warm and past 30 s on
  * a cold Neo4j page cache (after a graphiti restart); a longer deadline holds #629's lease and the
  * process single-flight for that long per slow group, so the cheaper lever on an install WITH
- * `NEO4J_URL` AND re-queue enabled (`GRAPH_DEEP_REQUEUE=true`, or once GRAPHSAT-2 lands) is a smaller
- * `GRAPH_LANDED_SCAN_DEPTH` (1,000 — the lookup judges the rest, the REST-window oracle stays a valid
- * subset). With the flag OFF the lookup path HOLDS never-landed verdicts, so lowering the depth would
- * stop 1k–5k groups from healing (Fable diff review M1). The default stays 5,000 because an install
- * WITHOUT Neo4j would lose judging for every 1k–5k group.
+ * `NEO4J_URL` is a smaller `GRAPH_LANDED_SCAN_DEPTH` (1,000 — the lookup judges the rest, the
+ * REST-window oracle stays a valid subset) — IN THIS ORDER (Codex diff review H1): lower the depth
+ * while `GRAPH_DEEP_REQUEUE` is OFF (the 1k–5k groups move onto the lookup path and their never-landed
+ * rows are HELD), inspect every held candidate with `deepRequeueElided 0` (GRAPHSAT-1 D4), THEN enable.
+ * Lowering the depth AFTER enabling would put groups onto the mutating path whose candidates were never
+ * audited at that depth, with an oracle covering only the newest 1,000 episodes. With the flag off and
+ * the depth lowered, those groups stop healing until the audit completes (Fable diff review M1) — a
+ * deliberate pause, stated. The default stays 5,000 because an install WITHOUT Neo4j would lose
+ * judging for every 1k–5k group.
  */
 export function landedListTimeoutMs(env: NodeJS.ProcessEnv = process.env): number | undefined {
   const raw = Number(env.GRAPH_LANDED_LIST_TIMEOUT_MS);
@@ -718,6 +722,9 @@ export async function reconcileProjectedEpisodes(
   // (the pass's counters and mutations are all retained).
   const errors: string[] = [];
   if (pendingErr) errors.push(`reconcile: pending-cleanup count failed: ${pendingErr.message}`);
+  // On a failed re-read the count is what THIS pass knows (the pending rows it loaded minus the
+  // ones it verified clean) — never a false zero beside the error (Codex diff review M1).
+  const knownPending = Math.max(0, [...pendingByGroup.values()].reduce((n, g) => n + g.length, 0) - cleaned);
 
   return {
     groupsChecked: byGroup.size,
@@ -725,7 +732,7 @@ export async function reconcileProjectedEpisodes(
     reQueued,
     cleaned,
     cleanedExternal,
-    pendingCleanups: (pendingRows ?? []).length,
+    pendingCleanups: pendingErr ? knownPending : (pendingRows ?? []).length,
     requeueThrottled,
     saturatedGroups,
     deepResolvedGroups,
