@@ -30,7 +30,11 @@ function auth(teamId: string, memberId: string) {
 // anything named *TOKEN* trips a CRITICAL secret finding -- which it did, blocking a
 // release gate on a value that is plainly fake. The shape has to stay realistic for the
 // test to be worth anything, so the binding is what changes. Do not rename this back.
-const FIXTURE_PK = "pk_12345678_REALCLICKUPTOKENABCDEF";
+// AIO-952 (workspace PR #633) closed that rename loophole: OGR03 now matches ClickUp
+// tokens BY VALUE (pk_<digits>_<key>), so this realistic shape needs an explicit,
+// value-bound fixture declaration. The marker names the first 16 chars of the declared
+// value and exempts only tokens starting with that prefix -- nothing else on the line.
+const FIXTURE_PK = "pk_12345678_REALCLICKUPTOKENABCDEF"; // aios-secret-fixture:pk_12345678_REAL
 
 describe("ClickUp integration connect (real Postgres)", () => {
   it("persists a ClickUp token + selection and reads the token back for ingestion", async () => {
