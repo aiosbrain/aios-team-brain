@@ -583,7 +583,7 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
   // the guard 25/25 green, plus the two spellings its remediation named. Every one is kept as a
   // permanent negative control: AUDITFIX-1's guard was beaten three times, and each defeat was a new
   // SPELLING of one act, so the spellings are the regression suite.
-  const CONTROLS: { n: string; files: { rel: string; code: string }[]; inv: Record<string, Entry>; kind: Violation["kind"] | null }[] = [
+  const CONTROLS: { n: string; files: { rel: string; code: string }[]; inv: Record<string, Entry>; kind: Violation["kind"] | null; msg?: string }[] = [
     { n: "1 canonical named import + call", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
     { n: "2 aliased import", files: [{ rel: "lib/f.ts", code: `import { ${WRITER} as writeItem } from "@/lib/ingest";\nawait writeItem(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
     { n: "3 namespace member call", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest.${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
@@ -617,7 +617,11 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     { n: "21 namespace passed as a value", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nregister(ingest);` }], inv: NO_INVENTORY, kind: "refused" },
     // ── Two rules added in the Fable fold whose mutations SURVIVED: nothing pinned them ────────
     { n: "22 the per-entry site COUNT is wrong (a new call site appeared)", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);\nawait ${WRITER}(b);` }], inv: classified("lib/f.ts", "SWEEP_COVERED", 1), kind: "stale" },
-    { n: "23 `after` imported under another name — the shape check cannot judge it", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nimport { after as later } from "next/server";\nawait ${WRITER}(a);\nlater(async () => { await reconcileItemContext(db, t, id); });` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape" },
+    // ONE CONDITION PER FIXTURE: the reconcile sits inside a bare `after(...)`, so the
+    // insideAfter rule is SATISFIED and `aliasedAfter` is the only rule that can fire. The first
+    // version of this row called `later(...)` instead, which tripped BOTH — and its mutation
+    // SURVIVED, because deleting the aliased-after rule left the other one failing it anyway.
+    { n: "23 `after` imported under another name — the shape check cannot judge it", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nimport { after as later } from "next/server";\nawait ${WRITER}(a);\nafter(async () => { await reconcileItemContext(db, t, id); });` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape", msg: "imports `after` under another name" },
     // ── Positive twins: without these, a guard that always failed would pass every row above ────
     { n: "T1 FABLE H1 — a LOCAL function of the same name, used as a VALUE", files: [{ rel: "lib/f.ts", code: `function ${WRITER}(x: string){ return x; }\nexport const registry = { ${WRITER} };` }], inv: NO_INVENTORY, kind: null },
     { n: "T2 a dynamic import of another module, no call", files: [{ rel: "lib/f.ts", code: `const { other } = await import("@/lib/other");` }], inv: NO_INVENTORY, kind: null },
@@ -629,10 +633,16 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
       ], inv: NO_INVENTORY, kind: null },
   ];
 
-  it.each(CONTROLS)("AC2 — control $n", ({ files, inv, kind }) => {
+  it.each(CONTROLS)("AC2 — control $n", ({ files, inv, kind, msg }) => {
     const { violations } = analyse(files, inv);
-    if (kind === null) expect(violations.map((v) => v.message)).toEqual([]);
-    else expect(violations.map((v) => v.kind)).toContain(kind);
+    if (kind === null) {
+      expect(violations.map((v) => v.message)).toEqual([]);
+      return;
+    }
+    expect(violations.map((v) => v.kind)).toContain(kind);
+    // Fable L2: asserting the KIND alone lets a control pass while failing for a different
+    // same-kind reason. Where a row names its message, the specific rule must be the one that fired.
+    if (msg) expect(violations.map((v) => v.message).join("\n")).toContain(msg);
   });
 
   it("AC9 — the walked + not-walked lists account for the ENTIRE top level", () => {
