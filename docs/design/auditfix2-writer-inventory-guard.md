@@ -711,7 +711,10 @@ three times and each defeat was a new *spelling* of one act, so the spellings AR
 | **L1/L4** | the scheduler comment and every ARCHITECTURE.md number **verified true** | cleared |
 
 **Verified by planting Fable's five exploits as real files in the tree**: four are now counted as call
-sites and one is REFUSED, while its innocent fixture produces nothing.
+sites and one is REFUSED, while its innocent fixture produces nothing. ⚠️ **Two sentences in this
+section were still too strong** and Codex struck them down in §13 — barrel handling did *not* close
+the hole generally (a RENAMED barrel still won), and "every control now asserts its exact message"
+was true of exactly one row.
 
 ### 12a. Two mutations survived the fold, and the second one twice
 
@@ -722,3 +725,26 @@ sites and one is REFUSED, while its innocent fixture produces nothing.
   test left the other one failing it anyway. **One condition per fixture**: the reconcile now sits
   inside a bare `after(...)` so `aliasedAfter` is the only rule that can fire, and every control may
   now assert its **exact message** rather than only its kind (Fable L2).
+
+
+## 13. Codex's diff review — BLOCKED, and a fifth defeat Fable missed
+
+Fable's five defeats were folded; Codex was pointed at the folds, which is where every defect in this
+program has landed. It landed there again.
+
+| # | finding | outcome |
+|---|---|---|
+| **B1** | **a RENAMED re-export barrel** — `export { ingestItem as writeItem } from "@/lib/ingest"`, imported as `writeItem`. `writerModules` correctly identified the barrel as a writer module and then `bindingsFor` bound consumers on the **literal name** `ingestItem`, losing the alias. Demonstrated with source that compiles clean (`tsc --noEmit` exit 0) while the guard stayed **40/40 green** | **CONFIRMED.** The function no longer returns *which modules* re-export the writer but **which NAMES each module exports that reach it** — the only form in which a consumer can import it. Default re-exports (`as default` + a default import) come with it. Controls 24-26 |
+| **H1** | **lexical shadowing = a build-breaking false positive.** Bindings were file-wide name strings, so `export function f(ingestItem: () => void) { ingestItem(); }` in a file that also imports the real one was reported as an unclassified writer | **CONFIRMED**, and it is the same deletion-risk mode §12 claims was eliminated — only its object-literal instance was. `usesOf` now carries a **scope stack** of names redeclared below module scope. Full symbol resolution would need a `Program` + checker, far too slow for a guard called ~30× per run. Twins T1c/T1d |
+| **H2** | **the acceptance suite was not mutation-verified as claimed** — AC2 asserted only the violation *kind* for every row but one, while the spec said each asserts its exact diagnostic; `reconcileShape` counted any bare call so deleting `await` survived; AC7 produced two violations and asserted only that *some* refusal existed; spec AC8 still described a "cannot see through" refusal the fold had deleted; T1 tested value-storage rather than the documented local-function call; T5 re-exported from an unresolved module | **all CONFIRMED.** Every negative row now names its exact message; the reconcile must be **awaited** (control 27); AC7 is isolated to one condition; **AC8 now asserts the export map directly** across a two-level renamed barrel and an `export *`; T1/T5 rebuilt |
+| **M1** | `ARCHITECTURE.md` and §12 overstate — "every import spelling", "every non-permitted use is refused", and a "carrier scan stops at function boundaries" describing code the rewrite had **deleted** | **CONFIRMED.** All three corrected. The numeric claims (15 calls, 7 files, run.ts = 7) it verified as true |
+| **M2** | **the corrected scheduler comment carried a SECOND false generalization** — "a concurrent PUSH (which the on-push hook partitions itself)". `/api/v1/codebases` has no such hook | **CONFIRMED**, and precisely the outcome I said would be worse than none. It now names `/api/v1/items` and states the codebases exception |
+| **L1/L2** | `statSync` can throw on a broken symlink; all in-memory candidates were checked before any disk candidate, so a later candidate could outrank an earlier real file | **both CONFIRMED**, both latent today, both fixed |
+
+**Verified by planting Codex's exploits as real files**: the renamed barrel and the default-export
+barrel are both counted as call sites, and its innocent shadowing fixture produces nothing.
+
+**The pattern across both diff reviews.** Every single defeat was a new *spelling* of one act, and
+every fix that enumerated spellings was beaten by the next one. What finally held was inverting the
+question twice — from "which call shapes do I recognise?" to "which positions may a resolved binding
+appear in?", and from "which modules re-export it?" to "under which NAMES?".

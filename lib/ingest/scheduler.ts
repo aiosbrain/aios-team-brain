@@ -357,7 +357,10 @@ export function startIngestScheduler(): void {
       // Cutoff = THIS STAGE's start, NOT the tick's. `startedAt` is taken at the top of
       // runContextBackfill, which the tick sequences AFTER all four connector legs — so a leg's
       // items were created BEFORE this cutoff and ARE swept in the same tick. The bound exists to
-      // stop chasing a concurrent PUSH mid-sweep (the on-push hook partitions those itself).
+      // stop chasing a concurrent `/api/v1/items` push mid-sweep — THAT route partitions in its own
+      // `after()`. ⚠️ Not every push does: `/api/v1/codebases` has no such hook (AUDITFIX-2 §3d
+      // classifies it SWEEP_COVERED), so a commit arriving after this cutoff is deliberately
+      // deferred to the next tick rather than partitioned by anyone.
       //
       // ⚠️ This comment said "Cutoff = tick start" and that one wrong sentence produced two rounds
       // of wrong design in AUDITFIX-2 — a whole slice was specced around "the sweep skips items

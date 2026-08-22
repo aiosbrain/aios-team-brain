@@ -140,11 +140,13 @@ function resolveSpecifier(fromRel: string, spec: string, known: ReadonlySet<stri
     ...["", ".ts", ".tsx", ".mts", ".cts", ".js", ".mjs"].map((e) => `${abs}${e}`),
     ...["index.ts", "index.tsx"].map((i) => join(abs, i)),
   ].map((c) => relative(ROOT, c).split("\\").join("/"));
-  // `known` FIRST — the analysed set. Fixtures are synthetic modules that do not exist on disk, and
-  // a disk-only resolver silently failed to follow them, which would have left the barrel controls
-  // green-by-construction: passing for the same reason a real barrel would have been missed.
-  for (const rel of rels) if (known.has(rel)) return rel;
+  // Candidate order is TypeScript's, and each candidate is checked against the analysed set AND the
+  // disk before moving on. Checking all in-memory candidates first (the earlier shape) let a LATER
+  // candidate outrank an EARLIER real file — Codex LOW 2; no collision exists today, but the
+  // ordering is what makes that true rather than luck. Fixtures are synthetic modules with no disk
+  // presence, so `known` cannot simply be dropped.
   for (const rel of rels) {
+    if (known.has(rel)) return rel;
     try {
       if (statSync(join(ROOT, rel)).isFile()) return rel;
     } catch {
@@ -158,34 +160,43 @@ function resolveSpecifier(fromRel: string, spec: string, known: ReadonlySet<stri
  * Every module through which the writer can be imported — the canonical one plus any RE-EXPORT
  * BARREL, to a fixpoint.
  *
- * ⚠️ FABLE DIFF REVIEW, BLOCKER 1. The previous version's comment claimed "one level is followed by
- * `resolveSpecifier`". That was false: `resolveSpecifier` resolves PATH SPELLINGS, it never reads a
- * re-export. Fable defeated the guard with four lines —
+ * ⚠️ TWO REVIEWS, TWO DEFEATS, ONE FUNCTION. Fable beat the first version with
  *   `lib/barrel.ts:  export { ingestItem } from "@/lib/ingest";`
- *   `lib/writer.ts:  import { ingestItem } from "@/lib/barrel"; await ingestItem(...)`
- * — and the guard stayed 25/25 green. Barrels are now FOLLOWED (transitively) rather than refused,
- * which both closes the hole and keeps a legitimate barrel usable.
+ * because the comment claimed "one level is followed by `resolveSpecifier`" and that function only
+ * resolves PATH SPELLINGS — it never reads a re-export. Barrels became followed.
+ *
+ * Codex then beat THAT with a RENAMED one:
+ *   `lib/barrel.ts:  export { ingestItem as writeItem } from "@/lib/ingest";`
+ *   `lib/writer.ts:  import { writeItem } from "@/lib/barrel"; await writeItem(...)`
+ * — the module was correctly identified as a writer module, and then consumers were bound on the
+ * literal name `ingestItem`, so the barrel's ALIAS was lost. Compiled clean, guard stayed 40/40.
+ *
+ * So this no longer returns "which modules re-export the writer" but **which NAMES each module
+ * exports that reach it** — the only form in which a consumer can actually import it.
  */
-function writerModules(files: { rel: string; code: string }[], known: ReadonlySet<string>): Set<string> {
-  const set = new Set<string>([CANONICAL]);
+function writerExports(files: { rel: string; code: string }[], known: ReadonlySet<string>): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>([[CANONICAL, new Set([WRITER])]]);
   const byRel = new Map(files.map((f) => [f.rel, f.code]));
   if (!byRel.has(CANONICAL)) byRel.set(CANONICAL, "");
   let grew = true;
   while (grew) {
     grew = false;
     for (const [rel, code] of byRel) {
-      if (set.has(rel)) continue;
       const src = parse(rel, code);
-      let exportsWriter = false;
+      const names = out.get(rel) ?? new Set<string>();
+      const before = names.size;
       const visit = (n: ts.Node): void => {
         if (ts.isExportDeclaration(n) && n.moduleSpecifier && ts.isStringLiteralLike(n.moduleSpecifier)) {
           const target = resolveSpecifier(rel, n.moduleSpecifier.text, known);
-          if (target && set.has(target)) {
-            // `export * from` re-exports everything; a named clause must actually name the writer.
-            if (!n.exportClause) exportsWriter = true;
-            else if (ts.isNamedExports(n.exportClause)) {
+          const upstream = target ? out.get(target) : undefined;
+          if (upstream) {
+            if (!n.exportClause) {
+              // `export * from` — every upstream name keeps its own spelling.
+              for (const u of upstream) if (u !== "default") names.add(u);
+            } else if (ts.isNamedExports(n.exportClause)) {
               for (const el of n.exportClause.elements) {
-                if ((el.propertyName?.text ?? el.name.text) === WRITER) exportsWriter = true;
+                // The name AS EXPORTED BY THIS MODULE is what a consumer will import.
+                if (upstream.has(el.propertyName?.text ?? el.name.text)) names.add(el.name.text);
               }
             }
           }
@@ -193,13 +204,13 @@ function writerModules(files: { rel: string; code: string }[], known: ReadonlySe
         ts.forEachChild(n, visit);
       };
       visit(src);
-      if (exportsWriter) {
-        set.add(rel);
+      if (names.size > before || (names.size > 0 && !out.has(rel))) {
+        out.set(rel, names);
         grew = true;
       }
     }
   }
-  return set;
+  return out;
 }
 
 /* ────────────────────────────── the walk ────────────────────────────── */
@@ -241,14 +252,17 @@ function moduleSpecifierOf(e: ts.Expression): string | null {
  * Anything else that TOUCHES one of these bindings is refused in pass 2 — that is where the
  * fail-closed promise in this file's header is actually kept.
  */
-function bindingsFor(rel: string, src: ts.SourceFile, modules: Set<string>, known: ReadonlySet<string>): Bindings {
+function bindingsFor(rel: string, src: ts.SourceFile, modules: Map<string, Set<string>>, known: ReadonlySet<string>): Bindings {
   const direct = new Set<string>();
   const namespaces = new Set<string>();
   const declSites = new Set<ts.Node>();
-  const isWriterModule = (spec: string) => {
+  /** The names THIS module would have to import to reach the writer, or null if the specifier is
+   *  not a writer module at all. */
+  const exportedNames = (spec: string): Set<string> | null => {
     const t = resolveSpecifier(rel, spec, known);
-    return t !== null && modules.has(t);
+    return t === null ? null : (modules.get(t) ?? null);
   };
+  const isWriterModule = (spec: string) => exportedNames(spec) !== null;
 
   let grew = true;
   while (grew) {
@@ -269,13 +283,20 @@ function bindingsFor(rel: string, src: ts.SourceFile, modules: Set<string>, know
     };
 
     const visit = (node: ts.Node): void => {
-      if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier) && isWriterModule(node.moduleSpecifier.text)) {
-        const named = node.importClause?.namedBindings;
-        if (named && ts.isNamedImports(named)) {
-          for (const el of named.elements) {
-            if ((el.propertyName?.text ?? el.name.text) === WRITER) addDirect(el.name.text, el.name);
-          }
-        } else if (named && ts.isNamespaceImport(named)) addNs(named.name.text, named.name);
+      if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        const exported = exportedNames(node.moduleSpecifier.text);
+        if (exported) {
+          const clause = node.importClause;
+          const named = clause?.namedBindings;
+          if (named && ts.isNamedImports(named)) {
+            for (const el of named.elements) {
+              // Match the name AS THE MODULE EXPORTS IT — a renamed barrel is why this is not `WRITER`.
+              if (exported.has(el.propertyName?.text ?? el.name.text)) addDirect(el.name.text, el.name);
+            }
+          } else if (named && ts.isNamespaceImport(named)) addNs(named.name.text, named.name);
+          // `import writeItem from "…"` against `export { ingestItem as default }`.
+          if (clause?.name && exported.has("default")) addDirect(clause.name.text, clause.name);
+        }
       }
       // `import ingest = require("@/lib/ingest")`
       if (
@@ -293,11 +314,12 @@ function bindingsFor(rel: string, src: ts.SourceFile, modules: Set<string>, know
         // `= await import(…)` / `= require(…)`, OR a two-step through a known namespace identifier.
         const fromKnownNs = ts.isIdentifier(init) && namespaces.has(init.text);
         if (fromWriterModule || fromKnownNs) {
+          const exported = spec !== null ? exportedNames(spec) : new Set([WRITER]);
           if (ts.isObjectBindingPattern(node.name)) {
             for (const el of node.name.elements) {
               const orig = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : undefined;
               const local = ts.isIdentifier(el.name) ? el.name.text : undefined;
-              if ((orig ?? local) === WRITER && local) addDirect(local, el.name);
+              if (local && exported?.has(orig ?? local)) addDirect(local, el.name);
             }
           } else if (ts.isIdentifier(node.name) && fromWriterModule) addNs(node.name.text, node.name);
         }
@@ -337,8 +359,54 @@ function usesOf(rel: string, src: ts.SourceFile, b: Bindings): { calls: string[]
     return false;
   };
 
+  /**
+   * SHADOWING (Codex diff review, HIGH 1). Bindings are file-wide NAMES, so a nested parameter or
+   * local of the same name was treated as the imported writer:
+   *
+   *   import { ingestItem } from "@/lib/ingest";
+   *   export function callInjectedCallback(ingestItem: () =&gt; void) { ingestItem(); }
+   *
+   * — an innocent file that BROKE THE BUILD, which is the same deletion-risk failure mode §12
+   * claims was eliminated (only its object-literal instance was). Full symbol resolution needs a
+   * Program + checker, far too slow for a guard called ~30 times per run, so this tracks a scope
+   * stack of names REDECLARED below module scope: inside such a scope the name is not ours.
+   */
+  const shadowed: string[] = [];
+  const declaredNamesIn = (n: ts.Node): string[] => {
+    const names: string[] = [];
+    const add = (name: ts.BindingName | undefined) => {
+      if (!name) return;
+      if (ts.isIdentifier(name)) names.push(name.text);
+      else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+        for (const el of name.elements) if (ts.isBindingElement(el)) add(el.name);
+      }
+    };
+    if (ts.isFunctionLike(n)) {
+      for (const prm of n.parameters) add(prm.name);
+      if ((ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) && n.name) names.push(n.name.text);
+    }
+    const body = ts.isFunctionLike(n) ? n.body : ts.isBlock(n) || ts.isSourceFile(n) ? n : undefined;
+    if (body && (ts.isBlock(body) || ts.isSourceFile(body))) {
+      for (const st of body.statements) {
+        if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) add(d.name);
+        else if (ts.isFunctionDeclaration(st) && st.name) names.push(st.name.text);
+        else if (ts.isClassDeclaration(st) && st.name) names.push(st.name.text);
+      }
+    }
+    return names;
+  };
+  const isShadowed = (name: string) => shadowed.includes(name);
+
   const visit = (node: ts.Node): void => {
-    if (ts.isIdentifier(node) && !b.declSites.has(node)) {
+    const opensScope = ts.isFunctionLike(node) || ts.isBlock(node) || ts.isCatchClause(node) || ts.isForStatement(node);
+    let pushed = 0;
+    if (opensScope) {
+      for (const n of declaredNamesIn(node)) {
+        shadowed.push(n);
+        pushed++;
+      }
+    }
+    if (ts.isIdentifier(node) && !b.declSites.has(node) && !isShadowed(node.text)) {
       const p = node.parent;
       if (b.direct.has(node.text)) {
         if (ts.isCallExpression(p) && p.expression === node) calls.push(at(p));
@@ -375,6 +443,7 @@ function usesOf(rel: string, src: ts.SourceFile, b: Bindings): { calls: string[]
       }
     }
     ts.forEachChild(node, visit);
+    for (let i = 0; i < pushed; i++) shadowed.pop();
   };
   visit(src);
   return { calls, refused };
@@ -406,8 +475,15 @@ function reconcileShape(rel: string, src: ts.SourceFile): { calls: number; insid
     let nowInAfter = inAfter;
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "after") nowInAfter = true;
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "reconcileItemContext") {
-      calls++;
-      if (inAfter) insideAfter++;
+      // AWAITED, directly or through a `.catch(...)`/`.then(...)` chain (merge.ts uses the former).
+      // Codex HIGH 2: counting any bare call let `await` be deleted with the suite still green,
+      // while both class names and the spec say the reconcile is awaited.
+      let top: ts.Node = node;
+      while (ts.isPropertyAccessExpression(top.parent) || ts.isCallExpression(top.parent)) top = top.parent;
+      if (ts.isAwaitExpression(top.parent)) {
+        calls++;
+        if (inAfter) insideAfter++;
+      }
     }
     ts.forEachChild(node, (c) => visit(c, nowInAfter));
   };
@@ -456,7 +532,13 @@ function productionFiles(): string[] {
     for (const name of readdirSync(join(ROOT, relDir))) {
       if (name === "node_modules" || name.startsWith(".")) continue;
       const rel = `${relDir}/${name}`;
-      const st = statSync(join(ROOT, rel));
+      // A broken symlink or an unreadable entry must not crash the guard (Codex LOW 1).
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(join(ROOT, rel));
+      } catch {
+        continue;
+      }
       if (st.isDirectory()) {
         // Symlinked directories would loop or double-count; visit each real path once.
         const real = relative(ROOT, realpathSync(join(ROOT, rel)));
@@ -469,8 +551,11 @@ function productionFiles(): string[] {
   for (const r of WALKED) walk(r);
   // Root-level sources ship too (`instrumentation.ts`, `proxy.ts`) and the old walk never saw them.
   for (const name of readdirSync(ROOT)) {
-    if (SOURCE_EXT.some((e) => name.endsWith(e)) && !SKIP_FILE(name) && statSync(join(ROOT, name)).isFile()) {
-      out.push(name);
+    if (!SOURCE_EXT.some((e) => name.endsWith(e)) || SKIP_FILE(name)) continue;
+    try {
+      if (statSync(join(ROOT, name)).isFile()) out.push(name);
+    } catch {
+      /* unreadable root entry */
     }
   }
   return out.sort();
@@ -489,7 +574,7 @@ function analyse(
   const violations: Violation[] = [];
   const sites: Record<string, number> = {};
   const known = new Set(files.map((f) => f.rel));
-  const modules = writerModules(files, known);
+  const modules = writerExports(files, known);
 
   for (const f of files) {
     const src = parse(f.rel, f.code);
@@ -584,52 +669,69 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
   // permanent negative control: AUDITFIX-1's guard was beaten three times, and each defeat was a new
   // SPELLING of one act, so the spellings are the regression suite.
   const CONTROLS: { n: string; files: { rel: string; code: string }[]; inv: Record<string, Entry>; kind: Violation["kind"] | null; msg?: string }[] = [
-    { n: "1 canonical named import + call", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "2 aliased import", files: [{ rel: "lib/f.ts", code: `import { ${WRITER} as writeItem } from "@/lib/ingest";\nawait writeItem(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "3 namespace member call", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest.${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "4 RELATIVE specifier (the escape already in this tree)", files: [{ rel: "scripts/f.ts", code: `import { ${WRITER} } from "../lib/ingest";\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "5 explicit /index specifier", files: [{ rel: "lib/f.ts", code: `import { ${WRITER} } from "@/lib/ingest/index";\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "6 dynamic-import destructure", files: [{ rel: "lib/f.ts", code: `const { ${WRITER} } = await import("@/lib/ingest");\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "7 direct alias", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nconst write = ${WRITER};\nawait write(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "8 computed namespace key", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest["${WRITER}"](a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "9 RECONCILES_AFTER_RESPONSE whose reconcile is only a comment", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\n// reconcileItemContext(db, t, id)\nawait ${WRITER}(a);` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape" },
-    { n: "10 stored in an object literal", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nconst box = { w: ${WRITER} };\nawait box.w(a);` }], inv: NO_INVENTORY, kind: "refused" },
-    { n: "11 stale entry — classified file with no call", files: [{ rel: "lib/f.ts", code: `export const x = 1;` }], inv: classified("lib/f.ts", "SWEEP_COVERED"), kind: "stale" },
+    { n: "1 canonical named import + call", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "2 aliased import", files: [{ rel: "lib/f.ts", code: `import { ${WRITER} as writeItem } from "@/lib/ingest";\nawait writeItem(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "3 namespace member call", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest.${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "4 RELATIVE specifier (the escape already in this tree)", files: [{ rel: "scripts/f.ts", code: `import { ${WRITER} } from "../lib/ingest";\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "scripts/f.ts calls" },
+    { n: "5 explicit /index specifier", files: [{ rel: "lib/f.ts", code: `import { ${WRITER} } from "@/lib/ingest/index";\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "6 dynamic-import destructure", files: [{ rel: "lib/f.ts", code: `const { ${WRITER} } = await import("@/lib/ingest");\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "7 direct alias", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nconst write = ${WRITER};\nawait write(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "8 computed namespace key", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest["${WRITER}"](a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "9 RECONCILES_AFTER_RESPONSE whose reconcile is only a comment", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\n// reconcileItemContext(db, t, id)\nawait ${WRITER}(a);` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape" , msg: "no reconcileItemContext inside an after() callback" },
+    { n: "10 stored in an object literal", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nconst box = { w: ${WRITER} };\nawait box.w(a);` }], inv: NO_INVENTORY, kind: "refused" , msg: "used as PropertyAssignment" },
+    { n: "11 stale entry — classified file with no call", files: [{ rel: "lib/f.ts", code: `export const x = 1;` }], inv: classified("lib/f.ts", "SWEEP_COVERED"), kind: "stale" , msg: "no longer calls" },
     // ── Fable's demonstrated defeats ──────────────────────────────────────────────────────────
     { n: "12 FABLE B1 — re-export barrel", files: [
         { rel: "lib/barrel.ts", code: `export { ${WRITER} } from "@/lib/ingest";` },
         { rel: "lib/w.ts", code: `import { ${WRITER} } from "@/lib/barrel";\nawait ${WRITER}(a);` },
-      ], inv: NO_INVENTORY, kind: "unclassified" },
+      ], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/w.ts calls" },
     { n: "13 FABLE B1b — barrel via a specifier containing no 'ingest'", files: [
         { rel: "lib/ingest/barrel.ts", code: `export { ${WRITER} } from "./index";` },
         { rel: "lib/w.ts", code: `import { ${WRITER} } from "@/lib/ingest/barrel";\nawait ${WRITER}(a);` },
-      ], inv: NO_INVENTORY, kind: "unclassified" },
+      ], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/w.ts calls" },
     { n: "14 FABLE B1c — export * barrel", files: [
         { rel: "lib/star.ts", code: `export * from "@/lib/ingest";` },
         { rel: "lib/w.ts", code: `import { ${WRITER} } from "@/lib/star";\nawait ${WRITER}(a);` },
-      ], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "15 FABLE B2 — two-step dynamic import", files: [{ rel: "lib/f.ts", code: `const mod = await import("@/lib/ingest");\nconst { ${WRITER} } = mod;\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "16 FABLE B2b — require() destructure", files: [{ rel: "lib/f.ts", code: `const { ${WRITER} } = require("../lib/ingest");\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "17 FABLE B2c — import = require()", files: [{ rel: "lib/f.ts", code: `import ingest = require("@/lib/ingest");\nawait ingest.${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" },
-    { n: "18 FABLE B3 — comma-expression indirect call", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait (0, ${WRITER})(a);` }], inv: NO_INVENTORY, kind: "refused" },
-    { n: "19 FABLE B3b — .call/.apply", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}.call(null, a);` }], inv: NO_INVENTORY, kind: "refused" },
-    { n: "20 FABLE B3c — passed as an argument", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nregister(${WRITER});` }], inv: NO_INVENTORY, kind: "refused" },
-    { n: "21 namespace passed as a value", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nregister(ingest);` }], inv: NO_INVENTORY, kind: "refused" },
+      ], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/w.ts calls" },
+    { n: "15 FABLE B2 — two-step dynamic import", files: [{ rel: "lib/f.ts", code: `const mod = await import("@/lib/ingest");\nconst { ${WRITER} } = mod;\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "16 FABLE B2b — require() destructure", files: [{ rel: "lib/f.ts", code: `const { ${WRITER} } = require("../lib/ingest");\nawait ${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "17 FABLE B2c — import = require()", files: [{ rel: "lib/f.ts", code: `import ingest = require("@/lib/ingest");\nawait ingest.${WRITER}(a);` }], inv: NO_INVENTORY, kind: "unclassified" , msg: "lib/f.ts calls" },
+    { n: "18 FABLE B3 — comma-expression indirect call", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait (0, ${WRITER})(a);` }], inv: NO_INVENTORY, kind: "refused", msg: "used as BinaryExpression" },
+    { n: "19 FABLE B3b — .call/.apply", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}.call(null, a);` }], inv: NO_INVENTORY, kind: "refused" , msg: "used as PropertyAccessExpression" },
+    { n: "20 FABLE B3c — passed as an argument", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nregister(${WRITER});` }], inv: NO_INVENTORY, kind: "refused" , msg: "used as CallExpression" },
+    { n: "21 namespace passed as a value", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nregister(ingest);` }], inv: NO_INVENTORY, kind: "refused" , msg: "namespace `ingest` used as CallExpression" },
+    // ── Codex's demonstrated defeats (it compiled them clean and the guard stayed 40/40) ───────
+    { n: "24 CODEX B1 — RENAMED re-export barrel", files: [
+        { rel: "lib/barrel.ts", code: `export { ${WRITER} as writeItem } from "@/lib/ingest";` },
+        { rel: "lib/w.ts", code: `import { writeItem } from "@/lib/barrel";\nawait writeItem(a);` },
+      ], inv: NO_INVENTORY, kind: "unclassified", msg: "lib/w.ts calls" },
+    { n: "25 CODEX B1b — DEFAULT re-export barrel", files: [
+        { rel: "lib/barrel.ts", code: `export { ${WRITER} as default } from "@/lib/ingest";` },
+        { rel: "lib/w.ts", code: `import w from "@/lib/barrel";\nawait w(a);` },
+      ], inv: NO_INVENTORY, kind: "unclassified", msg: "lib/w.ts calls" },
+    { n: "26 CODEX B1c — renamed barrel, then renamed AGAIN on import", files: [
+        { rel: "lib/barrel.ts", code: `export { ${WRITER} as writeItem } from "@/lib/ingest";` },
+        { rel: "lib/w.ts", code: `import { writeItem as w2 } from "@/lib/barrel";\nawait w2(a);` },
+      ], inv: NO_INVENTORY, kind: "unclassified", msg: "lib/w.ts calls" },
+    { n: "27 a reconcile that is NOT awaited does not satisfy its class", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);\nafter(async () => { reconcileItemContext(db, t, id); });` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape", msg: "no reconcileItemContext inside an after() callback" },
     // ── Two rules added in the Fable fold whose mutations SURVIVED: nothing pinned them ────────
-    { n: "22 the per-entry site COUNT is wrong (a new call site appeared)", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);\nawait ${WRITER}(b);` }], inv: classified("lib/f.ts", "SWEEP_COVERED", 1), kind: "stale" },
+    { n: "22 the per-entry site COUNT is wrong (a new call site appeared)", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);\nawait ${WRITER}(b);` }], inv: classified("lib/f.ts", "SWEEP_COVERED", 1), kind: "stale" , msg: "INVENTORY says 1" },
     // ONE CONDITION PER FIXTURE: the reconcile sits inside a bare `after(...)`, so the
     // insideAfter rule is SATISFIED and `aliasedAfter` is the only rule that can fire. The first
     // version of this row called `later(...)` instead, which tripped BOTH — and its mutation
     // SURVIVED, because deleting the aliased-after rule left the other one failing it anyway.
     { n: "23 `after` imported under another name — the shape check cannot judge it", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nimport { after as later } from "next/server";\nawait ${WRITER}(a);\nafter(async () => { await reconcileItemContext(db, t, id); });` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape", msg: "imports `after` under another name" },
     // ── Positive twins: without these, a guard that always failed would pass every row above ────
-    { n: "T1 FABLE H1 — a LOCAL function of the same name, used as a VALUE", files: [{ rel: "lib/f.ts", code: `function ${WRITER}(x: string){ return x; }\nexport const registry = { ${WRITER} };` }], inv: NO_INVENTORY, kind: null },
+    { n: "T1 a LOCAL function of the same name, CALLED", files: [{ rel: "lib/f.ts", code: `function ${WRITER}(x: string){ return x; }\nexport const y = ${WRITER}("a");` }], inv: NO_INVENTORY, kind: null },
+    { n: "T1b FABLE H1 — a LOCAL function of the same name, used as a VALUE", files: [{ rel: "lib/f.ts", code: `function ${WRITER}(x: string){ return x; }\nexport const registry = { ${WRITER} };` }], inv: NO_INVENTORY, kind: null },
+    { n: "T1c CODEX H1 — a PARAMETER shadowing a real canonical import", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nexport function callInjected(${WRITER}: () => void) { ${WRITER}(); }\nexport type W = typeof ${WRITER};` }], inv: NO_INVENTORY, kind: null },
+    { n: "T1d a LOCAL const shadowing a real canonical import inside a block", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nexport function f() { const ${WRITER} = (x: number) => x; return ${WRITER}(1); }` }], inv: NO_INVENTORY, kind: null },
     { n: "T2 a dynamic import of another module, no call", files: [{ rel: "lib/f.ts", code: `const { other } = await import("@/lib/other");` }], inv: NO_INVENTORY, kind: null },
     { n: "T3 canonical import used only in a TYPE position", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\ntype F = typeof ${WRITER};\nexport const z: F | null = null;` }], inv: NO_INVENTORY, kind: null },
     { n: "T4 a namespace's OTHER exports are not our business", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nawait ingest.somethingElse(a);` }], inv: NO_INVENTORY, kind: null },
-    { n: "T5 a barrel that re-exports something else entirely", files: [
-        { rel: "lib/other-barrel.ts", code: `export { helper } from "@/lib/other";` },
-        { rel: "lib/w.ts", code: `import { helper } from "@/lib/other-barrel";\nhelper();` },
+    { n: "T5 a writer barrel's OTHER exports are importable without penalty", files: [
+        { rel: "lib/barrel.ts", code: `export { ${WRITER}, somethingElse, andAnother } from "@/lib/ingest";` },
+        { rel: "lib/w.ts", code: `import { somethingElse, andAnother } from "@/lib/barrel";\nsomethingElse();\nandAnother();` },
       ], inv: NO_INVENTORY, kind: null },
   ];
 
@@ -688,13 +790,33 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
 
   it("AC7 — an undecidable binding is REFUSED, not ignored", () => {
     const { violations } = analyse(
-      [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nlet w = ${WRITER};\nw = somethingElse;\nawait w(a);` }],
+      // ONE CONDITION: the writer is only ever PASSED, never called, so the position refusal is the
+      // only rule that can fire. The first version also called it, producing a second violation and
+      // letting the assertion pass for the wrong reason (Codex HIGH 2).
+      [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nregisterWriter(${WRITER});` }],
       NO_INVENTORY
     );
-    expect(violations.some((v) => v.kind === "refused" && v.message.startsWith("REFUSED:"))).toBe(true);
+    expect(violations).toHaveLength(1);
+    expect(violations[0].kind).toBe("refused");
+    expect(violations[0].message).toContain("used as CallExpression");
   });
 
-  it("AC8 — no re-export barrel exists today, so the walk sees the real module", () => {
+  it("AC8 — a barrel's exported ALIAS is what consumers are bound on", () => {
+    // Codex BLOCKER 1: the module was correctly identified as a writer module and then consumers
+    // were bound on the literal name `ingestItem`, losing the barrel's alias. Asserted on the
+    // EXPORT MAP directly, so the property is pinned independently of any single control row.
+    const files = [
+      { rel: "lib/b1.ts", code: `export { ${WRITER} as writeItem } from "@/lib/ingest";` },
+      { rel: "lib/b2.ts", code: `export { writeItem as second } from "@/lib/b1";` },
+      { rel: "lib/b3.ts", code: `export * from "@/lib/b2";` },
+    ];
+    const map = writerExports(files, new Set(files.map((f) => f.rel)));
+    expect([...(map.get("lib/b1.ts") ?? [])]).toEqual(["writeItem"]);
+    expect([...(map.get("lib/b2.ts") ?? [])]).toEqual(["second"]);
+    expect([...(map.get("lib/b3.ts") ?? [])], "export * keeps each upstream spelling").toEqual(["second"]);
+  });
+
+  it("AC8b — no re-export barrel of the writer exists in the real tree today", () => {
     // If one ever appears, `bindingsFor` refuses a SECOND level rather than missing it silently.
     // Asserted here because otherwise that branch is unreachable and therefore untested.
     const barrels = productionFiles().filter(
