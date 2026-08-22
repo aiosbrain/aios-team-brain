@@ -296,6 +296,37 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect(res.refused, "and NOT as a settled refusal — the sweep must retry this").toBeFalsy();
   });
 
+  it("AC12: two concurrent reconciles of the SAME item SERIALIZE — the interleaving class is closed", async () => {
+    // §10c. Five review rounds each found a different two-reconciler interleaving, and each fix
+    // patched one instance. This is the criterion for the fix that retires the class: the second
+    // reconciler cannot run inside the first's move.
+    //
+    // Asserted on the OUTCOME both rounds cared about — the item must not end current in BOTH system
+    // projects — plus the final placement agreeing with the item's true access. A test that only
+    // asserted "no error" would pass the pre-transaction code, which reported success from both.
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "m/j.md", body: "j", access: "external", project: "mproj" });
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    await backfillTeamContext(db(), seed.teamId);
+    const general = await systemProject(seed, "general");
+    const ext = await systemProject(seed, "external-shared");
+    const unit = await unitOf(seed, item.id);
+
+    // Flip to team and fire two reconciles at once — the shape every blocker needed.
+    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+    const [a, b] = await Promise.all([
+      reconcileItemContext(db(), seed.teamId, item.id),
+      reconcileItemContext(db(), seed.teamId, item.id),
+    ]);
+    expect(a.ok || b.ok, "at least one reconcile must converge").toBe(true);
+
+    const inGeneral = await currentRows(seed, general, unit);
+    const inExt = await currentRows(seed, ext, unit);
+    expect(inGeneral.length + inExt.length, "never current in BOTH system projects").toBeLessThanOrEqual(1);
+    expect(inGeneral.length, "and the survivor is the one the item's true access selects").toBe(1);
+    expect(inExt, "external-shared must be empty after the narrowing").toEqual([]);
+  });
+
   it("AC8: the uncontended move still closes the opposite membership exactly once", async () => {
     // The regression half. A fix that reports failure more often is not automatically better.
     const seed = await seedTeam();

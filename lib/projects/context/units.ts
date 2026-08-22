@@ -73,17 +73,28 @@ export async function reconcileItemUnit(
       //   item.access and re-opens external-shared while closing N's General include.
       // Final state: items.access='team', current include only in external-shared, both reconcilers
       // reporting success, no read having failed. Reading `items` inside the write closes it.
-      const mirrored = await runSql<{ audience: "team" | "external" }>(
-        `update project_context_units u
-            set audience = i.access,
-                content_sha256 = i.content_sha256,
-                occurred_at = i.work_at,
-                updated_at = now()
-           from items i
-          where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
-        returning u.audience`,
-        [row.id, teamId, itemId]
-      );
+      // `runSql` awaits `pool.query` DIRECTLY and THROWS on a SQL or connection failure, where the
+      // adapter this replaced RETURNED `{ok:false, error}` (Codex diff review HIGH). Unwrapped, a
+      // statement timeout would reject the whole backfill instead of letting it return its
+      // structured failure with the last-good cursor — `lib/projects/context/backfill.ts` does not
+      // catch. Restoring the contract is the point of this try/catch, not defensiveness.
+      let mirrored;
+      try {
+        mirrored = await runSql<{ audience: "team" | "external" }>(
+          `update project_context_units u
+              set audience = i.access,
+                  content_sha256 = i.content_sha256,
+                  occurred_at = i.work_at,
+                  updated_at = now()
+             from items i
+            where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
+              and u.source_item_id = i.id and u.unit_kind = 'item'
+          returning u.audience`,
+          [row.id, teamId, itemId]
+        );
+      } catch (e) {
+        return { ok: false, error: `unit mirror failed: ${e instanceof Error ? e.message : String(e)}` };
+      }
       const mirroredRow = mirrored.rows[0];
       if (!mirroredRow) {
         // The unit or the item vanished under us (a delete cascade, a concurrent purge). Not an

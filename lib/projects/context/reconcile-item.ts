@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
 import { ensureIncludeMembership, closeMembershipInto, noWideningGate } from "@/lib/projects/context/memberships";
+import { withTransaction } from "@/lib/db/pg/tx";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
 /**
@@ -83,6 +84,57 @@ export async function reconcileItemContext(
     projects = resolved;
   }
 
+  // ── SERIALIZE THE MOVE PER ITEM (AUDITFIX-4 §10c) ───────────────────────────────────────────
+  // Five review rounds each found a different interleaving of two reconcilers on the same item, and
+  // each fix patched one instance. They all require an interleaving, so the transaction retires the
+  // CLASS: the second reconciler blocks on this row lock until the first commits, then re-reads
+  // fresh state.
+  //
+  // The same statement returns the AUTHORITATIVE (items.access, unit.audience) pair. That is not
+  // redundant with the lock: round 10's blocker is a staleness between a reconciler's OWN item read
+  // and a value changed by INGEST — not by another reconciler — which a lock cannot fix and an
+  // atomic pair read does. `authoritativeAccess` is what the move routes on, never an earlier read.
+  //
+  // MUTUAL EXCLUSION, NOT WRITE ATOMICITY, and the difference is deliberate: the adapter's queries
+  // run on other pooled connections (lib/db/pg/tx.ts documents this), so the writers below keep
+  // their EXCLSHADOW-1 / CLOSEMODE-1 logic untouched. A crash mid-move still leaves partial state
+  // for the sweep — the position this codebase already accepts. True atomicity means rewriting all
+  // three writers as raw SQL and is AUDITFIX-12.
+  return withTransaction(async (client) => {
+    // An ADVISORY lock, not `SELECT … FOR UPDATE`. The row-lock version DEADLOCKED against its own
+    // move, and the failure is instructive: `FOR UPDATE` on an `items` row conflicts with the
+    // `FOR KEY SHARE` that an INSERT into a child table (`project_context_units`, FK → items) takes,
+    // and the writers below run on OTHER pooled connections. Observed directly: this transaction
+    // `idle in transaction` holding the lock, the unit INSERT `active` on `Lock/transactionid`.
+    //
+    // An advisory lock takes no row locks, so it cannot interact with foreign keys at all, while
+    // still giving exactly what §10c asks for — two reconcilers for the same item serialize. It is
+    // transaction-scoped, so it releases on COMMIT or ROLLBACK with no unlock path to forget.
+    await client.query(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [itemId]);
+
+    // The authoritative read, INSIDE the lock. Round 10's blocker is a staleness between a
+    // reconciler's own item read and a value changed by INGEST, which the lock cannot fix; reading
+    // it here, under the lock, and routing on THIS value is what closes it.
+    const locked = await client.query<{ access: "team" | "external" }>(
+      `select i.access from items i where i.team_id = $1 and i.id = $2`,
+      [teamId, itemId]
+    );
+    const authoritativeAccess = locked.rows[0]?.access;
+    if (!authoritativeAccess) return { ok: false, error: "item not found" };
+
+    return moveItem(db, teamId, itemId, projects, authoritativeAccess);
+  });
+}
+
+/** The move itself, holding the caller's per-item lock. Split out only so the lock's scope is one
+ *  readable block; it has no other caller and is not exported. */
+async function moveItem(
+  db: DbClient,
+  teamId: string,
+  itemId: string,
+  projects: { general: string; externalShared: string },
+  authoritativeAccess: "team" | "external"
+): Promise<ReconcileItemResult> {
   const unit = await reconcileItemUnit(db, teamId, itemId);
   // AUDITFIX-4: the unit or its item vanished mid-reconcile (a delete cascade, a concurrent purge).
   // Not a failure to shout about, and not convergence either — surfaced as `skipped` so a batch
@@ -97,22 +149,25 @@ export async function reconcileItemContext(
   if (unit.stale) return { ok: true, skipped: true };
   if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit: ${unit.error}` };
 
-  const target = unit.audience === "external" ? projects.externalShared : projects.general;
-  const other = unit.audience === "external" ? projects.general : projects.externalShared;
+  // ROUTE ON THE AUTHORITATIVE ACCESS (§10c). `unit.audience` echoes whatever `reconcileItemUnit`
+  // read, and round 10's blocker is precisely that this echo can be stale when the item and the unit
+  // happen to agree at that instant. The locked read above cannot be.
+  const target = authoritativeAccess === "external" ? projects.externalShared : projects.general;
+  const other = authoritativeAccess === "external" ? projects.general : projects.externalShared;
 
   // ORDER IS DIRECTION-AWARE (AUDITFIX-4 §3a). A NARROWING move (external → team) that opens the
   // target first leaves the item STILL EXTERNALLY GRANTED if the close then fails; closing first
   // leaves it in neither project, which the sweep repairs (ARM 2) and which denies rather than
   // discloses in the meantime. A WIDENING move keeps open-first: a failure there leaves the item
   // visible to fewer people, and CLOSEMODE-1's protected-exclusion return depends on that order.
-  const narrowing = unit.audience === "team";
+  const narrowing = authoritativeAccess === "team";
 
   if (narrowing) {
     // PREFLIGHT — non-destructive (round 2 HIGH). Ask the gate whether it CAN answer before the
     // close destroys anything. `noWideningGate` performs no write, which is the whole point: doing
     // this through `ensureIncludeMembership` would open the target first and be the very
     // open-then-close order this branch exists to avoid.
-    const pre = await noWideningGate(db, teamId, target, unit.audience);
+    const pre = await noWideningGate(db, teamId, target, authoritativeAccess);
     if (!pre.ok) return { ok: false, error: `membership: ${pre.error}` };
 
     // CLOSE FIRST: a failure from here leaves the item in NEITHER project — denial rather than
