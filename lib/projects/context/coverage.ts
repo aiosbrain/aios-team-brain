@@ -112,8 +112,10 @@ select i.id, i.path
  order by i.id
  limit $4`;
 
-/** Items no eligible principal can reach, bounded. `null` on failure — never an empty result, which
- *  would read the same as "there are none" for a metric whose only job is finding an invisible hole. */
+/** Items no eligible principal can reach, bounded. Returns `{ error }` on failure — NEVER an empty
+ *  `rows`, which would read the same as "there are none" for a metric whose only job is finding an
+ *  invisible hole. (This said "`null` on failure" until the fold that replaced the bare `null` with a
+ *  discriminated union carrying the cause; the comment outlived the contract by one commit.) */
 export async function unreachableItems(
   db: DbClient,
   teamId: string,
@@ -136,6 +138,33 @@ export async function unreachableItems(
   }
 }
 
+/**
+ * Shape a bounded id query into the `CoverageResult` the CLI consumes — PURE, and extracted so the
+ * FLOOR semantics are testable without planting `MAX_UNREACHABLE + 1` rows in a database.
+ *
+ * ⚠️ Extracted because a review showed the floor was asserted by nothing: the dm criterion only
+ * checked `truncated === false` on a small fixture, so a mutation forcing `truncated = false` passed
+ * it. The boundary is the whole contract — at exactly `MAX_UNREACHABLE` the count is EXACT, at one
+ * more it is a FLOOR — and a boundary you cannot cheaply reach is a boundary nobody tests.
+ *
+ * The caller must query `MAX_UNREACHABLE + 1` rows: the extra row is what distinguishes "exactly at
+ * the bound" from "more exist".
+ */
+export function shapeCoverage(
+  rows: readonly { id: string; path: string }[],
+  scanned: number,
+  max = MAX_UNREACHABLE
+): CoverageResult {
+  const truncated = rows.length > max;
+  const kept = truncated ? rows.slice(0, max) : rows;
+  return {
+    scanned,
+    count: kept.length,
+    examples: kept.slice(0, EXAMPLE_LIMIT).map((r) => r.path),
+    truncated,
+  };
+}
+
 export async function findUnpartitionedItems(db: DbClient, teamId: string): Promise<CoverageResult> {
   // ONE OWNER (AUDITFIX-15A): this reader delegates to `unreachableItems` rather than carrying its
   // own idea of reachability. The previous version paged `items` and re-derived coverage in three
@@ -146,18 +175,11 @@ export async function findUnpartitionedItems(db: DbClient, teamId: string): Prom
   // FLOOR. A caller deciding what a whole team can see has to know it has one.
   const found = await unreachableItems(db, teamId, MAX_UNREACHABLE + 1);
   if (found.error !== undefined) throw new Error(`coverage read failed: ${found.error}`);
-  const truncated = found.rows.length > MAX_UNREACHABLE;
-  const rows = truncated ? found.rows.slice(0, MAX_UNREACHABLE) : found.rows;
 
   // `scanned` is the corpus size the answer is ABOUT. It was the paging loop's counter; now it is
   // asked directly, because a reader reporting "I looked at N" must not silently mean "N so far".
   const { count: scanned, error } = await db.from("items").select("id", { count: "exact", head: true }).eq("team_id", teamId);
   if (error) throw new Error(`items count failed: ${error.message}`);
 
-  return {
-    scanned: scanned ?? 0,
-    count: rows.length,
-    examples: rows.slice(0, EXAMPLE_LIMIT).map((r) => r.path),
-    truncated,
-  };
+  return shapeCoverage(found.rows, scanned ?? 0);
 }

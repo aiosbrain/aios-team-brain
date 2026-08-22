@@ -164,15 +164,21 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   //    is the check that decides the whole question.
   const unpartitioned = await findUnpartitionedItems(db, teamId);
   if (unpartitioned.count > 0) {
-    // ⚠️ The cause is NOT always an incomplete backfill (AUDITFIX-15A). The old predicate could only
-    // see "no membership at all", so "the backfill has not completed" was the only possible cause and
-    // the message said so. The corrected predicate ALSO catches an item that HAS a current include
-    // into a project granted only to a group no eligible principal is in — for which draining the
-    // backfill changes nothing and an operator following that advice loops. Both causes are named.
+    // ⚠️ DO NOT ENUMERATE THE CAUSES HERE. The original message named exactly one ("the backfill has
+    // not completed"), which was the only cause the OLD grant-only predicate could see. AUDITFIX-15A
+    // widened the predicate, so I widened the message to name two — and a review produced a
+    // counterexample to that too: an active non-connector AGENT in the built-in `everyone` group.
+    // Built-ins admit humans only, so the item is correctly unreachable, while BOTH stated causes are
+    // false — the backfill completed, and the group does contain an active non-connector agent.
+    // Unknown built-in slugs, retracted units, and exclude/closed memberships are further cases.
+    //
+    // An exhaustive "either/or" is a claim about the whole predicate, and this one has now been wrong
+    // twice. Point at what to inspect instead; the examples below say which items.
     blockers.push(
       `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (floor — more exist)" : ""} are reachable by NO eligible ` +
-        `principal. Either the §11 backfill has not completed, or their project is granted only to ` +
-        `group(s) that no active non-connector human/agent is in`
+        `principal. Inspect, for each: its context unit (active?), its membership (current include?), ` +
+        `its project's grants, and whether any granted group holds an ELIGIBLE member — built-in ` +
+        `groups admit humans only`
     );
   }
   // The old `else if (truncated)` arm is GONE, not forgotten: under the new contract `truncated`

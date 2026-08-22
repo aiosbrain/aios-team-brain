@@ -20,11 +20,18 @@ import ts from "typescript";
  *
  * ⚠️ WHAT IT DOES NOT CATCH, stated rather than implied (Fable diff review). It sees only literal
  * string SQL: a template with a `${…}` substitution, or `"from " + "items"`, is invisible to it. And
- * the call-graph half inspects only the direct body of `findUnpartitionedItems`, so a HELPER
- * elsewhere in this module doing its own grant-only read — the original defect's exact shape — would
- * pass both assertions. The residual protection is the dm matrix, which pins the reader's behaviour
- * for every enumerated case, so behaviour-changing drift still reddens. Read this as a tripwire on
- * the module's structure, not a proof that one definition exists.
+ * the call-graph half inspects only the direct body of `findUnpartitionedItems`.
+ *
+ * ⚠️ I first wrote that "a helper elsewhere in this module doing its own grant-only read would pass
+ * both assertions". A review checked it and that is TOO PESSIMISTIC: an ordinary helper with literal
+ * table names is caught by the substrate-query count above. Only an INTERPOLATED form escapes —
+ * verified by planting a second grant-only query as a `TemplateExpression`, which kept both tests
+ * green. Overstating a guard's blind spot is its own kind of wrong: it invites someone to replace a
+ * guard that works.
+ *
+ * The residual protection is the dm matrix, which pins the reader's behaviour for every enumerated
+ * case, so behaviour-changing drift still reddens. Read this as a tripwire on the module's structure,
+ * not a proof that one definition exists.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");

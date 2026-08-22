@@ -147,9 +147,15 @@ is_connector` join passes a prose criterion while admitting a planted agent buil
 - **AC8 — one owner, by call site (unit guard):** `findUnpartitionedItems` reaches the substrate only
   through the exported canonical function — asserted on the import and call graph. Deleting the
   delegation and re-inlining a second query **fails**.
-- **AC9 — the CLI contract is unchanged (dm):** `findUnpartitionedItems` still returns
-  `scanned`/`count`/`examples`/`truncated`, `truncated` still means "the count is a floor", and
-  `assessAccessHealth`'s blocker text is unchanged for a non-zero count.
+- **AC9 — the CLI contract holds, and the FLOOR is tested at its boundary (dm + unit):**
+  `findUnpartitionedItems` still returns `scanned`/`count`/`examples`/`truncated`, and a non-zero
+  count is still a blocker. ⚠️ Two corrections a review forced. (1) I wrote "the blocker text is
+  unchanged"; this branch **deliberately changes it**, because the old text named a cause that is
+  false for the case the fix exists to surface — what must not change is that a non-zero count
+  BLOCKS. (2) Asserting `truncated === false` on a small fixture pins nothing: a mutation forcing
+  `truncated = false` passes it. The bounded shaping is now a pure function (`shapeCoverage`) tested
+  at **exactly `max` (exact) vs `max + 1` (floor)**, which is unreachable in the dm tier without
+  planting 5,001 rows.
 - **AC10 — a read failure is not zero (dm):** with the query faulted, the caller sees an error rather
   than a clean bill of health. `countUnrepairable`'s rule: "could not read" must never be spelled the
   same as "there are none".
