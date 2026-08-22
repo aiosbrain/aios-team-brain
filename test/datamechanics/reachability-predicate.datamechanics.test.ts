@@ -203,6 +203,43 @@ describe("AUDITFIX-15A — universal reachability, the oracle's rule and nothing
     });
   }
 
+  // AC5 — the SERVING conjuncts. Omitted from the first implementation of this file even though the
+  // spec listed it, and two mutations SURVIVED as a result: deleting `u.state = 'active'` and
+  // deleting `pcm.decision = 'include'` each reddened nothing. A criterion that exists only in prose
+  // pins nothing.
+  for (const [label, unitOver, memOver] of [
+    ["a RETRACTED unit", { state: "retracted" }, {}],
+    ["an EXCLUDE membership", {}, { decision: "exclude" }],
+    ["a CLOSED membership", {}, { valid_to: new Date().toISOString() }],
+  ] as const) {
+    it(`AC5 — ${label} is UNREACHABLE`, async () => {
+      const seed = await seedTeam();
+      const p = await project(seed);
+      const g = await group(seed);
+      await join(seed, g, await member(seed));
+      await grant(seed, p, g);
+      const path = `ac5-${label.replace(/\W+/g, "")}.md`;
+      const { id: itemId } = await ingest(seed, { path, body: path, access: "team", project: "src" });
+      const { data: unit, error: uErr } = await db()
+        .from("project_context_units")
+        .insert({
+          team_id: seed.teamId, unit_kind: "item", source_item_id: itemId, unit_key: `item:${itemId}`,
+          audience: "team", content_sha256: "0".repeat(64), state: "active", ...unitOver,
+        })
+        .select("id")
+        .single();
+      if (uErr || !unit) throw new Error(`seed unit failed: ${uErr?.message}`);
+      const { error: mErr } = await db()
+        .from("project_context_memberships")
+        .insert({
+          team_id: seed.teamId, project_id: p, context_unit_id: unit.id,
+          decision: "include", mode: "auto", method: "rule", ...memOver,
+        });
+      if (mErr) throw new Error(`seed membership failed: ${mErr.message}`);
+      expect(await unreachable(seed, path)).toBe(true);
+    });
+  }
+
   it("AC6 — tier, project kind and membership mode are NOT serving conjuncts", async () => {
     const seed = await seedTeam();
     const p = await project(seed, "initiative"); // kind is not consulted by the oracle
