@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   unsourcedAdmission,
   provenanceRowSqlFromIds,
+  provenanceRowSql,
   newSqlParams,
   type UnsourcedAdmission,
 } from "@/lib/access/provenance-sql";
@@ -111,5 +112,33 @@ describe("AC8(iii, SQL half) — the id-array owner emits the project conjunct o
     const p = newSqlParams();
     const sql = provenanceRowSqlFromIds("t", p, { visibleItemIds: ids, teamPosture: true, principal: "token" });
     expect(sql, "the arm is OMITTED, not parameterised false").not.toContain("created_by");
+  });
+});
+
+describe("AC8(iii, SQL half) — the SEMIJOIN owner, asserted SEPARATELY", () => {
+  // ⚠️ A mutation dropping the project conjunct from THIS owner SURVIVED the first version of this
+  // file, because every SQL assertion targeted the id-array owner. The spec had already said it —
+  // "one mutation per SQL owner, so a shared fixture cannot mask either" — and I under-implemented
+  // it. Two owners, two sets of assertions, two mutations.
+  const base = { teamId: "t1", grantedProjectIds: ["g1"], teamPosture: true } as const;
+
+  it("member → the bare authored arm, with NO project filter", () => {
+    const sql = provenanceRowSql("t", newSqlParams(), { ...base, principal: "member" });
+    expect(sql).toContain("created_by is not null");
+    expect(sql, "a member's arm must not be project-gated here either").not.toContain("t.project_id");
+  });
+
+  it("token with a set → the authored arm AND a project filter on the ALIAS", () => {
+    const p = newSqlParams();
+    const sql = provenanceRowSql("t", p, { ...base, principal: "token", tokenProjectIds: ["p1"] });
+    expect(sql).toContain("created_by is not null");
+    expect(sql, "the alias column resolves without the caller selecting anything").toContain("t.project_id = any(");
+    expect(p.values.at(-1)).toEqual(["p1"]);
+  });
+
+  it("token with no set → NO authored arm at all", () => {
+    const sql = provenanceRowSql("t", newSqlParams(), { ...base, principal: "token" });
+    expect(sql).not.toContain("created_by");
+    expect(sql, "closing the arm must not blank the sourced half").toContain("source_item_id is not null");
   });
 });
