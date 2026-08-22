@@ -19,6 +19,10 @@ vi.mock("@/lib/projects/context/units", () => ({ reconcileItemUnit: (...a: unkno
 vi.mock("@/lib/projects/context/memberships", () => ({
   ensureIncludeMembership: (...a: unknown[]) => ensureMembership(...a),
   closeMembershipInto: (...a: unknown[]) => closeOthers(...a),
+  // AUDITFIX-4: the non-destructive preflight a NARROWING move runs before its close. This suite
+  // is about the backfill's CURSOR on failure, not about the gate, so it passes — the gate's own
+  // outcomes are pinned in the data-mechanics tier where a real project_groups row exists.
+  noWideningGate: () => Promise.resolve({ ok: true }),
 }));
 const candidates = vi.fn();
 vi.mock("@/lib/projects/context/backfill-candidates", () => ({

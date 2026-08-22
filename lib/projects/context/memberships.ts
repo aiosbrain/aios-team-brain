@@ -37,15 +37,30 @@ export interface WriteResult {
   refused?: boolean;
 }
 
-/** Does the target project grant visibility to the built-in `external` group? */
-async function projectIsExternalVisible(db: DbClient, teamId: string, projectId: string): Promise<boolean> {
-  const { data } = await db
+/**
+ * Can the target project be reached by the built-in `external` group — TRI-STATE (AUDITFIX-4).
+ *
+ * It used to return a bare `boolean` and destructure only `data`. The pg adapter RETURNS errors
+ * rather than throwing, so a failed read became `[]` → `some()` false → the caller's `&&`
+ * short-circuited → **the no-widening gate silently disappeared** and the widening placement was
+ * written. A bare boolean has nowhere to say "I could not determine this", which is why this is a
+ * signature change rather than an error check.
+ *
+ * `{ok:false}` is NOT "not reachable" — the caller must refuse, not proceed. `project_groups`
+ * decides who receives the project, so under a membership-only access model an undetermined read
+ * makes uncertainty MORE consequential, not less.
+ */
+type ExternalReach = { ok: true; reachable: boolean } | { ok: false; error: string };
+
+async function projectIsExternalVisible(db: DbClient, teamId: string, projectId: string): Promise<ExternalReach> {
+  const { data, error } = await db
     .from("project_groups")
     .select("groups(slug)")
     .eq("team_id", teamId)
     .eq("project_id", projectId);
+  if (error) return { ok: false, error: error.message };
   const rows = (data ?? []) as { groups: { slug: string } | null }[];
-  return rows.some((r) => r.groups?.slug === "external");
+  return { ok: true, reachable: rows.some((r) => r.groups?.slug === "external") };
 }
 
 /**
@@ -54,6 +69,33 @@ async function projectIsExternalVisible(db: DbClient, teamId: string, projectId:
  * `valid_to is null` also backstops a race). Auto-mode by default; the §11 backfill uses
  * method `ingestion_project`.
  */
+/**
+ * THE no-widening rule, in one place, callable WITHOUT writing (AUDITFIX-4 §3a3).
+ *
+ * `reconcileItemContext` needs the answer BEFORE it performs a destructive close on a narrowing
+ * move — otherwise a `project_groups` read outage closes the old membership and then refuses the new
+ * one, leaving the item in NEITHER project, and a persistent outage pins the backfill cursor and
+ * blocks every later candidate for the team. Having the writer be the only place that can ask was
+ * the second-order defect; this is the same rule with one owner and two callers.
+ */
+export async function noWideningGate(
+  db: DbClient,
+  teamId: string,
+  projectId: string,
+  unitAudience: string
+): Promise<WriteResult> {
+  if (unitAudience !== "team") return { ok: true };
+  const reach = await projectIsExternalVisible(db, teamId, projectId);
+  // UNDETERMINED refuses (AUDITFIX-4). Deliberately NOT `refused:true` — that flag means "the gate
+  // said no", a settled answer a sweep need not retry; this is "the gate could not answer", which it
+  // must retry. Collapsing the two would turn a transient outage into a permanent skip.
+  if (!reach.ok) return { ok: false, error: `no-widening: external reachability undetermined — ${reach.error}` };
+  if (reach.reachable) {
+    return { ok: false, refused: true, error: "no-widening: a team-audience unit cannot enter an external-visible project" };
+  }
+  return { ok: true };
+}
+
 export async function ensureIncludeMembership(
   db: DbClient,
   teamId: string,
@@ -68,9 +110,8 @@ export async function ensureIncludeMembership(
     .eq("id", args.contextUnitId)
     .maybeSingle();
   if (!unitRow) return { ok: false, error: "context unit not found" };
-  if ((unitRow as { audience: string }).audience === "team" && (await projectIsExternalVisible(db, teamId, args.projectId))) {
-    return { ok: false, refused: true, error: "no-widening: a team-audience unit cannot enter an external-visible project" };
-  }
+  const gate = await noWideningGate(db, teamId, args.projectId, (unitRow as { audience: string }).audience);
+  if (!gate.ok) return gate;
 
   // EXCLSHADOW-1 D1b: the probe is UNFILTERED (the partial unique index guarantees ≤1
   // current row per pair) and BRANCHES — an exclude is never returned as convergence. The
@@ -211,28 +252,81 @@ async function repairExcludeShadow(
  * (a General survivor would widen for a General-scoped delegated token and diverge from the
  * graph's single-home model — CLOSEMODE-1 design round 1).
  */
+export type CloseResult =
+  | { ok: true; closed: number; spared: number }
+  | { ok: false; error: string };
+
+/** Is this current row a human's standing exclusion, which the move must SPARE (CLOSEMODE-1)? */
+type CurrentRow = { id: string; decision: string; mode: string };
+const isProtected = (m: CurrentRow): boolean => m.decision === "exclude" && m.mode !== "auto";
+
 export async function closeMembershipInto(
   db: DbClient,
   teamId: string,
   contextUnitId: string,
   projectId: string
-): Promise<{ ok: boolean; error?: string; closed: number; spared: number }> {
-  const { data: current } = await db
-    .from("project_context_memberships")
-    .select("id, decision, mode")
-    .eq("team_id", teamId)
-    .eq("context_unit_id", contextUnitId)
-    .eq("project_id", projectId)
-    .is("valid_to", null);
-  const rows = (current ?? []) as { id: string; decision: string; mode: string }[];
-  const toClose = rows.filter((m) => !(m.decision === "exclude" && m.mode !== "auto"));
-  const spared = rows.length - toClose.length;
+): Promise<CloseResult> {
+  const readCurrent = async (): Promise<{ ok: true; rows: CurrentRow[] } | { ok: false; error: string }> => {
+    const { data, error } = await db
+      .from("project_context_memberships")
+      .select("id, decision, mode")
+      .eq("team_id", teamId)
+      .eq("context_unit_id", contextUnitId)
+      .eq("project_id", projectId)
+      .is("valid_to", null);
+    // AUDITFIX-4: the error was DESTRUCTURED AWAY here, so a failed read became `[]` → nothing to
+    // close → `{ok:true, closed:0}`. The function reported that it had successfully closed nothing,
+    // having failed to look.
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, rows: (data ?? []) as CurrentRow[] };
+  };
+
+  const first = await readCurrent();
+  if (!first.ok) return { ok: false, error: `close read failed: ${first.error}` };
+
+  const toClose = first.rows.filter((m) => !isProtected(m));
+  const spared = first.rows.length - toClose.length;
   if (toClose.length === 0) return { ok: true, closed: 0, spared };
-  const { error } = await db
-    .from("project_context_memberships")
-    .update({ valid_to: new Date().toISOString() })
-    .eq("team_id", teamId)
-    .in("id", toClose.map((m) => m.id));
-  if (error) return { ok: false, error: error.message, closed: 0, spared };
-  return { ok: true, closed: toClose.length, spared };
+
+  let closed = 0;
+  for (const row of toClose) {
+    // REASSERT the classification in the WHERE clause instead of trusting the id we read
+    // (AUDITFIX-4 round 1). Two races this closes: (a) the row was replaced by a different current
+    // row, so `valid_to is null` no longer matches this id; (b) the row BECAME a human's standing
+    // exclusion between the read and the write, and closing it by id would erase the very thing
+    // CLOSEMODE-1 exists to protect. `decision`/`mode` are non-null (schema.sql:1189), so exact
+    // equality is a faithful restatement of the predicate — it never closes MORE than the filter did.
+    //
+    // One statement per row costs nothing real: `pcm_current_idx` is unique on
+    // (team_id, project_id, context_unit_id) WHERE valid_to is null, so `toClose` holds at most one.
+    // Written as a loop anyway, because a predicate that silently depends on an index elsewhere is
+    // how the two drift.
+    const { data: affected, error } = await db
+      .from("project_context_memberships")
+      .update({ valid_to: new Date().toISOString() })
+      .eq("team_id", teamId)
+      .eq("id", row.id)
+      .eq("decision", row.decision)
+      .eq("mode", row.mode)
+      .is("valid_to", null)
+      .select("id"); // RETURNING — `closed` is MEASURED, never assumed from what we read
+    if (error) return { ok: false, error: `close failed: ${error.message}` };
+    closed += ((affected ?? []) as unknown[]).length;
+  }
+
+  if (closed === toClose.length) return { ok: true, closed, spared };
+
+  // Zero (or short) affected rows after a non-empty read means the world moved under us. That is
+  // NOT success: reread and let the FINAL STATE decide, because "we closed nothing" and "there is
+  // nothing left to close" are different facts and only the second is convergence.
+  const after = await readCurrent();
+  if (!after.ok) return { ok: false, error: `close reread failed: ${after.error}` };
+  const stillClosable = after.rows.filter((m) => !isProtected(m));
+  if (stillClosable.length > 0) {
+    // The move did NOT move. Reporting success here is the defect this slice is named for.
+    return { ok: false, error: `close did not converge: ${stillClosable.length} current row(s) remain closable` };
+  }
+  // Everything that had to go is gone — by us or by a concurrent writer — and whatever remains is
+  // protected. Converged, and `spared` reports the FINAL state rather than the stale first read.
+  return { ok: true, closed, spared: after.rows.length };
 }

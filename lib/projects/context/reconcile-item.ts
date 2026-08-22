@@ -1,7 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
-import { ensureIncludeMembership, closeMembershipInto } from "@/lib/projects/context/memberships";
+import { ensureIncludeMembership, closeMembershipInto, noWideningGate } from "@/lib/projects/context/memberships";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
 /**
@@ -82,10 +82,46 @@ export async function reconcileItemContext(
   }
 
   const unit = await reconcileItemUnit(db, teamId, itemId);
+  // AUDITFIX-4: a lost audience CAS is not a failure to report as one — another reconciler owns
+  // this unit's current audience, and its own pass will place the item. Surfaced as `skipped` so a
+  // batch neither fails nor claims convergence it did not achieve.
+  if (unit.stale) return { ok: true, skipped: true };
   if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit: ${unit.error}` };
 
   const target = unit.audience === "external" ? projects.externalShared : projects.general;
   const other = unit.audience === "external" ? projects.general : projects.externalShared;
+
+  // ORDER IS DIRECTION-AWARE (AUDITFIX-4 §3a). A NARROWING move (external → team) that opens the
+  // target first leaves the item STILL EXTERNALLY GRANTED if the close then fails; closing first
+  // leaves it in neither project, which the sweep repairs (ARM 2) and which denies rather than
+  // discloses in the meantime. A WIDENING move keeps open-first: a failure there leaves the item
+  // visible to fewer people, and CLOSEMODE-1's protected-exclusion return depends on that order.
+  const narrowing = unit.audience === "team";
+
+  if (narrowing) {
+    // PREFLIGHT — non-destructive (round 2 HIGH). Ask the gate whether it CAN answer before the
+    // close destroys anything. `noWideningGate` performs no write, which is the whole point: doing
+    // this through `ensureIncludeMembership` would open the target first and be the very
+    // open-then-close order this branch exists to avoid.
+    const pre = await noWideningGate(db, teamId, target, unit.audience);
+    if (!pre.ok) return { ok: false, error: `membership: ${pre.error}` };
+
+    // CLOSE FIRST: a failure from here leaves the item in NEITHER project — denial, which ARM 2 of
+    // the candidate sweep repairs — rather than still externally granted.
+    const closedFirst = await closeMembershipInto(db, teamId, unit.unitId, other);
+    if (!closedFirst.ok) return { ok: false, error: `move: ${closedFirst.error}` };
+
+    const opened = await ensureIncludeMembership(db, teamId, { projectId: target, contextUnitId: unit.unitId });
+    if (!opened.ok) return { ok: false, error: `membership: ${opened.error}` };
+    return {
+      ok: true,
+      unitId: unit.unitId,
+      unitCreated: unit.created,
+      membershipCreated: opened.created,
+      spared: closedFirst.spared,
+    };
+  }
+
   const m = await ensureIncludeMembership(db, teamId, { projectId: target, contextUnitId: unit.unitId });
   if (!m.ok) return { ok: false, error: `membership: ${m.error}` };
 

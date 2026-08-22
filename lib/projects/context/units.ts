@@ -12,6 +12,9 @@ import type { DbClient } from "@/lib/db/types";
 export interface ReconcileResult {
   ok: boolean;
   error?: string;
+  /** AUDITFIX-4: the audience CAS lost — another reconciler re-mirrored this unit. Distinct from a
+   *  failure: the caller should RESTART against fresh state, and the sweep's retry converges. */
+  stale?: boolean;
   unitId?: string;
   created?: boolean;
   /** The audience the unit now carries — mirrored from the item's CURRENT access. Callers must
@@ -56,7 +59,14 @@ export async function reconcileItemUnit(
     const row = existing as { id: string; audience: string; content_sha256: string; occurred_at: string };
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
     if (row.audience !== item.access || row.content_sha256 !== item.content_sha256 || workAtDrift) {
-      const { error } = await db
+      // COMPARE-AND-SET on `audience` (AUDITFIX-4 round 2). Without it a STALE reconciler wins:
+      //   S reads items.access='external'; the item flips to 'team'; N reads 'team' and writes the
+      //   unit 'team'; S then overwrites it back to 'external' — and the no-widening gate, which
+      //   rereads the unit, now sees S's stale value and PERMITS an external-shared placement. The
+      //   item ends current in BOTH system projects with both reconcilers reporting success, and no
+      //   read ever failed. Ordering cannot fix a LATER stale open; only binding the write to the
+      //   audience version that authorized it can.
+      const { data: affected, error } = await db
         .from("project_context_units")
         .update({
           audience: item.access,
@@ -65,8 +75,16 @@ export async function reconcileItemUnit(
           updated_at: new Date().toISOString(),
         })
         .eq("id", row.id)
-        .eq("team_id", teamId);
+        .eq("team_id", teamId)
+        .eq("audience", row.audience) // ← the CAS: only if nobody moved it since we read it
+        .select("id");
       if (error) return { ok: false, error: error.message };
+      if (((affected ?? []) as unknown[]).length === 0) {
+        // Someone re-mirrored this unit between our read and our write. Do NOT proceed on the
+        // audience we thought we had — every downstream placement decision is derived from it.
+        // `stale` is not an error: the caller restarts and the retry converges on fresh state.
+        return { ok: false, stale: true, error: "unit audience changed under this reconcile (CAS)" };
+      }
     }
     return { ok: true, unitId: row.id, created: false, audience: item.access };
   }
