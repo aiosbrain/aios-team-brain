@@ -458,6 +458,12 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     { n: "T1 a LOCAL function of the same name, no canonical import", rel: "lib/f.ts", code: `function ${WRITER}(a){return a}\nawait ${WRITER}(1);`, inv: NO_INVENTORY, kind: null },
     { n: "T2 a dynamic import of another module, no call", rel: "lib/f.ts", code: `const { other } = await import("@/lib/other");`, inv: NO_INVENTORY, kind: null },
     { n: "T3 canonical import used only in a TYPE position", rel: "lib/f.ts", code: `${IMPORT_CANON}\ntype F = typeof ${WRITER};\nexport const z: F | null = null;`, inv: NO_INVENTORY, kind: null },
+    // T4 pins the FUNCTION-BOUNDARY stop in `carriesWriter`, whose own mutation SURVIVED without it:
+    // the callee-exclusion alone already spares `lib/actions/handlers.ts`, so the boundary rule had
+    // no distinct property pinned and was effectively untested. Here the writer appears as a
+    // non-callee VALUE inside a function inside an object literal — a shape the callee check does
+    // NOT spare. Only the boundary stop keeps this from being a false REFUSAL.
+    { n: "T4 writer referenced as a value inside a nested function", rel: "lib/f.ts", code: `${IMPORT_CANON}\nconst registry = { register: () => track(${WRITER}) };\nexport default registry;`, inv: NO_INVENTORY, kind: null },
   ];
 
   it.each(CONTROLS)("AC2 — control $n", ({ rel, code, inv, kind }) => {
