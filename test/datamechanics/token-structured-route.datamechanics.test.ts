@@ -6,6 +6,17 @@ import { db, ingest, seedTeam, type Seed } from "./helpers";
 /**
  * AUDITFIX-1 AC5 — the leak proof at the ROUTE, not at the library.
  *
+ * ⚠️ AUDITFIX-7 DELIBERATELY REVERSED HALF OF THIS FILE'S ORIGINAL ASSERTION, under an explicit
+ * product ruling (Chetan, 2026-08-22): an agent granted a project SHOULD read what a person typed
+ * into that project by hand. AUDITFIX-1 closed the hand-typed arm for EVERY token because scope was
+ * being ignored entirely — an empty-scoped token received the whole team's hand-typed rows. The arm
+ * is now GATED on the token's effective project set rather than closed, so:
+ *   IN-scope hand-entered rows are SERVED (the ruling), and
+ *   OUT-OF-scope hand-entered rows are still ABSENT (AUDITFIX-1's actual protection, kept).
+ * The original test seeded its hand-entered rows INSIDE the token's scope, so it could only ever
+ * express the closed rule. It is converted, not deleted: the leak it proves is still proven, by the
+ * out-of-scope half.
+ *
  * Everything else in this slice calls `retrieve`/`matchingDecisions` directly and hands them a
  * `principal` the test itself chose. That proves the predicate, and proves nothing about whether the
  * shipped route reaches it: the reproduced CRITICAL was a real `POST /api/v1/query` disclosure, and
@@ -89,7 +100,7 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
     captured.structured = [];
   });
 
-  it("a NON-EMPTY-scoped aiosd_ token is served its in-scope sourced rows and NO hand-entered rows", async () => {
+  it("a NON-EMPTY-scoped aiosd_ token is served IN-scope hand-entered rows and never OUT-of-scope ones", async () => {
     const seed = await seedTeam();
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
     const { mintAgentToken } = await import("@/lib/access/agent-tokens");
@@ -102,20 +113,28 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
     const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
     await curateInto(seed, inScope.id, bySlug.get("rproj")!);
 
-    // A hand-entered task and decision — no source item, so no membership axis to test a scope
-    // against. These are the rows the reproduced defect handed to every token in the team.
+    // Hand-entered rows — no source item, so the ONLY thing that can gate them is the project the
+    // author chose. Seeded in BOTH directions in one invocation, because a spec round found that
+    // seeding only the in-scope half lets an implementation pass by deleting the gate outright, and
+    // seeding only a TASK lets it gate the task leg while leaving the decision leg open.
+    const inScopeTask = `INSCOPETASK-${randomUUID().slice(0, 8)}`;
+    const inScopeDecision = `INSCOPEDECISION-${randomUUID().slice(0, 8)} ${TERM}`;
     const secretTask = `SECRETTASK-${randomUUID().slice(0, 8)}`;
     const secretDecision = `SECRETDECISION-${randomUUID().slice(0, 8)} ${TERM}`;
-    const t = await db().from("tasks").insert({
-      team_id: seed.teamId, row_key: `RT-${randomUUID().slice(0, 6)}`, title: secretTask, status: "in_progress",
-      source_item_id: null, created_by: seed.memberId, audience: "team", project_id: bySlug.get("rproj")!, origin: "ui",
-    });
-    if (t.error) throw new Error(`task seed failed: ${t.error.message}`);
-    const d = await db().from("decisions").insert({
-      team_id: seed.teamId, row_key: `RD-${randomUUID().slice(0, 6)}`, title: secretDecision, decided_by: "x",
-      still_valid: true, source_item_id: null, created_by: seed.memberId, audience: "team", project_id: bySlug.get("rproj")!,
-    });
-    if (d.error) throw new Error(`decision seed failed: ${d.error.message}`);
+    const handEntered = async (title: string, decisionTitle: string, projectSlug: string) => {
+      const t = await db().from("tasks").insert({
+        team_id: seed.teamId, row_key: `RT-${randomUUID().slice(0, 6)}`, title, status: "in_progress",
+        source_item_id: null, created_by: seed.memberId, audience: "team", project_id: bySlug.get(projectSlug)!, origin: "ui",
+      });
+      if (t.error) throw new Error(`task seed failed: ${t.error.message}`);
+      const d = await db().from("decisions").insert({
+        team_id: seed.teamId, row_key: `RD-${randomUUID().slice(0, 6)}`, title: decisionTitle, decided_by: "x",
+        still_valid: true, source_item_id: null, created_by: seed.memberId, audience: "team", project_id: bySlug.get(projectSlug)!,
+      });
+      if (d.error) throw new Error(`decision seed failed: ${d.error.message}`);
+    };
+    await handEntered(inScopeTask, inScopeDecision, "rproj");
+    await handEntered(secretTask, secretDecision, "otherproj");
 
     // A SOURCED task on the in-scope item — the survival half. Without it, a route that returned
     // an empty structured digest for every token would pass this test while breaking the feature.
@@ -147,7 +166,57 @@ describe("AUDITFIX-1 AC5: the real POST /api/v1/query attenuates a delegated tok
     expect(captured.structured.length, "streamAnswer must have run — otherwise nothing was asserted").toBe(1);
     const structured = captured.structured[0];
     expect(structured, "the token's in-scope SOURCED task is still served").toContain(sourcedTask);
-    expect(structured, "a hand-entered TASK must never reach a token's prompt").not.toContain(secretTask);
-    expect(structured, "a hand-entered DECISION must never reach a token's prompt").not.toContain(secretDecision);
+    // The RULING (AUDITFIX-7): an agent granted a project reads what a person typed into it.
+    expect(structured, "an IN-SCOPE hand-entered TASK is served to the token").toContain(inScopeTask);
+    expect(structured, "an IN-SCOPE hand-entered DECISION is served to the token").toContain(inScopeDecision);
+    // AUDITFIX-1's protection, kept: the gate is a scope, not an open door.
+    expect(structured, "an OUT-OF-SCOPE hand-entered TASK must never reach a token's prompt").not.toContain(secretTask);
+    expect(structured, "an OUT-OF-SCOPE hand-entered DECISION must never reach a token's prompt").not.toContain(secretDecision);
+  });
+
+  it("an UNSCOPED token (projectScope: null) gets its launcher's projects — NOT nothing, NOT everything", async () => {
+    // Spec round 2's BLOCKER. The oracle attenuates only when the scope is NON-NULL, so `null` means
+    // "the launcher's granted projects" while `[]` means "sees nothing". Every other criterion here
+    // uses an explicit non-empty scope, so an implementation returning `[]` for a null scope would
+    // pass all of them and silently blind every unscoped agent — which is the exact narrowing the
+    // ruling forbids, and it would look identical to today's behaviour.
+    const seed = await seedTeam();
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    const { mintAgentToken } = await import("@/lib/access/agent-tokens");
+    const { addMemberToGroup, createGroup, grantProjectToGroup } = await import("@/lib/access/groups");
+
+    await ingest(seed, { path: "u/in.md", body: `in ${TERM}`, access: "team", project: "uproj" });
+    await ingest(seed, { path: "u/out.md", body: `out ${TERM}`, access: "team", project: "uother" });
+    await backfillTeamContext(db(), seed.teamId);
+    const { data: projects } = await db().from("projects").select("id, slug").eq("team_id", seed.teamId);
+    const bySlug = new Map(((projects ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+
+    const reachable = `UNSCOPEDREACHABLE-${randomUUID().slice(0, 8)}`;
+    const unreachable = `UNSCOPEDUNREACHABLE-${randomUUID().slice(0, 8)}`;
+    for (const [title, slug] of [[reachable, "uproj"], [unreachable, "uother"]] as const) {
+      const r = await db().from("tasks").insert({
+        team_id: seed.teamId, row_key: `UT-${randomUUID().slice(0, 6)}`, title, status: "in_progress",
+        source_item_id: null, created_by: seed.memberId, audience: "team", project_id: bySlug.get(slug)!, origin: "ui",
+      });
+      if (r.error) throw new Error(`task seed failed: ${r.error.message}`);
+    }
+
+    // The agent is granted ONLY uproj. The token names NO scope at all.
+    const agent = await seedMember(seed, { kind: "agent" });
+    const g = await createGroup(db(), seed.teamId, `ut-${randomUUID().slice(0, 6)}`, "G", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, agent, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, bySlug.get("uproj")!, g.groupId!, seed.memberId);
+    const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent, projectScope: null }, seed.memberId);
+    expect(minted.ok, minted.error).toBe(true);
+
+    const { POST: queryPOST } = await import("@/app/api/v1/query/route");
+    const res = await queryPOST(queryReq(minted.token!, `tell me about ${TERM}`));
+    expect(res.status).toBe(200);
+    await drain(res);
+
+    expect(captured.structured.length, "streamAnswer must have run").toBe(1);
+    const structured = captured.structured[0];
+    expect(structured, "an unscoped token still reaches its launcher's granted project").toContain(reachable);
+    expect(structured, "an unscoped token is NOT unattenuated — an ungranted project stays closed").not.toContain(unreachable);
   });
 });

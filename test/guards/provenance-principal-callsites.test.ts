@@ -110,7 +110,8 @@ function filesUnder(dir: string): string[] {
  *   2. no object literal carrying `visibleItemIds` may contain a SPREAD, which could overwrite it;
  *   3. nothing ASSIGNS to a `.principal` property, in any assignment operator;
  *   4. `Reflect.set` / `Object.defineProperty` may not target `principal`;
- *   5. every object literal carrying `visibleItemIds` also carries `principal` — the M13 property,
+ *   5. every object literal carrying `visibleItemIds` also carries `principal` AND `tokenProjectIds`
+ *      (AUDITFIX-7) — the M13 property,
  *      which exists because deleting a forward reddened nothing: it fails closed for a token and
  *      silently drops a MEMBER's hand-typed rows, and no fixture separates that leg from its twin.
  *
@@ -190,6 +191,13 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
         if (spread) bad.push(`${at(spread)} spread into a provenance ctx can overwrite principal`);
         // (5) the M13 property — carry it, don't merely be able to.
         if (!names.includes("principal")) bad.push(`${at(node)} provenance ctx omits principal`);
+        // (6) AUDITFIX-7: the token's project set is equally load-bearing and equally deletable.
+        // Deleting the forward closes the hand-typed arm for every token — which is EXACTLY today's
+        // behaviour, so no token test would notice and no mutation would redden. Same reasoning that
+        // put `principal` here: an absent forward is indistinguishable from the fail-closed default.
+        if (!names.includes("tokenProjectIds")) {
+          bad.push(`${at(node)} provenance ctx omits tokenProjectIds — a token's hand-typed arm closes silently`);
+        }
       }
     }
     ts.forEachChild(node, visit);
@@ -242,24 +250,28 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // Each of these passed the regex guard at some point in this slice's history. They are kept as
     // negative controls so a future simplification of the walk reddens here rather than silently
     // reopening the hole.
-    const FORWARD = "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };";
+    const FORWARD = "const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce?.principal };";
     const EVASIONS: [string, string][] = [
-      ["literal", 'const ctx = { visibleItemIds, teamPosture, principal: "member" };'],
-      ["named constant", "const ctx = { visibleItemIds, teamPosture, principal: MEMBER_ONLY_SURFACE };"],
+      ["literal", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: "member" };'],
+      ["named constant", "const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: MEMBER_ONLY_SURFACE };"],
       [
         "local binding + shorthand (Fable's HIGH)",
-        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, principal };',
+        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal };',
       ],
-      ["computed key", 'const ctx = { visibleItemIds, teamPosture, ["principal"]: "member" };'],
+      [
+        "AUDITFIX-7: tokenProjectIds omitted (closes every token's hand-typed arm SILENTLY)",
+        "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };",
+      ],
+      ["computed key", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, ["principal"]: "member" };'],
       [
         "spread override",
-        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, principal: enforce?.principal, ...o };',
+        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce?.principal, ...o };',
       ],
       ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
       ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
       ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
       ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
-      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, principal: tier === "team" ? "member" : "token" };'],
+      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: tier === "team" ? "member" : "token" };'],
       ["omitted entirely (M13)", "const ctx = { visibleItemIds, teamPosture };"],
       ["as-const literal", 'const ctx = { visibleItemIds, principal: "member" as const };'],
     ];
@@ -269,7 +281,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
 
     // …and it must ACCEPT the one legal shape, or it is a check that always fails.
     expect(astViolations(FORWARD), "forwarding must pass").toEqual([]);
-    expect(astViolations("const ctx = { visibleItemIds, teamPosture, principal: enforce.principal };")).toEqual([]);
+    expect(astViolations("const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce.principal };")).toEqual([]);
     // The three shapes that broke the hand-rolled scanner, all now handled by the parser.
     expect(
       astViolations('interface E { visibleItemIds: ReadonlySet<string>; principal?: "member" | "token" }'),
@@ -277,7 +289,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     ).toEqual([]);
     expect(astViolations("const { visibleItemIds } = enforce;"), "destructuring is not a construction").toEqual([]);
     expect(
-      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, principal: enforce?.principal };'),
+      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds, principal: enforce?.principal };'),
       "a brace inside a string no longer misleads anything"
     ).toEqual([]);
   });

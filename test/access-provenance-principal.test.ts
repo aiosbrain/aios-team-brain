@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { admitsUnsourced, newSqlParams, provenanceRowSql, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { unsourcedAdmission, newSqlParams, provenanceRowSql, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
 import { rowVisibleByProvenance } from "@/lib/access/provenance";
 
 /**
@@ -21,16 +21,23 @@ const PRINCIPALS = [
   ["administrator" as unknown as undefined, false],
 ] as const;
 
-describe("admitsUnsourced — the one policy, positively expressed", () => {
+/**
+ * ⚠️ AUDITFIX-7 made the policy THREE-VALUED. It returns `{kind:"closed"|"all"|"projects"}` instead
+ * of a boolean, because a token is no longer always-closed — it is closed UNLESS the row's project is
+ * in the token's effective set. These assertions are converted, not deleted: every principal that
+ * closed here still closes, and the token rows now say WHY (no project set supplied → closed), which
+ * is the same fail-closed default expressed in the richer type.
+ */
+describe("unsourcedAdmission — the one policy, positively expressed", () => {
   for (const [principal, admitted] of PRINCIPALS) {
     it(`principal=${String(principal)} at team posture → ${admitted ? "admits" : "closes"}`, () => {
-      expect(admitsUnsourced({ principal, teamPosture: true })).toBe(admitted);
+      expect(unsourcedAdmission({ principal, teamPosture: true }).kind).toBe(admitted ? "all" : "closed");
     });
   }
 
   it("a member at EXTERNAL posture still closes — posture is the other conjunct", () => {
     // The audience wall predates this slice and must survive it: this is not a token rule only.
-    expect(admitsUnsourced({ principal: "member", teamPosture: false })).toBe(false);
+    expect(unsourcedAdmission({ principal: "member", teamPosture: false })).toEqual({ kind: "closed" });
   });
 });
 

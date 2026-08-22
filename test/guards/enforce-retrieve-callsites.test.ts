@@ -109,10 +109,16 @@ describe("delegated query wiring in app/api/v1/query/route.ts (Phase B slice 3)"
     // QMIR-1 widened the pin: the agent arm must ALSO carry `principal: "token"` — the
     // org-structural mirror legs key on the positive member test, so losing the discriminant
     // here silently costs nothing today but is the field a future refactor must not drop.
+    // AUDITFIX-7 widened it again, for the SAME reason and it is worth stating twice: the arm must
+    // destructure `projectIds` from what `delegatedVisibleItemIds` returned and forward it as
+    // `tokenProjectIds`. Dropping it closes every token's hand-typed arm — which is EXACTLY the
+    // pre-AUDITFIX-7 behaviour, so no test would redden and no user would report it. The regex
+    // requires the forwarded name to be the destructured one, so a recomputed or same-named
+    // substitute does not satisfy it.
     // Comment lines between the resolve and the assignment are permitted; code is not.
     expect(src).toMatch(
       // PRET-6: the member arm is the unconditional ELSE (the flag read retired).
-      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*\}\s*;\s*\}\s*else\s*\{/
+      /if\s*\(agent\)\s*\{\s*const\s*\{\s*ids\s*,\s*projectIds\s*\}\s*=\s*await\s+delegatedVisibleItemIds\(\s*db\s*,\s*agent\s*\)\s*;\s*(?:\/\/[^\n]*\n\s*)*enforce\s*=\s*\{\s*visibleItemIds:\s*ids\s*,\s*principal:\s*"token"\s*,\s*tokenProjectIds:\s*projectIds\s*\}\s*;\s*\}\s*else\s*\{/
     );
     // No bare `enforce = null` assignment may exist anywhere (Codex B3 Low: the sequence regex
     // above survives a later re-null). The typed declaration (`let enforce: … | null = null`)
