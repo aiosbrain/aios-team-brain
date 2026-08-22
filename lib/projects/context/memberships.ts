@@ -74,9 +74,12 @@ async function projectIsExternalVisible(db: DbClient, teamId: string, projectId:
  *
  * `reconcileItemContext` needs the answer BEFORE it performs a destructive close on a narrowing
  * move — otherwise a `project_groups` read outage closes the old membership and then refuses the new
- * one, leaving the item in NEITHER project, and a persistent outage pins the backfill cursor and
- * blocks every later candidate for the team. Having the writer be the only place that can ask was
- * the second-order defect; this is the same rule with one owner and two callers.
+ * one, leaving the item in NEITHER project. Having the writer be the only place that can ask was the
+ * second-order defect; this is the same rule with one owner and two callers.
+ *
+ * It fixes DESTRUCTIVENESS only. A preflight `ok:false` pins the backfill cursor exactly as any
+ * other failure does (the deliberate retry-not-skip of `backfill.ts`), so a persistent reachability
+ * outage still blocks later candidates for that team — correctness over throughput, by design.
  */
 export async function noWideningGate(
   db: DbClient,

@@ -1,6 +1,7 @@
 # A membership move that did not move must not report success — AUDITFIX-4
 
-**Status:** spec, **revised twice**. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
+**Status:** spec, revised twice at design time and **once more against the shipped diff** (§9 — Fable
+review). Implemented. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
 error-check slice: round 2 established it is a **concurrency-correctness** slice, and the honest name
 for it is *make the membership transition sound*. §8 records it. Round 1's decisive finding: all
 seven of my acceptance criteria were satisfied by an implementation that still lets a move silently
@@ -282,3 +283,44 @@ contaminate a caller — the type change is hygiene, not a live bug.
   concurrent stale writers. Repeated rereading would livelock.
 
 **Nothing is built. No code exists for this slice.**
+
+
+## 9. Fable's diff review — BLOCKED, and the CAS was bound to the wrong version
+
+**3 HIGH, 2 MEDIUM, 3 LOW.** Every finding re-derived before folding; two were verified by mutation.
+
+- **HIGH — the CAS bound to the MIRROR, not the authorizing version.** §3a2 said "bind the placement
+  to the audience version that authorized it", and the code bound it to the unit's own audience while
+  the value written came from an `items` read one statement earlier. A reconciler holding a stale
+  `items.access` still won: it sees the FRESH unit audience, its CAS passes, it writes the stale value
+  back and routes on it. **Replaced by a single-statement mirror** — the update reads `items` inside
+  itself and returns the audience the caller routes on. §3a2's own words named `items.access`; the
+  code named the mirror.
+- **HIGH — the ordering flip was pinned by NOTHING.** Deleting the entire `if (narrowing)` block left
+  the whole suite green — **verified: mutation SURVIVED**. Every other test drives a writer directly
+  or asserts an order-insensitive final state. AC5 was the spec's pin for it and was unimplemented.
+  Now implemented and asserted through `visibleItemIds`; the same mutation now **REDDENS**.
+- **HIGH — six acceptance criteria were absent**, with two unkilled mutations named precisely: the
+  reread's own error check (AC9c) and the gate at the WRITER's own call site (AC6 — AC9d only ever
+  exercised the preflight). Both implemented; both mutations now redden their own criterion.
+  **AC3, AC7-dm and AC9 are WITHDRAWN rather than left implied**: AC3's "closed differs from rows
+  read" is unreachable given `pcm_current_idx` (≤1 current row); AC7's backfill-stall behaviour is
+  asserted by the existing cursor suite; AC9's static predicate agreement is covered by
+  `closemode-flip`.
+- **MEDIUM — a false claim in my own comment.** "in neither project … which ARM 2 repairs" is false
+  when the open is refused by a standing explicit exclude: `lib/projects/context/backfill-candidates.ts` carves that item
+  out of the candidate set entirely ("we skip the whole item"), so the denial is **permanent** until
+  an operator acts. Close-first converts a pre-existing KNOWN EDGE into that. Accepted deliberately —
+  denial is the safe direction and `countUnrepairable` reports it — and the comment now says so.
+- **MEDIUM — the file header denied the diff below it**, still citing the F3 transaction deferral for
+  a CAS this change ships without a transaction. Corrected.
+- **LOWs folded:** the preflight fixes destructiveness only and does *not* relieve cursor pinning
+  (the doc implied otherwise); AC2 now asserts the survivor is **reported** as `spared`, not merely
+  left alone; and `skipped` advancing the backfill cursor weakens `drainTeamContext`'s stated
+  contract for one tick — deferred as **AUDITFIX-11** with the reason recorded at the site.
+
+**What the review verified sound**, which is worth recording: the reread's paths are exhaustive
+(`pcm_current_idx` bounds both reads to ≤1 row, so "more rows on reread" and "partial success" are
+unreachable); `spared` recomputed from the final snapshot is the right semantics; the proxies in the
+dm suite intercept the reads they claim to; a lost mirror cannot livelock; and the neither-project
+downstreams hold (graph homing's carve-out, CLOSEMODE-1's widening return staying open-first).

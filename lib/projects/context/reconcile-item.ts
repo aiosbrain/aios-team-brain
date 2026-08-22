@@ -17,10 +17,12 @@ import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
  *
  * Idempotent and self-healing on re-run. CONCURRENCY (slice-5 Codex HIGH, deferred with F3):
  * two reconciles for the same item (push hook + scheduler) can read the item's access at
- * different instants during a tier flip; the membership writer's live no-widening re-read
- * narrows the leak window but the unit-audience compare-and-set needed to close it fully wants
- * the transaction surface the adapter does not expose yet (the standing F3 deferral). Rare
- * (concurrent reconcile + a same-instant tier flip) and inert in Phase A. Returns `skipped:true`
+ * different instants during a tier flip. AUDITFIX-4 CLOSED that: the unit mirror is now a SINGLE
+ * statement that reads `items.access` inside its own update and returns the value the caller routes
+ * on, so a placement is bound to the item version that authorized it — no transaction surface
+ * required, and the F3 deferral this comment used to cite no longer applies to it. (A
+ * compare-and-set on the unit's own audience was tried first and was NOT sufficient: it binds the
+ * write to the mirror while the value written comes from an earlier `items` read.) Returns `skipped:true`
  * (not an error) when the team's system projects don't exist yet — a team ingested before its bootstrap ran; the bootstrap +
  * backfill cover it, so the hook must not fail the push over it.
  */
@@ -82,9 +84,16 @@ export async function reconcileItemContext(
   }
 
   const unit = await reconcileItemUnit(db, teamId, itemId);
-  // AUDITFIX-4: a lost audience CAS is not a failure to report as one — another reconciler owns
-  // this unit's current audience, and its own pass will place the item. Surfaced as `skipped` so a
-  // batch neither fails nor claims convergence it did not achieve.
+  // AUDITFIX-4: the unit or its item vanished mid-reconcile (a delete cascade, a concurrent purge).
+  // Not a failure to shout about, and not convergence either — surfaced as `skipped` so a batch
+  // neither fails nor claims it placed something it did not.
+  //
+  // DEFERRED, stated not buried (Fable diff review LOW): `skipped` ADVANCES the backfill cursor, so
+  // `drainTeamContext` can report "fully partitioned" while a skipped item still lacks a membership.
+  // The next sweep tick repairs it, but drain's stated contract ("a team must not serve its first
+  // read while any item still lacks a membership") is weaker than it reads for that window. Fixing
+  // it means surfacing a skip count in `DrainResult` and is deliberately not folded into a
+  // correctness slice — AUDITFIX-11.
   if (unit.stale) return { ok: true, skipped: true };
   if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit: ${unit.error}` };
 
@@ -106,8 +115,17 @@ export async function reconcileItemContext(
     const pre = await noWideningGate(db, teamId, target, unit.audience);
     if (!pre.ok) return { ok: false, error: `membership: ${pre.error}` };
 
-    // CLOSE FIRST: a failure from here leaves the item in NEITHER project — denial, which ARM 2 of
-    // the candidate sweep repairs — rather than still externally granted.
+    // CLOSE FIRST: a failure from here leaves the item in NEITHER project — denial rather than
+    // still externally granted.
+    //
+    // ⚠️ ARM 2 of the candidate sweep repairs that in the ORDINARY case, but NOT when the open is
+    // refused by a standing explicit exclude in the target: `backfill-candidates.ts` carves such an
+    // item out of the candidate set entirely ("we skip the whole item"), so no sweep repairs it and
+    // the denial is PERMANENT until an operator acts. Close-first converts that pre-existing KNOWN
+    // EDGE from "keeps its opposite-project membership" into "in neither project". Accepted
+    // deliberately: under a membership-only model denial is the safe direction, and the state is
+    // reported by `countUnrepairable` rather than silent. An earlier version of this comment claimed
+    // ARM 2 repairs it unconditionally — that was false (Fable diff review MEDIUM).
     const closedFirst = await closeMembershipInto(db, teamId, unit.unitId, other);
     if (!closedFirst.ok) return { ok: false, error: `move: ${closedFirst.error}` };
 

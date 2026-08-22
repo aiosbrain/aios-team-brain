@@ -190,7 +190,13 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
       },
     }) as ReturnType<typeof db>;
 
-    await closeMembershipInto(stale, seed.teamId, unit, general);
+    const res = await closeMembershipInto(stale, seed.teamId, unit, general);
+
+    // The spec says the survivor is REPORTED as spared, not merely left alone — a caller that
+    // cannot see the sparing cannot log it, and CLOSEMODE-1's whole point is that the decision is
+    // visible in the reclassify trail.
+    expect(res.ok, "sparing is convergence, not failure").toBe(true);
+    if (res.ok) expect(res.spared, "the survivor is reported").toBeGreaterThan(0);
 
     const rows = await currentRows(seed, general, unit);
     expect(rows.length, "the human's exclusion must SURVIVE the write").toBe(1);
