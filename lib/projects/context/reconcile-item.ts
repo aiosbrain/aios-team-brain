@@ -2,7 +2,6 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
 import { ensureIncludeMembership, closeMembershipInto, noWideningGate } from "@/lib/projects/context/memberships";
-import { withTransaction } from "@/lib/db/pg/tx";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
 
 /**
@@ -18,12 +17,13 @@ import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
  *
  * Idempotent and self-healing on re-run. CONCURRENCY (slice-5 Codex HIGH, deferred with F3):
  * two reconciles for the same item (push hook + scheduler) can read the item's access at
- * different instants during a tier flip. AUDITFIX-4 CLOSED that: the unit mirror is now a SINGLE
- * statement that reads `items.access` inside its own update and returns the value the caller routes
- * on, so a placement is bound to the item version that authorized it — no transaction surface
- * required, and the F3 deferral this comment used to cite no longer applies to it. (A
- * compare-and-set on the unit's own audience was tried first and was NOT sufficient: it binds the
- * write to the mirror while the value written comes from an earlier `items` read.) Returns `skipped:true`
+ * different instants during a tier flip. AUDITFIX-4 NARROWED that and did NOT close it — see the
+ * block in `reconcileItemContext` and §11 of the slice's spec. The unit mirror is a single statement
+ * that reads `items.access` inside its own update, so the mirror itself cannot write a stale
+ * audience; what remains open is that INGEST rewrites `items.access` without coordinating with the
+ * move at all. Two designs for closing it (a compare-and-set on the unit audience; a per-item
+ * advisory lock) were built and pulled after review — the first binds to the mirror rather than to
+ * the authorizing version, the second serializes only one of the two writers. AUDITFIX-13. Returns `skipped:true`
  * (not an error) when the team's system projects don't exist yet — a team ingested before its bootstrap ran; the bootstrap +
  * backfill cover it, so the hook must not fail the push over it.
  */
@@ -84,57 +84,18 @@ export async function reconcileItemContext(
     projects = resolved;
   }
 
-  // ── SERIALIZE THE MOVE PER ITEM (AUDITFIX-4 §10c) ───────────────────────────────────────────
-  // Five review rounds each found a different interleaving of two reconcilers on the same item, and
-  // each fix patched one instance. They all require an interleaving, so the transaction retires the
-  // CLASS: the second reconciler blocks on this row lock until the first commits, then re-reads
-  // fresh state.
+  // ⚠️ CONCURRENCY IS **NOT** CLOSED BY THIS SLICE — stated here because the next reader will
+  // otherwise assume it is (AUDITFIX-4 §11). A transaction + per-item advisory lock was built,
+  // reviewed, and PULLED: it serialized RECONCILERS, but `items.access` is written by INGEST
+  // (`lib/ingest/index.ts`) which never takes that lock, so a narrowing can still complete against
+  // an access value that changed underneath it. Serializing one of two writers is not a protocol.
   //
-  // The same statement returns the AUTHORITATIVE (items.access, unit.audience) pair. That is not
-  // redundant with the lock: round 10's blocker is a staleness between a reconciler's OWN item read
-  // and a value changed by INGEST — not by another reconciler — which a lock cannot fix and an
-  // atomic pair read does. `authoritativeAccess` is what the move routes on, never an earlier read.
+  // What this slice DOES fix is the move's failure reporting and its ordering — a close that did not
+  // close now says so, a human's standing exclusion survives the read→write gap, and a narrowing
+  // denies rather than leaving external access live. Those hold for a single reconciler.
   //
-  // MUTUAL EXCLUSION, NOT WRITE ATOMICITY, and the difference is deliberate: the adapter's queries
-  // run on other pooled connections (lib/db/pg/tx.ts documents this), so the writers below keep
-  // their EXCLSHADOW-1 / CLOSEMODE-1 logic untouched. A crash mid-move still leaves partial state
-  // for the sweep — the position this codebase already accepts. True atomicity means rewriting all
-  // three writers as raw SQL and is AUDITFIX-12.
-  return withTransaction(async (client) => {
-    // An ADVISORY lock, not `SELECT … FOR UPDATE`. The row-lock version DEADLOCKED against its own
-    // move, and the failure is instructive: `FOR UPDATE` on an `items` row conflicts with the
-    // `FOR KEY SHARE` that an INSERT into a child table (`project_context_units`, FK → items) takes,
-    // and the writers below run on OTHER pooled connections. Observed directly: this transaction
-    // `idle in transaction` holding the lock, the unit INSERT `active` on `Lock/transactionid`.
-    //
-    // An advisory lock takes no row locks, so it cannot interact with foreign keys at all, while
-    // still giving exactly what §10c asks for — two reconcilers for the same item serialize. It is
-    // transaction-scoped, so it releases on COMMIT or ROLLBACK with no unlock path to forget.
-    await client.query(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [itemId]);
-
-    // The authoritative read, INSIDE the lock. Round 10's blocker is a staleness between a
-    // reconciler's own item read and a value changed by INGEST, which the lock cannot fix; reading
-    // it here, under the lock, and routing on THIS value is what closes it.
-    const locked = await client.query<{ access: "team" | "external" }>(
-      `select i.access from items i where i.team_id = $1 and i.id = $2`,
-      [teamId, itemId]
-    );
-    const authoritativeAccess = locked.rows[0]?.access;
-    if (!authoritativeAccess) return { ok: false, error: "item not found" };
-
-    return moveItem(db, teamId, itemId, projects, authoritativeAccess);
-  });
-}
-
-/** The move itself, holding the caller's per-item lock. Split out only so the lock's scope is one
- *  readable block; it has no other caller and is not exported. */
-async function moveItem(
-  db: DbClient,
-  teamId: string,
-  itemId: string,
-  projects: { general: string; externalShared: string },
-  authoritativeAccess: "team" | "external"
-): Promise<ReconcileItemResult> {
+  // The full protocol (ingest and the move sharing one serialization) is **AUDITFIX-13**, and it is
+  // a PREREQUISITE FOR TIERRET-1 that this slice does not satisfy.
   const unit = await reconcileItemUnit(db, teamId, itemId);
   // AUDITFIX-4: the unit or its item vanished mid-reconcile (a delete cascade, a concurrent purge).
   // Not a failure to shout about, and not convergence either — surfaced as `skipped` so a batch
@@ -149,25 +110,22 @@ async function moveItem(
   if (unit.stale) return { ok: true, skipped: true };
   if (!unit.ok || !unit.unitId || !unit.audience) return { ok: false, error: `unit: ${unit.error}` };
 
-  // ROUTE ON THE AUTHORITATIVE ACCESS (§10c). `unit.audience` echoes whatever `reconcileItemUnit`
-  // read, and round 10's blocker is precisely that this echo can be stale when the item and the unit
-  // happen to agree at that instant. The locked read above cannot be.
-  const target = authoritativeAccess === "external" ? projects.externalShared : projects.general;
-  const other = authoritativeAccess === "external" ? projects.general : projects.externalShared;
+  const target = unit.audience === "external" ? projects.externalShared : projects.general;
+  const other = unit.audience === "external" ? projects.general : projects.externalShared;
 
   // ORDER IS DIRECTION-AWARE (AUDITFIX-4 §3a). A NARROWING move (external → team) that opens the
   // target first leaves the item STILL EXTERNALLY GRANTED if the close then fails; closing first
   // leaves it in neither project, which the sweep repairs (ARM 2) and which denies rather than
   // discloses in the meantime. A WIDENING move keeps open-first: a failure there leaves the item
   // visible to fewer people, and CLOSEMODE-1's protected-exclusion return depends on that order.
-  const narrowing = authoritativeAccess === "team";
+  const narrowing = unit.audience === "team";
 
   if (narrowing) {
     // PREFLIGHT — non-destructive (round 2 HIGH). Ask the gate whether it CAN answer before the
     // close destroys anything. `noWideningGate` performs no write, which is the whole point: doing
     // this through `ensureIncludeMembership` would open the target first and be the very
     // open-then-close order this branch exists to avoid.
-    const pre = await noWideningGate(db, teamId, target, authoritativeAccess);
+    const pre = await noWideningGate(db, teamId, target, unit.audience);
     if (!pre.ok) return { ok: false, error: `membership: ${pre.error}` };
 
     // CLOSE FIRST: a failure from here leaves the item in NEITHER project — denial rather than

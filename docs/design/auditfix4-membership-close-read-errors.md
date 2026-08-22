@@ -1,19 +1,18 @@
 # A membership move that did not move must not report success — AUDITFIX-4
 
-**Status:** **round 10 — redesigned around a transaction (§10), implemented.** Five review rounds —
-three on the spec, two on the diff — all returned BLOCKED, each on a *different* two-reconciler
-interleaving. §10 records why the answer was to stop patching them one at a time. §7/§8/§9 record the
-earlier rounds and are kept because the superseded designs are the argument for this one.
+**Status:** **narrowed and shipped.** Six review rounds — three on the spec, three on the diff — all
+returned BLOCKED, each on a different concurrency interleaving. §11 records the decision to stop:
+the concurrency work is **pulled**, the failure-reporting and ordering work ships. §3a2, §7–§10 are
+kept as HISTORY because the designs that were built and withdrawn are the argument for withdrawing.
 
-⚠️ **§3a2 below is HISTORY, not the design.** It specifies a compare-and-set that shipped and was then
-refuted (§10a): it binds the write to the mirror rather than to the item version that authorized it.
-The live design is §10c.
+⚠️ **§3a2 and §10c describe designs that were BUILT AND PULLED.** Neither is the shipped code. §11 is.
 
 **Build with:** opus / high — it changes the failure contract of the writer that performs the
 membership MOVE, which under the ruling below is the authorization transaction itself.
 
-**Deps:** none to build. **It is a PREREQUISITE for TIERRET-1** (§1b), which is why it is sequenced
-first. AUDITFIX-1 is merged (`f94e9b2c`) and this branch is cut from it.
+**Deps:** none to build. ⚠️ **It was scoped as a PREREQUISITE for TIERRET-1 and, as narrowed, it does
+NOT satisfy that** — §11. The prerequisite is **AUDITFIX-13**. AUDITFIX-1 is merged (`f94e9b2c`) and
+this branch is cut from it.
 
 ---
 
@@ -401,3 +400,60 @@ lock acquired means no deadlock ordering to reason about.
 corrected; AC6/AC9d strengthened to assert the rows rather than the return; AC9b rewritten to test the
 no-drift bypass rather than a fixture that guarantees the drift branch; and the single-writer guard
 taught to recognise raw-SQL writes.
+
+
+## 11. Round 11, and the decision to narrow
+
+**BLOCKED — the sixth consecutive round.** The transaction and per-item advisory lock were built,
+reviewed, and are **pulled**. What ships is the failure-reporting and ordering work.
+
+### 11a. Why the lock did not close it
+
+`pg_advisory_xact_lock` serialized **reconcilers**. But `items.access` is written by **ingest**
+(`lib/ingest/index.ts`), which never takes that lock, so:
+
+> R1 takes the lock and reads `access='external'` → ingest flips it to `team` → R1's unit mirror reads
+> `team` → R1 still routes on its earlier value and picks the widening branch → the gate refuses →
+> **R1 returns before closing external-shared**, and external access stays live.
+
+Serializing one of two writers is not a protocol. Closing it means ingest and the move sharing one —
+a different, larger slice, filed as **AUDITFIX-13**.
+
+### 11b. What the six rounds cost, recorded honestly
+
+Each round fixed the named instance and introduced a new defect:
+
+| round | fixed | introduced |
+|---|---|---|
+| 2 | ordering | a CAS bound to the mirror, not the authorizing version |
+| 9 | the CAS | a conditional mirror the stale path bypassed |
+| 10 | the mirror | `runSql` throwing where the adapter returned |
+| 11 | the throw | a lock serializing only reconcilers, **and the same throw regression again** |
+
+Round 11 also found my docs false for the **third time in one diff** (§10c described `FOR UPDATE` and
+an atomic pair read while the code used an advisory lock reading one column), and a **seventh**
+green-by-construction test (AC9b never called the new code path).
+
+That pattern — not any single finding — is why the concurrency work is withdrawn rather than
+attempted a seventh time.
+
+### 11c. What ships, and what each part is pinned by
+
+- the read error is **captured**, not absorbed — the audit's original H3 (AC4);
+- the UPDATE **reasserts** `decision`/`mode`, so a human's standing exclusion survives the read→write
+  gap (AC2);
+- `closed` is **measured** via `RETURNING`, and a short count triggers a reread that returns
+  `ok:false` when anything closable remains (AC1, AC3 by inspection, AC9c for the reread's own error);
+- `projectIsExternalVisible` is **tri-state** and `noWideningGate` is one owner, askable without
+  writing (AC6);
+- a **narrowing closes before opening**, so a failed move denies rather than leaving external access
+  live (AC5) — behind a non-destructive preflight so an undetermined gate is not destructive (AC9d).
+
+Every one of those is single-reconciler behaviour, and every one is mutation-verified.
+
+### 11d. What does NOT ship, each with where it goes
+
+- **the whole concurrency protocol** → **AUDITFIX-13**, which is the real TIERRET-1 prerequisite;
+- true write **atomicity** for the move → **AUDITFIX-12**;
+- `skipped` advancing the backfill cursor → **AUDITFIX-11**;
+- the ~24 other swallowed reads on the access path → **AUDITFIX-10**.

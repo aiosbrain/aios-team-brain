@@ -15,14 +15,6 @@ const ensureMembership = vi.fn();
 const closeOthers = vi.fn();
 const bootstrap = vi.fn();
 
-// AUDITFIX-4: `reconcileItemContext` now runs its move inside `withTransaction`, taking a per-item
-// advisory lock so two reconcilers cannot interleave. This suite is about the BACKFILL's cursor on
-// failure — it has no database — so the transaction is a pass-through here and the lock's own
-// behaviour is pinned where a real Postgres exists
-// (test/datamechanics/membership-move-soundness AC12).
-vi.mock("@/lib/db/pg/tx", () => ({
-  withTransaction: (fn: (c: unknown) => unknown) => fn({ query: () => Promise.resolve({ rows: [{ access: "team" }] }) }),
-}));
 vi.mock("@/lib/projects/context/units", () => ({ reconcileItemUnit: (...a: unknown[]) => reconcile(...a) }));
 vi.mock("@/lib/projects/context/memberships", () => ({
   ensureIncludeMembership: (...a: unknown[]) => ensureMembership(...a),

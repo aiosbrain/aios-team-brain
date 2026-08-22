@@ -290,52 +290,18 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
 
     const { ensureIncludeMembership } = await import("@/lib/projects/context/memberships");
     const faulted = clientWithFailingRead("project_groups");
+    // Start from NO current row, so "a write happened" is observable. Codex: the previous fixture
+    // already had a General include, so an implementation that performs the forbidden write and then
+    // returns the gate error passed — it checked the return, never the rows.
+    await db().from("project_context_memberships").update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId).eq("project_id", general).eq("context_unit_id", unit).is("valid_to", null);
+    expect((await currentRows(seed, general, unit)).length, "fixture: nothing current to start").toBe(0);
+
     const res = await ensureIncludeMembership(faulted, seed.teamId, { projectId: general, contextUnitId: unit });
 
     expect(res.ok, "an undetermined reachability read must refuse the WRITE, not just the preflight").toBe(false);
     expect(res.refused, "and NOT as a settled refusal — the sweep must retry this").toBeFalsy();
-  });
-
-  it("AC12: the move takes a per-item lock — a second reconcile BLOCKS until the first releases", async () => {
-    // §10c's criterion, asserted on the LOCK rather than on a racing outcome.
-    //
-    // ⚠️ The first version of this test fired two `reconcileItemContext` calls with Promise.all and
-    // asserted the item did not end up in both projects. Mutation M9 (deleting the lock) SURVIVED it:
-    // two reconciles reading the SAME access are idempotent and converge to the same correct answer
-    // whether or not they serialize. The bad interleaving needs the access to CHANGE between them,
-    // which Promise.all cannot schedule deterministically. So this asserts the property directly:
-    // while an advisory lock on this item is held, the move cannot proceed.
-    const seed = await seedTeam();
-    const item = await ingest(seed, { path: "m/j.md", body: "j", access: "external", project: "mproj" });
-    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
-    await backfillTeamContext(db(), seed.teamId);
-
-    const { getPool } = await import("@/lib/db/pg/pool");
-    const holder = await getPool().connect();
-    let blocked = true;
-    try {
-      await holder.query("begin");
-      await holder.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [item.id]);
-
-      await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
-
-      // The move must not complete while the lock is held elsewhere.
-      const move = reconcileItemContext(db(), seed.teamId, item.id).then((r) => {
-        blocked = false;
-        return r;
-      });
-      await new Promise((r) => setTimeout(r, 1500));
-      expect(blocked, "the move must BLOCK while another holder has this item's lock").toBe(true);
-
-      // Release, and it completes.
-      await holder.query("commit");
-      const r = await move;
-      expect(r.ok, r.error).toBe(true);
-      expect(blocked).toBe(false);
-    } finally {
-      try { await holder.query("rollback"); } catch { /* already committed */ }
-      holder.release();
-    }
+    expect((await currentRows(seed, general, unit)).length, "and NO row may have been written").toBe(0);
   });
 
   it("AC8: the uncontended move still closes the opposite membership exactly once", async () => {
@@ -503,8 +469,11 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     const r = await reconcileItemContext(faulted, seed.teamId, item.id);
 
     expect(r.ok, "an undetermined gate must refuse, not proceed").toBe(false);
-    const inEither =
-      (await currentRows(seed, ext, unit)).length + (await currentRows(seed, general, unit)).length;
-    expect(inEither, "the item must be in at least one system project — never neither").toBeGreaterThan(0);
+    // Codex: "at least one membership exists" passed the exact destructive mutant this rejects —
+    // open General first, hit the injected gate failure, leave BOTH current. Assert the states.
+    expect((await currentRows(seed, ext, unit)).length,
+      "the ORIGINAL external membership must be untouched — the close was never issued").toBe(1);
+    expect(await currentRows(seed, general, unit),
+      "and the target must NOT have been opened against an undetermined gate").toEqual([]);
   });
 });

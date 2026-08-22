@@ -18,9 +18,11 @@ export interface ReconcileResult {
   stale?: boolean;
   unitId?: string;
   created?: boolean;
-  /** The audience the unit now carries — mirrored from the item's CURRENT access. Callers must
-   *  route placement by THIS, never by a separately-read item.access, so a tier flip between the
-   *  two reads can't create a team unit routed to an external project (slice-4 Codex H3). */
+  /** The audience the unit now carries. AUDITFIX-4 made the mirror a SINGLE statement that reads
+   *  `items.access` inside its own update and returns that value, so this is the item's access as of
+   *  the mirror — not an echo of a separately-read one. Callers route placement by THIS; a
+   *  separately-read `items.access` can be older. It is still not a lock: ingest may rewrite
+   *  `items.access` immediately after, which is the open half AUDITFIX-13 covers. */
   audience?: "team" | "external";
 }
 
