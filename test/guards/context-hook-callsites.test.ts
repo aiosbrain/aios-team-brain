@@ -648,6 +648,20 @@ function analyse(
 let realFilesCache: { rel: string; code: string }[] | null = null;
 const realFiles = () => (realFilesCache ??= productionFiles().map((rel) => ({ rel, code: read(rel) })));
 
+/**
+ * The real-tree pass, computed ONCE and shared.
+ *
+ * ⚠️ CI TAUGHT ME THIS TWICE. The tests below each analysed the whole tree independently, which is
+ * ~1,000 TypeScript parses per test. That fits comfortably under `npm test` locally and TIMED OUT at
+ * vitest's 5 s default in CI, which runs `npm run coverage` — instrumentation plus a slower shared
+ * runner. Parsing is memoised (see `parse`) and the analysis itself is now memoised too, so the tree
+ * is walked once per run rather than once per assertion. The explicit timeouts below are the honest
+ * belt-and-braces: this guard does real work over the whole repository and should be allowed to.
+ */
+const REAL_TREE_TIMEOUT_MS = 60_000;
+let realAnalysisCache: ReturnType<typeof analyse> | null = null;
+const analyseRealTree = () => (realAnalysisCache ??= analyse(realFiles(), INVENTORY));
+
 /* ────────────────────────────── the criteria ────────────────────────────── */
 
 const IMPORT_CANON = `import { ${WRITER} } from "@/lib/ingest";`;
@@ -658,7 +672,7 @@ const classified = (rel: string, cls: Classification, sites = 1): Record<string,
 
 describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
   it("AC3 — the real tree passes, and the discovered inventory is EXACT", () => {
-    const { violations, sites } = analyse(realFiles(), INVENTORY);
+    const { violations, sites } = analyseRealTree();
     expect(violations.map((v) => v.message), "the tree must be fully classified").toEqual([]);
     // Set EQUALITY, not a subset: a walk that finds nothing also "passes". This is the criterion
     // that makes the guard non-vacuous — and it is only as strong as the recognizer behind it,
@@ -672,7 +686,7 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
       "lib/actions/handlers.ts": 1,
       "scripts/seed-demo.ts": 3,
     });
-  });
+  }, REAL_TREE_TIMEOUT_MS);
 
   it("AC1 — an unclassified direct writer fails, and the message names the file", () => {
     const rel = "lib/new-writer.ts";
@@ -802,13 +816,13 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     expect(files.some((f) => f.startsWith("components/")), "components/ must be walked").toBe(true);
     expect(files, "root-level server sources must be walked").toContain("instrumentation.ts");
     expect(files.length).toBeGreaterThan(500);
-  });
+  }, REAL_TREE_TIMEOUT_MS);
 
   it("AC4 — a stale classification fails even when the tree is otherwise clean", () => {
     const { violations } = analyse(realFiles(), { ...INVENTORY, "lib/gone.ts": { sites: 1, class: "SWEEP_COVERED", reason: "r", latency: "l" } });
     expect(violations.map((v) => v.kind)).toEqual(["stale"]);
     expect(violations[0].message).toContain("lib/gone.ts");
-  });
+  }, REAL_TREE_TIMEOUT_MS);
 
   it("AC5 — the three classes carry DISTINCT obligations", () => {
     const afterCode = `${IMPORT_CANON}\nawait ${WRITER}(a);\nafter(async () => { await reconcileItemContext(db, t, id); });`;
@@ -861,7 +875,7 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
       (rel) => /^lib\/ingest\//.test(rel) && rel !== CANONICAL && /export\s[^;]*\sfrom\s+["'][^"']*ingest/.test(read(rel))
     );
     expect(barrels, "a new lib/ingest barrel needs the second-level refusal exercised").toEqual([]);
-  });
+  }, REAL_TREE_TIMEOUT_MS);
 });
 
 /* ───── the four assertions this guard shipped with (#530) — kept, unchanged ───── */
