@@ -236,35 +236,68 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect((await currentRows(seed, ext, unit)), "and NOT current in external-shared").toEqual([]);
   });
 
-  it("AC9b: a STALE reconciler loses the audience CAS and cannot re-open the opposite project", async () => {
+  it("AC9b: a STALE reconciler LOSES the audience CAS and does not overwrite a newer audience", async () => {
     // Round 2's blocker. Without the compare-and-set, a late reconciler overwrites a newer audience
-    // and the gate then permits a placement against its stale value — leaving the item current in
-    // BOTH system projects with everything reporting success.
+    // and the no-widening gate then permits a placement against its stale value — leaving the item
+    // current in BOTH system projects with every step reporting success.
+    //
+    // ⚠️ The first version of this test issued its OWN update with .eq("audience", …) and asserted
+    // zero rows — i.e. it asserted that Postgres implements compare-and-set, which it does whether or
+    // not this codebase uses one. Mutation M3 survived against it. The test must drive
+    // reconcileItemUnit itself, so the stale audience is injected into the READ the code performs.
     const seed = await seedTeam();
-    const item = await ingest(seed, { path: "m/e.md", body: "e", access: "external", project: "mproj" });
+    const item = await ingest(seed, { path: "m/e.md", body: "e", access: "team", project: "mproj" });
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
     await backfillTeamContext(db(), seed.teamId);
     const unit = await unitOf(seed, item.id);
 
-    // A newer writer moves the unit to `team` (mirroring an item flip).
-    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
-    const fresh = await reconcileItemUnit(db(), seed.teamId, item.id);
-    expect(fresh.ok && fresh.audience).toBe("team");
-
-    // The STALE writer now tries to re-mirror `external` from its older read. Simulated exactly as
-    // the code sees it: the unit row it expects (`audience='external'`) is no longer there.
-    await db().from("items").update({ access: "external" }).eq("id", item.id).eq("team_id", seed.teamId);
-    const { data: unitNow } = await db().from("project_context_units").select("audience")
+    const { data: settled } = await db().from("project_context_units").select("audience")
       .eq("team_id", seed.teamId).eq("id", unit).single();
-    expect((unitNow as { audience: string }).audience, "the fresh writer's value is what stands").toBe("team");
+    expect((settled as { audience: string }).audience, "converged before the race").toBe("team");
 
-    // A CAS keyed on the audience the stale writer READ ('external') must match zero rows.
-    const { data: casRows } = await db().from("project_context_units")
-      .update({ audience: "external", updated_at: new Date().toISOString() })
-      .eq("team_id", seed.teamId).eq("id", unit)
-      .eq("audience", "external") // ← what the stale writer believed
-      .select("id");
-    expect((casRows ?? []).length, "the stale write must lose the CAS").toBe(0);
+    // The stale reconciler believes the unit is still `external` — the value it read before a newer
+    // writer moved it to `team`. Its CAS is therefore keyed on a value no longer in the row.
+    let unitRead = true;
+    const stale = new Proxy(db() as object, {
+      get(t, prop, recv) {
+        if (prop !== "from") return Reflect.get(t, prop, recv);
+        return (name: string) => {
+          const q = (t as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_context_units") return q;
+          return new Proxy(q as object, {
+            get(qt, qp, qr) {
+              const v = Reflect.get(qt, qp, qr);
+              if (qp !== "then") {
+                return typeof v === "function"
+                  ? (...a: unknown[]) => {
+                      const r = (v as (...x: unknown[]) => unknown).apply(qt, a);
+                      return r === qt ? qr : r;
+                    }
+                  : v;
+              }
+              if (unitRead) {
+                unitRead = false;
+                return (res: (x: unknown) => unknown) =>
+                  res({
+                    data: { id: unit, audience: "external", content_sha256: "stale", occurred_at: new Date(0).toISOString() },
+                    error: null,
+                  });
+              }
+              return v;
+            },
+          });
+        };
+      },
+    }) as ReturnType<typeof db>;
+
+    const res = await reconcileItemUnit(stale, seed.teamId, item.id);
+
+    expect(res.stale, "the stale write must LOSE the CAS and say so").toBe(true);
+    expect(res.ok, "and must not report success").toBe(false);
+
+    const { data: after } = await db().from("project_context_units").select("audience")
+      .eq("team_id", seed.teamId).eq("id", unit).single();
+    expect((after as { audience: string }).audience, "the newer writer's value stands").toBe("team");
   });
 
   it("AC9d: a NARROWING move does not destroy the old membership when the gate cannot answer", async () => {
