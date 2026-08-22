@@ -138,6 +138,13 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
     return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "principal";
   };
 
+  /** The ONE permitted initialiser for the token project set: `enforce?.tokenProjectIds`. */
+  const isForwardedProjects = (e: ts.Expression): boolean => {
+    const inner = ts.isNonNullExpression(e) ? e.expression : e;
+    if (!ts.isPropertyAccessExpression(inner)) return false;
+    return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "tokenProjectIds";
+  };
+
   /** A property's name, resolving a literal COMPUTED key — the spelling Codex demonstrated. */
   const nameOf = (p: ts.ObjectLiteralElementLike): string | null => {
     if (ts.isSpreadAssignment(p)) return null;
@@ -197,6 +204,18 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
         // put `principal` here: an absent forward is indistinguishable from the fail-closed default.
         if (!names.includes("tokenProjectIds")) {
           bad.push(`${at(node)} provenance ctx omits tokenProjectIds — a token's hand-typed arm closes silently`);
+        } else {
+          // Fable diff review, LOW: presence alone was ASYMMETRIC with rule (1), which requires
+          // `principal` to be initialised to exactly `enforce?.principal`. `tokenProjectIds: undefined`
+          // or a locally recomputed set satisfied mere presence — and recomputing the authority is a
+          // second oracle read free to disagree with the first, which is the whole reason
+          // `delegatedVisibleItemIds` returns it. Same rule, same shape, both fields.
+          const prop = node.properties[names.indexOf("tokenProjectIds")];
+          if (prop && ts.isPropertyAssignment(prop) && !isForwardedProjects(prop.initializer)) {
+            bad.push(`${at(prop)} tokenProjectIds is \`${prop.initializer.getText(src)}\`, not enforce?.tokenProjectIds`);
+          } else if (prop && ts.isShorthandPropertyAssignment(prop)) {
+            bad.push(`${at(prop)} shorthand \`{ tokenProjectIds }\` — forwarding cannot be spelled that way`);
+          }
         }
       }
     }
@@ -250,13 +269,17 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // Each of these passed the regex guard at some point in this slice's history. They are kept as
     // negative controls so a future simplification of the walk reddens here rather than silently
     // reopening the hole.
-    const FORWARD = "const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce?.principal };";
+    const FORWARD = "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };";
     const EVASIONS: [string, string][] = [
-      ["literal", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: "member" };'],
-      ["named constant", "const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: MEMBER_ONLY_SURFACE };"],
+      ["literal", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: "member" };'],
+      ["named constant", "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: MEMBER_ONLY_SURFACE };"],
       [
         "local binding + shorthand (Fable's HIGH)",
-        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal };',
+        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal };',
+      ],
+      [
+        "AUDITFIX-7: tokenProjectIds RECOMPUTED rather than forwarded (a second oracle read free to disagree)",
+        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: await recomputeProjects(), principal: enforce?.principal };",
       ],
       [
         "AUDITFIX-7: tokenProjectIds omitted (closes every token's hand-typed arm SILENTLY)",
@@ -265,13 +288,13 @@ describe("guard: a token can never acquire member provenance semantics", () => {
       ["computed key", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, ["principal"]: "member" };'],
       [
         "spread override",
-        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce?.principal, ...o };',
+        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal, ...o };',
       ],
       ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
       ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
       ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
       ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
-      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: tier === "team" ? "member" : "token" };'],
+      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: tier === "team" ? "member" : "token" };'],
       ["omitted entirely (M13)", "const ctx = { visibleItemIds, teamPosture };"],
       ["as-const literal", 'const ctx = { visibleItemIds, principal: "member" as const };'],
     ];
@@ -281,7 +304,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
 
     // …and it must ACCEPT the one legal shape, or it is a check that always fails.
     expect(astViolations(FORWARD), "forwarding must pass").toEqual([]);
-    expect(astViolations("const ctx = { visibleItemIds, teamPosture, tokenProjectIds, principal: enforce.principal };")).toEqual([]);
+    expect(astViolations("const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce.principal };")).toEqual([]);
     // The three shapes that broke the hand-rolled scanner, all now handled by the parser.
     expect(
       astViolations('interface E { visibleItemIds: ReadonlySet<string>; principal?: "member" | "token" }'),
@@ -289,7 +312,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     ).toEqual([]);
     expect(astViolations("const { visibleItemIds } = enforce;"), "destructuring is not a construction").toEqual([]);
     expect(
-      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds, principal: enforce?.principal };'),
+      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };'),
       "a brace inside a string no longer misleads anything"
     ).toEqual([]);
   });
@@ -335,5 +358,27 @@ describe("guard: a token can never acquire member provenance semantics", () => {
         "hand-typed arm — OR the file genuinely no longer needs the entry. Check which before " +
         "deleting the allow-list line."
     ).toEqual([]);
+  });
+
+  it("AUDITFIX-7: the token arm's posture-free pin stays coupled to the external-delegation refusal", () => {
+    // Fable diff review, MEDIUM. `unsourcedAdmission`'s token branch deliberately does NOT consult
+    // `teamPosture` — a token's wall is its project authority. That is only SAFE because
+    // `verifyAgentToken` refuses external-tier delegation outright, so no live token is ever at
+    // external posture. If that refusal is lifted while the pin stands, an external-posture TOKEN
+    // would be admitted where its own external LAUNCHER is closed — the token exceeding its
+    // launcher, which lib/access/enforce.ts states can never happen.
+    //
+    // The coupling was written in a comment and enforced by nothing. Now deleting either end reddens.
+    const tokens = read("lib/access/agent-tokens.ts");
+    expect(
+      tokens,
+      "verifyAgentToken must still refuse external-tier delegation — the token arm's posture-free pin depends on it"
+    ).toMatch(/if\s*\(\s*effectiveTier\s*===\s*"external"\s*\)\s*return\s+null\s*;/);
+
+    const policy = read("lib/access/provenance-sql.ts");
+    expect(
+      policy,
+      "if the token arm ever DOES consult teamPosture, this guard has outlived its premise — delete it deliberately"
+    ).toMatch(/if \(ctx\.principal === "token"\) \{[\s\S]{0,1200}?const ids = ctx\.tokenProjectIds;/);
   });
 });

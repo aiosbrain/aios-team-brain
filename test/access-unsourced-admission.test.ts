@@ -18,9 +18,16 @@ import { rowVisibleByProvenance } from "@/lib/access/provenance";
  *   (i)  the policy function's EXACT union result, here;
  *   (ii) exhaustive `switch` + `never` in all three consumers, so a missed branch is a COMPILE error
  *        (that one is enforced by tsc, not by a test);
- *   (iii) both SQL forms executed against the same fixture truth table as the TS owner, in the
- *        data-mechanics tier where real rows exist.
- * This file is (i), plus the TS owner's half of (iii).
+ *   (iii) each SQL form asserted SEPARATELY, with its own mutation, so a shared fixture cannot mask
+ *        either owner.
+ *
+ * ⚠️ AN EARLIER VERSION OF THIS COMMENT CLAIMED (iii) meant "both SQL forms EXECUTED against the same
+ * fixture truth table in the data-mechanics tier". That was false and a diff review caught it: only
+ * the ID-ARRAY form is ever executed against real Postgres (through the route dm tests). The SEMIJOIN
+ * form's `"projects"` branch is production-dead today — all three of its callers are typed
+ * `MemberPrincipal`, so a token cannot reach it — and it is therefore STRING-asserted here plus
+ * mutation-pinned, not executed. Stating coverage the tests do not contain is the failure mode this
+ * whole slice keeps being caught by; the claim is now what is true.
  */
 
 const P = ["p1", "p2"] as const;

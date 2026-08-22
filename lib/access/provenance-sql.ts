@@ -79,6 +79,16 @@ export function unsourcedAdmission(ctx: {
 }): UnsourcedAdmission {
   if (ctx.principal === "member" && ctx.teamPosture === true) return { kind: "all" };
   if (ctx.principal === "token") {
+    // ⚠️ THE TOKEN ARM DOES NOT CONSULT `teamPosture`, AND THAT IS ONLY SAFE BECAUSE OF ONE LINE
+    // ELSEWHERE (Fable diff review, MEDIUM). A token's wall is its project authority, not posture —
+    // but if `verifyAgentToken`'s Phase-A refusal of external-tier delegation
+    // (`lib/access/agent-tokens.ts:170`, `if (effectiveTier === "external") return null`) is ever
+    // lifted, an external-posture token would get `{kind:"projects"}` while its own external LAUNCHER
+    // gets `{kind:"closed"}` — the token EXCEEDING its launcher, which `lib/access/enforce.ts:39`
+    // states can never happen. The per-leg `audience = 'external'` conjuncts would be the only
+    // remaining wall, and those are per-leg, not the central policy.
+    // `test/guards/provenance-principal-callsites.test.ts` reddens if that refusal is deleted while
+    // this pin stands, so the coupling cannot be broken silently from either end.
     const ids = ctx.tokenProjectIds;
     // An EMPTY set closes EXPLICITLY rather than relying on `= any('{}')` being false: the closed
     // case is a decision, not an emergent property of SQL. Absent closes for the same reason a

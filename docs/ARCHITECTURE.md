@@ -272,8 +272,10 @@ rejects the prefix; `aios_*` member keys are byte-for-byte unchanged.
 > there would silently blind every unscoped agent while every scoped test stayed green.
 > The two token-capable consumers (`lib/query/retrieve.ts`, `lib/query/structured-extras.ts`) may only
 > FORWARD `enforce.principal` **and `enforce.tokenProjectIds`**; deriving either would relabel or
-> re-derive authority, and `test/guards/provenance-principal-callsites.test.ts` fails the build on a
-> member literal in either file **and on a ctx that omits either field** — an omitted forward closes
+> re-derive authority — a recomputed project set is a SECOND oracle read free to disagree with the
+> first — and `test/guards/provenance-principal-callsites.test.ts` fails the build on a member literal
+> in either file, on a ctx that OMITS either field, and on either field being anything other than the
+> exact `enforce?.…` forward — an omitted forward closes
 > the arm, which is indistinguishable from the fail-closed default and so reddens nothing on its own.
 > On the TS owner the token path requires `project_id: string` STATICALLY (an overload): the column is
 > `NOT NULL`, so an absent field means the CALLER did not select it, and denying quietly there turns a

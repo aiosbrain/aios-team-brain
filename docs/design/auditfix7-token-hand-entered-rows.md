@@ -232,8 +232,11 @@ every positive used an **explicit non-empty scope**, so an implementation that r
   asserts `null → the launcher/represented intersection` while `[] → closed`. *Round 2's BLOCKER: the
   implementation that returns `[]` for a null scope passes AC1–AC2 and silently narrows every
   unscoped token.*
-- **AC4 — an EMPTY scope (`[]`) closes (dm):** the fail-closed floor, and distinct from AC3.
-- **AC5 — `created_by` null closes even in scope (dm):** seeded as `origin='ui'`,
+- **AC4 — an EMPTY scope (`[]`) closes (unit + dm, piecewise):** the unit tier proves `[] → closed`
+  from the policy; the dm leak suite independently proves an empty effective set. ⚠️ *Labelled "dm"
+  before the diff review; it is proven in two places, not one end-to-end fixture.*
+- **AC5 — `created_by` null closes even in scope (unit):** ⚠️ *labelled "dm" before the diff review;
+  it is asserted on the TS owner, not seeded through the route.* Shaped as `origin='ui'`,
   `source_item_id=null`, `created_by=null`, project **in scope** — the exact shape of the 66 legacy
   rows, making it explicit that project scope alone does not rehabilitate them.
 - **AC6 — the SOURCED arm is a positive control in the same invocation (dm).**
@@ -244,9 +247,15 @@ every positive used an **explicit non-empty scope**, so an implementation that r
   the owners return different types, so "compare their outputs" is not a mechanism.* Three parts:
   (i) the policy function's exact union result is unit-asserted for every (principal, posture, scope)
   input; (ii) all three consumers `switch` exhaustively with a `never` check, so a missed branch is a
-  compile error; (iii) **both SQL forms are executed against the same dm fixture truth table** as the
-  TS owner, and all three admit/deny identically.
-- **AC9 — the route forwards the real project set (http + unit guard):** a minted-token
+  compile error; (iii) each SQL form is asserted SEPARATELY with its OWN mutation, so a shared fixture
+  cannot mask either owner. ⚠️ *Corrected after the diff review: I had written "both SQL forms are
+  EXECUTED against the same dm fixture truth table". Only the id-array form is — the semijoin form's
+  `"projects"` branch is production-dead (all three callers are `MemberPrincipal`-typed, so no token
+  reaches it) and is string-asserted plus mutation-pinned rather than executed. Claiming coverage the
+  tests do not contain is the exact failure this slice has now been caught by three times.*
+- **AC9 — the route forwards the real project set (in-process route + unit guard):** ⚠️ *labelled
+  "http" before the diff review; the test imports the route handler and calls `POST` directly with
+  `streamAnswer` mocked — the real enforcement path, but not the wire tier.* a minted-token
   `POST /api/v1/query` returns an in-scope authored row and not an out-of-scope one; a structural
   guard asserts the route forwards what `delegatedVisibleItemIds` returned.
 - **AC10 — the forward is CARRIED, not merely available (unit guard):** deleting the project set from
