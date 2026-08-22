@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
 
 /**
  * THE single writer for `project_context_units` (spec §"project_context_units"; guarded by
@@ -59,34 +60,40 @@ export async function reconcileItemUnit(
     const row = existing as { id: string; audience: string; content_sha256: string; occurred_at: string };
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
     if (row.audience !== item.access || row.content_sha256 !== item.content_sha256 || workAtDrift) {
-      // COMPARE-AND-SET on `audience` (AUDITFIX-4 round 2). Without it a STALE reconciler wins:
-      //   S reads items.access='external'; the item flips to 'team'; N reads 'team' and writes the
-      //   unit 'team'; S then overwrites it back to 'external' — and the no-widening gate, which
-      //   rereads the unit, now sees S's stale value and PERMITS an external-shared placement. The
-      //   item ends current in BOTH system projects with both reconcilers reporting success, and no
-      //   read ever failed. Ordering cannot fix a LATER stale open; only binding the write to the
-      //   audience version that authorized it can.
-      const { data: affected, error } = await db
-        .from("project_context_units")
-        .update({
-          audience: item.access,
-          content_sha256: item.content_sha256,
-          occurred_at: item.work_at,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", row.id)
-        .eq("team_id", teamId)
-        .eq("audience", row.audience) // ← the CAS: only if nobody moved it since we read it
-        .select("id");
-      if (error) return { ok: false, error: error.message };
-      if (((affected ?? []) as unknown[]).length === 0) {
-        // Someone re-mirrored this unit between our read and our write. Do NOT proceed on the
-        // audience we thought we had — every downstream placement decision is derived from it.
-        // `stale` is not an error: the caller restarts and the retry converges on fresh state.
-        return { ok: false, stale: true, error: "unit audience changed under this reconcile (CAS)" };
+      // SINGLE-STATEMENT MIRROR (AUDITFIX-4, Fable diff review HIGH 1). The audience written is read
+      // from `items` INSIDE the same statement, and the value the caller routes on is the one
+      // RETURNED — so the placement is bound to the item version that authorized it.
+      //
+      // A compare-and-set on the UNIT's audience is not enough, and shipping one was the defect the
+      // review caught: it binds the write to the mirror, while the value being written comes from an
+      // `items` read one statement earlier. That leaves this interleaving open —
+      //   S reads items.access='external'; the item flips to 'team'; N completes fully (unit→'team',
+      //   closes external-shared, opens General); S then reads the unit and sees the FRESH 'team',
+      //   so its CAS keyed on 'team' PASSES and writes 'external' back; S routes on its stale
+      //   item.access and re-opens external-shared while closing N's General include.
+      // Final state: items.access='team', current include only in external-shared, both reconcilers
+      // reporting success, no read having failed. Reading `items` inside the write closes it.
+      const mirrored = await runSql<{ audience: "team" | "external" }>(
+        `update project_context_units u
+            set audience = i.access,
+                content_sha256 = i.content_sha256,
+                occurred_at = i.work_at,
+                updated_at = now()
+           from items i
+          where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
+        returning u.audience`,
+        [row.id, teamId, itemId]
+      );
+      const mirroredRow = mirrored.rows[0];
+      if (!mirroredRow) {
+        // The unit or the item vanished under us (a delete cascade, a concurrent purge). Not an
+        // error to shout about, but emphatically not convergence: restart on fresh state.
+        return { ok: false, stale: true, error: "unit or item vanished during mirror" };
       }
+      // ROUTE ON THE RETURNED VALUE, never on the earlier `item.access` read.
+      return { ok: true, unitId: row.id, created: false, audience: mirroredRow.audience };
     }
-    return { ok: true, unitId: row.id, created: false, audience: item.access };
+    return { ok: true, unitId: row.id, created: false, audience: row.audience as "team" | "external" };
   }
 
   const { data, error } = await db

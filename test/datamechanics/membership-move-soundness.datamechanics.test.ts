@@ -236,34 +236,28 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect((await currentRows(seed, ext, unit)), "and NOT current in external-shared").toEqual([]);
   });
 
-  it("AC9b: a STALE reconciler LOSES the audience CAS and does not overwrite a newer audience", async () => {
-    // Round 2's blocker. Without the compare-and-set, a late reconciler overwrites a newer audience
-    // and the no-widening gate then permits a placement against its stale value — leaving the item
-    // current in BOTH system projects with every step reporting success.
+  it("AC9b: a STALE items.access read cannot produce a stale placement — the mirror is one statement", async () => {
+    // Round 2's blocker, and Fable's HIGH 1 on the first fix for it.
     //
-    // ⚠️ The first version of this test issued its OWN update with .eq("audience", …) and asserted
-    // zero rows — i.e. it asserted that Postgres implements compare-and-set, which it does whether or
-    // not this codebase uses one. Mutation M3 survived against it. The test must drive
-    // reconcileItemUnit itself, so the stale audience is injected into the READ the code performs.
+    // A compare-and-set on the UNIT's audience is NOT sufficient: it binds the write to the mirror
+    // while the value written comes from an `items` read one statement earlier, so a reconciler
+    // holding a stale `items.access` still wins. The mirror now reads `items` INSIDE the update and
+    // the caller routes on the RETURNED value, so the placement is bound to the item version that
+    // authorized it. This test injects exactly that stale item read.
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "m/e.md", body: "e", access: "team", project: "mproj" });
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
     await backfillTeamContext(db(), seed.teamId);
     const unit = await unitOf(seed, item.id);
 
-    const { data: settled } = await db().from("project_context_units").select("audience")
-      .eq("team_id", seed.teamId).eq("id", unit).single();
-    expect((settled as { audience: string }).audience, "converged before the race").toBe("team");
-
-    // The stale reconciler believes the unit is still `external` — the value it read before a newer
-    // writer moved it to `team`. Its CAS is therefore keyed on a value no longer in the row.
-    let unitRead = true;
-    const stale = new Proxy(db() as object, {
+    // The reconciler's FIRST read (items) yields a stale `external`; the row really says `team`.
+    let itemsRead = true;
+    const staleItem = new Proxy(db() as object, {
       get(t, prop, recv) {
         if (prop !== "from") return Reflect.get(t, prop, recv);
         return (name: string) => {
           const q = (t as { from: (n: string) => unknown }).from(name);
-          if (name !== "project_context_units") return q;
+          if (name !== "items") return q;
           return new Proxy(q as object, {
             get(qt, qp, qr) {
               const v = Reflect.get(qt, qp, qr);
@@ -275,11 +269,11 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
                     }
                   : v;
               }
-              if (unitRead) {
-                unitRead = false;
+              if (itemsRead) {
+                itemsRead = false;
                 return (res: (x: unknown) => unknown) =>
                   res({
-                    data: { id: unit, audience: "external", content_sha256: "stale", occurred_at: new Date(0).toISOString() },
+                    data: { id: item.id, access: "external", content_sha256: "stale", work_at: new Date(0).toISOString() },
                     error: null,
                   });
               }
@@ -290,14 +284,83 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
       },
     }) as ReturnType<typeof db>;
 
-    const res = await reconcileItemUnit(stale, seed.teamId, item.id);
+    const res = await reconcileItemUnit(staleItem, seed.teamId, item.id);
 
-    expect(res.stale, "the stale write must LOSE the CAS and say so").toBe(true);
-    expect(res.ok, "and must not report success").toBe(false);
+    // THE PROPERTY: the audience the caller routes on is the item's TRUE access, never the stale read.
+    expect(res.ok, res.error).toBe(true);
+    expect(res.audience, "routes on the item version that authorized it, not the stale read").toBe("team");
 
     const { data: after } = await db().from("project_context_units").select("audience")
       .eq("team_id", seed.teamId).eq("id", unit).single();
-    expect((after as { audience: string }).audience, "the newer writer's value stands").toBe("team");
+    expect((after as { audience: string }).audience, "and the row itself was not moved to the stale value").toBe("team");
+  });
+
+  it("AC5: a NARROWING move whose SECOND write fails leaves DENIAL, not external exposure", async () => {
+    // THE PIN for close-before-open (spec §3a). Fable's HIGH 2: without it the entire `if (narrowing)`
+    // branch — "the part that actually removes the exposure" — can be deleted with the whole suite
+    // green, because every other test either drives the writers directly or asserts an
+    // order-insensitive final state.
+    //
+    // The property is asserted through visibleItemIds, the access primitive, not through the rows:
+    // "still externally readable" is the outcome that matters, and a row-level assertion would pass
+    // an implementation that merely rearranged the rows.
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "m/g.md", body: "g", access: "external", project: "mproj" });
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    await backfillTeamContext(db(), seed.teamId);
+    const ext = await systemProject(seed, "external-shared");
+    const unit = await unitOf(seed, item.id);
+    expect((await currentRows(seed, ext, unit)).length, "starts external-shared").toBe(1);
+
+    // A member whose ONLY path to this item is the external-shared grant.
+    const { externalMember } = await import("./helpers");
+    const outsider = await externalMember(seed);
+
+    const { visibleItemIds } = await import("@/lib/access/enforce");
+    const before = await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider });
+    expect(before.ids.has(item.id), "fixture: externally readable before the narrowing").toBe(true);
+
+    // Narrow it, and fault the SECOND write of the move (the open of General).
+    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+    let inserts = 0;
+    const faultSecondWrite = new Proxy(db() as object, {
+      get(t, prop, recv) {
+        if (prop !== "from") return Reflect.get(t, prop, recv);
+        return (name: string) => {
+          const q = (t as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_context_memberships") return q;
+          return new Proxy(q as object, {
+            get(qt, qp, qr) {
+              const v = Reflect.get(qt, qp, qr);
+              if (qp === "insert") {
+                inserts++;
+                return () =>
+                  new Proxy({}, { get: (_x, k) => (k === "then"
+                    ? (res: (x: unknown) => unknown) => res({ data: null, error: { message: "injected insert failure" } })
+                    : () => new Proxy({}, { get: (_y, k2) => (k2 === "then"
+                        ? (res: (x: unknown) => unknown) => res({ data: null, error: { message: "injected insert failure" } })
+                        : undefined) })) });
+              }
+              return typeof v === "function"
+                ? (...a: unknown[]) => {
+                    const r = (v as (...x: unknown[]) => unknown).apply(qt, a);
+                    return r === qt ? qr : r;
+                  }
+                : v;
+            },
+          });
+        };
+      },
+    }) as ReturnType<typeof db>;
+
+    const r = await reconcileItemContext(faultSecondWrite, seed.teamId, item.id);
+    expect(r.ok, "the move must report failure when its second write fails").toBe(false);
+    expect(inserts, "fixture: the open was actually attempted").toBeGreaterThan(0);
+
+    // THE OUTCOME: the external reader must NOT still be able to read it. Under open-then-close the
+    // close never runs, the external-shared include survives, and this assertion fails.
+    const after = await visibleItemIds(db(), { teamId: seed.teamId, memberId: outsider });
+    expect(after.ids.has(item.id), "a failed narrowing must DENY, never leave external exposure").toBe(false);
   });
 
   it("AC9d: a NARROWING move does not destroy the old membership when the gate cannot answer", async () => {
