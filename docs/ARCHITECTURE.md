@@ -254,15 +254,33 @@ rejects the prefix; `aios_*` member keys are byte-for-byte unchanged.
 > `visibleItemIds` — and every valid token is team-tier by construction, so an empty-scoped token
 > received every hand-entered task and decision in the team. Reproduced against real Postgres; found
 > by the Phase A audit, not by the suite (the existing token test asserted `ctx.sources` only).
-> **The rule now:** the hand-typed arm is emitted only on the POSITIVE test
-> `principal === "member" && teamPosture === true` (`lib/access/provenance-sql.admitsUnsourced`), so
-> a token, an absent value and any foreign value all close. All THREE owners of the contract take the
-> discriminator — `provenanceRowSqlFromIds`, `provenanceRowSql`, and the TS twin
-> `rowVisibleByProvenance`. The two token-capable consumers (`lib/query/retrieve.ts`,
-> `lib/query/structured-extras.ts`) may only FORWARD `enforce.principal`; deriving it from `tier` or
-> posture would relabel every token as a member, and `test/guards/provenance-principal-callsites.test.ts`
-> fails the build on a member literal in either file. A token still cannot see hand-entered rows in
-> projects it IS granted — those legs carry item ids only, and widening them is AUDITFIX-7.
+> **The rule now (AUDITFIX-7 made it three-valued):** `lib/access/provenance-sql.unsourcedAdmission`
+> returns `{kind:"all"}` for a member at team posture, `{kind:"projects"}` for a TOKEN whose effective
+> project set is non-empty, and `{kind:"closed"}` for everything else — an absent value, a foreign
+> value, and a token with an empty or absent set. All THREE owners consume it —
+> `provenanceRowSqlFromIds`, `provenanceRowSql`, and the TS twin `rowVisibleByProvenance` — and each
+> `switch`es EXHAUSTIVELY with a `never` check, because a union does not enforce itself: a consumer
+> branching on `kind !== "closed"` reads `"projects"` as `"all"` and hands a scoped token the corpus.
+> **AUDITFIX-7 deliberately reversed AUDITFIX-1's "a token never sees a hand-typed row"**, under an
+> explicit product ruling: an agent granted a project reads what a person typed into it. The
+> protection AUDITFIX-1 actually added is kept — the arm is GATED on the token's authority
+> (`effectiveVisibleProjects`) rather than closed — and the claim it rested on ("a null-source row
+> cannot be tested against that scope") was **false**: such rows carry `project_id`, written by the
+> dashboard create actions in the same insert as `created_by`, and both leg queries already join
+> `projects`. ⚠️ `projectScope: null` is NOT the empty set — the oracle attenuates only when the scope
+> is non-null, so an unscoped token's authority is its launcher's granted projects; returning `[]`
+> there would silently blind every unscoped agent while every scoped test stayed green.
+> The two token-capable consumers (`lib/query/retrieve.ts`, `lib/query/structured-extras.ts`) may only
+> FORWARD `enforce.principal` **and `enforce.tokenProjectIds`**; deriving either would relabel or
+> re-derive authority, and `test/guards/provenance-principal-callsites.test.ts` fails the build on a
+> member literal in either file **and on a ctx that omits either field** — an omitted forward closes
+> the arm, which is indistinguishable from the fail-closed default and so reddens nothing on its own.
+> On the TS owner the token path requires `project_id: string` STATICALLY (an overload): the column is
+> `NOT NULL`, so an absent field means the CALLER did not select it, and denying quietly there turns a
+> one-line wiring defect into a legitimate-looking empty result. **Making a project reachable by an
+> agent still requires an operator GRANT** — measured 2026-08-22, prod has 2 granted projects of 19
+> and zero delegated tokens, so this changed nothing on that fleet. Requiring a scope at mint is
+> **AUDITFIX-19**; the agents admin page is **AUDITFIX-20**.
 
 Brain API 1.18 was ADDITIVE: delegated agent tokens (`aiosd_*`, spec §10) on the Phase A surface
 only — `GET /api/v1/items` accepts them oracle-filtered, everything else rejects the prefix;
