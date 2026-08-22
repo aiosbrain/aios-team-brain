@@ -296,35 +296,46 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect(res.refused, "and NOT as a settled refusal — the sweep must retry this").toBeFalsy();
   });
 
-  it("AC12: two concurrent reconciles of the SAME item SERIALIZE — the interleaving class is closed", async () => {
-    // §10c. Five review rounds each found a different two-reconciler interleaving, and each fix
-    // patched one instance. This is the criterion for the fix that retires the class: the second
-    // reconciler cannot run inside the first's move.
+  it("AC12: the move takes a per-item lock — a second reconcile BLOCKS until the first releases", async () => {
+    // §10c's criterion, asserted on the LOCK rather than on a racing outcome.
     //
-    // Asserted on the OUTCOME both rounds cared about — the item must not end current in BOTH system
-    // projects — plus the final placement agreeing with the item's true access. A test that only
-    // asserted "no error" would pass the pre-transaction code, which reported success from both.
+    // ⚠️ The first version of this test fired two `reconcileItemContext` calls with Promise.all and
+    // asserted the item did not end up in both projects. Mutation M9 (deleting the lock) SURVIVED it:
+    // two reconciles reading the SAME access are idempotent and converge to the same correct answer
+    // whether or not they serialize. The bad interleaving needs the access to CHANGE between them,
+    // which Promise.all cannot schedule deterministically. So this asserts the property directly:
+    // while an advisory lock on this item is held, the move cannot proceed.
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "m/j.md", body: "j", access: "external", project: "mproj" });
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
     await backfillTeamContext(db(), seed.teamId);
-    const general = await systemProject(seed, "general");
-    const ext = await systemProject(seed, "external-shared");
-    const unit = await unitOf(seed, item.id);
 
-    // Flip to team and fire two reconciles at once — the shape every blocker needed.
-    await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
-    const [a, b] = await Promise.all([
-      reconcileItemContext(db(), seed.teamId, item.id),
-      reconcileItemContext(db(), seed.teamId, item.id),
-    ]);
-    expect(a.ok || b.ok, "at least one reconcile must converge").toBe(true);
+    const { getPool } = await import("@/lib/db/pg/pool");
+    const holder = await getPool().connect();
+    let blocked = true;
+    try {
+      await holder.query("begin");
+      await holder.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [item.id]);
 
-    const inGeneral = await currentRows(seed, general, unit);
-    const inExt = await currentRows(seed, ext, unit);
-    expect(inGeneral.length + inExt.length, "never current in BOTH system projects").toBeLessThanOrEqual(1);
-    expect(inGeneral.length, "and the survivor is the one the item's true access selects").toBe(1);
-    expect(inExt, "external-shared must be empty after the narrowing").toEqual([]);
+      await db().from("items").update({ access: "team" }).eq("id", item.id).eq("team_id", seed.teamId);
+
+      // The move must not complete while the lock is held elsewhere.
+      const move = reconcileItemContext(db(), seed.teamId, item.id).then((r) => {
+        blocked = false;
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(blocked, "the move must BLOCK while another holder has this item's lock").toBe(true);
+
+      // Release, and it completes.
+      await holder.query("commit");
+      const r = await move;
+      expect(r.ok, r.error).toBe(true);
+      expect(blocked).toBe(false);
+    } finally {
+      try { await holder.query("rollback"); } catch { /* already committed */ }
+      holder.release();
+    }
   });
 
   it("AC8: the uncontended move still closes the opposite membership exactly once", async () => {
