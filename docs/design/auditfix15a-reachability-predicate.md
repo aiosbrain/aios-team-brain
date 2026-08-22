@@ -162,7 +162,7 @@ saying otherwise is the failure this document's own §3 table exists to record.
 | risk | direction | mitigation |
 |---|---|---|
 | The corrected predicate reports items the old one called fine | a CLI run goes red where it was green | intended, and it is the point; measured **0 → 0** on prod today, so no fleet is surprised on day one |
-| A five-way `NOT EXISTS` scans the corpus | slow CLI command | AC7's control runs against a seeded corpus; index shapes and `EXPLAIN` evidence are required before **Phase B** puts it on a cadence, not before a manual command uses it |
+| A five-way `NOT EXISTS` scans the corpus | slow CLI command | **MEASURED, not deferred — `EXPLAIN (analyze)` on prod, 2026-08-22, 2,903 items: 56 ms.** Plan is a Merge Anti Join. ⚠️ **The inner side is `memberships x eligible principals`**, not just corpus: 2,903 memberships against 5 eligible members already materialises **14,515 rows**, and it is sorted. So this scales with HEADCOUNT as well as corpus. At the CLI's on-demand cadence that is fine at any plausible size; **Phase B must re-measure before putting it on a tick**, which is what §3 defers |
 | The truth table drifts from the oracle | the detector disagrees with enforcement again | every row cites the oracle line it encodes, and the whole table is one dm matrix |
 
 ---
