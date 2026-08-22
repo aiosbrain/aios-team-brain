@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, dirname, relative, resolve as resolvePath } from "node:path";
 import ts from "typescript";
 
@@ -178,10 +179,14 @@ function writerExports(files: { rel: string; code: string }[], known: ReadonlySe
   const out = new Map<string, Set<string>>([[CANONICAL, new Set([WRITER])]]);
   const byRel = new Map(files.map((f) => [f.rel, f.code]));
   if (!byRel.has(CANONICAL)) byRel.set(CANONICAL, "");
+  // Only files that RE-EXPORT anything can ever join the set, so the fixpoint iterates over those
+  // rather than the whole tree (the real tree has a handful; it had been re-parsing ~1,000 files a
+  // pass).
+  const reExporters = [...byRel].filter(([, code]) => /\bexport\b[^;]*\bfrom\b/.test(code));
   let grew = true;
   while (grew) {
     grew = false;
-    for (const [rel, code] of byRel) {
+    for (const [rel, code] of reExporters) {
       const src = parse(rel, code);
       const names = out.get(rel) ?? new Set<string>();
       const before = names.size;
@@ -225,8 +230,25 @@ interface Bindings {
 }
 
 const scriptKind = (rel: string) => (rel.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
-const parse = (rel: string, code: string) =>
-  ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, scriptKind(rel));
+
+/**
+ * Parsing is MEMOISED, and that is a correctness-of-the-suite matter rather than a nicety.
+ * `writerExports` iterates to a fixpoint over every file, so without this the real tree is parsed
+ * ~1,000 files × N passes × once per `analyse()` call — which pushed AC3 and AC4 past vitest's 5 s
+ * default under coverage instrumentation and FAILED IN CI while `npm test` was green locally.
+ * (CI runs `npm run coverage`, not `npm test`.) Keyed on the content, so a fixture that reuses a
+ * path with different code still parses fresh.
+ */
+const parseCache = new Map<string, ts.SourceFile>();
+const parse = (rel: string, code: string): ts.SourceFile => {
+  const key = `${rel}\u0000${code}`;
+  let sf = parseCache.get(key);
+  if (!sf) {
+    sf = ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, scriptKind(rel));
+    parseCache.set(key, sf);
+  }
+  return sf;
+};
 
 /** `require("…")` / `await import("…")` / `import("…")` → the specifier, when it is a string literal. */
 function moduleSpecifierOf(e: ts.Expression): string | null {
@@ -512,7 +534,6 @@ const NOT_WALKED: Record<string, string> = {
   ingestion: "the Python connector sidecar — HTTP-only to the brain",
   postgres: "SQL schema + migrations",
   public: "static assets",
-  supabase: "legacy SQL, retired backend",
   test: "tests are not writers",
   validation: "evaluation fixtures/reports",
 };
@@ -624,7 +645,8 @@ function analyse(
   return { violations, sites };
 }
 
-const realFiles = () => productionFiles().map((rel) => ({ rel, code: read(rel) }));
+let realFilesCache: { rel: string; code: string }[] | null = null;
+const realFiles = () => (realFilesCache ??= productionFiles().map((rel) => ({ rel, code: read(rel) })));
 
 /* ────────────────────────────── the criteria ────────────────────────────── */
 
@@ -747,31 +769,30 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     if (msg) expect(violations.map((v) => v.message).join("\n")).toContain(msg);
   });
 
-  it("AC9 — every top-level directory is accounted for, and every walked one exists", () => {
+  it("AC9 — every top-level directory IN THE REPOSITORY is accounted for", () => {
     // Fable HIGH 2: the previous roots list silently omitted `components/` (109 shipped files).
     // Coverage must not shrink as the repo grows, so a NEW top-level directory fails here until
     // someone decides which list it belongs in.
     //
-    // ⚠️ TWO DIRECTIONS, NOT ONE EQUALITY — and CI is what taught me the difference. The first
-    // version asserted set EQUALITY against `readdirSync`, which is the LOCAL FILESYSTEM: it passed
-    // on my machine and failed on a clean runner, because `supabase/` is GITIGNORED (a leftover from
-    // the Postgres migration) and exists only here. An assertion whose answer depends on which
-    // untracked directories a developer happens to have is not a property of the repository.
-    //
-    // The load-bearing direction is the SUBSET one: nothing present may be unaccounted for. The
-    // second guards the typo that would silently narrow the walk.
-    const present = readdirSync(ROOT)
-      .filter((n) => !n.startsWith(".") && n !== "node_modules" && statSync(join(ROOT, n)).isDirectory())
-      .sort();
-    const accounted = new Set<string>([...WALKED, ...Object.keys(NOT_WALKED)]);
-    expect(
-      present.filter((d) => !accounted.has(d)),
-      "a new top-level directory must be classified as walked or not-walked, with a reason"
-    ).toEqual([]);
-    expect(
-      WALKED.filter((d) => !present.includes(d)),
-      "a walked root that does not exist means the walk is silently narrower than it reads"
-    ).toEqual([]);
+    // ⚠️ ASK GIT, NOT THE FILESYSTEM — and it took CI two failures to teach me that. Asserting
+    // against `readdirSync(ROOT)` asks "what is on this disk", which is not a property of the
+    // repository and gave a different answer three ways:
+    //   1. it passed here and failed on a clean runner, because `supabase/` is GITIGNORED — a
+    //      leftover from the Postgres migration that exists only on my machine;
+    //   2. weakening it to a subset check then passed everywhere EXCEPT the CI job that runs
+    //      `npm run coverage`, because that command CREATES `coverage/` before this test reads the
+    //      directory listing — the harness manufacturing the very thing the assertion complains
+    //      about;
+    //   3. the next build artifact would have done it again.
+    // Tracked paths are the same on every machine and in every job, so equality is safe again —
+    // and equality also catches a STALE entry, which the subset form could not.
+    const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: ROOT, encoding: "utf8" })
+      .split("\0")
+      .filter(Boolean)
+      .filter((f) => f.includes("/"))
+      .map((f) => f.slice(0, f.indexOf("/")))
+      .filter((d) => !d.startsWith("."));
+    expect([...new Set(tracked)].sort()).toEqual([...WALKED, ...Object.keys(NOT_WALKED)].sort());
   });
 
   it("AC10 — the walk actually reaches components/ and the root-level sources", () => {
