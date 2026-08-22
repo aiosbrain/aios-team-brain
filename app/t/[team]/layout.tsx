@@ -2,7 +2,8 @@ import Link from "next/link";
 import { CircleAlert } from "lucide-react";
 import { activateInvitedMembership } from "@/lib/auth/pg-login";
 import { resolveTeamContext } from "@/lib/auth/team-context";
-import { TeamNav, type NavEntry, type NavLeaf } from "@/components/team-nav";
+import { TeamNav } from "@/components/team-nav";
+import { buildNavItems } from "@/lib/dashboard/nav-items";
 import { SignOutButton } from "@/components/account/sign-out-button";
 
 function NoTeamScreen({ slug }: { slug: string }) {
@@ -45,31 +46,7 @@ export default async function TeamLayout({
 
   const base = `/t/${team.slug}`;
 
-  // Settings groups the low-frequency config surfaces; Admin is appended only for admins.
-  // "Team tools" (/team-tools) removed from the nav (2026-07-13, product call) — route still resolves.
-  const settingsChildren: NavLeaf[] = [
-    { icon: "account", label: "Account", href: `${base}/account` },
-  ];
-  if (me.role === "admin") {
-    settingsChildren.push({ icon: "admin", label: "Admin", href: `${base}/admin` });
-  }
-
-  // Lean primary IA (2026-07-10, product call). Removed from the left nav — routes still resolve by
-  // direct URL, only the nav entry was cut: "Tasks" (/tasks), "Maturity" (/maturity), "Decisions"
-  // (/decisions, empty + unused). "Data" moved under Admin → Data (verification/debug view, now
-  // admin-gated). The "Work" group is dropped (nothing left in it; Projects stays commented out).
-  // "Meetings" stays a top-level entry — a new, actively-used surface, not part of the trim.
-  // "Pulse" (home) is now the flagship narrative surface: it absorbed the old "Learning" tab (arcs +
-  // timeline + facts/events), so that entry was removed and `/learning` redirects here. The Brain icon
-  // fronts Pulse to signal it's the synthesized-understanding surface, not a generic dashboard home.
-  const items: NavEntry[] = [
-    { icon: "learning", label: "Pulse", href: base, exact: true },
-    { icon: "codebases", label: "Codebases", href: `${base}/codebases` },
-    { icon: "meetings", label: "Meetings", href: `${base}/meetings` },
-    { icon: "query", label: "Query", href: `${base}/query` },
-  ];
-  // "Social" removed from the left nav (product call) — the /social route still resolves by direct URL.
-  items.push({ label: "Settings", children: settingsChildren });
+  const items = buildNavItems({ base, role: me.role });
 
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
