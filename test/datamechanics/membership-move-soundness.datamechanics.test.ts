@@ -215,6 +215,81 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect((await currentRows(seed, general, unit)).length).toBe(1);
   });
 
+  it("AC9c: the REREAD's own error reports ok:false — it must not read as 'nothing left to close'", async () => {
+    // Round 2 asked for this and the first implementation shipped without it; Fable named the exact
+    // unkilled mutation: delete the reread's error check and a failed reread falls through as
+    // rows=[] -> stillClosable=0 -> ok:true. AC1's reread is real and healthy, so nothing reddened.
+    //
+    // The design ADDED this read, so the design must fault-inject THIS read — not only the one it
+    // inherited (AC4). Faulting the SECOND membership read reaches it: read #1 classifies, the
+    // update matches nothing (stale id), read #2 is the reread.
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "m/h.md", body: "h", access: "team", project: "mproj" });
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    await backfillTeamContext(db(), seed.teamId);
+    const general = await systemProject(seed, "general");
+    const unit = await unitOf(seed, item.id);
+
+    const [rowA] = await currentRows(seed, general, unit);
+    await plant(seed, general, unit, "include", "auto"); // A replaced by B → the update matches 0
+
+    let read = 0;
+    const faultReread = new Proxy(db() as object, {
+      get(t, prop, recv) {
+        if (prop !== "from") return Reflect.get(t, prop, recv);
+        return (name: string) => {
+          const q = (t as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_context_memberships") return q;
+          let mutating = false;
+          return new Proxy(q as object, {
+            get(qt, qp, qr) {
+              const v = Reflect.get(qt, qp, qr);
+              // A builder that has had `.update()` called on it is a MUTATION, not a read. Counting
+              // its await as a read is how the first version of this fixture faulted the UPDATE and
+              // "passed" for the wrong reason — caught only because the assertion pinned the message.
+              if (qp === "update") mutating = true;
+              if (qp !== "then") {
+                return typeof v === "function"
+                  ? (...a: unknown[]) => {
+                      const r = (v as (...x: unknown[]) => unknown).apply(qt, a);
+                      return r === qt ? qr : r;
+                    }
+                  : v;
+              }
+              if (mutating) return v;
+              read++;
+              if (read === 1) return (res: (x: unknown) => unknown) => res({ data: [rowA], error: null });
+              return (res: (x: unknown) => unknown) =>
+                res({ data: null, error: { message: "injected reread failure" } });
+            },
+          });
+        };
+      },
+    }) as ReturnType<typeof db>;
+
+    const res = await closeMembershipInto(faultReread, seed.teamId, unit, general);
+    expect(res.ok, "a reread that failed cannot be read as convergence").toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/reread failed/);
+  });
+
+  it("AC6: the gate at ensureIncludeMembership itself refuses an undetermined read", async () => {
+    // Fable: AC9d exercises only the PREFLIGHT call site in reconcile-item, so reverting the gate at
+    // its ORIGINAL site (the writer) left the round-1 fail-open unpinned. This pins the writer.
+    const seed = await seedTeam();
+    const item = await ingest(seed, { path: "m/i.md", body: "i", access: "team", project: "mproj" });
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    await backfillTeamContext(db(), seed.teamId);
+    const general = await systemProject(seed, "general");
+    const unit = await unitOf(seed, item.id);
+
+    const { ensureIncludeMembership } = await import("@/lib/projects/context/memberships");
+    const faulted = clientWithFailingRead("project_groups");
+    const res = await ensureIncludeMembership(faulted, seed.teamId, { projectId: general, contextUnitId: unit });
+
+    expect(res.ok, "an undetermined reachability read must refuse the WRITE, not just the preflight").toBe(false);
+    expect(res.refused, "and NOT as a settled refusal — the sweep must retry this").toBeFalsy();
+  });
+
   it("AC8: the uncontended move still closes the opposite membership exactly once", async () => {
     // The regression half. A fix that reports failure more often is not automatically better.
     const seed = await seedTeam();
