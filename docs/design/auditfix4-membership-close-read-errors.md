@@ -1,13 +1,14 @@
 # A membership move that did not move must not report success — AUDITFIX-4
 
-**Status:** spec, **round 10 — redesigned around a transaction** (§10). Five review rounds (3 spec, 2
-diff) all returned BLOCKED, each on a different interleaving. §10 records why the answer is to stop
-patching them individually. The branch's current implementation is superseded by §10. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
-error-check slice: round 2 established it is a **concurrency-correctness** slice, and the honest name
-for it is *make the membership transition sound*. §8 records it. Round 1's decisive finding: all
-seven of my acceptance criteria were satisfied by an implementation that still lets a move silently
-not-move, because capturing the SELECT error does nothing about the UPDATE. The design below is the
-reviewer's, not my original.
+**Status:** **round 10 — redesigned around a transaction (§10), implemented.** Five review rounds —
+three on the spec, two on the diff — all returned BLOCKED, each on a *different* two-reconciler
+interleaving. §10 records why the answer was to stop patching them one at a time. §7/§8/§9 record the
+earlier rounds and are kept because the superseded designs are the argument for this one.
+
+⚠️ **§3a2 below is HISTORY, not the design.** It specifies a compare-and-set that shipped and was then
+refuted (§10a): it binds the write to the mirror rather than to the item version that authorized it.
+The live design is §10c.
+
 **Build with:** opus / high — it changes the failure contract of the writer that performs the
 membership MOVE, which under the ruling below is the authorization transaction itself.
 
