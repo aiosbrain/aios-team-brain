@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
-import { findUnpartitionedItems } from "@/lib/projects/context/coverage";
+import { findUnpartitionedItems, unreachableItems } from "@/lib/projects/context/coverage";
+import { assessAccessHealth } from "@/lib/admin/access-health";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 
@@ -270,5 +271,39 @@ describe("AUDITFIX-15A — universal reachability, the oracle's rule and nothing
     expect(b.ok, b.error).toBe(true);
     const r = await findUnpartitionedItems(db(), seed.teamId);
     expect(r.count, r.examples.join(", ")).toBe(0);
+  });
+
+  // AC9/AC10 — written into the spec and NOT implemented in the first pass. Fable's diff review
+  // caught it, and it is the THIRD time in this program that a prose-only criterion pinned nothing:
+  // AC5 here had already survived two mutations for the same reason. Criteria that live only in a
+  // document decay into surviving mutations.
+
+  it("AC9 — the CLI contract is unchanged: shape, floor semantics, and a blocker on a non-zero count", async () => {
+    const seed = await seedTeam();
+    const p = await project(seed);
+    await grant(seed, p, await group(seed)); // granted to a group nobody is in
+    await isolatedItem(seed, p, "ac9.md");
+
+    const r = await findUnpartitionedItems(db(), seed.teamId);
+    expect(Object.keys(r).sort()).toEqual(["count", "examples", "scanned", "truncated"]);
+    expect(r.count).toBeGreaterThan(0);
+    expect(r.truncated, "a small fixture is not a floor").toBe(false);
+    expect(r.scanned, "scanned is the corpus the answer is ABOUT").toBeGreaterThan(0);
+
+    // The consumer still turns a non-zero count into a BLOCKER — the contract that matters.
+    const h = await assessAccessHealth(db(), seed.teamId);
+    expect(h.healthy).toBe(false);
+    expect(h.blockers.join(" ")).toMatch(/reachable by NO eligible principal/);
+  });
+
+  it("AC10 — a read failure is an ERROR, never a clean bill of health", async () => {
+    // The silent direction this whole slice exists to close: "could not read" must not be spelled the
+    // same as "there are none". Faulted by asking for a nonsense team id, which makes the uuid cast
+    // fail inside the query rather than returning an empty set.
+    const bad = await unreachableItems(db(), "not-a-uuid", 10);
+    expect(bad.rows, "a failed read must not present as an empty result").toBeUndefined();
+    expect(bad.error, "the cause must survive — a bare catch left an operator with nothing").toBeTruthy();
+
+    await expect(findUnpartitionedItems(db(), "not-a-uuid")).rejects.toThrow(/coverage read failed/);
   });
 });

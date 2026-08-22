@@ -164,17 +164,20 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   //    is the check that decides the whole question.
   const unpartitioned = await findUnpartitionedItems(db, teamId);
   if (unpartitioned.count > 0) {
+    // ⚠️ The cause is NOT always an incomplete backfill (AUDITFIX-15A). The old predicate could only
+    // see "no membership at all", so "the backfill has not completed" was the only possible cause and
+    // the message said so. The corrected predicate ALSO catches an item that HAS a current include
+    // into a project granted only to a group no eligible principal is in — for which draining the
+    // backfill changes nothing and an operator following that advice loops. Both causes are named.
     blockers.push(
-      `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (scan truncated)" : ""} have no current project membership ` +
-        `and are invisible to everyone — the §11 backfill has not completed`
-    );
-  } else if (unpartitioned.truncated) {
-    // A truncated scan that found nothing is NOT a clean bill of health — it is an unfinished
-    // question, and the answer decides whether a team's whole corpus disappears.
-    blockers.push(
-      `the coverage scan hit its batch guard after ${unpartitioned.scanned} item(s) — the rest of the corpus is unverified`
+      `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (floor — more exist)" : ""} are reachable by NO eligible ` +
+        `principal. Either the §11 backfill has not completed, or their project is granted only to ` +
+        `group(s) that no active non-connector human/agent is in`
     );
   }
+  // The old `else if (truncated)` arm is GONE, not forgotten: under the new contract `truncated`
+  // implies `count === MAX_UNREACHABLE`, so the first branch always wins and the arm was dead code
+  // describing a batch guard that no longer exists.
 
   return {
     healthy: blockers.length === 0,

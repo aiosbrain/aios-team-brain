@@ -41,12 +41,15 @@ const MAX_UNREACHABLE = 5_000;
 
 export interface CoverageResult {
   scanned: number;
-  /** Items no principal could reach: no ACTIVE item-grain unit carrying a CURRENT
-   *  include-membership into a project that at least one group is GRANTED. */
+  /** Items NO ELIGIBLE PRINCIPAL can reach — the full oracle chain, not "the project has a grant".
+   *  ⚠️ This comment used to describe the grant-only predicate, i.e. the defect AUDITFIX-15A fixed;
+   *  it contradicted the module header two screens up. */
   count: number;
   /** Up to `EXAMPLE_LIMIT` paths, so an operator sees WHAT would vanish, not only how much. */
   examples: string[];
-  /** True when the scan hit its batch guard — the count is a floor, not the total. */
+  /** True when more than `MAX_UNREACHABLE` unreachable items exist — the count is a FLOOR, not the
+   *  total. (It used to mean "the paging loop hit its batch guard"; the loop is gone, the floor
+   *  contract is not.) */
   truncated: boolean;
 }
 
@@ -89,7 +92,7 @@ select i.id, i.path
          on pcm.team_id = u.team_id and pcm.context_unit_id = u.id
        join project_groups pg
          on pg.team_id = pcm.team_id and pg.project_id = pcm.project_id
-       join groups g on g.id = pg.group_id
+       join groups g on g.team_id = pg.team_id and g.id = pg.group_id
        join group_members gm on gm.team_id = g.team_id and gm.group_id = g.id
        join members m on m.id = gm.member_id
       where u.team_id = i.team_id
@@ -115,7 +118,7 @@ export async function unreachableItems(
   db: DbClient,
   teamId: string,
   limit: number
-): Promise<{ rows: { id: string; path: string }[] } | null> {
+): Promise<{ rows: { id: string; path: string }[]; error?: undefined } | { rows?: undefined; error: string }> {
   void db; // the pooled adapter; this read is raw SQL for the NOT EXISTS above
   try {
     const res = await runSql<{ id: string; path: string }>(UNREACHABLE_SQL, [
@@ -125,8 +128,11 @@ export async function unreachableItems(
       limit,
     ]);
     return { rows: res.rows };
-  } catch {
-    return null;
+  } catch (e) {
+    // CARRY THE CAUSE. A bare `catch {}` here left an on-call operator with "coverage read failed"
+    // and nothing else while diagnosing a production DB problem — the old paged version named which
+    // read failed. Swallowing it also violates the repo-wide never-silently-swallow rule.
+    return { error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -139,7 +145,7 @@ export async function findUnpartitionedItems(db: DbClient, teamId: string): Prom
   // `truncated` keeps its meaning: the query is bounded, and hitting the bound means the count is a
   // FLOOR. A caller deciding what a whole team can see has to know it has one.
   const found = await unreachableItems(db, teamId, MAX_UNREACHABLE + 1);
-  if (found === null) throw new Error("coverage read failed");
+  if (found.error !== undefined) throw new Error(`coverage read failed: ${found.error}`);
   const truncated = found.rows.length > MAX_UNREACHABLE;
   const rows = truncated ? found.rows.slice(0, MAX_UNREACHABLE) : found.rows;
 

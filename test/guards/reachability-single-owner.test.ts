@@ -17,6 +17,14 @@ import ts from "typescript";
  * this asserts the STRUCTURE — every substrate read in the module flows through the one exported
  * function — and leaves the MEANING to the truth-table matrix in
  * `test/datamechanics/reachability-predicate.datamechanics.test.ts`, which is where meaning belongs.
+ *
+ * ⚠️ WHAT IT DOES NOT CATCH, stated rather than implied (Fable diff review). It sees only literal
+ * string SQL: a template with a `${…}` substitution, or `"from " + "items"`, is invisible to it. And
+ * the call-graph half inspects only the direct body of `findUnpartitionedItems`, so a HELPER
+ * elsewhere in this module doing its own grant-only read — the original defect's exact shape — would
+ * pass both assertions. The residual protection is the dm matrix, which pins the reader's behaviour
+ * for every enumerated case, so behaviour-changing drift still reddens. Read this as a tripwire on
+ * the module's structure, not a proof that one definition exists.
  */
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -28,7 +36,7 @@ const parse = (code: string) => ts.createSourceFile(COVERAGE, code, ts.ScriptTar
 function substrateQueries(code: string): string[] {
   const found: string[] = [];
   const visit = (n: ts.Node): void => {
-    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && /\bfrom\s+items\b|\bproject_context_units\b|\bgroup_members\b/i.test(n.text)) {
+    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && /\bfrom\s+items\b|\bproject_context_units\b|\bproject_context_memberships\b|\bproject_groups\b|\bgroup_members\b/i.test(n.text)) {
       found.push(n.text);
     }
     ts.forEachChild(n, visit);
