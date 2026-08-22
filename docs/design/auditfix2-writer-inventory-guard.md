@@ -1,6 +1,6 @@
 # Every writer of an item is enumerated, or the build fails — AUDITFIX-2, narrowed twice
 
-**Status:** spec, **narrowed to a guard after two BLOCKED/DECLINE review rounds** (§9, §10).
+**Status:** **BUILT.** Narrowed to a guard after three BLOCKED/DECLINE spec rounds (§9, §10, §11), then **BLOCKED again by Fable's diff review**, which defeated the built guard four ways with working code (§12). Folded and re-verified.
 The predecessor (`docs/design/auditfix2-connector-reconcile-at-ingest.md`, branch
 `fix/auditfix-2-connector-reconcile`, two rounds, both BLOCKED, never built) rested on two false
 premises, refuted here in §0. **This document's own first draft was then declined too** — the
@@ -691,3 +691,34 @@ pressure is where over-correction hides, and this one had it.
 | **M11** | AC7 (pinning the corrected comment) is ceremony — forbidding one phrase cannot make a future comment accurate | **CONFIRMED. Dropped.** The comment fix stays as cleanup with no guard attached |
 
 **Nothing is built. No code exists for any of the four designs.**
+
+
+## 12. Fable's diff review — BLOCKED, and it defeated the shipped guard four ways
+
+**4 BLOCKER-class defeats demonstrated with working code that kept the guard 25/25 green, plus one
+build-breaking false positive.** Every one was reproduced against the real tree before folding, and
+every one is now a permanent negative control (§5a rows 12-21) — because AUDITFIX-1's guard was beaten
+three times and each defeat was a new *spelling* of one act, so the spellings ARE the regression suite.
+
+| # | defeat | outcome |
+|---|---|---|
+| **B1** | a **re-export barrel** — `export { ingestItem } from "@/lib/ingest"` in one file, imported from another. My code comment claimed "one level is followed by `resolveSpecifier`"; that function resolves **path spellings** and never reads a re-export | **CONFIRMED.** Barrels are now FOLLOWED transitively to a fixpoint, which closes the hole *and* keeps a legitimate barrel usable. The regex-based AC8 died with it: a barrel whose specifier was `"./index"` evaded it because the string contains no `"ingest"` |
+| **B2** | **two-step dynamic import** — `const mod = await import(…); const { ingestItem } = mod;`. The destructure's initializer is an Identifier, which hit no branch | **CONFIRMED.** Recognised now, along with `require()` and `import ingest = require(…)`. ⚠️ The spec **claimed** `require(...)` was resolved while the implementation had none — a spec-vs-code lie I introduced |
+| **B3** | **call spellings** — `(0, ingestItem)(…)`, `.call`/`.apply`, and passing it as an argument were all silently DROPPED, directly contradicting this file's own "fails closed" header | **CONFIRMED.** The rule now INVERTS: pass 1 resolves bindings, pass 2 permits a fixed set of positions and REFUSES every other use. That one mechanism closes B2 and B3 together |
+| **H1** | a **build-breaking false positive** — `carriesWriter` matched `ingestItem` by NAME, so an innocent local function of that name stored in an object literal broke the build | **CONFIRMED**, and it is the failure mode that gets a guard deleted. The name-matching heuristic is gone entirely; provenance decides |
+| **H2** | **coverage silently narrow** — the walk was `lib/app/scripts`, omitting `components/` (109 shipped files, several importing `lib/ingest/*`), every root-level source (`instrumentation.ts`, `proxy.ts`), and every non-`.ts` extension | **CONFIRMED.** Walks `components/` + root files + seven extensions, and **AC9** asserts the walked and not-walked lists account for the *entire* top level — a new shipped directory fails the build rather than silently shrinking coverage. **AC10** pins the width separately, because set-equality cannot prove it |
+| **M2/M3/M4** | an aliased `after` import is mis-judged · `.tsx` parsed as TS · the count table duplicated in a second place teaches "bump the number" | **all CONFIRMED.** Aliased `after` is refused explicitly; ScriptKind by extension; the count moved **into each `Entry`**, beside its reason |
+| **L1/L4** | the scheduler comment and every ARCHITECTURE.md number **verified true** | cleared |
+
+**Verified by planting Fable's five exploits as real files in the tree**: four are now counted as call
+sites and one is REFUSED, while its innocent fixture produces nothing.
+
+### 12a. Two mutations survived the fold, and the second one twice
+
+- **M6** (per-entry site count) and **M7** (the aliased-`after` refusal) both SURVIVED: I added both
+  rules *while folding Fable's review* and neither had a fixture. Controls 22 and 23 supply them.
+- **M7 then survived a second time.** Control 23's first version called `later(...)`, which tripped
+  the aliased-after rule **and** the "no reconcile inside `after()`" rule — so deleting the rule under
+  test left the other one failing it anyway. **One condition per fixture**: the reconcile now sits
+  inside a bare `after(...)` so `aliasedAfter` is the only rule that can fire, and every control may
+  now assert its **exact message** rather than only its kind (Fable L2).
