@@ -354,8 +354,16 @@ export function startIngestScheduler(): void {
     try {
       const { backfillAllTeams } = await import("@/lib/projects/context/backfill");
       const { recordIngestRun } = await import("@/lib/ingest/runs");
-      // Cutoff = tick start: bound this run to content that existed when the tick began, so a
-      // concurrent push (which the on-push hook partitions itself) isn't chased mid-sweep.
+      // Cutoff = THIS STAGE's start, NOT the tick's. `startedAt` is taken at the top of
+      // runContextBackfill, which the tick sequences AFTER all four connector legs — so a leg's
+      // items were created BEFORE this cutoff and ARE swept in the same tick. The bound exists to
+      // stop chasing a concurrent PUSH mid-sweep (the on-push hook partitions those itself).
+      //
+      // ⚠️ This comment said "Cutoff = tick start" and that one wrong sentence produced two rounds
+      // of wrong design in AUDITFIX-2 — a whole slice was specced around "the sweep skips items
+      // created during the tick that ingested them", which the line below disproves. Do not move
+      // the value to the tick start to make the old prose true: that would make the sweep skip
+      // same-tick items, which is the wrong direction.
       const cutoff = new Date(startedAt).toISOString();
       // BOUNDED (TICKSTALL-1). The stage used to drain to completion or not at all, which measured
       // 57-60 min against a 30-min interval and starved every stage below it. `batchSize: 100`, not
