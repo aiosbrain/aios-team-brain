@@ -9,8 +9,13 @@ sound: the writer inventory becomes build-enforced.
 
 **Round 2's one sentence:** *"Build only a narrower, sound writer-inventory guard; the route change is
 a best-effort latency optimization on an 8.6-minute-median self-healing path, and its folded 'budget'
-creates unbounded aggregate work without durable observability."* Accepted. No code was written for
-any of the three designs.
+creates unbounded aggregate work without durable observability."* Accepted.
+
+**Round 3 then BLOCKED the narrowed guard itself** (§11) — *"Build a smaller canonical-module
+direct-call inventory only after making its limits honest: it is a useful review tripwire that would
+have caught the commit-writer PR, but it neither inventories writer entry surfaces nor enforces
+partitioning or latency."* Three BLOCKERs, and one of them found the design **unsatisfiable against
+the real tree**. Folded in §2-§5. No code has been written for any of the four designs.
 
 **Build with:** opus / high — it changes what a write path owes the access substrate, where the
 failure mode is silent unreachability rather than a crash.
@@ -213,192 +218,265 @@ It does not reach here:
 
 ---
 
-## 2. The rule
+## 2. The rule — stated as exactly what the build enforces
 
-> **Every production call site that stores an item is CLASSIFIED — it either reconciles the item's
-> context itself, or it is recorded as sweep-covered together with the latency that choice actually
-> costs. A new, unclassified call site fails the build.**
+> **Every file that calls `ingestItem` directly, anywhere in the deployed tree or in a supported
+> operator command, carries a CLASSIFICATION enum and a non-empty human rationale in the guard
+> source. A file that calls it and is unclassified fails the build; so does a classification whose
+> file no longer calls it.**
 
-This is deliberately a rule about **knowing**, not about latency. Two review rounds established that
-the latency half needs an admission-control design this slice will not carry (§6).
+**That is the whole enforced invariant, and round 3 was right to make me say so.** Earlier drafts of
+this section also promised that each entry records *"the latency that choice actually costs"* — but
+nothing validates a rationale, a claimed latency, or poller dependence. A writer classified
+`SWEEP_COVERED — same tick, 1 minute` passes the build even when it is an HTTP path on an instance
+with polling disabled. **The latency column in §3d is review-only documentation.** Calling it part of
+the rule would have been the same species of overstatement this document has now corrected three
+times.
 
-**The failure mode this guard traces to is historical and checkable, and it is not the one I first
-wrote down.** My first draft said "a route was added, took the un-reconciled path, and no build
-failed." That is false, and the truth is worse. Checked against git:
+**What this is:** a build-enforced review tripwire on the *set of direct writers*.
+**What this is not:** an access-substrate control. It does not prove partitioning happens, that a
+`reconciles` call is reachable, or that any latency claim is true.
+
+### 2a. The failure mode behind it — third statement, and this one is checked
+
+CLAUDE.md §7: *"a guard with no failure mode behind it is ceremony."* So the claim has to be
+falsifiable, and my first two attempts at it were both wrong:
+
+| attempt | claim | verdict |
+|---|---|---|
+| 1 | *"a route was added, took the un-reconciled path, and no build failed"* | **false** — `app/api/v1/codebases/route.ts` landed **2026-06-17** (`bc613732`) writing no items at all |
+| 2 | *"the guard would have failed #530"* | **true but imprecise** — and it implied the guard protects against new routes, which round 3 showed it does not |
+| 3 | below | checked against git, with the limit stated |
+
+**The accurate version.** The direct writer is `projectCommitsToItems`
+(`lib/codebases/commits-to-items.ts:117`), added **2026-06-25** (`a32b6923`) — eight days after the
+route, and seven weeks before the context substrate existed. Then:
 
 | | |
 |---|---|
-| `lib/codebases/commits-to-items.ts` and its `ingestItem` call | **2026-06-25** (`a32b6923`) |
-| `reconcileItemContext` **and** `test/guards/context-hook-callsites.test.ts` | **2026-08-11** (`d3cb8e2c`, #530, Phase A slice 5) |
-| production `ingestItem` call sites present **on that day** | **12, across 6 files** — verified with `git grep` at `d3cb8e2c`: `lib/ingest/run.ts` ×7, `commits-to-items`, `actions/handlers`, `meetings/notes`, `meetings/merge`, `items/route` |
+| `reconcileItemContext` **and** `test/guards/context-hook-callsites.test.ts` | **2026-08-11** (`d3cb8e2c`, #530) |
+| direct `ingestItem` call sites present that day | **12, across 6 files** (`git grep` at `d3cb8e2c`) |
 | call sites the guard shipped that day pins | **3** |
 
-So the commits path was not overlooked at some later date; it was **never classified at all**. The
-slice that introduced the context substrate wired three writers, left nine unwired, and shipped a
-guard that pins exactly the three it had wired. That is characterization-by-construction — a test
-asserting what the author just did rather than what the contract requires — which this repo's §2
-operating principle forbids as the default, and it is why the guard has been green for eleven days
-while 64 % of ingested volume takes the unclassified path.
+So the guard specified here **would have failed `a32b6923`** (a new direct caller in an unclassified
+file) **and would have failed #530** (nine existing direct callers left unclassified while three were
+pinned). The second is the interesting one: #530 shipped a test asserting what its author had just
+wired rather than what the contract required — characterization-by-construction, which CLAUDE.md §2
+forbids as the default — and that is why it has been green for eleven days while 64 % of ingested
+volume takes an unclassified path.
 
-**The falsifiable version of this slice's claim, therefore:** the guard as specified in §3 would have
-**failed #530 itself**, forcing all twelve sites to be classified rather than three to be pinned.
-That is the failure mode behind it, and CLAUDE.md §7 is satisfied by a real one rather than an
-imagined one.
-
-The rule's second clause is the part that keeps it honest. An allow-list entry that just says
-"sweep-covered" is a shrug; one that says *"sweep-covered — same tick when the poller is on, next tick
-otherwise, **indefinitely** when `INGEST_POLL_ENABLED=false`"* is a measurement someone can act on.
+⚠️ **And the limit, stated because round 3 found it and §3a would otherwise only imply it: this guard
+would NOT catch a new HTTP route that calls an existing, already-classified wrapper.** Add a second
+route calling `ingestCodebaseScan` and no new direct call site appears; every criterion below still
+passes. Entry surfaces are documented in §3e and are **not** build-enforced. A tripwire on direct
+writers is what is soundly checkable without a whole-program call graph; claiming more would be the
+overstatement again.
 
 ---
 
-## 3. The design: a conservative closed-world inventory
+## 3. The design: a canonical-module direct-call inventory
 
-### 3a. What the guard is, and — first — what it is NOT
+### 3a. What it is, and first what it is not
 
-⚠️ **It is not a proof that every stored item gets partitioned.** Round 2 was right to press this,
-and the existing AST guard in this repo says the same about itself
-(`test/guards/provenance-principal-callsites.test.ts:117-126` explicitly disclaims cross-module
-resolution). A static walk cannot establish that a reconcile is *reached* on every branch — a call
-inside `if (false)` satisfies any structural check, and a helper in an allow-listed file can be called
-from a new unsafe path.
+A static walk cannot establish that a reconcile is *reached* on every branch — a call inside
+`if (false)` satisfies any structural check — and this repo's existing AST guard says the same about
+itself (`test/guards/provenance-principal-callsites.test.ts:117-126` explicitly disclaims cross-module
+resolution). So the guard answers only:
 
-So the guard is scoped to the one question it can answer soundly:
+> **Which files call `ingestItem` directly, and has a human classified each of them?**
 
-> **Which files call `ingestItem`, and has each of them been classified by a human?**
+**Fail-closed by default**, with the undecidable cases named rather than assumed away (§3c).
 
-It is a **closed-world inventory with a fail-closed default.** Its failure mode is a stale allow-list
-entry — someone classifying a new site carelessly — not a silent escalation. That is a strictly better
-failure mode than today's, which is *no one noticing at all*.
+### 3b. Canonical module resolution — not a literal specifier match
 
-### 3b. The walk
+**Round 3's BLOCKER 3, and the escape is already in the tree.** An earlier draft keyed the walk on the
+literal specifier `@/lib/ingest`. `tsconfig.json:21-23` maps `@/*` to `./*`, so `@/lib/ingest`,
+`@/lib/ingest/index`, `./ingest`, `../lib/ingest` and `../ingest/index` are all the same module — and
+`scripts/seed-demo.ts:13` **already imports it relatively** (`from "../lib/ingest"`). A literal
+matcher would have missed a writer that exists today, and AC3's set-equality would then have
+*certified* the incomplete set as complete.
 
-Over production sources only (excluding `test/`, `**/*.test.ts`, `lib/ingest/fake-supabase.ts`,
-`scripts/` — see §3d for why scripts are out), using the TypeScript AST, not text:
+So every specifier — static import, `export … from`, `await import(...)`, `require(...)` — is resolved
+to an absolute path (applying the `@/*` → repo-root mapping, and directory→`index.ts` resolution) and kept only
+if it resolves to **`lib/ingest/index.ts`**, the canonical module. One level of re-export barrel is
+followed; a second level **fails closed** with a message saying so (there is no such barrel today —
+asserted by AC8, so the day one appears the guard says it cannot see through it rather than silently
+missing it).
 
-1. **Collect the local names that can reach `ingestItem`**, per file:
-   - a named import from `@/lib/ingest`, **including an alias** (`import { ingestItem as writeItem }`);
-   - a namespace import (`import * as ingest` → `ingest.ingestItem`, including the computed form
-     `ingest["ingestItem"]`);
-   - a **dynamic import** (`const { ingestItem } = await import("@/lib/ingest")`);
-   - a **local rebinding** of any of the above (`const write = ingestItem`).
-2. **Find every `CallExpression`** whose callee resolves to one of those names.
-3. **Assert the containing file is in exactly one of two sets** — `RECONCILES` or `SWEEP_COVERED` —
-   each entry carrying its reason **in the guard source**. A file in neither **fails the build**, with
-   a message that names the file and tells the author to classify it rather than to silence it.
-4. **A file may not be in both**, and every listed file must still contain a call — a stale entry for a
-   deleted call site fails too, so the list cannot rot into fiction.
-5. **For a `RECONCILES` file**, pin the *structural* contract the items route already ships and that
-   the existing guard already asserts for it: the reconcile call appears **inside an `after(async …)`
-   callback**. Nothing stronger is claimed (§3a).
+### 3c. The binding forms, and what happens when provenance is undecidable
 
-**Bypasses the walk deliberately does NOT close**, listed rather than implied: a wrapper function
-exported from an allow-listed module and called elsewhere; a call reached only through a runtime
-indirection the parser cannot follow. Both are recorded in the guard's header as known gaps, because
-a guard whose limits are undocumented gets trusted past them.
+Supported, resolved syntax-only (no type checker — the existing guard's approach, and enough for
+these):
 
-### 3c. Negative controls — the guard is mutation-tested against every historical evasion
+| form | example |
+|---|---|
+| named import | `import { ingestItem } from "@/lib/ingest"` |
+| aliased named import | `import { ingestItem as writeItem } from "../lib/ingest"` |
+| namespace member | `import * as ingest` → `ingest.ingestItem(...)` / `ingest["ingestItem"](...)` |
+| dynamic-import destructure | `const { ingestItem } = await import("@/lib/ingest")` — the `ImportExpression` argument is a string literal and the binding pattern is inspectable, so this is decidable syntax-only |
+| direct alias | `const write = ingestItem` where the initializer is a canonical binding |
 
-Each of the following is fed to the guard as a synthetic source and **must fail** it. They are the
-list of every way a text matcher was beaten in this repo, plus the three round 2 added:
+**Everything else fails closed, loudly.** If an identifier's initializer traces to a canonical ingest
+binding through any construct not in that table — reassignment, a conditional alias, storage in an
+object or array, a chained alias, or a shadowed redeclaration — the guard **fails** and names the
+construct and the file. Round 3's point was that "local rebinding" is not decidable in general and my
+draft gave no behaviour for the undecidable case. It does now, and the direction is refusal:
+`REFUSED: unsupported ingestItem binding in <file>:<line> (<construct>) — express it as a direct
+import or classify the file explicitly`.
 
-| # | control | why it exists |
+That refusal is itself pinned (AC2, control 10), because a fail-closed branch nobody tests is the
+branch that quietly becomes fail-open.
+
+### 3d. Three obligation classes, not two — the design was unsatisfiable with two
+
+**Round 3's BLOCKER 2, and it was fatal to the previous draft.** It required every `RECONCILES` file
+to reconcile inside `after(async …)`. **Both meeting writers reconcile inline, deliberately**, and one
+of them must:
+
+- `lib/meetings/notes.ts:141` — inline, so the uploader's own meeting does not 404 until the sweep;
+  its comment explicitly contrasts itself with the items route (*"the HTTP items route does it in
+  `after()`"*).
+- `lib/meetings/merge.ts:287` — inline and **load-bearing**: it `throw`s and aborts the merge if the
+  reconcile fails, *before* re-pointing the survivor. Deferring it to `after()` would break the merge's
+  ordering contract.
+
+Implemented literally, AC3 could never have passed. So the enum has three values, each with the
+structural check that is true for it:
+
+| class | structural check | members |
 |---|---|---|
-| 1 | plain `ingestItem(` in an unclassified file | the baseline |
-| 2 | `import { ingestItem as writeItem }` then `writeItem(...)` | alias — beat AUDITFIX-1's guard |
-| 3 | `import * as ingest` then `ingest.ingestItem(...)` | namespace |
-| 4 | `ingest["ingestItem"](...)` | computed member — beat AUDITFIX-1's guard |
-| 5 | `const { ingestItem } = await import("@/lib/ingest")` | dynamic import (round 2) |
-| 6 | `const write = ingestItem; write(...)` | local rebinding (round 2) |
-| 7 | a `RECONCILES` file whose only `reconcileItemContext` is **in a comment** | the paired-mention hole |
-| 8 | a `RECONCILES` file whose reconcile is **outside** any `after()` | the "never inline" contract |
-| 9 | an allow-list entry whose file no longer calls `ingestItem` | stale-entry rot |
+| `RECONCILES_AFTER_RESPONSE` | an awaited `reconcileItemContext` **inside** an `after(async …)` callback | `app/api/v1/items/route.ts` |
+| `RECONCILES_INLINE` | an awaited `reconcileItemContext` in the module, **not** inside `after()` | `lib/meetings/notes.ts`, `lib/meetings/merge.ts` |
+| `SWEEP_COVERED` | none beyond a non-empty rationale | the rest |
 
-Control 9 is the one that fails in the *deletion* direction. A guard that only fires on addition
-cannot see a call site being removed and its entry left behind, and this repo has shipped that exact
-class of decay before.
+The inventory — **15 direct call sites across 7 files**, discovered by the walk and asserted equal to
+this table (AC3):
 
-### 3d. The classification, with its real latency cost
-
-The initial inventory — **12 call sites across 6 production files**, verified by the walk itself
-rather than asserted:
-
-| file | sites | class | reason, and the latency it actually carries |
+| file | sites | class | rationale, and its review-only latency note |
 |---|---|---|---|
-| `app/api/v1/items/route.ts` | 1 | **RECONCILES** | `after()`, best-effort. Measured **0.0 min** median (41/41 workspace-CLI items partitioned inside 60 s) |
-| `lib/meetings/notes.ts` | 1 | **RECONCILES** | reconciles explicitly |
-| `lib/meetings/merge.ts` | 1 | **RECONCILES** | reconciles explicitly |
-| `app/api/v1/codebases/route.ts` | 1 (via `commits-to-items`) | **SWEEP_COVERED** | ⚠️ the largest ingest volume — **64 %** of items, median **8.0–8.8 min**. A reconcile here is DECLINED in §6, not overlooked |
-| `lib/codebases/commits-to-items.ts` | 1 | **SWEEP_COVERED** | as above |
-| `lib/ingest/run.ts` | 7 | **SWEEP_COVERED** | same tick when scheduled (§0a, measured **0.8–1.9 min**); **next tick or later** via manual sync and the four admin actions; **indefinitely** with the poller off |
-| `lib/actions/handlers.ts` | 1 | **SWEEP_COVERED** | ⚠️ **next-tick**, not same-tick. Round 2 corrected me here: `note.create` runs in the scheduler's *process*, which is not the scheduler's *sequential chain* — fired after the tick's cutoff it waits for the next one |
+| `app/api/v1/items/route.ts` | 1 | `RECONCILES_AFTER_RESPONSE` | never blocks the push; measured **0.0 min** (41/41 inside 60 s) |
+| `lib/meetings/notes.ts` | 1 | `RECONCILES_INLINE` | the uploader must not 404 on their own meeting |
+| `lib/meetings/merge.ts` | 1 | `RECONCILES_INLINE` | must complete before the survivor is re-pointed; failure aborts the merge |
+| `lib/codebases/commits-to-items.ts` | 1 | `SWEEP_COVERED` | ⚠️ **64 % of ingested volume**, median **8.0–8.8 min**. A reconcile here is DECLINED in §6, not overlooked |
+| `lib/ingest/run.ts` | 7 | `SWEEP_COVERED` | same tick when scheduled (measured **0.8–1.9 min**); next tick or later via manual sync and the four admin actions; **indefinitely** with the poller off |
+| `lib/actions/handlers.ts` | 1 | `SWEEP_COVERED` | ⚠️ reached from **`POST /api/v1/actions`** (`app/api/v1/actions/route.ts:39` → `runAction`) and from the admin approval path — **not** the scheduler chain. Next tick or later; no backstop with the poller off |
+| `scripts/seed-demo.ts` | 3 | `SWEEP_COVERED` | ⚠️ drained **only** under `docker/bootstrap.mjs:313,331`. `npm run dev:seed`, `scripts/e2e.sh` and `scripts/dev-test-setup.sh` invoke it with **no drain** |
 
-`scripts/` is excluded from the walk and stated as such: `scripts/seed-demo.ts` calls `ingestItem`
-three times and is followed by an explicit drain (`docker/bootstrap.mjs:313,331`), and scripts are not
-a deployed request surface. Excluding a directory silently is how an inventory becomes wrong, so the
-exclusion and its reason live in the guard.
+Two entries corrected by round 3 rather than by me, and both were rationales I asserted without
+checking — the same habit §6c names:
+
+- **`lib/actions/handlers.ts`.** I wrote *"runs in the scheduler's process"*. It is an HTTP/admin
+  writer outside the scheduler chain entirely. Being in the same process is not being in the same
+  sequential `await` chain.
+- **`scripts/`.** I excluded the directory on the grounds that seeding *"is followed by a drain"*.
+  Only the Docker bootstrap drains. `npm run dev:seed` (`package.json:20`) runs the script directly,
+  and against an enforcing instance with polling disabled its items stay unreachable. **The exclusion
+  is withdrawn — `scripts/` is in the walk.** A rule that claims every writer while excluding a
+  supported writer command is the kind of quiet narrowing this whole document exists to stop.
+
+### 3e. Entry surfaces — documented, NOT enforced
+
+Recorded so the gap in §2a is visible rather than latent. **Nothing below is build-checked.**
+
+| entry surface | reaches the writer via |
+|---|---|
+| `POST /api/v1/codebases` | → `ingestCodebaseScan` → `projectCommitsToItems` → `ingestItem` |
+| `POST /api/v1/actions` | → `runAction` → `note.create` → `ingestItem` |
+| admin approval action | → `resolveApproval` → `runAction` → … |
+| the four admin "Run … now" actions | → `runSlackIngestion` etc. → `ingestItem` (and record **no** ingest run) |
+| `/sync` chat command, `scripts/connectors.ts` | → `runManualSync` → the same four |
+
+Closing this properly needs a whole-program call graph from every route/action entry point. That is
+**AUDITFIX-18** and is deliberately not attempted here.
 
 ---
 
 ## 4. Scope
 
 **In:**
-1. `test/guards/context-hook-callsites.test.ts` — the AST inventory, the two classified sets with
-   written reasons, the nine negative controls, and the existing three assertions kept.
-2. `lib/ingest/scheduler.ts` — correct the **`"Cutoff = tick start"`** comment. It says stage start in
-   code and tick start in prose, and that one wrong sentence produced two rounds of wrong design in
-   the predecessor spec. Comment only; the value is correct and does not change.
-3. `docs/ARCHITECTURE.md` — the context-partition row records the inventory and the three latency
-   classes.
+1. `test/guards/context-hook-callsites.test.ts` — the canonical-resolution AST inventory, three
+   obligation classes with written rationales, the fail-closed refusal, the negative controls **and
+   their positive twins**, and the four existing assertions kept.
+2. `lib/ingest/scheduler.ts` — correct the **`"Cutoff = tick start"`** comment (it says stage start in
+   code, tick start in prose, and that one sentence produced two rounds of wrong design).
+   **Comment only, and with no guard or acceptance criterion attached** — round 3 was right that
+   pinning one wrong phrase cannot make a future comment accurate, and that the writer-inventory guard
+   should not acquire a second, unrelated prose matcher.
+3. `docs/ARCHITECTURE.md` — the context-partition row records the inventory and the three classes.
 
-**Out, each with where it goes and why:**
-- **The codebases-route reconcile** — DECLINED, §6. **AUDITFIX-16** if the latency is ever worth the
-  admission-control design.
-- **Manual sync + the four admin "Run … now" actions** — **AUDITFIX-14**. Needs item ids threaded back
-  through four importers, the lifecycle restructure that BLOCKED the predecessor twice.
-- **Wiring `findUnpartitionedItems` to something that runs automatically** — **AUDITFIX-15**. The
-  count and the blocker already exist (`lib/projects/context/coverage.ts:36-67`,
-  `lib/admin/access-health.ts:163-184`); what is missing is an automatic caller, since the only
-  shipped caller is the CLI (`scripts/admin.ts:427`) — i.e. there is no **automatic or continuously
-  surfaced** caller, which is the accurate negative.
-- **A `.max()` on `recent_commits`** (`lib/api/schemas.ts:214`) — the route already loops over an
-  unbounded array doing a full `ingestItem` per element **inline, before the response**
-  (`lib/codebases/ingest.ts:180`). That is a pre-existing unbounded-work surface this slice neither
-  creates nor fixes. **AUDITFIX-17.**
+**Out, each with where it goes:**
+- **The codebases-route reconcile** — DECLINED, §6b. **AUDITFIX-16.**
+- **Entry-surface (call-graph) enforcement** — **AUDITFIX-18**, §3e.
+- **Manual sync + the four admin "Run … now" actions** — **AUDITFIX-14.**
+- **An automatic caller for `findUnpartitionedItems`** — **AUDITFIX-15.** The count and the blocker
+  exist (`lib/projects/context/coverage.ts:36-67`, `lib/admin/access-health.ts:163-184`); the only
+  shipped caller is the CLI (`scripts/admin.ts:427`), i.e. there is no **automatic or continuously
+  surfaced** caller.
+- **A `.max()` on `recent_commits`** (`lib/api/schemas.ts:214`) — **AUDITFIX-17**, and §6b now records
+  it as raising the urgency of bounding that input rather than as a refutation of anything.
 
 ---
 
 ## 5. Acceptance
 
-Every criterion is an outcome of running the guard, and each is **mutation-verified**: the mutation
-named must redden *that* criterion and not merely something.
+Each criterion is an outcome of running the guard, and each is **mutation-verified**: the named
+mutation must redden *that* criterion, not merely something.
 
-- **AC1 — an unclassified writer fails the build (unit guard):** a synthetic production file calling
-  `ingestItem` and listed in neither set makes the guard **fail**, with a message naming the file.
-- **AC2 — all nine evasions fail (unit guard):** each control in §3c, fed to the guard, **fails** it.
-  Asserted in a loop with the control's name in the failure message, so a control that stops
-  discriminating is visible rather than absorbed. *(One condition per fixture: each control trips
-  exactly one rule, checked by asserting the specific message.)*
-- **AC3 — the real tree passes, and the inventory is EXACT (unit guard):** run against the actual
-  repository, the guard passes **and** the set of discovered files equals §3d's table — not a subset.
-  A guard that finds nothing also "passes"; this is what makes it non-vacuous.
-- **AC4 — a deleted call site cannot leave a stale entry (unit guard):** an allow-list entry naming a
-  file with no `ingestItem` call **fails**. The deletion direction.
-- **AC5 — a `RECONCILES` file must reconcile inside `after()` (unit guard):** moving
-  `app/api/v1/items/route.ts`'s reconcile out of its `after()` callback **fails**; deleting the
-  reconcile entirely **fails**.
-- **AC6 — the three existing assertions still hold (unit guard):** the items-route `after()` pin, the
-  scheduler leg pin, the admin-action pin, and the shared-core pin are unchanged and still red when
-  mutated.
-- **AC7 — the corrected comment matches the code (unit guard):** `lib/ingest/scheduler.ts` must not
-  claim the cutoff is the tick start. Pinned, because the previous wording cost two design rounds and
-  nothing would otherwise stop it being written back.
+- **AC1 — an unclassified writer fails the build (unit guard):** a fixture with a canonical
+  `ingestItem` import and a real call, in neither class, **fails**, and the message names the file.
+- **AC2 — every evasion fails, and every innocent twin passes (unit guard):** the table in §5a, run as
+  a loop asserting **the exact diagnostic** for each row. Both directions are in one criterion on
+  purpose: a guard that fails everything also "catches every evasion".
+- **AC3 — the real tree passes and the inventory is EXACT (unit guard):** run against the actual
+  repository the guard passes, **and** the discovered file set equals §3d's seven files with their
+  site counts — not a subset. ⚠️ *Round 3 showed this criterion is only as strong as the recognizer
+  behind it: with a literal-specifier walk, set-equality certifies an incomplete set as complete. It
+  is §3b's canonical resolution that gives AC3 its meaning, and control 4 in §5a is what pins that.*
+- **AC4 — a stale entry fails (unit guard):** a classification naming a file with no `ingestItem` call
+  **fails**. The deletion direction, which an addition-only guard cannot see.
+- **AC5 — each class's structural check is enforced and is DISTINCT (unit guard):** moving the items
+  route's reconcile out of its `after()` **fails**; moving a meeting writer's reconcile *into* an
+  `after()` **fails**; deleting a reconcile from any `RECONCILES_*` file **fails**. The middle one is
+  what proves the three classes are not one class wearing three names.
+- **AC6 — the four existing assertions still hold (unit guard)**, each still red when mutated.
+- **AC7 — an undecidable binding is REFUSED, not ignored (unit guard):** a fixture aliasing a
+  canonical import through an unsupported construct makes the guard **fail** with the refusal message,
+  proving the fail-closed branch exists and is reached.
+- **AC8 — a second-level re-export barrel is refused (unit guard):** a fixture re-exporting a
+  re-export **fails** with the "cannot see through" message. There is no such barrel today, so without
+  this the branch would be unreachable and untested.
 
-**What no criterion claims:** that every stored item is partitioned, that partitioning is timely, or
-that a reconcile is reached on every branch. §3a says why a static walk cannot, and §6 says why the
-timeliness work is not here.
+### 5a. Controls — every fixture self-contained, every twin explicit
+
+**Round 3's HIGH 4: four of my nine controls tested nothing.** Control 1 had no import binding (so a
+binding-aware guard *should* ignore it), control 4 showed a namespace call with no namespace import,
+control 5 was a dynamic import **with no call at all** — not a writer, and it should pass — and
+control 6 rebound an identifier of unstated origin. Every fixture below carries a canonical import
+**and** an actual call, and each asserts its own exact message.
+
+| # | fixture | expected |
+|---|---|---|
+| 1 | canonical named import + call, unclassified | **fail** — unclassified |
+| 2 | `import { ingestItem as writeItem } from "@/lib/ingest"` + `writeItem(...)` | **fail** |
+| 3 | `import * as ingest from "@/lib/ingest"` + `ingest.ingestItem(...)` | **fail** |
+| 4 | `import { ingestItem } from "../lib/ingest"` (relative — the live escape) + call | **fail** |
+| 5 | `import { ingestItem } from "@/lib/ingest/index"` + call | **fail** |
+| 6 | `const { ingestItem } = await import("@/lib/ingest")` + call | **fail** |
+| 7 | `const write = ingestItem; write(...)` after a canonical import | **fail** |
+| 8 | `import * as ingest` + `ingest["ingestItem"](...)` | **fail** |
+| 9 | classified `RECONCILES_AFTER_RESPONSE` whose `reconcileItemContext` appears **only in a comment** | **fail** |
+| 10 | canonical import aliased through an unsupported construct (object storage) | **fail — REFUSED** (AC7) |
+| 11 | a classification entry whose file has no call | **fail — stale** (AC4) |
+| **T1** | a *locally defined* function also named `ingestItem`, no canonical import, called | **pass** — the binding-awareness twin |
+| **T2** | `await import("@/lib/other")` destructured, no `ingestItem` call | **pass** — a dynamic import is not a writer |
+| **T3** | a canonical import used only in a **type position** (`typeof ingestItem`) | **pass** — not a call |
+| **T4** | the real repository | **pass** (AC3) |
+
+Controls 4 and 5 are the ones round 3's BLOCKER 3 demands, and control 4 mirrors a file that exists
+today. T1–T3 are the positive twins: without them a guard that simply always fails would satisfy every
+row above.
 
 ---
-
 ## 6. What is DECLINED, and the evidence for declining it
 
 ### 6a. The connector-leg reconcile (the predecessor's design) — declined on cost
@@ -424,12 +502,14 @@ Three findings, each re-derived, that together say the sound version is a system
   **300 callback-seconds started per minute**. Inventing `RECONCILE_AT_PUSH_BUDGET_MS` next to the
   existing `CONTEXT_BACKFILL_BUDGET_MS` reuses a *parser*, not an *allocation* — which is precisely
   the BLOCKER the predecessor's round 2 raised, **re-created a third time by a fold meant to fix it.**
-  ⚠️ *Refuted in part, and it matters for how AUDITFIX-16 should be scoped:* the route **already**
-  performs unbounded, request-blocking work over the same array — `recent_commits` has no `.max()`
-  (`lib/api/schemas.ts:214`) and `projectCommitsToItems` runs a full `ingestItem` per element inline
-  (`lib/codebases/ingest.ts:180`). So the reconcile is a constant-factor increase on an existing
-  unbounded loop, not a new class. That argues for bounding the array (**AUDITFIX-17**) before adding
-  work to it — not for adding the work now.
+  ⚠️ *I called this "partially refuted" and round 3 struck that down, correctly.* The route **does**
+  already perform unbounded, request-blocking work over the same array — `recent_commits` has no
+  `.max()` (`lib/api/schemas.ts:214`) and `projectCommitsToItems` runs a full `ingestItem` per element
+  inline (`lib/codebases/ingest.ts:180`). But an existing unbounded **request** loop does not turn a
+  per-callback deadline into a **fleet allocation**: the declined reconcile would add post-response
+  work with its own duration and concurrency lifecycle on top. The correct reading is that this route
+  already has an unbounded per-request loop, which **raises the urgency of bounding its input**
+  (**AUDITFIX-17**) before adding another per-item stage — not that the allocation finding is weakened.
 - **"Structured logs only" fails this document's own non-silent rule.** `lib/ingest/runs.ts:4-12` says
   in its own header that the durable row exists *because* container logs disappear from the
   application surface, and `railway.json` configures no drain, retention or queryable sink. A deadline
@@ -457,8 +537,16 @@ third time. Meanwhile:
 - This document's first draft then asserted its own unchecked negative — *"nothing anywhere counts
   this"* — about `findUnpartitionedItems`, which had already shipped with a **stronger** definition.
 
-The common shape is not carelessness about code; it is **inherited prose treated as evidence.** The
-one artefact that reliably broke the chain was going back to production and measuring — which is what
+And round 3 found the habit twice more, in text I had written *while correcting the habit*: I
+classified `lib/actions/handlers.ts` as "runs in the scheduler's process" without opening
+`app/api/v1/actions/route.ts`, and excluded `scripts/` because seeding "is followed by a drain" when
+only the Docker bootstrap drains. It also caught the design being **unsatisfiable against the real
+tree** — a single `RECONCILES` class requiring `after()`, against two meeting writers that reconcile
+inline on purpose and one that must.
+
+The common shape is not carelessness about code; it is **inherited or invented prose treated as
+evidence.** The one artefact that reliably broke the chain was going back to the source — production
+for numbers, `git grep` for history, the file itself for a rationale — which is what
 turned a "30–72 minute defect" into an 8.6-minute one already fixed by a different slice, and what
 turned this slice from a system into a guard.
 
@@ -507,6 +595,14 @@ select date_trunc('day',created_at)::date, count(*),
        percentile_cont(0.5) within group (order by extract(epoch from (reachable_at-created_at))/60)
   from reach group by 1 order by 1;
 ```
+
+⚠️ **Labelled precisely, because round 3 showed "reachability" still overstates it.** This measures
+*"an active include into a project that has SOME grant"*. The oracle additionally intersects grants
+with the principal's own `group_members` edges (`lib/access/oracle.ts:65,74,98`), and this timestamps
+at `m.created_at` rather than the later of membership and grant — so an item included into a project
+granted only to an empty group would read as reachable. On this deployment both system projects are
+granted to `everyone` and all nine members are in it, so the two coincide; the label is narrowed
+rather than the claim re-argued.
 
 **Result: `unreachable_now = 0` on every one of the twelve days, and the medians are identical to the
 earlier series** — 08-10 1,579.4 · 08-16 84.6 · 08-19 19.6 · 08-21 **8.6**. So round 2's three
@@ -574,3 +670,24 @@ second-order defect in this program has landed.
 | **M3** | no further `commitItemIds` leak surface found; pin the explicit consumers | **CLEARED** — the only production caller is the route, and its run metadata is explicitly constructed |
 
 **Nothing is built for the declined work. No code exists for any of the three designs.**
+
+## 11. Round 3 — BLOCKED, and the design was unsatisfiable against the real tree
+
+**3 BLOCKER, 5 HIGH, 3 MEDIUM**, aimed at the narrowing — because a slice cut down under review
+pressure is where over-correction hides, and this one had it.
+
+| # | finding | outcome |
+|---|---|---|
+| **B1** | the guard would not have failed when the codebases route was introduced, and will not catch that shape again — the route calls `ingestCodebaseScan`, not `ingestItem`; a new route on an existing wrapper is invisible to it | **CONFIRMED.** My "would have failed #530" was true but implied protection it does not give. §2a now states the accurate claim (it would have failed `a32b6923` and #530) **and** the limit; §3e documents entry surfaces as explicitly unenforced, with **AUDITFIX-18** named |
+| **B2** | the `RECONCILES` rule cannot pass against the real inventory — both meeting writers reconcile **inline, deliberately**, and `merge.ts:287` must (it aborts the merge if the reconcile fails, before re-pointing the survivor) | **CONFIRMED, and fatal to the draft.** AC3 could never have passed. Three obligation classes now, each with the check that is actually true for it (§3d) |
+| **B3** | a literal-specifier walk misses `import { ingestItem } from "./ingest/index"`, and AC3's set-equality then **certifies** the incomplete set | **CONFIRMED — and the escape is already in the tree**: `scripts/seed-demo.ts:13` imports relatively. Canonical module resolution (§3b); controls 4 and 5 pin it |
+| **H4** | four of nine negative controls were incidental — control 5 had no call at all and should PASS | **CONFIRMED.** Every fixture is now self-contained with a canonical import and a real call, asserts its exact diagnostic, and four **positive twins** are added so a guard that always fails cannot satisfy the table (§5a) |
+| **H5** | the table listed seven files by adding the codebases route "via commits-to-items", which a direct-call walk cannot discover — AC3 would fail on its own stale entry | **CONFIRMED.** The route moved to §3e; the inventory is direct callers only |
+| **H6** | excluding `scripts/` is not justified — only Docker bootstrap drains; `npm run dev:seed` does not | **CONFIRMED. Exclusion withdrawn**, `scripts/` is in the walk (§3d). A rule claiming every writer while excluding a supported writer command is the quiet narrowing this document exists to stop |
+| **H7** | the `lib/actions/handlers.ts` rationale is factually wrong — reached from `POST /api/v1/actions`, not the scheduler | **CONFIRMED.** Reclassified as an HTTP/admin writer outside the scheduler chain |
+| **H8** | the latency clause is prose; nothing validates a rationale or a claimed latency | **CONFIRMED.** §2 now states exactly what the build enforces and marks the latency column review-only |
+| **M9** | §8 still overstates "reachability" — the oracle also intersects with the principal's own group edges, and the timestamp ignores a later grant | **CONFIRMED.** Label narrowed to "an active include into a project that has some grant"; why it coincides on this deployment is stated |
+| **M10** | "constant-factor increase" does not partially refute the allocation finding | **CONFIRMED. Withdrawn** — it raises the urgency of bounding the input (AUDITFIX-17), nothing more |
+| **M11** | AC7 (pinning the corrected comment) is ceremony — forbidding one phrase cannot make a future comment accurate | **CONFIRMED. Dropped.** The comment fix stays as cleanup with no guard attached |
+
+**Nothing is built. No code exists for any of the four designs.**
