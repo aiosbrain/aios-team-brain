@@ -180,9 +180,23 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
     // (4) reaching it reflectively.
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const callee = `${node.expression.expression.getText(src)}.${node.expression.name.text}`;
-      if (callee === "Reflect.set" || callee === "Object.defineProperty" || callee === "Object.assign") {
+      if (callee === "Reflect.set" || callee === "Object.defineProperty") {
+        // These name the field as a STRING ARGUMENT.
         if (node.arguments.some((a) => ts.isStringLiteralLike(a) && AUTHORITY_FIELDS.has(a.text))) {
           bad.push(`${at(node)} sets an authority field via ${callee}`);
+        }
+      }
+      if (callee === "Object.assign") {
+        // ⚠️ DIFFERENT SHAPE, and the first version of this rule missed it: `Object.assign` names the
+        // field as a KEY INSIDE an object-literal argument, not as a string argument. Reusing the
+        // string-argument test read as coverage and provided none — caught by its own mutation
+        // surviving.
+        for (const a of node.arguments) {
+          if (!ts.isObjectLiteralExpression(a)) continue;
+          for (const prop of a.properties) {
+            const n = nameOf(prop);
+            if (n && AUTHORITY_FIELDS.has(n)) bad.push(`${at(prop)} sets .${n} via Object.assign`);
+          }
         }
       }
     }
@@ -301,6 +315,14 @@ describe("guard: a token can never acquire member provenance semantics", () => {
         'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal, ...o };',
       ],
       ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
+      // ⚠️ Codex's diff review demonstrated this exact bypass: build the literal CORRECTLY, then
+      // mutate it one line later. The object-literal rule inspects construction; it says nothing
+      // about the value. Both authority fields, all three reflective shapes.
+      ["post-construction mutation of tokenProjectIds", `${FORWARD}\nctx.tokenProjectIds = ["out-of-scope"];`],
+      ["post-construction mutation of principal", `${FORWARD}\nctx.principal = "member";`],
+      ["Object.assign over tokenProjectIds", `${FORWARD}\nObject.assign(ctx, { "tokenProjectIds": ["out-of-scope"] });`],
+      ["Object.assign over principal", `${FORWARD}\nObject.assign(ctx, { "principal": "member" });`],
+      ["Reflect.set over tokenProjectIds", `${FORWARD}\nReflect.set(ctx, "tokenProjectIds", ["out-of-scope"]);`],
       ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
       ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
       ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
