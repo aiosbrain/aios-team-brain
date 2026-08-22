@@ -66,7 +66,13 @@ export async function matchingDecisions(
   // ENFB-2 §2.2: the provenance predicate compiles into THIS window too (the keyword leg was
   // one of the deferred post-LIMIT sites). Absent ctx (a caller with no enforcement view)
   // fails CLOSED: an empty visible set admits only nothing-sourced… i.e. no sourced rows.
-  enforce?: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: ProvenancePrincipal }
+  enforce?: {
+    visibleItemIds: ReadonlySet<string>;
+    teamPosture: boolean;
+    principal?: ProvenancePrincipal;
+    /** AUDITFIX-7: a token's effective project set; absent closes the hand-typed arm. */
+    tokenProjectIds?: readonly string[];
+  }
 ): Promise<DecisionMatch[]> {
   if (!orQuery.trim()) return [];
   try {
@@ -78,6 +84,8 @@ export async function matchingDecisions(
       // Absent enforcement closes the hand-typed arm (undefined), preserving this function's
       // existing fail-closed default rather than synthesising a member (AUDITFIX-1 §2d).
       principal: enforce?.principal,
+      // AUDITFIX-7: forwarded on the same terms — absent closes.
+      tokenProjectIds: enforce?.tokenProjectIds,
     });
     const params: unknown[] = p.values;
     const sql = `

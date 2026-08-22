@@ -135,10 +135,13 @@ export async function POST(req: NextRequest) {
   try {
     const { visibleItemIds, delegatedVisibleItemIds } = await import("@/lib/access/enforce");
     if (agent) {
-      const { ids } = await delegatedVisibleItemIds(db, agent);
+      const { ids, projectIds } = await delegatedVisibleItemIds(db, agent);
       // QMIR-1: a delegated token is `principal: "token"` — the org-structural mirror legs stay
       // absolutely omitted for it, tier-independent (the round-3 Codex Critical posture).
-      enforce = { visibleItemIds: ids, principal: "token" };
+      // AUDITFIX-7: `tokenProjectIds` is the token's EFFECTIVE project set and gates the hand-typed
+      // arm. It is forwarded from the value `delegatedVisibleItemIds` returned — never recomputed
+      // here, which would be a second oracle read free to disagree with the first.
+      enforce = { visibleItemIds: ids, principal: "token", tokenProjectIds: projectIds };
     } else {
       // PRET-6: enforcing is the only behavior — the member arm is unconditional.
       const { ids, projectIds } = await visibleItemIds(db, { teamId, memberId: auth!.memberId });

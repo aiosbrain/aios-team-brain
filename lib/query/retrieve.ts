@@ -149,6 +149,10 @@ export type RetrieveEnforce = {
   visibleItemIds: ReadonlySet<string>;
   graphProjectIds?: readonly string[];
   principal: "member" | "token";
+  /** AUDITFIX-7: a TOKEN's effective project set — the authority that gates the hand-typed arm.
+   *  Absent closes that arm, so this must be CARRIED, not merely available: an omitted forward
+   *  looks exactly like today's behaviour and reddens nothing on its own (the M13 lesson). */
+  tokenProjectIds?: readonly string[];
 };
 
 /** The wire half of the graph leg, injectable for tests (the client was previously constructed
@@ -604,6 +608,10 @@ async function nativeRetrieve(
         // discriminator is the only thing standing between a scoped token and every hand-typed
         // decision in the team. Deriving it here from `tier` would say "member" for every token.
         principal: enforce?.principal,
+        // AUDITFIX-7: this leg is the SECOND token-reachable path to a hand-typed decision. Round 1
+        // of the spec review found acceptance that seeded only a TASK — which would have gated the
+        // task leg correctly and left THIS one open. Forwarded on the same terms.
+        tokenProjectIds: enforce?.tokenProjectIds,
       })
     : Promise.resolve([]);
 
@@ -654,6 +662,10 @@ async function nativeRetrieve(
     visibleItemIds: visibleIds ?? new Set<string>(),
     teamPosture: tier === "team",
     principal: enforce?.principal,
+    // AUDITFIX-7: FORWARDED, never derived. Absent closes the hand-typed arm for a token, which is
+    // the fail-closed direction and also today's behaviour — so a deleted forward reddens nothing on
+    // its own. That is why the guard requires this to be CARRIED alongside `principal`.
+    tokenProjectIds: enforce?.tokenProjectIds,
   };
   const dParams = newSqlParams();
   const dTeam = dParams.add(teamId);
