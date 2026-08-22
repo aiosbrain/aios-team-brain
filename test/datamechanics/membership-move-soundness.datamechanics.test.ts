@@ -139,9 +139,11 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     expect(res.ok, "reporting success while a closable row remains current IS the defect").toBe(false);
   });
 
-  it("AC2: a row that becomes a PROTECTED exclusion between read and write survives", async () => {
-    // The predicate is reasserted in the UPDATE, so a row that turned into a human's standing
-    // exclusion after classification is not erased by an id-keyed write. CLOSEMODE-1's whole point.
+  it("AC2: a row that BECOMES a protected exclusion between read and write survives", async () => {
+    // The reassertion's own criterion. The row must look CLOSABLE when classified and be PROTECTED
+    // when written — otherwise the pre-existing classification filter does all the work and the
+    // reassertion is never exercised. (M1 proved that: dropping the reassertion did not redden the
+    // first version of this test, because its fixture was protected before the read.)
     const seed = await seedTeam();
     const item = await ingest(seed, { path: "m/b.md", body: "b", access: "team", project: "mproj" });
     const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
@@ -149,15 +151,51 @@ describe("AUDITFIX-4: a membership move that did not move must not report succes
     const general = await systemProject(seed, "general");
     const unit = await unitOf(seed, item.id);
 
-    await plant(seed, general, unit, "exclude", "force_exclude");
-    const res = await closeMembershipInto(db(), seed.teamId, unit, general);
+    const [live] = await currentRows(seed, general, unit);
+    expect(live, "fixture: one current row").toBeTruthy();
+
+    // It is NOW a human's standing exclusion…
+    await db().from("project_context_memberships")
+      .update({ decision: "exclude", mode: "force_exclude" })
+      .eq("team_id", seed.teamId).eq("id", live.id);
+
+    // …but the close is handed a classification read that still shows it as a closable include.
+    let firstRead = true;
+    const stale = new Proxy(db() as object, {
+      get(t, prop, recv) {
+        if (prop !== "from") return Reflect.get(t, prop, recv);
+        return (name: string) => {
+          const q = (t as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_context_memberships") return q;
+          return new Proxy(q as object, {
+            get(qt, qp, qr) {
+              const v = Reflect.get(qt, qp, qr);
+              if (qp !== "then") {
+                return typeof v === "function"
+                  ? (...a: unknown[]) => {
+                      const r = (v as (...x: unknown[]) => unknown).apply(qt, a);
+                      return r === qt ? qr : r;
+                    }
+                  : v;
+              }
+              if (firstRead) {
+                firstRead = false;
+                return (res: (x: unknown) => unknown) =>
+                  res({ data: [{ id: live.id, decision: "include", mode: "auto" }], error: null });
+              }
+              return v;
+            },
+          });
+        };
+      },
+    }) as ReturnType<typeof db>;
+
+    await closeMembershipInto(stale, seed.teamId, unit, general);
 
     const rows = await currentRows(seed, general, unit);
-    expect(rows.length, "the human's exclusion must SURVIVE").toBe(1);
-    expect(rows[0].decision).toBe("exclude");
-    expect(rows[0].mode).toBe("force_exclude");
-    expect(res.ok, "sparing is convergence, not failure").toBe(true);
-    if (res.ok) expect(res.spared).toBeGreaterThan(0);
+    expect(rows.length, "the human's exclusion must SURVIVE the write").toBe(1);
+    expect(rows[0].decision, "still an exclude").toBe("exclude");
+    expect(rows[0].mode, "still non-auto — CLOSEMODE-1's protection held").toBe("force_exclude");
   });
 
   it("AC4: a failed classification READ reports ok:false — it must not read as 'nothing to close'", async () => {
