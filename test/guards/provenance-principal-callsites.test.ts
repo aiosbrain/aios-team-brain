@@ -126,6 +126,10 @@ function filesUnder(dir: string): string[] {
  * arms. Read this guard as the fast build-failing layer over a tier that independently proves the
  * outcome — not as the only thing between a token and the hand-typed rows.
  */
+/** The two fields that carry a principal's AUTHORITY. Both are forward-only, and both are equally
+ *  deletable-without-reddening, so every rule below treats them identically. */
+const AUTHORITY_FIELDS = new Set(["principal", "tokenProjectIds"]);
+
 function astViolations(code: string, rel = "inline.ts"): string[] {
   const src = ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bad: string[] = [];
@@ -156,23 +160,29 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
   };
 
   const visit = (node: ts.Node): void => {
-    // (3) an assignment INTO a `.principal` property, in any assignment operator (`=`, `||=`, `??=`).
+    // (3) an assignment INTO an authority property, in any assignment operator (`=`, `||=`, `??=`).
+    // ⚠️ BOTH FIELDS, symmetrically (Codex diff review). This checked `principal` only, so the
+    // literal could be built correctly and then mutated:
+    //     const ctx = { …, tokenProjectIds: enforce?.tokenProjectIds };
+    //     ctx.tokenProjectIds = ["out-of-scope-project"];
+    // — which passed the object-literal rule and admitted that project. A carry rule that inspects
+    // only construction is a rule about the first line, not about the value.
     if (
       ts.isBinaryExpression(node) &&
       ts.isPropertyAccessExpression(node.left) &&
-      node.left.name.text === "principal" &&
+      AUTHORITY_FIELDS.has(node.left.name.text) &&
       node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
       node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
     ) {
-      bad.push(`${at(node)} assigns to .principal — this file may only FORWARD it`);
+      bad.push(`${at(node)} assigns to .${node.left.name.text} — this file may only FORWARD it`);
     }
 
     // (4) reaching it reflectively.
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const callee = `${node.expression.expression.getText(src)}.${node.expression.name.text}`;
-      if (callee === "Reflect.set" || callee === "Object.defineProperty") {
-        if (node.arguments.some((a) => ts.isStringLiteralLike(a) && a.text === "principal")) {
-          bad.push(`${at(node)} sets .principal via ${callee}`);
+      if (callee === "Reflect.set" || callee === "Object.defineProperty" || callee === "Object.assign") {
+        if (node.arguments.some((a) => ts.isStringLiteralLike(a) && AUTHORITY_FIELDS.has(a.text))) {
+          bad.push(`${at(node)} sets an authority field via ${callee}`);
         }
       }
     }

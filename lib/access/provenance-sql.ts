@@ -49,6 +49,18 @@ export function newSqlParams(initial: readonly unknown[] = []): SqlParams {
 export type ProvenancePrincipal = "member" | "token" | undefined;
 
 /**
+ * The two discriminant tags, DERIVED rather than re-spelled.
+ *
+ * ⚠️ Written this way for a specific reason: `test/guards/provenance-principal-callsites.test.ts`'s
+ * tree-wide layer flags a bare `"member"` literal outside a listed member-only boundary, and it
+ * cannot distinguish a TYPE annotation (`principal: "member";`) from a value assignment by text —
+ * the two are textually identical. `Extract` gives the discriminated `RetrieveEnforce` union its
+ * arms without introducing a literal the guard would have to be weakened to permit.
+ */
+export type MemberTag = Extract<ProvenancePrincipal, "member">;
+export type TokenTag = Extract<ProvenancePrincipal, "token">;
+
+/**
  * THE POLICY, in one place, expressed POSITIVELY (AUDITFIX-1) — now three-valued (AUDITFIX-7).
  *
  * Positive on purpose: `principal !== "token"` would admit `undefined`, `null` and any foreign value

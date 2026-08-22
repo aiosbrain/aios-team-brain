@@ -1,6 +1,9 @@
 # A delegated token sees hand-entered rows in projects it holds — AUDITFIX-7
 
-**Status:** spec, round 0. No code written.
+**Status:** **BUILT.** Two BLOCKED spec rounds (§7, §8), then two diff reviews — Fable CLEAR, Codex
+CLEAR-WITH-CONDITIONS — both folded (§9). ⚠️ *This line said "spec, round 0. No code written" after
+the code had landed; the second diff review caught it, which is the same class of stale claim this
+slice has now been caught by four times.*
 **Build with:** opus / high — it changes what a delegated agent may read, on the access path.
 
 **Deps:** none. **Sequence it BEFORE TIERRET-1**, which rewrites the same function
@@ -162,7 +165,7 @@ not a convention, is what makes a missed branch impossible.
 The two are **not** the same obligation, and conflating them is how a caller silently drops rows:
 
 - **SQL owners** need only that the alias exposes the column. `tasks.project_id` and
-  `decisions.project_id` are `not null` in the schema (`postgres/schema.sql:1068,1187`), so
+  `decisions.project_id` are `not null` in the schema (`postgres/schema.sql:1220` (tasks) and `:1394` (decisions) — ⚠️ *the first version of this cited 1068/1187, which are unrelated tables; a diff review caught it*), so
   `<alias>.project_id` always resolves. **No SQL caller needs to change.**
 - **The TS owner** operates on a materialised row, so the column must have been **selected**. Two
   production callers do not select it — the project-detail decisions query
@@ -302,11 +305,31 @@ each SQL owner** must redden — one mutation per owner, so a shared fixture can
 | # | finding | outcome |
 |---|---|---|
 | **B1** | **no criterion pinned `projectScope: null`.** An implementation returning `[]` for a null scope passes every folded positive and silently blinds every unscoped token — the exact narrowing the ruling forbids | **CONFIRMED. AC3 added**, asserting `null → launcher/represented intersection` and `[] → closed` as distinct outcomes |
-| **H1** | AC7 claimed three-owner parity with **no executable mechanism** — the owners return different types, and `{kind:"all"}` stays vulnerable to a consumer treating every non-closed result as the bare arm | **CONFIRMED.** AC8 is now three parts (union unit-asserted · exhaustive `switch` + `never` · both SQL forms executed against the TS owner's fixture table), plus per-owner mutations |
+| **H1** | AC7 claimed three-owner parity with **no executable mechanism** — the owners return different types, and `{kind:"all"}` stays vulnerable to a consumer treating every non-closed result as the bare arm | **CONFIRMED.** AC8 is now three parts (union unit-asserted · exhaustive `switch` + `never` · both SQL forms executed against the TS owner's fixture table), plus per-owner mutations. ⚠️ *This row still said "both SQL forms executed against the TS owner's fixture table" after AC8 was corrected — a diff review caught the contradiction.* |
 | **H2** | AC11's fail-closed was right on security but data-loss-shaped: `project_id` is `NOT NULL`, so a missing field means the CALLER forgot to select it. Two TS callers omit it today | **CONFIRMED.** AC12 requires it **statically** on the token path and makes the runtime denial loud |
 | **M1** | the caller inventory was claimed but absent; and "SQL alias exposes a column" ≠ "TS row selected it" | **CONFIRMED.** §3b draws the distinction, §3c is the inventory. **No SQL caller needs to change** |
 | **M2** | §2a's residual was **false** — a sync upsert preserves `created_by`, so a dashboard→sync→purge row DOES reach the project test | **CONFIRMED**, verified in `lib/ingest/tasks.ts:161`. §2a v3 rests on dashboard authorship, and on the upsert conflicting on `(team_id, project_id, row_key)` so the project stays the human's |
 | **M3** | the 66 legacy rows are separable, but acceptance should say so | **CONFIRMED.** AC5 seeds their exact shape |
 | — | the slice is cohesive enough not to split | **ACCEPTED** |
 
-**Nothing is built. No code exists for this slice.**
+**BUILT** — see the PR. (This line said "nothing is built" after the code landed; a diff review caught it.)
+
+## 9. The two diff reviews — Fable CLEAR, Codex CLEAR-WITH-CONDITIONS
+
+Neither could construct a token that reads an out-of-scope hand-entered row. Both found real defects
+anyway, and each found things the other did not — which is the whole argument for two models.
+
+| # | reviewer | finding | outcome |
+|---|---|---|---|
+| **M1** | Fable | **a false coverage claim I wrote**: the test header said both SQL forms were EXECUTED against a dm fixture table. Only the id-array form is; the semijoin `"projects"` branch is production-dead (its three callers are `MemberPrincipal`-typed) | **CONFIRMED.** Comment + spec corrected, along with AC4/AC5/AC9 tier labels that overstated their tiers |
+| **M2** | Fable | the token arm ignores `teamPosture` deliberately, and that is only safe because `verifyAgentToken` refuses external-tier delegation. The coupling was written nowhere | **CONFIRMED.** Recorded at the pin and **guarded from both ends** — deleting either reddens |
+| **M3** | **Codex** | **the carry was not required by the TYPE.** `tokenProjectIds` was optional, so `{ visibleItemIds, principal: "token" }` type-checked and silently restored pre-slice behaviour — and `lib/query/provider.ts` restated the shape while omitting the field entirely | **CONFIRMED.** `RetrieveEnforce` is a **discriminated union**; the provider reuses it instead of restating it. Verified with a probe: the unsafe shape is now a compile error |
+| **M4** | **Codex** | **the AST guard had a mutation bypass**: it forbade assignment to `.principal` but not `.tokenProjectIds`, so a ctx could be built correctly and then mutated. `Object.assign` escaped too | **CONFIRMED.** Both fields are now one `AUTHORITY_FIELDS` set across the assignment, `Reflect.set`, `defineProperty` and `Object.assign` rules |
+| **L1** | Fable | guard rule (6) was presence-only, asymmetric with rule (1) | **CONFIRMED.** `tokenProjectIds` must be exactly `enforce?.tokenProjectIds`; a recomputed set is a second oracle read free to disagree |
+| **L2** | Fable | on a substrate read error, an empty id set was returned WITH a populated project set — wider than the same failure before this slice | **CONFIRMED.** Gated on `!items.error`. ⚠️ *Its mutation SURVIVED until I wrote a test: I fixed it and pinned nothing, the fourth time in two slices* |
+| **L3** | **Codex** | four claims still false after the M1 fold — the status line, §8's row, a test comment, and a schema citation pointing at unrelated tables | **CONFIRMED**, all four corrected |
+
+**A note on the type change.** Making `RetrieveEnforce` a union put `principal: "member"` in a TYPE
+position, which the tree-wide guard layer flags — it cannot distinguish a type annotation from a value
+assignment by text. Rather than weaken the guard, the discriminants are **derived**
+(`Extract<ProvenancePrincipal, "member">`), so no new literal exists anywhere.
