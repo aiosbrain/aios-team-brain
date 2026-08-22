@@ -615,6 +615,9 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     { n: "19 FABLE B3b — .call/.apply", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}.call(null, a);` }], inv: NO_INVENTORY, kind: "refused" },
     { n: "20 FABLE B3c — passed as an argument", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nregister(${WRITER});` }], inv: NO_INVENTORY, kind: "refused" },
     { n: "21 namespace passed as a value", files: [{ rel: "lib/f.ts", code: `import * as ingest from "@/lib/ingest";\nregister(ingest);` }], inv: NO_INVENTORY, kind: "refused" },
+    // ── Two rules added in the Fable fold whose mutations SURVIVED: nothing pinned them ────────
+    { n: "22 the per-entry site COUNT is wrong (a new call site appeared)", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nawait ${WRITER}(a);\nawait ${WRITER}(b);` }], inv: classified("lib/f.ts", "SWEEP_COVERED", 1), kind: "stale" },
+    { n: "23 `after` imported under another name — the shape check cannot judge it", files: [{ rel: "lib/f.ts", code: `${IMPORT_CANON}\nimport { after as later } from "next/server";\nawait ${WRITER}(a);\nlater(async () => { await reconcileItemContext(db, t, id); });` }], inv: classified("lib/f.ts", "RECONCILES_AFTER_RESPONSE"), kind: "shape" },
     // ── Positive twins: without these, a guard that always failed would pass every row above ────
     { n: "T1 FABLE H1 — a LOCAL function of the same name, used as a VALUE", files: [{ rel: "lib/f.ts", code: `function ${WRITER}(x: string){ return x; }\nexport const registry = { ${WRITER} };` }], inv: NO_INVENTORY, kind: null },
     { n: "T2 a dynamic import of another module, no call", files: [{ rel: "lib/f.ts", code: `const { other } = await import("@/lib/other");` }], inv: NO_INVENTORY, kind: null },
