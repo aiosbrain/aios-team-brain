@@ -164,17 +164,26 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   //    is the check that decides the whole question.
   const unpartitioned = await findUnpartitionedItems(db, teamId);
   if (unpartitioned.count > 0) {
+    // ⚠️ DO NOT ENUMERATE THE CAUSES HERE. The original message named exactly one ("the backfill has
+    // not completed"), which was the only cause the OLD grant-only predicate could see. AUDITFIX-15A
+    // widened the predicate, so I widened the message to name two — and a review produced a
+    // counterexample to that too: an active non-connector AGENT in the built-in `everyone` group.
+    // Built-ins admit humans only, so the item is correctly unreachable, while BOTH stated causes are
+    // false — the backfill completed, and the group does contain an active non-connector agent.
+    // Unknown built-in slugs, retracted units, and exclude/closed memberships are further cases.
+    //
+    // An exhaustive "either/or" is a claim about the whole predicate, and this one has now been wrong
+    // twice. Point at what to inspect instead; the examples below say which items.
     blockers.push(
-      `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (scan truncated)" : ""} have no current project membership ` +
-        `and are invisible to everyone — the §11 backfill has not completed`
-    );
-  } else if (unpartitioned.truncated) {
-    // A truncated scan that found nothing is NOT a clean bill of health — it is an unfinished
-    // question, and the answer decides whether a team's whole corpus disappears.
-    blockers.push(
-      `the coverage scan hit its batch guard after ${unpartitioned.scanned} item(s) — the rest of the corpus is unverified`
+      `${unpartitioned.count} item(s)${unpartitioned.truncated ? "+ (floor — more exist)" : ""} are reachable by NO eligible ` +
+        `principal. Inspect, for each: its context unit (active?), its membership (current include?), ` +
+        `its project's grants, and whether any granted group holds an ELIGIBLE member — built-in ` +
+        `groups admit humans only`
     );
   }
+  // The old `else if (truncated)` arm is GONE, not forgotten: under the new contract `truncated`
+  // implies `count === MAX_UNREACHABLE`, so the first branch always wins and the arm was dead code
+  // describing a batch guard that no longer exists.
 
   return {
     healthy: blockers.length === 0,

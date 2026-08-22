@@ -1,5 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { runSql } from "@/lib/db/pg/pool";
+import { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/groups";
 
 /**
  * READ-ONLY coverage query over the §11 context substrate: which of a team's items have no
@@ -15,102 +17,169 @@ import type { DbClient } from "@/lib/db/types";
  * items`), which is a scheduler-tick optimization: counts can agree while a specific item is
  * uncovered (one item in two projects masks another in none). A caller about to change what a
  * whole team can see needs the per-item answer, not the aggregate.
+ *
+ * ## AUDITFIX-15A — this module is the ONE owner of "can anybody read this item?"
+ *
+ * It used to decide reachability from the existence of a `project_groups` GRANT. The oracle needs
+ * more: an ELIGIBLE PRINCIPAL must hold a `group_members` row in a granted group
+ * (`lib/access/oracle.ts:74-104`). **So a project granted only to a group nobody is in read as
+ * covered while nobody could read it** — and `assessAccessHealth` turned that under-report into a
+ * clean bill of health. Measured on prod 2026-08-22: `external-shared` is granted to `external`,
+ * which has ZERO eligible members; harmless only because `everyone` also holds a grant.
+ *
+ * ⚠️ WHAT THIS ANSWERS, EXACTLY: "does NO eligible principal at all reach this item" — **universal
+ * unreachability**, not access-health and not intended-audience correctness. Strip General's
+ * `everyone` grant but leave a custom group holding one agent and every HUMAN goes blind while this
+ * count stays 0. The per-human floor is a different question and lives in `assessAccessHealth`'s
+ * other arms. Naming it more broadly would be a claim the query does not support.
  */
 
-const SCAN_BATCH = 500;
-const MAX_SCAN_BATCHES = 10_000;
+/** The bound on the unreachable set a single call will enumerate. Beyond it the count is a FLOOR
+ *  (`truncated`), which is the only honest thing to say — the old paging loop had the same contract
+ *  spelled as a batch guard. */
+const MAX_UNREACHABLE = 5_000;
 
 export interface CoverageResult {
   scanned: number;
-  /** Items no principal could reach: no ACTIVE item-grain unit carrying a CURRENT
-   *  include-membership into a project that at least one group is GRANTED. */
+  /** Items NO ELIGIBLE PRINCIPAL can reach — the full oracle chain, not "the project has a grant".
+   *  ⚠️ This comment used to describe the grant-only predicate, i.e. the defect AUDITFIX-15A fixed;
+   *  it contradicted the module header two screens up. */
   count: number;
   /** Up to `EXAMPLE_LIMIT` paths, so an operator sees WHAT would vanish, not only how much. */
   examples: string[];
-  /** True when the scan hit its batch guard — the count is a floor, not the total. */
+  /** True when more than `MAX_UNREACHABLE` unreachable items exist — the count is a FLOOR, not the
+   *  total. (It used to mean "the paging loop hit its batch guard"; the loop is gone, the floor
+   *  contract is not.) */
   truncated: boolean;
 }
 
 const EXAMPLE_LIMIT = 5;
 
-export async function findUnpartitionedItems(db: DbClient, teamId: string): Promise<CoverageResult> {
-  let after: string | null = null;
-  let scanned = 0;
-  let count = 0;
-  const examples: string[] = [];
+/**
+ * THE definition. Every reader goes through this function — not through a second query that means
+ * to say the same thing, which is how the two definitions drifted apart in the first place.
+ *
+ * Each conjunct cites the line it encodes, because the last version of this rule was PROSE and prose
+ * is how a proxy predicate gets written twice:
+ *
+ *   unit        `unit_kind='item'` + `state='active'`         lib/access/enforce.ts:54-67
+ *   membership  `decision='include'` + `valid_to is null`     lib/access/enforce.ts:76-87
+ *   grant       a `project_groups` row                        lib/access/oracle.ts:98-104
+ *   member      active, not a connector, human|agent          lib/access/eligibility.ts:28-30
+ *   …if BUILTIN also `kind='human'` and a SANCTIONED slug     lib/access/eligibility.ts:38-40 + oracle.ts:84-95
+ *
+ * The built-in asymmetry is the clause a generic "is this an active principal" join gets wrong:
+ * agents are NEVER auto-admitted by a built-in, so an agent in `everyone` grants nothing while the
+ * same agent in a CUSTOM group grants reachability. A built-in with an unknown slug fails closed.
+ *
+ * NOT conjuncts, asserted by test so nobody re-adds them "for safety" and silently narrows what
+ * counts as reachable: `members.tier` (the oracle never re-evaluates it — an explicit built-in row
+ * is authoritative), `projects.kind` (`oracle.ts:98-104` does not consult it), membership `mode`.
+ *
+ * `runSql` because this is a five-way `NOT EXISTS`, which `lib/db/pg`'s `eq`/`in`/`is` surface
+ * cannot express — the same justification `backfill-candidates.ts` carries. The module stays
+ * READ-ONLY, which is what lets it name these tables at all without tripping the single-writer
+ * guard's variable-table-name net.
+ */
+const UNREACHABLE_SQL = `
+select i.id, i.path
+  from items i
+ where i.team_id = $1
+   and not exists (
+     select 1
+       from project_context_units u
+       join project_context_memberships pcm
+         on pcm.team_id = u.team_id and pcm.context_unit_id = u.id
+       join project_groups pg
+         on pg.team_id = pcm.team_id and pg.project_id = pcm.project_id
+       join groups g on g.team_id = pg.team_id and g.id = pg.group_id
+       join group_members gm on gm.team_id = g.team_id and gm.group_id = g.id
+       join members m on m.id = gm.member_id
+      where u.team_id = i.team_id
+        and u.source_item_id = i.id
+        and u.unit_kind = 'item'
+        and u.state = 'active'
+        and pcm.decision = 'include'
+        and pcm.valid_to is null
+        and m.status = 'active'
+        and coalesce(m.is_connector, false) = false
+        and m.kind in ('human', 'agent')
+        and (
+          g.is_builtin = false
+          or (m.kind = 'human' and g.slug in ($2, $3))
+        )
+   )
+ order by i.id
+ limit $4`;
 
-  for (let batch = 0; batch < MAX_SCAN_BATCHES; batch++) {
-    let q = db.from("items").select("id, path").eq("team_id", teamId).order("id", { ascending: true }).limit(SCAN_BATCH);
-    if (after) q = q.gt("id", after);
-    const { data, error } = await q;
-    if (error) throw new Error(`items read failed: ${error.message}`);
-    const items = (data ?? []) as { id: string; path: string }[];
-    if (items.length === 0) return { scanned, count, examples, truncated: false };
-
-    const covered = await coveredItemIds(
-      db,
+/** Items no eligible principal can reach, bounded. Returns `{ error }` on failure — NEVER an empty
+ *  `rows`, which would read the same as "there are none" for a metric whose only job is finding an
+ *  invisible hole. (This said "`null` on failure" until the fold that replaced the bare `null` with a
+ *  discriminated union carrying the cause; the comment outlived the contract by one commit.) */
+export async function unreachableItems(
+  db: DbClient,
+  teamId: string,
+  limit: number
+): Promise<{ rows: { id: string; path: string }[]; error?: undefined } | { rows?: undefined; error: string }> {
+  void db; // the pooled adapter; this read is raw SQL for the NOT EXISTS above
+  try {
+    const res = await runSql<{ id: string; path: string }>(UNREACHABLE_SQL, [
       teamId,
-      items.map((i) => i.id)
-    );
-    for (const item of items) {
-      scanned++;
-      if (!covered.has(item.id)) {
-        count++;
-        if (examples.length < EXAMPLE_LIMIT) examples.push(item.path);
-      }
-    }
-    after = items[items.length - 1].id;
-    if (items.length < SCAN_BATCH) return { scanned, count, examples, truncated: false };
+      EVERYONE_SLUG,
+      EXTERNAL_SLUG,
+      limit,
+    ]);
+    return { rows: res.rows };
+  } catch (e) {
+    // CARRY THE CAUSE. A bare `catch {}` here left an on-call operator with "coverage read failed"
+    // and nothing else while diagnosing a production DB problem — the old paged version named which
+    // read failed. Swallowing it also violates the repo-wide never-silently-swallow rule.
+    return { error: e instanceof Error ? e.message : String(e) };
   }
-  // A corpus bigger than the guard must NOT read as fully scanned — the caller decides what to do
-  // with a floor, but it has to know it has one.
-  return { scanned, count, examples, truncated: true };
 }
 
-/** The subset of `itemIds` that an enforcing read could serve to SOMEONE. */
-async function coveredItemIds(db: DbClient, teamId: string, itemIds: string[]): Promise<Set<string>> {
-  const { data: unitRows, error: uErr } = await db
-    .from("project_context_units")
-    .select("id, source_item_id")
-    .eq("team_id", teamId)
-    .eq("state", "active")
-    .eq("unit_kind", "item")
-    .in("source_item_id", itemIds);
-  if (uErr) throw new Error(`context-unit read failed: ${uErr.message}`);
-  const itemByUnit = new Map(
-    ((unitRows ?? []) as { id: string; source_item_id: string | null }[])
-      .filter((u) => u.source_item_id)
-      .map((u) => [u.id, u.source_item_id!])
-  );
-  const covered = new Set<string>();
-  if (itemByUnit.size === 0) return covered;
-
-  const { data: memRows, error: memErr } = await db
-    .from("project_context_memberships")
-    .select("context_unit_id, project_id")
-    .eq("team_id", teamId)
-    .eq("decision", "include")
-    .is("valid_to", null)
-    .in("context_unit_id", [...itemByUnit.keys()]);
-  if (memErr) throw new Error(`membership read failed: ${memErr.message}`);
-  const granted = await grantedProjectIds(db, teamId);
-  for (const r of (memRows ?? []) as { context_unit_id: string; project_id: string }[]) {
-    // A membership into a project NO GROUP is granted reaches nobody: the oracle derives its
-    // project set from grants, so such an item is as invisible under enforcing as an
-    // unpartitioned one. The sanctioned writers only ever route into the two just-granted system
-    // projects, so this cannot happen through them — but a brain repaired by hand in SQL is
-    // exactly this command's audience, and "has a membership" was the wrong question to ask it.
-    if (!granted.has(r.project_id)) continue;
-    const itemId = itemByUnit.get(r.context_unit_id);
-    if (itemId) covered.add(itemId);
-  }
-  return covered;
+/**
+ * Shape a bounded id query into the `CoverageResult` the CLI consumes — PURE, and extracted so the
+ * FLOOR semantics are testable without planting `MAX_UNREACHABLE + 1` rows in a database.
+ *
+ * ⚠️ Extracted because a review showed the floor was asserted by nothing: the dm criterion only
+ * checked `truncated === false` on a small fixture, so a mutation forcing `truncated = false` passed
+ * it. The boundary is the whole contract — at exactly `MAX_UNREACHABLE` the count is EXACT, at one
+ * more it is a FLOOR — and a boundary you cannot cheaply reach is a boundary nobody tests.
+ *
+ * The caller must query `MAX_UNREACHABLE + 1` rows: the extra row is what distinguishes "exactly at
+ * the bound" from "more exist".
+ */
+export function shapeCoverage(
+  rows: readonly { id: string; path: string }[],
+  scanned: number,
+  max = MAX_UNREACHABLE
+): CoverageResult {
+  const truncated = rows.length > max;
+  const kept = truncated ? rows.slice(0, max) : rows;
+  return {
+    scanned,
+    count: kept.length,
+    examples: kept.slice(0, EXAMPLE_LIMIT).map((r) => r.path),
+    truncated,
+  };
 }
 
-/** Projects reachable by SOME group. Read-only; the grant table is written only by
- *  `lib/access/groups.ts` (single writer) and this module never writes anything. */
-async function grantedProjectIds(db: DbClient, teamId: string): Promise<Set<string>> {
-  const { data, error } = await db.from("project_groups").select("project_id").eq("team_id", teamId);
-  if (error) throw new Error(`grant read failed: ${error.message}`);
-  return new Set(((data ?? []) as { project_id: string }[]).map((r) => r.project_id));
+export async function findUnpartitionedItems(db: DbClient, teamId: string): Promise<CoverageResult> {
+  // ONE OWNER (AUDITFIX-15A): this reader delegates to `unreachableItems` rather than carrying its
+  // own idea of reachability. The previous version paged `items` and re-derived coverage in three
+  // queries per page, which is how it came to disagree with the oracle at all — and how a fixture
+  // proving "the two definitions agree" would have blessed the same defect twice.
+  //
+  // `truncated` keeps its meaning: the query is bounded, and hitting the bound means the count is a
+  // FLOOR. A caller deciding what a whole team can see has to know it has one.
+  const found = await unreachableItems(db, teamId, MAX_UNREACHABLE + 1);
+  if (found.error !== undefined) throw new Error(`coverage read failed: ${found.error}`);
+
+  // `scanned` is the corpus size the answer is ABOUT. It was the paging loop's counter; now it is
+  // asked directly, because a reader reporting "I looked at N" must not silently mean "N so far".
+  const { count: scanned, error } = await db.from("items").select("id", { count: "exact", head: true }).eq("team_id", teamId);
+  if (error) throw new Error(`items count failed: ${error.message}`);
+
+  return shapeCoverage(found.rows, scanned ?? 0);
 }

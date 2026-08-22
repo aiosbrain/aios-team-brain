@@ -76,7 +76,13 @@ describe("access health — the re-homed standing scan (PRET-6 AC5)", () => {
     const h = await assessAccessHealth(db(), seed.teamId);
     expect(h.healthy).toBe(false);
     expect(h.unpartitioned.count).toBeGreaterThan(0);
-    expect(h.blockers.join(" ")).toMatch(/no current project membership/);
+    // AUDITFIX-15A widened the predicate, so the message stopped naming a single cause. It then
+    // stopped ENUMERATING causes at all: an exhaustive "either/or" was wrong twice (an active agent
+    // in a builtin group falsifies both of the two it briefly named). The PROPERTY under test — an
+    // item no eligible principal can reach is a blocker — is what is unchanged, so that is what is
+    // asserted, plus that the message points at what to inspect rather than diagnosing.
+    expect(h.blockers.join(" ")).toMatch(/reachable by NO eligible principal/);
+    expect(h.blockers.join(" ")).toMatch(/Inspect, for each/);
   });
 
   it("a CUSTOM-ONLY human (no builtin, but granted a project through an ordinary group) is a WARNING, not a blind blocker (Codex diff-review Medium)", async () => {
