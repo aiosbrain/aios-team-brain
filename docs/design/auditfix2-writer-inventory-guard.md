@@ -220,11 +220,30 @@ It does not reach here:
 > costs. A new, unclassified call site fails the build.**
 
 This is deliberately a rule about **knowing**, not about latency. Two review rounds established that
-the latency half needs an admission-control design this slice will not carry (§6). What produced the
-defect in the first place was not that a reconcile was slow — it was that **nobody was counting**:
-`test/guards/context-hook-callsites.test.ts` claims to pin "the §11 context-partition CALL SITES",
-pins three named files, and never enumerates `ingestItem`'s callers at all. A route was added, took
-the un-reconciled path, and no build failed.
+the latency half needs an admission-control design this slice will not carry (§6).
+
+**The failure mode this guard traces to is historical and checkable, and it is not the one I first
+wrote down.** My first draft said "a route was added, took the un-reconciled path, and no build
+failed." That is false, and the truth is worse. Checked against git:
+
+| | |
+|---|---|
+| `lib/codebases/commits-to-items.ts` and its `ingestItem` call | **2026-06-25** (`a32b6923`) |
+| `reconcileItemContext` **and** `test/guards/context-hook-callsites.test.ts` | **2026-08-11** (`d3cb8e2c`, #530, Phase A slice 5) |
+| production `ingestItem` call sites present **on that day** | **12, across 6 files** — verified with `git grep` at `d3cb8e2c`: `lib/ingest/run.ts` ×7, `commits-to-items`, `actions/handlers`, `meetings/notes`, `meetings/merge`, `items/route` |
+| call sites the guard shipped that day pins | **3** |
+
+So the commits path was not overlooked at some later date; it was **never classified at all**. The
+slice that introduced the context substrate wired three writers, left nine unwired, and shipped a
+guard that pins exactly the three it had wired. That is characterization-by-construction — a test
+asserting what the author just did rather than what the contract requires — which this repo's §2
+operating principle forbids as the default, and it is why the guard has been green for eleven days
+while 64 % of ingested volume takes the unclassified path.
+
+**The falsifiable version of this slice's claim, therefore:** the guard as specified in §3 would have
+**failed #530 itself**, forcing all twelve sites to be classified rather than three to be pinned.
+That is the failure mode behind it, and CLAUDE.md §7 is satisfied by a real one rather than an
+imagined one.
 
 The rule's second clause is the part that keeps it honest. An allow-list entry that just says
 "sweep-covered" is a shrug; one that says *"sweep-covered — same tick when the poller is on, next tick
