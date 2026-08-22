@@ -1,7 +1,8 @@
 # A membership move that did not move must not report success — AUDITFIX-4
 
-**Status:** spec, revised twice at design time and **once more against the shipped diff** (§9 — Fable
-review). Implemented. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
+**Status:** spec, **round 10 — redesigned around a transaction** (§10). Five review rounds (3 spec, 2
+diff) all returned BLOCKED, each on a different interleaving. §10 records why the answer is to stop
+patching them individually. The branch's current implementation is superseded by §10. Round 1 BLOCKED, round 2 BLOCKED — §7, §8. This is no longer an
 error-check slice: round 2 established it is a **concurrency-correctness** slice, and the honest name
 for it is *make the membership transition sound*. §8 records it. Round 1's decisive finding: all
 seven of my acceptance criteria were satisfied by an implementation that still lets a move silently
@@ -324,3 +325,78 @@ contaminate a caller — the type change is hygiene, not a live bug.
 unreachable); `spared` recomputed from the final snapshot is the right semantics; the proxies in the
 dm suite intercept the reads they claim to; a lost mirror cannot livelock; and the neither-project
 downstreams hold (graph homing's carve-out, CLOSEMODE-1's widening return staying open-first).
+
+
+## 10. Codex's diff review, and the redesign it forces
+
+**BLOCKED: 2 BLOCKER, 2 HIGH, 2 MEDIUM.** It broke the folds from §9, and the pattern across all five
+rounds is now the finding.
+
+### 10a. What it found
+
+- **BLOCKER — the "single-statement mirror" is CONDITIONAL, so the bypass survives.** The atomic SQL
+  runs only inside `if (drift)`. When a stale reader sees item and unit *agreeing* (both `external`,
+  while `items.access` has since flipped to `team`), no mirror runs and `units.ts` returns the stale
+  `item.access`. The insert-race loser path returns it too.
+- **BLOCKER — an unconditional mirror would still not bind the MEMBERSHIP writes.** The audience picks
+  `target` once, but neither write is conditional on it, so two reconcilers still interleave into both
+  projects current, both reporting success. My comments claiming the placement is "bound to the item
+  version" and that AUDITFIX-4 "CLOSED" concurrent reconciliation are therefore **false**.
+- **HIGH — `runSql` THROWS where the adapter RETURNED.** `lib/db/pg/pool.ts:94` awaits
+  `pool.query` directly; my new call has no `try/catch`, and `lib/projects/context/backfill.ts:87`
+  does not catch — so a statement timeout now rejects the whole backfill instead of returning its
+  structured failure with the last-good cursor. A regression I introduced.
+- **HIGH — close-first still has unpreflighted destructive failures**, and my "a failure from here
+  leaves the item in NEITHER project" is too broad: a close failure leaves the old membership intact.
+- **MEDIUM — AC6 and AC9d assert weaker outcomes than their prose** (AC6's fixture already has the
+  target include so it never observes an insert; AC9d passes an implementation that improperly opens
+  General). **AC9b is green by construction for the FIFTH time** — its fake item carries a fake hash
+  and epoch timestamp, *guaranteeing* the drift branch and so never testing the bypass.
+- **MEDIUM — the single-writer guard does not recognise `runSql("update project_context_units …")`**,
+  so the "single writers, guarded" claim is no longer fully true for that table.
+
+**It cleared the reread branch** — `pcm_current_idx` bounds the key to one current row, so protected
+and closable rows cannot coexist and `after.rows.length` is exactly the final protected count.
+
+### 10b. The premise I had been quoting is FALSE
+
+Every round of this slice patched one interleaving, and the next round found another. The reason is
+in the file header I inherited and repeated: *"the compare-and-set needed to close it fully wants the
+transaction surface the adapter does not expose yet (the standing F3 deferral)."*
+
+**`lib/db/pg/tx.ts` exports `withTransaction`, and four modules already use it** — including
+`lib/pm-sync/inbound.ts`, whose comment says it exists precisely because "loop-prevention requires
+`tasks.status` and the `task_pm_links` bookkeeping to move atomically." That is the same shape as this
+problem. The deferral was stale, and I spent five rounds honouring it.
+
+### 10c. The design: serialize the move per item, and read the authoritative pair atomically
+
+Two changes, both small, that retire the interleaving class instead of its instances:
+
+1. **The whole move runs inside `withTransaction`, opening with a `SELECT … FOR UPDATE` on the ITEM
+   row.** Two reconcilers for the same item can no longer interleave: the second blocks until the
+   first commits and then re-reads fresh state. Every BLOCKER from rounds 2, 9 and 10 requires an
+   interleaving, and none survives this.
+2. **That same statement reads the authoritative `(items.access, unit.audience)` pair in one shot**,
+   and the move routes on the `items.access` it returns. This is what closes BLOCKER 10a-1: the
+   staleness there is between a reconciler's *own* item read and the item's current value — changed
+   by ingest, not by another reconciler — so a lock alone does not fix it, and reading the pair
+   atomically does.
+
+**Deliberately NOT atomicity of the writes.** The adapter's queries run on other pooled connections
+(`lib/db/pg/tx.ts`'s own doc says so), so the existing writers stay exactly as they are and keep their
+EXCLSHADOW-1 and CLOSEMODE-1 logic untouched. What the transaction buys is **mutual exclusion**; a
+crash mid-move still leaves partial state and the sweep still repairs it — which is the position this
+codebase already documents and accepts. Rewriting all ~293 lines of writer logic as raw SQL to gain
+true atomicity is a bigger slice that would put the exclude-shadow repair at risk, and is **AUDITFIX-12**.
+
+**Costs, stated:** the move holds a pooled connection for its duration (~6-10 queries) — noted because
+a wedged pooled connection caused the 2026-07-13 outage — and a single lock taken first with no other
+lock acquired means no deadlock ordering to reason about.
+
+### 10d. Also folded from 10a
+
+`runSql`'s throw contract wrapped so the structured `{ok:false}` return survives; the false comments
+corrected; AC6/AC9d strengthened to assert the rows rather than the return; AC9b rewritten to test the
+no-drift bypass rather than a fixture that guarantees the drift branch; and the single-writer guard
+taught to recognise raw-SQL writes.
