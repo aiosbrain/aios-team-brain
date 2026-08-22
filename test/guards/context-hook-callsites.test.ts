@@ -747,14 +747,31 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     if (msg) expect(violations.map((v) => v.message).join("\n")).toContain(msg);
   });
 
-  it("AC9 — the walked + not-walked lists account for the ENTIRE top level", () => {
+  it("AC9 — every top-level directory is accounted for, and every walked one exists", () => {
     // Fable HIGH 2: the previous roots list silently omitted `components/` (109 shipped files).
     // Coverage must not shrink as the repo grows, so a NEW top-level directory fails here until
     // someone decides which list it belongs in.
-    const actual = readdirSync(ROOT)
+    //
+    // ⚠️ TWO DIRECTIONS, NOT ONE EQUALITY — and CI is what taught me the difference. The first
+    // version asserted set EQUALITY against `readdirSync`, which is the LOCAL FILESYSTEM: it passed
+    // on my machine and failed on a clean runner, because `supabase/` is GITIGNORED (a leftover from
+    // the Postgres migration) and exists only here. An assertion whose answer depends on which
+    // untracked directories a developer happens to have is not a property of the repository.
+    //
+    // The load-bearing direction is the SUBSET one: nothing present may be unaccounted for. The
+    // second guards the typo that would silently narrow the walk.
+    const present = readdirSync(ROOT)
       .filter((n) => !n.startsWith(".") && n !== "node_modules" && statSync(join(ROOT, n)).isDirectory())
       .sort();
-    expect(actual).toEqual([...WALKED, ...Object.keys(NOT_WALKED)].sort());
+    const accounted = new Set<string>([...WALKED, ...Object.keys(NOT_WALKED)]);
+    expect(
+      present.filter((d) => !accounted.has(d)),
+      "a new top-level directory must be classified as walked or not-walked, with a reason"
+    ).toEqual([]);
+    expect(
+      WALKED.filter((d) => !present.includes(d)),
+      "a walked root that does not exist means the walk is silently narrower than it reads"
+    ).toEqual([]);
   });
 
   it("AC10 — the walk actually reaches components/ and the root-level sources", () => {
