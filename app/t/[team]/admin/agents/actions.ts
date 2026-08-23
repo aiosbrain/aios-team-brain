@@ -48,16 +48,27 @@ export async function mintAgentTokenAction(
   const policy = validateMintRequest(input, Date.now());
   if (!policy.ok) return { ok: false, error: policy.error };
 
-  // SCOPE ⊆ WHAT THE ADMIN CAN SEE. The picker only offers visible projects, but the picker is a
-  // web page and this is a public endpoint — the property has to hold here or it is not a property.
-  // (Fable diff review: the claim was stated at the boundary and enforced only in the UX, which is
-  // the exact shape this whole slice exists to repudiate.) Fail-closed: a substrate error yields an
-  // empty visible set, so a scoped mint is refused rather than waved through.
+  // SCOPE ⊆ WHAT THE ADMIN CAN SEE **AND** WHAT THE LAUNCHER CAN SEE. Two different properties,
+  // and Codex's diff review was right that checking only the first is not enough:
+  //   · the ADMIN check is authorization — you cannot grant reach you do not have yourself;
+  //   · the LAUNCHER check is meaning — the token reads AS that member, so a project they cannot
+  //     see would mint a scope that silently grants nothing (the oracle intersects live).
+  // They differ whenever the admin mints for someone else, which is the normal case. Fail-closed:
+  // a substrate error yields an empty set, so a scoped mint is refused rather than waved through.
+  // NOT race-free by construction — visibility can change between this read and the insert. That is
+  // acceptable because it is not the enforcement boundary: the oracle re-derives visibility on every
+  // request, so a stale grant here can only ever be narrower in effect, never wider.
   if (input.projectScope != null) {
-    const visible = await visibleProjectRows(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId });
-    const unseen = input.projectScope.filter((id) => !visible.ids.has(id));
-    if (unseen.length > 0) {
+    const db = adminClient();
+    const [adminVisible, launcherVisible] = await Promise.all([
+      visibleProjectRows(db, { teamId: ctx.teamId, memberId: ctx.memberId }),
+      visibleProjectRows(db, { teamId: ctx.teamId, memberId: input.memberId }),
+    ]);
+    if (input.projectScope.some((id) => !adminVisible.ids.has(id))) {
       return { ok: false, error: "projectScope names project(s) you cannot see" };
+    }
+    if (input.projectScope.some((id) => !launcherVisible.ids.has(id))) {
+      return { ok: false, error: "projectScope names project(s) the launching member cannot see" };
     }
   }
 

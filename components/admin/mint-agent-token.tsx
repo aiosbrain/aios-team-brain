@@ -6,7 +6,9 @@ import { mintAgentTokenAction, revokeAgentTokenAction } from "@/app/t/[team]/adm
 import {
   DEFAULT_TOKEN_LIFETIME_DAYS,
   MAX_TOKEN_LIFETIME_MS,
+  MAX_PROJECT_SCOPE,
   canSubmitMint,
+  expiryInstantFor,
   type ScopeChoice,
 } from "@/lib/access/agent-token-policy";
 
@@ -63,8 +65,11 @@ export function MintAgentToken({
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState(defaultExpiryValue);
   const [scope, setScope] = useState<ScopeChoice>(null);
-  // Date bounds are impure; React forbids computing them during render. Fixed at mount — the form
-  // is short-lived, and the ACTION re-checks both bounds anyway, so a stale bound cannot widen.
+  // Date bounds read the clock. A lazy `useState` initializer still runs during the FIRST render —
+  // so this is not "no clock read during render", it is "read once, then stable", which is what
+  // keeps re-renders pure. Stated accurately because an earlier comment overclaimed it. A server/
+  // client boundary crossing midnight UTC can therefore differ by a day; harmless, because the
+  // ACTION re-checks and clamps both bounds, so a stale bound can never widen what is minted.
   const [expiryBounds] = useState(() => ({ min: minExpiryValue(), max: maxExpiryValue() }));
 
   // The rule itself lives in the policy module so it is unit-testable without a DOM harness, and so
@@ -192,11 +197,14 @@ export function MintAgentToken({
                 <input
                   type="checkbox"
                   checked={scope.projectIds.includes(p.id)}
+                  disabled={!scope.projectIds.includes(p.id) && scope.projectIds.length >= MAX_PROJECT_SCOPE}
                   onChange={(e) =>
                     setScope({
                       kind: "restrict",
+                      // Capped here too: the action refuses more than MAX_PROJECT_SCOPE, and the
+                      // form must not be able to compose a request the action will reject.
                       projectIds: e.target.checked
-                        ? [...scope.projectIds, p.id]
+                        ? [...scope.projectIds, p.id].slice(0, MAX_PROJECT_SCOPE)
                         : scope.projectIds.filter((id) => id !== p.id),
                     })
                   }
@@ -231,8 +239,9 @@ export function MintAgentToken({
               const res = await mintAgentTokenAction(teamSlug, {
                 memberId,
                 name,
-                // End of the chosen day, so "expires 2026-11-20" means through that day.
-                expiresAt: new Date(`${expiry}T23:59:59.000Z`).toISOString(),
+                // End of the chosen day, CLAMPED to the cap — picking the max offered date used to
+                // submit an instant ~12h past the exact 365-day limit, which the action then refused.
+                expiresAt: expiryInstantFor(expiry, Date.now()),
                 projectScope: scope?.kind === "restrict" ? scope.projectIds : null,
               });
               // Deliberately does NOT include res.token in any error path.

@@ -170,6 +170,59 @@ describe("AGENTUI-1 — mintAgentTokenAction against real Postgres", () => {
     expect(await tokenCount(seed.teamId), "a refused scope must not write").toBe(before);
   });
 
+  /**
+   * ADMIN and LAUNCHER are different identities, and the earlier test made them the same member —
+   * which hid the distinction entirely (Codex diff review). The token reads AS the launcher, so a
+   * project only the ADMIN can see would mint a scope that silently grants nothing.
+   */
+  it("REFUSES a project the admin can see but the LAUNCHING member cannot", async () => {
+    const seed = await seedTeam();
+    const adminM = await seedMember(seed, "human");
+    const launcher = await seedMember(seed, "agent");
+    vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: adminM });
+
+    // Granted to the ADMIN only — the launcher is in no group that reaches it.
+    const adminOnly = await grantedProject(seed, adminM);
+
+    const before = await tokenCount(seed.teamId);
+    const res = await mintAgentTokenAction("any-slug", {
+      memberId: launcher,
+      projectScope: [adminOnly],
+      expiresAt: future(30),
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.error, "must name the LAUNCHER, not the admin").toMatch(/launching member cannot see/);
+    expect(await tokenCount(seed.teamId)).toBe(before);
+  });
+
+  it("ACCEPTS a project BOTH the admin and the launcher can see (non-vacuity for the pair)", async () => {
+    const seed = await seedTeam();
+    const adminM = await seedMember(seed, "human");
+    const launcher = await seedMember(seed, "agent");
+    vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: adminM });
+
+    const shared = await grantedProject(seed, adminM);
+    await grantProjectToGroup(
+      db(),
+      seed.teamId,
+      shared,
+      (await createGroup(db(), seed.teamId, `g2-${randomUUID().slice(0, 6)}`, "g2", seed.memberId)).groupId!,
+      seed.memberId
+    );
+    // Put the launcher in a group that also reaches `shared`.
+    const g = await createGroup(db(), seed.teamId, `g3-${randomUUID().slice(0, 6)}`, "g3", seed.memberId);
+    await addMemberToGroup(db(), seed.teamId, g.groupId!, launcher, seed.memberId);
+    await grantProjectToGroup(db(), seed.teamId, shared, g.groupId!, seed.memberId);
+
+    const res = await mintAgentTokenAction("any-slug", {
+      memberId: launcher,
+      projectScope: [shared],
+      expiresAt: future(30),
+    });
+    expect(res.ok, res.error).toBe(true);
+  });
+
   it("a non-admin caller mints nothing (pins the action's own gate, not the gate's internals)", async () => {
     const seed = await seedTeam();
     const agent = await seedMember(seed, "agent");

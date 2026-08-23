@@ -242,9 +242,9 @@ Each is independently satisfiable; none constrains a file another one requires c
   (a) every admin directory with a `page.tsx` has a `TABS` entry, and (b) every admin directory with
   an `actions.ts` has a caller — an orphaned capability is the actual repeated bug (Skills catalog,
   `admin/agents` itself, `admin/access`). Direction (b) carries an explicit allowlist containing
-  `access` ONLY, so the known debt is documented rather than invisible and a THIRD orphan fails the
+  the known orphans ONLY, so that debt is documented rather than invisible and a NEW orphan fails the
   build. An earlier draft asserted only (a) and would not have caught its own motivating case.
-- `npm test` exits 0 for new unit coverage of the SERVER boundary in
+- `npm run test:datamechanics` exits 0 for coverage of the SERVER boundary in
   `app/t/[team]/admin/agents/actions.ts`, calling the action directly (not through the form) and
   asserting each refusal writes NO row: `onBehalfOf` set → refused; `expiresAt` absent → refused;
   `expiresAt` in the past → refused; `expiresAt` beyond 365 days → refused; `projectScope: []` →
@@ -254,9 +254,11 @@ Each is independently satisfiable; none constrains a file another one requires c
 - `npm run db:test:up && npm run test:datamechanics` exits 0, including new
   `test/datamechanics/agent-token-admin.datamechanics.test.ts`, which asserts against real Postgres:
   minting writes exactly one `agent_tokens` row whose `token_hash` is not the returned token;
-  `project_scope` persists as NULL when the form sends no restriction and as `{}` when it sends an
-  empty array, and those two rows are distinguishable on read; a revoked token sets `revoked_at`
-  and `verifyAgentToken` then returns null; and a non-admin caller mints nothing.
+  `project_scope` persists as NULL when no restriction is sent, and a populated array persists as
+  that array — an empty array is REFUSED by policy and therefore never written, so an earlier
+  draft's "persists as `{}`" asked for a row the design deliberately makes unreachable; a scope
+  naming a project the admin cannot see is refused AND writes no row; a revoked token sets
+  `revoked_at` and `verifyAgentToken` then returns null; and a non-admin caller mints nothing.
 - `npm test` exits 0, including unit coverage of the form's scope+expiry contract: an untouched
   scope control yields NO submittable payload (not `null`, not `[]`); choosing "inherit" yields
   `projectScope: null`; choosing "restrict" with zero projects is not submittable; the expiry

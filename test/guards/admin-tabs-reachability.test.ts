@@ -32,7 +32,8 @@ const TABS_FILE = join(ROOT, "components", "admin", "admin-tabs.tsx");
  * orphan behind a known one. Both entries below were found by this guard on its first run and are
  * pre-existing debt, deliberately not fixed by AGENTUI-1:
  *   - access/*      : the PCCA access-chain admin UI was never built (sibling of the agents gap).
- *   - linkMemberSlack: defined 2026-xx, referenced nowhere in app/, components/, lib/ or scripts/.
+ *   - linkMemberSlack: exported from members/actions.ts, referenced nowhere in app/, components/,
+ *     lib/ or scripts/ — surfaced by this guard's own first run; intent unknown, so not fixed here.
  * Asserted to equal the real set EXACTLY, so a new orphan fails the build and a fixed one forces
  * the entry to be removed rather than lingering as a lie.
  */
@@ -49,15 +50,22 @@ function tabSlugs(): string[] {
   // Comments are stripped first: a `// { slug: "agents" … }` line is NOT a shipped tab, and matching
   // it would let someone comment an entry out of the nav with direction (a) still green — the exact
   // "source text is not rendered output" hole this guard family keeps rediscovering.
-  const src = readFileSync(TABS_FILE, "utf8")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "");
+  const src = stripComments(readFileSync(TABS_FILE, "utf8"));
   return [...src.matchAll(/\{\s*slug:\s*"([^"]+)"/g)].map((m) => m[1]);
 }
 
 /** Exported server-action names declared in a directory's actions.ts. */
 export function exportedActions(src: string): string[] {
   return [...src.matchAll(/export\s+async\s+function\s+([A-Za-z0-9_]+)/g)].map((m) => m[1]);
+}
+
+/**
+ * Strip block AND line comments anywhere on a line — not just at line start. A trailing
+ * `const x = 0; // { slug: "agents" … }` kept direction (a) green when the live entry was removed
+ * (Codex diff review), which is the same "source text is not rendered output" hole in miniature.
+ */
+export function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 }
 
 /** Every source file under the searched roots. A FILESYSTEM walk, deliberately not `git grep`:
@@ -84,7 +92,8 @@ const SOURCES = sourceFiles();
 /** Is `name` referenced anywhere outside its own defining file? */
 function hasCaller(name: string, ownFile: string): boolean {
   const re = new RegExp(`\\b${name}\\b`);
-  return SOURCES.some((f) => f !== ownFile && re.test(readFileSync(f, "utf8")));
+  // Comments stripped here too: a commented-out invocation must not "pay" an orphan's debt.
+  return SOURCES.some((f) => f !== ownFile && re.test(stripComments(readFileSync(f, "utf8"))));
 }
 
 /** Every `dir/actions.ts :: exportName` in the admin tree that nothing references. */
@@ -135,11 +144,12 @@ describe("admin surface reachability", () => {
     ).toEqual([...ORPHAN_ALLOWLIST].sort());
   });
 
-  it("a commented-out tab does not count as shipped (non-vacuity)", () => {
-    const stripped = 'const TABS = [\n  // { slug: "ghost", label: "Ghost" },\n  { slug: "real", label: "Real" },\n];'
-      .replace(/^\s*\/\/.*$/gm, "");
-    const slugs = [...stripped.matchAll(/\{\s*slug:\s*"([^"]+)"/g)].map((m) => m[1]);
-    expect(slugs).toEqual(["real"]);
+  it("commented-out entries never count as shipped — including TRAILING comments (non-vacuity)", () => {
+    const slugsOf = (src: string) =>
+      [...stripComments(src).matchAll(/\{\s*slug:\s*"([^"]+)"/g)].map((m) => m[1]);
+    expect(slugsOf('  // { slug: "ghost" },\n  { slug: "real" },'), "leading comment").toEqual(["real"]);
+    expect(slugsOf('  const x = 0; // { slug: "ghost" }\n  { slug: "real" },'), "TRAILING comment").toEqual(["real"]);
+    expect(slugsOf('  /* { slug: "ghost" } */\n  { slug: "real" },'), "block comment").toEqual(["real"]);
   });
 
   it("the export parser discriminates (non-vacuity)", () => {

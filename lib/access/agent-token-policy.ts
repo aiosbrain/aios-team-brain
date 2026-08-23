@@ -27,6 +27,8 @@ export const MAX_PROJECT_SCOPE = 200;
 export const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** ISO-8601 instant, with Z or a numeric offset. Deliberately stricter than `Date.parse`. */
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
 export interface MintRequest {
   memberId: string;
@@ -44,7 +46,13 @@ export type PolicyResult = { ok: true } | { ok: false; error: string };
  * without the clock making the test flaky.
  */
 export function validateMintRequest(req: MintRequest, now: number): PolicyResult {
-  if (!UUID_RE.test(req.memberId ?? "")) {
+  // A server action receives whatever the caller sends. Everything below is a TYPE check before a
+  // VALUE check, because `RegExp.test` and `Date.parse` both coerce: `["<uuid>"]` stringifies to a
+  // valid uuid and would otherwise pass as a memberId.
+  if (req == null || typeof req !== "object" || Array.isArray(req)) {
+    return { ok: false, error: "invalid request" };
+  }
+  if (typeof req.memberId !== "string" || !UUID_RE.test(req.memberId)) {
     return { ok: false, error: "memberId must be a member uuid" };
   }
 
@@ -82,7 +90,7 @@ export function validateMintRequest(req: MintRequest, now: number): PolicyResult
         error: "projectScope must name at least one project, or be omitted to inherit the launcher's access",
       };
     }
-    if (req.projectScope.some((p) => !UUID_RE.test(p))) {
+      if (req.projectScope.some((p) => typeof p !== "string" || !UUID_RE.test(p))) {
       return { ok: false, error: "projectScope must contain project uuids" };
     }
   }
@@ -91,6 +99,11 @@ export function validateMintRequest(req: MintRequest, now: number): PolicyResult
   // so "absent" must be refused rather than quietly becoming forever.
   if (req.expiresAt == null || req.expiresAt === "") {
     return { ok: false, error: "expiresAt is required" };
+  }
+  // `Date.parse` accepts plenty that is not ISO-8601 ("12/31/2026" parses), and coerces arrays.
+  // The contract says ISO, so require the shape before trusting the parse.
+  if (typeof req.expiresAt !== "string" || !ISO_RE.test(req.expiresAt)) {
+    return { ok: false, error: "expiresAt must be an ISO timestamp" };
   }
   const at = Date.parse(req.expiresAt);
   if (Number.isNaN(at)) {
@@ -126,4 +139,18 @@ export function canSubmitMint(input: {
   if (input.scope === null) return false;
   if (input.scope.kind === "restrict" && input.scope.projectIds.length === 0) return false;
   return true;
+}
+
+/**
+ * The instant the form should submit for a chosen calendar date.
+ *
+ * WHY THIS EXISTS: the form offered `today + 365 days` as its max date and submitted it at
+ * 23:59:59Z — which is up to a day BEYOND the exact 365-day cap, so the action refused the very
+ * value its own picker allowed. The spec claims the form cannot request what the action refuses;
+ * this is what makes that true, and it lives beside the cap so the two cannot drift.
+ */
+export function expiryInstantFor(chosenDate: string, now: number): string {
+  const endOfDay = Date.parse(`${chosenDate}T23:59:59.000Z`);
+  const capped = Math.min(Number.isNaN(endOfDay) ? now : endOfDay, now + MAX_TOKEN_LIFETIME_MS);
+  return new Date(capped).toISOString();
 }

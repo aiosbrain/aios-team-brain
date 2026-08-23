@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  MAX_PROJECT_SCOPE,
   canSubmitMint,
+  expiryInstantFor,
   validateMintRequest,
   MAX_TOKEN_LIFETIME_MS,
   DEFAULT_TOKEN_LIFETIME_DAYS,
@@ -158,19 +160,84 @@ describe("agent-token admin surface obligations", () => {
   const page = readFileSync(join(ROOT, "app", "t", "[team]", "admin", "agents", "page.tsx"), "utf8");
   const actions = readFileSync(join(ROOT, "app", "t", "[team]", "admin", "agents", "actions.ts"), "utf8");
 
-  it("the page never selects token_hash — hash material must not reach a server component", () => {
-    const select = page.match(/\.from\("agent_tokens"\)[\s\S]*?\.select\("([^"]*)"\)/)?.[1] ?? "";
-    expect(select, "the agent_tokens select list").not.toMatch(/token_hash/);
-    expect(select, "non-vacuity: the select was actually found").toMatch(/id/);
+  it("the page never selects token_hash — checked per QUERY, not by mere absence of the word", () => {
+    // Occurrence checks were the weakness Codex named: a SECOND `.from("agent_tokens")` could add
+    // the hash while the first stayed clean. So pin the query count, then check each one.
+    const queries = [...page.matchAll(/\.from\("agent_tokens"\)([\s\S]*?)(?=\n\s*\]|\n\s*\);)/g)];
+    expect(queries.length, "exactly one agent_tokens query — add a test arm if a second is ever needed").toBe(1);
+    for (const q of queries) {
+      expect(q[1], "no agent_tokens query may select token_hash").not.toMatch(/token_hash/);
+      expect(q[1], "non-vacuity: the query body was actually captured").toMatch(/\.select\(/);
+    }
   });
 
-  it("both mint and revoke revalidate on success, so the list is never stale after the action", () => {
-    expect(actions.match(/revalidateAgents\(teamSlug\)/g) ?? [], "one call per action").toHaveLength(2);
+  it("mint and revoke EACH revalidate — per function body, not a global count", () => {
+    // A global count of 2 stays green with both calls in mint and none in revoke (Codex).
+    const bodies = actions.split(/export async function /).slice(1);
+    const byName = new Map(bodies.map((b) => [b.slice(0, b.indexOf("(")), b]));
+    for (const fn of ["mintAgentTokenAction", "revokeAgentTokenAction"]) {
+      expect(byName.get(fn), `non-vacuity: ${fn} body was found`).toBeTruthy();
+      expect(byName.get(fn)!, `${fn} must revalidate on success`).toMatch(/revalidateAgents\(teamSlug\)/);
+    }
     expect(actions, "revalidation must not be able to throw away a minted token").toMatch(/try \{[\s\S]*?revalidatePath/);
   });
 
   it("the expiry column uses fmtDate, not timeAgo (timeAgo renders every FUTURE date as 'just now')", () => {
     expect(page).toMatch(/fmtDate\(t\.expires_at\)/);
     expect(page, "a future expiry through timeAgo reads 'just now' for every live token").not.toMatch(/timeAgo\(t\.expires_at\)/);
+  });
+
+  it("the expiry instant offered by the form is always inside the cap the action enforces", () => {
+    const now = Date.parse("2026-08-22T12:00:00.000Z");
+    // The exact failure Codex found: the max date the picker offered, submitted at end-of-day,
+    // overshot the 365-day cap by ~12h and the action refused its own picker's value.
+    const maxDate = new Date(now + MAX_TOKEN_LIFETIME_MS).toISOString().slice(0, 10);
+    const instant = expiryInstantFor(maxDate, now);
+    expect(Date.parse(instant)).toBeLessThanOrEqual(now + MAX_TOKEN_LIFETIME_MS);
+    expect(validateMintRequest({ memberId: MEMBER, expiresAt: instant }, now)).toEqual({ ok: true });
+  });
+
+  it("a normal date is unchanged by the clamp (non-vacuity: it does not clamp everything)", () => {
+    const now = Date.parse("2026-08-22T12:00:00.000Z");
+    expect(expiryInstantFor("2026-09-20", now)).toBe("2026-09-20T23:59:59.000Z");
+  });
+});
+
+describe("policy hardening against malformed input (a public endpoint receives anything)", () => {
+  const NOW2 = Date.parse("2026-08-22T12:00:00.000Z");
+  const bad = (req: unknown) => validateMintRequest(req as never, NOW2);
+
+  it("refuses null/undefined/array requests instead of throwing", () => {
+    for (const r of [null, undefined, [], "nope"]) expect(bad(r).ok).toBe(false);
+  });
+
+  it("refuses an ARRAY memberId — RegExp.test coerces, so a type check must come first", () => {
+    expect(bad({ memberId: [MEMBER], expiresAt: "2026-09-20T00:00:00.000Z" })).toEqual({
+      ok: false,
+      error: "memberId must be a member uuid",
+    });
+  });
+
+  it("refuses a non-ISO date that Date.parse would happily accept", () => {
+    expect(bad({ memberId: MEMBER, expiresAt: "12/31/2026" }).ok).toBe(false);
+  });
+
+  it("accepts a numeric UTC offset (a legal ISO instant)", () => {
+    expect(bad({ memberId: MEMBER, expiresAt: "2026-09-20T10:00:00+02:00" })).toEqual({ ok: true });
+  });
+
+  it("refuses a non-array projectScope instead of throwing inside .some()", () => {
+    expect(bad({ memberId: MEMBER, expiresAt: "2026-09-20T00:00:00.000Z", projectScope: "x" }).ok).toBe(false);
+  });
+
+  it("refuses duplicates and over-cap scope lists", () => {
+    const dup = bad({ memberId: MEMBER, expiresAt: "2026-09-20T00:00:00.000Z", projectScope: [PROJECT, PROJECT] });
+    expect(dup.ok).toBe(false);
+    const many = Array.from({ length: MAX_PROJECT_SCOPE + 1 }, (_, i) => `${i}`.padStart(8, "0") + "-2222-4222-8222-222222222222");
+    expect(bad({ memberId: MEMBER, expiresAt: "2026-09-20T00:00:00.000Z", projectScope: many }).ok).toBe(false);
+  });
+
+  it("refuses a non-string name", () => {
+    expect(bad({ memberId: MEMBER, expiresAt: "2026-09-20T00:00:00.000Z", name: 5 }).ok).toBe(false);
   });
 });
