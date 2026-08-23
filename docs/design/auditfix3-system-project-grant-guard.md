@@ -81,7 +81,7 @@ What still partially masks a bad grant, verified by grep rather than asserted:
 **Retiring them widens what a bad grant yields**, so this slice is a prerequisite for that one rather
 than a beneficiary of it.
 
-### 0d. Production state (read-only, 2026-08-23)
+### 0d. Production state (read-only, 2026-08-23 UTC)
 
 | | |
 |---|---|

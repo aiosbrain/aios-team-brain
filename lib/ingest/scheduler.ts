@@ -310,8 +310,8 @@ export function startIngestScheduler(): void {
       // silent on THIS leg; it surfaces downstream instead, because backfillTeamContext re-runs
       // ensureAccessBootstrap and returns before any item, and context_backfill DOES write per-team
       // rows on success as well as failure with its heartbeat under a distinct
-      // 'context_backfill_all' source (below, ~line 427) — which is exactly the shape this leg
-      // needs. Fixing it is AUDITFIX-22; do not "fix" it by reddening the global row, which is the
+      // 'context_backfill_all' source (search that name; a line number here would rot on the next
+      // edit above it) — which is exactly the shape this leg needs. Fixing it is AUDITFIX-22; do not "fix" it by reddening the global row, which is the
       // decision the paragraph above records.
       for (const f of r.failed) {
         if (f.teamId === "*") continue; // teams-read failure → instance row below carries it

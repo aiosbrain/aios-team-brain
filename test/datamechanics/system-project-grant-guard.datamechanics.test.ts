@@ -57,6 +57,22 @@ async function adminMember(seed: Seed): Promise<string> {
   return data.id as string;
 }
 
+/**
+ * A fixture group, with its precondition ASSERTED.
+ *
+ * ⚠️ Not ceremony. An unasserted `createGroup` leaves `groupId` undefined on failure, and the
+ * writer then refuses with "group not found for team" — so a refusal criterion stays GREEN while
+ * testing nothing, and the mutation written for it stays green too. Two criteria in this file
+ * already shipped vacuous for exactly this reason (AC4's squatter, AC17's injector); the class is
+ * closed here rather than the instance (Fable diff review MEDIUM 1).
+ */
+async function ordinaryGroup(seed: Seed, actor: string, slug: string): Promise<string> {
+  const g = await createGroup(db(), seed.teamId, slug, slug, actor);
+  expect(g.ok, `fixture group '${slug}' must be created: ${g.error}`).toBe(true);
+  expect(g.groupId, `fixture group '${slug}' must have an id`).toBeTruthy();
+  return g.groupId as string;
+}
+
 async function project(seed: Seed, slug: string, kind: string): Promise<string> {
   const { data, error } = await db()
     .from("projects")
@@ -230,9 +246,9 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     const general = await systemProjectId(seed, GENERAL_SLUG);
 
     for (const t of TUPLES) {
-      const g = await createGroup(db(), seed.teamId, `vendors-${randomUUID().slice(0, 6)}`, "Vendors", admin);
+      const g = await ordinaryGroup(seed, admin, `vendors-${randomUUID().slice(0, 6)}`);
       const before = { edges: await edgeCount(seed), audits: await grantAudits(seed) };
-      const r = await grantProjectToGroup(db(), seed.teamId, general, g.groupId!, t.actor({ member: admin }), t.opts({ admin }));
+      const r = await grantProjectToGroup(db(), seed.teamId, general, g, t.actor({ member: admin }), t.opts({ admin }));
       expect(r.ok, `${t.label} must be refused`).toBe(false);
       expect(r.error, `${t.label} names the substrate`).toMatch(/system|substrate|sanctioned/i);
       await assertNothingWritten(seed, before, t.label);
@@ -281,10 +297,10 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     await ensureBuiltins(db(), seed.teamId);
     const admin = await adminMember(seed);
     const preAdoption = await project(seed, GENERAL_SLUG, "source");
-    const g = await createGroup(db(), seed.teamId, "vendors", "Vendors", admin);
+    const g = await ordinaryGroup(seed, admin, "vendors");
 
     const before = { edges: await edgeCount(seed), audits: await grantAudits(seed) };
-    const r = await grantProjectToGroup(db(), seed.teamId, preAdoption, g.groupId!, null, {});
+    const r = await grantProjectToGroup(db(), seed.teamId, preAdoption, g, null, {});
     expect(r.ok, "a source project already holding a reserved slug is destined for adoption").toBe(false);
     await assertNothingWritten(seed, before, "general@source->vendors");
     expect(await projectKind(preAdoption)).toBe("source");
@@ -342,11 +358,11 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     await ensureBuiltins(db(), seed.teamId);
     const admin = await adminMember(seed);
     const ordinary = await project(seed, `roadmap-${randomUUID().slice(0, 6)}`, "initiative");
-    const g1 = await createGroup(db(), seed.teamId, "leads", "Leads", admin);
-    const g2 = await createGroup(db(), seed.teamId, "eng", "Eng", admin);
+    const g1 = await ordinaryGroup(seed, admin, "leads");
+    const g2 = await ordinaryGroup(seed, admin, "eng");
 
-    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g1.groupId!, null, {})).ok, "T1").toBe(true);
-    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g2.groupId!, admin, {})).ok, "T3").toBe(true);
+    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g1, null, {})).ok, "T1").toBe(true);
+    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g2, admin, {})).ok, "T3").toBe(true);
   });
 
   it("AC10: a PRE-EXISTING forbidden edge is REFUSED, not reported as 'already granted'", async () => {
@@ -354,14 +370,15 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const admin = await adminMember(seed);
     const general = await systemProjectId(seed, GENERAL_SLUG);
-    const g = await createGroup(db(), seed.teamId, "vendors", "Vendors", admin);
+    const g = await ordinaryGroup(seed, admin, "vendors");
     // Plant the edge out of band — the state a fleet could already be in (spec §3b.4).
-    await db().from("project_groups").insert({ team_id: seed.teamId, project_id: general, group_id: g.groupId!, added_by: null });
+    const { error: plantErr } = await db().from("project_groups").insert({ team_id: seed.teamId, project_id: general, group_id: g, added_by: null });
+    expect(plantErr, "the out-of-band edge must actually be planted").toBeNull();
 
-    const r = await grantProjectToGroup(db(), seed.teamId, general, g.groupId!, null, {});
+    const r = await grantProjectToGroup(db(), seed.teamId, general, g, null, {});
     expect(r.ok, "the guard runs BEFORE the existence probe; ok:true here reads as sanction").toBe(false);
     expect(r.created, "and it is not a cheerful 'nothing written'").not.toBe(false);
-    const { data } = await db().from("project_groups").select("project_id").eq("team_id", seed.teamId).eq("project_id", general).eq("group_id", g.groupId!).maybeSingle();
+    const { data } = await db().from("project_groups").select("project_id").eq("team_id", seed.teamId).eq("project_id", general).eq("group_id", g).maybeSingle();
     expect(data, "this slice never deletes — repair is AUDITFIX-21").not.toBeNull();
   });
 
@@ -370,10 +387,10 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const admin = await adminMember(seed);
     const general = await systemProjectId(seed, GENERAL_SLUG);
-    const g = await createGroup(db(), seed.teamId, "vendors", "Vendors", admin);
+    const g = await ordinaryGroup(seed, admin, "vendors");
     const before = { edges: await edgeCount(seed), audits: await grantAudits(seed) };
 
-    const r = await grantProjectToGroup(clientWithFailingRead("projects", "project read exploded"), seed.teamId, general, g.groupId!, null, {});
+    const r = await grantProjectToGroup(clientWithFailingRead("projects", "project read exploded"), seed.teamId, general, g, null, {});
     expect(r.ok).toBe(false);
     // Without this the criterion is green under "swallow the error" too: data=null takes the
     // not-found branch and produces the same ok:false/no-edge observable (round 4 HIGH 1).
@@ -388,10 +405,10 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     // PROTECTED on purpose: an implementation may read the group only when the guard applies, and
     // on an ordinary project the faulted read is never reached — a vacuous criterion (round 4 H1).
     const general = await systemProjectId(seed, GENERAL_SLUG);
-    const g = await createGroup(db(), seed.teamId, "vendors", "Vendors", admin);
+    const g = await ordinaryGroup(seed, admin, "vendors");
     const before = { edges: await edgeCount(seed), audits: await grantAudits(seed) };
 
-    const r = await grantProjectToGroup(clientWithFailingRead("groups", "group read exploded"), seed.teamId, general, g.groupId!, null, {});
+    const r = await grantProjectToGroup(clientWithFailingRead("groups", "group read exploded"), seed.teamId, general, g, null, {});
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/group read exploded|read fail/i);
     await assertNothingWritten(seed, before, "faulted group read");
@@ -402,9 +419,10 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     await ensureBuiltins(db(), seed.teamId);
     const admin = await adminMember(seed);
     const preAdoption = await project(seed, GENERAL_SLUG, "source");
-    const g = await createGroup(db(), seed.teamId, "vendors", "Vendors", admin);
+    const g = await ordinaryGroup(seed, admin, "vendors");
     // The §0b state: granted while ordinary, BEFORE this guard existed.
-    await db().from("project_groups").insert({ team_id: seed.teamId, project_id: preAdoption, group_id: g.groupId!, added_by: null });
+    const { error: plantErr } = await db().from("project_groups").insert({ team_id: seed.teamId, project_id: preAdoption, group_id: g, added_by: null });
+    expect(plantErr, "the pre-guard edge must actually be planted").toBeNull();
     const auditsBefore = await adoptAudits(seed);
 
     const r = await ensureAccessBootstrap(db(), seed.teamId);
