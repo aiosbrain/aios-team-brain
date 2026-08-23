@@ -315,6 +315,7 @@ round 2 B2).
 | 12 | give the creation row `trigger: 'scheduler'` | AC12 |
 | 13 | let a callback throw escape the wrapper's guard | AC9 |
 | 14 | write the FLEET row twice per tick | AC5 |
+| 15 | flatten the creation row's real error to `"unknown"` | AC8 / AC8b |
 
 ⚠️ **Mutation 4 must change `ok` AND `errors` together, and finding that out cost a SURVIVED run.**
 `recordIngestRun` derives `ok: run.ok && errors.length === 0` (`lib/ingest/runs.ts:67`), so flipping
