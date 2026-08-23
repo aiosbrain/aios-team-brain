@@ -155,7 +155,7 @@ locked OUT, or a group let IN that the substrate never sanctioned"*, and the doc
   destructive repair is worse than a reported hole, and that ruling is inherited from AUDITFIX-3 §3.
 - **`ingest_runs` retention.** Per-team rows add one row/team/tick, which `context_backfill` already
   pays. The table is unpruned and `scoped` sorts a team's whole history — a real follow-up, already
-  recorded in `pipeline-health.ts`'s own header, and NOT made materially worse here (one extra source
+  recorded in the `lib/ingest/pipeline-health.ts` header, and NOT made materially worse here (one extra source
   at an existing cadence). Named so the next reader does not have to rediscover it.
 - **Making `newest` team-aware in general.** §2a explains why that is a wider and separately risky
   change; the distinct-source route reaches the same outcome for this leg without touching the others.
