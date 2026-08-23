@@ -103,123 +103,197 @@ The sanctioned set is exactly the three edges bootstrap itself creates
 `external-shared→everyone`. **Bootstrap calls the same writer**, so the guard must admit those three
 and nothing else, or it breaks the thing it protects.
 
-## 2. The design — four enforcement points, because it is not one conditional
+## 1a. How the accidental precondition arises — ordinary ingestion, verified
 
-⚠️ *The audit called this "one conditional." An earlier spec round found a second exploit through an
-ordinary group, and a third round found the adoption bypass. It is four places.*
+§0b starts from *"a team has `projects(slug='general', kind='source')`"*. That row needs **no operator
+action at all**:
 
-### 2a. The writer (`grantProjectToGroup`)
+- `lib/ingest/index.ts:130-140` upserts `projects` with `slug: payload.project` **straight from the
+  item payload**, on conflict `(team_id, slug)`.
+- The payload's project is validated as `z.string().max(120)` (`lib/api/schemas.ts:468,513`) — **no
+  reserved-slug check**. `isReservedSlug` (`lib/access/groups.ts:39`) guards GROUP slugs
+  (`everyone`/`external`/`person-*`), never project slugs.
+- `projects.kind` defaults to `'source'`
+  (`postgres/migrations/20260809150000_projects_kind.sql:9`).
 
-Resolve `projects.kind`; if `system`, admit only the sanctioned `(project.slug, group.slug)` pair.
-Identity is by **slug on both sides plus `groups.is_builtin`** — an earlier round found that a
-slug-only check lets an ordinary group squatting the `external` slug become an approved target.
+So pushing any item with `project: "general"` — a very plausible name — creates the row. Prod holds
+**17 `source` projects and 2 `system`**, none currently squatting a reserved slug.
 
-**Fail closed on an unreadable kind or group:** a read error must refuse the grant, not permit it.
+## 2. The design — five enforcement points
 
-### 2b. The kind TRANSITION (`ensureSystemProject`)
+⚠️ *The audit called this "one conditional." Two earlier spec rounds found a second exploit and the
+adoption bypass; round 1 of THIS document found the fifth, which also removes a race I had proposed to
+accept.*
 
-Before flipping `source → system`, read `project_groups` for that row. If any edge is not sanctioned,
-**refuse the adoption** and return an error naming the edge — the team stays un-bootstrapped and loud
-rather than silently promoted with a forbidden grant.
+### 2a. The writer — kind AND reserved slug
 
-⚠️ **The residual race, named:** a grant that lands between the check and the CAS flip survives. The
-flip is already a compare-and-set on `kind='source'`, so it cannot be made atomic with the grant read
-through this adapter (the transaction surface is AUDITFIX-12/13). The window is one scheduler tick
-wide and the narrowing is deliberate: **§2d detects what §2b cannot prevent**, and no automatic
-deletion is added, because a fail-open destructive repair is worse than a reported hole.
+`grantProjectToGroup` resolves the project and the target group, and refuses an unsanctioned pair when
+**either**:
 
-### 2c. The repair path (`revoke-verb.ts` + `revokeProjectFromGroup`)
+1. `projects.kind = 'system'`, **or**
+2. `projects.slug ∈ {general, external-shared}` **regardless of current kind**.
+
+Identity is **slug on both sides plus `groups.is_builtin`** — a slug-only check lets an ordinary group
+squatting the `external` slug become an approved target (earlier round). Cross-team pairs are
+prevented structurally by the composite FKs (`postgres/schema.sql:1073`), and a builtin/singleton
+hybrid is prohibited at `:1047`, so neither needs a runtime conjunct.
+
+⚠️ **Clause 2 is what closes the race, and it replaces §2b's accepted window.** Round 1: a
+kind-keyed check leaves the interval between the adoption census and the CAS flip open. Refusing on
+the reserved SLUG closes it from both sides — *before* adoption the slug rule refuses, *after*
+adoption the kind rule refuses, and there is no instant in between where the grant is legal. A
+`source` project holding a reserved slug is destined for adoption anyway.
+
+*(My own independent version of this was "reserve the slugs at INGEST". Round 1's is better: the
+ingest rule is a behaviour change on the push path — a wider blast radius — while this one lives in
+the access writer that is already being rewritten.)*
+
+**Fail closed on an unreadable project OR group.** A read error refuses the grant. Both reads, not
+just the project one — `getMember` (`lib/access/groups.ts:54`) drops its error today and that is
+exactly the mistake to not repeat.
+
+### 2b. The kind transition (`ensureSystemProject`)
+
+Before flipping `source → system` (`lib/access/bootstrap.ts:64-72`), read `project_groups` for that
+row. Any unsanctioned edge ⇒ **refuse the adoption**, naming the edge; `kind` stays `source` and the
+team stays loudly un-bootstrapped rather than silently promoted with a forbidden grant.
+
+⚠️ **The check must FAIL CLOSED, and round 1's BLOCKER 1 was that my acceptance did not say so.** The
+obvious implementation destructures `{ data }`, treats an error-derived `null` as "no grants", and
+flips a row that IS granted to `vendors` — reproducing the defect under an undetermined read while
+every ordinary fixture passes. A grant-read or group-resolution error refuses the adoption.
+
+With §2a clause 2 in place the residual race is closed, so this is now defence in depth rather than
+the only wall.
+
+### 2c. The repair path — and the WRITER is the invariant owner
+
+`revokeProjectFromGroup` says so in its own header: *"the destructive half of THE access edge, so the
+invariants live HERE, not in any caller"* (`lib/access/groups.ts:555`). `lib/access/revoke-verb.ts` is a
+preflight wrapper over an **injected** `revoke` (`:12-16`).
 
 The refusal becomes **sanctioned-edge-based rather than kind-based**: a system project's *sanctioned*
-edges stay unrevokable; an *unsanctioned* edge on a system project becomes revokable through the
-verb. Without this, fixing the writer leaves every existing bad edge permanent.
+edges stay unrevokable; an *unsanctioned* edge becomes revocable, so existing bad edges are repairable
+through the sanctioned path.
 
-⚠️ **This must fail CLOSED.** An earlier spec round's finding — *"revocable iff not sanctioned" fails
-open destructively if the canonical-group query errors, classifying `general→everyone` as forbidden
-and blinding every member* — is **not a defect in today's code** (lane C verified: there is no such
-query on the revoke path, and the kind read already fails closed). It is a **design constraint on
-this change**: an undetermined sanctioned-set read must refuse to revoke.
+⚠️ **Round 1's BLOCKER 2: acceptance that exercises only the verb proves nothing about the writer.**
+An implementation can make the verb refuse all three sanctioned pairs while the writer protects only
+`general→everyone` (the already-shipped case) and happily deletes `external-shared→external`. Every
+criterion below therefore hits the **writer directly**, not through the verb.
 
-### 2d. The census (`assessAccessHealth`)
+**It must fail CLOSED**: an undetermined sanctioned-set read refuses to revoke. And it must **not
+become an existence oracle** — `test/datamechanics/revoke-project.datamechanics.test.ts:154` pins
+*"same refusal with or without an edge — no existence oracle"*, and the refusal's position in the
+documented **D2c order** is pinned with it. Both survive.
 
-`lib/admin/access-health.ts` detects members who are **blind**; it has no inverse assertion, so a
-forbidden edge reports green. Add one: enumerate every `project_groups` edge whose project is
-`kind='system'` and whose pair is not sanctioned, and report it as a **blocker** with the edge named.
+### 2d. Detection that actually runs
+
+⚠️ **Round 1's HIGH 4 killed my first answer.** I proposed the inverse assertion in
+`assessAccessHealth`, whose only caller is the manual CLI (`scripts/admin.ts:422`) — the permission
+inspector calls `explainItemVisibility`, not health (`app/api/dashboard/access/inspect/route.ts:58`).
+A detector nobody asks does not detect.
+
+So the census runs where the scheduler already goes: `ensureAccessBootstrapAllTeams` validates
+**already-`system`** rows on every tick and returns an unsanctioned edge as a per-team failure, which
+`runAccessBootstrap` (`lib/ingest/scheduler.ts:293`) already records as an `ingest_runs` row. The
+`assessAccessHealth` assertion is added too, for the operator-asks path — but the scheduled one is
+what makes it unattended.
+
+**The census must fail closed as well** (round 1 HIGH 5): a swallowed edge-query error returning `[]`
+would certify absence from an undetermined read. Existing health reads throw
+(`lib/admin/access-health.ts:68`); this one matches them.
 
 ## 3. Scope
 
-**In:** `lib/access/groups.ts` (the writer guard + the sanctioned-edge predicate) ·
-`lib/access/bootstrap.ts` (the transition guard) · `lib/access/revoke-verb.ts` ·
-`lib/admin/access-health.ts` · `docs/ARCHITECTURE.md`.
+**In:** `lib/access/groups.ts` (writer guard + the shared sanctioned-edge predicate + the revoke
+change) · `lib/access/bootstrap.ts` (transition guard + the per-tick validation) ·
+`lib/access/revoke-verb.ts` · `lib/admin/access-health.ts` · `docs/ARCHITECTURE.md`.
 
-**Folded in from AUDITFIX-10** (re-derivation: it is 2 fail-opens + 1 provenance bug, not 24, and both
-of its surviving lines live in this slice's edit surface):
-- `lib/access/groups.ts:55` — `getMember` swallows its read error, so `removeMemberFromGroup`'s
-  non-human refusal does not fire. Direction is narrowing, not widening; closed on principle.
-- `lib/access/groups.ts:517` — the grant existence probe swallows its error, so a read failure
-  re-upserts an existing edge, **re-clobbering `added_by` and minting an audit row claiming
-  `created:true`** — precisely the damage its own comment says select-first exists to prevent. It sits
-  inside the function §2a rewrites.
+**Folded in from AUDITFIX-10:** `lib/access/groups.ts:517` — the grant existence probe swallows its
+error, so a read failure re-upserts an existing edge, **re-clobbering `added_by` and minting an audit
+row claiming `created:true`** — the exact damage its own comment says select-first prevents. It is
+inside the function §2a rewrites.
 
-**Out:** the `units.ts:53` fail-open (AUDITFIX-10's third — it exists only because `noWideningGate`
-reads a stored audience, and **TIERRET-1 deletes the gate**) · atomic adoption (§2b — needs the
-transaction surface, AUDITFIX-12/13) · any automatic deletion of a bad edge.
+**Out:**
+- **`lib/access/groups.ts:55` (`getMember`)** — ⚠️ *round 1 M7: it affects membership REMOVAL, not
+  project grants; folding it in grows the review surface without helping this invariant.* Its own
+  slice. AUDITFIX-10's remaining line dies with TIERRET-1.
+- Atomic adoption — unnecessary now that §2a clause 2 closes the window.
+- Any automatic deletion of a bad edge: a fail-open destructive repair is worse than a reported hole.
 
 ## 4. Acceptance
 
-- **AC1 — the three sanctioned edges are still creatable (dm):** a full `ensureAccessBootstrap` on a
-  fresh team succeeds and produces exactly those three. *Bootstrap calls the same writer; a guard that
-  breaks it breaks every team's access.*
-- **AC2 — a system project to an ORDINARY group is REFUSED (dm):** `grantProjectToGroup(general,
-  vendors)` returns `ok:false` and writes no row. *The exploit an earlier round found; the audit's
-  version only named the builtin `external` group.*
-- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external` — the forbidden
-  fourth edge the audit named.
-- **AC4 — identity is slug AND `is_builtin` (dm):** an ordinary group whose slug is `external` is
-  refused a grant to `external-shared`, so slug-squatting does not become an approved target.
-- **AC5 — a NON-system project is unaffected (dm):** granting an initiative to any group still works.
+- **AC1 — bootstrap's own three edges still work (dm):** a full `ensureAccessBootstrap` on a fresh
+  team succeeds and produces exactly them. *It calls the same writer with a NULL actor
+  (`bootstrap.ts:139`); a guard that breaks it breaks every team's access.*
+- **AC2 — a system project to an ORDINARY group is REFUSED, at the WRITER (dm).**
+- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external`.
+- **AC4 — identity is slug AND `is_builtin` (dm):** an ordinary group slugged `external` is refused a
+  grant to `external-shared`.
+- **AC5 — a RESERVED SLUG at `kind='source'` is REFUSED (dm):** `grantProjectToGroup(general@source,
+  vendors)` fails. *Round 1 HIGH 3 — this is what closes the adoption race, and without it the
+  interval between the census and the CAS stays open.*
+- **AC6 — a NON-reserved, non-system project is unaffected (dm):** an initiative grants normally.
   *The guard must not become a general-purpose refusal.*
-- **AC6 — an unreadable kind REFUSES (dm):** with the `projects` read faulted, the grant is refused
-  rather than permitted.
-- **AC7 — adoption REFUSES a row carrying an unsanctioned grant (dm):** a `kind='source'` project
-  slugged `general` with a `vendors` grant is not promoted; the error names the edge; `kind` is
-  unchanged. *§0b's accidental path, closed.*
-- **AC8 — adoption still promotes a CLEAN row (dm):** the same shape with no grants, or with only the
-  sanctioned one, is adopted normally.
-- **AC9 — an unsanctioned edge on a system project is REVOCABLE through the verb (dm):** planted with
-  raw SQL, then removed by `revoke-project`. **AC10 is what stops this from being a hole.**
-- **AC10 — a SANCTIONED edge is still refused by the verb (dm):** `general→everyone` cannot be revoked.
-  *Without this, AC9 is satisfied by deleting the refusal entirely.*
-- **AC11 — an undetermined sanctioned-set read REFUSES the revoke (dm):** with the group read faulted,
-  the verb refuses rather than classifying a sanctioned edge as forbidden and deleting it.
-- **AC12 — the health check reports a forbidden edge as a BLOCKER (dm):** planted edge ⇒ `healthy:false`
-  with the edge named. And a clean team stays healthy — *without that half, a check that always
-  blocked would pass.*
-- **AC13 — the swallowed grant probe is captured (dm):** with the existence read faulted,
-  `grantProjectToGroup` returns `ok:false` rather than re-upserting and minting a false
-  `created:true` audit row.
-- **AC14 — the swallowed member read is captured (unit/dm):** with `getMember` faulted,
-  `removeMemberFromGroup` refuses rather than skipping its non-human check.
+- **AC7 — an unreadable PROJECT refuses the grant (dm).**
+- **AC8 — an unreadable GROUP refuses the grant (dm):** ⚠️ *round 1 M6 — §2a said "project or group"
+  and my acceptance covered only the project.* Assert `ok:false`, **no upsert, and no audit row**.
+- **AC9 — adoption REFUSES a row carrying an unsanctioned grant (dm):** `kind` unchanged, error names
+  the edge.
+- **AC10 — adoption FAILS CLOSED on an unreadable grant census (dm):** ⚠️ *round 1 BLOCKER 1.* With
+  the `project_groups` read faulted, adoption refuses and **`kind` remains `source`** — asserted on
+  the row, not the return value.
+- **AC11 — adoption still promotes a CLEAN row (dm):** no grants, or only the sanctioned one.
+- **AC12 — an unsanctioned edge on a system project is revocable AT THE WRITER (dm).**
+- **AC13 — ALL THREE sanctioned edges are refused AT THE WRITER (dm):** `general→everyone`,
+  `external-shared→everyone`, `external-shared→external`. ⚠️ *round 1 BLOCKER 2: exercising the verb
+  only lets the writer protect one shipped case and delete the other two.*
+- **AC14 — the writer's refusal is not an existence oracle, and keeps its D2c position (dm):** the
+  same refusal with and without the edge present, in the documented order.
+- **AC15 — an undetermined sanctioned-set read REFUSES the revoke, at the WRITER (dm):** with the
+  group read faulted, no delete occurs.
+- **AC16 — the SCHEDULED bootstrap surfaces an unsanctioned edge on an already-system row (dm):**
+  `ensureAccessBootstrapAllTeams` returns that team as failed, so `runAccessBootstrap` records it.
+  *Round 1 HIGH 4 — detection that runs without an operator asking.*
+- **AC17 — the census FAILS CLOSED (dm):** with the edge query faulted, the check throws or reports
+  `healthy:false`; it never certifies absence from an undetermined read. *Round 1 HIGH 5.*
+- **AC18 — a clean team stays healthy (dm):** without it, a check that always blocked would pass AC16
+  and AC17.
+- **AC19 — the swallowed grant probe is captured (dm):** with the existence read faulted, the writer
+  returns `ok:false` rather than re-upserting and minting a false `created:true` audit row.
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
 | The guard refuses bootstrap's own three edges | **every team loses access** | AC1 runs the real bootstrap, not a fixture |
-| The revoke change makes a sanctioned edge deletable | a member goes blind | AC10 + AC11, both directions |
-| Adoption refusal wedges a team's bootstrap | the team stays un-bootstrapped | deliberate and LOUD (§2b); the alternative is silent promotion with a forbidden grant |
-| The transition race (§2b) | a bad edge survives adoption | detected by §2d; not silently accepted |
+| The revoke change makes a sanctioned edge deletable | a member goes blind | AC13 + AC15, both at the **writer** |
+| The revoke refusal becomes an existence oracle | information leak, and a tested contract broken | AC14 |
+| Adoption refusal wedges a team's bootstrap | the team stays un-bootstrapped | deliberate and LOUD; the alternative is silent promotion with a forbidden grant |
+| The reserved-slug rule breaks a legitimate grant | an ordinary project named `general` cannot be granted | intended — it is destined for adoption. AC6 pins that every other project is unaffected |
 | Someone reads the merge as fixing a live leak | wasted expectation | §0d: zero forbidden edges on prod; §0e: Medium, accident-prevention |
 
-## 6. What the two earlier spec rounds found
-
-Recorded because this document is written *after* them, and one of their findings was refuted by the
-re-derivation.
+## 6. What the earlier spec rounds found
 
 | # | finding | status |
 |---|---|---|
-| R1 | a second exploit through an **ordinary** group, which all eight of the then-criteria passed | **CONFIRMED** — AC2 |
-| R1 | the repair path was **unreachable**: `revoke-verb.ts:47` refuses before the writer, so fixing the writer alone leaves the command refusing | **CONFIRMED** — §2c |
-| R2 | a guard keyed on kind **at grant time** is bypassed by adoption flipping kind later | **CONFIRMED** — §2b, AC7 |
-| R2 | *"revocable iff not sanctioned" fails open destructively if the canonical-group query errors* | **REFUTED as a defect** — lane C verified there is no such query on today's revoke path, and the kind read fails closed. Carried as a **design constraint** instead — AC11 |
-| — | the audit's severity (*"hands outsiders the corpus"*) | **RE-FRAMED** — §0e |
+| R1 | a second exploit through an **ordinary** group | **CONFIRMED** — AC2 |
+| R1 | the repair path was **unreachable** — the verb refuses before the writer | **CONFIRMED** — §2c |
+| R2 | a kind-keyed guard is bypassed by adoption flipping kind later | **CONFIRMED** — §2b, and §2a clause 2 closes the window it left |
+| R2 | *"revocable iff not sanctioned" fails open destructively if the canonical-group query errors* | **REFUTED as a defect** (no such query exists on today's revoke path; the kind read fails closed) — carried as a **design constraint**, AC15 |
+| — | the audit's severity, *"hands outsiders the corpus"* | **RE-FRAMED** — §0e |
+
+## 7. Round 1 of THIS document — BLOCKED, and it removed a race I had proposed to accept
+
+| # | finding | outcome |
+|---|---|---|
+| **B1** | AC7/AC8 let the adoption check itself fail open — destructure `{ data }`, treat an error as "no grants", flip anyway; ordinary fixtures still pass | **CONFIRMED.** §2b fails closed; **AC10** faults the read and asserts `kind` is still `source` |
+| **B2** | AC9-AC11 exercised only the VERB, while `groups.ts:555` says the **writer** owns the invariant and the verb takes an injected `revoke` | **CONFIRMED.** Every revoke criterion now hits the writer directly; **AC13** covers all three sanctioned edges, not the one already shipped |
+| **H3** | the accepted adoption race is avoidable without transactions — refuse on the reserved **SLUG** regardless of kind | **CONFIRMED and adopted** (§2a clause 2, AC5). *I had independently reached "reserve the slugs at ingest"; this is the better version — the access writer is already being rewritten, the push path is not.* Also corrected: the window is the census→CAS interval, not "one scheduler tick" |
+| **H4** | §2d's detector is only reachable by an operator asking — `assessAccessHealth`'s single caller is the CLI, and the inspector route calls something else | **CONFIRMED.** Validation moves into the **scheduled** bootstrap, whose failures already become `ingest_runs` rows (**AC16**) |
+| **H5** | the new census had no fail-closed criterion — a swallowed error returning `[]` certifies `healthy:true` | **CONFIRMED** — **AC17** |
+| **M6** | §2a promised "project OR group" and acceptance covered only the project | **CONFIRMED** — **AC8** |
+| **M7** | the `getMember` fix belongs to membership removal, not project grants | **CONFIRMED. Split out** (§3); AC19 stays because it is inside the rewritten grant path |
+| — | slug+builtin identity is adequate; cross-team and hybrid cases are prevented structurally; no rename path found | **CLEARED** |
+
+**Nothing is built. No code exists for this slice.**
