@@ -210,11 +210,12 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
 
     const faulted = clientWithFailingSelect("teams", "teams read exploded");
     await runAccessBootstrapLeg(faulted);
+    // EXACTLY one per tick, checked after each — not ">= 2 in total". Two fleet rows in one tick
+    // would reach FAILURES_TO_CONFIRM (2) in the team_id-is-null partition after a SINGLE blip and
+    // forge `confirmed`, which is the fleet-level twin of the double-write AC1 pins per team.
+    expect((await legRows(null)).filter((r) => !r.ok).length, "exactly one after tick 1").toBe(1);
     await runAccessBootstrapLeg(faulted);
-
-    const globals = await legRows(null);
-    const failures = globals.filter((r) => !r.ok);
-    expect(failures.length, "one global failure row per faulted tick").toBeGreaterThanOrEqual(2);
+    expect((await legRows(null)).filter((r) => !r.ok).length, "exactly two after tick 2").toBe(2);
 
     const { health, leg, failing } = await legFor(team);
     expect(leg!.ok).toBe(false);
@@ -244,14 +245,16 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     await runAccessBootstrapLeg(empty);
     const after = await legRows(null);
     expect(after.length, "a leg with no rows at all is ABSENT, and absent reads as healthy").toBe(before + 1);
-    expect(after[after.length - 1].ok, "ok:false would manufacture a failure and red a team created moments later").toBe(true);
+    // Assert the PROPERTY, not a positional row: reading `after[last]` from an unordered select
+    // would make this pass or fail on row order the moment a second global row exists.
+    expect(after.every((r) => r.ok), "ok:false would manufacture a failure and red a team created moments later").toBe(true);
   });
 
   it("AC7 + AC12: a team created MID-TICK still has a row, and it does NOT claim to be the poller", async () => {
     const team = await createTeam(db(), { slug: `mid-${randomUUID().slice(0, 8)}`, name: "Mid" });
     // No tick has run for it at all — the row must come from the creation path.
     const rows = await legRows(team.id);
-    expect(rows.length, "created teams are never silent").toBe(1);
+    expect(rows.length, "the creation path ATTEMPTS this team's first row").toBe(1);
     expect(rows[0].ok).toBe(true);
     expect(rows[0].trigger, "team creation is not the poller — a 'scheduler' row here fakes liveness").not.toBe("scheduler");
 
@@ -349,7 +352,9 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
 
     let rowsMidFlight = 0;
     let stillRunning = false;
-    for (let i = 0; i < 100; i++) {
+    // Budget generously: a real-Postgres bootstrap under a contended shared container can take
+    // seconds, and this loop failing red on contention would read as a product bug.
+    for (let i = 0; i < 600; i++) {
       rowsMidFlight = (await legRows(a)).length + (await legRows(b)).length;
       if (rowsMidFlight > 0) {
         stillRunning = !settled;
@@ -389,10 +394,11 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
   it("AC13: the fossil-staleness cost is PINNED — a new team reads stale against a frozen global row", async () => {
     // Seed the fossil: an aged instance-wide scheduler row, which is what this slice stops refreshing.
     const old = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
-    await db().from("ingest_runs").insert({
+    const { error: fossilErr } = await db().from("ingest_runs").insert({
       team_id: null, source: "access_bootstrap", trigger: "scheduler", ok: true,
       created: 0, started_at: old, finished_at: old,
     });
+    expect(fossilErr, "the fossil must actually be seeded — this criterion is about it").toBeNull();
     const team = await createTeam(db(), { slug: `fossil-${randomUUID().slice(0, 8)}`, name: "Fossil" });
 
     const { leg } = await legFor(team.id);
