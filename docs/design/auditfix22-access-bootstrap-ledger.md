@@ -51,13 +51,13 @@ repair — nothing downstream corrects the verdict — but "always masks" would 
 ### 0b. The consumer has a confirmation threshold, and it changes every criterion
 
 `getPipelineHealth` exposes a lone failure as `legs[].ok === false` but keeps it **out of `failing`**
-until `FAILURES_TO_CONFIRM = 2` (`lib/ingest/failure-streak.ts:36`, `lib/ingest/pipeline-health.ts:454`),
+until `FAILURES_TO_CONFIRM = 2` (`lib/ingest/failure-streak.ts:37`, `lib/ingest/pipeline-health.ts:462-464`),
 and the banner renders only `failing` (`components/admin/pipeline-health-banner.tsx:57`). A criterion
 that ran one failed tick and asserted `legs.find(…).ok === false` would pass **while no banner appears
 at all**. Every visibility criterion below therefore runs **two** ticks and asserts the confirmed state.
 
 A leg that is **absent** yields `healthy: true` — `getPipelineHealth`'s empty shape is
-`{ legs: [], failing: [], healthy: true }` (`lib/ingest/pipeline-health.ts:350`). **A missing leg is
+`{ legs: [], failing: [], healthy: true }` (`lib/ingest/pipeline-health.ts:351`). **A missing leg is
 silent, not loud**, which is what makes §2b's zero-row cases matter.
 
 ### 0c. Production, read-only, 2026-08-23 UTC
@@ -106,7 +106,7 @@ global success row has no job left — and it is precisely what masks: its `ok` 
 
 **What this AVOIDS**, each a real registry rather than bookkeeping (round 1 H3, re-derived): a new
 entry in `INGEST_LEG_SOURCES`, whose guard fails the build on an undeclared source
-(`lib/ingest/leg-ledger.ts:21`); the default-threshold allowlist; the banner's label map; **two** legs
+(`lib/ingest/leg-ledger.ts:22`); the default-threshold allowlist; the banner's label map; **two** legs
 ageing stale together for one stopped stage; and a weakened per-source cap in `diversifyBySource`
 (`lib/ingest/runs.ts:106`).
 
@@ -132,10 +132,64 @@ The incremental write is why `ensureAccessBootstrapAllTeams` gains a **per-team 
 rather than only a richer return value: the return value cannot be recorded until the loop ends, which
 is exactly the property round 2 attacked.
 
+⚠️ **The wrapper guards the callback invocation itself** (round 3 M2). A throw from `onOutcome`
+*outside* the per-team `try` would abort every remaining team's convergence — observability taking
+ingestion down, the exact inverse of `lib/ingest/runs.ts:55-59`'s charter — and *inside* it would be
+mislabelled as that team's bootstrap failure and pushed to `failed`. Neither is acceptable: the
+callback gets its own guard, and a callback failure is recorded against neither.
+
 **Residual, stated rather than solved:** a team enumerated in a tick that dies before that team's own
 turn still has no row for that tick. It self-heals on the next tick, and after the change above a
-team's *first* row comes from creation rather than from a tick at all. The **maximum transition
-window is UNVERIFIED** — it is bounded by the tick cadence (§0c) only when nothing hangs.
+team's *first* row is ATTEMPTED at creation rather than waiting for a tick. ⚠️ *"Durable first row from
+the moment it exists" would be a universal over a best-effort insert (round 3 LOW): the creation insert
+is swallowed like every other (`lib/ingest/runs.ts:55-59`), and a team created by direct SQL bypasses
+`createTeam` entirely — round 3 verified that every PRODUCTION path routes through it
+(`scripts/admin.ts:135`, `docker/bootstrap.mjs:234`).* The **maximum transition window is UNVERIFIED**
+— bounded by the tick cadence (§0c) only when nothing hangs.
+
+### 2b.1 A cost this slice INTRODUCES, named rather than discovered later
+
+⚠️ **Round 3 MEDIUM 1, and it contradicts an intent the health module states in its own comment.**
+After this slice, the newest `scheduler`-triggered **instance-wide** `access_bootstrap` row freezes at
+deploy (591 exist on prod today; none will be added). The staleness beat is
+`distinct on (source)` over `team_id = $1 or team_id is null` **and** `trigger='scheduler'`
+(`lib/ingest/pipeline-health.ts:366-372`). So a team created AFTER deploy has no `scheduler` row of its
+own until its first tick, and is judged against that frozen fossil — **stale, therefore `failing`,
+therefore a red banner on a healthy brand-new team for up to one tick cadence (30-86 min measured,
+§0c).**
+
+That is precisely the case the module intends to exempt: *"A source with rows but no scheduler row yet
+(a brand-new team whose first tick hasn't landed …) has no heartbeat to judge, so it is not aged at
+all"* (`:394-400`). The fossil defeats the exemption.
+
+**This slice ACCEPTS it and pins it with a criterion (AC13) rather than fixing it**, because the fix is
+to the beat query — shared by every leg — and scope creep of exactly that kind is what round 2 blocked.
+**AUDITFIX-24** carries it. The cost is bounded, self-healing, and only ever affects a team between its
+creation and its first tick; the alternative — keeping a global `scheduler` heartbeat — reintroduces a
+masking window for the whole duration of each convergence loop, which is the defect this slice exists
+to remove.
+
+
+
+### 2c. The `trigger` on both writes is load-bearing — and neither round 1 nor round 2 looked at it
+
+⚠️ **Round 3 (a different model, deliberately) found the axis two Codex rounds never named.** The
+staleness clock reads **`trigger = 'scheduler'` rows only**
+(`lib/ingest/pipeline-health.ts:366-372`), and the module says why: *"Staleness answers 'is the
+scheduler still ticking', and only a `scheduler` row is evidence of that."* So:
+
+| write | trigger | why |
+|---|---|---|
+| the per-team **tick** row | **`'scheduler'`** | it IS the poller's evidence for that team |
+| the **creation** row (`lib/admin/teams.ts`) | **`'api'`** — anything but `'scheduler'` | team creation is not the poller; a `'scheduler'` row here would fake liveness for a team whose tick has never run |
+
+**The first of those would otherwise ship a green test suite and a permanently red production banner.**
+If the per-team tick rows carried a non-`scheduler` trigger, this slice stops writing the only
+`scheduler`-triggered `access_bootstrap` rows there are (**591 on prod today, all instance-wide**), so
+the beat freezes at deploy, every team's leg goes stale ~3h later, and the banner reds forever. The dm
+tier **cannot** catch it: a fresh test DB has no `scheduler` rows at all, so `beatAt.get(source)` is
+`undefined` and the leg is deliberately *not aged* (`:394-400`). Green by construction, broken in prod.
+**AC11 and AC12 assert the trigger values directly**, because no behavioural criterion can.
 
 ## 3. Scope
 
@@ -164,55 +218,75 @@ partial-write, deployment-transition, global-failure, confirmation, healing and 
 AUDITFIX-3's round 2 said the same thing about a nine-concern slice and was right.
 
 **The ledger goes first because the census depends on it**, not merely because it is smaller: a census
-finding reported through a masked leg is invisible, which is the entire lesson of §0a. **AUDITFIX-23**
-carries the census over every `kind='system'` project, `assessAccessHealth`'s inverse assertion, and
-the `blockers`/CLI widening — filed, with round 1's and round 2's findings on each recorded in it.
+finding reported through a masked leg is invisible, which is the entire lesson of §0a. **AUDITFIX-23** carries the census over every `kind='system'` project, `assessAccessHealth`'s inverse
+assertion, and the `blockers`/CLI widening. It is filed as a **brain task row** with rounds 1 and 2's
+findings written into its description; it has **no `docs/design/` spec yet** — that gets written when
+it is built, per this loop's own order. *(Round 3 LOW flagged that my wording implied an in-repo
+document.)*
 
 ## 4. Acceptance
 
 ⚠️ **Two shapes are pre-empted rather than rediscovered**, because AUDITFIX-3 shipped FIVE criteria
-that were green while testing nothing: every fixture precondition is asserted, and every fault injector
-fails **reads only** (an injector that also kills the write cannot observe the damage it exists to
-catch).
+that were green while testing nothing: every fixture precondition is asserted, and **every
+BOOTSTRAP-fault injector fails reads only** — an injector that also kills the write cannot observe the
+damage it exists to catch. *(Scoped to bootstrap faults on purpose: AC10 must fault an `ingest_runs`
+INSERT, so a blanket "reads only" rule would make it unimplementable — round 3 M3.)*
 
 ⚠️ **Every visibility criterion runs TWO ticks and asserts the CONFIRMED state** (§0b, round 1 B4 and
 round 2 B2).
 
-- **AC1 — a per-team failure is LOUD on that team's card (dm):** seed TWO teams, wedge one with a
-  reserved-slug `initiative` (the pre-existing shipped wedge), run **two** record sequences, then read
-  the shipped consumer: `getPipelineHealth(wedged)` has `access_bootstrap` in **`failing`**, its
-  `failureClass` is **`confirmed`**, and **`healthy === false`**.
-- **AC2 — the OTHER team stays green (dm):** `getPipelineHealth(healthy)` — `access_bootstrap` absent
-  from `failing`, `healthy === true`. *Without this, reddening every card passes AC1.*
+- **AC1 — a per-team failure is LOUD on that team's card, and written EXACTLY ONCE per tick (dm):**
+  seed TWO teams, wedge one with a reserved-slug `initiative`, run **two** record sequences, then read
+  the shipped consumer: `access_bootstrap` in **`failing`**, `failureClass` **`confirmed`**,
+  **`healthy === false`** — **and exactly one scoped `ok:false` row per failing team per tick (two
+  total)**. ⚠️ *Round 3 H2: leaving the existing `for (const f of r.failed)` loop in place alongside
+  the callback double-writes every failure, so ONE failed tick reaches streak 2 and goes `confirmed` —
+  single-failure loudness, undoing BANNERFLAP-1 for this leg. Nothing else in the suite pins the
+  failure-row count.*
+- **AC2 — the OTHER team stays green (dm):** absent from `failing`, `healthy === true`.
 - **AC3 — a HEALED team goes fully green (dm):** from AC1's **confirmed** red state, remove the wedge,
-  run one successful tick, and assert `ok`, `failureClass === "ok"`, `failingSince === null`, absent
-  from `failing`, and `healthy === true`. ⚠️ *Round 1 H1 — "green after" alone cannot distinguish
-  healed from never-visibly-failed, and mutation 1 would survive it.*
+  run one successful tick, assert `ok`, `failureClass === "ok"`, `failingSince === null`, absent from
+  `failing`, `healthy === true`.
 - **AC4 — an ordinary tick writes NO `team_id is null` row (dm):** two healthy teams ⇒ exactly two
-  `access_bootstrap` rows, both team-scoped. *The global success row is the thing that masks.*
-- **AC5 — a FLEET-level failure reds every card, at the confirmed threshold (dm):** with the `teams`
-  read faulted on **two** ticks, exactly one global row per tick is written `ok:false`, and
-  `getPipelineHealth` for a team **with no row of its own** reports `failing` + `confirmed` +
-  `healthy === false`. ⚠️ *Round 2 B2 — my one-tick version was unsatisfiable: a single failure is
-  `unconfirmed`, so `failing` stays empty and `healthy` stays true.*
-- **AC6 — ZERO teams writes an `ok:true` heartbeat (dm):** on an instance with no teams, one global
-  `access_bootstrap` row, **`ok: true`**. ⚠️ *Round 2 H1 — nothing to converge is not a failure, and a
-  global `ok:false` would falsely red a team created moments later.*
-- **AC7 — a team created MID-TICK still has a row (dm):** with the tick's `teams` snapshot taken before
-  team B exists, B nonetheless has an `access_bootstrap` row afterwards — written by the creation path
-  — and `getPipelineHealth(B)` therefore reports a leg rather than silence. ⚠️ *Round 2 B1 — without
-  this, B has neither a scoped nor a global row, `STREAK_SQL` returns no leg for it, and a missing leg
-  reads as `healthy: true` with staleness unable to fire.*
-- **AC8 — team creation records the outcome it actually got (dm):** when the creation-time
-  `ensureAccessBootstrap` FAILS, the recorded row is `ok:false` and names the error. *A creation row
-  that always said `ok:true` would satisfy AC7 while lying.*
-- **AC9 — rows are written AS EACH TEAM COMPLETES (dm):** with team A converging and team B's
-  convergence made to hang or throw after A's, A's row exists. ⚠️ *Round 2 H2 — writing after the
-  wrapper returns means one slow team delays every team's row, and a process death loses all of them.*
-- **AC10 — a swallowed scoped insert self-heals (dm):** with team A's row insert faulted on tick 1 and
-  healthy on tick 2, A's leg reports from tick 2. *`recordIngestRun` returns no insertion status
-  (`lib/ingest/runs.ts:59`), so "no per-team row was written" is not observable to the writer — the
-  design must not depend on detecting it.*
+  `access_bootstrap` rows, both team-scoped.
+- **AC5 — a FLEET-level failure reds every card, at the confirmed threshold (dm):** seed a team by
+  **direct `teams` insert** (bypassing `createTeam`, so it genuinely has no scoped row — the prod
+  analogue is a pre-slice team at the deploy transition) and **assert it has zero scoped rows first**;
+  then fault the `teams` read on **two** ticks; exactly one global `ok:false` row per tick; and
+  `getPipelineHealth` for that team reports `failing` + `confirmed` + `healthy === false`.
+  ⚠️ *Round 3 M4 — after this slice `createTeam` always attempts a row, so the precondition is
+  unconstructible through the normal path and must be stated.*
+- **AC6 — ZERO teams writes an `ok:true` heartbeat (dm):** one global row, **`ok: true`**.
+- **AC7 — a team created MID-TICK still has a row (dm):** with the tick's snapshot taken before team B
+  exists, B nonetheless has an `access_bootstrap` row afterwards, and `getPipelineHealth(B)` reports a
+  leg rather than silence.
+- **AC8 — the creation row records the outcome it actually got (dm):** when the creation-time
+  `ensureAccessBootstrap` **returns** `ok:false`, the row is `ok:false` and names the error.
+- **AC8b — and when it THROWS (dm):** with a read fault made to throw, the creation path still records
+  an `ok:false` row naming the error. ⚠️ *Round 3 H3 — the obvious implementation puts the record after
+  `ensureAccessBootstrap` inside `createTeam`'s existing `try` (`lib/admin/teams.ts:58-63`), so a throw
+  skips it; AC8's returned-false fault never exercises that path, and "record only on the non-throw
+  path" would pass every other criterion while recreating the zero-row case §2b claims to close — on
+  the one path where the creation row is load-bearing.*
+- **AC9 — rows are written AS EACH TEAM COMPLETES, asserted MID-FLIGHT (dm):** make team B's
+  convergence **block** on a never-resolving read; while the wrapper is still in flight, assert team
+  A's row already exists; then release the deferred so the run terminates. ⚠️ *Round 3 B1 — a THROW is
+  insufficient and cannot redden mutation 9: the wrapper catches a per-team throw and continues
+  (`lib/access/bootstrap.ts:169-171`), so a post-loop recording still writes A's row and the criterion
+  goes green. That is the third instance of the wrong-mutation-target class this branch has hit.*
+- **AC10 — a swallowed scoped insert self-heals (dm):** with team A's `ingest_runs` insert faulted on
+  tick 1 and healthy on tick 2, A's leg reports from tick 2. *`recordIngestRun` returns no insertion
+  status (`lib/ingest/runs.ts:59`), so the design must not depend on detecting a lost row.*
+- **AC11 — the per-team tick row carries `trigger: 'scheduler'` (dm):** asserted on the row.
+  ⚠️ *Round 3 H1 — no behavioural criterion can catch this. A non-`scheduler` trigger passes the whole
+  dm suite (a fresh DB has no scheduler rows, so the leg is never aged) and freezes the production beat
+  at deploy, reddening every team ~3h later, forever.*
+- **AC12 — the creation row does NOT carry `trigger: 'scheduler'` (dm):** asserted on the row.
+  *Team creation is not the poller; claiming otherwise fakes liveness for a team whose tick never ran.*
+- **AC13 — the fossil-staleness cost is PINNED, not accidental (dm):** seed an aged instance-wide
+  `scheduler` row for `access_bootstrap`, create a team, and assert the chosen behaviour — its leg
+  reads `stale` until its first tick row lands. ⚠️ *§2b.1 — this criterion exists so the cost is a
+  recorded decision with a ticket (AUDITFIX-24), not something a later reader discovers as a bug.*
 
 **Mutation coverage, one per enforcement point, each reddening ITS OWN criterion:**
 
@@ -226,12 +300,17 @@ round 2 B2).
 | 6 | write `ok:false` for the zero-teams heartbeat | AC6 |
 | 7 | drop the team-creation row | AC7 |
 | 8 | hardcode the creation row to `ok:true` | AC8 |
+| 8b | record the creation row only on the non-throw path | AC8b |
 | 9 | record outcomes after the loop instead of per team | AC9 |
+| 10 | keep the old `for (const f of r.failed)` loop alongside the callback | AC1 |
+| 11 | give the per-team tick row a non-`scheduler` trigger | AC11 |
+| 12 | give the creation row `trigger: 'scheduler'` | AC12 |
+| 13 | let a callback throw escape the wrapper's guard | AC9 |
 
-⚠️ *Mutations 2 and 3 are separate because ordering decides observability: a global success row written
-BEFORE the per-team rows leaves the team's row newest, so AC1 stays green and only AC4 catches it.
-Round 2's BLOCKER 5 found exactly that error in my previous table — two mutations pointed at criteria
-they could not redden.*
+⚠️ *Mutations 2 and 3 are separate because ordering decides observability, and mutation 10 exists
+because a double-write is invisible to every criterion that only asserts `confirmed`. Round 2 found
+two mutations pointed at criteria they could not redden and round 3 found a third — the table is
+checked against each criterion individually, not assumed.*
 
 ## 5. Risks
 
@@ -242,6 +321,11 @@ they could not redden.*
 | The per-team rows red every team's card | alarm noise, shipped decision reversed | AC2 |
 | A fleet-level failure stops reddening | the one case that SHOULD be global | AC5, mutation 4 |
 | The creation row lies about what happened | a false green at the moment a team is born | AC8, mutation 8 |
+| A non-`scheduler` trigger on the tick row | **green tests, permanently red production banner** | AC11, mutation 11 — §2c |
+| A `scheduler` trigger on the creation row | fakes poller liveness for a team that has never ticked | AC12, mutation 12 |
+| The old failure loop left in alongside the callback | double-written failures ⇒ single-failure loudness, undoing BANNERFLAP-1 | AC1's per-tick row count, mutation 10 |
+| A new team reads stale against the frozen global fossil | a red banner on a healthy brand-new team, ≤ one tick cadence | **accepted and pinned** — §2b.1, AC13, AUDITFIX-24 |
+| A callback throw aborts the remaining teams | observability taking ingestion down | §2b's callback guard, mutation 13 |
 | Row growth on an unpruned table | net `(N − 1) × ticks`; **zero on this fleet** | §3, and fleet scale marked unverified |
 
 ## 6. What this slice does NOT prove
@@ -270,5 +354,26 @@ and the third option was in the same file; here I asserted *"both halves are req
 option was in the same function. A negative universal of mine about design alternatives has now been
 wrong twice running. **When I write "the only way" or "both are required", that is a research task, not
 a conclusion.**
+
+**Nothing is built. No code exists for this slice.**
+
+## 8. Round 3 — FABLE, and the first different model found the axis two Codex rounds never named
+
+Rounds 1 and 2 were both gpt-5.6-sol. Round 3 went to Fable for the same reason it did on the previous
+slice, where the first Fable round found two blockers three Codex rounds had missed. It returned
+**BLOCKED**.
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **H1** | **`trigger` is load-bearing on both new writes and the spec never mentioned it.** A non-`scheduler` tick row passes the entire dm suite — a fresh test DB has no scheduler rows, so the leg is never aged — while freezing the production beat at deploy and reddening every team ~3h later, forever | **CONFIRMED.** The beat is `trigger='scheduler'` only (`lib/ingest/pipeline-health.ts:366-372`); prod holds **591** such rows for this source, all instance-wide, and this slice stops adding them | **ADOPTED** — new **§2c**, **AC11**/**AC12** assert the trigger values directly, mutations 11 and 12. *The best finding of the round: green by construction, broken in production.* |
+| **B1** | AC9's "hang or throw" conflated two fixtures, and the THROW variant cannot redden mutation 9 — the wrapper catches a per-team throw and continues, so a post-loop recording still writes A's row | **CONFIRMED** (`lib/access/bootstrap.ts:169-171`) | **ADOPTED** — AC9 uses a **blocking** fault and asserts A's row **mid-flight**. Third instance on this branch of a mutation aimed at a criterion it cannot redden |
+| **H2** | keeping the existing `for (const f of r.failed)` loop alongside the callback double-writes failures, so ONE failed tick reaches streak 2 and goes `confirmed` — single-failure loudness. No criterion pinned the failure-row count | **CONFIRMED** (`lib/ingest/scheduler.ts:316-327`) | **ADOPTED** — AC1 pins exactly one scoped `ok:false` row per failing team per tick; mutation 10 |
+| **H3** | a creation-time THROW still leaves a team with zero rows, and AC8's returned-false fault never exercises it | **CONFIRMED** (`lib/admin/teams.ts:58-63`) | **ADOPTED** — **AC8b** + mutation 8b |
+| **M1** | the frozen global fossil ages every NEW team into `stale`, contradicting the module's own stated exemption for a brand-new team | **CONFIRMED** (`lib/ingest/pipeline-health.ts:394-400`) | **ACCEPTED AND PINNED** — §2b.1, **AC13**, **AUDITFIX-24**. Fixing it means changing the beat query for every leg, which is the scope creep round 2 blocked |
+| **M2** | callback error containment unspecified — a throw outside the per-team `try` aborts every remaining team | **CONFIRMED** | **ADOPTED** — §2b, mutation 13 |
+| **M3** | "every fault injector fails reads only" contradicts AC10, which must fault an INSERT | **CONFIRMED** | **ADOPTED** — the rule is scoped to bootstrap-fault injectors |
+| **M4** | AC5's precondition is unconstructible via the normal path once `createTeam` always records | **CONFIRMED** | **ADOPTED** — direct-insert fixture, asserted |
+| **LOW** | "durable first row from the moment it exists" is a universal over a best-effort insert; four citations had rotted; §3a implied an in-repo spec for AUDITFIX-23 | **CONFIRMED** | **ADOPTED** — all three corrected |
+| — | §0a, §2a's case table, §3's `(N−1)×ticks` and one-team invariance, the `FAILURES_TO_CONFIRM` path, deleted-and-recreated teams, and mutations 1-8 individually | **CLEARED with evidence** | recorded so the build does not re-litigate them |
 
 **Nothing is built. No code exists for this slice.**
