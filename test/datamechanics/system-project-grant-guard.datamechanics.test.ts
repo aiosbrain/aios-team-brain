@@ -209,17 +209,24 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     const seed = await seedTeam();
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const shared = await systemProjectId(seed, EXTERNAL_SHARED_SLUG);
-    // A squatter can only be planted directly: the writer refuses a reserved slug for an ordinary
-    // group. Direct edge-table writes are legal from test files (single-writer guard scans app/lib/scripts).
-    const { data: squatter } = await db()
+    // `groups` is unique(team_id, slug), so the squatter and the real built-in cannot coexist —
+    // the built-in goes first (the same shape access-groups.dm uses to model a pre-bootstrap team).
+    // ⚠️ The FIRST version of this fixture inserted `external-x` and then UPDATEd the slug to
+    // `external`; the update silently violated that unique constraint, so the group kept a slug
+    // that is not in the sanctioned table at all and the test passed for the WRONG reason —
+    // dropping the is_builtin conjunct did not redden it. Hence the fixture assertion below.
+    await db().from("groups").delete().eq("team_id", seed.teamId).eq("slug", EXTERNAL_SLUG).eq("is_builtin", true);
+    const { data: squatter, error: sErr } = await db()
       .from("groups")
-      .insert({ team_id: seed.teamId, slug: `${EXTERNAL_SLUG}-x`, name: "squatter", is_builtin: false })
-      .select("id")
+      .insert({ team_id: seed.teamId, slug: EXTERNAL_SLUG, name: "curated", is_builtin: false })
+      .select("id, slug, is_builtin")
       .single();
-    await db().from("groups").update({ slug: EXTERNAL_SLUG }).eq("id", (squatter as { id: string }).id);
+    expect(sErr, "the squatter must actually be planted").toBeNull();
+    const sq = squatter as { id: string; slug: string; is_builtin: boolean };
+    expect([sq.slug, sq.is_builtin], "the fixture must hold the BUILTIN slug while NOT being builtin").toEqual([EXTERNAL_SLUG, false]);
 
     const before = { edges: await edgeCount(seed), audits: await grantAudits(seed) };
-    const r = await grantProjectToGroup(db(), seed.teamId, shared, (squatter as { id: string }).id, null, {});
+    const r = await grantProjectToGroup(db(), seed.teamId, shared, sq.id, null, {});
     expect(r.ok, "a non-builtin group holding the 'external' slug is not the External built-in").toBe(false);
     await assertNothingWritten(seed, before, "external-shared->squatter");
   });
