@@ -361,8 +361,14 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     const g1 = await ordinaryGroup(seed, admin, "leads");
     const g2 = await ordinaryGroup(seed, admin, "eng");
 
-    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g1, null, {})).ok, "T1").toBe(true);
-    expect((await grantProjectToGroup(db(), seed.teamId, ordinary, g2, admin, {})).ok, "T3").toBe(true);
+    // ok:true alone is not "grants normally": a guard that returned {ok:true, created:false} for
+    // every unprotected project would satisfy it while writing NOTHING (Codex diff review MEDIUM 2).
+    const t1 = await grantProjectToGroup(db(), seed.teamId, ordinary, g1, null, {});
+    expect([t1.ok, t1.created], `T1 must actually create the edge: ${t1.error}`).toEqual([true, true]);
+    const t3 = await grantProjectToGroup(db(), seed.teamId, ordinary, g2, admin, {});
+    expect([t3.ok, t3.created], `T3 must actually create the edge: ${t3.error}`).toEqual([true, true]);
+    const { data: rows } = await db().from("project_groups").select("group_id").eq("team_id", seed.teamId).eq("project_id", ordinary);
+    expect(((rows ?? []) as { group_id: string }[]).map((r) => r.group_id).sort(), "both edges are on the row").toEqual([g1, g2].sort());
   });
 
   it("AC10: a PRE-EXISTING forbidden edge is REFUSED, not reported as 'already granted'", async () => {
