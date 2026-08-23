@@ -155,8 +155,16 @@ deploy (591 exist on prod today; none will be added). The staleness beat is
 `distinct on (source)` over `team_id = $1 or team_id is null` **and** `trigger='scheduler'`
 (`lib/ingest/pipeline-health.ts:366-372`). So a team created AFTER deploy has no `scheduler` row of its
 own until its first tick, and is judged against that frozen fossil — **stale, therefore `failing`,
-therefore a red banner on a healthy brand-new team for up to one tick cadence (30-86 min measured,
-§0c).**
+therefore a red banner on a healthy brand-new team until its first scheduler row lands.**
+
+⚠️ **How long that is, corrected (Codex diff review MEDIUM 2).** I first wrote "one tick cadence
+(30-86 min)". That is right only because THIS fleet has one team. Teams converge **sequentially**
+inside one tick (`lib/access/bootstrap.ts`), and the whole tick is single-flighted with overlapping
+ticks **skipped rather than queued** (`lib/ingest/single-flight.ts:39-50`) — so a team enumerated last
+waits for a full convergence pass over every team ahead of it, and a single hung team makes the wait
+**unbounded**. The honest statement: bounded by **one full convergence pass**, which on this fleet
+equals one tick cadence (30-86 min measured, §0c) and on a multi-team fleet is **UNVERIFIED** — the
+same window §2b already declines to bound.
 
 That is precisely the case the module intends to exempt: *"A source with rows but no scheduler row yet
 (a brand-new team whose first tick hasn't landed …) has no heartbeat to judge, so it is not aged at

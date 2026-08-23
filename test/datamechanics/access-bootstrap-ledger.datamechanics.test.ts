@@ -43,10 +43,10 @@ async function wedge(teamId: string): Promise<string> {
   return (data as { id: string }).id;
 }
 
-async function legRows(teamId: string | null): Promise<{ ok: boolean; trigger: string; team_id: string | null }[]> {
-  const q = db().from("ingest_runs").select("ok, trigger, team_id").eq("source", "access_bootstrap");
+async function legRows(teamId: string | null): Promise<{ ok: boolean; trigger: string; team_id: string | null; errors: unknown }[]> {
+  const q = db().from("ingest_runs").select("ok, trigger, team_id, errors").eq("source", "access_bootstrap");
   const { data } = await (teamId === null ? q.is("team_id", null) : q.eq("team_id", teamId));
-  return (data ?? []) as { ok: boolean; trigger: string; team_id: string | null }[];
+  return (data ?? []) as { ok: boolean; trigger: string; team_id: string | null; errors: unknown }[];
 }
 
 async function legFor(teamId: string) {
@@ -137,8 +137,14 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     const healthy = await bareTeam();
     await wedge(wedged);
 
+    // Counted after EACH tick, not as a two-tick total: an implementation that double-writes on
+    // tick 1 and writes nothing on tick 2 leaves the same two rows and the same confirmed streak,
+    // so a total would pass while the per-tick invariant this criterion names is violated
+    // (Codex diff review HIGH 2 — AC5 already had this shape).
     await runAccessBootstrapLeg(db());
+    expect((await legRows(wedged)).length, "exactly one row after tick 1").toBe(1);
     await runAccessBootstrapLeg(db());
+    expect((await legRows(wedged)).length, "exactly one more after tick 2").toBe(2);
 
     const { health, leg, failing } = await legFor(wedged);
     expect(leg, "the leg must exist for this team").toBeDefined();
@@ -151,9 +157,7 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     // Exactly one scoped ok:false row per tick. Keeping the old `for (const f of r.failed)` loop
     // alongside the callback would double-write, so ONE failed tick would reach streak 2 and go
     // confirmed — single-failure loudness, undoing BANNERFLAP-1 for this leg.
-    const rows = await legRows(wedged);
-    expect(rows.length, "two ticks, two rows — not four").toBe(2);
-    expect(rows.every((r) => r.ok === false)).toBe(true);
+    expect((await legRows(wedged)).every((r) => r.ok === false)).toBe(true);
     void healthy;
   });
 
@@ -270,6 +274,10 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     const rows = await legRows(team.id);
     expect(rows.length).toBe(1);
     expect(rows[0].ok, "a row that always said ok:true would satisfy AC7 while lying").toBe(false);
+    // And it must carry the REAL error: replacing every message with "unknown" would leave a leg
+    // that reds with useless diagnostics while the count and ok:false assertions stayed green
+    // (Codex diff review MEDIUM 1).
+    expect(JSON.stringify(rows[0].errors), "the recorded row names what actually failed").toMatch(/exploded/);
   });
 
   it("AC8b: and when the creation-time bootstrap THROWS, the row is still written", async () => {
@@ -292,82 +300,47 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     const rows = await legRows(team.id);
     expect(rows.length, "the throw path is where this row is load-bearing").toBe(1);
     expect(rows[0].ok).toBe(false);
+    expect(JSON.stringify(rows[0].errors), "the thrown message is preserved, not flattened to 'unknown'").toMatch(/exploded/);
   });
 
-  it("AC9: rows are written AS EACH TEAM COMPLETES — asserted while the wrapper is still in flight", async () => {
+  it("AC9: the outcome for team 1 fires BEFORE team 2 converges — no timing, no polling", async () => {
     const a = await bareTeam();
     const b = await bareTeam();
 
-    // The block engages only AFTER the first ingest_runs insert, so it is armed by the very thing
-    // under test. Under "record outcomes after the loop" no insert ever happens during the loop, so
-    // the block never engages, the wrapper runs to completion, and nothing is observed mid-flight —
-    // which is exactly how this criterion discriminates. A THROW could not: the wrapper catches a
-    // per-team throw and continues, so a post-loop recording would still write both rows.
-    let inserts = 0;
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    const blocking = new Proxy(db() as object, {
-      get(target, prop, recv) {
-        if (prop !== "from") return Reflect.get(target, prop, recv);
-        return (name: string) => {
-          const q = (target as { from: (n: string) => unknown }).from(name);
-          if (name === "ingest_runs") {
-            return new Proxy(q as object, {
-              get(bt, bp, br) {
-                const v = Reflect.get(bt, bp, br);
-                if (typeof v !== "function") return v;
-                return (...args: unknown[]) => {
-                  if (bp === "insert") inserts += 1;
-                  const r = (v as (...x: unknown[]) => unknown).apply(bt, args);
-                  return r === bt ? br : r;
-                };
-              },
-            });
-          }
-          if (name !== "groups" || inserts === 0) return q;
-          // A never-resolving read for the NEXT team, until the test releases it.
-          return new Proxy(q as object, {
-            get(bt, bp, br) {
-              const v = Reflect.get(bt, bp, br);
-              if (bp === "then") {
-                return (res: (x: unknown) => unknown) => {
-                  void gate.then(() => res({ data: [], error: { message: "released" } }));
-                };
-              }
-              if (typeof v !== "function") return v;
-              return (...args: unknown[]) => {
-                const r = (v as (...x: unknown[]) => unknown).apply(bt, args);
-                return r === bt ? br : r;
-              };
-            },
-          });
-        };
-      },
-    }) as DbClient;
+    // The discriminator is a STATE ORACLE, not a clock. When the first team's outcome fires, has the
+    // OTHER team converged yet? Incremental: no. Record-after-the-loop: yes, because every
+    // convergence finished before any callback ran. An earlier version of this criterion polled for
+    // a row while the wrapper was "still in flight" and could pass a post-loop implementation by
+    // scheduling luck — the callback for A fires, the promise has not settled, and both assertions
+    // hold even though nothing was written during convergence (Codex diff review HIGH 1).
+    const hasGeneral = async (teamId: string): Promise<boolean> => {
+      const { data } = await db()
+        .from("projects")
+        .select("id")
+        .eq("team_id", teamId)
+        .eq("slug", GENERAL_SLUG)
+        .maybeSingle();
+      return data !== null;
+    };
 
-    let settled = false;
-    const inFlight = runAccessBootstrapLeg(blocking).finally(() => {
-      settled = true;
+    const seen: string[] = [];
+    let otherConvergedWhenFirstFired: boolean | null = null;
+    await ensureAccessBootstrapAllTeams(db(), {
+      onOutcome: async (o) => {
+        if (seen.length === 0) {
+          const other = o.teamId === a ? b : a;
+          otherConvergedWhenFirstFired = await hasGeneral(other);
+        }
+        seen.push(o.teamId);
+      },
     });
 
-    let rowsMidFlight = 0;
-    let stillRunning = false;
-    // Budget generously: a real-Postgres bootstrap under a contended shared container can take
-    // seconds, and this loop failing red on contention would read as a product bug.
-    for (let i = 0; i < 600; i++) {
-      rowsMidFlight = (await legRows(a)).length + (await legRows(b)).length;
-      if (rowsMidFlight > 0) {
-        stillRunning = !settled;
-        break;
-      }
-      if (settled) break;
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    release();
-    await inFlight;
-
-    expect(rowsMidFlight, "a team's row must exist before the wrapper returns").toBeGreaterThan(0);
-    expect(stillRunning, "and the wrapper must still have been running when it did").toBe(true);
+    expect(seen.length, "both teams reported").toBe(2);
+    expect(seen[0], "the first outcome is one of the two seeded teams").not.toBe(seen[1]);
+    expect(
+      otherConvergedWhenFirstFired,
+      "the first team's outcome must fire while the second is still unconverged"
+    ).toBe(false);
   });
 
   it("AC10: a swallowed scoped insert self-heals on the next tick", async () => {
