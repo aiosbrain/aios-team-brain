@@ -46,6 +46,57 @@ function minExpiryValue(): string {
   return new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
 }
 
+/** The show-once reveal. Split out so `MintAgentToken` stays under the complexity ceiling and so
+ *  the secret's handling lives in one small, readable place. */
+function MintedPanel({
+  token,
+  onDone,
+}: {
+  token: string;
+  onDone: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+
+  return (
+    <div className="prism-card flex max-w-xl flex-col gap-3 border border-violet/40 p-4">
+      <p className="text-sm font-medium text-ink">
+        Token minted — copy it now. It is shown exactly once; only its hash is stored.
+      </p>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 overflow-x-auto rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
+          {token}
+        </code>
+        <button
+          onClick={() => {
+            // A rejection (no permission / insecure context) must not become an unhandled rejection
+            // with no feedback. The token stays on screen for manual copy either way.
+            navigator.clipboard.writeText(token).then(
+              () => {
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              },
+              () => setCopyError("Couldn't copy — select the token above and copy it manually.")
+            );
+          }}
+          className="rounded-lg border border-border-default p-2 text-ink-secondary hover:text-ink"
+          aria-label="Copy token"
+        >
+          {copied ? <Check className="size-4 text-violet" /> : <Copy className="size-4" />}
+        </button>
+      </div>
+      {copyError && <p className="text-xs text-red-600">{copyError}</p>}
+      <p className="text-xs text-ink-tertiary">
+        Set it as <code>AIOS_API_KEY</code> for the agent. Reads only — <code>aios push</code> with
+        this token returns 401.
+      </p>
+      <button onClick={onDone} className="self-start rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white">
+        Done — I copied it
+      </button>
+    </div>
+  );
+}
+
 export function MintAgentToken({
   teamSlug,
   members,
@@ -57,7 +108,6 @@ export function MintAgentToken({
 }) {
   const [open, setOpen] = useState(false);
   const [minted, setMinted] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
@@ -79,50 +129,17 @@ export function MintAgentToken({
 
   if (minted) {
     return (
-      <div className="prism-card flex max-w-xl flex-col gap-3 border border-violet/40 p-4">
-        <p className="text-sm font-medium text-ink">
-          Token minted — copy it now. It is shown exactly once; only its hash is stored.
-        </p>
-        <div className="flex items-center gap-2">
-          <code className="flex-1 overflow-x-auto rounded-lg bg-surface-overlay px-3 py-2 font-mono text-xs text-ink">
-            {minted}
-          </code>
-          <button
-            onClick={() => {
-              // A rejection (no permission / insecure context) must not become an unhandled
-              // rejection with no feedback. The token stays on screen for manual copy either way.
-              navigator.clipboard.writeText(minted).then(
-                () => {
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 1500);
-                },
-                () => setError("Couldn't copy — select the token above and copy it manually.")
-              );
-            }}
-            className="rounded-lg border border-border-default p-2 text-ink-secondary hover:text-ink"
-            aria-label="Copy token"
-          >
-            {copied ? <Check className="size-4 text-violet" /> : <Copy className="size-4" />}
-          </button>
-        </div>
-        <p className="text-xs text-ink-tertiary">
-          Set it as <code>AIOS_API_KEY</code> for the agent. Reads only — <code>aios push</code> with
-          this token returns 401.
-        </p>
-        <button
-          onClick={() => {
-            setMinted(null);
-            setOpen(false);
-            setScope(null);
-            setMemberId("");
-            setName("");
-            setExpiry(defaultExpiryValue());
-          }}
-          className="self-start rounded-lg bg-violet px-4 py-2 text-sm font-medium text-white"
-        >
-          Done — I copied it
-        </button>
-      </div>
+      <MintedPanel
+        token={minted}
+        onDone={() => {
+          setMinted(null);
+          setOpen(false);
+          setScope(null);
+          setMemberId("");
+          setName("");
+          setExpiry(defaultExpiryValue());
+        }}
+      />
     );
   }
 

@@ -45,77 +45,89 @@ export type PolicyResult = { ok: true } | { ok: false; error: string };
  * `now` is a parameter, not `Date.now()`, so the expiry rules are testable at exact boundaries
  * without the clock making the test flaky.
  */
-export function validateMintRequest(req: MintRequest, now: number): PolicyResult {
-  // A server action receives whatever the caller sends. Everything below is a TYPE check before a
-  // VALUE check, because `RegExp.test` and `Date.parse` both coerce: `["<uuid>"]` stringifies to a
-  // valid uuid and would otherwise pass as a memberId.
-  if (req == null || typeof req !== "object" || Array.isArray(req)) {
-    return { ok: false, error: "invalid request" };
-  }
+/** Identity legs: the launcher, and the acting-as leg v1 refuses outright. */
+function checkIdentity(req: MintRequest): PolicyResult {
   if (typeof req.memberId !== "string" || !UUID_RE.test(req.memberId)) {
     return { ok: false, error: "memberId must be a member uuid" };
   }
-
-  // ACTING-AS: refused outright in v1. `on_behalf_of` makes a delegated query answer in the
-  // represented person's first-person identity while quota, cost and audit stay with the launcher —
-  // and no owner→agent authorization or consent model exists anywhere yet. Omitting the control from
-  // the form would leave this reachable by anyone posting to the action directly; refusing it here is
-  // what actually makes v1 self-only.
+  // ACTING-AS: refused server-side, not merely hidden. `on_behalf_of` makes a delegated query answer
+  // in the represented person's first-person identity while quota, cost and audit stay with the
+  // launcher, and no owner→agent authorization or consent model exists anywhere yet. Omitting the
+  // control from the form would leave this reachable by anyone posting to the action directly.
   if (req.onBehalfOf != null) {
     return { ok: false, error: "acting-as is not available in this version — tokens are self-only" };
   }
-
-  // SCOPE: `null`/absent means inherit, and is legal — but it must be the caller's DELIBERATE choice,
-  // which the form makes explicit. `[]` is a legal DB state ("sees nothing") that is never a legal
-  // REQUEST: the only way to produce it is an empty multi-select, i.e. an accident that mints a token
-  // which silently reads nothing.
   if (req.name != null && typeof req.name !== "string") {
     return { ok: false, error: "name must be a string" };
   }
-  if (req.projectScope != null) {
-    // A direct caller can send anything. Without this, a string or an object with a `length` throws
-    // inside `.some(...)` and the boundary returns an opaque 500 instead of a refusal.
-    if (!Array.isArray(req.projectScope)) {
-      return { ok: false, error: "projectScope must be an array of project uuids" };
-    }
-    if (req.projectScope.length > MAX_PROJECT_SCOPE) {
-      return { ok: false, error: `projectScope may name at most ${MAX_PROJECT_SCOPE} projects` };
-    }
-    if (new Set(req.projectScope).size !== req.projectScope.length) {
-      return { ok: false, error: "projectScope must not repeat a project" };
-    }
-    if (req.projectScope.length === 0) {
-      return {
-        ok: false,
-        error: "projectScope must name at least one project, or be omitted to inherit the launcher's access",
-      };
-    }
-      if (req.projectScope.some((p) => typeof p !== "string" || !UUID_RE.test(p))) {
-      return { ok: false, error: "projectScope must contain project uuids" };
-    }
-  }
+  return { ok: true };
+}
 
-  // EXPIRY: required. `mintAgentToken` stores `expiresAt ?? null`, and a null expiry never expires —
-  // so "absent" must be refused rather than quietly becoming forever.
+/**
+ * Scope: `null`/absent = inherit (legal, and the form makes it a deliberate choice). `[]` is a legal
+ * DB state ("sees nothing") but never a legal REQUEST — the only way to produce it is an empty
+ * multi-select, i.e. an accident that mints a token which silently reads nothing.
+ */
+function checkScope(req: MintRequest): PolicyResult {
+  if (req.projectScope == null) return { ok: true };
+  // A direct caller can send anything; without the array check a string throws inside `.some(...)`
+  // and the boundary returns an opaque 500 instead of a refusal.
+  if (!Array.isArray(req.projectScope)) {
+    return { ok: false, error: "projectScope must be an array of project uuids" };
+  }
+  if (req.projectScope.length === 0) {
+    return {
+      ok: false,
+      error: "projectScope must name at least one project, or be omitted to inherit the launcher's access",
+    };
+  }
+  if (req.projectScope.length > MAX_PROJECT_SCOPE) {
+    return { ok: false, error: `projectScope may name at most ${MAX_PROJECT_SCOPE} projects` };
+  }
+  if (new Set(req.projectScope).size !== req.projectScope.length) {
+    return { ok: false, error: "projectScope must not repeat a project" };
+  }
+  if (req.projectScope.some((p) => typeof p !== "string" || !UUID_RE.test(p))) {
+    return { ok: false, error: "projectScope must contain project uuids" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Expiry: REQUIRED and bounded. `mintAgentToken` stores `expiresAt ?? null` and a null expiry never
+ * expires, so "absent" must be refused rather than quietly becoming forever.
+ */
+function checkExpiry(req: MintRequest, now: number): PolicyResult {
   if (req.expiresAt == null || req.expiresAt === "") {
     return { ok: false, error: "expiresAt is required" };
   }
-  // `Date.parse` accepts plenty that is not ISO-8601 ("12/31/2026" parses), and coerces arrays.
-  // The contract says ISO, so require the shape before trusting the parse.
+  // `Date.parse` accepts plenty that is not ISO-8601 ("12/31/2026" parses) and coerces arrays, so
+  // require the shape before trusting the parse.
   if (typeof req.expiresAt !== "string" || !ISO_RE.test(req.expiresAt)) {
     return { ok: false, error: "expiresAt must be an ISO timestamp" };
   }
   const at = Date.parse(req.expiresAt);
-  if (Number.isNaN(at)) {
-    return { ok: false, error: "expiresAt must be an ISO timestamp" };
-  }
-  if (at <= now) {
-    return { ok: false, error: "expiresAt must be in the future" };
-  }
+  if (Number.isNaN(at)) return { ok: false, error: "expiresAt must be an ISO timestamp" };
+  if (at <= now) return { ok: false, error: "expiresAt must be in the future" };
   if (at > now + MAX_TOKEN_LIFETIME_MS) {
     return { ok: false, error: "expiresAt is beyond the 365-day maximum" };
   }
+  return { ok: true };
+}
 
+/**
+ * `now` is a parameter, not `Date.now()`, so the expiry rules are testable at exact boundaries
+ * without the clock making the test flaky. Split into three checks because a single chain of guard
+ * clauses crossed the complexity ceiling — the behaviour is unchanged and pinned by 35 tests.
+ */
+export function validateMintRequest(req: MintRequest, now: number): PolicyResult {
+  // A server action receives whatever the caller sends.
+  if (req == null || typeof req !== "object" || Array.isArray(req)) {
+    return { ok: false, error: "invalid request" };
+  }
+  for (const check of [checkIdentity(req), checkScope(req), checkExpiry(req, now)]) {
+    if (!check.ok) return check;
+  }
   return { ok: true };
 }
 
