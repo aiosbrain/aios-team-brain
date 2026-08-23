@@ -145,9 +145,24 @@ export async function visibleItemIds(
 export async function delegatedVisibleItemIds(
   db: DbClient,
   token: { teamId: string; memberId: string; onBehalfOf: string | null; projectScope: string[] | null }
-): Promise<VisibleItemIds> {
+): Promise<VisibleItemIds & { projectIds: string[] }> {
   const projects = await effectiveVisibleProjects(db, token);
-  return visibleItemIdsForProjects(db, token.teamId, projects);
+  const items = await visibleItemIdsForProjects(db, token.teamId, projects);
+  // AUDITFIX-7: RETURN the effective project set instead of discarding it. It is the token's
+  // authority, and the hand-typed arm needs it — recomputing the oracle a second time downstream
+  // would be a disagreement surface, which is the same reason `visibleItemIds` already returns it.
+  //
+  // ⚠️ `projectScope: null` is NOT the empty set: the oracle attenuates only when the scope is
+  // non-null (`lib/access/oracle.ts:106-110`), so an unscoped token's authority is its launcher's
+  // granted projects. Returning `[]` here would silently blind every unscoped token while every
+  // scoped test stayed green — spec round 2's BLOCKER, and the reason AC3 exists.
+  // ⚠️ ERROR-PATH SYMMETRY (Fable diff review, LOW). `visibleItemIdsForProjects` sets `error: true`
+  // when the substrate read failed, and the id set is then an ERROR-derived empty rather than a
+  // genuine one. Returning the project set anyway would make a failed request serve hand-typed rows
+  // while every SOURCED row was error-suppressed — a strictly WIDER answer than the same failure
+  // produced before AUDITFIX-7. "Substrate error → serve nothing" is the posture everywhere else
+  // here, so the project set is gated on it too.
+  return { ...items, projectIds: items.error ? [] : [...projects] };
 }
 
 /**

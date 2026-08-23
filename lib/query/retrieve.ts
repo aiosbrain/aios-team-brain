@@ -4,7 +4,7 @@ import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { runSql } from "@/lib/db/pg/pool";
-import { newSqlParams, provenanceRowSqlFromIds } from "@/lib/access/provenance-sql";
+import { newSqlParams, provenanceRowSqlFromIds, type MemberTag, type TokenTag } from "@/lib/access/provenance-sql";
 import {
   selectedProviderName,
   type RetrievalProvider,
@@ -145,11 +145,32 @@ const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000
  * (default-deny; the serve test is the POSITIVE `=== "member"`, guard-pinned). Routes assign it;
  * a caller never chooses its own arm.
  */
-export type RetrieveEnforce = {
-  visibleItemIds: ReadonlySet<string>;
-  graphProjectIds?: readonly string[];
-  principal: "member" | "token";
-};
+/**
+ * ⚠️ A DISCRIMINATED UNION, so the token's authority is REQUIRED BY THE TYPE (Codex diff review).
+ *
+ * It was an optional field first, which meant `{ visibleItemIds, principal: "token" }` type-checked
+ * and silently restored pre-AUDITFIX-7 behaviour — the arm closes, no test reddens, and it looks
+ * exactly like the shipped default. An AST guard caught it in the two files it analyses; the type
+ * system now catches it everywhere, including the provider seam that omitted the field entirely.
+ *
+ * `tokenProjectIds` MAY be empty — an empty set closes the arm, which is the correct fail-closed
+ * outcome for a token with no reachable projects. What it may not be is ABSENT.
+ */
+export type RetrieveEnforce =
+  | {
+      visibleItemIds: ReadonlySet<string>;
+      graphProjectIds?: readonly string[];
+      principal: MemberTag;
+      tokenProjectIds?: undefined;
+    }
+  | {
+      visibleItemIds: ReadonlySet<string>;
+      graphProjectIds?: readonly string[];
+      principal: TokenTag;
+      /** The token's effective project set. REQUIRED: an omitted forward looks exactly like the
+       *  fail-closed default and so reddens nothing on its own (the M13 lesson). */
+      tokenProjectIds: readonly string[];
+    };
 
 /** The wire half of the graph leg, injectable for tests (the client was previously constructed
  *  inline, making the partition wiring unpinnable). */
@@ -604,6 +625,10 @@ async function nativeRetrieve(
         // discriminator is the only thing standing between a scoped token and every hand-typed
         // decision in the team. Deriving it here from `tier` would say "member" for every token.
         principal: enforce?.principal,
+        // AUDITFIX-7: this leg is the SECOND token-reachable path to a hand-typed decision. Round 1
+        // of the spec review found acceptance that seeded only a TASK — which would have gated the
+        // task leg correctly and left THIS one open. Forwarded on the same terms.
+        tokenProjectIds: enforce?.tokenProjectIds,
       })
     : Promise.resolve([]);
 
@@ -654,6 +679,10 @@ async function nativeRetrieve(
     visibleItemIds: visibleIds ?? new Set<string>(),
     teamPosture: tier === "team",
     principal: enforce?.principal,
+    // AUDITFIX-7: FORWARDED, never derived. Absent closes the hand-typed arm for a token, which is
+    // the fail-closed direction and also today's behaviour — so a deleted forward reddens nothing on
+    // its own. That is why the guard requires this to be CARRIED alongside `principal`.
+    tokenProjectIds: enforce?.tokenProjectIds,
   };
   const dParams = newSqlParams();
   const dTeam = dParams.add(teamId);

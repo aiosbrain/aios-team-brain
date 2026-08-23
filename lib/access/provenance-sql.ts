@@ -40,21 +40,76 @@ export function newSqlParams(initial: readonly unknown[] = []): SqlParams {
  * WHO is asking. The unsourced (hand-typed) arm is admitted for a MEMBER at team posture and for
  * nobody else — see `admitsUnsourced`.
  *
- * A delegated token's authority is its attenuated scope; a row with no `source_item_id` cannot be
- * tested against that scope, so it can never be shown to one. Absent/foreign values close.
+ * ⚠️ THIS USED TO SAY a row with no `source_item_id` "cannot be tested against that scope, so it can
+ * never be shown to one". **The premise was false** (AUDITFIX-7): hand-entered rows carry
+ * `project_id`, written by the dashboard create actions in the same insert as `created_by`, and both
+ * token-reachable leg queries already join `projects`. A token now sees such a row when its EFFECTIVE
+ * project set contains that project. Absent/foreign values still close.
  */
 export type ProvenancePrincipal = "member" | "token" | undefined;
 
 /**
- * THE POLICY, in one place, expressed POSITIVELY (AUDITFIX-1).
+ * The two discriminant tags, DERIVED rather than re-spelled.
+ *
+ * ⚠️ Written this way for a specific reason: `test/guards/provenance-principal-callsites.test.ts`'s
+ * tree-wide layer flags a bare `"member"` literal outside a listed member-only boundary, and it
+ * cannot distinguish a TYPE annotation (`principal: "member";`) from a value assignment by text —
+ * the two are textually identical. `Extract` gives the discriminated `RetrieveEnforce` union its
+ * arms without introducing a literal the guard would have to be weakened to permit.
+ */
+export type MemberTag = Extract<ProvenancePrincipal, "member">;
+export type TokenTag = Extract<ProvenancePrincipal, "token">;
+
+/**
+ * THE POLICY, in one place, expressed POSITIVELY (AUDITFIX-1) — now three-valued (AUDITFIX-7).
  *
  * Positive on purpose: `principal !== "token"` would admit `undefined`, `null` and any foreign value
  * — and those are real runtime states here, because `tsconfig.json` excludes `test/`, so an omitted
- * discriminator never fails typecheck. Written this way, everything that is not an explicit member at
- * team posture closes.
+ * discriminator never fails typecheck. Everything that is not an explicit member at team posture, or
+ * an explicit token with a project set, closes.
+ *
+ * ⚠️ A UNION IS NOT SELF-ENFORCING. A consumer that branches on `kind !== "closed"` reads `"projects"`
+ * as `"all"` and hands a scoped token the whole corpus — the very widening the union was chosen to
+ * prevent (spec round 2, HIGH 1). Every consumer therefore switches EXHAUSTIVELY with a `never`
+ * check, so a missed branch is a COMPILE error rather than a policy decision nobody made.
  */
-export function admitsUnsourced(ctx: { principal?: ProvenancePrincipal; teamPosture: boolean }): boolean {
-  return ctx.principal === "member" && ctx.teamPosture === true;
+export type UnsourcedAdmission =
+  | { kind: "closed" }
+  | { kind: "all" }
+  | { kind: "projects"; projectIds: readonly string[] };
+
+/** Exhaustiveness helper — the compile error a missed union branch must produce. */
+export function assertNeverAdmission(x: never): never {
+  throw new Error(`unhandled UnsourcedAdmission: ${JSON.stringify(x)}`);
+}
+
+export function unsourcedAdmission(ctx: {
+  principal?: ProvenancePrincipal;
+  teamPosture: boolean;
+  /** The token's EFFECTIVE project set (`effectiveVisibleProjects`). Absent closes. */
+  tokenProjectIds?: readonly string[];
+}): UnsourcedAdmission {
+  if (ctx.principal === "member" && ctx.teamPosture === true) return { kind: "all" };
+  if (ctx.principal === "token") {
+    // ⚠️ THE TOKEN ARM DOES NOT CONSULT `teamPosture`, AND THAT IS ONLY SAFE BECAUSE OF ONE LINE
+    // ELSEWHERE (Fable diff review, MEDIUM). A token's wall is its project authority, not posture —
+    // but if `verifyAgentToken`'s Phase-A refusal of external-tier delegation
+    // (`lib/access/agent-tokens.ts:170`, `if (effectiveTier === "external") return null`) is ever
+    // lifted, an external-posture token would get `{kind:"projects"}` while its own external LAUNCHER
+    // gets `{kind:"closed"}` — the token EXCEEDING its launcher, which `lib/access/enforce.ts:39`
+    // states can never happen. The per-leg `audience = 'external'` conjuncts would be the only
+    // remaining wall, and those are per-leg, not the central policy.
+    // `test/guards/provenance-principal-callsites.test.ts` reddens if that refusal is deleted while
+    // this pin stands, so the coupling cannot be broken silently from either end.
+    const ids = ctx.tokenProjectIds;
+    // An EMPTY set closes EXPLICITLY rather than relying on `= any('{}')` being false: the closed
+    // case is a decision, not an emergent property of SQL. Absent closes for the same reason a
+    // missing discriminator does — a permissive default obtainable by saying nothing is the defect
+    // AUDITFIX-1 exists to have removed.
+    if (ids === undefined || ids.length === 0) return { kind: "closed" };
+    return { kind: "projects", projectIds: ids };
+  }
+  return { kind: "closed" };
 }
 
 export interface ProvenanceSqlCtx {
@@ -66,6 +121,8 @@ export interface ProvenanceSqlCtx {
   grantedProjectIds: readonly string[];
   /** True when the viewer is team posture — the hand-typed arm's audience wall. */
   teamPosture: boolean;
+  /** AUDITFIX-7: a TOKEN's effective project set, gating the hand-typed arm. Absent closes it. */
+  tokenProjectIds?: readonly string[];
 }
 
 /**
@@ -104,12 +161,23 @@ export function itemVisibleSql(expr: string, p: SqlParams, ctx: ProvenanceSqlCtx
  */
 export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSqlCtx): string {
   const sourced = `(${alias}.source_item_id is not null and ${itemVisibleSql(`${alias}.source_item_id`, p, ctx)})`;
-  // The arm is OMITTED, not parameterised false — a token's SQL simply has no hand-typed disjunct.
-  if (!admitsUnsourced(ctx)) return `(${sourced})`;
-  return `(
-    ${sourced}
-    or (${alias}.source_item_id is null and ${alias}.created_by is not null)
-  )`;
+  const authored = `${alias}.source_item_id is null and ${alias}.created_by is not null`;
+  const admission = unsourcedAdmission(ctx);
+  switch (admission.kind) {
+    // The arm is OMITTED, not parameterised false — a closed principal's SQL simply has no disjunct.
+    case "closed":
+      return `(${sourced})`;
+    case "all":
+      return `(\n    ${sourced}\n    or (${authored})\n  )`;
+    case "projects": {
+      // `alias.project_id` always resolves: both columns are NOT NULL in the schema, so a SQL caller
+      // never has to select anything extra (spec §3b — the distinction from the TS owner).
+      const scope = p.add([...admission.projectIds]);
+      return `(\n    ${sourced}\n    or (${authored} and ${alias}.project_id = any(${scope}::uuid[]))\n  )`;
+    }
+    default:
+      return assertNeverAdmission(admission);
+  }
 }
 
 /**
@@ -128,13 +196,28 @@ export function provenanceRowSql(alias: string, p: SqlParams, ctx: ProvenanceSql
 export function provenanceRowSqlFromIds(
   alias: string,
   p: SqlParams,
-  ctx: { visibleItemIds: ReadonlySet<string>; teamPosture: boolean; principal?: ProvenancePrincipal }
+  ctx: {
+    visibleItemIds: ReadonlySet<string>;
+    teamPosture: boolean;
+    principal?: ProvenancePrincipal;
+    /** AUDITFIX-7: the token's effective project set. Absent closes the arm for a token. */
+    tokenProjectIds?: readonly string[];
+  }
 ): string {
   const ids = p.add([...ctx.visibleItemIds]);
   const sourced = `(${alias}.source_item_id is not null and ${alias}.source_item_id = any(${ids}::uuid[]))`;
-  if (!admitsUnsourced(ctx)) return `(${sourced})`;
-  return `(
-    ${sourced}
-    or (${alias}.source_item_id is null and ${alias}.created_by is not null)
-  )`;
+  const authored = `${alias}.source_item_id is null and ${alias}.created_by is not null`;
+  const admission = unsourcedAdmission(ctx);
+  switch (admission.kind) {
+    case "closed":
+      return `(${sourced})`;
+    case "all":
+      return `(\n    ${sourced}\n    or (${authored})\n  )`;
+    case "projects": {
+      const scope = p.add([...admission.projectIds]);
+      return `(\n    ${sourced}\n    or (${authored} and ${alias}.project_id = any(${scope}::uuid[]))\n  )`;
+    }
+    default:
+      return assertNeverAdmission(admission);
+  }
 }

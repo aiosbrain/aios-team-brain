@@ -110,7 +110,8 @@ function filesUnder(dir: string): string[] {
  *   2. no object literal carrying `visibleItemIds` may contain a SPREAD, which could overwrite it;
  *   3. nothing ASSIGNS to a `.principal` property, in any assignment operator;
  *   4. `Reflect.set` / `Object.defineProperty` may not target `principal`;
- *   5. every object literal carrying `visibleItemIds` also carries `principal` — the M13 property,
+ *   5. every object literal carrying `visibleItemIds` also carries `principal` AND `tokenProjectIds`
+ *      (AUDITFIX-7) — the M13 property,
  *      which exists because deleting a forward reddened nothing: it fails closed for a token and
  *      silently drops a MEMBER's hand-typed rows, and no fixture separates that leg from its twin.
  *
@@ -125,6 +126,10 @@ function filesUnder(dir: string): string[] {
  * arms. Read this guard as the fast build-failing layer over a tier that independently proves the
  * outcome — not as the only thing between a token and the hand-typed rows.
  */
+/** The two fields that carry a principal's AUTHORITY. Both are forward-only, and both are equally
+ *  deletable-without-reddening, so every rule below treats them identically. */
+const AUTHORITY_FIELDS = new Set(["principal", "tokenProjectIds"]);
+
 function astViolations(code: string, rel = "inline.ts"): string[] {
   const src = ts.createSourceFile(rel, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bad: string[] = [];
@@ -135,6 +140,13 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
     const inner = ts.isNonNullExpression(e) ? e.expression : e;
     if (!ts.isPropertyAccessExpression(inner)) return false;
     return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "principal";
+  };
+
+  /** The ONE permitted initialiser for the token project set: `enforce?.tokenProjectIds`. */
+  const isForwardedProjects = (e: ts.Expression): boolean => {
+    const inner = ts.isNonNullExpression(e) ? e.expression : e;
+    if (!ts.isPropertyAccessExpression(inner)) return false;
+    return ts.isIdentifier(inner.expression) && inner.expression.text === "enforce" && inner.name.text === "tokenProjectIds";
   };
 
   /** A property's name, resolving a literal COMPUTED key — the spelling Codex demonstrated. */
@@ -148,23 +160,43 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
   };
 
   const visit = (node: ts.Node): void => {
-    // (3) an assignment INTO a `.principal` property, in any assignment operator (`=`, `||=`, `??=`).
+    // (3) an assignment INTO an authority property, in any assignment operator (`=`, `||=`, `??=`).
+    // ⚠️ BOTH FIELDS, symmetrically (Codex diff review). This checked `principal` only, so the
+    // literal could be built correctly and then mutated:
+    //     const ctx = { …, tokenProjectIds: enforce?.tokenProjectIds };
+    //     ctx.tokenProjectIds = ["out-of-scope-project"];
+    // — which passed the object-literal rule and admitted that project. A carry rule that inspects
+    // only construction is a rule about the first line, not about the value.
     if (
       ts.isBinaryExpression(node) &&
       ts.isPropertyAccessExpression(node.left) &&
-      node.left.name.text === "principal" &&
+      AUTHORITY_FIELDS.has(node.left.name.text) &&
       node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
       node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
     ) {
-      bad.push(`${at(node)} assigns to .principal — this file may only FORWARD it`);
+      bad.push(`${at(node)} assigns to .${node.left.name.text} — this file may only FORWARD it`);
     }
 
     // (4) reaching it reflectively.
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
       const callee = `${node.expression.expression.getText(src)}.${node.expression.name.text}`;
       if (callee === "Reflect.set" || callee === "Object.defineProperty") {
-        if (node.arguments.some((a) => ts.isStringLiteralLike(a) && a.text === "principal")) {
-          bad.push(`${at(node)} sets .principal via ${callee}`);
+        // These name the field as a STRING ARGUMENT.
+        if (node.arguments.some((a) => ts.isStringLiteralLike(a) && AUTHORITY_FIELDS.has(a.text))) {
+          bad.push(`${at(node)} sets an authority field via ${callee}`);
+        }
+      }
+      if (callee === "Object.assign") {
+        // ⚠️ DIFFERENT SHAPE, and the first version of this rule missed it: `Object.assign` names the
+        // field as a KEY INSIDE an object-literal argument, not as a string argument. Reusing the
+        // string-argument test read as coverage and provided none — caught by its own mutation
+        // surviving.
+        for (const a of node.arguments) {
+          if (!ts.isObjectLiteralExpression(a)) continue;
+          for (const prop of a.properties) {
+            const n = nameOf(prop);
+            if (n && AUTHORITY_FIELDS.has(n)) bad.push(`${at(prop)} sets .${n} via Object.assign`);
+          }
         }
       }
     }
@@ -190,6 +222,25 @@ function astViolations(code: string, rel = "inline.ts"): string[] {
         if (spread) bad.push(`${at(spread)} spread into a provenance ctx can overwrite principal`);
         // (5) the M13 property — carry it, don't merely be able to.
         if (!names.includes("principal")) bad.push(`${at(node)} provenance ctx omits principal`);
+        // (6) AUDITFIX-7: the token's project set is equally load-bearing and equally deletable.
+        // Deleting the forward closes the hand-typed arm for every token — which is EXACTLY today's
+        // behaviour, so no token test would notice and no mutation would redden. Same reasoning that
+        // put `principal` here: an absent forward is indistinguishable from the fail-closed default.
+        if (!names.includes("tokenProjectIds")) {
+          bad.push(`${at(node)} provenance ctx omits tokenProjectIds — a token's hand-typed arm closes silently`);
+        } else {
+          // Fable diff review, LOW: presence alone was ASYMMETRIC with rule (1), which requires
+          // `principal` to be initialised to exactly `enforce?.principal`. `tokenProjectIds: undefined`
+          // or a locally recomputed set satisfied mere presence — and recomputing the authority is a
+          // second oracle read free to disagree with the first, which is the whole reason
+          // `delegatedVisibleItemIds` returns it. Same rule, same shape, both fields.
+          const prop = node.properties[names.indexOf("tokenProjectIds")];
+          if (prop && ts.isPropertyAssignment(prop) && !isForwardedProjects(prop.initializer)) {
+            bad.push(`${at(prop)} tokenProjectIds is \`${prop.initializer.getText(src)}\`, not enforce?.tokenProjectIds`);
+          } else if (prop && ts.isShorthandPropertyAssignment(prop)) {
+            bad.push(`${at(prop)} shorthand \`{ tokenProjectIds }\` — forwarding cannot be spelled that way`);
+          }
+        }
       }
     }
     ts.forEachChild(node, visit);
@@ -242,24 +293,40 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     // Each of these passed the regex guard at some point in this slice's history. They are kept as
     // negative controls so a future simplification of the walk reddens here rather than silently
     // reopening the hole.
-    const FORWARD = "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };";
+    const FORWARD = "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };";
     const EVASIONS: [string, string][] = [
-      ["literal", 'const ctx = { visibleItemIds, teamPosture, principal: "member" };'],
-      ["named constant", "const ctx = { visibleItemIds, teamPosture, principal: MEMBER_ONLY_SURFACE };"],
+      ["literal", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: "member" };'],
+      ["named constant", "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: MEMBER_ONLY_SURFACE };"],
       [
         "local binding + shorthand (Fable's HIGH)",
-        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, principal };',
+        'const principal = "member" as ProvenancePrincipal;\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal };',
       ],
-      ["computed key", 'const ctx = { visibleItemIds, teamPosture, ["principal"]: "member" };'],
+      [
+        "AUDITFIX-7: tokenProjectIds RECOMPUTED rather than forwarded (a second oracle read free to disagree)",
+        "const ctx = { visibleItemIds, teamPosture, tokenProjectIds: await recomputeProjects(), principal: enforce?.principal };",
+      ],
+      [
+        "AUDITFIX-7: tokenProjectIds omitted (closes every token's hand-typed arm SILENTLY)",
+        "const ctx = { visibleItemIds, teamPosture, principal: enforce?.principal };",
+      ],
+      ["computed key", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds, ["principal"]: "member" };'],
       [
         "spread override",
-        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, principal: enforce?.principal, ...o };',
+        'const o = { principal: "member" };\nconst ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal, ...o };',
       ],
       ["direct assignment", `${FORWARD}\nenforce!.principal = "member";`],
+      // ⚠️ Codex's diff review demonstrated this exact bypass: build the literal CORRECTLY, then
+      // mutate it one line later. The object-literal rule inspects construction; it says nothing
+      // about the value. Both authority fields, all three reflective shapes.
+      ["post-construction mutation of tokenProjectIds", `${FORWARD}\nctx.tokenProjectIds = ["out-of-scope"];`],
+      ["post-construction mutation of principal", `${FORWARD}\nctx.principal = "member";`],
+      ["Object.assign over tokenProjectIds", `${FORWARD}\nObject.assign(ctx, { "tokenProjectIds": ["out-of-scope"] });`],
+      ["Object.assign over principal", `${FORWARD}\nObject.assign(ctx, { "principal": "member" });`],
+      ["Reflect.set over tokenProjectIds", `${FORWARD}\nReflect.set(ctx, "tokenProjectIds", ["out-of-scope"]);`],
       ["logical-or assignment", `${FORWARD}\nenforce!.principal ||= "member";`],
       ["Reflect.set", `${FORWARD}\nReflect.set(enforce, "principal", "member");`],
       ["defineProperty", `${FORWARD}\nObject.defineProperty(enforce, "principal", { value: "member" });`],
-      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, principal: tier === "team" ? "member" : "token" };'],
+      ["derived from tier", 'const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: tier === "team" ? "member" : "token" };'],
       ["omitted entirely (M13)", "const ctx = { visibleItemIds, teamPosture };"],
       ["as-const literal", 'const ctx = { visibleItemIds, principal: "member" as const };'],
     ];
@@ -269,7 +336,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
 
     // …and it must ACCEPT the one legal shape, or it is a check that always fails.
     expect(astViolations(FORWARD), "forwarding must pass").toEqual([]);
-    expect(astViolations("const ctx = { visibleItemIds, teamPosture, principal: enforce.principal };")).toEqual([]);
+    expect(astViolations("const ctx = { visibleItemIds, teamPosture, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce.principal };")).toEqual([]);
     // The three shapes that broke the hand-rolled scanner, all now handled by the parser.
     expect(
       astViolations('interface E { visibleItemIds: ReadonlySet<string>; principal?: "member" | "token" }'),
@@ -277,7 +344,7 @@ describe("guard: a token can never acquire member provenance semantics", () => {
     ).toEqual([]);
     expect(astViolations("const { visibleItemIds } = enforce;"), "destructuring is not a construction").toEqual([]);
     expect(
-      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, principal: enforce?.principal };'),
+      astViolations('const s = "{ visibleItemIds }";\nconst ctx = { visibleItemIds, tokenProjectIds: enforce?.tokenProjectIds, principal: enforce?.principal };'),
       "a brace inside a string no longer misleads anything"
     ).toEqual([]);
   });
@@ -323,5 +390,27 @@ describe("guard: a token can never acquire member provenance semantics", () => {
         "hand-typed arm — OR the file genuinely no longer needs the entry. Check which before " +
         "deleting the allow-list line."
     ).toEqual([]);
+  });
+
+  it("AUDITFIX-7: the token arm's posture-free pin stays coupled to the external-delegation refusal", () => {
+    // Fable diff review, MEDIUM. `unsourcedAdmission`'s token branch deliberately does NOT consult
+    // `teamPosture` — a token's wall is its project authority. That is only SAFE because
+    // `verifyAgentToken` refuses external-tier delegation outright, so no live token is ever at
+    // external posture. If that refusal is lifted while the pin stands, an external-posture TOKEN
+    // would be admitted where its own external LAUNCHER is closed — the token exceeding its
+    // launcher, which lib/access/enforce.ts states can never happen.
+    //
+    // The coupling was written in a comment and enforced by nothing. Now deleting either end reddens.
+    const tokens = read("lib/access/agent-tokens.ts");
+    expect(
+      tokens,
+      "verifyAgentToken must still refuse external-tier delegation — the token arm's posture-free pin depends on it"
+    ).toMatch(/if\s*\(\s*effectiveTier\s*===\s*"external"\s*\)\s*return\s+null\s*;/);
+
+    const policy = read("lib/access/provenance-sql.ts");
+    expect(
+      policy,
+      "if the token arm ever DOES consult teamPosture, this guard has outlived its premise — delete it deliberately"
+    ).toMatch(/if \(ctx\.principal === "token"\) \{[\s\S]{0,1200}?const ids = ctx\.tokenProjectIds;/);
   });
 });

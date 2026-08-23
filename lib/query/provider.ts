@@ -57,7 +57,10 @@ export interface RetrievalRequest {
    *  public entry throws without it, and this seam (independently callable) yields
    *  `principal: undefined`, which CLOSES the hand-typed structured arm (AUDITFIX-1 §2d).
    *  Never synthesise "member" here: that is the sentence that would reopen the leak. */
-  enforce?: { visibleItemIds: ReadonlySet<string>; graphProjectIds?: readonly string[]; principal: "member" | "token" } | null;
+  /** AUDITFIX-7: reuses `RetrieveEnforce` rather than restating its shape. The restated version
+   *  omitted `tokenProjectIds` entirely, so this seam could construct a token enforce that silently
+   *  closed the hand-typed arm — the drift a duplicated type invites (Codex diff review). */
+  enforce?: import("@/lib/query/retrieve").RetrieveEnforce | null;
 }
 
 /** A context layer. Swap the default by implementing this and selecting via CONTEXT_PROVIDER. */
