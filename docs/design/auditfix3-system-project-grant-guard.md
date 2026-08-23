@@ -52,11 +52,29 @@ restriction semantics". That holds for the project's **own items** and is silent
 
 ### 0c. TIERRET-1 makes this WORSE, not better
 
-The item primitive already has no tier conjunct (`lib/access/enforce.ts:9-12,69-89`), so a
-mis-granted group **already reads the whole General item corpus today**. What still partially masks a
-bad grant are the `audience` conjuncts TIERRET-1 removes (`lib/query/retrieve.ts:660,683`,
-`structured-extras.ts:26,73`, `grounding.ts:43`, two item routes). **Retiring them widens what a bad
-grant yields**, so this slice is a prerequisite for that one rather than a beneficiary of it.
+The **item-id primitive** has no tier conjunct — `visibleItemIdsForProjects`
+(`lib/access/enforce.ts:69-89`) filters on membership alone, and the module header says so outright:
+*"there is no mode, no flag, and no posture wall … the retired tier conjunct never overrides it"*
+(`:9-12`). So a mis-granted group **already reads the whole General item corpus today**, through
+retrieval and the item routes.
+
+⚠️ **But "the item primitive has no tier conjunct" is NOT true of the whole module, and I checked
+before a reviewer did.** `visibleProjectRows` and `visibleProjectCards` DO carry one —
+`(${posture} or i.access = 'external')` at `enforce.ts:295` and `:365`, deliberately, so a member's
+row-visibility cannot exceed what the container's own surfaces would list. Those are *project-row*
+surfaces, not the item read, and they are in TIERRET-1's removal set too.
+
+What still partially masks a bad grant, verified by grep rather than asserted:
+
+| file | conjunct |
+|---|---|
+| `lib/query/retrieve.ts` | 2 × `audience = 'external'` (tasks + decisions) |
+| `lib/query/structured-extras.ts` | 2 × `audience = 'external'` |
+| `lib/query/grounding.ts:43` | `and access = 'external'` — ⚠️ *`access`, not `audience`; my first draft named the wrong column* |
+| `lib/access/enforce.ts:295,365` | the project-row posture wall above |
+
+**Retiring them widens what a bad grant yields**, so this slice is a prerequisite for that one rather
+than a beneficiary of it.
 
 ### 0d. Production state (read-only, 2026-08-23)
 
