@@ -128,6 +128,51 @@ function clientWithFailingRead(table: string, message = "injected read failure")
   }) as DbClient;
 }
 
+/**
+ * A client whose SELECTs on one table fail while its WRITES go through for real.
+ *
+ * ⚠️ This exists because the blunt version defeated its own criterion. AC17 must prove that a
+ * faulted existence probe does not fall through to the upsert — but an injector that fails EVERY
+ * `project_groups` operation also fails the upsert, so `ok:false` and an unchanged `added_by` hold
+ * whether or not the probe's error is checked. The mutation "swallow the probe error" SURVIVED
+ * against it. Failing only the read lets the damage actually happen when the check is removed.
+ */
+function clientWithFailingSelect(table: string, message = "injected read failure"): DbClient {
+  const real = db();
+  const injected = { data: null, error: { message } };
+  return new Proxy(real as object, {
+    get(target, prop, recv) {
+      if (prop !== "from") return Reflect.get(target, prop, recv);
+      return (name: string) => {
+        const q = (target as { from: (n: string) => unknown }).from(name);
+        if (name !== table) return q;
+        let isWrite = false;
+        const wrap = (builder: object): unknown =>
+          new Proxy(builder, {
+            get(bt, bp, br) {
+              const v = Reflect.get(bt, bp, br);
+              if (bp === "then") {
+                if (isWrite) return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(bt) : v;
+                return (res: (x: unknown) => unknown) => res(injected);
+              }
+              if (typeof v !== "function") return v;
+              return (...args: unknown[]) => {
+                if (bp === "insert" || bp === "upsert" || bp === "update" || bp === "delete") isWrite = true;
+                const r = (v as (...a: unknown[]) => unknown).apply(bt, args);
+                // single()/maybeSingle() resolve directly rather than returning the builder.
+                if (bp === "single" || bp === "maybeSingle") {
+                  return isWrite ? r : { then: (res: (x: unknown) => unknown) => res(injected) };
+                }
+                return r === bt ? br : wrap(r as object);
+              };
+            },
+          });
+        return wrap(q as object);
+      };
+    },
+  }) as DbClient;
+}
+
 /** A client whose `project_groups` reads SUCCEED with a row whose embedded group is null — the
  *  shape the FK makes unreachable in Postgres, and the branch a future left-join would need. */
 function clientWithNullGroupCensus(groupId: string): DbClient {
@@ -376,7 +421,7 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     // Verify the row FIRST, so a later refusal cannot pass because something claimed it was absent.
     expect(await projectKind(preAdoption)).toBe("source");
 
-    const r = await ensureAccessBootstrap(clientWithFailingRead("project_groups", "census exploded"), seed.teamId);
+    const r = await ensureAccessBootstrap(clientWithFailingSelect("project_groups", "census exploded"), seed.teamId);
     expect(r.ok).toBe(false);
     expect(r.error, "attributable to the census, not to a missing row").toMatch(/census exploded|census/i);
     expect(await projectKind(preAdoption), "an undetermined read must not promote").toBe("source");
@@ -417,7 +462,8 @@ describe("AUDITFIX-3: a system project's grants are the substrate's, and nothing
     await db().from("project_groups").update({ added_by: admin }).eq("team_id", seed.teamId).eq("project_id", general).eq("group_id", everyone);
     const auditsBefore = await grantAudits(seed);
 
-    const r = await grantProjectToGroup(clientWithFailingRead("project_groups", "probe exploded"), seed.teamId, general, everyone, null, {});
+    // Reads only: the upsert must be free to do its damage if the probe's error is swallowed.
+    const r = await grantProjectToGroup(clientWithFailingSelect("project_groups", "probe exploded"), seed.teamId, general, everyone, null, {});
     expect(r.ok, "a read failure must not be read as 'no edge yet'").toBe(false);
     const { data } = await db().from("project_groups").select("added_by").eq("team_id", seed.teamId).eq("project_id", general).eq("group_id", everyone).single();
     expect((data as { added_by: string | null }).added_by, "added_by must not be re-clobbered").toBe(admin);
