@@ -52,9 +52,25 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     expect(read("app/actions/projects.ts")).toMatch(/kind:\s*"initiative"/);
   });
 
-  it("the scheduler tick runs the convergence leg", () => {
-    const source = read("lib/ingest/scheduler.ts");
-    expect(source).toMatch(/await runAccessBootstrap\(db\);/);
-    expect(source).toMatch(/ensureAccessBootstrapAllTeams/);
+  it("the scheduler tick runs the convergence leg — through the extracted ledger module", () => {
+    // AUDITFIX-22 moved the leg's body out of the scheduler closure into
+    // lib/ingest/access-bootstrap-leg so the ledger contract is testable against real Postgres
+    // (the closure was unreachable from any test). The INVARIANT is unchanged and still pinned
+    // end to end: the tick calls the leg, and the leg calls the convergence wrapper. Asserting
+    // only the scheduler would let the extraction become a no-op that converges nothing.
+    const scheduler = read("lib/ingest/scheduler.ts");
+    expect(scheduler).toMatch(/await runAccessBootstrap\(db\);/);
+    expect(scheduler).toMatch(/runAccessBootstrapLeg/);
+    const leg = read("lib/ingest/access-bootstrap-leg.ts");
+    expect(leg).toMatch(/ensureAccessBootstrapAllTeams/);
+  });
+
+  it("the ledger leg writes a per-team row and reserves the instance-wide row for fleet failure", () => {
+    // AUDITFIX-22's whole point: a global ok:true heartbeat every tick is what masked a wedged
+    // team's failure under `newest`. If the unconditional instance-wide write ever comes back,
+    // the leg silently returns to hiding per-team failures.
+    const leg = read("lib/ingest/access-bootstrap-leg.ts");
+    expect(leg, "the per-team row is written from the wrapper's callback").toMatch(/onOutcome/);
+    expect(leg, "and the instance-wide row is conditional").toMatch(/if \(globalFailure \|\| r\.teams === 0\)/);
   });
 });

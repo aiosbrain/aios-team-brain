@@ -149,13 +149,31 @@ export async function ensureAccessBootstrap(db: DbClient, teamId: string): Promi
   return { ok: true };
 }
 
+/** AUDITFIX-22: one team's convergence result, handed to the caller as that team FINISHES. */
+export interface TeamBootstrapOutcome {
+  teamId: string;
+  ok: boolean;
+  error?: string;
+}
+
 /**
  * Convergence over every team — the scheduler-tick backstop. Best-effort per team: one team's
  * failure never blocks another's bootstrap; failures surface through the ingest-run trace the
  * scheduler leg records, not by throwing.
+ *
+ * AUDITFIX-22: `onOutcome` fires as each team COMPLETES, success or failure, so the ledger row can
+ * be written per team instead of from the summary after the loop. That ordering is the point — a
+ * summary cannot be recorded until the last team finishes, so one slow team would delay every
+ * team's row and a process death would lose all of them.
+ *
+ * The callback is invoked inside its OWN guard, separate from the per-team convergence guard. A
+ * throw from it must neither abort the remaining teams (observability taking ingestion down, the
+ * inverse of `lib/ingest/runs`'s never-throw charter) nor be recorded as that team's bootstrap
+ * failure, which is what would happen if it shared the try above.
  */
 export async function ensureAccessBootstrapAllTeams(
-  db: DbClient
+  db: DbClient,
+  opts: { onOutcome?: (outcome: TeamBootstrapOutcome) => Promise<void> | void } = {}
 ): Promise<{ teams: number; failed: { teamId: string; error: string }[] }> {
   const { data: teams, error: tErr } = await db.from("teams").select("id");
   // A failed teams read must NOT report a green run — an instance whose read persistently
@@ -163,11 +181,23 @@ export async function ensureAccessBootstrapAllTeams(
   if (tErr) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${tErr.message}` }] };
   const failed: { teamId: string; error: string }[] = [];
   for (const t of (teams ?? []) as { id: string }[]) {
+    let outcome: TeamBootstrapOutcome;
     try {
       const r = await ensureAccessBootstrap(db, t.id);
       if (!r.ok) failed.push({ teamId: t.id, error: r.error ?? "unknown" });
+      outcome = r.ok ? { teamId: t.id, ok: true } : { teamId: t.id, ok: false, error: r.error ?? "unknown" };
     } catch (e) {
-      failed.push({ teamId: t.id, error: e instanceof Error ? e.message : "threw" });
+      const error = e instanceof Error ? e.message : "threw";
+      failed.push({ teamId: t.id, error });
+      outcome = { teamId: t.id, ok: false, error };
+    }
+    if (opts.onOutcome) {
+      try {
+        await opts.onOutcome(outcome);
+      } catch {
+        // The ledger write is observability; it may not take convergence down, and it may not be
+        // attributed to this team's bootstrap either — the outcome above already says what happened.
+      }
     }
   }
   return { teams: (teams ?? []).length, failed };

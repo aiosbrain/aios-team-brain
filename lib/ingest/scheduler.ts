@@ -291,68 +291,15 @@ export function startIngestScheduler(): void {
   // Create meeting notes for freshly-synced meeting transcripts, per team. Best-effort; idempotent
   // (already-noted items are skipped), so this is a cheap no-op once caught up.
   async function runAccessBootstrap(db: ReturnType<typeof adminClient>): Promise<void> {
-    const startedAt = Date.now();
+    // AUDITFIX-22: the leg's whole contract — per-team rows every tick, the instance-wide row only
+    // for a fleet-level failure or an empty fleet — lives in lib/ingest/access-bootstrap-leg so it
+    // is testable against a real Postgres. Read that module's header before changing anything here;
+    // `trigger` in particular is load-bearing and no behavioural test can catch getting it wrong.
     try {
-      const { ensureAccessBootstrapAllTeams } = await import("@/lib/access/bootstrap");
-      const { recordIngestRun } = await import("@/lib/ingest/runs");
-      const r = await ensureAccessBootstrapAllTeams(db);
-      // Failures are recorded PER TEAM with the actual refusal/error text — a single instance-wide
-      // failed row would have turned every team's admin banner red while hiding the cause in meta
-      // (slice-3 Codex Medium). The instance-wide row stays the every-tick heartbeat for staleness.
-      //
-      // ⚠️ THIS COMMENT USED TO SAY the per-team row "reds only THAT team's health card". IT DOES
-      // NOT, and AUDITFIX-3's spec review proved it: the instance-wide row below is written AFTER
-      // these, and getPipelineHealth's `newest` CTE is `distinct on (source)` over
-      // `team_id = $1 or team_id is null` ordered `finished_at desc, id desc`
-      // (lib/ingest/pipeline-health.ts) — so the later global ok=true row WINS and the per-team
-      // failure is invisible on the card. A team wedged by a reserved-slug squatter (an initiative
-      // here, and after AUDITFIX-3 also a source row carrying a forbidden grant) is therefore
-      // silent on THIS leg; it surfaces downstream instead, because backfillTeamContext re-runs
-      // ensureAccessBootstrap and returns before any item, and context_backfill DOES write per-team
-      // rows on success as well as failure with its heartbeat under a distinct
-      // 'context_backfill_all' source (search that name; a line number here would rot on the next
-      // edit above it) — which is exactly the shape this leg needs. Fixing it is AUDITFIX-22; do not "fix" it by reddening the global row, which is the
-      // decision the paragraph above records.
-      for (const f of r.failed) {
-        if (f.teamId === "*") continue; // teams-read failure → instance row below carries it
-        await recordIngestRun(db, {
-          teamId: f.teamId,
-          source: "access_bootstrap",
-          trigger: "scheduler",
-          ok: false,
-          created: 0,
-          errors: [f.error],
-          startedAt,
-        });
-      }
-      const globalFailure = r.failed.find((f) => f.teamId === "*");
-      await recordIngestRun(db, {
-        teamId: null,
-        source: "access_bootstrap",
-        trigger: "scheduler",
-        ok: !globalFailure,
-        created: 0,
-        errors: globalFailure ? [globalFailure.error] : undefined,
-        meta: { teams: r.teams, failedTeams: r.failed.length },
-        startedAt,
-      });
+      const { runAccessBootstrapLeg } = await import("@/lib/ingest/access-bootstrap-leg");
+      await runAccessBootstrapLeg(db, { startedAt: Date.now() });
     } catch (err) {
-      // An unexpected throw must still leave a failed trace — a silent catch left the
-      // previous green row standing until it aged stale (slice-3 Codex Low).
-      try {
-        const { recordIngestRun } = await import("@/lib/ingest/runs");
-        await recordIngestRun(db, {
-          teamId: null,
-          source: "access_bootstrap",
-          trigger: "scheduler",
-          ok: false,
-          created: 0,
-          errors: [err instanceof Error ? err.message : "bootstrap threw"],
-          startedAt,
-        });
-      } catch {
-        // recording itself failed — the console line below is the last resort
-      }
+      // The leg already recorded the fleet-level failure row; this is the operator-visible log.
       console.error("[ingest] access bootstrap failed", err);
     }
   }
