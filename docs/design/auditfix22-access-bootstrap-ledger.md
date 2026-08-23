@@ -295,7 +295,7 @@ round 2 B2).
 | 1 | write the per-team row only on failure | AC3 |
 | 2 | write a global `ok:true` row on ordinary ticks, AFTER the per-team rows | AC4 |
 | 3 | write that global success row BEFORE the per-team rows | AC4 |
-| 4 | make the global row's `ok` ignore a fleet-level failure | AC5 |
+| 4 | make the global row report success on a fleet-level failure — **`ok` AND `errors` together** | AC5 |
 | 5 | skip the global row when zero teams are enumerated | AC6 |
 | 6 | write `ok:false` for the zero-teams heartbeat | AC6 |
 | 7 | drop the team-creation row | AC7 |
@@ -306,6 +306,13 @@ round 2 B2).
 | 11 | give the per-team tick row a non-`scheduler` trigger | AC11 |
 | 12 | give the creation row `trigger: 'scheduler'` | AC12 |
 | 13 | let a callback throw escape the wrapper's guard | AC9 |
+
+⚠️ **Mutation 4 must change `ok` AND `errors` together, and finding that out cost a SURVIVED run.**
+`recordIngestRun` derives `ok: run.ok && errors.length === 0` (`lib/ingest/runs.ts:67`), so flipping
+`ok: !globalFailure` to `ok: true` alone is silently corrected by that sibling layer and the row still
+lands `ok:false` — the mutation tests nothing. The product is better for the redundancy; the mutation
+had to defeat it to say anything about THIS module. Same class as the defence-in-depth masking that has
+bitten this repo before.
 
 ⚠️ *Mutations 2 and 3 are separate because ordering decides observability, and mutation 10 exists
 because a double-write is invisible to every criterion that only asserts `confirmed`. Round 2 found
