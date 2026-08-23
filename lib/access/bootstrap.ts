@@ -5,10 +5,12 @@ import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import {
   EVERYONE_SLUG,
   EXTERNAL_SLUG,
+  censusUnsanctionedSystemEdges,
   ensureBuiltins,
   grantProjectToGroup,
   type WriteResult,
 } from "@/lib/access/groups";
+
 
 /**
  * §11 access bootstrap — the app-code "migration" that gives every team its built-in access
@@ -23,8 +25,10 @@ import {
  *                                                            today; not vice versa)
  */
 
-export const GENERAL_SLUG = "general";
-export const EXTERNAL_SHARED_SLUG = "external-shared";
+/** Definition moved to lib/access/system-projects (AUDITFIX-3) so the sanctioned-edge table, the
+ *  groups writer and this bootstrap share one source. Re-exported: no call site moves. */
+export { EXTERNAL_SHARED_SLUG, GENERAL_SLUG } from "@/lib/access/system-projects";
+import { EXTERNAL_SHARED_SLUG, GENERAL_SLUG } from "@/lib/access/system-projects";
 
 type ProjectRow = { id: string; kind: string };
 
@@ -61,6 +65,9 @@ async function ensureSystemProject(
       if (row.kind !== "source") {
         return { ok: false, error: `a kind='${row.kind}' project holds reserved slug '${slug}' — refusing to adopt it` };
       }
+      // AUDITFIX-3 §2b: census the row's grants BEFORE the flip. Fails closed.
+      const census = await censusUnsanctionedSystemEdges(db, teamId, row.id, slug);
+      if (!census.ok) return { ok: false, error: census.error };
       // Conditioned on kind='source' so a concurrent kind change after the refusal check
       // can't be clobbered, and only the caller that actually flipped the row audits.
       const { data: flipped, error } = await db

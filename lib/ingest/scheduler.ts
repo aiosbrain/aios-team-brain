@@ -296,11 +296,23 @@ export function startIngestScheduler(): void {
       const { ensureAccessBootstrapAllTeams } = await import("@/lib/access/bootstrap");
       const { recordIngestRun } = await import("@/lib/ingest/runs");
       const r = await ensureAccessBootstrapAllTeams(db);
-      // Failures are recorded PER TEAM with the actual refusal/error text, so one team's
-      // permanent refusal (an initiative squatting 'general') reds only THAT team's health
-      // card — a single instance-wide failed row would have turned every team's admin banner
-      // red while hiding the cause in meta (slice-3 Codex Medium). The instance-wide row
-      // stays the every-tick heartbeat for staleness.
+      // Failures are recorded PER TEAM with the actual refusal/error text — a single instance-wide
+      // failed row would have turned every team's admin banner red while hiding the cause in meta
+      // (slice-3 Codex Medium). The instance-wide row stays the every-tick heartbeat for staleness.
+      //
+      // ⚠️ THIS COMMENT USED TO SAY the per-team row "reds only THAT team's health card". IT DOES
+      // NOT, and AUDITFIX-3's spec review proved it: the instance-wide row below is written AFTER
+      // these, and getPipelineHealth's `newest` CTE is `distinct on (source)` over
+      // `team_id = $1 or team_id is null` ordered `finished_at desc, id desc`
+      // (lib/ingest/pipeline-health.ts) — so the later global ok=true row WINS and the per-team
+      // failure is invisible on the card. A team wedged by a reserved-slug squatter (an initiative
+      // here, and after AUDITFIX-3 also a source row carrying a forbidden grant) is therefore
+      // silent on THIS leg; it surfaces downstream instead, because backfillTeamContext re-runs
+      // ensureAccessBootstrap and returns before any item, and context_backfill DOES write per-team
+      // rows on success as well as failure with its heartbeat under a distinct
+      // 'context_backfill_all' source (below, ~line 427) — which is exactly the shape this leg
+      // needs. Fixing it is AUDITFIX-22; do not "fix" it by reddening the global row, which is the
+      // decision the paragraph above records.
       for (const f of r.failed) {
         if (f.teamId === "*") continue; // teams-read failure → instance row below carries it
         await recordIngestRun(db, {
