@@ -415,7 +415,10 @@ unpinned for an implementation to key on.
 - **AC8 — bootstrap still REFUSES to adopt that initiative (dm):** `ensureSystemProject` leaves
   `kind='initiative'` and errors. *The shipped `bootstrap.ts:57-60` behaviour AC7 depends on.*
 - **AC9 — a NON-reserved, non-system project is unaffected (dm):** an ordinary initiative grants
-  normally under T1 and T3. *The guard must not become a general-purpose refusal.*
+  normally under T1 and T3 — `ok:true` **and `created:true`**, with both `project_groups` rows read
+  back. *The guard must not become a general-purpose refusal — and `ok:true` alone does not say that:
+  a guard returning `{ok:true, created:false}` for every unprotected project satisfies it while
+  writing nothing, and AC1 pins only the three sanctioned edges (Codex diff review).*
 - **AC10 — a PRE-EXISTING forbidden edge is REFUSED, not reported as success (dm):** seed the edge
   out-of-band (raw insert — the precedent is
   `test/datamechanics/access-groups.datamechanics.test.ts:275`; the single-writer guard scans
@@ -482,9 +485,10 @@ criterion, not merely some criterion.
 | 12 | swallow the census read error | AC14 |
 | 13 | treat a null `groups` embed as sanctioned | AC15 |
 | 14 | swallow the grant existence-probe error | AC17 |
+| 15 | no-op the guard on an UNPROTECTED project (`return {ok:true, created:false}`) | AC9 |
 
-*Rows 4, 5, 6, 7, 9 and 13 all exist because a review found the enforcement point unobservable through
-the criteria as written — five of the fourteen. An omitted mutation is how the last slice shipped a
+*Rows 4, 5, 6, 7, 9, 13 and 15 all exist because a review found the enforcement point unobservable
+through the criteria as written — seven of the fifteen. An omitted mutation is how the last slice shipped a
 guard that two SQL owners shared one fixture for.*
 
 ## 5. Risks
