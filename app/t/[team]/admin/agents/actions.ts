@@ -5,6 +5,7 @@ import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { mintAgentToken, revokeAgentToken, type MintResult } from "@/lib/access/agent-tokens";
 import { validateMintRequest, type MintRequest } from "@/lib/access/agent-token-policy";
+import { visibleProjectRows } from "@/lib/access/enforce";
 
 /**
  * Cache revalidation must never be able to discard an already-minted credential. `revalidatePath`
@@ -46,6 +47,19 @@ export async function mintAgentTokenAction(
 
   const policy = validateMintRequest(input, Date.now());
   if (!policy.ok) return { ok: false, error: policy.error };
+
+  // SCOPE ⊆ WHAT THE ADMIN CAN SEE. The picker only offers visible projects, but the picker is a
+  // web page and this is a public endpoint — the property has to hold here or it is not a property.
+  // (Fable diff review: the claim was stated at the boundary and enforced only in the UX, which is
+  // the exact shape this whole slice exists to repudiate.) Fail-closed: a substrate error yields an
+  // empty visible set, so a scoped mint is refused rather than waved through.
+  if (input.projectScope != null) {
+    const visible = await visibleProjectRows(adminClient(), { teamId: ctx.teamId, memberId: ctx.memberId });
+    const unseen = input.projectScope.filter((id) => !visible.ids.has(id));
+    if (unseen.length > 0) {
+      return { ok: false, error: "projectScope names project(s) you cannot see" };
+    }
+  }
 
   const result = await mintAgentToken(
     adminClient(),

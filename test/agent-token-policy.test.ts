@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+  canSubmitMint,
   validateMintRequest,
   MAX_TOKEN_LIFETIME_MS,
   DEFAULT_TOKEN_LIFETIME_DAYS,
@@ -114,5 +117,60 @@ describe("agent token mint policy", () => {
 
   it("the form's default lifetime is inside the cap the action enforces (one constant, two readers)", () => {
     expect(DEFAULT_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000).toBeLessThan(MAX_TOKEN_LIFETIME_MS);
+  });
+});
+
+/**
+ * SPEC AC (agent-tokens-admin-ui-v1.md "Automated"): the form's scope+expiry contract. Extracted to
+ * a pure rule so it is pinned by assertions rather than by reading JSX — the "untouched scope
+ * silently inherits everything" hazard is the fail-open direction both spec reviewers flagged.
+ */
+describe("mint form submit rule", () => {
+  const base = { memberId: MEMBER, expiry: "2026-12-01" };
+
+  it("an UNTOUCHED scope is not submittable — never a silent inherit", () => {
+    expect(canSubmitMint({ ...base, scope: null })).toBe(false);
+  });
+
+  it("a deliberate inherit IS submittable", () => {
+    expect(canSubmitMint({ ...base, scope: { kind: "inherit" } })).toBe(true);
+  });
+
+  it("restrict with zero projects is not submittable — never a silent 'sees nothing'", () => {
+    expect(canSubmitMint({ ...base, scope: { kind: "restrict", projectIds: [] } })).toBe(false);
+  });
+
+  it("restrict with one project is submittable", () => {
+    expect(canSubmitMint({ ...base, scope: { kind: "restrict", projectIds: [PROJECT] } })).toBe(true);
+  });
+
+  it("a missing member or a cleared expiry blocks submit", () => {
+    expect(canSubmitMint({ memberId: "", expiry: "2026-12-01", scope: { kind: "inherit" } })).toBe(false);
+    expect(canSubmitMint({ memberId: MEMBER, expiry: "", scope: { kind: "inherit" } })).toBe(false);
+  });
+});
+
+/**
+ * SPEC AC: two source-level obligations the runtime tests cannot see.
+ */
+describe("agent-token admin surface obligations", () => {
+  const ROOT = join(import.meta.dirname, "..");
+  const page = readFileSync(join(ROOT, "app", "t", "[team]", "admin", "agents", "page.tsx"), "utf8");
+  const actions = readFileSync(join(ROOT, "app", "t", "[team]", "admin", "agents", "actions.ts"), "utf8");
+
+  it("the page never selects token_hash — hash material must not reach a server component", () => {
+    const select = page.match(/\.from\("agent_tokens"\)[\s\S]*?\.select\("([^"]*)"\)/)?.[1] ?? "";
+    expect(select, "the agent_tokens select list").not.toMatch(/token_hash/);
+    expect(select, "non-vacuity: the select was actually found").toMatch(/id/);
+  });
+
+  it("both mint and revoke revalidate on success, so the list is never stale after the action", () => {
+    expect(actions.match(/revalidateAgents\(teamSlug\)/g) ?? [], "one call per action").toHaveLength(2);
+    expect(actions, "revalidation must not be able to throw away a minted token").toMatch(/try \{[\s\S]*?revalidatePath/);
+  });
+
+  it("the expiry column uses fmtDate, not timeAgo (timeAgo renders every FUTURE date as 'just now')", () => {
+    expect(page).toMatch(/fmtDate\(t\.expires_at\)/);
+    expect(page, "a future expiry through timeAgo reads 'just now' for every live token").not.toMatch(/timeAgo\(t\.expires_at\)/);
   });
 });

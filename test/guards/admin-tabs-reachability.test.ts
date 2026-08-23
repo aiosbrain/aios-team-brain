@@ -46,7 +46,12 @@ function adminDirs(): string[] {
 }
 
 function tabSlugs(): string[] {
-  const src = readFileSync(TABS_FILE, "utf8");
+  // Comments are stripped first: a `// { slug: "agents" … }` line is NOT a shipped tab, and matching
+  // it would let someone comment an entry out of the nav with direction (a) still green — the exact
+  // "source text is not rendered output" hole this guard family keeps rediscovering.
+  const src = readFileSync(TABS_FILE, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
   return [...src.matchAll(/\{\s*slug:\s*"([^"]+)"/g)].map((m) => m[1]);
 }
 
@@ -128,6 +133,13 @@ describe("admin surface reachability", () => {
       orphanedExportKeys().sort(),
       "ORPHAN_ALLOWLIST must equal the exports that are actually orphaned — no more (silent debt), no fewer (stale entry claiming debt that was paid)"
     ).toEqual([...ORPHAN_ALLOWLIST].sort());
+  });
+
+  it("a commented-out tab does not count as shipped (non-vacuity)", () => {
+    const stripped = 'const TABS = [\n  // { slug: "ghost", label: "Ghost" },\n  { slug: "real", label: "Real" },\n];'
+      .replace(/^\s*\/\/.*$/gm, "");
+    const slugs = [...stripped.matchAll(/\{\s*slug:\s*"([^"]+)"/g)].map((m) => m[1]);
+    expect(slugs).toEqual(["real"]);
   });
 
   it("the export parser discriminates (non-vacuity)", () => {

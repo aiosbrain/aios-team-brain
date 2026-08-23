@@ -3,7 +3,12 @@
 import { useState, useTransition } from "react";
 import { Bot, Copy, Check } from "lucide-react";
 import { mintAgentTokenAction, revokeAgentTokenAction } from "@/app/t/[team]/admin/agents/actions";
-import { DEFAULT_TOKEN_LIFETIME_DAYS, MAX_TOKEN_LIFETIME_MS } from "@/lib/access/agent-token-policy";
+import {
+  DEFAULT_TOKEN_LIFETIME_DAYS,
+  MAX_TOKEN_LIFETIME_MS,
+  canSubmitMint,
+  type ScopeChoice,
+} from "@/lib/access/agent-token-policy";
 
 type MemberOpt = { id: string; display_name: string; actor_handle: string };
 type ProjectOpt = { id: string; name: string; slug: string };
@@ -25,8 +30,6 @@ type ProjectOpt = { id: string; name: string; slug: string };
  * autofill capture. It is held in state only until dismissed, and is never attached to an error —
  * the admin error boundary reports to Sentry.
  */
-
-type ScopeChoice = null | { kind: "inherit" } | { kind: "restrict"; projectIds: string[] };
 
 function defaultExpiryValue(): string {
   const d = new Date(Date.now() + DEFAULT_TOKEN_LIFETIME_DAYS * 24 * 60 * 60 * 1000);
@@ -64,9 +67,10 @@ export function MintAgentToken({
   // is short-lived, and the ACTION re-checks both bounds anyway, so a stale bound cannot widen.
   const [expiryBounds] = useState(() => ({ min: minExpiryValue(), max: maxExpiryValue() }));
 
-  const scopeChosen =
-    scope !== null && (scope.kind === "inherit" || scope.projectIds.length > 0);
-  const canSubmit = Boolean(memberId) && Boolean(expiry) && scopeChosen && !pending;
+  // The rule itself lives in the policy module so it is unit-testable without a DOM harness, and so
+  // the "untouched scope must not submit" hazard is pinned by an assertion rather than by this JSX.
+  const scopeChosen = canSubmitMint({ memberId: memberId || "x", expiry: expiry || "x", scope });
+  const canSubmit = canSubmitMint({ memberId, expiry, scope }) && !pending;
 
   if (minted) {
     return (
@@ -79,10 +83,16 @@ export function MintAgentToken({
             {minted}
           </code>
           <button
-            onClick={async () => {
-              await navigator.clipboard.writeText(minted);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
+            onClick={() => {
+              // A rejection (no permission / insecure context) must not become an unhandled
+              // rejection with no feedback. The token stays on screen for manual copy either way.
+              navigator.clipboard.writeText(minted).then(
+                () => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                },
+                () => setError("Couldn't copy — select the token above and copy it manually.")
+              );
             }}
             className="rounded-lg border border-border-default p-2 text-ink-secondary hover:text-ink"
             aria-label="Copy token"

@@ -20,6 +20,9 @@
 /** Hard ceiling on a token's lifetime. A credential with no horizon is the one nobody revokes. */
 export const MAX_TOKEN_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 
+/** Upper bound on a single token's scope list — a sanity cap, not a security control. */
+export const MAX_PROJECT_SCOPE = 200;
+
 /** What the mint form pre-fills. Short enough to force a renewal decision, long enough to be usable. */
 export const DEFAULT_TOKEN_LIFETIME_DAYS = 90;
 
@@ -58,7 +61,21 @@ export function validateMintRequest(req: MintRequest, now: number): PolicyResult
   // which the form makes explicit. `[]` is a legal DB state ("sees nothing") that is never a legal
   // REQUEST: the only way to produce it is an empty multi-select, i.e. an accident that mints a token
   // which silently reads nothing.
+  if (req.name != null && typeof req.name !== "string") {
+    return { ok: false, error: "name must be a string" };
+  }
   if (req.projectScope != null) {
+    // A direct caller can send anything. Without this, a string or an object with a `length` throws
+    // inside `.some(...)` and the boundary returns an opaque 500 instead of a refusal.
+    if (!Array.isArray(req.projectScope)) {
+      return { ok: false, error: "projectScope must be an array of project uuids" };
+    }
+    if (req.projectScope.length > MAX_PROJECT_SCOPE) {
+      return { ok: false, error: `projectScope may name at most ${MAX_PROJECT_SCOPE} projects` };
+    }
+    if (new Set(req.projectScope).size !== req.projectScope.length) {
+      return { ok: false, error: "projectScope must not repeat a project" };
+    }
     if (req.projectScope.length === 0) {
       return {
         ok: false,
@@ -87,4 +104,26 @@ export function validateMintRequest(req: MintRequest, now: number): PolicyResult
   }
 
   return { ok: true };
+}
+
+/**
+ * The mint form's submit rule, extracted as a pure function so it can be pinned by tests without a
+ * DOM harness — and so the "silent `null` inherits everything" hazard both spec reviewers flagged is
+ * covered by an assertion rather than by reading the JSX.
+ *
+ * `scope === null` means the admin has TOUCHED NOTHING. It must not be submittable: `null` would
+ * inherit the launcher's full visibility, which is the fail-open direction.
+ */
+export type ScopeChoice = null | { kind: "inherit" } | { kind: "restrict"; projectIds: string[] };
+
+export function canSubmitMint(input: {
+  memberId: string;
+  expiry: string;
+  scope: ScopeChoice;
+}): boolean {
+  if (!input.memberId) return false;
+  if (!input.expiry) return false;
+  if (input.scope === null) return false;
+  if (input.scope.kind === "restrict" && input.scope.projectIds.length === 0) return false;
+  return true;
 }

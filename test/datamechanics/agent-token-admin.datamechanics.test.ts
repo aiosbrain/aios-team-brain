@@ -7,6 +7,7 @@ vi.mock("@/lib/auth/guard", () => ({ requireTeamAdmin: vi.fn() }));
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { mintAgentTokenAction, revokeAgentTokenAction } from "@/app/t/[team]/admin/agents/actions";
 import { verifyAgentToken } from "@/lib/access/agent-tokens";
+import { addMemberToGroup, createGroup, grantProjectToGroup } from "@/lib/access/groups";
 
 /**
  * AGENTUI-1 — the mint ACTION against real Postgres.
@@ -16,8 +17,6 @@ import { verifyAgentToken } from "@/lib/access/agent-tokens";
  * policy that returns `{ok:false}` while the writer has already run would pass every unit test and
  * still mint the credential it claimed to refuse.
  */
-
-const ADMIN_CTX = { teamId: "", memberId: "" };
 
 async function seedMember(seed: Seed, kind = "human"): Promise<string> {
   const { data, error } = await db()
@@ -41,6 +40,31 @@ async function seedMember(seed: Seed, kind = "human"): Promise<string> {
 async function tokenCount(teamId: string): Promise<number> {
   const { data } = await db().from("agent_tokens").select("id").eq("team_id", teamId);
   return (data ?? []).length;
+}
+
+/** A project plus a group grant making it visible to `memberId` — the realistic admin setup. */
+async function grantedProject(seed: Seed, memberId: string): Promise<string> {
+  const { data, error } = await db()
+    .from("projects")
+    .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}` })
+    .select("id")
+    .single();
+  if (error || !data) throw new Error(`seed project failed: ${error?.message}`);
+  const g = await createGroup(db(), seed.teamId, `g-${randomUUID().slice(0, 6)}`, "g", seed.memberId);
+  await addMemberToGroup(db(), seed.teamId, g.groupId!, memberId, seed.memberId);
+  await grantProjectToGroup(db(), seed.teamId, data.id as string, g.groupId!, seed.memberId);
+  return data.id as string;
+}
+
+/** A project with NO grant to anyone — visible to no admin. */
+async function ungrantedProject(seed: Seed): Promise<string> {
+  const { data, error } = await db()
+    .from("projects")
+    .insert({ team_id: seed.teamId, slug: `u-${randomUUID().slice(0, 6)}` })
+    .select("id")
+    .single();
+  if (error || !data) throw new Error(`seed project failed: ${error?.message}`);
+  return data.id as string;
 }
 
 function future(days: number): string {
@@ -110,12 +134,7 @@ describe("AGENTUI-1 — mintAgentTokenAction against real Postgres", () => {
     const agent = await seedMember(seed, "agent");
     vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: agent });
 
-    const { data: proj } = await db()
-      .from("projects")
-      .insert({ team_id: seed.teamId, slug: `p-${randomUUID().slice(0, 6)}` })
-      .select("id")
-      .single();
-    const projectId = (proj as { id: string }).id;
+    const projectId = await grantedProject(seed, agent);
 
     const res = await mintAgentTokenAction("any-slug", {
       memberId: agent,
@@ -126,6 +145,29 @@ describe("AGENTUI-1 — mintAgentTokenAction against real Postgres", () => {
 
     const { data } = await db().from("agent_tokens").select("project_scope").eq("id", res.tokenRowId!).single();
     expect((data as { project_scope: string[] }).project_scope).toEqual([projectId]);
+  });
+
+  /**
+   * The property the commit claims: an admin cannot scope a token to a project they cannot see.
+   * Enforced in the ACTION, not the picker — the picker is a web page and the action is a public
+   * endpoint. Asserted in BOTH directions so it cannot pass by refusing everything.
+   */
+  it("REFUSES a scope naming a project the admin cannot see, and writes no row", async () => {
+    const seed = await seedTeam();
+    const agent = await seedMember(seed, "agent");
+    vi.mocked(requireTeamAdmin).mockResolvedValue({ teamId: seed.teamId, memberId: agent });
+
+    const unseen = await ungrantedProject(seed);
+    const before = await tokenCount(seed.teamId);
+    const res = await mintAgentTokenAction("any-slug", {
+      memberId: agent,
+      projectScope: [unseen],
+      expiresAt: future(30),
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/cannot see/);
+    expect(await tokenCount(seed.teamId), "a refused scope must not write").toBe(before);
   });
 
   it("a non-admin caller mints nothing (pins the action's own gate, not the gate's internals)", async () => {
@@ -164,10 +206,10 @@ describe("AGENTUI-1 — mintAgentTokenAction against real Postgres", () => {
 
     const minted = await mintAgentTokenAction("any-slug", { memberId: agent, expiresAt: future(30) });
     expect(minted.ok, minted.error).toBe(true);
-    expect(await verifyAgentToken(db(), minted.token!, seed.teamId)).not.toBeNull();
+    expect(await verifyAgentToken(db(), minted.token!)).not.toBeNull();
 
     const rev = await revokeAgentTokenAction("any-slug", minted.tokenRowId!);
     expect(rev.ok, rev.error).toBe(true);
-    expect(await verifyAgentToken(db(), minted.token!, seed.teamId)).toBeNull();
+    expect(await verifyAgentToken(db(), minted.token!)).toBeNull();
   });
 });

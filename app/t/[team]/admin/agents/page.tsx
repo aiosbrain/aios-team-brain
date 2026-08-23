@@ -4,7 +4,7 @@ import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin } from "@/lib/auth/guard";
 import { visibleProjectRows } from "@/lib/access/enforce";
 import { MintAgentToken, RevokeAgentTokenButton } from "@/components/admin/mint-agent-token";
-import { timeAgo } from "@/components/format";
+import { fmtDate, timeAgo } from "@/components/format";
 
 export const metadata: Metadata = { title: "Agents" };
 
@@ -17,8 +17,9 @@ export const metadata: Metadata = { title: "Agents" };
  * in depth, not the control. `teamId` is taken from the gate's result, never from the slug.
  *
  * PROJECT READ: the picker is gated by `visibleProjectRows` (ENFB-2), not a raw team-wide select.
- * Being an admin is authority to MANAGE, not a bypass of the access chain — and it yields a
- * property worth having: an admin cannot scope a token to a project they cannot themselves see.
+ * Being an admin is authority to MANAGE, not a bypass of the access chain. The matching PROPERTY —
+ * an admin cannot scope a token to a project they cannot themselves see — is enforced in the ACTION
+ * (`mintAgentTokenAction`), not here: this picker only decides what is easy to choose.
  * Fail-closed: on a substrate error the helper returns an empty set, so the picker offers nothing
  * rather than everything.
  *
@@ -121,17 +122,22 @@ export default async function AgentsAdminPage({ params }: { params: Promise<{ te
                     {describeScope(t.project_scope, projectNames)}
                   </td>
                   <td className="px-4 py-3 text-ink-tertiary">
-                    {t.expires_at ? timeAgo(t.expires_at) : "never"}
+                    {/* fmtDate, NOT timeAgo: timeAgo computes `Date.now() - then`, so a FUTURE date
+                        yields negative seconds and falls into its `secs < 60` branch — every live
+                        token would read "just now". Caught in review after an earlier version of
+                        this file claimed the opposite. */}
+                    {t.expires_at ? fmtDate(t.expires_at) : "never"}
                   </td>
                   <td className="px-4 py-3 text-ink-tertiary">
                     {t.last_used_at ? timeAgo(t.last_used_at) : "never"}
                   </td>
                   <td className="px-4 py-3 text-xs">
                     {/* No render-time clock read: React's purity rule forbids it, and evading the
-                        rule via a helper that calls Date.now() internally would be evasion, not a
-                        fix. The Expires column carries the same information — `timeAgo` renders a
-                        past date as "… ago", which reads as expired without render depending on
-                        the current time. */}
+                        rule via a helper that calls Date.now() internally would be evasion. So this
+                        column reports only what is stored — revoked or not. Whether a token has
+                        LAPSED is read off the Expires column's absolute date, which is honest about
+                        requiring the reader to know today's date; claiming more than that is what
+                        the earlier version got wrong. */}
                     {t.revoked_at ? (
                       <span className="text-red-600">revoked</span>
                     ) : (

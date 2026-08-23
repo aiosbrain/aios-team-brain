@@ -3,7 +3,23 @@ eval_tier: deterministic
 spec_gate: block
 safety: false
 type: issue-spec
+status: DECLINED
 ---
+
+> # ⛔ DECLINED — do not build this
+>
+> **QPROV-1 (AIO-1052) was declined in spec review on 2026-08-22 and is retained only as the record
+> of why.** Two adversarial rounds established that conversation-creation provenance cannot deliver
+> the property it promises: an agent holding a member-scoped key can `GET /api/v1/conversations`,
+> take a `dashboard` thread's id, and pass it to `POST /api/v1/query` — appending its question to a
+> human thread and bumping it to the top of the list. Two documented API calls defeat the whole
+> design, and the filter added to make it work is what enables the enumeration.
+>
+> The slice that replaced it is **AGENTUI-1** (`docs/design/agent-tokens-admin-ui-v1.md`): a
+> delegated principal is conversation-stateless, so agent traffic creates no threads at all and
+> there is nothing to filter.
+>
+> Everything below is the declined design, left unedited. Do not implement it.
 
 # Query provenance — the Query tab shows what a human typed, not what an agent asked
 
