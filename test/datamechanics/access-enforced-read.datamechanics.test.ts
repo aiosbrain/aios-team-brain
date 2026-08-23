@@ -147,10 +147,22 @@ describe("the enforced items read (one mode, post-PRET-6)", () => {
     // Agent launched by the admin (self, unattenuated) — inherits the admin's visibility.
     const agent = await seedMember(seed); // agent principal row
     const g2 = await createGroup(db(), seed.teamId, "agents", "Agents", seed.memberId);
-    await addMemberToGroup(db(), seed.teamId, g2.groupId!, agent, seed.memberId);
-    // grant the agent's group General so it can see shared, but NOT restricted
+    // Assert the fixture, or the refusal asserted below passes through "group not found for team"
+    // instead of through the guard — green while testing nothing (Codex diff review MEDIUM 1).
+    expect(g2.ok, `fixture group: ${g2.error}`).toBe(true);
+    expect(g2.groupId, "fixture group must have an id").toBeTruthy();
+    const placed = await addMemberToGroup(db(), seed.teamId, g2.groupId!, agent, seed.memberId);
+    expect(placed.ok, `fixture membership: ${placed.error}`).toBe(true);
+    // AUDITFIX-3 CONVERTED THIS LINE rather than deleting it. It used to grant General to the
+    // agents group "so it can see shared" — but that grant was REDUNDANT (seedMember writes no
+    // `kind`, and members.kind defaults to 'human', so this principal already reaches General
+    // through its `everyone` membership) and it is now REFUSED: a system project's grants are the
+    // access substrate. So the line becomes the assertion, and both original expectations below
+    // still hold — the protection survives, the restriction is added.
     const { data: gen } = await db().from("projects").select("id").eq("team_id", seed.teamId).eq("slug", "general").single();
-    await grantProjectToGroup(db(), seed.teamId, gen!.id, g2.groupId!, seed.memberId);
+    const forbidden = await grantProjectToGroup(db(), seed.teamId, gen!.id, g2.groupId!, seed.memberId);
+    expect(forbidden.ok, "General may not be granted to an ordinary group (AUDITFIX-3)").toBe(false);
+    expect(forbidden.error, "refused BY THE GUARD, not by a missing fixture").toMatch(/system|substrate|sanctioned/i);
     const minted = await mintAgentToken(db(), seed.teamId, { memberId: agent }, seed.memberId);
 
     const got = await paths(minted.token!);

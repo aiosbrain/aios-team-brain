@@ -2,6 +2,13 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
 import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
+import {
+  EVERYONE_SLUG,
+  EXTERNAL_SLUG,
+  isProtectedProject,
+  isSanctionedSystemEdge,
+  type EdgeGroupIdentity,
+} from "@/lib/access/system-projects";
 
 /**
  * THE single writer for the access-chain edge tables — `groups`, `group_members`,
@@ -26,11 +33,13 @@ import { isBuiltinEligible, isPrincipal } from "@/lib/access/eligibility";
  * data-mechanics tier asserts at least one audit row lands.
  */
 
-export const EVERYONE_SLUG = "everyone";
+/** The built-in group slugs. Their DEFINITION moved to lib/access/system-projects (AUDITFIX-3) so
+ *  the sanctioned-edge table and this writer cannot drift apart, and so bootstrap — which already
+ *  imports this module — can read them without a cycle. Re-exported: no call site moves. */
+export { EVERYONE_SLUG, EXTERNAL_SLUG } from "@/lib/access/system-projects";
 /** The one-time materialization's migration_markers name — single-sourced here (the writer);
  *  lib/access/posture re-exports it for the reader side (diff-review L3). */
 export const PRET4_MATERIALIZE_MARKER = "pret4_builtin_materialize";
-export const EXTERNAL_SLUG = "external";
 
 /** Slugs an ordinary group may not take: the two built-ins and the singleton namespace.
  *  Without this, a group created as "everyone" BEFORE ensureBuiltins first runs would be
@@ -489,6 +498,121 @@ export interface GrantResult extends WriteResult {
   created?: boolean;
 }
 
+/**
+ * AUDITFIX-3 §2b — the grant census that must pass before a `source` row is promoted to `system`.
+ *
+ * `ensureSystemProject` adopts a reserved-slug `source` row by flipping `kind`, and it never read
+ * `project_groups` — so a grant made while the row was still ordinary SURVIVED the flip and became
+ * a grant over the whole system corpus, with no operator doing anything wrong (spec §0b). The
+ * writer guard now stops such an edge being created; this stops one that predates the guard, or
+ * that was written out of band, being LAUNDERED into a system-project grant by adoption.
+ *
+ * ONE JOINED READ, deliberately. Deciding whether an edge is sanctioned needs the group's `slug`
+ * and `is_builtin`, not just its id — and a two-read form can fail closed on `project_groups` and
+ * still swallow the GROUP lookup, discard the unresolved edge, and promote (spec round 2 H3). The
+ * embed compiles into a correlated subquery inside the same statement, so one error covers both.
+ *
+ * IT LIVES HERE, not in bootstrap, for the same reason placedMemberIds does: the access-chain
+ * single-writer guard's coarse net refuses any other file that NAMES an edge table while containing
+ * write verbs (the variable-table idiom defence), and bootstrap writes `projects`. A read in the
+ * sanctioned file keeps that net tight instead of spending a READ_EXEMPT entry on it.
+ *
+ * FAILS CLOSED, and an unresolved group is UNSANCTIONED rather than absent: the obvious
+ * implementation destructures `{ data }`, reads an error-derived `null` as "no grants", and flips a
+ * row that IS granted to vendors, while every ordinary fixture still passes (spec round 1 B1).
+ */
+export async function censusUnsanctionedSystemEdges(
+  db: DbClient,
+  teamId: string,
+  projectId: string,
+  projectSlug: string
+): Promise<WriteResult> {
+  const { data, error } = await db
+    .from("project_groups")
+    .select("group_id, groups(slug, is_builtin)")
+    .eq("team_id", teamId)
+    .eq("project_id", projectId);
+  if (error) {
+    return { ok: false, error: `grant census failed, refusing to adopt '${projectSlug}': ${error.message}` };
+  }
+  const rows = (data ?? []) as { group_id: string; groups: EdgeGroupIdentity | null }[];
+  const unsanctioned = rows.filter((r) => !isSanctionedSystemEdge(projectSlug, r.groups));
+  if (unsanctioned.length > 0) {
+    const named = unsanctioned.map((r) => r.groups?.slug ?? `unresolved group ${r.group_id}`).join(", ");
+    return {
+      ok: false,
+      error:
+        `refusing to adopt '${projectSlug}': it already carries unsanctioned grant(s) to ${named}. ` +
+        `Promoting it would turn those into grants over the whole system corpus. The team stays ` +
+        `un-bootstrapped until the edge is removed (repair: AUDITFIX-21).`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * AUDITFIX-3 §2a — refuse an unsanctioned edge on a project the access substrate owns.
+ *
+ * Returns a refusal, or `null` to let the grant proceed. THREE THINGS ABOUT THE SIGNATURE ARE THE
+ * POINT, each traceable to a spec round that found an implementation passing the whole acceptance
+ * suite while `admin.ts grant-project vendors general` still worked:
+ *
+ *  - it takes NO `actorMemberId` (round 3 B1 — a guard skipped for the operator's NULL actor),
+ *  - it takes NO `opts` (round 4 B2 — a guard skipped when `--actor` was absent, which is the
+ *    canonical exploit invocation), and
+ *  - it never reads `person_member_id` (round 4 B1 — exempting person singletons, the exemption
+ *    the repo itself teaches at app/actions/projects.ts:83).
+ *
+ * The invariant is a function of the PAIR and nothing else, so the bypasses are not expressible
+ * here rather than merely untaken.
+ *
+ * It runs BEFORE the existence probe (round 4 M1): below it, a PRE-EXISTING forbidden edge returns
+ * `{ok:true, created:false}` and the CLI prints "already granted … nothing written" — success-shaped
+ * output an operator reads as sanction. Refusing first also makes the CLI the one place a forbidden
+ * edge is NAMED until AUDITFIX-22's census ships.
+ *
+ * Both reads fail CLOSED, and their errors are ATTRIBUTED: a swallowed error yields `data = null`,
+ * which takes the not-found branch and produces a byte-identical ok:false/no-edge observable — so a
+ * criterion that asserted only "refused" would stay green under the mutant (round 4 H1).
+ */
+async function refuseUnsanctionedSystemEdge(
+  db: DbClient,
+  teamId: string,
+  projectId: string,
+  groupId: string
+): Promise<GrantResult | null> {
+  const { data: projRow, error: projErr } = await db
+    .from("projects")
+    .select("kind, slug")
+    .eq("team_id", teamId)
+    .eq("id", projectId)
+    .maybeSingle();
+  if (projErr) return { ok: false, error: `refusing the grant: project read failed — ${projErr.message}` };
+  if (!projRow) return { ok: false, error: "project not found for team" };
+  const project = projRow as { kind: string; slug: string };
+  if (!isProtectedProject(project)) return null;
+
+  const { data: groupRow, error: groupErr } = await db
+    .from("groups")
+    .select("slug, is_builtin")
+    .eq("team_id", teamId)
+    .eq("id", groupId)
+    .maybeSingle();
+  if (groupErr) return { ok: false, error: `refusing the grant: group read failed — ${groupErr.message}` };
+  if (!groupRow) return { ok: false, error: "group not found for team" };
+  if (isSanctionedSystemEdge(project.slug, groupRow as EdgeGroupIdentity)) return null;
+
+  const g = groupRow as EdgeGroupIdentity;
+  return {
+    ok: false,
+    error:
+      `refusing to grant the system project '${project.slug}' to '${g.slug}' — a system project's grants ARE the ` +
+      `access substrate and only the sanctioned edges may exist (general->everyone, external-shared->everyone, ` +
+      `external-shared->external). Creating this edge is a one-way door: revocation through the sanctioned path ` +
+      `is refused for system projects (AUDITFIX-21 adds the repair).`,
+  };
+}
+
 /** Grant a group visibility into a project (THE access edge). REVOKE-1 (D1b): `opts.authorizedByMemberId`
  *  records a named ACTIVE-ADMIN authorizer in the audit META only — never in the actor field and never
  *  in `added_by` (either would attribute the operator's act to a human who merely approved it).
@@ -514,13 +638,20 @@ export async function grantProjectToGroup(
   // miss the select and both audit (double provenance for one ms-apart creation — the trail
   // over-reports, never under-reports). The atomic form (INSERT … ON CONFLICT DO NOTHING
   // RETURNING) needs adapter support; take it with the transaction surface.
-  const { data: existing } = await db
+  // AUDITFIX-3 §2a: FIRST, before the existence probe below. See refuseUnsanctionedSystemEdge.
+  const refusal = await refuseUnsanctionedSystemEdge(db, teamId, projectId, groupId);
+  if (refusal) return refusal;
+  // AUDITFIX-10 (folded in): this probe SWALLOWED its error, so a read failure fell through to the
+  // upsert, re-clobbering added_by and minting an audit row claiming created:true — the exact damage
+  // the comment above says select-first prevents.
+  const { data: existing, error: probeErr } = await db
     .from("project_groups")
     .select("project_id")
     .eq("team_id", teamId)
     .eq("project_id", projectId)
     .eq("group_id", groupId)
     .maybeSingle();
+  if (probeErr) return { ok: false, error: `refusing the grant: existing-edge probe failed — ${probeErr.message}` };
   if (existing) return { ok: true, created: false };
   const { error } = await db
     .from("project_groups")
