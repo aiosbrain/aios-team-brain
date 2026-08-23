@@ -203,6 +203,13 @@ edge, and promote. So: `.select("group_id, groups(slug, is_builtin)")` — the e
 used at `lib/access/groups.ts:307` and `lib/access/oracle.ts:76` — with **the error captured**, and a
 row whose group failed to resolve treated as **unsanctioned**, never as absent.
 
+The adapter compiles that embed into a correlated `row_to_json` scalar subquery inside the **same**
+statement (`lib/db/pg/query-builder.ts:299-325`), so a query failure fails the whole census (AC13)
+and a missing group would surface as `groups: null` with **no error**. Today's composite FK makes that
+second case unreachable (`postgres/schema.sql:1066-1074`) — the branch exists so a future left-join or
+two-read form cannot fail open, and AC14 pins it against an injected result rather than pretending it
+is seedable.
+
 With §2a clause 2 in place a *new* forbidden edge cannot appear on a pre-adoption row at all, so §2b
 is defence in depth against an edge that predates this slice or was written out of band.
 
@@ -237,12 +244,22 @@ dependency the review itself established:
   `finished_at desc, id desc` (`lib/ingest/pipeline-health.ts:296-325`) — so the later global
   `ok=true` row **wins over the affected team's failure**. The comment at `scheduler.ts:299-303`
   claiming a per-team failure *"reds only THAT team's health card"* is **false**.
-- The obvious cheap repairs are both wrong. Making the global row red on any team failure reverses a
-  deliberate shipped decision (that comment's *"would have turned every team's admin banner red"*).
-  Preferring the team-scoped row in `newest` pins a **healed** team red forever, because
+- The two repairs I first reached for are both wrong. Making the global row red on any team failure
+  reverses a deliberate shipped decision (that comment's *"would have turned every team's admin banner
+  red"*). Preferring the team-scoped row in `newest` pins a **healed** team red forever, because
   `runAccessBootstrap` writes a per-team row **only on failure** — there is no per-team success row to
-  supersede it. A correct fix needs per-team success rows plus a team-preferring read, which is a
-  change to every leg's health card, not a line in this slice.
+  supersede it.
+- ⚠️ **But my round-2 fold then asserted "neither cheap fix works", and that is wrong — I did not look
+  for a third, and the reviewer CONFIRMED the claim rather than catching it.** The same file already
+  solves this exact problem for a different leg: `runContextBackfill` writes a per-team `context_backfill`
+  row **on success as well as failure** (`lib/ingest/scheduler.ts:377-409`) and puts its instance-wide
+  heartbeat under a **distinct source**, `context_backfill_all`, with a comment naming the reason —
+  *"a teamId=null 'context_backfill' row would mask per-team rows under distinct-on"*
+  (`lib/ingest/scheduler.ts:427-436,459-460`). So the fix for `access_bootstrap` is per-team success
+  rows plus `access_bootstrap_all`, and it touches **one leg**, not every health card. That is smaller
+  than I said and it belongs to AUDITFIX-22, whose ticket now carries it — but the split stands on
+  slice size (four concerns), not on the fix being expensive. **A reviewer agreeing with a claim is not
+  evidence for it.**
 
 So a scheduled census landed here would be a detector whose output is invisible, and round 2's HIGH 2
 (census placement can stop sanctioned grants converging) is a defect that only exists once that census
@@ -252,74 +269,151 @@ health-ledger fix they depend on.
 ### 3b. The consequence of the split, stated rather than buried
 
 §2b's refusal **wedges that team's bootstrap** — `ensureAccessBootstrap` returns early on the general
-leg (`bootstrap.ts:117-118`), so the sanctioned grants stop converging for that team. It records a
-per-team `ingest_runs` failure naming the edge, and §3a is exactly the finding that **that row is
-masked on the health card today**.
+leg (`bootstrap.ts:117-118`), so the sanctioned grants stop converging for that team.
 
-Three things make this acceptable rather than a silent regression, and the third is the honest one:
+⚠️ **Round 3's HIGH 1: the wedge reaches further than "bootstrap does not converge", and I had not
+traced it.** `backfillTeamContext` calls `ensureAccessBootstrap` again and **returns before processing
+a single item** when it fails (`lib/projects/context/backfill.ts:45-47`), and the scheduler runs
+backfill straight after bootstrap (`lib/ingest/scheduler.ts:41-46`). So a wedged team's **context
+backfill stops entirely** — new items are never partitioned into their units and memberships.
+
+What IS and IS NOT visible, traced rather than assumed:
+
+| | |
+|---|---|
+| the `access_bootstrap` failure itself | **masked** — §3a |
+| the downstream `context_backfill` failure | **VISIBLE** — per-team rows on success and failure, heartbeat under the distinct `context_backfill_all` source (`scheduler.ts:377-409,427-436`) |
+| later scheduler stages | **not blocked** — `runAccessBootstrap` catches internally before the tick continues |
+| a new member's builtin rows | **not blocked** — `ensureBuiltins` runs before the General adoption (`bootstrap.ts:113-117`) and member creation writes the invite-default membership independently (`lib/admin/members.ts:108-143`) |
+| a forbidden edge that ALREADY exists on an already-`system` project | **undetected here, and CLI-unrevokable** — AUDITFIX-22 and -21 |
+
+Four things make this acceptable rather than a silent regression, and the fourth is the condition:
 
 1. **This wedge already ships.** `ensureSystemProject` has refused reserved-slug *initiatives* since
-   slice 3 (`bootstrap.ts:57-60`) — with the same masked failure row. AUDITFIX-3 adds a second
-   trigger for a state prod does not have (§0d) and that §2a makes newly unreachable.
-2. **The false comment is corrected in this slice** (`scheduler.ts:299-303`), pointing at
-   AUDITFIX-22, so the next reader is not misled by it the way I was.
-3. **It is not fixed here, and this document says so** rather than letting a merge imply detection
-   works.
+   slice 3 (`bootstrap.ts:57-60`) — same masked row, same downstream backfill stop. AUDITFIX-3 adds a
+   second trigger for a state prod does not have (§0d) and that §2a makes newly unreachable.
+2. **The false comment is corrected in this slice** (`scheduler.ts:299-303`), pointing at AUDITFIX-22.
+3. **This document says detection is not fixed here** rather than letting a merge imply it works.
+4. ⚠️ **A PRE-DEPLOY CENSUS IS REQUIRED, and it is a release condition, not a nicety** (round 3 HIGH
+   1: on a self-hosted fleet with unknown state, prevention alone is not a complete mitigation). Before
+   the guard is enabled on any instance, run the read-only census and record the result:
+
+   ```sql
+   select p.slug as project, g.slug as "group", g.is_builtin, pg.team_id
+     from project_groups pg
+     join projects p on p.id = pg.project_id
+     join groups   g on g.id = pg.group_id
+    where (p.kind = 'system' or (p.kind = 'source' and p.slug in ('general','external-shared')))
+      and not (
+            (p.slug = 'general'         and g.slug = 'everyone' and g.is_builtin)
+         or (p.slug = 'external-shared' and g.slug in ('everyone','external') and g.is_builtin)
+      );
+   ```
+
+   **Zero rows = safe to enable.** Any row means that instance would wedge the moment adoption next
+   runs, with no in-product way to see or repair it until -21 and -22 land. **This fleet: run
+   2026-08-23, zero rows** (§0d). The PR must carry the output, and the release note must carry the
+   query for self-hosters.
 
 ## 4. Acceptance
+
+⚠️ **Every refusal criterion names its `actorMemberId`, and round 3's BLOCKER 1 is why.** The real
+exploit is the CLI, which passes **`null`** (`scripts/admin.ts:319-320`), while the dashboard passes the
+creator's id (`app/actions/projects.ts:98-102`). Criteria that leave the actor unspecified admit
+`if (actorMemberId !== null && unsanctioned && protectedProject) refuse()` — AC1 still passes because
+bootstrap's own edges are sanctioned, every refusal criterion passes with a member actor, and
+`admin.ts grant-project vendors general` **still creates the forbidden edge**. The invariant is
+**actor-independent**, so the criteria must say so.
 
 - **AC1 — bootstrap's own three edges still work (dm):** a full `ensureAccessBootstrap` on a fresh
   team succeeds and produces exactly them. *It calls the same writer with a NULL actor
   (`bootstrap.ts:139`); a guard that breaks it breaks every team's access.*
-- **AC2 — a system project to an ORDINARY group is REFUSED, at the WRITER (dm):** no edge row, no
-  audit row.
-- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external`.
+- **AC2 — a system project to an ORDINARY group is REFUSED, at the WRITER, with the OPERATOR's actor
+  shape (dm):** `actorMemberId = null` and the operator opts `{authorizedByMemberId, via:"cli"}` — the
+  exact tuple `scripts/admin.ts:319-320` builds. No edge row, no audit row.
+- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external`,
+  `actorMemberId = null`.
 - **AC4 — identity is slug AND `is_builtin` (dm):** an ordinary group slugged `external` is refused a
-  grant to `external-shared`.
+  grant to `external-shared`, `actorMemberId = null`.
 - **AC5 — a RESERVED SLUG at `kind='source'` is REFUSED (dm):** `grantProjectToGroup(general@source,
-  vendors)` fails. *Round 1 HIGH 3 — this is what closes the adoption race; without it the interval
-  between the census and the CAS stays open.*
-- **AC6 — a reserved-slug INITIATIVE grants NORMALLY (dm):** a `kind='initiative'` project with
-  `slug='general'` granted to a person singleton returns `ok:true` and the edge exists. ⚠️ *Round 2
-  BLOCKER 1 — the exact call `grantProjectToCreator` makes (`app/actions/projects.ts:92-102`) for a
-  project a human named "General". Asserted at the writer because `createProjectAction` needs a
-  session; the dashboard path reaches this same call and nothing between them is conditional.*
-- **AC7 — bootstrap still REFUSES to adopt that initiative (dm):** `ensureSystemProject` leaves
-  `kind='initiative'` and errors. *The shipped `bootstrap.ts:57-60` behaviour AC6 depends on — if it
-  ever relaxed, AC6's row would become adoptable while granted.*
-- **AC8 — a NON-reserved, non-system project is unaffected (dm):** an ordinary initiative grants
-  normally. *The guard must not become a general-purpose refusal.*
-- **AC9 — an unreadable PROJECT refuses the grant (dm):** `ok:false`, no upsert, no audit row.
-- **AC10 — an unreadable GROUP refuses the grant (dm):** ⚠️ *round 1 M6 — §2a said "project or group"
-  and my acceptance covered only the project.* `ok:false`, no upsert, and no audit row.
-- **AC11 — adoption REFUSES a `source` row carrying an unsanctioned grant (dm):** `kind` unchanged on
+  vendors, null)` fails. *Round 1 HIGH 3 — this is what closes the adoption race; without it the
+  interval between the census and the CAS stays open.*
+- **AC6 — the refusal is ACTOR-INDEPENDENT (dm):** the AC2 pair repeated with a **member**
+  `actorMemberId` and with bare `opts = {}` is refused identically. ⚠️ *Round 3 BLOCKER 1 — AC2–AC5
+  alone admit an actor-keyed bypass that leaves the CLI exploit open.*
+- **AC7 — a reserved-slug INITIATIVE grants NORMALLY, through the dashboard's own tuple (dm):**
+  build it exactly as `grantProjectToCreator` does — `ensurePersonSingleton(db, teamId, creatorId,
+  creatorId)`, then `grantProjectToGroup(db, teamId, generalInitiativeId, singleton.groupId,
+  creatorId, {})` — and assert `ok:true` with the edge present. ⚠️ *Round 2 BLOCKER 1 is the defect;
+  round 3 HIGH 3 corrected my justification: I wrote that "nothing between `createProjectAction` and
+  the writer is conditional", which is **false** — `grantProjectToCreator` calls `ensurePersonSingleton`
+  first and returns without reaching the writer if it fails (`app/actions/projects.ts:92-102`). So the
+  criterion reproduces the helper's whole body instead of asserting the path is unconditional; what it
+  does NOT cover is `createProjectAction`'s session-dependent prologue, which is unrelated to this
+  guard.*
+- **AC8 — bootstrap still REFUSES to adopt that initiative (dm):** `ensureSystemProject` leaves
+  `kind='initiative'` and errors. *The shipped `bootstrap.ts:57-60` behaviour AC7 depends on — if it
+  ever relaxed, AC7's row would become adoptable while granted.*
+- **AC9 — a NON-reserved, non-system project is unaffected (dm):** an ordinary initiative grants
+  normally, with a NULL actor and with a member actor. *The guard must not become a general-purpose
+  refusal.*
+- **AC10 — an unreadable PROJECT refuses the grant (dm):** `ok:false`, no edge row, no audit row.
+- **AC11 — an unreadable GROUP refuses the grant (dm):** ⚠️ *round 1 M6 — §2a said "project or group"
+  and my acceptance covered only the project.* `ok:false`, no edge row, and no audit row.
+- **AC12 — adoption REFUSES a `source` row carrying an unsanctioned grant (dm):** `kind` unchanged on
   the row, error names the edge, and no `access.project_adopted` audit row.
-- **AC12 — adoption FAILS CLOSED on an unreadable grant census (dm):** ⚠️ *round 1 BLOCKER 1.* Seed
+- **AC13 — adoption FAILS CLOSED on an unreadable grant census (dm):** ⚠️ *round 1 BLOCKER 1.* Seed
   the `source` row and verify it is present FIRST, then fault the `project_groups` census
   specifically; adoption returns an error attributable to that census and **`kind` is still `source`
   when re-read on the row**. *Round 2 HIGH 3's second half: asserting only "refused" lets the
   criterion pass because some unrelated read claimed the row did not exist.*
-- **AC13 — adoption FAILS CLOSED on unresolvable GROUP identity (dm):** ⚠️ *round 2 HIGH 3.* With the
-  group side of the census unresolvable, adoption refuses; `kind` stays `source` and no adoption audit
-  row is written. *An edge whose group will not resolve is unsanctioned, never absent.*
-- **AC14 — adoption still promotes a CLEAN row (dm):** no grants, or only the sanctioned one, flips to
+- **AC14 — an edge whose group does not resolve is UNSANCTIONED, never absent (dm):** with a faulted
+  `DbClient` returning `{ data: [{ group_id, groups: null }], error: null }` for the census, adoption
+  refuses and `kind` stays `source`. ⚠️ *Round 3 HIGH 2 — this cannot be seeded against real Postgres
+  and I should have checked before writing a criterion: `project_groups.group_id` is `not null` under
+  a composite FK with cascade delete (`postgres/schema.sql:1066-1074`), and the embed compiles to a
+  correlated `row_to_json` scalar subquery inside the SAME statement
+  (`lib/db/pg/query-builder.ts:299-325`), so a single snapshot can never show an edge whose group is
+  gone. A **query** failure fails the whole census and is AC13. This criterion pins the classifier's
+  treatment of a null embed, which is the branch a future left-join or two-read form would need.*
+- **AC15 — adoption still promotes a CLEAN row (dm):** no grants, or only the sanctioned one, flips to
   `system` and audits.
-- **AC15 — the swallowed grant probe is captured (dm):** with the existence read faulted, the writer
-  returns `ok:false` rather than re-upserting and minting a false `created:true` audit row.
+- **AC16 — the swallowed grant probe is captured, with BOTH damages pinned (dm):** seed an existing
+  edge with a **distinctive `added_by`**, fault the existence read, then assert all three: `ok:false`,
+  `added_by` **unchanged**, and the count of `access.project_granted` audit rows **unchanged**.
+  ⚠️ *Round 3 MEDIUM 1: `ok:false` alone does not prove neither write happened — an implementation can
+  upsert, audit, and only then return failure.*
 
-**Mutation coverage is per enforcement point, not per file.** One mutation each for: clause 1, clause
-2, the `is_builtin` conjunct, each of the two writer fail-closed reads, the adoption census refusal,
-the census fail-closed branch, and the probe-error capture — and each must redden **its own**
-criterion, not merely some criterion.
+**Mutation coverage is per ENFORCEMENT POINT, not per file**, and each must redden **its own**
+criterion, not merely some criterion. One mutation each for:
+
+| # | mutation | must redden |
+|---|---|---|
+| 1 | delete the `kind='system'` clause | AC2 |
+| 2 | delete the reserved-slug/`source` clause | AC5 |
+| 3 | drop the `is_builtin` conjunct from edge identity | AC4 |
+| 4 | make the refusal actor-dependent (`actorMemberId !== null &&`) | AC6 |
+| 5 | swallow the writer's PROJECT read error | AC10 |
+| 6 | swallow the writer's GROUP read error | AC11 |
+| 7 | delete the adoption census refusal | AC12 |
+| 8 | swallow the census read error | AC13 |
+| 9 | treat a null `groups` embed as sanctioned/absent | AC14 |
+| 10 | swallow the grant existence-probe error | AC16 |
+
+*Mutations 4 and 9 exist because round 3 found each enforcement point unobservable through the
+criteria as written — an omitted mutation is how the last slice shipped a guard two SQL owners shared
+one fixture for.*
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
 | The guard refuses bootstrap's own three edges | **every team loses access** | AC1 runs the real bootstrap, not a fixture |
-| The reserved-slug rule breaks a legitimate grant | a creator cannot see the project they just made | **round 2 BLOCKER 1** — clause 2 is `source`-only; AC6 + AC7 pin both halves |
-| Adoption refusal wedges a team's bootstrap | the team stays un-bootstrapped, and the failure row is masked today | §3b — deliberate, pre-existing, and NOT fixed here; AUDITFIX-22 |
-| The census reads two relations and swallows one | a forbidden edge is promoted under an undetermined read | one joined read, error captured; AC13 |
+| The guard is keyed on the ACTOR, so the CLI exploit survives | the whole slice is decorative | **round 3 BLOCKER 1** — AC2–AC5 use the operator's NULL actor; AC6 pins actor-independence; mutation 4 |
+| The reserved-slug rule breaks a legitimate grant | a creator cannot see the project they just made | **round 2 BLOCKER 1** — clause 2 is `source`-only; AC7 + AC8 pin both halves |
+| Adoption refusal wedges a team's bootstrap AND its context backfill | the team stops partitioning new items; the `access_bootstrap` failure is masked | §3b — deliberate, pre-existing, surfaced via `context_backfill`, and gated on the pre-deploy census |
+| An instance already holds a forbidden edge | it wedges on first adoption with no in-product repair | **the pre-deploy census is a release condition** (§3b.4), not advice |
+| The census reads two relations and swallows one | a forbidden edge is promoted under an undetermined read | one joined read, error captured; a null embed is unsanctioned (AC14) |
 | Someone reads the merge as fixing a live leak, or as adding detection | wasted expectation | §0d: zero forbidden edges on prod; §3a/§3b: detection and repair are separate tickets |
 
 ## 6. What the earlier spec rounds found (pre-round-1)
@@ -350,7 +444,7 @@ criterion, not merely some criterion.
 |---|---|---|---|
 | **B1** | clause 2's "regardless of kind" rejects the creator grant for a dashboard-created initiative named "General", leaving a project its creator cannot see — and the suggested admin repair calls the same writer. The spec's *"destined for adoption"* premise is false for `initiative` | **CONFIRMED.** `slugify("General")==="general"` (`lib/ids.ts:24-31`, re-run); `app/actions/projects.ts:39` inserts `kind:'initiative'`; `:74-82` treats grant failure as fatal; `bootstrap.ts:57-60` refuses to adopt an initiative | **ADOPTED** — §2a clause 2 is `source`-only; **AC6** + **AC7** |
 | **B2** | the writer can be repaired while `revoke-project` stays permanently blocked — `revoke-verb.ts:47` refuses every `kind='system'` before the injected writer is reached | **CONFIRMED**, verbatim at `lib/access/revoke-verb.ts:47-50` | **Belongs to AUDITFIX-21**, and its ticket now carries the verb/writer agreement requirement |
-| **H1** | a per-team scheduled failure is masked by the global heartbeat in the real health reader; the code comment claiming otherwise is false | **CONFIRMED.** `scheduler.ts:304-325` writes the global row last; `pipeline-health.ts` `newest` is `distinct on (source)` ordered `finished_at desc, id desc` | **Drives the split** (§3a). Comment corrected here; the fix is AUDITFIX-22 |
+| **H1** | a per-team scheduled failure is masked by the global heartbeat in the real health reader; the code comment claiming otherwise is false | **CONFIRMED.** `lib/ingest/scheduler.ts:304-325` writes the global row last; `lib/ingest/pipeline-health.ts` `newest` is `distinct on (source)` ordered `finished_at desc, id desc` | **Drives the split** (§3a). Comment corrected here; the fix is AUDITFIX-22 |
 | **H2** | a census placed before convergence returns the required failure while a missing sanctioned edge is never restored | **CONFIRMED.** `ensureAccessBootstrap` grants the three edges last (`bootstrap.ts:112-142`) and returns early on the general leg | **Moves to AUDITFIX-22** with the census; converge-then-census is written into that ticket |
 | **H3** | adoption's fail-closed promise covers `project_groups` but not group identity resolution; AC10 could also pass for the wrong reason | **CONFIRMED** — sanctioned-ness needs `slug` + `is_builtin` | **ADOPTED** — one joined census (§2b); **AC12** rewritten, **AC13** added |
 | **M1** | the revised D2c order is invoked but never defined; the documented one (`groups.ts:559-564`) is obsolete once group identity is needed | **CONFIRMED** | **Belongs to AUDITFIX-21**; its ticket now names the proposed order |
@@ -359,3 +453,24 @@ criterion, not merely some criterion.
 | — | the structural claims (composite FKs, builtin/singleton hybrid, no rename path) | **CLEARED by the reviewer**, citations updated | §2a |
 
 **Nothing is built. No code exists for this slice.**
+
+## 9. Round 3 of this document — BLOCKED, on acceptance rather than design
+
+No design defect this round: clause 2's narrowing, the joined census, and the split all survived. What
+did not survive was the acceptance suite.
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | no refusal criterion names `actorMemberId`, so `if (actorMemberId !== null && …) refuse()` passes all fifteen while `admin.ts grant-project vendors general` still creates the edge | **CONFIRMED.** `scripts/admin.ts:319-320` passes `null`; `app/actions/projects.ts:98-102` passes the creator id | **ADOPTED** — AC2–AC5 use the operator tuple, **AC6** pins actor-independence, mutation 4 added |
+| **H1** | §3b understates the wedge: `backfillTeamContext` re-runs bootstrap and returns before any item, so the team's context backfill stops; that failure IS visible under `context_backfill`, unlike `access_bootstrap` | **CONFIRMED.** `lib/projects/context/backfill.ts:45-47`; `lib/ingest/scheduler.ts:41-46,377-409` | **ADOPTED** — §3b traces what is and is not visible, and adds the **pre-deploy census as a release condition** |
+| **H2** | AC13 (old) was not mechanically satisfiable — a null embed cannot be seeded under the FK, and a query error fails the whole census | **CONFIRMED**, and I had independently reached the same conclusion checking the adapter before the review returned | **ADOPTED** — split into AC13 (query error) and **AC14** (injected null embed), with mutation 9 |
+| **H3** | AC6 (old) claimed "nothing between `createProjectAction` and the writer is conditional" — false; `ensurePersonSingleton` can return first | **CONFIRMED** at `app/actions/projects.ts:92-102` | **ADOPTED** — **AC7** reproduces `grantProjectToCreator`'s whole body and the false claim is deleted |
+| **M1** | AC15 (old) asserted only `ok:false`, which does not prove the upsert and the false audit did not happen | **CONFIRMED** — `lib/access/groups.ts:517-535` | **ADOPTED** — **AC16** pins `added_by` unchanged and the audit count unchanged |
+| — | the §2a grep claim, the corrected §1a citation, and §3a's ledger analysis | **CLEARED by the reviewer** | but see below |
+
+⚠️ **The reviewer cleared a claim of mine that is wrong, and I caught it by following its own evidence.**
+§3a asserted that *"neither cheap fix works"* for the masked health row. Round 3 confirmed that
+reasoning. It is still wrong: the same file already solves this for another leg — per-team success rows
+plus a distinct `context_backfill_all` heartbeat source, with a comment naming the distinct-on masking
+(`lib/ingest/scheduler.ts:427-436,459-460`). The fix for `access_bootstrap` is the same shape and
+touches one leg. §3a is corrected and AUDITFIX-22 carries it. **A reviewer agreeing is not evidence.**
