@@ -249,7 +249,7 @@ round 2 B2).
   `failing`, `healthy === true`.
 - **AC4 — an ordinary tick writes NO `team_id is null` row (dm):** two healthy teams ⇒ exactly two
   `access_bootstrap` rows, both team-scoped.
-- **AC5 — a FLEET-level failure reds every card, at the confirmed threshold (dm):** seed a team by
+- **AC5 — a FLEET-level failure reds every card, at the confirmed threshold, writing EXACTLY one row per tick (dm):** seed a team by
   **direct `teams` insert** (bypassing `createTeam`, so it genuinely has no scoped row — the prod
   analogue is a pre-slice team at the deploy transition) and **assert it has zero scoped rows first**;
   then fault the `teams` read on **two** ticks; exactly one global `ok:false` row per tick; and
@@ -306,6 +306,7 @@ round 2 B2).
 | 11 | give the per-team tick row a non-`scheduler` trigger | AC11 |
 | 12 | give the creation row `trigger: 'scheduler'` | AC12 |
 | 13 | let a callback throw escape the wrapper's guard | AC9 |
+| 14 | write the FLEET row twice per tick | AC5 |
 
 ⚠️ **Mutation 4 must change `ok` AND `errors` together, and finding that out cost a SURVIVED run.**
 `recordIngestRun` derives `ok: run.ok && errors.length === 0` (`lib/ingest/runs.ts:67`), so flipping
