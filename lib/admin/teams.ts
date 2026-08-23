@@ -55,13 +55,53 @@ export async function createTeam(
   // three grants — created WITH the team so no window exists where a team has members but no
   // access topology. Best-effort (the scheduler tick converges any failure); never blocks
   // team creation.
+  //
+  // AUDITFIX-22: the OUTCOME is recorded as this team's first `access_bootstrap` ledger row.
+  // Without it a team created between a tick's `teams` snapshot and its write has no row at all —
+  // and a leg with no rows is ABSENT from `getPipelineHealth`, which reads as healthy with
+  // staleness unable to fire on it. The record must happen on the THROW path too: putting it only
+  // after a successful call recreates exactly that hole on the one path where this row is
+  // load-bearing.
+  //
+  // ⚠️ trigger is 'api', NOT 'scheduler'. The staleness clock reads scheduler rows only, as
+  // evidence that the POLLER is alive; team creation is not the poller, and claiming otherwise
+  // would fake liveness for a team whose tick has never run.
+  const bootstrapStartedAt = Date.now();
   try {
     const { ensureAccessBootstrap } = await import("@/lib/access/bootstrap");
-    await ensureAccessBootstrap(admin, team.id);
-  } catch {
-    // converged by the next scheduler tick
+    const r = await ensureAccessBootstrap(admin, team.id);
+    await recordTeamBootstrap(admin, team.id, bootstrapStartedAt, r.ok, r.error);
+  } catch (e) {
+    // converged by the next scheduler tick — but the attempt is still recorded
+    await recordTeamBootstrap(admin, team.id, bootstrapStartedAt, false, e instanceof Error ? e.message : "bootstrap threw");
   }
   return team;
+}
+
+
+/** AUDITFIX-22: this team's first `access_bootstrap` ledger row. Best-effort like every ingest-run
+ *  write — a ledger failure must never fail team creation. */
+async function recordTeamBootstrap(
+  admin: DbClient,
+  teamId: string,
+  startedAt: number,
+  ok: boolean,
+  error?: string
+): Promise<void> {
+  try {
+    const { recordIngestRun } = await import("@/lib/ingest/runs");
+    await recordIngestRun(admin, {
+      teamId,
+      source: "access_bootstrap",
+      trigger: "api",
+      ok,
+      created: 0,
+      errors: ok ? undefined : [error ?? "unknown"],
+      startedAt,
+    });
+  } catch {
+    // the next scheduler tick writes this team's next row
+  }
 }
 
 /**
