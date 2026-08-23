@@ -179,6 +179,31 @@ three of these structural claims and found no production project-rename path.)*
 just the project one — `getMember` (`lib/access/groups.ts:54`) drops its error today and that is
 exactly the mistake to not repeat.
 
+⚠️ **The guard runs BEFORE the existence probe** (round 4 MEDIUM 1). `grantProjectToGroup` returns
+`{ok:true, created:false}` at `lib/access/groups.ts:524` when the edge already exists — so a guard
+placed after it satisfies every refusal criterion (all fixtures start edge-less) while a **pre-existing
+forbidden edge returns success**, and `scripts/admin.ts:325-328` prints *"was already granted … nothing
+written"*. Success-shaped output an operator reads as sanction. Refusing first also means the CLI
+becomes the one place a forbidden edge is *named* before AUDITFIX-22 ships.
+
+⚠️ **Group class is NOT an exemption axis — round 4's BLOCKER 1.** The writer's own `GroupRow` already
+selects `person_member_id` (`lib/access/groups.ts:52`), and the repo *teaches* the exemption an
+implementer would reach for: the stranded-creator error message says to repair with
+`admin.ts grant-project <your-person-group> <slug>` (`app/actions/projects.ts:83`). Exempting
+singletons passes all sixteen criteria as previously written, while
+`admin.ts grant-project person-<id> general` creates the forbidden edge — singleton slugs are
+`person-*` (`lib/access/groups.ts:39`) and `scripts/admin.ts:293-297` resolves any group by slug.
+**The stranded-creator repair stays legal because clause 2 is scoped by KIND (an initiative is never
+protected), never by group class.** AC7a and mutation 11 pin it.
+
+⚠️ **The consequence for agents, which no round found and which the spec must state.** Built-ins admit
+humans only (`lib/access/eligibility.ts:38-40`, applied at `lib/access/oracle.ts:91`), so
+`general→everyone` is grant-inert for a `kind='agent'` member. Its only route to General was a **custom
+group granted General** — precisely what AC2 refuses. **After this slice an agent can be granted
+projects but never the corpus.** Ordinary projects are untouched. This is the AUDITFIX-19 ruling
+(*an agent scoped to a project so it cannot run amok*) expressed in the substrate; prod impact today is
+zero (§0d).
+
 **The predicate is shared, and it is the only definition.** `isSanctionedSystemEdge(projectSlug,
 {slug, is_builtin})` plus `RESERVED_PROJECT_SLUGS` live in one new module that neither
 `lib/access/groups.ts` nor `lib/access/bootstrap.ts` can duplicate (bootstrap already imports from
@@ -224,6 +249,20 @@ guard) · `docs/ARCHITECTURE.md` · one **comment correction** in `lib/ingest/sc
 error, so a read failure re-upserts an existing edge, **re-clobbering `added_by` and minting an audit
 row claiming `created:true`** — the exact damage its own comment says select-first prevents. It is
 inside the function §2a rewrites.
+
+**Test conversion, named rather than met as a surprise mid-build (round 4 HIGH 2):**
+`test/datamechanics/access-enforced-read.datamechanics.test.ts:152-153` grants the team's `general`
+(already `kind='system'`, because `backfillTeamContext` runs `ensureAccessBootstrap` —
+`lib/projects/context/backfill.ts:45-47`) to the ordinary `agents` group, and the guard would silently
+fail that grant and red the test at `:157`. **It is the only such call site** — round 4 swept all 24
+files calling `grantProjectToGroup` and this is the single hit; that claim belongs here, not in a
+review. **The conversion is small, because the grant is redundant:** `seedMember` inserts no `kind` and
+`members.kind` defaults to `'human'` (`postgres/schema.sql:1027`) despite the *"agent principal row"*
+comment, and `placeMemberByTier(…, "team")` already puts it in `everyone`
+(`test/datamechanics/helpers.ts:56-74`) — so the principal reaches General through the builtin either
+way. Replace the grant line with an assertion that it is **refused**; both original assertions keep
+passing. *(My first reading of round 4's proposed conversion called it impossible on the grant-inert
+rule; that rule is real but applies to `kind='agent'` rows, which this is not.)*
 
 **Out:**
 - **`lib/access/groups.ts:55` (`getMember`)** — ⚠️ *round 1 M7: it affects membership REMOVAL, not
@@ -310,110 +349,157 @@ Four things make this acceptable rather than a silent regression, and the fourth
       );
    ```
 
-   **Zero rows = safe to enable.** Any row means that instance would wedge the moment adoption next
-   runs, with no in-product way to see or repair it until -21 and -22 land. **This fleet: run
-   2026-08-23, zero rows** (§0d). The PR must carry the output, and the release note must carry the
-   query for self-hosters.
+   **Zero rows = safe to enable.** A non-empty result means two different things, and round 4's
+   MEDIUM 2 caught me telling self-hosters the wrong one:
+
+   - a **`kind='source'`** row **will wedge** that team's bootstrap (and its context backfill, §3b) the
+     moment adoption next runs;
+   - a **`kind='system'`** row does **not** wedge — an already-system project never re-enters the
+     adoption branch (`lib/access/bootstrap.ts:53-88` converges the pointer only). It is latent
+     unrevokable state, invisible until AUDITFIX-22 and unrepairable until AUDITFIX-21.
+
+   **This fleet: run 2026-08-23, zero rows** (§0d). The PR must carry the output, and the release note
+   must carry the query **and both readings**.
 
 ## 4. Acceptance
 
-⚠️ **Every refusal criterion names its `actorMemberId`, and round 3's BLOCKER 1 is why.** The real
-exploit is the CLI, which passes **`null`** (`scripts/admin.ts:319-320`), while the dashboard passes the
-creator's id (`app/actions/projects.ts:98-102`). Criteria that leave the actor unspecified admit
-`if (actorMemberId !== null && unsanctioned && protectedProject) refuse()` — AC1 still passes because
-bootstrap's own edges are sanctioned, every refusal criterion passes with a member actor, and
-`admin.ts grant-project vendors general` **still creates the forbidden edge**. The invariant is
-**actor-independent**, so the criteria must say so.
+⚠️ **Every refusal criterion names its actor AND its `opts`, and asserts that NOTHING was written.**
+Three rounds each found the same defect shape on a different axis: round 3 on the actor, round 4 on the
+`opts` shape and on group class. The invariant is a function of the **pair** — project and group — and
+of nothing else, so the criteria have to say that rather than leave an axis unnamed for an
+implementation to key on.
+
+**The tuple matrix.** Four caller shapes, all reachable in production; the refusal behaves the same
+under each. This matrix **excludes nothing** — every shipped caller of `grantProjectToGroup` appears in
+it (`lib/access/bootstrap.ts:139` = T1, `app/actions/projects.ts:101` = T3,
+`scripts/admin.ts:318-320` = T1 or T2 depending on `--actor`), and T4 is there so no axis is left
+unpinned for an implementation to key on.
+
+| # | `actorMemberId` | `opts` | reached by |
+|---|---|---|---|
+| T1 | `null` | `{}` | `admin.ts grant-project <g> <p>` **without `--actor`** — the canonical exploit (`scripts/admin.ts:319-320`) |
+| T2 | `null` | `{authorizedByMemberId, via:"cli"}` | the same command **with** `--actor` |
+| T3 | a member id | `{}` | the dashboard creator grant (`app/actions/projects.ts:101`) |
+| T4 | a member id | `{authorizedByMemberId, via:"cli"}` | no shipped caller — included so no axis is unpinned |
 
 - **AC1 — bootstrap's own three edges still work (dm):** a full `ensureAccessBootstrap` on a fresh
-  team succeeds and produces exactly them. *It calls the same writer with a NULL actor
+  team succeeds and produces exactly them. *It calls the same writer with T1
   (`bootstrap.ts:139`); a guard that breaks it breaks every team's access.*
-- **AC2 — a system project to an ORDINARY group is REFUSED, at the WRITER, with the OPERATOR's actor
-  shape (dm):** `actorMemberId = null` and the operator opts `{authorizedByMemberId, via:"cli"}` — the
-  exact tuple `scripts/admin.ts:319-320` builds. No edge row, no audit row.
-- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external`,
-  `actorMemberId = null`.
+- **AC2 — a system project to an ORDINARY group is REFUSED under ALL FOUR tuples (dm):** for each of
+  T1–T4: `ok:false`, **no `project_groups` row**, and the `access.project_granted` audit count
+  unchanged. ⚠️ *Round 3 BLOCKER 1 (the actor axis) and round 4 BLOCKER 2 (the `opts` axis). T1 is the
+  one that matters most and was the one no earlier criterion named: AC2 previously pinned only the
+  `--actor` variant, so `if (actorMemberId !== null || opts.authorizedByMemberId) applyGuard()` passed
+  everything while the bare CLI call created the edge.*
+- **AC3 — a system project to the WRONG builtin is REFUSED (dm):** `general→external`, T1. No edge, no
+  audit row.
 - **AC4 — identity is slug AND `is_builtin` (dm):** an ordinary group slugged `external` is refused a
-  grant to `external-shared`, `actorMemberId = null`.
+  grant to `external-shared`, T1. No edge, no audit row.
 - **AC5 — a RESERVED SLUG at `kind='source'` is REFUSED (dm):** `grantProjectToGroup(general@source,
-  vendors, null)` fails. *Round 1 HIGH 3 — this is what closes the adoption race; without it the
-  interval between the census and the CAS stays open.*
-- **AC6 — the refusal is ACTOR-INDEPENDENT (dm):** the AC2 pair repeated with a **member**
-  `actorMemberId` and with bare `opts = {}` is refused identically. ⚠️ *Round 3 BLOCKER 1 — AC2–AC5
-  alone admit an actor-keyed bypass that leaves the CLI exploit open.*
+  vendors)` under T1. No edge, no audit row. *Round 1 HIGH 3 — this is what closes the adoption race.*
+- **AC6 — a system project to a PERSON SINGLETON is REFUSED (dm):** under T1 **and** under T3 with the
+  singleton's own person as actor — the shape AC7's legitimate grant uses, pointed at a system project.
+  No edge, no audit row. ⚠️ *Round 4 BLOCKER 1: group class is the axis nothing else pins, the writer
+  already reads `person_member_id` (`lib/access/groups.ts:52`), and the repo's own stranded-creator
+  message teaches the exemption (`app/actions/projects.ts:83`). `grant-project person-<id> general` is
+  CLI-reachable.*
 - **AC7 — a reserved-slug INITIATIVE grants NORMALLY, through the dashboard's own tuple (dm):**
   build it exactly as `grantProjectToCreator` does — `ensurePersonSingleton(db, teamId, creatorId,
   creatorId)`, then `grantProjectToGroup(db, teamId, generalInitiativeId, singleton.groupId,
-  creatorId, {})` — and assert `ok:true` with the edge present. ⚠️ *Round 2 BLOCKER 1 is the defect;
-  round 3 HIGH 3 corrected my justification: I wrote that "nothing between `createProjectAction` and
-  the writer is conditional", which is **false** — `grantProjectToCreator` calls `ensurePersonSingleton`
-  first and returns without reaching the writer if it fails (`app/actions/projects.ts:92-102`). So the
-  criterion reproduces the helper's whole body instead of asserting the path is unconditional; what it
-  does NOT cover is `createProjectAction`'s session-dependent prologue, which is unrelated to this
-  guard.*
+  creatorId, {})` (T3) — and assert `ok:true` with the edge present. ⚠️ *Round 2 BLOCKER 1 is the
+  defect; round 3 HIGH 3 corrected my justification: I had written that "nothing between
+  `createProjectAction` and the writer is conditional", which is **false** —
+  `grantProjectToCreator` calls `ensurePersonSingleton` first and returns without reaching the writer
+  if it fails (`app/actions/projects.ts:92-102`). The criterion reproduces the helper's whole body
+  instead. **AC6 and AC7 are the pair that proves the exemption is by KIND, not by group class.***
 - **AC8 — bootstrap still REFUSES to adopt that initiative (dm):** `ensureSystemProject` leaves
-  `kind='initiative'` and errors. *The shipped `bootstrap.ts:57-60` behaviour AC7 depends on — if it
-  ever relaxed, AC7's row would become adoptable while granted.*
+  `kind='initiative'` and errors. *The shipped `bootstrap.ts:57-60` behaviour AC7 depends on.*
 - **AC9 — a NON-reserved, non-system project is unaffected (dm):** an ordinary initiative grants
-  normally, with a NULL actor and with a member actor. *The guard must not become a general-purpose
-  refusal.*
-- **AC10 — an unreadable PROJECT refuses the grant (dm):** `ok:false`, no edge row, no audit row.
-- **AC11 — an unreadable GROUP refuses the grant (dm):** ⚠️ *round 1 M6 — §2a said "project or group"
-  and my acceptance covered only the project.* `ok:false`, no edge row, and no audit row.
-- **AC12 — adoption REFUSES a `source` row carrying an unsanctioned grant (dm):** `kind` unchanged on
+  normally under T1 and T3. *The guard must not become a general-purpose refusal.*
+- **AC10 — a PRE-EXISTING forbidden edge is REFUSED, not reported as success (dm):** seed the edge
+  out-of-band (raw insert — the precedent is
+  `test/datamechanics/access-groups.datamechanics.test.ts:275`; the single-writer guard scans
+  `app`/`lib`/`scripts` only), then call the writer: `ok:false`, and the edge is **still there**
+  (this slice never deletes — §3). ⚠️ *Round 4 MEDIUM 1: a guard placed after the existence probe
+  (`groups.ts:518-524`) passes every other criterion and returns `{ok:true, created:false}` here, which
+  the CLI prints as "already granted … nothing written".*
+- **AC11 — an unreadable PROJECT refuses the grant, and says so (dm):** `ok:false`, no edge, no audit
+  row, **and the error names the READ FAILURE — distinguishable from "project not found"**.
+  ⚠️ *Round 4 HIGH 1: without the attribution clause the criterion is green under the mutant, because
+  a swallowed error yields `data=null` → the not-found branch → the same observable. The DANGEROUS
+  mutant is the other one — swallow, treat as unprotected, and proceed; the upsert uses the
+  **parameter** `projectId`, not the read (`groups.ts:524-529`), so it really does create the edge —
+  and the no-edge assertion catches that one. Both need pinning; they are different mutants.*
+- **AC12 — an unreadable GROUP refuses the grant, and says so (dm):** same three assertions plus the
+  attribution clause. ⚠️ *Round 1 M6 (§2a promised "project or group"); round 4 HIGH 1's second half:
+  **the fixture must be a PROTECTED project**, or an implementation that reads the group only when the
+  guard applies never reaches the faulted read and the criterion is vacuous.*
+- **AC13 — adoption REFUSES a `source` row carrying an unsanctioned grant (dm):** `kind` unchanged on
   the row, error names the edge, and no `access.project_adopted` audit row.
-- **AC13 — adoption FAILS CLOSED on an unreadable grant census (dm):** ⚠️ *round 1 BLOCKER 1.* Seed
+- **AC14 — adoption FAILS CLOSED on an unreadable grant census (dm):** ⚠️ *round 1 BLOCKER 1.* Seed
   the `source` row and verify it is present FIRST, then fault the `project_groups` census
-  specifically; adoption returns an error attributable to that census and **`kind` is still `source`
-  when re-read on the row**. *Round 2 HIGH 3's second half: asserting only "refused" lets the
+  specifically; adoption returns an error **attributable to that census** and **`kind` is still
+  `source` when re-read on the row**. *Round 2 HIGH 3's second half: asserting only "refused" lets the
   criterion pass because some unrelated read claimed the row did not exist.*
-- **AC14 — an edge whose group does not resolve is UNSANCTIONED, never absent (dm):** with a faulted
+- **AC15 — an edge whose group does not resolve is UNSANCTIONED, never absent (dm):** with a faulted
   `DbClient` returning `{ data: [{ group_id, groups: null }], error: null }` for the census, adoption
-  refuses and `kind` stays `source`. ⚠️ *Round 3 HIGH 2 — this cannot be seeded against real Postgres
-  and I should have checked before writing a criterion: `project_groups.group_id` is `not null` under
-  a composite FK with cascade delete (`postgres/schema.sql:1066-1074`), and the embed compiles to a
-  correlated `row_to_json` scalar subquery inside the SAME statement
-  (`lib/db/pg/query-builder.ts:299-325`), so a single snapshot can never show an edge whose group is
-  gone. A **query** failure fails the whole census and is AC13. This criterion pins the classifier's
-  treatment of a null embed, which is the branch a future left-join or two-read form would need.*
-- **AC15 — adoption still promotes a CLEAN row (dm):** no grants, or only the sanctioned one, flips to
+  refuses and `kind` stays `source`. ⚠️ *Round 3 HIGH 2 — this cannot be seeded against real Postgres,
+  and I should have checked before writing a criterion: `project_groups.group_id` is `not null` under a
+  composite FK with cascade delete (`postgres/schema.sql:1066-1074`), and the embed compiles to a
+  correlated `row_to_json` subquery inside the SAME statement (`lib/db/pg/query-builder.ts:299-325`),
+  so one snapshot can never show an edge whose group is gone. A **query** failure fails the whole
+  census and is AC14. This pins the classifier branch a future left-join or two-read form would need —
+  the same branch `lib/access/oracle.ts:89` already carries for the same reason.*
+- **AC16 — adoption still promotes a CLEAN row (dm):** no grants, or only the sanctioned one, flips to
   `system` and audits.
-- **AC16 — the swallowed grant probe is captured, with BOTH damages pinned (dm):** seed an existing
-  edge with a **distinctive `added_by`**, fault the existence read, then assert all three: `ok:false`,
-  `added_by` **unchanged**, and the count of `access.project_granted` audit rows **unchanged**.
+- **AC17 — the swallowed grant probe is captured, with BOTH damages pinned (dm):** seed an existing
+  **sanctioned** edge with a distinctive `added_by`, fault the existence read, then assert all three:
+  `ok:false`, `added_by` **unchanged**, and the `access.project_granted` audit count **unchanged**.
   ⚠️ *Round 3 MEDIUM 1: `ok:false` alone does not prove neither write happened — an implementation can
   upsert, audit, and only then return failure.*
+- **AC18 — the converted shipped test still protects what it protected (dm):**
+  `test/datamechanics/access-enforced-read.datamechanics.test.ts` keeps both of its assertions — the
+  principal sees General (now via its `everyone` membership) and still does NOT see the item moved to a
+  project its launcher cannot reach — with the redundant grant line replaced by an assertion that the
+  grant is refused. *§3 — convert, never delete.*
 
 **Mutation coverage is per ENFORCEMENT POINT, not per file**, and each must redden **its own**
-criterion, not merely some criterion. One mutation each for:
+criterion, not merely some criterion.
 
 | # | mutation | must redden |
 |---|---|---|
 | 1 | delete the `kind='system'` clause | AC2 |
 | 2 | delete the reserved-slug/`source` clause | AC5 |
 | 3 | drop the `is_builtin` conjunct from edge identity | AC4 |
-| 4 | make the refusal actor-dependent (`actorMemberId !== null &&`) | AC6 |
-| 5 | swallow the writer's PROJECT read error | AC10 |
-| 6 | swallow the writer's GROUP read error | AC11 |
-| 7 | delete the adoption census refusal | AC12 |
-| 8 | swallow the census read error | AC13 |
-| 9 | treat a null `groups` embed as sanctioned/absent | AC14 |
-| 10 | swallow the grant existence-probe error | AC16 |
+| 4 | make the refusal actor-dependent (`actorMemberId !== null &&`) | AC2 (T1) |
+| 5 | key the refusal on `opts` (skip when `authorizedByMemberId` absent) | AC2 (T1) |
+| 6 | exempt person-singleton groups (`group.person_member_id === null &&`) | AC6 |
+| 7 | move the guard BELOW the existence probe | AC10 |
+| 8 | swallow the PROJECT read error and treat the project as unprotected | AC11 (no-edge) |
+| 9 | swallow the PROJECT read error and report "not found" | AC11 (attribution) |
+| 10 | swallow the GROUP read error | AC12 |
+| 11 | delete the adoption census refusal | AC13 |
+| 12 | swallow the census read error | AC14 |
+| 13 | treat a null `groups` embed as sanctioned | AC15 |
+| 14 | swallow the grant existence-probe error | AC17 |
 
-*Mutations 4 and 9 exist because round 3 found each enforcement point unobservable through the
-criteria as written — an omitted mutation is how the last slice shipped a guard two SQL owners shared
-one fixture for.*
+*Rows 4, 5, 6, 7, 9 and 13 all exist because a review found the enforcement point unobservable through
+the criteria as written — five of the fourteen. An omitted mutation is how the last slice shipped a
+guard that two SQL owners shared one fixture for.*
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
 | The guard refuses bootstrap's own three edges | **every team loses access** | AC1 runs the real bootstrap, not a fixture |
-| The guard is keyed on the ACTOR, so the CLI exploit survives | the whole slice is decorative | **round 3 BLOCKER 1** — AC2–AC5 use the operator's NULL actor; AC6 pins actor-independence; mutation 4 |
-| The reserved-slug rule breaks a legitimate grant | a creator cannot see the project they just made | **round 2 BLOCKER 1** — clause 2 is `source`-only; AC7 + AC8 pin both halves |
-| Adoption refusal wedges a team's bootstrap AND its context backfill | the team stops partitioning new items; the `access_bootstrap` failure is masked | §3b — deliberate, pre-existing, surfaced via `context_backfill`, and gated on the pre-deploy census |
-| An instance already holds a forbidden edge | it wedges on first adoption with no in-product repair | **the pre-deploy census is a release condition** (§3b.4), not advice |
-| The census reads two relations and swallows one | a forbidden edge is promoted under an undetermined read | one joined read, error captured; a null embed is unsanctioned (AC14) |
+| The guard is keyed on an axis no criterion names — actor, `opts`, or group class | the whole slice is decorative and the CLI exploit survives | **rounds 3 B1, 4 B1, 4 B2** — the T1–T4 tuple matrix in AC2, AC6 for singletons, mutations 4/5/6 |
+| The guard sits below the existence probe | a pre-existing forbidden edge reports success to the operator | **round 4 M1** — AC10, mutation 7 |
+| The reserved-slug rule breaks a legitimate grant | a creator cannot see the project they just made | **round 2 B1** — clause 2 is `source`-only; AC7 + AC8, and AC6/AC7 together prove the exemption is by kind, not group class |
+| An agent can no longer be granted General | a deliberate narrowing nobody asked for | **stated, not silent** (§2a) — it matches the AUDITFIX-19 ruling, ordinary projects are unaffected, and prod impact is zero |
+| A converted test loses the protection it carried | a silent hole where a green test used to be | AC18 keeps both original assertions and adds the new refusal |
+| Adoption refusal wedges a team's bootstrap AND its context backfill | the team stops partitioning new items; the `access_bootstrap` failure is masked | §3b — deliberate, pre-existing, surfaced via `context_backfill`, gated on the census |
+| An instance already holds a forbidden edge | `source`-kind wedges on first adoption; `system`-kind is latent and unrepairable | **the pre-deploy census is a release condition** (§3b.4), with both readings written out |
+| The census reads two relations and swallows one | a forbidden edge is promoted under an undetermined read | one joined read, error captured; a null embed is unsanctioned (AC15) |
 | Someone reads the merge as fixing a live leak, or as adding detection | wasted expectation | §0d: zero forbidden edges on prod; §3a/§3b: detection and repair are separate tickets |
 
 ## 6. What the earlier spec rounds found (pre-round-1)
@@ -474,3 +560,37 @@ reasoning. It is still wrong: the same file already solves this for another leg 
 plus a distinct `context_backfill_all` heartbeat source, with a comment naming the distinct-on masking
 (`lib/ingest/scheduler.ts:427-436,459-460`). The fix for `access_bootstrap` is the same shape and
 touches one leg. §3a is corrected and AUDITFIX-22 carries it. **A reviewer agreeing is not evidence.**
+
+## 10. Round 4 — FABLE, and the first different model found two blockers three Codex rounds missed
+
+Rounds 1-3 were all gpt-5.6-sol. Round 4 was Fable precisely because extra rounds of one model are
+correlated rather than additive, and it is also the plan review CLAUDE.md requires. It returned
+**BLOCKED** with two blockers on axes three rounds had not looked at — the same defect *shape* round 3
+found on the actor axis, on two more axes.
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | group class is an unpinned axis: `refuse when unsanctioned && protected && group.person_member_id === null` passes all sixteen criteria, while `grant-project person-<id> general` creates the edge. The writer already reads `person_member_id` (`groups.ts:52`) and the repo TEACHES the exemption (`app/actions/projects.ts:83`) | **CONFIRMED.** Walked every criterion: AC2-AC6 used ordinary/builtin groups; the only singleton criterion pointed at an initiative, where the guard never fires. CLI-reachable — `scripts/admin.ts:293-297` resolves any slug, singletons are `person-*` | **ADOPTED** — **AC6**, mutation 6, and §2a states the repair path is exempt by KIND not by class |
+| **B2** | the canonical exploit tuple `(null, {})` — `grant-project <g> <p>` with no `--actor` — was pinned by no criterion; AC2 tested only the `--actor` variant, so `if (actor !== null \|\| opts.authorizedByMemberId) applyGuard()` passed everything | **CONFIRMED** at `scripts/admin.ts:319-320` (`grantAuthorizer ? {…} : {}`) | **ADOPTED** — the **T1-T4 tuple matrix**, mutation 5 |
+| **H1** | mutations 5/6 as tabled would NOT redden AC10/AC11: a swallowed read error yields `data=null` → the not-found branch → the same observable the criteria assert | **CONFIRMED**, and its second half too: the genuinely dangerous mutant differs (the upsert uses the *parameter* `projectId`, so swallow-and-proceed really creates the edge) | **ADOPTED** — AC11/AC12 gain an attribution clause, AC12's fixture must be a PROTECTED project, and the two mutants are separated (8 vs 9) |
+| **H2** | an existing dm test creates the exact forbidden edge and §3 planned no conversion, so the builder meets it as a mid-build red with two bad exits | **CONFIRMED** at `access-enforced-read.datamechanics.test.ts:152-157`; Fable swept all 24 caller files and it is the only one | **ADOPTED** — §3 names the file and the conversion; **AC18** keeps its protections |
+| **M1** | the guard's position relative to the `created:false` early return was unspecified; below it, a pre-existing forbidden edge returns success and the CLI prints "already granted" | **CONFIRMED** at `groups.ts:518-524` and `scripts/admin.ts:325-328` | **ADOPTED** — guard runs FIRST (§2a); **AC10**, mutation 7 |
+| **M2** | §3b.4 told self-hosters any census row means a wedge; false for `kind='system'` rows, which never re-enter adoption | **CONFIRMED** — `bootstrap.ts:53-88` converges the pointer only for an existing system row | **ADOPTED** — §3b.4 splits the two readings |
+| **M3** | refusal criteria were non-uniform on "nothing written" — round 3's own lesson had been applied to one criterion only | **CONFIRMED** | **ADOPTED** — every refusal now asserts edge count and audit count unchanged |
+| — | `.update({ kind` appears once; no slug-rename path; the ingest upsert writes no `kind`; the embed/FK reading; §3a/§3b's citations; the census SQL is correct and over-inclusive only, in the safe direction | **CLEARED with evidence** | recorded so the build does not re-litigate them |
+
+**One correction of my own, from following B1's evidence.** Round 4 proposed converting the broken test
+by giving its principal General through **Everyone membership**, and my first reading called that
+impossible because builtins are grant-inert for agents. Wrong for this test: `seedMember` sets no
+`kind` and `members.kind` defaults to `'human'` (`postgres/schema.sql:1027`), so the row the comment
+calls an *"agent principal row"* is a human and already reaches General through the builtin. The
+grant-inert rule is real and applies to `kind='agent'` rows — which is the agent consequence §2a now
+states — but it is not what that test exercises, and the conversion is smaller than I first thought.
+
+**Why round 5 is not being run.** Four rounds, two models, and the design has not changed since round
+2; rounds 3 and 4 both found only acceptance defects. A fifth round would be correlated with one of the
+two models already used, and the residual risk class — *a criterion weaker than its own rule* — is
+exactly what the fourteen mutations measure empirically during the build, followed by the loop's two
+adversarial DIFF reviews. Stated here so the choice is visible rather than implied.
+
+**Nothing is built. No code exists for this slice.**
