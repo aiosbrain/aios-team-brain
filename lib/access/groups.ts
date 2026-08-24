@@ -8,6 +8,7 @@ import {
   isProtectedProject,
   isSanctionedSystemEdge,
   type EdgeGroupIdentity,
+  type UnsanctionedEdge,
 } from "@/lib/access/system-projects";
 
 /**
@@ -548,6 +549,69 @@ export async function censusUnsanctionedSystemEdges(
     };
   }
   return { ok: true };
+}
+
+/**
+ * AUDITFIX-23 — the TEAM-WIDE system-edge census: every edge on every `kind='system'` project that
+ * `grantProjectToGroup` would refuse today.
+ *
+ * WHY IT EXISTS. AUDITFIX-3 closed the door on NEW forbidden edges; nothing looked for one that
+ * already existed, and `revokeProjectFromGroup` refuses every system revocation — so such an edge was
+ * invisible AND unrepairable. This makes it visible. It stays unrepairable until AUDITFIX-21.
+ *
+ * IT LIVES HERE, in the single-writer file, for the same reason `censusUnsanctionedSystemEdges` does:
+ * the access-chain guard's coarse net refuses any other file that NAMES an edge table while containing
+ * write verbs, and a read in the sanctioned file keeps that net tight.
+ *
+ * EDGE-DRIVEN, NOT PROJECT-DRIVEN, and that is forced rather than chosen: the reverse direction is
+ * to-MANY, which this adapter compiles only as `(count)`. So the census reads the team's whole edge set
+ * and embeds BOTH sides — the project to test `kind`/`slug`, the group to test the sanctioned pair —
+ * in ONE statement, then filters to system projects client-side (the adapter cannot push a predicate
+ * into an embed). Do not "optimise" that into a two-read form: swallowing the projects lookup is the
+ * exact fail-open shape the per-project census documents above.
+ *
+ * ⚠️ THE SANCTIONED SET IS THREE PAIRS, NOT "BUILT-INS ARE FINE". `general -> external` is a built-in
+ * target and is FORBIDDEN — it is the edge this whole program began with. An implementation that
+ * treats any `is_builtin` group as an approved target passes a suite whose fixtures all use ordinary
+ * groups while leaving that one invisible (spec round 3 BLOCKER 2).
+ *
+ * FAILS CLOSED: a read error is returned as an error, never as "no forbidden edges". An unresolved
+ * embed on either side is UNSANCTIONED, never absent.
+ */
+export interface TeamSystemEdgeCensus extends WriteResult {
+  /** Every unsanctioned edge found. Empty on a clean team; meaningless unless `ok`. */
+  edges: UnsanctionedEdge[];
+}
+
+export async function censusTeamSystemEdges(db: DbClient, teamId: string): Promise<TeamSystemEdgeCensus> {
+  const { data, error } = await db
+    .from("project_groups")
+    .select("project_id, group_id, projects(kind, slug), groups(slug, is_builtin)")
+    .eq("team_id", teamId);
+  if (error) {
+    return { ok: false, error: `system-edge census failed: ${error.message}`, edges: [] };
+  }
+  const rows = (data ?? []) as {
+    project_id: string;
+    group_id: string;
+    projects: { kind: string; slug: string } | null;
+    groups: EdgeGroupIdentity | null;
+  }[];
+  const edges: UnsanctionedEdge[] = [];
+  for (const r of rows) {
+    // Only system projects are this census's subject. A `source` project holding a reserved slug is
+    // already covered: AUDITFIX-3's adoption guard refuses to promote it and the team wedges LOUDLY,
+    // which AUDITFIX-22's per-team ledger reds. Reporting it here too would double-count one state.
+    if (r.projects?.kind !== "system") continue;
+    if (isSanctionedSystemEdge(r.projects.slug, r.groups)) continue;
+    edges.push({
+      projectId: r.project_id,
+      projectSlug: r.projects.slug,
+      groupId: r.group_id,
+      groupSlug: r.groups?.slug ?? `unresolved group ${r.group_id}`,
+    });
+  }
+  return { ok: true, edges };
 }
 
 /**

@@ -5,11 +5,13 @@ import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import {
   EVERYONE_SLUG,
   EXTERNAL_SLUG,
+  censusTeamSystemEdges,
   censusUnsanctionedSystemEdges,
   ensureBuiltins,
   grantProjectToGroup,
   type WriteResult,
 } from "@/lib/access/groups";
+import { describeUnsanctionedEdges } from "@/lib/access/system-projects";
 
 
 /**
@@ -181,15 +183,41 @@ export async function ensureAccessBootstrapAllTeams(
   if (tErr) return { teams: 0, failed: [{ teamId: "*", error: `teams read failed: ${tErr.message}` }] };
   const failed: { teamId: string; error: string }[] = [];
   for (const t of (teams ?? []) as { id: string }[]) {
-    let outcome: TeamBootstrapOutcome;
+    // AUDITFIX-23: TWO separately guarded phases. Convergence is awaited to completion first — so a
+    // missing sanctioned edge is restored before the census reads, and the census can never be the
+    // reason a team stays half-wired. Then the census runs REGARDLESS of what convergence did,
+    // including when it THREW: sharing one `try` would satisfy the returned-failure case and silently
+    // skip the census on a throw, which is the loudest case going silent. The census has its own guard
+    // for the same reason — the adapter can throw (an unknown embed does), and a throw escaping here
+    // would abort every REMAINING team and land as one fleet-level row.
+    let convergenceError: string | null = null;
     try {
       const r = await ensureAccessBootstrap(db, t.id);
-      if (!r.ok) failed.push({ teamId: t.id, error: r.error ?? "unknown" });
-      outcome = r.ok ? { teamId: t.id, ok: true } : { teamId: t.id, ok: false, error: r.error ?? "unknown" };
+      if (!r.ok) convergenceError = r.error ?? "unknown";
     } catch (e) {
-      const error = e instanceof Error ? e.message : "threw";
+      convergenceError = e instanceof Error ? e.message : "threw";
+    }
+
+    let censusError: string | null = null;
+    try {
+      const census = await censusTeamSystemEdges(db, t.id);
+      if (!census.ok) censusError = census.error ?? "system-edge census failed";
+      else if (census.edges.length > 0) censusError = describeUnsanctionedEdges(census.edges);
+    } catch (e) {
+      censusError = `system-edge census threw: ${e instanceof Error ? e.message : "threw"}`;
+    }
+
+    // The census finding goes FIRST when both are present: it is the fact no other surface reports,
+    // while a wedged team also reds its `context_backfill` leg (backfillTeamContext re-runs bootstrap
+    // and returns before any item). The labelled compound that carries BOTH is AUDITFIX-25 — its seam
+    // is untestable until the census truncation moves into the formatter (spec round 3 B1).
+    const error = censusError ? `census: ${censusError}` : convergenceError;
+    let outcome: TeamBootstrapOutcome;
+    if (error) {
       failed.push({ teamId: t.id, error });
       outcome = { teamId: t.id, ok: false, error };
+    } else {
+      outcome = { teamId: t.id, ok: true };
     }
     if (opts.onOutcome) {
       try {

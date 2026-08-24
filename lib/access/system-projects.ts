@@ -89,3 +89,57 @@ export function isSanctionedSystemEdge(projectSlug: string, group: EdgeGroupIden
   if (!group || !group.is_builtin) return false;
   return SANCTIONED.some((e) => e.project === projectSlug && e.group === group.slug);
 }
+
+/** One edge the writer would refuse, as the census reports it. Slugs are what a repair needs — both
+ *  tables are unique on `(team_id, slug)` — and the ids are carried so a repair need not re-resolve. */
+export interface UnsanctionedEdge {
+  projectId: string;
+  projectSlug: string;
+  groupId: string;
+  groupSlug: string;
+}
+
+/** How many characters of the human summary the sample may occupy (AUDITFIX-23 §2b.1). The ledger
+ *  clamps each stored error at 500 and the compound reserves the rest for the bootstrap half. */
+export const CENSUS_SAMPLE_BUDGET = 200;
+
+/**
+ * AUDITFIX-23 §2b.1 — the human-readable summary of a census result.
+ *
+ * WHY THIS IS A COUNT PLUS A SAMPLE, not the list. The spec's first draft promised "every forbidden
+ * edge is reported" in a field the ledger clamps to 500 characters, against `groups.slug` which is
+ * unconstrained `text`. An unbounded set cannot be named in a bounded string, so the promise was
+ * unkeepable — and worse, every criterion planting ONE edge let a `find`-style implementation satisfy
+ * the whole suite while a second edge went unreported forever (spec round 2).
+ *
+ * So: the COUNT is exact and unbounded-safe, the SAMPLE is deterministic — sorted by
+ * `(projectSlug, groupSlug)` so it is stable across runs and diffable between them — and the COMPLETE
+ * structured set travels in the ledger row's `meta`, which is jsonb and unclamped.
+ */
+export function describeUnsanctionedEdges(edges: readonly UnsanctionedEdge[]): string {
+  if (edges.length === 0) return "";
+  // CODE-POINT order, not localeCompare: the sample has to be byte-stable across runs and machines
+  // so two runs are diffable, and `localeCompare` is locale-sensitive. The sort is CLIENT-SIDE
+  // because the adapter orders only when explicitly asked, so the row order off the wire is
+  // unspecified — a criterion feeding permuted rows is what pins this (spec round 3 HIGH 4).
+  const ordered = [...edges].sort((a, b) =>
+    a.projectSlug < b.projectSlug ? -1
+      : a.projectSlug > b.projectSlug ? 1
+      : a.groupSlug < b.groupSlug ? -1
+      : a.groupSlug > b.groupSlug ? 1
+      : 0
+  );
+  const head = `${ordered.length} unsanctioned edge(s) on system projects: `;
+  const named: string[] = [];
+  let used = 0;
+  for (const e of ordered) {
+    const pair = `${e.projectSlug}→${e.groupSlug}`;
+    // Reserve room for the "+N more" suffix so the sample can never crowd the count out.
+    const suffix = ordered.length - named.length - 1 > 0 ? ` +${ordered.length - named.length - 1} more` : "";
+    if (used + pair.length + 2 + suffix.length > CENSUS_SAMPLE_BUDGET - head.length) break;
+    named.push(pair);
+    used += pair.length + 2;
+  }
+  const rest = ordered.length - named.length;
+  return head + named.join(", ") + (rest > 0 ? ` +${rest} more` : "");
+}
