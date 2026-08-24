@@ -154,6 +154,50 @@ function interceptCensusRead(onRead: () => Promise<void> | void, opts: { transfo
   return { client, count: () => intercepted };
 }
 
+/**
+ * Faults ONLY the census read, keyed on its select shape.
+ *
+ * ⚠️ A blunt "fault every `project_groups` read" injector CANNOT test this: it breaks the writer's
+ * three existence probes too, so convergence itself returns ok:false and the team is "reported failed"
+ * for the BOOTSTRAP reason — the fail-closed criterion passing while testing nothing. Spec round 3
+ * predicted exactly that, and the first version of AC6 built it anyway; the swallow-the-census-error
+ * mutation reddened AC12 and left AC6 green, which is how it was caught.
+ */
+function clientWithFailingCensusRead(message: string): DbClient {
+  const real = db();
+  const injected = { data: null, error: { message } };
+  return new Proxy(real as object, {
+    get(target, prop, recv) {
+      if (prop !== "from") return Reflect.get(target, prop, recv);
+      return (name: string) => {
+        const q = (target as { from: (n: string) => unknown }).from(name);
+        if (name !== "project_groups") return q;
+        let spec = "";
+        const wrap = (b: object): unknown =>
+          new Proxy(b, {
+            get(bt, bp, br) {
+              const v = Reflect.get(bt, bp, br);
+              if (bp === "then") {
+                const flat = spec.replace(/\s+/g, "");
+                if (!(flat.includes("projects(") && flat.includes("groups("))) {
+                  return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(bt) : v;
+                }
+                return (res: (x: unknown) => unknown) => res(injected);
+              }
+              if (typeof v !== "function") return v;
+              return (...args: unknown[]) => {
+                if (bp === "select") spec = String(args[0] ?? "");
+                const r = (v as (...a: unknown[]) => unknown).apply(bt, args);
+                return r === bt ? br : wrap(r as object);
+              };
+            },
+          });
+        return wrap(q as object);
+      };
+    },
+  }) as DbClient;
+}
+
 describe("AUDITFIX-23: a forbidden system-project grant is found without an operator asking", () => {
   it("AC1: a forbidden edge on external-shared is reported", async () => {
     const seed = await bareTeam();
@@ -288,15 +332,13 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
 
   it("AC6: the census FAILS CLOSED on a team that otherwise converges cleanly", async () => {
     const seed = await bareTeam();
-    // Faulting every project_groups read would break the writer's existence probes too, so
-    // convergence would fail and the team would be "reported failed" for the BOOTSTRAP reason —
-    // the fail-closed criterion passing while testing nothing.
-    const { client } = interceptCensusRead(() => {}, {});
-    void client;
-    const faulted = clientWithFailingSelect("project_groups", "census exploded");
+    // ONLY the census read is faulted — see clientWithFailingCensusRead. Convergence must still
+    // succeed, so the ONLY path to a failed outcome is the census failing closed.
+    const faulted = clientWithFailingCensusRead("census exploded");
     const r = await ensureAccessBootstrapAllTeams(faulted);
     const err = r.failed.find((f) => f.teamId === seed.teamId)?.error;
     expect(err, "an undetermined census is a failure, never 'no forbidden edges'").toBeTruthy();
+    expect(err, "and it is attributable to the CENSUS, not to convergence").toMatch(/census exploded|census/i);
   });
 
   it("AC8: a clean team is not reported", async () => {
@@ -368,7 +410,7 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
 
   it("AC12: assessAccessHealth FAILS CLOSED on an undetermined census", async () => {
     const seed = await bareTeam();
-    const faulted = clientWithFailingSelect("project_groups", "census exploded");
+    const faulted = clientWithFailingCensusRead("census exploded");
     const h = await assessAccessHealth(faulted, seed.teamId);
     expect(h.healthy, "an unverifiable team is never certified healthy").toBe(false);
     expect(h.blockers.join(" | ")).toMatch(/UNVERIFIED|census/i);
