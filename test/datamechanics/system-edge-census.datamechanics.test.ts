@@ -222,6 +222,70 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     expect(err, "convergence fails on the General leg, and the census must still run").toMatch(/external-shared→vendors/);
   });
 
+  it("AC4: the census runs when convergence THREW — the loudest case must not go silent", async () => {
+    const seed = await bareTeam();
+    await plant(seed, await projectId(seed, EXTERNAL_SHARED_SLUG), await ordinaryGroup(seed, "vendors"));
+
+    // Make CONVERGENCE throw while leaving the census's own reads working. `groups` is read by
+    // ensureBuiltins; project_groups (the census) is untouched. A shared try/catch would swallow this
+    // and skip the census entirely — passing AC3, which only exercises a RETURNED failure.
+    const real = db();
+    const thrower = new Proxy(real as object, {
+      get(target, prop, recv) {
+        if (prop !== "from") return Reflect.get(target, prop, recv);
+        return (name: string) => {
+          if (name === "groups") throw new Error("convergence exploded");
+          return (target as { from: (n: string) => unknown }).from(name);
+        };
+      },
+    }) as DbClient;
+
+    const r = await ensureAccessBootstrapAllTeams(thrower);
+    const err = r.failed.find((f) => f.teamId === seed.teamId)?.error;
+    expect(err, "the census still ran and named the edge").toMatch(/external-shared→vendors/);
+  });
+
+  it("AC6b: a census that THROWS is that team's failure, and later teams still get outcomes", async () => {
+    const a = await bareTeam();
+    const b = await bareTeam();
+    // A throw escaping the per-team guard would abort every REMAINING team and land as one
+    // fleet-level row — converting one team's finding into a fleet outage.
+    const seen: string[] = [];
+    const real = db();
+    const thrower = new Proxy(real as object, {
+      get(target, prop, recv) {
+        if (prop !== "from") return Reflect.get(target, prop, recv);
+        return (name: string) => {
+          const q = (target as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_groups") return q;
+          let spec = "";
+          const wrap = (bl: object): unknown =>
+            new Proxy(bl, {
+              get(bt, bp, br) {
+                const v = Reflect.get(bt, bp, br);
+                if (bp === "then" && spec.replace(/\s+/g, "").includes("projects(")) {
+                  throw new Error("census exploded");
+                }
+                if (typeof v !== "function") return v;
+                return (...args: unknown[]) => {
+                  if (bp === "select") spec = String(args[0] ?? "");
+                  const rr = (v as (...x: unknown[]) => unknown).apply(bt, args);
+                  return rr === bt ? br : wrap(rr as object);
+                };
+              },
+            });
+          return wrap(q as object);
+        };
+      },
+    }) as DbClient;
+
+    const r = await ensureAccessBootstrapAllTeams(thrower, { onOutcome: (o) => { seen.push(o.teamId); } });
+    expect(seen, "every team still reported").toEqual(expect.arrayContaining([a.teamId, b.teamId]));
+    for (const t of [a, b]) {
+      expect(r.failed.find((f) => f.teamId === t.teamId)?.error, "each team carries its own census throw").toMatch(/census/i);
+    }
+  });
+
   it("AC6: the census FAILS CLOSED on a team that otherwise converges cleanly", async () => {
     const seed = await bareTeam();
     // Faulting every project_groups read would break the writer's existence probes too, so
