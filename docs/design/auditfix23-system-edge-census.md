@@ -51,7 +51,17 @@ exactly like one that did.** Before this merges, all three must hold on prod, re
 1. an `access_bootstrap` row with the **real team id**, `trigger='scheduler'`, and `finished_at`
    **after** the AUDITFIX-22 deploy;
 2. **no** new ordinary instance-wide success row after that deploy;
-3. `getPipelineHealth` for that team selecting **that same scoped row** as its leg.
+3. `getPipelineHealth` for that team selecting **that same scoped row** as its leg;
+4. **two successive scheduled scoped rows at the expected cadence, with no duplicate scoped row in
+   either tick window** — round 2's HIGH 2: checks 1-3 are all satisfied by one lucky post-deploy tick
+   followed by a dead scheduler, and none of them pins the one-row-per-tick property that stops a
+   single failure reaching the confirmation threshold.
+
+✅ **ALL FOUR VERIFIED on prod, read-only, 2026-08-24** (evidence:
+`.context/rederive/auditfix22-release-gate-verified.md`). 40 team-scoped `trigger='scheduler'` rows
+starting ten minutes after the deploy, against **zero** in the seven days before it; **no** new
+instance-wide success row; `newest` selecting the scoped row, 3 minutes old; and 39 successive gaps at
+min 24.3 / avg 29.9 / max 35.6 minutes with **zero** sub-minute gaps.
 
 A successful row cannot prove the FAILURE branch live, so the two-tick card behaviour stays dm
 evidence — stated, not glossed.
@@ -128,22 +138,92 @@ therefore **in scope** (§3).
 A system project with **zero** edges needs no row in the result: there is no forbidden edge to report,
 and its absence is not a finding. An unresolved embed on either side is **unsanctioned, never absent**.
 
+**The read is the team's WHOLE edge set, with `kind` filtered client-side** — the adapter cannot push a
+predicate into an embed. That is fine at any realistic edge count (§0a: three on prod), and it is
+written down so nobody "optimises" it into a two-read form that swallows the projects lookup — the
+exact shape AUDITFIX-3's per-project census documents at `lib/access/groups.ts:511-514`.
+
+⚠️ **THE CENSUS IS IDENTIFIED BY ITS SELECT SHAPE, and round 2's BLOCKER 1 is why that has to be in the
+spec.** `project_groups` is read **four times per team per converged tick**: `grantProjectToGroup`'s
+existence probe fires once per sanctioned grant — **three** times (`lib/access/groups.ts:647-653`,
+loop at `lib/access/bootstrap.ts:141-148`) — plus AUDITFIX-3's per-project adopt census
+(`lib/access/groups.ts:530-534`). The three shapes are distinguishable and only one is new:
+
+| read | select |
+|---|---|
+| the grant existence probe (×3) | `project_id` |
+| AUDITFIX-3's adopt census | `group_id, groups(slug, is_builtin)` |
+| **this census** | the only one embedding **`projects(`** |
+
+Any criterion that needs to observe or fault "the census read" **keys on that embed**, never on the
+table name and never on read order — §4 says so at AC5 and AC6, because both were unimplementable
+without it.
+
+⚠️ **A census that THROWS is that team's failure, and later teams still get their rows** (round 2
+MEDIUM 1). The adapter can throw rather than return `{error}` — an unknown embed does
+(`lib/db/pg/query-builder.ts:313`). If the census sat outside the per-team `try`, its throw would
+escape the loop, abort every remaining team's outcome, and land as ONE fleet-level row through the
+leg's catch — silently converting a per-team finding into a fleet outage.
+
 ⚠️ **For a non-reserved system project, EVERY edge is reported, and that is deliberate.** The
 alternative — treat an unknown system slug as "anything goes" — would make the census disagree with
 the writer, which refuses all of them (§0c). A detector that disagrees with the thing it observes is
 worse than none.
 
-⚠️ *Round 1's MEDIUM 1 sharpened the justification, and the correction matters: "the writer refuses it
-now" does NOT establish that accumulated historical state was never legitimate — the writer only ever
-saw NEW grants. The load-bearing argument is the **data model**, which defines the kind as exactly the
-two built-ins: `'system' (§11 built-ins: general/external-shared)`
-(`postgres/schema.sql:997-998`, and the CHECK in
-`postgres/migrations/20260809150000_projects_kind.sql`). A non-reserved `kind='system'` row is
-**unsupported state**, not an operator extension the census is misreading.*
+⚠️ **This is a POLICY DECISION, and round 2's BLOCKER 3 is why it cannot be dressed as a derived
+fact.** Round 1 rightly said *"the writer refuses it now"* does not establish that accumulated
+historical state was never legitimate — the writer only ever saw NEW grants. My fold then claimed the
+DATA MODEL settles it. **It does not.** The CHECK constrains only the kind ENUM, never the slug
+(`postgres/migrations/20260809150000_projects_kind.sql:11`), and the graph-pointer migration
+deliberately mints an ordinary per-project pointer for *"everything else"* — which INCLUDES a
+non-reserved `kind='system'` row (`postgres/migrations/20260815140000_projects_graph_group_id.sql:44`).
+`schema.sql:997`'s "the two §11 built-ins" is a comment, not an enforced invariant. **That is the
+second time in this program I have derived a ruling from a data model that does not say it.**
+
+So, stated as the decision it is: **the current writer owns every system-kind edge, including
+historical ones**, and the census reports accordingly. The subject of the census is **edges**, not
+project rows — so a non-reserved system project with ZERO edges is **not** a finding here, and this
+spec makes no claim that the row itself is invalid. Both halves of that follow from the same
+edge-scoped reading, which is what round 2 found inconsistent in the previous draft.
+
+### 2b.1 What "report every edge" can actually mean — count, plus a bounded deterministic sample
+
+⚠️ **Round 2's BLOCKER 2 found the rule and the channel contradicting each other.** §1 promises every
+forbidden edge is reported; §2d clamps the census part of the error to 200 characters; and `groups.slug`
+has no length constraint (`postgres/schema.sql:1035`) while persistence clamps each error string to 500
+(`lib/ingest/runs.ts:51`). An unbounded set cannot be named in a bounded string — so the absolute
+promise was unkeepable, and every criterion planting exactly ONE forbidden edge let
+`rows.find(unsanctioned)` satisfy the entire suite while a second edge went unreported forever.
+
+**The contract, made satisfiable:**
+
+- the census **detects existence over the whole set** — never `find`, always a full scan;
+- it reports the **exact total count**, which is unbounded-safe;
+- plus a **deterministic bounded sample** — ordered by `(project slug, group slug)` so it is stable
+  across runs and diffable, truncated to fit the 200 characters with an explicit `+N more`;
+- and the **complete, structured** set goes in the ledger row's **`meta`** — round 2 MEDIUM 2, and it is
+  strictly better than my "the complete set is the repair path's problem". `ingest_runs.meta` is
+  `jsonb`, **unclamped**, already rendered by the Recent-runs panel, and **nothing reads this source's
+  `meta` today** — so `{ forbiddenEdges: [{ projectSlug, groupSlug, projectId, groupId }] }` costs
+  nothing and is exactly the evidence a controlled raw-SQL repair needs, and that AUDITFIX-21 will
+  validate its repair against. Slugs alone suffice to write that SQL, since both tables are unique on
+  `(team_id, slug)` (`postgres/schema.sql:995`, `:1047`) — but only for the edges a 200-character
+  clamp did not eat, which is the whole reason the structured channel exists.
+
+So the reported shape is `3 unsanctioned edge(s) on system projects: external-shared→contractors,
+general→vendors +1 more`. A `find`-style implementation reports `1`, and the count is what the criteria
+assert.
+
+**Every multi-edge criterion asserts the EXACT PAIRS, not merely that both names appear somewhere** —
+distinct project AND group names per fixture, so a report that names the right groups against the wrong
+projects fails.
 
 ### 2c. The operator-asks path, and the CLI's own words
 
-`assessAccessHealth` gains the same assertion.
+`assessAccessHealth` gains the same assertion — **by calling the SAME census function**, not by
+reimplementing the predicate (round 2 MEDIUM 3). A second implementation is the divergence class
+AUDITFIX-15A exists to prevent, and it is also what makes one mutation cover both surfaces: drop the
+`kind` conjunct once and both the scheduled and the operator path must redden.
 
 ⚠️ **It must read `projects.kind`.** Its project read selects `id, slug` and filters to the two
 reserved slugs (`lib/admin/access-health.ts:68-72`). A slug-keyed census would flag the **legitimate
@@ -157,13 +237,19 @@ output.** Today the field means lock-OUT and `printHealth` renders `health: LOCK
 untrue. So `blockers` becomes *"a human locked OUT, or a group let IN that the substrate never
 sanctioned"*.
 
-⚠️ **My "four places" inventory was FALSE — round 1 MEDIUM 2 enumerated more, and this is the
-grep-before-claiming-every-other failure again.** The narrow semantics live in **eight** places, all of
-which move together: `lib/admin/access-health.ts` — the module header (`:14`), and the `healthy`,
-`blockers` and `warnings` interface docs (`:26`, `:28`, `:30`), plus two implementation comments
-(`:113`, `:136`); and `scripts/admin.ts` — the CLI help (`:83`), the formatter comment (`:96`), the
-verdict literal (`:99` → **`ACCESS VIOLATIONS`**) and the command comment (`:423`). The
-`docs/ARCHITECTURE.md` entry widens with them. **No external programmatic consumer of
+⚠️ **I have now miscounted this inventory TWICE — four, then eight, and it is neither.** Round 1
+caught the four; round 2 caught the eight. So the number is dropped and the LOCATIONS are the contract,
+because a count is exactly the kind of claim I keep getting wrong:
+
+- `lib/admin/access-health.ts` — module header `:14`; the `healthy` / `blockers` / `warnings` interface
+  docs `:26`, `:28`, `:30`; implementation comments `:113`, `:136`
+- `scripts/admin.ts` — CLI help `:83`; formatter comment `:96`; the verdict literal `:99`
+  (→ **`ACCESS VIOLATIONS`**); command comment `:423`
+- `docs/ARCHITECTURE.md` — the access-enforcement entry (`:72`) and the operator-surface catalog
+  (`:797`)
+
+**The build greps for the narrow vocabulary before claiming the sweep is complete**, rather than
+trusting this list — the list is where to start, not proof of coverage. **No external programmatic consumer of
 `AccessHealth.blockers` exists** (round 1 grepped for one), so keeping the FIELD name is coherent —
 its entries stay fatal to `healthy`, which is the only contract that matters. Filing it under `warnings` is not an option: warnings
 are non-fatal, so `healthy` would stay `true` — the report-green-while-broken failure this slice exists
@@ -184,8 +270,9 @@ card would show a truncated bootstrap error with no mention of the forbidden gra
 INDEPENDENTLY clamped** — `census: <finding, ≤200 chars> | bootstrap: <error, ≤250 chars>` — so neither
 part can erase the other whatever the other's length, and the whole stays inside the 500 the ledger
 allows. The census part goes **first**, because it is the fact no other surface reports; the
-convergence failure is also visible on its own through the wedge it causes. The untruncated parts are
-additionally passed as later `errors[]` elements for the Recent-runs panel. **AC9 asserts both names
+convergence failure is also visible on its own through the wedge it causes. The parts are additionally passed as later `errors[]`
+elements for the Recent-runs panel — ⚠️ *which are themselves clamped at 500 characters each
+(`lib/ingest/runs.ts:61`), so "untruncated" was wrong; the unclamped channel is `meta` (§2b.1).* **AC9 asserts both names
 survive PERSISTENCE**, not just construction.
 
 ## 3. Scope
@@ -221,20 +308,42 @@ observe WHEN something happened, it uses a state oracle, not a clock.
 - **AC2 — and on a NON-reserved `kind='system'` project (dm):** `slug='legacy-system'` granted to
   `vendors`. *§0c/§2b — a two-slug census satisfies AC1 and AC1b while this stays invisible to both
   surfaces.*
+- **AC2b — MULTIPLE forbidden edges are all counted, and the sample names EXACT PAIRS (dm):** plant
+  three at once with distinct names — `general→vendors`, `external-shared→contractors`,
+  `legacy-system→auditors` — and assert the report's **count is 3** and its sample names the exact
+  project→group pairs in the documented order. ⚠️ *Round 2 BLOCKER 2: every criterion planted ONE
+  edge, so `rows.find(unsanctioned)` reported the first and passed the entire suite while the rest
+  went unreported forever. Distinct names on both sides, because a report that pairs the right groups
+  with the wrong projects must fail.*
 - **AC3 — the census runs when CONVERGENCE RETURNED a failure (dm):** wedge General with a
   reserved-slug initiative **and** plant a forbidden edge on an already-system `external-shared`; the
   team's single outcome names **both**.
 - **AC4 — and when convergence THREW (dm):** same fixture with convergence made to throw; the outcome
   still names the census finding. *A `catch … continue` that skips the census passes AC3.*
 - **AC5 — the census READ happens after all three sanctioned edges exist (dm):** with a forbidden edge
-  planted and the LAST sanctioned edge removed, observe the state **at the moment the census read
-  begins** — all three sanctioned edges are present — and assert the forbidden edge is reported.
+  planted and **ALL THREE** sanctioned edges removed, observe the state **at the moment the census read
+  begins — identified by the `projects(` embed, never by table name or read order** — assert all three
+  are present by then, and assert the forbidden edge is reported. ⚠️ *Round 2 BLOCKER 1: keyed on the
+  table, the oracle fires on the writer's existence probe (three per team per tick) and REDS A CORRECT
+  IMPLEMENTATION, because probe #1 legitimately runs before the edges are restored; keyed on the first
+  read, it pins that probe and never the census, so both ordering mutations pass. Round 2 HIGH 1:
+  removing only the "last" edge couples the mutation to the grant loop's order, which nothing pins —
+  if the removed edge happens to be granted first, the between-grants mutant sees all three present
+  and passes. Removing all three makes at least one absent at every pre-completion position.*
   ⚠️ *Round 1 BLOCKER 2 killed the outcome-only version: an implementation that censuses early, holds
   the finding, finishes converging and aggregates afterwards reports the same edge AND restores the
   same grant, so mutations 5 and 6 could not redden it. The criterion must observe the read's POSITION.
   It is a state oracle read inside a db proxy on the census query — no timing.*
-- **AC6 — the census FAILS CLOSED (dm):** with the edge read faulted, that team is reported failed; it
-  never reports "no forbidden edges" from a read it could not complete.
+- **AC6 — the census FAILS CLOSED, on a team that otherwise converges CLEANLY (dm):** fault **only the
+  census read** (keyed on the `projects(` embed) on a team whose convergence succeeds, and assert the
+  team is reported failed with an error attributable to the census. ⚠️ *Round 2 BLOCKER 1: faulting
+  every `project_groups` read also breaks the writer's three existence probes, so convergence itself
+  returns `ok:false` and the team is "reported failed" for the BOOTSTRAP reason — the swallow-the-
+  census-error mutation could not redden it. Green while testing nothing, in the criterion whose whole
+  job is fail-closed.*
+- **AC6b — and when the census THROWS rather than returning an error (dm):** the team is reported
+  failed **and every later team still gets its own outcome**. *Round 2 MEDIUM 1 — a census outside the
+  per-team guard converts one team's finding into a fleet-wide outage.*
 - **AC7 — a legitimate reserved-slug INITIATIVE's creator edge is never called unsanctioned (dm):**
   with the creator grant present, neither the census nor `assessAccessHealth` names **that edge** as a
   forbidden system-project grant. ⚠️ *Round 1 BLOCKER 1: `projects` is unique on `(team_id, slug)`
@@ -253,14 +362,32 @@ observe WHEN something happened, it uses a state oracle, not a clock.
   BLOCKER 4: without the naming clause a mutant can return a correct error from the wrapper and hand
   `onOutcome` `{ok:false, error:"unknown"}` — two ticks still go confirmed and the criterion passes
   while the card says nothing useful. The banner renders `PipelineLeg.error` and nothing else.*
-- **AC9b — both errors survive PERSISTENCE when convergence ALSO failed (dm):** with a wedge **and** a
-  forbidden edge, the persisted leg error names the forbidden edge **and** the convergence failure,
-  with a convergence error long enough (>400 chars) to have erased the census part under naive
-  concatenation. *§2d — the 500-char clamp is per error string, so this is the criterion that proves
-  the independent bounding rather than assuming it.*
-- **AC10 — `assessAccessHealth` reports a forbidden edge on BOTH project shapes and goes
-  `healthy:false` (dm):** reserved-slug and non-reserved, each as an independent fixture, blocker
-  naming project and group.
+- **AC9b — both errors survive PERSISTENCE, with the PART BOUNDARIES pinned (dm):** with a wedge
+  **and** a forbidden edge, and a convergence error carrying a **sentinel beyond character 250**,
+  assert on the PERSISTED row: the census part names the edge; the bootstrap part is present; the
+  sentinel is **absent from `errors[0]`** but **present in the later untruncated `errors[]` element**;
+  and `errors[0]` is within the documented compound length.
+- **AC9b-inverse — the SAME, with the long part on the CENSUS side (dm):** enough planted forbidden
+  edges that the census part alone would exceed the compound budget, plus a short convergence error;
+  assert the convergence failure's name STILL survives persistence. ⚠️ *Round 2 BLOCKER 2: the ledger
+  clamps from the FRONT, so naive census-first concatenation loses only its TAIL — with a short census
+  part and a long bootstrap part both names survive anyway and the no-clamping mutant passes. Only the
+  inverse arm catches it. This is the criteria-need-their-inverse class, again.* ⚠️ *Round 2 HIGH 1: asserting only that
+  both names appear lets naive census-first concatenation pass — a 70-char census part plus a 450-char
+  bootstrap part survives a single 500-char clamp with both names intact, so independent clamping could
+  be deleted with the criterion still green. The sentinel is what makes the boundary observable.*
+- **AC9c — the ledger row's `meta` carries the COMPLETE structured edge list (dm):** with more
+  forbidden edges than the sample can name, `meta.forbiddenEdges` contains every one with its project
+  and group slugs and ids, while the error string carries the count and the bounded sample. *§2b.1 —
+  the bounded string is for a human; this is what a repair reads.*
+- **AC10 — `assessAccessHealth` reports a forbidden edge on `general` (dm):** blocker names project
+  and group, `healthy:false`.
+- **AC10b — and on `external-shared` (dm):** independent fixture. ⚠️ *Round 2 BLOCKER 1: with one
+  reserved fixture, a health implementation that scans `general` plus every non-reserved system
+  project — and skips `external-shared` — passes AC10 through AC13 while `external-shared→vendors`
+  stays invisible to the operator who asks. The inverse implementation passes the mirror image. The
+  scheduled path already had this split; the operator path did not.*
+- **AC10c — and on a NON-reserved `kind='system'` project (dm):** independent fixture.
 - **AC11 — `assessAccessHealth` stays healthy on a clean team (dm):** the inverse control.
 - **AC12 — `assessAccessHealth` FAILS CLOSED (dm):** with its edge read faulted, it does not certify
   `healthy:true`.
@@ -282,12 +409,18 @@ observe WHEN something happened, it uses a state oracle, not a clock.
 | 6 | move the census read BEFORE the three sanctioned grants | AC5 |
 | 7 | move the census read BETWEEN the first and second grant | AC5 |
 | 8 | swallow the census read error | AC6 |
+| 8b | let a census throw escape the per-team guard | AC6b |
+| 8c | drop `meta.forbiddenEdges` | AC9c |
 | 9 | drop the `kind` conjunct so reserved SLUGS are censused regardless of kind | AC7 |
 | 10 | delete the census's unsanctioned-edge check | AC1 |
 | 11 | hand `onOutcome` a generic error instead of the named finding | AC9 |
-| 12 | concatenate the two errors without independent clamping | AC9b |
 | 13 | drop `assessAccessHealth`'s new blocker | AC10 |
-| 14 | make `assessAccessHealth` census only the two reserved slugs | AC10 |
+| 14 | make `assessAccessHealth` census only the two reserved slugs | AC10c |
+| 14b | make `assessAccessHealth` census only `general` | AC10b |
+| 14c | make `assessAccessHealth` census only `external-shared` | AC10 |
+| 14d | report only the FIRST forbidden edge (`find`, not a full scan) | AC2b |
+| 14e | drop the independent clamps and concatenate census-first | AC9b-inverse |
+| 14f | drop the independent clamps and concatenate bootstrap-first | AC9b |
 | 15 | swallow `assessAccessHealth`'s edge-read error | AC12 |
 | 16 | keep the CLI verdict text as `LOCKOUTS` | AC13 |
 | 17 | report the census finding without failing the outcome | AC9 |
@@ -336,5 +469,41 @@ reached. Until **AUDITFIX-21**, repair is raw SQL. A merge here means *"you will
 | **M1** | the non-reserved reading is right but "the writer refuses it now" does not prove historical state was never legitimate | **CONFIRMED** | **ADOPTED** — §2b now rests on the DATA MODEL (`schema.sql:997-998`) |
 | **M2** | the "four lockout spellings" inventory was FALSE — there are eight | **CONFIRMED** | **ADOPTED** — enumerated in §2c. *This is the grep-before-claiming-every-other failure again.* |
 | **M3** | detection need not wait for AUDITFIX-21 | **CONFIRMED** | slice order unchanged; §6 qualified |
+
+**Nothing is built. No code exists for this slice.**
+
+## 8. Round 2 — BLOCKED by BOTH models, run in parallel, and they found different things
+
+Round 1 was Codex. Round 2 ran **Codex against the fold** and **Fable cold** at the same time. They
+overlapped on almost nothing, which is the case for two models stated plainly.
+
+### Codex — attacking its own round-1 fold
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | AC10 tested "reserved and non-reserved", so a health implementation scanning `general` + all non-reserved but skipping `external-shared` passed everything while that project stayed invisible to an operator | **CONFIRMED** | **ADOPTED** — AC10 / AC10b / AC10c are three independent fixtures; mutations 14b/14c |
+| **B2** | every criterion planted ONE forbidden edge, so `rows.find(unsanctioned)` satisfied the whole suite; and a 200-char part cannot name an unbounded set, making §1's promise unkeepable | **CONFIRMED** — `groups.slug` is unconstrained `text`, errors clamp at 500 | **ADOPTED** — the contract is count + deterministic bounded sample (§2b.1); **AC2b** asserts exact pairs on three edges; mutation 14d |
+| **B3** | my "the data model says a non-reserved system project is unsupported" is FALSE — the CHECK constrains only the kind enum, and the graph-pointer migration mints an ordinary pointer for exactly such a row | **CONFIRMED** (`…projects_kind.sql:11`, `…projects_graph_group_id.sql:44`) | **ADOPTED** — restated as a POLICY decision; the census's subject is EDGES, so a zero-edge row is not a finding and no claim is made about the row's validity |
+| **H1** | mutation 12 could not redden AC9b | **CONFIRMED** | **ADOPTED** — see Fable B2, which found the same hole from the other side |
+| **H2** | the release gate proved one callback, not a continuing channel or one-row-per-tick | **CONFIRMED** | **ADOPTED** — a fourth check, and **all four are now VERIFIED on prod** (§0b) |
+| **M1** | the "eight places" inventory is ten code locations plus two docs | **CONFIRMED** | **ADOPTED** — the number is gone; locations listed, and the build greps rather than trusting the list |
+
+### Fable — cold, and it found the axis neither Codex round named
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | `project_groups` is read **FOUR times per team per tick** — the writer's existence probe once per sanctioned grant, plus AUDITFIX-3's adopt census — and my criteria said "the census read" with no discriminator. Keyed on the table, AC5's oracle **reds a correct implementation**; keyed on first-read it pins the probe; and AC6's injector breaks the probes so convergence fails and the fail-closed mutation cannot redden | **CONFIRMED** — `groups.ts:647-653` × 3 via `bootstrap.ts:141-148`, plus `groups.ts:530-534` | **ADOPTED** — §2b makes the `projects(` embed the census's IDENTITY; AC5 and AC6 key on it; AC6's fixture converges cleanly |
+| **B2** | mutation 12 cannot redden AC9b in its CENSUS-FIRST form: the ledger clamps from the FRONT, so naive concatenation loses only its tail and both names survive | **CONFIRMED** | **ADOPTED** — **AC9b-inverse**, with the long part on the census side; mutations 14e and 14f, one per concat order |
+| **H1** | "remove the LAST sanctioned edge" couples mutation 7 to the grant loop's order, which nothing pins | **CONFIRMED** | **ADOPTED** — AC5 removes all three |
+| **M1** | the census's own THROW path was uncovered, and outside the per-team guard it aborts every remaining team | **CONFIRMED** — the adapter throws on an unknown embed | **ADOPTED** — §2b; **AC6b**; mutation 8b |
+| **M2** | put the complete structured edge list in the row's `meta` — jsonb, unclamped, already rendered, nothing reads this source's meta today | **CONFIRMED** | **ADOPTED, and it is better than what it replaced** — §2b.1; **AC9c**; mutation 8c |
+| **M3** | the spec never said `assessAccessHealth` must consume the SAME census — a reimplemented predicate is the divergence AUDITFIX-15A exists to prevent | **CONFIRMED** | **ADOPTED** — §2c |
+| **LOW** | "eight places" is ten; the extra `errors[]` elements are 500-clamped too, so "untruncated" is wrong | **CONFIRMED** | **ADOPTED** — both corrected |
+| — | census cost per tick (indexed, three edges on prod, no single-flight or staleness interaction); census-first precedence (arithmetic 472 ≤ 500, and a wedged team also reds its `context_backfill` leg); no ninth `blockers` consumer; the slice order | **CLEARED with evidence** | recorded so the build does not re-litigate them |
+
+⚠️ **The pattern across both rounds: my criteria kept naming a thing the test could not identify.**
+"The census read" (four candidates), "the last sanctioned edge" (order-dependent), "both names appear"
+(passes under one concat order). Each was a criterion written from the DESIGN's vocabulary rather than
+from what a test can actually observe — and each would have shipped green.
 
 **Nothing is built. No code exists for this slice.**
