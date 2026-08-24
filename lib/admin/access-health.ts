@@ -70,13 +70,25 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const warnings: string[] = [];
 
   // 1. The §11 system projects must exist — everything below points at them.
+  //
+  // ⚠️ AUDITFIX-23: this read now selects `kind` and requires `system`. It matched on SLUG ALONE, so a
+  // `kind='initiative'` project squatting `general` — which a human creates by typing "General" in the
+  // dashboard, and which the bootstrap deliberately REFUSES to adopt — was accepted as the system
+  // project. The team then read as having one when it does not, and the wedge that actually blocks its
+  // bootstrap went unreported here. Found by a diff review, through a criterion that asserted the
+  // missing-project blocker names GENERAL specifically rather than merely matching "does not exist"
+  // (which the also-missing external-shared satisfied).
   const { data: projectRows, error: pErr } = await db
     .from("projects")
-    .select("id, slug")
+    .select("id, slug, kind")
     .eq("team_id", teamId)
     .in("slug", [GENERAL_SLUG, EXTERNAL_SHARED_SLUG]);
   if (pErr) throw new Error(`system-project read failed: ${pErr.message}`);
-  const projectBySlug = new Map(((projectRows ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+  const projectBySlug = new Map(
+    ((projectRows ?? []) as { id: string; slug: string; kind: string }[])
+      .filter((p) => p.kind === "system")
+      .map((p) => [p.slug, p.id])
+  );
   const generalId = projectBySlug.get(GENERAL_SLUG);
   const externalSharedId = projectBySlug.get(EXTERNAL_SHARED_SLUG);
   for (const [slug, id] of [

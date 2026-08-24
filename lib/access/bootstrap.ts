@@ -201,7 +201,8 @@ export async function ensureAccessBootstrapAllTeams(
     let censusError: string | null = null;
     try {
       const census = await censusTeamSystemEdges(db, t.id);
-      if (!census.ok) censusError = census.error ?? "system-edge census failed";
+      // The writer already prefixes its own read failures; do not double-prefix them below.
+      if (!census.ok) censusError = (census.error ?? "system-edge census failed").replace(/^system-edge census /, "");
       else if (census.edges.length > 0) censusError = describeUnsanctionedEdges(census.edges);
     } catch (e) {
       censusError = `system-edge census threw: ${e instanceof Error ? e.message : "threw"}`;

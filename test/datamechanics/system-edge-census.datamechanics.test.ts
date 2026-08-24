@@ -6,6 +6,8 @@ import { censusTeamSystemEdges, createGroup } from "@/lib/access/groups";
 import { ensureAccessBootstrap, ensureAccessBootstrapAllTeams, EXTERNAL_SHARED_SLUG, GENERAL_SLUG } from "@/lib/access/bootstrap";
 import { describeUnsanctionedEdges } from "@/lib/access/system-projects";
 import { assessAccessHealth } from "@/lib/admin/access-health";
+import { runAccessBootstrapLeg } from "@/lib/ingest/access-bootstrap-leg";
+import { getPipelineHealth } from "@/lib/ingest/pipeline-health";
 import { EXTERNAL_SLUG } from "@/lib/access/groups";
 
 /**
@@ -250,8 +252,16 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     const desc = describeUnsanctionedEdges([...forward.edges].reverse());
     expect(asc, "the summary is stable under permutation").toBe(desc);
     expect(asc).toMatch(/^3 unsanctioned edge\(s\) on system projects: /);
-    expect(asc).toMatch(/external-shared→contractors/);
-    expect(asc).toMatch(/general→vendors/);
+    // EVERY pair, exactly — omitting one lets an implementation return `legacy-system→vendors`
+    // instead of `legacy-system→auditors` with the same count and the same stable output (diff review).
+    const pairs = forward.edges.map((e) => `${e.projectSlug}→${e.groupSlug}`).sort();
+    expect(pairs).toEqual(["external-shared→contractors", "general→vendors", "legacy-system→auditors"]);
+    // And the SUMMARY string exactly, in the documented order. Asserting substrings lets a mutant that
+    // truncates the sample to two pairs emit "…contractors, general→vendors +1 more" — stable under
+    // reversal, count still 3, every substring present (diff review).
+    expect(asc).toBe(
+      "3 unsanctioned edge(s) on system projects: external-shared→contractors, general→vendors, legacy-system→auditors"
+    );
   });
 
   it("AC3: the census runs when convergence RETURNED a failure — the outcome names the edge", async () => {
@@ -341,6 +351,51 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     expect(err, "and it is attributable to the CENSUS, not to convergence").toMatch(/census exploded|census/i);
   });
 
+  it("an UNRESOLVED project embed is a finding, not a clean row", async () => {
+    const seed = await bareTeam();
+    // The FK makes this unreachable against real Postgres, so it is injected: a row whose project
+    // cannot be resolved cannot be shown to be legitimate, and skipping it would quietly break the
+    // "either side unsanctioned" half of the fail-closed contract.
+    const real = db();
+    const nulled = new Proxy(real as object, {
+      get(target, prop, recv) {
+        if (prop !== "from") return Reflect.get(target, prop, recv);
+        return (name: string) => {
+          const q = (target as { from: (n: string) => unknown }).from(name);
+          if (name !== "project_groups") return q;
+          let spec = "";
+          const wrap = (b: object): unknown =>
+            new Proxy(b, {
+              get(bt, bp, br) {
+                const v = Reflect.get(bt, bp, br);
+                if (bp === "then" && spec.replace(/\s+/g, "").includes("projects(")) {
+                  return (res: (x: unknown) => unknown) => {
+                    void (async () => {
+                      const out = await (bt as PromiseLike<{ data: unknown[] | null; error: unknown }>);
+                      const rows = (out.data ?? []).map((r) => ({ ...(r as object), projects: null }));
+                      res({ ...out, data: rows });
+                    })();
+                  };
+                }
+                if (typeof v !== "function") return v;
+                return (...args: unknown[]) => {
+                  if (bp === "select") spec = String(args[0] ?? "");
+                  const rr = (v as (...x: unknown[]) => unknown).apply(bt, args);
+                  return rr === bt ? br : wrap(rr as object);
+                };
+              },
+            });
+          return wrap(q as object);
+        };
+      },
+    }) as DbClient;
+
+    const census = await censusTeamSystemEdges(nulled, seed.teamId);
+    expect(census.ok).toBe(true);
+    expect(census.edges.length, "an unresolvable project is reported, never skipped").toBeGreaterThan(0);
+    expect(census.edges[0].projectSlug).toMatch(/unresolved project/);
+  });
+
   it("AC8: a clean team is not reported", async () => {
     const seed = await bareTeam();
     const r = await ensureAccessBootstrapAllTeams(db());
@@ -378,6 +433,50 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     expect(r.failed.find((f) => f.teamId === seed.teamId)?.error).toMatch(/legacy-system→vendors/);
   });
 
+  it("AC9: the finding reaches the TEAM'S CARD, NAMED, at the confirmed threshold", async () => {
+    const wedged = await bareTeam();
+    const healthy = await bareTeam();
+    await plant(wedged, await projectId(wedged, GENERAL_SLUG), await ordinaryGroup(wedged, "vendors"));
+
+    // The END-TO-END claim, and it was ABSENT: every other criterion stops at the wrapper's `failed`
+    // list. A mutant can return the right failure there and hand onOutcome {ok:true} or
+    // {ok:false, error:"unknown"} — the card stays green, or reds with nothing an operator can act
+    // on, while every other criterion passes (diff review). Two ticks, because a lone failure never
+    // enters `failing`.
+    await runAccessBootstrapLeg(db());
+    await runAccessBootstrapLeg(db());
+
+    const h = await getPipelineHealth(wedged.teamId);
+    const leg = h.legs.find((l) => l.source === "access_bootstrap");
+    expect(leg, "the leg exists for this team").toBeDefined();
+    expect(h.failing.some((l) => l.source === "access_bootstrap"), "and it is LOUD").toBe(true);
+    expect(leg!.failureClass).toBe("confirmed");
+    expect(h.healthy).toBe(false);
+    // The banner renders PipelineLeg.error and nothing else, so the NAME has to be in it.
+    expect(leg!.error, "the card names the project AND the group").toMatch(/general→vendors/);
+
+    const clean = await getPipelineHealth(healthy.teamId);
+    expect(clean.failing.some((l) => l.source === "access_bootstrap"), "the other team stays green").toBe(false);
+    expect(clean.healthy).toBe(true);
+  });
+
+  it("AC9b: when convergence ALSO failed, the card names the CENSUS finding", async () => {
+    const seed = await bareTeam();
+    await plant(seed, await projectId(seed, EXTERNAL_SHARED_SLUG), await ordinaryGroup(seed, "vendors"));
+    // Wedge General too, so BOTH a convergence failure and a census finding exist for this team.
+    await db().from("projects").update({ kind: "initiative" }).eq("team_id", seed.teamId).eq("slug", GENERAL_SLUG);
+
+    await runAccessBootstrapLeg(db());
+    await runAccessBootstrapLeg(db());
+
+    const h = await getPipelineHealth(seed.teamId);
+    const leg = h.legs.find((l) => l.source === "access_bootstrap");
+    expect(h.failing.some((l) => l.source === "access_bootstrap")).toBe(true);
+    // §2d: the census finding is what the card names, because it is the fact no other surface
+    // reports. The labelled compound carrying BOTH is AUDITFIX-25.
+    expect(leg!.error).toMatch(/external-shared→vendors/);
+  });
+
   it("AC10: assessAccessHealth reports a forbidden edge on general", async () => {
     const seed = await bareTeam();
     await plant(seed, await projectId(seed, GENERAL_SLUG), await ordinaryGroup(seed, "vendors"));
@@ -406,6 +505,10 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     const seed = await bareTeam();
     const h = await assessAccessHealth(db(), seed.teamId);
     expect(h.blockers.join(" | "), "no census blocker on a converged team").not.toMatch(/unsanctioned edge/);
+    // And the VERDICT, not just the absence of one phrasing: a differently worded bogus blocker
+    // would otherwise satisfy this criterion (diff review).
+    expect(h.healthy, "a converged team is healthy").toBe(true);
+    expect(h.blockers, "with no blockers at all").toEqual([]);
   });
 
   it("AC12: assessAccessHealth FAILS CLOSED on an undetermined census", async () => {
@@ -439,6 +542,11 @@ describe("AUDITFIX-23: a forbidden system-project grant is found without an oper
     expect(h.blockers.join(" | "), "and the operator path agrees").not.toMatch(/unsanctioned edge/);
     // The team IS unhealthy, but for the SEPARATE, correct reason: unique(team_id, slug) means the
     // system General cannot exist alongside the initiative, so the bootstrap never completed.
-    expect(h.blockers.join(" | "), "the missing system project is its own blocker").toMatch(/does not exist/);
+    // Name GENERAL specifically: `/does not exist/` alone is satisfied by external-shared's absence,
+    // which proves nothing about the condition this criterion claims (diff review).
+    expect(
+      h.blockers.some((b) => b.includes(`'${GENERAL_SLUG}'`) && b.includes("does not exist")),
+      "the missing GENERAL system project is its own, separate, correct blocker"
+    ).toBe(true);
   });
 });

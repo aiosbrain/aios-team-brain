@@ -599,10 +599,24 @@ export async function censusTeamSystemEdges(db: DbClient, teamId: string): Promi
   }[];
   const edges: UnsanctionedEdge[] = [];
   for (const r of rows) {
+    // An UNRESOLVED project embed is a finding, not a clean row. The header promises "an unresolved
+    // embed on either side is UNSANCTIONED, never absent", and skipping `{projects: null}` would have
+    // quietly broken that half — a row whose project cannot be resolved cannot be shown to be
+    // legitimate, which is the whole point of failing closed. Today the composite FKs make it
+    // unreachable; the branch is what keeps the contract true if that ever changes (diff review).
+    if (!r.projects) {
+      edges.push({
+        projectId: r.project_id,
+        projectSlug: `unresolved project ${r.project_id}`,
+        groupId: r.group_id,
+        groupSlug: r.groups?.slug ?? `unresolved group ${r.group_id}`,
+      });
+      continue;
+    }
     // Only system projects are this census's subject. A `source` project holding a reserved slug is
     // already covered: AUDITFIX-3's adoption guard refuses to promote it and the team wedges LOUDLY,
     // which AUDITFIX-22's per-team ledger reds. Reporting it here too would double-count one state.
-    if (r.projects?.kind !== "system") continue;
+    if (r.projects.kind !== "system") continue;
     if (isSanctionedSystemEdge(r.projects.slug, r.groups)) continue;
     edges.push({
       projectId: r.project_id,

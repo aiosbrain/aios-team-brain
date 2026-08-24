@@ -100,7 +100,10 @@ export interface UnsanctionedEdge {
 }
 
 /** How many characters of the human summary the sample may occupy (AUDITFIX-23 §2b.1). The ledger
- *  clamps each stored error at 500 and the compound reserves the rest for the bootstrap half. */
+ *  clamps each stored error at 500; this budget keeps the summary well inside that with room for the
+ *  `census: ` prefix the wrapper adds. (It does NOT reserve space for a dual-error compound — that
+ *  compound is AUDITFIX-25 and is deliberately not built here; saying otherwise described a design
+ *  this slice does not ship.) */
 export const CENSUS_SAMPLE_BUDGET = 200;
 
 /**
@@ -112,9 +115,14 @@ export const CENSUS_SAMPLE_BUDGET = 200;
  * unkeepable — and worse, every criterion planting ONE edge let a `find`-style implementation satisfy
  * the whole suite while a second edge went unreported forever (spec round 2).
  *
- * So: the COUNT is exact and unbounded-safe, the SAMPLE is deterministic — sorted by
- * `(projectSlug, groupSlug)` so it is stable across runs and diffable between them — and the COMPLETE
- * structured set travels in the ledger row's `meta`, which is jsonb and unclamped.
+ * So: the COUNT is exact and unbounded-safe, and the SAMPLE is deterministic — sorted by
+ * `(projectSlug, groupSlug)` so it is stable across runs and diffable between them.
+ *
+ * The COMPLETE structured set is deliberately NOT here. It was going to travel in the ledger row's
+ * `meta`, and a later spec round showed that channel does not exist yet (the outcome has no meta
+ * field), is invisible on FAILED rows (the Recent-runs panel renders metadata only when there are no
+ * errors), and is not unbounded-safe either (its insert failure is swallowed, so past some cardinality
+ * the whole row vanishes). That is AUDITFIX-25. The count is the unbounded-safe part and it is here.
  */
 export function describeUnsanctionedEdges(edges: readonly UnsanctionedEdge[]): string {
   if (edges.length === 0) return "";
@@ -140,6 +148,10 @@ export function describeUnsanctionedEdges(edges: readonly UnsanctionedEdge[]): s
     named.push(pair);
     used += pair.length + 2;
   }
+  // If not even ONE pair fits, name the first anyway: a summary that names nothing is useless to an
+  // operator, and the count already carries the unbounded-safe half. Better slightly over budget than
+  // "1 unsanctioned edge(s) on system projects:  +1 more" (diff review LOW).
+  if (named.length === 0) named.push(`${ordered[0].projectSlug}→${ordered[0].groupSlug}`);
   const rest = ordered.length - named.length;
   return head + named.join(", ") + (rest > 0 ? ` +${rest} more` : "");
 }
