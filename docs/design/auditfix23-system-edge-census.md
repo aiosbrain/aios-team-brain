@@ -155,6 +155,13 @@ loop at `lib/access/bootstrap.ts:141-148`) — plus AUDITFIX-3's per-project ado
 | AUDITFIX-3's adopt census | `group_id, groups(slug, is_builtin)` |
 | **this census** | the only one embedding **`projects(`** |
 
+✅ **Both halves of that table are VERIFIED, not asserted** (evidence:
+`.context/rederive/auditfix23-dual-embed-proven.md`). The dual embed compiles and returns both objects
+populated against a real Postgres — `error: null`, three rows, each carrying `projects{kind,slug}` AND
+`groups{slug,is_builtin}` — and a sweep of every `project_groups` select in `lib/`, `app/` and
+`scripts/` confirms **none** embeds `projects(` today. The `projects` relationship this needs is added
+to `lib/db/pg/relationships.ts` (§3).
+
 Any criterion that needs to observe or fault "the census read" **keys on that embed**, never on the
 table name and never on read order — §4 says so at AC5 and AC6, because both were unimplementable
 without it.
