@@ -89,3 +89,69 @@ export function isSanctionedSystemEdge(projectSlug: string, group: EdgeGroupIden
   if (!group || !group.is_builtin) return false;
   return SANCTIONED.some((e) => e.project === projectSlug && e.group === group.slug);
 }
+
+/** One edge the writer would refuse, as the census reports it. Slugs are what a repair needs — both
+ *  tables are unique on `(team_id, slug)` — and the ids are carried so a repair need not re-resolve. */
+export interface UnsanctionedEdge {
+  projectId: string;
+  projectSlug: string;
+  groupId: string;
+  groupSlug: string;
+}
+
+/** How many characters of the human summary the sample may occupy (AUDITFIX-23 §2b.1). The ledger
+ *  clamps each stored error at 500; this budget keeps the summary well inside that with room for the
+ *  `census: ` prefix the wrapper adds. (It does NOT reserve space for a dual-error compound — that
+ *  compound is AUDITFIX-25 and is deliberately not built here; saying otherwise described a design
+ *  this slice does not ship.) */
+export const CENSUS_SAMPLE_BUDGET = 200;
+
+/**
+ * AUDITFIX-23 §2b.1 — the human-readable summary of a census result.
+ *
+ * WHY THIS IS A COUNT PLUS A SAMPLE, not the list. The spec's first draft promised "every forbidden
+ * edge is reported" in a field the ledger clamps to 500 characters, against `groups.slug` which is
+ * unconstrained `text`. An unbounded set cannot be named in a bounded string, so the promise was
+ * unkeepable — and worse, every criterion planting ONE edge let a `find`-style implementation satisfy
+ * the whole suite while a second edge went unreported forever (spec round 2).
+ *
+ * So: the COUNT is exact and unbounded-safe, and the SAMPLE is deterministic — sorted by
+ * `(projectSlug, groupSlug)` so it is stable across runs and diffable between them.
+ *
+ * The COMPLETE structured set is deliberately NOT here. It was going to travel in the ledger row's
+ * `meta`, and a later spec round showed that channel does not exist yet (the outcome has no meta
+ * field), is invisible on FAILED rows (the Recent-runs panel renders metadata only when there are no
+ * errors), and is not unbounded-safe either (its insert failure is swallowed, so past some cardinality
+ * the whole row vanishes). That is AUDITFIX-25. The count is the unbounded-safe part and it is here.
+ */
+export function describeUnsanctionedEdges(edges: readonly UnsanctionedEdge[]): string {
+  if (edges.length === 0) return "";
+  // CODE-POINT order, not localeCompare: the sample has to be byte-stable across runs and machines
+  // so two runs are diffable, and `localeCompare` is locale-sensitive. The sort is CLIENT-SIDE
+  // because the adapter orders only when explicitly asked, so the row order off the wire is
+  // unspecified — a criterion feeding permuted rows is what pins this (spec round 3 HIGH 4).
+  const ordered = [...edges].sort((a, b) =>
+    a.projectSlug < b.projectSlug ? -1
+      : a.projectSlug > b.projectSlug ? 1
+      : a.groupSlug < b.groupSlug ? -1
+      : a.groupSlug > b.groupSlug ? 1
+      : 0
+  );
+  const head = `${ordered.length} unsanctioned edge(s) on system projects: `;
+  const named: string[] = [];
+  let used = 0;
+  for (const e of ordered) {
+    const pair = `${e.projectSlug}→${e.groupSlug}`;
+    // Reserve room for the "+N more" suffix so the sample can never crowd the count out.
+    const suffix = ordered.length - named.length - 1 > 0 ? ` +${ordered.length - named.length - 1} more` : "";
+    if (used + pair.length + 2 + suffix.length > CENSUS_SAMPLE_BUDGET - head.length) break;
+    named.push(pair);
+    used += pair.length + 2;
+  }
+  // If not even ONE pair fits, name the first anyway: a summary that names nothing is useless to an
+  // operator, and the count already carries the unbounded-safe half. Better slightly over budget than
+  // "1 unsanctioned edge(s) on system projects:  +1 more" (diff review LOW).
+  if (named.length === 0) named.push(`${ordered[0].projectSlug}→${ordered[0].groupSlug}`);
+  const rest = ordered.length - named.length;
+  return head + named.join(", ") + (rest > 0 ? ` +${rest} more` : "");
+}

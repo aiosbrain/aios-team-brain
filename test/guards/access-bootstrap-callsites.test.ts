@@ -65,6 +65,21 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     expect(leg).toMatch(/ensureAccessBootstrapAllTeams/);
   });
 
+  it("AUDITFIX-23: both census surfaces call the ONE exported census, and neither reimplements it", () => {
+    // The spec says "the same census function" — which was PROSE, and a duplicated predicate inside
+    // assessAccessHealth reddened no criterion (spec round 3 MEDIUM 1). A second implementation is the
+    // divergence AUDITFIX-15A exists to prevent, and single-sourcing is also what lets ONE mutation
+    // cover both surfaces.
+    const health = read("lib/admin/access-health.ts");
+    expect(health, "the operator path calls the census").toMatch(/censusTeamSystemEdges\s*\(/);
+    const wrapper = read("lib/access/bootstrap.ts");
+    expect(wrapper, "the scheduled path calls the same one").toMatch(/censusTeamSystemEdges\s*\(/);
+    // Neither may carry its own copy of the sanctioned-pair decision.
+    for (const [label, src] of [["access-health", health], ["bootstrap", wrapper]] as const) {
+      expect(src, `${label} must not reimplement the predicate`).not.toMatch(/isSanctionedSystemEdge\s*\(/);
+    }
+  });
+
   it("the ledger leg writes a per-team row and reserves the instance-wide row for fleet failure", () => {
     // AUDITFIX-22's whole point: a global ok:true heartbeat every tick is what masked a wedged
     // team's failure under `newest`. If the unconditional instance-wide write ever comes back,

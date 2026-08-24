@@ -21,6 +21,7 @@ import { addAuthorAlias } from "@/lib/admin/aliases";
 import { linkGithub, listOrgMembers } from "@/lib/codebases/github";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 import { assessAccessHealth, type AccessHealth } from "@/lib/admin/access-health";
+import { formatAccessHealth } from "@/lib/admin/access-health-format";
 // EXPLICIT-ID purge only. `purgeItemsByPathPrefix` is deliberately NOT imported: it is path-scoped
 // and team-wide, and the workspace path roots (`0-context/`, `2-work/`, `3-log/`) are shared by every
 // project in a team — a prefix purge from a command line would take out unrelated real content. That
@@ -80,7 +81,7 @@ const USAGE = `Team Brain admin CLI — commands:
   link-identity <member-email> <provider> <external-id> [--handle <h>] [--email <e>] [--team <id|slug>] [--force]
                                          # link a provider user id (e.g. slack U…) to a member
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
-  access-health <team-slug>              # standing lockout/read-zero scan (the re-homed readiness check)
+  access-health <team-slug>              # standing access-violation/read-zero scan (lockouts AND unsanctioned system grants)
   drain-context <team-slug>              # partition a team's items (the demo bootstrap's post-seed step)
   purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]
                                          # irreversibly remove specific items + their versions/chunks/
@@ -93,12 +94,12 @@ Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PURGE_USAGE = `purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]`;
 
-/** Print the standing access-health verdict: lockouts are what an operator must FIX (grants/
- *  backfill); warnings are read-zero states worth knowing. */
+/** Print the standing access-health verdict: blockers are what an operator must FIX — a human locked
+ *  OUT (grants/backfill) or a group let IN the substrate never sanctioned (AUDITFIX-23); warnings are
+ *  read-zero states worth knowing. The wording lives in an IMPORT-SAFE module because this file runs
+ *  `main()` at module scope, so a test cannot reach a formatter defined here. */
 function printHealth(r: AccessHealth): void {
-  console.log(`  health: ${r.healthy ? "OK" : "LOCKOUTS"} · ${r.humanPrincipals} human(s), ${r.agentPrincipals} agent(s), ${r.itemsScanned} item(s) scanned`);
-  for (const b of r.blockers) console.log(`  ✗ ${b}`);
-  for (const w of r.warnings) console.log(`  ⚠ ${w}`);
+  for (const line of formatAccessHealth(r)) console.log(line);
 }
 
 async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: string, email: string) {
@@ -421,7 +422,7 @@ async function main() {
     }
     case "access-health": {
       // PRET-6: the standing health check (the flip subsystem's readiness scan, re-homed) —
-      // lockouts and read-zero states, asked of the oracle itself.
+      // lockouts, unsanctioned system-project grants, and read-zero states, asked of the oracle itself.
       const teamRef = positionals[0] || die("usage: access-health <team-slug>");
       const team = await resolveTeam(admin, teamRef);
       const h = await assessAccessHealth(admin, team.id);

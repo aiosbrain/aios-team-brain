@@ -4,6 +4,8 @@ import { isPrincipal } from "@/lib/access/eligibility";
 import { visibleProjects } from "@/lib/access/oracle";
 import { findUnpartitionedItems } from "@/lib/projects/context/coverage";
 import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
+import { censusTeamSystemEdges } from "@/lib/access/groups";
+import { describeUnsanctionedEdges } from "@/lib/access/system-projects";
 
 /**
  * The STANDING access-health check (PRET-6 §1 — the flip subsystem's readiness scan, re-homed
@@ -11,7 +13,7 @@ import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
  * zero, any item unreachable?" — asked of the SAME primitives the enforced read uses (the
  * oracle itself), so a broken group/grant edge shows up as the member actually going blind,
  * never as a plausible-looking table row. Surfaced through the permission inspector's route.
- * Read-only. Under the retired model there is no flip to gate — `blockers` are LOCKOUTS an
+ * Read-only. Under the retired model there is no flip to gate — `blockers` are ACCESS VIOLATIONS an
  * operator must fix (grants/backfill), `warnings` are read-zero states worth knowing.
  */
 
@@ -23,11 +25,14 @@ export interface BlindPrincipal {
 }
 
 export interface AccessHealth {
-  /** True when NO human principal is locked out and every item is reachable. */
+  /** True when NO human principal is locked out, every item is reachable, AND no group is let in
+   *  that the substrate never sanctioned (AUDITFIX-23). */
   healthy: boolean;
-  /** Hard reasons to refuse — each would cost a human access to content they can see today. */
+  /** Hard reasons to refuse. AUDITFIX-23 WIDENED this from lock-OUT only: an entry is either a human
+   *  locked OUT of content they can see today, or a group let IN that the substrate never sanctioned.
+   *  Both are fatal to `healthy`, which is the only contract any consumer depends on. */
   blockers: string[];
-  /** Real behaviour changes that are NOT lockouts of a human — reported, never fatal. */
+  /** Real behaviour changes that are neither a lockout nor an over-exposure — reported, never fatal. */
   warnings: string[];
   itemsScanned: number;
   /** Items with no CURRENT include-membership: invisible to everyone. */
@@ -65,13 +70,25 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   const warnings: string[] = [];
 
   // 1. The §11 system projects must exist — everything below points at them.
+  //
+  // ⚠️ AUDITFIX-23: this read now selects `kind` and requires `system`. It matched on SLUG ALONE, so a
+  // `kind='initiative'` project squatting `general` — which a human creates by typing "General" in the
+  // dashboard, and which the bootstrap deliberately REFUSES to adopt — was accepted as the system
+  // project. The team then read as having one when it does not, and the wedge that actually blocks its
+  // bootstrap went unreported here. Found by a diff review, through a criterion that asserted the
+  // missing-project blocker names GENERAL specifically rather than merely matching "does not exist"
+  // (which the also-missing external-shared satisfied).
   const { data: projectRows, error: pErr } = await db
     .from("projects")
-    .select("id, slug")
+    .select("id, slug, kind")
     .eq("team_id", teamId)
     .in("slug", [GENERAL_SLUG, EXTERNAL_SHARED_SLUG]);
   if (pErr) throw new Error(`system-project read failed: ${pErr.message}`);
-  const projectBySlug = new Map(((projectRows ?? []) as { id: string; slug: string }[]).map((p) => [p.slug, p.id]));
+  const projectBySlug = new Map(
+    ((projectRows ?? []) as { id: string; slug: string; kind: string }[])
+      .filter((p) => p.kind === "system")
+      .map((p) => [p.slug, p.id])
+  );
   const generalId = projectBySlug.get(GENERAL_SLUG);
   const externalSharedId = projectBySlug.get(EXTERNAL_SHARED_SLUG);
   for (const [slug, id] of [
@@ -79,6 +96,28 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
     [EXTERNAL_SHARED_SLUG, externalSharedId],
   ] as const) {
     if (!id) blockers.push(`the §11 system project '${slug}' does not exist — the access bootstrap has never completed for this team`);
+  }
+
+  // AUDITFIX-23: the inverse assertion. Every other check here asks "is someone locked OUT"; this one
+  // asks "is a group let IN that the substrate never sanctioned" — the state AUDITFIX-3 made
+  // uncreatable but that an unaudited instance may already hold, and that no surface reported.
+  //
+  // It calls the SAME census the scheduled path uses. A second implementation here is the divergence
+  // AUDITFIX-15A exists to prevent, and it is also what lets ONE mutation cover both surfaces — a
+  // structural guard fails the build if this call goes away.
+  //
+  // FAILS CLOSED: an undetermined census is a blocker, never a clean bill of health.
+  {
+    const census = await censusTeamSystemEdges(db, teamId);
+    if (!census.ok) {
+      blockers.push(`the system-edge census could not complete, so this team's grants are UNVERIFIED: ${census.error}`);
+    } else if (census.edges.length > 0) {
+      blockers.push(
+        `${describeUnsanctionedEdges(census.edges)} — a system project's grants are the access substrate, ` +
+          `so these hand their whole corpus to a group that was never sanctioned. Repair is AUDITFIX-21; ` +
+          `until then it is a deliberate out-of-band act.`
+      );
+    }
   }
 
   // 2. Every ACTIVE HUMAN must still reach their tier's system project through the oracle. This is
@@ -110,7 +149,7 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
       // and external-shared, which holds the team-visible external content they can see
       // today; reaching General alone means they silently lost the external corpus. A member
       // in `external` only must reach external-shared. A member in NEITHER builtin reaches no
-      // system project — the lockout warning.
+      // system project — the access-violation warning.
       const inEveryone = builtinRows.everyone.has(m.id);
       const inExternal = builtinRows.external.has(m.id);
       if (inEveryone || inExternal) {
@@ -133,7 +172,7 @@ export async function assessAccessHealth(db: DbClient, teamId: string): Promise<
   }
   // CONNECTORS are not principals by design (service accounts must never resolve visibility), but
   // `authenticateApiKey` only rejects a non-ACTIVE member — so a pull through a connector key
-  // reads NOTHING. Not a lockout of a person, so not a blocker; but a silent integration going
+  // reads NOTHING. Neither a lockout nor an over-exposure, so not a blocker; but a silent integration going
   // empty is exactly the kind of change an operator must be told about.
   // (Live prod check while building this: 4 of that team's 9 active members are connectors.)
   const activeConnectors = all.filter((m) => m.is_connector && m.status === "active");

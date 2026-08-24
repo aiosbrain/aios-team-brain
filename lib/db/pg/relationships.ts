@@ -64,6 +64,11 @@ export const RELATIONSHIPS: Record<string, Record<string, Relationship>> = {
     // the membership no-widening gate checks whether a project is granted to the `external`
     // built-in group (lib/projects/context/memberships.ts).
     groups: { kind: "one", table: "groups", local: "group_id", foreign: "id" },
+    // AUDITFIX-23's system-edge census reads the team's whole edge set and needs BOTH sides in one
+    // statement: the project to test `kind`/`slug`, the group to test the sanctioned pair. The
+    // reverse direction (projects -> project_groups) is to-MANY, which this adapter supports only as
+    // `(count)`, so the census is necessarily edge-driven.
+    projects: { kind: "one", table: "projects", local: "project_id", foreign: "id" },
   },
   project_context_memberships: {
     // the enforced read resolves a membership's unit → its source item (lib/access/enforce.ts).
