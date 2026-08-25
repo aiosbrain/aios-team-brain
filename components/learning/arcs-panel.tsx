@@ -46,13 +46,6 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
   const [arcs, setArcs] = useState<Arc[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<Status>("loading");
-  // LEGACY-ALWAYS-NULL since PRET-6: the server's empty-panel diagnosis retired with the
-  // permissive mode (§5.7 — it read team-wide health a partitioned member must not see), so
-  // `reason`/`note` arrive as null/undefined and the red problem-card branch below never fires.
-  // Kept as wire-tolerant state (an older server could still populate them); diagnosis lives on
-  // the admin health surfaces.
-  const [emptyReason, setEmptyReason] = useState<string | null>(null);
-  const [emptyNote, setEmptyNote] = useState<string | null>(null);
   // COMPOSITE identity (Codex PPARC-3 High 1): arc_id is sha(title) and legitimately collides
   // ACROSS partitions in a fused panel — keying edit state on the id alone routed a human's prose
   // to the wrong partition (the first matching arc won). Key = `${sourceGroup}|${arc_id}`; "|"
@@ -73,11 +66,9 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
           body: JSON.stringify({ team: teamSlug }),
         });
         if (!res.ok) throw new Error();
-        const data = (await res.json()) as { arcs?: Arc[]; reason?: string | null; note?: string | null };
+        const data = (await res.json()) as { arcs?: Arc[] };
         if (alive) {
           setArcs(data.arcs ?? []);
-          setEmptyReason(data.reason ?? null);
-          setEmptyNote(data.note ?? null);
           setStatus("ready");
         }
       } catch {
@@ -188,22 +179,11 @@ export function ArcsPanel({ teamSlug, variant = "full" }: { teamSlug: string; va
     );
   }
   if (arcs.length === 0) {
-    // PRET-6: the server sends reason=null always (diagnosis retired — see the state note above),
-    // so this renders the benign empty note; the red card survives only for an older server.
-    const isProblem = emptyReason === "no_facts" || emptyReason === "model_failing";
-    if (isProblem && emptyNote) {
-      return (
-        <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-4 py-3 text-sm text-red-600 dark:text-red-300">
-          {emptyNote}
-        </div>
-      );
-    }
     return (
       <div className="prism-card flex flex-col items-center gap-2 px-4 py-8 text-center">
         <Sparkles className="size-5 text-violet" />
         <p className="max-w-sm text-sm text-ink-secondary">
-          {emptyNote ??
-            "No active narrative arcs yet — they emerge once the graph has enough team activity to synthesize."}
+          No active narrative arcs yet — they emerge once the graph has enough team activity to synthesize.
         </p>
       </div>
     );
