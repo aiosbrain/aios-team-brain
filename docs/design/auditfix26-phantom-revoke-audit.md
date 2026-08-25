@@ -78,6 +78,10 @@ absent. Removing it would be simpler and would save a round trip.
   question from that;
 - this lane has been blocked twice for widening a slice past the defect it named.
 
+⚠️ **And mutation 5 has since DEMONSTRATED the redundancy** (§4): deleting the probe's short-circuit
+alone changes no observable at all. That is the strongest evidence available that removing it is safe —
+it just is not evidence that removing it belongs in *this* slice.
+
 ⚠️ **If a reviewer thinks the probe should go, say so** — the properties all survive its removal
 (refusals still precede any edge read, so no oracle appears), and I would rather take that argument
 here than discover it in a diff review. It is recorded as an open choice, not a settled one.
@@ -137,7 +141,14 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 | 2 | audit on the PROBE's result instead of the delete's | AC1 |
 | 3 | move only the operator branch inside the guard | AC1 (the MEMBER arm) |
 | 4 | launder the authorizer into the actor field | AC2 |
-| 5 | audit on a genuine no-op | AC4 |
+| 5 | drop BOTH the probe short-circuit and the delete guard | AC4 |
+
+⚠️ **Mutation 5 as first written was a semantic NO-OP, and running it proved something worth keeping.**
+It removed only the probe's `if (!existing) return` — and SURVIVED, because a genuine no-op then falls
+through to the delete, which affects zero rows, so the new guard returns exactly the same
+`{ok:true, revoked:false}` with no audit. **That is empirical evidence for §2b's open question: the
+probe is redundant for correctness, demonstrated rather than argued.** The real detector for AC4 is
+removing both, which reddens it.
 
 ## 5. Risks
 
