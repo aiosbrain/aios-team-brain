@@ -61,6 +61,22 @@ const BODY_READ_CHARS = 2000;
 /** Rows scanned for candidate docs. Bounds the wide (body-less) read. */
 const ITEM_SCAN = 500;
 const MAX_TOKENS = 900;
+
+/**
+ * Why the pass produced nothing, in words an operator can act on (LLMCREDIT-1).
+ *
+ * This used to be the bare string "model returned null for every worker". On 2026-08-25 that is what
+ * the Pulse banner said while the real answer was an HTTP 402 — the provider account was out of
+ * credit — and it sends whoever reads it to look for a model bug. `completeTextOrNull` discards the
+ * error per call, but the PASS already carries the first one, so the reason is available and was
+ * simply not used.
+ *
+ * Pure, so the wording is a unit criterion rather than something only a live provider failure can
+ * demonstrate.
+ */
+export function docTaskInferFailureReason(firstError: string | null): string {
+  return firstError ? `every worker failed — ${firstError}` : "model returned null for every worker";
+}
 const TIMEOUT_MS = 45_000;
 /**
  * Minimum gap between two paid runs for one team, whichever trigger fires. This leg is offered BOTH the
@@ -333,7 +349,7 @@ async function runDocTaskInferenceWithPass(
       // cooldown applies either way (`lastRun` doesn't filter on ok), so this only affects honesty.
       // `scored: 0` for the same reason — the batch size is not what was scored.
       await record(db, teamId, startedAt, false, { inputs_hash: inputsHash, scored: 0, linked: 0 }, [
-        "model returned null for every worker",
+        docTaskInferFailureReason(pass.firstError),
       ]);
       return { scored: 0, linked: 0, skipped: "model-null" };
     }
