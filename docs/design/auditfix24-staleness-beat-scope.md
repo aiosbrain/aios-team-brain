@@ -1,7 +1,10 @@
 # The staleness beat must read the partition its poller actually writes — AUDITFIX-24
 
-**Status:** spec, round 1 folded (Codex **BLOCKED**, Fable **CLEAR-WITH-CONDITIONS** — they overlapped
-on almost nothing and disagreed on the central question). No code written. Filed 2026-08-23 out of
+**Status:** spec, rounds 1 and 2 folded — **four model passes, and the two models disagreed on the
+central question in BOTH rounds** (round 1: Codex BLOCKED / Fable CLEAR-WITH-CONDITIONS; round 2:
+Codex BLOCKED "the refusal FALLS" / Fable CLEAR-WITH-CONDITIONS "the refusal STANDS"). Round 2 is
+where I withdrew a refusal I had argued in writing, and where the guard I had just added turned out
+not to catch its own motivating mutation. No code written. Filed 2026-08-23 out of
 AUDITFIX-22's spec round 3, and PINNED as an accepted cost by that slice's AC13 rather than fixed there.
 
 **Build with:** opus / high — it changes the input to a LOUD banner for every leg at once, and the
@@ -72,10 +75,12 @@ Every `trigger='scheduler'` row, grouped by source and partition:
 | 2026-08-24 | **0** | 48 |
 | 2026-08-25 | **0** | 32 |
 
-**This is the number the whole design argument turns on.** Since the AUDITFIX-22 deploy the
-instance-wide `access_bootstrap` clock has not moved at all — so for a team with no scheduler row of
-its own, `stale` is `true` **whether the scheduler is alive or dead**. It is not a three-hour alarm
-for that team; it is a lamp wired to on. See §5a.
+**Since the AUDITFIX-22 deploy the instance-wide `access_bootstrap` clock has not moved at all** — so
+on THIS fleet, a team with no scheduler row of its own reads `stale` whether the scheduler is alive or
+dead. ⚠️ *That is a fact about a NON-EMPTY fleet, and round 2 caught me generalising it into an
+invariant: `access-bootstrap-leg.ts:70` still writes an `ok:true` instance-wide row every tick while
+`r.teams === 0`, so on a fresh install the clock is live until the first team exists. §5a is where
+that correction lands, and it is what withdrew a refusal.*
 
 **Not measured, and it matters:** this fleet has **one team** (`aios`, created 2026-06-16, 2,675
 scheduler rows of its own), so the defect is **latent here** and would fire on the next team created,
@@ -97,12 +102,16 @@ have team-scoped NON-scheduler paths whose scheduler beat is instance-wide.*
   connectors via `runImport`'s `label` (`scheduler.ts:229-243`), `pret3_sweep`, `pret4_materialize`,
   `graph_project` (`lib/graph/scheduler.ts:66`), `graph_health`
   (`lib/graph/extraction-alert.ts:373,517,529,544`).
-- **NO scheduler beat at all:** `arcs` — deliberately `trigger:"api"`, and the comment says why
-  (`lib/graph/arcs.ts:1254-1256`: *"`scheduler` rows are read as poller-heartbeat evidence in
-  pipeline-health; this one is not that"*) · `llm` (`trigger:"api"`, and not a pipeline leg at all) ·
-  `pm_sync` (reactive/manual) · `scan` (`trigger` comes from a **client header**,
-  `app/api/v1/codebases/route.ts:10,48-49` — so a caller can *claim* `scheduler`; its threshold is
-  `null`, but a future finite one would inherit a spoofable beat).
+- **NO TRUSTWORTHY poller clock** (`none`) — ⚠️ *round 2 corrected the name: "has no scheduler row at
+  all" is FALSE for two of these, and a rule stated that way would fail on current code.* `arcs` —
+  deliberately `trigger:"api"`, and its comment says why (`lib/graph/arcs.ts:1254-1256`: *"`scheduler`
+  rows are read as poller-heartbeat evidence in pipeline-health; this one is not that"*) · `llm`
+  (`trigger:"api"`, and not a pipeline leg at all) · `pm_sync` — its writer takes the trigger as a
+  PARAMETER (`lib/pm-sync/runs.ts:76,81`) and every caller today passes `api`/`manual`/`cli`, so
+  nothing statically forbids a `scheduler` row · `scan` — the trigger comes from a **client header**
+  (`app/api/v1/codebases/route.ts:10,48-49`), so an authenticated caller can *claim* `scheduler` and
+  its rows carry `teamId: auth.teamId`. Both have `null` thresholds today, and scope `none` is what
+  keeps a spoofed or future scheduler row from becoming anyone's clock.
 
 ### 0c. `access_bootstrap` writes BOTH partitions, and that stays true
 
@@ -145,13 +154,31 @@ repo keeps re-hitting** (Fable HIGH; Codex reached the same place through AC7). 
 every criterion here stays green, because the KEY SET is intact. So `test/guards/ingest-leg-ledger.test.ts`
 gains a cross-check on the scan it already runs (`:36-54` parses `recordIngestRun` argument lists):
 
-- a `team` source has ≥1 `trigger:"scheduler"` call site passing a `teamId`;
-- a `global` source has ≥1 `trigger:"scheduler"` call site passing none;
-- a `none` source has **no** `trigger:"scheduler"` call site — and, separately, **may not carry a
-  finite `STALE_MS_BY_SOURCE` threshold**, because a finite bar on a leg that can never resolve a
-  clock is silence by construction;
-- `access_bootstrap` is the ONE documented exception (§0c): declared `team`, and it legitimately has
-  instance-wide sites too.
+- **EVERY** attributable `trigger:"scheduler"` call site of a `team` source passes a non-null
+  `teamId`; **every** such site of a `global` source passes `null` or nothing.
+  ⚠️ *Round 2 killed the "≥1" form both models had let through in round 1: `meeting_notes` has TWO
+  scheduler sites (success `scheduler.ts:447`, failure `:458`), so flipping the ONE the spec names as
+  its motivating edit leaves the other satisfying an existential rule — mutation 8, the mutation this
+  spec calls the one that matters most, survived its own guard.*
+- **The parsing semantics are load-bearing and are part of the rule, not the implementation:**
+  `teamId: null` counts as passing NONE (`context_backfill_all`, `pret3_sweep`, `pret4_materialize`
+  all pass it explicitly, and a key-presence test would fail all three AND let mutation 8 through,
+  since the mutant writes `teamId: null`); an absent key counts as none; the shorthand `teamId,`
+  counts as passing one (`doc-task-infer-run.ts:510`).
+- a `none` source has no attributable `trigger:"scheduler"` call site — and, separately, **may not
+  carry a finite `STALE_MS_BY_SOURCE` threshold**, because a finite bar on a leg that can never
+  resolve a clock is silence by construction.
+- **ENUMERATED EXEMPTIONS, because a universal rule must say what it cannot see:**
+  (i) the four connectors, whose only scheduler writer is `source: label` (`scheduler.ts:229-243`)
+  and is deliberately unresolvable to the scan — a universal rule would otherwise RED ON CLEAN CODE;
+  (ii) `access_bootstrap`, declared `team`, which legitimately also writes instance-wide rows on the
+  fleet-failure/`teams===0`/throw paths (§0c) — the exception is only needed under the universal
+  rule, which is itself evidence the universal rule is the real one.
+- **And the scan gets one upgrade it needs anyway:** `recordIngestRun` sites with no parseable
+  `source:` are currently `continue`d silently (`ingest-leg-ledger.test.ts:81`), which hides
+  `graph_project`'s SUCCESS-path scheduler site behind `projectionRunInput` (`lib/graph/scheduler.ts:66`)
+  — its `global` claim is verified today only by the catch-path site, a coincidence. Those sites move
+  into `unresolved`, where the existing guard already demands an accounting.
 
 ### 2b. The beat query returns BOTH partitions; the resolver picks one
 
@@ -206,7 +233,9 @@ actually carries the completeness burden. Stated as defense-in-depth, not as a g
 
 **In:** `lib/ingest/leg-ledger.ts` (the scope map) · `lib/ingest/pipeline-health.ts` (the beat query +
 `resolveBeatClock`) · `test/guards/ingest-leg-ledger.test.ts` (the scope must be answered AND match
-the writers) · new unit + dm criteria · **converting AUDITFIX-22's AC13** · **correcting a false
+the writers) · **`lib/ingest/access-bootstrap-leg.ts` — the new unconditional instance-wide
+`access_bootstrap_all` heartbeat (§5a), plus its ledger + threshold entries** · new unit + dm
+criteria · **converting AUDITFIX-22's AC13** · **correcting a false
 comment in `test/pipeline-health-staleness.test.ts:36-37`**, which still says *"access_bootstrap
 writes an unconditional instance-wide heartbeat"* — untrue since AUDITFIX-22 and measured at 0
 instance-wide rows/day in §0a, and it is the exact sentence this slice's model contradicts.
@@ -216,8 +245,6 @@ instance-wide rows/day in §0a, and it is the exact sentence this slice's model 
 - **The verdict/streak read.** `STREAK_SQL` keeps choosing the leg from the newest partition. ⚠️ *My
   round-0 claim that the beat was "the last read in this file that mixes partitions" was FALSE —
   the `newest` CTE mixes them too (`:321-325`), deliberately, and AUDITFIX-22's AC5 depends on it.*
-- **Restoring an unconditional instance-wide `access_bootstrap` heartbeat** — §5a argues the refusal
-  and §6 files it.
 - **Retention / a bounded window** on `ingest_runs`; the connector-orphan suppression; BANNERFLAP
   classification; the synthetic `graph_extract` leg.
 
@@ -247,20 +274,37 @@ constructed. *(Both reviewers verified nothing else that test pins is lost.)*
   `stale === false`. *Also the only criterion that reddens a resolver keyed by `source` alone (§2b).*
 - **AC4 — an instance-wide leg still ages from instance-wide rows (dm):** an aged
   `context_backfill_all` scheduler row with no team row → `stale === true`; replaced by a recent one →
-  `false`. *`context_backfill_all` because it is global-only, has a finite (6h) threshold, and is not
+  `false`. *`context_backfill_all` because it is global-only, has a finite (6h) threshold (`pipeline-health.ts:95`), and is not
   connector-suppressed.*
 - **AC5 — a team-beat leg is judged per TEAM (dm):** two teams; A has a recent scheduler row, B has
   none. B not stale, A not stale; then age A's row — **A is stale and B is explicitly asserted NOT
-  stale.** *That last assertion is load-bearing: without it mutation 9 survives, because under it B
+  stale.** *That last assertion is load-bearing: without it mutation 12 survives, because under it B
   borrows A's FRESH row and the first two clauses still pass (Fable MEDIUM).*
 - **AC6 — the fail-open path is unchanged (unit):** `resolveBeatClock` with `beats === null` returns
   the leg's own `finished_at`, for every scope.
+- **AC6b — and `getPipelineHealth` actually USES it when the beat query fails (dm):** with the beat
+  read faulted, a leg whose own newest row is aged still reports `stale === true`. ⚠️ *Round 2: AC6
+  tests the pure helper only, and an implementation can keep the helper correct while the call path
+  bypasses it or hands it `undefined` — AC1–AC5 all use SUCCEEDING beat reads, so they stay green.
+  This is the criterion that pins the wire, not the function.*
 - **AC7 — every ledger source declares a beat scope AND the declaration matches its writers (unit
   guard):** key-set parity, plus the §2a cross-check. *Parity alone proves nothing about any scope
   VALUE — a wrong value for `auth_cleanup` would pass it and lose a 26h alarm (Codex HIGH).*
 - **AC8 — `none` may not carry a finite threshold (unit guard):** a `none` source with a number in
   `STALE_MS_BY_SOURCE` fails the build. *A finite bar on a leg that can never resolve a clock is
   silence by construction.*
+- **AC10 — the instance-wide heartbeat is written on EVERY tick, whatever the fleet did (dm):**
+  `runAccessBootstrapLeg` writes exactly one `access_bootstrap_all` instance-wide scheduler row per
+  tick — on a healthy multi-team pass, on a fleet-level failure, and on a throw. *Exactly one, not
+  "at least one": two rows in one tick would reach the BANNERFLAP confirmation threshold after a
+  single blip, which is the trap AUDITFIX-22's AC1 pins per team.*
+- **AC11 — and AUDITFIX-22's contracts survive it (dm):** an ordinary tick still writes NO
+  `team_id is null` row for source **`access_bootstrap`** (its AC4), and a fleet-level failure still
+  reds a team with no row of its own at the confirmed threshold (its AC5). *Both shipped criteria
+  must pass UNMODIFIED — the new source must not become a second way to write the old one.*
+- **AC12 — a brand-new team on a dead scheduler is aged by the heartbeat at the 3h bar (dm):** no
+  team-scoped rows, an aged `access_bootstrap_all` instance-wide row → that leg is `stale`. *This is
+  the criterion §5a exists for: the silent corner, closed and pinned.*
 - **AC9 — an undeclared source resolves from the instance-wide partition (unit):** `resolveBeatClock`
   for `auto_flip` reads the global row and ignores a team-scoped one. ⚠️ *Resolver-level only: no
   ledger-absent source has a finite threshold today, so this has no product observable, and saying so
@@ -281,10 +325,21 @@ constructed. *(Both reviewers verified nothing else that test pins is lost.)*
 | 11 | the undeclared default becomes `team` | AC9 |
 | 12 | resolve the team partition from ANY team's row (drop `team_id = $1`) | **AC5's B-side assertion** |
 | 13 | keep the global row as the clock when a team row exists but is older | AC2b |
+| 14 | team scope always resolves `undefined`, even when the team HAS a scheduler row | **AC2** |
+| 15 | keep `resolveBeatClock` correct but bypass it in `getPipelineHealth` when the beat read fails | **AC6b** |
+| 16 | write the `access_bootstrap_all` heartbeat only when the fleet pass succeeds | AC10 |
+| 17 | write the heartbeat under source `access_bootstrap` instead of `access_bootstrap_all` | AC11 (AUDITFIX-22's AC4) |
 
-⚠️ **Mutations 4, 8, 12 and 13 all exist because writing this table found the criteria missing.**
-Mutation 4 was the round-0 catch (AC1 cannot see it). Mutation 8 is the one that matters most: it is a
-real future edit, and before §2a's cross-check NOTHING in this slice could redden it.
+⚠️ **Mutations 4, 8, 12, 13, 14 and 15 all exist because writing this table found the criteria
+missing.** Mutation 4 was the round-0 catch (AC1 cannot see it). Mutation 8 is a real future edit that
+nothing could redden before §2a's cross-check — and round 2 then proved the cross-check as first
+written could not redden it either. Mutation 15 is round 2's: a helper that is right and a call path
+that ignores it.
+
+⚠️ **WHICH CRITERIA ARE RED-FIRST, stated because it is easy to miscount.** Genuinely red against the
+shipped code: **AC1, AC1b, AC2b, the AC13 flip**, and **AC10/AC12** (the heartbeat does not exist).
+**AC2, AC4, AC5's B-side and AC6 are GREEN pre-fix** — they are regression pins and mutation-killers,
+which is legitimate, but they are not evidence the fix does anything (Fable, round 2).
 
 ## 5. Risks
 
@@ -298,48 +353,64 @@ real future edit, and before §2a's cross-check NOTHING in this slice could redd
 | Over-correction: deleting AC13 instead of converting it | loss of the only fossil fixture | §3 |
 | A never-ticked team on a DEAD scheduler | detection moves from 3h to 6h | §5a — argued, measured, and refused |
 
-### 5a. The one real regression, its measured size, and why it is refused
+### 5a. The regression I tried to refuse, and why I am now fixing it instead
 
-⚠️ **Codex BLOCKED on this and I am not taking the fix. Here is the argument, so round 2 can attack
-it rather than re-derive it.**
+⚠️ **Round 1 (Codex) BLOCKED on this. Round 2 I argued a refusal. Round 2's re-review split again —
+Codex: the refusal FALLS; Fable: it STANDS — and the refusal is now WITHDRAWN.** The argument is kept
+because the evidence that killed it is worth more than the conclusion.
 
-The scenario: an instance ticks normally, a team is created (writing a `trigger='api'` creation row
-only), and the scheduler process **dies** before that team's first scheduler tick. Today the frozen
-instance-wide `access_bootstrap` row ages and the banner reds at 3h. Under this design that leg
-resolves no clock and says nothing.
+**What I claimed.** (a) Measured on prod, instance-wide `access_bootstrap` scheduler rows went 51/day
+to **0/day** at the AUDITFIX-22 deploy, so for a team with no rows of its own that clock is aged
+whether the scheduler is alive or dead — a lamp wired on, not a report. (b) `context_backfill_all` is
+an unconditional instance-wide heartbeat at a 6h bar, so the degradation is 3h→6h and never silence.
 
-**What today's 3h alarm is actually worth for that team: nothing.** §0a measures zero instance-wide
-`access_bootstrap` rows per day since 2026-08-23. The fossil is aged whether the scheduler is alive or
-dead, so for a team with no rows of its own that lamp is **wired on**, not reporting. Replacing a
-constant-true indicator with a silent one loses no information — it loses a coincidence.
+**What was wrong with (a) — and BOTH models found it independently.** `access-bootstrap-leg.ts:70`
+writes an `ok:true` instance-wide row when `r.teams === 0`. So on a **fresh self-hosted install** the
+instance-wide clock is live every tick until the first team is created — which is exactly the
+population most likely to meet this defect. My measurement generalised ONE non-empty fleet into an
+invariant. It holds for "any team created after the fleet's first team"; it is false for the first.
 
-**What still covers the scenario:** `context_backfill_all` is an unconditional instance-wide per-tick
-heartbeat (`scheduler.ts:393-395`, and on a throw `:415-419`; 648 rows ≈ 48/day in §0a, i.e. every
-tick) with a **6h** threshold (`pipeline-health.ts:88`), and instance-wide rows ARE in a new team's
-scope. `auth_cleanup` backstops at 26h on every instance regardless of connectors. So detection
-degrades **3h → 6h** in this corner, and never to silence. *(Codex said "at least 3h→6h, possibly
-silent"; the silent half does not hold, because `context_backfill_all` is unconditional. Fable said
-26h; that is the backstop, not the first responder.)*
+**What was wrong with (b).** "Unconditional per-tick" is contradicted by this file's own measurement:
+`pipeline-health.ts:40-52` records `context_backfill_all` writing ZERO rows across a 4.85h truncation
+window **while the scheduler was alive**, and states these legs' age means "last time a tick got this
+far", not "last time the poller ran". `runContextBackfill` is stage 7 of the tick and
+`runAccessBootstrap` is stage 6 (`scheduler.ts:40-45`), so a tick that reaches the access leg and then
+hangs writes the first and never the second.
 
-**And the exposure is one cadence.** The affected population is "teams created since the last tick" —
-30–86 min measured on this fleet. Any team that has ever ticked has its own 3h clock, permanently.
+**Which produces a genuinely silent corner**, and it is Codex's: a fresh instance ticks (writing an
+instance-wide `access_bootstrap` heartbeat), a hang or death prevents stage 7 so no
+`context_backfill_all` row ever lands, the first team is created, the scheduler dies. Today: red at
+3h. Under the round-2 design: **nothing, ever.** That is the direction this whole family of tickets
+exists to prevent, and no amount of prose in a risk table makes it acceptable.
 
-**The alternative I am refusing:** add `access_bootstrap_all`, an unconditional instance-wide
-heartbeat under a distinct source, mirroring `context_backfill_all` — which was invented for exactly
-this shape and whose comment names `access_bootstrap` as the untreated twin (`scheduler.ts:386-388`).
-It would restore a genuine 3h fleet beat for every team. It is refused **here** because it is a new
-permanent leg on every team's health panel, needing its own threshold decision and criteria, to buy
-3h of earlier detection in a one-cadence window — and this lane has twice been blocked for widening a
-slice past the defect it named. It is §6.
+**The fix, and it is the one the codebase already invented.** `access_bootstrap_all` — an
+unconditional instance-wide per-tick heartbeat under a DISTINCT source, exactly mirroring
+`context_backfill_all`, which exists for this shape and whose comment names `access_bootstrap` as the
+untreated twin (`scheduler.ts:386-388`). It restores at the 3h bar the fleet-liveness beat AUDITFIX-22
+removed — the one a shipped test comment still claims exists (`pipeline-health-staleness.test.ts:35-37`)
+— for every team including the first on a new instance.
+
+⚠️ **This is a deliberate scope increase and not a drift.** It is the safety prerequisite two review
+rounds identified: without it this slice trades a false alarm for a silent corner. §3 carries it.
+
+**The boundary no design can cross** (Fable, round 2): an instance whose scheduler is dead **from
+boot** has no scheduler rows anywhere, so nothing is aged today either (`pipeline-health.ts:400`
+resolves `undefined`). Not a regression, and stated so nobody re-derives it as a hole.
+
+**Why the distinct source rather than reviving the old row.** AUDITFIX-22 removed the instance-wide
+`access_bootstrap` row because it MASKED per-team failures under `distinct on (source)`. A separate
+source name is the fix that preserves both, and its AC4
+(`access-bootstrap-ledger…:197`) asserts no `team_id is null` row for source `access_bootstrap`
+specifically — untouched by a new source.
 
 ## 6. What this does NOT close, and what it files
 
 - **The wait.** A brand-new team is not aged now, but it still has no clock until its first tick, and
   that tick is one full sequential convergence pass over every team ahead of it (single-flighted,
   overlapping ticks SKIPPED — `lib/ingest/single-flight.ts:39-50`), measured at one cadence (30–86
-  min) on a ONE-team fleet and unbounded if an earlier team hangs.
-- **FILE AS ITS OWN TICKET:** restore an unconditional instance-wide scheduler heartbeat for the
-  access leg (`access_bootstrap_all`), per §5a — AUDITFIX-22 removed one that a shipped test comment
-  still claims exists, and the measured 3h→6h gap is the cost.
+  min) on a ONE-team fleet and **unbounded if an earlier team hangs** — the honest bound, and the one
+  round 2 caught §5a understating as "one cadence".
+- **Nothing is filed out of this any more.** Round 0 filed the instance-wide heartbeat as a follow-up
+  ticket; round 2 proved the slice is unsafe without it, so it is §3 In-scope instead (§5a).
 
 **Nothing is built. No code exists for this slice.**
