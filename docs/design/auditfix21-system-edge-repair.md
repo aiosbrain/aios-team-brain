@@ -166,8 +166,19 @@ read and the delete. That needs the group's `slug`/`is_builtin` or the project's
 and round 2 (MEDIUM 6) re-derived that `ensureBuiltins` **cannot** flip a squatter to builtin: it
 refuses an existing non-builtin reserved slug and inserts only if absent (`lib/access/groups.ts:108`),
 pinned by `test/datamechanics/access-groups.datamechanics.test.ts:259`. No in-repo `system→source`
-transition or slug rewrite exists. The only live identity transition is `source → system`, which can
-only make a pair MORE protected, never less.
+transition or slug rewrite exists. The only live identity transition is `source → system`, and for a reserved slug
+`isProtectedProject` is true on **both** sides of it while sanctioned-ness is a function of SLUGS the
+flip never touches — so classification is **flip-invariant**, in either direction.
+
+⚠️ **That argument rests on two invariants nothing pins, and naming them is the point** (round 2's
+MEDIUM 2, from the second model): **(a)** no code path ever UPDATEs `projects.slug` — the only project
+updates in the repo are `kind` (`lib/access/bootstrap.ts:76-77`) and `graph_group_id`
+(`lib/graph/project-pointer.ts:121-134`), and the ingest upserts key ON slug so they cannot rename;
+**(b)** `is_builtin` never flips `false → true` — `ensureBuiltins` is insert-if-absent and REFUSES an
+existing non-builtin reserved slug (`lib/access/groups.ts:122-124`), with the race-loser branch
+re-checking (`:132-139`). **A future project-rename feature, or an `ensureBuiltins` "repair" that
+adopts squatters, silently reopens the mid-call reclassification window.** Whoever writes either
+should find this paragraph.
 
 **AC7 is deleted, because it was unconstructible.** It asked for the flip to be interleaved between the
 identity read and the delete for `general@source→everyone` — but that pair is protected-and-sanctioned
@@ -207,8 +218,17 @@ AC5 already covers that path.
 
 ## 3. Scope
 
-**In:** `lib/access/groups.ts` (the new writer) · a new verb module + its import-safe wiring factory ·
-`scripts/admin.ts` (the command) · a structural guard · `docs/ARCHITECTURE.md`.
+**In:** `lib/access/groups.ts` (the new writer + the old one's hardening) · a new verb module + its
+import-safe wiring factory · `scripts/admin.ts` (the command) · a structural guard ·
+`docs/ARCHITECTURE.md`.
+
+⚠️ **What the structural guard checks, stated because "a structural guard" is not a specification**
+(round 2 MEDIUM 3): the repair verb module **imports and calls `revokeUnsanctionedSystemEdge`, and
+never `revokeProjectFromGroup`**, and `scripts/admin.ts`'s `repair-system-edge` arm calls that verb's
+factory. The existing single-writer guard cannot do this job: it is **file-scoped**
+(`test/guards/access-single-writer.test.ts:16`), so a second deleting function inside
+`lib/access/groups.ts` is invisible to it — it holds unchanged, and it also proves nothing about which
+writer the new verb routes to.
 
 **Out:**
 - **`revokeProjectFromGroup`** — untouched, including its D2c order and its `kind='system'` refusal.
@@ -235,7 +255,10 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
   ⚠️ *Round 1 HIGH 3: every AC2 group is a real builtin, so dropping the `is_builtin` conjunct changes
   nothing there and its mutation could not redden.*
 - **AC4 — a reserved-slug `kind='source'` project is PROTECTED (dm):** `general@source→everyone` is
-  refused. *§0b — the gate is `isProtectedProject`, not `kind==='system'`.*
+  refused **with the protected-and-sanctioned message, distinguishable from the not-my-case refusal**.
+  ⚠️ *Round 2 HIGH 1: under a `kind === 'system'` gate this pair is refused too — by the
+  not-protected branch — so "refused, edge survives" is the same observable and the mutation could not
+  redden. AC5 is the behavioural discriminator; this message assertion is the second one.*
 - **AC5 — and its unsanctioned edge is still revocable (dm):** `general@source→vendors` is revoked.
 - **AC6 — a reserved-slug `kind='initiative'` is NOT protected (dm):** its creator grant is revocable
   through this writer's refusal path — i.e. the writer refuses it as *not its case*, and
@@ -244,16 +267,25 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
 - **AC8 — an undetermined GROUP read refuses, ATTRIBUTED (dm):** the error names a read failure,
   distinguishable from "group not found"; no delete; edge survives.
 - **AC9 — an undetermined PROJECT read refuses, ATTRIBUTED (dm):** same.
-- **AC10 — an unauthorized principal is refused BEFORE anything is read about the edge (dm):**
-  non-admin, inactive, external-posture and unknown principals each get a principal rejection, the
-  edge survives, and no audit row is written.
+- **AC10 — an unauthorized principal is refused, and ZERO identity reads fire (dm):** non-admin,
+  inactive, external-posture and unknown principals each get a principal rejection, the edge survives,
+  no audit row is written — **and a wrapping client records that the `projects` and `groups` reads were
+  never issued**. ⚠️ *Round 2 HIGH 3, from the second model: "refused, edge survives, no audit" is
+  IDENTICAL whether the identity reads run before or after the authority check, so the
+  read-before-authority mutation could not redden this and §2a step 1's claim — "nothing is read about
+  the edge before authorization" — was asserted and unpinned. Counting the reads is the only thing that
+  observes the order.*
 - **AC11 — no edge-existence oracle (dm):** an invalid principal gets the SAME refusal whether the
   edge exists or not.
 - **AC12 — a no-op revoke does NOT audit (dm):** an authorized admin against an absent (but otherwise
   valid, unsanctioned) pair gets `{ok:true, revoked:false}` and **zero** new audit rows. *D3.*
-- **AC13 — a concurrent delete between read and delete does not audit a phantom (dm):** with the row
-  removed after classification, the call reports `revoked:false` and writes no audit row. *§0c — this
-  is what `RETURNING` buys, and the existing writer's copy of the bug is AUDITFIX-26.*
+- **AC13 — the PROBE-then-blind-delete shape cannot come back (dm):** with the row removed after
+  classification, the call reports `revoked:false` and writes no audit row. ⚠️ *Round 2 MEDIUM 1: for
+  THIS writer, which has no probe, "removed after classification" and "absent from the start" are the
+  same delete-returns-nothing path, so AC13 collapsed into AC12 and neither uniquely detected its
+  mutant. Its distinct value is against drift back toward the EXISTING writer's shape
+  (`lib/access/groups.ts:806-836`), so mutation 10 is that shape — probe hit, blind delete, audit on
+  the probe — and this criterion is its unique detector.*
 - **AC14 — the VERB reaches the writer for an unsanctioned edge (unit):** `repair-system-edge` calls
   the injected writer once with the resolved ids.
 - **AC15 — the VERB's REAL wiring resolves the identity it needs (unit):** the import-safe factory,
@@ -288,10 +320,10 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
 | 4 | protect only `general→everyone` | AC2 |
 | 5 | protect only for operator actors | AC2 |
 | 6 | drop the `is_builtin` conjunct | AC3 |
-| 7 | re-read identity BEFORE authority | AC10 |
+| 7 | read identity BEFORE authority | AC10 (the read counter) |
 | 8 | swallow the group read error into not-found | AC8 |
 | 9 | swallow the project read error into not-found | AC9 |
-| 10 | delete without `RETURNING` and audit unconditionally | AC13 |
+| 10 | probe, then blind delete, then audit on the PROBE (the existing writer's shape) | AC13 |
 | 11 | audit on a no-op | AC12 |
 | 12 | classify from the PAIR only, ignoring `isProtectedProject` | AC6 |
 | 13 | have the wiring factory select only `id` | AC15 |
@@ -335,5 +367,37 @@ observable (§0a: zero forbidden edges). It also does not fix the existing write
 decision** — the writer's absolute system refusal — and needed two shipped tests converted and the
 documented D2c order re-derived. This one adds a writer and touches neither. When a review offers a
 design that removes a reversal, that is worth more than the criteria it also fixes.
+
+**Nothing is built. No code exists for this slice.**
+
+## 8. Round 2 — BOTH models, and they found different things again
+
+Round 2 ran Codex **against its own round-1 proposal** and Fable **cold**, in parallel. Codex returned
+BLOCKED; Fable returned CLEAR-WITH-CONDITIONS with **no blocker** — and their findings barely overlap.
+
+### Codex — attacking the reshape it proposed
+
+| # | finding | outcome |
+|---|---|---|
+| **B1** | the reshape does not close the hole it exists for: the UNCHANGED old writer refuses only `kind==='system'`, so `general@source→everyone` — protected AND sanctioned — is deletable today, no race required | **ADOPTED** — §0b.1; the old writer is HARDENED to refuse every `isProtectedProject`; **AC17**/**AC18**; logged for the operator as a live defect |
+| **B2** | "the race is closed by construction" is false — steps 2-3 are separate reads, step 4 is an ID-only delete, and `RETURNING` proves which ROW went, not that identity still holds | **ADOPTED** — §2a is an explicit SNAPSHOT contract; **AC7 deleted as unconstructible** |
+| **H3/H4/M5** | three more mutations aimed at criteria they cannot redden; AC14+AC15 allow the shipped command to be ABSENT; AC16's protection overstated | **ADOPTED** — **AC19** pins the call site; AC16 restated as a regression criterion |
+
+### Fable — cold, and it could not break the design
+
+| # | finding | outcome |
+|---|---|---|
+| — | **attack 1 FAILED**: no sanctioned-edge deletion constructible. Classification is **flip-invariant** — `isProtectedProject` is true on both sides of the flip for a reserved slug, and sanctioned-ness is a function of slugs the flip never touches. `ensureBuiltins` cannot convert a squatter; no path updates `projects.slug`; recreation mints a new uuid; every read and the delete are team-scoped | **the design stands**, and this is the strongest evidence for it in the document |
+| **H3** | AC10's observables are IDENTICAL whether identity is read before or after authority, so §2a step 1's central claim was asserted and **unpinned** | **ADOPTED** — AC10 now COUNTS the identity reads |
+| **H1/H2** | mutation 1 cannot redden AC4 (the mutant refuses via the not-my-case branch); AC7 is vacuous by the design's own flip-invariance | **already folded from Codex B2/H3**, and AC4 gains the message assertion Fable asked for |
+| **M1** | AC13 collapses into AC12 for a writer with no probe | **ADOPTED** — mutation 10 becomes the probe-then-blind-delete shape, making AC13 its unique detector |
+| **M2** | "closed by construction" rests on two invariants nothing pins — `projects.slug` never updated, `is_builtin` never flips false→true | **ADOPTED** — §2a names both, so the change that breaks them finds the paragraph |
+| **M3** | "a structural guard" is not a specification, and the single-writer guard is FILE-scoped so it cannot pin which writer the verb routes to | **ADOPTED** — §3 says what the guard checks |
+| — | AC16 verified statically; §0b and §0c confirmed; refusing rather than delegating a non-protected project confirmed right | recorded so the build does not re-litigate them |
+
+⚠️ **Two rounds, three model passes, and the mutation table has now been wrong SEVENTEEN times across
+this lane.** Every instance is the same shape: a mutation whose observable is identical to the correct
+implementation's, so the criterion cannot tell them apart. Writing the table is what surfaces them —
+none was visible while writing criteria and code alone.
 
 **Nothing is built. No code exists for this slice.**
