@@ -34,11 +34,13 @@ only thing that says who removed whose access, so a fabricated entry is worse th
 | `access.project_granted` audit rows | 3 |
 | production callers of `revokeProjectFromGroup` | **one** — `scripts/admin.ts`'s `revoke-project` |
 
-**No phantom has ever been written**, and the race needs two concurrent operator CLI invocations
-against the same edge — so this is latent, not live. ⚠️ *And "zero rows" proves less than it looks:
-audit writes are best-effort and swallow both returned errors and exceptions (`lib/api/audit.ts:16`),
-and a successful no-op deliberately writes none. The honest statement is that **no phantom is
-evidenced**, not that none occurred.*
+**The measured database contains no persisted phantom evidence**, and the race needs two concurrent
+operator CLI invocations against the same edge — so this is latent, not live. ⚠️ *Round 1 MEDIUM 3
+caught me writing "no phantom has ever been written" and then, two sentences later, the correct weaker
+claim. Only the weaker one is supportable: audit writes are best-effort and swallow their errors
+(`lib/api/audit.ts:16`), so zero rows cannot prove no raced invocation occurred — though a failed audit
+insert writes no phantom either, so the failure mode does not hide one. The prod counts themselves are
+measured; the inference from them is what needed narrowing.*
 
 ### 0b. The sibling already has the fix, and its criterion
 
@@ -67,9 +69,11 @@ absent. Removing it would be simpler and would save a round trip.
 
 **It stays anyway**, for now:
 
-- it is **step (3) of the documented D2c order**, whose whole point is that `{revoked:false}` is
-  reachable only by an authorized principal — the shipped dm test pins that order and the
-  no-existence-oracle property against it;
+- it is **step (3) of the documented D2c order**. ⚠️ *Round 1 MEDIUM 1 corrected my reason: the shipped
+  dm test does NOT pin the probe as a step. It proves an unauthorized principal gets the same refusal
+  with and without an edge, and deleting directly with `RETURNING` after authorization preserves that
+  outcome exactly. So the probe is retained for **scope stability** — it keeps the documented sequence
+  and the probe-read-error behaviour unchanged — not because a test requires it;*
 - this slice's job is to stop the trail lying, and removing a documented step is a separate
   question from that;
 - this lane has been blocked twice for widening a slice past the defect it named.
@@ -80,7 +84,9 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 
 ### 2c. What must NOT change
 
-- **The check order** — refusal, principal, probe, delete — is a tested contract.
+- **The check order** — refusal, principal, probe, delete. The *refusal-before-principal* and
+  *principal-before-any-edge-read* halves are tested contracts; the probe's presence as a distinct step
+  is documented rather than pinned (§2b).
 - **The actor discipline** — an operator act audits as `system` with `meta.authorizedByMemberId`,
   never in the actor field, never in `added_by`.
 - **`{ok:true, revoked:false}` on a genuine no-op**, with no audit. That is D3 and it is already right;
@@ -98,9 +104,21 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 
 ## 4. Acceptance
 
-- **AC1 — a row removed between the probe and the delete is NOT audited (dm):** with a concurrent
-  delete interleaved after the probe, the call returns `{ok:true, revoked:false}` and writes **zero**
-  new `access.project_revoked` rows. *The defect, stated as an outcome.*
+- **AC1 — a row removed between the probe and the delete is NOT audited, for BOTH actor kinds (dm):**
+  with a concurrent delete interleaved after the probe, the call returns `{ok:true, revoked:false}` and
+  writes **zero** new `access.project_revoked` rows — asserted separately for an **operator** actor and
+  a **member** actor. ⚠️ *Round 1's BLOCKER: with a single actor kind, this implementation satisfies
+  all five criteria while still lying —*
+
+  ```ts
+  if (actor.kind === "operator") { if (!deleted) return { ok: true, revoked: false }; await auditOperator(); }
+  else { await auditMember(); }            // unconditional, after a probe hit
+  return { ok: true, revoked: deleted };
+  ```
+
+  *raced operator revokes come out clean, real deletions pass AC2/AC3, genuine no-ops exit at the probe
+  and pass AC4, the shipped tests pass — and a raced MEMBER revoke still writes a phantom. The sibling
+  fixture I was copying uses only an operator actor, which is how the gap travelled.*
 - **AC2 — a real deletion still audits, and still names the authorizer (dm):** `revoked:true`, one new
   audit row, `actor_kind='system'`, `member_id` NULL, `meta.authorizedByMemberId` set, `meta.via`
   carried from the ACTOR. *Counting rows leaves the anti-laundering discipline unprotected — the same
@@ -117,7 +135,7 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 |---|---|---|
 | 1 | delete without `RETURNING` and audit unconditionally (the current shape) | AC1 |
 | 2 | audit on the PROBE's result instead of the delete's | AC1 |
-| 3 | move only the operator branch inside the guard | AC3 |
+| 3 | move only the operator branch inside the guard | AC1 (the MEMBER arm) |
 | 4 | launder the authorizer into the actor field | AC2 |
 | 5 | audit on a genuine no-op | AC4 |
 
@@ -132,8 +150,31 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 
 ## 6. What this slice does NOT prove
 
-It does not make the revoke atomic. Two concurrent revokes of the same edge still race; what changes is
-that **at most one of them claims the deletion**, and the other reports the truth. Serializability would
-need a lock or a conditional delete this adapter cannot express — the same boundary AUDITFIX-21 drew.
+It does not make the whole operation atomic. **The deletion itself already is**: `project_groups` is
+keyed on `(project_id, group_id)` (`postgres/schema.sql:1072`), so of two concurrent
+`DELETE … RETURNING` statements exactly one returns the row — "at most one claims the deletion" is a
+consequence of that, not of a lock.
+
+⚠️ *Round 1 MEDIUM 2 corrected me: I had written that serializability "would need a conditional delete
+this adapter cannot express". It can express one — that is precisely what this slice uses. What remains
+non-atomic is the **preceding snapshot**: the project's kind and the principal's authority are read
+before the delete and could change in between. That is the same snapshot boundary AUDITFIX-21 named,
+and it is not what this slice is about.*
+
+**Nothing is built. No code exists for this slice.**
+
+## 7. Round 1 — BLOCKED on the mutation table, for the twentieth time in this lane
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | mutation 3 cannot redden AC3: with a single actor kind in AC1, a per-branch fix satisfies all five criteria while a raced MEMBER revoke still writes a phantom | **CONFIRMED** — the reviewer wrote the passing-but-lying implementation out, and noted the sibling fixture I was copying uses only an operator actor, which is how the gap travelled | **ADOPTED** — AC1 is parameterised over both actor kinds; mutation 3 targets the member arm |
+| **M1** | the shipped dm test does NOT pin the probe as a step — it pins the no-oracle OUTCOME, which survives deleting the probe | **CONFIRMED** | **ADOPTED** — §2b keeps the probe for scope stability and says so, instead of claiming a test requires it |
+| **M2** | §6 misidentified what is non-atomic: the adapter CAN express a conditional `DELETE … RETURNING`, and against the PK edge exactly one of two concurrent deletes returns the row | **CONFIRMED** | **ADOPTED** — the remaining non-atomicity is the preceding snapshot, not deletion ownership |
+| **M3** | §0a said "no phantom has ever been written" and then, correctly, "no phantom is evidenced" | **CONFIRMED** | **ADOPTED** — only the supportable claim survives |
+| — | the adapter semantics this rests on: `.select()` after `.delete()` sets `RETURNING`; zero rows → `data: []`; failure → `data:null` + error; so error-first then `(removed ?? []).length > 0` cannot suppress a real deletion. Both shipped tests statically compatible unmodified | **CLEARED with evidence** | recorded so the build does not re-derive them |
+
+⚠️ **Twenty.** That is how many times a mutation in this lane has pointed at a criterion it could not
+redden, and the shape has never varied: the mutation's observable is identical to the correct
+implementation's, usually because the fixture exercises one branch of something that has two.
 
 **Nothing is built. No code exists for this slice.**
