@@ -824,6 +824,9 @@ guard enforces it, it's named.
   variants, every added commit-range path and content block (including merge commits), and commit
   messages. Backreferences are rejected and every matcher has a hard timeout. Push events scan their full
   `before..sha` range too, so add-then-scrub history cannot disappear behind a clean final tree.
+  Untrusted PR ranges carry an explicit 500-commit ceiling; exceeding it fails closed with a distinct,
+  actionable count/limit verdict, while the trusted recreated-protected-branch fallback remains an
+  uncapped full-history scan. The separate 2,000-path and 64 MiB range ceilings remain fail-closed.
   Matching uses one POSIX ERE engine throughout. Public CI emits only the unavoidable pass/fail bit:
   it never includes matching text, locations, counts, a term, an index, or the private list size;
   `--reveal` is disabled in CI. The gate **fails closed** whenever the list or scanner is unavailable,
