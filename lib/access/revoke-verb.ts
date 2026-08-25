@@ -52,7 +52,15 @@ export async function runRevokeProjectVerb(
     // It has to move WITH the writer: while this tested only the kind, `revoke-project everyone general`
     // against a reserved-slug `kind='source'` project passed the preflight AND the writer's old
     // kind-only refusal, and deleted the substrate edge.
-    return { ok: false, error: `'${args.projectSlug}' holds the access substrate's wiring (general/external-shared ↔ the builtins) and cannot be revoked by this verb. An UNSANCTIONED edge on it is repairable with \`repair-system-edge\`.` };
+    // The sentence has to be TRUE for both shapes this now refuses. Saying "is a SYSTEM project"
+    // about a kind='source' row is simply false — the diff review caught it — but the SYSTEM wording
+    // is also the shipped contract for a system project, pinned by test/admin-cli-revoke.test.ts.
+    // So it is conditional: each kind gets an accurate sentence, and both name the substrate.
+    const what =
+      project.kind === "system"
+        ? `'${args.projectSlug}' is a SYSTEM project — its grants are the access substrate (general/external-shared ↔ the builtins)`
+        : `'${args.projectSlug}' holds a reserved substrate slug and is about to become a SYSTEM project — its grants are the access substrate (general/external-shared ↔ the builtins)`;
+    return { ok: false, error: `${what} and cannot be revoked by this verb. An UNSANCTIONED edge on it is repairable with \`repair-system-edge\`.` };
   }
   const authorizedByMemberId = await deps.resolveMemberIdByEmail(args.actorEmail);
   if (!authorizedByMemberId) return { ok: false, error: `no member '${args.actorEmail}' on this team` };
