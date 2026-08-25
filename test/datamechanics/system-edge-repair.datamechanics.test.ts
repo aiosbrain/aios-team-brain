@@ -103,6 +103,27 @@ describe("AUDITFIX-21: a forbidden system-project grant has a sanctioned repair"
     expect(r.revoked).toBe(true);
     expect(await edgeExists(seed, gen, vendors)).toBe(false);
     expect(await revokedAudits(seed), "a real deletion audits").toBe(before + 1);
+
+    // And the audit must NAME the authorizer correctly. Counting rows leaves the actor discipline
+    // completely unprotected: auditing as the member, omitting authorizedByMemberId, or recording the
+    // wrong `via` all keep the count identical (diff review). An operator act audits as SYSTEM with
+    // the authorizer in META — never in the actor field, which would attribute the deletion to a
+    // human who only approved it.
+    const { data: row } = await db()
+      .from("audit_log")
+      .select("actor_kind, member_id, meta")
+      .eq("team_id", seed.teamId)
+      .eq("action", "access.project_revoked")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const audit = row as { actor_kind: string; member_id: string | null; meta: Record<string, unknown> };
+    expect(audit.actor_kind, "an operator act audits as system").toBe("system");
+    expect(audit.member_id, "and never attributes the act to the approving human").toBeNull();
+    const meta = typeof audit.meta === "string" ? JSON.parse(audit.meta) : audit.meta;
+    expect(meta.authorizedByMemberId, "the authorizer is named in meta").toBe(a);
+    expect(meta.via).toBe("cli");
+    expect(meta.repair, "and the trail says this was a repair, not an ordinary revoke").toBe("unsanctioned_system_edge");
   });
 
   it("AC2: ALL THREE sanctioned pairs are refused, for BOTH actor kinds, and every edge survives", async () => {

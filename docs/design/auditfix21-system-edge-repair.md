@@ -118,9 +118,15 @@ buys.
 
 ## 1. The rule
 
-> **`revokeUnsanctionedSystemEdge` deletes exactly one edge, and only if — at the moment of the
-> delete — the project is protected, the pair is unsanctioned, and the caller is an active admin. It
-> audits only a row it actually removed. Every other revoke path is unchanged.**
+> **`revokeUnsanctionedSystemEdge` deletes exactly one edge, and only if — as read immediately
+> before — the project is protected, the pair is unsanctioned, and the caller is an active admin. It
+> audits only a row it actually removed. Every other revoke path keeps its meaning.**
+
+⚠️ *"as read immediately before", not "at the moment of the delete" — the diff review caught that
+overclaim. Authority is checked, THEN identity is read, THEN the delete runs, so a concurrent
+`deleteMember` or posture removal can disable the admin in between. **Snapshot authority, snapshot
+identity**, both stated rather than implied; the guarantee that holds unconditionally is that no
+delete happens before authorization.*
 
 ## 2. The design
 

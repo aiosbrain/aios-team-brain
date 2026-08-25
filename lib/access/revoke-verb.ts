@@ -52,7 +52,7 @@ export async function runRevokeProjectVerb(
     // It has to move WITH the writer: while this tested only the kind, `revoke-project everyone general`
     // against a reserved-slug `kind='source'` project passed the preflight AND the writer's old
     // kind-only refusal, and deleted the substrate edge.
-    return { ok: false, error: `'${args.projectSlug}' is a SYSTEM project — its grants are the access substrate (general/external-shared ↔ the builtins) and cannot be revoked by this verb` };
+    return { ok: false, error: `'${args.projectSlug}' holds the access substrate's wiring (general/external-shared ↔ the builtins) and cannot be revoked by this verb. An UNSANCTIONED edge on it is repairable with \`repair-system-edge\`.` };
   }
   const authorizedByMemberId = await deps.resolveMemberIdByEmail(args.actorEmail);
   if (!authorizedByMemberId) return { ok: false, error: `no member '${args.actorEmail}' on this team` };

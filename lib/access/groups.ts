@@ -776,6 +776,11 @@ export interface RevokeResult extends WriteResult {
  * ORDER, and every step is a refusal that leaves the edge intact:
  *   1. AUTHORITY. Nothing about the edge is read first, so an unauthorized caller learns nothing it
  *      could not already learn. The guarantee is the plain one: NO DELETE BEFORE AUTHORIZATION.
+ *      ⚠️ It is SNAPSHOT authority, not authority-at-the-instant-of-delete: reads follow this check,
+ *      and a concurrent `deleteMember` (lib/admin/members.ts) or a posture removal could disable the
+ *      admin in between, so the delete can land under a principal who was authorized when asked and
+ *      is not a moment later. Same class as the identity snapshot below, and stated for the same
+ *      reason — the alternative is a lock or a conditional delete this adapter cannot express.
  *   2. IDENTITY, fail closed, with ATTRIBUTED errors — a swallowed read error yields `null`, takes the
  *      not-found branch, and produces an observable identical to a real refusal, so the two must be
  *      distinguishable or the fail-closed mutation cannot be caught.
@@ -785,8 +790,9 @@ export interface RevokeResult extends WriteResult {
  *      writer would delete the substrate.
  *   4. DELETE with RETURNING, and 5. AUDIT ONLY A ROW THAT CAME BACK — D3: a revoke that revoked
  *      nothing writes no trail. (The general writer still deletes blind and audits unconditionally,
- *      which can record a revocation that never happened under a concurrent delete. That is a real
- *      defect on a function this slice does not touch: AUDITFIX-26.)
+ *      which can record a revocation that never happened under a concurrent delete: AUDITFIX-26. This
+ *      slice hardens that writer's REFUSAL — see its own header — but deliberately leaves its
+ *      delete/audit shape alone, because changing it drags its shipped tests back into scope.)
  *
  * THIS IS A SNAPSHOT CONTRACT, NOT AN ATOMIC ONE. Steps 2-3 are reads and step 4 deletes by id, so
  * identity could in principle change in between. It is safe because classification is FLIP-INVARIANT:

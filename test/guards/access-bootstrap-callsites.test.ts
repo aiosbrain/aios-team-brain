@@ -93,8 +93,11 @@ describe("PRET-4 explicit builtin-state call sites", () => {
 
     const cli = read("scripts/admin.ts");
     expect(cli, "the command exists").toMatch(/case "repair-system-edge"/);
-    expect(cli, "and is wired to the factory, not to hand-rolled deps").toMatch(/repairVerbDeps/);
-    expect(cli).toMatch(/runRepairSystemEdgeVerb/);
+    // The CALL SHAPE, not just the names: checking that `repairVerbDeps` appears SOMEWHERE lets an
+    // implementation import it and then pass hand-rolled or broken deps to the verb, which passes
+    // AC14, AC15 and a name-only guard together (diff review).
+    expect(cli, "the verb is called WITH the factory's result, not with hand-rolled deps")
+      .toMatch(/runRepairSystemEdgeVerb\(\s*\n?\s*repairVerbDeps\(/);
   });
 
   it("AUDITFIX-21: both revoke layers share ONE protection predicate", () => {
