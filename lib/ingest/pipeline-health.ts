@@ -2,6 +2,7 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { getGraphExtractionHealth, GRAPH_HEALTH_SOURCE } from "@/lib/graph/extraction-health";
 import { classifyFailure, type FailureClass } from "@/lib/ingest/failure-streak";
+import { beatScopeOf } from "@/lib/ingest/leg-ledger";
 
 /**
  * Aggregate ingestion-pipeline health for a LOUD admin surface. Every pipeline leg (slack/plane/
@@ -66,6 +67,9 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // account of the class.)
   pret4_materialize: null,
   auth_cleanup: 26 * 60 * 60 * 1000, // 24h cadence + 2h grace (genuinely-stuck still surfaces)
+  // AUDITFIX-24's fleet-liveness beat sits on the 3h DEFAULT deliberately, so it is absent from this
+  // map and listed in the staleness test's RECORDS_EVERY_POLL set instead: it is written every tick
+  // unconditionally, so its last-row age IS its last-poll age — the one property the default requires.
   // FITTED, NOT NULLED (BANNERFLAP-2) — and fitted UNIFORMLY, which is the part that matters. All
   // three sit in the deep half of the tick chain and their large gaps are THE SAME EVENT: measured to
   // the second, they go quiet together (04:26:21 / 04:26:26 / 04:26:21) and resume together
@@ -121,8 +125,10 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // an accepted tradeoff since it's per-team opt-in and any throw records `ok=false`.
   // (Contrast the legs that record on every tick THEY REACH, which is a different and weaker property
   // than "every tick" — see the truncation note above. `runImport` records each CONFIGURED connector
-  // (slack/plane/linear/github) "to prove the poller ran"; `runAccessBootstrap` writes an
-  // unconditional instance-wide heartbeat; `runContextBackfill` writes a per-team row per succeeded
+  // (slack/plane/linear/github) "to prove the poller ran"; `runAccessBootstrapLeg` writes a row per
+  // TEAM every tick plus an unconditional instance-wide `access_bootstrap_all` heartbeat (AUDITFIX-24
+  // — until then it wrote the heartbeat under `access_bootstrap` itself, which this sentence used to
+  // say and which AUDITFIX-22 had already made false); `runContextBackfill` writes a per-team row per succeeded
   // team PLUS an instance-wide `context_backfill_all` heartbeat; `runMeetingNotesBackfill` writes one
   // row per team unconditionally inside its loop. For all of those an age threshold IS meaningful.
   // What differs is only its VALUE: the connectors and access_bootstrap sit inside the 3h default
@@ -165,6 +171,37 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
  *  unit tests (a wrong threshold here fires the loud banner on a healthy job — the auth_cleanup bug). */
 export function staleThresholdMs(source: string): number | null {
   return source in STALE_MS_BY_SOURCE ? STALE_MS_BY_SOURCE[source] : STALE_MS;
+}
+
+/** The key a beat row occupies: one per (source, partition). Exported so the tests key the same way
+ *  the production read does, rather than re-spelling the convention and drifting from it. */
+export function beatKey(source: string, isGlobal: boolean): string {
+  return `${source}|${isGlobal ? "global" : "team"}`;
+}
+
+/**
+ * WHICH SCHEDULER ROW IS THIS LEG'S CLOCK — AUDITFIX-24. Pure, so every branch is a unit criterion
+ * rather than something only a real database can state.
+ *
+ * `beats === null` means the beat READ FAILED, and that is the one case that falls back to the leg's
+ * own newest row of any trigger. Fail open: never invent staleness from missing data. Every other
+ * `undefined` here is the deliberate "no heartbeat to judge" answer — a team-beat leg with no
+ * scheduler row for THIS team, an instance-wide leg with no instance-wide row, or a leg whose poller
+ * clock is not trustworthy at all (`none`).
+ *
+ * ⚠️ The distinction between those two `undefined`s is the whole design: a MISSING clock must not
+ * age a leg, and a FAILED READ must not silence one.
+ */
+export function resolveBeatClock(args: {
+  beats: ReadonlyMap<string, string> | null;
+  source: string;
+  legFinishedAt: string;
+}): string | undefined {
+  const { beats, source, legFinishedAt } = args;
+  if (beats === null) return legFinishedAt;
+  const scope = beatScopeOf(source);
+  if (scope === "none") return undefined;
+  return beats.get(beatKey(source, scope === "global"));
 }
 
 /**
@@ -265,9 +302,14 @@ type Row = {
  * would report "failing for 30 minutes" about a three-day outage).
  *
  * WHY THE PARTITION IS `(source, team_id)` AND NOT `source`. The outer scope is `team_id = $1 or
- * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team
- * `ok=false` row for each FAILING team, plus an unconditional instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`). A source-level
- * streak is therefore broken by global heartbeat rows that say nothing about this team's health.
+ * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team row
+ * every tick — for EVERY team, success as well as failure, since AUDITFIX-22 — plus an instance-wide
+ * row on a fleet-level failure, zero teams, or a throw (`lib/ingest/access-bootstrap-leg.ts`). A
+ * source-level streak is therefore broken by global rows that say nothing about this team's health.
+ * ⚠️ This sentence used to read "`ok=false` row for each FAILING team, plus an unconditional
+ * instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`)" — three clauses, all false since
+ * AUDITFIX-22, in the module whose beat scoping now DEPENDS on the per-team row being written every
+ * tick. The unconditional heartbeat exists again under `access_bootstrap_all` (AUDITFIX-24).
  * The codebase has been bitten by the same mixing before — `context_backfill_all` exists as its own
  * source precisely because a global row masked per-team rows under `distinct on`. Found in spec review.
  * The leg is then taken from the partition holding the newest row, which preserves today's "the newest
@@ -363,11 +405,14 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       // (trigger `api`) — would otherwise keep refreshing its own newest-row age while the poller was
       // wedged, masking a dead scheduler for exactly the teams that push most. `ok`/`error` still come
       // from the newest row of ANY trigger, so a real failure stays loud whoever caused it.
-      runSql<{ source: string; finished_at: string | Date }>(
-        `select distinct on (source) source, finished_at
+      // AUDITFIX-24: BOTH partitions, at most two rows per source — never "whichever is newer".
+      // A team-beat leg must not be aged by an instance-wide row, and an instance-wide leg must not
+      // be aged by a team row; `beatScopeOf` says which one this source's poller writes.
+      runSql<{ source: string; is_global: boolean; finished_at: string | Date }>(
+        `select distinct on (source, (team_id is null)) source, (team_id is null) as is_global, finished_at
            from ingest_runs
           where (team_id = $1 or team_id is null) and trigger = 'scheduler'
-          order by source, finished_at desc`,
+          order by source, (team_id is null), finished_at desc`,
         [teamId]
       ).catch(() => null),
       getGraphExtractionHealth(teamId).catch(() => null),
@@ -379,10 +424,14 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
     // null = the enabled-integrations read failed → unknown config → fail OPEN (suppress nothing).
     const enabledTypes: ReadonlySet<string> | null = enabled ? new Set(enabled.rows.map((r) => r.type)) : null;
     const iso = (v: string | Date) => (v instanceof Date ? v.toISOString() : String(v));
-    // source → newest SCHEDULER-triggered finish. Null when that read failed (fail open: fall back to
-    // the newest row of any trigger rather than inventing staleness from missing data).
+    // `source|is_global` → newest SCHEDULER-triggered finish. Null when that read failed (fail open:
+    // fall back to the newest row of any trigger rather than inventing staleness from missing data).
+    //
+    // ⚠️ KEYED BY THE PAIR, not by `source`. With a source-keyed map the two partitions overwrite each
+    // other and, because Postgres orders `is_global` false-then-true, the INSTANCE-WIDE row always
+    // wins the overwrite — silently restoring the exact defect this changes.
     const beatAt: Map<string, string> | null = beats
-      ? new Map(beats.rows.map((r) => [r.source, iso(r.finished_at)]))
+      ? new Map(beats.rows.map((r) => [beatKey(r.source, r.is_global), iso(r.finished_at)]))
       : null;
     // The dedupe-pollution alarm's transition LEDGER (lib/graph/extraction-alert) is not a leg: it
     // writes a row only when the alarm flips (weeks apart), so any age-based read of it is
@@ -397,7 +446,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
       // Age the POLLER, not the leg. A source with rows but no scheduler row yet (a brand-new team
       // whose first tick hasn't landed, or an on-demand-only leg) has no heartbeat to judge, so it is
       // not aged at all — consistent with this file's standing "never cry wolf" bias.
-      const clock = beatAt === null ? at : beatAt.get(r.source);
+      const clock = resolveBeatClock({ beats: beatAt, source: r.source, legFinishedAt: at });
       const stale = threshold !== null && clock !== undefined && now - Date.parse(clock) > threshold;
       // BANNERFLAP-1. `streak_length` is the current unbroken failure run ending at this newest row.
       // The coercion is DEFENSIVE, not a driver workaround — an earlier comment here claimed the

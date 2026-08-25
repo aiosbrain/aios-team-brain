@@ -33,7 +33,15 @@ describe("staleThresholdMs — per-source staleness cadence", () => {
 
   it("record-every-poll pollers use the 3h default and DO go stale when quiet", () => {
     // slack/plane/linear/github record every configured tick (scheduler.runImport "still record
-    // configured sources"); access_bootstrap writes an unconditional instance-wide heartbeat.
+    // configured sources").
+    //
+    // ⚠️ THIS COMMENT USED TO SAY "access_bootstrap writes an unconditional instance-wide heartbeat"
+    // AND HAD BEEN FALSE SINCE AUDITFIX-22, which replaced that row with a per-team row plus an
+    // instance-wide row only on a fleet-level failure (measured on prod: 51 instance-wide rows/day →
+    // 0/day across the deploy). `access_bootstrap` still belongs on the 3h bar — its per-team row IS
+    // written every tick — but what makes the bar meaningful for a team that has no row of its own is
+    // AUDITFIX-24's `access_bootstrap_all`, which is the unconditional heartbeat this sentence
+    // described.
     // Last-run age == last-poll age → age-based staleness is meaningful (a wedged scheduler flags in 3h).
     // Their measured worst gaps are 30–96 min, comfortably inside the bar. (meeting_notes and
     // context_backfill[_all] record every tick too, but sit at the SLOW end of the tick chain — see
@@ -140,7 +148,17 @@ describe("staleThresholdMs — per-source staleness cadence", () => {
     // "…when configured", not unconditionally: `runImport` records a connector only when an enabled
     // integration of that type exists (prod `plane` has none and writes nothing), and it is
     // `isOrphanedConnector`, not this map, that keeps a connector-with-no-integration quiet.
-    const RECORDS_EVERY_POLL = new Set(["slack", "plane", "linear", "github", "access_bootstrap"]);
+    const RECORDS_EVERY_POLL = new Set([
+      "slack",
+      "plane",
+      "linear",
+      "github",
+      "access_bootstrap",
+      // AUDITFIX-24: written every tick whatever the pass did — success, fleet failure, or a throw —
+      // which is exactly the property the 3h default requires. It is here rather than in
+      // STALE_MS_BY_SOURCE because "on the default, deliberately" is what this set MEANS.
+      "access_bootstrap_all",
+    ]);
     for (const s of RECORDS_EVERY_POLL) expect(staleThresholdMs(s)).toBe(3 * H);
     // …and every leg the banner can age is accounted for — either listed with its own threshold, or a
     // record-every-poll poller. Two documented absences, both structural rather than oversights:

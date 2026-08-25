@@ -32,6 +32,24 @@ async function bareTeam(): Promise<string> {
   return (data as { id: string }).id;
 }
 
+/** Rows for the AUDITFIX-24 fleet-liveness beat — a DIFFERENT source, which is what makes it safe. */
+async function heartbeatRows(): Promise<{ ok: boolean; trigger: string; team_id: string | null; meta: unknown }[]> {
+  // ORDERED, because a criterion below slices "the rows this tick added" off the end and an
+  // unordered select makes that assumption a flake surface rather than a fact (diff review).
+  const { data } = await db()
+    .from("ingest_runs")
+    .select("id, ok, trigger, team_id, meta")
+    .eq("source", "access_bootstrap_all")
+    .is("team_id", null)
+    .order("id", { ascending: true });
+  return (data ?? []) as { ok: boolean; trigger: string; team_id: string | null; meta: unknown }[];
+}
+
+/** `meta` arrives as jsonb — a string under some adapter paths, an object under others. */
+function metaOf(row: { meta: unknown }): Record<string, unknown> {
+  return typeof row.meta === "string" ? JSON.parse(row.meta) : ((row.meta ?? {}) as Record<string, unknown>);
+}
+
 /** The reserved-slug initiative that wedges bootstrap — the pre-existing shipped wedge. */
 async function wedge(teamId: string): Promise<string> {
   const { data, error } = await db()
@@ -364,7 +382,7 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     expect(rows[0].trigger).toBe("scheduler");
   });
 
-  it("AC13: the fossil-staleness cost is PINNED — a new team reads stale against a frozen global row", async () => {
+  it("AC13 (converted by AUDITFIX-24): a new team is NOT stale against a frozen global row", async () => {
     // Seed the fossil: an aged instance-wide scheduler row, which is what this slice stops refreshing.
     const old = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
     const { error: fossilErr } = await db().from("ingest_runs").insert({
@@ -377,10 +395,92 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
     const { leg } = await legFor(team.id);
     expect(leg, "its creation row makes the leg exist").toBeDefined();
     expect(leg!.ok, "and that row is a success").toBe(true);
-    // ACCEPTED COST, not a bug discovered later: the beat resolves from the frozen global fossil
-    // because this team has no scheduler row of its own yet, so a healthy brand-new team reads
-    // stale until its first tick. AUDITFIX-24 carries the fix; §2b.1 carries the decision.
-    expect(leg!.stale).toBe(true);
+    // ⚠️ CONVERTED BY AUDITFIX-24, which this criterion named as its fix. It used to assert `true`
+    // and called that an accepted cost: the beat resolved from the frozen instance-wide fossil
+    // because this team has no scheduler row of its own, so a healthy brand-new team read stale
+    // until its first tick. The clock now comes from the partition the poller writes, so a team with
+    // no beat of its own resolves NO clock. The fossil seeding, the leg-exists and the ok:true
+    // assertions above are UNCHANGED on purpose — this is the only place that scenario is built.
+    expect(leg!.stale).toBe(false);
+  });
+
+  it("AUDITFIX-24 AC10: every tick writes exactly ONE instance-wide heartbeat, whatever the fleet did", async () => {
+    const a = await bareTeam();
+    const b = await bareTeam();
+    await wedge(b); // one team fails; the FLEET did not
+    const before = (await heartbeatRows()).length;
+
+    await runAccessBootstrapLeg(db());
+
+    const rows = (await heartbeatRows()).slice(before);
+    // EXACTLY one, not ">= 1": two rows in a single tick would reach the BANNERFLAP confirmation
+    // threshold after one blip and forge `confirmed` — the fleet-level twin of the double-write
+    // AC1 pins per team.
+    expect(rows.length, "one heartbeat per tick").toBe(1);
+    expect(rows[0].trigger, "the beat is scheduler-triggered or it is not a beat").toBe("scheduler");
+    expect(rows[0].ok, "a single wedged team is that team's failure, not the fleet's").toBe(true);
+    void a;
+  });
+
+  it("AUDITFIX-24 AC10b: and it is written even when the fleet-level read explodes", async () => {
+    const before = (await heartbeatRows()).length;
+    await runAccessBootstrapLeg(clientWithFailingSelect("teams", "teams read exploded"));
+
+    const rows = (await heartbeatRows()).slice(before);
+    expect(rows.length, "the poller reached this stage — that is the whole claim the beat makes").toBe(1);
+    // ⚠️ `ok: true` on a FAILED fleet pass, deliberately: this row asserts LIVENESS, and the failure
+    // is carried by the `access_bootstrap` row. Asserting `false` here is what a diff review caught —
+    // it makes one failed teams-read confirm on two sources and the banner say "2 legs are broken".
+    expect(rows[0].ok, "the beat reports that the poller RAN, not that the fleet was healthy").toBe(true);
+    expect(metaOf(rows[0]).fleetOk, "and the outcome is still recorded, where it is not counted twice").toBe(false);
+  });
+
+  it("AUDITFIX-24 AC10c: ONE failed fleet pass is ONE broken leg, not two", async () => {
+    // The double-count class: a failed synthesis once lit both `arcs` and `llm` and the banner said
+    // "2 ingestion legs are broken" about one event (2026-08-11). A fleet-level failure must confirm
+    // on `access_bootstrap` alone.
+    const team = await bareTeam();
+    const faulted = clientWithFailingSelect("teams", "teams read exploded");
+    await runAccessBootstrapLeg(faulted);
+    await runAccessBootstrapLeg(faulted); // two ticks = FAILURES_TO_CONFIRM
+
+    const { health } = await legFor(team);
+    const failing = health.failing.map((l) => l.source).sort();
+    expect(failing, "the fleet failure is loud — once").toContain("access_bootstrap");
+    expect(failing, "and the liveness beat is not a second copy of it").not.toContain("access_bootstrap_all");
+  });
+
+  it("AUDITFIX-24 AC11: AUDITFIX-22's own contracts survive the new source", async () => {
+    const team = await bareTeam();
+    const globalBefore = (await legRows(null)).length;
+
+    await runAccessBootstrapLeg(db());
+
+    // Its AC4: an ordinary tick still writes NO team_id-is-null row for source `access_bootstrap`.
+    // The heartbeat lives under a DIFFERENT source precisely so restoring it cannot re-create the
+    // masking AUDITFIX-22 removed.
+    expect((await legRows(null)).length, "nothing instance-wide under the OLD source").toBe(globalBefore);
+    expect((await legRows(team)).length, "and the team still gets its own row").toBe(1);
+    expect((await heartbeatRows()).length, "while the heartbeat did land, elsewhere").toBeGreaterThan(0);
+  });
+
+  it("AUDITFIX-24 AC12: a brand-new team on a DEAD scheduler is aged by the heartbeat", async () => {
+    // The corner two spec rounds argued over: with the beat scoped per team, a team that has never
+    // ticked has no clock of its own — so the fleet beat is the only thing that can report a dead
+    // poller to it. Without `access_bootstrap_all` this team would be silent forever.
+    const old = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+    const { error } = await db().from("ingest_runs").insert({
+      team_id: null, source: "access_bootstrap_all", trigger: "scheduler", ok: true,
+      created: 0, started_at: old, finished_at: old,
+    });
+    expect(error, "the aged heartbeat must actually be seeded — this criterion is about it").toBeNull();
+    const team = await createTeam(db(), { slug: `dead-${randomUUID().slice(0, 8)}`, name: "Dead" });
+
+    const health = await getPipelineHealth(team.id);
+    const beat = health.legs.find((l) => l.source === "access_bootstrap_all");
+    expect(beat, "the heartbeat is a leg of its own").toBeDefined();
+    expect(beat!.stale, "a dead poller is still loud for a team that has never ticked").toBe(true);
+    expect(health.failing.map((l) => l.source)).toContain("access_bootstrap_all");
   });
 
   it("the callback's own failure never takes convergence down (spec §2b)", async () => {

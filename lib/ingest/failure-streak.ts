@@ -79,11 +79,13 @@ export interface StreakRow {
  * Exported and pure because the SQL that feeds it is the part that cannot be unit-tested, and this is
  * the part that decides the verdict. Callers MUST pass rows for a single `(source, team_id)`
  * partition, newest first — see `pipeline-health` for why the partition is not just `source`:
- * `access_bootstrap` writes a per-team failure row for each team that failed, plus an unconditional
- * instance-wide heartbeat row every tick (`lib/ingest/scheduler.ts`), so a source-level streak is
- * broken by global heartbeats that say nothing about that team. (Only the heartbeat is every-tick —
- * an earlier draft of this comment said both were, which the repo's own grep-before-claiming rule
- * exists to catch.)
+ * `access_bootstrap` writes a per-team row every tick — for EVERY team since AUDITFIX-22, success as
+ * well as failure — plus an instance-wide row on a fleet-level failure, zero teams, or a throw
+ * (`lib/ingest/access-bootstrap-leg.ts`), so a source-level streak is broken by global rows that say
+ * nothing about that team. (This comment has now been wrong twice about the same two clauses: an
+ * earlier draft said both rows were every-tick, and the correction that fixed it kept "an
+ * unconditional instance-wide heartbeat every tick", which AUDITFIX-22 had already made false. The
+ * unconditional heartbeat is `access_bootstrap_all` — AUDITFIX-24.)
  *
  * An empty input is `ok` with no streak: "nothing has ever run" is not a failure, and the surfaces
  * that care about never-ran already say so through other signals.

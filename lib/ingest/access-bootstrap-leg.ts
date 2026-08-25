@@ -38,6 +38,21 @@ import { ensureAccessBootstrapAllTeams } from "@/lib/access/bootstrap";
  * the suite stays green. The data-mechanics tier asserts the trigger VALUE directly instead.
  * (The row `lib/admin/teams.ts` writes at team creation is the mirror image: it must NOT claim
  * `scheduler`, because team creation is not the poller.)
+ *
+ * AUDITFIX-24 PUT THE FLEET HEARTBEAT BACK, UNDER A DIFFERENT NAME. Removing the instance-wide
+ * `ok:true` row was right — it was the thing doing the masking — but it also deleted the only
+ * evidence that the POLLER ITSELF is alive for a team that has no rows of its own yet. Measured on
+ * prod: instance-wide `access_bootstrap` scheduler rows went 51/day to 0/day across the deploy. Two
+ * spec-review rounds then produced the corner that decides it: a fresh install ticks (this leg is
+ * stage 6, `runContextBackfill` is stage 7), hangs before stage 7 so no `context_backfill_all` row
+ * ever lands, a team is created, and the scheduler dies — with the beat scoped per team, NOTHING
+ * would age, ever.
+ *
+ * So `access_bootstrap_all` is written unconditionally every tick, exactly mirroring
+ * `context_backfill_all`. A DISTINCT source is what makes that safe: the masking AUDITFIX-22 removed
+ * came from a global row competing with team rows under `distinct on (source)`, and a different
+ * source name cannot compete. This leg's own `team_id is null` rows keep their post-AUDITFIX-22
+ * meaning — fleet-level failure, zero teams, or a throw — and its AC4/AC5 contracts are untouched.
  */
 export async function runAccessBootstrapLeg(
   db: DbClient,
@@ -66,7 +81,28 @@ export async function runAccessBootstrapLeg(
     // the callback would write TWO ok:false rows per failing team per tick — which reaches the
     // BANNERFLAP-1 confirmation threshold (2) after a SINGLE failed tick and makes a lone failure
     // loud. The data-mechanics tier pins the per-tick row count for exactly that reason.
+    // The FLEET-LIVENESS beat (AUDITFIX-24) — attempted on every path, whatever the pass did, because
+    // its whole job is to prove the poller REACHED this stage. Written under its own source so it
+    // cannot mask the per-team rows above.
+    //
+    // ⚠️ `ok: true` EVEN WHEN THE FLEET FAILED, and that is the deliberate part. This row asserts
+    // LIVENESS, not correctness; the fleet-level failure is already carried by the instance-wide
+    // `access_bootstrap` row below, which AUDITFIX-22's AC5 depends on. A diff review caught the
+    // alternative: mirroring the failure here makes ONE failed teams-read confirm on TWO sources, and
+    // the banner then says "2 ingestion legs are broken" about a single event — the exact
+    // double-count that put `llm` in NOT_PIPELINE_LEGS after the 2026-08-11 incident. The outcome is
+    // still recorded, in `meta`, where it is diagnosable without being counted twice.
     const globalFailure = r.failed.find((f) => f.teamId === "*");
+    await recordIngestRun(db, {
+      teamId: null,
+      source: "access_bootstrap_all",
+      trigger: "scheduler",
+      ok: true,
+      created: 0,
+      meta: { teams: r.teams, failedTeams: r.failed.length, fleetOk: !globalFailure },
+      startedAt,
+    });
+
     if (globalFailure || r.teams === 0) {
       await recordIngestRun(db, {
         teamId: null,
@@ -84,6 +120,19 @@ export async function runAccessBootstrapLeg(
     // row standing until it aged stale (slice-3 Codex Low). This is fleet-level by definition: the
     // loop itself died, so it is the instance-wide row that carries it.
     try {
+      // Both rows on this path, and they say DIFFERENT things: the heartbeat proves the poller
+      // reached this stage (LIVENESS — `ok:true` for the same no-double-count reason as above, with
+      // the throw in `meta`), and the source-`access_bootstrap` row is the fleet-level FAILURE that
+      // AUDITFIX-22's AC5 depends on.
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "access_bootstrap_all",
+        trigger: "scheduler",
+        ok: true,
+        created: 0,
+        meta: { fleetOk: false, threw: err instanceof Error ? err.message : "bootstrap threw" },
+        startedAt,
+      });
       await recordIngestRun(db, {
         teamId: null,
         source: "access_bootstrap",

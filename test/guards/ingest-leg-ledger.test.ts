@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { staleThresholdMs } from "@/lib/ingest/pipeline-health";
 import { join } from "node:path";
-import { INGEST_LEG_SOURCES, UNSCANNABLE_LEG_SOURCES } from "@/lib/ingest/leg-ledger";
+import {
+  BEAT_SCOPE_BY_SOURCE,
+  INGEST_LEG_SOURCES,
+  UNSCANNABLE_LEG_SOURCES,
+  WRAPPER_RUN_SITES,
+  type BeatScope,
+} from "@/lib/ingest/leg-ledger";
 
 /**
  * BANNERFLAP-2 (`docs/design/staleness-threshold-fit.md` §Decision 3). A leg absent from
@@ -32,9 +39,10 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** The text of every `recordIngestRun(...)` argument list, paren-balanced (the calls span lines). */
-function recordCallArgs(src: string): string[] {
-  const out: string[] = [];
+/** The text of every `recordIngestRun(...)` argument list, paren-balanced (the calls span lines),
+ *  flagging the one that is the function's own declaration rather than a call. */
+function recordCallArgs(src: string): { args: string; isDeclaration: boolean }[] {
+  const out: { args: string; isDeclaration: boolean }[] = [];
   const needle = "recordIngestRun(";
   let i = src.indexOf(needle);
   while (i !== -1) {
@@ -47,7 +55,10 @@ function recordCallArgs(src: string): string[] {
         if (depth === 0) break;
       }
     }
-    out.push(src.slice(i + needle.length, j));
+    out.push({
+      args: src.slice(i + needle.length, j),
+      isDeclaration: /\bfunction\s+$/.test(src.slice(Math.max(0, i - 24), i)),
+    });
     i = src.indexOf(needle, j);
   }
   return out;
@@ -72,18 +83,87 @@ const scanned = new Map<string, string>();
 /** Call sites whose `source:` is neither a literal nor a resolvable constant. */
 const unresolved: string[] = [];
 
+/**
+ * One scheduler-triggered call site, for AUDITFIX-24's partition cross-check.
+ *
+ * `teamId` semantics are part of the RULE, not an implementation detail, and getting them wrong
+ * breaks the guard in both directions: an explicit `teamId: null` is how three instance-wide legs
+ * are written (`context_backfill_all`, `pret3_sweep`, `pret4_materialize`), so a key-PRESENCE test
+ * would fail all three — and would also let the mutation this check exists for through, since that
+ * mutant writes `teamId: null`. Shorthand (`teamId,`) counts as passing one.
+ */
+type SchedulerSite = { source: string; rel: string; partition: SitePartition };
+const schedulerSites: SchedulerSite[] = [];
+
+/**
+ * Which partition this call site writes — or AMBIGUOUS, which is a build failure rather than a guess.
+ *
+ * ⚠️ THE TRI-STATE IS THE FIX. The first version returned a boolean and treated every expression
+ * except the exact token `null` as team-scoped, so `teamId: undefined` and `teamId: maybeTeam ?? null`
+ * read as team-scoped while `recordIngestRun` persists `team_id = null` for both (`lib/ingest/runs.ts`
+ * coalesces with `?? null`). A diff review wrote out the bypass. A textual scan cannot evaluate those
+ * expressions, so it must REFUSE them instead of picking the convenient answer — the same fail-closed
+ * discipline the source-expression check above already uses.
+ */
+type SitePartition = "team" | "global" | "ambiguous";
+
+function partitionOf(args: string): SitePartition {
+  const explicit = args.match(/\bteamId\s*:\s*([^,\n}]+)/);
+  if (explicit) {
+    const expr = explicit[1].trim();
+    if (expr === "null" || expr === "undefined") return "global";
+    // A plain identifier or property access resolves to a team id at runtime or it does not compile.
+    // Anything with a conditional, a nullish coalesce, or a call can be null at runtime.
+    return /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(expr) ? "team" : "ambiguous";
+  }
+  return /\bteamId\s*[,\n]/.test(args) ? "team" : "global";
+}
+
+/** Comments are prose, and a guard that reads prose is not checking anything — the battery script has
+ *  a commented-out `recordIngestRun(projectionRunInput(...))` that would otherwise occupy a wrapper
+ *  exemption after the real call was deleted. Strings holding `//` are not stripped: the line rule
+ *  fires only when `//` starts the line. */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+}
+
 for (const file of files) {
-  const src = readFileSync(file, "utf8");
+  const src = stripComments(readFileSync(file, "utf8"));
   if (!src.includes("recordIngestRun(")) continue;
   const rel = file.slice(ROOT.length + 1);
-  for (const args of recordCallArgs(src)) {
+  for (const { args, isDeclaration } of recordCallArgs(src)) {
+    // The function's own `export async function recordIngestRun(...)` signature matches the needle
+    // and is not a call site. Skipping it by SHAPE rather than by filename, so moving the writer
+    // does not silently reopen the hole.
+    if (isDeclaration) continue;
     const m = args.match(/\bsource:\s*([^,\n}]+)/);
-    if (!m) continue;
+    if (!m) {
+      // Previously `continue` — which hid every wrapper-built row, including `graph_project`'s
+      // SUCCESS-path scheduler site (`lib/graph/scheduler.ts`, built by `projectionRunInput`). Its
+      // partition was verified only by the catch-path site, i.e. by coincidence. These now demand
+      // the same accounting a source expression does.
+      unresolved.push(`${rel}: argument built elsewhere`);
+      continue;
+    }
     const expr = m[1].trim();
     const literal = expr.match(/^"([^"]+)"$/);
-    if (literal) scanned.set(literal[1], rel);
-    else if (consts.has(expr)) scanned.set(consts.get(expr)!, rel);
-    else unresolved.push(`${rel}: source: ${expr}`);
+    const source = literal ? literal[1] : consts.get(expr);
+    if (source === undefined) {
+      unresolved.push(`${rel}: source: ${expr}`);
+      continue;
+    }
+    scanned.set(source, rel);
+    // A trigger that is not a string literal cannot be classified either — and a site whose trigger
+    // is a named constant or a variable could BE the poller. Refuse rather than skip: skipping is how
+    // a scheduler site leaves `schedulerSites` without anything reddening.
+    const trigger = args.match(/\btrigger:\s*([^,\n}]+)/);
+    if (trigger && !/^"[^"]*"$/.test(trigger[1].trim())) {
+      unresolved.push(`${rel}: trigger: ${trigger[1].trim()}`);
+      continue;
+    }
+    if (trigger && trigger[1].trim() === '"scheduler"') {
+      schedulerSites.push({ source, rel, partition: partitionOf(args) });
+    }
   }
 }
 
@@ -126,9 +206,103 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
     // The four connector types genuinely arrive as `runImport`'s `label` parameter; anything else must
     // be made resolvable or declared in UNSCANNABLE_LEG_SOURCES with a reason.
     expect(
-      unresolved,
+      unresolved.filter((u) => !u.includes("argument built elsewhere")).sort(),
       "make the source a literal or a named string constant, or document it in UNSCANNABLE_LEG_SOURCES"
-    ).toEqual(["lib/ingest/scheduler.ts: source: label", "lib/ingest/scheduler.ts: source: label"]);
+    ).toEqual([
+      "lib/ingest/scheduler.ts: source: label",
+      "lib/ingest/scheduler.ts: source: label",
+      // AUDITFIX-24 added trigger classification, and it immediately found this: `pm_sync`'s writer
+      // takes the trigger as a PARAMETER, so nothing static forbids a `scheduler` row from it. That
+      // is not a defect to fix here — it is precisely WHY `pm_sync` is declared beat scope `none`,
+      // and listing it keeps the two facts adjacent instead of one silently justifying the other.
+      "lib/pm-sync/runs.ts: trigger: input.trigger",
+    ]);
+  });
+
+  it("every WRAPPER-built call site is accounted for (AUDITFIX-24)", () => {
+    // The sites that build the argument object elsewhere. They were dropped silently until
+    // AUDITFIX-24 — which mattered because one of them is `graph_project`'s success-path SCHEDULER
+    // write, so its declared instance-wide partition was verified only by the catch-path site
+    // beside it. Each must now say what it writes, in WRAPPER_RUN_SITES.
+    const wrapperFiles = [...new Set(unresolved.filter((u) => u.includes("argument built elsewhere")).map((u) => u.split(":")[0]))];
+    expect(wrapperFiles.length, "the scan must still find wrapper sites — zero means the parser broke").toBeGreaterThanOrEqual(4);
+    expect(
+      wrapperFiles.filter((f) => !(f in WRAPPER_RUN_SITES)).sort(),
+      "a recordIngestRun call whose argument is built elsewhere must be documented in WRAPPER_RUN_SITES"
+    ).toEqual([]);
+  });
+
+  it("every DECLARED leg has a beat scope, and it MATCHES its scheduler writers (AUDITFIX-24)", () => {
+    // Half one: the question is answered at all. A leg with no scope entry would fall to the
+    // `beatScopeOf` default and be judged against a partition nobody chose.
+    expect(
+      INGEST_LEG_SOURCES.filter((s) => !(s in BEAT_SCOPE_BY_SOURCE)).sort(),
+      "declare the beat scope in BEAT_SCOPE_BY_SOURCE — a leg without one silently inherits `global`"
+    ).toEqual([]);
+    expect(
+      Object.keys(BEAT_SCOPE_BY_SOURCE).filter((s) => !INGEST_LEG_SOURCES.includes(s)).sort(),
+      "a scope for a source no longer in the ledger — remove it, or the map stops describing the system"
+    ).toEqual([]);
+
+    // Half two, and the half that has teeth: the declaration must match what the poller WRITES.
+    // UNIVERSAL, not "≥1 site agrees" — `meeting_notes` has two scheduler sites (success + failure),
+    // so an existential rule is satisfied by the untouched one when the other flips partition. Two
+    // review rounds let the existential form through; this is the mutation it could not redden.
+    //
+    // `access_bootstrap` is the ONE exception: declared `team` because its per-team row every tick is
+    // its heartbeat, while it also writes instance-wide rows on the fleet-level failure / zero-teams /
+    // throw paths. Those carry the VERDICT (AUDITFIX-22's AC5 depends on it), never the beat.
+    const EXEMPT_DUAL_WRITER = "access_bootstrap";
+    const wrong = schedulerSites
+      .filter((site) => site.source !== EXEMPT_DUAL_WRITER)
+      .filter((site) => {
+        const scope: BeatScope | undefined = BEAT_SCOPE_BY_SOURCE[site.source];
+        // AMBIGUOUS never matches anything, so an unclassifiable teamId expression fails here rather
+        // than being read as whichever partition the regex found easier.
+        if (scope === "team") return site.partition !== "team";
+        if (scope === "global") return site.partition !== "global";
+        return true; // `none` must have no scheduler site at all
+      })
+      .map((site) => `${site.source} (${site.rel}) declared ${BEAT_SCOPE_BY_SOURCE[site.source]}, writes ${site.partition}`);
+    expect(
+      wrong.sort(),
+      "a leg's declared beat scope must match EVERY scheduler call site that writes it — otherwise the " +
+        "staleness clock reads a partition the poller never fills, and the leg silently stops aging"
+    ).toEqual([]);
+  });
+
+  it("a `none` leg may not carry a finite staleness threshold (AUDITFIX-24)", () => {
+    // A leg whose scope is `none` can never resolve a clock, so a finite bar on it is not a loose
+    // alarm — it is silence by construction, dressed as a threshold somebody chose. The two rules
+    // have to be checked together or each looks individually reasonable.
+    const contradictory = Object.entries(BEAT_SCOPE_BY_SOURCE)
+      .filter(([, scope]) => scope === "none")
+      .filter(([source]) => staleThresholdMs(source) !== null)
+      .map(([source]) => `${source} (scope none, threshold ${staleThresholdMs(source)}ms)`);
+    expect(
+      contradictory.sort(),
+      "give it a real beat scope or set its STALE_MS_BY_SOURCE entry to null — a finite bar on a leg " +
+        "with no resolvable clock can never fire, which is the quiet half of the BANNERFLAP family"
+    ).toEqual([]);
+  });
+
+  it("the scheduler-site scan is NON-VACUOUS — it sees both partitions at real call sites", () => {
+    // Without this the cross-check above is green whenever `trigger:` or `teamId:` parsing breaks,
+    // which is the same failure the source scan already guards against one assertion up.
+    const bySource = (s: string) => schedulerSites.filter((x) => x.source === s);
+    expect(bySource("meeting_notes").length, "meeting_notes has scheduler sites").toBeGreaterThanOrEqual(2);
+    expect(bySource("meeting_notes").every((x) => x.partition === "team"), "…and they are team-scoped").toBe(true);
+    expect(bySource("auth_cleanup").length, "auth_cleanup has scheduler sites").toBeGreaterThanOrEqual(1);
+    expect(bySource("auth_cleanup").every((x) => x.partition === "global"), "…and they are instance-wide").toBe(true);
+    // The `teamId: null` form must read as instance-wide, not as "a teamId is present" — three
+    // global legs are written that way, and a key-presence test would fail all three.
+    expect(bySource("context_backfill_all").every((x) => x.partition === "global"), "explicit teamId: null is instance-wide").toBe(true);
+    // And nothing shipped is ambiguous today — so the fail-closed branch above is a real gate on new
+    // code rather than a rule the current tree already violates.
+    expect(
+      schedulerSites.filter((x) => x.partition === "ambiguous").map((x) => `${x.source} (${x.rel})`),
+      "an unclassifiable teamId expression must be made explicit — the scan will not guess"
+    ).toEqual([]);
   });
 
   // DELIBERATELY NOT HERE: "every declared leg has a threshold answer". That question has exactly one
