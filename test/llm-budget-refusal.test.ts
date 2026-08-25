@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { looksLikeBudgetRefusal, looksLikeSizeRefusal, looksLikeTokenLimit } from "@/lib/query/claude";
 
 // Same stub shape as `test/llm-complete.test.ts`: only the backend resolver is mocked, so the token
@@ -159,5 +161,23 @@ describe("LLMCREDIT-1: the leg reports the provider's reason, not 'model returne
     // No provider error recorded at all — the model really did return nothing. Losing this branch
     // would trade one misleading message for another.
     expect(docTaskInferFailureReason(null)).toBe("model returned null for every worker");
+  });
+});
+
+describe("LLMCREDIT-1: the wiring, not just the helper", () => {
+  it("AC7c: the leg CALLS docTaskInferFailureReason — reverting it to the literal is otherwise invisible", () => {
+    // ⚠️ THE CALL SITE IS THE PART THAT SHIPS, and nothing else pins it: `tsc` stays green if the site
+    // reverts to the hardcoded sentence, because the helper is exported and imported HERE, so no
+    // unused-symbol error ever fires. The dm tier cannot reach the model either (a seeded team has no
+    // answering key), so a behavioural criterion is not available at incident speed. This is the
+    // repo's "pin the call site, not just the function" class, closed the cheap way.
+    const src = readFileSync(join(import.meta.dirname, "..", "lib", "dashboard", "doc-task-infer-run.ts"), "utf8");
+    const withoutComments = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+    expect(
+      withoutComments.includes("docTaskInferFailureReason(pass.firstError)"),
+      "the failure path must go through the helper — a bare string here is the misleading message again"
+    ).toBe(true);
+    // Comments are stripped first: a guard that reads prose is not checking anything.
+    expect(withoutComments).not.toContain('["model returned null for every worker"]');
   });
 });

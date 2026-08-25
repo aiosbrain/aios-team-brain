@@ -108,6 +108,24 @@ ladder + the refusal record) · `lib/dashboard/doc-task-infer-run.ts` (the messa
   extraction needs credits.**
 - **Topping up, or repointing the answering model.** The durable fix, and the operator's.
 - **The token budgets themselves** (200 / 900 are already right-sized).
+- **An in-stream budget refusal** — HTTP 200 with `data:{"error":…}` routes through
+  `classifyErrorFrame` (`lib/query/stream-retry.ts`) as a 400 and never reaches this ladder.
+  Pre-existing, found by the diff review, not widened into an incident fix.
+
+⚠️ **WHAT THIS DOES NOT RESTORE, at the measured balance.** The affordable ceiling was **3,116
+tokens**, and the ladder's bottom rung is the task's own answer budget — so only tasks whose budget is
+UNDER that recover:
+
+| task | bottom rung | recovers at 3,116? |
+|---|---:|---|
+| `timeline-summary` | 200 | ✅ — this is the missing-summaries report |
+| `doc_task_infer` | 900 | ✅ |
+| `arcs` | 4,096 | ❌ still refused |
+| streaming Q&A (`ANSWER_BUDGET`) | 4,096 | ❌ still refused |
+| graph extraction | the sidecar's own | ❌ out of reach entirely |
+
+**So the Pulse banner will still be red after this ships**, and that is correct rather than a failed
+fix: the account is out of credit and two of its legs cannot be served on what remains.
 
 ## 4. Acceptance
 
@@ -141,7 +159,7 @@ ladder + the refusal record) · `lib/dashboard/doc-task-infer-run.ts` (the messa
 |---|---|---|
 | The credit problem becomes invisible because service resumes | SILENT degrade — the failure mode this repo names by name | §2b: the refusal is filed every time, and shows as `failed_attempts` |
 | Retrying burns the remaining balance faster | money | a refused request generates nothing and is not billed; the retry is the ladder that already exists |
-| A reasoning model loses its hidden-token headroom and returns empty | quality | the bottom rung is what 400/422 already falls back to; reasoning is off on OpenRouter unless a distinct reasoning model is set |
+| A reasoning model loses its hidden-token headroom and returns empty | quality **and money** | ⚠️ **NOT MITIGATED — the review corrected me here.** I wrote "reasoning is off on OpenRouter unless a distinct reasoning model is set", which is exactly FALSE for the one configuration where this risk exists: with `teams.reasoning_model` set to a distinct model, `reasoning:{enabled:false}` is NOT sent, so the step-down lands on the bare answer budget with reasoning ON, hidden thinking eats it, and the empty completion is METERED — turning a $0 refusal into a paid nothing, every cron cycle. Accepted because the identical trade already exists on the 400/422 rung and no team on this fleet has a distinct reasoning model set — but accepted knowingly, not mitigated. (`LLM_DISABLE_REASONING=0` is a second way to reach it.) |
 | A genuinely dead account is retried three times | noise | AC2 — only SIZE-shaped 402s step down |
 
 ## 6. What this does NOT fix
