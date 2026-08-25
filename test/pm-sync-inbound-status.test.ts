@@ -35,6 +35,12 @@ describe("linearStatusOrNull / linearStatus", () => {
     expect(linearStatusOrNull(undefined, undefined)).toBeNull();
   });
 
+  it("treats inherited Object.prototype names as unknown types on the strict inbound path", () => {
+    for (const hostile of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
+      expect(linearStatusOrNull("Weird", hostile)).toBeNull();
+    }
+  });
+
   it("linearStatus keeps the ingest default (backlog) for unresolvable states", () => {
     expect(linearStatus("Weird", "mystery")).toBe("backlog");
     expect(linearStatus("Blocked", "started")).toBe("blocked");

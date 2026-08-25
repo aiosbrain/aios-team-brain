@@ -95,13 +95,14 @@ export function linearMirrorProject(teamKey: string): string {
 }
 
 // Linear state.type → brain status. Linear uses "canceled" (one l); both terminal states → done.
-const TYPE_TO_STATUS: Record<string, string> = {
+// Match ClickUp's null-prototype table: provider JSON keys must never resolve Object.prototype.
+const TYPE_TO_STATUS: Record<string, string> = Object.assign(Object.create(null), {
   backlog: "backlog",
   unstarted: "ready",
   started: "in_progress",
   completed: "done",
   canceled: "done",
-};
+} as Record<string, string>);
 
 /**
  * Strict variant for the inbound apply (brain-api v1.4): a state whose name doesn't match a brain

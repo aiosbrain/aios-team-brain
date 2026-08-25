@@ -94,13 +94,14 @@ function safeSegment(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-const GROUP_TO_STATUS: Record<string, string> = {
+// Match ClickUp's null-prototype table: provider JSON keys must never resolve Object.prototype.
+const GROUP_TO_STATUS: Record<string, string> = Object.assign(Object.create(null), {
   backlog: "backlog",
   unstarted: "ready",
   started: "in_progress",
   completed: "done",
   cancelled: "done", // terminal/closed; the brain has no distinct "cancelled"
-};
+} as Record<string, string>);
 
 /** A state literally NAMED like a brain status wins (e.g. a "Blocked" state in the started group); else map by group. */
 function planeStatus(stateName: string | undefined, group: string | undefined): string {
