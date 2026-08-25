@@ -789,10 +789,9 @@ export interface RevokeResult extends WriteResult {
  *      breaking the creator grant AUDITFIX-3 kept deliberately legal. Without the pair test, this
  *      writer would delete the substrate.
  *   4. DELETE with RETURNING, and 5. AUDIT ONLY A ROW THAT CAME BACK — D3: a revoke that revoked
- *      nothing writes no trail. (The general writer still deletes blind and audits unconditionally,
- *      which can record a revocation that never happened under a concurrent delete: AUDITFIX-26. This
- *      slice hardens that writer's REFUSAL — see its own header — but deliberately leaves its
- *      delete/audit shape alone, because changing it drags its shipped tests back into scope.)
+ *      nothing writes no trail. (This shape shipped here first. AUDITFIX-21 hardened the general
+ *      writer's REFUSAL and deliberately left its delete/audit alone; AUDITFIX-26 then gave it the
+ *      same RETURNING-gated delete/audit — see its own header — so the two no longer differ here.)
  *
  * THIS IS A SNAPSHOT CONTRACT, NOT AN ATOMIC ONE. Steps 2-3 are reads and step 4 deletes by id, so
  * identity could in principle change in between. It is safe because classification is FLIP-INVARIANT:

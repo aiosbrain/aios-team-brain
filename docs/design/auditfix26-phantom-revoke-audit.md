@@ -1,6 +1,9 @@
 # A revoke that revoked nothing must not claim it did — AUDITFIX-26
 
-**Status:** spec, round 0. No code written. Found by AUDITFIX-21's spec round 1 (HIGH 5) on a function
+**Status:** BUILT — spec rounds 1 (Codex, BLOCKED) and the diff reviews below are folded; the code is in
+`lib/access/groups.ts` with criteria in `test/datamechanics/phantom-revoke-audit.datamechanics.test.ts`.
+The "nothing is built" lines further down are preserved as the state each SECTION was written in — a
+diff review caught them reading as current. Found by AUDITFIX-21's spec round 1 (HIGH 5) on a function
 that slice deliberately did not touch.
 
 **Build with:** opus / high — it changes a destructive writer's trail, and the trail is the only
@@ -139,7 +142,7 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 
 | # | mutation | must redden |
 |---|---|---|
-| 1 | delete without `RETURNING` and audit unconditionally (the current shape) | AC1 |
+| 1 | delete without `RETURNING` and audit unconditionally (the shape BEFORE this slice) | AC1 |
 | 2 | audit on the PROBE's result instead of the delete's | AC1 |
 | 3 | move only the operator branch inside the guard | AC1 (the MEMBER arm) |
 | 4 | launder the authorizer into the actor field | AC2 |
@@ -184,7 +187,7 @@ non-atomic is the **preceding snapshot**: the project's kind and the principal's
 before the delete and could change in between. That is the same snapshot boundary AUDITFIX-21 named,
 and it is not what this slice is about.*
 
-**Nothing is built. No code exists for this slice.**
+**Nothing was built at the time this section was written** (the slice is now built — see Status).
 
 ## 7. Round 1 — BLOCKED on the mutation table, for the twentieth time in this lane
 
@@ -200,4 +203,4 @@ and it is not what this slice is about.*
 redden, and the shape has never varied: the mutation's observable is identical to the correct
 implementation's, usually because the fixture exercises one branch of something that has two.
 
-**Nothing is built. No code exists for this slice.**
+**Nothing was built at the time this section was written** (the slice is now built — see Status).

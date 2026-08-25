@@ -62,11 +62,18 @@ async function edgeExists(seed: Seed, p: string, g: string): Promise<boolean> {
   return data !== null;
 }
 
-/** Removes the edge AFTER the probe has read it, so the delete finds nothing — the race, made real. */
-function deletesAfterProbe(seed: Seed, p: string, g: string): DbClient {
+/**
+ * Removes the edge AFTER the probe has read it, so the delete finds nothing — the race, made real.
+ *
+ * ⚠️ Returns a POSITIVE CONTROL alongside the client. Without it, an injector that never fired
+ * produces the same `revoked:false` + no-audit observable as the fix working, so AC1 would pass
+ * while testing nothing — the failure mode a read-counter with no positive control had in the
+ * sibling slice.
+ */
+function deletesAfterProbe(seed: Seed, p: string, g: string): { client: DbClient; fired: () => boolean } {
   const real = db();
   let probed = false;
-  return new Proxy(real as object, {
+  const client = new Proxy(real as object, {
     get(target, prop, recv) {
       if (prop !== "from") return Reflect.get(target, prop, recv);
       return (name: string) => {
@@ -104,6 +111,7 @@ function deletesAfterProbe(seed: Seed, p: string, g: string): DbClient {
       };
     },
   }) as DbClient;
+  return { client, fired: () => probed };
 }
 
 describe("AUDITFIX-26: a revoke that revoked nothing must not claim it did", () => {
@@ -116,11 +124,15 @@ describe("AUDITFIX-26: a revoke that revoked nothing must not claim it did", () 
       expect(g.ok, `fixture group: ${g.error}`).toBe(true);
       const group = g.groupId as string;
       expect((await grantProjectToGroup(db(), seed.teamId, project, group, a)).ok, "fixture grant").toBe(true);
+      // The edge must really be there, or the "race" is a genuine no-op and AC1 proves nothing.
+      expect(await edgeExists(seed, project, group), `${which}: fixture edge must exist before the race`).toBe(true);
       const before = await revokedAudits(seed);
 
       const actor = actorOf(which, a);
-      const r = await revokeProjectFromGroup(deletesAfterProbe(seed, project, group), seed.teamId, project, group, actor);
+      const race = deletesAfterProbe(seed, project, group);
+      const r = await revokeProjectFromGroup(race.client, seed.teamId, project, group, actor);
 
+      expect(race.fired(), `${which}: positive control — the injected concurrent delete must have run`).toBe(true);
       expect(r.ok, `${which}: ${r.error}`).toBe(true);
       expect(r.revoked, `${which}: this call removed nothing`).toBe(false);
       expect(await revokedAudits(seed), `${which}: and must not claim it did`).toBe(before);
@@ -138,10 +150,13 @@ describe("AUDITFIX-26: a revoke that revoked nothing must not claim it did", () 
       const group = g.groupId as string;
       expect((await grantProjectToGroup(db(), seed.teamId, project, group, a)).ok, "fixture grant").toBe(true);
 
+      const before = await revokedAudits(seed);
       const actor = actorOf(which, a);
       const r = await revokeProjectFromGroup(db(), seed.teamId, project, group, actor);
       expect(r.ok, r.error).toBe(true);
       expect(r.revoked).toBe(true);
+      // EXACTLY one — "the latest row looks right" is also satisfied by a duplicated audit.
+      expect(await revokedAudits(seed), `${which}: one real deletion writes one trail row`).toBe(before + 1);
 
       const { data } = await db()
         .from("audit_log")
