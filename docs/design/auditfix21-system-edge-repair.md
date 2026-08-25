@@ -61,6 +61,38 @@ lifecycle agree. And the converse matters too: testing `isSanctionedSystemEdge` 
 gate would make an ordinary `kind='initiative'` project named `general` unrevokable, breaking the
 legitimate creator-grant revoke that AUDITFIX-3 went out of its way to keep legal.
 
+### 0b.1 ⚠️ A LIVE hole in merged code: the old writer already deletes a SANCTIONED edge
+
+Round 2's BLOCKER 1, re-derived and confirmed — **and it means the reshape as first written did not
+close the outage path it exists for.**
+
+`revokeProjectFromGroup` reads **`kind` only** and refuses **only `kind === 'system'`**
+(`lib/access/groups.ts:789-800`). But `isProtectedProject` covers `kind='system'` **or**
+`kind='source'` holding a reserved slug. So for a `general@source` project:
+
+| | |
+|---|---|
+| `isProtectedProject({kind:'source', slug:'general'})` | **true** |
+| `isSanctionedSystemEdge('general', everyone@builtin)` | **true** |
+| the old writer's refusal | **does not fire** — kind is `source`, not `system` |
+
+An authorized admin can therefore run `revoke-project everyone general` today and delete
+`general→everyone`, the substrate edge. **No race is required** — the CLI's preflight refuses on the
+same `kind === 'system'` test (`lib/access/revoke-verb.ts:43-50`), so it lets the call through too.
+
+**This is a pre-existing asymmetry, not something this slice introduces**: AUDITFIX-3 gave the GRANT
+side `isProtectedProject` and left the REVOKE side on the older kind-only test, so the two halves of
+an edge's lifecycle disagree about what is protected.
+
+**Bounded, not unbounded:** `ensureAccessBootstrap` re-grants the three sanctioned edges every tick, so
+the row returns within one tick (30-86 min measured on this fleet). Until it does, every member of that
+team loses General visibility — and if that team's bootstrap is wedged, it never returns.
+
+**So this slice hardens the old writer after all** — by making it refuse MORE, never less: select
+`kind, slug` and refuse every `isProtectedProject`. That **strengthens** the shipped absolute refusal
+rather than reversing it, which is why both shipped tests still pass unmodified (they assert a
+`kind='system'` project is refused; it still is). §2c specifies it, and AC17/AC18 pin it.
+
 ### 0c. A pre-existing D3 violation this slice must not inherit
 
 `revokeProjectFromGroup` probes for the edge, deletes **without `RETURNING`**, then audits and reports
@@ -121,13 +153,28 @@ Order, and each step is a refusal that leaves the edge intact:
    with `meta.authorizedByMemberId`, never in the actor field or `added_by`. No row returned ⇒
    `{ok:true, revoked:false}` and **no audit**, which is D3.
 
-**The race is closed by construction:** classification reads and the delete are the same statement's
-neighbours, and the delete is keyed on the ids — but the *decision* is re-made from the project's
-CURRENT kind. A flip landing before step 2 makes the row protected-and-sanctioned and it is refused; a
-flip landing after step 4 cannot un-delete a row that was unsanctioned when read. What is NOT claimed:
-serializability. If identity could change between step 3 and step 4, the classification could be
-stale — so §4 pins the interleaving that matters (`source → system` mid-call) rather than asserting it
-away.
+⚠️ **This is a SNAPSHOT contract, and round 2's BLOCKER 2 made me say so.** I had written that the
+race is "closed by construction". It is not: steps 2-3 are separate reads and step 4 is an **ID-only**
+delete, so `RETURNING` proves *which row was removed*, never that the identities still satisfy the
+predicate — and the adapter cannot express a joined identity condition inside a delete
+(`lib/db/pg/query-builder.ts:416-420`). The honest statement is: **authorized and classified from
+preceding reads, with identity TOCTOU accepted.**
+
+**Why that residual is safe, from evidence rather than assertion.** For a classification to become
+WRONG in the dangerous direction, an *unsanctioned* pair would have to become *sanctioned* between the
+read and the delete. That needs the group's `slug`/`is_builtin` or the project's `slug` to change —
+and round 2 (MEDIUM 6) re-derived that `ensureBuiltins` **cannot** flip a squatter to builtin: it
+refuses an existing non-builtin reserved slug and inserts only if absent (`lib/access/groups.ts:108`),
+pinned by `test/datamechanics/access-groups.datamechanics.test.ts:259`. No in-repo `system→source`
+transition or slug rewrite exists. The only live identity transition is `source → system`, which can
+only make a pair MORE protected, never less.
+
+**AC7 is deleted, because it was unconstructible.** It asked for the flip to be interleaved between the
+identity read and the delete for `general@source→everyone` — but that pair is protected-and-sanctioned
+*before* the flip, so a correct implementation refuses at step 3 and never reaches the hook. And
+`general@source→vendors` stays unsanctioned after the flip, so deleting it proves nothing about a
+sanctioned-edge race. What replaces it is §0b.1's hardening and its criteria, which close the reachable
+hole rather than a hypothetical one.
 
 ### 2b. A NEW CLI verb, so `revoke-project` keeps its meaning
 
@@ -140,6 +187,23 @@ verb's dependency resolution is inline in `scripts/admin.ts` and today selects o
 its error (`:341-343`). A type-correct `resolveGroup: async () => null` would satisfy every behavioural
 criterion while leaving the command permanently broken. So the resolution moves into an **import-safe
 factory** that §4 tests with the real dependency shape.
+
+### 2c. The old writer is HARDENED — refusing more, never less
+
+`revokeProjectFromGroup` selects `kind, slug` instead of `kind`, and refuses every
+`isProtectedProject(project)` rather than only `kind === 'system'`. Its message keeps naming the
+substrate. `lib/access/revoke-verb.ts`'s preflight moves to the same predicate so the verb and the
+writer still agree.
+
+**This is not the reversal round 1 killed.** That design made system edges *deletable*; this one makes
+*more* edges refused, so every assertion the shipped tests make still holds — they assert a
+`kind='system'` project is refused, and it still is. The two writers now agree on what is protected,
+which is the property that was missing.
+
+⚠️ **One behaviour genuinely changes:** revoking any edge on a reserved-slug `kind='source'` project
+now fails where it previously succeeded. That is the point — the sanctioned ones must be refused — but
+it also means an **unsanctioned** edge on such a project is only revocable through the new writer.
+AC5 already covers that path.
 
 ## 3. Scope
 
@@ -177,9 +241,6 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
   through this writer's refusal path — i.e. the writer refuses it as *not its case*, and
   `revokeProjectFromGroup` still handles it. *§0b's converse: gating on the pair alone would make a
   legitimate initiative unrevokable.*
-- **AC7 — the `source → system` FLIP mid-call cannot delete a sanctioned edge (dm):** with the flip
-  interleaved between the identity read and the delete, `general→everyone` **survives**. ⚠️ *Round 1
-  BLOCKER 1 — the whole reason this is a new writer.*
 - **AC8 — an undetermined GROUP read refuses, ATTRIBUTED (dm):** the error names a read failure,
   distinguishable from "group not found"; no delete; edge survives.
 - **AC9 — an undetermined PROJECT read refuses, ATTRIBUTED (dm):** same.
@@ -200,15 +261,28 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
   `kind` and `slug`, and surfaces a read error rather than `null`. ⚠️ *Round 1 BLOCKER 2 — a
   type-correct `resolveGroup: async () => null` passes every behavioural criterion while the command
   stays permanently broken.*
-- **AC16 — `revoke-project` is UNCHANGED (unit + dm):** it still refuses `kind='system'` before the
-  writer, with the same message, and `revokeProjectFromGroup` still refuses every system edge. *The
-  shipped tests are the criterion; they must pass unmodified.*
+- **AC16 — the shipped revoke tests pass UNMODIFIED (unit + dm):** `test/admin-cli-revoke.test.ts` and
+  `test/datamechanics/revoke-project.datamechanics.test.ts` are not edited. ⚠️ *Round 2 MEDIUM 5
+  narrowed what this proves: the unit test pins only the PURE verb, and the dm test's system arm uses a
+  valid admin while its principal/oracle matrix runs on a separate initiative project. So this is a
+  REGRESSION criterion — it does not prove admin wiring or that two writers coexist safely.*
+- **AC17 — the OLD writer refuses a SANCTIONED edge on a reserved-slug `source` project (dm):**
+  `general@source→everyone` through `revokeProjectFromGroup` is refused and the edge SURVIVES.
+  ⚠️ *Round 2 BLOCKER 1 — this is deletable in merged code today, with no race required (§0b.1).*
+- **AC18 — and the old VERB refuses it too (unit):** the preflight uses the same predicate, so
+  `revoke-project everyone general` never reaches the writer. *The verb and the writer must not
+  disagree about what is protected — that disagreement is the defect.*
+- **AC19 — the SHIPPED command exists and is wired (unit, structural):** `scripts/admin.ts`'s
+  `repair-system-edge` arm imports the factory and calls the verb. ⚠️ *Round 2 HIGH 4: AC14 proves the
+  pure verb calls an injected writer and AC15 proves a factory issues the right queries — an
+  implementation satisfies BOTH while omitting the command case entirely, shipping a documented command
+  that does not exist.*
 
 **Mutation coverage, one per enforcement point, each reddening ITS OWN criterion:**
 
 | # | mutation | must redden |
 |---|---|---|
-| 1 | gate on `kind === 'system'` instead of `isProtectedProject` | AC4 |
+| 1 | gate on `kind === 'system'` instead of `isProtectedProject` | AC5 |
 | 2 | drop the protection gate (classify by pair alone) | AC6 |
 | 3 | drop the sanctioned test entirely | AC2 |
 | 4 | protect only `general→everyone` | AC2 |
@@ -219,9 +293,11 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
 | 9 | swallow the project read error into not-found | AC9 |
 | 10 | delete without `RETURNING` and audit unconditionally | AC13 |
 | 11 | audit on a no-op | AC12 |
-| 12 | classify once, before the authority check, and reuse it | AC7 |
+| 12 | classify from the PAIR only, ignoring `isProtectedProject` | AC6 |
 | 13 | have the wiring factory select only `id` | AC15 |
-| 14 | make `revoke-project` route to the new writer | AC16 |
+| 14 | delete the `repair-system-edge` arm from `scripts/admin.ts` | AC19 |
+| 15 | leave the old writer on `kind === 'system'` | AC17 |
+| 16 | leave the old verb's preflight on `kind === 'system'` | AC18 |
 
 ## 5. Risks
 
