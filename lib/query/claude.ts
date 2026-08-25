@@ -44,6 +44,34 @@ export function looksLikeTokenLimit(status: number, body: string): boolean {
   );
 }
 
+/**
+ * A 402 that is refusing the SIZE of the request, not the account (LLMCREDIT-1).
+ *
+ * OpenRouter prices a request by its `max_tokens` ceiling, so a nearly-empty balance refuses a big ask
+ * while still affording a small one — and it says so in the body: *"This request requires more
+ * credits, or fewer max_tokens. You requested up to 6900 tokens, but can only afford 3116"*, with a
+ * `remedy_hint` of *"Add credits …, or lower max_tokens / prompt size to fit your remaining balance."*
+ *
+ * WHY THIS MATTERS ENOUGH TO BE ITS OWN PREDICATE. Measured on prod 2026-08-25: every generation task
+ * was failing with `http_402` while the real budgets — 200 tokens for a timeline summary, 900 for
+ * doc-task inference — were far inside what the account could still afford. We were failing them
+ * asking for 6,200 and 6,900, because the REASONING HEADROOM is added on top and the ladder that
+ * exists to walk it back only fires on 400/422. The provider was naming the remedy in the response and
+ * nothing read it.
+ *
+ * ⚠️ Deliberately NOT "any 402". A 402 with no size language is a dead account — retrying it twice
+ * more buys nothing and delays the honest error.
+ */
+export function looksLikeBudgetRefusal(status: number, body: string): boolean {
+  if (status !== 402) return false;
+  return /fewer max[_ ]?tokens|can only afford|lower max[_ ]?tokens|fit your remaining balance/i.test(body);
+}
+
+/** Either shape of "your request was too big" — the ladder steps down for both. */
+export function looksLikeSizeRefusal(status: number, body: string): boolean {
+  return looksLikeTokenLimit(status, body) || looksLikeBudgetRefusal(status, body);
+}
+
 const SYSTEM_PROMPT = `You are the Team Brain — the shared memory and coordination assistant for a team using AIOS.
 
 Rules:
@@ -402,7 +430,7 @@ export async function* streamOpenAICompatible(
     const body = await res.text().catch(() => "");
     // If headroom pushed max_tokens past this model's ceiling, retry once with just the answer budget;
     // any other error surfaces immediately (with its own body).
-    if (looksLikeTokenLimit(res.status, body)) {
+    if (looksLikeSizeRefusal(res.status, body)) {
       res = await postChat(ANSWER_BUDGET);
       if (!res.ok) {
         throw new StreamHttpError(res.status, `LLM ${backend.model} @ ${backend.baseUrl}: ${res.status} ${await res.text().catch(() => "")}`);

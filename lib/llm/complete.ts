@@ -1,7 +1,7 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
-import { looksLikeTokenLimit } from "@/lib/query/claude";
+import { looksLikeBudgetRefusal, looksLikeSizeRefusal } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
 import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
@@ -385,9 +385,31 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
       let res = await doPost(rungs[0]);
       for (let i = 1; i < rungs.length && !res.ok; i++) {
         const errBody = await res.text().catch(() => "");
-        // Only a TOKEN-LIMIT refusal is worth retrying smaller; anything else is a real error and must
+        // Only a SIZE refusal is worth retrying smaller; anything else is a real error and must
         // surface immediately rather than being re-sent two more times.
-        if (!looksLikeTokenLimit(res.status, errBody)) throw httpError(backend, res.status, errBody);
+        //
+        // LLMCREDIT-1 widened "size" to include a budget-shaped 402. OpenRouter prices a request by
+        // its max_tokens CEILING, so a nearly-empty balance refuses the top rung while still affording
+        // the bottom one — and the ladder walking down is exactly the remedy the provider names in its
+        // own response. Measured on prod: every generation task failing at 6,200-6,900 tokens while
+        // their real budgets (200, 900) were well inside what the account could afford.
+        if (!looksLikeSizeRefusal(res.status, errBody)) throw httpError(backend, res.status, errBody);
+        // ⚠️ FILED EVEN IF THE NEXT RUNG SUCCEEDS. A budget refusal that we quietly recover from is the
+        // silent-degrade failure this repo has already been bitten by: service looks fine while the
+        // account empties. `llm_failures` is the ledger for provider refusals and surfaces as
+        // `failed_attempts` in the cost breakdown, so filing here makes "we are nearly out of credit"
+        // visible WITHOUT reddening a banner about work that did get done.
+        if (looksLikeBudgetRefusal(res.status, errBody) && opts.meter) {
+          await recordLlmFailure(opts.meter.db, {
+            teamId: opts.meter.teamId,
+            memberId: opts.meter.memberId ?? null,
+            source: opts.meter.source,
+            provider: backend.provider,
+            model: backend.model,
+            reason: `http_${res.status}` as `http_${number}`,
+            durationMs: Date.now() - startedAt,
+          }).catch(() => {});
+        }
         res = await doPost(rungs[i]);
       }
       if (!res.ok) {
