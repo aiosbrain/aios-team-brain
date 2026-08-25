@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 
 /**
- * Server-side conformance guard for the Brain API 1.22 codebase-scan payload
+ * Server-side conformance guard for the Brain API 1.23 codebase-scan payload
  * (POST /api/v1/codebases, incl. the optional provenance-only `metrics.codebase_health`
  * object — AIO-609). Mirror of aios-workspace/test/codebase-payload-contract.test.mjs,
  * run against vendored copies of the shared contract artifacts
@@ -28,23 +28,36 @@ import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 const CONTRACT_DIR = join(import.meta.dirname, "..", "fixtures", "contract");
 
 const PINNED = {
-  "codebase-payload-1.22.schema.json":
-    "f6c7ab22b7fa25e8bb581bc7ca7863e5228835d4830cf6946dbc8c63af0afb95",
-  "codebase-payload-1.22-fixtures.json":
-    "8f6c964ae91d7a64baabb28c721aff002223b3c5e43994808209f6b7f1d31f2d",
+  "codebase-payload-1.23.schema.json":
+    "0bcb686042369d31bfc7299c2ce5ea6b0257cc6a17995959ba02bf6d14d10c55",
+  "codebase-payload-1.23-fixtures.json":
+    "3d495a7892a7ac6c53334b3fa7f323fa89523ffae663bcc0086bf6f5d0abb4d6",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
 
 const fixtures = JSON.parse(
-  readFileSync(join(CONTRACT_DIR, "codebase-payload-1.22-fixtures.json"), "utf8"),
+  readFileSync(
+    join(CONTRACT_DIR, "codebase-payload-1.23-fixtures.json"),
+    "utf8",
+  ),
 ) as {
   readonly version: string;
-  readonly valid: readonly { readonly name: string; readonly payload: unknown }[];
-  readonly invalid: readonly { readonly name: string; readonly payload: unknown }[];
+  readonly valid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
+  readonly invalid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
+  readonly brain_invalid: readonly {
+    readonly name: string;
+    readonly payload: unknown;
+  }[];
 };
 
-describe("brain-api 1.22 codebase-payload conformance", () => {
+describe("brain-api 1.23 codebase-payload conformance", () => {
   it("vendored contract artifacts are byte-identical to the pinned canonical revision", () => {
     for (const [file, sha] of Object.entries(PINNED)) {
       const bytes = readFileSync(join(CONTRACT_DIR, file));
@@ -52,8 +65,8 @@ describe("brain-api 1.22 codebase-payload conformance", () => {
     }
   });
 
-  it("fixtures file tracks the 1.22 contract revision, both buckets populated", () => {
-    expect(fixtures.version).toBe("1.22");
+  it("fixtures file tracks the 1.23 contract revision, both buckets populated", () => {
+    expect(fixtures.version).toBe("1.23");
     expect(fixtures.valid.length).toBeGreaterThanOrEqual(3);
     expect(fixtures.invalid.length).toBeGreaterThanOrEqual(3);
   });
@@ -61,37 +74,59 @@ describe("brain-api 1.22 codebase-payload conformance", () => {
   it("accepts every canonical valid fixture (incl. with-health and pre-1.15 without-health)", () => {
     for (const entry of fixtures.valid) {
       const res = codebaseScanPayloadSchema.safeParse(entry.payload);
-      expect(res.success, `${entry.name}: ${res.success ? "" : res.error.issues[0]?.message}`).toBe(
-        true,
-      );
+      expect(
+        res.success,
+        `${entry.name}: ${res.success ? "" : res.error.issues[0]?.message}`,
+      ).toBe(true);
     }
   });
 
   it("rejects every canonical invalid fixture (sparse, malformed, smuggled keys, empty dimensions)", () => {
     for (const entry of fixtures.invalid) {
-      expect(codebaseScanPayloadSchema.safeParse(entry.payload).success, entry.name).toBe(false);
+      expect(
+        codebaseScanPayloadSchema.safeParse(entry.payload).success,
+        entry.name,
+      ).toBe(false);
+    }
+  });
+
+  it("rejects every brain-enforced fix-analysis invariant fixture", () => {
+    expect(fixtures.brain_invalid).toHaveLength(3);
+    for (const entry of fixtures.brain_invalid) {
+      expect(
+        codebaseScanPayloadSchema.safeParse(entry.payload).success,
+        entry.name,
+      ).toBe(false);
     }
   });
 
   it("a valid parse preserves codebase_health VERBATIM (no coercion, no stripping)", () => {
-    const withHealth = fixtures.valid.find((f) => f.name.startsWith("valid-with-health"));
+    const withHealth = fixtures.valid.find((f) =>
+      f.name.startsWith("valid-with-health"),
+    );
     expect(withHealth).toBeDefined();
     const payload = withHealth!.payload as {
       metrics: { codebase_health: Record<string, unknown> };
     };
     const parsed = codebaseScanPayloadSchema.parse(payload);
-    expect(parsed.metrics.codebase_health).toEqual(payload.metrics.codebase_health);
+    expect(parsed.metrics.codebase_health).toEqual(
+      payload.metrics.codebase_health,
+    );
   });
 
   it("omitted codebase_health stays omitted (distinguishable from a scored object)", () => {
-    const withoutHealth = fixtures.valid.find((f) => f.name.startsWith("valid-without-health"));
+    const withoutHealth = fixtures.valid.find((f) =>
+      f.name.startsWith("valid-without-health"),
+    );
     expect(withoutHealth).toBeDefined();
     const parsed = codebaseScanPayloadSchema.parse(withoutHealth!.payload);
     expect(parsed.metrics.codebase_health).toBeUndefined();
   });
 
   it("accepts v2 epistemic state and rejects contradictory or incomplete claims", () => {
-    const withoutHealth = fixtures.valid.find((f) => f.name.startsWith("valid-without-health"));
+    const withoutHealth = fixtures.valid.find((f) =>
+      f.name.startsWith("valid-without-health"),
+    );
     expect(withoutHealth).toBeDefined();
     const payload = structuredClone(withoutHealth!.payload) as {
       metrics: { codebase_health?: Record<string, unknown> };
@@ -108,7 +143,12 @@ describe("brain-api 1.22 codebase-payload conformance", () => {
       quality_gate: "unknown",
       automation_eligible: false,
       dimensions: {
-        test_rigor: { passed: 0, total: 0, band: null, evidence_status: "missing" },
+        test_rigor: {
+          passed: 0,
+          total: 0,
+          band: null,
+          evidence_status: "missing",
+        },
       },
       failed_invariant_ids: [],
       measured_at: "2026-08-04T00:00:00Z",
@@ -128,10 +168,14 @@ describe("brain-api 1.22 codebase-payload conformance", () => {
 
     const contradictory = structuredClone(payload);
     contradictory.metrics.codebase_health!.automation_eligible = true;
-    expect(codebaseScanPayloadSchema.safeParse(contradictory).success).toBe(false);
+    expect(codebaseScanPayloadSchema.safeParse(contradictory).success).toBe(
+      false,
+    );
 
     const malformed = structuredClone(payload);
-    delete (malformed.metrics.codebase_health!.findings as Record<string, unknown>[])[0].fingerprint;
+    delete (
+      malformed.metrics.codebase_health!.findings as Record<string, unknown>[]
+    )[0].fingerprint;
     expect(codebaseScanPayloadSchema.safeParse(malformed).success).toBe(false);
   });
 });

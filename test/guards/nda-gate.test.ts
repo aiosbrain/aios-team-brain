@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync, mkdtempSync, writeFileSync, rmSync, renameSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  renameSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTerms, scan, scanRange } from "@/scripts/nda-scan.mjs";
@@ -17,9 +26,13 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const SCRIPT = join(ROOT, "scripts", "nda-scan.mjs");
 
 /** Run the CLI and return its exit code + streams, without throwing on non-zero. */
-function run(env: Record<string, string>, args: string[] = []): { code: number; out: string; err: string } {
+function run(
+  env: Record<string, string>,
+  args: string[] = [],
+  cwd = ROOT
+): { code: number; out: string; err: string } {
   try {
-    const out = execFileSync("node", [SCRIPT, ...args], { cwd: ROOT, encoding: "utf8", env: { ...process.env, ...env } });
+    const out = execFileSync("node", [SCRIPT, ...args], { cwd, encoding: "utf8", env: { ...process.env, ...env } });
     return { code: 0, out, err: "" };
   } catch (e) {
     const x = e as { status: number; stdout: string; stderr: string };
@@ -86,6 +99,25 @@ describe("guard: the NDA confidentiality gate", () => {
     const r = run({ NDA_TERMS: privatePattern, CI: "true" }, ["--reveal"]);
     expect(r.code).toBe(2);
     expect(`${r.out}\n${r.err}`).not.toContain(privatePattern);
+  });
+
+  it("validates the explicit commit limit without exposing configured patterns", () => {
+    const invalid = run(
+      { NDA_TERMS: "SYNTHETIC_NEVER_PRESENT", CI: "true" },
+      ["--range", "HEAD", "--max-commits", "0"]
+    );
+    expect(invalid.code).toBe(2);
+    expect(invalid.err).toMatch(/positive safe integer/i);
+
+    const unscoped = run(
+      { NDA_TERMS: "SYNTHETIC_NEVER_PRESENT", CI: "true" },
+      ["--max-commits", "500"]
+    );
+    expect(unscoped.code).toBe(2);
+    expect(unscoped.err).toMatch(/requires --range/i);
+    expect(`${invalid.out}\n${invalid.err}\n${unscoped.out}\n${unscoped.err}`).not.toContain(
+      "SYNTHETIC_NEVER_PRESENT"
+    );
   });
 
   it("still executes when invoked through a symlinked CLI path", () => {
@@ -192,6 +224,117 @@ describe("guard: the NDA confidentiality gate", () => {
       expect(scanRange(["SYNTHETICTERM"], `${removed}..${pathAdded}`, { cwd: dir }).length).toBeGreaterThan(0);
       expect(scanRange(["SYNTHETICTERM"], `${pathAdded}..${pathScrubbed}`, { cwd: dir })).toEqual([]);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns real clean and blocked verdicts for ranges over 100 commits", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-long-range-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+
+      for (let i = 1; i <= 101; i += 1) {
+        git("commit", "-qm", `synthetic clean commit ${i}`, "--allow-empty");
+      }
+      expect(scanRange(["SYNTHETICTERM"], `${base}..HEAD`, { cwd: dir })).toEqual([]);
+
+      git("commit", "-qm", "synthetic message contains SYNTHETICTERM", "--allow-empty");
+      expect(scanRange(["SYNTHETICTERM"], `${base}..HEAD`, { cwd: dir, maxCommits: 500 }).length).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("fails an explicitly bounded range above 500 commits with a distinct actionable verdict", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-pr-limit-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.local");
+      git("config", "user.name", "t");
+      git("commit", "-qm", "base", "--allow-empty");
+      const base = git("rev-parse", "HEAD").trim();
+
+      for (let i = 1; i <= 501; i += 1) {
+        git("commit", "-qm", `synthetic empty commit ${i}`, "--allow-empty");
+      }
+      const bounded = run(
+        { NDA_TERMS: "SYNTHETIC_NEVER_PRESENT", CI: "true" },
+        ["--range", `${base}..HEAD`, "--max-commits", "500"],
+        dir
+      );
+      expect(bounded.code).toBe(3);
+      expect(bounded.err).toMatch(/501 commits/);
+      expect(bounded.err).toMatch(/limit of 500/);
+      expect(bounded.err).toMatch(/split or rebase/i);
+      expect(`${bounded.out}\n${bounded.err}`).not.toContain("SYNTHETIC_NEVER_PRESENT");
+
+      const engineFailure = run(
+        { NDA_TERMS: "SYNTHETIC[", CI: "true" },
+        ["--range", `${base}..HEAD`],
+        dir
+      );
+      expect(engineFailure.code).toBe(2);
+      expect(`${engineFailure.out}\n${engineFailure.err}`).not.toContain("SYNTHETIC[");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("counts a capped range before enumerating commit hashes and validates the count", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nda-gate-count-first-"));
+    const gitShim = join(dir, "git");
+    const enumerationMarker = join(dir, "enumerated");
+    const previousPath = process.env.PATH;
+    const previousCount = process.env.NDA_TEST_COMMIT_COUNT;
+    const previousMarker = process.env.NDA_TEST_ENUMERATION_MARKER;
+    try {
+      writeFileSync(
+        gitShim,
+        `#!/bin/sh
+if [ "$1" = "rev-list" ] && [ "$2" = "--count" ]; then
+  printf '%s\\n' "$NDA_TEST_COMMIT_COUNT"
+  exit 0
+fi
+if [ "$1" = "rev-list" ] && [ "$2" = "--reverse" ]; then
+  : > "$NDA_TEST_ENUMERATION_MARKER"
+  exit 97
+fi
+exit 98
+`
+      );
+      chmodSync(gitShim, 0o755);
+      process.env.PATH = `${dir}:${previousPath ?? ""}`;
+      process.env.NDA_TEST_ENUMERATION_MARKER = enumerationMarker;
+
+      process.env.NDA_TEST_COMMIT_COUNT = "not-a-count";
+      expect(() => scanRange(["SYNTHETICTERM"], "synthetic", { cwd: dir, maxCommits: 500 })).toThrow(
+        /scan could not run/i
+      );
+      expect(existsSync(enumerationMarker)).toBe(false);
+
+      process.env.NDA_TEST_COMMIT_COUNT = "9007199254740992";
+      expect(() => scanRange(["SYNTHETICTERM"], "synthetic", { cwd: dir, maxCommits: 500 })).toThrow(
+        /scan could not run/i
+      );
+      expect(existsSync(enumerationMarker)).toBe(false);
+
+      process.env.NDA_TEST_COMMIT_COUNT = "501";
+      expect(() => scanRange(["SYNTHETICTERM"], "synthetic", { cwd: dir, maxCommits: 500 })).toThrow(
+        /501 commits.*limit of 500/i
+      );
+      expect(existsSync(enumerationMarker)).toBe(false);
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousCount === undefined) delete process.env.NDA_TEST_COMMIT_COUNT;
+      else process.env.NDA_TEST_COMMIT_COUNT = previousCount;
+      if (previousMarker === undefined) delete process.env.NDA_TEST_ENUMERATION_MARKER;
+      else process.env.NDA_TEST_ENUMERATION_MARKER = previousMarker;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -319,9 +462,12 @@ describe("guard: the NDA confidentiality gate", () => {
     expect(workflow).toContain("refs/pull/$PR_NUMBER/head:refs/nda-scan/pr-head");
     expect(workflow).toContain("refs/pull/$PR_NUMBER/merge:refs/nda-scan/pr-merge");
     expect(workflow).toContain('test "$(git show -s --format=%P "$MERGE_SHA")" = "$BASE_SHA $HEAD_SHA"');
-    expect(workflow).toContain('node scripts/nda-scan.mjs --tree "$MERGE_SHA" --range "$BASE_SHA..$HEAD_SHA"');
+    expect(workflow).toContain(
+      'node scripts/nda-scan.mjs --tree "$MERGE_SHA" --range "$BASE_SHA..$HEAD_SHA" --max-commits 500'
+    );
     expect(workflow).toContain('node scripts/nda-scan.mjs --range "$BASE_SHA..$HEAD_SHA"');
-    expect(workflow).toContain('node scripts/nda-scan.mjs --range "$HEAD_SHA"');
+    expect(workflow).toMatch(/node scripts\/nda-scan\.mjs --range "\$HEAD_SHA"\s*\n/);
+    expect(workflow.match(/--max-commits/g)).toHaveLength(1);
     expect(workflow).toContain("timeout-minutes: 10");
     expect(workflow).toContain("secrets.NDA_TERMS");
     expect(workflow).toContain("statuses: write");

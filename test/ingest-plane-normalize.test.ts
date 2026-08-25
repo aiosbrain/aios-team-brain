@@ -176,6 +176,54 @@ describe("normalizePlaneProject", () => {
     expect((p.rows as Record<string, unknown>[])[0].status).toBe("blocked");
   });
 
+  it("never resolves a Plane state group through Object.prototype", () => {
+    const hostileGroups = ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"];
+    const p = normalizePlaneProject({
+      ...base,
+      states: hostileGroups.map((group, index) => ({
+        id: `s-hostile-${index}`,
+        name: `Native state ${index}`,
+        group,
+      })),
+      items: hostileGroups.map((_, index) => ({
+        id: `wi-hostile-${index}`,
+        sequence_id: 100 + index,
+        name: `Hostile group ${index}`,
+        state: `s-hostile-${index}`,
+      })),
+    });
+
+    expect((p.rows as Record<string, unknown>[]).map((row) => row.status)).toEqual([
+      "backlog",
+      "backlog",
+      "backlog",
+      "backlog",
+      "backlog",
+    ]);
+  });
+
+  it("preserves every configured Plane group mapping", () => {
+    const groups = ["backlog", "unstarted", "started", "completed", "cancelled"];
+    const p = normalizePlaneProject({
+      ...base,
+      states: groups.map((group, index) => ({ id: `s-group-${index}`, name: `Native ${index}`, group })),
+      items: groups.map((_, index) => ({
+        id: `wi-group-${index}`,
+        sequence_id: 200 + index,
+        name: `Known group ${index}`,
+        state: `s-group-${index}`,
+      })),
+    });
+
+    expect((p.rows as Record<string, unknown>[]).map((row) => row.status)).toEqual([
+      "backlog",
+      "ready",
+      "in_progress",
+      "done",
+      "done",
+    ]);
+  });
+
   it("serializes projectable fields into the body so a changed field shifts content_sha256", () => {
     const mk = (status: string) =>
       normalizePlaneProject({

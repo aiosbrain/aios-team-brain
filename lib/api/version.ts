@@ -75,8 +75,13 @@
  *        lib/codebases/score.ts).
  *        NEEDS A MIGRATION: seven new columns on `code_metrics`
  *        (postgres/migrations/20260820140000_code_metrics_coverage_denominator.sql).
+ * 1.23 — ADDITIVE: recent commits may carry a versioned Conventional Commit classification and,
+ *        for fixes, counts-only first-parent line-blame evidence (AIO-1073). The brain validates
+ *        numeric coherence, persists the observations, and derives debt mix, age, coverage, and
+ *        fix-on-fix KPIs without accepting source paths or excerpts. Legacy commit objects remain
+ *        valid; no database migration is needed because recent_commits is already JSON.
  */
-export const BRAIN_API_VERSION = "1.22";
+export const BRAIN_API_VERSION = "1.23";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

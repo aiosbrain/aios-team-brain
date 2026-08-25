@@ -9,13 +9,17 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import aios_ingest.analyzers.codebase as codebase_module
 from aios_ingest.analyzers.codebase import (
+    _analyze_fix_commit,
+    _analyze_git,
+    _classify_commit_subject,
     _coherent_coverage,
     _coherent_pair,
     _coherent_run,
-    _int_or_none,
     _detect_scaffolding,
     _entries_under,
+    _int_or_none,
     _read_coverage,
     _read_test_results,
     _resolve_in_repo,
@@ -50,6 +54,158 @@ def _init(tmp_path):
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "branch", "-m", "main")
     return tmp_path
+
+
+def test_conventional_commit_classification_is_versioned_and_explicit():
+    assert _classify_commit_subject("fix(parser)!: close the gap")["type"] == "fix"
+    assert _classify_commit_subject("feat: add dashboard")["type"] == "feat"
+    assert _classify_commit_subject("docs: explain evidence")["type"] == "other"
+    assert _classify_commit_subject("Repair dashboard")["type"] == "unparseable"
+    assert _classify_commit_subject("fix: x")["scheme"] == "conventional-commit-v1"
+
+
+def test_fix_analysis_uses_first_parent_age_and_prior_fix_counts(tmp_path):
+    repo = _init(tmp_path)
+    source = repo / "old name.py"
+    source.write_text("alpha\nbeta\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: seed alpha", when="2026-01-01T00:00:00Z")
+
+    source.write_text("alpha\nbeta feature\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: extend beta", when="2026-01-05T00:00:00Z")
+
+    _git(repo, "mv", "old name.py", "new name.py")
+    (repo / "new name.py").write_text("alpha repaired\nbeta repaired\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: repair both lines", when="2026-01-10T00:00:00Z")
+
+    scan = _analyze_git(repo, 3650)
+    latest = scan["recent_commits"][0]
+    assert latest["commit_classification"]["type"] == "fix"
+    analysis = latest["fix_analysis"]
+    assert analysis["method"] == "first-parent-line-blame-v1"
+    assert analysis["candidate_parent_lines"] == 2
+    assert analysis["blamed_parent_lines"] == 2
+    assert sum(analysis["age_buckets"].values()) == 2
+    assert analysis["age_buckets"]["2_7d"] == 1
+    assert analysis["age_buckets"]["8_30d"] == 1
+    assert analysis["prior_fix_parent_lines"] == 1
+    assert "path" not in str(analysis).lower()
+
+
+def test_root_fix_omits_analysis_and_addition_only_fix_reports_zero_counts(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "first.py").write_text("root\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: root commit", when="2026-02-01T00:00:00Z")
+
+    (repo / "added.py").write_text("new\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: add missing module", when="2026-02-02T00:00:00Z")
+
+    commits = _analyze_git(repo, 3650)["recent_commits"]
+    assert commits[0]["fix_analysis"] == {
+        "method": "first-parent-line-blame-v1",
+        "candidate_parent_lines": 0,
+        "blamed_parent_lines": 0,
+        "age_buckets": {
+            "0_1d": 0,
+            "2_7d": 0,
+            "8_30d": 0,
+            "31_90d": 0,
+            "91_365d": 0,
+            "366d_plus": 0,
+        },
+        "prior_fix_parent_lines": 0,
+    }
+    assert "fix_analysis" not in commits[1]
+
+
+def test_merge_commits_are_excluded_from_classification_feed(tmp_path):
+    repo = _init(tmp_path)
+    (repo / "base.py").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: base", when="2026-03-01T00:00:00Z")
+
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "feature.py").write_text("feature\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: branch", when="2026-03-02T00:00:00Z")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "main.py").write_text("main\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: main", when="2026-03-02T12:00:00Z")
+    _git(repo, "merge", "--no-ff", "feature", "-m", "fix: merge branch")
+
+    messages = [commit["message"] for commit in _analyze_git(repo, 3650)["recent_commits"]]
+    assert "fix: merge branch" not in messages
+    assert messages[:2] == ["feat: main", "feat: branch"]
+
+
+def test_binary_fix_has_measured_zero_parent_line_candidates(tmp_path):
+    repo = _init(tmp_path)
+    binary = repo / "asset.bin"
+    binary.write_bytes(b"\x00\x01\x02")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: add binary", when="2026-04-01T00:00:00Z")
+    binary.write_bytes(b"\x00\x03\x04")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: repair binary", when="2026-04-02T00:00:00Z")
+
+    analysis = _analyze_git(repo, 3650)["recent_commits"][0]["fix_analysis"]
+    assert analysis["candidate_parent_lines"] == 0
+    assert analysis["blamed_parent_lines"] == 0
+
+
+def test_shallow_fix_classifies_but_omits_unavailable_parent_analysis(tmp_path):
+    source = _init(tmp_path / "source")
+    tracked = source / "tracked.py"
+    tracked.write_text("before\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "feat: seed", when="2026-05-01T00:00:00Z")
+    tracked.write_text("after\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "fix: shallow head", when="2026-05-02T00:00:00Z")
+
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", str(shallow)],
+        check=True,
+        capture_output=True,
+    )
+    head = _analyze_git(shallow, 3650)["recent_commits"][0]
+    assert head["commit_classification"]["type"] == "fix"
+    assert "fix_analysis" not in head
+
+
+def test_unblamable_range_preserves_candidate_gap(tmp_path, monkeypatch):
+    repo = _init(tmp_path)
+    tracked = repo / "tracked.py"
+    tracked.write_text("before\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "feat: seed", when="2026-06-01T00:00:00Z")
+    tracked.write_text("after\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fix: change", when="2026-06-02T00:00:00Z")
+    sha = _git_out(repo, "rev-parse", "HEAD").strip()
+    real_git = codebase_module._git
+
+    def fail_blame(repo_path, *args):
+        if args and args[0] == "blame":
+            raise subprocess.CalledProcessError(128, ["git", *args])
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(codebase_module, "_git", fail_blame)
+    analysis = _analyze_fix_commit(
+        repo,
+        sha,
+        datetime.fromisoformat("2026-06-02T00:00:00+00:00"),
+    )
+    assert analysis is not None
+    assert analysis["candidate_parent_lines"] == 1
+    assert analysis["blamed_parent_lines"] == 0
+    assert sum(analysis["age_buckets"].values()) == 0
 
 
 def test_entries_under_excludes_doc_files(tmp_path):

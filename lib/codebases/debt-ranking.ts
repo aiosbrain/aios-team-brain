@@ -237,7 +237,7 @@ function factorScore(
   };
 }
 
-function effectiveLifecycle(
+export function effectiveLifecycle(
   finding: DebtFindingInput,
   now: string,
 ): {

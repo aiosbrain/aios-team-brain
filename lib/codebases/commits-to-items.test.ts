@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { normalizeCommit, parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
+import {
+  normalizeCommit,
+  parseAuthorIdentity,
+} from "@/lib/codebases/commits-to-items";
 
 describe("normalizeCommit", () => {
   it("maps a scan commit to a searchable artifact item with git provenance", () => {
@@ -11,6 +14,21 @@ describe("normalizeCommit", () => {
       ai: true,
       additions: 12,
       deletions: 3,
+      commit_classification: { scheme: "conventional-commit-v1", type: "fix" },
+      fix_analysis: {
+        method: "first-parent-line-blame-v1",
+        candidate_parent_lines: 3,
+        blamed_parent_lines: 3,
+        age_buckets: {
+          "0_1d": 0,
+          "2_7d": 3,
+          "8_30d": 0,
+          "31_90d": 0,
+          "91_365d": 0,
+          "366d_plus": 0,
+        },
+        prior_fix_parent_lines: 1,
+      },
     });
     expect(p).not.toBeNull();
     expect(p!.kind).toBe("artifact");
@@ -20,7 +38,15 @@ describe("normalizeCommit", () => {
     expect(p!.actor).toBe("Alice <alice@corp.com>");
     expect(p!.body).toContain("Fix the login redirect bug"); // message is searchable
     expect(p!.body).toContain("AI-assisted");
-    expect(p!.frontmatter).toMatchObject({ source: "git", type: "commit", sha: "abc1234567deadbeef" });
+    expect(p!.frontmatter).toMatchObject({
+      source: "git",
+      type: "commit",
+      sha: "abc1234567deadbeef",
+    });
+    expect(p!.frontmatter).toMatchObject({
+      commit_classification: { scheme: "conventional-commit-v1", type: "fix" },
+      fix_analysis: { candidate_parent_lines: 3, prior_fix_parent_lines: 1 },
+    });
   });
 
   it("persists the author email in frontmatter (so attribution can resolve by email)", () => {
@@ -44,12 +70,20 @@ describe("normalizeCommit", () => {
 
 describe("parseAuthorIdentity", () => {
   it("splits 'Name <email>'", () => {
-    expect(parseAuthorIdentity("Alice <alice@corp.com>")).toMatchObject({ name: "Alice", email: "alice@corp.com" });
+    expect(parseAuthorIdentity("Alice <alice@corp.com>")).toMatchObject({
+      name: "Alice",
+      email: "alice@corp.com",
+    });
   });
   it("treats a bare email as the email", () => {
-    expect(parseAuthorIdentity("bob@x.com")).toMatchObject({ email: "bob@x.com" });
+    expect(parseAuthorIdentity("bob@x.com")).toMatchObject({
+      email: "bob@x.com",
+    });
   });
   it("leaves a bare name without an email", () => {
-    expect(parseAuthorIdentity("Carol")).toMatchObject({ name: "Carol", email: undefined });
+    expect(parseAuthorIdentity("Carol")).toMatchObject({
+      name: "Carol",
+      email: undefined,
+    });
   });
 });

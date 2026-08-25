@@ -61,6 +61,28 @@ const rangeIdx = argv.indexOf("--range");
 const range = rangeIdx >= 0 ? argv[rangeIdx + 1] : null;
 const treeIdx = argv.indexOf("--tree");
 const tree = treeIdx >= 0 ? argv[treeIdx + 1] : null;
+const maxCommitsIdx = argv.indexOf("--max-commits");
+const maxCommitsRaw = maxCommitsIdx >= 0 ? argv[maxCommitsIdx + 1] : null;
+const parsedMaxCommits = maxCommitsRaw !== null && /^[1-9]\d*$/.test(maxCommitsRaw)
+  ? Number(maxCommitsRaw)
+  : null;
+const maxCommits = Number.isSafeInteger(parsedMaxCommits) ? parsedMaxCommits : null;
+
+class CommitRangeLimitError extends Error {
+  constructor(commitCount, limit) {
+    super(`commit range contains ${commitCount} commits, exceeding the configured limit of ${limit}; split or rebase the pull request`);
+    this.name = "CommitRangeLimitError";
+  }
+}
+
+function countRangeCommits(rangeSpec, cwd) {
+  const raw = runRedacted("git", ["rev-list", "--count", rangeSpec], { encoding: "utf8", cwd }) ?? "";
+  const value = raw.trim();
+  if (!/^(?:0|[1-9]\d*)$/.test(value)) throw new Error("confidential-pattern scan could not run");
+  const count = Number(value);
+  if (!Number.isSafeInteger(count)) throw new Error("confidential-pattern scan could not run");
+  return count;
+}
 
 // No path exclusions. This is a scan of the tracked tree, and a tracked lockfile, binary, symlink,
 // filename, or generated-looking directory is just as public as source code. `git grep` already
@@ -305,15 +327,25 @@ export function scan(terms, { revealLines = false, cwd = process.cwd(), treeish 
  * markers rather than file:line, because a patch hunk's "location" is a commit, and naming it is
  * enough to find it locally.
  */
-export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process.cwd() } = {}) {
+export function scanRange(terms, rangeSpec, { revealLines = false, cwd = process.cwd(), maxCommits = null } = {}) {
   if (terms.length === 0) throw new Error("no active NDA terms — refusing to report a pass");
   assertSafeTerms(terms);
+  if (maxCommits !== null && (!Number.isSafeInteger(maxCommits) || maxCommits < 1)) {
+    throw new Error("confidential-pattern scan could not run");
+  }
+  if (maxCommits !== null) {
+    const commitCount = countRangeCommits(rangeSpec, cwd);
+    if (commitCount > maxCommits) throw new CommitRangeLimitError(commitCount, maxCommits);
+  }
   const res = [];
   const normalizedTerms = terms.map((term) => term.normalize("NFKC"));
-  const commits = (runRedacted("git", ["rev-list", "--reverse", rangeSpec], { encoding: "utf8", cwd }) ?? "")
+  const enumerationLimit = maxCommits === null ? [] : [`--max-count=${BigInt(maxCommits) + 1n}`];
+  const commits = (runRedacted("git", ["rev-list", "--reverse", ...enumerationLimit, rangeSpec], { encoding: "utf8", cwd }) ?? "")
     .split("\n")
     .filter(Boolean);
-  if (commits.length > 100) throw new Error("confidential-pattern scan could not run");
+  if (maxCommits !== null && commits.length > maxCommits) {
+    throw new CommitRangeLimitError(commits.length, maxCommits);
+  }
   let changedPathCount = 0;
   let scannedByteCount = 0;
 
@@ -472,6 +504,14 @@ function main() {
     console.error("NDA-GATE: BLOCKED — an option is missing its value.");
     process.exit(2);
   }
+  if (argv.filter((arg) => arg === "--max-commits").length > 1 || (maxCommitsIdx >= 0 && maxCommits === null)) {
+    console.error("NDA-GATE: BLOCKED — --max-commits requires one positive safe integer.");
+    process.exit(2);
+  }
+  if (maxCommits !== null && !range) {
+    console.error("NDA-GATE: BLOCKED — --max-commits requires --range.");
+    process.exit(2);
+  }
   const raw = termsFile ? readFileSync(termsFile, "utf8") : (process.env.NDA_TERMS ?? "");
   if (reveal && process.env.CI) {
     console.error("NDA-GATE: BLOCKED — reveal mode is disabled in CI.");
@@ -487,10 +527,10 @@ function main() {
   try {
     findings = scan(terms, { revealLines: reveal, treeish: tree });
     // The tree is what ships; the range is what becomes permanent history. Both, when given one.
-    if (range) findings = findings.concat(scanRange(terms, range, { revealLines: reveal }));
+    if (range) findings = findings.concat(scanRange(terms, range, { revealLines: reveal, maxCommits }));
   } catch (e) {
     console.error(`NDA-GATE: BLOCKED — ${e.message}`);
-    process.exit(2);
+    process.exit(e instanceof CommitRangeLimitError ? 3 : 2);
   }
   if (findings.length === 0) {
     console.log("NDA-GATE: clean (private patterns checked across the tracked tree)");
