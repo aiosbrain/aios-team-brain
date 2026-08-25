@@ -14,6 +14,7 @@ import { IssuesList } from "@/components/codebases/issues-list";
 import { AgenticTrend } from "@/components/charts/agentic-trend";
 import { ContributionsTrend } from "@/components/charts/contributions-trend";
 import { DebtPatrol } from "@/components/codebases/debt-patrol";
+import { DebtEvidence, DebtMovement } from "@/components/codebases/debt-dashboard";
 
 export const metadata: Metadata = { title: "Codebase" };
 
@@ -130,6 +131,8 @@ export default async function CodebaseDetailPage({
         )
       ) : null}
 
+      <DebtMovement debt={cb.debtKpis} />
+
       <DebtPatrol
         patrol={cb.debtPatrol}
         findings={cb.findings}
@@ -139,6 +142,8 @@ export default async function CodebaseDetailPage({
         currentMemberId={me.id}
         canDecide={me.tier === "team" && (me.role === "admin" || me.role === "lead")}
       />
+
+      <DebtEvidence debt={cb.debtKpis} />
 
       <ContributionsTrend data={cb.commitVolume} />
 

@@ -18,6 +18,7 @@ repo metadata (stars/forks/languages) and issues/PRs are enriched best-effort.
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -50,6 +51,12 @@ _CODE_EXT = {
 _MAX_FILE_BYTES = 1_000_000  # skip giant/generated files when counting LOC
 _MAX_ISSUE_PAGES = 10  # GitHub issues pagination cap (1000 issues); logged if hit
 _MAX_BACKFILL_POINTS = 60  # bound on historical trend points per scan
+_MAX_FIX_PARENT_LINES = 10_000  # omit pathological analyses; coverage remains explicit
+_CONVENTIONAL_SUBJECT = re.compile(r"^(?P<type>[A-Za-z]+)(?:\([^)]*\))?!?:")
+_DIFF_OLD_PATH = re.compile(r"^--- (.+)$")
+_DIFF_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+_BLAME_HEADER = re.compile(r"^\^?([0-9a-f]{40,64}) \d+ \d+(?: \d+)?$")
+_FIX_AGE_BUCKETS = ("0_1d", "2_7d", "8_30d", "31_90d", "91_365d", "366d_plus")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -87,6 +94,150 @@ def _head_sha(repo: Path) -> str:
 
 def _author_key(name: str, email: str) -> str:
     return (email or name).strip().lower()
+
+
+def _classify_commit_subject(subject: str) -> dict[str, str]:
+    """Classify a subject under the explicit Brain API 1.23 convention."""
+    match = _CONVENTIONAL_SUBJECT.match(subject.strip())
+    if not match:
+        commit_type = "unparseable"
+    else:
+        conventional_type = match.group("type").lower()
+        commit_type = conventional_type if conventional_type in {"fix", "feat"} else "other"
+    return {"scheme": "conventional-commit-v1", "type": commit_type}
+
+
+def _decode_diff_path(raw: str) -> str | None:
+    """Decode git's old-side patch path without ever exposing it in scanner output."""
+    raw = raw.partition("\t")[0]
+    if raw == "/dev/null":
+        return None
+    try:
+        decoded = ast.literal_eval(raw) if raw.startswith('"') else raw
+    except (SyntaxError, ValueError):
+        return None
+    if not isinstance(decoded, str) or not decoded.startswith("a/"):
+        return None
+    return decoded[2:]
+
+
+def _first_parent_ranges(repo: Path, sha: str, parent: str) -> list[tuple[str, int, int]]:
+    """Return parent-side changed line ranges from a zero-context first-parent diff."""
+    patch = _git(
+        repo,
+        "diff",
+        "--unified=0",
+        "--no-color",
+        "--find-renames",
+        "--no-ext-diff",
+        parent,
+        sha,
+        "--",
+    )
+    old_path: str | None = None
+    ranges: list[tuple[str, int, int]] = []
+    for line in patch.splitlines():
+        path_match = _DIFF_OLD_PATH.match(line)
+        if path_match:
+            old_path = _decode_diff_path(path_match.group(1))
+            continue
+        hunk_match = _DIFF_HUNK.match(line)
+        if not hunk_match or old_path is None:
+            continue
+        start = int(hunk_match.group(1))
+        count = int(hunk_match.group(2) or "1")
+        if count > 0:
+            ranges.append((old_path, start, count))
+    return ranges
+
+
+def _commit_metadata(
+    repo: Path,
+    sha: str,
+    cache: dict[str, tuple[int, str] | None],
+) -> tuple[int, str] | None:
+    if sha in cache:
+        return cache[sha]
+    try:
+        raw = _git(repo, "show", "-s", "--format=%at%x1f%s", sha).strip()
+        epoch, subject = raw.split(_FS, 1)
+        value = (int(epoch), _classify_commit_subject(subject)["type"])
+    except (subprocess.CalledProcessError, ValueError):
+        value = None
+    cache[sha] = value
+    return value
+
+
+def _age_bucket(age_days: int) -> str:
+    if age_days <= 1:
+        return "0_1d"
+    if age_days <= 7:
+        return "2_7d"
+    if age_days <= 30:
+        return "8_30d"
+    if age_days <= 90:
+        return "31_90d"
+    if age_days <= 365:
+        return "91_365d"
+    return "366d_plus"
+
+
+def _analyze_fix_commit(repo: Path, sha: str, fix_dt: datetime) -> dict[str, Any] | None:
+    """Measure parent-side lines touched by a fix using first-parent blame.
+
+    Failures are coverage gaps, not fabricated zeroes. A root or unavailable parent omits the
+    observation; individual unblamable ranges remain visible through candidate-vs-blamed counts.
+    """
+    try:
+        parent = _git(repo, "rev-parse", f"{sha}^1").strip()
+        ranges = _first_parent_ranges(repo, sha, parent)
+    except subprocess.CalledProcessError:
+        return None
+
+    candidate_lines = sum(count for _path, _start, count in ranges)
+    if candidate_lines > _MAX_FIX_PARENT_LINES:
+        return None
+    age_buckets = {bucket: 0 for bucket in _FIX_AGE_BUCKETS}
+    blamed_lines = 0
+    prior_fix_lines = 0
+    metadata_cache: dict[str, tuple[int, str] | None] = {}
+
+    for path, start, count in ranges:
+        try:
+            blame = _git(
+                repo,
+                "blame",
+                "--line-porcelain",
+                "-L",
+                f"{start},{start + count - 1}",
+                parent,
+                "--",
+                path,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        for line in blame.splitlines():
+            header = _BLAME_HEADER.match(line)
+            if not header:
+                continue
+            metadata = _commit_metadata(repo, header.group(1), metadata_cache)
+            if metadata is None:
+                continue
+            epoch, prior_type = metadata
+            prior_dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            age_days = max(0, (fix_dt.astimezone(timezone.utc) - prior_dt).days)
+            age_buckets[_age_bucket(age_days)] += 1
+            blamed_lines += 1
+            if prior_type == "fix":
+                prior_fix_lines += 1
+
+    return {
+        "method": "first-parent-line-blame-v1",
+        "candidate_parent_lines": candidate_lines,
+        "blamed_parent_lines": blamed_lines,
+        "age_buckets": age_buckets,
+        "prior_fix_parent_lines": prior_fix_lines,
+    }
 
 
 def _analyze_git(
@@ -157,11 +308,19 @@ def _analyze_git(
         if last_dt is None or dt > last_dt:
             last_dt = dt
         if len(recent) < 20:
-            recent.append({
+            subject = body.splitlines()[0] if body else ""
+            classification = _classify_commit_subject(subject)
+            commit = {
                 "sha": sha[:10], "author": name, "author_email": email, "ai": ai,
                 "additions": adds, "deletions": dels,
-                "committed_at": iso, "message": body.splitlines()[0] if body else "",
-            })
+                "committed_at": iso, "message": subject,
+                "commit_classification": classification,
+            }
+            if classification["type"] == "fix":
+                fix_analysis = _analyze_fix_commit(repo, sha, dt)
+                if fix_analysis is not None:
+                    commit["fix_analysis"] = fix_analysis
+            recent.append(commit)
 
     contributions = [
         {

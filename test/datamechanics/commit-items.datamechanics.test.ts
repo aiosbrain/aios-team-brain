@@ -57,14 +57,26 @@ describe("commits → searchable, attributed items (real Postgres)", () => {
 
   it("is idempotent: re-projecting the same commits adds no new items", async () => {
     const seed = await seedTeam();
-    const commits: ScanCommit[] = [{ sha: "c".repeat(40), author: "Dev", message: "initial", committed_at: "2026-06-22T10:00:00Z", additions: 5, deletions: 0 }];
+    const commits: ScanCommit[] = [{
+      sha: "c".repeat(40), author: "Dev", message: "fix: initial", committed_at: "2026-06-22T10:00:00Z", additions: 5, deletions: 0,
+      commit_classification: { scheme: "conventional-commit-v1", type: "fix" },
+      fix_analysis: {
+        method: "first-parent-line-blame-v1", candidate_parent_lines: 2, blamed_parent_lines: 2,
+        age_buckets: { "0_1d": 2, "2_7d": 0, "8_30d": 0, "31_90d": 0, "91_365d": 0, "366d_plus": 0 },
+        prior_fix_parent_lines: 1,
+      },
+    }];
     const map = await buildIdentityMap(db(), seed.teamId);
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
 
     await projectCommitsToItems(db(), auth, "repo", commits, map);
     await projectCommitsToItems(db(), auth, "repo", commits, map); // second run
 
-    const { data } = await db().from("items").select("id").eq("team_id", seed.teamId).eq("path", `commits/repo/${"c".repeat(40)}.md`);
+    const { data } = await db().from("items").select("id, frontmatter").eq("team_id", seed.teamId).eq("path", `commits/repo/${"c".repeat(40)}.md`);
     expect((data ?? []).length).toBe(1); // exactly one item, not duplicated
+    expect((data?.[0] as { frontmatter: Record<string, unknown> }).frontmatter).toMatchObject({
+      commit_classification: { scheme: "conventional-commit-v1", type: "fix" },
+      fix_analysis: { candidate_parent_lines: 2, prior_fix_parent_lines: 1 },
+    });
   });
 });

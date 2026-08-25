@@ -58,7 +58,11 @@ export const codebaseRecordSchema = z.object({
 // Both reject paths, source text, finding detail, and contributor identity. Guarded by
 // test/guards/codebase-payload-contract.test.ts against the vendored canonical artifacts.
 const codebaseHealthV1Schema = z.strictObject({
-  schema_version: z.string().min(1).max(20).refine((value) => value !== "2"),
+  schema_version: z
+    .string()
+    .min(1)
+    .max(20)
+    .refine((value) => value !== "2"),
   rubric_version: z.string().min(1).max(40),
   head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
   score_pct: z.number().min(0).max(100),
@@ -82,83 +86,174 @@ const codebaseHealthV1Schema = z.strictObject({
     .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
 });
 
-const evidenceStatusSchema = z.enum(["complete", "partial", "missing", "stale", "error"]);
-const codebaseHealthV2Schema = z.strictObject({
-  schema_version: z.literal("2"),
-  rubric_version: z.string().min(1).max(40),
-  profile_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
-  profile_version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
-  head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
-  score_pct: z.number().min(0).max(100),
-  status: z.enum(["pass", "warn", "fail"]),
-  evidence_status: evidenceStatusSchema,
-  quality_gate: z.enum(["pass", "fail", "unknown"]),
-  automation_eligible: z.boolean(),
-  dimensions: z
-    .record(
-      z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
-      z.strictObject({
-        passed: z.number().int().nonnegative(),
-        total: z.number().int().nonnegative(),
-        band: z.number().int().min(0).max(4).nullable(),
-        evidence_status: evidenceStatusSchema,
+const evidenceStatusSchema = z.enum([
+  "complete",
+  "partial",
+  "missing",
+  "stale",
+  "error",
+]);
+const codebaseHealthV2Schema = z
+  .strictObject({
+    schema_version: z.literal("2"),
+    rubric_version: z.string().min(1).max(40),
+    profile_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+    profile_version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+    head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
+    score_pct: z.number().min(0).max(100),
+    status: z.enum(["pass", "warn", "fail"]),
+    evidence_status: evidenceStatusSchema,
+    quality_gate: z.enum(["pass", "fail", "unknown"]),
+    automation_eligible: z.boolean(),
+    dimensions: z
+      .record(
+        z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+        z.strictObject({
+          passed: z.number().int().nonnegative(),
+          total: z.number().int().nonnegative(),
+          band: z.number().int().min(0).max(4).nullable(),
+          evidence_status: evidenceStatusSchema,
+        }),
+      )
+      .refine((dimensions) => Object.keys(dimensions).length >= 1, {
+        message: "dimensions must have at least one entry",
       }),
-    )
-    .refine((dimensions) => Object.keys(dimensions).length >= 1, {
-      message: "dimensions must have at least one entry",
-    }),
-  failed_invariant_ids: z
-    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
-    .max(200),
-  measured_at: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
-  findings: z
-    .array(
-      z.strictObject({
-        fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
-        check_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
-        axis: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
-        kind: z.enum(["quality_issue", "evidence_gap"]),
-        severity: z.enum(["low", "medium", "high", "critical"]),
-        evidence_status: evidenceStatusSchema,
-        remediation_tier: z.number().int().min(0).max(3),
-      }),
-    )
-    .max(500),
-}).superRefine((health, context) => {
-  if (health.quality_gate === "pass" && health.evidence_status !== "complete") {
-    context.addIssue({
-      code: "custom",
-      path: ["quality_gate"],
-      message: "a passing quality gate requires complete evidence",
-    });
-  }
-  if (health.quality_gate === "unknown" && health.evidence_status === "complete") {
-    context.addIssue({
-      code: "custom",
-      path: ["quality_gate"],
-      message: "an unknown quality gate cannot claim complete evidence",
-    });
-  }
-  if (
-    health.automation_eligible &&
-    (health.quality_gate !== "pass" ||
-      health.evidence_status !== "complete" ||
-      health.status === "fail")
-  ) {
-    context.addIssue({
-      code: "custom",
-      path: ["automation_eligible"],
-      message: "automation requires complete evidence, a passing gate, and non-failing health",
-    });
-  }
-});
+    failed_invariant_ids: z
+      .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+      .max(200),
+    measured_at: z
+      .string()
+      .regex(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/,
+      ),
+    findings: z
+      .array(
+        z.strictObject({
+          fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+          check_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+          axis: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+          kind: z.enum(["quality_issue", "evidence_gap"]),
+          severity: z.enum(["low", "medium", "high", "critical"]),
+          evidence_status: evidenceStatusSchema,
+          remediation_tier: z.number().int().min(0).max(3),
+        }),
+      )
+      .max(500),
+  })
+  .superRefine((health, context) => {
+    if (
+      health.quality_gate === "pass" &&
+      health.evidence_status !== "complete"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quality_gate"],
+        message: "a passing quality gate requires complete evidence",
+      });
+    }
+    if (
+      health.quality_gate === "unknown" &&
+      health.evidence_status === "complete"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["quality_gate"],
+        message: "an unknown quality gate cannot claim complete evidence",
+      });
+    }
+    if (
+      health.automation_eligible &&
+      (health.quality_gate !== "pass" ||
+        health.evidence_status !== "complete" ||
+        health.status === "fail")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["automation_eligible"],
+        message:
+          "automation requires complete evidence, a passing gate, and non-failing health",
+      });
+    }
+  });
 
 // V1 remains accepted byte-for-byte. V2 adds the evidence needed to decide whether a
 // background remediation worker may act, without accepting raw source or finding text.
-export const codebaseHealthSchema = z.union([codebaseHealthV2Schema, codebaseHealthV1Schema]);
+export const codebaseHealthSchema = z.union([
+  codebaseHealthV2Schema,
+  codebaseHealthV1Schema,
+]);
 export type CodebaseHealth = z.infer<typeof codebaseHealthSchema>;
+
+export const commitClassificationSchema = z
+  .object({
+    scheme: z.literal("conventional-commit-v1"),
+    type: z.enum(["fix", "feat", "other", "unparseable"]),
+  })
+  .strict();
+
+export const fixAnalysisSchema = z
+  .object({
+    method: z.literal("first-parent-line-blame-v1"),
+    candidate_parent_lines: z.number().int().nonnegative(),
+    blamed_parent_lines: z.number().int().nonnegative(),
+    age_buckets: z
+      .object({
+        "0_1d": z.number().int().nonnegative(),
+        "2_7d": z.number().int().nonnegative(),
+        "8_30d": z.number().int().nonnegative(),
+        "31_90d": z.number().int().nonnegative(),
+        "91_365d": z.number().int().nonnegative(),
+        "366d_plus": z.number().int().nonnegative(),
+      })
+      .strict(),
+    prior_fix_parent_lines: z.number().int().nonnegative(),
+  })
+  .strict()
+  .superRefine((analysis, context) => {
+    const bucketedLines = Object.values(analysis.age_buckets).reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    if (analysis.blamed_parent_lines > analysis.candidate_parent_lines) {
+      context.addIssue({
+        code: "custom",
+        path: ["blamed_parent_lines"],
+        message: "blamed_parent_lines must be <= candidate_parent_lines",
+      });
+    }
+    if (bucketedLines !== analysis.blamed_parent_lines) {
+      context.addIssue({
+        code: "custom",
+        path: ["age_buckets"],
+        message: "age bucket counts must sum to blamed_parent_lines",
+      });
+    }
+    if (analysis.prior_fix_parent_lines > analysis.blamed_parent_lines) {
+      context.addIssue({
+        code: "custom",
+        path: ["prior_fix_parent_lines"],
+        message: "prior_fix_parent_lines must be <= blamed_parent_lines",
+      });
+    }
+  });
+
+export const recentCommitSchema = z
+  .object({
+    commit_classification: commitClassificationSchema.optional(),
+    fix_analysis: fixAnalysisSchema.optional(),
+  })
+  .passthrough()
+  .superRefine((commit, context) => {
+    if (commit.fix_analysis && commit.commit_classification?.type !== "fix") {
+      context.addIssue({
+        code: "custom",
+        path: ["fix_analysis"],
+        message: "fix_analysis requires commit_classification.type = fix",
+      });
+    }
+  });
+export type CommitClassification = z.infer<typeof commitClassificationSchema>;
+export type FixAnalysis = z.infer<typeof fixAnalysisSchema>;
 
 export const codeMetricsSchema = z.object({
   head_sha: z.string().min(1).max(64),
@@ -205,13 +300,52 @@ export const codeMetricsSchema = z.object({
   // `test_coverage_pct` itself, whose null already means "no report" rather than a measured 0%.
   // These are `int().nonnegative()` rather than percentages because they are COUNTS — the ratio
   // is derived in lib/codebases/score.ts, where the repo-size denominator (`loc`) also lives.
-  test_coverage_lines_total: z.number().int().nonnegative().nullable().optional().default(null),
-  test_coverage_lines_covered: z.number().int().nonnegative().nullable().optional().default(null),
-  tests_total: z.number().int().nonnegative().nullable().optional().default(null),
-  tests_passed: z.number().int().nonnegative().nullable().optional().default(null),
-  tests_skipped: z.number().int().nonnegative().nullable().optional().default(null),
-  tests_failed: z.number().int().nonnegative().nullable().optional().default(null),
-  recent_commits: z.array(z.record(z.string(), z.unknown())),
+  test_coverage_lines_total: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  test_coverage_lines_covered: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  tests_total: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  tests_passed: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  tests_skipped: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  tests_failed: z
+    .number()
+    .int()
+    .nonnegative()
+    .nullable()
+    .optional()
+    .default(null),
+  // Brain API 1.23 adds optional, versioned commit observations. The surrounding commit object
+  // stays open so legacy and additive scanner fields remain compatible; the two analytical
+  // objects are deliberately closed to keep paths and source text out of the boundary.
+  recent_commits: z.array(recentCommitSchema),
   // explicit scaffolding inputs (required)
   has_claude_md: z.boolean(),
   has_agents_md: z.boolean(),
@@ -302,7 +436,10 @@ export const codebaseScanPayloadSchema = z
   })
   .superRefine((payload, context) => {
     const health = payload.metrics.codebase_health;
-    if (health?.schema_version === "2" && health.head_sha !== payload.metrics.head_sha) {
+    if (
+      health?.schema_version === "2" &&
+      health.head_sha !== payload.metrics.head_sha
+    ) {
       context.addIssue({
         code: "custom",
         path: ["metrics", "codebase_health", "head_sha"],
@@ -325,10 +462,15 @@ export const codebaseScanPayloadSchema = z
       context.addIssue({
         code: "custom",
         path: ["metrics", "test_coverage_lines_covered"],
-        message: "test_coverage_lines_covered must be <= test_coverage_lines_total",
+        message:
+          "test_coverage_lines_covered must be <= test_coverage_lines_total",
       });
     }
-    for (const key of ["tests_passed", "tests_skipped", "tests_failed"] as const) {
+    for (const key of [
+      "tests_passed",
+      "tests_skipped",
+      "tests_failed",
+    ] as const) {
       const part = m[key];
       if (part != null && m.tests_total != null && part > m.tests_total) {
         context.addIssue({
@@ -356,7 +498,8 @@ export const codebaseScanPayloadSchema = z
         context.addIssue({
           code: "custom",
           path: ["metrics", "tests_total"],
-          message: "tests_passed + tests_skipped + tests_failed must be <= tests_total",
+          message:
+            "tests_passed + tests_skipped + tests_failed must be <= tests_total",
         });
       }
     }
@@ -378,7 +521,8 @@ export const codebaseScanPayloadSchema = z
       m.test_coverage_lines_covered != null &&
       m.test_coverage_lines_total > 0
     ) {
-      const implied = (100 * m.test_coverage_lines_covered) / m.test_coverage_lines_total;
+      const implied =
+        (100 * m.test_coverage_lines_covered) / m.test_coverage_lines_total;
       if (Math.abs(implied - m.test_coverage_pct) > 1) {
         context.addIssue({
           code: "custom",
@@ -652,8 +796,14 @@ export const INTEGRATION_TYPES = [
   "typefully",
 ] as const;
 /** Provider key integration types — the LLM providers whose key the query path resolves per team. */
-export const PROVIDER_INTEGRATION_TYPES = ["openai", "anthropic", "google", "openrouter"] as const;
-export type ProviderIntegrationType = (typeof PROVIDER_INTEGRATION_TYPES)[number];
+export const PROVIDER_INTEGRATION_TYPES = [
+  "openai",
+  "anthropic",
+  "google",
+  "openrouter",
+] as const;
+export type ProviderIntegrationType =
+  (typeof PROVIDER_INTEGRATION_TYPES)[number];
 export type IntegrationType = (typeof INTEGRATION_TYPES)[number];
 export const INTEGRATION_STATUSES = ["enabled", "disabled"] as const;
 
@@ -674,9 +824,22 @@ export type EmbeddingProvider = (typeof EMBEDDING_PROVIDER_TYPES)[number];
 export const EMBEDDING_DIM = 1536;
 
 /** Curated 1536-dim models per provider (label shown in the picker). Widening this needs a re-index flow. */
-export const EMBEDDING_MODELS: Record<EmbeddingProvider, { model: string; label: string }[]> = {
-  openai: [{ model: "text-embedding-3-small", label: "text-embedding-3-small (1536d)" }],
-  openrouter: [{ model: "openai/text-embedding-3-small", label: "openai/text-embedding-3-small (1536d)" }],
+export const EMBEDDING_MODELS: Record<
+  EmbeddingProvider,
+  { model: string; label: string }[]
+> = {
+  openai: [
+    {
+      model: "text-embedding-3-small",
+      label: "text-embedding-3-small (1536d)",
+    },
+  ],
+  openrouter: [
+    {
+      model: "openai/text-embedding-3-small",
+      label: "openai/text-embedding-3-small (1536d)",
+    },
+  ],
 };
 
 /**
@@ -693,7 +856,10 @@ export function canonicalEmbeddingModel(model: string): string {
 }
 
 /** Is `model` an allowed 1536-dim model for `provider`? (Save-time corruption guard.) */
-export function isCuratedEmbeddingModel(provider: EmbeddingProvider, model: string): boolean {
+export function isCuratedEmbeddingModel(
+  provider: EmbeddingProvider,
+  model: string,
+): boolean {
   return EMBEDDING_MODELS[provider].some((m) => m.model === model);
 }
 
@@ -723,7 +889,7 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
               days: z.number().int().min(0).max(3650),
               sinceIso: z.string().datetime({ offset: true }).max(40),
             })
-            .strict()
+            .strict(),
         )
         .max(200)
         .optional(),
@@ -778,7 +944,9 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
       workspaceId: z.string().max(64).optional(),
       listIds: z.array(z.string().min(1).max(64)).max(200).default([]),
       docIds: z.array(z.string().min(1).max(64)).max(200).optional(),
-      docParentType: z.enum(["SPACE", "FOLDER", "LIST", "EVERYTHING", "WORKSPACE"]).optional(),
+      docParentType: z
+        .enum(["SPACE", "FOLDER", "LIST", "EVERYTHING", "WORKSPACE"])
+        .optional(),
       docParentId: z.string().max(64).optional(),
     })
     .strict(),
@@ -795,11 +963,17 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
   // (which model that provider's key answers with — surfaced/chosen in Admin → Integrations).
   // google stays config-less (not wired into answering yet).
   openai: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
-  anthropic: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
+  anthropic: z
+    .object({ model: z.string().min(1).max(120).optional() })
+    .strict(),
   google: z.object({}).strict(),
-  openrouter: z.object({ model: z.string().min(1).max(120).optional() }).strict(),
+  openrouter: z
+    .object({ model: z.string().min(1).max(120).optional() })
+    .strict(),
   // Typefully: the social-set id to publish into (NON-secret); the API key stays encrypted.
-  typefully: z.object({ socialSetId: z.string().min(1).max(120).optional() }).strict(),
+  typefully: z
+    .object({ socialSetId: z.string().min(1).max(120).optional() })
+    .strict(),
 };
 
 const SECRET_KEY_RE =
@@ -865,7 +1039,9 @@ export function validateIntegrationConfig(
   // a clean validation failure.
   const schema = integrationConfigSchemas[type];
   if (!schema) {
-    throw new IntegrationConfigError(`unknown or retired integration type "${type}"`);
+    throw new IntegrationConfigError(
+      `unknown or retired integration type "${type}"`,
+    );
   }
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
