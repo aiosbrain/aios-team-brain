@@ -1,27 +1,27 @@
-# A forbidden system-project grant can be REVOKED through the sanctioned path — AUDITFIX-21
+# A forbidden system-project grant has a sanctioned repair — AUDITFIX-21
 
-**Status:** spec, round 0. No code written. The REPAIR half, split out of AUDITFIX-3 at its round 2.
+**Status:** spec, round 1 folded, **reshaped**. No code written. Round 1 returned BLOCKED and its
+MEDIUM 9 offered a strictly safer design than the one I had specced; §2 takes it, and §7 records what
+that replaced.
 
-**Build with:** opus / high — a DESTRUCTIVE write on the access substrate, and it reverses a shipped,
-tested refusal.
+**Build with:** opus / high — a DESTRUCTIVE write on the access substrate.
 
-**Deps:** AUDITFIX-3 (merged) for `isSanctionedSystemEdge`; AUDITFIX-23 (merged) for the census this
-validates against. Neither is required at runtime — this is the last slice of that lane.
+**Deps:** AUDITFIX-3 (merged) for `isProtectedProject`/`isSanctionedSystemEdge`; AUDITFIX-23 (merged)
+for the census whose findings this repairs. Last slice of the lane.
 
 ---
 
 ## What and why
 
-**What:** `revokeProjectFromGroup` stops refusing on `projects.kind` and starts refusing on the
-**sanctioned pair**. A system project's three sanctioned edges stay unrevokable; an **unsanctioned**
-edge on a system project becomes revocable — and the `revoke-project` CLI verb agrees with the writer
-instead of refusing first.
+**What:** ONE new, narrowly-named writer — `revokeUnsanctionedSystemEdge` — that deletes exactly one
+edge the census would report, and a CLI verb that calls it. **`revokeProjectFromGroup` is not
+touched**: its absolute `kind='system'` refusal, its documented D2c order, and both tests that pin
+them stay exactly as they are.
 
-**Why:** AUDITFIX-3 made the forbidden edge uncreatable and AUDITFIX-23 made an existing one visible.
-Both merged with the same sentence in their PR bodies: *"you will now be told, not it is now fixable."*
-Today a detected edge is repairable only by raw SQL against `project_groups` — the exact out-of-band
-act the single-writer guard exists to make deliberate — so the operator's only sanctioned move is one
-the architecture calls a barrier.
+**Why:** AUDITFIX-3 made the forbidden edge uncreatable; AUDITFIX-23 made an existing one visible.
+Both shipped saying *"you will now be told, not it is now fixable."* Repair today is raw SQL against
+`project_groups` — the out-of-band act the single-writer guard exists to make deliberate — so the
+operator's only sanctioned move is the one the architecture calls a barrier.
 
 ## 0. Terrain, measured before designing
 
@@ -31,177 +31,233 @@ the architecture calls a barrier.
 |---|---|
 | edges on `kind='system'` projects | **3**, all sanctioned |
 | forbidden edges | **0** |
-| `access.project_revoked` audit rows, all time | **0** — the verb has never successfully run |
+| `access.project_revoked` audit rows, all time | **0** |
 | `access.project_granted` audit rows | 3, newest 2026-08-11 |
 
-**So this slice repairs nothing on this fleet**, and its revoke path has never been exercised in
-production. That is the case for building it carefully rather than the case for skipping it: the first
-real use will be an operator with a live problem, and there is no production experience to fall back on.
+⚠️ **What those zero audit rows do NOT prove** (round 1 MEDIUM 8, correcting my first draft): audit
+writes are best-effort and swallow both returned errors and exceptions (`lib/api/audit.ts:16`), and a
+successful **no-op** revoke deliberately writes no row (D3). So the honest statement is: **no
+successful deletion is evidenced by `access.project_revoked`; actual invocations, and any unaudited
+deletion, are unverified.** I had written "the verb has never successfully run."
 
-### 0b. Both layers refuse today, and the outer one refuses FIRST
+**This slice repairs nothing on this fleet.** Its value is that the first operator to find a forbidden
+edge has a sanctioned move.
 
-| layer | refusal |
-|---|---|
-| `lib/access/revoke-verb.ts:47-50` | any `kind === "system"` project, **before** the injected writer is reached |
-| `lib/access/groups.ts` (the writer) | any `kind === 'system'` project, as step (1) of the documented D2c order |
+### 0b. Why a NEW writer and not a reversal — the race that killed the first design
 
-Fixing only the writer leaves `revoke-project vendors general` **permanently blocked** — the finding
-AUDITFIX-3's round 1 made, and the reason every criterion below hits the **writer** directly while a
-separate set pins the **verb**.
+My first draft replaced `revokeProjectFromGroup`'s kind-based refusal with a pair-based one. Round 1's
+BLOCKER 1 showed that shape can **delete a sanctioned edge**, which is a substrate outage for every
+member of that team:
 
-### 0c. The two shipped tests that encode the intent this reverses
+`ensureSystemProject` reads a reserved-slug **`source`** project, censuses its grants, then CAS-flips
+it to `system` (`lib/access/bootstrap.ts:64-78`). An implementation that gates on
+`kind === 'system'` alone classifies `general@source → everyone` as *not a system project, therefore
+revocable* — and if the flip lands between that classification and the delete, the row it removes is
+the now-sanctioned `general→everyone`.
 
-- `test/admin-cli-revoke.test.ts:47-53` — *"the system-kind preflight names the substrate and never
-  reaches the writer"*, asserting `revoke` was **not** called.
-- `test/datamechanics/revoke-project.datamechanics.test.ts:154+` — the writer refuses a system project
-  **in D2c order, with the edge INTACT**, and the principal matrix at `:178-207` pins **no existence
-  oracle**: an invalid principal gets the *same* refusal whether or not the edge exists.
+The gate has to be **`isProtectedProject`**, which covers `kind='system'` **and** `kind='source'`
+holding a reserved slug — the same predicate the grant writer uses, so both sides of the edge's
+lifecycle agree. And the converse matters too: testing `isSanctionedSystemEdge` *without* a protection
+gate would make an ordinary `kind='initiative'` project named `general` unrevokable, breaking the
+legitimate creator-grant revoke that AUDITFIX-3 went out of its way to keep legal.
 
-Both get **CONVERTED, not deleted**. The first's real content is *message quality plus "the writer is
-not reached for a case the verb can decide"*; the second's is *the substrate edge survives* and *no
-oracle* — all three survive this change, applied to the sanctioned pair instead of the kind.
+### 0c. A pre-existing D3 violation this slice must not inherit
+
+`revokeProjectFromGroup` probes for the edge, deletes **without `RETURNING`**, then audits and reports
+`revoked:true` unconditionally (`lib/access/groups.ts:805-825`). If a concurrent revoke removes the row
+between probe and delete, **this call deleted nothing and audits success** — which contradicts D3 (*"no-op
+revokes do NOT audit"*). The adapter supports `RETURNING` on a delete
+(`lib/db/pg/query-builder.ts:416-420`), so the new writer uses it from the start.
+
+⚠️ **The existing writer's copy of that bug is NOT fixed here** — it is a separate defect on a
+function this slice deliberately does not touch, and widening is what round 2 blocked twice on the
+previous slices. **AUDITFIX-26** carries it.
+
+### 0d. What the shipped tests actually pin
+
+Round 1's HIGH 6 corrected my §0c: `test/datamechanics/revoke-project.datamechanics.test.ts`'s **system-project arm uses
+only a valid admin** (`:162`), and the principal matrix plus the present/absent oracle comparison run
+against a **separate initiative project** (`:172`, `:197`). So the suite does *not* today pin
+"system refusal before principal" or a sanctioned-pair oracle.
+
+**Because this slice adds a writer instead of changing one, both shipped tests keep passing unmodified
+— no conversion, no reversal, no re-derived D2c order.** That is the single biggest thing the reshape
+buys.
 
 ## 1. The rule
 
-> **A SANCTIONED edge is unrevokable through the writer, whatever the principal. An UNSANCTIONED edge
-> on a system project is revocable by an authorized principal, audited. Neither layer may become an
-> edge-existence oracle, and an undetermined identity read refuses.**
+> **`revokeUnsanctionedSystemEdge` deletes exactly one edge, and only if — at the moment of the
+> delete — the project is protected, the pair is unsanctioned, and the caller is an active admin. It
+> audits only a row it actually removed. Every other revoke path is unchanged.**
 
 ## 2. The design
 
-### 2a. The writer's refusal becomes pair-based — and the D2c order has to be re-derived
+### 2a. One narrow writer, authority first, identity revalidated at the delete
 
-The current order is `(1) project resolution + kind refusal → (2) principal validation → (3) existence
-probe → (4) delete + audit`, and step (3) sits after (2) precisely so `{revoked:false}` is reachable
-only by an authorized principal — an unordered writer *"turns invalid principals into an
-edge-existence oracle"* (`lib/access/groups.ts`, the D2c contract).
+Signature (in `lib/access/groups.ts`, the single-writer file):
 
-Deciding whether a pair is sanctioned needs the **group's** identity too, which the current order never
-reads. **That makes the documented order obsolete, and the replacement is a real fork:**
+```
+revokeUnsanctionedSystemEdge(db, teamId, { projectId, groupId }, actor: RevokeActor)
+```
 
-| option | order | what it costs |
-|---|---|---|
-| **A** | resolve project **and group** identity → refuse a sanctioned pair → principal → probe → delete | an unauthorized principal can learn whether a GROUP exists ("no group for team"), which today it cannot |
-| **B** | principal validation → resolve identity → refuse a sanctioned pair → probe → delete | the substrate refusal becomes conditional on authorization, so an unauthorized operator gets "principal rejected" where today it gets the substrate sentence |
+Order, and each step is a refusal that leaves the edge intact:
 
-**Recommendation: B.** The D2c contract exists to stop an unauthorized principal learning ANYTHING it
-could not learn otherwise, and A adds a new leak in the same family it was written to close. B leaks
-strictly less. The cost is only message ORDERING for a caller who was going to be refused either way,
-and the substrate is still absolutely unrevokable — a sanctioned pair is refused for every principal
-that gets that far. ⚠️ **This reverses the documented "(1) … kind refusal" position deliberately**, so
-the spec states it as the decision it is, and §4 pins the resulting order.
+1. **Authority.** The same `activeAdminError` predicate the existing writer uses — role AND status AND
+   posture. Nothing is read about the edge before this, so no unauthorized caller learns anything.
+   *(Round 1 MEDIUM 7 narrowed my rationale: D2c's contract is specifically that an invalid principal
+   must not learn EDGE EXISTENCE, not "anything at all". The guarantee this order buys is the plain
+   one — **no delete can occur before authorization** — and an invalid principal gets a principal
+   rejection rather than an observable sanctioned-pair refusal.)*
+2. **Identity, fail closed.** Read the project (`kind, slug`) and group (`slug, is_builtin`). A read
+   ERROR refuses with an **attributed** message, distinguishable from not-found — round 1's HIGH 3:
+   a swallowed error yields `null`, takes the not-found branch, and produces an identical
+   `ok:false`/edge-survives observable, so the mutation could not redden.
+3. **Classify.** Refuse unless `isProtectedProject(project) && !isSanctionedSystemEdge(project.slug,
+   group)`. Protected-and-sanctioned is the substrate: refused. Not protected at all: refused too —
+   this writer is *only* for the forbidden-system-edge case, and an ordinary project's revoke keeps
+   going through `revokeProjectFromGroup` unchanged.
+4. **Delete with `RETURNING`,** scoped to `(team_id, project_id, group_id)`.
+5. **Audit only if a row came back** — `access.project_revoked`, operator actor audits as `system`
+   with `meta.authorizedByMemberId`, never in the actor field or `added_by`. No row returned ⇒
+   `{ok:true, revoked:false}` and **no audit**, which is D3.
 
-**Fail closed:** an undetermined project OR group read refuses the revoke — never "not sanctioned,
-proceed". A missing project or group is a refusal, not a deletion.
+**The race is closed by construction:** classification reads and the delete are the same statement's
+neighbours, and the delete is keyed on the ids — but the *decision* is re-made from the project's
+CURRENT kind. A flip landing before step 2 makes the row protected-and-sanctioned and it is refused; a
+flip landing after step 4 cannot un-delete a row that was unsanctioned when read. What is NOT claimed:
+serializability. If identity could change between step 3 and step 4, the classification could be
+stale — so §4 pins the interleaving that matters (`source → system` mid-call) rather than asserting it
+away.
 
-**Unsanctioned system edges become deletable, and that IS the point** — but nothing else changes: the
-sanctioned three are refused for every principal, and a non-system project behaves exactly as today.
+### 2b. A NEW CLI verb, so `revoke-project` keeps its meaning
 
-### 2b. The verb agrees with the writer instead of refusing first
+`repair-system-edge <group-slug> <project-slug> --actor <admin-email>` — a separate command whose name
+says what it does. `revoke-project` continues to refuse system projects with the same sentence it
+prints today.
 
-`runRevokeProjectVerb`'s preflight is documented as *"message quality only — the writer refuses
-independently"*. It currently refuses on `kind === "system"`, which is now WRONG for an unsanctioned
-edge. It must classify by the **same sanctioned-pair predicate**, which means its `RevokeVerbDeps` need
-the group's identity, not just its id: `resolveGroupId` becomes `resolveGroup` returning
-`{ id, slug, is_builtin }`.
-
-**One predicate, both layers** — the AUDITFIX-23 lesson applied in advance: the verb and the writer must
-not carry two copies of the sanctioned decision, and a structural guard asserts it.
-
-### 2c. What this slice must NOT become
-
-- **No automatic repair.** The census reports; the operator revokes. A fail-open destructive sweep is
-  worse than a reported hole — inherited from AUDITFIX-3 §3 and unchanged.
-- **No new authority.** The revoke still requires a named ACTIVE ADMIN authorizer, still audits as
-  `system` with `meta.authorizedByMemberId`, and still never writes the authorizer into the actor field
-  or `added_by`.
+⚠️ **The wiring itself must be pinned, not just the pure layer** (round 1 BLOCKER 2). The existing
+verb's dependency resolution is inline in `scripts/admin.ts` and today selects only `id`, swallowing
+its error (`:341-343`). A type-correct `resolveGroup: async () => null` would satisfy every behavioural
+criterion while leaving the command permanently broken. So the resolution moves into an **import-safe
+factory** that §4 tests with the real dependency shape.
 
 ## 3. Scope
 
-**In:** `lib/access/groups.ts` (the writer's refusal + the new order) · `lib/access/revoke-verb.ts`
-(the preflight + `RevokeVerbDeps`) · `scripts/admin.ts` (the verb's wiring for the richer group
-resolution) · the two converted tests · a structural guard · `docs/ARCHITECTURE.md`.
+**In:** `lib/access/groups.ts` (the new writer) · a new verb module + its import-safe wiring factory ·
+`scripts/admin.ts` (the command) · a structural guard · `docs/ARCHITECTURE.md`.
 
 **Out:**
-- **Automatic deletion of a detected edge** — §2c.
-- **A UI for revoke** — the CLI is the sanctioned surface; unchanged.
-- **The evidence channel** (AUDITFIX-25) and **the staleness beat** (AUDITFIX-24).
+- **`revokeProjectFromGroup`** — untouched, including its D2c order and its `kind='system'` refusal.
+- **The probe/delete/audit race in that existing writer** — **AUDITFIX-26** (§0c).
+- **Any automatic repair.** The census reports; a human runs the command. A fail-open destructive
+  sweep is worse than a reported hole (inherited from AUDITFIX-3 §3).
+- **A UI.** The CLI is the sanctioned surface.
 
 ## 4. Acceptance
 
-⚠️ **Every criterion hits the WRITER directly unless it names the verb**, because the writer owns the
-invariant and the verb takes an *injected* revoke — an implementation can make the verb behave while the
-writer deletes a sanctioned edge. And every fixture precondition is asserted; across this lane, ten
-criteria have shipped green while testing nothing.
+⚠️ Every criterion hits the **writer** unless it names the verb. Every fixture precondition is
+asserted. Across this lane, ten criteria shipped green while testing nothing.
 
-- **AC1 — an UNSANCTIONED edge on a system project is REVOCABLE at the writer (dm):** planted
-  `general→vendors`; an authorized admin revokes it, `revoked:true`, the row is gone, and an
-  `access.project_revoked` audit row exists naming the authorizer in meta.
-- **AC2 — ALL THREE sanctioned edges are REFUSED at the writer (dm):** `general→everyone`,
-  `external-shared→everyone`, `external-shared→external`, each with a valid admin; each edge SURVIVES.
-  *AUDITFIX-3 round 1's blocker: exercising the verb only lets the writer protect the one shipped case
-  and delete the other two.*
-- **AC3 — a sanctioned edge is refused for EVERY principal shape (dm):** member-actor and
-  operator-actor, admin and non-admin; the edge survives each.
-- **AC4 — a NON-system project is unaffected (dm):** revoke behaves exactly as before.
-- **AC5 — NO EXISTENCE ORACLE survives the reorder (dm):** an invalid principal gets the SAME refusal
-  against a present edge and an absent one, on a non-system project. *The tested contract at
-  `revoke-project.datamechanics.test.ts:178-207`, re-pinned against the new order.*
-- **AC6 — and no oracle for the SANCTIONED case either (dm):** an invalid principal gets the same
-  refusal whether the sanctioned edge is present or absent.
-- **AC7 — the NEW D2c order is pinned (dm):** with an invalid principal AND an unsanctioned system
-  edge present, the refusal names the PRINCIPAL, not the substrate — proving principal validation
-  precedes the pair test (option B). *If the team takes option A instead, this criterion inverts and
-  the spec must say so.*
-- **AC8 — an undetermined GROUP read refuses (dm):** with the group read faulted, `ok:false`, no
-  delete, and the edge survives.
-- **AC9 — an undetermined PROJECT read refuses (dm):** same.
-- **AC10 — the VERB reaches the writer for an unsanctioned edge (unit):** `revoke-project vendors
-  general` calls the injected revoke exactly once with the resolved ids. *Converted from
-  `admin-cli-revoke.test.ts:47` — the preflight must no longer refuse it.*
-- **AC11 — the VERB still refuses all three sanctioned pairs BEFORE the writer (unit):** `revoke` not
-  called, and the message still names the substrate. *The other half of the converted test — message
-  quality was its real content.*
-- **AC12 — verb and writer AGREE (unit + dm):** for each of the three sanctioned pairs and for one
-  unsanctioned edge, the verb's decision and the writer's decision match. *An implementation can fix
-  one layer and leave the other inverted.*
-- **AC13 — one predicate, both layers (unit, structural):** neither `lib/access/revoke-verb.ts` nor the verb's
-  wiring reimplements the sanctioned decision; both consume `isSanctionedSystemEdge`.
-- **AC14 — the converted dm test keeps its other contracts (dm):** the principal matrix, the D3
-  no-audit-on-no-op rule, and the grant-meta laundering assertions at
-  `revoke-project.datamechanics.test.ts:178-230` all still pass.
+- **AC1 — an unsanctioned edge on a `kind='system'` project is revoked (dm):** `general→vendors`;
+  `revoked:true`, the row is gone, one `access.project_revoked` audit row names the authorizer in meta.
+- **AC2 — ALL THREE sanctioned pairs are REFUSED, for BOTH actor kinds (dm):** `general→everyone`,
+  `external-shared→everyone`, `external-shared→external` × `{member, operator}` actors, each with a
+  VALID admin; each edge survives. ⚠️ *Round 1 HIGH 4: "a sanctioned edge across actor shapes" is not
+  the same matrix — a writer can refuse all three for operator actors and protect only
+  `general→everyone` for member actors, and both my old criteria passed while an authorized member
+  deleted either `external-shared` edge.*
+- **AC3 — a SQUATTER group carrying a sanctioned slug does not inherit the exemption (dm):** an
+  ordinary (`is_builtin:false`) group slugged `everyone`, granted `general`; the edge IS revocable.
+  ⚠️ *Round 1 HIGH 3: every AC2 group is a real builtin, so dropping the `is_builtin` conjunct changes
+  nothing there and its mutation could not redden.*
+- **AC4 — a reserved-slug `kind='source'` project is PROTECTED (dm):** `general@source→everyone` is
+  refused. *§0b — the gate is `isProtectedProject`, not `kind==='system'`.*
+- **AC5 — and its unsanctioned edge is still revocable (dm):** `general@source→vendors` is revoked.
+- **AC6 — a reserved-slug `kind='initiative'` is NOT protected (dm):** its creator grant is revocable
+  through this writer's refusal path — i.e. the writer refuses it as *not its case*, and
+  `revokeProjectFromGroup` still handles it. *§0b's converse: gating on the pair alone would make a
+  legitimate initiative unrevokable.*
+- **AC7 — the `source → system` FLIP mid-call cannot delete a sanctioned edge (dm):** with the flip
+  interleaved between the identity read and the delete, `general→everyone` **survives**. ⚠️ *Round 1
+  BLOCKER 1 — the whole reason this is a new writer.*
+- **AC8 — an undetermined GROUP read refuses, ATTRIBUTED (dm):** the error names a read failure,
+  distinguishable from "group not found"; no delete; edge survives.
+- **AC9 — an undetermined PROJECT read refuses, ATTRIBUTED (dm):** same.
+- **AC10 — an unauthorized principal is refused BEFORE anything is read about the edge (dm):**
+  non-admin, inactive, external-posture and unknown principals each get a principal rejection, the
+  edge survives, and no audit row is written.
+- **AC11 — no edge-existence oracle (dm):** an invalid principal gets the SAME refusal whether the
+  edge exists or not.
+- **AC12 — a no-op revoke does NOT audit (dm):** an authorized admin against an absent (but otherwise
+  valid, unsanctioned) pair gets `{ok:true, revoked:false}` and **zero** new audit rows. *D3.*
+- **AC13 — a concurrent delete between read and delete does not audit a phantom (dm):** with the row
+  removed after classification, the call reports `revoked:false` and writes no audit row. *§0c — this
+  is what `RETURNING` buys, and the existing writer's copy of the bug is AUDITFIX-26.*
+- **AC14 — the VERB reaches the writer for an unsanctioned edge (unit):** `repair-system-edge` calls
+  the injected writer once with the resolved ids.
+- **AC15 — the VERB's REAL wiring resolves the identity it needs (unit):** the import-safe factory,
+  driven by a fake db, returns a group carrying `id`, `slug` and `is_builtin` and a project carrying
+  `kind` and `slug`, and surfaces a read error rather than `null`. ⚠️ *Round 1 BLOCKER 2 — a
+  type-correct `resolveGroup: async () => null` passes every behavioural criterion while the command
+  stays permanently broken.*
+- **AC16 — `revoke-project` is UNCHANGED (unit + dm):** it still refuses `kind='system'` before the
+  writer, with the same message, and `revokeProjectFromGroup` still refuses every system edge. *The
+  shipped tests are the criterion; they must pass unmodified.*
 
 **Mutation coverage, one per enforcement point, each reddening ITS OWN criterion:**
 
 | # | mutation | must redden |
 |---|---|---|
-| 1 | refuse on `kind === 'system'` again (the pre-slice shape) | AC1 |
-| 2 | allow ALL system edges (drop the sanctioned test) | AC2 |
-| 3 | protect only `general→everyone` (the already-shipped case) | AC2 |
-| 4 | drop the `is_builtin` conjunct from the pair test | AC2 |
-| 5 | move the pair test BEFORE principal validation | AC7 |
-| 6 | move the existence probe BEFORE principal validation | AC5 |
-| 7 | swallow the group read error | AC8 |
-| 8 | swallow the project read error | AC9 |
-| 9 | leave the verb's `kind === 'system'` preflight in place | AC10 |
-| 10 | make the verb refuse NOTHING (drop its preflight entirely) | AC11 |
-| 11 | reimplement the pair decision in the verb | AC13 |
+| 1 | gate on `kind === 'system'` instead of `isProtectedProject` | AC4 |
+| 2 | drop the protection gate (classify by pair alone) | AC6 |
+| 3 | drop the sanctioned test entirely | AC2 |
+| 4 | protect only `general→everyone` | AC2 |
+| 5 | protect only for operator actors | AC2 |
+| 6 | drop the `is_builtin` conjunct | AC3 |
+| 7 | re-read identity BEFORE authority | AC10 |
+| 8 | swallow the group read error into not-found | AC8 |
+| 9 | swallow the project read error into not-found | AC9 |
+| 10 | delete without `RETURNING` and audit unconditionally | AC13 |
+| 11 | audit on a no-op | AC12 |
+| 12 | classify once, before the authority check, and reuse it | AC7 |
+| 13 | have the wiring factory select only `id` | AC15 |
+| 14 | make `revoke-project` route to the new writer | AC16 |
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
-| A sanctioned edge becomes deletable | **a substrate outage — every member of that team goes blind** | AC2 + AC3 at the WRITER; mutations 2, 3, 4 |
-| The reorder creates an existence oracle | information leak, and a tested contract broken | AC5 + AC6; mutations 5, 6 |
-| The verb and the writer disagree | the operator command stays blocked, or refuses what the writer allows | AC12, mutations 9, 10 |
-| An undetermined read deletes | a destructive fail-open | AC8 + AC9; mutations 7, 8 |
-| The converted tests lose what they protected | a silent hole where a green test used to be | AC14 names the surviving assertions |
-| Option B's reordering surprises an operator | a different refusal message than before | §2a states it as a decision; AC7 pins it |
+| A sanctioned edge is deleted | **substrate outage — every member of that team goes blind** | AC2 (3 pairs × 2 actor kinds), AC4, AC7; mutations 1-5, 12 |
+| The adoption flip races the delete | the same outage, intermittently | AC7, mutation 12 |
+| A legitimate initiative becomes unrevokable | a creator stranded, reversing AUDITFIX-3's ruling | AC6, mutation 2 |
+| An undetermined read deletes | destructive fail-open | AC8/AC9 with ATTRIBUTED errors; mutations 8, 9 |
+| A phantom audit claims a deletion that did not happen | the trail lies | AC12/AC13; mutations 10, 11 |
+| The command is wired to nothing | ships broken, every test green | AC15, mutation 13 |
+| `revoke-project`'s meaning drifts | a shipped contract reversed by accident | AC16, mutation 14 |
 
 ## 6. What this slice does NOT prove
 
-It does not repair anything automatically, and it gives the census no new authority. On this fleet it
-changes nothing observable (§0a: zero forbidden edges) — its value is that the first operator to find
-one has a sanctioned move.
+Nothing is repaired automatically, and the census gains no authority. On this fleet it changes nothing
+observable (§0a: zero forbidden edges). It also does not fix the existing writer's phantom-audit race
+(§0c, AUDITFIX-26).
+
+## 7. Round 1 — BLOCKED, and it replaced my design with a smaller one
+
+| # | finding | re-derived | outcome |
+|---|---|---|---|
+| **B1** | the pair-based reversal can DELETE A SANCTIONED EDGE: gate on `kind==='system'` alone and the `source→system` CAS flip lands between classification and delete | **CONFIRMED** (`lib/access/bootstrap.ts:64-78`) | **RESHAPED** — `isProtectedProject` is the gate, and §2a/AC7 pin the interleaving |
+| **B2** | nothing proved the REAL CLI wiring works — it selects only `id` and swallows its error, so `resolveGroup: async () => null` passes everything | **CONFIRMED** (`scripts/admin.ts:341-343`) | **ADOPTED** — an import-safe factory, **AC15**, mutation 13 |
+| **H3** | three mutations could not redden: `is_builtin` (every fixture was a real builtin) and the two swallowed-read ones (identical observable) | **CONFIRMED** | **ADOPTED** — **AC3**'s squatter, and ATTRIBUTED errors in AC8/AC9 |
+| **H4** | AC3 was not the Cartesian matrix its wording implied | **CONFIRMED** | **ADOPTED** — **AC2** is 3 pairs × 2 actor kinds |
+| **H5** | the EXISTING writer probes, deletes without `RETURNING`, then audits unconditionally — a phantom audit under a concurrent delete, contradicting D3 | **CONFIRMED** (`lib/access/groups.ts:805-825`) | **ADOPTED for the new writer** (AC13); the existing one is **AUDITFIX-26**, not widened into here |
+| **H6** | §0c overstated the shipped dm test: its system arm uses only a valid admin, and the matrix runs on a separate initiative project | **CONFIRMED** | **ADOPTED** — §0d, and the reshape means those tests need no conversion at all |
+| **M7** | Option B is right but my rationale was too broad; D2c is about EDGE existence specifically | **CONFIRMED** | **ADOPTED** — §2a states the guarantee as "no delete before authorization" |
+| **M8** | zero audit rows do not prove the verb never ran — audit is best-effort and a no-op writes none | **CONFIRMED** (`lib/api/audit.ts:16`) | **ADOPTED** — §0a restated |
+| **M9** | the safer scope is a dedicated `revokeUnsanctionedSystemEdge`, not a general reversal | **CONFIRMED and ADOPTED WHOLESALE** | this document |
+
+⚠️ **What the reshape bought, stated plainly:** the first design **reversed a deliberate, tested
+decision** — the writer's absolute system refusal — and needed two shipped tests converted and the
+documented D2c order re-derived. This one adds a writer and touches neither. When a review offers a
+design that removes a reversal, that is worth more than the criteria it also fixes.
 
 **Nothing is built. No code exists for this slice.**
