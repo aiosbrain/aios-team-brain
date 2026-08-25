@@ -105,7 +105,14 @@ export type LlmFailureReason =
   | "network" // the connection failed before any response
   | "no_usage" // a response arrived carrying no `usage` block, so there was nothing to meter
   | "empty_content" // 2xx with usage but no text (the reasoning-model starvation signature)
-  | `http_${number}`; // provider answered non-2xx with nothing meterable
+  | `http_${number}` // provider answered non-2xx with nothing meterable
+  // LLMCREDIT-2: a 402 has TWO causes with OPPOSITE remedies, and recording both as `http_402` meant
+  // nothing in the database could tell them apart — the only reason the second one was diagnosable at
+  // all is that a human pasted the banner text into a chat. `openrouter_credits` says this request is
+  // too big (step the token ladder down); `in_flight_budget_exhausted` says the OTHER requests in
+  // flight are (wait and re-send the same one). The distinct reason is what makes the difference
+  // legible in `llm_failures` without re-reading a provider body.
+  | "http_402_in_flight";
 
 export interface LlmFailureRecord {
   teamId: string;

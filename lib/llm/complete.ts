@@ -1,7 +1,7 @@
 import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
-import { looksLikeBudgetRefusal, looksLikeSizeRefusal } from "@/lib/query/claude";
+import { looksLikeBudgetRefusal, looksLikeInFlightRefusal, looksLikeSizeRefusal } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
 import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
@@ -294,6 +294,36 @@ export async function recordLlmOutcome(
  * when the answer is "top up the account". Misattributing the reason is the thing that column exists
  * to prevent.
  */
+/** Extra attempts for an IN-FLIGHT refusal (LLMCREDIT-2) — bounded, and the caller's `timeoutMs` still
+ *  governs the whole call, so a wedged provider cannot stall a rebuild. */
+export const IN_FLIGHT_RETRIES = 2;
+const IN_FLIGHT_BASE_MS = 1_200;
+/** No provider gets to park a background rebuild for longer than this, whatever its header says. */
+export const IN_FLIGHT_MAX_WAIT_MS = 8_000;
+
+/**
+ * How long to wait before re-sending a request the provider refused for IN-FLIGHT budget.
+ *
+ * `Retry-After` when the header is present and sane (seconds, per RFC 9110), otherwise exponential
+ * backoff. ⚠️ JITTER IS PART OF THE DESIGN, not a flourish: the refusals arrive because SIX siblings
+ * were in flight together, so a fixed delay would release all six at the same instant and reproduce
+ * the collision that caused them. `rand` is injected so the criterion is deterministic.
+ *
+ * The header is CLAMPED. An absent, negative, non-numeric or absurd value falls back to the computed
+ * backoff — a provider should not be able to stall a background rebuild for as long as it likes.
+ */
+export function inFlightWaitMs(retryAfter: string | null, attempt: number, rand: () => number = Math.random): number {
+  const header = Number(retryAfter);
+  if (retryAfter !== null && Number.isFinite(header) && header > 0) {
+    const ms = header * 1000;
+    if (ms <= IN_FLIGHT_MAX_WAIT_MS) return ms;
+  }
+  const base = Math.min(IN_FLIGHT_BASE_MS * 2 ** attempt, IN_FLIGHT_MAX_WAIT_MS);
+  return Math.round(base * (0.5 + rand() * 0.5)); // 50-100% of the base — spreads the burst
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 class LlmHttpError extends Error {
   constructor(readonly status: number, message: string) {
     super(message);
@@ -382,9 +412,43 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         maxTokens + REASONING_HEADROOM_TOKENS, // the budget prod ran on for months — known-accepted
         maxTokens,
       ])].sort((a, b) => b - a);
-      let res = await doPost(rungs[0]);
+      /**
+       * One rung, with the IN-FLIGHT refusal waited out in place (LLMCREDIT-2).
+       *
+       * Returns the body alongside the response because a `Response` body can only be read once and
+       * this has to classify it before deciding. Reading it here — rather than cloning — keeps the
+       * single-read contract obvious at the call sites below.
+       *
+       * ⚠️ THE SAME RUNG, deliberately. A smaller request does not help when the refusal is about the
+       * OTHER requests in flight; that is the difference between this and the size ladder underneath.
+       */
+      const postRung = async (mt: number): Promise<{ res: Response; errBody: string }> => {
+        let r = await doPost(mt);
+        for (let attempt = 0; attempt < IN_FLIGHT_RETRIES && !r.ok; attempt++) {
+          const body = await r.text().catch(() => "");
+          if (!looksLikeInFlightRefusal(r.status, body)) return { res: r, errBody: body };
+          // Filed even when the retry then succeeds — same reason as the budget refusal below: a
+          // throttle we recover from silently is how a depleted balance stays invisible.
+          if (opts.meter) {
+            await recordLlmFailure(opts.meter.db, {
+              teamId: opts.meter.teamId,
+              memberId: opts.meter.memberId ?? null,
+              source: opts.meter.source,
+              provider: backend.provider,
+              model: backend.model,
+              reason: "http_402_in_flight",
+              durationMs: Date.now() - startedAt,
+            }).catch(() => {});
+          }
+          await sleep(inFlightWaitMs(r.headers?.get?.("retry-after") ?? null, attempt));
+          r = await doPost(mt);
+        }
+        return { res: r, errBody: r.ok ? "" : await r.text().catch(() => "") };
+      };
+
+      let { res, errBody: bodyOfLastRefusal } = await postRung(rungs[0]);
       for (let i = 1; i < rungs.length && !res.ok; i++) {
-        const errBody = await res.text().catch(() => "");
+        const errBody = bodyOfLastRefusal;
         // Only a SIZE refusal is worth retrying smaller; anything else is a real error and must
         // surface immediately rather than being re-sent two more times.
         //
@@ -412,10 +476,10 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
             durationMs: Date.now() - startedAt,
           }).catch(() => {});
         }
-        res = await doPost(rungs[i]);
+        ({ res, errBody: bodyOfLastRefusal } = await postRung(rungs[i]));
       }
       if (!res.ok) {
-        throw httpError(backend, res.status, await res.text().catch(() => ""));
+        throw httpError(backend, res.status, bodyOfLastRefusal);
       }
       const j = (await res.json()) as {
         choices?: { message?: { content?: string }; finish_reason?: string }[];
