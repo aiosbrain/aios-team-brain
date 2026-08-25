@@ -260,6 +260,13 @@ describe("linearStatus — 'In Review' (brain-api v1.21)", () => {
     expect(linearStatus("Peer Feedback", "wat")).toBe("backlog");
   });
 
+  it("never resolves a Linear state type through Object.prototype", () => {
+    for (const hostile of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf"]) {
+      expect(linearStatus("Marinating", hostile)).toBe("backlog");
+      expect(linearStatusOrNull("Marinating", hostile)).toBeNull();
+    }
+  });
+
   it("still lets a state literally named like another brain status win over its type", () => {
     expect(linearStatus("Blocked", "started")).toBe("blocked");
     expect(linearStatus("Done", "started")).toBe("done");
