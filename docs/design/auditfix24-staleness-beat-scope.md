@@ -329,6 +329,9 @@ constructed. *(Both reviewers verified nothing else that test pins is lost.)*
 | 15 | keep `resolveBeatClock` correct but bypass it in `getPipelineHealth` when the beat read fails | **AC6b** |
 | 16 | write the `access_bootstrap_all` heartbeat only when the fleet pass succeeds | AC10 |
 | 17 | write the heartbeat under source `access_bootstrap` instead of `access_bootstrap_all` | AC11 (AUDITFIX-22's AC4) |
+| 18 | write a team-beat scheduler site as `teamId: t.id ?? null` — the reviewer's own bypass | **AC7 cross-check** (ambiguity is refused, not guessed) |
+| 19 | give a scheduler site a non-literal `trigger` | AC7's unresolved accounting |
+| 20 | mirror the fleet failure onto the heartbeat | **AC10c** (one failure, one broken leg) |
 
 ⚠️ **Mutations 4, 8, 12, 13, 14 and 15 all exist because writing this table found the criteria
 missing.** Mutation 4 was the round-0 catch (AC1 cannot see it). Mutation 8 is a real future edit that
@@ -340,6 +343,37 @@ that ignores it.
 shipped code: **AC1, AC1b, AC2b, the AC13 flip**, and **AC10/AC12** (the heartbeat does not exist).
 **AC2, AC4, AC5's B-side and AC6 are GREEN pre-fix** — they are regression pins and mutation-killers,
 which is legitimate, but they are not evidence the fix does anything (Fable, round 2).
+
+## 4b. The diff round — both models, and they split again
+
+**Fable: CLEAR-WITH-CONDITIONS. Codex: BLOCKED.** Every condition is folded.
+
+| finding | who | outcome |
+|---|---|---|
+| The guard GUESSES: `passesTeamId` treated everything except the literal `null` as team-scoped, so `teamId: undefined` and `teamId: x ?? null` read team-scoped while the writer persists NULL. And `trigger:` matched only an exact single-line literal, so a constant-trigger site left `schedulerSites` silently | Codex (HIGH), Fable (LOW, same residual) | **FOLDED** — the partition is TRI-STATE now (`team`/`global`/`ambiguous`) and ambiguity FAILS rather than resolving to the convenient answer; a non-literal trigger goes to `unresolved`. Mutations 18 and 19. The claim in §2a is narrowed to what a text scan can attribute |
+| A commented-out `recordIngestRun(...)` was parsed as a live wrapper site, so a deleted real call could leave its exemption apparently occupied | Codex (HIGH) | **FOLDED** — comments are stripped before scanning. Verified after: all five `WRAPPER_RUN_SITES` files still hold a REAL site, so no entry went stale |
+| The heartbeat DOUBLE-COUNTS: on a fleet failure it and `access_bootstrap` both confirm, so one failed teams-read reads as "2 ingestion legs are broken" — the exact class that put `llm` in `NOT_PIPELINE_LEGS` | Codex (MEDIUM) | **FOLDED** — the heartbeat asserts LIVENESS (`ok: true`, outcome in `meta.fleetOk`); the failure stays on `access_bootstrap`, where AUDITFIX-22's AC5 reads it. New AC10c pins the whole `failing` SET, which no criterion did |
+| The surviving `distinct on (source)` mutant marks a real hole: no criterion has a GLOBAL-scope leg with rows in BOTH partitions | Fable (MEDIUM) | **FOLDED** — AC4b, and the mutant now reddens AC4b and only AC4b |
+| **The false sentence had FOUR live copies.** I corrected the one the spec cited and never grepped for the rest — two more in the module I was editing (`pipeline-health.ts:129`, `:304`) and, found by the grep the review prompted, a third in `failure-streak.ts:83` that had already been corrected once and left a different false clause standing | Fable (MEDIUM ×2) | **FOLDED** — all four, plus `ARCHITECTURE.md:96`, which still recorded the fossil as an accepted cost and cited a criterion this diff inverts |
+| Red-first accounting omits AC6b, and it is red for an INCIDENTAL reason (its fault keys on `is_global`, absent pre-fix) | Fable (LOW) | **FOLDED** — the dm header says so |
+| `heartbeatRows` sliced an unordered select | Fable (LOW) | **FOLDED** — ordered by `id` |
+
+**Verified clean by both:** the SQL is newest-per-partition with no planner surprise; `is_global`
+arrives as a JS boolean (the pool overrides only date OIDs); the two `undefined`s stay distinct
+through the call site; the heartbeat cannot double-write (`recordIngestRun` never throws, so the catch
+path is reachable only before the success-path write); AUDITFIX-22's AC4/AC5 and the converted AC13
+are intact; `withFailingBeatRead` really intercepts, and `is_global` selects only the beat query.
+
+**Both models also confirmed my two mutation MISFIRE diagnoses** — `distinct on (source)` alone
+degrades to "prefer the team partition" because the ORDER BY still leads on the boolean, and dropping
+`team_id = $1` left `$1` unbound so the injected fault was "every beat read errors", not "reads any
+team's row".
+
+⚠️ **RESIDUAL, stated rather than implied away:** a scheduler call site built through a WRAPPER
+(`lib/graph/scheduler.ts` is one, for `graph_project`'s success path) escapes the cross-check
+entirely — `WRAPPER_RUN_SITES` documents what each writes, and that prose is not enforced. All five
+reasons were verified TRUE against their code during this round; nothing pins them. An AST-based scan
+would close it and is not in this slice.
 
 ## 5. Risks
 

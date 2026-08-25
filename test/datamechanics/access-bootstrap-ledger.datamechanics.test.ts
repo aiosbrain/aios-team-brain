@@ -33,13 +33,21 @@ async function bareTeam(): Promise<string> {
 }
 
 /** Rows for the AUDITFIX-24 fleet-liveness beat — a DIFFERENT source, which is what makes it safe. */
-async function heartbeatRows(): Promise<{ ok: boolean; trigger: string; team_id: string | null }[]> {
+async function heartbeatRows(): Promise<{ ok: boolean; trigger: string; team_id: string | null; meta: unknown }[]> {
+  // ORDERED, because a criterion below slices "the rows this tick added" off the end and an
+  // unordered select makes that assumption a flake surface rather than a fact (diff review).
   const { data } = await db()
     .from("ingest_runs")
-    .select("ok, trigger, team_id")
+    .select("id, ok, trigger, team_id, meta")
     .eq("source", "access_bootstrap_all")
-    .is("team_id", null);
-  return (data ?? []) as { ok: boolean; trigger: string; team_id: string | null }[];
+    .is("team_id", null)
+    .order("id", { ascending: true });
+  return (data ?? []) as { ok: boolean; trigger: string; team_id: string | null; meta: unknown }[];
+}
+
+/** `meta` arrives as jsonb — a string under some adapter paths, an object under others. */
+function metaOf(row: { meta: unknown }): Record<string, unknown> {
+  return typeof row.meta === "string" ? JSON.parse(row.meta) : ((row.meta ?? {}) as Record<string, unknown>);
 }
 
 /** The reserved-slug initiative that wedges bootstrap — the pre-existing shipped wedge. */
@@ -420,7 +428,26 @@ describe("AUDITFIX-22: a per-team access failure is loud on that team's card", (
 
     const rows = (await heartbeatRows()).slice(before);
     expect(rows.length, "the poller reached this stage — that is the whole claim the beat makes").toBe(1);
-    expect(rows[0].ok, "a fleet-level failure IS the fleet's").toBe(false);
+    // ⚠️ `ok: true` on a FAILED fleet pass, deliberately: this row asserts LIVENESS, and the failure
+    // is carried by the `access_bootstrap` row. Asserting `false` here is what a diff review caught —
+    // it makes one failed teams-read confirm on two sources and the banner say "2 legs are broken".
+    expect(rows[0].ok, "the beat reports that the poller RAN, not that the fleet was healthy").toBe(true);
+    expect(metaOf(rows[0]).fleetOk, "and the outcome is still recorded, where it is not counted twice").toBe(false);
+  });
+
+  it("AUDITFIX-24 AC10c: ONE failed fleet pass is ONE broken leg, not two", async () => {
+    // The double-count class: a failed synthesis once lit both `arcs` and `llm` and the banner said
+    // "2 ingestion legs are broken" about one event (2026-08-11). A fleet-level failure must confirm
+    // on `access_bootstrap` alone.
+    const team = await bareTeam();
+    const faulted = clientWithFailingSelect("teams", "teams read exploded");
+    await runAccessBootstrapLeg(faulted);
+    await runAccessBootstrapLeg(faulted); // two ticks = FAILURES_TO_CONFIRM
+
+    const { health } = await legFor(team);
+    const failing = health.failing.map((l) => l.source).sort();
+    expect(failing, "the fleet failure is loud — once").toContain("access_bootstrap");
+    expect(failing, "and the liveness beat is not a second copy of it").not.toContain("access_bootstrap_all");
   });
 
   it("AUDITFIX-24 AC11: AUDITFIX-22's own contracts survive the new source", async () => {

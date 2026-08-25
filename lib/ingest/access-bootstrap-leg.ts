@@ -81,20 +81,25 @@ export async function runAccessBootstrapLeg(
     // the callback would write TWO ok:false rows per failing team per tick — which reaches the
     // BANNERFLAP-1 confirmation threshold (2) after a SINGLE failed tick and makes a lone failure
     // loud. The data-mechanics tier pins the per-tick row count for exactly that reason.
-    // The FLEET-LIVENESS beat (AUDITFIX-24) — unconditional, whatever the pass did, because its whole
-    // job is to prove the poller reached this stage. Written under its own source so it cannot mask
-    // the per-team rows above. `ok` follows the fleet-level outcome only: a single wedged team is
-    // that team's failure, not the fleet's, and reddening every team's card for it is the
-    // over-reporting AUDITFIX-22 removed.
+    // The FLEET-LIVENESS beat (AUDITFIX-24) — attempted on every path, whatever the pass did, because
+    // its whole job is to prove the poller REACHED this stage. Written under its own source so it
+    // cannot mask the per-team rows above.
+    //
+    // ⚠️ `ok: true` EVEN WHEN THE FLEET FAILED, and that is the deliberate part. This row asserts
+    // LIVENESS, not correctness; the fleet-level failure is already carried by the instance-wide
+    // `access_bootstrap` row below, which AUDITFIX-22's AC5 depends on. A diff review caught the
+    // alternative: mirroring the failure here makes ONE failed teams-read confirm on TWO sources, and
+    // the banner then says "2 ingestion legs are broken" about a single event — the exact
+    // double-count that put `llm` in NOT_PIPELINE_LEGS after the 2026-08-11 incident. The outcome is
+    // still recorded, in `meta`, where it is diagnosable without being counted twice.
     const globalFailure = r.failed.find((f) => f.teamId === "*");
     await recordIngestRun(db, {
       teamId: null,
       source: "access_bootstrap_all",
       trigger: "scheduler",
-      ok: !globalFailure,
+      ok: true,
       created: 0,
-      errors: globalFailure ? [globalFailure.error] : undefined,
-      meta: { teams: r.teams, failedTeams: r.failed.length },
+      meta: { teams: r.teams, failedTeams: r.failed.length, fleetOk: !globalFailure },
       startedAt,
     });
 
@@ -115,15 +120,17 @@ export async function runAccessBootstrapLeg(
     // row standing until it aged stale (slice-3 Codex Low). This is fleet-level by definition: the
     // loop itself died, so it is the instance-wide row that carries it.
     try {
-      // Both rows on this path: the heartbeat proves the poller reached this stage (AUDITFIX-24) and
-      // the source-`access_bootstrap` row is the fleet-level failure AUDITFIX-22's AC5 depends on.
+      // Both rows on this path, and they say DIFFERENT things: the heartbeat proves the poller
+      // reached this stage (LIVENESS — `ok:true` for the same no-double-count reason as above, with
+      // the throw in `meta`), and the source-`access_bootstrap` row is the fleet-level FAILURE that
+      // AUDITFIX-22's AC5 depends on.
       await recordIngestRun(db, {
         teamId: null,
         source: "access_bootstrap_all",
         trigger: "scheduler",
-        ok: false,
+        ok: true,
         created: 0,
-        errors: [err instanceof Error ? err.message : "bootstrap threw"],
+        meta: { fleetOk: false, threw: err instanceof Error ? err.message : "bootstrap threw" },
         startedAt,
       });
       await recordIngestRun(db, {

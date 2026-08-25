@@ -15,9 +15,15 @@ import { getPipelineHealth, staleThresholdMs } from "@/lib/ingest/pipeline-healt
  * Real Postgres because the whole behaviour is the `distinct on` partitioning, which the in-memory
  * fake cannot run.
  *
- * ⚠️ WHICH OF THESE ARE RED-FIRST, because it is easy to miscount: AC1, AC1b, AC2b and AC12 fail
- * against the shipped code. AC2, AC4 and AC5's B-side pass before the fix — they are regression pins
- * and mutation targets, not evidence the fix does anything.
+ * ⚠️ WHICH OF THESE ARE RED-FIRST, because it is easy to miscount. Genuinely red against the shipped
+ * code: AC1, AC1b, AC2b, AC4b, and (in the sibling ledger file) AC12 plus the converted AC13. AC2,
+ * AC4 and AC5's other clauses pass BEFORE the fix — they are regression pins and mutation targets,
+ * not evidence the fix does anything.
+ *
+ * AC6b is red pre-fix too, but for an INCIDENTAL reason a review round had to point out: its fault
+ * keys on `is_global`, which the pre-fix query does not contain, so the fault never fires and the leg
+ * resolves no clock. It is red because the fixture cannot exist yet, not because the behaviour
+ * differs — worth knowing before anyone counts it as evidence.
  */
 
 const TEAM_BEAT = "access_bootstrap";
@@ -130,6 +136,23 @@ describe("AUDITFIX-24: the staleness beat reads the partition its poller writes 
     const healthy = await seedTeam();
     await record({ teamId: null, source: GLOBAL_BEAT, trigger: "scheduler", at: fresh() });
     expect((await legOf(healthy.teamId, GLOBAL_BEAT)).leg!.stale, "a recent global row clears it").toBe(false);
+  });
+
+  it("AC4b: a team-partition row does NOT shadow an instance-wide leg's clock", async () => {
+    // Found by a SURVIVING mutant, not by design. `distinct on (source)` alone survived the suite,
+    // because with the ORDER BY still leading on `(team_id is null)` it degrades to "one row per
+    // source, preferring the team partition" — and no criterion had a global-scope leg with rows in
+    // BOTH partitions, which is the only shape that can tell the two apart.
+    //
+    // Unreachable through today's writers (the ledger cross-check forbids a team-scoped
+    // `context_backfill_all`), but `ingest_runs` is append-only history and the guard is textual, so
+    // the read must be right about a row the writers no longer produce.
+    const { teamId } = await seedTeam();
+    await record({ teamId: null, source: GLOBAL_BEAT, trigger: "scheduler", at: aged(GLOBAL_BAR) });
+    await record({ teamId, source: GLOBAL_BEAT, trigger: "scheduler", at: fresh() });
+
+    const { leg } = await legOf(teamId, GLOBAL_BEAT);
+    expect(leg!.stale, "the global leg's clock is the global row, aged — the team row is not its beat").toBe(true);
   });
 
   it("AC5: a team-beat leg is judged per TEAM — nobody borrows another team's clock", async () => {

@@ -125,8 +125,10 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // an accepted tradeoff since it's per-team opt-in and any throw records `ok=false`.
   // (Contrast the legs that record on every tick THEY REACH, which is a different and weaker property
   // than "every tick" — see the truncation note above. `runImport` records each CONFIGURED connector
-  // (slack/plane/linear/github) "to prove the poller ran"; `runAccessBootstrap` writes an
-  // unconditional instance-wide heartbeat; `runContextBackfill` writes a per-team row per succeeded
+  // (slack/plane/linear/github) "to prove the poller ran"; `runAccessBootstrapLeg` writes a row per
+  // TEAM every tick plus an unconditional instance-wide `access_bootstrap_all` heartbeat (AUDITFIX-24
+  // — until then it wrote the heartbeat under `access_bootstrap` itself, which this sentence used to
+  // say and which AUDITFIX-22 had already made false); `runContextBackfill` writes a per-team row per succeeded
   // team PLUS an instance-wide `context_backfill_all` heartbeat; `runMeetingNotesBackfill` writes one
   // row per team unconditionally inside its loop. For all of those an age threshold IS meaningful.
   // What differs is only its VALUE: the connectors and access_bootstrap sit inside the 3h default
@@ -300,9 +302,14 @@ type Row = {
  * would report "failing for 30 minutes" about a three-day outage).
  *
  * WHY THE PARTITION IS `(source, team_id)` AND NOT `source`. The outer scope is `team_id = $1 or
- * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team
- * `ok=false` row for each FAILING team, plus an unconditional instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`). A source-level
- * streak is therefore broken by global heartbeat rows that say nothing about this team's health.
+ * team_id is null`, and at least one source writes BOTH: `access_bootstrap` records a per-team row
+ * every tick — for EVERY team, success as well as failure, since AUDITFIX-22 — plus an instance-wide
+ * row on a fleet-level failure, zero teams, or a throw (`lib/ingest/access-bootstrap-leg.ts`). A
+ * source-level streak is therefore broken by global rows that say nothing about this team's health.
+ * ⚠️ This sentence used to read "`ok=false` row for each FAILING team, plus an unconditional
+ * instance-wide heartbeat every tick (`lib/ingest/scheduler.ts`)" — three clauses, all false since
+ * AUDITFIX-22, in the module whose beat scoping now DEPENDS on the per-team row being written every
+ * tick. The unconditional heartbeat exists again under `access_bootstrap_all` (AUDITFIX-24).
  * The codebase has been bitten by the same mixing before — `context_backfill_all` exists as its own
  * source precisely because a global row masked per-team rows under `distinct on`. Found in spec review.
  * The leg is then taken from the partition holding the newest row, which preserves today's "the newest

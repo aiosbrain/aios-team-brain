@@ -92,17 +92,43 @@ const unresolved: string[] = [];
  * would fail all three — and would also let the mutation this check exists for through, since that
  * mutant writes `teamId: null`. Shorthand (`teamId,`) counts as passing one.
  */
-type SchedulerSite = { source: string; rel: string; passesTeamId: boolean };
+type SchedulerSite = { source: string; rel: string; partition: SitePartition };
 const schedulerSites: SchedulerSite[] = [];
 
-function passesTeamId(args: string): boolean {
+/**
+ * Which partition this call site writes — or AMBIGUOUS, which is a build failure rather than a guess.
+ *
+ * ⚠️ THE TRI-STATE IS THE FIX. The first version returned a boolean and treated every expression
+ * except the exact token `null` as team-scoped, so `teamId: undefined` and `teamId: maybeTeam ?? null`
+ * read as team-scoped while `recordIngestRun` persists `team_id = null` for both (`lib/ingest/runs.ts`
+ * coalesces with `?? null`). A diff review wrote out the bypass. A textual scan cannot evaluate those
+ * expressions, so it must REFUSE them instead of picking the convenient answer — the same fail-closed
+ * discipline the source-expression check above already uses.
+ */
+type SitePartition = "team" | "global" | "ambiguous";
+
+function partitionOf(args: string): SitePartition {
   const explicit = args.match(/\bteamId\s*:\s*([^,\n}]+)/);
-  if (explicit) return explicit[1].trim() !== "null";
-  return /\bteamId\s*[,\n]/.test(args);
+  if (explicit) {
+    const expr = explicit[1].trim();
+    if (expr === "null" || expr === "undefined") return "global";
+    // A plain identifier or property access resolves to a team id at runtime or it does not compile.
+    // Anything with a conditional, a nullish coalesce, or a call can be null at runtime.
+    return /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(expr) ? "team" : "ambiguous";
+  }
+  return /\bteamId\s*[,\n]/.test(args) ? "team" : "global";
+}
+
+/** Comments are prose, and a guard that reads prose is not checking anything — the battery script has
+ *  a commented-out `recordIngestRun(projectionRunInput(...))` that would otherwise occupy a wrapper
+ *  exemption after the real call was deleted. Strings holding `//` are not stripped: the line rule
+ *  fires only when `//` starts the line. */
+function stripComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
 }
 
 for (const file of files) {
-  const src = readFileSync(file, "utf8");
+  const src = stripComments(readFileSync(file, "utf8"));
   if (!src.includes("recordIngestRun(")) continue;
   const rel = file.slice(ROOT.length + 1);
   for (const { args, isDeclaration } of recordCallArgs(src)) {
@@ -127,7 +153,17 @@ for (const file of files) {
       continue;
     }
     scanned.set(source, rel);
-    if (/\btrigger:\s*"scheduler"/.test(args)) schedulerSites.push({ source, rel, passesTeamId: passesTeamId(args) });
+    // A trigger that is not a string literal cannot be classified either — and a site whose trigger
+    // is a named constant or a variable could BE the poller. Refuse rather than skip: skipping is how
+    // a scheduler site leaves `schedulerSites` without anything reddening.
+    const trigger = args.match(/\btrigger:\s*([^,\n}]+)/);
+    if (trigger && !/^"[^"]*"$/.test(trigger[1].trim())) {
+      unresolved.push(`${rel}: trigger: ${trigger[1].trim()}`);
+      continue;
+    }
+    if (trigger && trigger[1].trim() === '"scheduler"') {
+      schedulerSites.push({ source, rel, partition: partitionOf(args) });
+    }
   }
 }
 
@@ -172,7 +208,15 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
     expect(
       unresolved.filter((u) => !u.includes("argument built elsewhere")).sort(),
       "make the source a literal or a named string constant, or document it in UNSCANNABLE_LEG_SOURCES"
-    ).toEqual(["lib/ingest/scheduler.ts: source: label", "lib/ingest/scheduler.ts: source: label"]);
+    ).toEqual([
+      "lib/ingest/scheduler.ts: source: label",
+      "lib/ingest/scheduler.ts: source: label",
+      // AUDITFIX-24 added trigger classification, and it immediately found this: `pm_sync`'s writer
+      // takes the trigger as a PARAMETER, so nothing static forbids a `scheduler` row from it. That
+      // is not a defect to fix here — it is precisely WHY `pm_sync` is declared beat scope `none`,
+      // and listing it keeps the two facts adjacent instead of one silently justifying the other.
+      "lib/pm-sync/runs.ts: trigger: input.trigger",
+    ]);
   });
 
   it("every WRAPPER-built call site is accounted for (AUDITFIX-24)", () => {
@@ -213,11 +257,13 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
       .filter((site) => site.source !== EXEMPT_DUAL_WRITER)
       .filter((site) => {
         const scope: BeatScope | undefined = BEAT_SCOPE_BY_SOURCE[site.source];
-        if (scope === "team") return !site.passesTeamId;
-        if (scope === "global") return site.passesTeamId;
+        // AMBIGUOUS never matches anything, so an unclassifiable teamId expression fails here rather
+        // than being read as whichever partition the regex found easier.
+        if (scope === "team") return site.partition !== "team";
+        if (scope === "global") return site.partition !== "global";
         return true; // `none` must have no scheduler site at all
       })
-      .map((site) => `${site.source} (${site.rel}) declared ${BEAT_SCOPE_BY_SOURCE[site.source]}, writes ${site.passesTeamId ? "team-scoped" : "instance-wide"}`);
+      .map((site) => `${site.source} (${site.rel}) declared ${BEAT_SCOPE_BY_SOURCE[site.source]}, writes ${site.partition}`);
     expect(
       wrong.sort(),
       "a leg's declared beat scope must match EVERY scheduler call site that writes it — otherwise the " +
@@ -245,12 +291,18 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
     // which is the same failure the source scan already guards against one assertion up.
     const bySource = (s: string) => schedulerSites.filter((x) => x.source === s);
     expect(bySource("meeting_notes").length, "meeting_notes has scheduler sites").toBeGreaterThanOrEqual(2);
-    expect(bySource("meeting_notes").every((x) => x.passesTeamId), "…and they are team-scoped").toBe(true);
+    expect(bySource("meeting_notes").every((x) => x.partition === "team"), "…and they are team-scoped").toBe(true);
     expect(bySource("auth_cleanup").length, "auth_cleanup has scheduler sites").toBeGreaterThanOrEqual(1);
-    expect(bySource("auth_cleanup").every((x) => !x.passesTeamId), "…and they are instance-wide").toBe(true);
+    expect(bySource("auth_cleanup").every((x) => x.partition === "global"), "…and they are instance-wide").toBe(true);
     // The `teamId: null` form must read as instance-wide, not as "a teamId is present" — three
     // global legs are written that way, and a key-presence test would fail all three.
-    expect(bySource("context_backfill_all").every((x) => !x.passesTeamId), "explicit teamId: null is instance-wide").toBe(true);
+    expect(bySource("context_backfill_all").every((x) => x.partition === "global"), "explicit teamId: null is instance-wide").toBe(true);
+    // And nothing shipped is ambiguous today — so the fail-closed branch above is a real gate on new
+    // code rather than a rule the current tree already violates.
+    expect(
+      schedulerSites.filter((x) => x.partition === "ambiguous").map((x) => `${x.source} (${x.rel})`),
+      "an unclassifiable teamId expression must be made explicit — the scan will not guess"
+    ).toEqual([]);
   });
 
   // DELIBERATELY NOT HERE: "every declared leg has a threshold answer". That question has exactly one
