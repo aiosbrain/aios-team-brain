@@ -8,6 +8,7 @@ import {
   isProtectedProject,
   isSanctionedSystemEdge,
   type EdgeGroupIdentity,
+  type ProjectIdentity,
   type UnsanctionedEdge,
 } from "@/lib/access/system-projects";
 
@@ -762,6 +763,127 @@ export interface RevokeResult extends WriteResult {
 }
 
 /**
+ * AUDITFIX-21 — the ONLY sanctioned way to delete a forbidden edge on a protected project.
+ *
+ * WHY A SECOND WRITER RATHER THAN RELAXING THE FIRST. The first design reversed
+ * `revokeProjectFromGroup`'s absolute refusal so it could distinguish sanctioned from unsanctioned.
+ * A spec review killed it: gate on `kind === 'system'` alone and the `source -> system` CAS flip
+ * (lib/access/bootstrap.ts) can land between classifying an edge as revocable and deleting it, so the
+ * row removed is the now-sanctioned `general -> everyone`. That is a substrate outage for every member
+ * of the team. This writer instead does one narrow thing, and the general writer keeps its absolute
+ * refusal — which also means both of that writer's shipped tests still pass untouched.
+ *
+ * ORDER, and every step is a refusal that leaves the edge intact:
+ *   1. AUTHORITY. Nothing about the edge is read first, so an unauthorized caller learns nothing it
+ *      could not already learn. The guarantee is the plain one: NO DELETE BEFORE AUTHORIZATION.
+ *      ⚠️ It is SNAPSHOT authority, not authority-at-the-instant-of-delete: reads follow this check,
+ *      and a concurrent `deleteMember` (lib/admin/members.ts) or a posture removal could disable the
+ *      admin in between, so the delete can land under a principal who was authorized when asked and
+ *      is not a moment later. Same class as the identity snapshot below, and stated for the same
+ *      reason — the alternative is a lock or a conditional delete this adapter cannot express.
+ *   2. IDENTITY, fail closed, with ATTRIBUTED errors — a swallowed read error yields `null`, takes the
+ *      not-found branch, and produces an observable identical to a real refusal, so the two must be
+ *      distinguishable or the fail-closed mutation cannot be caught.
+ *   3. CLASSIFY: `isProtectedProject && !isSanctionedSystemEdge`. Both halves matter. Without the
+ *      protection gate, an ordinary `kind='initiative'` project named "General" becomes unrevokable,
+ *      breaking the creator grant AUDITFIX-3 kept deliberately legal. Without the pair test, this
+ *      writer would delete the substrate.
+ *   4. DELETE with RETURNING, and 5. AUDIT ONLY A ROW THAT CAME BACK — D3: a revoke that revoked
+ *      nothing writes no trail. (The general writer still deletes blind and audits unconditionally,
+ *      which can record a revocation that never happened under a concurrent delete: AUDITFIX-26. This
+ *      slice hardens that writer's REFUSAL — see its own header — but deliberately leaves its
+ *      delete/audit shape alone, because changing it drags its shipped tests back into scope.)
+ *
+ * THIS IS A SNAPSHOT CONTRACT, NOT AN ATOMIC ONE. Steps 2-3 are reads and step 4 deletes by id, so
+ * identity could in principle change in between. It is safe because classification is FLIP-INVARIANT:
+ * `isProtectedProject` is true on both sides of the only live transition (`source -> system`) for a
+ * reserved slug, and sanctioned-ness is a function of SLUGS the flip never touches. That rests on two
+ * invariants nothing enforces: no code path updates `projects.slug`; `is_builtin` never flips
+ * false -> true (`ensureBuiltins` is insert-if-absent and refuses an existing non-builtin reserved
+ * slug); and a BUILTIN's `groups.slug` is never rewritten — a rename of `external` to `everyone`
+ * between the group read and the delete would flip an unsanctioned classification sanctioned exactly
+ * as a project rename would. (That third one was missing from this list until a diff review counted
+ * them.) A project-rename feature, an `ensureBuiltins` that adopts squatters, or a group-rename
+ * surface each reopen this window.
+ */
+export async function revokeUnsanctionedSystemEdge(
+  db: DbClient,
+  teamId: string,
+  edge: { projectId: string; groupId: string },
+  actor: RevokeActor
+): Promise<RevokeResult> {
+  // (1) Authority FIRST — before anything about the edge is read.
+  const principalId = actor.kind === "member" ? actor.memberId : actor.authorizedByMemberId;
+  const bad = await activeAdminError(db, teamId, principalId);
+  if (bad) return { ok: false, error: `repair principal rejected: ${bad}` };
+
+  // (2) Identity, fail closed, ATTRIBUTED.
+  const { data: projRow, error: projErr } = await db
+    .from("projects")
+    .select("kind, slug")
+    .eq("team_id", teamId)
+    .eq("id", edge.projectId)
+    .maybeSingle();
+  if (projErr) return { ok: false, error: `refusing the repair: project read failed — ${projErr.message}` };
+  if (!projRow) return { ok: false, error: "project not found for team" };
+  const project = projRow as ProjectIdentity;
+
+  const { data: groupRow, error: groupErr } = await db
+    .from("groups")
+    .select("slug, is_builtin")
+    .eq("team_id", teamId)
+    .eq("id", edge.groupId)
+    .maybeSingle();
+  if (groupErr) return { ok: false, error: `refusing the repair: group read failed — ${groupErr.message}` };
+  if (!groupRow) return { ok: false, error: "group not found for team" };
+  const group = groupRow as EdgeGroupIdentity;
+
+  // (3) Classify. Two distinct refusals, deliberately distinguishable: a mutation that drops the
+  // protection gate refuses this pair too, via the other branch, so identical wording would make the
+  // two implementations observationally the same.
+  if (!isProtectedProject(project)) {
+    return {
+      ok: false,
+      error: `'${project.slug}' is not a protected project — this repair is only for a forbidden edge on the access substrate; use revoke-project`,
+    };
+  }
+  if (isSanctionedSystemEdge(project.slug, group)) {
+    return {
+      ok: false,
+      error: `refusing to remove '${project.slug}' -> '${group.slug}': it is one of the substrate's SANCTIONED edges, not a forbidden one`,
+    };
+  }
+
+  // (4) Delete with RETURNING — the row is the evidence that anything happened.
+  const { data: removed, error: delErr } = await db
+    .from("project_groups")
+    .delete()
+    .eq("team_id", teamId)
+    .eq("project_id", edge.projectId)
+    .eq("group_id", edge.groupId)
+    .select("project_id");
+  if (delErr) return { ok: false, error: delErr.message };
+  const deleted = ((removed ?? []) as unknown[]).length > 0;
+  if (!deleted) return { ok: true, revoked: false };
+
+  // (5) Audit only a real deletion (D3), with the same actor discipline as the general writer.
+  if (actor.kind === "member") {
+    await auditWrite(db, teamId, actor.memberId, "access.project_revoked", edge.projectId, {
+      groupId: edge.groupId,
+      repair: "unsanctioned_system_edge",
+    });
+  } else {
+    await auditWrite(db, teamId, null, "access.project_revoked", edge.projectId, {
+      groupId: edge.groupId,
+      authorizedByMemberId: actor.authorizedByMemberId,
+      via: actor.via,
+      repair: "unsanctioned_system_edge",
+    });
+  }
+  return { ok: true, revoked: true };
+}
+
+/**
  * Revoke a group's visibility into a project — the destructive half of THE access edge, so the
  * invariants live HERE, not in any caller (design round 1 H1/H2):
  *
@@ -786,16 +908,28 @@ export async function revokeProjectFromGroup(
   groupId: string,
   actor: RevokeActor
 ): Promise<RevokeResult> {
-  // (1) The system wiring is unrevokable through this writer.
+  // (1) The substrate's wiring is unrevokable through this writer.
+  //
+  // ⚠️ AUDITFIX-21 WIDENED this refusal, and it was a LIVE hole. It read `kind` only and refused only
+  // `kind === 'system'` — but `isProtectedProject` covers a `kind='source'` project holding a reserved
+  // slug too. So `general@source -> everyone`, a SANCTIONED edge on a PROTECTED project, was NOT
+  // refused here, and the CLI verb's preflight used the same kind-only test, so an authorized admin
+  // could delete the substrate edge with no race required. Bootstrap re-grants it on the next tick,
+  // so the outage was bounded — but every member of that team lost General visibility until then, and
+  // a team whose bootstrap is wedged never got it back. The asymmetry came from AUDITFIX-3 giving the
+  // GRANT side `isProtectedProject` and leaving this side on the older test.
+  //
+  // This refuses MORE than it did, never less, which is why both shipped revoke tests still pass: they
+  // assert a `kind='system'` project is refused, and it still is.
   const { data: proj } = await db
     .from("projects")
-    .select("kind")
+    .select("kind, slug")
     .eq("team_id", teamId)
     .eq("id", projectId)
     .maybeSingle();
   if (!proj) return { ok: false, error: "project not found for team" };
-  if ((proj as { kind: string }).kind === "system") {
-    return { ok: false, error: "refusing to revoke a system project's grant — the general/external-shared wiring is the access substrate (raw SQL is the deliberate barrier)" };
+  if (isProtectedProject(proj as ProjectIdentity)) {
+    return { ok: false, error: "refusing to revoke a substrate grant — the general/external-shared wiring is the access substrate. An UNSANCTIONED edge on such a project is repairable with `repair-system-edge` (AUDITFIX-21); everything else here is deliberate raw-SQL territory" };
   }
 
   // (2) The principal — whichever kind — must pass the app's admin predicate.
