@@ -789,10 +789,9 @@ export interface RevokeResult extends WriteResult {
  *      breaking the creator grant AUDITFIX-3 kept deliberately legal. Without the pair test, this
  *      writer would delete the substrate.
  *   4. DELETE with RETURNING, and 5. AUDIT ONLY A ROW THAT CAME BACK — D3: a revoke that revoked
- *      nothing writes no trail. (The general writer still deletes blind and audits unconditionally,
- *      which can record a revocation that never happened under a concurrent delete: AUDITFIX-26. This
- *      slice hardens that writer's REFUSAL — see its own header — but deliberately leaves its
- *      delete/audit shape alone, because changing it drags its shipped tests back into scope.)
+ *      nothing writes no trail. (This shape shipped here first. AUDITFIX-21 hardened the general
+ *      writer's REFUSAL and deliberately left its delete/audit alone; AUDITFIX-26 then gave it the
+ *      same RETURNING-gated delete/audit — see its own header — so the two no longer differ here.)
  *
  * THIS IS A SNAPSHOT CONTRACT, NOT AN ATOMIC ONE. Steps 2-3 are reads and step 4 deletes by id, so
  * identity could in principle change in between. It is safe because classification is FLIP-INVARIANT:
@@ -897,9 +896,22 @@ export async function revokeUnsanctionedSystemEdge(
  * D3: no-op revokes do NOT audit (a trail recording revocations that revoked nothing
  * over-reports). The audit insert itself is best-effort by the repo-wide contract
  * (lib/api/audit — an audit outage must not break the act; stated in the spec as the same
- * act-over-trail direction every audited write here takes). Bounded probe/act race as on the
- * grant side: two concurrent revokes can both probe-hit and both audit the same ms-apart act
- * (over-report, never under-report; the F3 transaction surface owns the atomic form).
+ * act-over-trail direction every audited write here takes).
+ *
+ * AUDITFIX-26 closed what this paragraph used to describe as a bounded "both audit the same act"
+ * race. It was worse than that: the loser of the race had deleted NOTHING and still audited. The
+ * delete now carries RETURNING and only a row that actually came back is audited, so of two
+ * concurrent revokes exactly one claims the deletion — a consequence of `project_groups` being keyed
+ * on (project_id, group_id); no APPLICATION-level lock is needed, the row lock the delete already
+ * takes does it. What is still NOT atomic is the preceding snapshot: the project's kind and the
+ * principal's authority are read before the delete and could change in between.
+ *
+ * ⚠️ The `RETURNING` result is what makes this work, so it is worth knowing where it does NOT: the
+ * legacy in-memory `lib/ingest/fake-supabase.ts` returns `[]` from every delete and treats a trailing
+ * `select()` as a no-op flag, so under THAT client a real deletion would read as `revoked:false` and
+ * go unaudited. Nothing pairs it with this writer today (the production caller uses the pg client and
+ * every dm test uses a real database), and the sibling writer already shipped the same pattern — but
+ * a future caller that reaches for the fake here would silently lose the trail.
  */
 export async function revokeProjectFromGroup(
   db: DbClient,
@@ -949,13 +961,29 @@ export async function revokeProjectFromGroup(
   if (!existing) return { ok: true, revoked: false };
 
   // (4) Delete + audit (audit only a real deletion — D3).
-  const { error } = await db
+  //
+  // ⚠️ AUDITFIX-26: the DELETE's OWN RESULT decides whether anything happened — not the probe's.
+  // This deleted blind and then audited unconditionally, so a concurrent revoke removing the row
+  // between the probe and the delete left this call having removed NOTHING while it wrote an
+  // access.project_revoked row and told its caller revoked:true. The header used to call that "two
+  // audits for one act", which understates it: the second audit is not a duplicate of a real act, it
+  // is a record of an act that never occurred, and on a destructive access change the trail is the
+  // only thing that says who removed whose access.
+  //
+  // BOTH audit branches sit inside the guard. Moving only one is a real implementation an earlier
+  // criterion could not tell from the correct one — a raced MEMBER revoke would still phantom.
+  const { data: removed, error } = await db
     .from("project_groups")
     .delete()
     .eq("team_id", teamId)
     .eq("project_id", projectId)
-    .eq("group_id", groupId);
+    .eq("group_id", groupId)
+    .select("project_id");
   if (error) return { ok: false, error: error.message };
+  if (((removed ?? []) as unknown[]).length === 0) {
+    // Someone else got there first. The truth is that this call revoked nothing (D3: no audit).
+    return { ok: true, revoked: false };
+  }
   if (actor.kind === "member") {
     await auditWrite(db, teamId, actor.memberId, "access.project_revoked", projectId, { groupId });
   } else {
