@@ -903,9 +903,16 @@ export async function revokeUnsanctionedSystemEdge(
  * race. It was worse than that: the loser of the race had deleted NOTHING and still audited. The
  * delete now carries RETURNING and only a row that actually came back is audited, so of two
  * concurrent revokes exactly one claims the deletion — a consequence of `project_groups` being keyed
- * on (project_id, group_id), not of any lock. What is still NOT atomic is the preceding snapshot: the
- * project's kind and the principal's authority are read before the delete and could change in
- * between.
+ * on (project_id, group_id); no APPLICATION-level lock is needed, the row lock the delete already
+ * takes does it. What is still NOT atomic is the preceding snapshot: the project's kind and the
+ * principal's authority are read before the delete and could change in between.
+ *
+ * ⚠️ The `RETURNING` result is what makes this work, so it is worth knowing where it does NOT: the
+ * legacy in-memory `lib/ingest/fake-supabase.ts` returns `[]` from every delete and treats a trailing
+ * `select()` as a no-op flag, so under THAT client a real deletion would read as `revoked:false` and
+ * go unaudited. Nothing pairs it with this writer today (the production caller uses the pg client and
+ * every dm test uses a real database), and the sibling writer already shipped the same pattern — but
+ * a future caller that reaches for the fake here would silently lose the trail.
  */
 export async function revokeProjectFromGroup(
   db: DbClient,

@@ -78,9 +78,11 @@ absent. Removing it would be simpler and would save a round trip.
   question from that;
 - this lane has been blocked twice for widening a slice past the defect it named.
 
-⚠️ **And mutation 5 has since DEMONSTRATED the redundancy** (§4): deleting the probe's short-circuit
-alone changes no observable at all. That is the strongest evidence available that removing it is safe —
-it just is not evidence that removing it belongs in *this* slice.
+⚠️ **Mutation 5 demonstrated that the SHORT-CIRCUIT is redundant** (§4) — deleting it alone changes no
+observable. It did **not** demonstrate that the whole probe is: the probe's error-abort runs before the
+destructive statement, and removing it would let a transient read failure proceed to a DELETE that
+currently cannot happen. So the open question is narrower than I posed it, and its answer leans the
+other way.
 
 ⚠️ **If a reviewer thinks the probe should go, say so** — the properties all survive its removal
 (refusals still precede any edge read, so no oracle appears), and I would rather take that argument
@@ -143,12 +145,22 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 | 4 | launder the authorizer into the actor field | AC2 |
 | 5 | drop BOTH the probe short-circuit and the delete guard | AC4 |
 
-⚠️ **Mutation 5 as first written was a semantic NO-OP, and running it proved something worth keeping.**
-It removed only the probe's `if (!existing) return` — and SURVIVED, because a genuine no-op then falls
-through to the delete, which affects zero rows, so the new guard returns exactly the same
-`{ok:true, revoked:false}` with no audit. **That is empirical evidence for §2b's open question: the
-probe is redundant for correctness, demonstrated rather than argued.** The real detector for AC4 is
-removing both, which reddens it.
+⚠️ **Mutation 5 as first written was a semantic NO-OP, and what it demonstrated is NARROWER than I
+first wrote.** It removed only the probe's `if (!existing) return` — and SURVIVED, because a genuine
+no-op then falls through to the delete, which affects zero rows, so the guard returns exactly the same
+`{ok:true, revoked:false}` with no audit.
+
+*I recorded that as "the probe is redundant, demonstrated rather than argued". The diff review
+narrowed it, correctly: the mutant still ran the probe QUERY and its `probeErr → {ok:false}` return.
+So what is demonstrated is that **the short-circuit** is redundant — not the probe. **Full probe
+removal has a divergence the mutant never exercised:** a probe SELECT that errors currently aborts
+**before** the destructive statement, whereas without it the same transient condition proceeds to
+DELETE the row and audit. That is the probe's remaining behavioural content, and §2b already named it
+as a retention reason — my §4 claim contradicted my own §2b. And epistemically, SURVIVED means the
+criteria cannot distinguish the mutant, not that no observable differs: the mutant also issues a
+zero-row DELETE on every genuine no-op.*
+
+The real detector for AC4 is removing both, which reddens it.
 
 ## 5. Risks
 
