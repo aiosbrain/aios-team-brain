@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { runRepairSystemEdgeVerb, repairVerbDeps, type RepairVerbDeps } from "@/lib/access/repair-verb";
+import { runRevokeProjectVerb } from "@/lib/access/revoke-verb";
 import type { DbClient } from "@/lib/db/types";
 
 /** AUDITFIX-21 — the repair verb's pure layer, and its REAL dependency factory. */
@@ -92,5 +93,40 @@ describe("AUDITFIX-21: repair-system-edge", () => {
       },
     } as unknown as DbClient;
     await expect(repairVerbDeps(erroring, "team", "cli").resolveGroup("vendors")).rejects.toThrow(/group read failed/);
+  });
+});
+
+describe("AUDITFIX-21: the revoke verb's preflight moved WITH the writer", () => {
+  it("AC18: `revoke-project` refuses a reserved-slug SOURCE project, never reaching the writer", async () => {
+    // While this tested only `kind === "system"`, the preflight AND the writer's old kind-only refusal
+    // both passed a reserved-slug source project — so `revoke-project everyone general` deleted the
+    // substrate edge. The two layers have to move together or that hole reopens.
+    const revoke = vi.fn(async () => ({ ok: true as const, revoked: true }));
+    const r = await runRevokeProjectVerb(
+      {
+        resolveGroupId: async () => "gid",
+        resolveProject: async () => ({ id: "pid", kind: "source", slug: "general" }),
+        resolveMemberIdByEmail: async () => "mid",
+        revoke,
+      },
+      { groupSlug: "everyone", projectSlug: "general", actorEmail: "admin@t.local" }
+    );
+    expect(r.ok).toBe(false);
+    expect(revoke, "the writer is never reached").not.toHaveBeenCalled();
+  });
+
+  it("and still lets an ORDINARY project through", async () => {
+    const revoke = vi.fn(async () => ({ ok: true as const, revoked: true }));
+    const r = await runRevokeProjectVerb(
+      {
+        resolveGroupId: async () => "gid",
+        resolveProject: async () => ({ id: "pid", kind: "initiative", slug: "roadmap" }),
+        resolveMemberIdByEmail: async () => "mid",
+        revoke,
+      },
+      { groupSlug: "leads", projectSlug: "roadmap", actorEmail: "admin@t.local" }
+    );
+    expect(r).toEqual({ ok: true, revoked: true });
+    expect(revoke).toHaveBeenCalledTimes(1);
   });
 });
