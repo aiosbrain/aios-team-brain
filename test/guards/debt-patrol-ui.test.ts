@@ -1,4 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DebtPatrol } from "@/components/codebases/debt-patrol";
 import { buildDebtPatrol } from "@/lib/codebases/debt-ranking";
@@ -68,5 +70,45 @@ describe("debt patrol accessibility guard", () => {
     expect(html).toContain("North Star reconciliation and admission gaps");
     expect(html).toContain('<th scope="row"');
     expect(html).not.toContain("Record operator decision");
+  });
+
+  it("keeps movement before patrol and evidence after it", () => {
+    const page = readFileSync(
+      join(
+        process.cwd(),
+        "app",
+        "t",
+        "[team]",
+        "codebases",
+        "[slug]",
+        "page.tsx",
+      ),
+      "utf8",
+    );
+    const movement = page.indexOf("<DebtMovement");
+    const patrol = page.indexOf("<DebtPatrol");
+    const evidence = page.indexOf("<DebtEvidence");
+    expect(movement).toBeGreaterThan(-1);
+    expect(patrol).toBeGreaterThan(movement);
+    expect(evidence).toBeGreaterThan(patrol);
+  });
+
+  it("reads the complete team-scoped finding ledger without row caps", () => {
+    const source = readFileSync(
+      join(process.cwd(), "lib", "metrics", "codebases.ts"),
+      "utf8",
+    );
+    const findingsStart = source.indexOf('.from("codebase_findings")');
+    const eventsStart = source.indexOf('.from("codebase_finding_events")');
+    const queryEnd = source.indexOf("  ]);", eventsStart);
+    const findingsQuery = source.slice(findingsStart, eventsStart);
+    const eventsQuery = source.slice(eventsStart, queryEnd);
+    expect(findingsStart).toBeGreaterThan(-1);
+    expect(eventsStart).toBeGreaterThan(findingsStart);
+    for (const query of [findingsQuery, eventsQuery]) {
+      expect(query).toContain('.eq("team_id", teamId)');
+      expect(query).toContain('.eq("codebase_id", codebaseId)');
+      expect(query).not.toContain(".limit(");
+    }
   });
 });

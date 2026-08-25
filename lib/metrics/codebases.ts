@@ -8,6 +8,10 @@ import { isUnscopedCoverage, scanPartial } from "@/lib/codebases/score";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
+import {
+  deriveCodebaseDebtKpis,
+  type CodebaseDebtKpis,
+} from "@/lib/codebases/debt-kpis";
 
 /**
  * The ONLY read path for codebase analytics tables — pages must go through here,
@@ -65,7 +69,7 @@ export const STALE_DAYS = 14;
 export function isCodebaseStale(
   lastScanAt: string | null,
   nowMs: number,
-  staleDays: number = STALE_DAYS
+  staleDays: number = STALE_DAYS,
 ): boolean {
   if (!lastScanAt) return true;
   const scannedMs = Date.parse(lastScanAt);
@@ -80,15 +84,21 @@ export function isCodebaseStale(
  * flat/empty line. Pure — unit-tested.
  */
 export function windowedSpark(
-  seriesNewestFirst: { scanned_at: string | Date; agentic_score: number | string }[],
+  seriesNewestFirst: {
+    scanned_at: string | Date;
+    agentic_score: number | string;
+  }[],
   windowStartIso: string,
-  fallback = 12
+  fallback = 12,
 ): number[] {
   // Compare by epoch ms — the pg adapter returns `scanned_at` as a Date, not an ISO string,
   // so a lexicographic string compare would silently never match (the #134 gotcha).
   const windowStartMs = Date.parse(windowStartIso);
-  const inWindow = seriesNewestFirst.filter((s) => new Date(s.scanned_at).getTime() >= windowStartMs);
-  const source = inWindow.length >= 2 ? inWindow : seriesNewestFirst.slice(0, fallback);
+  const inWindow = seriesNewestFirst.filter(
+    (s) => new Date(s.scanned_at).getTime() >= windowStartMs,
+  );
+  const source =
+    inWindow.length >= 2 ? inWindow : seriesNewestFirst.slice(0, fallback);
   return source.map((s) => num(s.agentic_score)).reverse();
 }
 
@@ -119,17 +129,21 @@ export async function getCodebaseSummaries(
   db: DbClient,
   teamId: string,
   range: Range,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<CodebaseListResult> {
   if (!canSeeCodebases(tier)) return { codebases: [], kpis: [] };
 
   const now = Date.now();
-  const windowStart = new Date(now - rangeDays(range) * 86_400_000).toISOString();
+  const windowStart = new Date(
+    now - rangeDays(range) * 86_400_000,
+  ).toISOString();
 
   const [cbRes, mRes] = await Promise.all([
     db
       .from("codebases")
-      .select("id, slug, full_name, primary_language, stars, open_issues, last_scan_at")
+      .select(
+        "id, slug, full_name, primary_language, stars, open_issues, last_scan_at",
+      )
       .eq("team_id", teamId)
       .order("last_scan_at", { ascending: false, nullsFirst: false }),
     // NOT windowed: we want each codebase's LAST scan for the headline even if it predates the
@@ -140,7 +154,7 @@ export async function getCodebaseSummaries(
       .select(
         "codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, " +
           "test_coverage_lines_total, coverage_breadth_pct, loc, tests_total, tests_skipped, tests_failed, " +
-          "ai_commit_ratio, readiness_level, readiness_pct"
+          "ai_commit_ratio, readiness_level, readiness_pct",
       )
       .eq("team_id", teamId)
       .order("scanned_at", { ascending: false })
@@ -179,27 +193,40 @@ export async function getCodebaseSummaries(
       last_scan_at: cb.last_scan_at,
       agentic_score: num(latest?.agentic_score),
       health_score: num(latest?.health_score),
-      test_coverage_pct: latest?.test_coverage_pct == null ? null : num(latest.test_coverage_pct),
+      test_coverage_pct:
+        latest?.test_coverage_pct == null
+          ? null
+          : num(latest.test_coverage_pct),
       test_coverage_lines_total:
-        latest?.test_coverage_lines_total == null ? null : num(latest.test_coverage_lines_total),
+        latest?.test_coverage_lines_total == null
+          ? null
+          : num(latest.test_coverage_lines_total),
       coverage_breadth_pct:
-        latest?.coverage_breadth_pct == null ? null : num(latest.coverage_breadth_pct),
+        latest?.coverage_breadth_pct == null
+          ? null
+          : num(latest.coverage_breadth_pct),
       loc: latest?.loc == null ? null : num(latest.loc),
       tests_total: latest?.tests_total == null ? null : num(latest.tests_total),
-      tests_skipped: latest?.tests_skipped == null ? null : num(latest.tests_skipped),
-      tests_failed: latest?.tests_failed == null ? null : num(latest.tests_failed),
+      tests_skipped:
+        latest?.tests_skipped == null ? null : num(latest.tests_skipped),
+      tests_failed:
+        latest?.tests_failed == null ? null : num(latest.tests_failed),
       // Derived here rather than stored: the raw counts are the durable fact, and one rule for
       // "partial" (lib/codebases/score.scanPartial) keeps the card and the detail page in step.
       scan_partial: latest
         ? scanPartial({
-            tests_total: latest.tests_total == null ? null : num(latest.tests_total),
-            tests_skipped: latest.tests_skipped == null ? null : num(latest.tests_skipped),
-            tests_failed: latest.tests_failed == null ? null : num(latest.tests_failed),
+            tests_total:
+              latest.tests_total == null ? null : num(latest.tests_total),
+            tests_skipped:
+              latest.tests_skipped == null ? null : num(latest.tests_skipped),
+            tests_failed:
+              latest.tests_failed == null ? null : num(latest.tests_failed),
           })
         : null,
       ai_commit_ratio: num(latest?.ai_commit_ratio),
       readiness_level: latest?.readiness_level ?? null,
-      readiness_pct: latest?.readiness_pct == null ? null : num(latest.readiness_pct),
+      readiness_pct:
+        latest?.readiness_pct == null ? null : num(latest.readiness_pct),
       // windowed trend (falls back to the most recent points so a stale card still shows a line)
       spark: windowedSpark(series, windowStart),
       stale: isCodebaseStale(cb.last_scan_at, now),
@@ -216,7 +243,9 @@ function avg(nums: number[]): number {
 }
 
 function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
-  const cov = s.map((c) => c.test_coverage_pct).filter((v): v is number => v != null);
+  const cov = s
+    .map((c) => c.test_coverage_pct)
+    .filter((v): v is number => v != null);
   // How many of the averaged percentages arrived without a denominator (AIO-995). The mean of a
   // set of percentages measured over wildly different fractions of their repos is not a team
   // coverage figure — a repo measuring 436 lines contributes exactly as much as one measuring
@@ -224,7 +253,7 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   // would be its own distortion) but the hint now says how much of it is unscoped, so nobody
   // reads it as a claim about the team's code rather than about a bag of unlike numbers.
   const unscoped = s.filter((c) =>
-    isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc)
+    isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc),
   ).length;
   return [
     {
@@ -301,7 +330,7 @@ export interface CodebaseFreshness {
 export async function getCodebaseFreshness(
   db: DbClient,
   teamId: string,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<CodebaseFreshness[]> {
   if (!canSeeCodebases(tier)) return [];
 
@@ -327,7 +356,10 @@ export async function getCodebaseFreshness(
     .order("scanned_at", { ascending: false })
     .limit(10_000);
   const latestSha = new Map<string, string>();
-  for (const m of (mData ?? []) as { codebase_id: string; head_sha: string }[]) {
+  for (const m of (mData ?? []) as {
+    codebase_id: string;
+    head_sha: string;
+  }[]) {
     if (!latestSha.has(m.codebase_id)) latestSha.set(m.codebase_id, m.head_sha);
   }
 
@@ -484,13 +516,14 @@ export interface CodebaseDetail {
   findings: CodebaseFinding[];
   decisionOwners: FindingDecisionOwner[];
   debtPatrol: DebtPatrol;
+  debtKpis: CodebaseDebtKpis;
 }
 
 export async function getCodebaseIdentity(
   db: DbClient,
   teamId: string,
   slug: string,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<{ id: string } | null> {
   if (!canSeeCodebases(tier)) return null;
   const { data } = await db
@@ -507,14 +540,14 @@ export async function getCodebaseDetail(
   teamId: string,
   slug: string,
   range: Range,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<CodebaseDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
   const { data: cb } = await db
     .from("codebases")
     .select(
-      "id, slug, full_name, default_branch, description, homepage, primary_language, languages, stars, forks, open_issues, last_scan_at"
+      "id, slug, full_name, default_branch, description, homepage, primary_language, languages, stars, forks, open_issues, last_scan_at",
     )
     .eq("team_id", teamId)
     .eq("slug", slug)
@@ -522,7 +555,10 @@ export async function getCodebaseDetail(
   if (!cb) return null;
 
   const codebaseId = (cb as { id: string }).id;
-  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString();
+  const rangeEnd = new Date().toISOString();
+  const windowStart = new Date(
+    Date.parse(rangeEnd) - rangeDays(range) * 86_400_000,
+  ).toISOString();
 
   const METRIC_COLS =
     "scanned_at, window_days, commits_window, agentic_score, health_score, ai_commit_ratio, test_coverage_score, " +
@@ -553,13 +589,17 @@ export async function getCodebaseDetail(
       .limit(2000),
     db
       .from("code_contributions")
-      .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
+      .select(
+        "author_key, author_name, member_id, day, commits, ai_commits, additions, deletions",
+      )
       .eq("codebase_id", codebaseId)
       .gte("day", windowStart.slice(0, 10))
       .limit(10_000),
     db
       .from("github_issues")
-      .select("number, title, state, is_pull_request, author_login, labels, url, opened_at")
+      .select(
+        "number, title, state, is_pull_request, author_login, labels, url, opened_at",
+      )
       .eq("codebase_id", codebaseId)
       .order("updated_at", { ascending: false })
       .limit(200),
@@ -568,57 +608,76 @@ export async function getCodebaseDetail(
       .select("id, display_name, github_login, avatar_url, tier, status")
       .eq("team_id", teamId),
     // Uploaded avatars live on member_profiles (1:1, separate table) — sibling query, merged in JS.
-    db.from("member_profiles").select("member_id, avatar_data_url").eq("team_id", teamId),
+    db
+      .from("member_profiles")
+      .select("member_id, avatar_data_url")
+      .eq("team_id", teamId),
     db
       .from("codebase_findings")
       .select(
-        "id, fingerprint, status, check_id, axis, kind, severity, evidence_status, remediation_tier, occurrence_count, first_seen_sha, last_seen_sha, first_seen_at, last_seen_at, resolved_at, decision_reason, decision_owner_member_id, decision_by_member_id, decision_at, decision_expires_at"
+        "id, fingerprint, status, check_id, axis, kind, severity, evidence_status, remediation_tier, occurrence_count, first_seen_sha, last_seen_sha, first_seen_at, last_seen_at, resolved_at, decision_reason, decision_owner_member_id, decision_by_member_id, decision_at, decision_expires_at",
       )
       .eq("team_id", teamId)
       .eq("codebase_id", codebaseId)
-      .order("last_seen_at", { ascending: false })
-      .limit(500),
+      .order("last_seen_at", { ascending: false }),
     db
       .from("codebase_finding_events")
       .select(
-        "id, finding_id, event_type, from_status, to_status, head_sha, observed_at, details"
+        "id, finding_id, event_type, from_status, to_status, head_sha, observed_at, details",
       )
       .eq("team_id", teamId)
       .eq("codebase_id", codebaseId)
-      .order("observed_at", { ascending: false })
-      .limit(5_000),
+      .order("observed_at", { ascending: false }),
   ]);
 
-  type MemberMeta = { display_name: string | null; github_login: string | null; avatar_url: string | null };
+  type MemberMeta = {
+    display_name: string | null;
+    github_login: string | null;
+    avatar_url: string | null;
+  };
   const avatarDataByMember = new Map(
-    ((profilesRes.data ?? []) as { member_id: string; avatar_data_url: string | null }[]).map((p) => [
-      p.member_id,
-      p.avatar_data_url,
-    ])
+    (
+      (profilesRes.data ?? []) as {
+        member_id: string;
+        avatar_data_url: string | null;
+      }[]
+    ).map((p) => [p.member_id, p.avatar_data_url]),
   );
   const members = new Map<string, MemberMeta>();
   for (const m of (membersRes.data ?? []) as ({ id: string } & MemberMeta)[]) {
-    members.set(m.id, { display_name: m.display_name, github_login: m.github_login, avatar_url: m.avatar_url });
+    members.set(m.id, {
+      display_name: m.display_name,
+      github_login: m.github_login,
+      avatar_url: m.avatar_url,
+    });
   }
-  const decisionOwners = ((membersRes.data ?? []) as Array<
-    { id: string; tier: string; status: string } & MemberMeta
-  >)
+  const decisionOwners = (
+    (membersRes.data ?? []) as Array<
+      { id: string; tier: string; status: string } & MemberMeta
+    >
+  )
     .filter((member) => member.tier === "team" && member.status === "active")
     .map((member) => ({
       id: member.id,
-      display_name: member.display_name ?? member.github_login ?? "Unnamed member",
+      display_name:
+        member.display_name ?? member.github_login ?? "Unnamed member",
     }))
     .sort((a, b) => a.display_name.localeCompare(b.display_name));
 
   // newest-first from the query. `latest` is the true last scan (unwindowed) so the breakdown
   // never blanks; the trend is windowed with a fallback to the most recent points.
-  const metrics = (metricsRes.data ?? []) as unknown as Record<string, unknown>[];
+  const metrics = (metricsRes.data ?? []) as unknown as Record<
+    string,
+    unknown
+  >[];
   // Compare by epoch ms — scanned_at comes back as a Date via the pg adapter (#134 gotcha).
   const windowStartMs = Date.parse(windowStart);
   const inWindow = metrics.filter(
-    (m) => new Date(m.scanned_at as string | Date).getTime() >= windowStartMs
+    (m) => new Date(m.scanned_at as string | Date).getTime() >= windowStartMs,
   );
-  const chronological = [...(inWindow.length >= 2 ? inWindow : metrics.slice(0, 12))].reverse();
+  const chronological = [
+    ...(inWindow.length >= 2 ? inWindow : metrics.slice(0, 12)),
+  ].reverse();
   const latest = metrics[0];
 
   const breakdown: AgenticBreakdown | null = latest
@@ -626,7 +685,9 @@ export async function getCodebaseDetail(
         agentic_score: num(latest.agentic_score as number),
         health_score: num(latest.health_score as number),
         ai_commit_ratio: num(latest.ai_commit_ratio as number),
-        test_coverage_score: numOrNull(latest.test_coverage_score as number | null),
+        test_coverage_score: numOrNull(
+          latest.test_coverage_score as number | null,
+        ),
         scaffolding_score: num(latest.scaffolding_score as number),
         skill_breadth_score: num(latest.skill_breadth_score as number),
         cadence_score: num(latest.cadence_score as number),
@@ -637,14 +698,26 @@ export async function getCodebaseDetail(
         skills_count: num(latest.skills_count as number),
         commands_count: num(latest.commands_count as number),
         test_coverage_pct:
-          latest.test_coverage_pct == null ? null : num(latest.test_coverage_pct as number),
+          latest.test_coverage_pct == null
+            ? null
+            : num(latest.test_coverage_pct as number),
         test_coverage_functions_pct:
-          latest.test_coverage_functions_pct == null ? null : num(latest.test_coverage_functions_pct as number),
+          latest.test_coverage_functions_pct == null
+            ? null
+            : num(latest.test_coverage_functions_pct as number),
         test_coverage_branches_pct:
-          latest.test_coverage_branches_pct == null ? null : num(latest.test_coverage_branches_pct as number),
-        test_coverage_lines_total: numOrNull(latest.test_coverage_lines_total as number | null),
-        test_coverage_lines_covered: numOrNull(latest.test_coverage_lines_covered as number | null),
-        coverage_breadth_pct: numOrNull(latest.coverage_breadth_pct as number | null),
+          latest.test_coverage_branches_pct == null
+            ? null
+            : num(latest.test_coverage_branches_pct as number),
+        test_coverage_lines_total: numOrNull(
+          latest.test_coverage_lines_total as number | null,
+        ),
+        test_coverage_lines_covered: numOrNull(
+          latest.test_coverage_lines_covered as number | null,
+        ),
+        coverage_breadth_pct: numOrNull(
+          latest.coverage_breadth_pct as number | null,
+        ),
         loc: num(latest.loc as number),
         tests_total: numOrNull(latest.tests_total as number | null),
         tests_passed: numOrNull(latest.tests_passed as number | null),
@@ -656,10 +729,17 @@ export async function getCodebaseDetail(
           tests_failed: numOrNull(latest.tests_failed as number | null),
         }),
         readiness_level: (latest.readiness_level as string | null) ?? null,
-        readiness_pct: latest.readiness_pct == null ? null : num(latest.readiness_pct as number),
+        readiness_pct:
+          latest.readiness_pct == null
+            ? null
+            : num(latest.readiness_pct as number),
         readiness_pillars:
-          (latest.readiness_pillars as Record<string, { passed: number; total: number }>) ?? {},
-        codebase_health: (latest.codebase_health as CodebaseHealth | null) ?? null,
+          (latest.readiness_pillars as Record<
+            string,
+            { passed: number; total: number }
+          >) ?? {},
+        codebase_health:
+          (latest.codebase_health as CodebaseHealth | null) ?? null,
       }
     : null;
 
@@ -669,7 +749,8 @@ export async function getCodebaseDetail(
       day: "numeric",
     }),
     agentic: num(m.agentic_score as number),
-    coverage: m.test_coverage_pct == null ? null : num(m.test_coverage_pct as number),
+    coverage:
+      m.test_coverage_pct == null ? null : num(m.test_coverage_pct as number),
     ai: num(m.ai_commit_ratio as number),
   }));
 
@@ -720,7 +801,9 @@ export async function getCodebaseDetail(
         member_id: r.member_id,
         member_name: meta?.display_name ?? null,
         avatar_url: meta?.avatar_url ?? null,
-        avatar_data_url: r.member_id ? (avatarDataByMember.get(r.member_id) ?? null) : null,
+        avatar_data_url: r.member_id
+          ? (avatarDataByMember.get(r.member_id) ?? null)
+          : null,
         github_login: meta?.github_login ?? null,
         commits: 0,
         ai_commits: 0,
@@ -733,7 +816,9 @@ export async function getCodebaseDetail(
     cur.deletions += r.deletions;
     byContributor.set(groupKey, cur);
   }
-  const contributors = [...byContributor.values()].sort((a, b) => b.commits - a.commits);
+  const contributors = [...byContributor.values()].sort(
+    (a, b) => b.commits - a.commits,
+  );
 
   const issues = ((issuesRes.data ?? []) as IssueRow[]).map((i) => ({
     ...i,
@@ -776,7 +861,9 @@ export async function getCodebaseDetail(
     decision_at: string | Date | null;
     decision_expires_at: string | Date | null;
   };
-  const findings: CodebaseFinding[] = ((findingsRes.data ?? []) as FindingRow[]).map((row) => {
+  const findings: CodebaseFinding[] = (
+    (findingsRes.data ?? []) as FindingRow[]
+  ).map((row) => {
     const events = findingEventsById.get(row.id) ?? [];
     return {
       ...row,
@@ -784,27 +871,57 @@ export async function getCodebaseDetail(
       occurrence_count: num(row.occurrence_count),
       first_seen_at: new Date(row.first_seen_at).toISOString(),
       last_seen_at: new Date(row.last_seen_at).toISOString(),
-      resolved_at: row.resolved_at == null ? null : new Date(row.resolved_at).toISOString(),
+      resolved_at:
+        row.resolved_at == null
+          ? null
+          : new Date(row.resolved_at).toISOString(),
       decision_owner_name:
         row.decision_owner_member_id == null
           ? null
-          : (members.get(row.decision_owner_member_id)?.display_name ?? "Former member"),
+          : (members.get(row.decision_owner_member_id)?.display_name ??
+            "Former member"),
       decision_by_member_name:
         row.decision_by_member_id == null
           ? null
-          : (members.get(row.decision_by_member_id)?.display_name ?? "Former member"),
-      decision_at: row.decision_at == null ? null : new Date(row.decision_at).toISOString(),
+          : (members.get(row.decision_by_member_id)?.display_name ??
+            "Former member"),
+      decision_at:
+        row.decision_at == null
+          ? null
+          : new Date(row.decision_at).toISOString(),
       decision_expires_at:
-        row.decision_expires_at == null ? null : new Date(row.decision_expires_at).toISOString(),
+        row.decision_expires_at == null
+          ? null
+          : new Date(row.decision_expires_at).toISOString(),
       events,
     };
   });
 
-  const patrolGeneratedAt = new Date().toISOString();
+  const patrolGeneratedAt = rangeEnd;
   const debtPatrol = buildDebtPatrol(findings, {
-    commitsWindow: latest?.commits_window == null ? null : num(latest.commits_window as number),
-    windowDays: latest?.window_days == null ? null : num(latest.window_days as number),
+    commitsWindow:
+      latest?.commits_window == null
+        ? null
+        : num(latest.commits_window as number),
+    windowDays:
+      latest?.window_days == null ? null : num(latest.window_days as number),
     now: patrolGeneratedAt,
+  });
+  const recentCommits = Array.isArray(latest?.recent_commits)
+    ? (latest.recent_commits as Record<string, unknown>[])
+    : [];
+  const debtKpis = deriveCodebaseDebtKpis({
+    findings,
+    commits: recentCommits,
+    rangeStart: windowStart,
+    rangeEnd,
+    asOf: rangeEnd,
+    commitsWindow:
+      latest?.commits_window == null
+        ? null
+        : num(latest.commits_window as number),
+    scannerWindowDays:
+      latest?.window_days == null ? null : num(latest.window_days as number),
   });
 
   const c = cb as Record<string, unknown>;
@@ -821,11 +938,12 @@ export async function getCodebaseDetail(
     forks: num(c.forks as number),
     open_issues: num(c.open_issues as number),
     last_scan_at: (c.last_scan_at as string) ?? null,
-    stale: isCodebaseStale((c.last_scan_at as string) ?? null, Date.now()),
+    stale: isCodebaseStale(
+      (c.last_scan_at as string) ?? null,
+      Date.parse(rangeEnd),
+    ),
     breakdown,
-    recent_commits: Array.isArray(latest?.recent_commits)
-      ? (latest.recent_commits as Record<string, unknown>[])
-      : [],
+    recent_commits: recentCommits,
     trend,
     commitVolume,
     contributors,
@@ -833,6 +951,7 @@ export async function getCodebaseDetail(
     findings,
     decisionOwners,
     debtPatrol,
+    debtKpis,
   };
 }
 
@@ -853,7 +972,13 @@ export interface ContributorDetail {
   name: string;
   avatar_url: string | null;
   github_login: string | null;
-  totals: { commits: number; ai_commits: number; additions: number; deletions: number; active_days: number };
+  totals: {
+    commits: number;
+    ai_commits: number;
+    additions: number;
+    deletions: number;
+    active_days: number;
+  };
   days: ContributorDay[];
 }
 
@@ -882,7 +1007,7 @@ export async function getContributorDetail(
   slug: string,
   ref: ContributorRef,
   range: Range,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<ContributorDetail | null> {
   if (!canSeeCodebases(tier)) return null;
 
@@ -894,15 +1019,22 @@ export async function getContributorDetail(
     .maybeSingle();
   if (!cb) return null;
 
-  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
+  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
   let q = db
     .from("code_contributions")
-    .select("author_key, author_name, member_id, day, commits, ai_commits, additions, deletions")
+    .select(
+      "author_key, author_name, member_id, day, commits, ai_commits, additions, deletions",
+    )
     .eq("codebase_id", (cb as { id: string }).id)
     .gte("day", windowStart)
     .order("day", { ascending: true })
     .limit(10_000);
-  q = "memberId" in ref ? q.eq("member_id", ref.memberId) : q.eq("author_key", ref.authorKey);
+  q =
+    "memberId" in ref
+      ? q.eq("member_id", ref.memberId)
+      : q.eq("author_key", ref.authorKey);
 
   const { data } = await q;
   const rows = (data ?? []) as {
@@ -918,7 +1050,13 @@ export async function getContributorDetail(
   if (rows.length === 0) return null;
 
   const byDay = new Map<string, ContributorDay>();
-  const totals = { commits: 0, ai_commits: 0, additions: 0, deletions: 0, active_days: 0 };
+  const totals = {
+    commits: 0,
+    ai_commits: 0,
+    additions: 0,
+    deletions: 0,
+    active_days: 0,
+  };
   for (const r of rows) {
     const day = dayStr(r.day);
     const d = byDay.get(day) ?? emptyDay(day);
@@ -937,7 +1075,10 @@ export async function getContributorDetail(
   let name = rows[0].author_name || rows[0].author_key;
   let avatar_url: string | null = null;
   let github_login: string | null = null;
-  const member_id = "memberId" in ref ? ref.memberId : rows.find((r) => r.member_id)?.member_id ?? null;
+  const member_id =
+    "memberId" in ref
+      ? ref.memberId
+      : (rows.find((r) => r.member_id)?.member_id ?? null);
   if (member_id) {
     const { data: m } = await db
       .from("members")
@@ -946,7 +1087,11 @@ export async function getContributorDetail(
       .eq("team_id", teamId)
       .maybeSingle();
     if (m) {
-      const mm = m as { display_name: string | null; avatar_url: string | null; github_login: string | null };
+      const mm = m as {
+        display_name: string | null;
+        avatar_url: string | null;
+        github_login: string | null;
+      };
       name = mm.display_name ?? name;
       avatar_url = mm.avatar_url;
       github_login = mm.github_login;
@@ -978,7 +1123,13 @@ export interface MemberProfile {
   avatar_url: string | null;
   github_login: string | null;
   role: string;
-  totals: { commits: number; ai_commits: number; additions: number; deletions: number; active_days: number };
+  totals: {
+    commits: number;
+    ai_commits: number;
+    additions: number;
+    deletions: number;
+    active_days: number;
+  };
   repos: MemberProfileRepo[];
   days: ContributorDay[]; // across all codebases — for a cross-repo heatmap
 }
@@ -992,33 +1143,39 @@ export async function getMemberProfile(
   teamId: string,
   handle: string,
   range: Range,
-  tier: ViewerTier
+  tier: ViewerTier,
 ): Promise<MemberProfile | null> {
   if (!canSeeCodebases(tier)) return null;
 
   const { data: members } = await db
     .from("members")
-    .select("id, display_name, actor_handle, github_login, avatar_url, role, status")
+    .select(
+      "id, display_name, actor_handle, github_login, avatar_url, role, status",
+    )
     .eq("team_id", teamId);
   const lc = handle.toLowerCase();
-  const member = ((members ?? []) as {
-    id: string;
-    display_name: string | null;
-    actor_handle: string | null;
-    github_login: string | null;
-    avatar_url: string | null;
-    role: string;
-    status: string;
-  }[]).find(
+  const member = (
+    (members ?? []) as {
+      id: string;
+      display_name: string | null;
+      actor_handle: string | null;
+      github_login: string | null;
+      avatar_url: string | null;
+      role: string;
+      status: string;
+    }[]
+  ).find(
     (m) =>
       m.status === "active" &&
       (m.actor_handle?.toLowerCase() === lc ||
         m.github_login?.toLowerCase() === lc ||
-        m.id === handle)
+        m.id === handle),
   );
   if (!member) return null;
 
-  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000).toISOString().slice(0, 10);
+  const windowStart = new Date(Date.now() - rangeDays(range) * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
   const { data: contribs } = await db
     .from("code_contributions")
     .select("day, commits, ai_commits, additions, deletions, codebases(slug)")
@@ -1039,7 +1196,13 @@ export async function getMemberProfile(
 
   const byDay = new Map<string, ContributorDay>();
   const byRepo = new Map<string, MemberProfileRepo>();
-  const totals = { commits: 0, ai_commits: 0, additions: 0, deletions: 0, active_days: 0 };
+  const totals = {
+    commits: 0,
+    ai_commits: 0,
+    additions: 0,
+    deletions: 0,
+    active_days: 0,
+  };
   for (const r of rows) {
     const day = dayStr(r.day);
     const d = byDay.get(day) ?? emptyDay(day);

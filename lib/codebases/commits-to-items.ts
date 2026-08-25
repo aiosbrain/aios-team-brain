@@ -2,8 +2,16 @@ import "server-only";
 import { createHash } from "node:crypto";
 import type { DbClient } from "@/lib/db/types";
 import { ingestItem } from "@/lib/ingest";
-import type { ItemPayload } from "@/lib/api/schemas";
-import { resolveMember, type IdentityMap, type AuthorIdentity } from "@/lib/identity/resolve";
+import type {
+  CommitClassification,
+  FixAnalysis,
+  ItemPayload,
+} from "@/lib/api/schemas";
+import {
+  resolveMember,
+  type IdentityMap,
+  type AuthorIdentity,
+} from "@/lib/identity/resolve";
 
 /**
  * Project a codebase scan's `recent_commits` into searchable `items` so NL queries can answer
@@ -25,6 +33,8 @@ export interface ScanCommit {
   ai?: unknown;
   additions?: unknown;
   deletions?: unknown;
+  commit_classification?: CommitClassification;
+  fix_analysis?: FixAnalysis;
 }
 
 function sha256(s: string): string {
@@ -32,22 +42,37 @@ function sha256(s: string): string {
 }
 
 function safeSegment(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "repo";
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "repo"
+  );
 }
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
-const int = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : 0);
+const int = (v: unknown): number =>
+  typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : 0;
 
 /** Pull a `name <email>` pair out of a git author string (best-effort). */
-export function parseAuthorIdentity(author: string): AuthorIdentity & { name: string } {
+export function parseAuthorIdentity(
+  author: string,
+): AuthorIdentity & { name: string } {
   const m = author.match(/^\s*(.*?)\s*<([^>]+)>\s*$/);
   if (m) return { name: m[1] || m[2], email: m[2].trim(), key: m[2].trim() };
   const isEmail = author.includes("@");
-  return { name: author, email: isEmail ? author.trim() : undefined, key: author.trim() };
+  return {
+    name: author,
+    email: isEmail ? author.trim() : undefined,
+    key: author.trim(),
+  };
 }
 
 /** Pure: a scan commit → the brain's ItemPayload (or null if it has no stable sha). */
-export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemPayload | null {
+export function normalizeCommit(
+  codebaseSlug: string,
+  commit: ScanCommit,
+): ItemPayload | null {
   const sha = str(commit.sha).trim();
   if (!sha) return null;
   const author = str(commit.author).trim() || "unknown";
@@ -66,6 +91,25 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
     `${message || "(no message)"}\n\n` +
     `\`${sha}\` · +${adds}/-${dels}${ai ? " · AI-assisted" : ""}\n`;
 
+  const frontmatter: ItemPayload["frontmatter"] = {
+    source: "git",
+    type: "commit",
+    codebase: codebaseSlug,
+    sha,
+    author,
+    author_email: authorEmail, // persisted so future re-attribution can resolve by email
+    committed_at: when,
+    ai,
+    additions: adds,
+    deletions: dels,
+  };
+  if (commit.commit_classification) {
+    frontmatter.commit_classification = commit.commit_classification;
+  }
+  if (commit.fix_analysis) {
+    frontmatter.fix_analysis = commit.fix_analysis;
+  }
+
   return {
     project: COMMITS_PROJECT,
     path: `commits/${slug}/${sha}.md`,
@@ -73,18 +117,7 @@ export function normalizeCommit(codebaseSlug: string, commit: ScanCommit): ItemP
     content_sha256: sha256(body),
     actor: author,
     access: "team",
-    frontmatter: {
-      source: "git",
-      type: "commit",
-      codebase: codebaseSlug,
-      sha,
-      author,
-      author_email: authorEmail, // persisted so future re-attribution can resolve by email
-      committed_at: when,
-      ai,
-      additions: adds,
-      deletions: dels,
-    },
+    frontmatter,
     body,
   };
 }
@@ -98,7 +131,7 @@ export async function projectCommitsToItems(
   auth: { teamId: string; memberId: string; apiKeyId: string },
   codebaseSlug: string,
   recentCommits: ScanCommit[],
-  identityMap: IdentityMap
+  identityMap: IdentityMap,
 ): Promise<number> {
   let processed = 0;
   for (const commit of recentCommits) {
