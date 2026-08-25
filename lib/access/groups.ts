@@ -798,9 +798,13 @@ export interface RevokeResult extends WriteResult {
  * identity could in principle change in between. It is safe because classification is FLIP-INVARIANT:
  * `isProtectedProject` is true on both sides of the only live transition (`source -> system`) for a
  * reserved slug, and sanctioned-ness is a function of SLUGS the flip never touches. That rests on two
- * invariants nothing enforces — no code path updates `projects.slug`, and `is_builtin` never flips
+ * invariants nothing enforces: no code path updates `projects.slug`; `is_builtin` never flips
  * false -> true (`ensureBuiltins` is insert-if-absent and refuses an existing non-builtin reserved
- * slug). A project-rename feature, or an `ensureBuiltins` that adopts squatters, reopens this window.
+ * slug); and a BUILTIN's `groups.slug` is never rewritten — a rename of `external` to `everyone`
+ * between the group read and the delete would flip an unsanctioned classification sanctioned exactly
+ * as a project rename would. (That third one was missing from this list until a diff review counted
+ * them.) A project-rename feature, an `ensureBuiltins` that adopts squatters, or a group-rename
+ * surface each reopen this window.
  */
 export async function revokeUnsanctionedSystemEdge(
   db: DbClient,

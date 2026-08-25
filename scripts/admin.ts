@@ -74,7 +74,7 @@ const USAGE = `Team Brain admin CLI — commands:
   add-group-member <group-slug> <member-email> [--team <id|slug>]     # deliberate membership action; builtins = the posture move (humans only)
   remove-group-member <group-slug> <member-email> [--team <id|slug>]  # inverse; builtin removal mirrors members.tier
   grant-project <group-slug> <project-slug> [--actor <admin-email>] [--team <id|slug>]   # ENFB-2: THE access edge (group → project); audited as system — --actor records a named admin authorizer in the audit META (REVOKE-1 D1b)
-  repair-system-edge <group-slug> <project-slug> --actor <admin-email>   # remove a FORBIDDEN substrate edge (AUDITFIX-21)
+  repair-system-edge <group-slug> <project-slug> --actor <admin-email> [--team <id|slug>]  # remove a FORBIDDEN substrate edge (AUDITFIX-21)
   revoke-project <group-slug> <project-slug> --actor <admin-email> [--team <id|slug>]    # REVOKE-1: the destructive half — --actor REQUIRED (an active team-posture admin); system projects refuse; no-op revokes report + audit nothing
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]

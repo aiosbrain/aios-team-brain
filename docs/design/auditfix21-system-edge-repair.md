@@ -341,8 +341,8 @@ asserted. Across this lane, ten criteria shipped green while testing nothing.
 
 | risk | direction | mitigation |
 |---|---|---|
-| A sanctioned edge is deleted | **substrate outage — every member of that team goes blind** | AC2 (3 pairs × 2 actor kinds), AC4, AC7; mutations 1-5, 12 |
-| The adoption flip races the delete | the same outage, intermittently | AC7, mutation 12 |
+| A sanctioned edge is deleted | **substrate outage — every member of that team goes blind** | AC2 (3 pairs × 2 actor kinds), AC4, AC17; mutations 1-5, 12, 15 |
+| The adoption flip races the delete | the same outage, intermittently | closed by FLIP-INVARIANCE (§2a), not by a criterion — AC7 was deleted as unconstructible |
 | A legitimate initiative becomes unrevokable | a creator stranded, reversing AUDITFIX-3's ruling | AC6, mutation 2 |
 | An undetermined read deletes | destructive fail-open | AC8/AC9 with ATTRIBUTED errors; mutations 8, 9 |
 | A phantom audit claims a deletion that did not happen | the trail lies | AC12/AC13; mutations 10, 11 |

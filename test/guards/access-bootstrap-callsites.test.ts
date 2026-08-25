@@ -104,16 +104,24 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     // While the writer used isProtectedProject and the verb's preflight used kind === 'system', a
     // reserved-slug SOURCE project passed both and its SANCTIONED edge was deletable. The two must
     // move together or that hole reopens.
-    for (const f of ["lib/access/groups.ts", "lib/access/revoke-verb.ts"]) {
-      expect(read(f), `${f} must gate on isProtectedProject`).toMatch(/isProtectedProject\s*\(/);
-    }
+    //
     // Strip comments first: the prose in these files EXPLAINS the old test by quoting it, and a guard
     // that reads prose is not checking anything. (Caught by this guard firing on its own commit.)
     const code = (f: string) =>
       read(f).replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
-    expect(code("lib/access/revoke-verb.ts"), "the old kind-only test must be gone from the CODE")
-      .not.toMatch(/kind\s*===\s*"system"/);
-    expect(code("lib/access/groups.ts"), "and from the writer").not.toMatch(/\.kind\s*===\s*"system"/);
+
+    // ⚠️ The obvious form of this guard is VACUOUS, and both diff reviews said so from opposite
+    // sides: `isProtectedProject(` already appears in groups.ts for the GRANT side, so matching it
+    // anywhere proves nothing about the revoke side — deleting the revoke gate entirely would still
+    // pass. And a blunt negative match on `kind === "system"` fires on the CONDITIONAL MESSAGE the
+    // preflight legitimately uses to name the right kind. So pin the GATE's shape, scoped to the
+    // function that must have it.
+    const revokeWriter = code("lib/access/groups.ts").split("export async function revokeProjectFromGroup")[1] ?? "";
+    expect(revokeWriter, "the revoke writer must exist").not.toBe("");
+    expect(revokeWriter.slice(0, 2000), "and gate on isProtectedProject, not on kind alone")
+      .toMatch(/isProtectedProject\s*\(/);
+    expect(code("lib/access/revoke-verb.ts"), "the preflight gates on the same predicate")
+      .toMatch(/if\s*\(\s*isProtectedProject\s*\(\s*project\s*\)\s*\)/);
   });
 
   it("the ledger leg writes a per-team row and reserves the instance-wide row for fleet failure", () => {

@@ -255,6 +255,13 @@ describe("AUDITFIX-21: a forbidden system-project grant has a sanctioned repair"
       expect(await edgeExists(seed, gen, vendors)).toBe(true);
     }
     expect(await revokedAudits(seed)).toBe(auditsBefore);
+
+    // POSITIVE CONTROL: without it, a refactor that reads identity off anything but the passed client
+    // leaves the counter at 0 for an AUTHORIZED run too, and this criterion goes silently vacuous.
+    const { client, identityReads } = countingIdentityReads();
+    const ok = await revokeUnsanctionedSystemEdge(client, seed.teamId, { projectId: gen, groupId: vendors }, { kind: "operator", authorizedByMemberId: a, via: "cli" });
+    expect(ok.ok, ok.error).toBe(true);
+    expect(identityReads(), "an authorized run DOES read both identities through this client").toBeGreaterThanOrEqual(2);
   });
 
   it("AC11: no edge-existence oracle — same refusal whether the edge is there or not", async () => {
