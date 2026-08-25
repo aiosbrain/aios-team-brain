@@ -38,6 +38,21 @@ import { ensureAccessBootstrapAllTeams } from "@/lib/access/bootstrap";
  * the suite stays green. The data-mechanics tier asserts the trigger VALUE directly instead.
  * (The row `lib/admin/teams.ts` writes at team creation is the mirror image: it must NOT claim
  * `scheduler`, because team creation is not the poller.)
+ *
+ * AUDITFIX-24 PUT THE FLEET HEARTBEAT BACK, UNDER A DIFFERENT NAME. Removing the instance-wide
+ * `ok:true` row was right — it was the thing doing the masking — but it also deleted the only
+ * evidence that the POLLER ITSELF is alive for a team that has no rows of its own yet. Measured on
+ * prod: instance-wide `access_bootstrap` scheduler rows went 51/day to 0/day across the deploy. Two
+ * spec-review rounds then produced the corner that decides it: a fresh install ticks (this leg is
+ * stage 6, `runContextBackfill` is stage 7), hangs before stage 7 so no `context_backfill_all` row
+ * ever lands, a team is created, and the scheduler dies — with the beat scoped per team, NOTHING
+ * would age, ever.
+ *
+ * So `access_bootstrap_all` is written unconditionally every tick, exactly mirroring
+ * `context_backfill_all`. A DISTINCT source is what makes that safe: the masking AUDITFIX-22 removed
+ * came from a global row competing with team rows under `distinct on (source)`, and a different
+ * source name cannot compete. This leg's own `team_id is null` rows keep their post-AUDITFIX-22
+ * meaning — fleet-level failure, zero teams, or a throw — and its AC4/AC5 contracts are untouched.
  */
 export async function runAccessBootstrapLeg(
   db: DbClient,
@@ -66,7 +81,23 @@ export async function runAccessBootstrapLeg(
     // the callback would write TWO ok:false rows per failing team per tick — which reaches the
     // BANNERFLAP-1 confirmation threshold (2) after a SINGLE failed tick and makes a lone failure
     // loud. The data-mechanics tier pins the per-tick row count for exactly that reason.
+    // The FLEET-LIVENESS beat (AUDITFIX-24) — unconditional, whatever the pass did, because its whole
+    // job is to prove the poller reached this stage. Written under its own source so it cannot mask
+    // the per-team rows above. `ok` follows the fleet-level outcome only: a single wedged team is
+    // that team's failure, not the fleet's, and reddening every team's card for it is the
+    // over-reporting AUDITFIX-22 removed.
     const globalFailure = r.failed.find((f) => f.teamId === "*");
+    await recordIngestRun(db, {
+      teamId: null,
+      source: "access_bootstrap_all",
+      trigger: "scheduler",
+      ok: !globalFailure,
+      created: 0,
+      errors: globalFailure ? [globalFailure.error] : undefined,
+      meta: { teams: r.teams, failedTeams: r.failed.length },
+      startedAt,
+    });
+
     if (globalFailure || r.teams === 0) {
       await recordIngestRun(db, {
         teamId: null,
@@ -84,6 +115,17 @@ export async function runAccessBootstrapLeg(
     // row standing until it aged stale (slice-3 Codex Low). This is fleet-level by definition: the
     // loop itself died, so it is the instance-wide row that carries it.
     try {
+      // Both rows on this path: the heartbeat proves the poller reached this stage (AUDITFIX-24) and
+      // the source-`access_bootstrap` row is the fleet-level failure AUDITFIX-22's AC5 depends on.
+      await recordIngestRun(db, {
+        teamId: null,
+        source: "access_bootstrap_all",
+        trigger: "scheduler",
+        ok: false,
+        created: 0,
+        errors: [err instanceof Error ? err.message : "bootstrap threw"],
+        startedAt,
+      });
       await recordIngestRun(db, {
         teamId: null,
         source: "access_bootstrap",
