@@ -14,8 +14,8 @@ import { GENERAL_SLUG, EXTERNAL_SHARED_SLUG } from "@/lib/access/bootstrap";
  * `visibleGroupIds(teamSlug, tier)` — so after a team slug rename the projector kept writing
  * `<old-slug>_team` while the readers searched `<new-slug>_team`, a group nothing has ever written
  * to. Writer and reader disagreed about what a group id is, and the disagreement is SILENT: no
- * error, no empty-graph banner (`graphHasFacts` counts episodes team-wide and correctly reports
- * facts exist), just permanently empty results. Found 2026-08-18 on a real rename.
+ * error, no empty-graph banner (the team-wide episode count correctly reports that facts exist),
+ * just permanently empty results. Found 2026-08-18 on a real rename.
  *
  * The fix is the smaller of the two candidates: the reader stops deriving the id independently and
  * follows the pointer. No data migration, no re-extraction (which is an LLM bill), history stays
