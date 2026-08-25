@@ -96,8 +96,15 @@ function deletesAfterProbe(seed: Seed, p: string, g: string): { client: DbClient
                   }
                   return out;
                 };
-                if (bp === "maybeSingle") return () => ({ then: (res: (x: unknown) => unknown) => void settle().then(res) });
-                return (res: (x: unknown) => unknown) => void settle().then(res);
+                // ⚠️ BOTH handlers are forwarded. An earlier version passed only `res`, so a
+                // rejection anywhere inside `settle` — the probe read, or the injected delete —
+                // produced a promise nothing ever resolved: the awaiting writer hung forever and the
+                // error was invisible. A harness whose only failure mode is a hang has no
+                // termination argument; a rejected read must fail the criterion, loudly.
+                type Handlers = (ok: (x: unknown) => unknown, bad: (e: unknown) => unknown) => void;
+                const forward: Handlers = (ok, bad) => void settle().then(ok, bad);
+                if (bp === "maybeSingle") return () => ({ then: forward });
+                return forward;
               }
               if (typeof v !== "function") return v;
               return (...args: unknown[]) => {
