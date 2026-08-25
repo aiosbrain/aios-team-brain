@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { staleThresholdMs } from "@/lib/ingest/pipeline-health";
 import { join } from "node:path";
 import {
   BEAT_SCOPE_BY_SOURCE,
@@ -221,6 +222,21 @@ describe("guard: every ingest leg is declared before it can inherit a staleness 
       wrong.sort(),
       "a leg's declared beat scope must match EVERY scheduler call site that writes it — otherwise the " +
         "staleness clock reads a partition the poller never fills, and the leg silently stops aging"
+    ).toEqual([]);
+  });
+
+  it("a `none` leg may not carry a finite staleness threshold (AUDITFIX-24)", () => {
+    // A leg whose scope is `none` can never resolve a clock, so a finite bar on it is not a loose
+    // alarm — it is silence by construction, dressed as a threshold somebody chose. The two rules
+    // have to be checked together or each looks individually reasonable.
+    const contradictory = Object.entries(BEAT_SCOPE_BY_SOURCE)
+      .filter(([, scope]) => scope === "none")
+      .filter(([source]) => staleThresholdMs(source) !== null)
+      .map(([source]) => `${source} (scope none, threshold ${staleThresholdMs(source)}ms)`);
+    expect(
+      contradictory.sort(),
+      "give it a real beat scope or set its STALE_MS_BY_SOURCE entry to null — a finite bar on a leg " +
+        "with no resolvable clock can never fire, which is the quiet half of the BANNERFLAP family"
     ).toEqual([]);
   });
 
