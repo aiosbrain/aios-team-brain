@@ -86,7 +86,7 @@ jobs:
             exit 1
           fi
           if [ "$EVENT_NAME" = "pull_request_target" ]; then
-            node scripts/nda-scan.mjs --tree "$MERGE_SHA" --range "$BASE_SHA..$HEAD_SHA"
+            node scripts/nda-scan.mjs --tree "$MERGE_SHA" --range "$BASE_SHA..$HEAD_SHA" --max-commits 500
           elif [ -n "${BASE_SHA:-}" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
             node scripts/nda-scan.mjs --range "$BASE_SHA..$HEAD_SHA"
           else
