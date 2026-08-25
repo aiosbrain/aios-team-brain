@@ -80,6 +80,39 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     }
   });
 
+  it("AUDITFIX-21: the repair verb routes to the NEW writer, and the CLI arm actually calls it", () => {
+    // The single-writer guard cannot do this job: it is FILE-scoped, so a second deleting function
+    // inside lib/access/groups.ts is invisible to it — it holds unchanged and proves nothing about
+    // WHICH writer the repair verb uses. And AC14/AC15 together still allow the shipped command to be
+    // absent: one pins the pure verb against an injected writer, the other pins a factory's queries,
+    // and neither proves scripts/admin.ts has the arm at all (spec round 2 HIGH 4).
+    const verb = read("lib/access/repair-verb.ts");
+    expect(verb, "the repair path uses the narrow writer").toMatch(/revokeUnsanctionedSystemEdge/);
+    expect(verb, "and never the general one, which would delete an initiative's edge under a repair name")
+      .not.toMatch(/revokeProjectFromGroup/);
+
+    const cli = read("scripts/admin.ts");
+    expect(cli, "the command exists").toMatch(/case "repair-system-edge"/);
+    expect(cli, "and is wired to the factory, not to hand-rolled deps").toMatch(/repairVerbDeps/);
+    expect(cli).toMatch(/runRepairSystemEdgeVerb/);
+  });
+
+  it("AUDITFIX-21: both revoke layers share ONE protection predicate", () => {
+    // While the writer used isProtectedProject and the verb's preflight used kind === 'system', a
+    // reserved-slug SOURCE project passed both and its SANCTIONED edge was deletable. The two must
+    // move together or that hole reopens.
+    for (const f of ["lib/access/groups.ts", "lib/access/revoke-verb.ts"]) {
+      expect(read(f), `${f} must gate on isProtectedProject`).toMatch(/isProtectedProject\s*\(/);
+    }
+    // Strip comments first: the prose in these files EXPLAINS the old test by quoting it, and a guard
+    // that reads prose is not checking anything. (Caught by this guard firing on its own commit.)
+    const code = (f: string) =>
+      read(f).replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+    expect(code("lib/access/revoke-verb.ts"), "the old kind-only test must be gone from the CODE")
+      .not.toMatch(/kind\s*===\s*"system"/);
+    expect(code("lib/access/groups.ts"), "and from the writer").not.toMatch(/\.kind\s*===\s*"system"/);
+  });
+
   it("the ledger leg writes a per-team row and reserves the instance-wide row for fleet failure", () => {
     // AUDITFIX-22's whole point: a global ok:true heartbeat every tick is what masked a wedged
     // team's failure under `newest`. If the unconditional instance-wide write ever comes back,

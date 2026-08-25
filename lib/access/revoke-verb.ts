@@ -1,4 +1,5 @@
 import type { RevokeResult } from "@/lib/access/groups";
+import { isProtectedProject } from "@/lib/access/system-projects";
 
 /**
  * REVOKE-1: the `revoke-project` CLI verb's PURE decision layer — extracted so the
@@ -11,7 +12,7 @@ import type { RevokeResult } from "@/lib/access/groups";
  */
 export interface RevokeVerbDeps {
   resolveGroupId(groupSlug: string): Promise<string | null>;
-  resolveProject(projectSlug: string): Promise<{ id: string; kind: string } | null>;
+  resolveProject(projectSlug: string): Promise<{ id: string; kind: string; slug: string } | null>;
   resolveMemberIdByEmail(email: string): Promise<string | null>;
   revoke(projectId: string, groupId: string, authorizedByMemberId: string): Promise<RevokeResult>;
 }
@@ -44,8 +45,13 @@ export async function runRevokeProjectVerb(
   if (!groupId) return { ok: false, error: `no group '${args.groupSlug}' on this team` };
   const project = await deps.resolveProject(args.projectSlug);
   if (!project) return { ok: false, error: `no project '${args.projectSlug}' on this team` };
-  if (project.kind === "system") {
+  if (isProtectedProject(project)) {
     // Preflight for message quality only — the writer refuses independently (D2).
+    //
+    // ⚠️ AUDITFIX-21 widened this from `kind === "system"` to the same predicate the writer now uses.
+    // It has to move WITH the writer: while this tested only the kind, `revoke-project everyone general`
+    // against a reserved-slug `kind='source'` project passed the preflight AND the writer's old
+    // kind-only refusal, and deleted the substrate edge.
     return { ok: false, error: `'${args.projectSlug}' is a SYSTEM project — its grants are the access substrate (general/external-shared ↔ the builtins) and cannot be revoked by this verb` };
   }
   const authorizedByMemberId = await deps.resolveMemberIdByEmail(args.actorEmail);

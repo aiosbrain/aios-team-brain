@@ -74,6 +74,7 @@ const USAGE = `Team Brain admin CLI — commands:
   add-group-member <group-slug> <member-email> [--team <id|slug>]     # deliberate membership action; builtins = the posture move (humans only)
   remove-group-member <group-slug> <member-email> [--team <id|slug>]  # inverse; builtin removal mirrors members.tier
   grant-project <group-slug> <project-slug> [--actor <admin-email>] [--team <id|slug>]   # ENFB-2: THE access edge (group → project); audited as system — --actor records a named admin authorizer in the audit META (REVOKE-1 D1b)
+  repair-system-edge <group-slug> <project-slug> --actor <admin-email>   # remove a FORBIDDEN substrate edge (AUDITFIX-21)
   revoke-project <group-slug> <project-slug> --actor <admin-email> [--team <id|slug>]    # REVOKE-1: the destructive half — --actor REQUIRED (an active team-posture admin); system projects refuse; no-op revokes report + audit nothing
   rename-team <new-slug> [--name <display>] [--team <id|slug>]
   add-author-alias <member-email> <git-identity> [--team <id|slug>] [--force]
@@ -328,6 +329,28 @@ async function main() {
       );
       break;
     }
+    case "repair-system-edge": {
+      // AUDITFIX-21: the ONLY sanctioned way to delete a FORBIDDEN edge on a protected project —
+      // the state AUDITFIX-23's census reports and `revoke-project` refuses by design. The WRITER
+      // holds every invariant (authority first, protected-and-unsanctioned only, delete with
+      // RETURNING, audit only a real deletion); this arm resolves the team and hands over.
+      const groupSlug = positionals[0];
+      const projectSlug = positionals[1];
+      if (flags.actor === true) die("--actor requires a value (an admin email)");
+      const team = await resolveTeam(admin, teamSlug);
+      const { runRepairSystemEdgeVerb, repairVerbDeps } = await import("@/lib/access/repair-verb");
+      const outcome = await runRepairSystemEdgeVerb(
+        repairVerbDeps(admin, team.id, "cli"),
+        { groupSlug, projectSlug, actorEmail: typeof flags.actor === "string" ? flags.actor : undefined }
+      );
+      if (!outcome.ok) die(outcome.error);
+      console.log(
+        outcome.revoked
+          ? `· removed the unsanctioned edge '${projectSlug}' -> '${groupSlug}' on ${team.slug}`
+          : `· nothing to remove — '${projectSlug}' -> '${groupSlug}' does not exist on ${team.slug}`
+      );
+      break;
+    }
     case "revoke-project": {
       // REVOKE-1: the destructive half of the access edge. The WRITER holds the invariants
       // (system-kind refusal, the app's admin predicate, check order — spec D2/D2b/D2c); this
@@ -345,8 +368,9 @@ async function main() {
             return (data as { id: string } | null)?.id ?? null;
           },
           resolveProject: async (slug) => {
-            const { data } = await admin.from("projects").select("id, kind").eq("team_id", team.id).eq("slug", slug).maybeSingle();
-            return (data as { id: string; kind: string } | null) ?? null;
+            // AUDITFIX-21: `slug` too — the preflight now uses isProtectedProject, which needs it.
+            const { data } = await admin.from("projects").select("id, kind, slug").eq("team_id", team.id).eq("slug", slug).maybeSingle();
+            return (data as { id: string; kind: string; slug: string } | null) ?? null;
           },
           resolveMemberIdByEmail: (email) => memberIdByEmail(admin, team.id, email),
           revoke: (projectId, groupId, authorizedByMemberId) =>
