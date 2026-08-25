@@ -147,6 +147,9 @@ here than discover it in a diff review. It is recorded as an open choice, not a 
 | 3 | move only the operator branch inside the guard | AC1 (the MEMBER arm) |
 | 4 | launder the authorizer into the actor field | AC2 |
 | 5 | drop BOTH the probe short-circuit and the delete guard | AC4 |
+| 6 | audit TWICE on a real deletion (Codex L4) | AC2 — **REDDENED**, and only AC2 |
+| 7 | disable the race injector (Codex M2, positive control) | AC1 — **REDDENED** |
+| 8 | delete AC1's fixture grant, so the "race" runs against an edge that never existed (Codex M2, the vacuous-fixture scenario stated as an input) | AC1 — **REDDENED** on the new pre-race existence assertion. ⚠️ Derived, not measured: pre-fold, EVERY assertion in AC1 passes under this mutant — probe misses, `revoked:false`, audit count unchanged, edge absent at the end — which is exactly why it needed the new one |
 
 ⚠️ **Mutation 5 as first written was a semantic NO-OP, and what it demonstrated is NARROWER than I
 first wrote.** It removed only the probe's `if (!existing) return` — and SURVIVED, because a genuine
