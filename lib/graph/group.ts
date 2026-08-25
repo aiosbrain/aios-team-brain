@@ -39,8 +39,9 @@ export function isExternalGroupId(groupId: string): boolean {
 // tier-visible read set from the LIVE team slug, while the projector writes to the built-ins'
 // IMMUTABLE `projects.graph_group_id` pointer — so after a team slug rename the writer and the
 // reader named different groups and every graph-backed surface went silently empty (found
-// 2026-08-18 on a real rename; no error, no banner, `graphHasFacts` still reporting true). The
-// read set is now resolved from the pointers by `lib/graph/tier-groups.visibleTierGroupIds`.
+// 2026-08-18 on a real rename; no error, no banner, while the team-wide episode count stayed
+// positive). The read set is now resolved from the pointers by
+// `lib/graph/tier-groups.visibleTierGroupIds`.
 //
 // It is DELETED rather than deprecated so the fix is structural: there is no symbol left for a
 // future read leg to import, and tsc refuses the mistake instead of a guard noticing it later.

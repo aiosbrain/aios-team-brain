@@ -936,9 +936,9 @@ guard enforces it, it's named.
   "a frozen legacy id (possibly under an old slug — the rename doctrine)". The projector honours
   that; every read leg used to recompute `<live-slug>_team` instead. So a team slug rename made the
   writer and the readers name **different groups**, and the failure is invisible: no error, no
-  empty-graph banner (`graphHasFacts` counts episodes team-wide and correctly reports facts exist),
-  the panel blaming the model for a "usually transient" synthesis miss that never recovers. A
-  renamed team's graph was gone forever. Observed 2026-08-18 on a real rename.
+  empty-graph banner (the then-active diagnostic counted episodes team-wide and correctly reported
+  that facts existed), the panel blaming the model for a "usually transient" synthesis miss that
+  never recovers. A renamed team's graph was gone forever. Observed 2026-08-18 on a real rename.
   **The pointer authority went through two eras:** `lib/graph/tier-groups.visibleTierGroupIds`
   (pointer-first with the slug-derived unbootstrapped fallback) closed the rename hole for every
   read leg; then ENFB-1/-3 moved the SERVING legs onto the oracle's stored-pointer partition
