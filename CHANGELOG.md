@@ -3,8 +3,9 @@
 All notable changes to AIOS Team Brain are documented here. Dates are ISO-8601.
 
 The Brain API sync contract (`docs/brain-api.md` in aios-workspace) is versioned
-separately. The current member-facing major remains **v1**, at additive document
-revision **v1.22**.
+separately. The current member-facing major remains **v1**; the revision this server
+implements is declared in `lib/api/version.ts` — restating it here is what let this
+line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 

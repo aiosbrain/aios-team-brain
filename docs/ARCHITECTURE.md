@@ -1170,6 +1170,11 @@ guard enforces it, it's named.
 - **Change the brain-api wire contract** → the contract is pinned in
   `aios-workspace/docs/brain-api.md`; bump `BRAIN_API_VERSION` (`lib/api/version.ts`) and this
   doc's `v<version>` references together (guard: `test/guards/contract-version.test.ts`).
+- **Cut a release, or change what installed users run** → [`docs/RELEASING.md`](RELEASING.md). Two
+  facts drive everything there: the one-click template deploys **our** repo on **`main`** with no
+  fork, and `scripts/migrate-from-existing.mjs` requires the release tag to be DECLARED in
+  `DEFAULT_TAGS` before it is cut (`nextTagPolicy`) — the lane runs on every PR, so getting that
+  order wrong reds the whole repo.
 - **Cross the module boundary** → `lib/` is the backend domain layer (never imports `app/`), and
   `app/` reaches the DB only through the data-client factories (`lib/db/server|admin`), never
   `lib/db/pg` internals. Both directions are enforced by `import/no-restricted-paths` in
