@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing.mjs";
 
@@ -24,6 +24,11 @@ import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing
 
 const ROOT = join(__dirname, "..", "..");
 const REAL_TAGS = ["v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
+
+/** A fully-CUT declared list, for policy semantics. Deliberately NOT `DEFAULT_TAGS`: the live list
+ *  legitimately carries a declared-but-uncut release during preparation, and assertions that assumed
+ *  otherwise turned red the moment a release was declared. */
+const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"];
 
 /**
  * Does THIS checkout have the release tags?
@@ -51,9 +56,13 @@ const itWithTags = HAS_RELEASE_TAGS ? it : it.skip;
 
 describe("release tag policy — the prepared release (criteria 1, 2, 5)", () => {
   it("ALLOWS the newest declared tag to be absent, and says so instead of throwing", () => {
-    const res = nextTagPolicy([...DEFAULT_TAGS, "v0.11.0"], REAL_TAGS);
-    expect(res.pending).toBe("v0.11.0");
-    expect(res.usable).toEqual(DEFAULT_TAGS);
+    // FIXTURE list, not DEFAULT_TAGS. Two assertions here used to read the live declared list, so the
+    // moment a release was DECLARED (`pending` stops being null, `usable` stops equalling the list)
+    // they went red — the guard that exists to make releases possible would have blocked one. Policy
+    // semantics are tested against fixtures; the live list gets its own legal-state check below.
+    const res = nextTagPolicy([...CUT_FIXTURE, "v9.9.9"], REAL_TAGS);
+    expect(res.pending).toBe("v9.9.9");
+    expect(res.usable).toEqual(CUT_FIXTURE);
     expect(res.notice).toMatch(/declared but not yet cut/);
   });
 
@@ -91,16 +100,32 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     // A check that only ever passes is indistinguishable from one that matches nothing — this repo has
     // shipped that failure before. Fixture-based, so it runs in every environment including a tagless
     // CI checkout.
-    expect(() => nextTagPolicy(DEFAULT_TAGS, REAL_TAGS)).not.toThrow();
-    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...REAL_TAGS])).toThrow(/stale: v0\.99\.0/);
+    expect(() => nextTagPolicy(CUT_FIXTURE, REAL_TAGS)).not.toThrow();
+    expect(() => nextTagPolicy(CUT_FIXTURE, ["v0.99.0", ...REAL_TAGS])).toThrow(/stale: v0\.99\.0/);
   });
 
-  itWithTags("…and against the tags this checkout actually has", () => {
-    // The same two directions against live git, where the history is present. Gated rather than
-    // assumed: see HAS_RELEASE_TAGS.
+  itWithTags("the LIVE declared list is in a legal state — the only thing that stays true mid-release", () => {
+    // This is what replaced "nothing is pending". A declared-but-uncut tag is a legal state (it is how
+    // a release is prepared); an illegal one is a middle hole or a stale list. Asserting legality holds
+    // between releases AND during one, so declaring a release can never redden this file.
     expect(gitTags).toContain("v0.10.0");
     expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags)).not.toThrow();
+    // …and still non-vacuous against live git: a newer real tag nobody declared is a stale list.
     expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags])).toThrow(/stale: v0\.99\.0/);
+  });
+
+  it("declares AT MOST ONE pending tag — two would reintroduce the middle-hole throw", () => {
+    // `nextTagPolicy` permits exactly one uncut tag. If an editor declares two, the older becomes an
+    // illegal hole and every PR throws `unknown git tag` — the freeze this program keeps rediscovering.
+    // Checked against a tag set containing everything declared EXCEPT the newest, which is the state
+    // during a release preparation.
+    const byVersion = [...DEFAULT_TAGS].sort((a, b) => {
+      const p = (t: string) => t.slice(1).split(".").map(Number);
+      const [ax, ay, az] = p(a); const [bx, by, bz] = p(b);
+      return ax - bx || ay - by || az - bz;
+    });
+    const allButNewest = byVersion.slice(0, -1);
+    expect(() => nextTagPolicy(DEFAULT_TAGS, allButNewest)).not.toThrow();
   });
 
   it("compares by version, so a newer tag cannot hide behind string ordering", () => {
@@ -124,8 +149,8 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
   });
 
   it("each outcome fires ALONE for an input that triggers only it", () => {
-    expect(nextTagPolicy(DEFAULT_TAGS, REAL_TAGS)).toEqual({ usable: DEFAULT_TAGS, pending: null, notice: null });
-    expect(nextTagPolicy([...DEFAULT_TAGS, "v0.11.0"], REAL_TAGS).pending).toBe("v0.11.0");
+    expect(nextTagPolicy(CUT_FIXTURE, REAL_TAGS)).toEqual({ usable: CUT_FIXTURE, pending: null, notice: null });
+    expect(nextTagPolicy([...CUT_FIXTURE, "v9.9.9"], REAL_TAGS).pending).toBe("v9.9.9");
     expect(() => nextTagPolicy(["v0.7.0", "v0.8.5", "v0.10.0"], REAL_TAGS)).toThrow(/unknown git tag/);
     expect(() => nextTagPolicy(["v0.7.0"], REAL_TAGS)).toThrow(/stale/);
   });
@@ -154,6 +179,55 @@ describe("release tag policy — the real corpus is MIXED (criterion 6)", () => 
     // …and `--points-at` peels both, which is the one gathering idiom that is safe.
     const peeled = execFileSync("git", ["tag", "--points-at", "v0.9.0^{commit}"], { cwd: ROOT, encoding: "utf8" });
     expect(peeled).toContain("v0.9.0");
+  });
+});
+
+describe("release: the operator-facing commands must actually run (criteria 5, 6, 7)", () => {
+  /** Fenced code blocks only — what a reader COPIES. Prose that discusses a command (including this
+   *  file's own criteria, and the spec that describes this guard) must not trip it: the first spelling
+   *  of a sibling guard in this program failed on the sentence explaining it. */
+  function fencedCommands(md: string): string[] {
+    return [...md.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split("\n"));
+  }
+
+  it("no doc publishes a bare `npx tsx scripts/admin.ts` — it throws on server-only before reaching the DB", () => {
+    // `scripts/admin.ts` pulls in `lib/access/posture.ts`, which imports "server-only"; without
+    // `--conditions react-server` the import throws. Every other invocation in this repo carries it
+    // (`package.json`'s `admin` script, the admin skill, docs/CI-ARCHITECTURE.md) — but
+    // docs/RELEASE-NOTES-pret6.md published the bare form on the MANDATORY PRET-6 upgrade path, where
+    // an operator would hit the throw while trying to satisfy a deployment precondition.
+    const docs = readdirSync(join(ROOT, "docs"), { recursive: true, encoding: "utf8" })
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => ({ f, md: readFileSync(join(ROOT, "docs", f), "utf8") }));
+    const offenders: string[] = [];
+    for (const { f, md } of docs) {
+      for (const line of fencedCommands(md)) {
+        if (/\bnpx\s+tsx\b/.test(line) && /scripts\/admin\.ts/.test(line) && !/--conditions\s+react-server/.test(line)) {
+          offenders.push(`docs/${f}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("is NON-VACUOUS: it flags the exact form that shipped", () => {
+    // The guard above reports zero today. Prove the detector fires rather than matching nothing.
+    const bad = "```bash\nnpx tsx scripts/admin.ts set-access-enforcement acme enforcing\n```";
+    const good = "```bash\nnpm run admin -- set-access-enforcement acme enforcing\n```";
+    const hits = (md: string) =>
+      fencedCommands(md).filter((l) => /\bnpx\s+tsx\b/.test(l) && /scripts\/admin\.ts/.test(l) && !/--conditions\s+react-server/.test(l));
+    expect(hits(bad)).toHaveLength(1);
+    expect(hits(good)).toHaveLength(0);
+  });
+
+  it("RELEASING.md gates the PRET-6 upgrade on a QUERY, not a log line", () => {
+    // The boot retry lives in the scheduler, which only starts when ingestion is enabled — so a log
+    // line is not evidence. Both preconditions must be checked directly.
+    const doc = readFileSync(join(ROOT, "docs", "RELEASING.md"), "utf8");
+    expect(doc).toMatch(/pret4_builtin_materialize/);
+    expect(doc).toMatch(/access_enforcement\s*=\s*'permissive'/);
+    expect(doc).toMatch(/INGEST_POLL_ENABLED/);
+    expect(doc).toMatch(/release\/v0\.11\.0/);
   });
 });
 

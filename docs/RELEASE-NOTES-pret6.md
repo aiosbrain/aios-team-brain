@@ -16,7 +16,7 @@ You may **not** jump to this release from a pre-flip installation. The required 
    unfinished backfill), and connector warnings are a judgment call for you:
 
    ```bash
-   npx tsx scripts/admin.ts set-access-enforcement <team-slug> enforcing
+   npm run admin -- set-access-enforcement <team-slug> enforcing
    ```
 
 3. **Verify nothing is left permissive** before upgrading:
