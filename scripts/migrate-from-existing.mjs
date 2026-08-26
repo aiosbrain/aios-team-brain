@@ -132,8 +132,24 @@ export function nextTagPolicy(declared, existing) {
     );
   }
 
+  // NOTHING TO UPGRADE FROM is a refusal, not an empty run. Found by attacking this function rather
+  // than by review: with `--tags v0.11.0` against a checkout whose tags are absent, every declared tag
+  // is "pending", `usable` comes back empty, `main()`'s `if (usableTags.length)` skips runUpgrades
+  // entirely — and the lane prints success having tested no upgrade at all. A green migration lane that
+  // exercised nothing is strictly worse than a red one.
+  //
+  // An EMPTY declared list stays legal: `--mirror-only` and `--deletion-sweep-only` pass one on purpose.
+  const usable = list.filter((t) => known.has(t));
+  if (list.length > 0 && usable.length === 0) {
+    throw new Error(
+      `no usable upgrade tags: ${list.join(", ")} declared, none present in git. The lane would have ` +
+      `reported success without testing a single upgrade. Check the checkout has tags ` +
+      `(\`fetch-depth: 0\`), or pass --mirror-only if you meant to skip upgrades.`,
+    );
+  }
+
   return {
-    usable: list.filter((t) => known.has(t)),
+    usable,
     pending,
     notice: pending
       ? `${pending} is declared but not yet cut — skipping it this run. Cut the tag and this lane ` +

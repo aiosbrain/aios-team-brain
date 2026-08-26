@@ -72,6 +72,20 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     expect(() => nextTagPolicy(["v0.9.0"], ["v0.10.0", "v0.9.0"])).toThrow(/stale: v0\.10\.0/);
   });
 
+  it("REFUSES when every declared tag is pending — a lane that tests nothing must not report success", () => {
+    // Found by attacking the function, not by review. `main()` gates runUpgrades on `usableTags.length`,
+    // so an all-pending list makes the whole upgrade block vanish and the lane print success having
+    // exercised no upgrade at all. Reachable with `--tags v0.11.0` against a checkout without tags.
+    expect(() => nextTagPolicy(["v0.11.0"], [])).toThrow(/no usable upgrade tags/);
+    expect(() => nextTagPolicy(["v0.11.0"], [])).toThrow(/reported success without testing/);
+  });
+
+  it("still ALLOWS an empty declared list — --mirror-only and --deletion-sweep-only pass one on purpose", () => {
+    // The refusal above must not swallow the legitimate no-upgrades modes; that would break two flags
+    // while fixing a fail-open, which is how a fix acquires its own regression.
+    expect(nextTagPolicy([], ["v0.10.0"])).toEqual({ usable: [], pending: null, notice: null });
+  });
+
   it("each outcome fires ALONE for an input that triggers only it", () => {
     expect(nextTagPolicy(DEFAULT_TAGS, REAL_TAGS)).toEqual({ usable: DEFAULT_TAGS, pending: null, notice: null });
     expect(nextTagPolicy([...DEFAULT_TAGS, "v0.11.0"], REAL_TAGS).pending).toBe("v0.11.0");
