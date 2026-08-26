@@ -59,8 +59,123 @@ import { assertServiceIdentity } from "./service-guard.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-/** Tags whose schema state we upgrade forward. Every one must exist in git. */
+/**
+ * Tags whose schema state we upgrade forward.
+ *
+ * Every one must exist in git — EXCEPT the newest, which may be a release being prepared. See
+ * `nextTagPolicy` for why that exception exists and how narrow it is.
+ */
 export const DEFAULT_TAGS = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"];
+
+// No leading zeros: `v01.2.3` and `v1.2.3` would otherwise compare EQUAL through Number(), and the
+// exemption would land on whichever the caller happened to list first.
+const RELEASE_TAG_RE = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+
+/**
+ * Decide what to do with the declared upgrade set against the tags git actually has — pure, so the
+ * boundary is testable without a repository (`test/guards/release-tag-policy.test.ts`).
+ *
+ * ── THE DEADLOCK THIS EXISTS TO BREAK (RELPTR-1) ────────────────────────────────────────────────
+ * Two rules used to run back to back, and together they made cutting a release impossible without
+ * freezing the repo:
+ *
+ *   1. every declared tag must exist            → extend the list first, and the extension PR throws
+ *                                                  `unknown git tag`
+ *   2. the newest existing tag must be declared  → cut the tag first, and EVERY open PR throws
+ *                                                  `DEFAULT_TAGS is stale`, because this lane runs
+ *                                                  in `ci.yml` on `pull_request`
+ *
+ * There is no order that avoids a red window. The repo could not cut `v0.11.0` without a repo-wide
+ * merge freeze, and that was true regardless of any branch or release strategy.
+ *
+ * ── THE FIX, AND WHY IT IS EXACTLY ONE TAG WIDE ─────────────────────────────────────────────────
+ * The single NEWEST declared tag may be absent: that is a release being prepared, and this lane skips
+ * it with a notice until it exists. Land the preparation PR, cut the tag, and the next run upgrades
+ * through it. No window.
+ *
+ * It is deliberately NOT "skip any missing tag". The staleness rule exists because a hardcoded list
+ * rots silently, and a blanket skip would delete that property — a typo in the middle of the list
+ * would read as a clean run forever. So: a hole in the middle still throws.
+ *
+ * TWO LIMITS, stated because review found both and neither is obvious:
+ *   - the staleness rule only checks the NEWEST existing release, so an existing-but-undeclared tag in
+ *     the middle of the range still passes. "Any tag that exists must be declared" would be too strong.
+ *   - a DELETED newest tag is indistinguishable from one not yet cut, so it reports as pending rather
+ *     than throwing. Accepted: nothing in the ritual deletes a release tag, and no in-repo signal
+ *     separates the two states (the version bump and the CHANGELOG heading both land BEFORE the tag).
+ *
+ * @param {readonly string[]} declared  the upgrade set (DEFAULT_TAGS or --tags)
+ * @param {readonly string[]} existing  tags git reports, newest-first
+ * @returns {{ usable: string[], pending: string|null, notice: string|null }}
+ * @throws  on a hole in the middle, or on a stale list
+ */
+export function nextTagPolicy(declared, existing, { allowPending = true } = {}) {
+  const known = new Set(existing ?? []);
+  const list = [...(declared ?? [])];
+
+  // The newest DECLARED release tag is the only one allowed to be absent. Ordering here is by version,
+  // not by list position: a list written out of order must not change which tag is exempt.
+  const releases = list.filter((t) => RELEASE_TAG_RE.test(t)).sort(compareVersions);
+  const newestDeclared = releases.length ? releases[releases.length - 1] : null;
+
+  // `allowPending` is false for an operator's `--tags`: the exemption exists for the RELEASE
+  // DECLARATION, and widening it to arbitrary CLI input would silently skip a typo like
+  // `--tags v0.10.0,v0.11.9` instead of rejecting the request that was actually made.
+  const missing = list.filter((t) => !known.has(t));
+  const holes = allowPending ? missing.filter((t) => t !== newestDeclared) : missing;
+  if (holes.length > 0) {
+    throw new Error(
+      `unknown git tag: ${holes[0]}. Only the newest declared release tag may be absent (a release ` +
+      `being prepared); a gap anywhere else is a typo or a deleted tag, not a pending release.`,
+    );
+  }
+
+  const pending = allowPending && missing.length > 0 ? newestDeclared : null;
+
+  // The anti-rot rule, unchanged in substance: a tag that EXISTS and is newer than everything declared
+  // means the list went stale after a release. Compared by VERSION rather than by git's sort order, so
+  // it cannot be fooled by a non-release tag sorting first.
+  const newestExisting = (existing ?? []).filter((t) => RELEASE_TAG_RE.test(t)).sort(compareVersions).pop() ?? null;
+  if (list.length && newestExisting && !list.includes(newestExisting)) {
+    throw new Error(
+      `DEFAULT_TAGS is stale: ${newestExisting} is the newest release tag but is not in the upgrade ` +
+      `set (${list.join(", ")}). Add it, so the lane keeps testing an upgrade from the CURRENT release.`,
+    );
+  }
+
+  // NOTHING TO UPGRADE FROM is a refusal, not an empty run. Found by attacking this function rather
+  // than by review: with `--tags v0.11.0` against a checkout whose tags are absent, every declared tag
+  // is "pending", `usable` comes back empty, `main()`'s `if (usableTags.length)` skips runUpgrades
+  // entirely — and the lane prints success having tested no upgrade at all. A green migration lane that
+  // exercised nothing is strictly worse than a red one.
+  //
+  // An EMPTY declared list stays legal: `--mirror-only` and `--deletion-sweep-only` pass one on purpose.
+  const usable = list.filter((t) => known.has(t));
+  if (list.length > 0 && usable.length === 0) {
+    throw new Error(
+      `no usable upgrade tags: ${list.join(", ")} declared, none present in git. The lane would have ` +
+      `reported success without testing a single upgrade. Check the checkout has tags ` +
+      `(\`fetch-depth: 0\`), or pass --mirror-only if you meant to skip upgrades.`,
+    );
+  }
+
+  return {
+    usable,
+    pending,
+    notice: pending
+      ? `${pending} is declared but not yet cut — skipping it this run. Cut the tag and this lane ` +
+        `upgrades through it automatically.`
+      : null,
+  };
+}
+
+/** Semver-ish comparison for `vX.Y.Z`, so ordering never depends on string sort (`v0.9.0` > `v0.10.0`). */
+function compareVersions(a, b) {
+  const parts = (t) => t.slice(1).split(".").map(Number);
+  const [ax, ay, az] = parts(a);
+  const [bx, by, bz] = parts(b);
+  return ax - bx || ay - by || az - bz;
+}
 
 /**
  * Objects a migration creates that `postgres/schema.sql` deliberately does not mirror, each with the
@@ -395,27 +510,26 @@ export async function main(argv = process.argv.slice(2)) {
     ? []
     : value("tags", DEFAULT_TAGS.join(",")).split(",").filter(Boolean);
 
+  // Tags are dereferenced to COMMITS by `--sort=-v:refname` listing plus git's own peeling downstream;
+  // what matters here is the NAME set. This repo's tags are mixed (v0.7.0/v0.9.0 annotated,
+  // v0.8.0/v0.10.0 lightweight), so any comparison by object id must peel — see nextTagPolicy's tests.
   const known = git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean);
-  const knownSet = new Set(known);
-  for (const tag of tags) if (!knownSet.has(tag)) throw new Error(`unknown git tag: ${tag}`);
-  // A hardcoded tag list rots SILENTLY — after v0.11.0 ships, the lane would keep upgrading from an
-  // ever-staler state and stay green, which is the exact failure shape this file exists to remove.
-  // Whenever a release is cut, add it to DEFAULT_TAGS.
-  const newest = known.find((t) => /^v\d+\.\d+\.\d+$/.test(t));
-  if (tags.length && newest && !tags.includes(newest)) {
-    throw new Error(
-      `DEFAULT_TAGS is stale: ${newest} is the newest release tag but is not in the upgrade set ` +
-      `(${tags.join(", ")}). Add it, so the lane keeps testing an upgrade from the CURRENT release.`,
-    );
-  }
+  // `allowPending` only for the declaration. An explicit `--tags` is the operator's request, and a
+  // request naming a tag that does not exist is an error, not a release being prepared.
+  const usingDeclaration = !argv.includes("--tags");
+  const policy = nextTagPolicy(tags, known, { allowPending: usingDeclaration });
+  if (policy.notice) console.log(`  · ${policy.notice}`);
+  const usableTags = policy.usable;
 
   const t0 = Date.now();
   const baseline = await buildFromZero(opts);
   const report = [`  ✓ from-zero baseline: ${baseline.length} catalog objects (${ms(t0)})`];
   const failures = [];
 
-  if (tags.length) {
-    const r = await runUpgrades(tags, baseline, opts);
+  // `usableTags`, not `tags`: a declared-but-not-yet-cut release is skipped with a notice rather than
+  // throwing (nextTagPolicy). Upgrading "from" a tag that does not exist is not a thing git can do.
+  if (usableTags.length) {
+    const r = await runUpgrades(usableTags, baseline, opts);
     failures.push(...r.failures); report.push(...r.report);
   }
   if (flag("mirror-check") || flag("mirror-only")) {
