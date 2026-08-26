@@ -386,27 +386,8 @@ export function diagnosisForLeg(error: string | null): { headline: string; actio
   return faultOf(error);
 }
 
-/** The provider's own words are kept available, never allowed to BE the message. ONE constant: the
- *  banner had its own copy of this number, which is two constants that would drift. */
-export const RAW_ERROR_CLIP = 160;
-
-/**
- * What the banner prints for one failing leg: the sentence an operator can act on, and the provider's
- * own words underneath.
- *
- * PURE, and it is the CALL SITE — extracted because the component itself is not reachable from this
- * repo's unit tier (no DOM harness), so pinning only the classifier would leave "does the banner
- * actually lead with it" tested by nothing. That is the pin-the-call-site failure this repo names.
- */
-export function legDetail(leg: Pick<PipelineLeg, "error" | "diagnosis">): { lead: string | null; raw: string | null } {
-  const raw = leg.error
-    ? leg.error.length > RAW_ERROR_CLIP
-      ? `${leg.error.slice(0, RAW_ERROR_CLIP)}…`
-      : leg.error
-    : null;
-  if (!leg.diagnosis) return { lead: null, raw };
-  return { lead: `${leg.diagnosis.headline} ${leg.diagnosis.action}`, raw };
-}
+// `legDetail`/`RAW_ERROR_CLIP` live in `lib/ingest/leg-detail` — the banner is a CLIENT component
+// and this module is `server-only`, so anything both sides need cannot live here.
 
 function faultOf(error: string | null): { headline: string; action: string } | null {
   const f = diagnoseProviderFault(error);

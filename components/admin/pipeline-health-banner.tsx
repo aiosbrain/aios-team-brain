@@ -5,7 +5,7 @@ import { AlertTriangle, X } from "lucide-react";
 import type { PipelineHealth } from "@/lib/ingest/pipeline-health";
 import { alertSignature } from "@/lib/ingest/pipeline-alert";
 import { timeAgo } from "@/components/format";
-import { legDetail } from "@/lib/ingest/pipeline-health";
+import { legDetail } from "@/lib/ingest/leg-detail";
 
 /** Human labels for the ingest_runs `source` slugs. */
 const LABEL: Record<string, string> = {

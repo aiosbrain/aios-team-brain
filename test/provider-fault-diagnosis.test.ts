@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { diagnoseProviderFault, faultSentence, providerNameFrom } from "@/lib/llm/provider-fault";
 import { degradedNote, type LlmTaskHealth } from "@/lib/query/llm-health";
-import { diagnosisForLeg, legDetail, RAW_ERROR_CLIP } from "@/lib/ingest/pipeline-health";
+import { diagnosisForLeg } from "@/lib/ingest/pipeline-health";
+import { legDetail, RAW_ERROR_CLIP } from "@/lib/ingest/leg-detail";
 
 /**
  * LLMCREDIT-3 — spec `docs/design/llmcredit3-provider-fault-diagnosis.md`.
