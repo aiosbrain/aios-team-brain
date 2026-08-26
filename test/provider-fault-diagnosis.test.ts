@@ -108,6 +108,18 @@ describe("LLMCREDIT-3: the operator reads a diagnosis, not the provider's JSON",
     expect(providerNameFrom(OUT_OF_CREDIT)).toBe("OpenRouter");
     expect(providerNameFrom("LLM gpt-5 @ https://api.openai.com/v1: 402 insufficient_quota")).toBe("OpenAI");
     expect(providerNameFrom("claude @ https://api.anthropic.com/v1: 401")).toBe("Anthropic");
+    // ⚠️ A MODEL SLUG IS NOT A PROVIDER. `openai/gpt-5` is what an OpenRouter-routed model is CALLED;
+    // naming OpenAI from it accuses a provider that refused nothing. A mutation reverting to the
+    // word-match SURVIVED until this case existed — the hostname list was doing nothing observable.
+    expect(providerNameFrom("LLM openai/gpt-5 @ https://proxy.internal/v1: 402 can only afford 5")).toBe(
+      "the model provider"
+    );
+    expect(providerNameFrom("LLM anthropic/claude-4 @ https://proxy.internal/v1: 401 unauthorized")).toBe(
+      "the model provider"
+    );
+    // …while a real hostname still identifies it, whatever the slug says.
+    expect(providerNameFrom("LLM openai/gpt-5 @ https://openrouter.ai/api/v1: 402 x")).toBe("OpenRouter");
+
     // Unidentifiable → a generic noun, NOT a guess. The operator asked for provider-agnostic.
     expect(providerNameFrom("402 payment required")).toBe("the model provider");
     const selfHosted = diagnoseProviderFault('402 {"error":{"message":"can only afford 10 tokens"}}');
