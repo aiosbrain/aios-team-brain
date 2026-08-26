@@ -72,6 +72,29 @@ export function looksLikeSizeRefusal(status: number, body: string): boolean {
   return looksLikeTokenLimit(status, body) || looksLikeBudgetRefusal(status, body);
 }
 
+/**
+ * A 402 refusing this request because of the OTHER requests in flight (LLMCREDIT-2).
+ *
+ * The third member of the family, and the one whose remedy is the opposite of the second's. OpenRouter
+ * reserves credit per in-flight request, so against a small balance a burst of parallel calls has some
+ * of its members refused:
+ *
+ *   `"This request would exceed your available credits given your current in-flight requests. Retry
+ *    after in-flight requests settle, or add credits."` · `"reason":"in_flight_budget_exhausted"` ·
+ *   `"remedy_hint":"Retry after your in-flight requests settle (see the Retry-After header)."`
+ *
+ * ⚠️ A SMALLER REQUEST DOES NOT HELP HERE — the problem is the other five, not this one. Stepping the
+ * token ladder down would be the wrong response; waiting is the right one, and the provider says so.
+ *
+ * Measured on prod 2026-08-25: timeline summaries fan out at CONCURRENCY 6, and 41 of 43 failures
+ * landed inside a single minute while a 45-item person-day succeeded and a 40-item one did not. Size
+ * was not the discriminator; position in the burst was.
+ */
+export function looksLikeInFlightRefusal(status: number, body: string): boolean {
+  if (status !== 402) return false;
+  return /in[_-]?flight[_ ]?budget|in-flight requests settle|in_flight_budget_exhausted/i.test(body);
+}
+
 const SYSTEM_PROMPT = `You are the Team Brain — the shared memory and coordination assistant for a team using AIOS.
 
 Rules:
