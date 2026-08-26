@@ -50,7 +50,8 @@ classifier here must keep those apart or it will send an operator to top up an a
 | **in-flight budget** | `402` + `"reason":"in_flight_budget_exhausted"` | top up (raises the in-flight budget); transient, already retried by LLMCREDIT-2 |
 | **reasoning starvation** | 200 OK, `empty content … finish_reason=length` | pick a NON-reasoning answering model |
 | **bad/expired key** | `401` / `403` | fix the key in Admin → Integrations |
-| **rate limited** | `429` | wait; not a spend problem |
+| **rate limited** | `429` **with rate-limit language** | wait; a burst limit |
+| **out of credit, via 429** | `429` + `insufficient_quota` | ⚠️ *the diff review killed my original row here.* I wrote "429 → wait; not a spend problem" as a semantic fact. It is FALSE for the most common real 429 an answering-model fleet sees: OpenAI reports an exhausted BILLING quota as `429 insufficient_quota` — the literal fixture in this repo's own shipped test, and the shape of the quota incident already in this fleet's history. Quota language now wins over the status |
 
 The first three are evidenced by production screenshots and `llm_failures` rows from 2026-08-25/26.
 ⚠️ *`401`/`403`/`429` are NOT observed on this fleet — they are included because the classifier's job
@@ -156,6 +157,11 @@ admin-area gated and this neither widens nor narrows that.
 
 | # | mutation | must redden |
 |---|---|---|
+| 9 | `statusIn` accepts any bare 3-digit number (graph PROSE becomes a billing diagnosis) | **AC4c** |
+| 10 | the unobserved kinds drop their corroboration requirement | AC4b |
+| 11 | a 429 carrying `insufficient_quota` is called a rate limit | **AC4d** |
+| 12 | `degradedNote` leads even when the fault kinds DISAGREE | **AC6c** |
+| 13 | `providerNameFrom` matches a bare model slug again | AC5 |
 | 1 | the classifier returns `out_of_credit` for any 402 | AC2 |
 | 2 | reasoning starvation classified as `out_of_credit` | **AC3** |
 | 3 | an unrecognised failure returns a generic credit fault instead of `null` | AC4 |
@@ -164,6 +170,30 @@ admin-area gated and this neither widens nor narrows that.
 | 6 | `degradedNote` drops the "Still working" clause | AC6's survival assertion |
 | 7 | the leg's diagnosis is computed from the SOURCE name rather than the error text | AC7 |
 | 8 | the banner renders `l.error` ahead of the diagnosis | AC8 |
+
+## 4b. The diff round — BLOCKED, four HIGHs, all folded
+
+**Fable: BLOCKED.** Every finding was real and three of them were about the classifier being confidently
+wrong — the exact risk §5 names.
+
+| finding | outcome |
+|---|---|
+| **The classifier read text no LLM recorder wrote.** `PipelineLeg.diagnosis` also runs over the synthetic `graph_extract` leg, whose reason is PROSE built from a corpus count — and whose template OPENS with it: *"402 items have been projected for this team, but the graph holds 0 extracted facts…"* (`lib/graph/extraction-health.ts:675`). A team with 402 items would have read **"the model provider refused the call for payment"** on the graph leg, for days, with the real cause clipped underneath | **FOLDED** — a status is now recognised only where a recorder puts one (`@ <baseUrl>: <status>`, `HTTP <status>`, or `<status> {`). AC4c pins five counts (401/402/403/429/500) as prose |
+| **The 429 branch confidently denied the balance problem** for OpenAI's actual out-of-credit shape, and the shipped fixture I inherited takes that branch | **FOLDED** — `429 insufficient_quota` classifies `out_of_credit`; the plain-429 copy now also points at the balance. AC4d |
+| **`degradedNote` diagnosed `errs[0]` and attributed it to EVERY degraded task** — and the fleet that motivated this slice had exactly the breaking shape (a 402 and a starvation concurrently), so the lead depended on Map insertion order and could change between page loads | **FOLDED** — diagnosed per task, leads only when all degraded tasks agree, and `Affected:` is scoped to the tasks carrying that fault. AC6c |
+| **AC7 and AC8 did not exist.** I specced them and never wrote them, so mutations 7 and 8 pointed at nothing and the call sites were pinned by nothing | **FOLDED** — both written. AC8 could not be a render test (no DOM harness in this tier, `@testing-library` not installed), so the composition was EXTRACTED into the pure `legDetail` rather than left as JSX nothing could observe |
+| `providerNameFrom` was word-match while the spec claimed base-URL — a model slug `openai/gpt-5` named OpenAI, which on this fleet is an OpenRouter-routed model | **FOLDED** — hostnames only, which is what §2b always claimed |
+
+⚠️ **AND MUTATION TESTING FOUND TWO MORE THINGS THE REVIEW DID NOT.** Twice, a hardening I had just
+added turned out to be doing nothing observable, because a sibling layer was catching the case:
+
+- reverting `statusIn` to any-bare-number **SURVIVED** — the corroboration gates were doing all the
+  work, so the anchor itself was untested until a case existed that only the anchor stops (a token
+  count sitting beside a corroborating word);
+- reverting `providerNameFrom` to the word-match **SURVIVED** — every fixture had a recognisable
+  hostname, so the tightening was unobservable until a slug-behind-a-proxy-URL case existed.
+
+That is the defence-in-depth-masks-the-mutation shape, twice in one slice.
 
 ## 5. Risks
 
