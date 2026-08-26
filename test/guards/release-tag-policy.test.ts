@@ -39,6 +39,14 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
     expect(() => nextTagPolicy(["v0.7.0", "v0.8.5", "v0.10.0"], REAL_TAGS)).toThrow(/unknown git tag: v0\.8\.5/);
   });
 
+  it("REJECTS a leading-zero version as a release tag, so it cannot steal the exemption", () => {
+    // `v01.2.3` and `v1.2.3` compare EQUAL through Number(), so a loose `\d+` grammar would let
+    // `v01.2.3` rank as the newest declared release and take the exemption from the real one. With the
+    // strict grammar it is not a release tag at all, so an absent one is a hole and throws.
+    // (This assertion exists because the mutation that loosened the grammar SURVIVED without it.)
+    expect(() => nextTagPolicy(["v0.10.0", "v01.2.3"], ["v0.10.0"])).toThrow(/unknown git tag: v01\.2\.3/);
+  });
+
   it("picks the exempt tag by VERSION, not by list position", () => {
     // `v0.9.0` > `v0.10.0` under string sort. A list written out of order must not change which tag
     // is allowed to be missing, or the exemption moves under a harmless reformat.
