@@ -72,6 +72,27 @@ describe("LLMCREDIT-3: the operator reads a diagnosis, not the provider's JSON",
     }
   });
 
+  it("AC4b: a TOKEN COUNT in the HTTP status range is not an HTTP status", () => {
+    // ⚠️ FOUND BY ATTACKING THIS FUNCTION, not by design, and it is the exact risk the spec names.
+    // These strings are full of three-digit numbers. The first version read any of them as a status:
+    //   "you requested up to 429 tokens" -> rate_limited
+    //   "only afford 403 tokens"         -> bad_key   <-- the OUT-OF-CREDIT body's own phrasing,
+    //                                                      diagnosed as a key problem, which sends
+    //                                                      the operator to the wrong console entirely.
+    expect(diagnoseProviderFault("LLM x @ y: you requested up to 429 tokens")).toBeNull();
+    expect(diagnoseProviderFault("only afford 403 tokens, retry")).toBeNull();
+    expect(diagnoseProviderFault("budget 500 tokens exhausted")).toBeNull();
+    // A REAL status still parses, from both shapes the codebase actually produces.
+    expect(diagnoseProviderFault("HTTP 429 rate limit exceeded")?.kind).toBe("rate_limited");
+    expect(diagnoseProviderFault('402 {"error":{"message":"can only afford 10 tokens"}}')?.kind).toBe(
+      "out_of_credit"
+    );
+    // And the two UNOBSERVED kinds need the words as well as the number — a status alone is not
+    // evidence when no production body has ever backed the branch.
+    expect(diagnoseProviderFault("LLM x @ y: 401 something odd")).toBeNull();
+    expect(diagnoseProviderFault("LLM x @ y: 401 unauthorized")?.kind).toBe("bad_key");
+  });
+
   it("AC5: the provider is DERIVED from the failure text, never assumed", () => {
     expect(providerNameFrom(OUT_OF_CREDIT)).toBe("OpenRouter");
     expect(providerNameFrom("LLM gpt-5 @ https://api.openai.com/v1: 402 insufficient_quota")).toBe("OpenAI");

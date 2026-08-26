@@ -52,9 +52,22 @@ export function providerNameFrom(text: string): string {
   return "the model provider";
 }
 
-/** The HTTP status a provider failure string carries, when it carries one. */
+/**
+ * The HTTP status a provider failure string carries, when it carries one.
+ *
+ * ⚠️ ANCHORED, because the first version read any bare three-digit number and these strings are FULL
+ * of them. `"you requested up to 429 tokens"` was diagnosed as rate-limiting, and — worse —
+ * `"only afford 403 tokens"` as a bad API key, which is the out-of-credit body's own phrasing sent to
+ * entirely the wrong console. Found by attacking this function with realistic strings rather than the
+ * three that motivated it.
+ *
+ * Real shapes: `LLM model @ https://host/v1: 402 {…}` and `HTTP 429 insufficient_quota`. So the digits
+ * must follow a colon, `HTTP`, or `status` — and must not be a count of something.
+ */
 function statusIn(text: string): number | null {
-  const m = text.match(/(?:^|\s)(\d{3})(?=\s|$|\s*\{)/);
+  // `^` is an anchor too: a caller that hands us a bare `402 {…}` is naming a status, and the
+  // false positives all sit MID-string after a word like "up to", never at the start.
+  const m = text.match(/(?:^\s*|:\s*|\bHTTP\s+|\bstatus\s+)(\d{3})\b(?!\s*(?:tokens?|credits?|chars?|ms\b))/i);
   const n = m ? Number(m[1]) : NaN;
   return Number.isFinite(n) && n >= 400 && n <= 599 ? n : null;
 }
@@ -73,7 +86,7 @@ export function diagnoseProviderFault(text: string | null | undefined): Provider
   // The two 402s, kept apart because LLMCREDIT-1/-2 proved their remedies are opposite. Both
   // predicates are CONSUMED rather than re-spelled, so this vocabulary has exactly one owner and
   // cannot drift from the retry logic that acts on it.
-  if (status === 402 || /\b402\b/.test(text)) {
+  if (status === 402) {
     if (looksLikeInFlightRefusal(402, text)) {
       return {
         kind: "in_flight_budget",
@@ -109,14 +122,17 @@ export function diagnoseProviderFault(text: string | null | undefined): Provider
   // ⚠️ NOT OBSERVED ON THIS FLEET — unlike everything above, these two have no production body behind
   // them. They are named so the unknown branch stays honest rather than swallowing them into a credit
   // diagnosis, and they are marked so nobody later reads them as measured.
-  if (status === 401 || status === 403) {
+  // ⚠️ CORROBORATION REQUIRED for the two unobserved kinds. A status alone is not enough: these
+  // branches have no production body behind them, so the safe default when the words do not agree
+  // with the number is `null` — the caller then shows the provider's own text.
+  if ((status === 401 || status === 403) && /unauthor|invalid.{0,12}key|forbidden|authenticat|permission/i.test(text)) {
     return {
       kind: "bad_key",
       headline: `${provider} rejected the API key.`,
       action: `Check the key in Admin → Integrations — it may be revoked, expired, or scoped wrong.`,
     };
   }
-  if (status === 429) {
+  if (status === 429 && /rate.?limit|too many requests|quota/i.test(text)) {
     return {
       kind: "rate_limited",
       headline: `${provider} is rate-limiting this account.`,
