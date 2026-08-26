@@ -110,13 +110,55 @@ describe("release tag policy — the real corpus is MIXED (criterion 6)", () => 
   });
 });
 
+describe("release tag policy — the CALL SITE, not just the function (criterion 10)", () => {
+  // BOTH reviewers led with this, and it is this repo's own recorded lesson: 14 green tests over a
+  // pure function say nothing about whether anything CALLS it. Delete the `nextTagPolicy` call and
+  // restore the old inline checks, or pass `tags` instead of `usableTags`, and every assertion above
+  // stays green while the deadlock comes back — and it would surface only during a pending window,
+  // i.e. on release day, the one day this fix exists for.
+  const SRC = readFileSync(join(ROOT, "scripts", "migrate-from-existing.mjs"), "utf8");
+
+  it("main() routes the declared tags THROUGH the policy", () => {
+    expect(SRC).toMatch(/const policy = nextTagPolicy\(tags, known, \{ allowPending: usingDeclaration \}\)/);
+  });
+
+  it("main() upgrades from policy.usable — not from the raw declared list", () => {
+    // `runUpgrades(tags, …)` would re-introduce `fatal: invalid object name` on a pending tag, which
+    // is precisely the failure the policy removes.
+    expect(SRC).toMatch(/if \(usableTags\.length\)/);
+    expect(SRC).toMatch(/await runUpgrades\(usableTags,/);
+    // The CALL, not the declaration: `async function runUpgrades(tags, …)` legitimately names `tags`,
+    // and a first spelling of this assertion matched that and failed on correct code.
+    expect(SRC).not.toMatch(/await runUpgrades\(tags,/);
+  });
+
+  it("the old inline checks are GONE, not merely bypassed", () => {
+    // A revert that leaves the policy call in place but restores the throws above it would deadlock
+    // exactly as before while this file stayed green.
+    expect(SRC).not.toMatch(/for \(const tag of tags\) if \(!knownSet\.has\(tag\)\)/);
+  });
+
+  it("the pending exemption is reserved for the DECLARATION, not for --tags", () => {
+    expect(SRC).toMatch(/const usingDeclaration = !argv\.includes\("--tags"\)/);
+  });
+});
+
 describe("release tag policy — the lane's preconditions (criteria 7, 8, 9)", () => {
-  it("ci.yml still gives the migration lane full history and tags", () => {
+  it("ci.yml gives THE MIGRATION JOB full history and tags", () => {
     // The policy is meaningless against a shallow, tagless checkout: every declared tag would look
-    // absent. `ci.yml`'s own comment says this, and this pins it.
+    // absent. Scoped to the migration job's own block rather than grepping the whole file — an
+    // existential "some job has fetch-depth: 0" is satisfied by a sibling job and would survive the
+    // exact regression it claims to catch (this repo's ∃-guard lesson).
     const ci = readFileSync(join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
-    expect(ci).toMatch(/fetch-depth:\s*0/);
-    expect(ci).toMatch(/migrate-from-existing/);
+    // Split on job keys (two-space indent under `jobs:`) and take the whole job that runs the lane,
+    // rather than guessing at offsets — a hand-computed slice got this wrong and read an adjacent job.
+    const jobs = ci.split(/\n  (?=[a-z0-9_-]+:\n)/);
+    const migrationJob = jobs.find((j) => j.includes("migrate-from-existing"));
+    expect(migrationJob, "ci.yml must still run the migration lane").toBeTruthy();
+    expect(migrationJob!, "the migration job itself needs fetch-depth: 0").toMatch(/fetch-depth:\s*0/);
+    // Non-vacuity: a job that does NOT ask for full history must not satisfy this.
+    const shallow = jobs.find((j) => !j.includes("fetch-depth: 0") && j.includes("steps:"));
+    if (shallow) expect(shallow).not.toMatch(/fetch-depth:\s*0/);
   });
 
   it("docs/RELEASING.md records the cutover constraints, each pointing at a file that resolves", () => {
@@ -176,7 +218,12 @@ describe("release tag policy — the lane's preconditions (criteria 7, 8, 9)", (
     // is good documentation; a guard that punishes it is teaching the wrong lesson. So the invariant
     // is the one that actually helps a reader: the file says what the default is and how to pin.
     const sh = readFileSync(join(ROOT, "install.sh"), "utf8");
-    expect(sh).toMatch(/AIOS_REF/);
+    // The ASSIGNMENT, not just the prose: a guard that only reads comments passes while the default
+    // silently becomes something else, which is the regression this file is about.
+    expect(sh, "the default ref must still be main and still be overridable").toMatch(
+      /REF="\$\{AIOS_REF:-main\}"/
+    );
+    expect(sh).toMatch(/--branch "\$REF"/);
     expect(sh, "must say the default is trunk").toMatch(/default is trunk/);
     expect(sh, "must show how to install a release").toMatch(/AIOS_REF=vX\.Y\.Z/);
     expect(sh, "must point at the release process").toMatch(/docs\/RELEASING\.md/);

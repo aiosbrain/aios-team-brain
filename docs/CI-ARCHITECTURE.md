@@ -212,7 +212,8 @@ Repo: `aiosbrain/aios-team-brain` → Settings → Branches → `main`
       already happened.
 - [x] Require branches to be up to date before merging — **now ON** (`required_status_checks.strict
       = true`, live read 2026-08-25). This line recorded it as off, verified 2026-07-31; it was turned
-      on since. The cost it warned about is real and now paid: a PR must rebase whenever `main` moves. Left as-is
+      on since. The cost this line used to warn about is real and now paid: a PR must rebase whenever
+      `main` moves, on this repo's merge rate. Left as-is
       rather than silently flipped: turning it on forces a rebase-and-re-run on every PR whenever `main`
       moves, which on this repo's merge rate is a real cost the team should choose deliberately.
 - [ ] Dismiss stale reviews on new pushes — **documented as on, actually off**

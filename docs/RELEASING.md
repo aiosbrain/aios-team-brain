@@ -3,7 +3,8 @@
 **Status: there is no release process yet, and this file is the first half of building one.**
 
 What exists today: four tags (`v0.7.0` … `v0.10.0`), the newest cut **2026-08-03**, with `main`
-**166 commits and 29 added migrations** past it and `package.json` still reading `0.10.0`. What does
+**166 commits and 34 migration files (29 added, 5 modified)** past it and `package.json` still reading
+`0.10.0` — measured 2026-08-25 at `63e88c99`, and already moving. What does
 not exist: any documented ritual, any branch that means "the current release", and — until the change
 that ships alongside this file — **the ability to cut a tag at all without freezing the repository**.
 
@@ -39,13 +40,17 @@ runs, today and at every future rebuild — and that branch is trunk.
    `scripts/migrate-from-existing.mjs` and land that PR. The lane skips a declared-but-uncut tag with
    a notice, so this is green *before* the tag exists — that is exactly what the change bought.
 2. **Bump `package.json`'s `version`** to the release version, in the same PR.
-3. **Move `CHANGELOG.md`'s `[Unreleased]` into a dated `## [X.Y.Z] — YYYY-MM-DD` section.** The
-   heading is what a release-time check looks for, and it is the only human-readable record of what a
-   pinned user is running.
-4. **Cut the tag on the release commit** and push it. The migration lane now upgrades
-   `previous → X.Y.Z` on the next run; that is the check that the release is installable from an
-   existing database, and for `v0.11.0` it is the largest step the lane has ever taken (29 added / 34
-   changed migrations, `postgres/schema.sql` +831/−14). Expect it to be slow, and read its output.
+3. **Move `CHANGELOG.md`'s `[Unreleased]` into a dated `## [X.Y.Z] — YYYY-MM-DD` section.** It is the
+   only human-readable record of what a pinned user is running. **No automated check reads this
+   heading today** — an earlier draft of this file claimed one did, which is exactly the kind of
+   invented-check claim the rest of this PR corrects.
+4. **Cut the tag on the release commit** and push it. **Pushing a tag triggers nothing** —
+   `ci.yml` fires on `pull_request` and `push` to branches only, so there is no tag-triggered run to
+   watch. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
+   check that the release is installable from an existing database. For `v0.11.0` it is the largest
+   step the lane has ever taken (**34 migration files touched: 29 added, 5 modified**;
+   `postgres/schema.sql` +831/−14), so expect it to be slow and read its output. A `v*`-triggered
+   verification workflow would close that gap and is named as follow-on work, not shipped here.
 5. **Publish the GitHub Release** from the tag, with the CHANGELOG section as its body.
 
 **Roll forward, never back.** At least one shipped migration is explicitly one-way —
@@ -80,7 +85,7 @@ found, not a proof of completeness.**
 | 3 | **`aios-work-sync` breaks the day contributions move**, and cannot be deferred: it fires on a `pull_request` closed against `main` (`.github/workflows/aios-work-sync.yml`), so merges elsewhere emit nothing — and a release delivered by direct push emits nothing either. Decide whether *integration* or *release* closes a ticket before the first merge lands elsewhere. | `.github/workflows/aios-work-sync.yml` |
 | 4 | **`git diff origin/main...HEAD` is an operative instruction**, not documentation — the review gate and the attestation skills run it. The moment features branch elsewhere, that diff carries every unreleased commit. It must be updated *at* the cutover, not after. | `CLAUDE.md` §Review gate |
 | 5 | **`staging` is 249 commits behind `main` and 0 ahead**, and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
-| 6 | **Bare `gh pr create` targets the default branch**, and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
+| 6 | **Bare `gh pr create` targets the default branch** absent a `branch.<name>.gh-merge-base` override (none is set here), and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
 
 ### 3.2 Ordering pairs that encode a hazard
 
@@ -122,9 +127,17 @@ different base.
 
 No ordering avoided a red window, so the repository could not cut `v0.11.0` without a merge freeze —
 regardless of branch strategy. `nextTagPolicy` widens the first rule by **exactly one tag**: the
-newest *declared* release may be absent, because that is a release being prepared. A gap anywhere else
-still throws, and any tag that exists must still be declared, so the anti-rot property the staleness
-rule was built for is intact.
+newest *declared* release may be absent, because that is a release being prepared — **and only when the
+list comes from `DEFAULT_TAGS`**, never from an operator's `--tags`, so a typo on the command line is
+still rejected rather than silently skipped.
+
+Two limits worth stating rather than discovering, both found in review:
+
+- The staleness rule checks only the **newest** existing release, so a tag that exists in the middle of
+  the range and is not declared still passes. "Any tag that exists must be declared" would be too strong.
+- A **deleted** newest tag is indistinguishable from one not yet cut, so it reports as pending rather
+  than throwing. Accepted: deleting a release tag is not a thing the ritual does, and no in-repo signal
+  separates the two states.
 
 That rule is not a nuisance. Its own comment explains it: a hardcoded list *"rots SILENTLY — the lane
 would keep upgrading from an ever-staler state and stay green, which is the exact failure shape this

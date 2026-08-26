@@ -67,7 +67,9 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
  */
 export const DEFAULT_TAGS = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"];
 
-const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+$/;
+// No leading zeros: `v01.2.3` and `v1.2.3` would otherwise compare EQUAL through Number(), and the
+// exemption would land on whichever the caller happened to list first.
+const RELEASE_TAG_RE = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 
 /**
  * Decide what to do with the declared upgrade set against the tags git actually has — pure, so the
@@ -93,15 +95,21 @@ const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+$/;
  *
  * It is deliberately NOT "skip any missing tag". The staleness rule exists because a hardcoded list
  * rots silently, and a blanket skip would delete that property — a typo in the middle of the list
- * would read as a clean run forever. So: a hole in the middle still throws, and any tag that EXISTS
- * must still be declared.
+ * would read as a clean run forever. So: a hole in the middle still throws.
+ *
+ * TWO LIMITS, stated because review found both and neither is obvious:
+ *   - the staleness rule only checks the NEWEST existing release, so an existing-but-undeclared tag in
+ *     the middle of the range still passes. "Any tag that exists must be declared" would be too strong.
+ *   - a DELETED newest tag is indistinguishable from one not yet cut, so it reports as pending rather
+ *     than throwing. Accepted: nothing in the ritual deletes a release tag, and no in-repo signal
+ *     separates the two states (the version bump and the CHANGELOG heading both land BEFORE the tag).
  *
  * @param {readonly string[]} declared  the upgrade set (DEFAULT_TAGS or --tags)
  * @param {readonly string[]} existing  tags git reports, newest-first
  * @returns {{ usable: string[], pending: string|null, notice: string|null }}
  * @throws  on a hole in the middle, or on a stale list
  */
-export function nextTagPolicy(declared, existing) {
+export function nextTagPolicy(declared, existing, { allowPending = true } = {}) {
   const known = new Set(existing ?? []);
   const list = [...(declared ?? [])];
 
@@ -110,8 +118,11 @@ export function nextTagPolicy(declared, existing) {
   const releases = list.filter((t) => RELEASE_TAG_RE.test(t)).sort(compareVersions);
   const newestDeclared = releases.length ? releases[releases.length - 1] : null;
 
+  // `allowPending` is false for an operator's `--tags`: the exemption exists for the RELEASE
+  // DECLARATION, and widening it to arbitrary CLI input would silently skip a typo like
+  // `--tags v0.10.0,v0.11.9` instead of rejecting the request that was actually made.
   const missing = list.filter((t) => !known.has(t));
-  const holes = missing.filter((t) => t !== newestDeclared);
+  const holes = allowPending ? missing.filter((t) => t !== newestDeclared) : missing;
   if (holes.length > 0) {
     throw new Error(
       `unknown git tag: ${holes[0]}. Only the newest declared release tag may be absent (a release ` +
@@ -119,7 +130,7 @@ export function nextTagPolicy(declared, existing) {
     );
   }
 
-  const pending = missing.length > 0 ? newestDeclared : null;
+  const pending = allowPending && missing.length > 0 ? newestDeclared : null;
 
   // The anti-rot rule, unchanged in substance: a tag that EXISTS and is newer than everything declared
   // means the list went stale after a release. Compared by VERSION rather than by git's sort order, so
@@ -503,7 +514,10 @@ export async function main(argv = process.argv.slice(2)) {
   // what matters here is the NAME set. This repo's tags are mixed (v0.7.0/v0.9.0 annotated,
   // v0.8.0/v0.10.0 lightweight), so any comparison by object id must peel — see nextTagPolicy's tests.
   const known = git(["tag", "--sort=-v:refname"]).split("\n").filter(Boolean);
-  const policy = nextTagPolicy(tags, known);
+  // `allowPending` only for the declaration. An explicit `--tags` is the operator's request, and a
+  // request naming a tag that does not exist is an error, not a release being prepared.
+  const usingDeclaration = !argv.includes("--tags");
+  const policy = nextTagPolicy(tags, known, { allowPending: usingDeclaration });
   if (policy.notice) console.log(`  · ${policy.notice}`);
   const usableTags = policy.usable;
 

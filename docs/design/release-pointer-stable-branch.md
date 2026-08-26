@@ -202,14 +202,30 @@ unit tests); `docs/RELEASING.md`; the four corrections above; and `docs/ARCHITEC
 4. **unit** — the stale check is proven NON-VACUOUS against the repo's real tag corpus: with
    `DEFAULT_TAGS` as shipped and the real tags, it passes; add a fictional newer tag and it throws.
 5. **unit** — each of those three outcomes is asserted to occur ALONE for an input that triggers only it.
-6. **unit** — the policy PEELS annotated tags, proven against the real mixed corpus (`v0.9.0` annotated,
-   `v0.10.0` lightweight), because a comparison against raw tag-ref SHAs would miss half of them.
+6. **unit** — the repo's tag corpus is proven MIXED (`v0.9.0` annotated, `v0.10.0` lightweight), which
+   is why any future check that compares tag OBJECT ids must peel. Stated precisely after review:
+   `nextTagPolicy` compares NAMES and never touches object ids, so this pins the property for the
+   check that will need it rather than claiming the policy peels.
 7. **unit** — a guard asserts `ci.yml` still runs the migration lane with `fetch-depth: 0`, since the
    policy is meaningless against a tagless shallow checkout.
 8. **unit** — `docs/RELEASING.md` exists and its six cutover constraints each name a file the guard can
    resolve, so a constraint cannot rot into prose that points at nothing.
-9. **unit** — the four corrected claims are pinned: no doc asserts a brain-api version other than
-   `lib/api/version.ts`'s, and `install.sh` no longer claims the served copy pins a ref.
+9. **unit** — the corrected claims are pinned: no CURRENT-STATE prose restates a brain-api version
+   (history in dated CHANGELOG entries may, and must), and `install.sh`'s actual `REF` ASSIGNMENT is
+   asserted — a guard reading only its comments would pass while the default silently changed.
+10. **unit** — the CALL SITE is pinned, not just the function: `main()` is asserted to route the
+    declared tags through `nextTagPolicy`, to upgrade from `policy.usable`, and to have LOST the old
+    inline checks. Both reviewers led with this, and it is this repo's own recorded lesson — 18 green
+    tests over a pure function say nothing about whether anything calls it, and the regression would
+    surface only during a pending window, i.e. on release day.
+11. **unit** — the pending exemption is reserved for the DECLARATION: an operator's `--tags` is strict,
+    so `--tags v0.10.0,v0.11.9` rejects the typo instead of skipping it.
+12. **unit** — an all-pending declaration REFUSES rather than reporting success, because `main()` gates
+    the upgrade block on `usableTags.length` and would otherwise print a green lane that exercised no
+    upgrade at all. Found by attacking the function, not by review.
+13. **unit** — the `fetch-depth: 0` assertion is scoped to the MIGRATION JOB, not grepped across the
+    whole workflow (`.github/workflows/ci.yml`): an existential "some job asks for full history" is satisfied by a sibling and would
+    survive the exact regression it claims to catch.
 
 ## What would falsify this
 
