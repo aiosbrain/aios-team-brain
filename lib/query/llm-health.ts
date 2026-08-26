@@ -1,6 +1,7 @@
 import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { classifyFailure, foldStreak, FAILURES_TO_CONFIRM } from "@/lib/ingest/failure-streak";
+import { diagnoseProviderFault } from "@/lib/llm/provider-fault";
 
 /**
  * Answering-model health for the admin dashboard. Non-streaming LLM tasks funnel through
@@ -245,6 +246,12 @@ export function deriveLlmState(tasks: readonly LlmTaskHealth[]): LlmHealthState 
  * was false in both directions: it named a feature the leg had never observed, and it named only two
  * when more could be failing. Pure and exported so the sentence is testable without a database.
  */
+/** The provider's own words, kept available but never allowed to BE the message (LLMCREDIT-3). */
+const RAW_ERROR_CLIP = 160;
+function clipError(e: string): string {
+  return e.length <= RAW_ERROR_CLIP ? e : `${e.slice(0, RAW_ERROR_CLIP)}…`;
+}
+
 export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
   const failing = tasks.filter((t) => t.state === "degraded");
   if (failing.length === 0) return "";
@@ -261,14 +268,23 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
   // still working is an observation claim its own newest observation contradicts.
   const healthy = tasks.filter((t) => t.state === "healthy").map((t) => taskLabel(t.task));
   const unaffected = healthy.length > 0 ? ` Still working: ${healthy.join(", ")}.` : "";
-  return (
-    `The answering model is failing for ${names} — output is missing there.` +
-    (starved
-      ? " It returned empty output, the signature of a reasoning model starving its own answer; pick a non-reasoning model in Admin → Active answering model."
-      : " Check the model and key in Admin → Active answering model.") +
-    unaffected +
-    (errs.length > 0 ? ` (${errs[0]})` : "")
-  );
+  // LLMCREDIT-3: LEAD WITH THE DIAGNOSIS. This used to open with "The answering model is failing for
+  // …" and then append the provider's raw JSON in parentheses — 400 characters an operator had to read
+  // to find "out of credit". When the failure is recognisable, the first sentence now says what is
+  // wrong and what to do; the raw text stays, clipped, at the end. When it is NOT recognisable
+  // `diagnoseProviderFault` returns null and the old wording is exactly what remains, because a
+  // confident wrong headline is worse than the provider's own words.
+  const fault = errs.length > 0 ? diagnoseProviderFault(errs[0]) : null;
+  const lead = fault
+    ? `${fault.headline} ${fault.action}`
+    : `The answering model is failing for ${names} — output is missing there.` +
+      (starved
+        ? " It returned empty output, the signature of a reasoning model starving its own answer; pick a non-reasoning model in Admin → Active answering model."
+        : " Check the model and key in Admin → Active answering model.");
+  // Named even when the diagnosis leads, because WHICH features are dark is not derivable from the
+  // provider's complaint.
+  const affected = fault ? ` Affected: ${names}.` : "";
+  return lead + affected + unaffected + (errs.length > 0 ? ` (${clipError(errs[0])})` : "");
 }
 
 /**

@@ -100,7 +100,26 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
                     the synthetic `graph_extract` leg, which is not a point-in-time failure and gets no
                     fabricated instant — the copy falls back to the cause alone. */}
                 — failing{l.failingSince ? ` since ${timeAgo(l.failingSince)}` : ""}
-                {l.error ? <span className="text-red-600/80 dark:text-red-300/80">: {l.error}</span> : null}
+                {/* LLMCREDIT-3: THE DIAGNOSIS LEADS. This rendered `l.error` alone, which for a
+                    provider failure meant four hundred characters of JSON — clipped mid-word — where
+                    "OpenRouter is out of credit" was the whole answer. When the fault is recognised
+                    the operator reads that sentence; the provider's own words stay underneath,
+                    clipped, because a real outage still has to be diagnosable. When it is NOT
+                    recognised `diagnosis` is null and this is exactly the old rendering. */}
+                {l.diagnosis ? (
+                  <>
+                    <span className="text-red-700 dark:text-red-200">
+                      : {l.diagnosis.headline} {l.diagnosis.action}
+                    </span>
+                    {l.error ? (
+                      <span className="block pl-6 text-[11px] text-red-600/60 dark:text-red-300/60">
+                        {l.error.length > 160 ? `${l.error.slice(0, 160)}…` : l.error}
+                      </span>
+                    ) : null}
+                  </>
+                ) : l.error ? (
+                  <span className="text-red-600/80 dark:text-red-300/80">: {l.error}</span>
+                ) : null}
               </span>
             )}
           </li>

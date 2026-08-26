@@ -3,6 +3,7 @@ import { runSql } from "@/lib/db/pg/pool";
 import { getGraphExtractionHealth, GRAPH_HEALTH_SOURCE } from "@/lib/graph/extraction-health";
 import { classifyFailure, type FailureClass } from "@/lib/ingest/failure-streak";
 import { beatScopeOf } from "@/lib/ingest/leg-ledger";
+import { diagnoseProviderFault } from "@/lib/llm/provider-fault";
 
 /**
  * Aggregate ingestion-pipeline health for a LOUD admin surface. Every pipeline leg (slack/plane/
@@ -251,6 +252,12 @@ export interface PipelineLeg {
   source: string;
   ok: boolean;
   error: string | null;
+  /**
+   * The operator-facing reading of `error`, when it is recognisable (LLMCREDIT-3) — otherwise null,
+   * and the banner falls back to the raw string. Computed here rather than in the component so the
+   * generation banner and this one cannot drift apart on the same provider fault.
+   */
+  diagnosis: { headline: string; action: string } | null;
   at: string; // finished_at ISO
   stale: boolean; // ran before, but not recently
   /**
@@ -373,6 +380,12 @@ const STREAK_SQL = `
       on s.source = n.source
      and s.team_id is not distinct from n.team_id`;
 
+/** The diagnosis for a leg's own recorded error, or null when nothing confident can be said. */
+function faultOf(error: string | null): { headline: string; action: string } | null {
+  const f = diagnoseProviderFault(error);
+  return f ? { headline: f.headline, action: f.action } : null;
+}
+
 function firstError(errors: unknown): string | null {
   const arr = Array.isArray(errors)
     ? errors
@@ -464,6 +477,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
         source: r.source,
         ok: r.ok,
         error: r.ok ? null : firstError(r.errors),
+        diagnosis: r.ok ? null : faultOf(firstError(r.errors)),
         at,
         stale,
         failureClass,
@@ -484,6 +498,7 @@ export async function getPipelineHealth(teamId: string): Promise<PipelineHealth>
         source: "graph_extract",
         ok: false,
         error: extraction.reason,
+        diagnosis: faultOf(extraction.reason),
         at: "", // not a point-in-time failure — the banner shows the cause, not a "since" time
         stale: false,
         // EXEMPT FROM CONFIRMATION, deliberately (BANNERFLAP-1). This leg has NO `ingest_runs` rows —
