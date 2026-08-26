@@ -4,8 +4,13 @@
 #   curl -fsSL https://aiosbrain.dev/install.sh | sh
 #
 # This file is the AUDITED source. The copy served from the website is a thin bootstrap that fetches
-# a pinned ref of this repo and runs the wizard below — so the logic that matters lives in git, under
+# THIS file from `$AIOS_REF` and runs the wizard below — so the logic that matters lives in git, under
 # review, rather than in a mutable file on a CDN. Read it before you run it; it is short on purpose.
+#
+# Be precise about what that does and does not guarantee: the bootstrap pins whatever `AIOS_REF` is,
+# and its default — like the one below — is `main`. An earlier version of this comment said it
+# "fetches a pinned ref", which describes a property this file does not have: the mechanism is
+# pinnable, the default is trunk. Set AIOS_REF=vX.Y.Z to install a release. See docs/RELEASING.md.
 #
 # WHAT IT DOES, AND WHAT IT REFUSES TO DO
 #

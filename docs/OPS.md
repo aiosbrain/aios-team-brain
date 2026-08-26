@@ -349,8 +349,9 @@ chooses to adopt.
 
 ## 7. Upgrading across a brain-api contract bump
 
-The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (currently
-**v1.21**) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
+The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (this server
+declares **v1.23** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
+drift the table below exists to prevent and did not) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
 item kinds, new optional fields) stay within the current major _only if both directions degrade
@@ -361,9 +362,9 @@ that an older brain doesn't yet serve.
 
 | File                                                       | Role                                                                                                                                                                  |
 | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (`**Version: 1.21**`) and carries a dated _Revisions_ changelog for every additive change. |
-| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose: `"This server implements brain-api v1.21"`.                                                                  |
-| `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION = "1.21"` — the single server-side declaration of which contract version this codebase targets.                                        |
+| `aios-workspace/docs/brain-api.md`                         | Source of truth for the wire contract; states the version in its first line (**the number lives there, not here** — copying it into this table is what let the paragraph above drift) and carries a dated _Revisions_ changelog for every additive change. |
+| `docs/ARCHITECTURE.md` (this repo, §"Auth & access tiers") | Carries the canonical implemented-version claim in prose, pinned against the code by `test/guards/contract-version.test.ts`.                                                                  |
+| `lib/api/version.ts`                                       | `export const BRAIN_API_VERSION` — **the** single server-side declaration of which contract version this codebase targets. Read it there; every copy of the number in prose has drifted at least once.                                        |
 | `test/guards/contract-version.test.ts`                     | Fails the build if `BRAIN_API_VERSION` and the `ARCHITECTURE.md` prose claim drift apart — forces both to move together.                                              |
 | `aios-workspace/docs/contract/brain-contract.json`         | Canonical conformance fixture (`version`, `tierAliases`, `sse.frames`, `provisioningTools`, `contentHash`).                                                           |
 | `test/fixtures/contract/brain-contract.json` (this repo)   | A vendored **copy** of the file above — must match byte-for-byte (`contentHash` pins the content) or `test/guards/contract-conformance.test.ts` fails.                |
