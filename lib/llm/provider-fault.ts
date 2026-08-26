@@ -46,28 +46,48 @@ export interface ProviderFault {
  * another. Naming the configured one when a different one refused is a confident lie.
  */
 export function providerNameFrom(text: string): string {
+  // ⚠️ HOSTNAMES ONLY. An earlier version also matched the bare words, which named OpenAI for a MODEL
+  // SLUG like `openai/gpt-5` — a slug this fleet routes through OpenRouter, so it would have named a
+  // provider that refused nothing. A review caught that the code and the spec disagreed: the spec
+  // says "derived from the failure text's own base URL", and now that is what it does. When no host
+  // is present the generic noun is the honest answer.
   if (/openrouter\.ai/i.test(text)) return "OpenRouter";
-  if (/api\.openai\.com|(^|\W)openai(\W|$)/i.test(text)) return "OpenAI";
-  if (/anthropic\.com|(^|\W)anthropic(\W|$)/i.test(text)) return "Anthropic";
+  if (/api\.openai\.com|openai\.azure\.com/i.test(text)) return "OpenAI";
+  if (/anthropic\.com/i.test(text)) return "Anthropic";
   return "the model provider";
 }
 
 /**
- * The HTTP status a provider failure string carries, when it carries one.
+ * The HTTP status a provider failure string carries — recognised ONLY in a shape an LLM recorder
+ * actually writes.
  *
- * ⚠️ ANCHORED, because the first version read any bare three-digit number and these strings are FULL
- * of them. `"you requested up to 429 tokens"` was diagnosed as rate-limiting, and — worse —
- * `"only afford 403 tokens"` as a bad API key, which is the out-of-credit body's own phrasing sent to
- * entirely the wrong console. Found by attacking this function with realistic strings rather than the
- * three that motivated it.
+ * ⚠️ THIS IS THE WHOLE SAFETY PROPERTY, and two rounds of attack were needed to get it right.
  *
- * Real shapes: `LLM model @ https://host/v1: 402 {…}` and `HTTP 429 insufficient_quota`. So the digits
- * must follow a colon, `HTTP`, or `status` — and must not be a count of something.
+ * First it read any bare three-digit number, and these strings are full of them:
+ * `"you requested up to 429 tokens"` became rate-limiting, and `"only afford 403 tokens"` — the
+ * OUT-OF-CREDIT body's own phrasing — became a bad API key.
+ *
+ * Then a review found the sharper one: this classifier also runs over `graph_extract`'s reason, which
+ * is PROSE, not a provider response, and whose template opens with a raw count —
+ * `"402 items have been projected for this team, but the graph holds 0 extracted facts…"`
+ * (`lib/graph/extraction-health.ts`). A corpus of 402 items would have put "the model provider refused
+ * the call for payment" on the graph leg, for days, with the real cause clipped underneath.
+ *
+ * So the digits must sit where a RECORDER puts them, never where prose can:
+ *   `LLM <model> @ <baseUrl>: <status> …`  (lib/llm/complete, lib/query/claude)
+ *   `HTTP <status> …`
+ *   `<status> {…}`                          (a status immediately introducing a JSON body)
+ * Anything else — including a sentence that merely begins with a number — is not a status.
  */
 function statusIn(text: string): number | null {
-  // `^` is an anchor too: a caller that hands us a bare `402 {…}` is naming a status, and the
-  // false positives all sit MID-string after a word like "up to", never at the start.
-  const m = text.match(/(?:^\s*|:\s*|\bHTTP\s+|\bstatus\s+)(\d{3})\b(?!\s*(?:tokens?|credits?|chars?|ms\b))/i);
+  const m =
+    // `@ <baseUrl>: <status>` — `\S*` must be allowed to swallow the URL, whose own `://` is a colon.
+    // The first version used `[^:]*` and could never get past `https:`, so this branch matched nothing
+    // and every passing case was really being caught by the JSON-adjacency pattern below. A criterion
+    // with no `{` in it is what exposed that.
+    text.match(/@\s*\S*:\s*(\d{3})\b/) ??
+    text.match(/\bHTTP\s+(\d{3})\b/i) ??
+    text.match(/(?:^|\s)(\d{3})\s*\{/);
   const n = m ? Number(m[1]) : NaN;
   return Number.isFinite(n) && n >= 400 && n <= 599 ? n : null;
 }
@@ -132,11 +152,23 @@ export function diagnoseProviderFault(text: string | null | undefined): Provider
       action: `Check the key in Admin → Integrations — it may be revoked, expired, or scoped wrong.`,
     };
   }
-  if (status === 429 && /rate.?limit|too many requests|quota/i.test(text)) {
+  // ⚠️ A 429 IS NOT ALWAYS A RATE LIMIT. OpenAI reports an exhausted BILLING QUOTA as
+  // `429 insufficient_quota` — the exact string in this repo's own shipped fixture, and the shape of
+  // the quota incident already in this fleet's history. The first draft answered that with "the
+  // account's rate tier is the limit, NOT its balance", which is a confident inversion of the truth
+  // and would have sent someone to the wrong console. Quota language wins over the status.
+  if (status === 429 && /insufficient_quota|exceeded your current quota|billing/i.test(text)) {
+    return {
+      kind: "out_of_credit",
+      headline: `${provider} says this account's quota is exhausted.`,
+      action: `Top up or raise the plan's quota — this is a billing limit, not a burst limit.`,
+    };
+  }
+  if (status === 429 && /rate.?limit|too many requests/i.test(text)) {
     return {
       kind: "rate_limited",
       headline: `${provider} is rate-limiting this account.`,
-      action: `This clears on its own. If it persists, the account's rate tier is the limit, not its balance.`,
+      action: `This usually clears on its own. If it persists, check the account's rate tier — and its balance, since some providers report an exhausted quota as a 429.`,
     };
   }
 

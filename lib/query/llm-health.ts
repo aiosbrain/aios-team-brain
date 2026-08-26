@@ -274,7 +274,15 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
   // wrong and what to do; the raw text stays, clipped, at the end. When it is NOT recognisable
   // `diagnoseProviderFault` returns null and the old wording is exactly what remains, because a
   // confident wrong headline is worse than the provider's own words.
-  const fault = errs.length > 0 ? diagnoseProviderFault(errs[0]) : null;
+  // ⚠️ DIAGNOSE PER TASK, AND ONLY LEAD WHEN THEY AGREE. The first draft diagnosed `errs[0]` and then
+  // attributed it to EVERY degraded task — and the fleet that motivated this slice had exactly the
+  // shape that breaks: `doc-task-infer` failing on a 402 while `arcs` failed on reasoning starvation,
+  // concurrently, both tasks of this banner. That version would have filed one under the other, and
+  // WHICH one led depended on Map insertion order, so the diagnosis could change between page loads.
+  // A misattributed diagnosis is the thing this whole slice exists to avoid.
+  const diagnosed = failing.map((t) => ({ task: t, fault: diagnoseProviderFault(t.lastError) }));
+  const kinds = new Set(diagnosed.map((d) => d.fault?.kind).filter(Boolean));
+  const fault = kinds.size === 1 ? diagnosed.find((d) => d.fault)!.fault! : null;
   const lead = fault
     ? `${fault.headline} ${fault.action}`
     : `The answering model is failing for ${names} — output is missing there.` +
@@ -282,8 +290,15 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
         ? " It returned empty output, the signature of a reasoning model starving its own answer; pick a non-reasoning model in Admin → Active answering model."
         : " Check the model and key in Admin → Active answering model.");
   // Named even when the diagnosis leads, because WHICH features are dark is not derivable from the
-  // provider's complaint.
-  const affected = fault ? ` Affected: ${names}.` : "";
+  // provider's complaint — and scoped to the tasks that ACTUALLY carry this fault, so a task failing
+  // for a different reason is never listed under it.
+  // Each task WITH ITS OWN MODEL, the same shape `names` uses: a shipped criterion pins that a
+  // two-task outage is never fronted by one model's name, and my first version dropped the models
+  // while scoping the list — trading one misattribution for another.
+  const matching = diagnosed
+    .filter((d) => d.fault?.kind === fault?.kind)
+    .map((d) => `${taskLabel(d.task.task)}${d.task.model ? ` (${d.task.model})` : ""}`);
+  const affected = fault ? ` Affected: ${matching.join(", ")}.` : "";
   return lead + affected + unaffected + (errs.length > 0 ? ` (${clipError(errs[0])})` : "");
 }
 

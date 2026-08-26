@@ -5,6 +5,7 @@ import { AlertTriangle, X } from "lucide-react";
 import type { PipelineHealth } from "@/lib/ingest/pipeline-health";
 import { alertSignature } from "@/lib/ingest/pipeline-alert";
 import { timeAgo } from "@/components/format";
+import { legDetail } from "@/lib/ingest/pipeline-health";
 
 /** Human labels for the ingest_runs `source` slugs. */
 const LABEL: Record<string, string> = {
@@ -102,24 +103,21 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
                 — failing{l.failingSince ? ` since ${timeAgo(l.failingSince)}` : ""}
                 {/* LLMCREDIT-3: THE DIAGNOSIS LEADS. This rendered `l.error` alone, which for a
                     provider failure meant four hundred characters of JSON — clipped mid-word — where
-                    "OpenRouter is out of credit" was the whole answer. When the fault is recognised
-                    the operator reads that sentence; the provider's own words stay underneath,
-                    clipped, because a real outage still has to be diagnosable. When it is NOT
-                    recognised `diagnosis` is null and this is exactly the old rendering. */}
-                {l.diagnosis ? (
-                  <>
-                    <span className="text-red-700 dark:text-red-200">
-                      : {l.diagnosis.headline} {l.diagnosis.action}
-                    </span>
-                    {l.error ? (
-                      <span className="block pl-6 text-[11px] text-red-600/60 dark:text-red-300/60">
-                        {l.error.length > 160 ? `${l.error.slice(0, 160)}…` : l.error}
-                      </span>
-                    ) : null}
-                  </>
-                ) : l.error ? (
-                  <span className="text-red-600/80 dark:text-red-300/80">: {l.error}</span>
-                ) : null}
+                    "OpenRouter is out of credit" was the whole answer. The composition is
+                    `legDetail`, a pure function, because this component is not reachable from the
+                    unit tier and pinning only the classifier would leave the call site untested. */}
+                {(() => {
+                  const d = legDetail(l);
+                  if (!d.lead) return d.raw ? <span className="text-red-600/80 dark:text-red-300/80">: {d.raw}</span> : null;
+                  return (
+                    <>
+                      <span className="text-red-700 dark:text-red-200">: {d.lead}</span>
+                      {d.raw ? (
+                        <span className="block pl-6 text-[11px] text-red-600/60 dark:text-red-300/60">{d.raw}</span>
+                      ) : null}
+                    </>
+                  );
+                })()}
               </span>
             )}
           </li>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { diagnoseProviderFault, faultSentence, providerNameFrom } from "@/lib/llm/provider-fault";
 import { degradedNote, type LlmTaskHealth } from "@/lib/query/llm-health";
+import { diagnosisForLeg, legDetail, RAW_ERROR_CLIP } from "@/lib/ingest/pipeline-health";
 
 /**
  * LLMCREDIT-3 — spec `docs/design/llmcredit3-provider-fault-diagnosis.md`.
@@ -137,6 +138,78 @@ describe("LLMCREDIT-3: the operator reads a diagnosis, not the provider's JSON",
     const note = degradedNote([task("arcs", "degraded", "fetch failed: ECONNRESET")]);
     expect(note.startsWith("The answering model is failing for")).toBe(true);
     expect(note).toContain("ECONNRESET");
+  });
+});
+
+describe("LLMCREDIT-3: the two surfaces, not just the classifier", () => {
+  it("AC4c: graph_extract's PROSE is never mistaken for a provider response", () => {
+    // ⚠️ THE SHARPEST FINDING OF THE DIFF REVIEW. `PipelineLeg.diagnosis` also runs over the synthetic
+    // graph_extract leg, whose reason is PROSE built from a corpus count — and whose template opens
+    // with that count (lib/graph/extraction-health.ts). A team with 402 items would have read "the
+    // model provider refused the call for payment" on the graph leg, for days, with the real cause
+    // clipped underneath. A status is only a status where a RECORDER puts one.
+    for (const items of [401, 402, 403, 429, 500]) {
+      const prose =
+        `${items} items have been projected for this team, but the graph holds 0 extracted facts in ` +
+        `this team's graph groups. Check the graphiti service logs for the actual error.`;
+      expect(diagnoseProviderFault(prose), prose.slice(0, 40)).toBeNull();
+    }
+    expect(
+      diagnoseProviderFault("The graph does hold 402 facts in those groups — arc corrections write facts")
+    ).toBeNull();
+  });
+
+  it("AC4d: a 429 carrying insufficient_quota is a BALANCE problem, not a burst limit", () => {
+    // OpenAI reports an exhausted billing quota as 429 insufficient_quota — this repo's own shipped
+    // fixture. The first draft answered it with "the account's rate tier is the limit, not its
+    // balance", a confident inversion that sends the operator to the wrong console.
+    const f = diagnoseProviderFault("LLM gpt-5 @ https://api.openai.com/v1: 429 insufficient_quota");
+    expect(f?.kind).toBe("out_of_credit");
+    expect(f!.action.toLowerCase()).toMatch(/top up|quota/);
+    // A genuine burst limit still reads as one.
+    const rl = diagnoseProviderFault("HTTP 429 rate limit exceeded, please slow down");
+    expect(rl?.kind).toBe("rate_limited");
+  });
+
+  it("AC6c: two DIFFERENT faults at once are never filed under one another", () => {
+    // The 2026-08-26 fleet, exactly: doc-task-infer on a 402 while arcs starved, concurrently.
+    const note = degradedNote([
+      task("doc-task-infer", "degraded", OUT_OF_CREDIT),
+      task("arcs", "degraded", STARVED),
+    ]);
+    // Neither diagnosis may lead, because leading would file the other task under it — and which one
+    // led used to depend on Map insertion order, so the banner could change between page loads.
+    expect(note.startsWith("The answering model is failing for")).toBe(true);
+    expect(note).not.toContain("Affected:");
+    // Both tasks are still named, which is what the operator needs.
+    expect(note).toContain("task suggestions");
+    expect(note).toContain("Learning arcs");
+  });
+
+  it("AC7: the LEG carries its diagnosis, computed from the error TEXT", () => {
+    expect(diagnosisForLeg(OUT_OF_CREDIT)?.headline).toContain("OpenRouter");
+    // …and from the text, NOT the leg's name: an unrecognisable error yields nothing to say.
+    expect(diagnosisForLeg("connection reset")).toBeNull();
+    expect(diagnosisForLeg(null)).toBeNull();
+  });
+
+  it("AC8: the banner's line LEADS with the diagnosis and keeps the raw text underneath", () => {
+    // ⚠️ PINNING THE CALL SITE, NOT THE CLASSIFIER. The component itself is unreachable from this tier
+    // (the unit config includes only `*.test.ts` and there is no DOM harness), so the composition was
+    // extracted into `legDetail` rather than left as JSX nothing could observe — the review found that
+    // the specced AC7/AC8 did not exist at all, so reverting the banner to render `l.error` first
+    // would have left every test green.
+    const withFault = legDetail({ error: OUT_OF_CREDIT, diagnosis: diagnosisForLeg(OUT_OF_CREDIT) });
+    expect(withFault.lead).toContain("Top up the account");
+    expect(withFault.lead).not.toContain('{"error"');
+    // The provider's own words survive, clipped — a real outage must stay diagnosable.
+    expect(withFault.raw!.length).toBeLessThanOrEqual(RAW_ERROR_CLIP + 1);
+    expect(withFault.raw!.endsWith("…")).toBe(true);
+
+    // An UNRECOGNISED error has no lead at all, so the banner falls back to the raw string.
+    const unknown = legDetail({ error: "connection reset by peer", diagnosis: null });
+    expect(unknown.lead).toBeNull();
+    expect(unknown.raw).toBe("connection reset by peer");
   });
 });
 
