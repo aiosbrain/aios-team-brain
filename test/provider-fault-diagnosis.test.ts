@@ -91,6 +91,16 @@ describe("LLMCREDIT-3: the operator reads a diagnosis, not the provider's JSON",
     // evidence when no production body has ever backed the branch.
     expect(diagnoseProviderFault("LLM x @ y: 401 something odd")).toBeNull();
     expect(diagnoseProviderFault("LLM x @ y: 401 unauthorized")?.kind).toBe("bad_key");
+
+    // ⚠️ THE CASE ONLY THE ANCHOR STOPS. A mutation reverting `statusIn` to any-bare-number SURVIVED
+    // the assertions above, because the corroboration gates were quietly doing all the work — the
+    // "defence in depth masks the mutation" shape. This string corroborates ("quota") AND carries a
+    // mid-sentence 429 that is a token count, so ONLY the anchored parse keeps it out of a confident
+    // rate-limit diagnosis.
+    expect(
+      diagnoseProviderFault("daily quota note: you may use up to 429 tokens per request"),
+      "a token count that happens to sit beside a corroborating word is still not a status"
+    ).toBeNull();
   });
 
   it("AC5: the provider is DERIVED from the failure text, never assumed", () => {
