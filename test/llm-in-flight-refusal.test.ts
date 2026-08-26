@@ -68,8 +68,18 @@ describe("LLMCREDIT-2: an in-flight refusal is a throttle, not a verdict", () =>
   });
 
   it("AC5: Retry-After is honoured when sane, clamped when not", () => {
-    const noJitter = () => 1; // pins the jittered branch so the assertions are deterministic
-    expect(inFlightWaitMs("2", 0, noJitter), "a sane header wins").toBe(2000);
+    const noJitter = () => 1; // pins the random draw so the assertions are deterministic
+    // ⚠️ AT LEAST the header, never exactly it. A review round caught the first version pinning
+    // `toBe(2000)` — which PINNED THE BUG: the provider's remedy_hint tells every refused sibling to
+    // read the same Retry-After, so honouring it verbatim releases all six together and reproduces
+    // the collision. RFC 9110 makes the header a minimum, so the spread goes upward.
+    const honoured = inFlightWaitMs("2", 0, noJitter);
+    expect(honoured, "the header is honoured as a floor").toBeGreaterThanOrEqual(2000);
+    expect(honoured, "and still clamped").toBeLessThanOrEqual(IN_FLIGHT_MAX_WAIT_MS);
+    expect(
+      inFlightWaitMs("2", 0, () => 0),
+      "two siblings handed the SAME header must not wait the same time"
+    ).not.toBe(inFlightWaitMs("2", 0, () => 1));
     // Absent / negative / non-numeric / absurd all fall back to the computed backoff.
     for (const bad of [null, "-5", "soon", String(IN_FLIGHT_MAX_WAIT_MS / 1000 + 60)]) {
       const ms = inFlightWaitMs(bad, 0, noJitter);
@@ -145,9 +155,12 @@ describe("LLMCREDIT-2: the retry, against a stubbed transport", () => {
     fetchMock.mockResolvedValue(inFlight());
 
     await expect(settle(completeText({ system: "s", prompt: "p" }, { maxTokens: 200 }))).rejects.toThrow(/402/);
-    // Two rungs (headroom, bare budget), each allowed IN_FLIGHT_RETRIES extra attempts.
-    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(2 * (IN_FLIGHT_RETRIES + 1));
-    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    // EXACTLY the allowance, not "at most twice it". A review round caught the loose `<=` letting a
+    // widen-the-bound mutant survive — and corrected the count: the second rung never fires, because
+    // an in-flight body is not a SIZE refusal, so the ladder throws instead of stepping down.
+    expect(fetchMock.mock.calls.length, "one attempt plus its bounded retries, on one rung").toBe(
+      IN_FLIGHT_RETRIES + 1
+    );
   });
 
   it("AC8: the added waiting is bounded by the CALLER's budget, not just the attempt count", async () => {
@@ -178,6 +191,24 @@ describe("LLMCREDIT-2: the retry, against a stubbed transport", () => {
     const reasons = rows.filter((r) => r.failure_reason !== undefined).map((r) => r.failure_reason);
     // Not plain `http_402`: nothing in the database could tell the two causes apart before this.
     expect(reasons).toContain("http_402_in_flight");
+  });
+
+  it("AC6b: the row for the failure that actually KILLED the task carries the flavour too", async () => {
+    // The retry rows said `http_402_in_flight` while the TERMINAL row said plain `http_402` — so the
+    // one row describing the fatal refusal was indistinguishable from a dead account. Review finding.
+    fetchMock.mockResolvedValue(inFlight());
+    const rows: Record<string, unknown>[] = [];
+    const db = {
+      from: () => ({ insert: async (r: Record<string, unknown>) => { rows.push(r); return { error: null }; } }),
+    } as never;
+
+    await expect(
+      settle(completeText({ system: "s", prompt: "p" }, { maxTokens: 200, meter: { db, teamId: "t1", source: "arcs" } }))
+    ).rejects.toThrow(/402/);
+
+    const reasons = rows.filter((r) => r.failure_reason !== undefined).map((r) => r.failure_reason);
+    expect(reasons.length, "the retries plus the terminal row").toBeGreaterThan(1);
+    expect(reasons, "every one of them names the flavour").toEqual(reasons.map(() => "http_402_in_flight"));
   });
 
   it("AC7: a SIZE refusal still steps DOWN rather than waiting in place", async () => {

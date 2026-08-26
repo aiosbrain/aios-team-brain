@@ -3,7 +3,13 @@ import Anthropic from "@anthropic-ai/sdk";
 import { selectLlmBackend, reasoningActive, type LlmBackendKeys, type LlmRole } from "@/lib/query/llm-backend";
 import { looksLikeBudgetRefusal, looksLikeInFlightRefusal, looksLikeSizeRefusal } from "@/lib/query/claude";
 import { recordIngestRun } from "@/lib/ingest/runs";
-import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
+import {
+  recordLlmUsage,
+  recordLlmFailure,
+  classifyLlmFailure,
+  type LlmFailureReason,
+  type LlmUsageSource,
+} from "@/lib/costs/llm-usage";
 import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
 import type { DbClient } from "@/lib/db/types";
 
@@ -294,8 +300,15 @@ export async function recordLlmOutcome(
  * when the answer is "top up the account". Misattributing the reason is the thing that column exists
  * to prevent.
  */
-/** Extra attempts for an IN-FLIGHT refusal (LLMCREDIT-2) — bounded, and the caller's `timeoutMs` still
- *  governs the whole call, so a wedged provider cannot stall a rebuild. */
+/**
+ * Extra attempts for an IN-FLIGHT refusal (LLMCREDIT-2), and the ADDED waiting is separately bounded by
+ * the caller's `timeoutMs` (the deadline in `postRung`).
+ *
+ * ⚠️ `timeoutMs` does NOT bound the whole call, and an earlier draft of this comment said it did.
+ * `AbortSignal.timeout` is constructed inside each request, so every attempt gets a fresh budget and
+ * the wall clock is their SUM. The deadline below is what makes the added waiting honest; the
+ * per-attempt timeouts are pre-existing and unchanged.
+ */
 export const IN_FLIGHT_RETRIES = 2;
 const IN_FLIGHT_BASE_MS = 1_200;
 /** No provider gets to park a background rebuild for longer than this, whatever its header says. */
@@ -314,9 +327,15 @@ export const IN_FLIGHT_MAX_WAIT_MS = 8_000;
  */
 export function inFlightWaitMs(retryAfter: string | null, attempt: number, rand: () => number = Math.random): number {
   const header = Number(retryAfter);
-  if (retryAfter !== null && Number.isFinite(header) && header > 0) {
-    const ms = header * 1000;
-    if (ms <= IN_FLIGHT_MAX_WAIT_MS) return ms;
+  const sane = retryAfter !== null && Number.isFinite(header) && header > 0 && header * 1000 <= IN_FLIGHT_MAX_WAIT_MS;
+  if (sane) {
+    // ⚠️ JITTER ON TOP OF THE HEADER, NOT INSTEAD OF IT — the review caught this and it is the whole
+    // scenario. The provider's own `remedy_hint` says "see the Retry-After header", so all six refused
+    // siblings receive the SAME value; honouring it verbatim releases them in the same instant and
+    // reproduces the collision that refused them. The first draft jittered only the fallback branch,
+    // i.e. never in production. Waiting LONGER than `Retry-After` is allowed (RFC 9110 makes it a
+    // minimum), so the spread goes upward, and the clamp still caps it.
+    return Math.min(Math.round(header * 1000 * (1 + rand() * 0.5)), IN_FLIGHT_MAX_WAIT_MS);
   }
   const base = Math.min(IN_FLIGHT_BASE_MS * 2 ** attempt, IN_FLIGHT_MAX_WAIT_MS);
   return Math.round(base * (0.5 + rand() * 0.5)); // 50-100% of the base — spreads the burst
@@ -325,7 +344,15 @@ export function inFlightWaitMs(retryAfter: string | null, attempt: number, rand:
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 class LlmHttpError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(
+    readonly status: number,
+    message: string,
+    /** The ledger reason this refusal should be filed under. Carried on the error because the throw
+     *  site is the only place that still holds the provider's body — without it the row describing
+     *  THE failure that killed the task reads as a plain `http_402`, i.e. indistinguishable from a
+     *  dead account, while its own retry rows say otherwise (review finding). */
+    readonly reason: LlmFailureReason = `http_${status}` as LlmFailureReason
+  ) {
     super(message);
     this.name = "LlmHttpError";
   }
@@ -335,7 +362,11 @@ const isConfigError = (err: unknown): boolean =>
   err instanceof Error && /api[_ ]?key|apiKey|could not resolve|missing credentials/i.test(err.message);
 
 const httpError = (backend: { model: string; baseUrl?: string }, status: number, body: string): LlmHttpError =>
-  new LlmHttpError(status, `LLM ${backend.model} @ ${backend.baseUrl ?? "?"}: ${status} ${body}`);
+  new LlmHttpError(
+    status,
+    `LLM ${backend.model} @ ${backend.baseUrl ?? "?"}: ${status} ${body}`,
+    looksLikeInFlightRefusal(status, body) ? "http_402_in_flight" : (`http_${status}` as LlmFailureReason)
+  );
 
 export async function completeText(args: CompleteArgs, opts: CompleteOptions = {}): Promise<string> {
   const keys = opts.keys ?? {};
@@ -433,7 +464,8 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
           // it did not, and waiting is the one thing this change adds that a caller cannot see. So the
           // added waiting is bounded by that same budget, which makes the claim true instead of just
           // correcting it.
-          if (Date.now() - startedAt >= timeoutMs) return { res: r, errBody: body };
+          const wait = inFlightWaitMs(r.headers?.get?.("retry-after") ?? null, attempt);
+          if (Date.now() - startedAt + wait >= timeoutMs) return { res: r, errBody: body };
           // Filed even when the retry then succeeds — same reason as the budget refusal below: a
           // throttle we recover from silently is how a depleted balance stays invisible.
           if (opts.meter) {
@@ -447,7 +479,7 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
               durationMs: Date.now() - startedAt,
             }).catch(() => {});
           }
-          await sleep(inFlightWaitMs(r.headers?.get?.("retry-after") ?? null, attempt));
+          await sleep(wait);
           r = await doPost(mt);
         }
         return { res: r, errBody: r.ok ? "" : await r.text().catch(() => "") };
@@ -620,7 +652,7 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         source: opts.meter.source,
         provider: backend.provider,
         model: backend.model,
-        reason: err instanceof LlmHttpError ? (`http_${err.status}` as `http_${number}`) : classifyLlmFailure(err),
+        reason: err instanceof LlmHttpError ? err.reason : classifyLlmFailure(err),
         durationMs: Date.now() - startedAt,
       });
     }

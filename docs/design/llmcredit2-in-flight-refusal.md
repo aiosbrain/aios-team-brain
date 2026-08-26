@@ -53,18 +53,37 @@ requests are in flight at once. Against a small balance, OpenRouter reserves cre
 request and refuses the ones that do not fit — so within a single rebuild burst some person-days get
 prose and some do not, **independently of how big they are.**
 
-⚠️ **THE MEASUREMENT CORRECTED MY FIRST HYPOTHESIS, which was that the big days were failing.** From
-`work_timeline_cache`:
+⚠️ **THE MEASUREMENT CORRECTED MY FIRST HYPOTHESIS, which was that the big days were failing.** I
+reconstructed the ACTUAL prompt for all 14 person-days from `work_timeline_cache`, using the real
+`summaryPromptFor` shape (per-source `itemCap = 8`), and compared it against whether that day got
+prose — sorted by prompt size:
 
-| got a summary? | person-days | avg items | max items | max tasks |
-|---|---:|---:|---:|---:|
-| yes | 8 | 13 | **45** | **17** |
-| no | 6 | 19 | 40 | 8 |
+| summary? | ~tokens | items | tasks | person / day |
+|---|---:|---:|---:|---|
+| no | **2,404** | 16 | 7 | Chetan / Fri Aug 21 |
+| **YES** | **2,006** | 9 | 4 | Chetan / Today |
+| no | 1,751 | 8 | 4 | Chetan / Wed Aug 19 |
+| **YES** | 1,579 | **45** | **17** | John Ellison / Fri Aug 21 |
+| no | 1,062 | 40 | 8 | John Ellison / Thu Aug 20 |
+| no | 524 | 36 | 5 | John Ellison / Wed Aug 19 |
+| **YES** | 535 | 28 | 9 | John Ellison / Today |
+| no | **63** | 2 | 0 | John Ellison / Tue Aug 18 |
+| **YES** | **33** | 2 | 0 | Fatma / Thu Aug 20 |
 
-**A 45-item / 17-task day succeeded while a 40-item / 8-task day failed.** Size is not the
-discriminator; position in the concurrency burst is. That is exactly the shape a per-request in-flight
-reservation produces, and it matches the code's own comment that *"some people have prose and some
-don't is the common outcome of a flaky or rate-limited provider"* (`timeline-summary.ts:149-150`).
+**A 63-token prompt FAILED while a 2,006-token prompt SUCCEEDED.** The two distributions overlap
+almost completely (with: 33–2,006 · without: 63–2,404). Against an affordability of ~3,116 tokens, a
+63-token request is affordable under any reading — so **size cannot be the discriminator**, and the
+`itemCap` already bounds the tail. That is exactly the shape a per-request in-flight reservation
+produces, and it matches the code's own comment that *"some people have prose and some don't is the
+common outcome of a flaky or rate-limited provider"* (`timeline-summary.ts:149-150`).
+
+⚠️ **AND THE REVIEW NARROWED WHICH EVIDENCE ACTUALLY CARRIES THIS.** The burst timing is weak on its
+own — a rebuild that runs in one minute puts all its failures in one minute under ANY cause — and so
+is the item-count inversion at n=14, since item count is a poor proxy for tokens. What carries it is
+(a) the table above, where the smallest prompt in the whole set failed; (b) the provider CLASSIFYING
+ITS OWN refusal as `in_flight_budget_exhausted`, which is not statistics; and (c) the fact that these
+43 failures happened AFTER LLMCREDIT-1 shipped — a size-shaped 402 now steps down to the 200-token
+rung, so a size refusal can no longer kill a summary, and 43 died anyway.
 
 ## 1. The rule
 
@@ -86,18 +105,35 @@ be retried-in-place (it will just be refused again), and an in-flight refusal mu
 ### 2b. A bounded wait-and-retry, honouring `Retry-After`
 
 In `lib/llm/complete.ts`, before the size ladder: on an in-flight refusal, sleep and re-send the SAME
-rung. `Retry-After` when the header is present and sane, else a short backoff with **jitter** — jitter
-matters here specifically, because six siblings were refused by the same burst and a fixed delay would
-re-collide them.
+rung. `Retry-After` when the header is present and sane, else exponential backoff.
 
-Bounded at **2 extra attempts**, and the total is clamped by the caller's existing `timeoutMs` budget
-(20s for summaries), so a wedged provider cannot stall a rebuild.
+⚠️ **JITTER APPLIES TO THE HEADER PATH TOO, and the first draft got this exactly backwards.** It
+jittered only the FALLBACK branch — i.e. never in production, because the provider's own `remedy_hint`
+says *"see the Retry-After header"*, so all six refused siblings receive the SAME value, sleep the same
+2,000 ms, and are released in the same instant, reproducing the collision that refused them. The
+review caught it, and caught that the criterion PINNED the bug (`expect(...).toBe(2000)`). RFC 9110
+makes `Retry-After` a MINIMUM, so the spread goes upward from it, still clamped.
+
+Bounded at **2 extra attempts per rung** — so up to +4 requests for a two-rung call, or +6 for a
+three-rung reasoning-role call. ⚠️ *An earlier draft said "2 extra attempts" without "per rung".*
+
+⚠️ **AND `timeoutMs` DOES NOT BOUND THE WHOLE CALL — I claimed it did, in three places.**
+`AbortSignal.timeout` is constructed inside each request, so every attempt gets a fresh budget and the
+wall clock is their SUM (worst case ~152 s for a summary against ~40 s before). Rather than just
+correcting the sentence, the ADDED waiting is now bounded for real: `postRung` computes the wait and
+refuses to start it when `elapsed + wait` would exceed the caller's `timeoutMs`. The per-attempt
+timeouts are pre-existing and unchanged.
 
 ### 2c. The two 402s stop being indistinguishable in the ledger
 
 `llm_failures.failure_reason` records `http_402` for both flavours today, so nothing in the database
 could have told these two apart — the only reason this was diagnosable at all is that a human pasted
 the banner text. The in-flight flavour files `http_402_in_flight`.
+
+⚠️ **INCLUDING THE TERMINAL ROW.** The first draft filed the flavour only on the RETRY rows, leaving
+the row that describes the failure which actually KILLED the task as a plain `http_402` —
+indistinguishable from a dead account, and the one row an operator reads first. The reason now rides
+on `LlmHttpError`, because the throw site is the only place still holding the provider's body.
 
 `failure_reason` is `text` with no CHECK, and the one consumer
 (`lib/metrics/llm-costs.getLlmCostBreakdown`) groups by `source` and never by reason, so widening the
