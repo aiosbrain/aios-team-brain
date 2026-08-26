@@ -25,6 +25,30 @@ import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing
 const ROOT = join(__dirname, "..", "..");
 const REAL_TAGS = ["v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
 
+/**
+ * Does THIS checkout have the release tags?
+ *
+ * It cannot be assumed. `ci.yml`'s "Brain unit tests" job checks out shallow and tagless — only the
+ * migration lane asks for `fetch-depth: 0` — so the first version of this file called `git tag` and
+ * `git cat-file` unconditionally, passed locally against a full clone, and FAILED on CI. A unit test
+ * that needs history the unit tier does not fetch is a broken test, not a broken tier.
+ *
+ * So the guarantees below are carried by FIXTURE assertions that always run; the real-corpus checks are
+ * an extra that runs where the history exists (a developer's clone, and the migration job's
+ * environment). They are gated, never silently skipped in a way that could read as a pass.
+ */
+const gitTags = (() => {
+  try {
+    return execFileSync("git", ["tag", "--sort=-v:refname"], { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .split("\n")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+})();
+const HAS_RELEASE_TAGS = REAL_TAGS.every((t) => gitTags.includes(t));
+const itWithTags = HAS_RELEASE_TAGS ? it : it.skip;
+
 describe("release tag policy — the prepared release (criteria 1, 2, 5)", () => {
   it("ALLOWS the newest declared tag to be absent, and says so instead of throwing", () => {
     const res = nextTagPolicy([...DEFAULT_TAGS, "v0.11.0"], REAL_TAGS);
@@ -63,15 +87,20 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     expect(() => nextTagPolicy(["v0.7.0", "v0.8.0"], REAL_TAGS)).toThrow(/DEFAULT_TAGS is stale: v0\.10\.0/);
   });
 
-  it("is NON-VACUOUS against the repo's REAL tags: shipped list passes, a fictional release reddens it", () => {
-    // Both directions against real data. A check that only ever passes is indistinguishable from one
-    // that matches nothing — this repo has shipped that failure before.
-    const realFromGit = execFileSync("git", ["tag", "--sort=-v:refname"], { cwd: ROOT, encoding: "utf8" })
-      .split("\n")
-      .filter(Boolean);
-    expect(realFromGit).toContain("v0.10.0");
-    expect(() => nextTagPolicy(DEFAULT_TAGS, realFromGit)).not.toThrow();
-    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...realFromGit])).toThrow(/stale: v0\.99\.0/);
+  it("is NON-VACUOUS in both directions against the SHIPPED list", () => {
+    // A check that only ever passes is indistinguishable from one that matches nothing — this repo has
+    // shipped that failure before. Fixture-based, so it runs in every environment including a tagless
+    // CI checkout.
+    expect(() => nextTagPolicy(DEFAULT_TAGS, REAL_TAGS)).not.toThrow();
+    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...REAL_TAGS])).toThrow(/stale: v0\.99\.0/);
+  });
+
+  itWithTags("…and against the tags this checkout actually has", () => {
+    // The same two directions against live git, where the history is present. Gated rather than
+    // assumed: see HAS_RELEASE_TAGS.
+    expect(gitTags).toContain("v0.10.0");
+    expect(() => nextTagPolicy(DEFAULT_TAGS, gitTags)).not.toThrow();
+    expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags])).toThrow(/stale: v0\.99\.0/);
   });
 
   it("compares by version, so a newer tag cannot hide behind string ordering", () => {
@@ -103,7 +132,17 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
 });
 
 describe("release tag policy — the real corpus is MIXED (criterion 6)", () => {
-  it("this repo has both annotated and lightweight tags, which is why nothing may compare raw ref ids", () => {
+  it("the policy is NAME-based, so a mixed corpus cannot change its answer", () => {
+    // Deterministic counterpart to the live check below: whatever object type a tag is, nextTagPolicy
+    // sees a name. This is the property the lane relies on, and it holds in a tagless checkout too.
+    expect(nextTagPolicy(["v0.9.0", "v0.10.0"], ["v0.10.0", "v0.9.0"])).toEqual({
+      usable: ["v0.9.0", "v0.10.0"],
+      pending: null,
+      notice: null,
+    });
+  });
+
+  itWithTags("this repo has both annotated and lightweight tags, which is why nothing may compare raw ref ids", () => {
     // Measured, not assumed: v0.7.0/v0.9.0 are annotated (the ref names a tag OBJECT), v0.8.0/v0.10.0
     // are lightweight (the ref names the commit). Any future check that compares a tag's ref id to a
     // commit id would silently miss half the releases — so this pins the property that makes peeling
