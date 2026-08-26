@@ -427,6 +427,13 @@ export async function completeText(args: CompleteArgs, opts: CompleteOptions = {
         for (let attempt = 0; attempt < IN_FLIGHT_RETRIES && !r.ok; attempt++) {
           const body = await r.text().catch(() => "");
           if (!looksLikeInFlightRefusal(r.status, body)) return { res: r, errBody: body };
+          // ⚠️ A REAL DEADLINE, because `timeoutMs` does NOT bound this on its own: the abort signal is
+          // built inside `doPost`, so EVERY attempt gets its own fresh `timeoutMs` and the wall clock
+          // is the sum. An earlier draft of the spec claimed the caller's budget clamped the total —
+          // it did not, and waiting is the one thing this change adds that a caller cannot see. So the
+          // added waiting is bounded by that same budget, which makes the claim true instead of just
+          // correcting it.
+          if (Date.now() - startedAt >= timeoutMs) return { res: r, errBody: body };
           // Filed even when the retry then succeeds — same reason as the budget refusal below: a
           // throttle we recover from silently is how a depleted balance stays invisible.
           if (opts.meter) {

@@ -150,6 +150,20 @@ describe("LLMCREDIT-2: the retry, against a stubbed transport", () => {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
   });
 
+  it("AC8: the added waiting is bounded by the CALLER's budget, not just the attempt count", async () => {
+    // `timeoutMs` does not bound this on its own — the abort signal is built per request, so every
+    // attempt gets a fresh one and the wall clock is the sum. A caller that asked for 500ms must not
+    // be kept waiting through the full retry allowance.
+    fetchMock.mockResolvedValue(inFlight());
+
+    await expect(
+      settle(completeText({ system: "s", prompt: "p" }, { maxTokens: 200, timeoutMs: 500 }))
+    ).rejects.toThrow(/402/);
+
+    // Strictly fewer requests than the unbounded allowance: the deadline cuts the retry short.
+    expect(fetchMock.mock.calls.length).toBeLessThan(IN_FLIGHT_RETRIES + 1);
+  });
+
   it("AC6: the flavours are distinguishable in the ledger", async () => {
     fetchMock.mockResolvedValueOnce(inFlight()).mockResolvedValueOnce(ok("text"));
     const rows: Record<string, unknown>[] = [];
