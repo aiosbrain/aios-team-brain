@@ -194,7 +194,13 @@ describe("degradedNote — names what was observed, and only that", () => {
       ],
       NOW
     );
-    expect(degradedNote(starved)).toMatch(/reasoning model starving/i);
+    // ⚠️ THE WORDING MOVED, THE CONTRACT DID NOT (LLMCREDIT-3). The starvation hint now comes from the
+    // shared `diagnoseProviderFault` classifier, so this surface and the ingestion banner cannot drift
+    // apart on the one fault they both already knew about. Pinning the retired phrase
+    // (/reasoning model starving/) would pin the implementation; what this test is FOR is that a
+    // starved model is diagnosed as such and sent to the right picker — so that is what it asserts.
+    expect(degradedNote(starved)).toMatch(/hidden reasoning/i);
+    expect(degradedNote(starved)).toContain("Admin → Active answering model");
 
     const other = deriveTaskHealth(
       [
@@ -203,7 +209,7 @@ describe("degradedNote — names what was observed, and only that", () => {
       ],
       NOW
     );
-    expect(degradedNote(other)).not.toMatch(/reasoning model starving/i);
+    expect(degradedNote(other)).not.toMatch(/hidden reasoning/i);
     expect(degradedNote(other)).toContain("429");
   });
 

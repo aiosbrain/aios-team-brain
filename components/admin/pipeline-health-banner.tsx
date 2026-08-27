@@ -5,6 +5,7 @@ import { AlertTriangle, X } from "lucide-react";
 import type { PipelineHealth } from "@/lib/ingest/pipeline-health";
 import { alertSignature } from "@/lib/ingest/pipeline-alert";
 import { timeAgo } from "@/components/format";
+import { legDetail } from "@/lib/ingest/leg-detail";
 
 /** Human labels for the ingest_runs `source` slugs. */
 const LABEL: Record<string, string> = {
@@ -100,7 +101,23 @@ export function PipelineHealthBanner({ health, href }: { health: PipelineHealth;
                     the synthetic `graph_extract` leg, which is not a point-in-time failure and gets no
                     fabricated instant — the copy falls back to the cause alone. */}
                 — failing{l.failingSince ? ` since ${timeAgo(l.failingSince)}` : ""}
-                {l.error ? <span className="text-red-600/80 dark:text-red-300/80">: {l.error}</span> : null}
+                {/* LLMCREDIT-3: THE DIAGNOSIS LEADS. This rendered `l.error` alone, which for a
+                    provider failure meant four hundred characters of JSON — clipped mid-word — where
+                    "OpenRouter is out of credit" was the whole answer. The composition is
+                    `legDetail`, a pure function, because this component is not reachable from the
+                    unit tier and pinning only the classifier would leave the call site untested. */}
+                {(() => {
+                  const d = legDetail(l);
+                  if (!d.lead) return d.raw ? <span className="text-red-600/80 dark:text-red-300/80">: {d.raw}</span> : null;
+                  return (
+                    <>
+                      <span className="text-red-700 dark:text-red-200">: {d.lead}</span>
+                      {d.raw ? (
+                        <span className="block pl-6 text-[11px] text-red-600/60 dark:text-red-300/60">{d.raw}</span>
+                      ) : null}
+                    </>
+                  );
+                })()}
               </span>
             )}
           </li>
