@@ -134,8 +134,10 @@ commit status with any context name onto any sha — which is exactly how `nda-g
 own required context today, so this is demonstrated rather than theorised. The permissions guard
 therefore covers `contents`, `statuses` and `checks` (and `write-all`), allowlisting only
 `nda-gate.yml`'s `statuses`. What the guard cannot do is stop protection from consuming a forged
-status, so the runbook carries the rest as **constraint 9**: the required contexts are currently
-app-pinned, and that pinning must survive the moment this gate becomes required.
+status, so the runbook carries the rest as **constraint 9**. Note what round 2 corrected there: app
+pinning does NOT close this, because a forged status and the genuine check share one app identity —
+the conditional allowlist (nda-gate keeps its exemption only while it stays `pull_request_target`-only)
+is what actually narrows it.
 
 **6. The gate's context name gets a uniqueness guard.** Branch protection identifies a required check
 by context name (plus optionally an app id) — **not** by the workflow file that produced it, and
@@ -180,8 +182,7 @@ protection. Measurement changed the size of that problem, not its ownership.
 
 **In:** `scripts/release-candidate-guard.mjs` (pure decision + a thin git/API-reading entry);
 `.github/workflows/release-candidate.yml`; a workflow-permissions guard; a context-name uniqueness
-guard; `docs/RELEASING.md` §3 corrections (constraint 1 corrected by measurement, constraints 7 and 8
-added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests for all of it.
+guard; `docs/RELEASING.md` §3 corrections (constraint 1 corrected by measurement, constraints 7, 8 and 9 added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests for all of it.
 
 **Cut, each with the reason:**
 
@@ -278,5 +279,5 @@ added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests 
   existed being trusted afterwards — constraint 7 recorded but mis-ordered.
 - **The release fast-forward blocked by a context the candidate cannot acquire** — the measured
   correction was wrong, or `PR records a diff review` was never relocated.
-- **A ninth cutover constraint discovered at cutover time** — eight is what four review rounds across
+- **A tenth cutover constraint discovered at cutover time** — nine is what six review rounds across
   two models have found, not a proof of completeness.

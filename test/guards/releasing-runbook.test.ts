@@ -34,15 +34,22 @@ describe("guard: the cutover constraints survive editing (criterion 13)", () => 
     expect(RUNBOOK).toMatch(/Assertion D is false until `staging` is fast-forwarded/);
   });
 
-  it("constraint 9 names the statuses/checks forge route and the app-pinning mitigation", () => {
+  it("constraint 9 names the statuses forge route AND corrects the app-pinning claim", () => {
     // The third route to a green on an unexamined commit, found during the CODE review after two
     // design rounds had centred on the first two. It is unguardable from inside the repo beyond the
     // permissions guard, so the runbook carries the part a human must not forget: keep the app
     // pinning when the gate becomes required.
-    expect(RUNBOOK).toMatch(/\|\s*9\s*\|/);
-    expect(RUNBOOK).toMatch(/statuses: write` is a third context-forging route/);
-    expect(RUNBOOK).toMatch(/app-pinned/);
-    expect(RUNBOOK).toMatch(/Keep the app pinning when the gate becomes required/);
+    // Anchored INSIDE row 9, not merely "these phrases appear somewhere in the file" — Codex noted the
+    // first version would pass if row 9 were replaced with unrelated text while the phrases survived
+    // elsewhere. A constraint table row is the unit that has to be right.
+    const row9 = RUNBOOK.split("\n").find((l) => l.startsWith("| 9 |")) ?? "";
+    expect(row9, "constraint row 9 must exist").not.toBe("");
+    expect(row9).toMatch(/statuses: write` is a third context-forging route/);
+    // And the correction round 2 forced: app pinning is NOT the mitigation, because a forged status
+    // and the genuine check share one app identity.
+    expect(row9).toMatch(/App pinning is NOT a mitigation here/);
+    expect(row9).toMatch(/conditional on it keeping a `pull_request_target`-only trigger/);
+    expect(row9, "must not restate the claim it corrects").not.toMatch(/which a status from another app cannot satisfy/);
   });
 
   it("§3.2 carries BOTH new ordering pairs", () => {
@@ -64,6 +71,9 @@ describe("guard: the cutover constraints survive editing (criterion 13)", () => 
     const rows = [...section.matchAll(/^\|\s*(\d+)\s*\|/gm)].map((m) => Number(m[1]));
     const highest = Math.max(...rows);
     expect(highest, "constraint table should reach 9").toBe(9);
+    // …and they must READ in order. The fold inserted 9 above 8, which no assertion noticed because
+    // `Math.max` is order-insensitive — a table a human scans during a cutover should not go 7, 9, 8.
+    expect(rows, "constraint rows must be in ascending order").toEqual([...rows].sort((a, b) => a - b));
     expect(RUNBOOK, "the prose must not still say six").not.toMatch(/^Six, each verified/m);
     expect(RUNBOOK).toMatch(/\*\*Nine\*\*, each verified/);
   });

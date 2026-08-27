@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -8,7 +8,7 @@ import { main as runGate, releaseCandidateVerdict } from "../../scripts/release-
 
 /**
  * RELPTR-3 — the release-candidate gate.
- * Spec: `docs/design/release-pointer-cutover-guard.md` (criteria 1–16).
+ * Spec: `docs/design/release-pointer-cutover-guard.md` (criteria 1–17).
  *
  * WHY FOUR ASSERTIONS AND NOT THREE. Two pre-code review rounds across two models converged on this:
  * A+B+C certify "an annotated, correctly-versioned tag on SOME descendant of `main`" — which is not
@@ -123,12 +123,15 @@ describe("release candidate — the workflow that runs it (criteria 6, 7, 8)", (
     // An enumeration of what is forbidden can only ever be as complete as the author's imagination.
     // Comparing the PARSED trigger to the one shape that is allowed inverts that: anything added,
     // anywhere in the block, reddens without this test having to have predicted it.
-    // NOTE the YAML 1.1 trap: `on:` is a boolean key in 1.1 and a string key in 1.2. The `yaml`
-    // package is 1.2 by default, so `["on"]` is correct here — but read both, because a parser
-    // upgrade that flipped it would otherwise turn this assertion into `undefined === undefined`.
+    // The `on:` key must EXIST and be exactly this. Asserting existence separately matters: an
+    // earlier version fell back to `doc[String(true)]` as "YAML 1.1 compatibility hardening", and
+    // Codex showed the hardening was itself a hole — a document whose only key is a literal `true:`
+    // (no `on:` at all, i.e. a workflow GitHub would never run) satisfied the fallback and the
+    // comparison passed. The pinned `yaml` is 1.2, where `on` is a plain string key, so there is
+    // nothing to be compatible with; guessing at a second spelling only widened what counts as a pass.
     const doc = parseYaml(WF) as Record<string, unknown>;
-    const on = doc["on"] ?? doc[String(true)];
-    expect(on).toEqual({ push: { tags: ["v*"] } });
+    expect(Object.keys(doc), "the trigger must be spelled `on:`").toContain("on");
+    expect(doc["on"]).toEqual({ push: { tags: ["v*"] } });
   });
 
   it("asks for full history, since ancestry and reachability need it", () => {
@@ -204,12 +207,36 @@ describe("release candidate — the entry path is wired (criteria 5, 12, 16)", (
  * after both reviewers had verified the order was correct without noting that nothing held it there.
  */
 describe("release candidate — the wiring, against real git (criteria 5, 12, 16)", () => {
-  const git = (cwd: string, ...args: string[]) =>
-    execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
+  // A developer's or CI runner's git config must not reach these repos. Both reviewers flagged that
+  // the first version isolated only the SETUP calls, while the calls inside `runGate` inherited the
+  // real global AND system config — `commit.gpgSign`, `core.hooksPath`, a url rewrite, or an inherited
+  // `GIT_DIR` could break them or point them somewhere else entirely. Neither found a vacuous-pass
+  // route, but "fails for an unrelated reason" is its own cost. Isolated once, for every child process.
+  const ISOLATED = {
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+  beforeAll(() => {
+    for (const [k, v] of Object.entries(ISOLATED)) vi.stubEnv(k, v);
+    // UNSET, not blanked: git treats a set-but-empty GIT_DIR as a path and dies with
+    // "fatal: The empty string is not a valid path". An inherited one would override every `cwd`.
+    for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) vi.stubEnv(k, undefined);
+  });
+  afterAll(() => {
+    vi.unstubAllEnvs();
+    for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  /** Every scratch repo made in this block, removed in `afterAll` — five leaked before. */
+  const made: string[] = [];
+
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
   /** A repo with `main` ahead of `integration`, and an annotated tag on main's tip. */
   function scratch() {
     const dir = mkdtempSync(join(tmpdir(), "rcg-"));
+    made.push(dir);
     git(dir, "init", "-q", "-b", "main");
     git(dir, "config", "user.email", "t@example.com");
     git(dir, "config", "user.name", "t");

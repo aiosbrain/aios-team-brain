@@ -36,7 +36,7 @@ const WORKFLOWS = join(__dirname, "..", "..", ".github", "workflows");
 const files = () => readdirSync(WORKFLOWS).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
 /** A parsed workflow. Deliberately loose — this guard inspects arbitrary YAML, including shapes that
  *  are not valid workflows, because the shapes it must CATCH are the ones nobody would write on purpose. */
-type Workflow = { permissions?: unknown; jobs?: Record<string, { permissions?: unknown; name?: unknown }> };
+type Workflow = { on?: unknown; permissions?: unknown; jobs?: Record<string, { permissions?: unknown; name?: unknown }> };
 const load = (f: string) => parseYaml(readFileSync(join(WORKFLOWS, f), "utf8")) as Workflow;
 
 type Grant = { scope: string; value: string; where: string };
@@ -70,13 +70,38 @@ const FORGING_SCOPES = new Set(["contents", "statuses", "checks", "*"]);
 
 /** The ONE workflow allowed a forging scope, and exactly which. Anything else is a new capability. */
 const ALLOWLIST: Record<string, Set<string>> = {
-  // Publishes its trusted verdict onto the validated PR head — the whole point of the NDA gate, and
-  // it runs on `pull_request_target`, i.e. the BASE copy, not a PR's own edited copy.
+  // Publishes its trusted verdict onto the validated PR head — the whole point of the NDA gate.
   "nda-gate.yml": new Set(["statuses"]),
 };
 
+/**
+ * The exemption is CONDITIONAL on the shape that makes it safe, not on the filename.
+ *
+ * Codex, round 2, and this one mattered: keying the allowlist on the basename alone meant a
+ * same-repository pull request could EDIT `nda-gate.yml` — keep `pull_request_target`, ADD
+ * `pull_request`, and add a job that POSTs `state=success, context='Release candidate gate'` onto any
+ * sha — and the guard would pass, because the basename was retained. `nda-gate.test.ts` does not close
+ * it either: it asserts `pull_request_target:` is PRESENT and never that `pull_request:` is absent.
+ *
+ * What makes nda-gate's grant safe is that it runs the BASE copy of the workflow
+ * (`pull_request_target`), never a PR's own edited copy. So that is what is checked. A file that gains
+ * an untrusted trigger loses the exemption and reddens.
+ */
+export function allowlistApplies(file: string, doc: Workflow): boolean {
+  if (!(file in ALLOWLIST)) return false;
+  const triggers = Object.keys((doc as { on?: Record<string, unknown> })?.on ?? {});
+  // The line is drawn at WHOSE COPY of the workflow runs, not at "which triggers look scary".
+  // `pull_request` runs the PULL REQUEST'S OWN edited copy, before any merge — that is the route.
+  // `workflow_call` can be invoked BY such a workflow, inheriting the grant, so it is on the list too.
+  // `pull_request_target` and `push` run the base/pushed-ref copy, which a pull request cannot edit;
+  // nda-gate legitimately declares both. (Narrowed after an over-broad first attempt that included
+  // `push` and would have reddened the real file for a reason I could not defend.)
+  const prControlled = ["pull_request", "workflow_call"];
+  return triggers.includes("pull_request_target") && !prControlled.some((t) => triggers.includes(t));
+}
+
 export function forgingGrants(file: string, doc: Workflow): Grant[] {
-  const allowed = ALLOWLIST[file] ?? new Set<string>();
+  const allowed = allowlistApplies(file, doc) ? ALLOWLIST[file] : new Set<string>();
   return writeGrants(doc).filter((g) => FORGING_SCOPES.has(g.scope) && !allowed.has(g.scope));
 }
 
@@ -118,11 +143,26 @@ describe("guard: no workflow may acquire a context-forging write grant (criterio
     expect(forgingGrants("some-new-workflow.yml", parseYaml(yaml))).toEqual([]);
   });
 
+  it("the allowlist is CONDITIONAL on the trusted trigger shape, not on the filename", () => {
+    // Codex, round 2: keying on the basename let a same-repo PR edit nda-gate.yml to keep
+    // `pull_request_target`, ADD `pull_request`, and post a forged status from its own edited copy —
+    // all while the guard stayed green because the filename had not changed.
+    const trusted = "on:\n  pull_request_target:\n    branches: [main]\npermissions:\n  statuses: write\n";
+    const hijacked = "on:\n  pull_request_target:\n    branches: [main]\n  pull_request:\npermissions:\n  statuses: write\n";
+    expect(forgingGrants("nda-gate.yml", parseYaml(trusted)), "trusted shape keeps the exemption").toEqual([]);
+    expect(forgingGrants("nda-gate.yml", parseYaml(hijacked)), "an added pull_request trigger loses it").not.toEqual([]);
+    // The real file must still qualify — otherwise this guard is red for the wrong reason.
+    expect(allowlistApplies("nda-gate.yml", load("nda-gate.yml"))).toBe(true);
+    // …and a file with the right name but NO trusted trigger gets nothing.
+    expect(allowlistApplies("nda-gate.yml", parseYaml("on:\n  push:\n"))).toBe(false);
+  });
+
   it("allowlists nda-gate's `statuses: write` NARROWLY — that one file, that one scope", () => {
     // It is an allowlist, and it is deliberately keyed on both file AND scope: the same grant in any
     // other workflow is the forge route above, and a different scope in nda-gate is not covered.
-    expect(forgingGrants("nda-gate.yml", parseYaml("permissions:\n  statuses: write\n"))).toEqual([]);
-    expect(forgingGrants("nda-gate.yml", parseYaml("permissions:\n  contents: write\n"))).not.toEqual([]);
+    const trusted = (perms: string) => parseYaml(`on:\n  pull_request_target:\n${perms}`);
+    expect(forgingGrants("nda-gate.yml", trusted("permissions:\n  statuses: write\n"))).toEqual([]);
+    expect(forgingGrants("nda-gate.yml", trusted("permissions:\n  contents: write\n"))).not.toEqual([]);
     expect(forgingGrants("other.yml", parseYaml("permissions:\n  statuses: write\n"))).not.toEqual([]);
     // …and the real file still only wants what the allowlist grants it.
     expect(forgingGrants("nda-gate.yml", load("nda-gate.yml"))).toEqual([]);
@@ -152,10 +192,42 @@ export function jobNames(doc: Workflow): string[] {
   );
 }
 
+/**
+ * Job names that are EXPRESSIONS, and therefore un-analysable from the file alone.
+ *
+ * Codex, round 2. `jobNames` compares the literal parsed string, but GitHub EVALUATES
+ * `jobs.<id>.name` before publishing the check — so `name: ${{ 'Release candidate gate' }}`, or
+ * `name: ${{ matrix.context }}` with `context: [Release candidate gate]`, publishes the gate's exact
+ * context while the parsed value is `"${{ … }}"` and the uniqueness assertion sails past. App pinning
+ * does not help: the counterfeit and the genuine check are emitted by the same GitHub Actions app.
+ *
+ * There is no honest way to resolve an expression statically, so this does not try. It reports them,
+ * and the guard treats "cannot be analysed" as a failure rather than a pass — which is the only
+ * direction that keeps criterion 10's claim ("every resulting check name") true.
+ */
+export function expressionJobNames(doc: Workflow): string[] {
+  return jobNames(doc).filter((n) => n.includes("${{"));
+}
+
 describe("guard: the gate's check context is unique (criterion 10)", () => {
   it("exactly one workflow can produce the gate's context name", () => {
     const declaring = files().filter((f) => jobNames(load(f)).includes(CONTEXT));
     expect(declaring, `"${CONTEXT}" must be produced by exactly one workflow`).toEqual(["release-candidate.yml"]);
+  });
+
+  it("NO workflow uses an EXPRESSION for a job name, because one cannot be analysed", () => {
+    // Codex, round 2. `name: ${{ 'Release candidate gate' }}` publishes the gate's exact context while
+    // parsing to a literal `"${{ … }}"`, so a purely textual comparison can never see it. Rather than
+    // pretend to evaluate expressions, the repo simply does not use them for job names — and this
+    // assertion is what keeps that true, turning the un-analysable case into a red diff.
+    const offenders = files().flatMap((f) => expressionJobNames(load(f)).map((n) => `${f}: ${n}`));
+    expect(offenders, `expression job names cannot be checked for context collisions:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("is NON-VACUOUS about expressions: both counterfeit shapes are detected", () => {
+    expect(expressionJobNames(parseYaml("jobs:\n  a:\n    name: ${{ 'Release candidate gate' }}\n"))).toHaveLength(1);
+    expect(expressionJobNames(parseYaml("jobs:\n  a:\n    name: ${{ matrix.context }}\n"))).toHaveLength(1);
+    expect(expressionJobNames(parseYaml("jobs:\n  a:\n    name: Release candidate gate\n"))).toEqual([]);
   });
 
   it("is NON-VACUOUS at ANY indentation, and for an unnamed job", () => {
