@@ -69,6 +69,13 @@ line go stale while the code moved on, so it is not restated.
   un-rescanned ones under two different formulas. Null means unknown throughout — never zero,
   never full scope.
 
+- **One issue, one row — a DB backstop for PM links (ADOPTUNIQ-1).** A unique index now enforces that
+  at most one `task_pm_links` row per `(team, provider)` may claim a given `provider_resource_id`.
+  **It declines rather than aborting**: the migration is exception-contained, so on a fleet that
+  already holds duplicates the index is *not* created and the release still succeeds — the log line is
+  the only signal. If you want the backstop, de-duplicate and re-run `pg:schema`. Nothing is deleted
+  and no data is rewritten either way.
+
 > This section lists the changes that were written down. The interval also contains a great deal of
 > work that was never itemised here — it is not an exhaustive record, and is not presented as one.
 > (An earlier draft claimed a precise commit count; it was measured days before the release and was
