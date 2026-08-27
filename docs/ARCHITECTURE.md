@@ -22,6 +22,16 @@ secret functions generate `AUTH_SECRET`, `SECRETS_KEY`, and `GRAPH_LLM_PROXY_SEC
 supplies team and first-admin identity in Railway's form, including an `ADMIN_PASSWORD` of at least
 10 characters.
 
+**Railway builds the repo-root `Dockerfile` for production.** Its GitHub integration auto-detects
+it, so the same image serves the one-command local stack (`docker compose up`) and the live deploy.
+They differ in more than one place — compose additionally supplies the database, volumes and
+environment — but the difference that matters here is the START: `railway.json`'s `startCommand`
+OVERRIDES the image's `ENTRYPOINT`/`CMD`, so `scripts/railway-start.sh` is production's entrypoint
+and `docker/entrypoint.sh` is the local one, both routing through the same `docker/bootstrap.mjs`. The
+runner stage reads nothing from the build context and asserts its boot chain at build time
+(`test/guards/dockerfile-runner-stage.test.ts`, DOCKERPROD-2); a second trip to the context there
+failed two production deploys.
+
 On first start, `railway.json` runs the idempotent schema loader before release. The opt-in Railway
 startup wrapper then runs the shared bootstrap to ensure the real team and first admin from
 `TEAM_*` / `ADMIN_*`. Bootstrap runs on
