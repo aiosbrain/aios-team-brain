@@ -116,6 +116,65 @@ different base.
 
 ---
 
+## 3.4 Upgrading an EXISTING installation past PRET-6 — the ordered path
+
+**A pre-flip installation cannot jump to the retirement release.**
+`postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql` refuses:
+
+```
+PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
+                — upgrade through the prior release first
+```
+
+That refusal is correct and fails safe — `pg:schema` aborts, Railway's preDeploy halts, and the old
+code keeps serving. But until `v0.11.0` exists there was **no release to upgrade through**: `v0.10.0`
+predates the entire PRET series.
+
+### The path
+
+0. **Before cutting the tag** (maintainers): let in-flight migration jobs drain and ask open PRs to
+   rebase onto the commit that declares `v0.11.0`. Declaring before cutting keeps every PR that
+   *contains* the declaration green — but a PR still on an older base declares only through `v0.10.0`,
+   and its migration job reads full history, so a rerun after the tag exists throws
+   `DEFAULT_TAGS is stale`.
+
+1. **Point the service at `release/v0.11.0`** and deploy it. A tag is not enough — Railway's GitHub
+   source is a *connected branch*, so there is no supported, fleet-wide way to select a tag.
+2. **Let it boot, and let auto-flip converge.** The marker is written by the running application
+   (`instrumentation.ts`), not by a migration — applying the schema alone does **not** satisfy the
+   precondition.
+> **Steps 3 and 4 run against the `v0.11.0` release and its database — not after the upgrade.** The
+> retirement deletes both: `set-access-enforcement` is gone from the admin CLI at HEAD, and
+> `teams.access_enforcement` is dropped from the schema. Verified: the command exists at `803122ff`
+> (`scripts/admin.ts:369`) and the column at `803122ff:postgres/schema.sql:162`; both are absent at
+> HEAD. Running either after upgrading gives a confusing error, not a warning.
+
+3. **Flip any team auto-flip could not**, using the command that release carries:
+
+   ```bash
+   npm run admin -- set-access-enforcement <team-slug> enforcing
+   ```
+
+4. **Verify both preconditions directly. This query is the gate — not a log line:**
+
+   ```sql
+   select exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') as marker_ok,
+          (select count(*) from teams where access_enforcement = 'permissive') as permissive_left;
+   ```
+
+   Proceed only on `marker_ok = t` **and** `permissive_left = 0`.
+
+   Why a query rather than the boot log: the boot materialization is best-effort and its retry lives in
+   the scheduler, which `instrumentation.ts` starts **only when `INGEST_POLL_ENABLED !== "false"`**. A
+   transient boot failure on a service with ingestion disabled leaves a healthy-looking instance with
+   no marker — and the next upgrade refuses exactly as before.
+
+5. **Point the service back at `main`** and deploy the retirement release.
+
+Full detail, including what auto-flip will and will not do for you: `RELEASE-NOTES-pret6.md`.
+
+---
+
 ## 4. The deadlock this file ships with the fix for
 
 `scripts/migrate-from-existing.mjs` enforced two rules back to back:

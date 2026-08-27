@@ -471,17 +471,23 @@ invariant"):
 
 ## 9. Access enforcement — arming per-project visibility for a team
 
-**The one-line summary:** every team is `permissive` until someone changes it, and `permissive`
-means one flat pool — every `team`-tier member reads every other member's pushed content, and the
-whole timeline. If a customer believes their people are separated from each other, they are wrong
-until this is armed **and** their content is curated (see "What enforcing does not buy" below).
+> ⚠️ **THE ARMING STEP IS RETIRED (PRET-6).** There is no longer a mode to flip: `permissive` was
+> deleted, `teams.access_enforcement` was dropped from the schema, and `set-access-enforcement` was
+> removed from the admin CLI. **Enforcing is the only behaviour** — membership decides what a member
+> reads, always. What survives below is the description of *what enforcement covers*, which is still
+> accurate and still worth reading; the commands that armed it no longer exist.
+>
+> Upgrading an installation that predates the retirement is an ordered, one-way path:
+> [`RELEASING.md`](RELEASING.md) §3.4 and `RELEASE-NOTES-pret6.md`.
 
-### The command
+**What this used to mean, and why the section exists:** a team was `permissive` until someone armed
+it, and `permissive` meant one flat pool — every `team`-tier member read every other member's pushed
+content and the whole timeline. That default is what PRET-6 removed.
 
-```
-npx tsx --conditions react-server scripts/admin.ts \
-  set-access-enforcement <team-slug> <permissive|enforcing> [--dry-run]
-```
+### The command — REMOVED
+
+The arming command is gone. It is not reproduced here even as an example: a copyable command for a
+verb the CLI no longer has is found during an incident, which is the worst moment to discover it.
 
 - The team is a **positional argument**, not `--team`. Every other command in this CLI defaults to
   `--team demo`; a silent default on the flag that decides what an entire team can see is exactly
@@ -539,14 +545,18 @@ direction is fail-CLOSED (content briefly hidden, never leaked) and self-heals, 
 arming enforcement during an active sync, wait a tick and re-run `--dry-run` before you trust the
 verdict.
 
-### Rolling back
+### Rolling back — **there is no longer a way back**
 
-```
-… scripts/admin.ts set-access-enforcement <team-slug> permissive
-```
+**PRET-6 deleted the permissive mode.** `set-access-enforcement` is gone from the admin CLI and
+`teams.access_enforcement` is dropped from the schema, so the command this section used to publish —
+`… scripts/admin.ts set-access-enforcement <team-slug> permissive` — no longer exists. It is recorded
+here rather than silently removed, because a stale rollback instruction is worse than an absent one:
+someone reaching for it during an incident would burn the incident discovering it.
 
-`permissive` is never gated on readiness — it is the fail-open-to-today direction and cannot hide
-anything, so it is also the one-command undo for a team someone armed by hand in SQL.
+Membership is now the only thing that decides what a member reads. The undo for an over-broad grant is
+a membership or grant change (`npm run admin -- revoke-project …`), not a mode flip. If you are
+upgrading a pre-flip installation, the ordered path — and the fact that it is one-way — is in
+[`RELEASING.md`](RELEASING.md) §3.4 and `RELEASE-NOTES-pret6.md`.
 
 ### What `enforcing` actually covers — and what it does not
 
