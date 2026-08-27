@@ -39,11 +39,20 @@ runs, today and at every future rebuild — and that branch is trunk.
 1. **Declare the release before you cut it.** Add the new tag to `DEFAULT_TAGS` in
    `scripts/migrate-from-existing.mjs` and land that PR. The lane skips a declared-but-uncut tag with
    a notice, so this is green *before* the tag exists — that is exactly what the change bought.
-2. **Bump `package.json`'s `version`** to the release version, in the same PR.
-3. **Move `CHANGELOG.md`'s `[Unreleased]` into a dated `## [X.Y.Z] — YYYY-MM-DD` section.** It is the
-   only human-readable record of what a pinned user is running. **No automated check reads this
-   heading today** — an earlier draft of this file claimed one did, which is exactly the kind of
-   invented-check claim the rest of this PR corrects.
+2. **Bump the version at all THREE sites**, in the same PR — `package.json` `.version`,
+   `package-lock.json` `.version`, and `package-lock.json` `.packages[""].version`. Bumping only the
+   first is the mistake this repo has already made: the version sat at `0.10.0` for 23 days and two
+   releases' worth of work. `test/guards/release-version-agreement.test.ts` now fails the build if the
+   three disagree, or if the newest **declared** tag is not `v${package.json.version}`.
+3. **Move `CHANGELOG.md`'s `[Unreleased]` into a dated `## [X.Y.Z] — YYYY-MM-DD` section**, and leave
+   an empty `## [Unreleased]` above it. It is the only human-readable record of what a pinned user is
+   running. **A check now reads this heading** (RELPTR-2): the build fails if there is no section for
+   the version being shipped, or if no `[Unreleased]` heading is left for the next cycle. It checks
+   *presence*, not contents — and it ignores headings inside fenced code blocks, so an illustration
+   cannot stand in for a missing section. Note what it still cannot check: whether the section is
+   TRUE. Anything merged before you cut the tag ships in the release whether or not it is listed.
+   (An earlier draft of this file claimed a check existed when none did; this line is accurate as of
+   the guard, not aspirational.)
 4. **Cut the tag on the release commit** and push it. **Pushing a tag triggers nothing** —
    `ci.yml` fires on `pull_request` and `push` to branches only, so there is no tag-triggered run to
    watch. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
