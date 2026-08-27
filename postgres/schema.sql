@@ -1323,6 +1323,35 @@ alter table task_pm_links add column if not exists projection_fingerprint text;
 alter table task_pm_links add column if not exists provider_seen_status text;
 alter table task_pm_links add column if not exists last_projected_brain_status text;
 
+-- ADOPTUNIQ-1 — the DB backstop for one-issue-one-row. THIS BLOCK IS DUPLICATED VERBATIM IN
+-- `postgres/migrations/20260826230000_task_pm_links_provider_resource_uq.sql`, which carries the full
+-- rationale; read it before changing either copy. Two things it must keep:
+--
+--   1. It must stay BELOW the `create table if not exists task_pm_links` region above — a from-zero
+--      load errors on a missing table otherwise, and `undefined_table` is deliberately NOT caught so
+--      that mistake is loud.
+--   2. It must stay a GUARDED `do $$ … $$`, never a bare `create unique index`. schema.sql is sent as
+--      one multi-statement query (ONE implicit transaction) and runs BEFORE the migrations, so an
+--      unguarded failure here aborts the entire schema load — on a deploy where the old app version is
+--      still serving and still writing these rows.
+--
+-- The three `when` clauses each trace to a staged, verified abort (duplicate data; lock_timeout
+-- expiry; a real deadlock in which this transaction was the victim). Never `when others`.
+-- Guarded by `test/guards/task-pm-links-unique-index.test.ts`.
+do $$
+begin
+  create unique index if not exists task_pm_links_provider_resource_uq
+    on task_pm_links (team_id, provider, provider_resource_id)
+    where provider_resource_id is not null;
+exception
+  when unique_violation then
+    raise warning 'ADOPTUNIQ-1: duplicate provider_resource_id present - DB backstop NOT installed; repair the duplicates (this skip does NOT self-heal)';
+  when lock_not_available then
+    raise warning 'ADOPTUNIQ-1: could not acquire the lock - DB backstop NOT installed; the next deploy retries';
+  when deadlock_detected then
+    raise warning 'ADOPTUNIQ-1: deadlock while creating the index - DB backstop NOT installed; the next deploy retries';
+end $$;
+
 -- Task ↔ evidence links (work-timeline context layer): which items (commits, docs, Slack threads)
 -- are the actual WORK behind a task. Populated deterministically by issue-key references in the item's
 -- text (a commit/PR/branch/doc that cites `AIO-123`) via lib/dashboard/timeline-evidence (sole writer);

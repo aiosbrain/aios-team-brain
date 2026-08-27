@@ -3,6 +3,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { recordIngestRun, type IngestRunRow, type IngestTrigger } from "@/lib/ingest/runs";
 import { isStale } from "@/lib/ingest/runs-format";
+import { withTransaction } from "@/lib/db/pg/tx";
 import type { PmProvider } from "@/lib/pm-sync/provider";
 import type { ProjectionReport } from "@/lib/pm-sync/project";
 
@@ -113,23 +114,97 @@ export type ProjectionHealthStatus = "never_run" | "ok" | "stale" | "failed";
 // the same `isStale` age check the ingest-runs panel already uses (lib/ingest/runs-format.ts).
 export const PROJECTION_STALE_AFTER_HOURS = 24;
 
+/**
+ * ADOPTUNIQ-1 — is the one-issue-one-row DB backstop actually installed and CORRECT?
+ *
+ * `unknown` is not a synonym for `healthy`: a catalog read that fails resolves here, never to
+ * `installed`. A probe that reports green when it cannot see is the fail-open shape this repo has
+ * already been bitten by.
+ */
+export type BackstopStatus = "installed" | "missing" | "malformed" | "unknown";
+
 export interface ProjectionHealth {
   status: ProjectionHealthStatus;
   lastRun: IngestRunRow | null;
   ageMs: number | null;
+  /**
+   * DELIBERATELY A SEPARATE FIELD, not a value folded into `status`. `status` describes the last
+   * projection RUN (never_run/failed/stale/ok); the backstop is a schema property with no relation to
+   * it, and overloading one enum would make "ok" mean two unrelated things.
+   */
+  backstop: BackstopStatus;
 }
 
-export function computeProjectionHealth(lastRun: IngestRunRow | null, now = Date.now()): ProjectionHealth {
-  if (!lastRun) return { status: "never_run", lastRun: null, ageMs: null };
+export function computeProjectionHealth(
+  lastRun: IngestRunRow | null,
+  now = Date.now(),
+  backstop: BackstopStatus = "unknown",
+): ProjectionHealth {
+  if (!lastRun) return { status: "never_run", lastRun: null, ageMs: null, backstop };
   const finishedAtMs = new Date(lastRun.finished_at).getTime();
   const ageMs = now - finishedAtMs;
-  if (!lastRun.ok) return { status: "failed", lastRun, ageMs };
-  if (isStale(finishedAtMs, now, PROJECTION_STALE_AFTER_HOURS)) return { status: "stale", lastRun, ageMs };
-  return { status: "ok", lastRun, ageMs };
+  if (!lastRun.ok) return { status: "failed", lastRun, ageMs, backstop };
+  if (isStale(finishedAtMs, now, PROJECTION_STALE_AFTER_HOURS)) return { status: "stale", lastRun, ageMs, backstop };
+  return { status: "ok", lastRun, ageMs, backstop };
 }
 
-/** Convenience: last run + derived health in one round trip. */
+/**
+ * ADOPTUNIQ-1 — classify the catalog row for `task_pm_links_provider_resource_uq`.
+ *
+ * Pure, so the whole decision table is unit-testable without a database. `indexdef` is Postgres's
+ * NORMALIZED rendering from `pg_get_indexdef`, not our source DDL — comparing against the source text
+ * would break on whitespace and on Postgres's own parenthesisation of the predicate.
+ *
+ * `malformed` exists because `create unique index IF NOT EXISTS` accepts ANY existing relation with
+ * that name, whatever its columns, order, predicate or uniqueness — so a wrong index of the right name
+ * would otherwise read as a successful deploy forever.
+ */
+export function classifyBackstop(
+  row: { indexdef: string; isvalid: boolean } | null,
+): BackstopStatus {
+  if (!row) return "missing";
+  if (!row.isvalid) return "malformed";
+  const def = row.indexdef.toLowerCase().replace(/\s+/g, " ").trim();
+  const wellFormed =
+    def.includes("create unique index") &&
+    // schema+table binding, not just the index name
+    /\son\s+public\.task_pm_links\s+using\s+btree\s*\(/.test(def) &&
+    // exact ORDERED key columns, and nothing else (no expression/include columns)
+    def.includes("(team_id, provider, provider_resource_id)") &&
+    // the partial predicate, in Postgres's normalized rendering
+    def.includes("where (provider_resource_id is not null)");
+  return wellFormed ? "installed" : "malformed";
+}
+
+/**
+ * Read the backstop's catalog row. FAIL-CLOSED: any error resolves `unknown`, never `installed`.
+ *
+ * Raw SQL rather than the query builder because `DbClient` cannot express the `pg_index`/`pg_class`
+ * joins — the same reason `lib/pm-sync/inbound.ts` reaches for `withTransaction`.
+ */
+export async function readBackstopStatus(): Promise<BackstopStatus> {
+  try {
+    return await withTransaction(async (client) => {
+      const res = await client.query(
+        `select pg_get_indexdef(i.indexrelid) as indexdef, i.indisvalid as isvalid
+           from pg_index i
+           join pg_class c on c.oid = i.indexrelid
+           join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = 'public' and c.relname = 'task_pm_links_provider_resource_uq'`,
+      );
+      const row = (res.rows?.[0] ?? null) as { indexdef: string; isvalid: boolean } | null;
+      return classifyBackstop(row);
+    });
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Convenience: last run + derived health + the DB backstop in one call. */
 export async function getProjectionHealth(db: DbClient, teamId: string): Promise<ProjectionHealth> {
-  const runs = await listRecentProjectionRuns(db, teamId, 1);
-  return computeProjectionHealth(runs[0] ?? null);
+  const [runs, backstop] = await Promise.all([
+    listRecentProjectionRuns(db, teamId, 1),
+    readBackstopStatus(),
+  ]);
+  return computeProjectionHealth(runs[0] ?? null, Date.now(), backstop);
 }
