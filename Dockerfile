@@ -50,9 +50,18 @@ EXPOSE 3000
 # root — where `-r` passes on a directory and on a zero-byte file, both of which still boot dead.
 # NOT `-x`: the ENTRYPOINT below invokes through `sh`, which reads the file rather than executing
 # it, and requiring the mode bit would re-couple what that form deliberately decouples.
+#
+# ⚠️ EACH TEST EXITS EXPLICITLY, and that is not style. The first version of this line was
+# `test -f "$f" && test -s "$f" && test -r "$f"` under `set -eu`, which DOES NOT FAIL: POSIX
+# ignores errexit for a command in an AND-OR list, so a missing file fell straight through and the
+# build went green. Measured — a build with bootstrap.mjs absent printed "BUILD PASSED WITH
+# bootstrap.mjs MISSING". An assertion that cannot fail is worse than none, because it reads as
+# coverage. `|| { …; exit 1; }` depends on no shell option at all, and names what is missing.
 RUN set -eu; \
     for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs; do \
-      test -f "$f" && test -s "$f" && test -r "$f"; \
+      test -f "$f" || { echo "boot chain: $f is missing or not a regular file" >&2; exit 1; }; \
+      test -s "$f" || { echo "boot chain: $f is empty" >&2; exit 1; }; \
+      test -r "$f" || { echo "boot chain: $f is not readable" >&2; exit 1; }; \
     done; \
     /bin/sh -n /app/docker/entrypoint.sh
 

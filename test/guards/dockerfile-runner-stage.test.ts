@@ -287,9 +287,16 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
     //
     // `-r` alone is nearly `-e` as root, and passes on a directory and on a zero-byte file — both of
     // which still build green and boot dead. Hence -f and -s too.
+    // Each test EXITS EXPLICITLY. The first version chained them with `&&` under `set -eu`, which
+    // does not fail: POSIX ignores errexit for a command in an AND-OR list, so a missing boot file
+    // fell through and the image built green. Pinning the exact text is what stops that shape
+    // coming back — a static guard cannot otherwise tell a working assertion from a decorative one.
+    const fail = (msg: string) => `|| { echo "boot chain: $f ${msg}" >&2; exit 1; }`;
     const expected =
       `set -eu; for f in ${bootPaths.join(" ")}; do ` +
-      `test -f "$f" && test -s "$f" && test -r "$f"; done; ` +
+      `test -f "$f" ${fail("is missing or not a regular file")}; ` +
+      `test -s "$f" ${fail("is empty")}; ` +
+      `test -r "$f" ${fail("is not readable")}; done; ` +
       `/bin/sh -n ${entrypointArgv?.[1]}`;
     expect(normalise(finalStage.instructions[assertionIndex].args)).toBe(normalise(expected));
   });

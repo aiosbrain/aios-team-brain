@@ -161,13 +161,44 @@ EXPOSE 3000
 # TERMINAL boot-chain assertion — nothing below this line may touch the filesystem.
 RUN set -eu; \
     for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs; do \
-      test -f "$f" && test -s "$f" && test -r "$f"; \
+      test -f "$f" || { echo "boot chain: $f is missing or not a regular file" >&2; exit 1; }; \
+      test -s "$f" || { echo "boot chain: $f is empty" >&2; exit 1; }; \
+      test -r "$f" || { echo "boot chain: $f is not readable" >&2; exit 1; }; \
     done; \
     /bin/sh -n /app/docker/entrypoint.sh
 
 ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]
 CMD ["npm", "start"]
 ```
+
+### ⚠️ 2a-bis. The assertion I first wrote COULD NOT FAIL — measured, not reasoned
+
+The first version, under `set -eu`, was `for f in …; do test -f "$f" && test -s "$f" && test -r "$f"; done`.
+
+**It does not fail.** POSIX ignores `errexit` for a command in an AND-OR list, so a missing file falls
+straight through:
+
+```
+$ sh -c 'set -eu; for f in /nope; do test -f "$f" && test -s "$f"; done; echo REACHED'
+REACHED          exit=0     <- the && form
+$ sh -c 'set -eu; for f in /nope; do test -f "$f"; test -s "$f"; done; echo REACHED'
+                 exit=1     <- separate statements DO fire errexit
+```
+
+and end to end, which is the reading that matters — a real image build with `bootstrap.mjs` absent:
+
+```
+#8 [runner 3/3] RUN echo "!!! BUILD PASSED WITH bootstrap.mjs MISSING !!!"
+#8 0.113 !!! BUILD PASSED WITH bootstrap.mjs MISSING !!!
+```
+
+So the centrepiece repair of this slice — the thing that closes the fail-open — **was itself
+fail-open**, and all 21 static mutations still passed, because a static guard compares TEXT and the
+text looked right. Neither the spec reviews nor the mutation battery could have caught it; only
+building it could. Hence **AC5**: an assertion whose failure has never been observed is
+unfalsifiable, and unfalsifiable reads exactly like coverage.
+
+The shipped form exits explicitly, depends on no shell option, and names what is missing.
 
 ⚠️ **The assertion repairs a fail-open the deletion would otherwise introduce — the sharpest finding of
 round 1.** Today, if the file were absent from the build stage, line 35 **fails the build**. Delete
@@ -294,6 +325,10 @@ if the deploy flow's prose is affected.
   `["/bin/sh", "<path>"]` → exit 1 @ 1s; OLD bare path → exit 1 @ 2s; PID 1 is `npm start` in both.
   Recorded rather than quietly corrected, because "the criterion named a number I had not observed"
   is the finding.*
+- **AC5 — the assertion is FALSIFIABLE (manual, negative controls):** with each boot-chain file
+  removed, emptied, or replaced by a directory, `docker build` must **FAIL**; with all present it must
+  pass. *Without this, §2a-bis shipped: a decoration that every other criterion called green.*
+
   ⚠️ *Manual and named as such — this repo has no container test tier and claiming CI proves it would
   be false. Round 1 said "boots through entrypoint.sh", "answers an HTTP request" and "no orphan",
   all three of which are design vocabulary that would ship green: a 500 page answers a request, and
@@ -381,6 +416,19 @@ Postgres. Every line is a reading, not a claim.
 
 That is AC2(b)'s failure mode, observed rather than argued: a container that prints a login URL and a
 password, then exits successfully having served nothing.
+
+### AC5 — the negative controls, against the SHIPPED assertion
+
+| build | expected | result |
+|---|---|---|
+| `entrypoint.sh` missing | FAIL | **FAILED** |
+| `bootstrap.mjs` missing | FAIL | **FAILED** |
+| `bootstrap.mjs` present but **0 bytes** | FAIL | **FAILED** — `boot chain: /app/docker/bootstrap.mjs is empty` |
+| `entrypoint.sh` is a **directory** | FAIL | **FAILED** |
+| both present and valid (positive control) | PASS | **PASSED** |
+
+Each leg fires with its own message, so `-s` and `-r` are live rather than decorative. Against the
+FIRST version of the assertion, rows 1-4 all **PASSED** the build.
 
 **Code is written. AC1–AC3 are guarded in `test/guards/dockerfile-runner-stage.test.ts`; AC4 is the
 table above.**
