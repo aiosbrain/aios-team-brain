@@ -153,7 +153,19 @@ export function parseDockerfile(text: string): { stages: Stage[]; all: Instructi
   return { stages, all: joined };
 }
 
-const parsed = parseDockerfile(DOCKERFILE);
+/**
+ * Parsed EAGERLY but not THROWN eagerly. A throw at module scope makes vitest collect ZERO tests,
+ * and zero tests ran looks identical to all-green — the mutation harness refuses to call it a
+ * verdict, and rightly. A parse failure has to be a red TEST.
+ */
+let parseError: Error | null = null;
+let parsed: { stages: Stage[]; all: Instruction[] } = { stages: [], all: [] };
+try {
+  parsed = parseDockerfile(DOCKERFILE);
+} catch (e) {
+  parseError = e as Error;
+  parsed = { stages: [{ name: null, from: "<unparsed>", instructions: [], line: 0 }], all: [] };
+}
 /** FINAL = the last `FROM` in file order, i.e. the default build target — what compose and Railway build. */
 const finalStage = parsed.stages[parsed.stages.length - 1];
 const earlierStageNames = new Set(
@@ -199,6 +211,10 @@ function only(op: string): Instruction[] {
 }
 
 describe("AC1 — the final stage's filesystem comes from earlier stages of this file, and nothing else", () => {
+  it("the Dockerfile PARSES — an unmodellable directive or an illegal pre-FROM instruction fails here, not silently", () => {
+    expect(parseError?.message ?? null).toBeNull();
+  });
+
   it("(a) the final stage's own FROM names an earlier declared stage", () => {
     expect(
       earlierStageNames.has(finalStage.from),
@@ -279,7 +295,14 @@ const entrypointArgv = (() => {
 
 const bootPaths: string[] = (() => {
   const script = entrypointArgv?.[1];
-  const referenced = [...ENTRYPOINT_SCRIPT.matchAll(/(\/app\/[A-Za-z0-9_./-]+)/g)].map((m) => m[1]);
+  // The trailing lookahead is load-bearing: without it `node /app/docker/bootstrap.mjs?typo` yields
+  // the valid PREFIX `/app/docker/bootstrap.mjs`, so the assertion covers a path node never
+  // requests and the guard reports everything fine. Measured — that mutation SURVIVED until this
+  // boundary was added. Now the path simply does not match, the derived expectation loses it, and
+  // AC2(c) reddens loudly instead.
+  const referenced = [
+    ...ENTRYPOINT_SCRIPT.matchAll(/(\/app\/[A-Za-z0-9_./-]+)(?=["'`\s;)|&]|$)/gm),
+  ].map((m) => m[1]);
   return [...new Set([...(script ? [script] : []), ...referenced])];
 })();
 
