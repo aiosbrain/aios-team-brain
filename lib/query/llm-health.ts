@@ -73,6 +73,16 @@ export interface LlmTaskHealth {
    *  rest the query model, so a leg-level model name would send an operator to the wrong picker. */
   model: string | null;
   lastError: string | null;
+  /**
+   * The operator-facing reading of `lastError` (LLMCREDIT-3/-4), or null when nothing confident can be
+   * said — in which case the surface falls back to the raw text.
+   *
+   * ⚠️ COMPUTED SERVER-SIDE AND PASSED DOWN, exactly as `PipelineLeg.diagnosis` is. The banner is a
+   * CLIENT component and `diagnoseProviderFault` reaches `lib/query/claude`, which is `server-only`, so
+   * importing it there would break `next build` while `tsc` and every unit test stayed green — the
+   * failure CI caught once already on this lane.
+   */
+  diagnosis: { headline: string; action: string } | null;
   lastFailedAt: string | null;
   lastOkAt: string | null;
 }
@@ -216,6 +226,7 @@ export function deriveTaskHealth(runsNewestFirst: readonly LlmRun[] | null, nowM
       // retry's model sends an operator to the wrong picker.
       model: state === "healthy" ? newest.model : (newestFailure?.model ?? newest.model),
       lastError: newestFailure?.error ?? null,
+      diagnosis: faultOfTask(newestFailure?.error ?? null),
       lastFailedAt: newestFailure?.finishedAt ?? null,
       lastOkAt: newestOk?.finishedAt ?? null,
     });
@@ -250,6 +261,12 @@ export function deriveLlmState(tasks: readonly LlmTaskHealth[]): LlmHealthState 
 const RAW_ERROR_CLIP = 160;
 function clipError(e: string): string {
   return e.length <= RAW_ERROR_CLIP ? e : `${e.slice(0, RAW_ERROR_CLIP)}…`;
+}
+
+/** The diagnosis for one task's own recorded error, or null when nothing confident can be said. */
+function faultOfTask(error: string | null): { headline: string; action: string } | null {
+  const f = diagnoseProviderFault(error);
+  return f ? { headline: f.headline, action: f.action } : null;
 }
 
 export function degradedNote(tasks: readonly LlmTaskHealth[]): string {

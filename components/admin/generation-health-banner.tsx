@@ -73,7 +73,26 @@ export function GenerationHealthBanner({ health, href }: { health: LlmHealth; hr
               <li key={t.task} className="list-disc text-xs">
                 <span className="font-medium">{labelOf(t.task)}</span>
                 {t.model ? <span className="text-red-600/80 dark:text-red-300/80"> · {t.model}</span> : null}
-                {t.lastError ? (
+                {/* LLMCREDIT-4: THE DIAGNOSIS LEADS HERE TOO. LLMCREDIT-3 gave the summary paragraph
+                    below its plain-English reading but left THIS bullet rendering the provider's raw
+                    JSON — and the bullet is the most prominent red text on the page, so the operator
+                    still met four hundred characters of `{"error":{"message":…` first. `diagnosis` is
+                    computed SERVER-side (see LlmTaskHealth) because this is a client component and
+                    the classifier reaches a `server-only` module. Null when unrecognised, and then
+                    this is exactly the old rendering. */}
+                {t.diagnosis ? (
+                  <>
+                    <span className="text-red-700 dark:text-red-200">
+                      {" "}
+                      — {t.diagnosis.headline} {t.diagnosis.action}
+                    </span>
+                    {t.lastError ? (
+                      <span className="mt-0.5 block text-[11px] text-red-600/60 dark:text-red-300/60">
+                        {t.lastError.length > 160 ? `${t.lastError.slice(0, 160)}…` : t.lastError}
+                      </span>
+                    ) : null}
+                  </>
+                ) : t.lastError ? (
                   <span className="text-red-600/80 dark:text-red-300/80"> — {t.lastError}</span>
                 ) : null}
               </li>

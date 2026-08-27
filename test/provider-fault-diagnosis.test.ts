@@ -206,6 +206,43 @@ describe("LLMCREDIT-3: the two surfaces, not just the classifier", () => {
     expect(diagnosisForLeg(null)).toBeNull();
   });
 
+  it("AC9: every FAILING task carries its own diagnosis, computed server-side", async () => {
+    // ⚠️ LLMCREDIT-3 fixed the summary paragraph and LEFT THIS — the per-task bullet, which is the
+    // most prominent red text on the page, so the operator still met the raw JSON first. It is
+    // computed SERVER-side and passed down because the banner is a client component and the
+    // classifier reaches `lib/query/claude`, which is `server-only`: importing it there breaks
+    // `next build` while tsc and every unit test stay green. That exact mistake shipped once on this
+    // lane and CI caught it, so the criterion pins the SERVER field rather than the JSX.
+    const { deriveTaskHealth } = await import("@/lib/query/llm-health");
+    const now = Date.now();
+    const run = (task: string, ok: boolean, error: string | null) => ({
+      task,
+      ok,
+      error,
+      model: "qwen/qwen3.7-max",
+      finishedAt: new Date(now - 60_000).toISOString(),
+      calls: 1,
+      failures: ok ? 0 : 1,
+    });
+    const tasks = deriveTaskHealth(
+      [
+        run("doc-task-infer", false, OUT_OF_CREDIT),
+        run("doc-task-infer", false, OUT_OF_CREDIT),
+      ] as never,
+      now
+    );
+    const t = tasks.find((x) => x.task === "doc-task-infer")!;
+    expect(t.diagnosis?.headline).toContain("OpenRouter");
+    expect(t.diagnosis?.action.toLowerCase()).toMatch(/top up/);
+
+    // An unrecognised error yields null, so the bullet falls back to the provider's own words.
+    const other = deriveTaskHealth(
+      [run("arcs", false, "connection reset"), run("arcs", false, "connection reset")] as never,
+      now
+    );
+    expect(other.find((x) => x.task === "arcs")!.diagnosis).toBeNull();
+  });
+
   it("AC8: the banner's line LEADS with the diagnosis and keeps the raw text underneath", () => {
     // ⚠️ PINNING THE CALL SITE, NOT THE CLASSIFIER. The component itself is unreachable from this tier
     // (the unit config includes only `*.test.ts` and there is no DOM harness), so the composition was
