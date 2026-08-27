@@ -1,0 +1,56 @@
+name: Release candidate
+
+# RELPTR-3 — validates a release candidate ON THE EVENT THAT CREATES ONE.
+# Spec: docs/design/release-pointer-cutover-guard.md · runbook: docs/RELEASING.md §3
+#
+# WHY A TAG PUSH AND NOT `push: main`. Branch protection accepts a direct push to a protected branch
+# only if the pushed commit ALREADY carries its required contexts. A workflow triggered BY the push to
+# `main` therefore runs after the commit has landed — it can alarm, it cannot gate. A tag-push run's
+# GITHUB_SHA is the PEELED commit, and this job's check run attaches to that commit, which is exactly
+# the SHA protection evaluates when `main` is later fast-forwarded onto it.
+#
+# THIS IS NOT A REQUIRED CONTEXT YET, deliberately. Making it required is a branch-protection change,
+# and docs/RELEASING.md §3.2 records the ordering pair the hard way: switching on a required context
+# before its workflow existed left SEVEN open pull requests stuck on "Expected — waiting for status".
+# The workflow lands and runs first; protection consumes it at the cutover.
+#
+# IT CANNOT BLOCK A MERGE. It runs on no branch event and no pull_request event, so there is no red
+# box on ordinary work. (One honest caveat: a `v*` tag pushed onto a commit that happens to be a pull
+# request's head will DISPLAY a red run on that PR's checks tab. Non-blocking, and self-inflicted.)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only, like every other workflow here. `test/guards/workflow-permissions.test.ts` fails the build
+# if any workflow requests `contents: write` — that read-only property is what makes "a pull request
+# cannot forge a tag" true, and it is configuration rather than law, so it is guarded.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # This job's name becomes the check context. `test/guards/workflow-context-uniqueness.test.ts`
+    # asserts no other workflow produces the same name: branch protection identifies a required check
+    # by CONTEXT NAME, not by the workflow file that produced it, so a duplicate elsewhere could mint
+    # the accepted context on a commit this gate never examined.
+    name: Release candidate gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Ancestry (assertion C) and reachability (assertion D) are meaningless against a shallow
+          # checkout, and the guard re-fetches the tag object itself because checkout is known to
+          # replace an annotated tag with a lightweight one locally.
+          fetch-depth: 0
+
+      - name: Validate the candidate
+        # `--run` is a POSITIVE ACK TOKEN. The script does nothing without it, so importing it under
+        # test is silent by construction — and this repo has already shipped an entry guard that
+        # printed nothing and exited 0 from a symlinked path, which a shell reads as success.
+        run: node scripts/release-candidate-guard.mjs --run
