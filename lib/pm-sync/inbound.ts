@@ -498,7 +498,8 @@ async function adoptInbound(
        * NARROW ON PURPOSE: contain ONLY a uniqueness rejection, and re-throw everything else.
        *
        * A blanket catch here would be worse than the abort it replaces. `skipped` does not feed
-       * `ok` (`summarizeInbound` counts `errors`), and a skipped-only result is not even recorded by
+       * `ok` (`runLinearInbound` computes it from `errors` alone, :653), and a skipped-only result is not
+       * even recorded by
        * the manual sync — so a database outage during every adoption would report a clean, successful
        * run. Losing the pass is the RIGHT outcome for an outage; it is only the one-issue-one-row
        * rejection that must not take the other candidates down with it.

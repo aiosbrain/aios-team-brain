@@ -520,8 +520,8 @@ describe("inbound adopt — Linear-native issues become owned team-tier tasks (r
    *
    * `adoptInbound` now catches around its `withTransaction` so that one contested issue cannot take
    * down the whole pass. That catch swallows ONLY SQLSTATE 23505 and re-throws everything else, and
-   * the re-throw is the load-bearing half: `skipped` does not feed `ok` (`summarizeInbound` counts
-   * `errors`), and a skipped-only result is not recorded by the manual sync at all — so a blanket
+   * the re-throw is the load-bearing half: `skipped` does not feed `ok` (`runLinearInbound` computes it from `errors`
+   * alone), and a skipped-only result is not recorded by the manual sync at all — so a blanket
    * catch would turn a database outage during every adoption into a clean, successful run. Losing
    * the pass is the CORRECT outcome for an outage.
    *

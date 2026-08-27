@@ -515,9 +515,9 @@ describe("ADOPTUNIQ-1 — the skip is AUDIBLE, and survives the real loader", ()
 
 describe("ADOPTUNIQ-1 — the read-side backstop signal", () => {
   it("reports `installed` against the tier's OWN live schema", async () => {
-    // The only assertion here that proves the block in postgres/schema.sql actually executed during
-    // `db:test:up`. If someone deletes the schema.sql copy, the guard test still passes (it reads
-    // files) but THIS reddens.
+    // The distinct property here is EXECUTION, not existence: the unit guard reads the files and would
+    // also redden if the schema.sql copy were deleted, but only this can show the block actually RAN
+    // during `db:test:up` and produced a real catalog object.
     expect(await readBackstopStatus()).toBe("installed");
   });
 

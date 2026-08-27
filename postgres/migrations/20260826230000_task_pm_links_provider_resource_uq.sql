@@ -56,8 +56,9 @@
 -- (lib/pm-sync/project.ts:200), erasing the signal within one push cycle; and the stamping UPDATE sits
 -- OUTSIDE the protected CREATE INDEX, on precisely the hot rows the live old app is writing, so a row
 -- lock wait would raise from a statement no handler covers and abort the very release it reports on.
--- The signal is READ-side instead: `backstopHealth` in lib/pm-sync/runs.ts validates the index from
--- the catalog at runtime, which cannot be erased, self-clears on repair, and adds no deploy-time write.
+-- The signal is READ-side instead: `readBackstopStatus`/`classifyBackstop` in lib/pm-sync/runs.ts
+-- validate the index from the catalog at runtime, which cannot be erased, self-clears on repair, and
+-- adds no deploy-time write.
 do $$
 begin
   create unique index if not exists task_pm_links_provider_resource_uq

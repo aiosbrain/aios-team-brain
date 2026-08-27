@@ -335,7 +335,7 @@ describe("ADOPTUNIQ-1 — inbound containment is NARROW", () => {
    * The containment must swallow a uniqueness rejection and NOTHING else.
    *
    * A blanket catch would be worse than the abort it replaced: `skipped` does not feed `ok`
-   * (`summarizeInbound` counts `errors`), and a skipped-only result is not recorded by the manual
+   * (`runLinearInbound` computes it from `errors` alone), and a skipped-only result is not recorded by the manual
    * sync at all — so a database outage during every adoption would report a clean, successful run.
    * Losing the pass is the CORRECT outcome for an outage.
    *
