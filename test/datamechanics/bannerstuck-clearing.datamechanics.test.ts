@@ -241,6 +241,65 @@ describe("BANNERSTUCK-1 — a healed leg can clear, and can never hide a live fa
     expect(await rowCount(seed), "healthy + idle must be silent").toBe(n);
   });
 
+  it("AC1 — `:206` unsaturated: work docs exist but none is scoreable, and the leg clears", async () => {
+    // The `no-candidates` case above exits before the item filters run. This one gets past them and
+    // clears at the SECOND site, so the saturation flag and the doc filters are on the proven path.
+    const seed = await seedTeam();
+    await withModel(seed.teamId);
+    await task(seed);
+    const projectId = await project(seed);
+    const owner = await member(seed.teamId);
+    // A handful of conversational rows: they fill `items` but every one is dropped by
+    // `isScoreableSource`, so `docRows` is empty — far below ITEM_SCAN, so the scan is complete.
+    const rows = Array.from({ length: 3 }, () => ({
+      team_id: seed.teamId, project_id: projectId, kind: "artifact" as const,
+      path: `x/${randomUUID()}.md`, access: "team" as const, body: "chatter", member_id: owner,
+      content_sha256: randomUUID().replace(/-/g, ""),
+      frontmatter: { source: "slack", title: "t", updated: recentIso },
+      work_at: recentIso, work_at_from_source: true,
+    }));
+    const ins = await db().from("items").insert(rows);
+    if (ins.error) throw new Error(`items insert failed: ${ins.error.message}`);
+    await confirmedFailureStreak(seed);
+
+    expect((await runDocTaskInference(db(), seed.teamId)).skipped).toBe("nothing-to-score");
+    expect(await isFailing(seed)).toBe(false);
+  });
+
+  it("AC2d — a CONNECTOR-owned window clears, which is the ONLY path that runs `ownerKinds`", async () => {
+    /**
+     * The inverted bug this must not ship: if `ownerKinds` misreads its query, every raw owner becomes
+     * `unresolvable`, `hasUnjudgeableDrop` is true, and a connector-fed team's banner NEVER clears —
+     * the original incident, recreated by the fix. That helper is new DB code and this is the only
+     * test at any tier that executes it, so the assertion is the OBSERVABLE clear, not the helper.
+     */
+    const seed = await seedTeam();
+    await withModel(seed.teamId);
+    await task(seed);
+    const projectId = await project(seed);
+
+    // A connector member: excluded from credit BY DESIGN, so its docs have no human to reason about.
+    const { data: conn, error: cErr } = await db().from("members")
+      .insert({ team_id: seed.teamId, email: `github-${randomUUID().slice(0, 8)}@connector.local`,
+        display_name: "GitHub", actor_handle: "github", is_connector: true, status: "active" })
+      .select("id").single();
+    if (cErr) throw new Error(`connector member insert failed: ${cErr.message}`);
+
+    const ins = await db().from("items").insert([{
+      team_id: seed.teamId, project_id: projectId, kind: "deliverable" as const,
+      path: `2-work/${randomUUID()}.md`, access: "team" as const, body: "prose about some work",
+      member_id: (conn as { id: string }).id, content_sha256: randomUUID().replace(/-/g, ""),
+      frontmatter: { source: "", title: "A design doc", updated: recentIso },
+      work_at: recentIso, work_at_from_source: true,
+    }]);
+    if (ins.error) throw new Error(`items insert failed: ${ins.error.message}`);
+    await confirmedFailureStreak(seed);
+
+    // Dropped at `:237` — a legitimate nothing-to-do, NOT the oracle abstaining — so it clears.
+    expect((await runDocTaskInference(db(), seed.teamId)).skipped).toBe("nothing-to-score");
+    expect(await isFailing(seed), "a connector-owned window is nothing to do, not a fault").toBe(false);
+  });
+
   it("AC3b — clearing does NOT arm the paid cooldown: new work is scored on the next tick", async () => {
     /**
      * The regression the design must not trade for a banner fix, and AC3 could not see it: AC3 seeds
