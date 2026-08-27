@@ -1,6 +1,7 @@
 # A confirmed failure that nothing can clear — BANNERSTUCK-1
 
-**Status:** spec, round 3 — four review rounds folded (Codex BLOCKED ×2, Fable CLEAR-WITH-CONDITIONS ×2). No code written.
+**Status:** spec, round 4 — SIX review rounds folded (Codex BLOCKED ×3, Fable CLEAR-WITH-CONDITIONS ×3).
+Round 3 made the design SMALLER: two of the states I had built criteria around cannot occur. No code written.
 
 **Build with:** opus / high — it changes when the loudest alarm in the product speaks, and the
 failure mode in BOTH directions is a lie: an alarm that will not stop, or one that goes quiet on a
@@ -126,223 +127,190 @@ is inherited, not negotiable here.
 
 ## 1. The rule
 
-> **A confirmed failure is evidence only while the leg is still being exercised. A pass that
-> OBSERVED THE WHOLE ELIGIBLE SET and found no work demanded has produced contrary evidence, and that
-> evidence must be able to clear the alarm — while a pass that was gated, abstained, or saw only part
-> of the set must neither clear it nor be masked by one.**
+> **A confirmed failure is evidence only while the leg is still being exercised. A pass that OBSERVED
+> THE WHOLE ELIGIBLE SET and found no work demanded has produced contrary evidence and may clear the
+> alarm. A pass that was gated, abstained, or saw only PART of the set must do neither — and must never
+> be able to hide a failure that happened while it ran.**
 
 ## 2. The design
 
-### 2a. Only a pass that observed the WHOLE eligible set and found no work may clear
+### 2a. Which outcomes may clear — derived from the code, not from the labels
 
-The outcome LABELS are not the rule — two of them cover both a healthy and an unhealthy state:
+| site | outcome | clears? |
+|---|---|---|
+| `:147` | `cooldown` | ❌ the pass never ran |
+| `:151` | `no-llm` | ❌ unconfigured — a different state, and its own signal |
+| `:195` | `no-candidates` | ✅ the task list was read; nothing to offer |
+| `:206` | `nothing-to-score` | ✅ **only if the item scan did not saturate** |
+| `:237` | `nothing-to-score` | ✅ **only if unsaturated AND no doc was dropped for an unresolvable owner** |
+| `:270` | `unchanged` | ✅ **only if the item scan did not saturate** |
 
-| site | outcome | clears? | why |
-|---|---|---|---|
-| `:147` | `cooldown` | ❌ | the pass never ran |
-| `:151` | `no-llm` | ❌ | unconfigured — a different state, and its own signal |
-| `:195` | `no-candidates` | ✅ | the task list was read; there is nothing to offer |
-| `:206` | `nothing-to-score` | ✅ **only if the scan did not saturate** | see below |
-| `:237` | `nothing-to-score` | ✅ **only if every drop was a legitimate one** | see below |
-| `:270` | `unchanged` | ✅ | every eligible doc is already answered |
+**The saturation rule covers THREE sites, not one.** The item read is `.limit(ITEM_SCAN)` = 500,
+ordered **`work_at desc`** (`doc-task-infer-run.ts:184` — round 3 said `updated_at`, which is the
+*tasks* read at `:164`; the sentence was wrong). `:206`, `:237` and `:270` are all derived by JS
+filters over that one truncated page, so with ≥500 items in the window each of them is a claim about
+*the newest 500 only* — item #501 can be an unscored design doc. §1's rule therefore forces all three
+to abstain when `items.length >= ITEM_SCAN`. *(`visibleItems(q,"team")` is a passthrough, so nothing
+post-drops rows and the count is honest. Exactly 500 abstains too — conservative, and correct.)*
 
-**`:206` — the bounded scan.** The item read is `.limit(ITEM_SCAN)` = **500**, ordered `updated_at desc`
-(`doc-task-infer-run.ts:185`). So `docRows` empty means *"nothing scoreable in the newest 500"*, not
-*"nothing in the 7-day window"*: 500 newer Slack rows can hide an older unscored design document, and
-clearing there would silence the alarm while work is genuinely pending. **So `:206` may clear only
-when the scan returned fewer than `ITEM_SCAN` rows** — i.e. the window was observed in full. When it
-saturates, the pass abstains. *(Prod today: 152 items in 7 days, so this is not the live path — but a
-busy team crosses 500 and the fix must not be wrong for them.)*
+**The `:237` abstain bucket is NOT what round 3 said.** Both reviewers independently derived, and I
+verified, that *"a human-owned doc with no attribution"* **cannot occur**:
 
-⚠️ *A residual, stated: `:206`'s pure filters can still be emptied by a data-shaped regression
-(`frontmatter.source` naming, `classifyWork`, `work_at_from_source` stamping). Pre-change that made
-the leg silently invisible; post-change it would actively clear. The emptiness does derive from rows
-the pass actually READ — unlike `:237` — which is why the line is drawn here, but the direction of the
-cost changed and that is worth knowing.*
+- the wide scan already excludes ownerless items in SQL — `.not("member_id","is",null)` (`:177`);
+- `creditedPrimaryId` returns null **only** when `currentMemberId` is null, and that is nulled only
+  when `isHuman()` is false (`contributor-credit.ts:50-61,190`);
+- a genuine oracle failure **throws** in `strict` mode (`contributor-credit.ts:126-128`) and lands in
+  the catch at `:408` as an `ok=false` run — it never appears as a `:237` drop.
 
-**`:237` — split by DROP REASON, not wholesale.** `scoreableDocs` (`doc-task-infer.ts:97`) drops on
-**three** predicates, and round 2 treated all of them as the oracle abstaining:
+So the four real buckets are:
 
-```ts
-!d.hasDeterministicLink && d.access !== "external" && !!d.memberId
-```
-
-| dropped because | legitimate no-work? |
+| dropped because | legitimate? |
 |---|---|
-| already has a deterministic issue-key link | ✅ yes — the link exists, nothing to infer |
-| `access === "external"` | ✅ yes — deliberately never scored |
-| no `memberId`, and the item is **connector-owned** | ✅ yes — connectors are excluded from credit BY DESIGN (`contributor-credit.ts`), so there is no person to reason about |
-| no `memberId` for a **human-owned** item | ❌ **NO** — this is `resolveItemCreditIds({strict:true})` abstaining, and the code says so: *"if the oracle can't answer, the right move is to spend nothing this tick"* |
+| already deterministically linked | ✅ |
+| `access === "external"` | ✅ |
+| owner is a **connector** (excluded from credit by design) | ✅ |
+| owner resolves to **no member row for this team** (dangling / cross-team id) | ❌ **abstain** |
 
-So `scoreableDocs` must report drop counts by reason, and the pass clears only when the
-unattributable-human count is **zero**. Round 2 would have blocked clearing for the three legitimate
-cases — making the leg never clear for a team whose docs are all deterministically linked.
+Only the last is a reason to withhold, and telling it apart needs `members.is_connector` for the raw
+`member_id` — which neither the oracle's return nor `teamRoster` exposes (`:545`, no `is_connector`,
+and `status='active'`-filtered). So the run adds a plain `is_connector` read keyed off `docRows`'
+member ids, populating a new `InferDoc.ownerKind`. `scoreableDocs` has exactly **one** production
+caller (`:236`), so returning drop counts leaks no policy.
 
-⚠️ **The justification is narrow, and narrower than round 0 claimed.** An idle pass does **not** prove
-the provider recovered — `lib/llm/complete.ts:212` argues exactly this in-repo (*"`ok: true` would
-claim a model that was never asked"*). It proves only: **there is no output currently demanded, so a
-historical provider failure must not drive a present-tense alarm.**
+⚠️ **The justification remains narrow:** an idle pass does not prove the provider recovered
+(`lib/llm/complete.ts:212` argues exactly that in-repo). It proves only that **no output is currently
+demanded, so a historical failure must not drive a present-tense alarm.**
 
-### 2b. The clearing row is BACKDATED — masking becomes impossible by ordering, not improbable by guarding
+### 2b. Correctness is ORDERING; the condition is only write-avoidance
 
-Rounds 0–2 tried two mechanisms and both were wrong:
+The clearing row is written with **`finishedAt = the pass's own startedAt`** (`:140`;
+`recordIngestRun` already accepts `finishedAt`, `runs.ts:31`). `STREAK_SQL` orders
+`finished_at desc, id desc` (`pipeline-health.ts:351`), so **any row recorded during the pass sorts
+newer than the clearing row** — a concurrent failure cannot be masked by commit order, snapshot
+visibility, or an `INSERT … WHERE NOT EXISTS` that round 3 proved races under `READ COMMITTED`.
 
-- **Round 0** wrote the row only when the newest row was a failure — a check-then-insert race.
-- **Round 2** added a "no row since this pass started" guard. **Also insufficient**: under PostgreSQL
-  `READ COMMITTED` an `INSERT … WHERE NOT EXISTS` runs its subquery against the statement snapshot, so
-  a concurrent `ok=false` that has not yet committed is invisible, both rows land, and the clearing
-  row is still newer. `ingest_runs` has no unique constraint to conflict on, and an advisory lock only
-  works if **every** writer takes it — the failure path is a plain `recordIngestRun` (`runs.ts:59`).
+⚠️ **Two residuals, stated rather than claimed away.** Round 3 wrote "impossible … whatever the clock
+skew", which is an overclaim: ordering compares timestamp VALUES, so masking needs
+`t_B − t_A < skew_A − skew_B`. (a) a failure finishing in the same millisecond loses the `id desc` tie;
+(b) two processes with skewed clocks. Bounded in practice: the scheduler runs **inside the web
+process** (`instrumentation.ts:57`) and the timeline rebuild runs there too, so the live deployment has
+one clock; a deploy-overlap twin is NTP-scale. And a masked failure is **self-correcting** — `failing`
+needs a streak of two, so the next real failure re-confirms.
 
-**The fix is ordering, not locking.** The clearing row is written with
-**`finishedAt = the pass's own startedAt`** (`doc-task-infer-run.ts:140`). `recordIngestRun` already
-accepts `finishedAt` (`runs.ts:31`), so this needs no new plumbing. Because `STREAK_SQL` orders
-`finished_at desc, id desc` (`pipeline-health.ts:351`), **any row recorded during the pass is strictly
-newer than the clearing row** — a concurrent failure can never be masked, whatever the commit order,
-snapshot or clock skew.
+**The write happens only when the leg's newest verdict is a FAILURE** — event-driven, not throttled.
+This is round 0's condition returning, but its job has changed completely: correctness now comes from
+the ordering above, and the condition exists to avoid perpetual ledger traffic.
 
-It also interacts correctly with the cooldown: `lastRun` orders on `finished_at` alone
-(`doc-task-infer-run.ts:457`), so a backdated clearing row older than a concurrent failure leaves the
-cooldown counting from the failure, which is the right clock.
+⚠️ **That deletes an entire layer.** Round 3 had the clearing row resetting the paid-run cooldown, a
+freshness regression that would make Monday morning's doc wait 12h, "fixed" by a two-clock scheme with
+a `meta.skipped` filter on `lastRun`'s `limit(1)` read. **All of it is unnecessary:** in the steady
+state (newest verdict already `ok=true`) nothing is written, so the cooldown is never touched, no new
+duration constant is needed, and ~730 rows/team/year of append-only history are never created.
 
-⚠️ **Residual, stated:** a failure finishing in the same millisecond as the pass's start loses the
-`id desc` tie to the clearing row. ~1ms; accepted.
+The row carries **`meta.health_clear = true`** — a dedicated marker, not the overloaded `meta.skipped`.
 
-**The existence check stays**, demoted to what it honestly is — a write-avoidance optimisation, not a
-correctness guarantee — and its comparator is **`>=`** (a `>` misses the same-millisecond row).
+⚠️ **Two honest labels:** `duration_ms` is **0** by construction (`runs.ts:77`), and the row's
+`finished_at` is the pass's START. Nothing computes on either (`listRecentIngestRuns` is
+order-tolerant; `doc_task_infer`'s staleness threshold is `null`), but the row is synthetic health
+evidence and its comment must say so rather than let a reader take it for a timed pass.
 
-### 2b-bis. TWO CLOCKS — the clearing row must not defer real scoring
+### 2c. The map is corrected — the whole block
 
-⚠️ Round 2 said "clearing takes up to 12h" and **understated the cost**. The real regression is on the
-other side: today, once past the cooldown, an idle pass records nothing, so the clock never resets and
-the first tick after new work arrives scores it within ≤30 min. If a clearing row became `lastRun`,
-every quiet weekend pass would reset the clock and **Monday morning's design doc would wait up to 12
-hours** for linking that costs one tick today. That is a new steady-state freshness regression, and it
-contradicts the existing comment that the cooldown is a minimum gap between **paid** runs
-(`doc-task-infer-run.ts:143`) — a clearing pass is unpaid.
+`pipeline-health.ts:154-168` carries **four** claims that this change falsifies, not the one round 0
+found. The `null`-threshold conclusion stays right; its argument is rewritten.
 
-So there are two clocks:
+### 2d. Fix `doc_task_infer` alone
 
-- **the paid-run cooldown** (`:147`) ignores rows carrying `meta.skipped` — unchanged behaviour;
-- **the clearing write** throttles on the age of the last *clearing* row.
-
-Same ~2 rows/team/day, and **zero added scoring latency**.
-
-### 2c. The map is corrected — the whole block, not one sentence
-
-`pipeline-health.ts:154-168` will have **four** false claims after this change, not the one round 0
-found: that five outcomes write no row (three now do), and that "a perfectly healthy leg polled every
-30 minutes still writes nothing for days". The `null`-threshold **conclusion** stays correct — a
-`no-llm` team still writes nothing, so no finite age is right — but its argument must be rewritten.
-
-### 2d. Fix `doc_task_infer` alone — and record why, so the next one is recognised
-
-- **`pret3_sweep` is ALREADY FIXED** (§0f) — round 0 listed it, wrongly.
-- **`linear_inbound` is a CONFIRMED twin**, not merely unverified: a quiet healthy pass returns before
-  `recordIngestRun` (`scheduler.ts:159-160`), so heal-with-nothing-to-apply latches. Not fixed here.
-- **`dense` has a narrower hole**: it records only on `failed > 0 || indexed > 0`
-  (`scheduler.ts:106-128`), so if the failing backlog is PURGED during an outage rather than retried,
-  the healing run indexes 0, records nothing, and the streak latches.
-- `arcs` and `graph_project` self-clear: their failure leaves pending work that survives the heal.
-
+`pret3_sweep` is **already fixed** (§0f). `linear_inbound` is a **confirmed twin**
+(`scheduler.ts:159-160`) — not fixed here. `dense` has a narrower hole (records only on
+`failed>0 || indexed>0`, so a *purged* backlog latches). `arcs`/`graph_project` self-clear.
 `doc_task_infer` is unique in that **healing removes the reason to record**.
 
-⚠️ **Two residual BANNERSTUCKs, named not fixed:** a team that removes its keys stays loud forever
-(`no-llm` never clears); and a team whose entire 7-day scoreable window is **connector-attributed**
-sits at `:237` legitimately forever. Both are the same class.
+⚠️ **Residual, named:** a team that removes its keys stays loud forever (`no-llm` never clears).
 
 ## 3. Scope
 
-**In:** `lib/dashboard/doc-task-infer-run.ts` · `lib/dashboard/doc-task-infer.ts` (drop reasons) ·
-the corrected block in `lib/ingest/pipeline-health.ts` · guards · data-mechanics tests ·
-`docs/ARCHITECTURE.md` if the ingestion-health prose is affected.
+**In:** `lib/dashboard/doc-task-infer-run.ts` · `lib/dashboard/doc-task-infer.ts` (drop reasons +
+`ownerKind`) · the corrected block in `lib/ingest/pipeline-health.ts` · guards · data-mechanics tests.
 
-**Out:**
-- **Any new duration constant, grace period or age-out** — rejected by BANNERFLAP-1 §3a (§0e).
-- `STALE_MS_BY_SOURCE`, `FAILURES_TO_CONFIRM` — unchanged.
-- `linear_inbound`, `dense`, the `no-llm` and connector residuals — named in §2d, separate slices.
-- Paging the `ITEM_SCAN` read — §2a abstains on saturation instead, which is correct and smaller.
+**Out:** any new duration constant (none is needed — §2b); `STALE_MS_BY_SOURCE`;
+`FAILURES_TO_CONFIRM`; `linear_inbound`/`dense`/the `no-llm` residual; **paging the `ITEM_SCAN` read**
+— saturation abstains instead, which is correct for THIS slice's no-false-clear property, though a
+busy team then stays latched until it drops under 500 (named, not fixed).
 
 ## 4. Acceptance
 
-⚠️ **Fixture requirements, because three of these cannot pass without them:** AC1–AC3 must seed
-answering keys, or the pass returns `no-llm` before any clearing branch. **AC4 must AGE its first
-produced failure** (`update ingest_runs set finished_at = …`) between the two runs — `COOLDOWN_MS` has
-a **1-hour floor** (`Math.max(1, …)`, `:88`), so no env value lets a second run reach the model, and
-seeding the second failure instead is exactly what AC4 forbids.
+⚠️ **Fixture facts, each of which blocks a criterion if missed:** seeded failure rows are non-skipped
+and therefore **arm the cooldown** — they must be aged past `COOLDOWN_MS` or the pass returns
+`cooldown` before any clearing branch. AC1's `:237`/`:270` cases must **seed tasks**, or `:195`
+`no-candidates` clears first and the fixture trips two criteria. AC4 must **age its produced first
+failure** (`COOLDOWN_MS` has a 1-hour floor, `Math.max(1,…)` at `:88`), never seed the second.
 
-- **AC1 — every clearing outcome clears (data-mechanics):** seed a confirmed streak, then once per
-  clearing case — `no-candidates`, `:206` unsaturated, `:237` with only legitimate drops, `unchanged` —
-  assert via **`getPipelineHealth`** that the leg leaves `failing`, and assert the inserted row has
-  `ok=true`, `meta.skipped`, and `finished_at === passStartedAt`.
-- **AC2 — `cooldown` does not clear (dm).** **AC2b — `no-llm` does not clear (dm)** *(one gate above
-  the clearing branches — a write wired one return too high passes everything else)*. **AC2c — a
-  HUMAN-owned unattributable doc at `:237` does not clear (dm)**, while **AC2d — an all-connector-owned
-  window at `:237` DOES clear (dm)**. **AC2e — a SATURATED `:206` scan does not clear (dm).** *Each
-  asserts the exact returned outcome and that the row count is unchanged.*
-- **AC3 — the steady state (dm):** newest row `ok=true` and older than the cooldown; the pass returns
-  its idle outcome and writes **exactly** the row the design permits — not "at most", which permits
-  zero and would let a no-op implementation pass.
-- **AC4 — a real failure is still loud (dm):** two failures **produced by running the pass** (stubbed
-  model returns null → `ok=false` at `:351`), ageing the first between runs; leg `confirmed`, in
-  `failing`, `failingSince` = the OLDEST failure.
-- **AC5 — a concurrent failure can never be masked (dm, deterministic):** the clearing write is an
-  exported seam `recordClearingRun(db, teamId, passStartedAt, reason)`. Seed the streak, record a
-  produced failure NOW, then call the seam with `passStartedAt` five minutes in the past: the leg is
-  **still `failing`**, and the clearing row's `finished_at` is strictly older than the failure's.
-  *Round 2's version was VACUOUS: an idle pass has no awaitable seam between its reads and its write,
-  so a `Promise.all` test ends `failing` even with the guard deleted — the mutation would have
-  survived and the criterion was green by construction.*
-- **AC5b — the call site passes its OWN `startedAt` (guard, unit):** the pass must hand
-  `recordClearingRun` the `startedAt` captured at `:140`, not `Date.now()` at write time. *That
-  mutation empties the ordering window and the seam test alone cannot see it.*
-- **AC6 — a thrown read never becomes a clearing row (UNIT):** with each of the task/item/credit/roster
-  reads throwing, the orchestration records `ok=false` or nothing, never a clearing row. *Unit, not
-  data-mechanics: real Postgres has no fault injection, and this is orchestration shape.*
-- **AC7 — no time-based escalation (dm, behavioural):** `getPipelineHealth` over real rows classifies
-  a failure at 2 days and at 60 days **identically** with no intervening run. *Named surface on
-  purpose: `classifyFailure`/`foldStreak` are pure over the streak and never see a clock, so a unit
-  test there is green under any escalation added where the clock actually lives (`:463-494`).*
-- **AC8 — the whole comment block is true (guard, unit):** `pipeline-health.ts:154-168` no longer
-  claims five outcomes write no row, nor that a healthy leg writes nothing for days, and states the
-  narrower truth. *Round 2 scoped this to one sentence, satisfiable while three other claims lie.*
+- **AC1 — every clearing outcome clears (dm):** once per case — `no-candidates`, unsaturated `:206`,
+  unsaturated `:237` with only legitimate drops, unsaturated `:270` — assert via **`getPipelineHealth`**
+  that the leg leaves `failing`, and that the row has `ok=true`, `meta.health_clear`, and
+  `finished_at === passStartedAt`.
+- **AC2 / AC2b — `cooldown` and `no-llm` do not clear (dm):** exact returned outcome, row count unchanged.
+- **AC2c — a doc dropped for an UNRESOLVABLE owner does not clear (dm):** a `member_id` that resolves
+  to no member row for this team. *Round 3 specified this as "a human-owned doc with no attribution",
+  a state the code cannot produce — the criterion was unbuildable and its mutation aimed at nothing.*
+- **AC2d — a CONNECTOR-owned window DOES clear (dm):** the inverse. *Without it, the conservative
+  reading ships and the leg never clears for a connector-fed team.*
+- **AC2e — a SATURATED scan does not clear, at ALL THREE sites (dm):** `:206`, `:237` and `:270` each
+  abstain with ≥`ITEM_SCAN` items. *Round 3 pinned only `:206` while `:237`/`:270` read the same
+  truncated page.*
+- **AC3 — the steady state writes nothing (dm):** newest verdict `ok=true` → an idle pass writes
+  **zero** rows. *This is now the whole cooldown story: nothing is written, so nothing is deferred.*
+- **AC4 — a real failure is still loud (dm):** two failures produced by RUNNING the pass, ageing the
+  first between runs; `confirmed`, in `failing`, `failingSince` = the oldest.
+- **AC5 — a concurrent failure can never be masked (dm, deterministic):** via the exported seam
+  `recordClearingRun(db, teamId, passStartedAt, reason)` — seed the streak, record a produced failure
+  NOW, call the seam with `passStartedAt` five minutes past: still `failing`, and the clearing row's
+  `finished_at` is strictly older than the failure's.
+- **AC5b — the call site passes its OWN `startedAt` (unit, CLOCK-ADVANCING):** the fake clock must
+  ADVANCE between `:140` and the write, or `Date.now()` at write time equals the captured value and
+  mutation 10 survives a naive spy. *Green-by-construction otherwise — the class AC5 exists to avoid.*
+- **AC6 — a thrown read never becomes a clearing row (unit).**
+- **AC7 — no time-based escalation (dm, behavioural):** `getPipelineHealth` classifies a failure at 2
+  days and at 60 days identically with no intervening run.
+- **AC8 — the whole `:154-168` block is true (guard, unit).**
 
 | # | mutation | must redden |
 |---|---|---|
 | 1 | the clearing row is never written | AC1 |
-| 2 | only one clearing outcome is wired; the others stay stuck | AC1 |
-| 3 | `cooldown` also clears | AC2 |
-| 4 | the write is wired above `:151`, so `no-llm` clears | AC2b |
-| 5 | `:237` clears regardless of drop reason | **AC2c** |
-| 6 | `:237` never clears (round-2's over-broad rule) | **AC2d** |
-| 7 | `:206` clears even when the scan saturated | **AC2e** |
-| 8 | the clearing row is written with `ok=false` | AC1 |
-| 9 | **`finishedAt` is `Date.now()` instead of `passStartedAt`** | **AC5** |
+| 2 | only one clearing outcome is wired | AC1 |
+| 3 | `cooldown` clears | AC2 |
+| 4 | the write is wired above `:151` | AC2b |
+| 5 | an unresolvable owner clears | **AC2c** |
+| 6 | `:237` never clears (round 3's over-broad rule) | **AC2d** |
+| 7 | the saturation abstain is dropped at `:206` | AC2e |
+| 8 | the saturation abstain is dropped at `:237`/`:270` | **AC2e** |
+| 9 | `finishedAt` is `Date.now()` instead of `passStartedAt` | **AC5** |
 | 10 | the call site passes `Date.now()` rather than its own `startedAt` | **AC5b** |
-| 11 | the paid-run cooldown counts clearing rows (one clock) | AC3 / freshness |
-| 12 | a thrown read is swallowed into a clearing row | AC6 |
-| 13 | `FAILURES_TO_CONFIRM` raised so nothing confirms | AC4 |
-| 14 | `failingSince` reports the newest failure | AC4 |
-| 15 | an inline elapsed-time escalation in `getPipelineHealth` (real shape) | **AC7** |
-| 16 | restore any one of the four false claims in the block | AC8 |
+| 11 | the row is written even when the newest verdict is `ok` | **AC3** |
+| 12 | the clearing row is written with `ok=false` | AC1 |
+| 13 | a thrown read becomes a clearing row | AC6 |
+| 14 | `FAILURES_TO_CONFIRM` raised so nothing confirms | AC4 |
+| 15 | `failingSince` reports the newest failure | AC4 |
+| 16 | an inline elapsed-time escalation in `getPipelineHealth` | AC7 |
+| 17 | restore any one of the four false claims in the block | AC8 |
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
-| A concurrent real failure is masked by a clearing row | **the loudest alarm goes quiet on a broken leg** | §2b backdating makes it impossible by ordering; AC5 + mutations 9/10 |
-| A broken attribution oracle silences the alarm | same label, opposite meaning | §2a's drop-reason split; AC2c + mutation 5 |
-| The fix makes the leg NEVER clear | the bug, inverted — and round 2 would have shipped it | AC2d + mutation 6 |
-| Clearing on a partial view of the window | clears while work is pending | §2a's saturation check; AC2e + mutation 7 |
-| The clearing row defers real scoring by up to 12h | a new freshness regression traded for a banner fix | §2b-bis's two clocks; mutation 11 |
+| A concurrent failure is masked | **the loudest alarm goes quiet on a broken leg** | §2b backdating (ordering, not guarding); AC5 + mutations 9/10; residuals stated and self-correcting |
+| Clearing on a partial view of the window | clears while work is pending | saturation abstain at all three sites; AC2e + mutations 7/8 |
+| An unresolvable owner silences the alarm | a data-integrity fault reads as health | §2a's drop split; AC2c + mutation 5 |
+| The fix makes the leg NEVER clear | the bug inverted — round 3 would have shipped it | AC2d + mutation 6 |
 | The alarm is silenced by a leg that never ran | worse than the bug | AC2/AC2b + mutations 3/4 |
-| A later tweak reintroduces a grace period | the fix §3a proved wrong | AC7 is behavioural, mutation 15 |
+| A later tweak reintroduces a grace period | the fix BANNERFLAP-1 §3a proved wrong | AC7 behavioural, mutation 16 |
 
 ## 6. What would falsify this
 
-If `doc_task_infer` records a **successful** run before this ships, the banner clears on its own and
-the incident looks self-healing. **That would not falsify the defect** — the mechanism in §0c is
-unchanged and the next healed-but-idle failure reproduces it. Re-take §0a's streak, not the banner's
-colour.
+A **successful** `doc_task_infer` run before this ships would clear the banner on its own and make the
+incident look self-healing. It would not falsify the defect. **Re-measured 2026-08-28: the streak is
+still 4, with no new row in a further ~24h** — the leg has now been silent-but-polled for ~2 days, and
+the falsifier has not fired.
 
 **Nothing is built. No code exists for this slice.**
