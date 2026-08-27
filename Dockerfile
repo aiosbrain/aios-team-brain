@@ -65,9 +65,10 @@ RUN set -eu; \
     done; \
     /bin/sh -n /app/docker/entrypoint.sh
 
-# Invoked through `sh` rather than as a bare path so the boot depends on nothing outside this file
-# — not the executable bit, not `/usr/bin/env`, not PATH. Same idiom as railway.json's
-# `sh scripts/railway-start.sh`.
+# Invoked through `sh` rather than as a bare path so INVOKING the entrypoint depends on nothing
+# outside this file — not the executable bit, not `/usr/bin/env`, not PATH. (The script's own line 5
+# still resolves `node` through PATH; that is unchanged and not what this form is about.) Same idiom
+# as railway.json's `sh scripts/railway-start.sh`.
 ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]
 # Load-bearing, not decoration: entrypoint.sh ends in `exec "$@"`, and POSIX `exec` with zero
 # arguments is a no-op — an empty CMD makes the script fall off the end and exit 0, which is a

@@ -445,5 +445,5 @@ exercises. That is the sweeping-claim habit this section exists to check, caught
 
 Against the FIRST version of the assertion, rows 1-4 all **PASSED** the build.
 
-**Code is written. AC1–AC3 are guarded in `test/guards/dockerfile-runner-stage.test.ts`; AC4 is the
-table above.**
+**Code is written. AC1–AC3 are guarded in `test/guards/dockerfile-runner-stage.test.ts`; AC4 and AC5
+are the tables above.**

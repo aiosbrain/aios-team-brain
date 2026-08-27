@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
 /**
@@ -31,6 +32,17 @@ const RAILWAY_JSON = readFileSync(join(ROOT, "railway.json"), "utf8");
 
 /** The image root every in-container path is resolved against (`WORKDIR /app` in the base stage). */
 const IMAGE_ROOT = "/app";
+
+/**
+ * The EXACT command that serves. Not "any script package.json defines": measured,
+ * `npm start -- --help` exits 0 without serving, and `npm build` is not a valid invocation at all.
+ */
+const SERVING_CMD = ["npm", "start"];
+
+/** Files git actually tracks — `readFileSync` succeeding proves only that something is on disk. */
+const TRACKED = new Set(
+  execFileSync("git", ["ls-files"], { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean)
+);
 
 /**
  * Instructions that cannot change the filesystem, and may therefore follow the boot-chain assertion.
@@ -97,6 +109,14 @@ export function parseDockerfile(text: string): { stages: Stage[]; all: Instructi
     joined.push({ op, args: m[2].trim(), line: bufferLine });
   };
 
+  // A parser directive can change what a backslash MEANS. `# escape=\`` makes backslash an ordinary
+  // character, so every continuation below would be misread while the guard stayed green.
+  for (const line of raw.slice(0, 5)) {
+    if (/^\s*#\s*escape\s*=/i.test(line)) {
+      throw new Error(`Dockerfile: an \`escape\` parser directive changes continuation semantics — this guard does not model it`);
+    }
+  }
+
   raw.forEach((lineText, i) => {
     const lineNo = i + 1;
     if (/^\s*#/.test(lineText)) return; // comment — dropped even mid-continuation
@@ -118,7 +138,14 @@ export function parseDockerfile(text: string): { stages: Stage[]; all: Instructi
       if (!m) throw new Error(`Dockerfile line ${ins.line}: cannot parse FROM: ${ins.args}`);
       stages.push({ name: m[2] ?? null, from: m[1], instructions: [], line: ins.line });
     } else {
-      if (stages.length === 0) continue; // pre-FROM ARG etc.
+      if (stages.length === 0) {
+        // Docker permits ONLY a global `ARG` before the first `FROM`. Silently skipping anything
+        // else contradicts this parser's fail-loud contract.
+        if (ins.op !== "ARG") {
+          throw new Error(`Dockerfile line ${ins.line}: \`${ins.op}\` before the first FROM — only ARG is legal there`);
+        }
+        continue;
+      }
       stages[stages.length - 1].instructions.push(ins);
     }
   }
@@ -150,9 +177,21 @@ function execForm(args: string): string[] | null {
   }
 }
 
-/** Collapse runs of whitespace so a multi-line `RUN` compares by content, not by formatting. */
+/**
+ * Collapse runs of ASCII whitespace so a multi-line `RUN` compares by content, not by formatting.
+ *
+ * ASCII ONLY, and that is the point: JavaScript's `\s` matches U+00A0, so `set\u00A0-eu` would
+ * normalise equal to `set -eu` while dash reports `set -eu: command not found`. Whole-instruction
+ * "equality" that folds non-breaking spaces is not equality. `assertAscii` closes the rest.
+ */
 function normalise(s: string): string {
-  return s.replace(/\s+/g, " ").trim();
+  return s.replace(/[ \t\r\n]+/g, " ").trim();
+}
+
+/** Anything outside printable ASCII in a shell body is a homoglyph waiting to happen. */
+function assertAscii(s: string, what: string): void {
+  const bad = [...s].filter((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) > 0x7e);
+  expect(bad, `${what} contains non-ASCII characters: ${JSON.stringify(bad)}`).toEqual([]);
 }
 
 function only(op: string): Instruction[] {
@@ -220,9 +259,18 @@ describe("AC1 — the final stage's filesystem comes from earlier stages of this
 });
 
 /**
- * The paths the boot chain needs, derived rather than hardcoded: the ENTRYPOINT's own script, plus
- * every absolute `/app/…` path that script goes on to execute. Adding a new boot dependency to
- * `docker/entrypoint.sh` therefore extends what the image must assert, automatically.
+ * The paths the boot chain needs: the ENTRYPOINT's own script, plus every absolute `/app/…` LITERAL
+ * appearing in that script.
+ *
+ * ⚠️ This is a LITERAL SCAN, not a dependency analysis, and the difference matters:
+ *   - a path built from a variable (`node "$ROOT/bootstrap.mjs"`) or written relatively is invisible;
+ *   - `node /app/docker/bootstrap.mjs?typo` yields the valid PREFIX, so the assertion passes while
+ *     node requests a file that does not exist;
+ *   - an `/app/…` string inside a COMMENT manufactures a dependency that is not one;
+ *   - it is DEPTH-1 — `bootstrap.mjs` itself imports three modules under `scripts/` that nothing
+ *     here asserts (pre-existing; see the spec's §2a depth note).
+ * So it does NOT automatically extend when a dependency is added. It covers the shape the boot
+ * chain actually has today, and AC2(f) fails loudly if a scanned path is not a tracked file.
  */
 const entrypointArgv = (() => {
   const ins = only("ENTRYPOINT");
@@ -260,7 +308,7 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
     expect(argv?.[0]).toBe("/bin/sh");
   });
 
-  it("(b) CMD is present, exec-form and non-empty — an empty CMD exits 0 at boot, silently", () => {
+  it("(b) CMD is exactly the serving command — an empty or non-serving CMD exits 0 at boot, silently", () => {
     // docker/entrypoint.sh ends in `exec "$@"`, and POSIX `exec` with zero arguments is a NO-OP:
     // the script falls off the end and returns 0. Green build, container gone, no error anywhere.
     const ins = only("CMD");
@@ -268,14 +316,19 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
     const argv = execForm(ins[0].args);
     expect(argv, `CMD must be JSON exec form, got: ${ins[0].args}`).not.toBeNull();
     // Non-empty is NOT the invariant — `CMD ["true"]` is non-empty and boots a container that exits
-    // 0 having served nothing. What must hold is that CMD runs a DEFINED npm script of this package,
-    // derived from package.json rather than pinned to a literal.
-    expect(argv?.[0], "CMD must invoke npm").toBe("npm");
+    // 0 having served nothing. Nor is "a script package.json defines": measured,
+    // `npm start -- --help` prints help and exits 0 WITHOUT serving, and `npm build` is not even a
+    // valid invocation (npm answers `Unknown command: "build"` — arbitrary scripts need `npm run`).
+    // So the argv is pinned EXACTLY, and the script it names must exist.
+    //
+    // Pinning a literal is deliberate and fail-closed: DOCKERPROD-1 will want `["node","server.js"]`
+    // for the standalone image, and this reddens loudly and forces a conscious edit in that PR —
+    // which is the guard working, not the guard being brittle.
+    expect(argv, "CMD must be exactly the serving command").toEqual(SERVING_CMD);
     const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts ?? {};
-    expect(
-      Object.keys(scripts),
-      `CMD runs \`npm ${argv?.[1]}\`, which package.json does not define`
-    ).toContain(argv?.[1]);
+    expect(Object.keys(scripts), `package.json defines no \`${SERVING_CMD[1]}\` script`).toContain(
+      SERVING_CMD[1]
+    );
   });
 
   it("(c) the assertion is EXACTLY the derived boot-chain check — no more, no less", () => {
@@ -300,6 +353,7 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
       `test -s "$f" ${fail("is empty")}; ` +
       `test -r "$f" ${fail("is not readable")}; done; ` +
       `/bin/sh -n ${entrypointArgv?.[1]}`;
+    assertAscii(finalStage.instructions[assertionIndex].args, "the boot-chain assertion");
     expect(normalise(finalStage.instructions[assertionIndex].args)).toBe(normalise(expected));
   });
 
@@ -323,8 +377,11 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
     // observe the image — a copy from the wrong stage passes this and fails those.
     for (const p of bootPaths) {
       expect(p.startsWith(`${IMAGE_ROOT}/`), `${p} is not under ${IMAGE_ROOT}`).toBe(true);
-      const repoPath = join(ROOT, p.slice(IMAGE_ROOT.length + 1));
-      expect(() => readFileSync(repoPath), `${p} has no counterpart at ${repoPath}`).not.toThrow();
+      const rel = p.slice(IMAGE_ROOT.length + 1);
+      // `..` would escape the repo, and `readFileSync` succeeding proves only that SOMETHING is on
+      // disk — a generated or untracked file would pass while never entering the build context.
+      expect(rel.split("/").includes(".."), `${p} escapes ${IMAGE_ROOT}`).toBe(false);
+      expect(TRACKED.has(rel), `${p} maps to ${rel}, which git does not track`).toBe(true);
     }
   });
 });
@@ -354,7 +411,15 @@ describe("AC3 — the deploy contract is asserted where it is actually configure
     // no-staging-gate rationale both silently become false while every prose check still passes.
     const cfg = JSON.parse(RAILWAY_JSON);
     expect(typeof cfg?.deploy?.startCommand).toBe("string");
-    expect((cfg.deploy.startCommand as string).trim().length).toBeGreaterThan(0);
+    // Non-EMPTY is not the invariant: `startCommand: "true"` overrides the entrypoint and exits
+    // immediately, so §0c's claim ("Railway's runtime process is unchanged") would be false while
+    // this passed. What must hold is that it still runs the wrapper the claim names.
+    const wrapper = "scripts/railway-start.sh";
+    expect(
+      cfg.deploy.startCommand as string,
+      `railway.json's startCommand must still run ${wrapper}`
+    ).toContain(wrapper);
+    expect(TRACKED.has(wrapper), `${wrapper} is not tracked`).toBe(true);
   });
 });
 
