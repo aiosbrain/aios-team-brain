@@ -265,8 +265,20 @@ failure** (`COOLDOWN_MS` has a 1-hour floor, `Math.max(1,…)` at `:88`), never 
   first between runs; `confirmed`, in `failing`, `failingSince` = the oldest.
 - **AC5 — a concurrent failure can never be masked (dm, deterministic):** via the exported seam
   `recordClearingRun(db, teamId, passStartedAt, reason)` — seed the streak, record a produced failure
-  NOW, call the seam with `passStartedAt` five minutes past: still `failing`, and the clearing row's
-  `finished_at` is strictly older than the failure's.
+  NOW, call the seam with `passStartedAt` five minutes past. The assertion is that **the failure is
+  still the NEWEST row** (`leg.ok === false`) and the leg is `unconfirmed`, and that the very next
+  failure re-confirms it.
+
+  ⚠️ **Round 4 wrote this as "still `failing`", which is wrong, and the test caught it.** The
+  backdated row lands BETWEEN the old streak and the new failure, so the newest failure's streak is 1
+  and `FAILURES_TO_CONFIRM = 2` makes it `unconfirmed` — quiet by the SAME policy that stops one blip
+  painting the banner. Round 2's Codex review said exactly this and I folded the words but not the
+  criterion. **The property backdating actually guarantees is narrower: the clearing row can never sit
+  ON TOP of a concurrent failure and erase it.** The alarm is deferred by one run, not lost — and the
+  positive control below proves the mechanism is load-bearing.
+- **AC5-control — WITHOUT backdating the same interleaving DOES mask (dm):** the identical fixture with
+  the row stamped `now` instead of the pass start leaves the leg `ok` and not failing. *A negative
+  control on the mechanism itself: without it, AC5 would pass on a build where backdating did nothing.*
 - **AC5b — the call site passes its OWN `startedAt` (unit, CLOCK-ADVANCING):** the fake clock must
   ADVANCE between `:140` and the write, or `Date.now()` at write time equals the captured value and
   mutation 10 survives a naive spy. *Green-by-construction otherwise — the class AC5 exists to avoid.*
