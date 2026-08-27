@@ -8,6 +8,28 @@ revision **v1.17**.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-18
+
+**This is the convergence release, and upgrading through it is MANDATORY.** The next release
+(`v0.12.0`) retires the permissive access mode, and its migration **refuses to run** against a
+database that has not been through this one:
+
+```
+PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
+```
+
+Run this release, let it boot, let auto-flip converge, flip any team it could not, and verify both
+preconditions directly before upgrading. The ordered path is in `docs/RELEASING.md` §3.4 and
+`docs/RELEASE-NOTES-pret6.md`.
+
+Beyond the itemised changes below, this release contains **PRET-4** (the tier-wall teardown —
+membership replaces tier on every read path, #594) and **PRET-5** (the external-member proof, #606),
+which land the explicit built-in membership rows and the boot materialization the next release
+requires. They are named here because the entries below predate them and this release's identity
+depends on them.
+
+
+
 ### Changed
 
 - **PRET-3 — every arcs panel is now the fused per-project panel.** External members and
