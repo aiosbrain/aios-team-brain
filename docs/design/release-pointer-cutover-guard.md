@@ -54,7 +54,7 @@ anything else that exists. It only means a release tag cut *before* the integrat
 red on D — which is **true**, is not required by protection so blocks nothing, and is exactly the
 ordering the program wants.
 
-### Measured terrain (live, read-only, 2026-08-27)
+### Measured terrain (live, read-only, 2026-08-26)
 
 | fact | value | why it matters |
 |---|---|---|
@@ -129,11 +129,28 @@ the junk tag and re-running).
 or `write-all`. Scope limit, stated: this covers `GITHUB_TOKEN` permissions only — credentials
 supplied through secrets are outside it, and no guard here claims otherwise.
 
+**5a. A THIRD forge route, found in code review: `statuses: write`.** A workflow holding it can POST a
+commit status with any context name onto any sha — which is exactly how `nda-gate.yml` satisfies its
+own required context today, so this is demonstrated rather than theorised. The permissions guard
+therefore covers `contents`, `statuses` and `checks` (and `write-all`), allowlisting only
+`nda-gate.yml`'s `statuses`. What the guard cannot do is stop protection from consuming a forged
+status, so the runbook carries the rest as **constraint 9**: the required contexts are currently
+app-pinned, and that pinning must survive the moment this gate becomes required.
+
 **6. The gate's context name gets a uniqueness guard.** Branch protection identifies a required check
 by context name (plus optionally an app id) — **not** by the workflow file that produced it, and
 GitHub warns that duplicate check names make required-check behaviour ambiguous. So another workflow
 declaring a job with the same name could mint the accepted context on a commit this gate never saw.
 A guard asserts no other workflow under `.github/workflows/` produces that name. Both reviewers.
+
+**6a. A residual the code review found, stated rather than closed.** The SHA binding in Decision 2
+detects a changed peeled COMMIT, not a changed tag OBJECT. Push lightweight `v1.2.3 → C`, then replace
+it with an annotated tag object pointing at the same `C` before the job fetches: the peel still equals
+`GITHUB_SHA`, `cat-file` now reports `tag`, and assertion A passes for a tag the EVENT did not carry.
+It does not validate the wrong commit — the candidate is still `C` — so this is a provenance gap, not
+a wrong-green. It is also not fixable from inside the job: the push event gives the commit, never the
+original tag object id. Constraint 7's ruleset (no update, no delete on `refs/tags/v*`) closes it, and
+criterion 5 is written to claim only what the binding actually delivers.
 
 **7. Tag deletion and stale greens are REAL and answered in the runbook, not by a cleverer check.**
 No in-repo check can defend the facts it reads. Recorded as **cutover constraint 7** — a ruleset on
@@ -195,8 +212,10 @@ added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests 
    passes the half-cut release it exists for.
 5. **unit** — the entry path in `scripts/release-candidate-guard.mjs` asserts
    `peel(event tag ref) === GITHUB_SHA` and FAILS CLOSED when the ref has moved, is absent, or
-   disagrees — pinned at the call site, because validating a commit other than the one the green
-   attaches to is the wrong-green path that made round 1 DECLINE and round 2 BLOCK.
+   disagrees — exercised against a REAL git repository, not only asserted about the source text,
+   because validating a commit other than the one the green attaches to is the wrong-green path that
+   made round 1 DECLINE and round 2 BLOCK. Scope, per Decision 6a: this binds the COMMIT, not the tag
+   object's identity.
 6. **unit** — a guard over `.github/workflows/release-candidate.yml` asserts it triggers on `push`
    with a `tags:` filter and NOT on `pull_request` or any branch push, so it cannot block a merge.
 7. **unit** — a guard over `.github/workflows/release-candidate.yml` asserts the job carries no
@@ -206,14 +225,16 @@ added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests 
    `scripts/release-candidate-guard.mjs` and that no step neutralises its exit status via
    `continue-on-error`, `|| true`, or a step-level `if:` — a workflow satisfying the trigger guards
    while running `echo ok` would pass criteria 6 and 7 with the tested entry point never called.
-9. **unit** — a guard asserts NO workflow under `.github/workflows/` requests `contents: write` or
-   `permissions: write-all`, with SEPARATE tripping fixtures for each of those two spellings (one
-   condition per fixture), and the guard is proven non-vacuous by each. `nda-gate.yml`'s
-   `statuses: write` is untouched by this guard because it is neither spelling — stated so the
-   allowlist is not mistaken for an exemption.
-10. **unit** — a guard asserts NO other workflow under `.github/workflows/` declares a job whose
-    resulting check name equals the release-candidate context, closing the duplicate-context-name
-    route by which a green could be minted on an unexamined commit.
+9. **unit** — a guard PARSES each workflow under `.github/workflows/` and asserts none requests a
+   `contents`, `statuses` or `checks` write grant, nor `write-all`, at workflow OR job level, with a
+   narrow allowlist of exactly `nda-gate.yml`'s `statuses`. SEPARATE tripping fixtures per spelling
+   (one condition per fixture), including the ones that broke the first, regex-based version: a
+   trailing comment, a quoted value, and a flow mapping. **It parses rather than matches text**,
+   because a guard that cannot express the shape it guards against is decoration.
+10. **unit** — a guard PARSES each workflow and asserts no other declares a job whose resulting check
+    name equals the release-candidate context — including a job with no `name:`, which produces a
+    context under its id. Parsed, not grepped: the first version assumed four-space indentation and
+    missed a duplicate at any other indent, which is precisely this guard's threat model.
 11. **unit** — a guard asserts `docs/RELEASING.md` §3.1 names `PR records a diff review` as the single
     `pull_request`-only required context AND labels that count as a **dated measurement** with its
     date — so that protection gaining an eleventh context makes the doc stale-by-construction rather
@@ -235,6 +256,11 @@ added, §3.2 ordering pairs added, the cost in Decision 9 recorded); unit tests 
 16. **unit** — the entry path exits NON-ZERO on `FAIL` and ZERO on `PASS`, pinned at the call site: a
     pure function with green tests says nothing about whether anything calls it — this repository's
     own recorded lesson.
+17. **unit** — the WIRING that computes the assertions is exercised against a real git repository, and
+    assertion D's `merge-base` ARGUMENT ORDER is pinned specifically. Nothing else holds it: the pure
+    function takes a boolean, and an inverted order returns `true` in today's pre-cutover graph
+    (`staging` is behind `main`, so it is an ancestor of any candidate) — a silent pass on the one
+    assertion two review rounds existed to restore.
 
 ---
 

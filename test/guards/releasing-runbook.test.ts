@@ -34,6 +34,17 @@ describe("guard: the cutover constraints survive editing (criterion 13)", () => 
     expect(RUNBOOK).toMatch(/Assertion D is false until `staging` is fast-forwarded/);
   });
 
+  it("constraint 9 names the statuses/checks forge route and the app-pinning mitigation", () => {
+    // The third route to a green on an unexamined commit, found during the CODE review after two
+    // design rounds had centred on the first two. It is unguardable from inside the repo beyond the
+    // permissions guard, so the runbook carries the part a human must not forget: keep the app
+    // pinning when the gate becomes required.
+    expect(RUNBOOK).toMatch(/\|\s*9\s*\|/);
+    expect(RUNBOOK).toMatch(/statuses: write` is a third context-forging route/);
+    expect(RUNBOOK).toMatch(/app-pinned/);
+    expect(RUNBOOK).toMatch(/Keep the app pinning when the gate becomes required/);
+  });
+
   it("§3.2 carries BOTH new ordering pairs", () => {
     expect(RUNBOOK).toMatch(/tag-ruleset: before the release-candidate context is FIRST MINTED/);
     expect(RUNBOOK).toMatch(/fast-forward-staging: before any candidate tag is pushed/);
@@ -52,9 +63,9 @@ describe("guard: the cutover constraints survive editing (criterion 13)", () => 
     expect(section.length, "the §3.1 section must be locatable").toBeGreaterThan(200);
     const rows = [...section.matchAll(/^\|\s*(\d+)\s*\|/gm)].map((m) => Number(m[1]));
     const highest = Math.max(...rows);
-    expect(highest, "constraint table should reach 8").toBe(8);
+    expect(highest, "constraint table should reach 9").toBe(9);
     expect(RUNBOOK, "the prose must not still say six").not.toMatch(/^Six, each verified/m);
-    expect(RUNBOOK).toMatch(/\*\*Eight\*\*, each verified/);
+    expect(RUNBOOK).toMatch(/\*\*Nine\*\*, each verified/);
   });
 });
 
@@ -70,7 +81,7 @@ describe("guard: constraint 1's correction cannot silently revert (criterion 11)
     // sentence goes false. It cannot be fixed by asserting harder — so the doc is required to carry
     // its own date and an instruction to re-measure, which makes it stale-by-construction rather
     // than silently wrong.
-    expect(RUNBOOK).toMatch(/MEASURED 2026-08-27/);
+    expect(RUNBOOK).toMatch(/MEASURED 2026-08-26/);
     expect(RUNBOOK).toMatch(/A dated measurement, not an invariant/);
     expect(RUNBOOK).toMatch(/re-measure rather than trusting this row/);
   });
@@ -86,6 +97,13 @@ describe("guard: the cost of requiring the gate is written down (criterion 14)",
     // A fast-forward attempted while the context is pending is rejected — a foot-gun that costs a
     // confused ten minutes on release day if it is not written down.
     expect(RUNBOOK).toMatch(/wait for `Release candidate gate` to go green/);
+  });
+
+  it("§2 no longer claims a tag push triggers nothing — this slice made that false", () => {
+    // An operator following the old §2 would ignore the new gate's red result and publish anyway.
+    expect(RUNBOOK, "the stale claim must be gone").not.toMatch(/\*\*Pushing a tag triggers nothing\*\*/);
+    expect(RUNBOOK).toMatch(/Pushing a tag now runs the release-candidate/);
+    expect(RUNBOOK, "and it must say what a red D means before the cutover").toMatch(/expected to fail assertion D/);
   });
 
   it("points at the files that implement the gate, so the section cannot describe a ghost", () => {

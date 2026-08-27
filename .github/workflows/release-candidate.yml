@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   gate:
-    # This job's name becomes the check context. `test/guards/workflow-context-uniqueness.test.ts`
+    # This job's name becomes the check context. `test/guards/workflow-permissions.test.ts`
     # asserts no other workflow produces the same name: branch protection identifies a required check
     # by CONTEXT NAME, not by the workflow file that produced it, so a duplicate elsewhere could mint
     # the accepted context on a commit this gate never examined.

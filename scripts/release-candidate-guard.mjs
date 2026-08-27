@@ -101,7 +101,13 @@ export function releaseCandidateVerdict({
 
 /* ─────────────────────────── the thin measuring shell ─────────────────────────── */
 
-const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
+// `cwd` is threaded through rather than relying on the process's directory SO THAT THE WIRING CAN BE
+// TESTED. That is not incidental: the pure decision below takes `reachableFromIntegration` as a
+// boolean, so nothing about the argument order of the `merge-base` call that COMPUTES it is pinned by
+// those tests — and an inverted order would return `true` in today's pre-cutover graph (`staging` is
+// behind `main`, so `staging` IS an ancestor of the candidate). It would pass silently, on the one
+// assertion two review rounds existed to restore.
+const gitIn = (cwd) => (...args) => execFileSync("git", args, { encoding: "utf8", cwd }).trim();
 
 /**
  * Resolve the tag the EVENT carried, and bind it to the immutable SHA the check will attach to.
@@ -115,7 +121,8 @@ const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
  * `+<commit>:refs/tags/<tag>`, which turns an annotated tag into a lightweight one LOCALLY. Reading
  * the object type from checkout's leftovers would redden every valid annotated release.
  */
-export function resolveEventTag({ ref, sha, remote = "origin" }) {
+export function resolveEventTag({ ref, sha, remote = "origin", cwd = undefined }) {
+  const git = gitIn(cwd);
   const name = String(ref ?? "").replace(/^refs\/tags\//, "");
   if (!name || name === String(ref)) {
     throw new Error(`this gate runs on tag pushes only; GITHUB_REF was ${ref ?? "unset"}`);
@@ -136,17 +143,18 @@ export function resolveEventTag({ ref, sha, remote = "origin" }) {
   return { name, objectType, commit: peeled };
 }
 
-function taggedTreeVersion(commit) {
+function taggedTreeVersion(commit, cwd) {
   try {
-    return JSON.parse(git("show", `${commit}:package.json`)).version ?? null;
+    return JSON.parse(gitIn(cwd)("show", `${commit}:package.json`)).version ?? null;
   } catch {
     return null;
   }
 }
 
-function isAncestor(maybeAncestor, descendant) {
+/** True iff `maybeAncestor` is an ancestor of `descendant` — or the same commit. */
+function isAncestor(maybeAncestor, descendant, cwd) {
   try {
-    execFileSync("git", ["merge-base", "--is-ancestor", maybeAncestor, descendant], { stdio: "ignore" });
+    execFileSync("git", ["merge-base", "--is-ancestor", maybeAncestor, descendant], { stdio: "ignore", cwd });
     return true;
   } catch {
     return false;
@@ -159,16 +167,20 @@ export function main({
   remote = "origin",
   mainRef = "refs/remotes/origin/main",
   integrationRef = "refs/remotes/origin/staging",
+  cwd = undefined,
   log = console.log,
 } = {}) {
-  const tag = resolveEventTag({ ref, sha, remote });
+  const tag = resolveEventTag({ ref, sha, remote, cwd });
 
   const facts = {
     tagName: tag.name,
     tagObjectType: tag.objectType,
-    taggedTreeVersion: taggedTreeVersion(tag.commit),
-    mainIsAncestor: isAncestor(mainRef, tag.commit),
-    reachableFromIntegration: isAncestor(tag.commit, integrationRef),
+    taggedTreeVersion: taggedTreeVersion(tag.commit, cwd),
+    // C: is `main` an ancestor OF the candidate — i.e. can `main` fast-forward to it.
+    mainIsAncestor: isAncestor(mainRef, tag.commit, cwd),
+    // D: is the candidate an ancestor of INTEGRATION — i.e. did it cross integration. The argument
+    // order is the opposite of C's and that is the whole point; see `gitIn`'s note.
+    reachableFromIntegration: isAncestor(tag.commit, integrationRef, cwd),
   };
 
   const { verdict, failures } = releaseCandidateVerdict(facts);

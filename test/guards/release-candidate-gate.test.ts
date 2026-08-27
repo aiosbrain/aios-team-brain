@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { releaseCandidateVerdict } from "../../scripts/release-candidate-guard.mjs";
+import { parse as parseYaml } from "yaml";
+import { main as runGate, releaseCandidateVerdict } from "../../scripts/release-candidate-guard.mjs";
 
 /**
  * RELPTR-3 — the release-candidate gate.
@@ -110,13 +113,22 @@ describe("release candidate — the tag itself (criteria 3, 4, 15)", () => {
 describe("release candidate — the workflow that runs it (criteria 6, 7, 8)", () => {
   const WF = readFileSync(join(ROOT, ".github/workflows/release-candidate.yml"), "utf8");
 
-  it("triggers on a TAG push and on nothing else", () => {
-    // Decision 4's no-red-box property, checked rather than asserted. If this ever gains a
-    // `pull_request` or branch trigger it becomes able to redden ordinary work, and the reason the
-    // slice was safe to land early evaporates.
-    expect(WF).toMatch(/on:\s*\n\s*push:\s*\n\s*tags:\s*\n\s*-\s*"v\*"/);
-    expect(WF, "must not trigger on pull_request").not.toMatch(/^\s*pull_request(_target)?:/m);
-    expect(WF, "must not trigger on a branch push").not.toMatch(/^\s*branches:/m);
+  it("triggers on a TAG push and on NOTHING else — the whole `on:` block, compared exactly", () => {
+    // Decision 4's no-red-box property. The first version of this test listed forbidden spellings,
+    // and both reviewers walked past it: `branches-ignore: [never]` under `push:` opts BRANCH pushes
+    // back in (GitHub treats branch and tag filters independently), so every push to `main` would run
+    // the gate and go red at `resolveEventTag` — while every assertion here stayed green. `schedule:`
+    // and `workflow_call:` slipped through the same way.
+    //
+    // An enumeration of what is forbidden can only ever be as complete as the author's imagination.
+    // Comparing the PARSED trigger to the one shape that is allowed inverts that: anything added,
+    // anywhere in the block, reddens without this test having to have predicted it.
+    // NOTE the YAML 1.1 trap: `on:` is a boolean key in 1.1 and a string key in 1.2. The `yaml`
+    // package is 1.2 by default, so `["on"]` is correct here — but read both, because a parser
+    // upgrade that flipped it would otherwise turn this assertion into `undefined === undefined`.
+    const doc = parseYaml(WF) as Record<string, unknown>;
+    const on = doc["on"] ?? doc[String(true)];
+    expect(on).toEqual({ push: { tags: ["v*"] } });
   });
 
   it("asks for full history, since ancestry and reachability need it", () => {
@@ -178,5 +190,112 @@ describe("release candidate — the entry path is wired (criteria 5, 12, 16)", (
 
   it("refuses any ref that is not a tag", () => {
     expect(SRC).toMatch(/runs on tag pushes only/);
+  });
+});
+
+/**
+ * THE WIRING, against real git — not the pure decision, the code that COMPUTES its inputs.
+ *
+ * Why this exists at all: `releaseCandidateVerdict` takes `reachableFromIntegration` as a boolean, so
+ * every test above passes whatever it likes and none of them pins the `merge-base` argument order that
+ * produces it. Swap the arguments and, in today's pre-cutover graph, the answer flips to `true` —
+ * `staging` is BEHIND `main`, so `staging` is an ancestor of any candidate. A silent inversion of the
+ * one assertion two review rounds existed to restore, passing green. Found by probing git directly,
+ * after both reviewers had verified the order was correct without noting that nothing held it there.
+ */
+describe("release candidate — the wiring, against real git (criteria 5, 12, 16)", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
+
+  /** A repo with `main` ahead of `integration`, and an annotated tag on main's tip. */
+  function scratch() {
+    const dir = mkdtempSync(join(tmpdir(), "rcg-"));
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "t");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.1.0" }));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "base");
+    git(dir, "branch", "integration");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.2.0" }));
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "release prep");
+    git(dir, "tag", "-a", "v0.2.0", "-m", "v0.2.0");
+    return { dir, head: git(dir, "rev-parse", "HEAD") };
+  }
+
+  const run = (dir: string, head: string) =>
+    runGate({
+      ref: "refs/tags/v0.2.0",
+      sha: head,
+      remote: ".",
+      mainRef: "refs/heads/main",
+      integrationRef: "refs/heads/integration",
+      cwd: dir,
+      log: () => {},
+    });
+
+  it("computes D in the RIGHT DIRECTION: un-integrated candidate FAILS", () => {
+    const { dir, head } = scratch();
+    const res = run(dir, head);
+    // `integration` is behind, exactly like `staging` is today. The candidate did not cross it.
+    expect(res.facts.reachableFromIntegration, "candidate is NOT reachable from integration").toBe(false);
+    // …and the inverted question would have answered `true`, which is what makes this test necessary.
+    expect(
+      (() => {
+        try {
+          execFileSync("git", ["merge-base", "--is-ancestor", "refs/heads/integration", head], { cwd: dir, stdio: "ignore" });
+          return true;
+        } catch {
+          return false;
+        }
+      })(),
+      "the INVERTED order would have said true — a silent pass"
+    ).toBe(true);
+    expect(res.verdict).toBe("FAIL");
+    expect(res.failures.join(" ")).toMatch(/never crossed integration/);
+  });
+
+  it("PASSES once the candidate really is on the integration line", () => {
+    const { dir, head } = scratch();
+    git(dir, "branch", "-f", "integration", head); // the cutover's fast-forward, in miniature
+    const res = run(dir, head);
+    expect(res.facts).toMatchObject({
+      tagName: "v0.2.0",
+      tagObjectType: "tag",
+      taggedTreeVersion: "0.2.0",
+      mainIsAncestor: true,
+      reachableFromIntegration: true,
+    });
+    expect(res.verdict).toBe("PASS");
+  });
+
+  it("reads the object type as ANNOTATED for an annotated tag, and lightweight for a lightweight one", () => {
+    const { dir, head } = scratch();
+    git(dir, "branch", "-f", "integration", head);
+    expect(run(dir, head).facts.tagObjectType).toBe("tag");
+    // Replace it with a lightweight tag at the same commit: A must now fail.
+    git(dir, "tag", "-d", "v0.2.0");
+    git(dir, "tag", "v0.2.0", head);
+    const res = run(dir, head);
+    expect(res.facts.tagObjectType).toBe("commit");
+    expect(res.verdict).toBe("FAIL");
+    expect(res.failures.join(" ")).toMatch(/LIGHTWEIGHT/);
+  });
+
+  it("FAILS CLOSED when the tag has moved away from the event's SHA", () => {
+    const { dir, head } = scratch();
+    git(dir, "branch", "-f", "integration", head);
+    const stale = git(dir, "rev-parse", "HEAD~1");
+    // The event said `head`; the ref now peels somewhere else. Validating it would attach a green to
+    // a commit this run never examined.
+    expect(() => run(dir, stale)).toThrow(/refusing:/);
+  });
+
+  it("REFUSES a ref that is not a tag", () => {
+    const { dir, head } = scratch();
+    expect(() => runGate({ ref: "refs/heads/main", sha: head, remote: ".", cwd: dir, log: () => {} })).toThrow(
+      /tag pushes only/
+    );
   });
 });
