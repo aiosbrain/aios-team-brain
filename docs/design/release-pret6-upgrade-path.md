@@ -162,7 +162,7 @@ asserts only that the declared list is in a **legal** state, which is true mid-p
 entirely — the deleted permissive mode, the mandatory ordered upgrade, and the deployment refusal
 (`docs/RELEASE-NOTES-pret6.md:31-55`). Publishing that as `v0.12.0`'s notes would hide the one thing a
 pinned operator must act on. This slice adds a pointer to the PRET-6 release notes and the upgrade
-order; it does **not** editorialise 168 commits it did not review.
+order; it does **not** editorialise the interval's commits it did not review.
 
 ## Scope
 

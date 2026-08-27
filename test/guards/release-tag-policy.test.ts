@@ -60,8 +60,8 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
     // moment a release was DECLARED (`pending` stops being null, `usable` stops equalling the list)
     // they went red — the guard that exists to make releases possible would have blocked one. Policy
     // semantics are tested against fixtures; the live list gets its own legal-state check below.
-    const res = nextTagPolicy([...CUT_FIXTURE, "v9.9.9"], REAL_TAGS);
-    expect(res.pending).toBe("v9.9.9");
+    const res = nextTagPolicy([...CUT_FIXTURE, "v0.100.0"], REAL_TAGS);
+    expect(res.pending).toBe("v0.100.0");
     expect(res.usable).toEqual(CUT_FIXTURE);
     expect(res.notice).toMatch(/declared but not yet cut/);
   });
@@ -83,15 +83,19 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
   it("picks the exempt tag by VERSION, not by list position", () => {
     // `v0.9.0` > `v0.10.0` under string sort. A list written out of order must not change which tag
     // is allowed to be missing, or the exemption moves under a harmless reformat.
-    // SYNTHETIC versions on purpose. These fixtures originally used `v0.11.0` as "the uncut one" — and
-    // broke the day v0.11.0 was actually cut. A fixture that borrows a plausible real version rots into
-    // a false failure the moment the project reaches it.
+    // SYNTHETIC, and specifically `v0.100.0`: it string-sorts BELOW `v0.9.0` while being numerically the
+    // newest, so a string-sorting exemption pick fails this test. The previous fixture (`v9.9.9`) was the
+    // maximum under both orderings and had silently stopped discriminating — review caught that.
+    // These fixtures originally used `v0.11.0` as "the uncut one" and broke the day it was cut; a fixture
+    // borrowing a plausible real version rots the moment the project reaches it. ROT HORIZON: 88 more
+    // minor releases. If the project ever reaches v0.100.0, move these to the next version that sorts
+    // below the newest real one as text — the property being tested is that disagreement, not the number.
     // Derived from CUT_FIXTURE (with the synthetic pending tag pushed to the FRONT) rather than
     // hand-listed: a hand-listed copy silently omits the newest cut release and trips the staleness
     // rule instead of testing the ordering it claims to.
-    const res = nextTagPolicy(["v9.9.9", ...CUT_FIXTURE], REAL_TAGS);
-    expect(res.pending).toBe("v9.9.9");
-    expect(() => nextTagPolicy(["v9.9.9", "v0.9.5", ...CUT_FIXTURE], [...REAL_TAGS, "v9.9.9"])).toThrow(
+    const res = nextTagPolicy(["v0.100.0", ...CUT_FIXTURE], REAL_TAGS);
+    expect(res.pending).toBe("v0.100.0");
+    expect(() => nextTagPolicy(["v0.100.0", "v0.9.5", ...CUT_FIXTURE], [...REAL_TAGS, "v0.100.0"])).toThrow(
       /unknown git tag: v0\.9\.5/
     );
   });
@@ -167,7 +171,7 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
 
   it("each outcome fires ALONE for an input that triggers only it", () => {
     expect(nextTagPolicy(CUT_FIXTURE, REAL_TAGS)).toEqual({ usable: CUT_FIXTURE, pending: null, notice: null });
-    expect(nextTagPolicy([...CUT_FIXTURE, "v9.9.9"], REAL_TAGS).pending).toBe("v9.9.9");
+    expect(nextTagPolicy([...CUT_FIXTURE, "v0.100.0"], REAL_TAGS).pending).toBe("v0.100.0");
     expect(() => nextTagPolicy(["v0.7.0", "v0.8.5", "v0.10.0"], REAL_TAGS)).toThrow(/unknown git tag/);
     expect(() => nextTagPolicy(["v0.7.0"], REAL_TAGS)).toThrow(/stale/);
   });

@@ -66,7 +66,8 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
  * `nextTagPolicy` for why that exception exists and how narrow it is.
  */
 export const DEFAULT_TAGS = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0", "v0.11.0", "v0.12.0"];
-// `v0.11.0` is DECLARED BEFORE IT IS CUT, on purpose (RELPTR-2). Cutting it first would fail
+// The NEWEST entry is DECLARED BEFORE IT IS CUT, on purpose (RELPTR-2) — `v0.12.0` today, `v0.11.0`
+// when that line was written. Cutting first would fail
 // `DEFAULT_TAGS is stale` on every open PR — the freeze `nextTagPolicy` exists to prevent. Its
 // pending slot is exactly this affordance: declare, then cut, and nothing reddens in between.
 

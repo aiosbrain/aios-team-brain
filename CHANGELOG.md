@@ -24,18 +24,35 @@ line go stale while the code moved on, so it is not restated.
   PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
   ```
 
-  Both refusal conditions must be cleared first — the PRET-4 marker present, and zero teams left
-  `permissive`. Run `v0.11.0` (the `release/v0.11.0` branch), let it boot, let auto-flip converge,
-  flip anything it could not, and verify with the query in [`docs/RELEASING.md`](docs/RELEASING.md)
-  §3.4. A successful deploy is not the gate; the query is. Full detail:
-  `docs/RELEASE-NOTES-pret6.md`.
+  **The upgrade, in full — inlined deliberately.** The `v0.11.0` tree predates these docs, so an
+  operator pinned there cannot open them:
+
+  1. Point the service at the **`release/v0.11.0`** branch and deploy it. (Railway's connected source
+     is a branch; there is no supported fleet-wide way to select a tag.)
+  2. Let it **boot** — the PRET-4 marker is written by the running application, not by a migration,
+     so applying the schema alone does not satisfy the precondition.
+  3. Let auto-flip converge, then flip anything it could not, using the command that release carries:
+
+     ```bash
+     npm run admin -- set-access-enforcement <team-slug> enforcing
+     ```
+
+  4. **Verify both conditions directly. This query is the gate — a successful deploy is not:**
+
+     ```sql
+     select exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') as marker_ok,
+            (select count(*) from teams where access_enforcement = 'permissive') as permissive_left;
+     ```
+
+     Proceed only on `marker_ok = t` and `permissive_left = 0`. Both the command above and this
+     column are **deleted by this release**, so run them while still on `v0.11.0`.
+  5. Point the service back at `main` and deploy.
+
+  Fuller background: [`docs/RELEASING.md`](docs/RELEASING.md) §3.4 and `docs/RELEASE-NOTES-pret6.md`
+  (both present from this release onward).
 
   **One-way.** At least one migration in this range adds an enum value, which Postgres cannot drop.
   Roll forward, not back.
-
-### Added
-
-### Changed
 
 ### Added
 
@@ -52,10 +69,18 @@ line go stale while the code moved on, so it is not restated.
   un-rescanned ones under two different formulas. Null means unknown throughout — never zero,
   never full scope.
 
-> This section lists the changes that were written down. The interval also contains work that was
-> never itemised here — it is not an exhaustive record of 168 commits, and is not presented as one.
+> This section lists the changes that were written down. The interval also contains a great deal of
+> work that was never itemised here — it is not an exhaustive record, and is not presented as one.
+> (An earlier draft claimed a precise commit count; it was measured days before the release and was
+> already wrong by the time it was written down.)
 
 ## [0.11.0] — 2026-08-18
+
+> **Read this date as the content boundary, not the cut date.** `v0.11.0` was branched from
+> `803122ff` (authored 2026-08-18) and tagged on 2026-08-26 — the eight days between are this
+> repo's own work on the release path, none of which is in the release. Every other entry in this
+> file was cut the day its content landed, so this one is the exception and is labelled rather than
+> silently normalised. The tagged tree carries this same heading, unchanged.
 
 **The convergence release.** Upgrading through it is mandatory for any installation older than it;
 see the `v0.12.0` entry above. It also carries **PRET-4** (the tier-wall teardown, #594) and
