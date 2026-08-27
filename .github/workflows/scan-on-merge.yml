@@ -16,9 +16,13 @@ name: scan-on-merge
 # (These already exist for the aios-work-sync workflow; the scanner reads BRAIN_URL, mapped below.)
 # GITHUB_TOKEN is the built-in token (read access to this repo for stars/issues metadata).
 
+# RELPTR-4 — both branches. After the cutover `main` advances only by release fast-forward, so a
+# `[main]`-only trigger would silently drop codebase-readiness from per-merge to per-release freshness.
+# Widening carries no risk here: the scan is read-only against the repo and idempotent on the brain
+# (keyed by `head_sha`), so a push to either branch is safe to scan.
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
 
 permissions:
   contents: read

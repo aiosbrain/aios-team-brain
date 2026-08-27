@@ -95,7 +95,7 @@ completeness.**
 |---|---|---|
 | 1 | A fast-forward push to `main` can be **rejected by a required check the candidate cannot acquire** — but this is **one context, not ten**. **MEASURED 2026-08-26** on the real merge commit `6dfddfc7` (a push to `main`): **9 of the 10 required contexts are present**, because `ci.yml` and `nda-gate.yml` both fire on `push`. The sole exception is **`PR records a diff review`**, emitted only on `pull_request` (`.github/workflows/pr-review-gate.yml`). The cutover therefore needs that one context **relocated** to the integration branch — not a release-actor bypass that defeats the other nine. *(A dated measurement, not an invariant: if protection gains an eleventh context, re-measure rather than trusting this row.)* | live protection on `main`; check-runs on `6dfddfc7` |
 | 2 | **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
-| 3 | **`aios-work-sync` breaks the day contributions move**, and cannot be deferred: it fires on a `pull_request` closed against `main` (`.github/workflows/aios-work-sync.yml`), so merges elsewhere emit nothing — and a release delivered by direct push emits nothing either. Decide whether *integration* or *release* closes a ticket before the first merge lands elsewhere. | `.github/workflows/aios-work-sync.yml` |
+| 3 | **PREPARED (RELPTR-4).** `aios-work-sync` fired on `pull_request` closed against `main` only, so merges elsewhere would have emitted nothing and **nothing would have closed a ticket**. It now fires on both `main` and `staging`, landed early because it is near-inert until contributions move. `scan-on-merge` was widened for the same reason — otherwise codebase readiness silently drops from per-merge to per-release. **The decision constraint 3 demanded is made: a ticket closes at INTEGRATION, not at release** (see §3.1b). **Still human at cutover:** nothing for this constraint. | `.github/workflows/aios-work-sync.yml` |
 | 4 | **`git diff origin/main...HEAD` is an operative instruction**, not documentation — the review gate and the attestation skills run it. The moment features branch elsewhere, that diff carries every unreleased commit. It must be updated *at* the cutover, not after. | `CLAUDE.md` §Review gate |
 | 5 | **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
 | 6 | **Bare `gh pr create` targets the default branch** absent a `branch.<name>.gh-merge-base` override (none is set here), and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
@@ -132,6 +132,63 @@ in advance:
 the tag, wait for `Release candidate gate` to go green on that commit, *then* fast-forward `main`. A
 fast-forward attempted while the context is still pending is rejected.
 
+### 3.1b When a ticket closes, and what this repo's automation actually does
+
+**Decision (RELPTR-4): a ticket closes when its work merges to the CONTRIBUTION BASE — not when a
+release ships.** The work is done at integration; a release may be days later and batch dozens of
+tickets, and between `v0.10.0` and `v0.12.0` that was 23 days and ~170 commits. Release-closes would
+leave the board stale exactly when it is most useful.
+
+**Revert and abandonment:** a ticket closed at integration **stays closed** if the release is later
+reverted or never cut. That is identical to today's behaviour and is accepted — here "done" means
+**integrated**, not shipped. A separate shipped/released signal is follow-on work, not part of this.
+
+**What the automation actually does, which the PR template used to overstate:**
+
+| the row came from | resolution | what happens |
+|---|---|---|
+| brain-native, in this project | `applied` | completed **and** projected to Linear automatically |
+| pushed from the workspace (`3-log/tasks.md`) | `linked` | the event is recorded, the task is **deliberately left open** — completing on a team-wide match would create duplicate Linear issues. **You close it and `aios push`.** |
+
+**Known limitation, recorded rather than discovered later:** the work-sync payload carries only
+`pr.head.ref`. After the cutover the brain therefore **cannot tell which base a merge event came
+from** — every event looks the same whether it landed on the contribution base or the release branch.
+
+### 3.1c The cutover-day edits that a shared constant does NOT remove
+
+`scripts/branches.mjs` (RELPTR-4) names the three branch roles once, so the Node and instruction
+consumers move in one edit. **It is not "the cutover is one edit"**, and the difference is worth
+writing down before someone plans a day around the wrong number. These remain separate, and each is a
+file a human must change:
+
+1. **`.github/dependabot.yml` `target-branch`** — YAML cannot import a module, and unlike a workflow
+   `branches:` list there is no two-branch superset that is correct both before and after.
+2. **Prose that NAMES a branch** rather than pointing at the module — undetectable by any guard,
+   because `main` is a legitimate token everywhere.
+3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
+   relocating `PR records a diff review`.
+4. **The instruction corpus** — 31 operative `origin/main` command lines across 19 files. That is
+   **RELPTR-5**, deliberately its own slice; see §3.1d.
+
+### 3.1d Why the instruction corpus is its own slice
+
+Two independent pre-code reviews BLOCKED an attempt to fold it into RELPTR-4, both on the same defect:
+the corpus was undercounted (14 reported, **31 lines across 19 files** actual), so a guard built to
+that scope would have reddened on day one against files the scope never named — including
+`CONTRIBUTING.md`, the contributor entry point.
+
+Two properties make it a slice rather than a fold, and both must be settled **before** the guard is
+written rather than after:
+
+- **"Operative `origin/main`" is design vocabulary, not an observable.** It is implementable as a
+  *declared* heuristic — a line carrying a `git` invocation token plus the ref — which correctly
+  separates `branch-reconciliation/SKILL.md:30` from the historical prose in
+  `lib/graph/extraction-health.ts:297`. But it false-negatives on `adversarial-build`'s
+  "Branch from `origin/main`", which carries no `git` token.
+- **A past-tense rewrite does not exclude a quotation from a regex.** Constraint 4's row below quotes
+  the old instruction to explain itself; past-tenseness is invisible to a matcher. Either the literal
+  goes or the path is excluded — an earlier draft asked for both.
+
 ### 3.2 Ordering pairs that encode a hazard
 
 Not a total order — these are the adjacencies where getting it backwards causes the incident:
@@ -148,6 +205,8 @@ order:
   - workflow-on-main: before any new context is made required
   - tag-ruleset: before the release-candidate context is FIRST MINTED
   - fast-forward-staging: before any candidate tag is pushed
+  - work-sync-and-scan-widened: DONE (RELPTR-4), before contributions move
+  - dependabot-target-branch: at the cutover, never before (it would aim at a stale branch)
 ```
 
 The `workflow-on-main` pair is this repository's own scar tissue: `docs/CI-ARCHITECTURE.md` records that switching on

@@ -1,9 +1,21 @@
 name: AIOS work sync
 
+# RELPTR-4 — BOTH the contribution base and the integration branch, deliberately, and landed BEFORE
+# the cutover rather than on the day. This fires on `pull_request` closed; today no pull request
+# targets `staging`, so adding it is near-inert — but the day contributions move, this workflow is
+# already right instead of being one more thing to remember while everything else is changing.
+#
+# THE ACCEPTED COST, stated rather than discovered: a MISTAKEN merge into `staging` (258 behind) now
+# emits a work event where before it emitted nothing. For a brain-native row in the pushed project
+# that resolves `applied`, i.e. it would complete a task and project it to Linear for work that is not
+# on trunk. Judged smaller than the risk of doing this on cutover day.
+#
+# The branch list is pinned by `test/guards/branch-roles.test.ts` as an EXACT SET — not "contains
+# both", because `[main, staging, "**"]` satisfies containment while silently widening to every branch.
 on:
   pull_request:
     types: [closed]
-    branches: [main]
+    branches: [main, staging]
 
 permissions:
   contents: read
