@@ -1,13 +1,14 @@
 # The runner stage stops reading the build context — DOCKERPROD-2
 
-**Status:** spec, round 1 (both spec reviews folded). No code written.
+**Status:** spec, round 2 (four model reviews folded: two rounds × two models). No code written.
 
-**Build with:** opus / high — it changes the image production boots from. The blast radius is small
-(one `COPY` deleted, one `ENTRYPOINT` changed, one build-time assertion added) but the failure mode is
-a container that builds green and cannot start, and the only roll-forward from that is another deploy.
+**Build with:** opus / high — it changes the image production boots from. The diff is small but the
+failure mode is a container that builds green and cannot start, and the only roll-forward from that is
+another deploy. Round 2 found **three** distinct ways to reach exactly that outcome while every
+round-1 criterion stayed green.
 
-**Deps:** none. **Blocks:** DOCKERPROD-1, the standalone/production-image slice, which is deliberately
-NOT this one.
+**Deps:** none. **Blocks:** DOCKERPROD-1, the standalone/production-image slice, deliberately NOT this
+one.
 
 ---
 
@@ -24,11 +25,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh                        # line 36
 
 **Line 35 copies a file the image already has.** The build stage's `COPY . .` (line 28) puts it at
 `/app/docker/entrypoint.sh`, and the runner's `COPY --from=build /app ./` (line 34) brings that in.
-That redundancy is the whole case for this slice, and it holds regardless of anything in §0b.
+That redundancy is the whole case for this slice and it holds independently of §0b.
 
-**The motivation** — not the argument — is that this same instruction failed two Railway production
-builds, each time blocking a merged fix from reaching production for hours and each time needing a
-human dashboard re-trigger:
+**The motivation** — not the argument — is that this instruction failed two Railway production builds,
+each time blocking a merged fix from production for hours and needing a human dashboard re-trigger:
 
 | deployment | PR | date | failure |
 |---|---|---|---|
@@ -46,51 +46,54 @@ $ docker build -f /tmp/probe/Dockerfile .      # FROM busybox; WORKDIR /app; COP
 -rwxr-xr-x    1 root     root           665 Jul 30 01:48 /app/docker/entrypoint.sh
 ```
 
-So the context COPY lands the file at exactly the path the new `ENTRYPOINT` will name, **with its
-`100755` mode preserved**. Supporting reads:
+The context COPY lands the file at exactly the path the new `ENTRYPOINT` names, with its `100755` mode
+preserved. Supporting reads:
 
 | claim | how checked | result |
 |---|---|---|
 | `.dockerignore` does not exclude `docker/` | read the file | excludes `node_modules`, `.next`, `.git`, `.github`, env files, dev noise — **nothing under `docker/`** |
 | the file is tracked, executable | `git ls-files -s docker/entrypoint.sh` | `100755 e940c8fa` |
-| nothing else consumes `/usr/local/bin/entrypoint.sh` | `grep -rn` across the repo | only the `Dockerfile`'s own `COPY`/`chmod`/`ENTRYPOINT` triple; both reviews confirmed independently |
+| nothing else consumes `/usr/local/bin/entrypoint.sh` | `grep -rn` across the repo | only the `Dockerfile`'s own `COPY`/`chmod`/`ENTRYPOINT` triple; both reviewers confirmed independently |
 | the copy-through already works in production | `docker/entrypoint.sh:5` runs `node /app/docker/bootstrap.mjs` | the **sibling file** ships through this exact path today, and every compose boot proves it |
 
 ### 0b. Why the flake is MOTIVATION and not EVIDENCE — a claim I withdrew
 
-Round 0 of this spec argued that the LATE context read is the vulnerable one, and offered the error's
-leading slash (`lstat /docker/…`) as proof that the daemon resolved the path against `/` rather than
-against the context. **Both reviewers rejected that, and they were right.** I tested it:
+Round 0 argued the LATE context read is the vulnerable one, offering the error's leading slash
+(`lstat /docker/…`) as proof the daemon resolved against `/` rather than the context. **Both reviewers
+rejected it and they were right.** Measured:
 
 ```
 $ docker build .        # COPY definitely-not-here.sh /tmp/x   — a genuinely absent context file
 ERROR: failed to calculate checksum of ref …: "/definitely-not-here.sh": not found
 ```
 
-A plainly context-relative miss **also prints a leading slash**, because the context root IS `/`. The
-slash discriminates nothing and that sentence is deleted. *(The message text does differ — `failed to
-calculate checksum … not found` here vs `lstat … no such file or directory` on Railway — but I am not
-going to build a second mechanism claim on one local buildkit version.)*
+A plainly context-relative miss **also prints a leading slash** — the context root IS `/`. The slash
+discriminates nothing; the sentence is deleted.
 
-What survives as fact: two failures at the identical instruction; the file present at both commits;
+**What survives as fact:** two failures at the identical instruction; the file present at both commits;
 `git diff` on `Dockerfile`, `.dockerignore` and `docker/` between the last success and the failure is
-**empty**; and in the #648 failure `npm run build` demonstrably EXECUTED (its full route table is in
-the build log), so the build stage was not a pure cache replay.
+**empty**; and in the #648 failure `npm run build` demonstrably EXECUTED (its route table is in the
+build log), so the build stage was not a pure cache replay — the same context session was read
+successfully minutes before the failing read. That is **consistent with** a late-read/session-longevity
+mechanism at n=2. It does not establish one.
 
-**What remains a hypothesis, explicitly:** that the late context read is more exposed than the early
-one. ⚠️ **The honest no-improvement reading, which I accept:** if Railway/buildkit has an unreliable
-context session, deleting line 35 may just move the next failure onto `COPY . .`, leaving the total
-flake rate unchanged. **This slice does not promise a lower flake rate.** It removes an instruction
-that copies a file the image already carries — which is worth doing on its own, and is why the design
-does not rest on the mechanism at all.
+**What this slice does and does not promise:**
+
+- ❌ **It does not promise a lower flake rate.** If Railway/buildkit has an unreliable context session,
+  the next failure may simply land on `COPY . .` instead. That reading is accepted.
+- ✅ **It provably cannot RAISE context exposure.** The change strictly removes one of the file's three
+  context reads and adds no new context dependency. Monotone, and free to state.
 
 ### 0c. On the production path, the entrypoint never runs
 
 `railway.json:5` sets `startCommand: "sh scripts/railway-start.sh"`, which replaces the image's
-`ENTRYPOINT`; `scripts/railway-start.sh:4-5` says so in its own comment and duplicates the bootstrap
-for that reason. So on Railway this file is **dead weight whose `COPY` can still fail the build**. Its
-only consumer is the local `docker compose` stack (`compose.yml`'s `app` service — `build: .`, no
-`entrypoint:` override).
+`ENTRYPOINT`; `scripts/railway-start.sh:4-5` says so and duplicates the bootstrap for that reason. On
+Railway this file is **dead weight whose `COPY` can still fail the build**. Its only consumer is the
+local `docker compose` stack (`compose.yml`'s `app` service — `build: .`, no `entrypoint:` override).
+
+⚠️ *That fact is load-bearing for §6, and it lives in `railway.json` — not in the Dockerfile. Deleting
+`deploy.startCommand` silently falsifies §0c AND §6 while every prose check still passes, which is why
+AC3(c) checks the file where the contract actually is.*
 
 ### 0d. The header sentence that made this look harmless is false
 
@@ -105,62 +108,121 @@ critical path, so correcting it belongs to THIS slice: leaving a sentence I have
 the file I am editing, for the reason I am editing it, is its own defect. **Both reviewers agreed this
 is not DOCKERPROD-1 scope creep.**
 
+### 0e. Two behaviours I measured because the reviewers disagreed or I was about to guess
+
+**`ONBUILD` fires inside a single Dockerfile.** Codex said it "does not execute in the current image
+build"; Fable said it bypasses the guard entirely. Fable is right, and the build log settles it — the
+context read is attributed to the *runner* stage while appearing in no runner-stage instruction:
+
+```
+FROM busybox AS base
+ONBUILD COPY leaked.txt /leaked.txt
+FROM base AS runner
+RUN ls -l /leaked.txt
+--------------------------------------------------------------------
+#6 [runner 1/2] ONBUILD COPY leaked.txt /leaked.txt
+#7 0.169 -rw-r--r--  1 root root  7 … /leaked.txt      ← the context, read inside runner
+```
+
+So AC1 must reject `ONBUILD` **anywhere in the file**, not just in the final stage.
+
+**An empty `CMD` is a silent, successful exit.** `docker/entrypoint.sh:17` ends in `exec "$@"`; POSIX
+`exec` with zero arguments is a no-op, so the script falls off the end and returns 0:
+
+```
+$ /bin/sh entrypoint-like.sh            # no args, i.e. CMD deleted
+bootstrap ran
+exit=0                                  ← green build, container exits at boot, no error anywhere
+```
+
+`CMD ["npm", "start"]` is therefore half the boot invocation and was pinned by nothing in round 1.
+
 ## 1. The rule
 
-> **The runner stage builds from earlier stages of this same Dockerfile and from nothing else — no
-> context, no named context, no external image. Anything it needs is already in the image, and it
-> asserts at BUILD time that what it points at is there.**
+> **The final stage's FILESYSTEM comes from earlier stages of this same Dockerfile and from nothing
+> else — no build context, no named context, no external image. Everything the boot chain needs is
+> already in the image, the stage ASSERTS that at build time, and that assertion is the last thing in
+> the stage that can touch the filesystem.**
+
+*Deliberately scoped to filesystem sources.* A final-stage `RUN` may still reach the network; policing
+that is a different rule and claiming it here would be claiming more than the guard checks.
 
 ## 2. The design
 
-### 2a. Delete the redundant copy; assert what replaces it; point `ENTRYPOINT` at it
+### 2a. Delete the redundant copy; assert the boot chain terminally; complete the invocation
 
 ```dockerfile
 FROM base AS runner
 ENV NODE_ENV=production
 COPY --from=build /app ./
-RUN test -r /app/docker/entrypoint.sh          # ← fail CLOSED at build time
-...
+ENV PORT=3000 HOSTNAME=0.0.0.0
+EXPOSE 3000
+
+# TERMINAL boot-chain assertion — nothing below this line may touch the filesystem.
+RUN set -eu; \
+    for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs; do \
+      test -f "$f" && test -s "$f" && test -r "$f"; \
+    done; \
+    /bin/sh -n /app/docker/entrypoint.sh
+
 ENTRYPOINT ["/bin/sh", "/app/docker/entrypoint.sh"]
+CMD ["npm", "start"]
 ```
 
-⚠️ **The `RUN test -r` is not belt-and-braces — it repairs a fail-open the deletion would otherwise
-introduce, and it is the sharpest thing either review found.** Today, if the file were ever absent
-from the build stage, line 35 **fails the build**. Delete line 35 and that same absence becomes:
-`COPY --from=build /app ./` succeeds, `next build` succeeds, the image is green, and the *container*
-dies at boot — a defect moved from build time to somebody's runtime. One `RUN` puts it back where it
-was.
+⚠️ **The assertion repairs a fail-open the deletion would otherwise introduce — the sharpest finding of
+round 1.** Today, if the file were absent from the build stage, line 35 **fails the build**. Delete
+line 35 and that absence becomes: `COPY --from=build /app ./` succeeds, `next build` succeeds, the
+image is green, and the *container* dies at boot — a defect moved from build time to somebody's
+runtime. The `RUN` puts it back.
 
-**Why `/bin/sh <path>` and not the bare path.** The two forms genuinely differ: the bare path makes
-the kernel read `#!/usr/bin/env sh` and resolve `sh` through `PATH` via `/usr/bin/env`, and it requires
-the executable bit; the explicit form depends on neither. `/bin/sh` is guaranteed on this Debian base
-(the upstream node image's own entrypoint uses `#!/bin/sh`, and this Dockerfile already relies on the
-default `/bin/sh -c` for its shell-form `RUN`s). It is also the idiom this repo already uses for the
-same script's production twin (`railway.json`: `sh scripts/railway-start.sh`).
+Round 2 then broke my first version of it three ways, all folded above:
 
-⚠️ *Round 0 justified this as removing a dependence on something "pinned by nothing." That was wrong
-and Fable caught it: the mode bit **is** pinned, by the git index at `100755`, which §0a verifies. The
-honest justification is narrower — the explicit form depends on nothing outside the Dockerfile, at
-zero cost. AC2 pins the form so a later bare-path edit cannot silently reintroduce the dependence.*
+- **`test -r` alone is nearly `test -e`.** The build runs as root, where `access(2)` grants read on any
+  mode — and `-r` passes on a **directory** at that path and on a **zero-byte file**, both of which
+  still yield a green image and a container that exits without serving. Verified: `[ -r <dir> ]` is
+  true, `[ -f <dir> ]` is false. Hence `-f` + `-s` + `-r`, plus `sh -n` as a build-time parse of the
+  script. **Not `-x`** — that would re-couple the build to the very mode bit the `/bin/sh <path>` form
+  deliberately decouples from.
+- **It covered one of the two boot files.** `entrypoint.sh:5` runs `node /app/docker/bootstrap.mjs`;
+  any absence mechanism that can eat one can eat the other. Both are asserted.
+- **The assertion must be TERMINAL.** `RUN test …` followed by `RUN rm …` — or even
+  `RUN test … && rm …` — passed round 1's wording, which is precisely the "rm after copying" hole the
+  assertion exists to close. AC2(d) forbids any filesystem-touching instruction after it.
 
-Inside the script nothing changes: `$@` forwarding, `set -eu`, exit-code propagation, and the final
-`exec "$@"` are identical, and `sh` is the interim PID 1 in both forms.
+**Caching cannot stale this.** The `RUN`'s cache key includes its parent layer; `COPY --from=build
+/app ./` re-checksums the build stage's `/app`, so a changed tree invalidates the COPY and therefore
+the RUN. A cache hit implies a byte-identical tree, in which case the cached success is a true success.
+Both reviewers agree; recorded so the next one need not re-derive it.
 
-⚠️ *One correction to the existing comment at `docker/entrypoint.sh:15`, which says the exec makes
-"the server" PID 1: `exec "$@"` runs `npm start` (`package.json:9` → `next start`), so **npm** becomes
-PID 1, not Next. That is pre-existing and NOT changed by this slice; AC4 measures what PID 1 actually
-is and the finding is reported rather than fixed here.*
+**Why `/bin/sh <path>` and not the bare path.** The bare path makes the kernel read
+`#!/usr/bin/env sh`, resolve `sh` through `PATH` via `/usr/bin/env`, and require the executable bit;
+the explicit form depends on none of that. `/bin/sh` is guaranteed on this Debian base (the upstream
+node image's own entrypoint uses `#!/bin/sh`, and this Dockerfile already relies on the default
+`/bin/sh -c` for its shell-form `RUN`s), and it is the idiom this repo already uses for the same
+script's production twin (`railway.json`: `sh scripts/railway-start.sh`). Inside the script nothing
+changes: `$@` forwarding, `set -eu`, exit-code propagation and the final `exec "$@"` are identical.
 
-### 2b. The header stops claiming it is off the deploy path
+⚠️ *Round 0 justified this as removing a dependence on something "pinned by nothing." Wrong — the mode
+bit IS pinned, by the git index at `100755`, which §0a verifies. The honest justification is narrower:
+the explicit form depends on nothing outside the Dockerfile, at zero cost.*
 
-Rewritten to state the two facts positively: Railway auto-detects and builds this root `Dockerfile`,
-and Railway's configured `startCommand` overrides the image's `ENTRYPOINT` — so the entrypoint is the
-local-compose path only. The devDependencies paragraph stays; it is still accurate and DOCKERPROD-1
-owns changing it.
+⚠️ *One correction to `docker/entrypoint.sh:15`, which says the exec makes "the server" PID 1:
+`exec "$@"` runs `npm start` (`package.json:9` → `next start`), so **npm** becomes PID 1, not Next.
+Pre-existing and NOT changed here; AC4 records what PID 1 actually is and the finding is reported
+rather than fixed in this slice.*
+
+### 2b. The header states the deploy contract positively
+
+Two sentinel sentences, quoted here verbatim so the header and the guard cannot drift:
+
+> `Railway's GitHub integration auto-detects this root Dockerfile and BUILDS PRODUCTION with it.`
+> `Railway overrides this image's ENTRYPOINT/CMD with railway.json's startCommand, so the entrypoint below is the local `docker compose` path only.`
+
+The devDependencies paragraph stays — still accurate, and DOCKERPROD-1 owns changing it.
 
 ## 3. Scope
 
-**In:** `Dockerfile` (the runner lines + the header) · one guard, unit tier · `docs/ARCHITECTURE.md`
+**In:** `Dockerfile` (the runner stage + the header) · one guard, unit tier · `docs/ARCHITECTURE.md`
 if the deploy flow's prose is affected.
 
 **Out — all of it DOCKERPROD-1:**
@@ -172,63 +234,89 @@ if the deploy flow's prose is affected.
 
 ## 4. Acceptance
 
-- **AC1 — the final stage reads nothing but declared earlier stages (guard, unit, ∀):** in the
-  Dockerfile's FINAL stage, (a) there is no `ADD`; (b) every `COPY` carries `--from=<name>` where
-  `<name>` is a stage declared by an earlier `FROM … AS <name>` **in this file**; (c) no
-  `RUN --mount=type=bind` without an explicit `from=<declared stage>`; and (d) — non-vacuity — at
-  least one `COPY --from=<declared stage>` exists. *Round 0 quantified over `COPY` alone, which both
-  reviewers broke three ways: `ADD` reads the context, `--from=` may name an external image or a named
-  context rather than a stage, and buildkit's default bind-mount source IS the context. A ∀ narrower
-  than the rule it claims to enforce is not a guard.*
-- **AC2 — the entrypoint is a build-asserted path in the invoked form (guard, unit):** the guard parses
-  `ENTRYPOINT`, and (a) **fails loudly on any shape it does not recognise** — shell form, `-c` string,
-  anything but `["/bin/sh", "<path>"]`; (b) requires the final stage to contain a `RUN` asserting that
-  exact `<path>` is readable; (c) requires `<path>` to correspond, under the image's `/app` root, to a
-  file tracked in the repo. *Round 0's version checked only (c) and called it proof the image carries
-  the file — Codex's counterexample: copy from the wrong stage, or `rm` after copying, and (c) still
-  passes. (b) is what actually observes the image, at build time. (a) exists because an ENTRYPOINT
-  shape the guard silently skips is a guard that passes on the defect.*
-- **AC3 — the header states the deploy contract positively (guard, unit):** the Dockerfile does not
-  contain the retired sentence, AND asserts both that Railway builds this Dockerfile and that its
-  `startCommand` overrides the image entrypoint. *Round 0 required only that the word "Railway" appear
-  — satisfied by "Railway never builds this Dockerfile," which is false. Asserting the contract is the
-  only version that cannot be satisfied by a differently-worded lie.*
-- **AC4 — the image builds, serves, and STOPS (manual, recorded):** `docker compose build app`
-  succeeds; a container from it boots through `entrypoint.sh` and answers an HTTP request;
-  `docker compose stop` terminates it within the grace period with no orphan; and `PID 1` is recorded
-  as observed (see §2a). ⚠️ *Manual and named as such — this repo has no container test tier and
-  claiming CI proves it would be false. The stop leg is here because the `ENTRYPOINT` form is the one
-  thing this slice changes about the running container.*
+- **AC1 — the final stage's filesystem sources are earlier stages of this file, and nothing else
+  (guard, unit, ∀):** in the FINAL stage — defined as the last `FROM` in file order, i.e. the default
+  build target, which is what both `compose.yml:38` (`build: .`) and Railway build today —
+  **(a)** its own `FROM` names a stage declared earlier in this file; **(b)** there is no `ADD`;
+  **(c)** every `COPY` carries `--from=<name>` naming an earlier declared stage; **(d)** no `RUN`
+  carries any `--mount`; **(e)** no `ONBUILD` appears **anywhere in the file**; **(f)** the parser
+  fails LOUDLY rather than skipping — an unclassifiable instruction, a numeric or `ARG`-substituted
+  `--from`, a duplicate stage name, or a final stage with no instructions is a failure, not a pass.
+  *Round 1 quantified over `COPY` alone and round 2 broke it four ways: the stage's own `FROM` could
+  be `busybox` (green build, no `node`, dead boot); `--mount` with `type=` omitted defaults to bind
+  and `from=` omitted defaults to the context; `ONBUILD` in a parent stage executes inside this one
+  (§0e, measured); and "non-vacuity" was a parser property masquerading as a product criterion.
+  `--mount` is forbidden outright rather than allowlisted because modelling buildkit's mount defaults
+  is a bug surface and nothing here uses one.*
+- **AC2 — the boot invocation is complete, build-asserted, and terminal (guard, unit):**
+  **(a)** `ENTRYPOINT` is present and is exactly `["/bin/sh", "<path>"]` — absence, shell form, a bare
+  path, or any shape the parser does not recognise FAILS; **(b)** `CMD` is present, exec-form and
+  non-empty; **(c)** the final stage asserts, at build time, that **both** boot-chain files are
+  regular, non-empty and readable, and that the entrypoint parses; **(d)** that assertion is TERMINAL
+  — only `ENV`, `EXPOSE`, `LABEL`, `ARG`, `STOPSIGNAL`, `HEALTHCHECK`, `ENTRYPOINT`, `CMD` may follow
+  it (an allowlist, so an unknown instruction fails closed); **(e)** the `ENTRYPOINT` path is one of
+  the asserted paths; **(f)** the asserted paths correspond, under the image's `/app` root, to files
+  tracked in the repo. *(f) is the weakest leg and is labelled so: it observes the repo, not the
+  image — (c)+(d) are what observe the image. (b) exists because `exec "$@"` with an empty `$@` exits
+  0 silently (§0e), so an unpinned `CMD` reproduces this slice's stated worst case with nothing
+  noticing.*
+- **AC3 — the deploy contract is asserted where it is actually configured (guard, unit):**
+  **(a)** the Dockerfile does not contain the retired sentence; **(b)** it contains both §2b sentinel
+  sentences verbatim; **(c)** `railway.json` has a non-empty `deploy.startCommand`. *Round 1 required
+  only that the word "Railway" appear — satisfied by "Railway never builds this Dockerfile." And a
+  prose-only criterion cannot see the deletion of `deploy.startCommand`, which is what would actually
+  falsify §0c and §6.* ⚠️ **Stated limit:** a repo guard cannot see a Railway **dashboard**-set start
+  command or build target; that stays a deployment assumption, verified post-merge.
+- **AC4 — the image builds, serves, and STOPS (manual, recorded as observed):**
+  1. `docker compose build app` → exit 0.
+  2. `docker inspect -f '{{.Config.Entrypoint}} {{.Config.Cmd}}'` → `[/bin/sh /app/docker/entrypoint.sh] [npm start]`.
+  3. `docker compose logs app` contains bootstrap's own named startup line.
+  4. `curl -fsS http://localhost:3000/login` → exit 0.
+  5. `docker exec … cat /proc/1/cmdline` → recorded verbatim (expect `npm`, per §2a).
+  6. `docker compose stop app`; `docker inspect -f '{{.State.ExitCode}}'` → **143** (SIGTERM honoured),
+     NOT 137 (SIGKILL after the grace period); `docker compose ps` lists nothing running.
+  ⚠️ *Manual and named as such — this repo has no container test tier and claiming CI proves it would
+  be false. Round 1 said "boots through entrypoint.sh", "answers an HTTP request" and "no orphan",
+  all three of which are design vocabulary that would ship green: a 500 page answers a request, and
+  after `exec` there is no wrapper left to orphan. The numbers above are what a person can check.*
 
 | # | mutation | must redden |
 |---|---|---|
-| 1 | restore `COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh` in the runner | **AC1** (a context `COPY`) |
-| 2 | add `ADD package.json ./x` to the runner | **AC1** (the `ADD` leg) |
-| 3 | add `COPY --from=somectx package.json ./x` — a source that is not a declared stage | **AC1** (the undeclared-source leg) |
-| 4 | add `RUN --mount=type=bind,target=/ctx true` to the runner | **AC1** (the bind-mount leg) |
-| 5 | delete `COPY --from=build /app ./` entirely | **AC1** (the non-vacuity leg) |
-| 6 | `ENTRYPOINT` points at `/usr/local/bin/entrypoint.sh` | **AC2** (assertion/entrypoint divergence) |
-| 7 | `ENTRYPOINT` and the `RUN test` BOTH move to `/app/docker/nope.sh` | **AC2** (the repo-correspondence leg) |
-| 8 | delete the `RUN test -r` assertion | **AC2** (the build-assertion leg) |
-| 9 | `ENTRYPOINT /app/docker/entrypoint.sh` in **shell form** | **AC2** (ambiguity must fail, not skip) |
-| 10 | `ENTRYPOINT ["/app/docker/entrypoint.sh"]` — bare path, no `/bin/sh` | **AC2** (the invoked-form leg) |
-| 11 | restore the "NOT wired into the Railway deploy path" sentence | **AC3** |
-| 12 | header reads "Railway never builds this Dockerfile" — false, contains "Railway" | **AC3** (the round-0 bypass) |
-| 13 | header drops the `startCommand`-override statement | **AC3** (the second positive leg) |
+| 1 | final stage becomes `FROM busybox AS runner` | AC1(a) |
+| 2 | restore `COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh` | AC1(c) |
+| 3 | add `ADD package.json ./x` to the runner | AC1(b) |
+| 4 | add `COPY --from=somectx package.json ./x` — source is not a declared stage | AC1(c) |
+| 5 | add `RUN --mount=target=/ctx true` — type omitted ⇒ bind, from omitted ⇒ context | AC1(d) |
+| 6 | add `ONBUILD COPY . .` to the `base` stage | AC1(e) |
+| 7 | declare `AS build` twice | AC1(f) |
+| 8 | delete `ENTRYPOINT` entirely | AC2(a) |
+| 9 | `ENTRYPOINT` in shell form | AC2(a) |
+| 10 | `ENTRYPOINT ["/app/docker/entrypoint.sh"]` — bare path | AC2(a) |
+| 11 | **delete `CMD ["npm", "start"]`** | **AC2(b)** |
+| 12 | assertion drops `/app/docker/bootstrap.mjs` | AC2(c) |
+| 13 | assertion weakens to `test -r` only (a dir or empty file would pass) | AC2(c) |
+| 14 | **insert `RUN rm /app/docker/entrypoint.sh` AFTER the assertion** | **AC2(d)** |
+| 15 | `ENTRYPOINT` → `/app/scripts/railway-start.sh` — tracked and corresponds, but unasserted | AC2(e) |
+| 16 | assertion AND `ENTRYPOINT` both → `/app/docker/nope.sh` | AC2(f) |
+| 17 | restore the "NOT wired into the Railway deploy path" sentence | AC3(a) |
+| 18 | header reads "Railway never builds this Dockerfile" — false, contains "Railway" | AC3(b) |
+| 19 | **delete `deploy.startCommand` from `railway.json`** | **AC3(c)** |
 
-Each row changes exactly ONE condition, so a redden attributes to one criterion. Every row must redden
-the criterion NAMED, not merely something.
+Each row changes exactly ONE condition, so a redden attributes to one criterion, and every row must
+redden the criterion NAMED — not merely something. *These are unit-guard mutations; several would also
+fail AC4, which is manual and not part of the attribution.*
 
 ## 5. Risks
 
 | risk | direction | mitigation |
 |---|---|---|
-| The file is absent from the build stage; the build goes green and the container dies at boot | **fail-open introduced by this very change** — the worst outcome here | §2a's `RUN test -r`, pinned by AC2(b) and mutation 8 |
-| Wrong entrypoint path or lost exec bit | an unbootable container | AC2(a)+(c); §2a removes the exec-bit dependence; AC4 boots a real container |
-| The guard reads the Dockerfile as prose | a guard with no failure mode is ceremony | it must parse stages and instructions; all 13 mutations must redden the NAMED criterion |
-| AC1 passes vacuously on a stage with no `COPY` at all | silently green | AC1(d), mutation 5 |
-| Someone reads this as "the flake is fixed" | a false claim in the map | §0b states the limit and the no-improvement reading; the PR body must repeat both |
-| Railway builds a different Dockerfile than the one guarded | the guard watches the wrong file | the build logs name these stages (`build`, `runner`) verbatim — §0b |
+| The boot chain is absent; the build goes green and the container dies at boot | **fail-open introduced by this very change** | §2a's terminal assertion over both files, pinned by AC2(c)+(d), mutations 12–14 |
+| `CMD` is dropped and the container exits 0 at boot, silently | same outcome, no error anywhere (§0e) | AC2(b), mutation 11 |
+| `deploy.startCommand` is removed and §0c/§6 quietly become false | the release rationale evaporates unobserved | AC3(c), mutation 19 |
+| **Dropping the static `.dockerignore` leg trades pre-merge detection for at-Railway-build detection** | a PR adding `docker/` to `.dockerignore` passes ALL CI (this repo runs no docker build in CI), merges, and fails the Railway build — verbatim the incident class in this spec's own motivation table | Accepted, and it is **not a regression**: today's line 35 fails that same Railway build the same way. A third option was considered and declined — a battle-tested matcher library (`@balena/dockerignore`) is not hand-rolling — because a new production dependency to guard a one-line risk is out of proportion to this slice |
+| The guard reads the Dockerfile as prose | a guard with no failure mode is ceremony | it must parse stages and instructions; all 19 mutations must redden the NAMED criterion |
+| Railway builds a different Dockerfile, or a dashboard-set `--target`/start command diverges from the repo | the guard watches the wrong file | out of a repo guard's reach by construction; stated in AC3's limit; the build logs name these stages (`build`, `runner`) verbatim |
+| Someone reads this as "the flake is fixed" | a false claim in the map | §0b states the limit AND the monotone claim; the PR body must repeat both |
 
 ## 6. Release condition
 
@@ -237,13 +325,14 @@ change what the runtime contains." It does: `/usr/local/bin/entrypoint.sh` is go
 is different. What is actually true is narrower, and it is enough:
 
 - **Railway's runtime process is unchanged**, because `startCommand` overrides the image entrypoint
-  (§0c) — so the production path does not execute the thing this slice changes.
-- **Local compose is the path whose behaviour changes**, and AC4 exercises exactly that, in the real
+  (§0c) — so the production path does not execute the thing this slice changes. *Pinned by AC3(c),
+  because otherwise this bullet is prose that a one-line edit to `railway.json` can falsify.*
+- **Local compose is the path whose behaviour changes**, and AC4 exercises exactly that in a real
   container, including the stop path.
 - **One staging build could not demonstrate the absence of a stochastic flake anyway**, so invoking the
   gate here would spend it on a question it cannot answer.
 
-That is a risk-based boundary, not an erosion of the gate DOCKERPROD-1 genuinely needs. Post-merge,
-the normal Railway deploy verification applies.
+A risk-based boundary, not an erosion of the gate DOCKERPROD-1 genuinely needs. Post-merge, the normal
+Railway deploy verification applies.
 
 **Nothing is built. No code exists for this slice.**
