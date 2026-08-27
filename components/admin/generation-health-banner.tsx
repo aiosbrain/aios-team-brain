@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import type { LlmHealth } from "@/lib/query/llm-health";
+import { legDetail } from "@/lib/ingest/leg-detail";
 
 /**
  * LOUD, hard-to-miss banner on Pulse when GENERATION is degraded — the answering model has stopped
@@ -73,28 +74,29 @@ export function GenerationHealthBanner({ health, href }: { health: LlmHealth; hr
               <li key={t.task} className="list-disc text-xs">
                 <span className="font-medium">{labelOf(t.task)}</span>
                 {t.model ? <span className="text-red-600/80 dark:text-red-300/80"> · {t.model}</span> : null}
-                {/* LLMCREDIT-4: THE DIAGNOSIS LEADS HERE TOO. LLMCREDIT-3 gave the summary paragraph
-                    below its plain-English reading but left THIS bullet rendering the provider's raw
-                    JSON — and the bullet is the most prominent red text on the page, so the operator
-                    still met four hundred characters of `{"error":{"message":…` first. `diagnosis` is
-                    computed SERVER-side (see LlmTaskHealth) because this is a client component and
-                    the classifier reaches a `server-only` module. Null when unrecognised, and then
-                    this is exactly the old rendering. */}
-                {t.diagnosis ? (
-                  <>
-                    <span className="text-red-700 dark:text-red-200">
-                      {" "}
-                      — {t.diagnosis.headline} {t.diagnosis.action}
-                    </span>
-                    {t.lastError ? (
-                      <span className="mt-0.5 block text-[11px] text-red-600/60 dark:text-red-300/60">
-                        {t.lastError.length > 160 ? `${t.lastError.slice(0, 160)}…` : t.lastError}
-                      </span>
-                    ) : null}
-                  </>
-                ) : t.lastError ? (
-                  <span className="text-red-600/80 dark:text-red-300/80"> — {t.lastError}</span>
-                ) : null}
+                {/* LLMCREDIT-4: THE DIAGNOSIS LEADS HERE TOO. LLMCREDIT-3 gave the summary
+                    paragraph below its plain-English reading but left THIS bullet rendering the
+                    provider's raw JSON — and the bullet renders FIRST, above the note, carrying ~470
+                    unclipped characters, so that is what the operator met.
+                    Composed by `legDetail`, the pure client-safe helper extracted during LLMCREDIT-3
+                    for exactly this: it owns the lead/raw split AND the clip length, so this banner
+                    and the ingestion one cannot drift, and a revert to raw JSON is catchable by a
+                    guard rather than invisible. `diagnosis` is computed SERVER-side (see
+                    LlmTaskHealth) because this is a client component and the classifier reaches a
+                    `server-only` module. */}
+                {(() => {
+                  const d = legDetail({ error: t.lastError, diagnosis: t.diagnosis });
+                  if (!d.lead)
+                    return d.raw ? <span className="text-red-600/80 dark:text-red-300/80"> — {d.raw}</span> : null;
+                  return (
+                    <>
+                      <span className="text-red-700 dark:text-red-200"> — {d.lead}</span>
+                      {d.raw ? (
+                        <span className="block pl-6 text-[11px] text-red-600/60 dark:text-red-300/60">{d.raw}</span>
+                      ) : null}
+                    </>
+                  );
+                })()}
               </li>
             ))}
           </ul>
