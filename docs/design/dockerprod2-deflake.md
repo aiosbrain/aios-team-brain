@@ -1,6 +1,6 @@
 # The runner stage stops reading the build context — DOCKERPROD-2
 
-**Status:** spec, round 2 (four model reviews folded: two rounds × two models). No code written.
+**Status:** spec, round 3 (five model reviews folded). Code written against it.
 
 **Build with:** opus / high — it changes the image production boots from. The diff is small but the
 failure mode is a container that builds green and cannot start, and the only roll-forward from that is
@@ -250,9 +250,9 @@ if the deploy flow's prose is affected.
   is a bug surface and nothing here uses one.*
 - **AC2 — the boot invocation is complete, build-asserted, and terminal (guard, unit):**
   **(a)** `ENTRYPOINT` is present and is exactly `["/bin/sh", "<path>"]` — absence, shell form, a bare
-  path, or any shape the parser does not recognise FAILS; **(b)** `CMD` is present, exec-form and
-  non-empty; **(c)** the final stage asserts, at build time, that **both** boot-chain files are
-  regular, non-empty and readable, and that the entrypoint parses; **(d)** that assertion is TERMINAL
+  path, or any shape the parser does not recognise FAILS; **(b)** `CMD` is present, exec-form, and runs a
+  **script `package.json` actually defines**; **(c)** the final stage's boot-chain assertion is
+  EXACTLY the derived check — whole-instruction equality, not `contains`; **(d)** that assertion is TERMINAL
   — only `ENV`, `EXPOSE`, `LABEL`, `ARG`, `STOPSIGNAL`, `HEALTHCHECK`, `ENTRYPOINT`, `CMD` may follow
   it (an allowlist, so an unknown instruction fails closed); **(e)** the `ENTRYPOINT` path is one of
   the asserted paths; **(f)** the asserted paths correspond, under the image's `/app` root, to files
@@ -260,6 +260,15 @@ if the deploy flow's prose is affected.
   image — (c)+(d) are what observe the image. (b) exists because `exec "$@"` with an empty `$@` exits
   0 silently (§0e), so an unpinned `CMD` reproduces this slice's stated worst case with nothing
   noticing.*
+
+  ⚠️ **Two conditions that a round-3 confirmation pass added, both against the built guard rather
+  than the prose.** (i) `contains` was not enough for (c): `RUN <assertion> && rm <path>` asserts,
+  passes, and then destroys what it observed **inside one instruction**, where (d)'s look-ahead
+  cannot see it. Equality closes that, and has a second payoff — the Dockerfile line becomes a
+  DERIVED artifact, so adding a boot dependency to `docker/entrypoint.sh` reddens the guard until
+  the Dockerfile is updated to match. (ii) "non-empty `CMD`" was not the invariant either:
+  `CMD ["true"]` is non-empty and boots a container that exits 0 having served nothing. The
+  invariant is that `CMD` runs a script `package.json` defines — derived, not a pinned literal.
 - **AC3 — the deploy contract is asserted where it is actually configured (guard, unit):**
   **(a)** the Dockerfile does not contain the retired sentence; **(b)** it contains both §2b sentinel
   sentences verbatim; **(c)** `railway.json` has a non-empty `deploy.startCommand`. *Round 1 required
@@ -293,9 +302,11 @@ if the deploy flow's prose is affected.
 | 9 | `ENTRYPOINT` in shell form | AC2(a) |
 | 10 | `ENTRYPOINT ["/app/docker/entrypoint.sh"]` — bare path | AC2(a) |
 | 11 | **delete `CMD ["npm", "start"]`** | **AC2(b)** |
+| 11b | **`CMD ["true"]`** — non-empty, exec-form, serves nothing | **AC2(b)** |
 | 12 | assertion drops `/app/docker/bootstrap.mjs` | AC2(c) |
 | 13 | assertion weakens to `test -r` only (a dir or empty file would pass) | AC2(c) |
 | 14 | **insert `RUN rm /app/docker/entrypoint.sh` AFTER the assertion** | **AC2(d)** |
+| 14b | **append `&& rm /app/docker/entrypoint.sh` INSIDE the assertion instruction** | **AC2(c)** |
 | 15 | `ENTRYPOINT` → `/app/scripts/railway-start.sh` — tracked and corresponds, but unasserted | AC2(e) |
 | 16 | assertion AND `ENTRYPOINT` both → `/app/docker/nope.sh` | AC2(f) |
 | 17 | restore the "NOT wired into the Railway deploy path" sentence | AC3(a) |
