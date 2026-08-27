@@ -62,7 +62,25 @@ describe("computeProjectionHealth", () => {
   const NOW = new Date("2026-07-13T12:00:00Z").getTime();
 
   it("is never_run when no run has ever been recorded", () => {
-    expect(computeProjectionHealth(null, NOW)).toEqual({ status: "never_run", lastRun: null, ageMs: null });
+    // `backstop` defaults to "unknown", NOT "installed" (ADOPTUNIQ-1): a caller that cannot read the
+    // catalog must never be handed a green backstop. Asserted as an exact shape deliberately — this
+    // is the assertion that caught the field being added, and it should catch the next one too.
+    expect(computeProjectionHealth(null, NOW)).toEqual({
+      status: "never_run",
+      lastRun: null,
+      ageMs: null,
+      backstop: "unknown",
+    });
+  });
+
+  it("carries the backstop through every run status without conflating it with `status`", () => {
+    // The two are independent: a healthy last run says nothing about whether the DB constraint is
+    // installed, which is exactly why `backstop` is a separate field rather than a value folded into
+    // the `ProjectionHealthStatus` enum.
+    const ok = run({ ok: true, finished_at: new Date(NOW - 5 * 60_000).toISOString() });
+    expect(computeProjectionHealth(ok, NOW, "missing")).toMatchObject({ status: "ok", backstop: "missing" });
+    const bad = run({ ok: false, finished_at: new Date(NOW - 5 * 60_000).toISOString() });
+    expect(computeProjectionHealth(bad, NOW, "installed")).toMatchObject({ status: "failed", backstop: "installed" });
   });
 
   it("is ok for a recent successful run", () => {

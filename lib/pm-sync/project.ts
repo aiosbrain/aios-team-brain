@@ -68,6 +68,31 @@ export interface ProjectTaskOptions {
   bootstrap?: unknown;
   // Map of row_key → already-projected provider resource id (parent-first ordering).
   resolved?: Map<string, string>;
+  /**
+   * ADOPTUNIQ-1 — row keys whose PROVIDER write succeeded but whose link bookkeeping did NOT persist.
+   * Disjoint from `resolved` by construction: a row lands in exactly one of them.
+   *
+   * It exists because "don't set `resolved`" and "don't re-invoke the adapter" are otherwise in direct
+   * conflict, and both are required:
+   *   • Not setting `resolved` is mandatory — the resource id was never durably claimed, and on a
+   *     unique violation it is a row ANOTHER link owns. Parenting children beneath it would attach
+   *     them to a stranger's issue.
+   *   • But absence from `resolved` alone sends the child down the inline fallback below, which
+   *     reloads the parent and calls `projectTask` on it AGAIN — the link still has no
+   *     `provider_resource_id` and a stale fingerprint, so the short-circuit misses and the adapter
+   *     runs a SECOND time in the same push. That can mint a duplicate provider issue.
+   * A separate channel gives the second job its own signal and dissolves the conflict: a child sees
+   * the parent here and fails fast, without invoking anything.
+   *
+   * SCOPE, deliberately narrow on both axes:
+   *   • PERSIST failures only. An adapter THROW already re-projects inline per child today; that
+   *     behaviour is shipped and is intentionally left alone (widening this to cover it would be a
+   *     silent behaviour change, pinned against by the adapter-throw regression test).
+   *   • INVOCATION-LOCAL. Like `resolved`, this set is built per `projectRows` call, so it cannot
+   *     constrain a standalone `projectTask` in a LATER cycle re-invoking the adapter. That is
+   *     ordinary retry semantics, not the batch-internal double-mutation this exists to stop.
+   */
+  contested?: Set<string>;
   // Guards against parent cycles when projecting a single task's parent chain inline.
   visiting?: Set<string>;
 }
@@ -176,6 +201,24 @@ async function ensureLink(
   return data as TaskPmLink;
 }
 
+/**
+ * Persist the bookkeeping for a projection that the PROVIDER already accepted.
+ *
+ * RETURNS the failure instead of swallowing it (ADOPTUNIQ-1). The pg adapter does NOT throw — it
+ * catches the driver error and returns `{ data: null, error }` (`lib/db/pg/query-builder.ts:221-224`)
+ * — and this function used to `await` the update and never read `error`. Every failure of it was
+ * therefore silent: the row reported SUCCESS while the provider had been mutated and the link kept no
+ * `provider_resource_id`, so the next push missed rung 1 and took the adopt path again.
+ *
+ * That mattered little while nothing could reject the write. The partial unique index
+ * `task_pm_links_provider_resource_uq` makes it reachable on the path that matters, so the error is
+ * now surfaced to the caller.
+ *
+ * ⚠️ It RETURNS the error and does NOT throw, and that is load-bearing rather than stylistic. A throw
+ * would land in `projectTask`'s shared catch, which also catches ADAPTER throws — and an adapter throw
+ * must keep its existing inline-retry behaviour (see `contested` below). Mixing the two there is the
+ * over-correction this shape exists to prevent.
+ */
 async function persistSuccess(
   db: DbClient,
   link: TaskPmLink,
@@ -184,9 +227,9 @@ async function persistSuccess(
   // Exact brain `tasks.status` this projection wrote from — the inbound conflict baseline
   // (brain-api v1.4). The group-granular fingerprint can't distinguish in_progress / in_review / blocked.
   brainStatus: string
-) {
+): Promise<{ error: { message: string } | null }> {
   const now = new Date().toISOString();
-  await db
+  const { error } = await db
     .from("task_pm_links")
     .update({
       provider_resource_id: result.providerResourceId,
@@ -201,6 +244,7 @@ async function persistSuccess(
       updated_at: now,
     })
     .eq("id", link.id);
+  return { error: error ?? null };
 }
 
 async function persistError(db: DbClient, link: TaskPmLink, message: string) {
@@ -257,6 +301,22 @@ export async function projectTask(
     const resolved = opts.resolved;
     if (resolved?.has(row.parent_row_key)) {
       parentResourceId = resolved.get(row.parent_row_key) ?? null;
+    } else if (opts.contested?.has(row.parent_row_key)) {
+      /**
+       * ADOPTUNIQ-1 — the parent's provider write landed but its bookkeeping did not, so its resource
+       * id is not durably ours (and on a unique violation it is another row's outright). Fail here,
+       * BEFORE the inline fallback below re-invokes the parent's adapter.
+       *
+       * This check must stay between the `resolved` hit above and the inline fallback below. Moved
+       * after it, the adapter runs again and the duplicate-issue risk returns; the fact that the
+       * failure is still reported would make that regression invisible.
+       */
+      return {
+        row_key: row.row_key,
+        provider,
+        status: "failed",
+        error: `parent ${row.parent_row_key}: provider write succeeded but the link did not persist — not parenting beneath an unclaimed issue`,
+      };
     } else {
       const visiting = opts.visiting ?? new Set<string>();
       if (visiting.has(row.row_key)) {
@@ -348,7 +408,23 @@ export async function projectTask(
         parentResourceId
       );
     }
-    await persistSuccess(db, link, result, effectiveFingerprint, row.status);
+    /**
+     * ADOPTUNIQ-1 — the provider has ALREADY been written by this point. If the bookkeeping fails, the
+     * only honest report is a failure for THIS row: contained (the batch continues), loud (the error
+     * lands on the link and in the report), and never silent, which is what it used to be.
+     *
+     * Checked inline on the success path rather than thrown, so the shared catch below keeps meaning
+     * "the adapter failed" — see `persistSuccess` and `ProjectTaskOptions.contested`.
+     */
+    const persisted = await persistSuccess(db, link, result, effectiveFingerprint, row.status);
+    if (persisted.error) {
+      const message = `link bookkeeping failed after the provider write: ${persisted.error.message}`;
+      await persistError(db, link, message);
+      // NOT `resolved` — the id was never durably claimed, and on a unique violation another link owns
+      // it. `contested` stops children re-invoking the adapter without pretending the id is ours.
+      opts.contested?.add(row.row_key);
+      return { row_key: row.row_key, provider, status: "failed", error: message };
+    }
     opts.resolved?.set(row.row_key, result.providerResourceId);
     return { row_key: row.row_key, provider, status: result.status, providerResourceId: result.providerResourceId };
   } catch (e) {
@@ -408,6 +484,9 @@ export async function projectRows(
   const sleep = opts.sleep ?? realSleep;
   const throttleMs = opts.throttleMs ?? DEFAULT_THROTTLE_MS;
   const resolved = new Map<string, string>();
+  // ADOPTUNIQ-1 — shared for the whole batch, like `resolved`, so a parent whose bookkeeping failed
+  // stops its children re-invoking the adapter. Invocation-local by design; see `contested`.
+  const contested = new Set<string>();
   const reports: ProjectionReport[] = [];
 
   for (const row of topoOrder(rows)) {
@@ -415,6 +494,7 @@ export async function projectRows(
       primary,
       bootstrap,
       resolved,
+      contested,
       fetchImpl: opts.fetchImpl,
     });
     reports.push(report);

@@ -258,6 +258,31 @@ async function makeProject(seed: Seed, slug: string): Promise<string> {
  * THE INVARIANT. Mirrors `ADOPTUNIQ-1`'s index exactly:
  *   unique (team_id, provider, provider_resource_id) where provider_resource_id is not null
  */
+/**
+ * The counting half, PURE and exported so it can have a positive control.
+ *
+ * It used to be inlined in the DB read below, and that made it untestable once the index shipped:
+ * with duplicates impossible in this database, every caller asserts `[]`, so gutting the function to
+ * `return []` left all 19 tests green — verified with a mutation, after a review caught that the
+ * "rehomed" control in the scratch-database file exercises INDEPENDENT raw SQL and never this code.
+ * Splitting the pure part is what restores a control that can actually fail.
+ */
+export function groupDuplicates(
+  rows: { provider: string; provider_resource_id: string }[],
+): { provider: string; id: string; n: number }[] {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const key = JSON.stringify([row.provider, row.provider_resource_id]);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, n]) => n > 1)
+    .map(([key, n]) => {
+      const [provider, id] = JSON.parse(key) as [string, string];
+      return { provider, id, n };
+    });
+}
+
 async function duplicateGroups(teamId: string): Promise<{ provider: string; id: string; n: number }[]> {
   const { data } = await db()
     .from("task_pm_links")
@@ -268,17 +293,7 @@ async function duplicateGroups(teamId: string): Promise<{ provider: string; id: 
   // nothing has to be split back apart to report. An earlier draft joined on a space (which truncated
   // the reported id if one contained a space) and then on a NUL (which put a control character in the
   // source for no benefit).
-  const counts = new Map<string, number>();
-  for (const row of (data ?? []) as { provider: string; provider_resource_id: string }[]) {
-    const key = JSON.stringify([row.provider, row.provider_resource_id]);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .filter(([, n]) => n > 1)
-    .map(([key, n]) => {
-      const [provider, id] = JSON.parse(key) as [string, string];
-      return { provider, id, n };
-    });
+  return groupDuplicates((data ?? []) as { provider: string; provider_resource_id: string }[]);
 }
 
 async function ownedLinkCount(teamId: string): Promise<number> {
@@ -291,34 +306,94 @@ async function ownedLinkCount(teamId: string): Promise<number> {
 }
 
 describe("ADOPT-TASK-8 — no two links in a team share one PM issue (real Postgres)", () => {
-  it("THE DETECTOR WORKS: two links deliberately sharing one issue are REPORTED", async () => {
-    // The inverse control. Draft 1 of the spec proposed "the query returns zero rows on a team with no
-    // links", which proves the opposite of what it claimed — that the query passes on nothing, which IS
-    // the vacuity. Any query typo that matches nothing would survive that. This is the assertion that
-    // makes every `toEqual([])` below mean something.
+  /**
+   * THE POSITIVE CONTROL, restored. Without it the detector can break completely while every
+   * uniqueness assertion in this file stays green — verified: gutting `groupDuplicates` to
+   * `return []` survived all 19 tests before this existed.
+   *
+   * It runs against the PURE half deliberately. The database can no longer hold a duplicate, so this
+   * is the only place the reporting path can be shown to fire at all. A control written as
+   * independent raw SQL (as an earlier fold did) proves the QUERY works and says nothing about this
+   * function — which is the difference between moving a property and replacing it with a lookalike.
+   */
+  it("THE DETECTOR STILL WORKS: the grouping half reports a duplicate when given one", () => {
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: OWNED_ISSUE_ID },
+        { provider: "linear", provider_resource_id: OWNED_ISSUE_ID },
+      ]),
+    ).toEqual([{ provider: "linear", id: OWNED_ISSUE_ID, n: 2 }]);
+
+    // Provider-scoped, matching the index it mirrors: the same id under two providers is NOT a
+    // violation, and this is asserted alongside the positive case so neither can be vacuous.
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: "same" },
+        { provider: "plane", provider_resource_id: "same" },
+      ]),
+    ).toEqual([]);
+
+    // Three rows report n=3, so the count is real rather than a boolean dressed up as one.
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: "x" },
+        { provider: "linear", provider_resource_id: "x" },
+        { provider: "linear", provider_resource_id: "x" },
+      ]),
+    ).toEqual([{ provider: "linear", id: "x", n: 3 }]);
+  });
+
+  it("THE DATABASE NOW REFUSES IT: two links sharing one issue cannot both exist", async () => {
+    /**
+     * THIS CASE INVERTED WHEN `ADOPTUNIQ-1` SHIPPED, and the inversion is the point.
+     *
+     * It used to seed two links on one issue and assert the insert SUCCEEDED, so that
+     * `duplicateGroups` had a positive control and every `toEqual([])` below meant something. The
+     * partial unique index `task_pm_links_provider_resource_uq` now rejects that second insert, so the
+     * old assertion cannot pass — and simply flipping it to expect an error would leave
+     * `duplicateGroups` with no positive control at all.
+     *
+     * So the control moved rather than being deleted. What lives here now is the STRONGER statement:
+     * the invariant is ENFORCED, not merely detected. The positive control for the grouping query
+     * itself moved to `task-pm-links-unique-index.datamechanics.test.ts`, which builds its own scratch
+     * database and can therefore observe duplicates BEFORE the index exists — something this database
+     * can no longer do at all.
+     *
+     * READ THIS BEFORE TRUSTING A `toEqual([])` BELOW. With the DB enforcing, those assertions are
+     * partly green by construction: the database rejects the bad write whatever the app code decided.
+     * The load-bearing assertions in this file are therefore the MUTATION ANCHORS — that the adapter
+     * was reached, and that it did NOT write into the owner's issue. Those observe the app's decision
+     * BEFORE the write, which is the one thing the index cannot fake.
+     */
     const seed = await seedTeam();
     await seedLinearPrimary(seed);
     const projectA = await makeProject(seed, "dup-a");
     const projectB = await makeProject(seed, "dup-b");
-    for (const [i, projectId] of [projectA, projectB].entries()) {
-      // `provider_external_id` is NOT NULL with no default — omitting it makes the insert fail and the
-      // whole control silently pass over an empty table, which is the exact vacuity this case exists to
-      // rule out. So the error is checked rather than discarded.
-      const { error } = await db()
-        .from("task_pm_links")
-        .insert({
-          team_id: seed.teamId,
-          project_id: projectId,
-          row_key: `DUP${i}`,
-          provider: "linear",
-          provider_external_id: `DUP${i}`,
-          provider_resource_id: OWNED_ISSUE_ID,
-        });
-      expect(error, "the seeded duplicate link must actually insert").toBeFalsy();
-    }
-    expect(await duplicateGroups(seed.teamId)).toEqual([
-      { provider: "linear", id: OWNED_ISSUE_ID, n: 2 },
-    ]);
+
+    const first = await db().from("task_pm_links").insert({
+      team_id: seed.teamId,
+      project_id: projectA,
+      row_key: "DUP0",
+      provider: "linear",
+      provider_external_id: "DUP0",
+      provider_resource_id: OWNED_ISSUE_ID,
+    });
+    expect(first.error, "the first link must insert, or the refusal below proves nothing").toBeFalsy();
+
+    const second = await db().from("task_pm_links").insert({
+      team_id: seed.teamId,
+      project_id: projectB,
+      row_key: "DUP1",
+      provider: "linear",
+      provider_external_id: "DUP1",
+      provider_resource_id: OWNED_ISSUE_ID,
+    });
+    expect(second.error, "the DB backstop must refuse a second claim on one issue").toBeTruthy();
+
+    // And the refused row genuinely did not land — an error with a row written would be worse than
+    // either outcome alone.
+    expect(await ownedLinkCount(seed.teamId)).toBe(1);
+    expect(await duplicateGroups(seed.teamId)).toEqual([]);
 
     // And it is provider-scoped, matching the index it pre-verifies: the SAME id under a different
     // provider is NOT a violation, because the index would permit it.

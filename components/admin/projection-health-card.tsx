@@ -69,6 +69,25 @@ export function ProjectionHealthCard({ health }: { health: ProjectionHealth }) {
           {run.errors[0]}
         </p>
       ) : null}
+      {/*
+        ADOPTUNIQ-1 — the DB backstop's state, surfaced HERE because this is the page an operator
+        already opens when PM sync misbehaves. It is deliberately rendered on the same card rather
+        than exported and left unwired: the signal this replaces (a `last_error` stamp) died partly
+        because nothing displayed it. Silent only when the backstop is installed — a healthy schema
+        should not cost a line of UI.
+      */}
+      {health.backstop !== "installed" ? (
+        <p
+          className="mt-2 rounded-lg border border-amber-400/25 bg-amber-400/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-300"
+          data-backstop={health.backstop}
+        >
+          {health.backstop === "missing"
+            ? "The one-issue-one-row database backstop is NOT installed. The most likely cause is duplicate provider_resource_id rows, which the migration deliberately skips rather than aborting the release — that skip does not repair itself. Two links can currently claim the same issue."
+            : health.backstop === "malformed"
+              ? "An index named task_pm_links_provider_resource_uq exists but does not match the expected definition (columns, order, predicate, uniqueness or validity), so it is not enforcing the invariant."
+              : "Could not read the database catalog to confirm the one-issue-one-row backstop. Treating it as unverified rather than healthy."}
+        </p>
+      ) : null}
     </div>
   );
 }
