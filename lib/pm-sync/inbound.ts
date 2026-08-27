@@ -445,39 +445,83 @@ async function adoptInbound(
       parentResourceId
     );
 
-    const inserted = await withTransaction(async (client) => {
-      const res = await client.query(
-        `insert into task_pm_links
-           (team_id, project_id, task_id, row_key, provider, provider_resource_id,
-            provider_external_source, provider_external_id, provider_url,
-            last_projected_status, last_projected_brain_status, projection_fingerprint,
-            provider_seen_status, updated_at)
-         values ($1, $2, $3, $4, 'linear', $5, $6, $7, $8, $9, $10, $11, $9, now())
-         on conflict (team_id, project_id, row_key, provider) do nothing
-         returning id`,
-        [
-          teamId,
-          projectId,
-          task.id,
-          it.identifier,
-          it.id,
-          externalSource,
-          it.identifier,
-          it.url ?? "",
-          stateName,
-          status,
-          fingerprint,
-        ]
+    /**
+     * ADOPTUNIQ-1 — contain a failed adopt to THIS candidate.
+     *
+     * The insert below infers `on conflict (team_id, project_id, row_key, provider)` — the row-identity
+     * constraint. Postgres allows exactly one inference clause, so a violation of the partial unique
+     * index `task_pm_links_provider_resource_uq` is NOT absorbed by it: it throws out of
+     * `withTransaction`, out of this loop, and out of `runInboundForTeam` before `return result` —
+     * discarding Phase A's applies along with every remaining candidate. One contested issue would
+     * take down the whole team's inbound pass.
+     *
+     * The transaction is the unit that rolls back, so the task row cannot be left half-adopted: the
+     * `origin`/`status`/`body` flip below shares the transaction with the insert deliberately.
+     */
+    let inserted: boolean;
+    try {
+      inserted = await withTransaction(async (client) => {
+        const res = await client.query(
+          `insert into task_pm_links
+             (team_id, project_id, task_id, row_key, provider, provider_resource_id,
+              provider_external_source, provider_external_id, provider_url,
+              last_projected_status, last_projected_brain_status, projection_fingerprint,
+              provider_seen_status, updated_at)
+           values ($1, $2, $3, $4, 'linear', $5, $6, $7, $8, $9, $10, $11, $9, now())
+           on conflict (team_id, project_id, row_key, provider) do nothing
+           returning id`,
+          [
+            teamId,
+            projectId,
+            task.id,
+            it.identifier,
+            it.id,
+            externalSource,
+            it.identifier,
+            it.url ?? "",
+            stateName,
+            status,
+            fingerprint,
+          ]
+        );
+        if ((res.rowCount ?? 0) === 0) return false; // raced adopt — the unique index guarantees no duplicate
+        // origin 'ui': once owned, ingest excludes this issue from the mirror push, and only
+        // origin='sync' rows are diff-deleted — the flip is what makes the adopted task durable.
+        await client.query(
+          `update tasks set origin = 'ui', status = $1, raw_status = null, body = $2, updated_at = now() where id = $3`,
+          [status, body, task.id]
+        );
+        return true;
+      });
+    } catch (err) {
+      /**
+       * NARROW ON PURPOSE: contain ONLY a uniqueness rejection, and re-throw everything else.
+       *
+       * A blanket catch here would be worse than the abort it replaces. `skipped` does not feed
+       * `ok` (`runLinearInbound` computes it from `errors` alone, :653), and a skipped-only result is not
+       * even recorded by
+       * the manual sync — so a database outage during every adoption would report a clean, successful
+       * run. Losing the pass is the RIGHT outcome for an outage; it is only the one-issue-one-row
+       * rejection that must not take the other candidates down with it.
+       *
+       * The code is available here because this path uses raw SQL through `withTransaction`, not the
+       * query builder that flattens errors to `{ message }`. Matching on the message text instead
+       * would break under a non-English `lc_messages` on a self-hosted fleet — and it would fail in
+       * the DANGEROUS direction, silently swallowing real outages.
+       */
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== "23505") throw err;
+      // Contained to this candidate: the transaction rolled back (no link row, and the task row's
+      // origin/status/body are untouched), so the pass continues with the next one and Phase A's
+      // accumulated applies survive. The message names the identifier AND the cause, because a bare
+      // `skipped` entry is indistinguishable from the ordinary "no mirror task yet" skips above.
+      result.skipped.push(
+        `${it.identifier}: adopt rejected — another link already claims this issue (${
+          (err as { constraint?: string } | null)?.constraint ?? "unique constraint"
+        })`,
       );
-      if ((res.rowCount ?? 0) === 0) return false; // raced adopt — the unique index guarantees no duplicate
-      // origin 'ui': once owned, ingest excludes this issue from the mirror push, and only
-      // origin='sync' rows are diff-deleted — the flip is what makes the adopted task durable.
-      await client.query(
-        `update tasks set origin = 'ui', status = $1, raw_status = null, body = $2, updated_at = now() where id = $3`,
-        [status, body, task.id]
-      );
-      return true;
-    });
+      continue;
+    }
     if (!inserted) continue;
 
     resourceByRowKey.set(it.identifier, it.id);
