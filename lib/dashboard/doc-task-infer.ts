@@ -127,7 +127,13 @@ export type OwnerKind = "human" | "connector" | "unresolvable";
  * run. Two spec reviews independently derived this after an earlier draft built a criterion on it.
  */
 export function hasUnjudgeableDrop(docs: readonly InferDoc[]): boolean {
-  return docs.some((d) => !d.memberId && d.ownerKind === "unresolvable");
+  // The first two predicates MIRROR `scoreableDocs`, and that is load-bearing rather than tidy: a doc
+  // that is already linked, or external, is legitimately dropped for THAT reason whatever its owner
+  // resolves to. Counting it here would let one external doc with a broken owner block clearing
+  // forever — the spec calls those drops legitimate, and without this the code disagreed with it.
+  return docs.some(
+    (d) => !d.hasDeterministicLink && d.access !== "external" && !d.memberId && d.ownerKind === "unresolvable"
+  );
 }
 
 /**

@@ -241,6 +241,32 @@ describe("BANNERSTUCK-1 — a healed leg can clear, and can never hide a live fa
     expect(await rowCount(seed), "healthy + idle must be silent").toBe(n);
   });
 
+  it("AC3b — clearing does NOT arm the paid cooldown: new work is scored on the next tick", async () => {
+    /**
+     * The regression the design must not trade for a banner fix, and AC3 could not see it: AC3 seeds
+     * an already-old success, so it never performs failure -> clear -> new work. Here the pass HEALS
+     * (writing a near-current clearing row) and then work arrives a minute later. If the paid-run
+     * clock counted that row, every pass would return `cooldown` for the next 12 hours — stalling
+     * inference at exactly the moment the leg recovered.
+     */
+    const seed = await seedTeam();
+    await withModel(seed.teamId);
+    await doc(seed);
+    await confirmedFailureStreak(seed);
+
+    // 1. the heal: a clean idle pass writes the clearing row
+    expect((await runDocTaskInference(db(), seed.teamId)).skipped).toBe("no-candidates");
+    expect(await isFailing(seed)).toBe(false);
+
+    // 2. work arrives immediately afterwards
+    await task(seed);
+
+    // 3. the next pass must NOT be gated. It gets as far as the model (stubbed absent here, so it
+    //    reaches a later gate) — the point is that it is not `cooldown`.
+    const after = await runDocTaskInference(db(), seed.teamId);
+    expect(after.skipped, "the clearing row must not start a paid cooldown").not.toBe("cooldown");
+  });
+
   it("AC7 — classification does not drift with age: 2 days and 60 days read the same", async () => {
     // BANNERFLAP-1 §3a rejected time-based escalation. A grace period here is the one fix already
     // known to be wrong, so the property is behavioural, not a source grep.

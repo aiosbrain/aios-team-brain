@@ -99,6 +99,19 @@ describe("AC2c/AC2d — which drops mean 'nothing to do' and which mean 'could n
     expect(hasUnjudgeableDrop([doc({ access: "external" })])).toBe(false);
   });
 
+  it("…even when their owner ALSO fails to resolve — the drop reason takes precedence", () => {
+    // The earlier fixture left `memberId` at its human default, so neither doc could reach the
+    // owner predicate at all and the test passed without exercising it. A doc that is external (or
+    // already linked) is legitimately dropped for THAT reason; letting a broken owner override it
+    // would block clearing on a doc the pass was never going to score.
+    expect(hasUnjudgeableDrop([doc({ access: "external", memberId: null, ownerKind: "unresolvable" })])).toBe(false);
+    expect(
+      hasUnjudgeableDrop([doc({ hasDeterministicLink: true, memberId: null, ownerKind: "unresolvable" })])
+    ).toBe(false);
+    // …and a doc that WOULD have been scored still blocks.
+    expect(hasUnjudgeableDrop([doc({ memberId: null, ownerKind: "unresolvable" })])).toBe(true);
+  });
+
   it("one unjudgeable doc among many legitimate ones still blocks clearing", () => {
     // ∀, not ∃: the pass either observed the whole set or it did not.
     expect(

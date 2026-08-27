@@ -89,6 +89,13 @@ const TIMEOUT_MS = 45_000;
  */
 const COOLDOWN_MS = Math.max(1, Number(process.env.DOC_TASK_INFER_INTERVAL_HOURS) || 12) * 3_600_000;
 
+/**
+ * How many recent rows `lastRun` reads to find the newest PAID one. Clearing rows are written only
+ * when a failure stands, and writing one makes the verdict `ok`, so at most a couple can ever sit at
+ * the head (two concurrent passes can both write). A small window is therefore ample, and bounded.
+ */
+const CLOCK_SCAN = 10;
+
 /** `ingest_runs.source` for this leg — also the key used to find the previous run's inputs hash. */
 export const DOC_TASK_INFER_SOURCE = "doc_task_infer";
 
@@ -507,23 +514,38 @@ async function lastRun(
   try {
     const { data } = await db
       .from("ingest_runs")
-      .select("meta, ok, finished_at")
+      .select("id, meta, ok, finished_at")
       .eq("team_id", teamId)
       .eq("source", DOC_TASK_INFER_SOURCE)
       .order("finished_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const row = data as { meta?: { inputs_hash?: unknown } | null; ok?: boolean; finished_at?: string | Date } | null;
-    if (!row) return null;
-    const raw = row.finished_at;
+      // `id` desc as the SAME tie-break `STREAK_SQL` uses (`lib/ingest/pipeline-health.ts`). Without it
+      // two rows sharing a millisecond — a fast fail then a retry in one tick — can resolve here in the
+      // opposite order to the banner, so `ok` below would disagree with the verdict the user is seeing.
+      .order("id", { ascending: false })
+      .limit(CLOCK_SCAN);
+    const rows = (data ?? []) as {
+      meta?: { inputs_hash?: unknown; health_clear?: unknown } | null;
+      ok?: boolean;
+      finished_at?: string | Date;
+    }[];
+    // THE PAID-RUN CLOCK IGNORES CLEARING ROWS. A `health_clear` row is written at the moment the leg
+    // HEALS and carries a near-current timestamp, so counting it would start a fresh 12h cooldown at
+    // exactly the point the leg recovers: a doc arriving a minute later would wait until evening for
+    // linking that costs one tick today. The cooldown exists to bound PAID runs, and a clearing pass
+    // paid for nothing.
+    const newest = rows[0] ?? null;
+    const row = rows.find((r) => r?.meta?.health_clear !== true) ?? null;
+    if (!newest) return null;
+    const raw = row?.finished_at;
     const finishedAt = raw ? (typeof raw === "string" ? Date.parse(raw) : new Date(raw).getTime()) : 0;
-    const h = row.ok ? row.meta?.inputs_hash : null;
+    const h = row?.ok ? row.meta?.inputs_hash : null;
     return {
+      // From the newest PAID run — see above.
       finishedAt: Number.isFinite(finishedAt) ? finishedAt : 0,
       inputsHash: typeof h === "string" && h ? h : null,
-      // The newest VERDICT, which is what decides whether a clearing row is worth writing at all
-      // (BANNERSTUCK-1 §2b). `ok` is already selected above for `inputsHash`.
-      ok: row.ok === true,
+      // …but the VERDICT is the newest row of ANY kind, because that is what the banner reads. Taking
+      // it from the paid row would make the pass re-clear a leg it has already cleared, every tick.
+      ok: newest.ok === true,
     };
   } catch {
     return null; // unreadable history → run (spending once beats silently never running again)
@@ -580,8 +602,8 @@ async function markScored(
  * ⚠️ `finishedAt` is the pass's OWN `startedAt`, and that is the whole correctness argument. Two
  * callers reach this leg (`lib/ingest/scheduler.ts` and `lib/dashboard/timeline-cache.ts`) and they
  * are not mutually single-flighted, so a clearing pass can overlap a failing one. `STREAK_SQL` orders
- * `finished_at desc, id desc`, so backdating makes any row recorded DURING this pass sort strictly
- * newer — a concurrent failure cannot be hidden by commit order or snapshot visibility. A guard
+ * `finished_at desc, id desc`, so backdating makes any row whose `finished_at` is after this pass
+ * began sort strictly newer — a concurrent failure cannot be hidden by commit order or snapshot visibility. A guard
  * (`insert … where not exists`) does NOT achieve this: under READ COMMITTED the subquery cannot see
  * an uncommitted failure, so both rows land and the clearing row still wins.
  *

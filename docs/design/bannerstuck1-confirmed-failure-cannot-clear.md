@@ -1,7 +1,8 @@
 # A confirmed failure that nothing can clear — BANNERSTUCK-1
 
 **Status:** spec, round 4 — SIX review rounds folded (Codex BLOCKED ×3, Fable CLEAR-WITH-CONDITIONS ×3).
-Round 3 made the design SMALLER: two of the states I had built criteria around cannot occur. No code written.
+Round 3 made the design SMALLER: two of the states I had built criteria around cannot occur.
+Round 5 = the DIFF reviews, folded below. **Code is built.**
 
 **Build with:** opus / high — it changes when the loudest alarm in the product speaks, and the
 failure mode in BOTH directions is a lie: an alarm that will not stop, or one that goes quiet on a
@@ -201,11 +202,18 @@ needs a streak of two, so the next real failure re-confirms.
 This is round 0's condition returning, but its job has changed completely: correctness now comes from
 the ordering above, and the condition exists to avoid perpetual ledger traffic.
 
-⚠️ **That deletes an entire layer.** Round 3 had the clearing row resetting the paid-run cooldown, a
-freshness regression that would make Monday morning's doc wait 12h, "fixed" by a two-clock scheme with
-a `meta.skipped` filter on `lastRun`'s `limit(1)` read. **All of it is unnecessary:** in the steady
-state (newest verdict already `ok=true`) nothing is written, so the cooldown is never touched, no new
-duration constant is needed, and ~730 rows/team/year of append-only history are never created.
+⚠️ **This removes the perpetual traffic, but NOT the cooldown problem — round 4 claimed it did, and
+that claim was false.** Round 4 argued that because nothing is written in the steady state, the
+cooldown is never touched. The steady state was never the issue: the clearing row is written at the
+moment the leg HEALS, with a near-current timestamp, and `lastRun` reads the newest row of any kind.
+So a doc arriving a minute after the heal would wait a full cooldown — stalling inference at exactly
+the point of recovery. **The diff review caught this, and AC3 could not have: it seeds an already-old
+success rather than performing heal → new work.**
+
+**So `lastRun` does filter after all:** the PAID-run clock skips rows carrying `meta.health_clear`
+(the verdict still comes from the newest row of any kind, because that is what the banner reads).
+What the event-driven write genuinely buys is the absence of ~730 rows/team/year and of any new
+duration constant — not an untouched clock.
 
 The row carries **`meta.health_clear = true`** — a dedicated marker, not the overloaded `meta.skipped`.
 
@@ -321,7 +329,7 @@ failure** (`COOLDOWN_MS` has a 1-hour floor, `Math.max(1,…)` at `:88`), never 
 ## 6. What would falsify this
 
 A **successful** `doc_task_infer` run before this ships would clear the banner on its own and make the
-incident look self-healing. It would not falsify the defect. **Re-measured 2026-08-28: the streak is
+incident look self-healing. It would not falsify the defect. **Re-measured 2026-08-27, ~24h after §0a: the streak is
 still 4, with no new row in a further ~24h** — the leg has now been silent-but-polled for ~2 days, and
 the falsifier has not fired.
 
