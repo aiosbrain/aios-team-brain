@@ -4,7 +4,15 @@
 
 ## Work item
 
-<!-- Reference the brain task so aios-work-sync advances it to Done on merge (brain → Linear).
+<!-- Reference the brain task. What happens on merge depends on WHERE the row came from, and the
+     difference matters — this template used to promise the first case for both:
+
+       * a BRAIN-NATIVE row in this project resolves `applied` — aios-work-sync completes it and
+         projects it to Linear automatically;
+       * a row you pushed from the workspace (`3-log/tasks.md`) resolves `linked` — the event is
+         recorded and the task is DELIBERATELY left open, because completing on a team-wide match
+         would create duplicate Linear issues. For those, YOU close the row and `aios push`.
+
      No task yet, and this work should be tracked? Create one FIRST in the Team Brain dashboard
      (→ Tasks; it projects to Linear), then put its key here. Don't hand-edit the Linear issue —
      the brain is the source of truth, Linear is a one-way projection. -->

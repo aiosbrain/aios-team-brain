@@ -30,6 +30,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef } from "./branches.mjs";
 
 /** A release tag is EXACTLY `vX.Y.Z`. No pre-release, no build metadata, no leading zeros. */
 const RELEASE_TAG = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
@@ -165,8 +166,14 @@ export function main({
   ref = process.env.GITHUB_REF,
   sha = process.env.GITHUB_SHA,
   remote = "origin",
-  mainRef = "refs/remotes/origin/main",
-  integrationRef = "refs/remotes/origin/staging",
+  // RELPTR-4: these were hardcoded here, which made this file an UNDECLARED SECOND OWNER of the
+  // integration branch — two names for one concept, holding different values. They now come from
+  // `scripts/branches.mjs`. Note WHICH role each takes: assertion C reads the RELEASE branch and
+  // assertion D the INTEGRATION branch, and today RELEASE_BRANCH and CONTRIBUTION_BASE are both
+  // `main`, so wiring C to the contribution base would be invisible until the cutover moved it.
+  // `test/guards/branch-roles.test.ts` pins that distinction with a sentinel.
+  mainRef = remoteRef(RELEASE_BRANCH),
+  integrationRef = remoteRef(INTEGRATION_BRANCH),
   cwd = undefined,
   log = console.log,
 } = {}) {
