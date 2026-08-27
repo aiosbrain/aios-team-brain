@@ -60,53 +60,97 @@ describe("branch roles — one owner per role (criteria 1, 2)", () => {
 });
 
 describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
-  it("the release ref follows RELEASE_BRANCH, NOT the contribution base", () => {
-    // BOTH REVIEWERS found this missing. Today RELEASE_BRANCH === CONTRIBUTION_BASE === "main", so
-    // `expect(mainRef).toBe("refs/remotes/origin/main")` passes whichever token the code used. The only
-    // way to tell them apart NOW is to make them differ: rewrite the module with a sentinel
-    // contribution base, re-import it, and assert the release guard's default did not move.
-    const src = read("scripts/branches.mjs");
-    const stubbed = src.replace('export const CONTRIBUTION_BASE = "main";', 'export const CONTRIBUTION_BASE = "SENTINEL-not-a-branch";');
-    expect(stubbed, "the sentinel substitution must actually apply").not.toBe(src);
+  /**
+   * WHY THIS RUNS THE GUARD INSTEAD OF READING ITS SOURCE.
+   *
+   * A first version of this pin stubbed `CONTRIBUTION_BASE` and then asserted
+   * `remoteRef(RELEASE_BRANCH) === "refs/remotes/origin/main"` — which is TAUTOLOGICAL. It evaluates
+   * its own expression and never imports the release guard, so mis-wiring the guard could not redden
+   * it. Mutation-testing caught that: the mutation `mainRef = remoteRef(CONTRIBUTION_BASE)` reddened
+   * only the source-token assertion, and a source-token regex is evadable by an equivalent spelling.
+   *
+   * So this copies BOTH modules into a scratch tree with `CONTRIBUTION_BASE` set to a sentinel, builds
+   * a real repository where a valid candidate exists, and runs the guard through its DEFAULT refs. If
+   * `mainRef` follows the contribution base, it resolves to a ref that does not exist, assertion C
+   * goes false, and the verdict flips to FAIL. Behaviour, not text.
+   */
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
-    const dir = mkdtempSync(join(tmpdir(), "roles-"));
-    try {
-      writeFileSync(join(dir, "branches.mjs"), stubbed);
-      // The guard's default expressions, evaluated against the stubbed module. If a future edit wires
-      // `mainRef` to CONTRIBUTION_BASE, this reddens immediately instead of on cutover day.
-      const out = execFileSync(
+  function scratchWithStub(stubValue: string | null) {
+    const dir = mkdtempSync(join(tmpdir(), "roles-pin-"));
+    const src = read("scripts/branches.mjs");
+    const branches =
+      stubValue === null ? src : src.replace('export const CONTRIBUTION_BASE = "main";', `export const CONTRIBUTION_BASE = ${JSON.stringify(stubValue)};`);
+    if (stubValue !== null) expect(branches, "the stub must apply").not.toBe(src);
+    writeFileSync(join(dir, "branches.mjs"), branches);
+    writeFileSync(join(dir, "release-candidate-guard.mjs"), read("scripts/release-candidate-guard.mjs"));
+
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "t");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.3.0" }));
+    git(dir, "add", "package.json");
+    git(dir, "commit", "-qm", "release");
+    const head = git(dir, "rev-parse", "HEAD");
+    // A valid candidate: main and staging both AT the tagged commit, so C and D both hold.
+    git(dir, "update-ref", "refs/remotes/origin/main", head);
+    git(dir, "update-ref", "refs/remotes/origin/staging", head);
+    git(dir, "tag", "-a", "v0.3.0", "-m", "v0.3.0");
+    return { dir, head };
+  }
+
+  /** Run the guard with its DEFAULT refs — the thing under test. */
+  const runWithDefaults = (dir: string, head: string) =>
+    JSON.parse(
+      execFileSync(
         "node",
         [
           "--input-type=module",
           "-e",
-          `import { CONTRIBUTION_BASE, RELEASE_BRANCH, INTEGRATION_BRANCH, remoteRef } from ${JSON.stringify(join(dir, "branches.mjs"))};
-           process.stdout.write(JSON.stringify({ base: CONTRIBUTION_BASE, main: remoteRef(RELEASE_BRANCH), integration: remoteRef(INTEGRATION_BRANCH) }));`,
+          `import { main } from ${JSON.stringify(join(dir, "release-candidate-guard.mjs"))};
+           const r = main({ ref: "refs/tags/v0.3.0", sha: ${JSON.stringify(head)}, remote: ".", cwd: ${JSON.stringify(dir)}, log: () => {} });
+           process.stdout.write(JSON.stringify(r));`,
         ],
         { encoding: "utf8" }
-      );
-      const got = JSON.parse(out);
-      expect(got.base, "the stub must have taken effect").toBe("SENTINEL-not-a-branch");
-      expect(got.main, "the release ref must NOT follow the contribution base").toBe("refs/remotes/origin/main");
-      expect(got.integration).toBe("refs/remotes/origin/staging");
+      )
+    );
+
+  it("PASSES with a sentinel contribution base — the release ref does not follow it", () => {
+    const { dir, head } = scratchWithStub("SENTINEL-not-a-branch");
+    try {
+      const r = runWithDefaults(dir, head);
+      expect(r.facts.mainIsAncestor, "assertion C must still resolve against the RELEASE branch").toBe(true);
+      expect(r.facts.reachableFromIntegration).toBe(true);
+      expect(r.verdict, `moving CONTRIBUTION_BASE must not affect the release check: ${r.failures}`).toBe("PASS");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("is NON-VACUOUS: wiring the release ref to CONTRIBUTION_BASE would be caught", () => {
-    // Proves the pin above can fail — the mutation it is aimed at, executed directly.
-    const wrong = `export const CONTRIBUTION_BASE = "SENTINEL-not-a-branch";
-export const remoteRef = (b) => \`refs/remotes/origin/\${b}\`;
-export const mainRef = remoteRef(CONTRIBUTION_BASE);`;
-    const dir = mkdtempSync(join(tmpdir(), "roles-neg-"));
+  it("is NON-VACUOUS: mis-wiring mainRef to CONTRIBUTION_BASE makes this FAIL", () => {
+    // The mutation the pin exists for, executed. Without this, a green above proves nothing.
+    const { dir, head } = scratchWithStub("SENTINEL-not-a-branch");
     try {
-      writeFileSync(join(dir, "wrong.mjs"), wrong);
-      const out = execFileSync(
-        "node",
-        ["--input-type=module", "-e", `import { mainRef } from ${JSON.stringify(join(dir, "wrong.mjs"))}; process.stdout.write(mainRef);`],
-        { encoding: "utf8" }
-      );
-      expect(out, "the wrong wiring produces a different ref, so the pin discriminates").not.toBe("refs/remotes/origin/main");
+      const guard = readFileSync(join(dir, "release-candidate-guard.mjs"), "utf8");
+      const mis = guard
+        .replace("import { INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef }", "import { CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef }")
+        .replace("mainRef = remoteRef(RELEASE_BRANCH)", "mainRef = remoteRef(CONTRIBUTION_BASE)");
+      expect(mis, "the mis-wiring must apply").not.toBe(guard);
+      writeFileSync(join(dir, "release-candidate-guard.mjs"), mis);
+      const r = runWithDefaults(dir, head);
+      expect(r.facts.mainIsAncestor, "the sentinel ref does not exist, so C goes false").toBe(false);
+      expect(r.verdict).toBe("FAIL");
+      expect(r.failures.join(" ")).toMatch(/^C: |C: /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the UNSTUBBED module still passes, so the sentinel is what makes the difference", () => {
+    const { dir, head } = scratchWithStub(null);
+    try {
+      expect(runWithDefaults(dir, head).verdict).toBe("PASS");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
