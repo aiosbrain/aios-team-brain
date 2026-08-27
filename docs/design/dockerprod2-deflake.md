@@ -282,8 +282,18 @@ if the deploy flow's prose is affected.
   3. `docker compose logs app` contains bootstrap's own named startup line.
   4. `curl -fsS http://localhost:3000/login` → exit 0.
   5. `docker exec … cat /proc/1/cmdline` → recorded verbatim (expect `npm`, per §2a).
-  6. `docker compose stop app`; `docker inspect -f '{{.State.ExitCode}}'` → **143** (SIGTERM honoured),
-     NOT 137 (SIGKILL after the grace period); `docker compose ps` lists nothing running.
+  6. `docker compose stop app` → stop latency **far under the 10s grace period** (SIGTERM honoured,
+     not a SIGKILL at the end of it), `docker compose ps` lists nothing running, and the exit code is
+     **UNCHANGED against the same image running `main`'s bare-path entrypoint** — an A/B, not a
+     predicted constant.
+
+  ⚠️ *Round 3 of this criterion said "exit code **143**, not 137." **Measured: it is 1, in both
+  forms.** `npm start` catches SIGTERM, forwards it, and exits 1 rather than 128+15 — so 143 was a
+  value I predicted instead of measured, written into an acceptance criterion where it would have
+  read as a regression in a change that causes none. The A/B is what discriminates: NEW
+  `["/bin/sh", "<path>"]` → exit 1 @ 1s; OLD bare path → exit 1 @ 2s; PID 1 is `npm start` in both.
+  Recorded rather than quietly corrected, because "the criterion named a number I had not observed"
+  is the finding.*
   ⚠️ *Manual and named as such — this repo has no container test tier and claiming CI proves it would
   be false. Round 1 said "boots through entrypoint.sh", "answers an HTTP request" and "no orphan",
   all three of which are design vocabulary that would ship green: a 500 page answers a request, and
@@ -346,4 +356,31 @@ is different. What is actually true is narrower, and it is enough:
 A risk-based boundary, not an erosion of the gate DOCKERPROD-1 genuinely needs. Post-merge, the normal
 Railway deploy verification applies.
 
-**Nothing is built. No code exists for this slice.**
+## 7. AC4, as observed
+
+Run against the real image built from this branch (`docker compose build app`, exit 0), on a real
+Postgres. Every line is a reading, not a claim.
+
+| # | observable | result |
+|---|---|---|
+| 1 | `docker compose build app` | **exit 0**; the runner stage is now 2 steps and **reads nothing from the context** — `#12 COPY --from=build /app ./`, `#13 RUN set -eu; …` |
+| 2 | `docker inspect -f '{{.Config.Entrypoint}} {{.Config.Cmd}}'` | `[/bin/sh /app/docker/entrypoint.sh]  [npm start]` |
+| 2b | the deleted copy is gone; the boot chain is present | `/usr/local/bin/entrypoint.sh`: **No such file or directory**; `/app/docker/entrypoint.sh` (665 b) and `/app/docker/bootstrap.mjs` (16,295 b) both `-rwxr-xr-x` |
+| 3 | booted THROUGH `entrypoint.sh` | `docker compose logs app` opens with bootstrap's own lines — `▶ generated AUTH_SECRET + SECRETS_KEY`, `▶ waiting for postgres…`, `▶ loading schema…` |
+| 4 | `curl -fsS http://localhost:3199/login` | **exit 0** |
+| 5 | `cat /proc/1/cmdline` | `npm start` — confirming §2a's correction: **npm** is PID 1, not Next |
+| 6 | stop | exit **1** @ **1s** (NEW) vs exit **1** @ **2s** (OLD bare path) — unchanged, and far under the 10s grace |
+
+**And the empty-`CMD` fail-open reproduced in a real container** — first by accident, because a compose
+`entrypoint:` override silently clears the image's `CMD`, then deliberately:
+
+| run | result |
+|---|---|
+| image defaults (`ENTRYPOINT` + `CMD`) | `Running=true` |
+| `CMD` removed | `Running=false`, **`ExitCode=0`**, last log line is the success banner's rule — **no error anywhere** |
+
+That is AC2(b)'s failure mode, observed rather than argued: a container that prints a login URL and a
+password, then exits successfully having served nothing.
+
+**Code is written. AC1–AC3 are guarded in `test/guards/dockerfile-runner-stage.test.ts`; AC4 is the
+table above.**
