@@ -674,6 +674,38 @@ changed this push** — `lib/ingest` computes the changed set by diffing the pro
 `task_pm_links.last_error`; the `projection_fingerprint` skip keeps them from re-writing the board.
 The manual `projectBoardAction` and the inline work-events projection remain.
 
+**One issue, one link — enforced by the DB, not only by app code (ADOPTUNIQ-1,
+`docs/design/task-pm-links-unique-index.md`).** `task_pm_links_provider_resource_uq` is a PARTIAL
+unique index on `(team_id, provider, provider_resource_id) where provider_resource_id is not null`.
+`ownedResourceIds` in `lib/pm-sync/project.ts` is still the first line of defence, but it is a
+check-then-act read followed by a write; the index closes the race, and it also covers **Plane**,
+whose adapter never consults `ownedResourceIds` at all. NULLs are excluded deliberately, so a link
+that never resolved (the orphan `chetan`/`TT2` row) is untouched.
+
+Two things about it are load-bearing and easy to undo by accident:
+
+1. **It is created ONLY by a guarded `do $$ … $$` block, duplicated verbatim in `postgres/schema.sql`
+   and `postgres/migrations/20260826…`.** `pg:schema` loads `schema.sql` FIRST and as ONE implicit
+   transaction, and a top-level `create unique index` DOES execute against an existing database — so a
+   bare statement there would abort the entire schema load before any migration guard could run. The
+   block catches `unique_violation`, `lock_not_available` AND `deadlock_detected` and never `when
+   others`; each clause traces to a staged failure, and the last two abort a release with **zero dirty
+   data** (a lock wait and a deadlock during preDeploy, while the old app version is still projecting).
+   Guarded by `test/guards/task-pm-links-unique-index.test.ts`.
+2. **A skip is reported READ-side**, via `backstopHealth` on `ProjectionHealth` (Admin → PM sync). Not
+   a `last_error` stamp: `persistSuccess` nulls `last_error` on every successful projection, so a
+   stamp erases itself within one push cycle — and its UPDATE would sit outside the protected
+   `create index`, able to abort the very release it reports on.
+
+**Containment, because the index made two existing paths reachable.** `persistSuccess` now READS the
+returned error (the pg adapter returns rather than throws) and reports that row `failed` — it used to
+be silent, reporting success while the provider had already been mutated. `adoptInbound` wraps each
+candidate in `try/catch`; its `on conflict` names the row-identity constraint, so a violation of this
+index would otherwise throw past `runInboundForTeam` and discard the whole inbound pass. A parent
+whose bookkeeping fails is recorded in an invocation-local `contested` set so its children fail fast
+instead of re-invoking the adapter and minting a duplicate provider issue; an adapter **throw** keeps
+its shipped inline-retry behaviour, pinned by an exact-count test.
+
 **Dashboard hierarchical CRUD (brain-api v1.2 Phase 4).** The tasks page (`app/t/[team]/tasks`)
 is the second authoring surface alongside `aios push`. It **server-renders the hierarchy** —
 `components/kanban/task-hierarchy.tsx` groups sub-tasks under their epic (by `parent_row_key`) and
