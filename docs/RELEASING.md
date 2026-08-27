@@ -132,6 +132,12 @@ predates the entire PRET series.
 
 ### The path
 
+0. **Before cutting the tag** (maintainers): let in-flight migration jobs drain and ask open PRs to
+   rebase onto the commit that declares `v0.11.0`. Declaring before cutting keeps every PR that
+   *contains* the declaration green — but a PR still on an older base declares only through `v0.10.0`,
+   and its migration job reads full history, so a rerun after the tag exists throws
+   `DEFAULT_TAGS is stale`.
+
 1. **Point the service at `release/v0.11.0`** and deploy it. A tag is not enough — Railway's GitHub
    source is a *connected branch*, so there is no supported, fleet-wide way to select a tag.
 2. **Let it boot, and let auto-flip converge.** The marker is written by the running application

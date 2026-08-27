@@ -57,7 +57,9 @@ lane is not evidence that an installed user can upgrade.
 
 `803122ff` verified: PRET-6's **direct parent**; an ancestor of `main`; carries
 `20260811160000_access_enforcement_flag.sql` and `20260817120000_autoflip_hold.sql`; does **not**
-carry the PRET-6 migration; and its own CI was **green (8/8 checks)**.
+carry the PRET-6 migration; and its own CI was **green — 8 check-runs, 0 failures**, read from
+`repos/aiosbrain/aios-team-brain/commits/803122ff/check-runs` on 2026-08-26 (eight was the required
+count at that date, per `docs/CI-ARCHITECTURE.md`'s record of the time).
 
 **The release branch gets NO CI, and that is a gap this slice must close by hand.** `.github/workflows/ci.yml` fires on
 `pull_request` and `push` to `main`/`staging` only, so pushing `release/v0.11.0` and its tag triggers
@@ -70,9 +72,11 @@ automated here; both are named steps.
 source is a *connected branch* — its own docs describe only a trigger branch, and the repo's install
 paths name `main`. An operator whose service tracks `main` therefore has no way to deploy a tag. So
 `release/v0.11.0` exists as a branch they can repoint at, deploy, let converge, and then repoint away
-from. **A tag alone would have been undeployable by exactly the fleet that needs it** (narrowed after
-review: there is no *supported, fleet-wide connected-source* path to select a tag — a service that
-already deployed that SHA could redeploy it, which no pre-flip install has) — which would
+from. **A tag alone would have left the fleet without a supported path** — narrowed twice under review, and
+now stated exactly: Railway's connected-source and UI path is branch-based, so the branch is what an
+operator can actually use. It is **not** true that the tag target is undeployable in principle —
+Railway's API accepts a specific `commitSha`, so someone comfortable with the API could resolve the
+tag and deploy it. The branch exists so the documented path does not require that — which would
 have made the "two releases" answer correct on paper and useless in practice.
 
 **3. The branch carries ONE commit on top of `803122ff`:** the version moved to `0.11.0` at all three
@@ -89,13 +93,20 @@ affordance for that.
 | # | step | why this order |
 |---|---|---|
 | 1 | **PR A on `main`** — declare `v0.11.0` (pending; it does not exist yet) | legal, because only the newest declared tag may be absent — and it means no PR goes stale when the tag appears |
-| 2 | **cut `release/v0.11.0` + tag `v0.11.0`** | now declared, so nothing reddens |
+| 2 | **cut `release/v0.11.0` + tag `v0.11.0`** | declared first, so any PR **that contains the declaration** stays green |
 | 3 | **PR B on `main`** — declare `v0.12.0` (pending), bump the version, date the changelog, ship the agreement guards | `v0.11.0` now exists, so declaring a second pending tag is legal |
 | 4 | **tag `v0.12.0`** on the merged PR B commit | |
 
 Declaring **both** while neither exists throws `unknown git tag: v0.11.0` (verified by running it) —
-the middle-hole rule. So the machinery enforces the sequence the release notes require, and the
-two-PR split is what keeps every step green.
+the middle-hole rule. So the machinery enforces the sequence the release notes require.
+
+**NARROWED after review — "nothing reddens" was too strong.** Declaring first protects PRs whose tree
+*contains* the declaration. A PR still based on an older commit declares only through `v0.10.0`, and
+its migration job reads full history — so once `v0.11.0` exists it throws `DEFAULT_TAGS is stale`, on
+a rerun or a queued job for an old merge SHA. The window is real, just far smaller than cutting first.
+So the runbook adds a step: **before cutting, let in-flight migration jobs drain and ask open PRs to
+rebase onto the declaring commit.** A PR that rebases is fine; one that sits on an old base and reruns
+is not.
 
 A second, better consequence: once `v0.11.0` exists and is declared, the migration lane starts
 exercising **`v0.11.0 → current`** — structurally testing the very upgrade the fleet must perform.

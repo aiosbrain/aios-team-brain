@@ -124,17 +124,17 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
   });
 
   it("declares AT MOST ONE pending tag — two would reintroduce the middle-hole throw", () => {
-    // `nextTagPolicy` permits exactly one uncut tag. If an editor declares two, the older becomes an
-    // illegal hole and every PR throws `unknown git tag` — the freeze this program keeps rediscovering.
-    // Checked against a tag set containing everything declared EXCEPT the newest, which is the state
-    // during a release preparation.
-    const byVersion = [...DEFAULT_TAGS].sort((a, b) => {
-      const p = (t: string) => t.slice(1).split(".").map(Number);
-      const [ax, ay, az] = p(a); const [bx, by, bz] = p(b);
-      return ax - bx || ay - by || az - bz;
-    });
-    const allButNewest = byVersion.slice(0, -1);
-    expect(() => nextTagPolicy(DEFAULT_TAGS, allButNewest)).not.toThrow();
+    // GREEN BY CONSTRUCTION, first spelling: it built the "existing" set as DEFAULT_TAGS-minus-the-
+    // newest, so declaring TWO uncut tags made the fixture pretend the older one existed and the
+    // assertion passed. A guard that manufactures the very state it is checking for proves nothing —
+    // and a sibling test caught the mutation, which is exactly how a vacuous layer hides.
+    //
+    // Counted against a STATIC known-cut fixture, not live git and not a set derived from DEFAULT_TAGS.
+    // Both reviewers landed here: gating it on live tags would skip it in CI's TAGLESS unit job — the
+    // one place it most needs to run — and deriving the set from DEFAULT_TAGS is what made it vacuous.
+    // CUT_FIXTURE grows by one each time a release is actually cut, which is a deliberate edit.
+    const declaredButAbsent = DEFAULT_TAGS.filter((t) => !CUT_FIXTURE.includes(t));
+    expect(declaredButAbsent.length, `pending: ${declaredButAbsent.join(", ") || "none"}`).toBeLessThanOrEqual(1);
   });
 
   it("compares by version, so a newer tag cannot hide behind string ordering", () => {
@@ -196,7 +196,31 @@ describe("release: the operator-facing commands must actually run (criteria 5, 6
    *  file's own criteria, and the spec that describes this guard) must not trip it: the first spelling
    *  of a sibling guard in this program failed on the sentence explaining it. */
   function fencedCommands(md: string): string[] {
-    return [...md.matchAll(/```[a-z]*\n([\s\S]*?)```/g)].flatMap((m) => m[1].split("\n"));
+    // BOTH fence styles, and line CONTINUATIONS joined first. Review found four evasions of the first
+    // spelling: a `~~~` fence, `npx tsx \` wrapped onto the next line, `pnpm dlx tsx`, and a false PASS
+    // when `--conditions react-server` appeared AFTER the entrypoint — where node ignores it.
+    // The info string may be anything (` ```SQL `, ` ```bash title=x `). The first spelling required
+    // `[a-z]*`, so such a fence never matched — and worse, its CLOSING fence then paired with the NEXT
+    // block's opener, inverting inside/outside for the rest of the file and letting later commands
+    // escape the scan entirely. Match any info string, both fence styles.
+    const blocks = [
+      ...[...md.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map((m) => m[1]),
+      ...[...md.matchAll(/~~~[^\n]*\n([\s\S]*?)~~~/g)].map((m) => m[1]),
+    ];
+    return blocks.flatMap((b) => b.replace(/\\\n\s*/g, " ").split("\n"));
+  }
+
+  /** A command that will throw on `server-only` before it reaches the database. */
+  function throwsOnServerOnly(line: string): boolean {
+    // Any runner that reaches tsx: npx / pnpm dlx / bunx / `npx --yes tsx` / a bare `tsx`. Keyed on the
+    // ENTRYPOINT rather than the launcher, because the launcher list is exactly what rots.
+    if (!/\btsx\b/.test(line) || !/scripts\/admin\.ts/.test(line)) return false;
+    if (/\bnpm\s+run\s+admin\b/.test(line)) return false;
+    // The condition must come BEFORE the entrypoint; after it, node never sees it. Space AND equals
+    // forms are both valid and both accepted — flagging `--conditions=react-server` would be a false
+    // positive on a correct command.
+    const beforeEntry = line.slice(0, line.indexOf("scripts/admin.ts"));
+    return !/--conditions[= ]react-server/.test(beforeEntry);
   }
 
   it("no doc publishes a bare `npx tsx scripts/admin.ts` — it throws on server-only before reaching the DB", () => {
@@ -211,9 +235,7 @@ describe("release: the operator-facing commands must actually run (criteria 5, 6
     const offenders: string[] = [];
     for (const { f, md } of docs) {
       for (const line of fencedCommands(md)) {
-        if (/\bnpx\s+tsx\b/.test(line) && /scripts\/admin\.ts/.test(line) && !/--conditions\s+react-server/.test(line)) {
-          offenders.push(`docs/${f}: ${line.trim()}`);
-        }
+        if (throwsOnServerOnly(line)) offenders.push(`docs/${f}: ${line.trim()}`);
       }
     }
     expect(offenders).toEqual([]);
@@ -221,12 +243,48 @@ describe("release: the operator-facing commands must actually run (criteria 5, 6
 
   it("is NON-VACUOUS: it flags the exact form that shipped", () => {
     // The guard above reports zero today. Prove the detector fires rather than matching nothing.
-    const bad = "```bash\nnpx tsx scripts/admin.ts set-access-enforcement acme enforcing\n```";
-    const good = "```bash\nnpm run admin -- set-access-enforcement acme enforcing\n```";
-    const hits = (md: string) =>
-      fencedCommands(md).filter((l) => /\bnpx\s+tsx\b/.test(l) && /scripts\/admin\.ts/.test(l) && !/--conditions\s+react-server/.test(l));
-    expect(hits(bad)).toHaveLength(1);
-    expect(hits(good)).toHaveLength(0);
+    const hits = (md: string) => fencedCommands(md).filter(throwsOnServerOnly);
+    // The exact form that shipped…
+    expect(hits("```bash\nnpx tsx scripts/admin.ts set-access-enforcement acme enforcing\n```")).toHaveLength(1);
+    // …and each evasion review found. All four must be caught.
+    expect(hits("~~~bash\nnpx tsx scripts/admin.ts list-members\n~~~"), "tilde fence").toHaveLength(1);
+    expect(hits("```bash\nnpx tsx \\\n  scripts/admin.ts list-members\n```"), "continuation").toHaveLength(1);
+    expect(hits("```bash\npnpm dlx tsx scripts/admin.ts list-members\n```"), "pnpm dlx").toHaveLength(1);
+    expect(
+      hits("```bash\nnpx tsx scripts/admin.ts list-members --conditions react-server\n```"),
+      "condition AFTER the entrypoint is ignored by node"
+    ).toHaveLength(1);
+    // …and the correct forms stay clean.
+    expect(hits("```bash\nnpm run admin -- set-access-enforcement acme enforcing\n```")).toHaveLength(0);
+    expect(hits("```bash\nnpx tsx --conditions react-server scripts/admin.ts list-members\n```")).toHaveLength(0);
+    expect(hits("```bash\nnpx tsx --conditions=react-server scripts/admin.ts list-members\n```"), "equals form is valid").toHaveLength(0);
+    // …and the fence-pairing inversion an info string used to cause: the BAD command sits in a later
+    // block, which the old regex stopped seeing entirely.
+    expect(
+      hits("```SQL\nselect 1;\n```\n\n```bash\nnpx tsx scripts/admin.ts list-members\n```"),
+      "an info-string fence must not blind the scan to later blocks"
+    ).toHaveLength(1);
+    expect(hits("```bash\nbunx tsx scripts/admin.ts x\n```"), "bunx").toHaveLength(1);
+  });
+
+  it("no doc still teaches a verb PRET-6 DELETED", () => {
+    // docs/OPS.md's "Rolling back" section published `set-access-enforcement … permissive` — a command
+    // the retirement removed from the CLI. The prose prefix `… scripts/admin.ts` hid it from the
+    // runner-based detector above, which is why this keys on the VERB instead. A stale rollback
+    // instruction is worse than an absent one: it is found during an incident.
+    const retired = "set-access-enforcement";
+    expect(readFileSync(join(ROOT, "scripts", "admin.ts"), "utf8"), "the verb is retired at HEAD").not.toContain(retired);
+    const docs = readdirSync(join(ROOT, "docs"), { recursive: true, encoding: "utf8" })
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => ({ f, md: readFileSync(join(ROOT, "docs", f), "utf8") }));
+    const offenders: string[] = [];
+    for (const { f, md } of docs) {
+      for (const line of fencedCommands(md)) {
+        // RELEASE-NOTES/RELEASING legitimately publish it for the v0.11.0 RELEASE, where it exists.
+        if (line.includes(retired) && !/RELEASE-NOTES-pret6|RELEASING/.test(f)) offenders.push(`docs/${f}: ${line.trim()}`);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 
   it("RELEASING.md gates the PRET-6 upgrade on a QUERY, not a log line", () => {
