@@ -233,9 +233,15 @@ const bootPaths: string[] = (() => {
   return [...new Set([...(script ? [script] : []), ...referenced])];
 })();
 
-/** The final stage's boot-chain assertion: the RUN that tests the boot paths. */
+/**
+ * The final stage's boot-chain assertion, located by its `set -eu` preamble.
+ *
+ * Located by PREAMBLE and not by content: keying on `test -f` made a mutation that WEAKENS the
+ * assertion (dropping `-f`) also unfindable, so it reddened (c), (d) and (e) at once and proved
+ * only whichever ran first. The preamble is stable under exactly the mutations (c) exists to catch.
+ */
 const assertionIndex = finalStage.instructions.findIndex(
-  (i) => i.op === "RUN" && /\btest\s+-f\b/.test(i.args)
+  (i) => i.op === "RUN" && /^set\s+-eu\b/.test(i.args.trim())
 );
 
 describe("AC2 — the boot invocation is complete, build-asserted, and terminal", () => {
