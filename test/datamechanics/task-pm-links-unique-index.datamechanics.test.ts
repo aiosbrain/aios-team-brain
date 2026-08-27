@@ -43,10 +43,31 @@ function adminUrl(): string {
 /** A throwaway database with just enough of the real shape to exercise the index. */
 async function withScratchDb<T>(fn: (c: Client, name: string) => Promise<T>): Promise<T> {
   const name = `adoptuniq_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-  const admin = new Client({ connectionString: adminUrl() });
-  await admin.connect();
-  await admin.query(`create database ${name}`);
-  await admin.end();
+  /**
+   * RETRIED, because it flaked once in a full parallel run and a 1-in-N test is a liability.
+   *
+   * `create database` takes a short exclusive lock and can transiently fail while other files in the
+   * tier are creating or dropping their own scratch databases. The failure surfaced as a bare
+   * assertion mismatch in an unrelated-looking case, which is precisely how infrastructure contention
+   * gets misread as a product bug. Bounded, and it rethrows rather than silently proceeding against a
+   * database that does not exist.
+   */
+  let created = false;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 5 && !created; attempt++) {
+    const admin = new Client({ connectionString: adminUrl() });
+    try {
+      await admin.connect();
+      await admin.query(`create database ${name}`);
+      created = true;
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+    } finally {
+      await admin.end().catch(() => {});
+    }
+  }
+  if (!created) throw new Error(`could not create scratch database ${name}: ${String(lastErr)}`);
 
   const target = new URL(adminUrl());
   target.pathname = `/${name}`;
@@ -171,6 +192,46 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       expect(later.rows[0].n, "the schema load must continue past the skip").toBe(1);
       const rows = await c.query(`select count(*)::int as n from task_pm_links`);
       expect(rows.rows[0].n, "no row may be touched by the skip").toBe(2);
+    });
+  });
+
+  /**
+   * THE POSITIVE CONTROL FOR THE INVARIANT QUERY, rehomed from
+   * `pm-link-uniqueness.datamechanics.test.ts`.
+   *
+   * That file used to prove its `duplicateGroups` detector non-vacuous by inserting a real duplicate
+   * and asserting the query REPORTED it. The index makes that impossible in the tier's shared
+   * database — nothing can be duplicated there any more — so the control would have been silently
+   * lost, leaving every `toEqual([])` in that file green by construction with nothing proving the
+   * query can ever return a non-empty result.
+   *
+   * Here it still works, because this scratch database has no index until the block runs.
+   */
+  it("the invariant QUERY can still report a duplicate — the control the index would have deleted", async () => {
+    await withScratchDb(async (c) => {
+      await insertLink(c, { rid: "dup", key: "A" });
+      await insertLink(c, { rid: "dup", key: "B" });
+      // Same shape as pm-link-uniqueness's `duplicateGroups`: grouped by (provider, resource id),
+      // NULLs excluded by the identical predicate the index uses.
+      const groups = await c.query(
+        `select provider, provider_resource_id, count(*)::int as n
+           from task_pm_links
+          where provider_resource_id is not null
+          group by provider, provider_resource_id
+         having count(*) > 1`,
+      );
+      expect(groups.rows).toEqual([{ provider: "linear", provider_resource_id: "dup", n: 2 }]);
+
+      // And it is provider-scoped, matching the index it mirrors: the same id under a different
+      // provider is NOT a violation.
+      await insertLink(c, { rid: "solo", provider: "linear", key: "C" });
+      await insertLink(c, { rid: "solo", provider: "plane", key: "D" });
+      const after = await c.query(
+        `select provider_resource_id from task_pm_links
+          where provider_resource_id is not null
+          group by provider, provider_resource_id having count(*) > 1`,
+      );
+      expect(after.rows.map((r) => r.provider_resource_id)).toEqual(["dup"]);
     });
   });
 
