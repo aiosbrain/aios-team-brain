@@ -165,15 +165,19 @@ export function classifyBackstop(
   if (!row) return "missing";
   if (!row.isvalid) return "malformed";
   const def = row.indexdef.toLowerCase().replace(/\s+/g, " ").trim();
-  const wellFormed =
-    def.includes("create unique index") &&
-    // schema+table binding, not just the index name
-    /\son\s+public\.task_pm_links\s+using\s+btree\s*\(/.test(def) &&
-    // exact ORDERED key columns, and nothing else (no expression/include columns)
-    def.includes("(team_id, provider, provider_resource_id)") &&
-    // the partial predicate, in Postgres's normalized rendering
-    def.includes("where (provider_resource_id is not null)");
-  return wellFormed ? "installed" : "malformed";
+  /**
+   * Matched as a WHOLE definition, not a bag of substrings.
+   *
+   * A substring check accepted `… (team_id, provider, provider_resource_id) INCLUDE (task_id) WHERE …`
+   * as installed, contradicting this function's own promise to validate the exact definition. Anchoring
+   * the pattern end-to-end means anything Postgres renders that we did not ask for — INCLUDE columns,
+   * a tablespace, `NULLS NOT DISTINCT`, a collation or opclass — falls to `malformed` rather than
+   * being quietly tolerated. Erring strict is right: the whole point is that a wrong index of the
+   * right NAME must not read as a successful deploy.
+   */
+  const EXPECTED =
+    /^create unique index task_pm_links_provider_resource_uq on public\.task_pm_links using btree \(team_id, provider, provider_resource_id\) where \(provider_resource_id is not null\)$/;
+  return EXPECTED.test(def) ? "installed" : "malformed";
 }
 
 /**

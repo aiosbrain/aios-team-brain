@@ -361,6 +361,12 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
         expect(await indexCount(c), "deadlocked -> not installed").toBe(0);
         const later = await c.query(`select count(*)::int as n from pg_tables where tablename = 'later_ran'`);
         expect(later.rows[0].n, "the release must NOT abort on a deadlock").toBe(1);
+
+        // SELF-HEAL, asserted rather than inferred from the lock case's identical profile. The
+        // pre-code experiment could not isolate this (its fixture went dirty), so without this line
+        // the claim would rest on an analogy.
+        await c.query(await guardedBlock());
+        expect(await indexCount(c), "contention cleared -> installed on the next deploy").toBe(1);
       } finally {
         await old.query(`rollback`).catch(() => {});
         await old.end().catch(() => {});
@@ -388,6 +394,123 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       expect(await indexCount(c), "contention cleared -> installed, no operator step").toBe(1);
     });
   });
+});
+
+describe("ADOPTUNIQ-1 — the skip is AUDIBLE, and survives the real loader", () => {
+  it("each branch RAISES ITS OWN WARNING, delivered through the notice channel", async () => {
+    // `pg-load-schema.mjs:57` installs a `notice` listener precisely so RAISE WARNING reaches the
+    // deploy log. That log line is the only signal a skipped fleet gets at deploy time, and an
+    // untested warning is a signal nobody has ever seen fire.
+    await withScratchDb(async (c, name) => {
+      const url = new URL(adminUrl());
+      url.pathname = `/${name}`;
+      const listening = new Client({ connectionString: url.toString() });
+      const notices: string[] = [];
+      listening.on("notice", (n) => notices.push(String(n.message)));
+      await listening.connect();
+      try {
+        await listening.query(
+          `insert into task_pm_links (team_id, provider, provider_resource_id, row_key) values ($1,'linear','dup','A'),($1,'linear','dup','B')`,
+          [TEAM_A],
+        );
+        await listening.query(await guardedBlock());
+        expect(
+          notices.some((m) => /duplicate provider_resource_id/i.test(m)),
+          `expected a duplicate-data warning, got ${JSON.stringify(notices)}`,
+        ).toBe(true);
+        // And it names the consequence, not just the condition — a fleet reading this needs to know
+        // the backstop is absent and that THIS skip will not repair itself.
+        expect(notices.join(" ")).toMatch(/NOT installed/i);
+        expect(notices.join(" ")).toMatch(/does NOT self-heal/i);
+      } finally {
+        await listening.end().catch(() => {});
+      }
+    });
+  });
+
+  it("THE REAL LOADER survives a dirty upgrade — schema.sql AND every migration still apply", async () => {
+    /**
+     * The other cases execute the guarded block directly. This one runs `loadSchema` itself — the
+     * actual Railway preDeployCommand — so the property under test is the real one: schema.sql is
+     * sent as ONE implicit transaction, and a caught exception inside it must not poison the rest of
+     * the load.
+     *
+     * Staged as a genuine UPGRADE: load once (clean, index created), drop the index, dirty the data,
+     * then load again exactly as a deploy would.
+     */
+    const { pathToFileURL } = await import("node:url");
+    const { join: joinPath } = await import("node:path");
+    // Imported by file URL: the module is a plain .mjs outside the "@/" alias root, and it must be
+    // the REAL one — a re-implementation here would test a paraphrase of the deploy path.
+    const { loadSchema } = await import(
+      pathToFileURL(joinPath(__dirname, "..", "..", "scripts", "pg-load-schema.mjs")).href
+    );
+    const name = `adoptuniq_loader_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    const admin = new Client({ connectionString: adminUrl() });
+    await admin.connect();
+    await admin.query(`create database ${name}`);
+    await admin.end();
+    const url = new URL(adminUrl());
+    url.pathname = `/${name}`;
+
+    const c = new Client({ connectionString: url.toString() });
+    await c.connect();
+    try {
+      await loadSchema({ databaseUrl: url.toString(), logger: { log: () => {} } });
+      expect(await indexCount(c), "a clean from-zero load installs it").toBe(1);
+
+      await c.query(`drop index ${INDEX}`);
+      // Staged UNCONDITIONALLY. An earlier version used an `insert … select` over teams/projects with
+      // a `.catch()` fallback — but the select matched ZERO rows rather than erroring, so the catch
+      // never fired, no duplicate existed, and the test passed over an empty table while asserting
+      // nothing. The rows are checked in.
+      /**
+       * The marker is stamped because the moment this test inserts a `teams` row it becomes a
+       * NON-EMPTY fleet, and `20260818210000_pret6_retire_access_enforcement.sql` REFUSES to replay
+       * against one that has not completed the PRET-4 builtin materialization — aborting the load
+       * with P0001 for a reason that has nothing to do with this index. A real fleet stamps this at
+       * boot; emulating that is what makes the reload below exercise the branch under test rather
+       * than an unrelated precondition.
+       */
+      await c.query(
+        `insert into migration_markers (name) values ('pret4_builtin_materialize') on conflict (name) do nothing`,
+      );
+      const { rows: tr } = await c.query(`insert into teams (slug, name) values ('dirty','d') returning id`);
+      const { rows: pr } = await c.query(
+        `insert into projects (team_id, slug, name) values ($1,'dp','dp') returning id`,
+        [tr[0].id],
+      );
+      for (const k of ["A", "B"]) {
+        await c.query(
+          `insert into task_pm_links (team_id, project_id, row_key, provider, provider_external_id, provider_resource_id)
+           values ($1,$2,$3,'linear',$3,'dup')`,
+          [tr[0].id, pr[0].id, k],
+        );
+      }
+      const dupes = await c.query(
+        `select count(*)::int as n from task_pm_links where provider_resource_id = 'dup'`,
+      );
+      expect(dupes.rows[0].n, "the duplicate must actually exist or this proves nothing").toBe(2);
+
+      // THE ASSERTION: a deploy over dirty data completes. Before the guard, this threw and Railway
+      // halted the release.
+      await expect(
+        loadSchema({ databaseUrl: url.toString(), logger: { log: () => {} } }),
+      ).resolves.toBeUndefined();
+      expect(await indexCount(c), "dirty -> skipped, and the rest of the load still applied").toBe(0);
+
+      // Prove the load really did continue rather than stopping early at the block: a table created
+      // by a LATER migration must exist.
+      const later = await c.query(`select count(*)::int as n from pg_tables where tablename = 'connector_cursors'`);
+      expect(later.rows[0].n, "statements after the guarded block must still have applied").toBe(1);
+    } finally {
+      await c.end().catch(() => {});
+      const cleanup = new Client({ connectionString: adminUrl() });
+      await cleanup.connect();
+      await cleanup.query(`drop database if exists ${name} with (force)`).catch(() => {});
+      await cleanup.end().catch(() => {});
+    }
+  }, 120_000);
 });
 
 describe("ADOPTUNIQ-1 — the read-side backstop signal", () => {

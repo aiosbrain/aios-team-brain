@@ -51,10 +51,17 @@ export function stripSqlComments(sql: string): string {
     .join("\n");
 }
 
-/** Count real `create unique index` statements naming this index (comments excluded). */
+/**
+ * Count real `create unique index` statements ON `task_pm_links` (comments excluded).
+ *
+ * Matched on the TABLE, not on our index NAME. Keying on the name let a bare equivalent index under
+ * any other spelling escape the guard entirely and restore the preDeploy abort path this whole file
+ * exists to prevent — the invariant is "no unguarded unique index on this table", not "no unguarded
+ * index called X".
+ */
 export function countCreators(sql: string): number {
   const code = stripSqlComments(sql).toLowerCase();
-  return (code.match(new RegExp(`create\\s+unique\\s+index[^;]*${INDEX_NAME}`, "g")) ?? []).length;
+  return (code.match(/create\s+unique\s+index[^;]*?\btask_pm_links\b/g) ?? []).length;
 }
 
 /**
@@ -155,6 +162,14 @@ end $$;`;
     expect(creatorsAreGuarded(mutant)).toBe(false);
   });
 
+  it("REJECTS an equivalent unique index under a DIFFERENT name", () => {
+    // Keying the matcher on our index NAME let this through, and a bare create on this table is the
+    // preDeploy abort path regardless of what it is called.
+    const aliased = `create unique index if not exists some_other_name on task_pm_links (team_id, provider, provider_resource_id) where provider_resource_id is not null;`;
+    expect(countCreators(aliased)).toBe(1);
+    expect(creatorsAreGuarded(aliased)).toBe(false);
+  });
+
   it("is COMMENT-AWARE: prose quoting the DDL is not a creator", () => {
     // 20260817164500 already describes this index in prose; without this, that file would count as a
     // creator and the per-file counts above would be satisfied by a comment.
@@ -200,6 +215,8 @@ describe("ADOPTUNIQ-1 — backstop classification fails CLOSED", () => {
     ["wrong predicate", GOOD.replace("IS NOT NULL", "IS NULL")],
     ["wrong table", GOOD.replace("public.task_pm_links", "public.tasks")],
     ["wrong schema", GOOD.replace("public.task_pm_links", "other.task_pm_links")],
+    ["carrying INCLUDE columns", GOOD.replace(" WHERE (", " INCLUDE (task_id) WHERE (")],
+    ["carrying a trailing clause we never asked for", GOOD + " NULLS NOT DISTINCT"],
   ])("a same-named index that is %s reads as `malformed`", (_name, indexdef) => {
     expect(indexdef, "the mutation must actually change the fixture").not.toBe(GOOD);
     expect(classifyBackstop({ indexdef, isvalid: true })).toBe("malformed");

@@ -258,6 +258,31 @@ async function makeProject(seed: Seed, slug: string): Promise<string> {
  * THE INVARIANT. Mirrors `ADOPTUNIQ-1`'s index exactly:
  *   unique (team_id, provider, provider_resource_id) where provider_resource_id is not null
  */
+/**
+ * The counting half, PURE and exported so it can have a positive control.
+ *
+ * It used to be inlined in the DB read below, and that made it untestable once the index shipped:
+ * with duplicates impossible in this database, every caller asserts `[]`, so gutting the function to
+ * `return []` left all 19 tests green — verified with a mutation, after a review caught that the
+ * "rehomed" control in the scratch-database file exercises INDEPENDENT raw SQL and never this code.
+ * Splitting the pure part is what restores a control that can actually fail.
+ */
+export function groupDuplicates(
+  rows: { provider: string; provider_resource_id: string }[],
+): { provider: string; id: string; n: number }[] {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const key = JSON.stringify([row.provider, row.provider_resource_id]);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .filter(([, n]) => n > 1)
+    .map(([key, n]) => {
+      const [provider, id] = JSON.parse(key) as [string, string];
+      return { provider, id, n };
+    });
+}
+
 async function duplicateGroups(teamId: string): Promise<{ provider: string; id: string; n: number }[]> {
   const { data } = await db()
     .from("task_pm_links")
@@ -268,17 +293,7 @@ async function duplicateGroups(teamId: string): Promise<{ provider: string; id: 
   // nothing has to be split back apart to report. An earlier draft joined on a space (which truncated
   // the reported id if one contained a space) and then on a NUL (which put a control character in the
   // source for no benefit).
-  const counts = new Map<string, number>();
-  for (const row of (data ?? []) as { provider: string; provider_resource_id: string }[]) {
-    const key = JSON.stringify([row.provider, row.provider_resource_id]);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  return [...counts.entries()]
-    .filter(([, n]) => n > 1)
-    .map(([key, n]) => {
-      const [provider, id] = JSON.parse(key) as [string, string];
-      return { provider, id, n };
-    });
+  return groupDuplicates((data ?? []) as { provider: string; provider_resource_id: string }[]);
 }
 
 async function ownedLinkCount(teamId: string): Promise<number> {
@@ -291,6 +306,43 @@ async function ownedLinkCount(teamId: string): Promise<number> {
 }
 
 describe("ADOPT-TASK-8 — no two links in a team share one PM issue (real Postgres)", () => {
+  /**
+   * THE POSITIVE CONTROL, restored. Without it the detector can break completely while every
+   * uniqueness assertion in this file stays green — verified: gutting `groupDuplicates` to
+   * `return []` survived all 19 tests before this existed.
+   *
+   * It runs against the PURE half deliberately. The database can no longer hold a duplicate, so this
+   * is the only place the reporting path can be shown to fire at all. A control written as
+   * independent raw SQL (as an earlier fold did) proves the QUERY works and says nothing about this
+   * function — which is the difference between moving a property and replacing it with a lookalike.
+   */
+  it("THE DETECTOR STILL WORKS: the grouping half reports a duplicate when given one", () => {
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: OWNED_ISSUE_ID },
+        { provider: "linear", provider_resource_id: OWNED_ISSUE_ID },
+      ]),
+    ).toEqual([{ provider: "linear", id: OWNED_ISSUE_ID, n: 2 }]);
+
+    // Provider-scoped, matching the index it mirrors: the same id under two providers is NOT a
+    // violation, and this is asserted alongside the positive case so neither can be vacuous.
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: "same" },
+        { provider: "plane", provider_resource_id: "same" },
+      ]),
+    ).toEqual([]);
+
+    // Three rows report n=3, so the count is real rather than a boolean dressed up as one.
+    expect(
+      groupDuplicates([
+        { provider: "linear", provider_resource_id: "x" },
+        { provider: "linear", provider_resource_id: "x" },
+        { provider: "linear", provider_resource_id: "x" },
+      ]),
+    ).toEqual([{ provider: "linear", id: "x", n: 3 }]);
+  });
+
   it("THE DATABASE NOW REFUSES IT: two links sharing one issue cannot both exist", async () => {
     /**
      * THIS CASE INVERTED WHEN `ADOPTUNIQ-1` SHIPPED, and the inversion is the point.

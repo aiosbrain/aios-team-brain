@@ -692,7 +692,7 @@ Two things about it are load-bearing and easy to undo by accident:
    others`; each clause traces to a staged failure, and the last two abort a release with **zero dirty
    data** (a lock wait and a deadlock during preDeploy, while the old app version is still projecting).
    Guarded by `test/guards/task-pm-links-unique-index.test.ts`.
-2. **A skip is reported READ-side**, via `backstopHealth` on `ProjectionHealth` (Admin → PM sync). Not
+2. **A skip is reported READ-side**, via the `backstop` field on `ProjectionHealth` (`classifyBackstop`/`readBackstopStatus`) (Admin → PM sync). Not
    a `last_error` stamp: `persistSuccess` nulls `last_error` on every successful projection, so a
    stamp erases itself within one push cycle — and its UPDATE would sit outside the protected
    `create index`, able to abort the very release it reports on.

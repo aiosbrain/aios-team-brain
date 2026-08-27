@@ -494,12 +494,30 @@ async function adoptInbound(
         return true;
       });
     } catch (err) {
+      /**
+       * NARROW ON PURPOSE: contain ONLY a uniqueness rejection, and re-throw everything else.
+       *
+       * A blanket catch here would be worse than the abort it replaces. `skipped` does not feed
+       * `ok` (`summarizeInbound` counts `errors`), and a skipped-only result is not even recorded by
+       * the manual sync — so a database outage during every adoption would report a clean, successful
+       * run. Losing the pass is the RIGHT outcome for an outage; it is only the one-issue-one-row
+       * rejection that must not take the other candidates down with it.
+       *
+       * The code is available here because this path uses raw SQL through `withTransaction`, not the
+       * query builder that flattens errors to `{ message }`. Matching on the message text instead
+       * would break under a non-English `lc_messages` on a self-hosted fleet — and it would fail in
+       * the DANGEROUS direction, silently swallowing real outages.
+       */
+      const code = (err as { code?: string } | null)?.code;
+      if (code !== "23505") throw err;
       // Contained to this candidate: the transaction rolled back (no link row, and the task row's
       // origin/status/body are untouched), so the pass continues with the next one and Phase A's
       // accumulated applies survive. The message names the identifier AND the cause, because a bare
       // `skipped` entry is indistinguishable from the ordinary "no mirror task yet" skips above.
       result.skipped.push(
-        `${it.identifier}: adopt rejected — ${err instanceof Error ? err.message : "database error"}`
+        `${it.identifier}: adopt rejected — another link already claims this issue (${
+          (err as { constraint?: string } | null)?.constraint ?? "unique constraint"
+        })`,
       );
       continue;
     }
