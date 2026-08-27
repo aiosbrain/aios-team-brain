@@ -356,6 +356,8 @@ if the deploy flow's prose is affected.
 | 10 | `ENTRYPOINT ["/app/docker/entrypoint.sh"]` — bare path | AC2(a) |
 | 11 | **delete `CMD ["npm", "start"]`** | **AC2(b)** |
 | 11b | **`CMD ["true"]`** — non-empty, exec-form, serves nothing | **AC2(b)** |
+| 11c | **`CMD ["npm","start","--","--help"]`** — a defined script that prints help and exits 0 | **AC2(b)** |
+| 11d | **`CMD ["npm","build"]`** — in `package.json.scripts`, but npm answers `Unknown command` | **AC2(b)** |
 | 12 | assertion drops `/app/docker/bootstrap.mjs` | AC2(c) |
 | 13 | assertion weakens to `test -r` only (a dir or empty file would pass) | AC2(c) |
 | 13b | **assertion reverts to the `&&` AND-OR form** — the §2a-bis shape that cannot fail | **AC2(c)** |
@@ -367,10 +369,28 @@ if the deploy flow's prose is affected.
 | 17 | restore the "NOT wired into the Railway deploy path" sentence | AC3(a) |
 | 18 | header reads "Railway never builds this Dockerfile" — false, contains "Railway" | AC3(b) |
 | 19 | **delete `deploy.startCommand` from `railway.json`** | **AC3(c)** |
+| 19b | **`startCommand: "true"`** — non-empty, overrides the entrypoint, exits immediately | **AC3(c)** |
+| 20 | prepend a `` # escape=` `` parser directive — it changes what a backslash MEANS | parse test |
+| 21 | an instruction before the first `FROM` (only a global `ARG` is legal there) | parse test |
+| 22 | `COPY --from=2` — a numeric stage reference that cannot be statically resolved | AC1(c)+(f) |
+| 23 | **`node /app/docker/bootstrap.mjs?typo` in `docker/entrypoint.sh`** — the valid-PREFIX case | **AC2(c)** |
 
-Each row changes exactly ONE condition, so a redden attributes to one criterion, and every row must
-redden the criterion NAMED — not merely something. *These are unit-guard mutations; several would also
-fail AC4, which is manual and not part of the attribution.*
+Every row must redden the criterion NAMED — not merely something — and all 30 were **run**, not
+narrated. *These are unit-guard mutations; several would also fail AC4/AC5, which are manual.*
+
+⚠️ **Where isolation does NOT hold, stated rather than smoothed over.** Four rows (8, 9, 10, 15) also
+trip AC2(c), because the boot-chain expectation is DERIVED from the `ENTRYPOINT` by design — breaking
+the entrypoint necessarily breaks the derivation. Row 22 trips AC1(c) as well as (f). Rows 20/21 make
+the parse fail, which reddens the parse test and every test downstream of it by construction. In all
+of these the NAMED criterion is among the reddened; none is a case where the criterion under test
+stayed green.
+
+⚠️ **Row 23 SURVIVED on first run, and that is the point of running them.** `…/bootstrap.mjs?typo`
+yielded the valid PREFIX `/app/docker/bootstrap.mjs`, so the assertion covered a path node never
+requests and the guard reported everything fine. Closed by requiring a shell word boundary after the
+path. ⚠️ **Rows 20 and 21 first came back `REFUSING — ZERO tests ran`**: the parser threw at module
+scope, so vitest collected nothing, and zero-tests-ran is indistinguishable from all-green. A parse
+failure is now a red TEST rather than a collection error.
 
 ## 5. Risks
 
