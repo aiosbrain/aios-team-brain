@@ -24,6 +24,16 @@ import { db, seedTeam, type Seed } from "./helpers";
 
 const INDEX = "task_pm_links_provider_resource_uq";
 
+/**
+ * Every scratch-database case needs far more than the tier's 5s default, and the reason is real work
+ * rather than a slow assertion: each one CREATEs a database (Postgres copies `template1`), connects,
+ * runs DDL, and DROPs it — and under the full tier a dozen files do that concurrently. Two of three
+ * full runs timed out here at 5s while passing standalone in ~2s, which is the signature of
+ * contention, not of a hang. Raising it is the honest fix; the alternative is a test that reddens for
+ * reasons that have nothing to do with the index.
+ */
+const SCRATCH_TIMEOUT = 60_000;
+
 /** The guarded block, byte-identical to the shipped migration — read from disk, never paraphrased. */
 async function guardedBlock(): Promise<string> {
   const { readFileSync } = await import("node:fs");
@@ -147,7 +157,7 @@ describe("ADOPTUNIQ-1 — what the index enforces once installed", () => {
       expect(err.code).toBe("23505");
       expect(err.constraint).toBe(INDEX);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("PERMITS unlimited NULL resource ids — the live orphan row cannot be broken by this", async () => {
     await withScratchDb(async (c) => {
@@ -158,7 +168,7 @@ describe("ADOPTUNIQ-1 — what the index enforces once installed", () => {
       const n = await c.query(`select count(*)::int as n from task_pm_links where provider_resource_id is null`);
       expect(n.rows[0].n).toBe(3);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("keys on ALL THREE columns — same id under a different team or provider is allowed", async () => {
     await withScratchDb(async (c) => {
@@ -171,7 +181,7 @@ describe("ADOPTUNIQ-1 — what the index enforces once installed", () => {
       // and the actual duplicate still rejects, so the permissive cases above aren't vacuous
       await expect(insertLink(c, { rid: "shared", team: TEAM_A, provider: "linear" })).rejects.toMatchObject({ code: "23505" });
     });
-  });
+  }, SCRATCH_TIMEOUT);
 });
 
 describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () => {
@@ -193,7 +203,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       const rows = await c.query(`select count(*)::int as n from task_pm_links`);
       expect(rows.rows[0].n, "no row may be touched by the skip").toBe(2);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   /**
    * THE POSITIVE CONTROL FOR THE INVARIANT QUERY, rehomed from
@@ -233,7 +243,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       );
       expect(after.rows.map((r) => r.provider_resource_id)).toEqual(["dup"]);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("DIRTY DATA committed by a SECOND connection is contained identically", async () => {
     await withScratchDb(async (c, name) => {
@@ -252,7 +262,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       await c.query(await guardedBlock());
       expect(await indexCount(c)).toBe(0);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("SELF-HEAL asymmetry: the duplicate-data skip does NOT heal until the data is repaired", async () => {
     await withScratchDb(async (c) => {
@@ -272,7 +282,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       await c.query(await guardedBlock());
       expect(await indexCount(c), "repaired -> installed on the next deploy").toBe(1);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("is IDEMPOTENT on a clean database — replay does not raise or duplicate", async () => {
     await withScratchDb(async (c) => {
@@ -281,7 +291,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       await c.query(await guardedBlock());
       expect(await indexCount(c)).toBe(1);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   /**
    * THE ROUND-2 REGRESSION TEST. `pg-load-schema.mjs:66-67` sets `lock_timeout`. A non-concurrent
@@ -313,7 +323,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
         await holder.end().catch(() => {});
       }
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   /**
    * THE ROUND-3 REGRESSION TEST, and it exists because the mutation SURVIVED without it.
@@ -372,7 +382,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
         await old.end().catch(() => {});
       }
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("the LOCK skip DOES self-heal once the lock clears", async () => {
     await withScratchDb(async (c, name) => {
@@ -393,7 +403,7 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       await c.query(await guardedBlock());
       expect(await indexCount(c), "contention cleared -> installed, no operator step").toBe(1);
     });
-  });
+  }, SCRATCH_TIMEOUT);
 });
 
 describe("ADOPTUNIQ-1 — the skip is AUDIBLE, and survives the real loader", () => {
@@ -426,7 +436,7 @@ describe("ADOPTUNIQ-1 — the skip is AUDIBLE, and survives the real loader", ()
         await listening.end().catch(() => {});
       }
     });
-  });
+  }, SCRATCH_TIMEOUT);
 
   it("THE REAL LOADER survives a dirty upgrade — schema.sql AND every migration still apply", async () => {
     /**
@@ -545,7 +555,7 @@ describe("ADOPTUNIQ-1 — the read-side backstop signal", () => {
       await c.query(await guardedBlock());
       expect(await read()).toBe("installed");
     });
-  });
+  }, SCRATCH_TIMEOUT);
 });
 
 describe("ADOPTUNIQ-1 — the live schema really carries the constraint", () => {
