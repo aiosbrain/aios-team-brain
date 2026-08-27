@@ -360,6 +360,7 @@ if the deploy flow's prose is affected.
 | 13 | assertion weakens to `test -r` only (a dir or empty file would pass) | AC2(c) |
 | 13b | **assertion reverts to the `&&` AND-OR form** — the §2a-bis shape that cannot fail | **AC2(c)** |
 | 14 | **insert `RUN rm /app/docker/entrypoint.sh` AFTER the assertion** | **AC2(d)** |
+| 14c | **`ENV PATH=/nope` after the assertion** — green build, dead boot (`entrypoint.sh:5` resolves `node` via PATH) | **AC2(d)** |
 | 14b | **append `&& rm /app/docker/entrypoint.sh` INSIDE the assertion instruction** | **AC2(c)** |
 | 15 | `ENTRYPOINT` → `/app/scripts/railway-start.sh` — tracked and corresponds, but unasserted | AC2(e) |
 | 16 | assertion AND `ENTRYPOINT` both → `/app/docker/nope.sh` | AC2(f) |
