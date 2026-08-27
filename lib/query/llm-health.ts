@@ -2,6 +2,7 @@ import "server-only";
 import { runSql } from "@/lib/db/pg/pool";
 import { classifyFailure, foldStreak, FAILURES_TO_CONFIRM } from "@/lib/ingest/failure-streak";
 import { diagnoseProviderFault } from "@/lib/llm/provider-fault";
+import { RAW_ERROR_CLIP } from "@/lib/ingest/leg-detail";
 
 /**
  * Answering-model health for the admin dashboard. Non-streaming LLM tasks funnel through
@@ -82,7 +83,7 @@ export interface LlmTaskHealth {
    * importing it there would break `next build` while `tsc` and every unit test stayed green — the
    * failure CI caught once already on this lane.
    */
-  diagnosis: { headline: string; action: string } | null;
+  diagnosis: { kind: string; headline: string; action: string } | null;
   lastFailedAt: string | null;
   lastOkAt: string | null;
 }
@@ -257,16 +258,20 @@ export function deriveLlmState(tasks: readonly LlmTaskHealth[]): LlmHealthState 
  * was false in both directions: it named a feature the leg had never observed, and it named only two
  * when more could be failing. Pure and exported so the sentence is testable without a database.
  */
-/** The provider's own words, kept available but never allowed to BE the message (LLMCREDIT-3). */
-const RAW_ERROR_CLIP = 160;
+/** The provider's own words, kept available but never allowed to BE the message (LLMCREDIT-3).
+ *  ⚠️ `RAW_ERROR_CLIP` is IMPORTED, not re-declared: `leg-detail` calls itself "ONE constant", and a
+ *  local copy here made that sentence false the moment it was written. A review counted three. */
 function clipError(e: string): string {
   return e.length <= RAW_ERROR_CLIP ? e : `${e.slice(0, RAW_ERROR_CLIP)}…`;
 }
 
-/** The diagnosis for one task's own recorded error, or null when nothing confident can be said. */
-function faultOfTask(error: string | null): { headline: string; action: string } | null {
+/** The diagnosis for one task's own recorded error, or null when nothing confident can be said.
+ *  ⚠️ `kind` is KEPT. The first version projected it away, which forced `degradedNote` to re-derive
+ *  the same answer from the same string — two independently-computed diagnoses on one object, free to
+ *  disagree for any task not built by `deriveTaskHealth`. A review caught it; there is one answer now. */
+function faultOfTask(error: string | null): { kind: string; headline: string; action: string } | null {
   const f = diagnoseProviderFault(error);
-  return f ? { headline: f.headline, action: f.action } : null;
+  return f ? { kind: f.kind, headline: f.headline, action: f.action } : null;
 }
 
 export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
@@ -297,7 +302,9 @@ export function degradedNote(tasks: readonly LlmTaskHealth[]): string {
   // concurrently, both tasks of this banner. That version would have filed one under the other, and
   // WHICH one led depended on Map insertion order, so the diagnosis could change between page loads.
   // A misattributed diagnosis is the thing this whole slice exists to avoid.
-  const diagnosed = failing.map((t) => ({ task: t, fault: diagnoseProviderFault(t.lastError) }));
+  // Reads the FIELD rather than re-deriving it — see `faultOfTask`. A task built without one (an old
+  // fixture, a future producer) still derives, so this cannot go silently blank.
+  const diagnosed = failing.map((t) => ({ task: t, fault: t.diagnosis ?? diagnoseProviderFault(t.lastError) }));
   const kinds = new Set(diagnosed.map((d) => d.fault?.kind).filter(Boolean));
   const fault = kinds.size === 1 ? diagnosed.find((d) => d.fault)!.fault! : null;
   const lead = fault
