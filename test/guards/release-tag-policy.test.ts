@@ -237,6 +237,10 @@ describe("release: the operator-facing commands must actually run (criteria 5, 6
     expect(doc).toMatch(/access_enforcement\s*=\s*'permissive'/);
     expect(doc).toMatch(/INGEST_POLL_ENABLED/);
     expect(doc).toMatch(/release\/v0\.11\.0/);
+    // …and says WHERE those steps run. Both the flip command and the column the gate reads are
+    // DELETED by the retirement (`set-access-enforcement` absent at HEAD; `teams.access_enforcement`
+    // dropped), so an operator running them after upgrading gets an error rather than a warning.
+    expect(doc).toMatch(/not after the upgrade/);
   });
 });
 

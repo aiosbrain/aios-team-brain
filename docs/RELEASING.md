@@ -137,6 +137,12 @@ predates the entire PRET series.
 2. **Let it boot, and let auto-flip converge.** The marker is written by the running application
    (`instrumentation.ts`), not by a migration — applying the schema alone does **not** satisfy the
    precondition.
+> **Steps 3 and 4 run against the `v0.11.0` release and its database — not after the upgrade.** The
+> retirement deletes both: `set-access-enforcement` is gone from the admin CLI at HEAD, and
+> `teams.access_enforcement` is dropped from the schema. Verified: the command exists at `803122ff`
+> (`scripts/admin.ts:369`) and the column at `803122ff:postgres/schema.sql:162`; both are absent at
+> HEAD. Running either after upgrading gives a confusing error, not a warning.
+
 3. **Flip any team auto-flip could not**, using the command that release carries:
 
    ```bash
