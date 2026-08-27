@@ -515,6 +515,55 @@ describe("inbound adopt — Linear-native issues become owned team-tier tasks (r
     return (data as { id: string }).id;
   }
 
+  /**
+   * ADOPTUNIQ-1 — the per-candidate containment must be NARROW.
+   *
+   * `adoptInbound` now catches around its `withTransaction` so that one contested issue cannot take
+   * down the whole pass. That catch swallows ONLY SQLSTATE 23505 and re-throws everything else, and
+   * the re-throw is the load-bearing half: `skipped` does not feed `ok` (`summarizeInbound` counts
+   * `errors`), and a skipped-only result is not recorded by the manual sync at all — so a blanket
+   * catch would turn a database outage during every adoption into a clean, successful run. Losing
+   * the pass is the CORRECT outcome for an outage.
+   *
+   * Staged with a temporary trigger raising a non-23505 error; dropped in `finally`, because a
+   * surviving trigger would poison every later test against this database.
+   */
+  it("a NON-uniqueness failure during adopt PROPAGATES — an outage must not read as a clean pass", async () => {
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+    const mirror = await seedProject(seed.teamId, "linear-eng");
+    await seedMirrorTask(seed, mirror, "ENG-9");
+
+    await runSql(`
+        create or replace function adoptuniq_inbound_boom() returns trigger as $fn$
+        begin
+          if new.row_key = 'ENG-9' then
+            raise exception 'simulated outage' using errcode = '08006';
+          end if;
+          return new;
+        end $fn$ language plpgsql;
+        create trigger adoptuniq_inbound_boom_trg before insert on task_pm_links
+          for each row execute function adoptuniq_inbound_boom();
+    `);
+    try {
+      const native = issue("li-n9", "ls-started", {
+        identifier: "ENG-9",
+        title: "Native ENG-9",
+        description: "A Linear-authored description",
+        url: "https://linear.app/li-n9",
+      });
+      const mock = linearMock([native]);
+      await expect(
+        runInboundForTeam(db(), seed.teamId, { fetchImpl: mock.fetchImpl }),
+      ).rejects.toThrow(/simulated outage/i);
+    } finally {
+      await runSql(`
+        drop trigger if exists adoptuniq_inbound_boom_trg on task_pm_links;
+        drop function if exists adoptuniq_inbound_boom();
+      `);
+    }
+  });
+
   it("adopts: backfills the link + footer, flips origin to 'ui', seeds body, and never duplicates", async () => {
     const seed = await seedTeam();
     await seedLinearPrimary(seed);

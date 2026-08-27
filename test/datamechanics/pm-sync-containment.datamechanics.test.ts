@@ -4,7 +4,15 @@ import { describe, expect, it, vi } from "vitest";
 import { projectRows, projectTask, type ProjectionTaskRow } from "@/lib/pm-sync/project";
 import { resolvePrimaryProvider } from "@/lib/pm-sync/project";
 import { upsertIntegration, setIntegrationSecret } from "@/lib/integrations/manage";
+import { withTransaction } from "@/lib/db/pg/tx";
 import { db, seedTeam, type Seed } from "./helpers";
+
+/** Raw DDL against the tier's database — the query builder cannot express triggers. */
+async function rawExec(sql: string): Promise<void> {
+  await withTransaction(async (c) => {
+    await c.query(sql);
+  });
+}
 
 /**
  * ADOPTUNIQ-1 — CONTAINMENT. The index is only safe because a rejected write is contained to the row
@@ -319,5 +327,64 @@ describe("ADOPTUNIQ-1 — the `contested` channel", () => {
     // retry semantics, not the batch-internal double-mutation this guards.
     expect(report.status).toBe("failed");
     expect(mock.mutations).toHaveLength(1);
+  });
+});
+
+describe("ADOPTUNIQ-1 — inbound containment is NARROW", () => {
+  /**
+   * The containment must swallow a uniqueness rejection and NOTHING else.
+   *
+   * A blanket catch would be worse than the abort it replaced: `skipped` does not feed `ok`
+   * (`summarizeInbound` counts `errors`), and a skipped-only result is not recorded by the manual
+   * sync at all — so a database outage during every adoption would report a clean, successful run.
+   * Losing the pass is the CORRECT outcome for an outage.
+   *
+   * Staged with a temporary trigger raising a NON-23505 error, because that is the only way to make
+   * the adopt transaction fail for a reason that is not a constraint the schema already enforces.
+   * Installed and dropped inside this test; `finally` runs even on assertion failure, since a
+   * surviving trigger would poison every later test against this database.
+   */
+  it("a NON-uniqueness database failure PROPAGATES rather than being reported as a clean run", async () => {
+    const seed = await seedTeam();
+    await seedLinearPrimary(seed);
+    const project = await makeProject(seed, "acme");
+    const row = await makeTask(seed, project, "BOOM");
+
+    await db().from("task_pm_links").insert({
+      team_id: seed.teamId,
+      project_id: project,
+      row_key: "BOOM",
+      provider: "linear",
+      provider_external_id: "BOOM",
+    });
+
+    await rawExec(`
+      create or replace function adoptuniq_boom() returns trigger as $fn$
+      begin
+        if new.row_key = 'BOOM' then
+          raise exception 'simulated outage' using errcode = '08006';
+        end if;
+        return new;
+      end $fn$ language plpgsql;
+      create trigger adoptuniq_boom_trg before update on task_pm_links
+        for each row execute function adoptuniq_boom();
+    `);
+    try {
+      const mock = linearMock();
+      const primary = await resolvePrimaryProvider(db(), seed.teamId);
+      // The outbound path is the reachable one for this trigger, and it exercises the same rule:
+      // a non-uniqueness persist failure must be reported, never silently treated as success.
+      const reports = await projectRows(db(), primary as never, [row], {
+        fetchImpl: mock.fetchImpl,
+        throttleMs: 0,
+      });
+      expect(reports[0].status, "an outage-shaped failure must not read as synced").toBe("failed");
+      expect(reports[0].error).toMatch(/simulated outage/i);
+    } finally {
+      await rawExec(`
+        drop trigger if exists adoptuniq_boom_trg on task_pm_links;
+        drop function if exists adoptuniq_boom();
+      `);
+    }
   });
 });
