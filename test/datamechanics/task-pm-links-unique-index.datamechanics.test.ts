@@ -63,6 +63,11 @@ async function withScratchDb<T>(fn: (c: Client, name: string) => Promise<T>): Pr
         provider_resource_id text,
         row_key text not null
       );
+      -- A second relation, so a DEADLOCK cycle can be staged: the deploy transaction locks this one
+      -- first (standing in for the ACCESS EXCLUSIVE locks schema.sql accumulates from its earlier
+      -- alter-table-if-not-exists no-ops), while the old app version waits on it.
+      create table other_rel (x int);
+      insert into other_rel values (1);
     `);
     return await fn(c, name);
   } finally {
@@ -85,6 +90,22 @@ async function insertLink(
     `insert into task_pm_links (team_id, provider, provider_resource_id, row_key) values ($1,$2,$3,$4)`,
     [over.team ?? TEAM_A, over.provider ?? "linear", over.rid === undefined ? "issue-1" : over.rid, over.key ?? randomUUID().slice(0, 8)],
   );
+}
+
+/** Block until some backend is actually WAITING on `rel` — polling beats a fixed sleep, which would
+ *  either flake on a slow machine or silently stage no contention at all. */
+async function waitForWaiter(c: Client, rel: string): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    const r = await c.query(
+      `select count(*)::int as n from pg_locks l
+         join pg_class cl on cl.oid = l.relation
+        where cl.relname = $1 and not l.granted`,
+      [rel],
+    );
+    if ((r.rows[0].n as number) > 0) return;
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  throw new Error(`no backend ever waited on ${rel} — the deadlock was never staged`);
 }
 
 async function indexCount(c: Client): Promise<number> {
@@ -229,6 +250,59 @@ describe("ADOPTUNIQ-1 — the block SKIPS rather than aborting the release", () 
       } finally {
         await holder.query(`rollback`).catch(() => {});
         await holder.end().catch(() => {});
+      }
+    });
+  });
+
+  /**
+   * THE ROUND-3 REGRESSION TEST, and it exists because the mutation SURVIVED without it.
+   *
+   * `deadlock_timeout` defaults to 1s — well before the 15s `lock_timeout` — and by the time this
+   * block runs, `schema.sql` has already taken ACCESS EXCLUSIVE locks from its earlier
+   * `alter table … if not exists` no-ops while the old app version is still serving. So a genuine
+   * cycle is ordinary, not exotic. Staged and confirmed: this transaction is chosen victim, and
+   * without `when deadlock_detected` the 40P01 escapes, poisons the implicit transaction, and aborts
+   * the release — on a CLEAN table, with zero dirty data.
+   */
+  it("DEADLOCK on a CLEAN table: contained, and the schema load continues", async () => {
+    await withScratchDb(async (c, name) => {
+      const url = new URL(adminUrl());
+      url.pathname = `/${name}`;
+      const old = new Client({ connectionString: url.toString() });
+      await old.connect();
+      try {
+        await c.query(`set deadlock_timeout = '100ms'`);
+        await c.query(`set lock_timeout = 30000`);
+
+        // 1. The old app takes ROW EXCLUSIVE on task_pm_links — the relation we are about to index.
+        await old.query(`begin`);
+        await old.query(
+          `insert into task_pm_links (team_id, provider, provider_resource_id, row_key) values ($1,'linear','held','H')`,
+          [TEAM_A],
+        );
+
+        // 2. The deploy transaction takes ACCESS EXCLUSIVE on the other relation.
+        await c.query(`begin`);
+        await c.query(`lock table other_rel in access exclusive mode`);
+
+        // 3. The old app now requests the relation we hold -> it waits on us. NOT awaited: it blocks.
+        const blocked = old.query(`update other_rel set x = x + 1`).catch(() => undefined);
+        await waitForWaiter(c, "other_rel");
+
+        // 4. We request the relation IT holds -> cycle. One of us is the victim.
+        await c.query(await guardedBlock());
+        await c.query(`create table later_ran (x int)`);
+        await c.query(`commit`);
+
+        await old.query(`rollback`).catch(() => {});
+        await blocked;
+
+        expect(await indexCount(c), "deadlocked -> not installed").toBe(0);
+        const later = await c.query(`select count(*)::int as n from pg_tables where tablename = 'later_ran'`);
+        expect(later.rows[0].n, "the release must NOT abort on a deadlock").toBe(1);
+      } finally {
+        await old.query(`rollback`).catch(() => {});
+        await old.end().catch(() => {});
       }
     });
   });
