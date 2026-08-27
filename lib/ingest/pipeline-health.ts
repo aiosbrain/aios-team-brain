@@ -153,18 +153,28 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   arcs: null,
   // The record-only-when-active rule in its strongest form. `doc_task_infer` IS polled reliably — the
   // scheduler calls it every tick for every team (`lib/ingest/scheduler.ts`), alongside the timeline's
-  // background rebuild — so this is NOT a case of "maybe nothing triggered it". It is that FIVE of its
-  // eight outcomes write no `ingest_runs` row at all: `cooldown` (12h, `DOC_TASK_INFER_INTERVAL_HOURS`),
-  // `no-llm`, `no-candidates`, `nothing-to-score`, and `unchanged` all return before `record()`. So on a
-  // quiet corpus — no new scoreable docs in the 7-day window — a perfectly healthy leg polled every 30
-  // minutes still writes nothing for days, and its newest row's age is unbounded at ANY threshold. That
-  // is why this is `null` rather than "12h + grace": no finite number is correct.
+  // background rebuild — so this is NOT a case of "maybe nothing triggered it". It is that most of its
+  // outcomes write no `ingest_runs` row: `cooldown` (12h, `DOC_TASK_INFER_INTERVAL_HOURS`) and `no-llm`
+  // always return before any write, and the four clean-and-idle outcomes (`no-candidates`,
+  // `nothing-to-score` at either site, `unchanged`) write only the health-clearing row described below,
+  // and only when there is a failure standing. So on a quiet corpus a healthy leg polled every 30
+  // minutes still writes nothing for days once its verdict is `ok`, and its newest row's age is
+  // unbounded at ANY threshold. That is why this is `null` rather than "12h + grace": no finite number
+  // is correct.
   //
   // Observed in prod flagging a leg that had never failed, on a measured 12.1–12.4h cadence, while every
   // connector was running on time — the banner said the brain wasn't getting fresh data when it was.
-  // Real failures still surface: the model-null and thrown-error paths DO record (`ok=false`), and since
-  // the cooldown counts failed runs too, a persistent failure keeps re-recording and stays the newest
-  // row. Shortfalls also show as `workers_failed` in the run meta.
+  //
+  // ⚠️ This block used to end with a claim that the cooldown counting failed runs meant a standing
+  // failure would keep re-recording and stay the newest row. TRUE ONLY WHILE IT PERSISTS, and that gap was
+  // BANNERSTUCK-1: when the cause healed and no work was demanded, nothing re-recorded, the four-long
+  // 402 streak stayed newest, and the loud banner latched red with no future event able to clear it —
+  // `failing` includes `confirmed` regardless of age, so staleness (`null`, correctly) cannot help.
+  // A clean-and-idle pass now records a BACKDATED `ok=true` row (`meta.health_clear`) when the newest
+  // verdict is a failure, which breaks the streak; see `lib/dashboard/doc-task-infer-run.recordClearingRun`
+  // for why backdating rather than a guard is what stops it masking a concurrent failure.
+  // Real failures still surface: the model-null and thrown-error paths record `ok=false`, and shortfalls
+  // show as `workers_failed` in the run meta.
   doc_task_infer: null,
 };
 

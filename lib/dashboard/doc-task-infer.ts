@@ -52,6 +52,16 @@ export interface InferDoc {
   id: string;
   /** The doc's credited worker (from the shared attribution oracle), NOT the raw pusher. */
   memberId: string | null;
+  /**
+   * What the doc's RAW `items.member_id` resolves to on this team — the thing `memberId` alone cannot
+   * tell you once it is null (BANNERSTUCK-1).
+   *
+   * `memberId` is null for a connector-owned doc AND for one whose owner resolves to no member row,
+   * and those mean opposite things: the first is a doc with no human to reason about (nothing to do,
+   * legitimately), the second is a data-integrity fault. Only the health-clearing decision needs to
+   * tell them apart; scoring drops both either way.
+   */
+  ownerKind: OwnerKind;
   title: string;
   /** `items.content_sha256` — an edited doc must re-score, so the hash keys on content, not id. */
   contentSha: string;
@@ -95,6 +105,35 @@ export interface InferredLink {
  */
 export function scoreableDocs(docs: readonly InferDoc[]): InferDoc[] {
   return docs.filter((d) => !d.hasDeterministicLink && d.access !== "external" && !!d.memberId);
+}
+
+/** What a doc's raw owner resolves to. `human` implies a non-null `memberId` — see `creditedPrimaryId`. */
+export type OwnerKind = "human" | "connector" | "unresolvable";
+
+/**
+ * Was any doc dropped for a reason that means "this pass could not judge", rather than "there is
+ * nothing here to do"? (BANNERSTUCK-1.)
+ *
+ * The three scoring drops are NOT equivalent as health evidence. Already-linked and external are
+ * settled facts — the work is done or deliberately out of scope. A connector-owned doc has no human
+ * to attribute, by design (`lib/attribution/contributor-credit` excludes connectors), so it is also
+ * a genuine nothing-to-do. But an owner that resolves to NO member row for this team is a data
+ * fault, and a pass that hit one has not established that the leg is healthy — so it must not be
+ * allowed to clear a standing failure.
+ *
+ * Note what is deliberately absent: "a HUMAN-owned doc with no attribution". That state cannot occur
+ * — the wide scan excludes null `member_id` in SQL, `creditedPrimaryId` returns null only when the
+ * owner fails `isHuman`, and a real oracle failure THROWS in strict mode and is recorded as a failed
+ * run. Two spec reviews independently derived this after an earlier draft built a criterion on it.
+ */
+export function hasUnjudgeableDrop(docs: readonly InferDoc[]): boolean {
+  // The first two predicates MIRROR `scoreableDocs`, and that is load-bearing rather than tidy: a doc
+  // that is already linked, or external, is legitimately dropped for THAT reason whatever its owner
+  // resolves to. Counting it here would let one external doc with a broken owner block clearing
+  // forever — the spec calls those drops legitimate, and without this the code disagreed with it.
+  return docs.some(
+    (d) => !d.hasDeterministicLink && d.access !== "external" && !d.memberId && d.ownerKind === "unresolvable"
+  );
 }
 
 /**

@@ -14,6 +14,7 @@ import {
   applyInferredLinks,
   buildInferPrompt,
   candidatesFor,
+  hasUnjudgeableDrop,
   inferenceInputsHash,
   isScoreableSource,
   parseInferResponse,
@@ -21,6 +22,7 @@ import {
   type InferCandidate,
   type InferDoc,
   type InferredLink,
+  type OwnerKind,
 } from "./doc-task-infer";
 import { recordIngestRun } from "@/lib/ingest/runs";
 
@@ -87,6 +89,13 @@ const TIMEOUT_MS = 45_000;
  */
 const COOLDOWN_MS = Math.max(1, Number(process.env.DOC_TASK_INFER_INTERVAL_HOURS) || 12) * 3_600_000;
 
+/**
+ * How many recent rows `lastRun` reads to find the newest PAID one. Clearing rows are written only
+ * when a failure stands, and writing one makes the verdict `ok`, so at most a couple can ever sit at
+ * the head (two concurrent passes can both write). A small window is therefore ample, and bounded.
+ */
+const CLOCK_SCAN = 10;
+
 /** `ingest_runs.source` for this leg — also the key used to find the previous run's inputs hash. */
 export const DOC_TASK_INFER_SOURCE = "doc_task_infer";
 
@@ -146,6 +155,19 @@ async function runDocTaskInferenceWithPass(
     const prior = await lastRun(db, teamId);
     if (prior && Date.now() - prior.finishedAt < COOLDOWN_MS) return { scored: 0, linked: 0, skipped: "cooldown" };
 
+    /**
+     * A pass that ran cleanly and found nothing to do is contrary evidence against a STANDING failure
+     * — record it so the streak can break (BANNERSTUCK-1). Only when the newest verdict is a failure:
+     * in the steady state this writes nothing, which is what keeps the paid-run cooldown untouched
+     * (a clearing row that became `lastRun` would defer real scoring by up to a cooldown) and keeps
+     * ~730 rows/team/year out of an append-only table.
+     *
+     * NOT called for `cooldown` (the pass never ran) or `no-llm` (unconfigured — a different state).
+     */
+    const clearIfHealed = async (reason: string): Promise<void> => {
+      if (prior?.ok === false) await recordClearingRun(db, teamId, startedAt, reason);
+    };
+
     // Spend nothing when the team has no model configured (every data-mechanics team, most self-hosts).
     const keys = await resolveAnsweringKeys(db, teamId).catch(() => null);
     if (!keys || !llmConfigured(keys)) return { scored: 0, linked: 0, skipped: "no-llm" };
@@ -192,7 +214,20 @@ async function runDocTaskInferenceWithPass(
 
     const tasks = (taskRes.data ?? []) as { id: string; row_key: string | null; title: string; status: string | null; assignee: string | null }[];
     const items = (itemRes.data ?? []) as ItemRow[];
-    if (!tasks.length) return { scored: 0, linked: 0, skipped: "no-candidates" };
+    if (!tasks.length) {
+      // No bound to worry about: an EMPTY task list is complete however wide the limit was.
+      await clearIfHealed("no-candidates");
+      return { scored: 0, linked: 0, skipped: "no-candidates" };
+    }
+
+    /**
+     * Did the item read fill its page? `docRows`/`allScoreable`/`pending` are all JS filters over this
+     * ONE bounded page (`limit(ITEM_SCAN)`, ordered `work_at desc`), so when it saturates, "nothing to
+     * score" means "nothing in the newest 500" — item 501 can be an unscored design doc. A saturated
+     * pass has not observed the eligible set and must not clear (BANNERSTUCK-1 §2a). `visibleItems`
+     * is a passthrough for `team`, so nothing post-drops rows and this count is honest.
+     */
+    const scanSaturated = items.length >= ITEM_SCAN;
 
     // AUTHORED DOCUMENTS only — `isScoreableSource` carries the reasoning for each exclusion, and
     // `classifyWork` drops SIGNAL (a decision, a meeting: data ABOUT work).
@@ -203,7 +238,10 @@ async function runDocTaskInferenceWithPass(
       return classifyWork(r.kind, str(fm.source)) === "work";
       // No work-time check here: the SQL window above already restricted to rows the timeline would keep.
     });
-    if (!docRows.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
+    if (!docRows.length) {
+      if (!scanSaturated) await clearIfHealed("nothing-to-score");
+      return { scored: 0, linked: 0, skipped: "nothing-to-score" };
+    }
 
     // DETERMINISTIC WINS: anything the issue-key matcher already links is never offered to the model.
     const deterministic = computeTaskLinks(
@@ -223,9 +261,22 @@ async function runDocTaskInferenceWithPass(
       { strict: true, items: docRows.map((r) => ({ id: r.id, member_id: r.member_id, member_id_locked: r.member_id_locked ?? null })) }
     );
 
+    /**
+     * What each doc's RAW owner is, which `credit` alone cannot say once `primaryId` is null: a
+     * connector (no human to reason about — a legitimate nothing-to-do) or an id that resolves to no
+     * member row for this team (a data fault). Only the health-clearing decision needs the difference
+     * (BANNERSTUCK-1); scoring drops both regardless.
+     *
+     * A plain read rather than widening the attribution oracle or `teamRoster`: the oracle's return
+     * carries credited ids, not owner kinds, and `teamRoster` filters `status='active'`, which would
+     * make a deactivated human look unresolvable.
+     */
+    const ownerKindById = await ownerKinds(db, teamId, docRows.map((r) => r.member_id));
+
     const docs: InferDoc[] = docRows.map((r) => ({
       id: r.id,
       memberId: credit.get(r.id)?.primaryId ?? null,
+      ownerKind: ownerKindById.get(r.member_id ?? "") ?? "unresolvable",
       title: str(r.frontmatter?.title) ?? (r.path ? r.path.split("/").pop() ?? r.path : "(untitled)"),
       contentSha: r.content_sha256 ?? "",
       access: r.access === "external" ? "external" : "team",
@@ -234,7 +285,13 @@ async function runDocTaskInferenceWithPass(
     }));
 
     const allScoreable = scoreableDocs(docs);
-    if (!allScoreable.length) return { scored: 0, linked: 0, skipped: "nothing-to-score" };
+    if (!allScoreable.length) {
+      // Every doc was dropped. Deterministic-linked, external and connector-owned are settled facts —
+      // nothing to do. An owner resolving to NO member row is a data fault, and a pass that hit one
+      // has judged nothing, so it must not clear (`hasUnjudgeableDrop`).
+      if (!scanSaturated && !hasUnjudgeableDrop(docs)) await clearIfHealed("nothing-to-score");
+      return { scored: 0, linked: 0, skipped: "nothing-to-score" };
+    }
 
     // Resolve each task's assignee to a member so ranking uses the identity mapping, not the raw string
     // (prod carries `Chetan` / `chetan.nandakumar` / `John Ellison` / `john` for two people).
@@ -267,7 +324,10 @@ async function runDocTaskInferenceWithPass(
     const inputsHash = inferenceInputsHash([], candidates, DOC_TASK_SYSTEM);
     const alreadyScored = await scoredKeys(db, teamId, allScoreable.map((d) => d.id));
     const pending = allScoreable.filter((d) => !alreadyScored.has(`${d.id}:${d.contentSha}:${inputsHash}`));
-    if (!pending.length) return { scored: 0, linked: 0, skipped: "unchanged" };
+    if (!pending.length) {
+      if (!scanSaturated) await clearIfHealed("unchanged");
+      return { scored: 0, linked: 0, skipped: "unchanged" };
+    }
     // OLDEST-FIRST is now just fairness: the scored ones drop out of `pending`, so the queue drains
     // whichever end it is taken from. Oldest-first stops a steady drip of new docs starving the tail.
     const scoreable = pending.slice(-batchCap).reverse();
@@ -447,24 +507,45 @@ async function attachBodies(db: DbClient, teamId: string, docs: InferDoc[]): Pro
  *    The recorded `meta.inputs_hash` stays as run PROVENANCE — it answers "what question did this run
  *    ask?" when reading the ledger — but nothing branches on it any more.
  */
-async function lastRun(db: DbClient, teamId: string): Promise<{ finishedAt: number; inputsHash: string | null } | null> {
+async function lastRun(
+  db: DbClient,
+  teamId: string
+): Promise<{ finishedAt: number; inputsHash: string | null; ok: boolean } | null> {
   try {
     const { data } = await db
       .from("ingest_runs")
-      .select("meta, ok, finished_at")
+      .select("id, meta, ok, finished_at")
       .eq("team_id", teamId)
       .eq("source", DOC_TASK_INFER_SOURCE)
       .order("finished_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const row = data as { meta?: { inputs_hash?: unknown } | null; ok?: boolean; finished_at?: string | Date } | null;
-    if (!row) return null;
-    const raw = row.finished_at;
+      // `id` desc as the SAME tie-break `STREAK_SQL` uses (`lib/ingest/pipeline-health.ts`). Without it
+      // two rows sharing a millisecond — a fast fail then a retry in one tick — can resolve here in the
+      // opposite order to the banner, so `ok` below would disagree with the verdict the user is seeing.
+      .order("id", { ascending: false })
+      .limit(CLOCK_SCAN);
+    const rows = (data ?? []) as {
+      meta?: { inputs_hash?: unknown; health_clear?: unknown } | null;
+      ok?: boolean;
+      finished_at?: string | Date;
+    }[];
+    // THE PAID-RUN CLOCK IGNORES CLEARING ROWS. A `health_clear` row is written at the moment the leg
+    // HEALS and carries a near-current timestamp, so counting it would start a fresh 12h cooldown at
+    // exactly the point the leg recovers: a doc arriving a minute later would wait until evening for
+    // linking that costs one tick today. The cooldown exists to bound PAID runs, and a clearing pass
+    // paid for nothing.
+    const newest = rows[0] ?? null;
+    const row = rows.find((r) => r?.meta?.health_clear !== true) ?? null;
+    if (!newest) return null;
+    const raw = row?.finished_at;
     const finishedAt = raw ? (typeof raw === "string" ? Date.parse(raw) : new Date(raw).getTime()) : 0;
-    const h = row.ok ? row.meta?.inputs_hash : null;
+    const h = row?.ok ? row.meta?.inputs_hash : null;
     return {
+      // From the newest PAID run — see above.
       finishedAt: Number.isFinite(finishedAt) ? finishedAt : 0,
       inputsHash: typeof h === "string" && h ? h : null,
+      // …but the VERDICT is the newest row of ANY kind, because that is what the banner reads. Taking
+      // it from the paid row would make the pass re-clear a leg it has already cleared, every tick.
+      ok: newest.ok === true,
     };
   } catch {
     return null; // unreadable history → run (spending once beats silently never running again)
@@ -512,6 +593,80 @@ async function markScored(
     { onConflict: "team_id,item_id" }
   );
   if (error) console.warn("[doc-task] could not record scored batch:", error.message);
+}
+
+/**
+ * Record that this pass ran cleanly and found no work — the row that lets a CONFIRMED failure streak
+ * clear (BANNERSTUCK-1).
+ *
+ * ⚠️ `finishedAt` is the pass's OWN `startedAt`, and that is the whole correctness argument. Two
+ * callers reach this leg (`lib/ingest/scheduler.ts` and `lib/dashboard/timeline-cache.ts`) and they
+ * are not mutually single-flighted, so a clearing pass can overlap a failing one. `STREAK_SQL` orders
+ * `finished_at desc, id desc`, so backdating makes any row whose `finished_at` is after this pass
+ * began sort strictly newer — a concurrent failure cannot be hidden by commit order or snapshot visibility. A guard
+ * (`insert … where not exists`) does NOT achieve this: under READ COMMITTED the subquery cannot see
+ * an uncommitted failure, so both rows land and the clearing row still wins.
+ *
+ * Residuals, stated rather than claimed away: a failure finishing in the SAME millisecond loses the
+ * `id desc` tie, and two processes with skewed clocks compare timestamp values rather than a shared
+ * order. Both are bounded — the scheduler runs inside the web process, so the live deployment has one
+ * clock — and self-correcting, because `failing` needs a streak of two.
+ *
+ * ⚠️ The row is SYNTHETIC health evidence, not a timed pass: `duration_ms` is 0 by construction and
+ * `finished_at` is the pass's start, not its end.
+ *
+ * Exported so the ordering property can be tested deterministically. An idle pass has no awaitable
+ * seam between its reads and this write, so a `Promise.all` race test would pass even with the
+ * mechanism removed.
+ */
+export async function recordClearingRun(
+  db: DbClient,
+  teamId: string,
+  passStartedAt: number,
+  reason: string
+): Promise<void> {
+  await recordIngestRun(db, {
+    teamId,
+    source: DOC_TASK_INFER_SOURCE,
+    trigger: "scheduler",
+    ok: true,
+    errors: [],
+    meta: { health_clear: true, skipped: reason },
+    startedAt: passStartedAt,
+    finishedAt: passStartedAt,
+  });
+}
+
+/**
+ * Classify each raw `items.member_id` as a human, a connector, or unresolvable-on-this-team.
+ *
+ * Deliberately NOT filtered on `status`: a deactivated human is still a human, and treating them as
+ * unresolvable would make a normal roster change look like a data fault and block health clearing.
+ * On a read error every id is reported `unresolvable`, which fails CLOSED — the pass then declines to
+ * clear rather than clearing on an unread roster.
+ */
+async function ownerKinds(
+  db: DbClient,
+  teamId: string,
+  memberIds: readonly (string | null)[]
+): Promise<Map<string, OwnerKind>> {
+  const out = new Map<string, OwnerKind>();
+  const ids = [...new Set(memberIds.filter((m): m is string => !!m))];
+  if (!ids.length) return out;
+  try {
+    const { data, error } = await db
+      .from("members")
+      .select("id, is_connector")
+      .eq("team_id", teamId)
+      .in("id", ids);
+    if (error) return out; // every id stays absent → `unresolvable` → no clearing. Fail closed.
+    for (const m of (data ?? []) as { id: string; is_connector: boolean | null }[]) {
+      out.set(m.id, m.is_connector ? "connector" : "human");
+    }
+  } catch {
+    return new Map(); // same fail-closed reasoning
+  }
+  return out;
 }
 
 async function record(
