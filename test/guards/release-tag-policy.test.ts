@@ -114,6 +114,15 @@ describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)",
     expect(() => nextTagPolicy(DEFAULT_TAGS, ["v0.99.0", ...gitTags])).toThrow(/stale: v0\.99\.0/);
   });
 
+  it("DECLARES v0.11.0 — the intermediate release the PRET-6 upgrade path passes through", () => {
+    // The mutation that removed it SURVIVED, which meant the entire point of the declaring PR was
+    // pinned by nothing. Stated as the durable invariant rather than "is pending", because that is
+    // true both before the tag is cut and forever after: `v0.11.0` is the release a pre-flip
+    // installation must run before the retirement, so the migration lane has to keep exercising the
+    // upgrade FROM it. Dropping it silently stops testing the path the fleet actually takes.
+    expect(DEFAULT_TAGS).toContain("v0.11.0");
+  });
+
   it("declares AT MOST ONE pending tag — two would reintroduce the middle-hole throw", () => {
     // `nextTagPolicy` permits exactly one uncut tag. If an editor declares two, the older becomes an
     // illegal hole and every PR throws `unknown git tag` — the freeze this program keeps rediscovering.
