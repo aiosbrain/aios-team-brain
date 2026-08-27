@@ -43,6 +43,37 @@ describe("guard: the reason is specific — feature, model, error", () => {
     expect(SRC).toContain("t.lastError");
   });
 
+  it("LLMCREDIT-4: the raw provider error is NEVER rendered directly — it goes through legDetail", () => {
+    // ⚠️ THIS GUARD EXISTS BECAUSE THE DIFF REVIEW RAN THE MUTATION AND IT SURVIVED. Reverting this
+    // component to `{t.lastError}` — the exact defect LLMCREDIT-4 removes — left the whole unit tier
+    // green, because the criterion pinned the SERVER field while the JSX was what changed. That is
+    // the pin-the-call-site failure, one ticket after the same finding was folded on LLMCREDIT-3.
+    //
+    // ∀, not ∃: the property is that NO rendered interpolation of the raw error exists, not that a
+    // good one exists somewhere. Scoped to the JSX region for the reason the sibling guard above
+    // learned — the dismissal signature legitimately reads `t.lastError` in a template literal above
+    // the return.
+    const jsx = SRC.slice(SRC.indexOf("  return ("));
+    const rendered = [...jsx.matchAll(/\{\s*t\.lastError\b/g)];
+    expect(
+      rendered.map((m) => jsx.slice(Math.max(0, m.index - 40), m.index + 40)),
+      "the provider's raw JSON must not be interpolated into the markup — compose it with legDetail()"
+    ).toEqual([]);
+    // …and the composition that replaced it is actually present, so this cannot pass by the bullet
+    // rendering nothing at all.
+    expect(jsx).toContain("legDetail({ error: t.lastError");
+  });
+
+  it("LLMCREDIT-4: the client component imports llm-health as a TYPE only", () => {
+    // The hazard is documented three times in this lane and was guarded zero times. `llm-health`
+    // reaches `provider-fault` → `lib/query/claude`, which is `server-only`: a VALUE import here
+    // breaks `next build` while tsc and the whole unit tier stay green. That mistake shipped once on
+    // this lane and CI caught it; a comment is not a check.
+    for (const m of SRC.matchAll(/^import\s+(type\s+)?\{[^}]*\}\s+from\s+"@\/lib\/query\/llm-health";/gm)) {
+      expect(m[1], `value import of llm-health in a client component: ${m[0]}`).toBeTruthy();
+    }
+  });
+
   it("names features through a label map, never a raw slug", () => {
     expect(SRC).toMatch(/labelOf\(t\.task\)/);
     // A bare slug in the RENDERED MARKUP is the defect. Scoped to the JSX region (from the component's

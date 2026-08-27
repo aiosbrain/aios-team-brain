@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { diagnoseProviderFault, faultSentence, providerNameFrom } from "@/lib/llm/provider-fault";
-import { degradedNote, type LlmTaskHealth } from "@/lib/query/llm-health";
+import { degradedNote, deriveTaskHealth, type LlmTaskHealth } from "@/lib/query/llm-health";
 import { diagnosisForLeg } from "@/lib/ingest/pipeline-health";
 import { legDetail, RAW_ERROR_CLIP } from "@/lib/ingest/leg-detail";
 
@@ -204,6 +204,47 @@ describe("LLMCREDIT-3: the two surfaces, not just the classifier", () => {
     // …and from the text, NOT the leg's name: an unrecognisable error yields nothing to say.
     expect(diagnosisForLeg("connection reset")).toBeNull();
     expect(diagnosisForLeg(null)).toBeNull();
+  });
+
+  it("AC9: every FAILING task carries its own diagnosis, computed server-side", async () => {
+    // ⚠️ LLMCREDIT-3 fixed the summary paragraph and LEFT THIS — the per-task bullet, which renders
+    // FIRST, above the note, carrying ~470 unclipped characters, so that is what the operator met.
+    // (An earlier version of this comment called it "the most prominent red text on the page". A
+    // review disproved that from the classNames — it was `text-red-600/80` at `text-xs`, i.e. the
+    // LEAST prominent. The true fact — rendered first, unclipped — carries the point on its own.) It is
+    // computed SERVER-side and passed down because the banner is a client component and the
+    // classifier reaches `lib/query/claude`, which is `server-only`: importing it there breaks
+    // `next build` while tsc and every unit test stay green. That exact mistake shipped once on this
+    // lane and CI caught it, so the criterion pins the SERVER field rather than the JSX.
+    const now = Date.now();
+    // No `calls`/`failures` here: neither exists on `LlmRun`, and carrying them forced an `as never`
+    // that switched OFF all argument checking rather than just tolerating the extras (review LOW-3).
+    const run = (task: string, ok: boolean, error: string | null) => ({
+      task,
+      ok,
+      error,
+      model: "qwen/qwen3.7-max",
+      finishedAt: new Date(now - 60_000).toISOString(),
+    });
+    const tasks = deriveTaskHealth(
+      [
+        run("doc-task-infer", false, OUT_OF_CREDIT),
+        run("doc-task-infer", false, OUT_OF_CREDIT),
+      ] as Parameters<typeof deriveTaskHealth>[0],
+      now
+    );
+    const t = tasks.find((x) => x.task === "doc-task-infer")!;
+    expect(t.diagnosis?.headline).toContain("OpenRouter");
+    expect(t.diagnosis?.action.toLowerCase()).toMatch(/top up/);
+
+    // An unrecognised error yields null, so the bullet falls back to the provider's own words.
+    const other = deriveTaskHealth(
+      [run("arcs", false, "connection reset"), run("arcs", false, "connection reset")] as Parameters<
+        typeof deriveTaskHealth
+      >[0],
+      now
+    );
+    expect(other.find((x) => x.task === "arcs")!.diagnosis).toBeNull();
   });
 
   it("AC8: the banner's line LEADS with the diagnosis and keeps the raw text underneath", () => {

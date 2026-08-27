@@ -242,6 +242,7 @@ describe("pickReportedFailure — the singular fields must not describe a HEALED
     state,
     model,
     lastError: failedAgo === null ? null : "err",
+    diagnosis: null,
     lastFailedAt: failedAgo === null ? null : ago(failedAgo),
     lastOkAt: null,
   });
