@@ -325,4 +325,33 @@ incident look self-healing. It would not falsify the defect. **Re-measured 2026-
 still 4, with no new row in a further ~24h** — the leg has now been silent-but-polled for ~2 days, and
 the falsifier has not fired.
 
-**Nothing is built. No code exists for this slice.**
+## 7. Mutations, as RUN
+
+Behavioural rows ran against the real-Postgres suite; ∀-over-sites rows against the guard. **The
+baseline was verified green under the exact invocation first** — an earlier attempt pointed at the
+wrong database (`app` rather than `app_test`), where the suite was ALREADY red and every mutation
+reported `REDDENED` while proving nothing.
+
+| # | mutation | tier | result |
+|---|---|---|---|
+| 1 | the clearing row is never written | dm | ✅ AC1 ×2 |
+| 3 | `cooldown` also clears | dm | ✅ AC2 |
+| 4 | the write is wired above the `no-llm` gate | dm | ✅ AC2b |
+| 5 | an unresolvable owner is treated as legitimate | guard | ✅ AC2c |
+| 6 | ANY null-credit drop blocks clearing (round 3's over-broad rule) | guard | ✅ AC2d |
+| 7 | the saturation gate is dropped at `:206` | dm | ✅ AC2e |
+| 8 | the saturation gate is dropped at `:270` | dm | ⚠️ **SURVIVED** → guard | ✅ AC2e (∀) |
+| 9 | `finishedAt` is `Date.now()` instead of `passStartedAt` | dm | ✅ AC5 + AC1 |
+| 11 | the row is written even when the newest verdict is `ok` | dm | ✅ AC3 |
+| 17 | a false claim is restored to the comment block | guard | ✅ AC8 |
+
+⚠️ **Mutation 8 SURVIVED the behavioural suite, and that is recorded rather than smoothed over.**
+AC2e's fixture fills the page with conversational rows, so the pass exits at `:206` and never reaches
+`:270` — exactly the gap Fable's round-3 review predicted ("AC2e and mutation 7 pin only `:206`").
+Reaching `:270` under saturation needs 500 already-scored docs keyed on an `inputsHash` derived from
+the candidate set and the prompt, which is not reasonably constructible in a fixture. **So the split
+is deliberate and stated: the MECHANISM is proven behaviourally at `:206`, and the ∀-over-sites
+property — that all three JS-derived outcomes carry the gate — is proven by the guard**, which
+reddens when the gate is removed at `:237` or `:270`. Both mutations were run against it.
+
+**Code is built.** AC1–AC5 + AC7 are the data-mechanics suite; AC2c/AC2d/AC2e(∀)/AC5b/AC8 are the guard.
