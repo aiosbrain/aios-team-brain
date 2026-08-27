@@ -165,8 +165,8 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   // Observed in prod flagging a leg that had never failed, on a measured 12.1–12.4h cadence, while every
   // connector was running on time — the banner said the brain wasn't getting fresh data when it was.
   //
-  // ⚠️ This block used to end: "since the cooldown counts failed runs too, a persistent failure keeps
-  // re-recording and stays the newest row." TRUE ONLY WHILE THE FAILURE PERSISTS, and that gap was
+  // ⚠️ This block used to end with a claim that the cooldown counting failed runs meant a standing
+  // failure would keep re-recording and stay the newest row. TRUE ONLY WHILE IT PERSISTS, and that gap was
   // BANNERSTUCK-1: when the cause healed and no work was demanded, nothing re-recorded, the four-long
   // 402 streak stayed newest, and the loud banner latched red with no future event able to clear it —
   // `failing` includes `confirmed` regardless of age, so staleness (`null`, correctly) cannot help.

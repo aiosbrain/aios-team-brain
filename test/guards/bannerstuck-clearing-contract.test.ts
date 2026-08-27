@@ -32,7 +32,14 @@ describe("AC8 — the architecture comment no longer carries the claim that let 
   it("does not assert that a persistent failure keeps re-recording", () => {
     // The load-bearing falsehood: true only WHILE the failure persists. Once the cause healed and no
     // work was demanded, nothing re-recorded and the stale failure was indistinguishable from a live one.
-    expect(HEALTH).not.toContain("a persistent failure keeps re-recording and stays the newest");
+    //
+    // Matched over a WHITESPACE-NORMALISED, comment-marker-stripped source. The first version was a
+    // raw `toContain` on the file, which the sentence escaped only because a line wrap fell between
+    // two of its words — the guard's property held by lineation luck, and a reflow would have
+    // reddened it for no reason. (The old sentence is also no longer quoted verbatim above, so this
+    // now asserts absence rather than a formatting accident.)
+    const flat = HEALTH.replace(/^\s*(\/\/|\*)\s?/gm, " ").replace(/\s+/g, " ");
+    expect(flat).not.toContain("a persistent failure keeps re-recording and stays the newest row");
   });
 
   it("does not claim FIVE outcomes write no row — four of them now write the clearing row", () => {
