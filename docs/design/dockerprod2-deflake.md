@@ -220,6 +220,14 @@ Round 2 then broke my first version of it three ways, all folded above:
   `RUN test … && rm …` — passed round 1's wording, which is precisely the "rm after copying" hole the
   assertion exists to close. AC2(d) forbids any filesystem-touching instruction after it.
 
+⚠️ **The assertion is DEPTH-1, and "the two boot files" is not the whole chain.** `bootstrap.mjs`
+statically imports `../scripts/pg-load-schema.mjs` and two modules under `../scripts/setup/`, and the
+derivation only reads `entrypoint.sh` — so a `.dockerignore` line excluding `scripts/` would build
+green and boot dead. **Not a regression** (the old Dockerfile had the identical hole, and asserted
+nothing at all), and a complete check would mean resolving the ESM import graph at build time —
+`node -e "import(…)"` would do it but would also RUN bootstrap against no database, which is not a
+trade this slice should make. Named as a limit rather than left implied. Raised by the diff review.
+
 **Caching cannot stale this.** The `RUN`'s cache key includes its parent layer; `COPY --from=build
 /app ./` re-checksums the build stage's `/app`, so a changed tree invalidates the COPY and therefore
 the RUN. A cache hit implies a byte-identical tree, in which case the cached success is a true success.
@@ -350,6 +358,7 @@ if the deploy flow's prose is affected.
 | 11b | **`CMD ["true"]`** — non-empty, exec-form, serves nothing | **AC2(b)** |
 | 12 | assertion drops `/app/docker/bootstrap.mjs` | AC2(c) |
 | 13 | assertion weakens to `test -r` only (a dir or empty file would pass) | AC2(c) |
+| 13b | **assertion reverts to the `&&` AND-OR form** — the §2a-bis shape that cannot fail | **AC2(c)** |
 | 14 | **insert `RUN rm /app/docker/entrypoint.sh` AFTER the assertion** | **AC2(d)** |
 | 14b | **append `&& rm /app/docker/entrypoint.sh` INSIDE the assertion instruction** | **AC2(c)** |
 | 15 | `ENTRYPOINT` → `/app/scripts/railway-start.sh` — tracked and corresponds, but unasserted | AC2(e) |
@@ -427,8 +436,13 @@ password, then exits successfully having served nothing.
 | `entrypoint.sh` is a **directory** | FAIL | **FAILED** |
 | both present and valid (positive control) | PASS | **PASSED** |
 
-Each leg fires with its own message, so `-s` and `-r` are live rather than decorative. Against the
-FIRST version of the assertion, rows 1-4 all **PASSED** the build.
+`-f` and `-s` were each observed firing with their own message. ⚠️ **`-r` was NOT, and cannot be:**
+the build runs as root, where `access(2)` grants read regardless of mode — measured, `test -r` passes
+on a `chmod 000` file as root. It stays as belt, labelled untestable in this context rather than
+claimed live. *(An earlier draft of this line said "so `-s` and `-r` are live" — a leg no row
+exercises. That is the sweeping-claim habit this section exists to check, caught by the diff review.)*
+
+Against the FIRST version of the assertion, rows 1-4 all **PASSED** the build.
 
 **Code is written. AC1–AC3 are guarded in `test/guards/dockerfile-runner-stage.test.ts`; AC4 is the
 table above.**

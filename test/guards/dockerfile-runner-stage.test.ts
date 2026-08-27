@@ -38,15 +38,17 @@ const IMAGE_ROOT = "/app";
  * behind the assertion the way `RUN rm …` would.
  */
 const NON_FILESYSTEM_OPS = new Set([
-  "ENV",
   "EXPOSE",
   "LABEL",
-  "ARG",
   "STOPSIGNAL",
-  "HEALTHCHECK",
   "ENTRYPOINT",
   "CMD",
 ]);
+// Deliberately NOT here: `ENV` (an `ENV PATH=…` after the assertion is a green build and a dead
+// boot — docker/entrypoint.sh:5 resolves `node` through PATH), `ARG` (feeds ENV substitution), and
+// `HEALTHCHECK` (runs a command). Nothing in this stage needs any of the three after the assertion,
+// and an allowlist that is wrong in the permissive direction is the failure this criterion exists
+// to prevent.
 
 const KNOWN_OPS = new Set([
   "FROM",
