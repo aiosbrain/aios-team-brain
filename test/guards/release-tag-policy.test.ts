@@ -23,12 +23,12 @@ import { DEFAULT_TAGS, nextTagPolicy } from "../../scripts/migrate-from-existing
  */
 
 const ROOT = join(__dirname, "..", "..");
-const REAL_TAGS = ["v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
+const REAL_TAGS = ["v0.11.0", "v0.10.0", "v0.9.0", "v0.8.0", "v0.7.0"]; // newest-first, as git reports them
 
 /** A fully-CUT declared list, for policy semantics. Deliberately NOT `DEFAULT_TAGS`: the live list
  *  legitimately carries a declared-but-uncut release during preparation, and assertions that assumed
  *  otherwise turned red the moment a release was declared. */
-const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"];
+const CUT_FIXTURE = ["v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0", "v0.11.0"];
 
 /**
  * Does THIS checkout have the release tags?
@@ -83,9 +83,15 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
   it("picks the exempt tag by VERSION, not by list position", () => {
     // `v0.9.0` > `v0.10.0` under string sort. A list written out of order must not change which tag
     // is allowed to be missing, or the exemption moves under a harmless reformat.
-    const res = nextTagPolicy(["v0.11.0", "v0.7.0", "v0.8.0", "v0.9.0", "v0.10.0"], REAL_TAGS);
-    expect(res.pending).toBe("v0.11.0");
-    expect(() => nextTagPolicy(["v0.11.0", "v0.9.5", "v0.10.0"], [...REAL_TAGS, "v0.11.0"])).toThrow(
+    // SYNTHETIC versions on purpose. These fixtures originally used `v0.11.0` as "the uncut one" — and
+    // broke the day v0.11.0 was actually cut. A fixture that borrows a plausible real version rots into
+    // a false failure the moment the project reaches it.
+    // Derived from CUT_FIXTURE (with the synthetic pending tag pushed to the FRONT) rather than
+    // hand-listed: a hand-listed copy silently omits the newest cut release and trips the staleness
+    // rule instead of testing the ordering it claims to.
+    const res = nextTagPolicy(["v9.9.9", ...CUT_FIXTURE], REAL_TAGS);
+    expect(res.pending).toBe("v9.9.9");
+    expect(() => nextTagPolicy(["v9.9.9", "v0.9.5", ...CUT_FIXTURE], [...REAL_TAGS, "v9.9.9"])).toThrow(
       /unknown git tag: v0\.9\.5/
     );
   });
@@ -93,7 +99,9 @@ describe("release tag policy — the prepared release (criteria 1, 2, 5)", () =>
 
 describe("release tag policy — the anti-rot rule survives (criteria 3, 4, 5)", () => {
   it("THROWS when a tag EXISTS that is newer than everything declared", () => {
-    expect(() => nextTagPolicy(["v0.7.0", "v0.8.0"], REAL_TAGS)).toThrow(/DEFAULT_TAGS is stale: v0\.10\.0/);
+    // The newest EXISTING tag is whatever REAL_TAGS says today — asserted by name so the message is
+    // pinned, and updated deliberately when a release is cut (it was v0.10.0 before v0.11.0 existed).
+    expect(() => nextTagPolicy(["v0.7.0", "v0.8.0"], REAL_TAGS)).toThrow(/DEFAULT_TAGS is stale: v0\.11\.0/);
   });
 
   it("is NON-VACUOUS in both directions against the SHIPPED list", () => {

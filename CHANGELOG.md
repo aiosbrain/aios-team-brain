@@ -9,6 +9,60 @@ line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-26
+
+### Removed
+
+- **PRET-6 — the permissive access mode is deleted.** `teams.access_enforcement` and
+  `teams.autoflip_hold` are dropped; membership is the only thing that decides what a member reads.
+  There is no flag to flip back, and `set-access-enforcement` is gone from the admin CLI.
+
+  **⚠️ You may not upgrade to this release directly from anything older than `v0.11.0`.** The
+  migration refuses:
+
+  ```
+  PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
+  ```
+
+  Both refusal conditions must be cleared first — the PRET-4 marker present, and zero teams left
+  `permissive`. Run `v0.11.0` (the `release/v0.11.0` branch), let it boot, let auto-flip converge,
+  flip anything it could not, and verify with the query in [`docs/RELEASING.md`](docs/RELEASING.md)
+  §3.4. A successful deploy is not the gate; the query is. Full detail:
+  `docs/RELEASE-NOTES-pret6.md`.
+
+  **One-way.** At least one migration in this range adds an enum value, which Postgres cannot drop.
+  Roll forward, not back.
+
+### Added
+
+### Changed
+
+### Added
+
+- **Coverage arrives with its denominator (AIO-995, Brain API 1.22).** `test_coverage_pct` was a
+  bare percentage carrying 40% of `health_score` and 25% of `agentic_score`, so a repo measuring
+  436 lines and one measuring 10,647 were indistinguishable in every composite. The scan payload
+  gains six optional, nullable raw measures — `test_coverage_lines_total` /
+  `test_coverage_lines_covered` (the denominator) and `tests_total` / `tests_passed` /
+  `tests_skipped` / `tests_failed` (run integrity) — and the brain derives, persists and displays
+  `coverage_breadth_pct`. Coverage now renders with its scope (`99% (436 / 3,140 lines)`), a
+  narrow measurement is visually distinct, and a run with skipped or failed cases is flagged
+  partial. **No score changes**: breadth is disclosed, not weighted, because every pre-1.22 row
+  has a null denominator and a factor applied today would rank re-scanned repos against
+  un-rescanned ones under two different formulas. Null means unknown throughout — never zero,
+  never full scope.
+
+> This section lists the changes that were written down. The interval also contains work that was
+> never itemised here — it is not an exhaustive record of 168 commits, and is not presented as one.
+
+## [0.11.0] — 2026-08-18
+
+**The convergence release.** Upgrading through it is mandatory for any installation older than it;
+see the `v0.12.0` entry above. It also carries **PRET-4** (the tier-wall teardown, #594) and
+**PRET-5** (the external-member proof, #606), which write the explicit built-in membership rows and
+the boot materialization the retirement requires — named here because the entries below predate them
+and this release's identity depends on them.
+
 ### Changed
 
 - **PRET-3 — every arcs panel is now the fused per-project panel.** External members and
@@ -32,19 +86,6 @@ line go stale while the code moved on, so it is not restated.
   `admin.ts set-access-enforcement --dry-run`, and the flip stays a manual decision.
 
 ### Added
-
-- **Coverage arrives with its denominator (AIO-995, Brain API 1.22).** `test_coverage_pct` was a
-  bare percentage carrying 40% of `health_score` and 25% of `agentic_score`, so a repo measuring
-  436 lines and one measuring 10,647 were indistinguishable in every composite. The scan payload
-  gains six optional, nullable raw measures — `test_coverage_lines_total` /
-  `test_coverage_lines_covered` (the denominator) and `tests_total` / `tests_passed` /
-  `tests_skipped` / `tests_failed` (run integrity) — and the brain derives, persists and displays
-  `coverage_breadth_pct`. Coverage now renders with its scope (`99% (436 / 3,140 lines)`), a
-  narrow measurement is visually distinct, and a run with skipped or failed cases is flagged
-  partial. **No score changes**: breadth is disclosed, not weighted, because every pre-1.22 row
-  has a null denominator and a factor applied today would rank re-scanned repos against
-  un-rescanned ones under two different formulas. Null means unknown throughout — never zero,
-  never full scope.
 
 - **Code Maintenance Loop Phase 0 (AIO-610)** — Brain API 1.17 accepts the backward-compatible
   codebase-health v2 snapshot with repository profile identity, explicit evidence completeness,
