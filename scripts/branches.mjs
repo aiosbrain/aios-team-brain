@@ -26,7 +26,7 @@
  * WHAT THIS DOES NOT BUY. It is NOT "the cutover is one edit". It makes the Node and instruction
  * consumers one edit. YAML cannot import a module, so `.github/dependabot.yml`'s `target-branch`,
  * prose that names a branch, and every branch-protection change remain separate cutover-day edits —
- * enumerated in `docs/RELEASING.md` §3.2 so they cannot be forgotten. The first draft overclaimed this
+ * enumerated in `docs/RELEASING.md` §3.1c so they cannot be forgotten. The first draft overclaimed this
  * and review corrected it.
  */
 
@@ -48,7 +48,10 @@ export const remoteRef = (branch) => `refs/remotes/origin/${branch}`;
 if (process.argv.includes("--print")) {
   const roles = { contribution: CONTRIBUTION_BASE, integration: INTEGRATION_BRANCH, release: RELEASE_BRANCH };
   const asked = process.argv[process.argv.indexOf("--print") + 1];
-  const value = roles[asked];
+  // `Object.hasOwn`, not truthiness: `roles["constructor"]` inherits a function from the prototype
+  // chain, which is truthy — so `--print constructor` would reach `stdout.write` and throw a
+  // TypeError instead of the intended diagnostic. Loud either way, but the wrong loud.
+  const value = Object.hasOwn(roles, asked ?? "") ? roles[asked] : undefined;
   if (!value) {
     process.stderr.write(`unknown role ${asked ?? "(none)"} — expected one of ${Object.keys(roles).join(", ")}\n`);
     process.exit(2);

@@ -19,8 +19,9 @@ instruction corpus) — no persistence and no HTTP surface
 
 **Deps:** RELPTR-3 merged (`5e2fe27f`). No code dependency.
 
-**Increment:** ONE PR = two named branch constants with one owner, `aios-work-sync` and
-`scan-on-merge` widened, the operative review instruction made base-relative, and guards for each.
+**Increment:** ONE PR = three named branch roles with one owner each, the release-candidate guard
+turned into a consumer, `aios-work-sync` and `scan-on-merge` widened, the PR template corrected, and
+guards for each. **The operative review instruction is NOT in this slice** — it is RELPTR-5.
 **No branch protection is changed, no release actor is created, `staging` is not fast-forwarded,
 Dependabot is not retargeted, and no required context is added or moved.**
 
@@ -30,7 +31,8 @@ Dependabot is not retargeted, and no required context is added or moved.**
 
 Option B moves contributions from `main` to an integration branch. `docs/RELEASING.md` §3.1 records
 **nine** constraints; several are repo-side code that breaks the moment contributions move, and **the
-failure mode of each is silence, not an error**:
+failure mode of each is silence, not an error**. Two of them are fixed here; the third — the operative
+`git diff` instruction — is described below and deferred to RELPTR-5:
 
 - **`aios-work-sync` fires on `pull_request` closed with `branches: [main]`.** The day work merges to
   `staging`, it emits nothing — **nothing closes a ticket**, and the board stops meaning anything.
@@ -93,7 +95,7 @@ to it.
 
 **The honest claim about cutover cost, restated because the first draft overclaimed it.** This does
 **not** make the cutover one edit. It makes the *Node and instruction* consumers one edit. These
-remain separate, enumerated, cutover-day edits, recorded in `docs/RELEASING.md` §3.2 so they cannot be
+remain separate, enumerated, cutover-day edits, recorded in `docs/RELEASING.md` §3.1c so they cannot be
 forgotten:
 
 - `.github/dependabot.yml` `target-branch` (YAML cannot import a module, and there is no two-branch
@@ -153,7 +155,7 @@ Two further problems make it a slice of its own rather than a fold:
 RELPTR-5 gets a complete per-file disposition (rewrite / exclude-as-history) decided BEFORE the guard
 is written, which is the opposite order from this attempt.
 
-**6. What this slice does NOT do**, each with its reason:
+**4. What this slice does NOT do**, each with its reason:
 
 - **Any branch-protection change**, the release actor, the `refs/tags/v*` ruleset, making
   `Release candidate gate` required, relocating `PR records a diff review` — outward-facing GitHub
@@ -176,7 +178,7 @@ is written, which is the opposite order from this attempt.
 `CONTRIBUTING.md`, `docs/agent-handoffs.md`, `docs/TODO.md`, `test-ci-wiring-audit`,
 `adversarial-build`, and the guard over them. Decision 3.
 
-**Cut:** everything in Decision 6.
+**Cut:** everything in Decision 4.
 
 ---
 
@@ -213,12 +215,12 @@ is written, which is the opposite order from this attempt.
    Presence-asserted, because stripping the sentence would satisfy a pure absence check.
 9. **unit** — a guard asserts `docs/RELEASING.md` records (a) the ticket-closing decision with its
    revert/abandonment policy and the `pr.head.ref`-only limitation, (b) that constraint 3 is PREPARED
-   with what remains human, and (c) the enumerated cutover-day edits from Decision 1 in §3.2.
+   with what remains human, and (c) the enumerated cutover-day edits from Decision 1 in §3.1c, including the branch-protection changes.
 
 ## What would falsify this
 
 - **A ticket that does not close after the cutover** — Decision 2 was wrong, or the widening was
-  re-narrowed by a condition criterion 6 failed to pin.
+  re-narrowed by a condition criterion 7 failed to pin — including one inside the run body.
 - **A reviewer handed every unreleased commit** — that is RELPTR-5's falsifier now, not this slice's;
   if it happens before RELPTR-5 lands, the split was the wrong call.
 - **Assertion C or D answering a different question after the cutover** — the refactor wired a ref to

@@ -41,7 +41,12 @@ describe("branch roles — one owner per role (criteria 1, 2)", () => {
 
   it("each role is DECLARED exactly once across scripts/**", () => {
     // One owner per role, so moving the contribution base at cutover is one edit rather than a sweep.
-    const files = readdirSync(join(ROOT, "scripts")).filter((f) => f.endsWith(".mjs") || f.endsWith(".ts"));
+    // RECURSIVE — criterion 1 says `scripts/**` and the first version read only `scripts/*`. Both
+    // reviewers found the same surviving mutation: declare a role in `scripts/setup/deploy-policy.mjs`
+    // and the undeclared-second-owner class this slice exists to kill returns one directory down.
+    const files = readdirSync(join(ROOT, "scripts"), { recursive: true })
+      .map(String)
+      .filter((f) => f.endsWith(".mjs") || f.endsWith(".ts"));
     for (const role of ["CONTRIBUTION_BASE", "INTEGRATION_BRANCH", "RELEASE_BRANCH"]) {
       const declaring = files.filter((f) => new RegExp(`export const ${role}\\b`).test(read(`scripts/${f}`)));
       expect(declaring, `${role} must have exactly one declaration`).toEqual(["branches.mjs"]);
@@ -55,7 +60,9 @@ describe("branch roles — one owner per role (criteria 1, 2)", () => {
     expect(src, "must import the roles").toMatch(/from "\.\/branches\.mjs"/);
     expect(src).toMatch(/mainRef = remoteRef\(RELEASE_BRANCH\)/);
     expect(src).toMatch(/integrationRef = remoteRef\(INTEGRATION_BRANCH\)/);
-    expect(src, "no hardcoded remote ref may remain").not.toMatch(/"refs\/remotes\/origin\/(main|staging)"/);
+    // Any quoting, not just double — a single-quoted or backticked literal would have evaded the
+    // first spelling of this assertion.
+    expect(src, "no hardcoded remote ref may remain").not.toMatch(/refs\/remotes\/origin\/(main|staging)/);
   });
 });
 
@@ -74,8 +81,23 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
    * `mainRef` follows the contribution base, it resolves to a ref that does not exist, assertion C
    * goes false, and the verdict flips to FAIL. Behaviour, not text.
    */
+  // Isolated for every child process, git AND node. Both reviewers flagged that the RELPTR-3 twin in
+  // `release-candidate-gate.test.ts` already does this and this file did not: a machine with
+  // `tag.gpgSign = true` would make the annotated tag below attempt signing and the pin would red — or
+  // hang on a pinentry — for a reason that has nothing to do with the wiring under test. `vi.stubEnv`
+  // alone would not reach the spawned `node`, so the env is passed explicitly.
+  const ISOLATED = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_DIR: undefined,
+    GIT_WORK_TREE: undefined,
+    GIT_INDEX_FILE: undefined,
+  } as NodeJS.ProcessEnv;
+
   const git = (cwd: string, ...args: string[]) =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+    execFileSync("git", args, { cwd, encoding: "utf8", env: ISOLATED }).trim();
 
   function scratchWithStub(stubValue: string | null) {
     const dir = mkdtempSync(join(tmpdir(), "roles-pin-"));
@@ -89,15 +111,28 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
     git(dir, "init", "-q", "-b", "main");
     git(dir, "config", "user.email", "t@example.com");
     git(dir, "config", "user.name", "t");
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.2.0" }));
+    git(dir, "add", "package.json");
+    git(dir, "commit", "-qm", "base");
+    const parent = git(dir, "rev-parse", "HEAD");
     writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "0.3.0" }));
     git(dir, "add", "package.json");
     git(dir, "commit", "-qm", "release");
     const head = git(dir, "rev-parse", "HEAD");
-    // A valid candidate: main and staging both AT the tagged commit, so C and D both hold.
-    git(dir, "update-ref", "refs/remotes/origin/main", head);
+
+    // ASYMMETRIC ON PURPOSE — both reviewers found the first version degenerate. With `origin/main`,
+    // `origin/staging` and the tag all at ONE commit, C and D become indistinguishable: a full C↔D
+    // ref SWAP passes every behavioural test, leaving only a source-token regex holding the line —
+    // and this file's own header calls those evadable. Post-cutover a surviving swap would make D ask
+    // "reachable from main", turning the deliberate pre-cutover red green.
+    //
+    // So: release branch one commit BEHIND, integration branch AT the candidate. C still holds (the
+    // parent is an ancestor of head) and D still holds (head is reachable from staging) — but swap
+    // them and D asks whether head is reachable from the PARENT, which it is not. The swap now reds.
+    git(dir, "update-ref", "refs/remotes/origin/main", parent);
     git(dir, "update-ref", "refs/remotes/origin/staging", head);
     git(dir, "tag", "-a", "v0.3.0", "-m", "v0.3.0");
-    return { dir, head };
+    return { dir, head, parent };
   }
 
   /** Run the guard with its DEFAULT refs — the thing under test. */
@@ -112,7 +147,7 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
            const r = main({ ref: "refs/tags/v0.3.0", sha: ${JSON.stringify(head)}, remote: ".", cwd: ${JSON.stringify(dir)}, log: () => {} });
            process.stdout.write(JSON.stringify(r));`,
         ],
-        { encoding: "utf8" }
+        { encoding: "utf8", env: ISOLATED }
       )
     );
 
@@ -142,6 +177,25 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
       expect(r.facts.mainIsAncestor, "the sentinel ref does not exist, so C goes false").toBe(false);
       expect(r.verdict).toBe("FAIL");
       expect(r.failures.join(" ")).toMatch(/^C: |C: /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is NON-VACUOUS on the OTHER axis: swapping the C and D refs makes this FAIL", () => {
+    // The mutation the asymmetric fixture exists for. Until the fixture stopped putting every ref on
+    // one commit, this swap was caught only by a source-token regex.
+    const { dir, head } = scratchWithStub(null);
+    try {
+      const guard = readFileSync(join(dir, "release-candidate-guard.mjs"), "utf8");
+      const swapped = guard
+        .replace("mainRef = remoteRef(RELEASE_BRANCH)", "mainRef = remoteRef(__TMP__)")
+        .replace("integrationRef = remoteRef(INTEGRATION_BRANCH)", "integrationRef = remoteRef(RELEASE_BRANCH)")
+        .replace("mainRef = remoteRef(__TMP__)", "mainRef = remoteRef(INTEGRATION_BRANCH)");
+      expect(swapped, "the swap must apply").not.toBe(guard);
+      writeFileSync(join(dir, "release-candidate-guard.mjs"), swapped);
+      const r = runWithDefaults(dir, head);
+      expect(r.verdict, "a C/D swap must be observable, not just readable").toBe("FAIL");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -187,6 +241,15 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     expect(stepIfs, "no step may carry its own condition").toEqual([]);
   });
 
+  it("the work-sync BODY never reads the base ref either", () => {
+    // Fable found the layer below the layer: criterion 7 pins the trigger and the job/step conditions,
+    // but the run body is free text. `if (pr.base.ref !== "main") process.exit(0)` inside it would keep
+    // every guard green while post-cutover staging merges emitted nothing — the exact silent failure
+    // constraint 3 describes. This also documents §3.1b's limitation: the payload is `pr.head.ref` only.
+    const body = read(".github/workflows/aios-work-sync.yml");
+    expect(body, "no base-ref branching in the body").not.toMatch(/base_ref|base\.ref/);
+  });
+
   it("is NON-VACUOUS: the parsed shapes are real, not empty reads", () => {
     // A parse returning undefined would make every assertion above vacuously pass.
     expect(workflow("aios-work-sync.yml").jobs!["notify-brain"].steps!.length).toBeGreaterThan(0);
@@ -203,9 +266,10 @@ describe("branch roles — the PR template states the split (criterion 8)", () =
     // a brain-native row in this project really does complete automatically — so the fix is to state
     // the split, not to delete the promise.
     const t = TPL();
-    expect(t, "the automatic case").toMatch(/brain-native/i);
-    expect(t).toMatch(/`applied`/);
-    expect(t, "the case where the human closes it").toMatch(/`linked`/);
+    // NOT existential: swapping `applied` and `linked` preserves both tokens while publishing the
+    // opposite guidance, so the MAPPING is asserted, not the vocabulary.
+    expect(t, "brain-native rows map to applied").toMatch(/BRAIN-NATIVE row[\s\S]{0,120}`applied`/);
+    expect(t, "workspace rows map to linked").toMatch(/pushed from the workspace[\s\S]{0,160}`linked`/);
     expect(t).toMatch(/3-log\/tasks\.md/);
     expect(t, "must say the workspace row is left open on purpose").toMatch(/DELIBERATELY left open/);
   });
@@ -235,6 +299,7 @@ describe("branch roles — the runbook records the decisions (criterion 9)", () 
     expect(r).toMatch(/is not "the cutover is one edit"|not \*\*"the cutover is one edit"\*\*/);
     expect(r).toMatch(/dependabot\.yml` `target-branch`/);
     expect(r, "prose naming a branch is undetectable by a guard").toMatch(/Prose that NAMES a branch/);
+    expect(r, "and the protection changes, which nothing in code can move").toMatch(/Every branch-protection change/);
   });
 
   it("constraint 3 is marked PREPARED with what remains human", () => {
