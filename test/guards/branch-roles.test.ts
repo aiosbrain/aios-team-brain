@@ -241,6 +241,16 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     expect(stepIfs, "no step may carry its own condition").toEqual([]);
   });
 
+  it("scan-on-merge's concurrency group is PER-REF, so one branch cannot cancel the other", () => {
+    // Found by a mutation that SURVIVED: widening the trigger while leaving one global group means a
+    // push to either branch cancels an in-flight scan of the other (`cancel-in-progress: true`), so a
+    // staging push could kill a main scan and leave the older snapshot as the dashboard's latest.
+    // Changing the group without pinning it would have been a fix nothing held in place.
+    const wf = workflow("scan-on-merge.yml") as unknown as { concurrency?: { group?: string; "cancel-in-progress"?: boolean } };
+    expect(wf.concurrency?.group, "must vary by ref").toMatch(/\$\{\{\s*github\.ref\s*\}\}/);
+    expect(wf.concurrency?.["cancel-in-progress"], "still one scan at a time PER ref").toBe(true);
+  });
+
   it("the work-sync BODY never reads the base ref either", () => {
     // Fable found the layer below the layer: criterion 7 pins the trigger and the job/step conditions,
     // but the run body is free text. `if (pr.base.ref !== "main") process.exit(0)` inside it would keep
