@@ -32,7 +32,7 @@ const PINNED = {
   "codebase-payload-1.24.schema.json":
     "761f8e74be2f98d2883d9d61697f7d0c95c28df7770ba7e467d35dd6492feca6",
   "codebase-payload-1.24-fixtures.json":
-    "ae7fc3840bcf7e7d1ec10086d8dee858347c0d7f792d27f28d97ae5a238a792b",
+    "67fa64a19273c0ec78f571a9f956de19fb5174febdb1ba081c4e651fa024b7fd",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;

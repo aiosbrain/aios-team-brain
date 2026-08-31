@@ -1385,7 +1385,7 @@
     }
   ],
   "scanner_state": {
-    "_note": "Consumer conformance vectors for the brain-api 1.24 scanner-identity READING (AIO-1011). JSON Schema pins the WIRE shape of metrics.scanner_version; these pin what a reader must CONCLUDE from it, which the schema cannot express. Three states and no fourth — unknown | stale | current — compared against codebasePayloadContract.minScannerVersion in brain-contract.json. The load-bearing rule: absent, null and unparseable are UNKNOWN, never stale. \"The scan did not tell us\" is a different statement from \"the scan told us it is old\", and collapsing them is the exact defect 1.24 exists to remove — absence of evidence rendered as evidence. Deliberately no parser-grammar edge cases here (no \"0.2\", no \"v0.2.0-dirty\"): the exact grammar is the reader's, and a value it cannot read normalizes to unknown by the rule above, so pinning those would over-specify the contract. A vector with no scanner_version key means the field was ABSENT from the payload.",
+    "_note": "Consumer conformance vectors for the brain-api 1.24 scanner-identity READING (AIO-1011). JSON Schema pins the WIRE shape of metrics.scanner_version; these pin what a reader must CONCLUDE from it, which the schema cannot express. Three states and no fourth - unknown | stale | current - compared against codebasePayloadContract.minScannerVersion in brain-contract.json. The load-bearing rule: absent, null and unparseable are UNKNOWN, never stale. \"The scan did not tell us\" is a different statement from \"the scan told us it is old\", and collapsing them is the exact defect 1.24 exists to remove - absence of evidence rendered as evidence. Note also that unknown is NOT a synonym for \"predates 1.24\": a current scanner that cannot determine its own build is required to send null too. PARSEABLE is defined narrowly and normatively in docs/brain-api.md beneath each truth table - exactly three dotted non-negative integers, nothing else - so a leading v, a two-part version, a channel name, and any SemVer pre-release or build suffix are unreadable and therefore unknown. That choice fails safe (an unrecognised build is a caveat, never a pass) and is pinned by the vectors below rather than left implied. A vector with no scanner_version key means the field was ABSENT from the payload. THESE VECTORS ARE THE ENFORCEMENT SURFACE: a consumer is conformant only by running them against its own real classifier - the workspace side merely checks they are self-consistent.",
     "vectors": [
       {
         "name": "absent: a pre-1.24 scan never sent the field and can never be backfilled",
@@ -1409,6 +1409,41 @@
       {
         "name": "unparseable channel name, not a version",
         "scanner_version": "nightly",
+        "state": "unknown"
+      },
+      {
+        "name": "pre-release suffix: SemVer orders it BEFORE 0.2.0, so it is not evidence of currency",
+        "scanner_version": "0.2.0-rc1",
+        "state": "unknown"
+      },
+      {
+        "name": "build suffix: unreadable under the published grammar, so unknown - never falsely current",
+        "scanner_version": "0.2.0+dirty",
+        "state": "unknown"
+      },
+      {
+        "name": "malformed suffix: a dangling separator is not a version",
+        "scanner_version": "0.2.0-",
+        "state": "unknown"
+      },
+      {
+        "name": "leading v: unreadable, and must not be silently normalised into a match",
+        "scanner_version": "v0.2.0",
+        "state": "unknown"
+      },
+      {
+        "name": "two-part version: not three dotted integers, so unreadable",
+        "scanner_version": "0.2",
+        "state": "unknown"
+      },
+      {
+        "name": "BELOW-minimum prefix with an unreadable suffix: must NOT fall through to stale - reading 0.1.0 out of a string the parser just failed on is a verdict from a measurement never made",
+        "scanner_version": "0.1.0-rc.1",
+        "state": "unknown"
+      },
+      {
+        "name": "four components: more than three integers is not the published grammar",
+        "scanner_version": "1.0.0.0",
         "state": "unknown"
       },
       {
