@@ -529,6 +529,16 @@ flowchart LR
   ST[("sqlite: cursors + watch channels")] -.-> T2
 ```
 
+The codebase-scan path has an exact fixed-window retry handshake. When
+`POST /api/v1/codebases` exhausts its authenticated team-tier bucket
+(`apiKeyId:codebases:post`, 60/min), the 429 carries a decimal-integer `Retry-After` from the
+same clock sample used to select that minute window: 60 at its start and 1 just before reset.
+`BrainClient.push_codebase_scan` makes at most six attempts (the initial call plus five retries),
+uses valid server delta-seconds within that 1–60-second contract, and otherwise waits
+2 + 4 + 8 + 16 + 32 seconds before the final attempt. Jitter is additive and bounded to one second
+per wait, so it cannot erode the fallback's 62-second floor; the terminal response keeps its actual
+429/5xx error class and is never followed by another sleep.
+
 ### PM progression loop — merged work → done in the primary PM tool (Linear)
 
 ```mermaid

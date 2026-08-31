@@ -101,3 +101,161 @@ async def test_fetch_integration_selections_raises_on_definitive_4xx():
         with pytest.raises(BrainError) as ei:
             await c.fetch_integration_selections()
     assert ei.value.status_code == 403
+
+
+def _scan_client(
+    transport: httpx.MockTransport,
+    sleeps: list[float],
+    *,
+    random_value: float = 0.0,
+) -> BrainClient:
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    c = BrainClient(
+        "http://brain",
+        "aios_abc_def",
+        "demo",
+        max_per_min=10_000,
+        sleep=sleep,
+        random_fn=lambda: random_value,
+    )
+    c._client = httpx.AsyncClient(transport=transport)
+    return c
+
+
+async def test_codebase_scan_honors_valid_retry_after_then_succeeds():
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                429,
+                headers={"retry-after": "17"},
+                json={"error": {"code": "rate_limited", "message": "wait"}},
+            )
+        return httpx.Response(201, json={"status": "ok"})
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps, random_value=0.25) as c:
+        result = await c.push_codebase_scan({"scan": "payload"})
+
+    assert result == {"status": "ok"}
+    assert calls == 2
+    assert sleeps == [17.25]
+
+
+@pytest.mark.parametrize(
+    "retry_after",
+    [None, "", "garbage", "-1", "0", "1.5", "NaN", "61", "600000"],
+)
+async def test_codebase_scan_invalid_or_missing_retry_after_uses_conservative_fallback(retry_after):
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 5:
+            headers = {} if retry_after is None else {"retry-after": retry_after}
+            return httpx.Response(
+                429,
+                headers=headers,
+                json={"error": {"code": "rate_limited", "message": "wait"}},
+            )
+        return httpx.Response(201, json={"status": "ok"})
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        result = await c.push_codebase_scan({"scan": "payload"})
+
+    assert result == {"status": "ok"}
+    assert calls == 6
+    assert sleeps == [2, 4, 8, 16, 32]
+    assert sum(sleeps) > 60
+
+
+async def test_codebase_scan_adds_at_most_one_second_of_jitter_per_wait():
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return httpx.Response(429, json={"error": {"code": "rate_limited", "message": "wait"}})
+        return httpx.Response(201, json={"status": "ok"})
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps, random_value=1.0) as c:
+        await c.push_codebase_scan({"scan": "payload"})
+
+    assert sleeps == [3, 5]
+
+
+async def test_codebase_scan_persistent_429_caps_at_six_attempts_without_terminal_sleep():
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "7"},
+            json={"error": {"code": "rate_limited", "message": "still limited"}},
+        )
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        with pytest.raises(BrainError) as exc:
+            await c.push_codebase_scan({"scan": "payload"})
+
+    assert calls == 6
+    assert sleeps == [7, 7, 7, 7, 7]
+    assert exc.value.status_code == 429
+    assert exc.value.code == "rate_limited"
+    assert "still limited" in str(exc.value)
+
+
+async def test_codebase_scan_terminal_5xx_keeps_actual_final_error_class():
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            json={"error": {"code": "upstream_unavailable", "message": "brain unavailable"}},
+        )
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        with pytest.raises(BrainError) as exc:
+            await c.push_codebase_scan({"scan": "payload"})
+
+    assert calls == 6
+    assert sleeps == [2, 4, 8, 16, 32]
+    assert exc.value.status_code == 503
+    assert exc.value.code == "upstream_unavailable"
+
+
+async def test_codebase_scan_non_429_4xx_is_immediate_and_never_sleeps():
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            422,
+            json={"error": {"code": "invalid_payload", "message": "bad scan"}},
+        )
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        with pytest.raises(BrainError) as exc:
+            await c.push_codebase_scan({"scan": "payload"})
+
+    assert calls == 1
+    assert sleeps == []
+    assert exc.value.status_code == 422
+    assert exc.value.code == "invalid_payload"

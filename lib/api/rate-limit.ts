@@ -3,7 +3,8 @@ import type { DbClient } from "@/lib/db/types";
 
 /**
  * Postgres fixed-window rate limiting (no Vercel KV — self-host portable).
- * Window = 1 minute. Returns true if the call is allowed.
+ * Window = 1 minute. Existing callers receive a boolean; callers that need to tell a client when
+ * the same fixed window resets can use rateLimitWithReset().
  */
 
 // In-process fixed-window fallback used ONLY when the DB rate-limit RPC errors (audit M3). Previously
@@ -31,12 +32,33 @@ export async function rateLimit(
   bucket: string,
   limitPerMinute: number
 ): Promise<boolean> {
-  const windowStart = new Date();
+  return (await rateLimitWithReset(db, bucket, limitPerMinute)).allowed;
+}
+
+export type RateLimitDecision = {
+  allowed: boolean;
+  retryAfterSeconds: number;
+};
+
+export async function rateLimitWithReset(
+  db: DbClient,
+  bucket: string,
+  limitPerMinute: number,
+  now = new Date(),
+): Promise<RateLimitDecision> {
+  const windowStart = new Date(now);
   windowStart.setSeconds(0, 0);
   const { data, error } = await db.rpc("rate_limit_hit", {
     p_bucket: bucket,
     p_window_start: windowStart.toISOString(),
   });
-  if (error) return fallbackAllow(bucket, limitPerMinute, windowStart.getTime()); // degrade, don't open
-  return (data as number) <= limitPerMinute;
+  const allowed = error
+    ? fallbackAllow(bucket, limitPerMinute, windowStart.getTime()) // degrade, don't open
+    : (data as number) <= limitPerMinute;
+  const resetAtMs = windowStart.getTime() + 60_000;
+  const retryAfterSeconds = Math.min(
+    60,
+    Math.max(1, Math.ceil((resetAtMs - now.getTime()) / 1_000)),
+  );
+  return { allowed, retryAfterSeconds };
 }
