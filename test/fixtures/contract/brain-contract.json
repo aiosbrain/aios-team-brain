@@ -102,15 +102,15 @@
   "codebasePayloadContract": {
     "version": "1.24",
     "minScannerVersion": "0.2.0",
-    "_minScannerVersionNote": "The oldest ingestion-package build (aios_ingest.__version__) that emits everything this contract revision asks a scanner for. A scan whose metrics.scanner_version is absent, unparseable, or orders below this is STALE, and the brain says so at the point of confusion rather than rendering an unexplained '(scope unknown)'. Deliberately a declared minimum and NOT a commit distance: commit distance is undefined across branches and forks, needs a git history the brain does not hold at runtime, stops existing when the scanner ships as a package, and says nothing about whether anything the contract needs actually changed. The cost of the choice, stated so it is not forgotten: RAISE THIS in the same PR as any revision that requires new scanner output, or staleness detection is silently off for that field. The brain mirrors this value in lib/codebases/scanner-version.ts and a guard asserts the two agree.",
+    "_minScannerVersionNote": "The oldest ingestion-package build (aios_ingest.__version__) that emits everything this contract revision asks a scanner for. A scan whose metrics.scanner_version is PARSEABLE and orders below this is STALE. Absent, null or unparseable is UNKNOWN, which is a DIFFERENT outcome and must never be reported as stale: 'the scan did not tell us' is not 'the scan told us it is old', and collapsing the two is the exact error this field exists to remove. Three states, no fourth: unknown | stale | current (see the truth table in docs/brain-api.md, and the scanner_state conformance vectors in codebase-payload-1.24-fixtures.json). Either way the brain says so at the point of confusion rather than rendering an unexplained '(scope unknown)'. Deliberately a declared minimum and NOT a commit distance: commit distance is undefined across branches and forks, needs a git history the brain does not hold at runtime, stops existing when the scanner ships as a package, and says nothing about whether anything the contract needs actually changed. The cost of the choice, stated so it is not forgotten: RAISE THIS in the same PR as any revision that requires new scanner output, or staleness detection is silently off for that field. The brain mirrors this value in lib/codebases/scanner-version.ts and a guard asserts the two agree.",
     "schema": {
       "path": "codebase-payload-1.24.schema.json",
       "sha256": "761f8e74be2f98d2883d9d61697f7d0c95c28df7770ba7e467d35dd6492feca6"
     },
     "fixtures": {
       "path": "codebase-payload-1.24-fixtures.json",
-      "sha256": "8ba896e6d6edc3c3d3d6edb7956f67747b41ee6f12c9137720ab63d2d55cc2b8"
+      "sha256": "ae7fc3840bcf7e7d1ec10086d8dee858347c0d7f792d27f28d97ae5a238a792b"
     }
   },
-  "contentHash": "a99df0367bec16d23a194e29dd7e0c11e7a83df64bf507b2f72c8b25af7ec831"
+  "contentHash": "358e59e50fb23788b8f22a963e3b47861c1c1d4c7d1de85877b4ccbc5e711e71"
 }

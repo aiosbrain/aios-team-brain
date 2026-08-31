@@ -1383,5 +1383,59 @@
         }
       }
     }
-  ]
+  ],
+  "scanner_state": {
+    "_note": "Consumer conformance vectors for the brain-api 1.24 scanner-identity READING (AIO-1011). JSON Schema pins the WIRE shape of metrics.scanner_version; these pin what a reader must CONCLUDE from it, which the schema cannot express. Three states and no fourth — unknown | stale | current — compared against codebasePayloadContract.minScannerVersion in brain-contract.json. The load-bearing rule: absent, null and unparseable are UNKNOWN, never stale. \"The scan did not tell us\" is a different statement from \"the scan told us it is old\", and collapsing them is the exact defect 1.24 exists to remove — absence of evidence rendered as evidence. Deliberately no parser-grammar edge cases here (no \"0.2\", no \"v0.2.0-dirty\"): the exact grammar is the reader's, and a value it cannot read normalizes to unknown by the rule above, so pinning those would over-specify the contract. A vector with no scanner_version key means the field was ABSENT from the payload.",
+    "vectors": [
+      {
+        "name": "absent: a pre-1.24 scan never sent the field and can never be backfilled",
+        "state": "unknown"
+      },
+      {
+        "name": "null: the scanner could not determine its own build and said so",
+        "scanner_version": null,
+        "state": "unknown"
+      },
+      {
+        "name": "empty string: unreadable, so unknown — and still not a 422",
+        "scanner_version": "",
+        "state": "unknown"
+      },
+      {
+        "name": "unparseable: a fork or local build emits something that is not a version",
+        "scanner_version": "not a version at all",
+        "state": "unknown"
+      },
+      {
+        "name": "unparseable channel name, not a version",
+        "scanner_version": "nightly",
+        "state": "unknown"
+      },
+      {
+        "name": "below the declared minimum: the one case that is genuinely STALE",
+        "scanner_version": "0.1.0",
+        "state": "stale"
+      },
+      {
+        "name": "below the declared minimum on the patch component",
+        "scanner_version": "0.1.9",
+        "state": "stale"
+      },
+      {
+        "name": "exactly the declared minimum: at-or-above is current, the boundary is inclusive",
+        "scanner_version": "0.2.0",
+        "state": "current"
+      },
+      {
+        "name": "above the declared minimum on patch",
+        "scanner_version": "0.2.1",
+        "state": "current"
+      },
+      {
+        "name": "above the declared minimum on major",
+        "scanner_version": "1.0.0",
+        "state": "current"
+      }
+    ]
+  }
 }

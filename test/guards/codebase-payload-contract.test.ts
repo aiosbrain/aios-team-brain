@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { scannerStaleness } from "@/lib/codebases/scanner-version";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 
 /**
- * Server-side conformance guard for the Brain API 1.23 codebase-scan payload
+ * Server-side conformance guard for the Brain API 1.24 codebase-scan payload
  * (POST /api/v1/codebases, incl. the optional provenance-only `metrics.codebase_health`
  * object — AIO-609). Mirror of aios-workspace/test/codebase-payload-contract.test.mjs,
  * run against vendored copies of the shared contract artifacts
@@ -31,7 +32,7 @@ const PINNED = {
   "codebase-payload-1.24.schema.json":
     "761f8e74be2f98d2883d9d61697f7d0c95c28df7770ba7e467d35dd6492feca6",
   "codebase-payload-1.24-fixtures.json":
-    "8ba896e6d6edc3c3d3d6edb7956f67747b41ee6f12c9137720ab63d2d55cc2b8",
+    "ae7fc3840bcf7e7d1ec10086d8dee858347c0d7f792d27f28d97ae5a238a792b",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
@@ -55,6 +56,19 @@ const fixtures = JSON.parse(
     readonly name: string;
     readonly payload: unknown;
   }[];
+  // brain-api 1.24 (AIO-1011). Consumer-READING vectors: JSON Schema pins the wire shape of
+  // `scanner_version`, but it cannot express what a reader must CONCLUDE from it. `scanner_version`
+  // is OPTIONAL on the vector on purpose — an absent key models a pre-1.24 payload that never
+  // carried the field, which is a different input from an explicit `null`, and both must read
+  // "unknown".
+  readonly scanner_state: {
+    readonly _note: string;
+    readonly vectors: readonly {
+      readonly name: string;
+      readonly scanner_version?: string | null;
+      readonly state: "unknown" | "stale" | "current";
+    }[];
+  };
 };
 
 describe("brain-api 1.24 codebase-payload conformance", () => {
@@ -69,6 +83,58 @@ describe("brain-api 1.24 codebase-payload conformance", () => {
   // (brain-contract.json → codebasePayloadContract, hashed since 1.24). Checking against that
   // declaration as well means a re-vendor that updates the files and the local PINNED table but
   // forgets brain-contract.json cannot pass: the canonical statement and the bytes must agree.
+  // brain-api 1.24 (AIO-1011). The upstream `scanner_state` vectors are the EXECUTABLE form of
+  // the three-state truth table. Driving the reading off them — rather than off a table retyped
+  // in this repo — is what makes the two repos agree by construction instead of by two people
+  // reading the same paragraph. The contract deliberately omits parser-grammar edge cases
+  // ("0.2", "v0.2.0-dirty"): the grammar is the READER's, and anything it cannot read normalizes
+  // to unknown by the rule below, so pinning them upstream would make the contract stricter than
+  // the brain — the 1.22 drift, pointed the other way.
+  describe("scanner-identity reading conforms to the canonical vectors", () => {
+    const vectors = fixtures.scanner_state.vectors;
+
+    it("the vector set is populated and covers all three states (non-vacuous)", () => {
+      expect(vectors.length).toBeGreaterThanOrEqual(10);
+      expect(new Set(vectors.map((v) => v.state))).toEqual(
+        new Set(["unknown", "stale", "current"]),
+      );
+    });
+
+    it.each(vectors.map((v) => [v.name, v] as const))(
+      "%s",
+      (_name, v) => {
+        // An ABSENT key and an explicit null are different inputs that must reach the same
+        // verdict, so the absent case is passed as `undefined` rather than coerced to null.
+        const declared = "scanner_version" in v ? v.scanner_version : undefined;
+        expect(scannerStaleness(declared)).toBe(v.state);
+      },
+    );
+
+    it("UNPARSEABLE resolves to unknown and is NEVER ordered against the minimum", () => {
+      // The load-bearing rule, asserted directly rather than inferred from the loop above:
+      // every vector the contract calls unreadable must land in `unknown`, and none of them may
+      // fall through to `stale` — "the scan did not tell us" is a different statement from
+      // "the scan told us it is old", and collapsing them is the defect 1.24 exists to remove.
+      const unreadable = vectors.filter(
+        (v) =>
+          v.state === "unknown" &&
+          "scanner_version" in v &&
+          typeof v.scanner_version === "string",
+      );
+      expect(unreadable.length).toBeGreaterThan(0);
+      for (const v of unreadable) {
+        expect(scannerStaleness(v.scanner_version), v.name).toBe("unknown");
+        expect(scannerStaleness(v.scanner_version), v.name).not.toBe("stale");
+      }
+    });
+
+    it("absence and explicit null agree, and neither is ever 'current'", () => {
+      expect(scannerStaleness(undefined)).toBe("unknown");
+      expect(scannerStaleness(null)).toBe("unknown");
+      expect(scannerStaleness(undefined)).not.toBe("current");
+    });
+  });
+
   it("the vendored payload artifacts match the hashes the CONTRACT declares for them", () => {
     const brainContract = JSON.parse(
       readFileSync(join(CONTRACT_DIR, "brain-contract.json"), "utf8"),
