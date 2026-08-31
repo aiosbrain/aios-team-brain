@@ -6,6 +6,11 @@ import { normalizeTier, PROVISIONING_TOOLS } from "@/lib/api/schemas";
 import { itemPayloadSchema } from "@/lib/api/schemas";
 import { formatSseFrame } from "@/lib/api/sse";
 import { BRAIN_API_VERSION } from "@/lib/api/version";
+import {
+  MIN_SCANNER_VERSION,
+  parseScannerVersion,
+  scannerStaleness,
+} from "@/lib/codebases/scanner-version";
 import { ALL_TOOLS } from "@/lib/provisioning/run";
 
 /**
@@ -74,6 +79,7 @@ describe("brain-api tier + SSE conformance", () => {
       provisioningTools,
       gatewayContract,
       itemPayloadContract,
+      codebasePayloadContract,
     } = fixture;
     const recomputed = createHash("sha256")
       .update(
@@ -85,6 +91,10 @@ describe("brain-api tier + SSE conformance", () => {
             provisioningTools,
             gatewayContract,
             itemPayloadContract,
+            // Hashed since 1.24 (AIO-1011). This block carries `minScannerVersion` — the declared
+            // threshold a scan's `scanner_version` is read against — so it is contract CONTENT,
+            // not commentary, and an out-of-band edit to it must break the hash like any other.
+            codebasePayloadContract,
           }),
         ),
       )
@@ -94,6 +104,24 @@ describe("brain-api tier + SSE conformance", () => {
 
   it("fixture version tracks BRAIN_API_VERSION", () => {
     expect(fixture.version).toBe(BRAIN_API_VERSION);
+  });
+
+  // brain-api 1.24 (AIO-1011). The staleness threshold is DECLARED in the canonical contract and
+  // MIRRORED in this repo as a constant the read path uses. This guard is the thing that stops
+  // the two drifting — and drift here is silent by construction: a brain reading a stale mirror
+  // would keep classifying scans without erroring, which is the exact failure mode (a wrong
+  // answer with no red) that AIO-1011 exists to end.
+  it("MIN_SCANNER_VERSION mirrors the contract's declared minScannerVersion", () => {
+    expect(fixture.codebasePayloadContract.minScannerVersion).toBe(
+      MIN_SCANNER_VERSION,
+    );
+  });
+
+  it("the mirrored minimum is an ordered version the read path can actually parse", () => {
+    // A minimum this repo cannot parse would disable staleness detection fleet-wide and silently:
+    // `scannerStaleness` refuses to invent a threshold, so every repo would read "unknown".
+    expect(parseScannerVersion(MIN_SCANNER_VERSION)).not.toBeNull();
+    expect(scannerStaleness("0.0.1", MIN_SCANNER_VERSION)).toBe("stale");
   });
 
   // The item-payload contract carries its OWN version (last changed at 1.12) and is decoupled from
