@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
+import { normalizeStoredScannerField } from "@/lib/codebases/scanner-version";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
 import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
 import { audit } from "@/lib/api/audit";
@@ -125,6 +126,14 @@ export async function ingestCodebaseScan(
         // schema rejects sparse (health-only) pushes at the boundary. Nested arrays ride
         // inside a plain object, which the pg adapter auto-casts to ::jsonb as a whole.
         codebase_health: m.codebase_health ?? null,
+        // brain-api 1.24 — which scanner build produced this point (AIO-1011). Stored VERBATIM,
+        // including a version string this server cannot parse: provenance is most valuable
+        // exactly when something is wrong with it, and the interpretation ("stale" / "unknown")
+        // is a read-time reading in `lib/codebases/scanner-version`, not a write-time verdict.
+        // Nothing here can fail the upsert — a scanner that omits them writes null, which is what
+        // every pre-1.24 row already holds and can never stop holding.
+        scanner_version: normalizeStoredScannerField(m.scanner_version),
+        scanner_sha: normalizeStoredScannerField(m.scanner_sha),
         ...scores,
       },
       { onConflict: "codebase_id,head_sha" }

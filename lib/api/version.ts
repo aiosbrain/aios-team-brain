@@ -80,8 +80,34 @@
  *        numeric coherence, persists the observations, and derives debt mix, age, coverage, and
  *        fix-on-fix KPIs without accepting source paths or excerpts. Legacy commit objects remain
  *        valid; no database migration is needed because recent_commits is already JSON.
+ * 1.24 — ADDITIVE: POST /api/v1/codebases `metrics` gains two optional, nullable scanner-identity
+ *        fields — `scanner_version` (the ingestion package build, `aios_ingest.__version__`) and
+ *        `scanner_sha` (the aios-team-brain commit it ran from, provenance only) — so a scan
+ *        declares WHICH SCANNER BUILT IT (AIO-1011). The brain persists both verbatim and derives
+ *        a `current` / `stale` / `unknown` reading from `scanner_version` alone, against the
+ *        contract's declared `codebasePayloadContract.minScannerVersion` (0.2.0 at this revision).
+ *        WHY: 1.22's coverage denominator shipped and never arrived. All seven consuming repos
+ *        pin the scanner to an exact commit in their own `.github/scripts/fetch-brain-scanner.sh`
+ *        (a deliberate supply-chain control), and all seven were pinned to a build predating the
+ *        field. Every scan returned 200, nothing went red, and the dashboard showed an
+ *        unexplained `(scope unknown)` for the whole fleet until a human noticed. The pin is not
+ *        the defect; the absence of staleness DETECTION is.
+ *        NULL MEANS UNKNOWN, AND SPECIFICALLY "PREDATES 1.24" — never "current". Every row
+ *        already in `code_metrics` is in that state and cannot be backfilled, so unknown is the
+ *        COMMON state and is rendered as a caveat, not a pass.
+ *        NEVER A REJECTION: both fields are typed as a bounded string with no pattern, and an
+ *        unparseable value normalizes to unknown at READ time. A 422 would drop the repo's entire
+ *        scan and return before the ingest run is recorded, so the failure would not even be
+ *        logged; provenance can never be worth that.
+ *        Staleness is a DECLARED MINIMUM, not a commit distance — commit distance is undefined
+ *        across branches and forks, needs a git history the brain does not hold at runtime, stops
+ *        existing when the scanner ships as a package, and says nothing about whether anything
+ *        the contract needs actually changed. The cost: raise `minScannerVersion` in the same PR
+ *        as any revision requiring new scanner output, or detection is silently off for it.
+ *        NEEDS A MIGRATION: two new columns on `code_metrics`
+ *        (postgres/migrations/20260831120000_code_metrics_scanner_identity.sql).
  */
-export const BRAIN_API_VERSION = "1.23";
+export const BRAIN_API_VERSION = "1.24";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

@@ -1,5 +1,10 @@
 import { AlertTriangle } from "lucide-react";
 import { isUnscopedCoverage } from "@/lib/codebases/score";
+import {
+  MIN_SCANNER_VERSION,
+  scannerStalenessLabel,
+  type ScannerStaleness,
+} from "@/lib/codebases/scanner-version";
 
 export { isUnscopedCoverage };
 
@@ -23,6 +28,13 @@ export { isUnscopedCoverage };
  *   • scope UNKNOWN           → the percentage plus an explicit "scope unknown" marker. Never
  *                               a zero, never a dash in a denominator slot, and never silence —
  *                               silence is what let the number read as a whole-repo claim.
+ *
+ * **And, since 1.24 (AIO-1011): unknown scope now names its CAUSE.** "(scope unknown)" was true
+ * and unactionable. The reason it was true for all seven repos was that each was pinned to a
+ * scanner build predating the field — 1.22 shipped, every scan returned 200, and the feature
+ * never arrived. A caveat that cannot be acted on is only marginally better than silence, so when
+ * the scan declares a build older than the contract needs (or declares none at all), the marker
+ * says so where the reader meets the confusion, not in a log nobody opens.
  */
 
 export const NARROW_BREADTH_PCT = 50;
@@ -46,20 +58,38 @@ export function CoverageScope({
   linesInstrumented,
   loc,
   breadthPct,
+  scannerStaleness,
+  scannerVersion,
   className = "",
 }: {
   linesInstrumented: number | null;
   loc: number | null;
   breadthPct: number | null;
+  /**
+   * Which scanner build produced the scan (brain-api 1.24). Optional so a caller that genuinely
+   * has no scan context can omit it — omitted is treated as `"unknown"`, never as `"current"`,
+   * because defaulting to "current" would reinstate exactly the silent pass this fixes.
+   */
+  scannerStaleness?: ScannerStaleness;
+  scannerVersion?: string | null;
   className?: string;
 }) {
   if (linesInstrumented == null || loc == null || loc <= 0) {
+    // The cause, when we know it. A scan from a scanner that predates the field could not have
+    // reported scope no matter what the repo did — so "re-scan" is the wrong advice and "bump the
+    // pin" is the right one. Where the scanner IS current, the scope is genuinely missing (no
+    // coverage report parsed the counts) and the original wording still holds.
+    const cause = scannerStalenessLabel(scannerStaleness ?? "unknown", scannerVersion);
     return (
       <span
-        title="This scan did not report how many lines the coverage run measured, so the percentage above could describe the whole repository or a small corner of it. Re-scan with a current scanner to record the scope."
+        title={
+          cause
+            ? `${cause}. The percentage above could describe the whole repository or a small corner of it. Bump this repo's scanner pin in .github/scripts/fetch-brain-scanner.sh to a build at or after ${MIN_SCANNER_VERSION} — the exact-SHA pin is deliberate, so it is bumped, never removed.`
+            : "This scan ran a current scanner but did not report how many lines the coverage run measured, so the percentage above could describe the whole repository or a small corner of it."
+        }
         className={`font-mono text-[10px] text-ink-tertiary italic ${className}`}
       >
-        (scope unknown)
+        {cause ? "(scope unknown — stale scanner)" : "(scope unknown)"}
       </span>
     );
   }
@@ -109,6 +139,38 @@ export function PartialRunBadge({
     >
       <AlertTriangle className="size-2.5" />
       partial
+    </span>
+  );
+}
+
+/**
+ * "scanner outdated" badge — the repo's pinned scanner cannot send what the contract now asks for.
+ *
+ * Rendered independently of coverage, because the consequence is not limited to coverage: an old
+ * scanner under-reports whatever the newest revision added, and the next revision will add
+ * something else. A repo with no coverage number at all still needs its pin bumped.
+ *
+ * `"current"` renders NOTHING. `"unknown"` DOES render — that is the whole discipline: a scan that
+ * declined to say what built it is not evidence of a current build, and every scan pushed before
+ * 1.24 is in exactly that state. The two non-current states carry DIFFERENT words, because they
+ * have different remedies.
+ */
+export function ScannerStalenessBadge({
+  staleness,
+  scannerVersion,
+}: {
+  staleness: ScannerStaleness;
+  scannerVersion: string | null;
+}) {
+  const label = scannerStalenessLabel(staleness, scannerVersion);
+  if (!label) return null;
+  return (
+    <span
+      title={`${label}. Bump this repo's pin in .github/scripts/fetch-brain-scanner.sh to a scanner build at or after ${MIN_SCANNER_VERSION}. The exact-SHA pin is deliberate — it keeps another repo's code from executing in your CI unreviewed — so it is bumped, never removed.`}
+      className="inline-flex items-center gap-1 rounded-full border border-amber-400/25 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-500/90"
+    >
+      <AlertTriangle className="size-2.5" />
+      {staleness === "unknown" ? "scanner unknown" : "scanner outdated"}
     </span>
   );
 }

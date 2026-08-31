@@ -1,0 +1,1387 @@
+{
+  "$schema": "./codebase-payload-1.24.schema.json",
+  "version": "1.24",
+  "_note": "Canonical parity fixtures for codebase-payload-1.24.schema.json (POST /api/v1/codebases). Synthetic data only. valid/invalid pin JSON Schema parity. brain_invalid pins the sibling-count invariants that JSON Schema 2020-12 cannot express and the Brain must reject at its boundary. 1.23 added optional versioned commit classification and first-parent fix-analysis counts; 1.24 adds scanner identity - a payload that declares its build, one that declares a version but no SHA, one that declares neither, and - load-bearing - one whose version string the brain cannot parse, which must still be ACCEPTED. Staleness is a reading of the payload, never a reason to refuse it: a 422 drops the repo's entire scan and returns before the ingest run is logged, so an unreadable version must degrade to 'unknown scanner', not to 'no data at all'. Neither revision changes legacy payload validity.",
+  "valid": [
+    {
+      "name": "valid-with-health: full metrics block plus codebase_health",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z",
+              "commit_classification": {
+                "scheme": "conventional-commit-v1",
+                "type": "fix"
+              },
+              "fix_analysis": {
+                "method": "first-parent-line-blame-v1",
+                "candidate_parent_lines": 42,
+                "blamed_parent_lines": 39,
+                "age_buckets": {
+                  "0_1d": 2,
+                  "2_7d": 6,
+                  "8_30d": 8,
+                  "31_90d": 9,
+                  "91_365d": 10,
+                  "366d_plus": 4
+                },
+                "prior_fix_parent_lines": 7
+              }
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": null,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "valid-without-health: pre-1.15 payload remains valid unchanged",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            }
+          },
+          "readiness_rubric_version": "1.0.0"
+        }
+      }
+    },
+    {
+      "name": "valid-minimal: only the required core raw-scan fields",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 2,
+          "ai_commits_window": 1,
+          "additions_window": 20,
+          "deletions_window": 3,
+          "recent_commits": [],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0
+        }
+      }
+    },
+    {
+      "name": "valid-health-clean-pass: passing health snapshot with empty failed_invariant_ids",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+          "loc": 500,
+          "files": 20,
+          "commits_window": 5,
+          "ai_commits_window": 2,
+          "additions_window": 100,
+          "deletions_window": 10,
+          "recent_commits": [
+            {
+              "sha": "ffff000",
+              "author": "Sam",
+              "ai": false
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": true,
+          "agents_md_count": 1,
+          "skills_count": 2,
+          "commands_count": 1,
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "score_pct": 100,
+            "status": "pass",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [],
+            "measured_at": "2026-07-30T09:00:00Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "valid-1.22-coverage-denominator: the six new measures, coherent",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0
+        }
+      }
+    },
+    {
+      "name": "valid-1.22-explicit-nulls: unknown is a sendable value, and is not zero",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 99,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": null,
+          "test_coverage_lines_covered": null,
+          "tests_total": null,
+          "tests_passed": null,
+          "tests_skipped": null,
+          "tests_failed": null
+        }
+      }
+    },
+    {
+      "name": "valid-1.24-scanner-identity: the scan declares which build produced it",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_version": "0.2.0",
+          "scanner_sha": "8c29919236e602af63508abf5e988d4ab1d97eff"
+        }
+      }
+    },
+    {
+      "name": "valid-1.24-scanner-version-without-sha: a package install has no git history",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_version": "0.2.0",
+          "scanner_sha": null
+        }
+      }
+    },
+    {
+      "name": "valid-1.24-scanner-identity-explicit-null: unknown build is a sendable value, and is not 'current'",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_version": null,
+          "scanner_sha": null
+        }
+      }
+    },
+    {
+      "name": "valid-1.24-scanner-version-unparseable: a version the brain cannot read must NOT 422 the scan",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_version": "nightly",
+          "scanner_sha": null
+        }
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "invalid-sparse-health-only: codebase_health without the full raw-metrics block",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-bad-health-types: wrong scalar types inside codebase_health",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 2,
+          "ai_commits_window": 1,
+          "additions_window": 20,
+          "deletions_window": 3,
+          "recent_commits": [],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0,
+          "codebase_health": {
+            "schema_version": 1,
+            "rubric_version": "1.0.0",
+            "head_sha": "not-a-sha",
+            "score_pct": "eighty",
+            "status": "amber",
+            "dimensions": {
+              "structure": {
+                "passed": "four",
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": "OGR04.tier-coverage",
+            "measured_at": "yesterday"
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-health-missing-required: codebase_health without status/measured_at",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 2,
+          "ai_commits_window": 1,
+          "additions_window": 20,
+          "deletions_window": 3,
+          "recent_commits": [],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0,
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": []
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-health-unknown-key: codebase_health smuggling a non-scalar surface (file path)",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 2,
+          "ai_commits_window": 1,
+          "additions_window": 20,
+          "deletions_window": 3,
+          "recent_commits": [],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0,
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z",
+            "failing_files": [
+              "5-personal/notes.md"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-missing-metrics: payload without the metrics block at all",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        }
+      }
+    },
+    {
+      "name": "invalid-empty-dimensions: dimensions map may not be empty",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 2,
+          "ai_commits_window": 1,
+          "additions_window": 20,
+          "deletions_window": 3,
+          "recent_commits": [],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0,
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {},
+            "failed_invariant_ids": [],
+            "measured_at": "2026-07-30T09:00:00Z"
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid-1.22-negative-denominator: a count below zero is not a measurement",
+      "reason": "test_coverage_lines_total/_covered are integers >= 0; the brain's schema is nonnegative, so a canonical contract that accepted these would license a payload the brain 422s - losing the whole scan, not just the field.",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 99,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": -1,
+          "test_coverage_lines_covered": -2
+        }
+      }
+    },
+    {
+      "name": "invalid-1.22-negative-skipped: same rule for the run-integrity counts",
+      "reason": "tests_* are integers >= 0.",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": null,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "tests_total": 10,
+          "tests_skipped": -1
+        }
+      }
+    },
+    {
+      "name": "invalid-1.22-fractional-count: these are counts, not percentages",
+      "reason": "test_coverage_lines_total must be an integer.",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": null,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 100.5
+        }
+      }
+    },
+    {
+      "name": "invalid-1.23-fix-analysis-on-feature: fix evidence requires a fix classification",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 1,
+          "ai_commits_window": 0,
+          "additions_window": 3,
+          "deletions_window": 2,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "commit_classification": {
+                "scheme": "conventional-commit-v1",
+                "type": "feat"
+              },
+              "fix_analysis": {
+                "method": "first-parent-line-blame-v1",
+                "candidate_parent_lines": 2,
+                "blamed_parent_lines": 2,
+                "age_buckets": {
+                  "0_1d": 2,
+                  "2_7d": 0,
+                  "8_30d": 0,
+                  "31_90d": 0,
+                  "91_365d": 0,
+                  "366d_plus": 0
+                },
+                "prior_fix_parent_lines": 0
+              }
+            }
+          ],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0
+        }
+      }
+    },
+    {
+      "name": "invalid-1.24-scanner-version-not-a-string: identity is a string or null, never a number",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_version": 2
+        }
+      }
+    },
+    {
+      "name": "invalid-1.24-scanner-sha-overlong: bounded because it becomes a stored column",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo",
+          "full_name": "synthetic-org/synthetic-repo",
+          "provider": "github"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "window_days": 90,
+          "loc": 12000,
+          "files": 240,
+          "commits_window": 40,
+          "ai_commits_window": 18,
+          "additions_window": 3200,
+          "deletions_window": 900,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "author": "Alex",
+              "ai": true,
+              "committed_at": "2026-07-29T10:00:00Z"
+            }
+          ],
+          "has_claude_md": true,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 7,
+          "commands_count": 3,
+          "test_coverage_pct": 60.25,
+          "readiness_level": "L3",
+          "readiness_pct": 61.11,
+          "readiness_pillars": {
+            "testing": {
+              "passed": 2,
+              "total": 2
+            },
+            "docs": {
+              "passed": 2,
+              "total": 3
+            }
+          },
+          "readiness_rubric_version": "1.0.0",
+          "codebase_health": {
+            "schema_version": "1.0",
+            "rubric_version": "1.0.0",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
+            "score_pct": 87.5,
+            "status": "warn",
+            "dimensions": {
+              "structure": {
+                "passed": 4,
+                "total": 4
+              },
+              "governance": {
+                "passed": 3,
+                "total": 4
+              }
+            },
+            "failed_invariant_ids": [
+              "OGR04.tier-coverage"
+            ],
+            "measured_at": "2026-07-30T09:00:00Z"
+          },
+          "test_coverage_lines_total": 10647,
+          "test_coverage_lines_covered": 6415,
+          "tests_total": 451,
+          "tests_passed": 451,
+          "tests_skipped": 0,
+          "tests_failed": 0,
+          "scanner_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    }
+  ],
+  "brain_invalid": [
+    {
+      "name": "brain-invalid-1.23-blame-exceeds-candidates",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 1,
+          "ai_commits_window": 0,
+          "additions_window": 3,
+          "deletions_window": 2,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "commit_classification": {
+                "scheme": "conventional-commit-v1",
+                "type": "fix"
+              },
+              "fix_analysis": {
+                "method": "first-parent-line-blame-v1",
+                "candidate_parent_lines": 2,
+                "blamed_parent_lines": 3,
+                "age_buckets": {
+                  "0_1d": 3,
+                  "2_7d": 0,
+                  "8_30d": 0,
+                  "31_90d": 0,
+                  "91_365d": 0,
+                  "366d_plus": 0
+                },
+                "prior_fix_parent_lines": 0
+              }
+            }
+          ],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0
+        }
+      }
+    },
+    {
+      "name": "brain-invalid-1.23-age-buckets-do-not-sum",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 1,
+          "ai_commits_window": 0,
+          "additions_window": 3,
+          "deletions_window": 2,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "commit_classification": {
+                "scheme": "conventional-commit-v1",
+                "type": "fix"
+              },
+              "fix_analysis": {
+                "method": "first-parent-line-blame-v1",
+                "candidate_parent_lines": 3,
+                "blamed_parent_lines": 3,
+                "age_buckets": {
+                  "0_1d": 2,
+                  "2_7d": 0,
+                  "8_30d": 0,
+                  "31_90d": 0,
+                  "91_365d": 0,
+                  "366d_plus": 0
+                },
+                "prior_fix_parent_lines": 0
+              }
+            }
+          ],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0
+        }
+      }
+    },
+    {
+      "name": "brain-invalid-1.23-prior-fix-exceeds-blamed",
+      "payload": {
+        "codebase": {
+          "slug": "synthetic-repo"
+        },
+        "metrics": {
+          "head_sha": "abc123def456abc123def456abc123def456abc1",
+          "loc": 100,
+          "files": 5,
+          "commits_window": 1,
+          "ai_commits_window": 0,
+          "additions_window": 3,
+          "deletions_window": 2,
+          "recent_commits": [
+            {
+              "sha": "abc123d",
+              "commit_classification": {
+                "scheme": "conventional-commit-v1",
+                "type": "fix"
+              },
+              "fix_analysis": {
+                "method": "first-parent-line-blame-v1",
+                "candidate_parent_lines": 3,
+                "blamed_parent_lines": 2,
+                "age_buckets": {
+                  "0_1d": 2,
+                  "2_7d": 0,
+                  "8_30d": 0,
+                  "31_90d": 0,
+                  "91_365d": 0,
+                  "366d_plus": 0
+                },
+                "prior_fix_parent_lines": 3
+              }
+            }
+          ],
+          "has_claude_md": false,
+          "has_agents_md": false,
+          "agents_md_count": 0,
+          "skills_count": 0,
+          "commands_count": 0
+        }
+      }
+    }
+  ]
+}

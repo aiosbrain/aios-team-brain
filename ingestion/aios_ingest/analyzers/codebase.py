@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..build import scanner_sha, scanner_version
 from .readiness import score_readiness
 
 log = logging.getLogger(__name__)
@@ -1070,6 +1071,14 @@ def _metrics_block(
         "readiness_pct": r.get("readiness_pct"),
         "readiness_pillars": r.get("readiness_pillars", {}),
         "readiness_rubric_version": r.get("readiness_rubric_version"),
+        # brain-api 1.24 (AIO-1011) — WHICH SCANNER BUILD produced this payload. Emitted on every
+        # block, historical backfill included: a backfilled point was produced by THIS scanner
+        # reading a past commit, so the build that made it is this one, not the one that existed
+        # then. Both are already normalized by `aios_ingest.build` and are None when unknown —
+        # never a placeholder string, and never a guess. `None` reads as "unknown scanner", which
+        # is exactly what an unidentifiable build is; the brain never reads it as "current".
+        "scanner_version": scanner_version(),
+        "scanner_sha": scanner_sha(),
     }
     if scanned_at:
         block["scanned_at"] = scanned_at  # historical snapshots set their as-of date
