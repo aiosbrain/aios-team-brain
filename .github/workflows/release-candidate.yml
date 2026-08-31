@@ -42,7 +42,7 @@ jobs:
     name: Release candidate gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Ancestry (assertion C) and reachability (assertion D) are meaningless against a shallow
           # checkout, and the guard re-fetches the tag object itself because checkout is known to
