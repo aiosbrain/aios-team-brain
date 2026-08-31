@@ -163,6 +163,40 @@ describe("scanner identity persistence + the three states (real Postgres)", () =
     expect(summary?.scanner_staleness).toBe("unknown");
   });
 
+  it("the coverage KPI hint names the cause WITHOUT calling an unknown scanner 'stale'", async () => {
+    // Day one of 1.24, essentially every repo is on a pre-1.24 scanner sending no identity at
+    // all — so `unknown` is the overwhelmingly common state, and whatever word the KPI uses is
+    // the word shown for the whole fleet. Calling that union "stale" would assert something
+    // false: these repos did not declare an old build, they declared nothing. The aggregate may
+    // only claim what it can support ("not current"); the per-repo badge is where the two states
+    // are told apart.
+    const seed = await seedTeam();
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    // Unscoped coverage (a percentage with no denominator) + no scanner identity: the exact
+    // fleet state that made 1.22 look like a transient blank for weeks.
+    await push(
+      seed,
+      scan(slug, { test_coverage_pct: 99, test_coverage_lines_total: null }),
+    );
+
+    const { codebases, kpis } = await getCodebaseSummaries(
+      db(),
+      seed.teamId,
+      "90d",
+      "team",
+    );
+    expect(codebases.find((c) => c.slug === slug)?.scanner_staleness).toBe(
+      "unknown",
+    );
+
+    const coverage = kpis.find((k) => k.key === "coverage");
+    expect(coverage?.hint).toContain("without scope");
+    // The cause is named...
+    expect(coverage?.hint).toContain("scanner not current");
+    // ...but an unknown build is NOT reported as a stale one.
+    expect(coverage?.hint).not.toMatch(/stale/i);
+  });
+
   it("re-scanning with a NEWER scanner moves the repo out of stale (the remedy actually works)", async () => {
     // Without this, "stale" could be a label that never clears — and an alert that cannot be
     // resolved is one people learn to ignore, which is how the original silence started.
