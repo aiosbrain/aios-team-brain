@@ -94,11 +94,24 @@ strict only about SUBSTANCE, because a gate that rejects honest attestations get
 inside fenced blocks and HTML comments is ignored, so quoting the template neither satisfies nor poisons
 the check. Reads only the event payload — no secrets, no network. See CLAUDE.md §"Review gate".
 
-### `aios-work-sync.yml` — fires on merge to `main`
+### `aios-work-sync.yml` — fires on a merged PR into `main` or `staging`
 
 Extracts work keys from the PR **title, body and branch ref** and POSTs a merge event to `/api/v1/work-events`. This closes the matching issue in the team's primary PM tool automatically — currently **Linear** (the brain projects the merge event to whichever provider `teams.primary_pm_provider` names; the sync path itself is provider-neutral).
 
 **Required secrets:** `AIOS_BRAIN_URL`, `AIOS_API_KEY`, `AIOS_TEAM`
+
+**⛔ It runs on `pull_request_target`, and every line of code it executes comes from the base branch** — the same shape, and for the same reason, as `pr-task-link.yml` below. The trigger used to be `pull_request: types: [closed]`, and on `pull_request` GitHub takes the **workflow file itself** from the PR head. So the `merged == true` guard was contributor-editable, and the attack needed no merge and no approval: push a branch, edit this file to delete the guard and print the three secrets, open a PR, then **close it unmerged** — `closed` fires on any close. Same class as `pr-task-link.yml`'s defect, one step worse, because the thing that was supposed to limit it lived inside the rewritable file.
+
+What makes the current shape safe, in the order the properties matter:
+
+- **Base-branch code only.** `actions/checkout` takes no `ref:` — on `pull_request_target` the default is the base branch — and nothing from the PR head is fetched, installed, built or executed. The PR contributes **data only**: title, body, branch ref, head SHA, merge-commit SHA, html URL, author and merger, each passed through the step's `env:` and read with `process.env`. No `github.event.*` expression appears in a `run:` body, because interpolation happens before the shell parses and a PR title is therefore a command-injection primitive next to a durable credential.
+- **`branches: [main, staging]` is not decoration.** Under `pull_request_target` the "base" is whatever branch the PR targets, so without an explicit filter a collaborator pushes `evil`, opens `evil2 → evil`, and the trusted base-branch code **is their own tree**. The filter is what makes "base branch" mean a reviewed branch.
+- **Same-repository condition.** `github.event.pull_request.head.repo.full_name == github.repository`, alongside `merged == true`. Under `pull_request` a fork run received no secrets and skipped harmlessly; `pull_request_target` would newly hand the brain credentials to a run an outside contributor can start, so the condition restores what the old trigger gave for free.
+- **`permissions: contents: read` only**, and `environment: trusted-automation` — a blast-radius control, **not** a fork boundary; see the identical note under `pr-task-link.yml`.
+
+`test/guards/pr-task-link-credential-isolation.test.ts` pins every one of those as parsed YAML, and its `KNOWN_GAPS` list is now **empty**: no PR-reachable workflow in this repo is excused from the rule.
+
+**One cost, inert today and not at the RELPTR-4 cutover.** The environment's deployment branch policy allows `main` only, and on `pull_request_target` the run's ref is the PR's target branch. A merge into `staging` would be **refused the environment** and the job would go red having run zero steps — loud rather than silent, but with no work event posted. No PR targets `staging` today; at the cutover the branch policy and the trigger list move together. `docs/RELEASING.md` §3.1c carries the entry.
 
 ### Work-key extraction — `scripts/pr-work-keys.mjs` (ONE copy)
 
@@ -124,7 +137,7 @@ What makes the current shape safe:
 
   So the only thing protecting this key is the rule above: **base-branch code only, no PR-head checkout/fetch/import/execute, no attacker-controlled value interpolated into a `run:` body.** Treat it as load-bearing, because it is the entire defence.
 
-  The environment is also **not connected yet**: `AIOS_API_KEY`, `AIOS_BRAIN_URL` and `AIOS_TEAM` still exist as plain repository secrets, and GitHub gives those to every job whether or not it names an environment — an environment secret only *shadows* a same-named repository secret, it does not revoke access to one. Connecting it means entering the values there **and deleting the repository-level copies**, which is blocked on rewriting `aios-work-sync.yml` (its `pull_request: closed` runs have ref `refs/pull/N/merge`, which a `main`-only policy would refuse). The trigger is pinned to `branches: [main]` so the run's ref always matches the policy; if the contribution base moves (RELPTR-4) the trigger list and the branch policy move together — `docs/RELEASING.md` §3.1c carries that entry.
+  The environment is also **not connected yet**: `AIOS_API_KEY`, `AIOS_BRAIN_URL` and `AIOS_TEAM` still exist as plain repository secrets, and GitHub gives those to every job whether or not it names an environment — an environment secret only *shadows* a same-named repository secret, it does not revoke access to one. Connecting it means entering the values there **and deleting the repository-level copies**. That deletion used to be blocked on `aios-work-sync.yml`, whose `pull_request: closed` runs had ref `refs/pull/N/merge` that a `main`-only policy would refuse; it no longer is. **All three `AIOS_*` consumers — this file, `aios-work-sync.yml` and `scan-on-merge.yml` — now name the environment**, which `test/guards/pr-task-link-credential-isolation.test.ts` asserts by enumerating every job with one of the three secrets in scope rather than by naming the three files. So the deletion is unblocked and is a **repository-admin action**, not a code change. The trigger here is pinned to `branches: [main]` so the run's ref always matches the policy; if the contribution base moves (RELPTR-4) the trigger list and the branch policy move together — `docs/RELEASING.md` §3.1c carries that entry.
 
   **A mismatched branch policy fails loudly**, not silently: `Branch "x" is not allowed to deploy to trusted-automation`, job failed, zero steps run. It never arrives as an empty secret.
 - **`permissions: contents: read` only.** No `statuses: write` / `checks: write` — a PR-reachable workflow with either can mint a required context on an arbitrary SHA (`test/guards/workflow-permissions.test.ts`).
@@ -138,7 +151,7 @@ The soft-skip path — `brain credentials not configured (missing: …) — only
 
 Runs the Python codebase scanner over this repo and POSTs the result to `/api/v1/codebases`, so the Codebases dashboard's agent-readiness figures for `aios-team-brain` stay fresh. It runs `npm run coverage` first purely as a **metrics source** for the scanner's `_read_coverage()` (`|| true` — the coverage _gate_ stays in `ci.yml`), then `python -m aios_ingest.cli scan`. Concurrency group `scan-on-merge` with `cancel-in-progress: true`, and the job is pinned to `if: github.repository == 'aiosbrain/aios-team-brain'` so a fork never scans into someone else's brain.
 
-**Required secrets — the SAME three as `aios-work-sync.yml`:** `AIOS_BRAIN_URL`, `AIOS_TEAM`, `AIOS_API_KEY`.
+**Required secrets — the SAME three as `aios-work-sync.yml`:** `AIOS_BRAIN_URL`, `AIOS_TEAM`, `AIOS_API_KEY`. The job names `environment: trusted-automation` for the same reason the other two do — enrolment, so the repository-level copies can be deleted; it is not a boundary of any kind here, since this workflow is not PR-reachable at all. Its trigger is `push`, so the run's ref is the pushed branch: `main` satisfies the `main`-only branch policy, and a push to `staging` would be refused it and fail with zero steps run. Nothing has pushed `staging` since 2026-07-25.
 
 Three things about them are easy to get wrong, and each fails in a way that does not look like a failure:
 
@@ -259,8 +272,11 @@ integration auto-deploys `main` → `production` and `staging` → `staging`. Th
 deploy job, and the Railway CLI stays read-only in this repo (see `CLAUDE.md` §6).
 
 `ci.yml` runs on PRs and pushes to **both** `main` and `staging`, so `staging` carries the same
-required-check bar. `aios-work-sync.yml` stays scoped to `main` only — a staging merge must not
-close Linear issues.
+required-check bar. This paragraph used to say `aios-work-sync.yml` "stays scoped to `main` only —
+a staging merge must not close Linear issues"; **RELPTR-4 reversed that decision** and widened both
+`aios-work-sync.yml` and `scan-on-merge.yml` to `[main, staging]` ahead of the cutover, with the
+accepted cost written into each workflow's header. See `docs/RELEASING.md` §3.1b for the
+ticket-closing decision and §3.1c for what still moves on cutover day.
 
 ### Staging variable boundary
 

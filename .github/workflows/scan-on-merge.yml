@@ -49,6 +49,22 @@ jobs:
     name: codebase readiness scan → brain
     runs-on: ubuntu-latest
     if: github.repository == 'aiosbrain/aios-team-brain'
+    # ENROLMENT, NOT ISOLATION. `trusted-automation` is a repository Environment whose deployment
+    # branch policy allows `main` only. Naming it here is a BLAST-RADIUS control: it declares which
+    # workflows in this repository may reach AIOS_BRAIN_URL / AIOS_TEAM / AIOS_API_KEY. It is not a
+    # trust boundary of any kind, and it does not make the credentials environment-scoped on its own —
+    # an environment secret only SHADOWS a same-named repository secret. This job is the third and
+    # last of the three `AIOS_*` consumers to enrol (`pr-task-link.yml` and `aios-work-sync.yml` are
+    # the others), which is what makes deleting the repository-level copies possible; that deletion is
+    # a manual admin step, deliberately not part of the change that added this line.
+    #
+    # WHY THE POLICY ACCEPTS THIS JOB: the trigger is `push`, so the run's ref is the pushed branch.
+    # For `main` that is `refs/heads/main` and the policy allows it. For `staging` — the RELPTR-4
+    # second entry above — it does NOT: such a push would be refused the environment and the job
+    # would go red having run zero steps, loud rather than silent, with no scan posted. Nothing has
+    # pushed `staging` since 2026-07-25, so that is inert today; at cutover the environment's branch
+    # policy and this trigger list move together. `docs/RELEASING.md` §3.1c carries the entry.
+    environment: trusted-automation
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

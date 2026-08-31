@@ -167,16 +167,37 @@ file a human must change:
    because `main` is a legitimate token everywhere.
 3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
    relocating `PR records a diff review`.
-4. **`pr-task-link.yml`'s `branches:` list AND the `trusted-automation` environment's deployment
-   branch policy, together.** This one is unlike `aios-work-sync` and `scan-on-merge`, which were
-   deliberately pre-widened to both branches so cutover day would not have to remember them.
-   `pr-task-link` **cannot** be pre-widened: it runs on `pull_request_target`, so the run's ref is the
-   PR's base branch, and once the environment holds the credentials a `staging`-based run would be
-   refused a `main`-only policy and go red — on an advisory check that is never allowed to go red.
-   Leaving the trigger at `[main]` instead makes it go **dark** for `staging` PRs, which is the safer
-   failure but is still a loss nobody would notice. So both move in one edit, and
-   `test/guards/pr-task-link-credential-isolation.test.ts` pins the trigger to exactly `["main"]` so
-   the widening has to be deliberate rather than accidental.
+4. **The `trusted-automation` environment's deployment branch policy — `main` only today — and it now
+   gates all three `AIOS_*` consumers.** This entry has grown, and the earlier version of it is now
+   wrong in a way worth naming: it said `aios-work-sync` and `scan-on-merge` "were deliberately
+   pre-widened to both branches so cutover day would not have to remember them". The trigger lists
+   still are. The **environment** is not, and after the credential-isolation fix all three workflows
+   name it, so the policy is a cutover-day edit for every one of them:
+
+   - **`pr-task-link.yml`** — the trigger list AND the policy move together. It runs on
+     `pull_request_target`, so the run's ref is the pull request's target branch; once the environment
+     holds the credentials a `staging`-based run would be refused a `main`-only policy and go red — on
+     an advisory check that is never allowed to go red. Leaving its trigger at `[main]` instead makes
+     it go **dark** for `staging` pull requests: the safer failure, still a loss nobody would notice.
+     `test/guards/pr-task-link-credential-isolation.test.ts` pins that trigger to exactly `["main"]`
+     so the widening has to be deliberate.
+   - **`aios-work-sync.yml`** — trigger already `[main, staging]`, but it moved from `pull_request` to
+     `pull_request_target` to close the credential hole (the `merged == true` gate used to live in a
+     file the pull request could rewrite). Same consequence: the run's ref is the target branch, so a
+     `staging` merge would be refused the environment and go red having run zero steps, and **no work
+     event would post**. Loud, not silent — and inert only while nothing targets `staging`.
+   - **`scan-on-merge.yml`** — trigger already `[main, staging]`, on `push`, so the run's ref is the
+     pushed branch. A `staging` push would be refused the environment the same way. Nothing has pushed
+     `staging` since 2026-07-25.
+
+   So the cutover-day edit is one policy change (add `staging` to the environment's branch policy)
+   plus `pr-task-link.yml`'s trigger list. Do the policy **first**: widening it is inert until a
+   branch is actually used, whereas doing it late means red merge automation on the day.
+
+   A related manual step, **not** a cutover item and **not** to be done in the pull request that
+   enrolled these workflows: the three values still exist as repository-level secrets, which GitHub
+   hands to every job regardless of `environment:`. Only deleting the repository copies makes the
+   environment load-bearing, and that is a repository-admin action.
 5. **The instruction corpus** — 31 operative `origin/main` command lines across 19 files. That is
    **RELPTR-5**, deliberately its own slice; see §3.1d.
 
