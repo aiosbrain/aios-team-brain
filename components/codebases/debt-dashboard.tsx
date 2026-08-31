@@ -138,14 +138,19 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-tertiary">
-            Debt movement
+            Scanner-admitted debt
           </p>
           <h2
             id="debt-movement-heading"
             className="mt-1 font-display text-xl text-ink text-balance"
           >
-            Is the codebase paying debt down?
+            What has the deterministic health scanner admitted?
           </h2>
+          <p className="mt-2 max-w-3xl text-xs leading-5 text-ink-tertiary">
+            Every row below is a scanner-admitted finding — only what the
+            configured deterministic health scanner admitted into the ledger —
+            and is not a count of all defects in this codebase.
+          </p>
         </div>
         <p className="text-xs text-ink-tertiary">
           Stock as of {new Date(movement.asOf).toLocaleDateString()} · flow in
@@ -157,7 +162,7 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
         <div className="border-b border-border-subtle pb-5 lg:border-r lg:border-b-0 lg:pr-5 lg:pb-0">
           <dl className="grid grid-cols-2 gap-x-5">
             <Metric
-              label="Actionable"
+              label="Active scanner findings"
               value={movement.actionable}
               detail={`${movement.actionableOpen} open · ${movement.actionableReopened} reopened`}
               tone="arrival"
@@ -218,7 +223,7 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
             Open age
           </h3>
           <Distribution
-            label="Actionable findings by open-age bucket"
+            label="Active scanner findings by open-age bucket"
             rows={openAgeRows}
             total={movement.actionable}
             colorClass="bg-amber-500"
@@ -229,7 +234,7 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
             Current severity
           </h3>
           <Distribution
-            label="Actionable findings by current severity"
+            label="Active scanner findings by current severity"
             rows={severityRows}
             total={movement.actionable}
             colorClass="bg-red-500"
@@ -239,6 +244,13 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
             event-time snapshots.
           </p>
         </div>
+      </div>
+
+      <div className="mt-5">
+        <EvidenceGap
+          label="UltraHarden intake"
+          reason="candidate intake is not connected yet, so candidates that were rejected, deduplicated, or never filed do not appear here"
+        />
       </div>
     </section>
   );

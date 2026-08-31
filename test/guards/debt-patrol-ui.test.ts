@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DebtPatrol } from "@/components/codebases/debt-patrol";
+import { DebtMovement } from "@/components/codebases/debt-dashboard";
 import { buildDebtPatrol } from "@/lib/codebases/debt-ranking";
+import { deriveCodebaseDebtKpis } from "@/lib/codebases/debt-kpis";
 import type { CodebaseFinding } from "@/lib/metrics/codebases";
 
 const finding: CodebaseFinding = {
@@ -69,7 +71,43 @@ describe("debt patrol accessibility guard", () => {
     expect(html).toContain("unknown");
     expect(html).toContain("North Star reconciliation and admission gaps");
     expect(html).toContain('<th scope="row"');
+    expect(html).toContain("Ranking evidence coverage");
+    expect(html).toContain("ranking evidence");
+    expect(html).toContain(
+      "Recurring counts a repeated scanner observation of the same fingerprint",
+    );
     expect(html).not.toContain("Record operator decision");
+    expect(html).not.toContain("Score coverage");
+    expect(html).not.toContain("score admission");
+  });
+
+  it("names the scanner-admitted population and the absent UltraHarden intake", () => {
+    const debt = deriveCodebaseDebtKpis({
+      findings: [finding],
+      commits: [],
+      rangeStart: "2026-07-01T00:00:00.000Z",
+      rangeEnd: "2026-08-04T12:00:00.000Z",
+      asOf: "2026-08-04T12:00:00.000Z",
+      commitsWindow: 30,
+      scannerWindowDays: 90,
+    });
+    const html = renderToStaticMarkup(DebtMovement({ debt }));
+
+    expect(html).toContain('aria-labelledby="debt-movement-heading"');
+    expect(html).toContain("Scanner-admitted debt");
+    expect(html).toContain(
+      "What has the deterministic health scanner admitted?",
+    );
+    expect(html).toContain("scanner-admitted");
+    expect(html).toContain("not a count of all defects");
+    expect(html).toContain("Active scanner findings");
+    expect(html).toContain("UltraHarden intake");
+    expect(html).toContain(
+      "candidate intake is not connected yet, so candidates that were rejected, deduplicated, or never filed do not appear here",
+    );
+    expect(html).not.toContain("Debt movement");
+    expect(html).not.toContain("Is the codebase paying debt down?");
+    expect(html).not.toContain("Actionable findings by");
   });
 
   it("keeps movement before patrol and evidence after it", () => {

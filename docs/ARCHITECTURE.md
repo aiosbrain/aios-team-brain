@@ -812,11 +812,19 @@ current state plus append-only `codebase_finding_events`; it does not persist so
 symbols, diagnostic prose, or source text. `lib/metrics/codebases.getCodebaseDetail` is the only
 read path and builds the report-only patrol with `lib/codebases/debt-ranking`.
 
+The dashboard population is **scanner-admitted only**: every row is a finding the configured
+deterministic health scanner admitted into the ledger, not a count of all defects in the codebase.
+UltraHarden candidate intake is not connected, so candidates that were rejected, deduplicated, or
+never filed do not appear; the UI states that as a named evidence gap rather than implying
+completeness. `Recurring` counts a repeated scanner observation of the same fingerprint
+(`occurrence_count > 1`), not two distinct underlying defects.
+
 Ranking method v1 is deterministic. Principal (severity plus explicitly unknown reachability) is
 reported separately from interest (recurrence, age, repository change pressure, and explicitly
 unknown agent friction). Evidence confidence and remediation affordability are disclosed as
-separate factors. The score normalizes over known factor weight and always publishes admission
-coverage; unknown reachability, friction, or review cost is never converted to a measured zero.
+separate factors. The score normalizes over known factor weight and always publishes **ranking
+evidence coverage** — the share of factor weight actually evidenced (surfaced per finding and as a
+mean rollup); unknown reachability, friction, or review cost is never converted to a measured zero.
 North Star rollups are labelled `proxy` or `unknown`. The independently verified efficacy/cost
 report stays in the engineering harness and is not redefined by this dashboard.
 

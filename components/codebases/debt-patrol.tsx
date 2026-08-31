@@ -154,7 +154,7 @@ export function DebtPatrol({
             ["Recurring", patrol.rollups.recurring],
             ["Suppressed", patrol.rollups.suppressed],
             [
-              "Score coverage",
+              "Ranking evidence coverage",
               patrol.rollups.admission.meanCoveragePct == null
                 ? "n/a"
                 : `${patrol.rollups.admission.meanCoveragePct}%`,
@@ -168,6 +168,10 @@ export function DebtPatrol({
             </div>
           ))}
         </dl>
+        <p className="mt-2 text-xs text-ink-tertiary">
+          Recurring counts a repeated scanner observation of the same
+          fingerprint, not two distinct underlying defects.
+        </p>
       </div>
 
       {patrol.ranked.length === 0 ? (
@@ -243,7 +247,7 @@ export function DebtPatrol({
                   </div>
 
                   <p className="mt-2 font-mono text-[10px] text-ink-tertiary">
-                    fingerprint {finding.fingerprint} · score admission{" "}
+                    fingerprint {finding.fingerprint} · ranking evidence{" "}
                     {ranking.scoreCoveragePct}%
                   </p>
                   <DecisionSummary finding={finding} />
