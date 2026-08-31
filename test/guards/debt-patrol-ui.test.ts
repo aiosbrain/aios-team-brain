@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DebtPatrol } from "@/components/codebases/debt-patrol";
+import { DebtMovement } from "@/components/codebases/debt-dashboard";
 import { buildDebtPatrol } from "@/lib/codebases/debt-ranking";
+import { deriveCodebaseDebtKpis } from "@/lib/codebases/debt-kpis";
 import type { CodebaseFinding } from "@/lib/metrics/codebases";
 
 const finding: CodebaseFinding = {
@@ -69,7 +71,57 @@ describe("debt patrol accessibility guard", () => {
     expect(html).toContain("unknown");
     expect(html).toContain("North Star reconciliation and admission gaps");
     expect(html).toContain('<th scope="row"');
+    expect(html).toContain("Ranking evidence coverage");
+    expect(html).toContain("ranking evidence");
+    expect(html).toContain(
+      "Recurring counts active ranked findings whose fingerprint the scanner observed more than once",
+    );
     expect(html).not.toContain("Record operator decision");
+    expect(html).not.toContain("Score coverage");
+    expect(html).not.toContain("score admission");
+  });
+
+  it("names the scanner-admitted population and the absent UltraHarden intake", () => {
+    const debt = deriveCodebaseDebtKpis({
+      findings: [finding],
+      commits: [],
+      rangeStart: "2026-07-01T00:00:00.000Z",
+      rangeEnd: "2026-08-04T12:00:00.000Z",
+      asOf: "2026-08-04T12:00:00.000Z",
+      commitsWindow: 30,
+      scannerWindowDays: 90,
+    });
+    const html = renderToStaticMarkup(DebtMovement({ debt }));
+
+    expect(html).toContain('aria-labelledby="debt-movement-heading"');
+    expect(html).toContain("Scanner-admitted debt");
+    expect(html).toContain(
+      "What has the deterministic health scanner admitted?",
+    );
+    expect(html).toContain("scanner-admitted");
+    expect(html).toContain("not a count of all defects");
+    expect(html).toContain("UltraHarden intake");
+    expect(html).toContain(
+      "candidate intake is not connected yet, so candidates that were rejected, deduplicated, or never filed do not appear here",
+    );
+
+    // The three "Active scanner findings" sites are asserted SEPARATELY on purpose. A bare
+    // toContain("Active scanner findings") is satisfied by either aria-label alone, so the metric
+    // label could regress to "Actionable" — or a chart could lose its accessible name — while the
+    // guard stayed green. That is a test passing for the wrong reason, which is worse than no test:
+    // it certifies copy nobody checked.
+    expect(html).toContain(">Active scanner findings</dt>");
+    expect(html).toContain(
+      'aria-label="Active scanner findings by open-age bucket"',
+    );
+    expect(html).toContain(
+      'aria-label="Active scanner findings by current severity"',
+    );
+
+    expect(html).not.toContain("Debt movement");
+    expect(html).not.toContain("Is the codebase paying debt down?");
+    expect(html).not.toContain(">Actionable</dt>");
+    expect(html).not.toContain("Actionable findings by");
   });
 
   it("keeps movement before patrol and evidence after it", () => {
