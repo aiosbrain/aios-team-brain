@@ -812,12 +812,14 @@ current state plus append-only `codebase_finding_events`; it does not persist so
 symbols, diagnostic prose, or source text. `lib/metrics/codebases.getCodebaseDetail` is the only
 read path and builds the report-only patrol with `lib/codebases/debt-ranking`.
 
-The dashboard population is **scanner-admitted only**: every row is a finding the configured
-deterministic health scanner admitted into the ledger, not a count of all defects in the codebase.
+The dashboard population is **scanner-admitted only**: the section is derived from findings the
+configured deterministic health scanner admitted into the ledger and from their lifecycle events,
+not from a count of all defects in the codebase. Arrivals, closures, and net flow are event counts,
+so one finding can contribute several of them.
 UltraHarden candidate intake is not connected, so candidates that were rejected, deduplicated, or
 never filed do not appear; the UI states that as a named evidence gap rather than implying
-completeness. `Recurring` counts a repeated scanner observation of the same fingerprint
-(`occurrence_count > 1`), not two distinct underlying defects.
+completeness. `Recurring` counts active ranked findings whose fingerprint was observed more than once
+(`occurrence_count > 1`) — a finding observed ten times contributes 1, not 9.
 
 Ranking method v1 is deterministic. Principal (severity plus explicitly unknown reachability) is
 reported separately from interest (recurrence, age, repository change pressure, and explicitly

@@ -74,7 +74,7 @@ describe("debt patrol accessibility guard", () => {
     expect(html).toContain("Ranking evidence coverage");
     expect(html).toContain("ranking evidence");
     expect(html).toContain(
-      "Recurring counts a repeated scanner observation of the same fingerprint",
+      "Recurring counts active ranked findings whose fingerprint the scanner observed more than once",
     );
     expect(html).not.toContain("Record operator decision");
     expect(html).not.toContain("Score coverage");
@@ -100,13 +100,27 @@ describe("debt patrol accessibility guard", () => {
     );
     expect(html).toContain("scanner-admitted");
     expect(html).toContain("not a count of all defects");
-    expect(html).toContain("Active scanner findings");
     expect(html).toContain("UltraHarden intake");
     expect(html).toContain(
       "candidate intake is not connected yet, so candidates that were rejected, deduplicated, or never filed do not appear here",
     );
+
+    // The three "Active scanner findings" sites are asserted SEPARATELY on purpose. A bare
+    // toContain("Active scanner findings") is satisfied by either aria-label alone, so the metric
+    // label could regress to "Actionable" — or a chart could lose its accessible name — while the
+    // guard stayed green. That is a test passing for the wrong reason, which is worse than no test:
+    // it certifies copy nobody checked.
+    expect(html).toContain(">Active scanner findings</dt>");
+    expect(html).toContain(
+      'aria-label="Active scanner findings by open-age bucket"',
+    );
+    expect(html).toContain(
+      'aria-label="Active scanner findings by current severity"',
+    );
+
     expect(html).not.toContain("Debt movement");
     expect(html).not.toContain("Is the codebase paying debt down?");
+    expect(html).not.toContain(">Actionable</dt>");
     expect(html).not.toContain("Actionable findings by");
   });
 

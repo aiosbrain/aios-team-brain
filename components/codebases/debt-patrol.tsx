@@ -169,8 +169,9 @@ export function DebtPatrol({
           ))}
         </dl>
         <p className="mt-2 text-xs text-ink-tertiary">
-          Recurring counts a repeated scanner observation of the same
-          fingerprint, not two distinct underlying defects.
+          Recurring counts active ranked findings whose fingerprint the
+          scanner observed more than once — not repeated observations, and not
+          distinct underlying defects.
         </p>
       </div>
 

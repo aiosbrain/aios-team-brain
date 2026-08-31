@@ -147,9 +147,10 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
             What has the deterministic health scanner admitted?
           </h2>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-ink-tertiary">
-            Every row below is a scanner-admitted finding — only what the
-            configured deterministic health scanner admitted into the ledger —
-            and is not a count of all defects in this codebase.
+            This section is derived only from scanner-admitted findings and
+            their lifecycle events — what the configured deterministic health
+            scanner admitted into the ledger — and is not a count of all
+            defects in this codebase.
           </p>
         </div>
         <p className="text-xs text-ink-tertiary">
