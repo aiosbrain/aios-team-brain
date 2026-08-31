@@ -278,10 +278,17 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   ).length;
   // How many of the unscoped ones are unscoped BECAUSE their scanner cannot report scope
   // (brain-api 1.24 / AIO-1011). "7 without scope" was true and unactionable — it read as a
-  // property of the repos when it was a property of their pins. "7 without scope (7 stale
-  // scanner)" names the thing to fix. Counted only among the repos already contributing to the
-  // average, so the hint stays a description of THIS number rather than of the whole fleet.
-  const staleScanner = s.filter(
+  // property of the repos when it was a property of their pins. Naming the cause makes it a
+  // thing someone can fix. Counted only among the repos already contributing to the average, so
+  // the hint stays a description of THIS number rather than of the whole fleet.
+  //
+  // The wording is "not current", NOT "stale", and that is deliberate. This count is the UNION of
+  // the stale and unknown states, and calling the union "stale" would assert something false
+  // about the unknown ones: they did not declare an old build, they declared nothing. That is
+  // the common case — every scan taken before 1.24 — so the wrong word here would be the word
+  // shown for the whole fleet on day one. The card badge still distinguishes the two states
+  // ("scanner outdated" vs "scanner unknown"); this aggregate only claims what it can support.
+  const notCurrentScanner = s.filter(
     (c) =>
       c.test_coverage_pct != null &&
       isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc) &&
@@ -314,8 +321,8 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
       spark: [],
       hint: cov.length
         ? unscoped > 0
-          ? staleScanner > 0
-            ? `${cov.length} reporting · ${unscoped} without scope (${staleScanner} stale scanner)`
+          ? notCurrentScanner > 0
+            ? `${cov.length} reporting · ${unscoped} without scope (${notCurrentScanner} scanner not current)`
             : `${cov.length} reporting · ${unscoped} without scope`
           : `${cov.length} reporting`
         : "no reports",
