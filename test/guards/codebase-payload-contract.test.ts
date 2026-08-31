@@ -28,17 +28,17 @@ import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 const CONTRACT_DIR = join(import.meta.dirname, "..", "fixtures", "contract");
 
 const PINNED = {
-  "codebase-payload-1.23.schema.json":
-    "0bcb686042369d31bfc7299c2ce5ea6b0257cc6a17995959ba02bf6d14d10c55",
-  "codebase-payload-1.23-fixtures.json":
-    "3d495a7892a7ac6c53334b3fa7f323fa89523ffae663bcc0086bf6f5d0abb4d6",
+  "codebase-payload-1.24.schema.json":
+    "761f8e74be2f98d2883d9d61697f7d0c95c28df7770ba7e467d35dd6492feca6",
+  "codebase-payload-1.24-fixtures.json":
+    "8ba896e6d6edc3c3d3d6edb7956f67747b41ee6f12c9137720ab63d2d55cc2b8",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;
 
 const fixtures = JSON.parse(
   readFileSync(
-    join(CONTRACT_DIR, "codebase-payload-1.23-fixtures.json"),
+    join(CONTRACT_DIR, "codebase-payload-1.24-fixtures.json"),
     "utf8",
   ),
 ) as {
@@ -57,7 +57,7 @@ const fixtures = JSON.parse(
   }[];
 };
 
-describe("brain-api 1.23 codebase-payload conformance", () => {
+describe("brain-api 1.24 codebase-payload conformance", () => {
   it("vendored contract artifacts are byte-identical to the pinned canonical revision", () => {
     for (const [file, sha] of Object.entries(PINNED)) {
       const bytes = readFileSync(join(CONTRACT_DIR, file));
@@ -65,8 +65,33 @@ describe("brain-api 1.23 codebase-payload conformance", () => {
     }
   });
 
-  it("fixtures file tracks the 1.23 contract revision, both buckets populated", () => {
-    expect(fixtures.version).toBe("1.23");
+  // The hashes above are also DECLARED by the contract itself, inside its own hashed content set
+  // (brain-contract.json → codebasePayloadContract, hashed since 1.24). Checking against that
+  // declaration as well means a re-vendor that updates the files and the local PINNED table but
+  // forgets brain-contract.json cannot pass: the canonical statement and the bytes must agree.
+  it("the vendored payload artifacts match the hashes the CONTRACT declares for them", () => {
+    const brainContract = JSON.parse(
+      readFileSync(join(CONTRACT_DIR, "brain-contract.json"), "utf8"),
+    ) as {
+      readonly codebasePayloadContract: {
+        readonly version: string;
+        readonly minScannerVersion: string;
+        readonly schema: { readonly path: string; readonly sha256: string };
+        readonly fixtures: { readonly path: string; readonly sha256: string };
+      };
+    };
+    const block = brainContract.codebasePayloadContract;
+    expect(block.version).toBe("1.24");
+    for (const ref of [block.schema, block.fixtures]) {
+      const bytes = readFileSync(join(CONTRACT_DIR, ref.path));
+      expect(createHash("sha256").update(bytes).digest("hex"), ref.path).toBe(
+        ref.sha256,
+      );
+    }
+  });
+
+  it("fixtures file tracks the 1.24 contract revision, both buckets populated", () => {
+    expect(fixtures.version).toBe("1.24");
     expect(fixtures.valid.length).toBeGreaterThanOrEqual(3);
     expect(fixtures.invalid.length).toBeGreaterThanOrEqual(3);
   });

@@ -1720,8 +1720,18 @@ create table if not exists code_metrics (
   -- Workspace-governance health snapshot (brain-api 1.15; AIO-609) — scored scanner-side,
   -- persisted verbatim (closed scalar object incl. measured_at); null = not scored
   codebase_health jsonb,
+  -- Which scanner BUILD produced this point (brain-api 1.24; AIO-1011). `scanner_version` is the
+  -- ingestion package version and is the only input to the staleness reading; `scanner_sha` is
+  -- the brain commit it ran from, provenance only. Both null = UNKNOWN build, which is the state
+  -- of every row written before 1.24 and cannot be backfilled — never read as "current".
+  scanner_version text,
+  scanner_sha text,
   created_at timestamptz not null default now(),
   unique (codebase_id, head_sha),
+  constraint code_metrics_scanner_identity_len check (
+    (scanner_version is null or length(scanner_version) <= 64)
+    and (scanner_sha is null or length(scanner_sha) <= 64)
+  ),
   constraint code_metrics_coverage_denominator_nonneg check (
     (test_coverage_lines_total is null or test_coverage_lines_total >= 0)
     and (test_coverage_lines_covered is null or test_coverage_lines_covered >= 0)
@@ -2205,6 +2215,14 @@ alter table code_metrics add column if not exists test_coverage_branches_pct num
 -- already-deployed code_metrics gains it on `pg:schema` (mirror of
 -- postgres/migrations/20260730130000_code_metrics_codebase_health.sql).
 alter table code_metrics add column if not exists codebase_health jsonb;
+
+-- Scanner identity (brain-api 1.24; AIO-1011) — added via alter so an already-deployed
+-- code_metrics gains them on `pg:schema` (mirror of
+-- postgres/migrations/20260831120000_code_metrics_scanner_identity.sql). Nullable with NO
+-- default: null means UNKNOWN build, which is what every existing row is and must stay. A
+-- default of any kind would assert a build on behalf of a scan that named none.
+alter table code_metrics add column if not exists scanner_version text;
+alter table code_metrics add column if not exists scanner_sha text;
 
 -- Keep `npm run pg:schema` safe for existing deployments that created
 -- code_metrics before AEM readiness fields were added. The table declaration
