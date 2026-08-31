@@ -8,10 +8,12 @@ backing off on 429. It is the only thing in the sidecar that talks to the brain.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
+import random
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 import httpx
 
@@ -22,6 +24,7 @@ IngestStatus = Literal["created", "updated", "unchanged"]
 # Brain limit is 120/min/key; stay safely under it. Tokens refill continuously.
 _DEFAULT_MAX_PER_MIN = 100
 _MAX_RETRIES = 5
+_SCAN_RATE_LIMIT_WINDOW_SECONDS = 60
 # A codebase scan push is the heaviest single request: the brain projects every recent commit into
 # searchable items (with embeddings) synchronously before responding, which can far exceed the 30s
 # default. The scan runs in CI (latency-insensitive) and the endpoint is idempotent, so we give this
@@ -82,6 +85,8 @@ class BrainClient:
         *,
         max_per_min: int = _DEFAULT_MAX_PER_MIN,
         timeout: float = 30.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        random_fn: Callable[[], float] = random.random,
     ):
         if not api_key.startswith("aios_"):
             raise ValueError("api_key must look like aios_<key_id>_<secret>")
@@ -93,6 +98,8 @@ class BrainClient:
         }
         self._limiter = _RateLimiter(max_per_min)
         self._client = httpx.AsyncClient(timeout=timeout)
+        self._sleep = sleep
+        self._random = random_fn
 
     async def __aenter__(self) -> "BrainClient":
         return self
@@ -140,20 +147,38 @@ class BrainClient:
 
     async def push_codebase_scan(self, payload: dict) -> dict:
         """POST one codebase scan (RAW metrics) to /api/v1/codebases. The brain computes
-        scores, audits, and upserts idempotently. Same retry policy as push(); a longer
+        scores, audits, and upserts idempotently. Uses the codebase-specific six-attempt
+        fixed-window retry policy and a longer
         read timeout (_SCAN_TIMEOUT) because the server projects commits→items synchronously."""
         url = f"{self._base}/api/v1/codebases"
-        for attempt in range(_MAX_RETRIES):
+        for attempt in range(_MAX_RETRIES + 1):
             await self._limiter.acquire()
             resp = await self._client.post(url, json=payload, headers=self._headers, timeout=_SCAN_TIMEOUT)
             if resp.status_code in (200, 201):
                 return resp.json()
             if resp.status_code == 429 or resp.status_code >= 500:
-                backoff = _retry_after(resp) or min(2**attempt, 30)
-                await asyncio.sleep(backoff)
+                if attempt == _MAX_RETRIES:
+                    raise BrainError(resp.status_code, *_error_fields(resp))
+                server_delay = _retry_after_delta_seconds(resp) if resp.status_code == 429 else None
+                backoff = server_delay or min(2 ** (attempt + 1), 32)
+                await self._sleep(backoff + _bounded_jitter(self._random()))
                 continue
             raise BrainError(resp.status_code, *_error_fields(resp))
-        raise BrainError(429, "rate_limited", f"gave up after {_MAX_RETRIES} retries")
+        raise AssertionError("unreachable retry loop")
+
+
+def _retry_after_delta_seconds(resp: httpx.Response) -> int | None:
+    raw = resp.headers.get("retry-after")
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        return None
+    seconds = int(raw)
+    return seconds if 1 <= seconds <= _SCAN_RATE_LIMIT_WINDOW_SECONDS else None
+
+
+def _bounded_jitter(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    return min(1.0, max(0.0, value))
 
 
 def _retry_after(resp: httpx.Response) -> float | None:

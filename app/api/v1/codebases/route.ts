@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { adminClient } from "@/lib/db/admin";
 import { authenticateApiKey } from "@/lib/api/auth";
-import { rateLimit } from "@/lib/api/rate-limit";
+import { rateLimitWithReset } from "@/lib/api/rate-limit";
 import { codebaseScanPayloadSchema, errorResponse } from "@/lib/api/schemas";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { recordIngestRun, type IngestTrigger } from "@/lib/ingest/runs";
@@ -23,8 +23,11 @@ export async function POST(req: NextRequest) {
   }
 
   const db = adminClient();
-  if (!(await rateLimit(db, `${auth.apiKeyId}:codebases:post`, 60))) {
-    return errorResponse("rate_limited", "60 scans/min per key", 429);
+  const rateLimitDecision = await rateLimitWithReset(db, `${auth.apiKeyId}:codebases:post`, 60);
+  if (!rateLimitDecision.allowed) {
+    const response = errorResponse("rate_limited", "60 scans/min per key", 429);
+    response.headers.set("Retry-After", String(rateLimitDecision.retryAfterSeconds));
+    return response;
   }
 
   const len = parseInt(req.headers.get("content-length") || "0", 10);
