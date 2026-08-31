@@ -90,8 +90,32 @@ def test_unparseable_versions_void_to_unknown_rather_than_shipping():
 
 
 def test_real_release_shapes_survive_normalization():
-    for good in ["0.2.0", "1.0.0", "0.2.0-rc1", "0.2.0+dirty", "10.20.30"]:
+    for good in ["0.2.0", "1.0.0", "10.20.30", "0.10.0"]:
         assert normalize_scanner_version(good) == good, good
+
+
+def test_suffixed_builds_are_unreadable_and_void_rather_than_being_stripped():
+    """A suffix is never stripped and shipped as if it were the release.
+
+    These were ACCEPTED in the first draft, and the brain then compared their numeric core: it
+    read `0.2.0-alpha.1` as "current" though a SemVer prerelease sorts before its release, and
+    `0.1.0-rc.1` as "stale" — an ordering verdict about a string nobody had fully read. Voiding
+    to None here is the same conclusion one hop earlier, and it keeps this grammar identical to
+    the brain's `parseScannerVersion`, which is what stops a valid-here/unknown-there mismatch
+    flagging a current build.
+
+    Accepted cost, stated: a genuine release candidate reports an unknown build rather than a
+    current one. "I could not read this" is true; "this is current" would be a guess.
+    """
+    for suffixed in [
+        "0.2.0-alpha.1",
+        "0.2.0-rc1",
+        "0.2.0+dirty",
+        "0.2.0+build.5",
+        "0.2.0-",
+        "1.0.0.0",
+    ]:
+        assert normalize_scanner_version(suffixed) is None, suffixed
 
 
 def test_sha_normalization_refuses_anything_that_is_not_a_commit():

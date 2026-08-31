@@ -38,13 +38,22 @@ from pathlib import Path
 
 from . import __version__
 
-# A dotted release version the brain can ORDER. Deliberately permissive about what follows the
-# three numbers (a local build may carry `+dirty`, an rc may carry `-rc1`); deliberately strict
-# that the three numbers are there, because an unorderable string cannot answer the only question
-# the field exists to answer. The charset MIRRORS the brain's `parseScannerVersion`
-# (lib/codebases/scanner-version.ts) — if the two disagreed, this scanner would send a value it
-# considers valid that the brain reads as "unknown", flagging itself stale for no reason.
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+.][0-9A-Za-z.\-+]*)?$")
+# A dotted release version the brain can ORDER: EXACTLY three non-negative integers, nothing else.
+#
+# This was permissive in the first draft (it allowed `-rc1`, `+dirty`, and even a fourth `.0`
+# component) and that was a bug on both sides of the wire. The brain stripped such a suffix and
+# compared the numeric core, so `0.2.0-alpha.1` read as "current" — though a SemVer prerelease
+# sorts BEFORE its release — and `0.1.0-rc.1` read as "stale", an ordering verdict derived from a
+# string that had not actually been understood. Unreadable must resolve to "unknown" before any
+# ordering happens.
+#
+# The grammar MIRRORS the brain's `parseScannerVersion` (lib/codebases/scanner-version.ts) and the
+# mirror is load-bearing: if this side considered a suffixed string valid and SENT it, the brain
+# would read "unknown" and the repo would flag itself for no reason. Voiding it here to None is
+# the same verdict reached one hop earlier, and None is the honest reading of a build we cannot
+# identify. Cost, accepted deliberately: a real `0.2.0-rc1` build reports "unknown" rather than
+# "current". "I could not read this" is true; "this is current" would be a guess.
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # Both fields become bounded TEXT columns on `code_metrics`; the wire contract caps them at 64.
 # Truncating would invent a version that was never built, so an over-long value is voided.

@@ -60,21 +60,35 @@ export type ScannerStaleness = "current" | "stale" | "unknown";
 /**
  * `[major, minor, patch]`, or null when the string is not an ordered release version.
  *
- * Pre-release / build suffixes (`0.2.0-rc1`, `0.2.0+dirty`, `1.0.0.0`) are accepted and compared
- * on their numeric core only. Refining that ordering would be inventing precision: the question
- * here is "can this build emit the fields", and an rc of 0.2.0 can.
+ * STRICT: exactly three dotted non-negative integers, and nothing else. Any suffix — `0.2.0-rc1`,
+ * `0.2.0+dirty`, `0.2.0-alpha.1`, the malformed `0.2.0-`, or a fourth component `1.0.0.0` — is
+ * UNREADABLE and returns null, which the table above resolves to `"unknown"`.
  *
- * The suffix charset deliberately MIRRORS the scanner's own `_VERSION_RE`
- * (`ingestion/aios_ingest/build.py`). Both sides must agree on what counts as a version, or the
- * scanner would send a value it considers valid that the brain then reads as "unknown" — a
- * self-inflicted false staleness flag. It is a charset and not `.*` for the same reason the
- * column is bounded: `.*` would accept whitespace and control characters as a "version".
+ * **This was lenient in the first draft and that was a bug.** It stripped the suffix and compared
+ * the numeric core, which produced two wrong answers. `0.2.0-alpha.1` read as `current` even
+ * though a SemVer prerelease sorts BEFORE its release, so if anything it is behind. Worse,
+ * `0.1.0-rc.1` read as `stale` — a verdict about ordering derived from a string this function had
+ * just failed to fully understand. That is the same prior-as-fact error removed twice already
+ * from this feature: reporting a measurement that was never made. Unreadable resolves to
+ * `"unknown"` BEFORE any ordering happens, and the boundary is exactly here.
+ *
+ * Failing safe costs something real and it is the right trade: a genuine `0.2.0-rc1` build now
+ * reads `"unknown"` rather than `"current"`, so a release candidate is flagged as unidentified.
+ * "I could not read this" is a true statement; "this is current" would have been a guess.
+ *
+ * The grammar deliberately MIRRORS the scanner's own `_VERSION_RE`
+ * (`ingestion/aios_ingest/build.py`), which voids the same shapes to `None` at its own choke
+ * point. Both sides must agree on what counts as a version: if the scanner considered a suffixed
+ * string valid and sent it, the brain would read `"unknown"` and the repo would flag itself for
+ * no reason. The contract deliberately does NOT pin this grammar (its `scanner_state` vectors
+ * carry no suffixed cases) — it is the reader's to define, so it is defined here and covered by
+ * this repo's unit tests.
  */
 export function parseScannerVersion(
   raw: string | null | undefined
 ): [number, number, number] | null {
   if (typeof raw !== "string") return null;
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:[-+.][0-9A-Za-z.+-]*)?$/.exec(raw.trim());
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
   if (!m) return null;
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }

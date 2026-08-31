@@ -87,24 +87,55 @@ describe("scannerStaleness — the three states", () => {
   });
 });
 
-describe("parseScannerVersion", () => {
-  it("accepts release shapes, including pre-release and build suffixes", () => {
+describe("parseScannerVersion — STRICT: three dotted integers, nothing else", () => {
+  it("accepts exactly three dotted non-negative integers, trimmed", () => {
     expect(parseScannerVersion("0.2.0")).toEqual([0, 2, 0]);
     expect(parseScannerVersion(" 1.2.3 ")).toEqual([1, 2, 3]);
-    // Compared on the numeric core only — an rc of 0.2.0 can emit what 0.2.0 emits.
-    expect(parseScannerVersion("0.2.0-rc1")).toEqual([0, 2, 0]);
-    expect(parseScannerVersion("0.2.0+dirty")).toEqual([0, 2, 0]);
-    // A four-part version is not semver, but its numeric core answers the only question asked:
-    // whether the build can emit the fields. Read leniently rather than flagged as unknown.
-    expect(parseScannerVersion("1.0.0.0")).toEqual([1, 0, 0]);
-    // ...but whitespace is not a suffix. The charset matches the scanner's own, so the two sides
-    // cannot disagree about what a version is.
-    expect(parseScannerVersion("0.2.0 rc1")).toBeNull();
+    expect(parseScannerVersion("10.20.30")).toEqual([10, 20, 30]);
   });
 
   it("refuses anything it cannot ORDER", () => {
     for (const bad of [null, undefined, "", "0.2", "v1.0.0", "nightly", "1.0.0 beta"]) {
       expect(parseScannerVersion(bad as string | null), String(bad)).toBeNull();
+    }
+  });
+
+  // These six were LENIENT in the first draft and the leniency was a bug. The earlier version of
+  // this test asserted the wrong answers as if they were the design, which is why the defect
+  // stayed green: the test pinned it. Both wrong readings are recorded here so the reason the
+  // grammar is strict cannot be lost.
+  it("PARTIALLY readable is unreadable — a suffix never gets stripped and ordered", () => {
+    // Read `current` before the fix, on a build that in SemVer sorts BEFORE its own release.
+    expect(parseScannerVersion("0.2.0-alpha.1")).toBeNull();
+    expect(parseScannerVersion("0.2.0-rc1")).toBeNull();
+    expect(parseScannerVersion("0.2.0+dirty")).toBeNull();
+    expect(parseScannerVersion("0.2.0+build.5")).toBeNull();
+    // Malformed: the old suffix group matched empty, so this parsed cleanly as 0.2.0.
+    expect(parseScannerVersion("0.2.0-")).toBeNull();
+    // A fourth component is not a version this reader can order.
+    expect(parseScannerVersion("1.0.0.0")).toBeNull();
+  });
+
+  it("an unreadable version is UNKNOWN and is never ordered into 'stale'", () => {
+    // The worst of the two old readings, and the one worth a test of its own: `0.1.0-rc.1`
+    // reported `stale`. That is a claim about ordering derived from a string the parser had just
+    // failed to understand — the same prior-as-fact error removed twice already from this
+    // feature. Unreadable resolves BEFORE any comparison to the minimum.
+    expect(scannerStaleness("0.1.0-rc.1")).toBe("unknown");
+    expect(scannerStaleness("0.1.0-rc.1")).not.toBe("stale");
+    expect(scannerStaleness("0.2.0-alpha.1")).toBe("unknown");
+    expect(scannerStaleness("0.2.0-alpha.1")).not.toBe("current");
+  });
+
+  it("the strict grammar MIRRORS the scanner's, so neither side flags the other", () => {
+    // ingestion/aios_ingest/build.py voids exactly these to None at its own choke point. If the
+    // two grammars disagreed, the scanner would send a value it considered valid that this reader
+    // called unknown — a self-inflicted staleness flag on a perfectly current build.
+    for (const v of ["0.2.0", "1.0.0", "10.20.30"]) {
+      expect(parseScannerVersion(v), v).not.toBeNull();
+    }
+    for (const v of ["0.2.0-rc1", "0.2.0+dirty", "1.0.0.0", "0.2.0-"]) {
+      expect(parseScannerVersion(v), v).toBeNull();
     }
   });
 });
