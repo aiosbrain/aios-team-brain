@@ -2,7 +2,9 @@ import { AlertTriangle } from "lucide-react";
 import { isUnscopedCoverage } from "@/lib/codebases/score";
 import {
   MIN_SCANNER_VERSION,
+  isScannerOutdated,
   scannerStalenessLabel,
+  scannerStalenessNoun,
   type ScannerStaleness,
 } from "@/lib/codebases/scanner-version";
 
@@ -89,7 +91,9 @@ export function CoverageScope({
         }
         className={`font-mono text-[10px] text-ink-tertiary italic ${className}`}
       >
-        {cause ? "(scope unknown — stale scanner)" : "(scope unknown)"}
+        {cause
+          ? `(scope unknown — ${scannerStalenessNoun(scannerStaleness ?? "unknown")})`
+          : "(scope unknown)"}
       </span>
     );
   }
@@ -158,15 +162,27 @@ export function PartialRunBadge({
 export function ScannerStalenessBadge({
   staleness,
   scannerVersion,
+  scannerSha = null,
 }: {
   staleness: ScannerStaleness;
   scannerVersion: string | null;
+  /**
+   * The brain commit the scan ran from, when known. Rendered into THIS element's own title
+   * rather than a wrapper's: a nested `title` shadows its ancestor's on hover, so a wrapping
+   * span whose box is exactly this badge's box can never be hovered independently — the
+   * provenance would be stored, tested, and unreachable. It belongs here because it is the
+   * answer to the question the badge provokes: which pin do I bump?
+   */
+  scannerSha?: string | null;
 }) {
   const label = scannerStalenessLabel(staleness, scannerVersion);
-  if (!label) return null;
+  if (!label || !isScannerOutdated(staleness)) return null;
+  const provenance = scannerSha
+    ? ` This scan was built from aios-team-brain commit ${scannerSha}.`
+    : " This scan did not record which commit built it.";
   return (
     <span
-      title={`${label}. Bump this repo's pin in .github/scripts/fetch-brain-scanner.sh to a scanner build at or after ${MIN_SCANNER_VERSION}. The exact-SHA pin is deliberate — it keeps another repo's code from executing in your CI unreviewed — so it is bumped, never removed.`}
+      title={`${label}.${provenance} Bump this repo's pin in .github/scripts/fetch-brain-scanner.sh to a scanner build at or after ${MIN_SCANNER_VERSION}. The exact-SHA pin is deliberate — it keeps another repo's code from executing in your CI unreviewed — so it is bumped, never removed.`}
       className="inline-flex items-center gap-1 rounded-full border border-amber-400/25 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-500/90"
     >
       <AlertTriangle className="size-2.5" />

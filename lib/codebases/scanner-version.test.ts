@@ -6,6 +6,7 @@ import {
   parseScannerVersion,
   scannerStaleness,
   scannerStalenessLabel,
+  scannerStalenessNoun,
   type ScannerStaleness,
 } from "./scanner-version";
 
@@ -127,6 +128,30 @@ describe("scannerStalenessLabel — the words a reader actually sees", () => {
     expect(scannerStalenessLabel("unknown", "nightly")).toContain('"nightly"');
     // An unknown build is never described as current or up to date.
     expect(scannerStalenessLabel("unknown", null)).not.toMatch(/current|up to date/i);
+  });
+});
+
+describe("scannerStalenessNoun — the words every surface shares", () => {
+  it("never calls an UNKNOWN scanner stale or outdated", () => {
+    // The bug this pins was made twice in this feature's first draft — once in the coverage KPI
+    // hint and once in the `(scope unknown)` marker — because each call site retyped the word.
+    // On the day 1.24 ships, essentially every repo is unknown, so the wrong word here is the
+    // word shown for the entire fleet.
+    const noun = scannerStalenessNoun("unknown");
+    expect(noun).not.toMatch(/stale|outdated/i);
+    expect(noun).toBe("scanner not identified");
+  });
+
+  it("names a genuinely old build as outdated", () => {
+    expect(scannerStalenessNoun("stale")).toBe("outdated scanner");
+  });
+
+  it("says nothing at all about a current scanner", () => {
+    expect(scannerStalenessNoun("current")).toBeNull();
+  });
+
+  it("the two non-current states are given DIFFERENT words (different remedies)", () => {
+    expect(scannerStalenessNoun("stale")).not.toBe(scannerStalenessNoun("unknown"));
   });
 });
 

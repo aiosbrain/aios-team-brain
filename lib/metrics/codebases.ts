@@ -5,7 +5,11 @@ import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
 import { isUnscopedCoverage, scanPartial } from "@/lib/codebases/score";
-import { scannerStaleness, type ScannerStaleness } from "@/lib/codebases/scanner-version";
+import {
+  isScannerOutdated,
+  scannerStaleness,
+  type ScannerStaleness,
+} from "@/lib/codebases/scanner-version";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
@@ -290,9 +294,8 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   // ("scanner outdated" vs "scanner unknown"); this aggregate only claims what it can support.
   const notCurrentScanner = s.filter(
     (c) =>
-      c.test_coverage_pct != null &&
       isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc) &&
-      c.scanner_staleness !== "current",
+      isScannerOutdated(c.scanner_staleness),
   ).length;
   return [
     {
