@@ -114,6 +114,22 @@ export function isScannerOutdated(staleness: ScannerStaleness): boolean {
 }
 
 /**
+ * The SHORT noun phrase for a non-current scanner — one vocabulary, used by every surface.
+ *
+ * This exists because the two non-current states kept getting collapsed into the word "stale" at
+ * individual call sites, which is a false statement about the unknown ones: they did not declare
+ * an old build, they declared nothing. That mistake was made twice in this feature's own first
+ * draft (the coverage KPI hint and the `(scope unknown)` marker), which is the argument for
+ * deriving the words from one function rather than retyping them per component.
+ *
+ * `"current"` returns null — a repo on a current scanner is never labelled at all.
+ */
+export function scannerStalenessNoun(staleness: ScannerStaleness): string | null {
+  if (staleness === "current") return null;
+  return staleness === "stale" ? "outdated scanner" : "scanner not identified";
+}
+
+/**
  * One sentence naming the cause, for the place the reader meets the effect.
  *
  * Kept beside the rule rather than in a component so the card, the detail page and the KPI hint

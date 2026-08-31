@@ -152,21 +152,14 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
             genuinely lacks it, so every "no X report" above is only as trustworthy as this line.
             `scanner_sha` is shown in the title only — it is the thing you need in order to bump a
             pin, and it is noise to everyone not doing that. */}
-        {b.scanner_staleness === "current" ? null : (
-          <span
-            className="inline-flex items-center gap-1.5"
-            title={
-              b.scanner_sha
-                ? `Scan produced by aios-team-brain commit ${b.scanner_sha}.`
-                : "This scan did not record which commit built it."
-            }
-          >
-            <ScannerStalenessBadge
-              staleness={b.scanner_staleness}
-              scannerVersion={b.scanner_version}
-            />
-          </span>
-        )}
+        {/* The sha rides in the badge's OWN title. A wrapper span carrying it was unreachable:
+            a nested `title` shadows its ancestor's, and the wrapper's box was exactly the
+            badge's box, so the provenance could never be hovered. */}
+        <ScannerStalenessBadge
+          staleness={b.scanner_staleness}
+          scannerVersion={b.scanner_version}
+          scannerSha={b.scanner_sha}
+        />
       </div>
     </section>
   );
