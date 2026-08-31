@@ -167,7 +167,17 @@ file a human must change:
    because `main` is a legitimate token everywhere.
 3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
    relocating `PR records a diff review`.
-4. **The instruction corpus** — 31 operative `origin/main` command lines across 19 files. That is
+4. **`pr-task-link.yml`'s `branches:` list AND the `trusted-automation` environment's deployment
+   branch policy, together.** This one is unlike `aios-work-sync` and `scan-on-merge`, which were
+   deliberately pre-widened to both branches so cutover day would not have to remember them.
+   `pr-task-link` **cannot** be pre-widened: it runs on `pull_request_target`, so the run's ref is the
+   PR's base branch, and once the environment holds the credentials a `staging`-based run would be
+   refused a `main`-only policy and go red — on an advisory check that is never allowed to go red.
+   Leaving the trigger at `[main]` instead makes it go **dark** for `staging` PRs, which is the safer
+   failure but is still a loss nobody would notice. So both move in one edit, and
+   `test/guards/pr-task-link-credential-isolation.test.ts` pins the trigger to exactly `["main"]` so
+   the widening has to be deliberate rather than accidental.
+5. **The instruction corpus** — 31 operative `origin/main` command lines across 19 files. That is
    **RELPTR-5**, deliberately its own slice; see §3.1d.
 
 ### 3.1d Why the instruction corpus is its own slice

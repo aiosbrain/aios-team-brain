@@ -9,25 +9,107 @@ name: PR task link (advisory)
 # reach them — and shipped reading the tasks response in a shape it never returns, so the
 # check reported a REAL key as nonexistent on its first run.
 #
-# ⛔ THIS MUST STAY ON `pull_request`. NEVER `pull_request_target`.
-# The job checks out the PR's head and EXECUTES a script from it (`scripts/pr-work-keys.mjs`)
-# with `AIOS_API_KEY` in the environment. On `pull_request`, GitHub withholds secrets from
-# fork-PR runs, so a fork that edits that script gets an empty key and there is nothing to
-# steal. `pull_request_target` runs with secrets AND the base repo's permissions — switching
-# it would turn this into a textbook pwn-request: edit the script in a fork, exfiltrate the
-# key. Fork PRs correctly reporting "credentials not configured" is the intended behaviour,
-# not a bug to fix by changing the trigger. (This repo is public.)
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# ⛔ THIS RUNS `pull_request_target` AND MUST NEVER CHECK OUT, FETCH, BUILD, INSTALL, IMPORT
+#    OR EXECUTE ANYTHING FROM THE PR HEAD.
+#
+# THE HEADER THIS REPLACES WAS WRONG, and it was wrong in the direction that mattered. It
+# argued that `pull_request` was the safe trigger because GitHub withholds secrets from FORK
+# pull requests, and concluded "a fork that edits that script gets an empty key and there is
+# nothing to steal". Forks were never the whole population. A SAME-REPOSITORY branch pull
+# request — which is how every agent and every maintainer in this repo works — gets the full
+# secret set, and on `pull_request` `actions/checkout` gives it the PR's own merge ref. So the
+# previous shape ran `scripts/pr-work-keys.mjs` FROM THE PULL REQUEST, with a TEAM-tier
+# `AIOS_API_KEY` plus `AIOS_BRAIN_URL` and `AIOS_TEAM` in the environment: one same-repo PR
+# editing that file exfiltrated a durable brain credential, and nothing in CI would have said so.
+# Fork safety was real and it was irrelevant; the reasoning stopped one branch short.
+#
+# WHAT MAKES THIS SHAPE SAFE. On `pull_request_target` GitHub runs the workflow file AND
+# `actions/checkout`'s default ref from the BASE branch, which no pull request can edit. Every
+# line of code that executes here is trusted `main` code. The pull request contributes DATA
+# only — its title, body, branch name and number, read out of the event payload — and that data
+# is treated as attacker-controlled throughout: it is never interpolated into a `run:` block,
+# never used to construct a shell command, and never used to select what to check out or fetch.
+# The one thing it feeds is a regex over strings in `scripts/pr-work-keys.mjs`.
+#
+# The remaining discipline is a single rule with no exceptions: DO NOT add `ref:` to the
+# checkout, do not `git fetch`/`git checkout` a PR ref, do not `npm ci`/`npm install` (lifecycle
+# scripts are PR-controlled code), and do not download a PR artifact. `pull_request_target` plus
+# any of those is the textbook pwn-request, and the credential in scope here is durable.
+# `test/guards/pr-task-link-credential-isolation.test.ts` fails the build on each of them.
+#
+# WHAT THE ENVIRONMENT IS, AND — MORE IMPORTANTLY — WHAT IT IS NOT.
+# `environment: trusted-automation` is a repository Environment whose deployment branch policy allows
+# `main` only. It is a BLAST-RADIUS control over WHICH WORKFLOWS can reach the credential. It is NOT
+# a trust boundary against untrusted AUTHORS, and reading it as one would repeat this file's original
+# mistake in a new place. Measured in a disposable repository rather than assumed:
+#
+#   * a `pull_request_target` run has `GITHUB_REF=refs/heads/main`, satisfies the `main`-only policy,
+#     and DOES receive the environment's secrets — so the check keeps working; and
+#   * a FORK pull request gets them too. On `pull_request_target` the ref is always the base branch,
+#     so every author trivially satisfies the branch policy regardless of who they are.
+#
+# So the environment cannot be the thing protecting this key. THE ONLY THING PROTECTING IT IS THE RULE
+# ABOVE: base-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
+# value interpolated into a `run:` body. Treat that rule as load-bearing, because it is the whole of
+# the defence.
+#
+# SECOND LAYER, NOT YET CONNECTED. The three values still exist as plain REPOSITORY secrets, and
+# GitHub hands those to every job whether or not it names an environment — an environment secret only
+# SHADOWS a repository secret of the same name, it does not revoke access to one. Connecting the layer
+# means entering the values into the environment and DELETING the repository-level copies, which is
+# blocked on rewriting `aios-work-sync.yml` (it reads the same three from a `pull_request: closed`
+# run, whose ref IS `refs/pull/N/merge`, and a `main`-only policy would refuse it). Until then this
+# job reads the repository-level values and really does call the brain.
+#
+# THE FAILURE MODE OF A MISMATCHED POLICY IS LOUD, NOT SILENT: `Branch "x" is not allowed to deploy to
+# trusted-automation`, and the job fails having run ZERO steps. It is not an empty-secret shrug. The
+# soft skip below is therefore NOT a guard against that case — it exists for exactly one thing, the
+# window where the repository copies are gone and John has not yet entered the values, and it names
+# the missing variables so that window is distinguishable in the log from any other quiet outcome.
+#
+# On `pull_request_target` the run's ref is NOT `refs/pull/N/merge` — GitHub's event table words it as
+# the default branch, the security guidance as the base of the pull request, and the trigger below is
+# pinned to `branches: [main]` so the two coincide and neither reading can surprise us. That pin is
+# also what keeps this advisory once the environment IS load-bearing: a pull request into any other
+# branch would be refused the environment and go red, and a nudge about board hygiene is never
+# allowed to go red. If the contribution base ever moves (RELPTR-4), the trigger list and the
+# environment's branch policy have to move together — `docs/RELEASING.md` §3.1c carries that entry.
+# ─────────────────────────────────────────────────────────────────────────────────────────
 on:
-  pull_request:
+  pull_request_target:
+    branches: [main]
     types: [opened, edited, synchronize, reopened]
 
+# `contents: read` and nothing else, forever. `statuses: write`/`checks: write` would let this
+# PR-reachable workflow mint a required context on an arbitrary SHA — see
+# `test/guards/workflow-permissions.test.ts`.
 permissions:
   contents: read
+
+concurrency:
+  group: pr-task-link-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   work-key:
     name: PR references a brain task
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # ADVISORY MEANS ADVISORY — that is a requirement on this check, not a workaround for a
+    # misconfiguration. The script below `.catch`es everything it can, but that only covers failures
+    # INSIDE the script; a checkout failure or a runner fault would still paint a red X on someone's
+    # pull request over board hygiene. This must never be the thing standing between a correct
+    # change and `main`.
+    #
+    # STATED COST, because it cuts both ways: this also masks a LOUD environment refusal (a branch
+    # policy that does not match fails the job with zero steps run). The `branches: [main]` pin above
+    # is what makes that path unreachable rather than merely hidden — if you widen the trigger, you
+    # are relying on this line to hide a broken job, which is not what it is for.
+    continue-on-error: true
+    # A blast-radius control over which WORKFLOWS reach the credential — not a trust boundary against
+    # untrusted authors. See the header: a fork PR satisfies this policy too.
+    environment: trusted-automation
     env:
       AIOS_BRAIN_URL: ${{ secrets.AIOS_BRAIN_URL }}
       # MUST be a TEAM-tier key. The brain correctly refuses to tell an external-tier caller that a
@@ -36,7 +118,12 @@ jobs:
       AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
-      - uses: actions/checkout@v7
+      # NO `ref:`. On `pull_request_target` the default is the base branch — the trusted copy.
+      # Adding `ref: ${{ github.event.pull_request.head.sha }}` here is precisely the vulnerability
+      # this workflow was rewritten to close.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Check for an AIOS work-key
         run: |
           node <<'NODE'
@@ -44,7 +131,18 @@ jobs:
           // syntax error. A `.catch` keeps the job advisory — an unexpected throw must not fail a PR.
           (async () => {
           const fs = require("node:fs");
+          // BASE-BRANCH CODE. `./scripts/…` resolves inside the checkout above, which on
+          // `pull_request_target` is `main`, not the pull request. Same module the merge-time
+          // workflow uses, so the two cannot disagree about what counts as a cited key.
           const { extractWorkKeys, knownKeysFrom, taskRowsFrom, unknownKeysFrom, answersByKey, verifyKeys, TASKS_PAGE_BOUND } = await import("./scripts/pr-work-keys.mjs");
+          // UNTRUSTED DATA, read as data. The event payload is the ONLY thing the pull request
+          // contributes. Reading it from the file rather than through a `github.event.pull_request.*`
+          // workflow expression is deliberate: an interpolated title or branch name is substituted
+          // into the shell script BEFORE the shell parses it, which is a command-injection primitive
+          // in a job that holds a durable credential. (Nor can this comment SAY the interpolation
+          // syntax: a `run:` block is scanned for expressions with no idea that JavaScript has
+          // comments, so writing one here would be evaluated for real. `actionlint` caught that.)
+          // Nothing below ever leaves this process.
           const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const keys = extractWorkKeys(ev.pull_request || {});
           if (!keys.length) {
@@ -60,7 +158,17 @@ jobs:
           const key = process.env.AIOS_API_KEY;
           const team = process.env.AIOS_TEAM;
           if (!brain || !key || !team) {
-            console.log("::warning title=Work key not verified::brain credentials not configured — only the FORMAT was checked.");
+            // THE SOFT SKIP, and it covers exactly ONE situation: the repository-level copies of these
+            // secrets are gone and the `trusted-automation` environment has not been given the values
+            // yet. It is deliberately NOT a catch-all. A branch policy that does not match fails the
+            // job LOUDLY with zero steps run, so it can never arrive here wearing an empty string —
+            // and if some future event ever could, naming the missing variables is what tells the two
+            // apart in a log. NAMES ONLY: printing a value would publish the credential this whole
+            // rewrite exists to protect.
+            const missing = [["AIOS_BRAIN_URL", brain], ["AIOS_API_KEY", key], ["AIOS_TEAM", team]]
+              .filter(([, v]) => !v)
+              .map(([n]) => n);
+            console.log(`::warning title=Work key not verified::brain credentials not configured (missing: ${missing.join(", ")}) — only the FORMAT was checked. If the repo secrets were removed, these three still need entering in the trusted-automation environment.`);
             return;
           }
           const base = `${brain.replace(/\/$/, "")}/api/v1/tasks`;
