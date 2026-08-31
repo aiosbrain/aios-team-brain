@@ -225,16 +225,22 @@ export function credentialExposures(file: string, doc: Workflow): Finding[] {
 }
 
 /**
- * The ONE documented exception, and it is a different vulnerability with a different fix.
+ * EMPTY, and that is the claim this file now makes: every PR-reachable workflow in this repository
+ * is asserted clean, with no exception.
  *
- * `aios-work-sync.yml` runs on `pull_request: [closed]` gated by `merged == true`, so its default
- * checkout is PR-controlled code running with the same three brain secrets. It is NOT closed here
- * for two reasons: it fires only AFTER a merge (so it costs a reviewer's approval, not just an
- * `edited` event), and rewriting it is Phase 0 item 5 of the leak-gate remediation plan — a separate
- * change with its own test evidence. Removing it from this list without fixing the workflow is the
- * only wrong move: the entry is here so the hole is counted, not so it is forgotten.
+ * It held `aios-work-sync.yml` until Phase 0 item 5 of the leak-gate remediation plan. That workflow
+ * ran on `pull_request: [closed]` gated by `merged == true` — and the gate lived in the same file,
+ * which on `pull_request` GitHub takes from the pull request's head. So the gate was not a gate: a
+ * same-repository branch could delete it, print the three brain secrets, and CLOSE ITS OWN UNMERGED
+ * pull request to fire the job. `closed` fires on any close. It is now `pull_request_target` with a
+ * same-repository condition, base-branch code only, and `environment: trusted-automation`; the
+ * `aios-work-sync.yml specifically` block below pins each of those.
+ *
+ * A name added back to this list is a new hole. A name left on it after its workflow was fixed makes
+ * the list lie about what is outstanding — which is why the assertion below is an exact-set equality
+ * in both directions rather than a subset check.
  */
-const KNOWN_GAPS = new Set(["aios-work-sync.yml"]);
+const KNOWN_GAPS = new Set<string>([]);
 
 describe("guard: no PR-reachable job runs PR-controlled code with a credential", () => {
   it("finds a non-trivial set of workflows, so a rename cannot empty this guard", () => {
@@ -251,13 +257,29 @@ describe("guard: no PR-reachable job runs PR-controlled code with a credential",
     expect(offenders, `these hand a durable credential to code a pull request can edit:\n${offenders.join("\n")}`).toEqual([]);
   });
 
-  it("the gap list is EXACTLY the documented one, and every entry still really trips the detector", () => {
+  it("the gap list is EMPTY — no workflow here is excused from the rule", () => {
     // Two failure modes, both real. A new name silently added to the list is a new hole; a name left
     // on the list after its workflow was fixed makes the list lie about what is outstanding.
-    expect([...KNOWN_GAPS]).toEqual(["aios-work-sync.yml"]);
+    expect([...KNOWN_GAPS]).toEqual([]);
     for (const f of KNOWN_GAPS) {
       expect(credentialExposures(f, load(f)), `${f} no longer trips this — remove it from KNOWN_GAPS`).not.toEqual([]);
     }
+  });
+
+  it("the exclusion is still WIRED, so emptying the list did not disarm the filter", () => {
+    // With no entries the `for` loop above is inert and the `.filter(…)` in the sweep is a no-op, so
+    // neither can any longer show that KNOWN_GAPS does anything. Without this, someone could delete
+    // the mechanism entirely and every assertion in this file would stay green — and the NEXT hole
+    // would be waved through by a list that no longer exists. Proven by exercising the filter over a
+    // known-dirty file name instead of by reading the source.
+    const dirty = "aios-work-sync-preimage.yml";
+    const preimage = parseYaml(
+      "on:\n  pull_request:\n    types: [closed]\njobs:\n  a:\n    env:\n      K: ${{ secrets.AIOS_API_KEY }}\n    steps:\n      - uses: actions/checkout@abc\n"
+    ) as Workflow;
+    expect(credentialExposures(dirty, preimage), "the pre-fix shape must still be a finding").not.toEqual([]);
+    const gaps = new Set([dirty]);
+    expect([dirty].filter((f) => !gaps.has(f)), "a listed name is excluded from the sweep").toEqual([]);
+    expect([dirty].filter((f) => !KNOWN_GAPS.has(f)), "an unlisted name is not").toEqual([dirty]);
   });
 
   it("`nda-gate.yml` stays clean: fetching PR objects as DATA is not an exposure", () => {
@@ -509,5 +531,208 @@ describe("guard: pr-task-link.yml specifically", () => {
       // this catches it, and the bright line is cheaper to hold than the taxonomy.
       expect(run, "a `run:` block in this job must contain no workflow expression whatsoever").not.toContain("${{");
     }
+  });
+});
+
+/**
+ * The file with every COMMENT removed — YAML `#` lines and the JavaScript `//` lines inside the
+ * heredoc alike.
+ *
+ * These workflows describe the vulnerability they close, at length and on purpose, because the
+ * control that failed here was a header that reasoned about the wrong threat. A guard that cannot
+ * tell the warning from the practice would push the next person to delete the warning, so the
+ * "must not contain X" assertions read this view rather than the raw text.
+ */
+const executable = (f: string): string =>
+  text(f)
+    .split("\n")
+    .filter((l) => !/^\s*(#|\/\/)/.test(l))
+    .join("\n");
+
+describe("guard: aios-work-sync.yml specifically", () => {
+  const FILE = "aios-work-sync.yml";
+  const doc = () => load(FILE);
+  const job = () => doc().jobs!["notify-brain"];
+
+  it("has no credential exposure of any kind — this is what leaving KNOWN_GAPS means", () => {
+    expect(credentialExposures(FILE, doc())).toEqual([]);
+    // Belt and braces on the exact regression, over the executable lines only.
+    const code = executable(FILE);
+    expect(code).not.toMatch(/ref:\s*\$\{\{[^}]*github\.event\.pull_request\.head/);
+    expect(code).not.toMatch(/ref:\s*\$\{\{[^}]*github\.head_ref/);
+  });
+
+  it("the comment stripper is NON-VACUOUS — it removes comments and keeps code", () => {
+    // Otherwise `executable()` could silently return "" and every not-toContain assertion above
+    // would pass by reading nothing at all.
+    const code = executable(FILE);
+    expect(code, "the checkout is code and must survive").toContain("actions/checkout@");
+    expect(code, "so must the step env").toContain("PR_TITLE:");
+    expect(code, "a YAML comment must not").not.toContain("pwn-request");
+    expect(code, "nor a JS comment inside the heredoc").not.toContain("BASE-BRANCH CODE");
+  });
+
+  it("runs ONLY on pull_request_target — an added `pull_request` trigger restores the whole hole", () => {
+    // Not "includes pull_request_target". Declaring BOTH would run the pull request's own copy of
+    // this file with the same three secrets, and every other assertion here would still pass. That
+    // is not hypothetical: `pull_request` IS the trigger this workflow shipped with, and on it the
+    // `merged == true` gate below is contributor-editable, so an unmerged close fires the job.
+    expect(triggers(doc())).toEqual(["pull_request_target"]);
+  });
+
+  it("carries an explicit branch filter — without one, a contributor picks the base", () => {
+    // MANDATORY, and it is the non-obvious half of the fix. `pull_request_target` alone means the
+    // "base" is whatever branch the pull request targets, so a collaborator pushes `evil`, opens
+    // `evil2 -> evil`, and the trusted base-branch code IS their own tree. The filter is what makes
+    // "base branch" mean a reviewed branch. Asserted as an EXACT SET, matching branch-roles.test.ts:
+    // `[main, staging, "**"]` satisfies containment while widening to every branch in the repository.
+    const on = doc().on as Record<string, { branches?: unknown; types?: unknown }>;
+    expect(on.pull_request_target.branches).toEqual(["main", "staging"]);
+    expect(on.pull_request_target.types).toEqual(["closed"]);
+  });
+
+  it("keeps `merged == true`, and adds the same-repository condition forks used to get for free", () => {
+    // `closed` fires on ANY close, so `merged == true` is the whole of the merge semantics — it is
+    // preserved, but now it lives in base-branch code where a pull request cannot delete it. The
+    // second clause is new: under `pull_request` a fork run received no secrets and skipped
+    // harmlessly, and `pull_request_target` would newly hand the brain credentials to a run an
+    // outside contributor can start. Asserted as an exact string so dropping either half reds.
+    expect(job().if).toBe(
+      "github.event.pull_request.merged == true && github.event.pull_request.head.repo.full_name == github.repository"
+    );
+  });
+
+  it("takes its credentials from the `trusted-automation` environment", () => {
+    // The third and last `AIOS_*` consumer to enrol, which is what unblocks deleting the
+    // repository-level copies. NOT a fork boundary: on pull_request_target the ref is always the
+    // base branch, so a fork pull request satisfies a `main`-only policy too. See the file header.
+    expect(job().environment).toBe("trusted-automation");
+    expect(secretRefs(job())).toEqual(["AIOS_API_KEY", "AIOS_BRAIN_URL", "AIOS_TEAM"]);
+  });
+
+  it("requests `contents: read` and NOTHING else", () => {
+    expect((doc() as { permissions?: unknown }).permissions).toEqual({ contents: "read" });
+    expect(job().permissions, "no job-level widening either").toBeUndefined();
+  });
+
+  it("checks out the BASE branch: a checkout with no `ref:`, pinned by full commit SHA", () => {
+    const checkouts = asSteps(job()).filter(isCheckout);
+    expect(checkouts.length, "no checkout found — the ref assertion would be vacuous").toBe(1);
+    expect(stepRef(checkouts[0]), "any `ref:` at all is the pwn-request").toBeUndefined();
+    const uses = asSteps(job()).map(usesId).filter(Boolean);
+    expect(uses.length, "no actions found — this assertion would be vacuous").toBeGreaterThan(0);
+    for (const u of uses) expect(u, `${u} is not pinned by SHA`).toMatch(/@[0-9a-f]{40}$/);
+  });
+
+  it("reads pull request metadata from `env:`, never as a `run:` interpolation", () => {
+    // Interpolation is substituted before the shell parses, so a pull request TITLE is a
+    // command-injection primitive in a job that holds a durable credential.
+    const steps = asSteps(job());
+    const runs = steps.map((s) => (typeof s.run === "string" ? s.run : ""));
+    expect(runs.filter(Boolean).length, "no run blocks found — this would be vacuous").toBeGreaterThan(0);
+    for (const run of runs) {
+      // NO INTERPOLATION AT ALL, not "no dangerous interpolation" — GitHub scans a `run:` block for
+      // expressions with no idea that JavaScript has comments, so even a commented-out one is
+      // evaluated for real. `actionlint` caught that in the sibling workflow; the bright line is
+      // cheaper to hold than the taxonomy.
+      expect(run, "a `run:` block in this job must contain no workflow expression whatsoever").not.toContain("${{");
+    }
+    // …and the values really do arrive, so the rule above did not simply delete the feature.
+    const stepEnv = steps.flatMap((s) => Object.entries(((s as { env?: Record<string, string> }).env ?? {})));
+    const fromPr = stepEnv.filter(([, v]) => String(v).includes("github.event.pull_request."));
+    expect(fromPr.map(([k]) => k).sort()).toEqual([
+      "PR_BODY",
+      "PR_HEAD_REF",
+      "PR_HEAD_SHA",
+      "PR_HTML_URL",
+      "PR_MERGED_BY",
+      "PR_MERGE_COMMIT_SHA",
+      "PR_TITLE",
+      "PR_USER",
+    ]);
+    const body = text(FILE);
+    for (const [name] of fromPr) expect(body, `${name} must be read with process.env`).toContain(`process.env.${name}`);
+    // The enumerated set above is the POINT: a whole-payload read would make the trusted field list
+    // implied rather than visible, so the workflow must not go back to parsing the event file.
+    // EXECUTABLE LINES ONLY — both the YAML header and the inline JS say the words "no longer parses
+    // GITHUB_EVENT_PATH" on purpose, and a guard that cannot tell the explanation from the practice
+    // would push the next person to delete the explanation.
+    expect(executable(FILE), "no whole-payload read").not.toContain("GITHUB_EVENT_PATH");
+  });
+
+  it("STILL posts the merged work event through the ONE shared matcher", () => {
+    // The regression most likely to be lost in a security rewrite: this is the only step that closes
+    // a task. `scripts/pr-work-keys.mjs` is shared with pr-task-link.yml precisely because two inline
+    // copies disagreed once — the advisory check cleared a PR whose keys this step read differently.
+    const body = text(FILE);
+    expect(body).toContain("scripts/pr-work-keys.mjs");
+    expect(body).toContain("extractWorkKeys");
+    expect(body).toContain("/api/v1/work-events");
+    expect(body, "the pushed project decides applied-vs-linked").toContain("AIOS_PROJECT: aios-team-brain");
+  });
+
+  it("fails LOUDLY — it is the only thing that closes a task", () => {
+    // The opposite requirement to pr-task-link.yml, which is advisory and `continue-on-error: true`.
+    // A silent skip here leaves the board wrong with a green tick next to it.
+    expect(job()["continue-on-error"], "must not be excused from failing").toBeUndefined();
+    expect(text(FILE)).toContain("process.exit(1)");
+  });
+});
+
+/**
+ * ENROLMENT COMPLETENESS — the precondition for deleting the repository-level secrets.
+ *
+ * `AIOS_API_KEY` / `AIOS_BRAIN_URL` / `AIOS_TEAM` exist twice over: as repository secrets, which
+ * GitHub hands to EVERY job, and (once entered) as `trusted-automation` environment secrets, which
+ * only jobs naming that environment can read. An environment secret merely SHADOWS a same-named
+ * repository secret — so the environment becomes load-bearing only when the repository copies are
+ * DELETED, and deleting them breaks any consumer that has not enrolled.
+ *
+ * So the guard is not "these three files name the environment", which a rename would empty. It is:
+ * every job anywhere in this repository that reads one of the three MUST name the environment. A new
+ * consumer added without it is caught here rather than by a red workflow after the deletion.
+ *
+ * STATED LIMIT, because this is exactly where an overstated guard would do harm: naming the
+ * environment does NOT scope the credential, and a green result here is not evidence that the
+ * repository-level copies are gone. That deletion is a repository-admin action this file cannot see.
+ */
+describe("guard: every AIOS_* credential consumer is enrolled in `trusted-automation`", () => {
+  const BRAIN_SECRETS = ["AIOS_API_KEY", "AIOS_BRAIN_URL", "AIOS_TEAM"];
+
+  /** [file, jobId] for every job with one of the three brain secrets in scope. */
+  const consumers = (): [string, string][] =>
+    files().flatMap((f) => {
+      const doc = load(f);
+      const wf = secretRefs(doc?.env);
+      return Object.entries(doc?.jobs ?? {})
+        .filter(([, job]) => [...wf, ...secretRefs(job)].some((s) => BRAIN_SECRETS.includes(s)))
+        .map(([id]) => [f, id] as [string, string]);
+    });
+
+  it("finds exactly the three known consumers — a rename cannot empty this", () => {
+    // Enumerated, so a fourth consumer appearing is a deliberate decision rather than a silent one.
+    expect(consumers().map(([f, j]) => `${f}:${j}`).sort()).toEqual([
+      "aios-work-sync.yml:notify-brain",
+      "pr-task-link.yml:work-key",
+      "scan-on-merge.yml:scan",
+    ]);
+  });
+
+  it("every one of them names the environment", () => {
+    const unenrolled = consumers()
+      .filter(([f, j]) => load(f).jobs![j].environment !== "trusted-automation")
+      .map(([f, j]) => `${f} [job:${j}]`);
+    expect(
+      unenrolled,
+      `these read a brain secret without naming trusted-automation, so deleting the repository-level copies would break them:\n${unenrolled.join("\n")}`
+    ).toEqual([]);
+  });
+
+  it("is NON-VACUOUS: an unenrolled consumer is detected", () => {
+    const doc = parseYaml(
+      "on:\n  push:\njobs:\n  a:\n    env:\n      K: ${{ secrets.AIOS_API_KEY }}\n    steps:\n      - run: 'true'\n"
+    ) as Workflow;
+    expect(doc.jobs!["a"].environment, "the fixture must really lack it").toBeUndefined();
+    expect(secretRefs(doc.jobs!["a"]).some((s) => BRAIN_SECRETS.includes(s))).toBe(true);
   });
 });

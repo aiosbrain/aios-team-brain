@@ -215,12 +215,21 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
   it("aios-work-sync fires on EXACTLY the contribution base and the integration branch", () => {
     // EXACT SET, not "contains both": `[main, staging, "**"]` satisfies a containment check while
     // silently widening the trigger to every branch in the repository. Codex found that.
+    //
+    // `pull_request_target`, not `pull_request` — the credential-isolation fix. Under `pull_request`
+    // the workflow FILE comes from the pull request's head, so the `merged == true` gate was
+    // contributor-editable and an unmerged close fired the job with three brain secrets in scope.
+    // The branch filter is doubly load-bearing on this trigger: without it the "base" is whatever
+    // branch a pull request targets, so a collaborator can make their own tree the trusted one.
+    // `test/guards/pr-task-link-credential-isolation.test.ts` owns the security half; this owns the
+    // RELPTR-4 half, and both must move together.
     const on = workflow("aios-work-sync.yml").on!;
-    expect(on.pull_request!.branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
-    expect(on.pull_request!.types).toEqual(["closed"]);
+    expect(Object.keys(on), "the trigger itself is part of criterion 5 now").toEqual(["pull_request_target"]);
+    expect(on.pull_request_target!.branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+    expect(on.pull_request_target!.types).toEqual(["closed"]);
     // …and INTEGRATION_BRANCH is `staging` TODAY, so this pins the widening now rather than
     // collapsing to "contains main" until the cutover moves the value.
-    expect(on.pull_request!.branches).toContain("staging");
+    expect(on.pull_request_target!.branches).toContain("staging");
   });
 
   it("scan-on-merge fires on EXACTLY the same two branches", () => {
@@ -236,7 +245,13 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // it. Codex found this too. The job gate is pinned as an exact string; steps carry no `if:` at all.
     const wf = workflow("aios-work-sync.yml");
     const job = wf.jobs!["notify-brain"];
-    expect(job.if, "the job gate, exactly").toBe("github.event.pull_request.merged == true");
+    // Exact string, both clauses. `merged == true` is the merge semantics (`closed` fires on ANY
+    // close); the same-repository clause is the credential fix keeping fork pull requests away from
+    // secrets that `pull_request` used to withhold for us. NEITHER of them narrows by BRANCH, which
+    // is what criterion 5 is protecting here.
+    expect(job.if, "the job gate, exactly").toBe(
+      "github.event.pull_request.merged == true && github.event.pull_request.head.repo.full_name == github.repository"
+    );
     const stepIfs = (job.steps ?? []).filter((step) => step.if !== undefined);
     expect(stepIfs, "no step may carry its own condition").toEqual([]);
   });
