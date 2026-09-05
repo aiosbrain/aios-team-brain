@@ -1,3 +1,10 @@
+> ⚠️ **ARCHIVED (RELPTR-5, 2026-08-27). The commands below are NOT executable as written.**
+> They hardcode `origin/main` as the branch to work from and to open pull requests against. Under the
+> option-B branch model (`docs/RELEASING.md` §3) that is the RELEASE branch, not the branch
+> contributions target — so copying one verbatim would branch from, and target, the wrong place. The
+> file is kept because the *structure* of a parallel-agent handoff is still a useful template; the
+> refs in it are not. For the current contribution base see `scripts/branches.mjs`.
+
 # AIOS — Parallel Agent Handoff Prompts
 
 > **Status:** Wave 1 (`F3`–`F5`, `W1.1`–`W1.4`) below has shipped and merged; the prompts are kept
