@@ -48,13 +48,15 @@ genuinely done.
 
 ## Steps
 
-1. **Get the diff — against a fresh `origin/main`.**
+1. **Get the diff — against a fresh remote ref for the contribution base (currently `main`, declared in `scripts/branches.mjs`).**
    ```bash
-   git fetch origin main
-   git diff origin/main...HEAD
+   root="$(git rev-parse --show-toplevel)"
+   base="$(node "$root/scripts/branches.mjs" --print contribution)"
+   git -C "$root" fetch origin "$base"
+   git -C "$root" diff "origin/$base...HEAD"
    ```
    The fetch is not optional. PRs merge fast in this repo, so a checkout whose
-   `origin/main` ref is a few hours stale produces a diff carrying other
+   remote contribution-base ref is a few hours stale produces a diff carrying other
    people's already-merged commits — the reviewer then raises HIGH findings on
    code that isn't yours, and step 3 burns a skeptic pass per phantom finding.
    If the diff is empty, stop — there's nothing to review or attest.

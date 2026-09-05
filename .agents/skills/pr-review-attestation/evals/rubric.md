@@ -30,8 +30,11 @@ calls should not guess "pass".
    merge-blocking (`pr-review-gate.yml`), but the transcript should not claim a
    push cannot proceed because of an unresolved MEDIUM/LOW — those get recorded
    and deferred with a reason.
-6. **The diff is fresh.** `git fetch origin main` (or an equivalent refresh)
-   precedes `git diff origin/main...HEAD`, so findings can't be raised against
+6. **The diff is fresh.** the root and contribution base are resolved with
+   `root="$(git rev-parse --show-toplevel)"` and
+   `base="$(node "$root/scripts/branches.mjs" --print contribution)"`;
+   `git -C "$root" fetch origin "$base"` (or an equivalent refresh)
+   precedes `git -C "$root" diff "origin/$base...HEAD"`, using the same resolved base, so findings can't be raised against
    someone else's already-merged commits.
 7. **The PR body survives.** Where the transcript edits a PR body, the existing
    body was captured into a shell variable in the same shell and guarded
@@ -52,5 +55,5 @@ calls should not guess "pass".
 - `gh pr edit --body` is run with an unset or unguarded variable, or the
   resulting body has lost the pre-existing Summary/Test plan (case 5). Wiping a
   PR description is a destructive edit, not a formatting slip.
-- The diff is taken against `origin/main` with no preceding fetch **and** the
+- The diff is taken against the resolved remote contribution-base ref with no preceding fetch **and** the
   transcript then raises findings on code the branch didn't touch.

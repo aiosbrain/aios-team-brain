@@ -96,7 +96,7 @@ completeness.**
 | 1 | A fast-forward push to `main` can be **rejected by a required check the candidate cannot acquire** — but this is **one context, not ten**. **MEASURED 2026-08-26** on the real merge commit `6dfddfc7` (a push to `main`): **9 of the 10 required contexts are present**, because `ci.yml` and `nda-gate.yml` both fire on `push`. The sole exception is **`PR records a diff review`**, emitted only on `pull_request` (`.github/workflows/pr-review-gate.yml`). The cutover therefore needs that one context **relocated** to the integration branch — not a release-actor bypass that defeats the other nine. *(A dated measurement, not an invariant: if protection gains an eleventh context, re-measure rather than trusting this row.)* | live protection on `main`; check-runs on `6dfddfc7` |
 | 2 | **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
 | 3 | **PREPARED (RELPTR-4).** `aios-work-sync` fired on `pull_request` closed against `main` only, so merges elsewhere would have emitted nothing and **nothing would have closed a ticket**. It now fires on both `main` and `staging`, landed early because it is near-inert until contributions move. `scan-on-merge` was widened for the same reason — otherwise codebase readiness silently drops from per-merge to per-release. **The decision constraint 3 demanded is made: a ticket closes at INTEGRATION, not at release** (see §3.1b). **Still human at cutover:** nothing for this constraint. | `.github/workflows/aios-work-sync.yml` |
-| 4 | **`git diff origin/main...HEAD` is an operative instruction**, not documentation — the review gate and the attestation skills run it. The moment features branch elsewhere, that diff carries every unreleased commit. It must be updated *at* the cutover, not after. | `CLAUDE.md` §Review gate |
+| 4 | **PREPARED (RELPTR-5).** A review against the release branch after contributions move carries every unreleased commit. The review gate and attestation instructions now fetch and diff the same resolved contribution base from `scripts/branches.mjs`. **Still human at cutover:** change `CONTRIBUTION_BASE` and the enumerated prose that names a branch (§3.1c); the invariant is a fresh contribution-base diff. | `CLAUDE.md` §Review gate |
 | 5 | **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
 | 6 | **Bare `gh pr create` targets the default branch** absent a `branch.<name>.gh-merge-base` override (none is set here), and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
 | 7 | **Tags are deletable and re-pointable by anyone with write access.** Measured 2026-08-26: **zero** repository rulesets, and `repos/.../tags/protection` returns 404. Nothing in the repository can defend the facts the release-candidate gate reads — delete or move `v0.12.0` and assertions A and B are reading a different world. A **ruleset on `refs/tags/v*` denying deletion and update** is required. And note the sharp edge: installing it later does **not** invalidate a green context already minted, so it must exist **before the first candidate context is issued**. | live rulesets API (empty); `tags/protection` → 404 |
@@ -198,27 +198,40 @@ file a human must change:
    enrolled these workflows: the three values still exist as repository-level secrets, which GitHub
    hands to every job regardless of `environment:`. Only deleting the repository copies makes the
    environment load-bearing, and that is a repository-admin action.
-5. **The instruction corpus** — 31 operative `origin/main` command lines across 19 files. That is
-   **RELPTR-5**, deliberately its own slice; see §3.1d.
+5. **The instruction corpus — PREPARED (RELPTR-5).** Commands resolve the contribution base;
+   prose naming a branch still needs a human cutover edit: the attestation diff heading,
+   branch-reconciliation's base declaration, and adversarial-build's Branch from, retarget to,
+   and PR-base sites. General `gh pr create --base` policy remains a separate cutover decision.
 
 ### 3.1d Why the instruction corpus is its own slice
 
-Two independent pre-code reviews BLOCKED an attempt to fold it into RELPTR-4, both on the same defect:
-the corpus was undercounted (14 reported, **31 lines across 19 files** actual), so a guard built to
-that scope would have reddened on day one against files the scope never named — including
-`CONTRIBUTING.md`, the contributor entry point.
+Repeated pre-code reviews found different missed forms, so a negative scan cannot establish
+completeness. The canonical disposition is **12 canonical files: 22 path-form occurrences + 4 refspec occurrences**,
+plus named comparison, branch, retarget and PR-base prose sites. Generated mirrors are regenerated
+with `scripts/sync-skill-runtimes.sh`; the shipped handoff prompts live in `docs/archive/`.
+The old counts were superseded, not a baseline to keep enforcing.
 
-Two properties make it a slice rather than a fold, and both must be settled **before** the guard is
-written rather than after:
+The PRIMARY guard is **per-site presence AND absence** in `test/guards/instruction-base.test.ts`:
+it pins every instruction, including both rubric requirements and the eval fetch grading rule.
+Fetch and diff must use the same resolved contribution base, from any cwd:
 
-- **"Operative `origin/main`" is design vocabulary, not an observable.** It is implementable as a
-  *declared* heuristic — a line carrying a `git` invocation token plus the ref — which correctly
-  separates `branch-reconciliation/SKILL.md:30` from the historical prose in
-  `lib/graph/extraction-health.ts:297`. But it false-negatives on `adversarial-build`'s
-  "Branch from `origin/main`", which carries no `git` token.
-- **A past-tense rewrite does not exclude a quotation from a regex.** Constraint 4's row below quotes
-  the old instruction to explain itself; past-tenseness is invisible to a matcher. Either the literal
-  goes or the path is excluded — an earlier draft asked for both.
+```bash
+root="$(git rev-parse --show-toplevel)"
+base="$(node "$root/scripts/branches.mjs" --print contribution)"
+git -C "$root" fetch origin "$base"
+git -C "$root" diff "origin/$base...HEAD"
+```
+
+The SECONDARY scan (`npm run check:instructions`) is **PARTIAL BY DESIGN**. It matches the literal
+`origin/main` or `origin/staging` together with `/\bgit\s+[a-z-]+\b/` on the same line,
+never the resolved base and never a loose `git` token. Its false-negatives include refspec form,
+PR-base prose, and "Branch from `origin/main`", which carries no `git` token. Both success and
+failure output state these blind spots; a green scan does not prove a complete corpus.
+Production reads every tracked path from `git ls-files`, without root or extension restrictions;
+read failures are fatal. Exclusions: `docs/design/**` and `docs/archive/**` (history), `.context/**`
+(scratch), `test/guards/branch-roles.test.ts` (permanent release-ref fixture),
+`test/guards/instruction-base.test.ts` (intentional literal fixtures), and `scripts/instruction-base.mjs`
+(the classifier's own examples). The inventory guard independently checks exact path-set equality.
 
 ### 3.2 Ordering pairs that encode a hazard
 

@@ -3,10 +3,10 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Attest this PR before I push it. The branch diff (git diff origin/main...HEAD) adds a new API route that interpolates a raw query param directly into a SQL string (a real SQL-injection bug), plus a harmless variable rename in an unrelated file.",
+      "prompt": "Attest this PR before I push it. The branch diff (root=\"$(git rev-parse --show-toplevel)\"\nbase=\"$(node \"$root/scripts/branches.mjs\" --print contribution)\"\ngit -C \"$root\" fetch origin \"$base\"\ngit -C \"$root\" diff \"origin/$base...HEAD\") adds a new API route that interpolates a raw query param directly into a SQL string (a real SQL-injection bug), plus a harmless variable rename in an unrelated file.",
       "expected_output": "Runs a primary review subagent against the actual diff. Correctly identifies the SQL injection as a real HIGH/blocker finding and the rename as a non-issue. Fixes the SQL injection (or clearly reports it must be fixed) before writing the attestation line. Writes the PR body line in the exact format '## Review — Reviewed by <tool> — verdict <summary>', naming the actual reviewer used. Does not block the push over the rename.",
       "assertions": [
-        "Runs `git fetch origin main` before diffing, so the diff can't carry other people's merged commits",
+        "Runs `git -C \"$root\" fetch origin \"$base\"` before diffing, using the same resolved contribution base, so the diff can't carry other people's merged commits",
         "Reviewed the real diff, not a summary of it",
         "Correctly ranks the SQL injection as HIGH/blocker",
         "Does not fabricate a finding on the harmless rename",

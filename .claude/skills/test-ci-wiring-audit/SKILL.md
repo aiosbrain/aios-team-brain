@@ -50,9 +50,12 @@ needed.
 4. **Coverage staleness check.**
    ```bash
    stat -f %m coverage/coverage-summary.json   # or ls -l / date -r, mtime
-   git log -1 --format=%ci origin/main
+   root="$(git rev-parse --show-toplevel)"
+   base="$(node "$root/scripts/branches.mjs" --print contribution)"
+   git -C "$root" fetch origin "$base"
+   git -C "$root" log -1 --format=%ci "origin/$base"
    ```
-   If the coverage report's mtime predates the latest `main` commit by a
+   If the coverage report's mtime predates the latest contribution-base commit by a
    meaningful margin (days, not minutes), flag it as stale. Independently, for
    every file the report names as a top-offender / worst-covered file, verify
    it still exists on disk (`git ls-files --error-unmatch <path>` or a plain
