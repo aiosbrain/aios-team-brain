@@ -2,7 +2,12 @@ import { Check, X } from "lucide-react";
 import type { AgenticBreakdown as Breakdown } from "@/lib/metrics/codebases";
 import { AGENTIC_WEIGHTS } from "@/lib/codebases/score";
 import { ScoreRing } from "./score-ring";
-import { CoverageScope, PartialRunBadge, isNarrowCoverage } from "./coverage-scope";
+import {
+  CoverageScope,
+  PartialRunBadge,
+  ScannerStalenessBadge,
+  isNarrowCoverage,
+} from "./coverage-scope";
 
 const BARS: { key: keyof typeof AGENTIC_WEIGHTS; label: string; score: keyof Breakdown }[] = [
   { key: "test_coverage_score", label: "Test coverage", score: "test_coverage_score" },
@@ -102,6 +107,8 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
               linesInstrumented={b.test_coverage_lines_total}
               loc={b.loc}
               breadthPct={b.coverage_breadth_pct}
+              scannerStaleness={b.scanner_staleness}
+              scannerVersion={b.scanner_version}
             />
           )}
         </span>
@@ -139,6 +146,20 @@ export function AgenticScoreCard({ b }: { b: Breakdown }) {
           // branch can't see it, but the guard states the intent rather than relying on that.
           <Check2 ok label={`${b.tests_total} tests, none skipped`} />
         ) : null}
+        {/* Which BUILD produced all of the above (brain-api 1.24 / AIO-1011). It sits at the end
+            of the evidence list rather than in the header because it QUALIFIES every item in the
+            list: a scanner that predates a field reports its absence identically to a repo that
+            genuinely lacks it, so every "no X report" above is only as trustworthy as this line.
+            `scanner_sha` is shown in the title only — it is the thing you need in order to bump a
+            pin, and it is noise to everyone not doing that. */}
+        {/* The sha rides in the badge's OWN title. A wrapper span carrying it was unreachable:
+            a nested `title` shadows its ancestor's, and the wrapper's box was exactly the
+            badge's box, so the provenance could never be hovered. */}
+        <ScannerStalenessBadge
+          staleness={b.scanner_staleness}
+          scannerVersion={b.scanner_version}
+          scannerSha={b.scanner_sha}
+        />
       </div>
     </section>
   );

@@ -396,6 +396,28 @@ export const codeMetricsSchema = z.object({
   // Optional and additive: a pre-1.15 payload without it stays valid unchanged. No
   // `.default()`/no null: omitted must stay distinguishable from a scored object.
   codebase_health: codebaseHealthSchema.optional(),
+  // brain-api 1.24 (AIO-1011) — WHICH SCANNER BUILD produced this payload.
+  //
+  // `scanner_version` is the ingestion package version (`aios_ingest.__version__`); `scanner_sha`
+  // is the aios-team-brain commit it ran from, provenance only. Optional and defaulting to null,
+  // so a pre-1.24 payload is byte-for-byte unchanged.
+  //
+  // `null` MEANS UNKNOWN — and here, specifically, "predates 1.24". It must never read as
+  // "current": every scan ever pushed before this revision is in that state and it cannot be
+  // backfilled, so unknown is the COMMON case. That is the whole point — 1.22's coverage
+  // denominator shipped to seven repos pinned to a scanner that had never heard of it, every scan
+  // returned 200, and nothing could tell an old scanner apart from a current one with genuinely
+  // nothing to report.
+  //
+  // DELIBERATELY PERMISSIVE, and this is the load-bearing decision. No regex, no enum, no format:
+  // just a bounded string, exactly as the canonical schema pins it. A 422 here would drop the
+  // repo's ENTIRE scan — metrics, findings, contributions, issues — and returns before
+  // `recordIngestRun`, so the failure would not even be logged. A provenance string can never be
+  // worth that. A version this server cannot parse is stored verbatim and READ as unknown
+  // (`lib/codebases/scanner-version`), never rejected. The 64-char bound exists because these
+  // become text columns, not to police shape.
+  scanner_version: z.string().max(64).nullable().optional().default(null),
+  scanner_sha: z.string().max(64).nullable().optional().default(null),
 });
 
 export const codeContributionSchema = z.object({

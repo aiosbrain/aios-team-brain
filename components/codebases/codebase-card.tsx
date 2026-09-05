@@ -4,7 +4,13 @@ import type { CodebaseSummary } from "@/lib/metrics/codebases";
 import { timeAgo } from "@/components/format";
 import { Sparkline } from "@/components/sparkline";
 import { ScoreRing } from "./score-ring";
-import { CoverageScope, PartialRunBadge, isNarrowCoverage, isUnscopedCoverage } from "./coverage-scope";
+import {
+  CoverageScope,
+  PartialRunBadge,
+  ScannerStalenessBadge,
+  isNarrowCoverage,
+  isUnscopedCoverage,
+} from "./coverage-scope";
 
 export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseSummary }) {
   return (
@@ -55,6 +61,8 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
                 linesInstrumented={cb.test_coverage_lines_total}
                 loc={cb.loc}
                 breadthPct={cb.coverage_breadth_pct}
+                scannerStaleness={cb.scanner_staleness}
+                scannerVersion={cb.scanner_version}
               />
             )}
           </span>
@@ -91,6 +99,18 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
           <CircleDot className="size-3" /> {cb.open_issues}
         </span>
         <span className="ml-auto inline-flex items-center gap-1.5">
+          {/* Two different "stale"s, and conflating them would hide the one nobody can act on
+              from the dashboard. `cb.stale` = nobody has scanned this repo lately, fixed by
+              running a scan. `scanner_staleness` = the scan RAN, on schedule, green — and the
+              build that ran cannot report what the contract now asks for, fixed by bumping a
+              pin. The second is the failure mode that let 1.22 ship to nobody, and it is
+              invisible to every freshness check because the scan itself is perfectly fresh. */}
+          {cb.scanned ? (
+            <ScannerStalenessBadge
+              staleness={cb.scanner_staleness}
+              scannerVersion={cb.scanner_version}
+            />
+          ) : null}
           {cb.scanned && cb.stale ? (
             <span
               title="No recent scan — showing the last known values. Re-scan to refresh."

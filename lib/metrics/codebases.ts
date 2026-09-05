@@ -5,6 +5,11 @@ import type { Kpi } from "./pulse";
 import { rangeDays, type Range } from "./range";
 import { canSeeCodebases, type ViewerTier } from "@/lib/codebases/visibility";
 import { isUnscopedCoverage, scanPartial } from "@/lib/codebases/score";
+import {
+  isScannerOutdated,
+  scannerStaleness,
+  type ScannerStaleness,
+} from "@/lib/codebases/scanner-version";
 import { num, numOrNull, round } from "@/lib/num";
 import type { FindingStatus } from "@/lib/codebases/finding-ledger";
 import { buildDebtPatrol, type DebtPatrol } from "@/lib/codebases/debt-ranking";
@@ -44,6 +49,17 @@ export interface CodebaseSummary {
   loc: number | null;
   /** null = no test-result report (completeness unknown); true = the run skipped or failed cases. */
   scan_partial: boolean | null;
+  /**
+   * Which scanner build produced the last scan (brain-api 1.24 / AIO-1011), and how it compares
+   * to what the current contract needs. `"unknown"` on every scan taken before 1.24 — and that is
+   * a PERMANENT state, not a transient one, because the field cannot be backfilled.
+   *
+   * This is what turns an unexplained `(scope unknown)` into an attributable cause. 1.22's
+   * denominator reached zero of seven repos because each was pinned to a scanner that could not
+   * send it, and nothing anywhere said so.
+   */
+  scanner_version: string | null;
+  scanner_staleness: ScannerStaleness;
   tests_skipped: number | null;
   tests_failed: number | null;
   tests_total: number | null;
@@ -120,6 +136,8 @@ type MetricRow = {
   tests_total: number | string | null;
   tests_skipped: number | string | null;
   tests_failed: number | string | null;
+  // brain-api 1.24 (AIO-1011) — null on every row written before the column existed.
+  scanner_version: string | null;
   ai_commit_ratio: number | string;
   readiness_level: string | null;
   readiness_pct: number | string | null;
@@ -154,6 +172,7 @@ export async function getCodebaseSummaries(
       .select(
         "codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, " +
           "test_coverage_lines_total, coverage_breadth_pct, loc, tests_total, tests_skipped, tests_failed, " +
+          "scanner_version, " +
           "ai_commit_ratio, readiness_level, readiness_pct",
       )
       .eq("team_id", teamId)
@@ -223,6 +242,12 @@ export async function getCodebaseSummaries(
               latest.tests_failed == null ? null : num(latest.tests_failed),
           })
         : null,
+      // Read from the LAST scan, like every other headline value. `scannerStaleness` maps an
+      // absent or unparseable version to "unknown" — never to "current". A repo with no scan at
+      // all also reads "unknown", which is the true statement: nothing has told us what would
+      // scan it.
+      scanner_version: latest?.scanner_version ?? null,
+      scanner_staleness: scannerStaleness(latest?.scanner_version),
       ai_commit_ratio: num(latest?.ai_commit_ratio),
       readiness_level: latest?.readiness_level ?? null,
       readiness_pct:
@@ -255,6 +280,23 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
   const unscoped = s.filter((c) =>
     isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc),
   ).length;
+  // How many of the unscoped ones are unscoped BECAUSE their scanner cannot report scope
+  // (brain-api 1.24 / AIO-1011). "7 without scope" was true and unactionable — it read as a
+  // property of the repos when it was a property of their pins. Naming the cause makes it a
+  // thing someone can fix. Counted only among the repos already contributing to the average, so
+  // the hint stays a description of THIS number rather than of the whole fleet.
+  //
+  // The wording is "not current", NOT "stale", and that is deliberate. This count is the UNION of
+  // the stale and unknown states, and calling the union "stale" would assert something false
+  // about the unknown ones: they did not declare an old build, they declared nothing. That is
+  // the common case — every scan taken before 1.24 — so the wrong word here would be the word
+  // shown for the whole fleet on day one. The card badge still distinguishes the two states
+  // ("scanner outdated" vs "scanner unknown"); this aggregate only claims what it can support.
+  const notCurrentScanner = s.filter(
+    (c) =>
+      isUnscopedCoverage(c.test_coverage_pct, c.test_coverage_lines_total, c.loc) &&
+      isScannerOutdated(c.scanner_staleness),
+  ).length;
   return [
     {
       key: "agentic",
@@ -282,7 +324,9 @@ function teamKpis(s: CodebaseSummary[], range: Range): Kpi[] {
       spark: [],
       hint: cov.length
         ? unscoped > 0
-          ? `${cov.length} reporting · ${unscoped} without scope`
+          ? notCurrentScanner > 0
+            ? `${cov.length} reporting · ${unscoped} without scope (${notCurrentScanner} scanner not current)`
+            : `${cov.length} reporting · ${unscoped} without scope`
           : `${cov.length} reporting`
         : "no reports",
       accent: "cyan",
@@ -406,6 +450,11 @@ export interface AgenticBreakdown {
   tests_failed: number | null;
   /** null = completeness unknown (no test-result report); true = cases skipped or failed. */
   scan_partial: boolean | null;
+  /** Which scanner build produced this scan (brain-api 1.24 / AIO-1011). null = unknown build. */
+  scanner_version: string | null;
+  /** Provenance only — the brain commit the scanner ran from, for locating a stale pin. */
+  scanner_sha: string | null;
+  scanner_staleness: ScannerStaleness;
   readiness_level: string | null;
   readiness_pct: number | null;
   readiness_pillars: Record<string, { passed: number; total: number }>;
@@ -567,7 +616,8 @@ export async function getCodebaseDetail(
     "test_coverage_functions_pct, test_coverage_branches_pct, recent_commits, " +
     "test_coverage_lines_total, test_coverage_lines_covered, coverage_breadth_pct, loc, " +
     "tests_total, tests_passed, tests_skipped, tests_failed, " +
-    "readiness_level, readiness_pct, readiness_pillars, codebase_health";
+    "readiness_level, readiness_pct, readiness_pillars, codebase_health, " +
+    "scanner_version, scanner_sha";
 
   const [
     metricsRes,
@@ -728,6 +778,13 @@ export async function getCodebaseDetail(
           tests_skipped: numOrNull(latest.tests_skipped as number | null),
           tests_failed: numOrNull(latest.tests_failed as number | null),
         }),
+        // Stored verbatim, read as a verdict here — including a version string this server
+        // cannot parse, which reads "unknown" rather than being rejected or silently passed.
+        scanner_version: (latest.scanner_version as string | null) ?? null,
+        scanner_sha: (latest.scanner_sha as string | null) ?? null,
+        scanner_staleness: scannerStaleness(
+          latest.scanner_version as string | null,
+        ),
         readiness_level: (latest.readiness_level as string | null) ?? null,
         readiness_pct:
           latest.readiness_pct == null
