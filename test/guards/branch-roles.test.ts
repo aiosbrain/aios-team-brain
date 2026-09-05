@@ -241,11 +241,23 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // `CONTRIBUTION_BASE` becomes `staging`, the old expectation COLLAPSES to
     // `["staging", "staging"]`, and this guard reddens against a workflow file that is correct.
     //
-    // Why RELEASE and not CONTRIBUTION is the right role here: this trigger is a SECURITY
-    // ALLOWLIST of trusted pull-request bases, not "the branches that receive contributions". A
-    // release fast-forward to `main` emits no `pull_request_target` at all, so `main`'s entry
-    // exists for in-flight and exceptional pull requests into the release branch — stated here
-    // rather than left implicit, because if that is NOT the policy the entry is pure exposure.
+    // WHY RELEASE AND NOT CONTRIBUTION — by elimination, which is the only argument that holds in
+    // both worlds. The trigger needs two DISTINCT branches. `[CONTRIBUTION_BASE, RELEASE_BRANCH]`
+    // collapses today (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
+    // cutover (both `staging`); `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both. That is
+    // the whole justification and it is checkable.
+    //
+    // A REFUTED VERSION, kept so it is not re-derived: a draft called this pair a SECURITY
+    // ALLOWLIST of trusted pull-request bases. Fable disproved it — on `pull_request_target` the
+    // workflow file, `on:` filter included, is read from the pull request's BASE branch, and a
+    // same-repo collaborator can push a branch and control that copy. The filter cannot allowlist
+    // against the population this workflow's own header names as the threat. The real blast-radius
+    // control is the `trusted-automation` environment's deployment branch policy, which lives in
+    // repository settings, not in this file.
+    //
+    // What IS true and worth keeping: a release fast-forward to `main` emits no
+    // `pull_request_target` at all, so `main`'s entry serves in-flight and exceptional pull
+    // requests into the release branch.
     const on = workflow("aios-work-sync.yml").on!;
     expect(Object.keys(on), "the trigger itself is part of criterion 5 now").toEqual(["pull_request_target"]);
     expect(on.pull_request_target!.branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
@@ -257,10 +269,27 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // that stopped meaning anything once `staging` could be BOTH values. `[RELEASE_BRANCH,
     // INTEGRATION_BRANCH]` is a two-branch allowlist by construction; `[CONTRIBUTION_BASE,
     // INTEGRATION_BRANCH]` is only a two-branch allowlist by accident of today's values.
+    //
+    // ONE assertion, not two. A first version followed this with
+    // `expect([A,B]).toHaveLength(new Set([A,B]).size)` and a comment claiming it pinned the
+    // COLLAPSE of the old pair. For a 2-tuple that is the same predicate respelled, and it never
+    // mentioned `CONTRIBUTION_BASE` — a comment describing a third thing neither line did.
     expect(RELEASE_BRANCH, "a collapsed pair is a one-branch trigger wearing a two-branch shape").not.toBe(INTEGRATION_BRANCH);
-    // …and the pair that WAS used does collapse, which is the whole finding, pinned so the
-    // regression is a red test rather than a rediscovery on cutover day.
-    expect([RELEASE_BRANCH, INTEGRATION_BRANCH]).toHaveLength(new Set([RELEASE_BRANCH, INTEGRATION_BRANCH]).size);
+  });
+
+  it("the workflow triggers are pinned to the RELEASE role, not the contribution base", () => {
+    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: today
+    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs are the SAME VALUE
+    // and no value or behavioural assertion can tell them apart. Measured, not assumed — reverting
+    // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves all 41 tests in
+    // this file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
+    // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the
+    // alternative was a fix nothing held in place until cutover day made it loud.
+    const src = read("test/guards/branch-roles.test.ts");
+    expect(src, "the trigger assertions must name RELEASE_BRANCH").not.toMatch(/toEqual\(\[CONTRIBUTION_BASE, INTEGRATION_BRANCH\]\)/);
+    // NON-VACUOUS: forbidding a shape proves nothing unless the shape it REPLACED is present.
+    // Both trigger sites, counted — deleting one would otherwise satisfy the line above.
+    expect(src.match(/toEqual\(\[RELEASE_BRANCH, INTEGRATION_BRANCH\]\)/g), "both trigger sites").toHaveLength(2);
   });
 
   it("scan-on-merge fires on EXACTLY the same two branches", () => {
