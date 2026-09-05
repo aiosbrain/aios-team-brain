@@ -222,7 +222,7 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
 });
 
 describe("branch roles — the workflows that must follow the cutover (criteria 5, 6, 7)", () => {
-  it("aios-work-sync fires on EXACTLY the contribution base and the integration branch", () => {
+  it("aios-work-sync fires on EXACTLY the release branch and the integration branch", () => {
     // EXACT SET, not "contains both": `[main, staging, "**"]` satisfies a containment check while
     // silently widening the trigger to every branch in the repository. Codex found that.
     //
