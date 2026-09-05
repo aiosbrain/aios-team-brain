@@ -101,10 +101,22 @@ The real justifications differ per workflow and must be stated separately rather
 - **`scan-on-merge` (push):** keeping `main` buys release-time retry/reconciliation, at the cost of
   normally re-scanning a SHA already scanned on `staging`. Storage is keyed by `head_sha`, so the
   open question — no-op or duplicate compute — must be answered and tested, not assumed.
-- **`aios-work-sync` (`pull_request_target: closed`):** the pair is a **security allowlist of trusted
-  PR bases**, not "the branches that receive contributions". A release fast-forward to `main` emits no
-  `pull_request_target` event at all, so `main`'s entry exists only for in-flight or exceptional pull
-  requests — a policy that must be stated explicitly or the entry is unnecessary exposure.
+- **`aios-work-sync` (`pull_request_target: closed`):** a release fast-forward to `main` emits no
+  `pull_request_target` event at all, so `main`'s entry serves in-flight and exceptional pull requests
+  into the release branch.
+
+  **REFUTED by Fable's diff review, recorded rather than deleted:** a draft called this pair a
+  *security allowlist of trusted PR bases*. It is not one. On `pull_request_target` the workflow file
+  — `on:` filter included — is read from the pull request's BASE branch, and a same-repo collaborator
+  can push a branch and control that copy, which is exactly the population the workflow's own header
+  names as the threat. The real blast-radius control is the `trusted-automation` environment's
+  deployment branch policy, which lives in repository settings, not in the file.
+
+  **What actually justifies the pair, in both workflows, is elimination:** the trigger needs two
+  DISTINCT branches. `[CONTRIBUTION_BASE, RELEASE_BRANCH]` collapses today (both `main`);
+  `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the cutover (both `staging`);
+  `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both worlds. That is checkable, and it is
+  what the guard now asserts.
 
 **This correction is value-invariant today** (`RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`), so
 it can be verified before the flip and carries no behavioural risk. It is the identity trap the
@@ -150,7 +162,8 @@ occurrences) follows without further edits. `INTEGRATION_BRANCH` and `RELEASE_BR
 release branch and the integration branch; the contribution base is one of them, not a third thing.
 
 **Decision 3 — sentinels must not be real branch names.** D2 and D3 both come from fixtures keyed on
-a real value. Both become sentinels that no role can ever equal (`__NOT-A-BRANCH__`), and the stub is
+a real value. Both become sentinels that no role can ever equal (`contribution-sentinel` and
+`release-sentinel` — an earlier draft of this line said `__NOT-A-BRANCH__`, which is not what shipped), and the stub is
 applied by a regex over the declaration rather than an exact-literal replace.
 
 **Decision 4 — SUPERSEDED BY REVIEW. `.github/workflows/pr-task-link.yml` stays at `[main]`, and its guard keeps the
@@ -204,6 +217,7 @@ have the fix. Reviewer should rule.
 | `test/guards/pr-task-link-credential-isolation.test.ts` | trigger pin `["main"]` → `["main", "staging"]` |
 | `.github/dependabot.yml` | `target-branch: "staging"` on all three ecosystems |
 | `.github/workflows/pr-task-link.yml` | `branches: [main, staging]` + header prose corrected |
+| `.github/workflows/aios-work-sync.yml`, `.github/workflows/scan-on-merge.yml` | HEADER COMMENTS ONLY — both still describe their trigger as "the contribution base and the integration branch", which reads as "staging and staging" after the flip. The guard already asserts release+integration; this is the identity trap surviving in prose. Assigned here by Fable's diff review, which found them unowned by either half |
 | `.claude/skills/{adversarial-build,adversarial-build-astra,branch-reconciliation,pr-review-attestation,test-ci-wiring-audit}/**` | `currently \`main\`` → `currently \`staging\`` |
 | `.agents/**`, `.opencode/**`, `.cursor/**` | REGENERATED ONLY, by `scripts/sync-skill-runtimes.sh` |
 | `docs/RELEASING.md` | §3 cutover status, constraint rows 1/4/5/7/8, §3.2 ordering pairs |
@@ -215,12 +229,18 @@ A change to any file not in this table is a finding, not a tidy-up.
 
 ## Acceptance criteria
 
+**PARTITIONED BY PR — the split in the Status block reached only that block, which Fable's diff
+review caught.** **PR A (the value-invariant hardening) is criteria 2, 3, 4, 5, 6 and 15.** Every
+other criterion belongs to the **held cutover change set** and is not satisfiable, or even
+meaningful, until `CONTRIBUTION_BASE` moves.
+
+
 1. `scripts/branches.mjs` exports `CONTRIBUTION_BASE === "staging"` — asserted in unit tier `test/guards/branch-roles.test.ts`.
-2. `test/guards/branch-roles.test.ts` asserts `.github/workflows/aios-work-sync.yml`'s trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]` and NOT `[CONTRIBUTION_BASE, …]` — the source token is pinned, so a revert to the old pair reddens.
-3. `test/guards/branch-roles.test.ts` asserts `.github/workflows/scan-on-merge.yml`'s push trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]` — same pin.
+2. `test/guards/branch-roles.test.ts` asserts `.github/workflows/aios-work-sync.yml`'s trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]`, AND a source-token assertion forbids `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` while counting both surviving `RELEASE_BRANCH` sites — mutation: reverting either site must redden. **This sentence was FALSE when first written** and Fable's diff review measured it: the value assertion alone cannot see the revert, because the two pairs are the same value today, and both revert mutations SURVIVED. A source regex is evadable and is the only instrument that works here; the pin was added in the fold, and the same two mutations now REDDEN.
+3. `test/guards/branch-roles.test.ts` asserts `.github/workflows/scan-on-merge.yml`'s push trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]` — covered by the same source-token pin as criterion 2.
 4. `test/guards/branch-roles.test.ts`'s stub applies via a regex over `export const CONTRIBUTION_BASE = "<any>"`, so it survives any future value — mutation: change the declared value, the stub must still apply.
 5. `test/guards/instruction-base.test.ts`'s scratch module uses a sentinel base that **no** role equals — asserted by importing all three roles and requiring the sentinel differs from each.
-6. `test/guards/instruction-base.test.ts` is NON-VACUOUS after the flip: hardcoding `origin/staging` in the instruction under test must redden it (negative control, executed).
+6. `test/guards/instruction-base.test.ts` is NON-VACUOUS: the negative control rewrites `scripts/pr-review-gate.mjs`'s `origin/${CONTRIBUTION_BASE}...HEAD` to a hardcoded `origin/main...HEAD` and asserts the rendered message loses the sentinel (executed, in-test). `origin/main` rather than `origin/staging` because it is the equivalent mutation against a sentinel base and proves the same property identically before and after the cutover — an earlier draft of this criterion named `origin/staging`, which is not what the code does.
 7. `.github/dependabot.yml` sets `target-branch: "staging"` on all three ecosystems — asserted by a unit guard that parses the YAML and requires the count to equal the ecosystem count.
 8. `.github/workflows/pr-task-link.yml` fires on exactly `[main, staging]` — asserted in `test/guards/pr-task-link-credential-isolation.test.ts` as an EXACT array, not containment.
 9. `.github/workflows/pr-task-link.yml`'s header no longer claims the `[main]` pin is what keeps it advisory, and states the environment-policy precondition instead — presence assertion.
@@ -230,7 +250,7 @@ A change to any file not in this table is a finding, not a tidy-up.
 13. `docs/RELEASING.md` records what the fast-forward MEASURED: `scan-on-merge` red with zero steps, and Railway staging not auto-deploying — both are new facts, not predictions.
 14. `npm run check:instructions` stays green and its partial-scan blind-spot message is unchanged — Decision 6.
 15. `npx tsc --noEmit`, `npm run lint`, `npm test`, `npm run check:docs` all pass.
-16. The PR body states the merge preconditions (environment policy widened first; default branch moved; `PR records a diff review` relocated) and is opened as a DRAFT.
+16. **(Held set only.)** The cutover PR body states the merge preconditions (environment policy widened first; default branch moved; `PR records a diff review` relocated) and is opened as a DRAFT. **PR A is deliberately NOT a draft** — it is value-invariant and meant to merge; an earlier version of this criterion applied the draft rule to both halves.
 
 ## What would falsify this design
 
@@ -273,9 +293,9 @@ satisfied without the thing it names being true:
    environment branch policies, the default branch, the tag ruleset, the release actor's push ability,
    the required-context sets, the deployed staging SHA, and a successful pre-deploy schema hook.
 5. **There is no criterion for the Railway staging runtime at all** — see below.
-6. **`test/guards/branch-roles.test.ts:232`'s `toContain("staging")` loses its meaning** once `staging`
-   is both the contribution and integration value. Remove it as redundant after the exact role-pair
-   correction, or recast it explicitly as an integration-role assertion.
+6. ~~**`test/guards/branch-roles.test.ts:232`'s `toContain("staging")` loses its meaning**~~ —
+   **RESOLVED in PR A.** Removed; it was implied by the `toEqual` above it, and replaced by an
+   assertion that the two roles in the pair can never be the same branch.
 
 ## The prerequisite this spec wrongly called out of scope
 
