@@ -68,9 +68,43 @@ they have different fixes:
   this account; fall back to `gpt-5.6-sol` and **say in the PR which model actually
   ran**. Never silently substitute a model and describe it as astra.
 
+**If astra is unavailable, use the sibling skill `adversarial-build`.** Do not run
+*this* loop with a different model holding the pen — its whole shape (the
+correlation weighting in §7, the write-access bounding in §6) is built around astra
+being the author. Swapping the author silently makes the attestation a fiction.
+
 Also inherited: `codex exec` **hangs without `< /dev/null`**, and quota exhaustion
 is a real mid-loop state — when it happens, name the missing reviewer in the PR
 rather than substituting a correlated round and calling it replication.
+
+### What the sandbox actually enforces — measured, not assumed
+
+Probed 2026-09-05 under `--sandbox workspace-write`:
+
+| astra can | astra cannot |
+|---|---|
+| write files anywhere in the worktree, **with no approval prompt** (`approval_policy = "never"` is already set in `~/.codex/config.toml`) | reach the **network** — `curl https://api.github.com/zen` → `Could not resolve host` |
+| **`git add` and `git commit`** — a probe commit landed | write outside the workspace (`$HOME` is denied; `/tmp` is allowed) |
+
+Two consequences, and neither is optional:
+
+- **"Must not push / merge / touch Railway / change a GitHub setting" is enforced by
+  the sandbox**, not by asking politely. State it that way; it is a guarantee.
+- **"Must not commit" is NOT enforced.** Astra committing mid-build is the one that
+  bites, because it makes a post-hoc `git status` come back clean — see §6.
+
+### The standing prohibition block — prepend to EVERY astra invocation
+
+Not only the build one. §2 already grants `workspace-write`, so a "just measuring
+the terrain" run can do all of this too:
+
+```
+Do NOT: run `git add`, `git commit`, `git stash`, `git checkout`, `git reset`, or
+`git update-ref`. Do NOT run `npm test`, `npm run db:test:up`, or any
+data-mechanics target — `db:test:up` is a destructive RESET of a Postgres shared
+with other worktrees. Do NOT edit files outside the Scope this task names.
+Leave every change UNCOMMITTED in the working tree.
+```
 
 ---
 
@@ -83,8 +117,11 @@ rather than substituting a correlated round and calling it replication.
   `/opt/homebrew/bin/aios push --dry-run 3-log/tasks.md` and
   `/opt/homebrew/bin/aios push 3-log/tasks.md`. The bare `aios` on PATH is a shell
   function that fails outside a workspace — use the binary path.
-- **Read the projection back** (`aios query "what is the status of <KEY>?"`). A push
-  that printed `ok` is not proof the row moved.
+- **Read the projection back deterministically** — `/opt/homebrew/bin/aios status`,
+  which prints `pm projection: ok · N synced · 0 errors`, and/or the row's
+  `task_pm_links.provider_url`. A push that printed `ok` is not proof the row moved.
+  Do **not** substitute `aios query "…"` for this: that is an LLM answering from an
+  index, which can be stale, and it is not a projection check.
 - Cite the **brain row key** in the branch, PR and `AIOS-Work:` trailer — never the
   Linear `AIO-*` key, which resolves to nothing.
 
@@ -94,14 +131,19 @@ rather than substituting a correlated round and calling it replication.
 
 **Measure the terrain first and put the numbers IN the prompt.** The most expensive
 failures in this repo's history were specs whose scope came from a count taken
-afterwards — one slice was blocked four times across two models for exactly that,
-and the count was wrong three times running. Give astra the measured facts and tell
+afterwards — one slice absorbed four blocking verdicts across two models, three of
+them for exactly that, and the count was wrong three times running. Give astra the measured facts and tell
 it to attack the *inferences*, not the numbers.
 
 ```bash
 codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
-  < /tmp/astra-spec-prompt.md > /tmp/astra-spec.out 2>&1 &
+  < /tmp/astra-spec-prompt.md > /tmp/astra-spec.out 2>&1; echo "EXIT=$?" >> /tmp/astra-spec.out
 ```
+
+Run it with the Bash tool's **`run_in_background`**, not a trailing `&` — the shell
+does not persist between calls, so a bare `&` leaves you no completion signal and
+you will read a half-written file and fold a partial spec. Wait for the `EXIT=`
+sentinel before reading.
 
 The prompt must carry:
 
@@ -152,17 +194,37 @@ Prompt discipline:
 - require file:line or a concrete inputs→wrong-outcome scenario, and a verdict:
   `BLOCKED | CLEAR-WITH-CONDITIONS | CLEAR | DECLINE`.
 
+**Optional, and cheap: an astra cold read of the SPEC too.** The diff gets two
+reviewers; the spec gets one. The sibling skill's evidence is that pre-code rounds
+are where designs actually die. If you run it, it carries the same correlation
+caveat as §7 — astra reading a spec astra wrote is a weaker signal than Fable's.
+
 ### The stopping rule — "a good place" made concrete
 
-Cycle spec → Fable → fold. **Stop when a full round returns no BLOCKER and no HIGH,
-*and* that round discovered no new scope.** The second half is the one that matters:
-a round which finds only wording is convergence; a round which finds *another file
-nobody had counted* is not, however mild its verdict.
+**Who folds: the ORCHESTRATOR, not astra.** Astra authored the thing under review;
+handing it its own findings makes §7's correlation label meaningless. State this in
+the PR, because it changes what the attestation means.
+
+Cycle spec → Fable → fold. **A round has converged iff BOTH hold:**
+
+1. the verdict carries no BLOCKER and no HIGH; **and**
+2. the fold changed **none** of the spec's `Scope`, `Deps`, or `Decision` sections
+   — diff those three sections before and after the fold and check it is empty.
+
+Condition 2 is the operational definition of "no new scope", and it is deliberately
+mechanical rather than a judgement call: a round that finds only wording is
+convergence; a round that moves a file into Scope is not, however mild its verdict.
+Two agents can disagree about "is this scope?" — they cannot disagree about whether
+a section diff is empty.
 
 **If three rounds do not converge, the slice is too big — split it.** That is not
 defeat, it is the measured outcome: on this repo's release program the split is
-exactly what unblocked a slice that had absorbed four blocking verdicts. Record the
-deferred half as its own ticket, with the ordering rule that failed written into it.
+exactly what unblocked RELPTR-4 after four blocking verdicts. Record the deferred
+half as its own ticket, with the ordering rule that failed written into it.
+
+Two edges, so the counter is unambiguous: **a `DECLINE` ends the loop** (take it back
+to the operator; do not spend rounds arguing with it), and **the counter resets after
+a split**, because the narrowed slice is a different design.
 
 ---
 
@@ -186,11 +248,17 @@ Running the eval as a cheap **preflight** and handing its blocker list to the
 reviewer is fine; what must not happen is `SPEC_READY` being the last word before
 code.
 
-Two gate edges worth knowing: a criterion whose FIRST line leads with a
-backticked path to a file that does not exist yet is read as "existing code" and
-blocks — phrase it as *"a guard asserts … (the constant lands in a new module,
-`scripts/foo.mjs`)"*. And **re-run the eval after ANY amendment** — SPEC_READY is a
-state, not a milestone.
+**`SR3/minor` for a path that does not exist yet is EXPECTED and does not block** —
+"fine if it is a new file to create" is the gate's own wording, and a spec full of
+new modules will emit a screenful of them while still returning `SPEC_READY`. Do not
+contort criteria to silence minors. (An earlier draft of this skill claimed a
+backticked non-existent path on a criterion's first line *blocks*; that was measured
+FALSE — both that phrasing and the same path in `Scope` return `SPEC_READY` with a
+minor.) If you *do* hit an `SR3/blocker` saying a path "is named as existing code",
+rephrase that one reference to make the newness explicit — but treat the blocker as
+the signal, not the phrasing superstition.
+
+**Re-run the eval after ANY amendment** — SPEC_READY is a state, not a milestone.
 
 ---
 
@@ -201,8 +269,10 @@ Then hand astra the approved spec:
 
 ```bash
 codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
-  < /tmp/astra-build-prompt.md > /tmp/astra-build.out 2>&1 &
+  < /tmp/astra-build-prompt.md > /tmp/astra-build.out 2>&1; echo "EXIT=$?" >> /tmp/astra-build.out
 ```
+
+`run_in_background`, and wait for the `EXIT=` sentinel — see §2.
 
 The prompt must carry the spec path, the criteria as the definition of done, and
 this repo's non-negotiables:
@@ -218,9 +288,22 @@ this repo's non-negotiables:
 - **Astra must not**: run the data-mechanics tier (collides with the main session's
   Postgres), push, merge, touch Railway, or change any GitHub setting.
 
-**Then verify yourself — do not take the build report on trust.** `npx tsc
---noEmit` · `npm run lint` · `npm test` · `npm run check:docs`. Read the diff.
-An author's summary of its own work is a claim, not evidence.
+**Then verify yourself — do not take the build report on trust.** An author's
+summary of its own work is a claim, not evidence. Read the diff, then run:
+
+- `npx tsc --noEmit` — note `test/` is excluded from tsconfig, so this says nothing
+  about the tests astra just wrote;
+- `npm run lint` · `npm test` · `npm run check:docs`;
+- **`npm run test:datamechanics:iso`** whenever the slice touches persistence or
+  access. Astra is forbidden from running this tier (§0) — that prohibition assigns
+  the tier to YOU, it does not excuse skipping it. `:iso` rather than `:local`
+  because other worktrees share the `:5434` container. CLAUDE.md §4 makes this tier
+  authoritative for persistence and tier isolation; unit green proves nothing there.
+- `npm run test:neo4j` if the slice touches the graph tier.
+
+**Commit a checkpoint before mutation-testing.** `scripts/mutate.mjs` refuses a dirty
+tree — and after §0's prohibition astra will have committed nothing, so this is
+always your step.
 
 ### Mutation-test every guard, with the command
 
@@ -252,12 +335,44 @@ Same subagent invocation as §3, now against `git diff origin/<base>...HEAD`.
   attacks the folds rather than re-reporting.
 - Same DB-test prohibition. Same evidence bar. Same verdict vocabulary.
 
-**Bounding astra's write access, since §5 grants it.** After the build, confirm
-astra changed only what the slice claims: `git status --short` and `git diff --stat`
-against the spec's Scope. A file outside Scope is a finding, not a tidy-up — the
-sibling skill has a scar from 399 lines of a *different* session's uncommitted work
-being swept into one commit. Stage deliberately; never `git add -A` in a tree you
-did not leave clean.
+### Bounding astra's write access — a precondition, not just a post-check
+
+An earlier draft bounded this with `git status --short` after the build. **That is
+checked at the wrong layer**, and Fable's review measured why: astra **can `git
+commit`** under `workspace-write`. If it commits mid-build — agents do this
+routinely — `git status` comes back clean and the post-check certifies a sweep it
+never saw. In a tree like a Conductor worktree, which often carries another slice's
+uncommitted work, that is precisely how a foreign change rides into a commit under
+your message.
+
+So bound it at both ends:
+
+**Before launching astra**
+
+1. The tree must be a **clean committed checkpoint** — the same rule
+   `scripts/mutate.mjs` enforces, for the same reason. If another slice's work is in
+   the tree, commit it on its own branch or stop; do not build over it.
+2. Record the starting point: `BEFORE=$(git rev-parse HEAD)`.
+3. Include §0's standing prohibition block, which forbids `git add`/`commit`/`stash`
+   /`checkout`/`reset`.
+
+**After astra returns**
+
+```bash
+test "$(git rev-parse HEAD)" = "$BEFORE"   # astra must NOT have committed
+git status --short --ignored               # --ignored: .env.local, node_modules are invisible without it
+git diff --stat                            # the working-tree change set
+```
+
+A moved `HEAD` means astra committed despite the prohibition: **inspect that commit
+before anything else**, because every other check below is now blind. A file outside
+the spec's Scope is a finding, not a tidy-up. Stage deliberately; never `git add -A`
+in a tree you did not leave clean — an operator lost 399 lines of a *different*
+session's work to exactly that.
+
+Two things this still cannot see, stated rather than implied: writes to `/tmp`
+(including the prompt and output files this loop reads), and anything astra did
+inside a path git ignores. The network is closed, so nothing leaves the machine.
 
 ---
 
@@ -269,7 +384,7 @@ Then astra's round — and **the session must be fresh**:
 
 ```bash
 codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check - \
-  < /tmp/astra-review-prompt.md > /tmp/astra-review.out 2>&1 &
+  < /tmp/astra-review-prompt.md > /tmp/astra-review.out 2>&1; echo "EXIT=$?" >> /tmp/astra-review.out
 ```
 
 - **`--sandbox read-only`** here, not `workspace-write`. The reviewer reads.
@@ -280,10 +395,26 @@ codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check - \
   breaking the folds** — the second-order bug introduced by a fix is the defect
   class an author structurally cannot see.
 
-**Read its verdict with the correlation in mind.** If astra clears a diff astra
-wrote, that is weak evidence. If it BLOCKS, that is strong — a model finding fault
-with its own output is unlikely to be a false positive. Weight them asymmetrically
-and say so in the PR.
+**Read its verdict with the correlation in mind: an astra CLEAR on a diff astra
+wrote is weak evidence.** Same model, same blind spots.
+
+Do **not** invert that into "an astra BLOCK is strong". An earlier draft said so and
+it is wrong: a model hallucinating a defect in its own output is no rarer than in
+anyone else's, and this repo has a recorded case of a reviewer's confident
+regex-match claim refuted by a one-line `node -e`. **Every finding stays a
+hypothesis**, whoever raised it, and gets re-derived before it is folded.
+
+### The independent reviewer must see what actually ships
+
+This ordering — Fable, fold, astra, fold, push — leaves the **last fold reviewed by
+nobody**, and the first fold reviewed only by the correlated model. That is the
+second-order-bug class CLAUDE.md names as the one an author structurally cannot see,
+walking straight out the door.
+
+**So: if either fold changes non-trivial code — not comments, not prose — re-run
+Fable on the post-fold diff and require it to clear before pushing.** A doc-only or
+comment-only fold does not need it. If you skip the re-clear, say so in the PR and
+say why; do not let the attestation imply Fable read a diff it never saw.
 
 ---
 
@@ -292,8 +423,20 @@ and say so in the PR.
 Same fold discipline. Re-run the full verification set after **every** fold, not
 just the last.
 
-`git push -u origin <branch>`, then `gh pr create --base main`. The PR body carries,
-honestly:
+`git push -u origin <branch>`, then open the PR against the **contribution base**,
+resolved rather than hardcoded:
+
+```bash
+gh pr create --base "$(node scripts/branches.mjs --print contribution)"
+```
+
+`main` today; `staging` after the option-B cutover. Hardcoding `main` here would
+both contradict §5's "branch from the contribution base" and quietly open the PR
+against the release branch on cutover day. (`gh pr create --base` is itself listed
+in `docs/RELEASING.md` §3.1c as a cutover-day edit — resolving it is how that edit
+stops being needed.)
+
+The PR body carries, honestly:
 
 - what the slice is, and what is deliberately NOT in it (name the next slice);
 - the verification table — tier counts, mutations run and what each reddened,
@@ -308,8 +451,10 @@ honestly:
   the correlated one.
 - deferrals with reasons, and `AIOS-Work: <ROW-KEY>`.
 
-**Verify the body as STORED**, not by the exit code — `gh pr edit` has silently
-no-opped behind a GraphQL deprecation warning here. Read it back with `gh pr view`.
+**Verify the body as STORED**, not by the exit code, and read it back with
+`gh pr view --json body`. The documented hazard is that `gh pr edit --body`
+**replaces** the whole body rather than appending (see `pr-review-attestation`), so
+an edit that "succeeded" can have dropped everything else in it.
 
 Watch checks to a terminal state. Read the brain-task check's **runtime log** for
 `Found work key(s): …` — it is advisory and greens on failure.
