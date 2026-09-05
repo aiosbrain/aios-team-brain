@@ -341,11 +341,12 @@ describe("branch roles — the runbook records the decisions (criterion 9)", () 
     expect(r).toMatch(/dependabot-target-branch: at the cutover, never before/);
   });
 
-  it("§3.1d records WHY the instruction corpus is deferred, with the real measurement", () => {
-    // The number was wrong twice. It is written down with its correction so a third attempt starts
-    // from the measurement rather than re-deriving it.
-    const r = RUNBOOK();
-    expect(r).toMatch(/31 lines across 19 files|\*\*31 lines across 19 files\*\*/);
+  it("§3.1d records the instruction corpus disposition and the scan's limits", () => {
+    // RELPTR-5 replaces the undercount with a per-site disposition. Keep the release-role
+    // identity fixture above fixed; only this superseded runbook assertion changes.
+    const r = RUNBOOK().split("### 3.1d")[1].split("### 3.2")[0];
+    expect(r).toContain("12 canonical files: 22 path-form occurrences + 4 refspec occurrences");
+    expect(r).toContain("per-site presence AND absence");
     expect(r, "and that the heuristic has known error bars").toMatch(/false-negatives/);
   });
 });

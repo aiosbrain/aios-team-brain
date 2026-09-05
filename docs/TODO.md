@@ -21,14 +21,17 @@ competing in-flight work first — it costs seconds:
 
 ```
 gh pr list --state all --search "<subsystem> in:title" --limit 20
-git log --oneline -20 origin/main            # has main moved in this area?
+root="$(git rev-parse --show-toplevel)"
+base="$(node "$root/scripts/branches.mjs" --print contribution)"
+git -C "$root" fetch origin "$base"
+git -C "$root" log --oneline -20 "origin/$base" # has the contribution base moved in this area?
 ```
 
 If another worktree is already shipping the same milestone, **stop and confirm which worktree owns
-it** rather than building a duplicate. Also `git fetch origin main` partway through a long build (not
-just at merge time) — `main` can move by many PRs during one session. When a duplicate is discovered
-after the fact: the merged version wins, **close the duplicate PR**, and salvage only the delta main
-lacks (diff the closed branch vs `main`).
+it** rather than building a duplicate. Also `git -C "$root" fetch origin "$base"` partway through a long build (not
+just at merge time) — the contribution base can move by many PRs during one session. When a duplicate is discovered
+after the fact: the merged version wins, **close the duplicate PR**, and salvage only the delta the contribution base
+lacks (diff the closed branch vs the contribution base).
 
 ---
 

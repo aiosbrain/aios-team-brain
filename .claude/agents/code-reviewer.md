@@ -53,7 +53,15 @@ You are the AIOS Team Brain Code Reviewer. The team is small and uses different 
 ## Review evidence contract
 
 - A local diff review (Local Bugbot or Fable, whichever the author has) over
-  `git diff origin/main...HEAD` should be recorded in the PR body. If none ran, the
+  the freshly fetched contribution base should be recorded in the PR body.
+  Resolve and review from any cwd:
+  ```bash
+  root="$(git rev-parse --show-toplevel)"
+  base="$(node "$root/scripts/branches.mjs" --print contribution)"
+  git -C "$root" fetch origin "$base"
+  git -C "$root" diff "origin/$base...HEAD"
+  ```
+  If none ran, the
   `ready-for-review` label should be on the PR (CodeRabbit reviews instead). Flag a PR with
   neither — a PR with neither FAILS the required `pr-review-gate.yml` check.
 - Local review evidence is scoped to the branch head it reviewed. Treat it as stale after a fix

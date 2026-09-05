@@ -1,3 +1,5 @@
+import { CONTRIBUTION_BASE } from "./branches.mjs";
+
 /**
  * The pre-push review gate, as a check (CLAUDE.md §"Review gate").
  *
@@ -121,7 +123,7 @@ export function evaluatePr(pr) {
 // pastes this whole message into the PR body while fixing it doesn't lock themselves out.
 export const FAIL_MESSAGE = {
   missing:
-    "This PR records no diff review. Per CLAUDE.md, review `git diff origin/main...HEAD` with a local " +
+    `This PR records no diff review. Per CLAUDE.md, fetch the contribution base and review \`git diff origin/${CONTRIBUTION_BASE}...HEAD\` with a local ` +
     "reviewer (Fable `code-reviewer`, Local Bugbot, or equivalent), then add ONE line to the PR body:\n" +
     "```\n## Review — Reviewed by <the reviewer you ran> — verdict <what it found>\n```\n" +
     `If no local reviewer was available, say so and add the \`${CODERABBIT_LABEL}\` label so CodeRabbit reviews it instead.`,

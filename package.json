@@ -30,6 +30,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
+    "check:instructions": "node scripts/instruction-base.mjs --run",
     "check:docs": "node scripts/check-docs-drift.mjs",
     "check:skills": "bash scripts/sync-skill-runtimes.sh --check",
     "check:skills:fix": "bash scripts/sync-skill-runtimes.sh --all",

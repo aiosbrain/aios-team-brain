@@ -22,41 +22,44 @@ cheap-to-expensive verification ladder that catches it.
 
 ## Steps
 
+Use the contribution base (currently `main`, declared in `scripts/branches.mjs`).
+
 Run the cheap passes on every branch before spending a real read on any of them.
 
 1. **Enumerate.**
    ```bash
-   git fetch --prune
-   git branch -r --no-merged origin/main
+   root="$(git rev-parse --show-toplevel)"
+   base="$(node "$root/scripts/branches.mjs" --print contribution)"
+   git -C "$root" fetch --prune origin
+   git -C "$root" branch -r --no-merged "origin/$base"
    ```
 
 2. **Cheap pass — patch-equivalence.** For each candidate branch:
    ```bash
-   git cherry origin/main origin/<branch>
+   git -C "$root" cherry "origin/$base" origin/<branch>
    ```
-   Every commit prefixed `-` is patch-equivalent to something already on `main`.
+   Every commit prefixed `-` is patch-equivalent to something already on the contribution base.
    If **all** commits come back `-`, bucket as **(b) squash-duplicate** — record
-   the matching `main` commit(s) as evidence and stop there.
+   the matching contribution-base commit(s) as evidence and stop there.
 
 3. **For branches with `+` commits, check squash-merge equivalence.** `git cherry`
    only catches patch-identical commits — it misses squash merges, which rewrite
    the diff into a single new commit. For each `+` commit / remaining branch:
    ```bash
-   git diff origin/main...origin/<branch> --name-only
-   # then per changed file, compare current main content directly:
-   git diff origin/main:<file> origin/<branch>:<file>
+   git -C "$root" diff "origin/$base...origin/<branch>" --name-only
+   # then per changed file, compare current contribution-base content directly:
+   git -C "$root" diff "origin/$base:<file>" origin/<branch>:<file>
    gh pr list --state merged --search "<branch-name OR topic>"
-   git log origin/main --grep="<commit subject>"
+   git -C "$root" log "origin/$base" --grep="<commit subject>"
    ```
    If the file-level diffs are empty (or trivially whitespace/rename) against
-   current `main`, and a merged PR or matching commit subject is found, bucket as
+   current contribution base, and a merged PR or matching commit subject is found, bucket as
    **(b)** with the PR number / commit SHA as evidence. This step is what catches
    what step 2 misses — squash merges hide equivalence from `git cherry` entirely.
 
 4. **Real read — only for survivors.** Branches that fail both the cherry check
    and the content-compare are the only ones worth actually opening. Read the
-   diff for content, assess shippability, and flag merge risk against current
-   `main` (conflicts, staleness, whether the feature is still wanted). Bucket as
+   diff for content, assess shippability, and flag merge risk against the current contribution base (conflicts, staleness, whether the feature is still wanted). Bucket as
    **(a) truly unmerged** if it has live, shippable content, or **(c) stale /
    abandoned** if it's dead work, a spike, or superseded by other since-merged
    work.

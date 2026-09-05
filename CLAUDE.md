@@ -101,10 +101,16 @@ catching the class of defect the author structurally cannot see: the **second-or
 their own fix**, and the **call site that nothing pins** (a helper with a dozen green tests whose
 wiring could be deleted with every one of them still passing). So this is not advisory:
 
-- **Before you `git push` a PR branch:** review `git diff origin/main...HEAD` with a local reviewer —
+- **Before you `git push` a PR branch:** resolve and fetch the contribution base, then review the diff with a local reviewer —
   **Fable `code-reviewer`** (Chetan — `Agent(subagent_type: "code-reviewer", model: "fable")`) or
   **Local Bugbot** (John, via Cursor). The gate is **tool-flexible but not optional**: any equivalent
   local diff review counts, skipping it does not.
+  ```bash
+  root="$(git rev-parse --show-toplevel)"
+  base="$(node "$root/scripts/branches.mjs" --print contribution)"
+  git -C "$root" fetch origin "$base"
+  git -C "$root" diff "origin/$base...HEAD"
+  ```
 - **Address blocker/HIGH findings before pushing**; fix or consciously defer MEDIUM/LOW with a
   one-line reason in the PR body.
 - **Record what reviewed the diff in the PR body** — exactly one line:

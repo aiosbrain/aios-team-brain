@@ -10,9 +10,11 @@ reviewer will hold you to.
 1. **Work in a git worktree, never a feature branch in the primary checkout.** People work in the
    primary checkout concurrently; committing feature work there collides with them. From the repo:
    ```bash
-   git fetch origin
-   git worktree add -b feat/<short-task> ../aios-team-brain-<short-task> origin/main
-   cd ../aios-team-brain-<short-task>
+   root="$(git rev-parse --show-toplevel)"
+   base="$(node "$root/scripts/branches.mjs" --print contribution)"
+   git -C "$root" fetch origin "$base"
+   git -C "$root" worktree add -b feat/<short-task> ../aios-team-brain-<short-task> "origin/$base"
+   cd "$root/../aios-team-brain-<short-task>"
    ln -sfn ../aios-team-brain/node_modules node_modules   # share deps (or run npm install)
    ```
    Open the PR from the worktree branch; `git worktree remove <path>` after it merges.

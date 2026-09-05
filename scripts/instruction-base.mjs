@@ -28,6 +28,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 /** Both role-branch literals. Not the resolved base — see the header. */
 export const ROLE_REFS = /origin\/(main|staging)\b/;
@@ -47,6 +48,7 @@ export const EXCLUSIONS = [
   "docs/archive/", // archived, and banner-marked non-executable
   ".context/", // untracked scratch; listed so a future fs-walk cannot pick it up
   "test/guards/branch-roles.test.ts", // the fixed RELEASE ref in RELPTR-4's identity fixture
+  "test/guards/instruction-base.test.ts", // intentional literal regression fixtures
   "scripts/instruction-base.mjs", // this file documents the forms it hunts
 ];
 
@@ -78,12 +80,13 @@ export function scanInventory(records) {
 
 /** Every tracked file, as the scan's production inventory. */
 export function trackedInventory(cwd = undefined) {
-  const files = execFileSync("git", ["ls-files"], { encoding: "utf8", cwd }).trim().split("\n").filter(Boolean);
-  return files.flatMap((path) => {
+  const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8", cwd }).replace(/\n$/, "");
+  const files = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8", cwd: root }).split("\0").filter(Boolean);
+  return [...new Set(files)].filter((path) => !isExcluded(path)).map((path) => {
     try {
-      return [{ path, content: readFileSync(path, "utf8") }];
-    } catch {
-      return []; // binary or unreadable — nothing to scan
+      return { path, content: readFileSync(join(root, path), "utf8") };
+    } catch (cause) {
+      throw new Error(`Cannot read tracked instruction inventory path ${path}`, { cause });
     }
   });
 }
@@ -102,6 +105,7 @@ export function report(hits) {
     `${hits.length} instruction(s) hardcode a role branch in a git command:`,
     ...hits.map((h) => `  ${h.path}:${h.line}  ${h.text}`),
     "Resolve the contribution base instead — see scripts/branches.mjs and docs/RELEASING.md §3.1d.",
+    "PARTIAL BY DESIGN: does not cover refspec form, PR-base prose, or bare refs without a git subcommand. Use the per-site presence and absence assertions too.",
   ].join("\n");
 }
 
