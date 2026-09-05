@@ -1,8 +1,10 @@
 ---
 name: adversarial-build-astra
 description: >
-  The adversarial build loop with the ROLES INVERTED: gpt-6-astra AUTHORS (the
-  spec, then the code) and Fable 5.1 is the independent reviewer. Spine — AIOS
+  The adversarial build loop with the ROLES INVERTED: the WORKTREE'S SELECTED
+  Codex model AUTHORS (the spec, then the code) — `gpt-6-astra` by default,
+  resolved from config rather than pinned — and Fable 5.1 is the independent
+  reviewer. Spine — AIOS
   ticket → astra writes the spec → fold → Fable reviews the SPEC → fold → cycle
   to convergence → spec gate (`aios spec eval` must say SPEC_READY) → astra
   writes the code → Fable reviews the DIFF → fold → astra reviews the DIFF cold
@@ -23,8 +25,10 @@ The spine:
 > push the PR → update the ticket**
 
 **What is different from `adversarial-build`, and why it matters.** In the sibling
-skill Claude authors and two models review. Here **astra authors both the spec and
-the code**, which changes two things you must not paper over:
+skill Claude authors and two models review. Here **the worktree's selected Codex
+model authors both the spec and the code** — `gpt-6-astra` in this operator's
+config today, but §0 resolves it rather than assuming it — which changes two things
+you must not paper over:
 
 1. **Astra gets WRITE access to the worktree** (`--sandbox workspace-write`). The
    sibling skill only ever ran Codex read-only. §6 bounds that.
@@ -40,38 +44,91 @@ holding the pen.
 
 ---
 
-## 0. Prerequisite — the CLI, probed, before anything long
+## 0. Prerequisite — RESOLVE the author model, then probe it
 
-**`gpt-6-astra` needs a recent Codex CLI.** Measured 2026-09-05: `codex-cli 0.147.0`
-(Homebrew cask) returns, *after the prompt is sent*:
+**Do not pin a model id in this skill.** The author is whatever Codex is configured
+to use in this worktree, so the same loop works when the operator changes models
+without anyone editing the skill. `codex exec` **with no `--model` flag** resolves
+from `~/.codex/config.toml` (or `$CODEX_HOME`, or `--profile`, or `-c model=…`) —
+verified: omitting the flag ran `model: gpt-6-astra`, the configured value.
 
-```
-400 invalid_request_error: The 'gpt-6-astra' model requires a newer version of
-Codex. Please upgrade to the latest app or CLI and try again.
-```
-
-That is a different failure from an unsupported model — the id is real and the
-account can use it; the binary is stale. Upgrade with `brew upgrade --cask codex`.
-
-**Probe before every long run, not once ever:**
+**Resolve and RECORD it, before EVERY long run — not once ever.** The config this
+resolves from is global and mutable, so a stale record is a lie that §8 publishes.
 
 ```bash
-codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check \
-  "reply with exactly: OK" < /dev/null 2>&1 | tail -3
+# The record lives OUTSIDE the workspace on purpose: $HOME is denied to the sandbox
+# and /tmp is not (see the table below) — and §6's argument is that bounds must be
+# ENFORCED, not requested. A record astra can overwrite is not a record.
+WT=$(basename "$(git rev-parse --show-toplevel)")
+REC=~/.cache/aios-astra/author-model-$WT; mkdir -p "$(dirname "$REC")"
+codex exec --sandbox read-only --skip-git-repo-check \
+  "reply with exactly: OK" < /dev/null 2>&1 | tee "/tmp/astra-probe-$WT.out" | tail -3
+
+# GATE ON THE ANSWER, NOT THE BANNER. Codex prints `model: <id>` from CONFIG *before*
+# the request is sent, so a probe that 400s still shows an id. Measured: a deliberately
+# bogus id printed `model: bogus-model-xyz` and THEN the 400 — a check on the extracted
+# name passes happily. Only the final line proves the model actually answered.
+tail -1 "/tmp/astra-probe-$WT.out" | grep -qx OK \
+  || { echo "REFUSING: probe did not answer OK — the model did not run"; exit 1; }
+
+grep -m1 '^model:'            "/tmp/astra-probe-$WT.out" | awk '{print $2}'  > "$REC"
+grep -m1 '^reasoning effort:' "/tmp/astra-probe-$WT.out" | awk '{print $3}' >> "$REC"
+test -s "$REC" || { echo "REFUSING: banner format changed; cannot resolve the author"; exit 1; }
+cat "$REC"
 ```
 
-A clean `OK` is the only green light. Two failure shapes to tell apart, because
-they have different fixes:
+**`$REC` is the author of record** — the id *and* the reasoning effort, because an
+author at `low` effort is a materially different author from one at `high`, and the
+config sets both. If the banner format ever changes, `grep` returns nothing and the
+`test -s` stops the run; without it §8 would interpolate an empty string and publish
+an attestation naming **no model at all** — a fabricated attestation, which this repo
+treats as worse than an absent one.
 
-- `requires a newer version of Codex` → upgrade the CLI;
-- `is not supported when using Codex with a ChatGPT account` → the id is wrong for
-  this account; fall back to `gpt-5.6-sol` and **say in the PR which model actually
-  ran**. Never silently substitute a model and describe it as astra.
+**Write it to a FILE, not a shell variable.** The orchestrator's shell does **not
+persist between tool calls** — an `AUTHOR_MODEL=…` assignment here is gone by §7 and
+§8. Verified: an exported variable set in one call reads back empty in the next. For
+the same reason **every later read must re-derive the path inline**:
 
-**If astra is unavailable, use the sibling skill `adversarial-build`.** Do not run
-*this* loop with a different model holding the pen — its whole shape (the
-correlation weighting in §7, the write-access bounding in §6) is built around astra
-being the author. Swapping the author silently makes the attestation a fiction.
+```bash
+WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT
+```
+
+Never describe the run as "astra" without reading it; the whole point of resolving is
+that it can change. ("astra" is the name of the AUTHOR ROLE in this skill, not a
+promise about which id filled it.)
+
+**Every run must agree with the record.** §2, §5 and §7 each write a `.out` file whose
+banner names the model that actually ran. After each, assert it matches:
+
+```bash
+grep -m1 '^model:' /tmp/astra-<step>.out | awk '{print $2}'   # must equal line 1 of $REC
+```
+
+A mismatch means the author changed mid-loop — stop, re-probe, and disclose it. This
+is what lets §8 truthfully name the model *for the spec* and *for the code* separately;
+a re-probe at §7 reports §7's state and cannot tell you what built the diff at §5.
+
+**Per-worktree selection**, if you want two worktrees on different models: set
+`CODEX_HOME` to a worktree-local directory holding its own `config.toml`, or pass
+`--profile <name>`. Both are honoured by the flag-free invocation above, so nothing
+else in this skill changes.
+
+Two failure shapes to tell apart, because they have different fixes:
+
+- `requires a newer version of Codex` → upgrade the CLI (`brew upgrade --cask
+  codex`). Measured 2026-09-05: `gpt-6-astra` on `codex-cli 0.147.0` returned
+  `400 … requires a newer version of Codex` **after the prompt was sent**; 0.153.4
+  answered cleanly. The id was real and the account could use it — only the binary
+  was stale, which is why this is not the failure below.
+- `is not supported when using Codex with a ChatGPT account` → the configured id is
+  wrong for this account. Fix the config rather than papering over it here. A
+  probe-verified id on this account as of 2026-09-05 is **`gpt-5.6-sol`** (the sibling
+  skill §4 records why guessing `gpt-5.6` cost a round trip on GRAPHSMALL-1).
+
+**If Codex is unavailable entirely, use the sibling skill `adversarial-build`.** Do
+not run *this* loop with Claude holding the pen — its whole shape (the correlation
+weighting in §7, the write-access bounding in §6) assumes a Codex author and a
+Claude reviewer. Swapping that silently makes the attestation a fiction.
 
 Also inherited: `codex exec` **hangs without `< /dev/null`**, and quota exhaustion
 is a real mid-loop state — when it happens, name the missing reviewer in the PR
@@ -136,7 +193,7 @@ them for exactly that, and the count was wrong three times running. Give astra t
 it to attack the *inferences*, not the numbers.
 
 ```bash
-codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
+codex exec --sandbox workspace-write --skip-git-repo-check - \
   < /tmp/astra-spec-prompt.md > /tmp/astra-spec.out 2>&1; echo "EXIT=$?" >> /tmp/astra-spec.out
 ```
 
@@ -268,7 +325,7 @@ Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `mai
 Then hand astra the approved spec:
 
 ```bash
-codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
+codex exec --sandbox workspace-write --skip-git-repo-check - \
   < /tmp/astra-build-prompt.md > /tmp/astra-build.out 2>&1; echo "EXIT=$?" >> /tmp/astra-build.out
 ```
 
@@ -383,13 +440,21 @@ Fold Fable's findings with the same re-derivation discipline as §3.
 Then astra's round — and **the session must be fresh**:
 
 ```bash
-codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check - \
+codex exec --sandbox read-only --skip-git-repo-check - \
   < /tmp/astra-review-prompt.md > /tmp/astra-review.out 2>&1; echo "EXIT=$?" >> /tmp/astra-review.out
 ```
 
 - **`--sandbox read-only`** here, not `workspace-write`. The reviewer reads.
-- **A NEW invocation, never a resumed build session.** Astra reviewing its own build
-  context is self-review; astra reading the diff cold is at least an independent
+- **No `--model`, same as every other invocation** — this round must run the SAME
+  model recorded by §0 that built the diff — read it with
+  `WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT`,
+  re-deriving `WT` inline because the shell does not persist. That is what makes it
+  the *correlated* round,
+  and the weighting below depends on it. If the config changed mid-loop so a
+  different model answers, you no longer have the round this section describes:
+  re-probe, and say in the PR which model reviewed.
+- **A NEW invocation, never a resumed build session.** The author reviewing its own
+  build context is self-review; reading the diff cold is at least an independent
   *pass*, even though it is the same model.
 - Tell it what Fable found and what was folded, and **task it explicitly with
   breaking the folds** — the second-order bug introduced by a fix is the defect
@@ -441,14 +506,18 @@ The PR body carries, honestly:
 - what the slice is, and what is deliberately NOT in it (name the next slice);
 - the verification table — tier counts, mutations run and what each reddened,
   including any that SURVIVED and what that told you;
-- **who wrote it**: state that astra authored the spec and the code. A reader
-  weighing the review evidence needs to know the author was not the reviewer;
+- **who wrote it**: name the model §0 recorded — read it with
+  `WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT`
+  (re-derive `WT` inline; the shell does not persist) — the actual id, not the word
+  "astra", and the id each `.out` banner confirms for the spec and for the code — for the spec and for the code. A reader weighing the review
+  evidence needs to know the author was not the reviewer, and needs to know *which*
+  model, because the skill no longer pins one;
 - the `## Review` attestation, with **at least one line parsing as**
   `Reviewed by <tool> — verdict <summary>` — the required `pr-review-gate` check
   matches that exact shape, and an unedited `<tool>` placeholder is rejected.
   Name **both** rounds and their verdicts *including the BLOCKED ones*; an
-  attestation that only says CLEAR launders the process. Mark the astra round as
-  the correlated one.
+  attestation that only says CLEAR launders the process. Name the reviewing model
+  by its resolved id and mark that round as the correlated one.
 - deferrals with reasons, and `AIOS-Work: <ROW-KEY>`.
 
 **Verify the body as STORED**, not by the exit code, and read it back with
@@ -483,4 +552,4 @@ deliberately does not close workspace-pushed rows — they resolve `linked`, not
 | The second-order bug inside a fix | §7's "break the folds" |
 | A correlated CLEAR read as independent | §7's asymmetric weighting |
 | A fabricated attestation | §8's both-rounds-including-BLOCKED rule |
-| A model substituted silently for the one named | §0's two failure shapes |
+| A model substituted silently for the one named | §0's recorded author + the per-run banner assertion + §8's naming rule |
