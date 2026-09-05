@@ -4,8 +4,12 @@ Status: **round 1 BLOCKED by Codex (gpt-5.6-sol), 2026-09-05 — folded into a S
 ruling: the value-invariant guard hardening is sound and should merge now; the branch flip, the
 Dependabot retarget and the `pr-task-link` trigger must NOT sit in a mergeable precursor, because the
 runbook's ordering pairs (`dependabot-target-branch: at the cutover, never before`) and the
-`pr-task-link` header's own argument both forbid it. Round 2 is pending on the criteria rewrite
-listed under "Open findings". Owner: chetan
+`pr-task-link` header's own argument both forbid it. Round 2 ran: Fable reviewed the DIFF
+(CLEAR-WITH-CONDITIONS), gpt-6-astra reviewed it cold (BLOCKED — it caught a false premise in Fable's
+own refutation), and Fable re-cleared the post-fold diff (CLEAR-WITH-CONDITIONS, prose only). PR A's
+criteria (2–6, 15) are folded and satisfied. **The HELD set's criteria — 1, 7–14, 16 — remain in their
+round-1 form and still carry the open findings listed at the end of this document; they are not
+review-clean and must not be treated as such when the cutover PR is written.** Owner: chetan
 · Tier build-with: **unit** (`test/guards/branch-roles.test.ts`, `test/guards/instruction-base.test.ts`,
 `test/guards/pr-task-link-credential-isolation.test.ts`) — no persistence, no HTTP, no model.
 
@@ -278,9 +282,14 @@ meaningful, until `CONTRIBUTION_BASE` moves.
 
 ## What would falsify this design
 
-- If widening `.github/workflows/pr-task-link.yml`'s trigger before the environment policy does **not** produce a red
-  job — then Decision 4's ordering is unnecessary and the runbook overstates it. (Observable: the
-  `scan-on-merge` failure measured today is the same mechanism, so this is already evidenced once.)
+- **(Rewritten — the original was met by this spec and left standing, which Fable's re-clear caught.)**
+  It said: *if widening `pr-task-link`'s trigger before the environment policy does not produce a red
+  job, Decision 4's ordering is unnecessary*, and cited the `scan-on-merge` failure as the same
+  mechanism. Decision 4 now asserts that exact outcome — no red while the default branch is `main` —
+  and says `scan-on-merge` was a `push`, a **different** mechanism. The live falsifier is the new
+  hazard: **if, after the default branch moves to `staging` under a `main`-only `trusted-automation`
+  policy, `pull_request_target` runs are NOT refused, then the widen-policy-before-default-branch
+  ordering pair is unnecessary.**
 - If `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is the wrong pair because post-cutover `main` should stop
   receiving `scan-on-merge` entirely — that would be a product decision reversing RELPTR-4, and would
   make D1 a scope change rather than a bug fix.
@@ -321,11 +330,20 @@ satisfied without the thing it names being true:
    **RESOLVED in PR A.** Removed; it was implied by the `toEqual` above it, and replaced by an
    assertion that the two roles in the pair can never be the same branch.
 
-7. **`docs/RELEASING.md` §3.1c carries the same pre-2025-12-08 `pull_request_target` model** and must
-   be corrected with Decision 4 — it argues that a `staging`-based run "would be refused a `main`-only
-   policy and go red", which is false while the default branch is `main` and understates what happens
-   once it is not. Left to the held change set rather than expanded into PR A, because it is
-   cutover-planning prose, not a guard; flagged here so it is not discovered on the day.
+7. **FOUR files carry the superseded pre-2025-12-08 `pull_request_target` model**, not one. An
+   earlier version of this finding named only the first, and Fable's re-clear enumerated the rest:
+   - `docs/RELEASING.md` §3.1c (~:178–190) — argues a `staging`-based run "would be refused a
+     `main`-only policy and go red": false while the default branch is `main`, and it understates
+     what happens once it is not;
+   - `.github/workflows/aios-work-sync.yml` (:25, :29, :46, **:69–71**, :112, :135) — the "SECOND
+     COST" paragraph is now false, and it sits ten lines above the trigger this PR's new test pins;
+   - `.github/workflows/pr-task-link.yml` (:28, :49, :71–75, :121, :134);
+   - `test/guards/pr-task-link-credential-isolation.test.ts` (:471–472, :608) — the **assertion**
+     (`["main"]`) still holds; only its stated rationale is stale.
+
+   All four are held-set corrections, not PR A's: they are cutover-planning and rationale prose, and
+   widening PR A to chase them would break its value-invariant story. Flagged so they are not
+   discovered on the day.
 8. **Both reviewers were wrong about this, in opposite directions, and neither could have settled it
    alone.** Fable refuted a claim using the old event model; gpt-6-astra refuted the refutation but
    had no network to check its own citation. The primary source decided it. Recorded because the

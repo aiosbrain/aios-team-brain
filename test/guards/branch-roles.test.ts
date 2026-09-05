@@ -262,13 +262,21 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // the default branch". (github.blog/changelog/2025-11-07-actions-pull_request_target-and-
     // environment-branch-protections-changes/)
     //
-    // So the base branch controls neither the workflow file nor the environment evaluation, and this
-    // `branches:` filter is a plain event filter — not a security control in either direction. The
-    // blast-radius control is the `trusted-automation` environment policy, evaluated against the
-    // DEFAULT branch, which is repository settings and not this file.
+    // So the base branch controls neither the workflow file nor the environment evaluation. But
+    // "therefore the filter is not a security control" — a first version of this comment — is the
+    // over-correction, and Fable's re-clear caught it. The filter is not a CREDENTIAL boundary; it is
+    // the INTEGRITY control over which merges count. With `branches: ["**"]` a collaborator opens a
+    // pull request into their own unprotected branch, merges it themselves, satisfies
+    // `merged == true && same-repo` from trusted default-branch code, and `notify-brain` posts a work
+    // event that can resolve `applied` and close a task. Under the verified model the filter is MORE
+    // load-bearing, not less, because a same-repo branch can no longer edit it. The separate
+    // blast-radius control over the CREDENTIAL is the `trusted-automation` environment policy,
+    // evaluated against the DEFAULT branch — repository settings, not this file.
     //
-    // What IS true and worth keeping: a release fast-forward to `main` emits no
-    // `pull_request_target` at all, so `main`'s entry serves in-flight and exceptional pull
+    // What IS true and worth keeping: a release fast-forward is a PUSH, so it does not by itself
+    // raise `pull_request_target`. ("emits none at all" was too strong — if a `staging`→`main` pull
+    // request is open when the push lands, GitHub marks it merged and `closed` fires with
+    // `merged == true`.) `main`'s entry serves exactly those in-flight and exceptional pull
     // requests into the release branch.
     const on = workflow("aios-work-sync.yml").on!;
     expect(Object.keys(on), "the trigger itself is part of criterion 5 now").toEqual(["pull_request_target"]);
@@ -293,15 +301,18 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: today
     // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs are the SAME VALUE
     // and no value or behavioural assertion can tell them apart. Measured, not assumed — reverting
-    // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves all 41 tests in
-    // this file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
+    // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves EVERY test in this
+    // file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
     // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the
     // alternative was a fix nothing held in place until cutover day made it loud.
     // COMMENT LINES ARE STRIPPED FIRST. gpt-6-astra's cold review found the hole in the first
     // version: prefixing either assertion with `//` leaves both regex checks satisfied — the string
     // is still in the file — while removing its execution entirely, so the count certified coverage
-    // that no longer runs. Stated limit, because a guard's blind spots belong in the guard: this
-    // strips LINE comments only, so a `/* … */` block around an assertion would still evade it.
+    // that no longer runs. Stated limits, because a guard's blind spots belong in the guard: this
+    // strips LINE comments only, so a `/* … */` block around an assertion evades it — and so does
+    // disabling the test that contains it (`it.skip`, `describe.skip`, `xit`, `it.todo`), which
+    // leaves the source text and therefore the count untouched. Same class, same acceptance: these
+    // are deliberate edits by someone reading this comment, not silent drift.
     const src = read("test/guards/branch-roles.test.ts")
       .split("\n")
       .filter((line) => !line.trim().startsWith("//"))
