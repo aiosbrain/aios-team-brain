@@ -247,13 +247,25 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // cutover (both `staging`); `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both. That is
     // the whole justification and it is checkable.
     //
-    // A REFUTED VERSION, kept so it is not re-derived: a draft called this pair a SECURITY
-    // ALLOWLIST of trusted pull-request bases. Fable disproved it — on `pull_request_target` the
-    // workflow file, `on:` filter included, is read from the pull request's BASE branch, and a
-    // same-repo collaborator can push a branch and control that copy. The filter cannot allowlist
-    // against the population this workflow's own header names as the threat. The real blast-radius
-    // control is the `trusted-automation` environment's deployment branch policy, which lives in
-    // repository settings, not in this file.
+    // TWO REFUTED VERSIONS, both kept so neither is re-derived. This is the one claim in this slice
+    // that three passes disagreed about, so the evidence is written down rather than the conclusion.
+    //
+    //   (1) A draft called this pair a SECURITY ALLOWLIST of trusted pull-request bases.
+    //   (2) Fable's diff review disproved (1) by arguing that on `pull_request_target` the workflow
+    //       file — `on:` filter included — is read from the pull request's BASE branch, which a
+    //       same-repo collaborator controls.
+    //
+    // (2) IS ALSO WRONG, AND IS THE OLDER MODEL. gpt-6-astra caught it and it was verified against
+    // the primary source: GitHub changed `pull_request_target` effective 2025-12-08 —
+    // "The workflow file and checkout commit will always be taken from the repository's default
+    // branch, regardless of the pull request's base branch", and "environment rules evaluate against
+    // the default branch". (github.blog/changelog/2025-11-07-actions-pull_request_target-and-
+    // environment-branch-protections-changes/)
+    //
+    // So the base branch controls neither the workflow file nor the environment evaluation, and this
+    // `branches:` filter is a plain event filter — not a security control in either direction. The
+    // blast-radius control is the `trusted-automation` environment policy, evaluated against the
+    // DEFAULT branch, which is repository settings and not this file.
     //
     // What IS true and worth keeping: a release fast-forward to `main` emits no
     // `pull_request_target` at all, so `main`'s entry serves in-flight and exceptional pull
@@ -285,11 +297,20 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // this file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
     // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the
     // alternative was a fix nothing held in place until cutover day made it loud.
-    const src = read("test/guards/branch-roles.test.ts");
+    // COMMENT LINES ARE STRIPPED FIRST. gpt-6-astra's cold review found the hole in the first
+    // version: prefixing either assertion with `//` leaves both regex checks satisfied — the string
+    // is still in the file — while removing its execution entirely, so the count certified coverage
+    // that no longer runs. Stated limit, because a guard's blind spots belong in the guard: this
+    // strips LINE comments only, so a `/* … */` block around an assertion would still evade it.
+    const src = read("test/guards/branch-roles.test.ts")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
     expect(src, "the trigger assertions must name RELEASE_BRANCH").not.toMatch(/toEqual\(\[CONTRIBUTION_BASE, INTEGRATION_BRANCH\]\)/);
     // NON-VACUOUS: forbidding a shape proves nothing unless the shape it REPLACED is present.
-    // Both trigger sites, counted — deleting one would otherwise satisfy the line above.
-    expect(src.match(/toEqual\(\[RELEASE_BRANCH, INTEGRATION_BRANCH\]\)/g), "both trigger sites").toHaveLength(2);
+    // Both trigger sites, counted — deleting or commenting out one would otherwise satisfy the
+    // line above while removing the assertion it exists to protect.
+    expect(src.match(/toEqual\(\[RELEASE_BRANCH, INTEGRATION_BRANCH\]\)/g), "both trigger sites, uncommented").toHaveLength(2);
   });
 
   it("scan-on-merge fires on EXACTLY the same two branches", () => {
@@ -301,8 +322,15 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // `main` by claiming its removal would reduce readiness to per-release. Codex disproved it —
     // post-cutover every merge lands on `staging`, so `staging`-only scanning is still per-merge.
     // `main`'s entry buys release-time retry/reconciliation, at the cost of normally re-scanning a
-    // SHA already scanned on `staging` (the workflow keys stored results by `head_sha`, so that is
-    // duplicate compute rather than a wrong result). Same role correction as above, same reason.
+    // SHA already scanned on `staging`.
+    //
+    // A FIRST VERSION CALLED THAT "duplicate compute rather than a wrong result". Too strong, and
+    // gpt-6-astra produced the counterexample; re-derived here before folding. `lib/codebases/ingest.ts`
+    // upserts on `(codebase_id, head_sha)` and REFRESHES `scanned_at`, while
+    // `lib/metrics/codebases.ts` picks the latest scan by ORDERING ON `scanned_at`. So: staging
+    // scans A then B; a later release fast-forward re-scans A; A now carries the newest timestamp
+    // and wins "latest" despite B being newer by ancestry. That is a pre-existing operational risk
+    // this slice neither introduces nor fixes — recorded so the reassurance is not repeated.
     const on = workflow("scan-on-merge.yml").on!;
     expect((on.push as { branches?: string[] }).branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
   });

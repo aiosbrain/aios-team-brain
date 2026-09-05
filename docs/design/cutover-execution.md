@@ -169,11 +169,35 @@ applied by a regex over the declaration rather than an exact-literal replace.
 **Decision 4 — SUPERSEDED BY REVIEW. `.github/workflows/pr-task-link.yml` stays at `[main]`, and its guard keeps the
 exact `["main"]` pin, until the environment policy is observably widened.** The original decision
 widened the trigger and relied on a PR-body precondition to stop an early merge; the reviewer's
-objection is that a stated precondition is not enforcement, and the failure it permits is concrete:
-merge the widening while the policy is `main`-only → the first pull request targeting `staging` starts
-`pr-task-link` → the environment refuses it with zero steps → an advisory check is red, hidden only by
-`continue-on-error`, which the file's own header says must never be relied on for that. The edit moves
-into the cutover change set. Original reasoning follows. §3.1c is explicit: the environment's branch policy must be widened
+objection is that a stated precondition is not enforcement. **The conclusion stands; the SCENARIO
+that was given for it does not, and the correction changes the cutover ordering.**
+
+The scenario said: merge the widening while the policy is `main`-only → a pull request targeting
+`staging` runs `pr-task-link` → the environment refuses it with zero steps → an advisory check goes
+red. gpt-6-astra's cold review found this rests on **pre-2025-12-08 `pull_request_target` semantics**,
+and the primary source confirms it — GitHub's 2025-11-07 changelog, effective **2025-12-08**: *"The
+workflow file and checkout commit will always be taken from the repository's default branch,
+regardless of the pull request's base branch"*, and *"For `pull_request_target`, environment rules
+evaluate against the default branch."*
+
+**So, with the default branch still `main`:** a pull request based on `staging` evaluates the
+environment against `main`, the `main`-only policy ALLOWS it, and nothing goes red. Widening the
+trigger early is not the hazard that was claimed.
+
+**The real hazard moves to the DEFAULT-BRANCH MOVE, and it is bigger.** Once the default branch
+becomes `staging`, every `pull_request_target` workflow — `.github/workflows/pr-task-link.yml` AND `.github/workflows/aios-work-sync.yml`
+— evaluates the `trusted-automation` policy against `staging`. A `main`-only policy then refuses
+**all of them**, so the advisory check goes red on every pull request and no work event posts on any
+merge. The ordering pair is therefore **widen the environment policy BEFORE moving the default
+branch**, not before widening a trigger.
+
+**What is unaffected:** the `scan-on-merge` failure measured on 2026-09-05 was a **`push`** event,
+whose `GITHUB_REF` is the pushed branch. That evaluated against `staging`, was refused, and ran zero
+steps. That measurement stands and is untouched by the `pull_request_target` change.
+
+The edit still moves into the cutover change set — a trigger widening with no branch to serve is
+churn, and it belongs with the policy and default-branch changes it is ordered against. Original
+reasoning follows, and is superseded by the paragraphs above. §3.1c is explicit: the environment's branch policy must be widened
 **first**. Widening the trigger while the policy is `main`-only makes a `staging` pull request's run
 get refused the environment and go red — on a check whose whole contract is that it never goes red.
 `continue-on-error: true` masks it, which the file's own header calls out as *"relying on this line to
@@ -296,6 +320,17 @@ satisfied without the thing it names being true:
 6. ~~**`test/guards/branch-roles.test.ts:232`'s `toContain("staging")` loses its meaning**~~ —
    **RESOLVED in PR A.** Removed; it was implied by the `toEqual` above it, and replaced by an
    assertion that the two roles in the pair can never be the same branch.
+
+7. **`docs/RELEASING.md` §3.1c carries the same pre-2025-12-08 `pull_request_target` model** and must
+   be corrected with Decision 4 — it argues that a `staging`-based run "would be refused a `main`-only
+   policy and go red", which is false while the default branch is `main` and understates what happens
+   once it is not. Left to the held change set rather than expanded into PR A, because it is
+   cutover-planning prose, not a guard; flagged here so it is not discovered on the day.
+8. **Both reviewers were wrong about this, in opposite directions, and neither could have settled it
+   alone.** Fable refuted a claim using the old event model; gpt-6-astra refuted the refutation but
+   had no network to check its own citation. The primary source decided it. Recorded because the
+   lesson generalises: a reviewer's confident mechanism claim about a third-party platform is a
+   hypothesis until the vendor's own changelog is read.
 
 ## The prerequisite this spec wrongly called out of scope
 
