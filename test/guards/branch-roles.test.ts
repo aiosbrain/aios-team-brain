@@ -99,11 +99,21 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
   const git = (cwd: string, ...args: string[]) =>
     execFileSync("git", args, { cwd, encoding: "utf8", env: ISOLATED }).trim();
 
+  // RELPTR-6 D2 — match the DECLARATION, not the value it currently holds. The first version
+  // replaced the literal string `export const CONTRIBUTION_BASE = "main";`, so the day the cutover
+  // moves that value the substitution silently stops matching. It fails loudly today (the
+  // `not.toBe(src)` below), which is why this is brittleness rather than a false green — but
+  // "update the literal to `staging`" would reintroduce the identical coupling one cutover later.
+  // Global + count-checked: a SECOND declaration would otherwise leave one copy unstubbed, and the
+  // stub would test a module that still resolves the real branch.
+  const CONTRIBUTION_BASE_DECL = /export const CONTRIBUTION_BASE = "[^"]*";/g;
+
   function scratchWithStub(stubValue: string | null) {
     const dir = mkdtempSync(join(tmpdir(), "roles-pin-"));
     const src = read("scripts/branches.mjs");
+    expect(src.match(CONTRIBUTION_BASE_DECL), "exactly one declaration to stub").toHaveLength(1);
     const branches =
-      stubValue === null ? src : src.replace('export const CONTRIBUTION_BASE = "main";', `export const CONTRIBUTION_BASE = ${JSON.stringify(stubValue)};`);
+      stubValue === null ? src : src.replace(CONTRIBUTION_BASE_DECL, `export const CONTRIBUTION_BASE = ${JSON.stringify(stubValue)};`);
     if (stubValue !== null) expect(branches, "the stub must apply").not.toBe(src);
     writeFileSync(join(dir, "branches.mjs"), branches);
     writeFileSync(join(dir, "release-candidate-guard.mjs"), read("scripts/release-candidate-guard.mjs"));
@@ -223,20 +233,49 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // branch a pull request targets, so a collaborator can make their own tree the trusted one.
     // `test/guards/pr-task-link-credential-isolation.test.ts` owns the security half; this owns the
     // RELPTR-4 half, and both must move together.
+    //
+    // RELPTR-6 D1 — THE PAIR IS `[RELEASE_BRANCH, INTEGRATION_BRANCH]`, AND IT USED TO BE
+    // `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]`. Today those evaluate identically (`["main",
+    // "staging"]`), which is exactly why the mis-wiring was invisible — the same identity trap
+    // `scripts/branches.mjs`'s header names, found in a second place. On cutover day
+    // `CONTRIBUTION_BASE` becomes `staging`, the old expectation COLLAPSES to
+    // `["staging", "staging"]`, and this guard reddens against a workflow file that is correct.
+    //
+    // Why RELEASE and not CONTRIBUTION is the right role here: this trigger is a SECURITY
+    // ALLOWLIST of trusted pull-request bases, not "the branches that receive contributions". A
+    // release fast-forward to `main` emits no `pull_request_target` at all, so `main`'s entry
+    // exists for in-flight and exceptional pull requests into the release branch — stated here
+    // rather than left implicit, because if that is NOT the policy the entry is pure exposure.
     const on = workflow("aios-work-sync.yml").on!;
     expect(Object.keys(on), "the trigger itself is part of criterion 5 now").toEqual(["pull_request_target"]);
-    expect(on.pull_request_target!.branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+    expect(on.pull_request_target!.branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
     expect(on.pull_request_target!.types).toEqual(["closed"]);
-    // …and INTEGRATION_BRANCH is `staging` TODAY, so this pins the widening now rather than
-    // collapsing to "contains main" until the cutover moves the value.
-    expect(on.pull_request_target!.branches).toContain("staging");
+  });
+
+  it("the two roles in that pair can never be the same branch", () => {
+    // The property the old pair lacked, asserted directly instead of via a `toContain("staging")`
+    // that stopped meaning anything once `staging` could be BOTH values. `[RELEASE_BRANCH,
+    // INTEGRATION_BRANCH]` is a two-branch allowlist by construction; `[CONTRIBUTION_BASE,
+    // INTEGRATION_BRANCH]` is only a two-branch allowlist by accident of today's values.
+    expect(RELEASE_BRANCH, "a collapsed pair is a one-branch trigger wearing a two-branch shape").not.toBe(INTEGRATION_BRANCH);
+    // …and the pair that WAS used does collapse, which is the whole finding, pinned so the
+    // regression is a red test rather than a rediscovery on cutover day.
+    expect([RELEASE_BRANCH, INTEGRATION_BRANCH]).toHaveLength(new Set([RELEASE_BRANCH, INTEGRATION_BRANCH]).size);
   });
 
   it("scan-on-merge fires on EXACTLY the same two branches", () => {
-    // After the cutover `main` advances only by release fast-forward, so a `[main]`-only trigger
-    // would drop codebase readiness from per-merge to per-release without any error.
+    // RELPTR-4's original failure: a `[main]`-ONLY push trigger after contributions moved would
+    // drop codebase readiness from per-merge to per-release without any error. That is why the
+    // trigger was widened, and it is still why `staging` must be here.
+    //
+    // RELPTR-6 D1, and a REFUTATION worth keeping: a draft of that slice justified retaining
+    // `main` by claiming its removal would reduce readiness to per-release. Codex disproved it —
+    // post-cutover every merge lands on `staging`, so `staging`-only scanning is still per-merge.
+    // `main`'s entry buys release-time retry/reconciliation, at the cost of normally re-scanning a
+    // SHA already scanned on `staging` (the workflow keys stored results by `head_sha`, so that is
+    // duplicate compute rather than a wrong result). Same role correction as above, same reason.
     const on = workflow("scan-on-merge.yml").on!;
-    expect((on.push as { branches?: string[] }).branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+    expect((on.push as { branches?: string[] }).branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
   });
 
   it("nothing INSIDE aios-work-sync re-narrows what the trigger widened", () => {
