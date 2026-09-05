@@ -1,0 +1,298 @@
+# The cutover, executed — `staging` becomes the contribution base (RELPTR-6)
+
+Status: **round 1 BLOCKED by Codex (gpt-5.6-sol), 2026-09-05 — folded into a SPLIT.** The reviewer's
+ruling: the value-invariant guard hardening is sound and should merge now; the branch flip, the
+Dependabot retarget and the `pr-task-link` trigger must NOT sit in a mergeable precursor, because the
+runbook's ordering pairs (`dependabot-target-branch: at the cutover, never before`) and the
+`pr-task-link` header's own argument both forbid it. Round 2 is pending on the criteria rewrite
+listed under "Open findings". Owner: chetan
+· Tier build-with: **unit** (`test/guards/branch-roles.test.ts`, `test/guards/instruction-base.test.ts`,
+`test/guards/pr-task-link-credential-isolation.test.ts`) — no persistence, no HTTP, no model.
+
+**Deps:** RELPTR-4 (`1633e438`, `scripts/branches.mjs`) and RELPTR-5 (`c76e66af`, the instruction
+corpus resolves the base) are both merged. `staging` was fast-forwarded to `c76e66af` on 2026-09-05
+(see Measured terrain), which is the §3.2 pair `fast-forward-staging: before retargeting any
+contribution flow`.
+
+**Increment — SPLIT after review, two change sets, not one:**
+
+- **PR A (mergeable now):** the three value-invariant guard fixes, D1/D2/D3 below. No branch flip, no
+  Dependabot edit, no workflow trigger edit, no cutover-status prose. Every fix is correct **today**
+  and each is a latent defect that only surfaces on cutover day, so leaving it in an unmerged branch
+  means the repository does not have the fix.
+- **The cutover change set (held for the coordinated window):** the `CONTRIBUTION_BASE` flip, the
+  instruction prose + regenerated mirrors, the Dependabot `target-branch` overrides and the
+  `pr-task-link` trigger — applied **alongside** the verified environment-policy and branch-protection
+  changes, with the Railway staging prerequisite verified before contributions reopen.
+
+Every branch protection change, the `trusted-automation` environment branch policy, the tag ruleset,
+the release actor and the GitHub default branch are **human admin steps and are in neither PR**.
+
+---
+
+## Problem
+
+`docs/RELEASING.md` §3 records a cutover that has been designed, prepared across four slices, and
+never executed. RELPTR-4 made the Node consumers follow a single declared role; RELPTR-5 made the
+instruction corpus resolve that role at run time. What remains in code is the one-line flip plus the
+sites that a shared constant provably does **not** cover — §3.1c enumerates them, and this slice is
+the enumeration turned into a diff.
+
+The slice exists as its own row because the flip is **not** safe to write casually: today
+`RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so several assertions that look like they pin a
+value are today satisfied by *either* role, and moving the contribution base is the event that tells
+them apart. Three of those are latent defects this slice found by reading, not by running.
+
+---
+
+## Measured terrain — live, 2026-09-05
+
+Everything below was read from the live GitHub API, the live Railway project, and the repository at
+`c76e66af`. Nothing here is inferred.
+
+| fact | measurement |
+|---|---|
+| `staging` before | `05a771ff` (2026-07-25), **0 ahead / 267 behind** `main` |
+| `staging` after | fast-forwarded to `c76e66af`; **0 ahead / 0 behind** — constraints 5 and 8 now hold |
+| the push | required an **admin bypass** (`staging` requires a pull request at 0 approvals); `enforce_admins: false` on `staging` made that possible |
+| `scan-on-merge` on that push | **red in 3s having run ZERO steps** — the `trusted-automation` environment's branch policy is `main` only |
+| `trusted-automation` policy | exactly one branch policy: `main` (API-confirmed) |
+| repository rulesets | **zero**; `repos/.../tags/protection` → **404** (constraint 7 still false) |
+| `main` protection | 10 required contexts, `enforce_admins: true`, `strict: true`, **no push restrictions** — so no actor can push to `main` at all (constraint 1/the release actor: still false) |
+| `staging` protection | 7 required contexts, **no** `PR records a diff review`, push restricted to `chetan-guevara` + `johnellison`, `enforce_admins: false` |
+| `.github/dependabot.yml` | 3 ecosystems (npm, pip, github-actions), **zero** `target-branch` overrides |
+| `.github/workflows/pr-task-link.yml` | `on.pull_request_target.branches: [main]`; guard pins it to exactly `["main"]` |
+| `.github/workflows/aios-work-sync.yml` / `.github/workflows/scan-on-merge.yml` | already `[main, staging]` |
+| Railway staging | **did not auto-deploy** the fast-forward; latest deployment still 2026-07-25 08:36. Staging Postgres carries the July-25 schema (**70** tables vs `main`'s **85**; `members.handle` absent) |
+
+**What is NOT measured:** whether Railway's staging service has a GitHub source connected at all, or
+whether the webhook was merely dropped. Distinguishing those needs the Railway dashboard, which is a
+human read; the CLI is read-only here and cannot show service source settings.
+
+---
+
+## The three latent defects the flip exposes
+
+These are the reason this is a spec and not a one-line commit. Each is green today and each fails —
+or worse, silently stops testing anything — the moment `CONTRIBUTION_BASE` moves.
+
+### D1 — the workflow triggers are wired to the wrong role, invisibly
+
+`test/guards/branch-roles.test.ts:228,239` assert:
+
+```ts
+expect(on.pull_request_target!.branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+expect((on.push as { branches?: string[] }).branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+```
+
+Today that evaluates to `["main", "staging"]` and matches both files. After the flip it evaluates to
+`["staging", "staging"]` and the guard goes **red against a correct file**.
+
+The correct role pair is `[RELEASE_BRANCH, INTEGRATION_BRANCH]`.
+
+**REFUTED, and the refutation is recorded rather than quietly dropped:** a first draft of this spec
+justified keeping `main` by claiming that dropping it would reduce codebase readiness to per-release.
+Codex disproved that — post-cutover every merge lands on `staging`, so `staging`-only scanning is
+still per-merge. RELPTR-4's original failure was the mirror image (a `main`-ONLY trigger after
+contributions moved), and reversing it is not an argument for this pair.
+
+The real justifications differ per workflow and must be stated separately rather than under one slogan:
+
+- **`scan-on-merge` (push):** keeping `main` buys release-time retry/reconciliation, at the cost of
+  normally re-scanning a SHA already scanned on `staging`. Storage is keyed by `head_sha`, so the
+  open question — no-op or duplicate compute — must be answered and tested, not assumed.
+- **`aios-work-sync` (`pull_request_target: closed`):** the pair is a **security allowlist of trusted
+  PR bases**, not "the branches that receive contributions". A release fast-forward to `main` emits no
+  `pull_request_target` event at all, so `main`'s entry exists only for in-flight or exceptional pull
+  requests — a policy that must be stated explicitly or the entry is unnecessary exposure.
+
+**This correction is value-invariant today** (`RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`), so
+it can be verified before the flip and carries no behavioural risk. It is the identity trap the
+`scripts/branches.mjs` header warns about, found in a second place.
+
+### D2 — the identity pin's stub is keyed on the literal being replaced
+
+`test/guards/branch-roles.test.ts:106` builds its sentinel by string-replacing
+`'export const CONTRIBUTION_BASE = "main";'`. After the flip that literal no longer exists.
+
+This one fails **loudly** — line 107's `expect(branches, "the stub must apply").not.toBe(src)` catches
+it — so it is a maintenance defect, not a silent one. It is listed because the fix must not be "update
+the literal to `staging`", which would reintroduce the same coupling one cutover later.
+
+### D3 — the instruction-base sentinel stops being a sentinel (silent)
+
+`test/guards/instruction-base.test.ts:182` writes a scratch module:
+
+```ts
+writeFileSync(join(dir, "branches.mjs"), 'export const CONTRIBUTION_BASE = "staging"; export const RELEASE_BRANCH = "release-sentinel";');
+```
+
+`"staging"` is chosen precisely because it is **not** the real value — that is what makes the test
+prove the instruction resolves the base rather than hardcoding it. After the flip, `"staging"` **is**
+the real value, and the test can no longer distinguish "resolved the base" from "hardcoded `staging`".
+It stays green while proving nothing.
+
+This is the dangerous one: no assertion reddens, so nothing announces the loss. It is the
+[measured-one-state-claimed-an-invariant] shape — a fixture whose discriminating power depends on a
+value that this very PR changes.
+
+---
+
+## Decisions
+
+**Decision 1 — the flip is one line, and the roles absorb the rest.**
+`CONTRIBUTION_BASE = "staging"` in `scripts/branches.mjs`. Every Node consumer
+(`scripts/pr-review-gate.mjs`) and every instruction site (RELPTR-5's 22 path + 4 refspec
+occurrences) follows without further edits. `INTEGRATION_BRANCH` and `RELEASE_BRANCH` do not move.
+
+**Decision 2 — express "both live branches" as `[RELEASE_BRANCH, INTEGRATION_BRANCH]`, not
+`[CONTRIBUTION_BASE, INTEGRATION_BRANCH]`.** See D1. Post-cutover the two live branches are the
+release branch and the integration branch; the contribution base is one of them, not a third thing.
+
+**Decision 3 — sentinels must not be real branch names.** D2 and D3 both come from fixtures keyed on
+a real value. Both become sentinels that no role can ever equal (`__NOT-A-BRANCH__`), and the stub is
+applied by a regex over the declaration rather than an exact-literal replace.
+
+**Decision 4 — SUPERSEDED BY REVIEW. `.github/workflows/pr-task-link.yml` stays at `[main]`, and its guard keeps the
+exact `["main"]` pin, until the environment policy is observably widened.** The original decision
+widened the trigger and relied on a PR-body precondition to stop an early merge; the reviewer's
+objection is that a stated precondition is not enforcement, and the failure it permits is concrete:
+merge the widening while the policy is `main`-only → the first pull request targeting `staging` starts
+`pr-task-link` → the environment refuses it with zero steps → an advisory check is red, hidden only by
+`continue-on-error`, which the file's own header says must never be relied on for that. The edit moves
+into the cutover change set. Original reasoning follows. §3.1c is explicit: the environment's branch policy must be widened
+**first**. Widening the trigger while the policy is `main`-only makes a `staging` pull request's run
+get refused the environment and go red — on a check whose whole contract is that it never goes red.
+`continue-on-error: true` masks it, which the file's own header calls out as *"relying on this line to
+hide a broken job, which is not what it is for"*. The PR therefore lands the widening but the merge is
+gated on the policy change, and this is written into the PR body as a merge precondition.
+
+**Decision 5 — the prose parentheticals flip, the mirrors are regenerated, never hand-edited.**
+Six canonical files carry `the contribution base (currently \`main\`, declared in
+\`scripts/branches.mjs\`)`; `.claude/skills/adversarial-build-astra/SKILL.md` carries a `today \`main\``
+variant. All become `staging`. `.agents/`, `.opencode/` and `.cursor/` copies are regenerated with
+`scripts/sync-skill-runtimes.sh`.
+
+**Decision 6 — `scripts/instruction-base.mjs` does NOT change.** It matches the literals
+`origin/(main|staging)` deliberately, never the resolved base, so that post-cutover it still sees a
+reintroduced `origin/main` — the likeliest regression. RELPTR-5 records this as a decision; this slice
+must not "fix" it into following the role.
+
+### Open question for review — one PR or two?
+
+D1, D2 and D3 are **correct today and value-invariant**: they can merge before the cutover and stop
+being latent. The flip itself must not merge until the admin steps are done. Two shapes:
+
+- **A (one PR, draft):** everything together, held unmerged. Simple, but it rots against a moving
+  `main`, and the three hardening fixes stay latent for however long the admin steps take.
+- **B (two PRs, stacked):** PR A = D1+D2+D3 hardening, mergeable immediately; PR B = the flip +
+  dependabot + trigger + prose, draft. More coordination; removes the latency.
+
+The operator asked for one PR. **Recommendation: B**, because the whole point of D3 is that it is a
+guard which silently stops working, and leaving it in an unmerged branch means the repository does not
+have the fix. Reviewer should rule.
+
+---
+
+## Scope — every file this PR may touch
+
+| file | change |
+|---|---|
+| `scripts/branches.mjs` | `CONTRIBUTION_BASE` → `"staging"`; header prose updated to describe the post-cutover world |
+| `test/guards/branch-roles.test.ts` | role-pair fix (D1), sentinel de-coupling (D2), value assertion `"staging"` |
+| `test/guards/instruction-base.test.ts` | sentinel de-vacuity (D3), `prose` const → `currently \`staging\`` |
+| `test/guards/pr-task-link-credential-isolation.test.ts` | trigger pin `["main"]` → `["main", "staging"]` |
+| `.github/dependabot.yml` | `target-branch: "staging"` on all three ecosystems |
+| `.github/workflows/pr-task-link.yml` | `branches: [main, staging]` + header prose corrected |
+| `.claude/skills/{adversarial-build,adversarial-build-astra,branch-reconciliation,pr-review-attestation,test-ci-wiring-audit}/**` | `currently \`main\`` → `currently \`staging\`` |
+| `.agents/**`, `.opencode/**`, `.cursor/**` | REGENERATED ONLY, by `scripts/sync-skill-runtimes.sh` |
+| `docs/RELEASING.md` | §3 cutover status, constraint rows 1/4/5/7/8, §3.2 ordering pairs |
+| `docs/design/cutover-execution.md` | this spec |
+
+A change to any file not in this table is a finding, not a tidy-up.
+
+---
+
+## Acceptance criteria
+
+1. `scripts/branches.mjs` exports `CONTRIBUTION_BASE === "staging"` — asserted in unit tier `test/guards/branch-roles.test.ts`.
+2. `test/guards/branch-roles.test.ts` asserts `.github/workflows/aios-work-sync.yml`'s trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]` and NOT `[CONTRIBUTION_BASE, …]` — the source token is pinned, so a revert to the old pair reddens.
+3. `test/guards/branch-roles.test.ts` asserts `.github/workflows/scan-on-merge.yml`'s push trigger equals `[RELEASE_BRANCH, INTEGRATION_BRANCH]` — same pin.
+4. `test/guards/branch-roles.test.ts`'s stub applies via a regex over `export const CONTRIBUTION_BASE = "<any>"`, so it survives any future value — mutation: change the declared value, the stub must still apply.
+5. `test/guards/instruction-base.test.ts`'s scratch module uses a sentinel base that **no** role equals — asserted by importing all three roles and requiring the sentinel differs from each.
+6. `test/guards/instruction-base.test.ts` is NON-VACUOUS after the flip: hardcoding `origin/staging` in the instruction under test must redden it (negative control, executed).
+7. `.github/dependabot.yml` sets `target-branch: "staging"` on all three ecosystems — asserted by a unit guard that parses the YAML and requires the count to equal the ecosystem count.
+8. `.github/workflows/pr-task-link.yml` fires on exactly `[main, staging]` — asserted in `test/guards/pr-task-link-credential-isolation.test.ts` as an EXACT array, not containment.
+9. `.github/workflows/pr-task-link.yml`'s header no longer claims the `[main]` pin is what keeps it advisory, and states the environment-policy precondition instead — presence assertion.
+10. Every canonical instruction file that carried `currently \`main\`` carries `currently \`staging\`` and **no** `currently \`main\`` — per-site presence AND absence, per RELPTR-5 criterion 14.
+11. `.agents/`, `.opencode/` and `.cursor/` copies match a fresh `scripts/sync-skill-runtimes.sh` run — asserted by `npm run check:skills`. This fence excludes nothing: no hand-authored content lives in those trees, and any file there that is not regenerable is an orphan the same check already reports (it did so in this worktree, for an untracked local skill stub).
+12. `docs/RELEASING.md` §3.2 no longer says `cutover: pending`, and rows 5 and 8 record the fast-forward as done with its date and sha.
+13. `docs/RELEASING.md` records what the fast-forward MEASURED: `scan-on-merge` red with zero steps, and Railway staging not auto-deploying — both are new facts, not predictions.
+14. `npm run check:instructions` stays green and its partial-scan blind-spot message is unchanged — Decision 6.
+15. `npx tsc --noEmit`, `npm run lint`, `npm test`, `npm run check:docs` all pass.
+16. The PR body states the merge preconditions (environment policy widened first; default branch moved; `PR records a diff review` relocated) and is opened as a DRAFT.
+
+## What would falsify this design
+
+- If widening `.github/workflows/pr-task-link.yml`'s trigger before the environment policy does **not** produce a red
+  job — then Decision 4's ordering is unnecessary and the runbook overstates it. (Observable: the
+  `scan-on-merge` failure measured today is the same mechanism, so this is already evidenced once.)
+- If `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is the wrong pair because post-cutover `main` should stop
+  receiving `scan-on-merge` entirely — that would be a product decision reversing RELPTR-4, and would
+  make D1 a scope change rather than a bug fix.
+- If the repository intends the default branch to stay `main` (contributions retargeted by tooling
+  rather than by default), constraint 6 changes shape and Decision 1 is insufficient on its own.
+
+## Out of scope, named
+
+Branch protection changes of any kind · the release actor · the `refs/tags/v*` ruleset · moving the
+GitHub default branch · widening the `trusted-automation` environment branch policy · making
+`Release candidate gate` a required context · relocating `PR records a diff review` · re-triggering
+the Railway staging deploy · anything touching the staging database.
+
+
+---
+
+## Open findings from round 1 — the criteria rewrite round 2 must clear
+
+Recorded verbatim rather than silently folded, because every one of them is a criterion that can be
+satisfied without the thing it names being true:
+
+1. **Criterion 7 is existential in aggregate.** "target-branch count equals ecosystem count" is
+   satisfied by one ecosystem carrying two keys and another carrying none. Parse every `updates`
+   entry and require **exactly one** `target-branch: staging` per entry, universally.
+2. **Criterion 9 has no inverse.** It requires the new prose to be present and never requires the old
+   claim — that the `[main]` pin is what prevents environment refusal — to be absent.
+3. **Criterion 10 is per-FILE where per-SITE is required.** Several canonical files carry more than one
+   `currently \`main\`` site; a per-file existential passes after deleting one of them. Reuse RELPTR-5's
+   per-site enumeration (`test/guards/instruction-base.test.ts:23`) with site-level presence AND
+   old-value absence — the identical defect that BLOCKED RELPTR-5 twice.
+4. **Criteria 12, 13 and 16 test documentation, not the world.** A prose edit removing `cutover:
+   pending` satisfies criterion 12 while constraints 1 and 7 (release actor, tag ruleset) remain
+   measurably false. Replace them with API-observable predicates: exact branch protections, exact
+   environment branch policies, the default branch, the tag ruleset, the release actor's push ability,
+   the required-context sets, the deployed staging SHA, and a successful pre-deploy schema hook.
+5. **There is no criterion for the Railway staging runtime at all** — see below.
+6. **`test/guards/branch-roles.test.ts:232`'s `toContain("staging")` loses its meaning** once `staging`
+   is both the contribution and integration value. Remove it as redundant after the exact role-pair
+   correction, or recast it explicitly as an integration-role assertion.
+
+## The prerequisite this spec wrongly called out of scope
+
+Round 1's third blocker, accepted: **the staging runtime is a cutover prerequisite, not an unrelated
+operational annoyance.** The branch advanced; the service did not. The app is serving July code
+against a 70-table July schema while the branch it tracks expects 85 tables. After the cutover every
+merge lands on `staging` — and if its runtime neither deploys nor migrates, the integration branch has
+lost the operational feedback that is the entire reason to have one. Worse, because the service's
+source connection is **unmeasured**, the next merge is not evidence that deployment will recover.
+
+Before contributions reopen, these must be observed rather than assumed:
+
+- the staging service's source is connected to this repository and to the `staging` branch;
+- a deployment of the current `staging` SHA succeeds;
+- the pre-deploy schema step (`npm run pg:schema`) runs and exits zero;
+- the deployed SHA equals the branch tip;
+- a health check exercises the current build against the migrated staging database.
+
+Re-triggering a deploy is a Railway **dashboard** action and stays a human step. Verifying the
+resulting state is an acceptance criterion of the cutover.
