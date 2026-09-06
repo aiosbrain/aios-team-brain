@@ -5,10 +5,11 @@ description: >
   Codex model AUTHORS (the spec, then the code) — `gpt-6-astra` by default,
   resolved from config rather than pinned — and Fable 5.1 is the independent
   reviewer. Spine — AIOS
-  ticket → astra writes the spec → fold → Fable reviews the SPEC → fold → cycle
-  to convergence → spec gate (`aios spec eval` must say SPEC_READY) → astra
-  writes the code → Fable reviews the DIFF → fold → astra reviews the DIFF cold
-  → fold → push the PR → update the ticket. Use when asked to build a slice with
+  task opened FIRST → astra writes the spec → fold → Fable reviews the SPEC → fold
+  → cycle to convergence → spec gate (`aios spec eval` must say SPEC_READY) → post
+  the spec to the task and move it to in_progress → astra writes the code → Fable
+  reviews the DIFF → fold → astra reviews the DIFF cold → fold → push the PR citing
+  the task key → the task goes done only when EVERY PR carrying that key is merged. Use when asked to build a slice with
   astra as the author, or /adversarial-build-astra. The sibling skill
   `adversarial-build` is the same loop with Claude authoring; prefer that one
   unless astra is specifically wanted. Never merges; the merge word belongs to
@@ -19,10 +20,11 @@ description: >
 
 The spine:
 
-> **aios ticket → astra WRITES the spec → fold → Fable reviews the SPEC → fold →
-> cycle until convergence → spec gate (`aios spec eval`) → astra WRITES the code →
-> Fable reviews the DIFF → fold → astra reviews the DIFF (fresh session) → fold →
-> push the PR → update the ticket**
+> **open the task (`todo`) → astra WRITES the spec → fold → Fable reviews the SPEC →
+> fold → cycle until convergence → spec gate (`aios spec eval`) → POST the spec to the
+> task and move it to `in_progress` → astra WRITES the code → Fable reviews the DIFF →
+> fold → astra reviews the DIFF (fresh session) → fold → push the PR citing the task
+> key → … → when EVERY PR carrying that key is merged, the task goes `done`**
 
 **What is different from `adversarial-build`, and why it matters.** In the sibling
 skill Claude authors and two models review. Here **the worktree's selected Codex
@@ -165,22 +167,103 @@ Leave every change UNCOMMITTED in the working tree.
 
 ---
 
-## 1. Ticket first (AIOS CLI)
+## 1. Open the task FIRST — it is the spine everything else hangs off
 
-- Detect first: `grep '<KEY>' ~/Projects/chetan-workspace/3-log/tasks.md`. If no
-  ticket exists, append a row; if one exists, update it. ID must match
-  `[A-Z][A-Z0-9]+-\d+` — ONE hyphen, uppercase.
+The task is created **before the spec exists**, carries the spec once it does, and is
+the thing every PR in the slice points at. Nothing else in this loop is allowed to
+start until it has a key.
+
+**Create it.** A task is a row in `~/Projects/chetan-workspace/3-log/tasks.md` that
+`aios push` projects into Linear:
+
+```
+| KEY-1 | one-line imperative description | chetan | todo |  |  |
+```
+
+- Detect first — `grep '<KEY>' ~/Projects/chetan-workspace/3-log/tasks.md`. Update an
+  existing row rather than opening a second one for the same work.
+- The ID must match `[A-Z][A-Z0-9]+-\d+` — **ONE hyphen, uppercase**. `ARC-STAB-1`
+  extracts as `STAB-1` and silently fails to close; `arc-stab-1` extracts nothing.
 - `cd ~/Projects/chetan-workspace && set -a && . ./.env && set +a`, then
-  `/opt/homebrew/bin/aios push --dry-run 3-log/tasks.md` and
-  `/opt/homebrew/bin/aios push 3-log/tasks.md`. The bare `aios` on PATH is a shell
-  function that fails outside a workspace — use the binary path.
-- **Read the projection back deterministically** — `/opt/homebrew/bin/aios status`,
-  which prints `pm projection: ok · N synced · 0 errors`, and/or the row's
-  `task_pm_links.provider_url`. A push that printed `ok` is not proof the row moved.
-  Do **not** substitute `aios query "…"` for this: that is an LLM answering from an
-  index, which can be stale, and it is not a projection check.
-- Cite the **brain row key** in the branch, PR and `AIOS-Work:` trailer — never the
-  Linear `AIO-*` key, which resolves to nothing.
+  `/opt/homebrew/bin/aios push --dry-run 3-log/tasks.md` and then without `--dry-run`.
+  The bare `aios` on PATH is a shell function that fails outside a workspace — use the
+  binary path.
+- **Check the push landed**: `/opt/homebrew/bin/aios status` prints
+  `pm projection: ok · N synced · 0 errors`. A `502` prints a `✗` line and
+  `pushed 0/1 item(s)` — **read the count**, and retry; it is the platform's deploy
+  cycle, not your payload.
+- **`aios status` does NOT read a row's status** — it reports file sync and the
+  projection, nothing per-task. Treating it as a status read-back is the proxy this
+  bullet exists to forbid. To actually read the row back, query the brain:
+  `GET /api/v1/tasks?mode=table&keys=<KEY>` — its rows carry `status`.
+- Do **not** use `aios query "…"` either: that is an LLM answering from an index,
+  which can be stale.
+
+**Open at `backlog` or `ready` — NOT `todo`.** The file contains `todo` rows, but the
+brain's canonical set is `backlog, ready, in_progress, in_review, blocked, done`
+(`lib/api/schemas.ts`), and `normalizeTaskStatus("todo")` maps to `backlog` while
+carrying `todo` as a non-canonical `raw_status`. Writing `todo` therefore lands the
+Linear issue in Backlog anyway, just with a stray raw string attached. `in_review` is
+also available if you want a "pushed, awaiting merge" state between `in_progress` and
+`done`.
+
+### Posting the spec to the task — and the cap that decides how
+
+> ⚠️ **This subsection runs AFTER §4, not here.** It lives in §1 because it is the
+> task's lifecycle, but the spec does not exist until §2 writes it, §3 converges it and
+> §4 gates it. Do steps 1–3 below once `aios spec eval` says `SPEC_READY`.
+
+**A spec does not fit in a task description. The cap is exactly 2000 characters** on
+the description field, enforced at both ends — CLI-side in the workspace parser's
+`stringWithin(row.title, 0, 2000)` and brain-side by `lib/api/item-payload-schema.ts`'s
+`z.string().max(2000)`. Exceeding it fails with `local Brain API 1.12 payload
+validation failed`, which names neither the field nor the limit. A real spec is five to
+ten times that. (An earlier draft cited "the longest row is 2001" — that counted the
+table cell's padding spaces; the longest real description is 1999.)
+
+So the spec goes to the brain **as its own document**, and the task carries a pointer:
+
+1. Write the spec to **`~/Projects/chetan-workspace/2-work/specs/<slug>.md`** with
+   `access: team` frontmatter — without it nothing syncs (default-deny). The repo copy
+   in `docs/design/<slug>.md` is what the spec gate and the PR reference; the workspace
+   copy is what the brain can retrieve. Keep them the same document.
+2. Push it — **naming both paths explicitly**, never bare:
+   `aios push --dry-run 2-work/specs/<slug>.md 3-log/tasks.md`, then without
+   `--dry-run`. A bare `aios push` sends every dirty eligible file in the workspace
+   (`0-context`, `2-work`, `4-shared`, `.claude/memory`), so an unrelated draft or a
+   memory file rides out with your spec — and this is outward-facing.
+3. **Update the task row in the same push**: rewrite its description to the spec's
+   one-paragraph summary plus the spec path, and move the status to **`in_progress`**.
+4. **Re-push the spec after the final fold in §8.** The repo copy at
+   `docs/design/<slug>.md` is CANONICAL — it is what the spec gate reads and what the
+   PR cites. The workspace copy exists so the brain can retrieve it, and it goes stale
+   every time §3, §6 or §7 amends the spec. One refresh at §8, after the last fold, is
+   the honest minimum; without it the brain serves a spec that no longer matches the
+   merged work.
+
+That is what "post the spec to the task" means here — a retrievable document plus a
+pointer that fits, rather than a truncated paste that fails validation.
+
+### Where the task ends when the loop does NOT reach a PR
+
+Two exits are reachable before any code, and leaving the row at its opening status is
+how a board fills with work nobody is doing:
+
+- **DECLINE at §3** — the design should not be built. Set the row to `blocked` with the
+  reason in the description, or delete it if the work was never real. Take the decline
+  back to the operator; do not spend rounds arguing with it.
+- **Split at §3** — the original row keeps the narrowed slice and stays `in_progress`;
+  the deferred half gets its own row at `backlog` carrying the ordering rule that
+  failed. Do not close the original as `done` — it did not ship what it described.
+
+### Every PR in the slice cites the SAME key
+
+`AIOS-Work: <KEY>` in the PR body, on its own line. **The brain row key, never the
+Linear `AIO-*` key** — a trailer citing the Linear key resolves to nothing, and a real
+but unrelated key files your work under a stranger's name. Both have happened here.
+
+A slice that takes three PRs uses one key three times. That is what makes §9's
+completion check possible.
 
 ---
 
@@ -532,12 +615,68 @@ Watch checks to a terminal state. Read the brain-task check's **runtime log** fo
 
 ---
 
-## 9. Close the loop
+## 9. Close the task — only when EVERY PR carrying its key is merged
 
-After the human merges: set the row's `Status` to `done` in `3-log/tasks.md`,
-`aios push` (dry-run first), and **read the status back**. The merge automation
-deliberately does not close workspace-pushed rows — they resolve `linked`, not
-`applied` — so closing it yourself is the only thing that closes it.
+The task closes when the **work** is done, not when *a* PR is. A slice that took three
+PRs is not done because the third merged; it is done because all three did.
+
+**Enumerate them exactly.** The obvious search is wrong — measured: `gh pr list
+--search "RELPTR-6 in:body"` returned PRs for RELPTR-4, RELPTR-5, RELPTR-2 and
+SKILLASTRA-1, because GitHub tokenizes the key and matches loosely. A close driven by
+that would fire early or never. Use a quoted phrase, or filter locally on the exact
+trailer:
+
+```bash
+KEY=RELPTR-6
+gh pr list --state all --limit 1000 --json number,state,body \
+  | jq -r --arg k "$KEY" '.[] | select(.body // "" | test("AIOS-Work:[ ]*[*`]*" + $k + "\\b")) | "#\(.number) \(.state)"'
+```
+
+Three things in that line are load-bearing, and I got two of them wrong first:
+
+- **`--limit 1000`, not 100.** Measured: the repo has **673 PRs**, and `--limit 100`
+  reaches back only to **#579**. A slice whose first PR is older than that lists only
+  its recent PRs, sees them all `MERGED`, and closes the task while an earlier one is
+  still open — failing open in exactly the direction this check exists to prevent.
+- **Do NOT anchor the trailer to its own line.** Measured over the last 100 PRs: 73
+  bodies carry `AIOS-Work:`, and a `(?m)^…$` anchor matches only **68**. The five it
+  drops are real trailers written `**AIOS-Work: AUDITFIX-4**` or with backticks — and
+  the repo's own extractor (`scripts/pr-work-keys.mjs`, `lib/pm-sync/work-keys.ts`)
+  links all five, so they ARE part of their tasks. Anchoring would close a task early
+  because one author bolded a line. `[*\`]*` absorbs the decoration; `\b` stops
+  `AUDITFIX-1` matching `AUDITFIX-1x`.
+- **Do not substitute a `--search`.** `gh pr list --search "$KEY in:body"` over-matches
+  badly (it returned RELPTR-4/5/2 and SKILLASTRA-1 when asked for RELPTR-6), and the
+  quoted-phrase form `'"AIOS-Work: RELPTR-2" in:body'` also over-matches — it returns
+  #665, which merely *mentions* RELPTR-2 in prose. (An earlier draft of this section
+  credited line-anchoring for excluding #665. That was wrong: #665 is excluded because
+  its own trailer names RELPTR-3. The label requirement is what does the work.)
+
+Verified verbatim: the command above returns exactly `#662 #660` for `RELPTR-2` and
+`#678` for `RELPTR-6`.
+
+**Then, and only then:**
+
+1. every listed PR reads `MERGED`. If any is `OPEN`, the task stays `in_progress`. If
+   any is `CLOSED` **unmerged**, decide explicitly and record it in the row: either the
+   task waits for a replacement PR carrying the same key, or that PR's scope is
+   formally dropped from the slice. "Say so" is not a decision, and an abandoned PR
+   silently counted as done is how a task closes over work that never shipped;
+2. set `Status` to `done` in the row, `aios push` (dry-run first);
+3. **read the status back** and check the pushed count — a 502 reports `pushed 0/1`
+   while looking otherwise unremarkable.
+
+**Why you close it yourself.** The merge automation deliberately does **not** close a
+workspace-pushed row. `aios-work-sync` fires on the trailer and writes a `work_events`
+row, but a row pushed from `3-log/tasks.md` resolves through the team-wide fallback and
+lands **`linked`**, not `applied` — recorded, and deliberately left open, because
+completing on a team-wide match would create duplicate Linear issues. Six tasks once sat
+open with correct trailers for exactly this reason. Closing it yourself is not
+belt-and-braces; it is the only thing that closes it.
+
+And note the direction of travel: `lib/ingest/tasks` writes status straight from the
+file row, so if a task ever IS auto-closed while your local row still says
+`in_progress`, the next `aios push` clobbers it back open. Fix the row before pushing.
 
 ---
 
