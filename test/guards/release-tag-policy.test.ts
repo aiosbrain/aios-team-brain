@@ -301,10 +301,29 @@ describe("release: the operator-facing commands must actually run (criteria 5, 6
 
   it("RELEASING.md gates the PRET-6 upgrade on a QUERY, not a log line", () => {
     // The boot retry lives in the scheduler, which only starts when ingestion is enabled — so a log
-    // line is not evidence. Both preconditions must be checked directly.
+    // line is not evidence. The preconditions must be checked directly.
+    //
+    // RETARGETED by STAGINGMARK-2, and this guard CAUGHT that change in CI, which is why the
+    // retarget is deliberate rather than a deletion. This used to require `pret4_builtin_materialize`
+    // in the doc, because a missing marker was a precondition the operator had to satisfy by hand.
+    // It is not one any more: the PRET-6 migration repairs a missing marker itself. Requiring the
+    // string now would pin the doc to advice that is false. What replaced it is the SUBSTRATE
+    // condition — the one thing repair cannot manufacture — so the guard's intent (both live
+    // preconditions are checked by a query) is preserved by pinning the CURRENT two.
     const doc = readFileSync(join(ROOT, "docs", "RELEASING.md"), "utf8");
-    expect(doc).toMatch(/pret4_builtin_materialize/);
-    expect(doc).toMatch(/access_enforcement\s*=\s*'permissive'/);
+    expect(doc, "the permissive precondition is unchanged and still gates").toMatch(/access_enforcement\s*=\s*'permissive'/);
+    expect(
+      doc,
+      "the substrate precondition replaced the marker one: content with no partition rows still refuses"
+    ).toMatch(/project_context_memberships/);
+    // …and the retired marker precondition must not come back AS A GATE. Pinned on the invariant,
+    // not the string: prose explaining that the old check was dropped is legitimate and useful to an
+    // operator who remembers it, so this asserts the marker is absent from the QUERY the doc tells
+    // you to run, and that nothing instructs you to proceed on it. (A first version of this
+    // assertion banned the bare string and reddened on that very explanation.)
+    const sqlBlocks = [...doc.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) => m[1]).join("\n");
+    expect(sqlBlocks, "the gate query must not re-acquire a marker precondition").not.toMatch(/marker_ok/);
+    expect(doc, "and nothing may instruct an operator to gate on the marker").not.toMatch(/Proceed only on[^.]*marker_ok/);
     expect(doc).toMatch(/INGEST_POLL_ENABLED/);
     expect(doc).toMatch(/release\/v0\.11\.0/);
     // …and says WHERE those steps run. Both the flip command and the column the gate reads are
