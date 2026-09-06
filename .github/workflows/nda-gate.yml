@@ -97,8 +97,8 @@ jobs:
             # insufficient (add→scrub history would disappear). Scan all reachable history.
             node scripts/nda-scan.mjs --range "$HEAD_SHA"
           fi
-      # pull_request_target's own check belongs to the DEFAULT-branch SHA (the BASE SHA before
-      # 2025-12-08), so branch protection cannot use it
+      # pull_request_target's own check belongs to the DEFAULT-branch SHA (it was the base SHA before 2025-12-08),
+      # so branch protection cannot use it
       # for the PR head. Publish the verdict explicitly, after validating/fetching that exact head.
       - name: Publish PR-head verdict
         if: github.event_name == 'pull_request_target' && always()

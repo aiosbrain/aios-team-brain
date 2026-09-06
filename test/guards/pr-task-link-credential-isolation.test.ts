@@ -515,6 +515,10 @@ describe("guard: pr-task-link.yml specifically", () => {
     [/default is the base branch/i, "checkout default is the base branch"],
     [/base.branch (?:code|scanner) only/i, "base-branch-code-only rule"],
     [/policy allows\s+`main`\s+only/i, "policy allows main only"],
+    // "base SHA" — the vocabulary the EIGHTH carrier used. Fable found the text AND the gap: fixing
+    // the line without adding the pattern leaves the guard unable to catch its return (mutation M16
+    // SURVIVED until this row existed).
+    [/base SHA/i, "check attaches to the base SHA"],
   ];
   /** The claim that must be POSITIVELY made — a date alone certifies nothing. */
   const CURRENT_MODEL = /default branch,? regardless of the pull request's base|evaluate against the default branch|ref is the DEFAULT branch|from the DEFAULT branch/;
