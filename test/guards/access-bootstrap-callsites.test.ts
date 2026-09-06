@@ -41,6 +41,24 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     expect(downstreamIdx).toBeGreaterThan(matIdx);
   });
 
+  it("STAGINGMARK-1: the admin CLI reaches the materialization ONLY through the tested handler", () => {
+    const admin = read("scripts/admin.ts");
+    // (a) the dispatch exists, pinned by CALL SHAPE rather than a bare name — a comment naming
+    //     the handler must not satisfy this.
+    expect(admin).toMatch(/runMaterializeCommand\s*\(/);
+    expect(admin).toMatch(/makeMaterializeDeps\s*\(/);
+    // (b) the command is discoverable.
+    expect(admin).toMatch(/materialize-builtins/);
+    // (c) THE LOAD-BEARING HALF. Without it the CLI could call the handler *and* invoke the
+    //     materializer directly, leaving every behavioural test in
+    //     test/access-materialize-command.test.ts green while the real command still wrote —
+    //     the second-writer shape this file exists to prevent.
+    expect(
+      admin,
+      "scripts/admin.ts must not call materializeBuiltinMembershipOnce directly — go through runMaterializeCommand"
+    ).not.toMatch(/materializeBuiltinMembershipOnce/);
+  });
+
   it("team creation bootstraps the access topology", () => {
     expect(read("lib/admin/teams.ts")).toMatch(/ensureAccessBootstrap\s*\(/);
   });

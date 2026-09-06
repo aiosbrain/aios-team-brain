@@ -228,11 +228,14 @@ guard; the USAGE line; the runbook section.
   `teams:0` the output distinguishes *marker stamped, zero teams reconciled* from AC3's substantive
   wording. *The first draft would have printed "it ran" for a call that did nothing.*
 - **AC8 — `--confirm` is a bare flag, and a value is REFUSED (unit):** the CLI-boundary parser accepts
-  `--confirm`; for `--confirm false`, `--confirm=false` and a duplicated `--confirm`, it **refuses**
-  with a message rather than treating the string as truthy. *Verified at the parse boundary, not
-  through the handler, because `parseArgs` (`scripts/admin.ts:37-48`) is exactly where
-  `"false"` becomes truthy — AC1–AC5 take an already-normalised boolean and structurally cannot catch
-  this.*
+  the bare forms; for `--confirm false`, `--confirm-production <value>` and `--confirm=false` it
+  **refuses** with a message rather than treating the string as truthy or silently ignoring it.
+  *Verified at the parse boundary, not through the handler, because `parseArgs`
+  (`scripts/admin.ts:37-48`) is exactly where `"false"` becomes truthy — AC1–AC5 take an
+  already-normalised boolean and structurally cannot catch this. Round 2 also asked for a duplicated
+  `--confirm` to be refused; that is **not built and the criterion does not claim it**, because
+  `parseArgs` collapses `--confirm --confirm` to the same `true` before this layer sees it, making the
+  two spellings indistinguishable by construction — and they mean the same thing.*
 - **AC9 — the dispatch is pinned by SHAPE, and there is no second writer (unit guard):**
   `test/guards/access-bootstrap-callsites.test.ts` asserts (a) `scripts/admin.ts` calls
   `runMaterializeCommand(` , (b) `USAGE` lists `materialize-builtins`, and (c) `scripts/admin.ts`
