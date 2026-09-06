@@ -7,13 +7,12 @@ import { PRET4_MATERIALIZE_MARKER, materializeBuiltinMembershipOnce } from "@/li
  * STAGINGMARK-1 — the operator entry point for PRET-4's one-time builtin materialization.
  * Spec: docs/design/stagingmark1-materialize-oneshot.md.
  *
- * WHY THIS EXISTS. The PRET-6 preDeploy guard refuses a fleet that has teams but no
- * `pret4_builtin_materialize` marker, and that marker has exactly ONE writer
- * (`materializeBuiltinMembershipOnce`) reachable from exactly TWO call sites — boot
- * (`instrumentation.ts`) and the scheduler tick — both of which are downstream of a deploy that
- * SUCCEEDED. A fleet in that state therefore cannot get the marker by any amount of redeploying:
- * the guard refuses, the code never boots, the marker is never stamped. Observed on staging
- * 2026-09-05 (deploy 2e67246e).
+ * WHY THIS EXISTS. STAGINGMARK-1 provided attended recovery for the markerless fleet
+ * observed on staging 2026-09-05 (deploy 2e67246e). STAGINGMARK-2 now reconciles such
+ * fleets during PRET-6 preDeploy through the frozen SQL function in schema.sql.
+ * The TypeScript materializer remains callable from boot, scheduler and this command;
+ * both historical writers stamp only after reconciliation. This command remains useful
+ * for an operator inspecting a fleet or recovering an older release.
  *
  * WHY THE BEHAVIOUR LIVES HERE AND NOT IN `scripts/admin.ts`. That file USED TO call `main()` at
  * module scope, so a test importing it executed the CLI — the same reason `formatAccessHealth` was

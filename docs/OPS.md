@@ -753,29 +753,35 @@ legs go stale in staging, but that alarm is *thresholded* and *true*).
   button, and `scripts/graph-window-battery/run-projection.ts`.
 - Staging is **disposable**: anything created there is destroyed by the next refresh.
 
-### If a deploy refuses with "the PRET-4 builtin materialization has not completed"
+### Builtin materialization during deploy and attended recovery
 
-The exact failure, as it appears in the Railway build log — the deploy stops at `preDeploy`:
+**STAGINGMARK-2 repairs markerless fleets during PRET-6 preDeploy**, including teams with
+no builtin groups and fleets that never booted PRET-4. `schema.sql` defines the frozen
+`materialize_builtin_membership_once()` function once; the migration calls it after the
+permissive-team readiness refusal and before dropping the retired columns. It creates Everyone
+and External, reconciles every member by tier in both directions, and stamps the marker last.
+An already-marked fleet returns without membership writes, audits or materializer locks.
 
-```
-schema load failed: PRET-6 refused: the PRET-4 builtin materialization has not completed on this
-fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.md)
-```
+Reconcile failures (including a non-builtin group holding a reserved slug) halt the deploy.
+Reconciliation, marker and column drops roll back together. Earlier schema/migrations have
+already committed: the loader has no transaction around the entire replay. Resolve the reported
+failure and retry; permissive teams still require the prior release's readiness/flip path.
 
-**This happened to staging on 2026-09-05** (deploy `2e67246e`). It means the database has teams but no
-`pret4_builtin_materialize` marker. **The refusal is safe, and the running version keeps serving** — it
-raises before the column drop, so the PRET-6 block changes nothing. Be precise about the rest:
-`scripts/pg-load-schema.mjs` replays `postgres/schema.sql` and then each migration in filename order
-with **no wrapping transaction**, so `schema.sql` and every migration sorting before
-`20260818210000_pret6_retire_access_enforcement.sql` HAVE already applied (idempotently), and the ones
-sorting after it have not. The release is stopped part-way through an idempotent replay, which the next
-successful deploy completes — not an all-or-nothing abort.
+On a marker miss the function locks `teams`, `members`, `groups`, `group_members`, then
+`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker. The migration sets
+`lock_timeout` to 15 seconds per LOCK/drop statement: five locks plus the ACCESS EXCLUSIVE
+column-drop upgrade can wait **6 × 15 s = 90 s**, not a fleet-size or total-runtime guarantee.
+The deadlock-freedom premise is that no current application transaction spans two of those
+five tables; a future `members` → `group_members` transaction would invalidate it. An older
+release's multi-statement TypeScript materializer is not retroactively serialized by these locks.
 
-It is also a **deadlock**, which is why it needs a command rather than a retry: the marker is written
-only by application code (`instrumentation.ts` at boot, and the scheduler tick), and both of those are
-downstream of a deploy that succeeded. Redeploying the same commit will refuse again, forever.
+**Never delete the marker as a repair recipe.** Marker loss cannot be distinguished from first
+materialization and can restore deliberately removed memberships. Boot/tick already had this
+behavior; preDeploy now performs it earlier.
 
-**The fix — stamp the marker directly:**
+**Attended recovery remains available**, particularly for older releases that still emit
+“the PRET-4 builtin materialization has not completed” (the staging failure on 2026-09-05,
+deploy `2e67246e`). The command reconciles before stamping; it never merely silences a guard:
 
 ```bash
 DATABASE_URL="<the wedged database's URL>" npm run admin -- materialize-builtins
@@ -801,5 +807,4 @@ so running it against a healthy fleet is harmless.
 **The alternative, if you would rather not run a command against the database:** roll back to the
 previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
 see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
-is what `docs/RELEASE-NOTES-pret6.md` describes; the command above exists because a self-hoster has no
-dashboard to roll back in.
+is an older-release recovery option; current STAGINGMARK-2 deployments perform marker repair themselves.

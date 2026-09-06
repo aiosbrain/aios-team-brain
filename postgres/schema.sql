@@ -2959,3 +2959,77 @@ create table if not exists content_approvals (
 );
 create index if not exists content_approvals_team_status_idx on content_approvals (team_id, status, created_at desc);
 create index if not exists content_approvals_variant_idx on content_approvals (variant_id);
+
+-- STAGINGMARK-2: frozen PRET-4 tier predicate, callable before later migrations.
+-- Keep the boolean signature and this single definition stable. SECURITY INVOKER:
+-- the loader and app share DATABASE_URL's role; no elevated privilege is needed.
+-- No application transaction currently spans two of these five locked tables.
+-- A future members -> group_members transaction invalidates that deadlock premise.
+-- Old multi-statement TS callers are not retroactively serialized by these locks.
+create or replace function materialize_builtin_membership_once()
+returns boolean language plpgsql security invoker as $$
+declare
+  builtin record;
+  added uuid[];
+  removed uuid[];
+begin
+  if exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
+    return false;
+  end if;
+
+  lock table teams in share row exclusive mode;
+  lock table members in share row exclusive mode;
+  lock table groups in share row exclusive mode;
+  lock table group_members in share row exclusive mode;
+  lock table migration_markers in share row exclusive mode;
+  if exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
+    return false;
+  end if;
+
+  -- Refuse every squatter before any mutation, then CREATE absent builtins before
+  -- computing want. Joining only existing groups would silently stamp empty teams.
+  if exists (select 1 from groups where slug in ('everyone', 'external') and not is_builtin) then
+    raise exception 'PRET-4 refused: a non-builtin group holds a reserved slug';
+  end if;
+  insert into groups (team_id, slug, name, is_builtin)
+    select t.id, b.slug, b.name, true from teams t
+    cross join (values ('everyone', 'Everyone'), ('external', 'External')) b(slug, name)
+    on conflict (team_id, slug) do nothing;
+
+  for builtin in
+    select id, team_id, slug from groups
+    where is_builtin and slug in ('everyone', 'external') order by team_id, slug
+  loop
+    with inserted as (
+      insert into group_members (team_id, group_id, member_id)
+        select builtin.team_id, builtin.id, m.id from members m
+        where m.team_id = builtin.team_id
+          and m.tier = (case when builtin.slug = 'everyone' then 'team' else 'external' end)::access_tier
+        on conflict (group_id, member_id) do nothing
+        returning member_id
+    ) select coalesce(array_agg(member_id), '{}'::uuid[]) into added from inserted;
+
+    with deleted as (
+      delete from group_members gm
+        where gm.team_id = builtin.team_id and gm.group_id = builtin.id
+          and not exists (select 1 from members m
+            where m.team_id = builtin.team_id and m.id = gm.member_id
+              and m.tier = (case when builtin.slug = 'everyone' then 'team' else 'external' end)::access_tier)
+        returning member_id
+    ) select coalesce(array_agg(member_id), '{}'::uuid[]) into removed from deleted;
+
+    if cardinality(added) > 0 or cardinality(removed) > 0 then
+      -- Only audit is best-effort. Reconciliation errors must abort the statement.
+      begin
+        insert into audit_log (team_id, actor_kind, action, target_type, target_id, meta)
+          values (builtin.team_id, 'system', 'access.builtin_materialized', 'access', builtin.id::text,
+            jsonb_build_object('slug', builtin.slug, 'added', added, 'removed', removed));
+      exception when others then
+        raise notice 'access.builtin_materialized audit failed for group %: %', builtin.id, sqlerrm;
+      end;
+    end if;
+  end loop;
+
+  insert into migration_markers (name) values ('pret4_builtin_materialize') on conflict (name) do nothing;
+  return true;
+end $$;
