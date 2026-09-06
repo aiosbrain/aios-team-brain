@@ -78,6 +78,17 @@ describe.each(cases)("AC8 $script registry", ({script,registry}) => {
   it("covers every boolean consumer and excludes value consumers", () => {
     expect(violations(source,registry)).toEqual([]);
   });
+  // KNOWN GAP, recorded rather than overclaimed (astra diff review). The forall clause is per
+  // NAME, not per OCCURRENCE: one classified read blesses every other read of the same name, so a
+  // name proven to be a value flag can still be truthiness-gated in an unrecognised spelling. Going
+  // per-occurrence would require every `flags.x !== undefined` and every plain assignment across
+  // both CLIs (~20 reads, none related to flag arity) to be rewritten into a recognised form, which
+  // is disproportionate for this slice. `it.fails` so this flips RED the day someone closes it.
+  it.fails("KNOWN GAP: a value-classified name can still be truthiness-gated elsewhere", () => {
+    const mixed = 'typeof flags.wipe === "string";\nconst w = flags.wipe;\nif (w) destroy();';
+    expect(violations(mixed, [])).toContain("unclassified read: wipe");
+  });
+
   it("negative control: a boolean-typed `as` cast cannot launder an unregistered flag", () => {
     for (const read of ["const w = flags.wipe as boolean; if (w) go();", "flags.wipe as true;"]) {
       expect(violations(read, []), read).toContain("unregistered boolean: wipe");
