@@ -57,21 +57,24 @@ name: AIOS work sync
 # happens this job reads the repository-level values and really does post the work event.
 #
 # ─────────────────────────────────────────────────────────────────────────────────────────
-# RELPTR-4 — BOTH the contribution base and the integration branch, deliberately, and landed
-# BEFORE the cutover rather than on the day. Today no pull request targets `staging`, so the
-# second entry is near-inert.
+# RELPTR-4 landed BOTH branches before the cutover rather than on the day. THE CUTOVER HAPPENED
+# 2026-09-06 (RELPTR-7): `staging` is now the contribution base and the default branch, so the
+# `staging` entry carries the ordinary traffic and `main` is the one that is now near-inert —
+# `main` advances by release fast-forward, which is a PUSH and raises no `pull_request_target`.
+# `main`'s entry therefore serves in-flight and exceptional pull requests into the release branch.
 #
-# THE ACCEPTED COST, stated rather than discovered: a MISTAKEN merge into `staging` (258 behind)
-# now emits a work event where before it emitted nothing. For a brain-native row in the pushed
-# project that resolves `applied`, i.e. it would complete a task and project it to Linear for
-# work that is not on trunk. Judged smaller than the risk of doing this on cutover day.
+# THE ACCEPTED COST, stated rather than discovered, and now inverted: before the cutover the worry
+# was a MISTAKEN merge into `staging` emitting a work event for work that was not on trunk. Post
+# cutover `staging` IS the trunk, so that cost is gone; the mirror-image case — a merge into `main`
+# outside the release ritual — is the one to watch.
 #
-# THE SECOND COST, NEW WITH `pull_request_target` AND NOT INERT AT CUTOVER: the run's ref is the
-# pull request's target branch, and `trusted-automation` permits `main` only. A merge into
-# `staging` would be REFUSED the environment and the job would go red having run zero steps —
-# loud, not silent, but a work event that never posts. That is fine while nothing targets
-# `staging`; at cutover the environment's branch policy and this trigger list have to move
-# together, exactly as `pr-task-link.yml`'s do. `docs/RELEASING.md` §3.1c carries the entry.
+# THE SECOND COST IS RETIRED, AND THE PARAGRAPH THAT STATED IT WAS WRONG. It said the run's ref is
+# the pull request's target branch, so a `staging` merge would be refused a `main`-only environment
+# and go red with zero steps. That was the pre-2025-12-08 model. GitHub changed it, effective
+# 2025-12-08: "For `pull_request_target`, environment rules evaluate against the default branch."
+# So this job's environment check follows the DEFAULT branch, never the pull request's base — which
+# is precisely why `trusted-automation` had to contain `staging` BEFORE the default moved, and why
+# it did. See `pr-task-link.yml`'s header for the full quotation and the changelog link.
 #
 # The branch list is pinned by `test/guards/branch-roles.test.ts` as an EXACT SET — not
 # "contains both", because `[main, staging, "**"]` satisfies containment while silently

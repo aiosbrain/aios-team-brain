@@ -18,7 +18,7 @@ const resolution = 'root="$(git rev-parse --show-toplevel)"\nbase="$(node "$root
 const fetch = 'git -C "$root" fetch origin "$base"';
 const diff = 'git -C "$root" diff "origin/$base...HEAD"';
 const sequence = `${resolution}\n${fetch}\n${diff}`;
-const prose = 'the contribution base (currently `main`, declared in `scripts/branches.mjs`)';
+const prose = 'the contribution base (currently `staging`, declared in `scripts/branches.mjs`)';
 const normalized = (path: string) => read(path).replace(/^ +/gm, "");
 
 // Each entry is a SITE, including scan-blind grading/prose. Deleting any site must fail.

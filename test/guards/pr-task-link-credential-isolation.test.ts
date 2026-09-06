@@ -467,12 +467,20 @@ describe("guard: pr-task-link.yml specifically", () => {
     expect(triggers(doc())).toEqual(["pull_request_target"]);
   });
 
-  it("is pinned to `main`, which is what the environment's branch policy allows", () => {
-    // On pull_request_target the run's ref is the PR's BASE branch, and `trusted-automation` only
-    // permits `main`. A PR into any other branch would be refused the environment and go RED — and
-    // this check is advisory, so it is never allowed to go red. The two settings move together.
+  it("fires on exactly the release branch and the contribution base", () => {
+    // WAS "pinned to `main`, which is what the environment's branch policy allows", and the
+    // rationale under it was the pre-2025-12-08 event model: it said the run's ref is the PR's BASE
+    // branch, so a PR into any other branch would be refused a `main`-only environment and go red.
+    //
+    // GitHub changed that effective 2025-12-08 — "For `pull_request_target`, environment rules
+    // evaluate against the default branch" — so the base branch never decides the environment check,
+    // and the trigger list and the policy are INDEPENDENT. The assertion below was always right; only
+    // its reason was wrong, which is the more dangerous half to leave standing.
+    //
+    // What keeps this advisory check off red now is the `trusted-automation` policy containing the
+    // DEFAULT branch (widened to `[main, staging]` before the default moved at the cutover).
     const on = doc().on as Record<string, { branches?: unknown; types?: unknown }>;
-    expect(on.pull_request_target.branches).toEqual(["main"]);
+    expect(on.pull_request_target.branches).toEqual(["main", "staging"]);
     expect(on.pull_request_target.types).toEqual(["opened", "edited", "synchronize", "reopened"]);
   });
 
@@ -604,8 +612,10 @@ describe("guard: aios-work-sync.yml specifically", () => {
 
   it("takes its credentials from the `trusted-automation` environment", () => {
     // The third and last `AIOS_*` consumer to enrol, which is what unblocks deleting the
-    // repository-level copies. NOT a fork boundary: on pull_request_target the ref is always the
-    // base branch, so a fork pull request satisfies a `main`-only policy too. See the file header.
+    // repository-level copies. NOT a fork boundary: on `pull_request_target` the ref is the DEFAULT
+    // branch (GitHub, effective 2025-12-08), so every author — fork or not — satisfies the policy
+    // identically. An earlier version of this line said "always the base branch"; same conclusion,
+    // obsolete mechanism. See the file header.
     expect(job().environment).toBe("trusted-automation");
     expect(secretRefs(job())).toEqual(["AIOS_API_KEY", "AIOS_BRAIN_URL", "AIOS_TEAM"]);
   });

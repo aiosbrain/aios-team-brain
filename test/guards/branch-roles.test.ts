@@ -33,7 +33,7 @@ const workflow = (name: string) => parseYaml(read(`.github/workflows/${name}`)) 
 
 describe("branch roles — one owner per role (criteria 1, 2)", () => {
   it("the three roles hold the values the design says they hold", () => {
-    expect(CONTRIBUTION_BASE, "moves at the cutover").toBe("main");
+    expect(CONTRIBUTION_BASE, "MOVED at the cutover, 2026-09-06").toBe("staging");
     expect(INTEGRATION_BRANCH, "already staging — RELPTR-3 reads it").toBe("staging");
     expect(RELEASE_BRANCH, "what installers deploy").toBe("main");
     expect(remoteRef("x")).toBe("refs/remotes/origin/x");

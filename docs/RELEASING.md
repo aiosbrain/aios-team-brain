@@ -72,11 +72,26 @@ checkpoint you can return to once its migrations have run.
 
 ---
 
-## 3. The cutover that has not happened yet
+## 3. The cutover — EXECUTED 2026-09-06 (RELPTR-7)
 
-The repository still deploys trunk to production and still hands trunk to installers. Fixing that
-means choosing a branch model and executing a coordinated cutover. **The design work is done and
-recorded** in `design/release-pointer-stable-branch.md`; the decision and the execution are not.
+**Option B is live.** `staging` is the default branch and the contribution base; `main` is the release
+branch and advances only by fast-forward to a tagged commit. `scripts/branches.mjs` answers `staging`
+for `--print contribution`. The design is in `design/release-pointer-stable-branch.md`; the execution
+is `design/cutover-execution.md`.
+
+**What was measured on the day, because two of these were surprises:**
+
+- `main` was **not an ancestor of `staging`** — three reviewed commits had landed on `main` after the
+  default branch moved, so no release candidate could satisfy both guard assertions at once. Fixed by
+  a back-merge (#681) *before* anything else; the ancestry that makes a fast-forward release possible
+  is a precondition, not a consequence.
+- `scan-on-merge` went red in 3 seconds with **zero steps run**, twice, because the
+  `trusted-automation` environment still permitted `main` only. That is a `push` trigger, whose ref is
+  the pushed branch — see §3.1c item 4 for why its two `pull_request_target` siblings behave
+  differently.
+
+The rest of this section is kept in its original tense where it records *why* the model was chosen,
+and corrected where it made claims that the execution disproved.
 
 The recommendation there is **option B — `main` becomes the release branch, `staging` becomes the
 integration branch** — because every artefact that names a branch today already names `main`: the
@@ -174,25 +189,31 @@ file a human must change:
    still are. The **environment** is not, and after the credential-isolation fix all three workflows
    name it, so the policy is a cutover-day edit for every one of them:
 
-   - **`pr-task-link.yml`** — the trigger list AND the policy move together. It runs on
-     `pull_request_target`, so the run's ref is the pull request's target branch; once the environment
-     holds the credentials a `staging`-based run would be refused a `main`-only policy and go red — on
-     an advisory check that is never allowed to go red. Leaving its trigger at `[main]` instead makes
-     it go **dark** for `staging` pull requests: the safer failure, still a loss nobody would notice.
-     `test/guards/pr-task-link-credential-isolation.test.ts` pins that trigger to exactly `["main"]`
-     so the widening has to be deliberate.
-   - **`aios-work-sync.yml`** — trigger already `[main, staging]`, but it moved from `pull_request` to
-     `pull_request_target` to close the credential hole (the `merged == true` gate used to live in a
-     file the pull request could rewrite). Same consequence: the run's ref is the target branch, so a
-     `staging` merge would be refused the environment and go red having run zero steps, and **no work
-     event would post**. Loud, not silent — and inert only while nothing targets `staging`.
-   - **`scan-on-merge.yml`** — trigger already `[main, staging]`, on `push`, so the run's ref is the
-     pushed branch. A `staging` push would be refused the environment the same way. Nothing has pushed
-     `staging` since 2026-07-25.
+   ⚠️ **THE MECHANISM BELOW WAS WRONG FOR THE TWO `pull_request_target` WORKFLOWS, and the correction
+   changes what the ordering pair protects.** The original text said their run ref is *the pull
+   request's target branch*, so a `staging`-based run would be refused a `main`-only policy. GitHub
+   changed that effective **2025-12-08**: *"The workflow file and checkout commit will always be taken
+   from the repository's default branch, regardless of the pull request's base branch"*, and *"For
+   `pull_request_target`, environment rules evaluate against the default branch."*
+   ([changelog](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/))
 
-   So the cutover-day edit is one policy change (add `staging` to the environment's branch policy)
-   plus `pr-task-link.yml`'s trigger list. Do the policy **first**: widening it is inert until a
-   branch is actually used, whereas doing it late means red merge automation on the day.
+   - **`pr-task-link.yml`** (`pull_request_target`) — the environment is evaluated against the
+     **default** branch, so the base of a pull request never decides it, and the trigger list and the
+     policy are **independent**. Widening the trigger early was therefore harmless; leaving it at
+     `[main]` after the default moved made it go **dark** for `staging` pull requests — the safer
+     failure, still a loss nobody would notice. Now `[main, staging]`.
+   - **`aios-work-sync.yml`** (`pull_request_target`) — same evaluation, same conclusion. Its move from
+     `pull_request` closed a credential hole (the `merged == true` gate used to live in a file the pull
+     request could rewrite) and is unrelated to the branch question.
+   - **`scan-on-merge.yml`** (`push`) — **the one the old mechanism was right about.** A `push` run's
+     ref IS the pushed branch, and the 2025-12-08 change does not touch `push`. MEASURED 2026-09-05:
+     two `staging` pushes were refused a `main`-only policy and went red in 3 seconds having run zero
+     steps, with no scan posted.
+
+   So the real hazard is not the trigger widening at all — it is the **default-branch move**, after
+   which *every* `pull_request_target` run evaluates against the new default and a policy lacking it
+   refuses all of them at once. Do the policy **first**: widening it is inert until the default moves
+   or a branch is actually pushed, whereas doing it late means red automation across the whole repo.
 
    A related manual step, **not** a cutover item and **not** to be done in the pull request that
    enrolled these workflows: the three values still exist as repository-level secrets, which GitHub
@@ -238,8 +259,10 @@ read failures are fatal. Exclusions: `docs/design/**` and `docs/archive/**` (his
 Not a total order — these are the adjacencies where getting it backwards causes the incident:
 
 ```yaml
-cutover: pending
+cutover: done                      # 2026-09-06, RELPTR-7
 order:
+  - widen-trusted-automation-policy: BEFORE the default branch moves   # the one that bit us
+  - reconcile-main-into-staging: before any release candidate          # main must be an ANCESTOR
   - fast-forward-staging: before retargeting any contribution flow
   - declare-tag-in-DEFAULT_TAGS: before cutting the tag
   - release-actor-protection: before the first fast-forward push to main
@@ -251,6 +274,7 @@ order:
   - fast-forward-staging: before any candidate tag is pushed
   - work-sync-and-scan-widened: DONE (RELPTR-4), before contributions move
   - dependabot-target-branch: at the cutover, never before (it would aim at a stale branch)
+  - tag-ruleset-ENFORCEMENT-active: creating the ruleset is not enabling it   # shipped `disabled`
 ```
 
 The `workflow-on-main` pair is this repository's own scar tissue: `docs/CI-ARCHITECTURE.md` records that switching on

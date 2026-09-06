@@ -404,7 +404,7 @@ the signal, not the phrasing superstition.
 
 ## 5. Astra writes the code
 
-Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `main`).
+Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `staging`).
 Then hand astra the approved spec:
 
 ```bash
