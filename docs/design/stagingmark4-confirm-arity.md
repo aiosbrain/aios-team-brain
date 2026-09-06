@@ -168,8 +168,10 @@ records call COUNTS; a throwing fake alone is not proof of non-invocation.
   from either CLI must redden this**, demonstrated by an executed mutation, not asserted in prose.*
 - **AC8 — the registry is provably complete (unit guard):** ∀ over `scripts/admin.ts` AND
   `scripts/brain-tasks.ts` — every truthiness read (`Boolean(flags.x)`, `!flags.x`, `flags.x &&`,
-  bare `flags.x` in a condition) is IN that CLI's registry, every `as string` / `typeof === "string"`
-  read is NOT in it, **any flag NAME with no classified read anywhere fails as `unclassified read:
+  bare `flags.x` in a condition) is IN that CLI's registry, every `as <value type>` / `typeof === "string"`
+  read is NOT in it, an `as` cast is classified by its ASSERTED TYPE (boolean-only => boolean read;
+  a value type => value read; `any`/`unknown`/`as const`/a type reference => UNRESOLVABLE, so the
+  forall clause fires), **any flag NAME with no classified read anywhere fails as `unclassified read:
   <name>`** (per NAME, not per occurrence — see the recorded gap below), a name in both classes fails, and `CONFIRM_KEYS` from
   `lib/access/materialize-command.ts` is a subset of `admin.ts`'s registry (read from the
   DECLARATION via the AST — not an import and not a copied literal, so it cannot drift). *Negative controls, both required: one `flags.newflag &&` read, AND each unclassified spelling
@@ -178,8 +180,9 @@ records call COUNTS; a throwing fake alone is not proof of non-invocation.
   EXISTENTIAL: it proves things about the spellings it recognises and is silent on the rest.
   **Recorded residual:** the clause is per NAME, so one classified read blesses the name's other
   reads; a value-classified flag truthiness-gated in an unrecognised spelling still passes. Pinned
-  as an `it.fails` gap rather than claimed closed — per-occurrence strictness would require ~20
-  unrelated read rewrites across both CLIs. Without this a
+  as an `it.fails` gap rather than claimed closed — per-occurrence strictness would require 37
+  unrelated read rewrites across both CLIs (measured by the diff review: 17 of 46 in `admin.ts`,
+  20 of 57 in `brain-tasks.ts`). Without this a
   future boolean flag silently reintroduces the trap, and this is the criterion the first draft was
   missing entirely.*
 

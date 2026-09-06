@@ -5,12 +5,37 @@ import { ADMIN_BOOLEAN_FLAGS, TASK_BOOLEAN_FLAGS } from "@/lib/admin/args";
 import { parseConfirmFlags } from "@/lib/access/materialize-command";
 
 function unwrap(node: ts.Node): ts.Node {
-  return ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node;
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) {
+    return unwrap(node.expression);
+  }
+  return node;
 }
 function flagName(node: ts.Node): string | undefined {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node) && node.expression.getText() === "flags") return node.name.text;
   if (ts.isElementAccessExpression(node) && node.expression.getText() === "flags" && ts.isStringLiteral(node.argumentExpression)) return node.argumentExpression.text;
+}
+/** The OUTERMOST cast of a chain — `x as unknown as boolean` must be judged by `boolean`. */
+function unwrapType(node: ts.AsExpression): ts.Node {
+  return node.expression;
+}
+type TypeVerdict = "boolean" | "value" | "unresolvable";
+function classifyType(t: ts.TypeNode): TypeVerdict {
+  if (t.kind === ts.SyntaxKind.BooleanKeyword) return "boolean";
+  if (ts.isLiteralTypeNode(t) && [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword].includes(t.literal.kind)) return "boolean";
+  if (t.kind === ts.SyntaxKind.StringKeyword || t.kind === ts.SyntaxKind.NumberKeyword) return "value";
+  if (ts.isLiteralTypeNode(t) && ts.isStringLiteral(t.literal)) return "value";
+  if (ts.isUnionTypeNode(t)) {
+    // Drop the nullish members, then: all-boolean => boolean; any value member => value (this is the
+    // boundary `flags.labels as string | boolean | undefined` sits on, and it must stay a VALUE).
+    const parts = t.types.filter(m => m.kind !== ts.SyntaxKind.UndefinedKeyword && m.kind !== ts.SyntaxKind.NullKeyword
+      && !(ts.isLiteralTypeNode(m) && m.literal.kind === ts.SyntaxKind.NullKeyword));
+    const vs = parts.map(classifyType);
+    if (vs.length && vs.every(v => v === "boolean")) return "boolean";
+    if (vs.some(v => v === "value")) return "value";
+    return "unresolvable";
+  }
+  return "unresolvable"; // any, unknown, as const, TypeReference, everything else
 }
 function classify(source: string) {
   const file = ts.createSourceFile("cli.ts", source, ts.ScriptTarget.Latest, true);
@@ -39,12 +64,20 @@ function classify(source: string) {
     // earlier fold did, to classify `flags.tier as "team" | "external"` — let
     // `const w = flags.wipe as boolean; if (w) destroy();` past the guard with NO violation:
     // not a boolean, not unregistered, not unclassified. Found by attacking my own fold.
-    if (ts.isAsExpression(node)) {
-      const t = node.type.kind;
-      const isBool = t === ts.SyntaxKind.BooleanKeyword
-        || (ts.isLiteralTypeNode(node.type)
-            && [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword].includes(node.type.literal.kind));
-      add(isBool ? booleans : values, node.expression);
+    // An `as` cast declares intent, and the classification must FAIL CLOSED when the cast does not
+    // actually declare one. Two earlier attempts both leaked, each time widening the door I had just
+    // narrowed: accepting every cast as a "value" let `flags.wipe as boolean` through, and then
+    // checking only BooleanKeyword/true/false let `flags.wipe as boolean | undefined` — the spelling
+    // a careful author reaches for, given `Flags = Record<string, string | boolean>` — through too.
+    // So: boolean-only asserted type => boolean read (must be registered); a type that is clearly a
+    // value => value read; ANYTHING UNRESOLVABLE (`any`, `unknown`, `as const`, a type reference a
+    // syntactic classifier cannot follow) => NEITHER, so the forall clause fires.
+    if (ts.isAsExpression(node) && !ts.isAsExpression(unwrapType(node))) {
+      const verdict = classifyType(node.type);
+      if (verdict === "boolean") add(booleans, node.expression);
+      else if (verdict === "value") add(values, node.expression);
+      // else: unresolvable — classify NOTHING, so the read stays in `seen` only and the
+      // forall clause reports it as `unclassified read: <name>`.
     }
     if (ts.isBinaryExpression(node)) {
       for (const [left,right] of [[node.left,node.right],[node.right,node.left]]) {
@@ -86,15 +119,34 @@ describe.each(cases)("AC8 $script registry", ({script,registry}) => {
   // is disproportionate for this slice. `it.fails` so this flips RED the day someone closes it.
   it.fails("KNOWN GAP: a value-classified name can still be truthiness-gated elsewhere", () => {
     const mixed = 'typeof flags.wipe === "string";\nconst w = flags.wipe;\nif (w) destroy();';
-    expect(violations(mixed, [])).toContain("unclassified read: wipe");
+    // `not.toEqual([])` pins the PROPERTY (some violation is reported), not a message string —
+    // a per-occurrence fix that reports under a different wording would otherwise leave this green.
+    expect(violations(mixed, [])).not.toEqual([]);
   });
 
   it("negative control: a boolean-typed `as` cast cannot launder an unregistered flag", () => {
-    for (const read of ["const w = flags.wipe as boolean; if (w) go();", "flags.wipe as true;"]) {
+    for (const read of [
+      "const w = flags.wipe as boolean; if (w) go();",
+      "flags.wipe as true;",
+      // the spellings that defeated the two earlier attempts at this rule:
+      "const w = flags.wipe as boolean | undefined; if (w) go();",
+      "const w = flags.wipe as true | false; if (w) go();",
+    ]) {
       expect(violations(read, []), read).toContain("unregistered boolean: wipe");
     }
-    // …and a non-boolean cast is still a VALUE read, which is what classifies `flags.tier`.
+    // A cast that declares NO intent must fail closed — not be treated as a value declaration.
+    for (const read of [
+      "const w = flags.wipe as any; if (w) go();",
+      "const w = flags.wipe as unknown; if (w) go();",
+      "const w = flags.wipe as unknown as boolean; if (w) go();",
+      "const w = flags.wipe as Flag; if (w) go();",
+    ]) {
+      expect(violations(read, []), read).not.toEqual([]);
+    }
+    // …and the two real mixed/value unions stay VALUE reads, which is the boundary the rule must
+    // respect: classifying these as boolean would redden both real CLIs.
     expect(violations('flags.tier as "team" | "external";', [])).toEqual([]);
+    expect(violations("flags.labels as string | boolean | undefined;", [])).toEqual([]);
   });
 
   it("negative control: an UNCLASSIFIED read fails — the spellings that defeated the existential form", () => {

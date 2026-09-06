@@ -574,7 +574,6 @@ export async function main(argv: string[]) {
   }
 }
 
-// Suffix comparison also works when /tmp resolves through /private/tmp.
 // basename, not a suffix: `endsWith("/admin.ts")` never matches a Windows path separator, and the
 // failure mode is SILENT SUCCESS — the module loads, does nothing, and exits 0. Stated precisely
 // (astra review corrected an earlier overclaim): this does NOT fix a RENAMED copy, which still

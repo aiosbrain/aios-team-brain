@@ -361,7 +361,6 @@ export async function main(argv: string[]) {
   }
 }
 
-// Suffix comparison also works when /tmp resolves through /private/tmp.
 // basename, not a suffix — see the note in scripts/admin.ts.
 if (basename(process.argv[1] ?? "") === "brain-tasks.ts") {
   main(process.argv.slice(2))
