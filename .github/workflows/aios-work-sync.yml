@@ -22,9 +22,12 @@ name: AIOS work sync
 #
 # WHAT MAKES THIS SHAPE SAFE — four properties, all of them load-bearing:
 #
-#   1. `pull_request_target` runs the BASE branch's copy of this file and of the checkout below.
-#      Every line that executes is reviewed `main` code that no pull request can edit. The gate
-#      on the job is therefore trusted again, which is the whole point.
+#   1. `pull_request_target` runs the DEFAULT branch's copy of this file and of the checkout below.
+#      (It said "BASE branch" and "reviewed `main` code" until 2025-12-08, when GitHub made the
+#      workflow file always come from the default branch regardless of the pull request's base —
+#      strictly stronger, since the base is contributor-selectable and the default is not.) Every
+#      line that executes is reviewed default-branch code that no pull request can edit. The gate on
+#      the job is therefore trusted, which is the whole point.
 #   2. NOTHING from the pull request's head is checked out, fetched, installed, built or run.
 #      The checkout below carries NO `ref:` — on this trigger the default is the base branch.
 #      Adding `ref:`, a `git fetch`/`git checkout` of a pull ref, an `npm ci` (lifecycle scripts
@@ -40,11 +43,12 @@ name: AIOS work sync
 #      `permissions:` stays `contents: read` — no `statuses: write`, no `checks: write`.
 #
 # WHAT `environment: trusted-automation` IS, AND WHAT IT IS NOT. It is a repository Environment
-# whose deployment branch policy allows `main` only. It is a BLAST-RADIUS control over WHICH
+# whose deployment branch policy allows `[main, staging]`. It is a BLAST-RADIUS control over WHICH
 # WORKFLOWS in this repository may reach `AIOS_API_KEY` / `AIOS_BRAIN_URL` / `AIOS_TEAM`. It is
 # NOT a boundary against forks, and reading it as one would repeat the mistake above in a new
-# place: on `pull_request_target` the run's ref is ALWAYS the base branch, so a fork pull
-# request satisfies a `main`-only policy exactly as easily as a maintainer's branch does. Point
+# place: on `pull_request_target` the run's ref is the DEFAULT branch (it said "ALWAYS the base
+# branch" pre-2025-12-08), so a fork pull request satisfies the policy exactly as easily as a
+# maintainer's branch does. Point
 # 4 is what excludes forks; points 1-3 are what protect the credential. Measured, not assumed —
 # the same measurement is recorded in `pr-task-link.yml`'s header.
 #

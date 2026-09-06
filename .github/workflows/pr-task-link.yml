@@ -40,14 +40,21 @@ name: PR task link (advisory)
 #
 # WHAT THE ENVIRONMENT IS, AND — MORE IMPORTANTLY — WHAT IT IS NOT.
 # `environment: trusted-automation` is a repository Environment whose deployment branch policy allows
-# `main` only. It is a BLAST-RADIUS control over WHICH WORKFLOWS can reach the credential. It is NOT
-# a trust boundary against untrusted AUTHORS, and reading it as one would repeat this file's original
-# mistake in a new place. Measured in a disposable repository rather than assumed:
+# `[main, staging]`. It is a BLAST-RADIUS control over WHICH WORKFLOWS can reach the credential. It is
+# NOT a trust boundary against untrusted AUTHORS, and reading it as one would repeat this file's
+# original mistake in a new place:
 #
-#   * a `pull_request_target` run has `GITHUB_REF=refs/heads/main`, satisfies the `main`-only policy,
-#     and DOES receive the environment's secrets — so the check keeps working; and
-#   * a FORK pull request gets them too. On `pull_request_target` the ref is always the base branch,
-#     so every author trivially satisfies the branch policy regardless of who they are.
+#   * a `pull_request_target` run has `GITHUB_REF` = the DEFAULT branch (`staging` since the cutover),
+#     satisfies the policy because the policy contains it, and DOES receive the environment's
+#     secrets — so the check keeps working; and
+#   * a FORK pull request gets them too. The ref is the DEFAULT branch for every author, so all of
+#     them satisfy the branch policy equally regardless of who they are.
+#
+# THE TWO BULLETS ABOVE USED TO SAY `refs/heads/main` AND "the ref is always the base branch", and
+# both were measured in a disposable repository — correctly, under the model of the time. GitHub
+# changed it effective 2025-12-08 (see the paragraph below), so the ref is the DEFAULT branch, not
+# the base. The conclusion — the environment is not an author boundary — is unchanged; only the
+# mechanism moved, and a stale mechanism is the half that gets re-derived into a wrong ordering.
 #
 # So the environment cannot be the thing protecting this key. THE ONLY THING PROTECTING IT IS THE RULE
 # ABOVE: base-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
@@ -58,9 +65,10 @@ name: PR task link (advisory)
 # GitHub hands those to every job whether or not it names an environment — an environment secret only
 # SHADOWS a repository secret of the same name, it does not revoke access to one. Connecting the layer
 # means entering the values into the environment and DELETING the repository-level copies, which is
-# blocked on rewriting `aios-work-sync.yml` (it reads the same three from a `pull_request: closed`
-# run, whose ref IS `refs/pull/N/merge`, and a `main`-only policy would refuse it). Until then this
-# job reads the repository-level values and really does call the brain.
+# no longer blocked on `aios-work-sync.yml`: #673 moved that workflow to `pull_request_target`, so it
+# no longer runs with a `refs/pull/N/merge` ref, and the policy now contains both live branches. All
+# three `AIOS_*` consumers are enrolled. Until the repository-level copies are deleted — a
+# repository-admin action — this job reads those values and really does call the brain.
 #
 # THE FAILURE MODE OF A MISMATCHED POLICY IS LOUD, NOT SILENT: `Branch "x" is not allowed to deploy to
 # trusted-automation`, and the job fails having run ZERO steps. It is not an empty-secret shrug. The

@@ -249,6 +249,8 @@ have the fix. Reviewer should rule.
 | `.claude/skills/{adversarial-build,adversarial-build-astra,branch-reconciliation,pr-review-attestation,test-ci-wiring-audit}/**` | `currently \`main\`` → `currently \`staging\`` |
 | `.agents/**`, `.opencode/**`, `.cursor/**` | REGENERATED ONLY, by `scripts/sync-skill-runtimes.sh` |
 | `docs/RELEASING.md` | §3 cutover status, constraint rows 1/4/5/7/8, §3.2 ordering pairs |
+| `CLAUDE.md` | **ADDED to Scope by Fable's RELPTR-7 diff review.** §6 said "Deploys happen ONLY by merging to `main`", so post-cutover an agent merging to `staging` would run the **production** schema load for code not on `main`. Out of the original fence, in-scope now: it is the file every session reads and the one stale claim with an operational blast radius |
+| `docs/CI-ARCHITECTURE.md` | **ADDED to Scope by the same review** — a FIFTH carrier of the superseded `pull_request_target` model (open finding 7 said four). Three sites: the `evil2 → evil` base-branch claim, the "run's ref is the PR's target branch" cost paragraph, and `scan-on-merge`'s `main`-only note |
 | `docs/design/cutover-execution.md` | this spec |
 
 A change to any file not in this table is a finding, not a tidy-up.
@@ -369,3 +371,31 @@ Before contributions reopen, these must be observed rather than assumed:
 
 Re-triggering a deploy is a Railway **dashboard** action and stays a human step. Verifying the
 resulting state is an acceptance criterion of the cutover.
+
+
+---
+
+## RELPTR-7 diff review — what Fable found, and what it changes
+
+**Verdict: CLEAR-WITH-CONDITIONS.** All conditions folded before push. The findings worth carrying
+forward, because each names a defect class rather than a typo:
+
+1. **HIGH — an inverse guard that pinned PHRASES, not the CLAIM.** The first version forbade two exact
+   strings and was green over a file that asserted the same refuted model four lines higher ("the ref
+   is always the base branch"). *A guard that pins phrasing proves the text changed, not that the model
+   did.* Rewritten to forbid a family of assertions across BOTH `pull_request_target` workflows — with
+   a deliberate subtlety: the corrections **quote** the old claim in order to retract it, so retracted
+   lines are stripped before matching, and a dedicated test proves the stripping catches an unmarked
+   assertion while sparing a marked quotation.
+2. **A guard nobody could keep.** The first Dependabot test asserted every `package-ecosystem` value
+   was unique — a property Dependabot does not have (the same ecosystem in two directories is ordinary
+   config). It would have reddened on a legitimate change, which is how a guard gets deleted rather
+   than fixed. Replaced with a role-pin plus a per-entry count.
+3. **The release ritual never advanced `main`.** §2 produced a tag and stopped; the fast-forward that
+   makes a tag a release existed only as an aside in §3.1a. Following §2 as written would have left
+   installers on the pre-cutover `main` **forever**. Now step 5, with the ordering constraint.
+4. **Measured facts stated in the present tense go false silently.** Constraint rows 2/5/7/8 read as
+   current state; all four had been satisfied. Marked satisfied with the date, historical measurement
+   retained.
+5. **The four-carrier enumeration was wrong — there were five**, and the fifth was in the file that
+   documents CI itself.

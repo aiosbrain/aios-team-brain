@@ -267,11 +267,20 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   `pg:schema` after `schema.sql`, in filename order) **and** mirror it into `schema.sql` for
   from-zero. See `postgres/migrations/README.md`. (A brand-new table needs no migration —
   `create table if not exists` in `schema.sql` covers it.)
-- **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by merging to `main`** —
-  Railway's GitHub integration auto-builds AIOS → `aios-team-brain`. After a merge, run `npm run pg:schema`
-  against prod for any schema change, and **confirm the platform started a new build** (`railway deployment
-list`; CI webhooks can be silently dropped) — re-trigger via the Railway dashboard if the latest deploy
-  predates the merge.
+- **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by pushing a branch a Railway
+  environment tracks — and since the 2026-09-06 cutover there are TWO, which is the part this line used to
+  get dangerously wrong.** It said "ONLY by merging to `main`", so an agent that merged to `staging` (now
+  the contribution base, where ordinary work lands) would have run the **production** schema load for code
+  that is not on `main`.
+  - **`staging` → the STAGING environment.** Ordinary merges land here. Its own Postgres, its own
+    schema load; nothing to do against prod.
+  - **`main` → PRODUCTION.** Post-cutover `main` advances only by fast-forward to a tagged release
+    (`docs/RELEASING.md` §2 step 5). Only then run `npm run pg:schema` against prod for a schema change.
+
+  Either way, **confirm the platform started a new build** (`railway deployment list`) — webhooks are
+  silently dropped in practice, twice on 2026-09-05 — and re-trigger from the Railway dashboard if the
+  latest deploy predates the push. **Deleting a Railway variable does NOT restart the container**: the
+  running process keeps the old environment until something triggers a deploy.
 - **Inspecting the prod DB (read-only, for diagnostics).** The internal `DATABASE_URL`
   (`postgres.railway.internal`) is unreachable from a laptop; use the **public TCP proxy** the Railway
   Postgres service exposes. Always confirm `railway status` shows **Project: AIOS** first, then:

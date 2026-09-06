@@ -412,11 +412,20 @@ describe("branch roles — Dependabot targets the contribution base (RELPTR-7)",
     }
   });
 
-  it("names the ROLE's value, so a future move is one edit and this guard follows it", () => {
-    // Asserted against the role rather than the literal `"staging"`: pinning the literal would make
-    // this guard the second owner of the contribution base, which is the defect RELPTR-4 existed for.
-    const ecosystems = (dependabot().updates ?? []).map((u) => u["package-ecosystem"]);
-    expect(new Set(ecosystems).size, "each ecosystem appears once").toBe(ecosystems.length);
+  it("pins the ROLE, not the literal — so the next move is still one edit", () => {
+    // WHAT THIS REPLACED, because the original was a guard nobody could keep: it asserted every
+    // `package-ecosystem` value was unique. Dependabot does not guarantee that — the same ecosystem
+    // in two directories (`npm` at `/` and `/website`) is ordinary config — so the guard would have
+    // reddened on a legitimate change, which is how a guard gets deleted rather than fixed.
+    //
+    // The property actually worth pinning is that this file follows the ROLE. Asserting the literal
+    // `"staging"` here would make the guard a SECOND OWNER of the contribution base, which is the
+    // exact defect RELPTR-4 existed to kill.
+    const src = read(".github/dependabot.yml");
+    expect(src, "the value must be the role's, resolved from scripts/branches.mjs").toContain(`target-branch: "${CONTRIBUTION_BASE}"`);
+    // Non-vacuous: one entry per declared ecosystem, counted against the parse rather than the text.
+    const declared = (dependabot().updates ?? []).length;
+    expect(src.match(/target-branch:/g) ?? [], "exactly one per update entry").toHaveLength(declared);
   });
 });
 

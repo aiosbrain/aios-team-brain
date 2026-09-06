@@ -467,20 +467,51 @@ describe("guard: pr-task-link.yml specifically", () => {
     expect(triggers(doc())).toEqual(["pull_request_target"]);
   });
 
-  it("the header no longer claims the `[main]` pin is what prevents an environment refusal", () => {
-    // THE INVERSE, which gpt-6-astra's spec review found missing: criterion 9 required the NEW prose
-    // to be present and never required the OLD claim to be gone. Presence alone is satisfiable while
-    // the refuted mechanism sits three lines below it, and a stale mechanism is worse than none —
-    // the next reader re-derives the wrong ordering from it.
-    const header = text("pr-task-link.yml");
-    expect(header, "the pre-2025-12-08 model must not survive").not.toMatch(/run's ref is the pull request's target branch/);
-    expect(header).not.toMatch(/pinned to `branches: \[main\]` so the two coincide/);
-    // …and the correction must actually be stated, not merely the old text deleted.
-    expect(header, "the current model, with its date").toContain("2025-12-08");
-    // Contiguous on one line: the quotation wraps after "environment rules", and a regex spanning
-    // that break would fail for formatting rather than for content — a guard that reddens on a
-    // reflow teaches people to loosen it.
-    expect(header).toMatch(/evaluate against the default branch/);
+  /**
+   * THE REFUTED pull_request_target MODEL MUST BE GONE AS A CLAIM, not merely as two phrases.
+   *
+   * The first version of this guard forbade two exact strings. Fable's review showed it green over a
+   * file that still asserted the same thing in different words four lines higher ("the ref is always
+   * the base branch"), which is the whole failure mode: a guard that pins phrasing teaches you the
+   * text changed, not that the model did.
+   *
+   * THE WRINKLE, and why this is not a plain `not.toMatch`: the corrections deliberately QUOTE the
+   * old claim in order to retract it ("it said ALWAYS the base branch pre-2025-12-08"). A blanket
+   * ban would forbid the retraction along with the assertion and push the next author to delete the
+   * history instead of recording it. So retracted lines are stripped first, and what remains must
+   * contain no assertion of the old model.
+   */
+  const RETRACTION = /used to say|it said|USED TO SAY|pre-2025-12-08|until 2025-12-08|obsolete|refuted|WAS WRONG|no longer/i;
+  const OLD_MODEL: readonly [RegExp, string][] = [
+    [/ref is (?:always |ALWAYS )?the (?:pull request's )?base branch/i, "ref is the base branch"],
+    [/run's ref is the pull request's target branch/i, "ref is the target branch"],
+    [/runs the BASE branch's copy/i, "workflow file comes from the base branch"],
+    [/policy allows\s+`main`\s+only/i, "policy allows main only"],
+  ];
+
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"]])(
+    "%s asserts the CURRENT pull_request_target model and never the refuted one",
+    (file) => {
+      const live = text(file)
+        .split("\n")
+        .filter((line) => !RETRACTION.test(line))   // a quoted retraction is history, not a claim
+        .join("\n");
+      for (const [re, label] of OLD_MODEL) {
+        expect(live, `refuted model survives as an assertion: ${label}`).not.toMatch(re);
+      }
+      // …and the correction must be stated, not merely the old text deleted.
+      expect(text(file), "the current model, dated").toContain("2025-12-08");
+    }
+  );
+
+  it("is NON-VACUOUS: the stripping cannot swallow a real assertion", () => {
+    // The strip is the risky half — too broad and every line becomes "history". Proven directly:
+    // an UNMARKED assertion is caught, and the identical sentence carrying a retraction marker is not.
+    const strip = (s: string) => s.split("\n").filter((l) => !RETRACTION.test(l)).join("\n");
+    const assertion = "# On pull_request_target the ref is always the base branch, so the policy is satisfied.";
+    const retracted = "# It said the ref is always the base branch; that was the pre-2025-12-08 model.";
+    expect(strip(assertion), "an unmarked assertion must survive stripping").toMatch(OLD_MODEL[0][0]);
+    expect(strip(retracted), "a retracted quotation must be stripped").not.toMatch(OLD_MODEL[0][0]);
   });
 
   it("fires on exactly the release branch and the contribution base", () => {
