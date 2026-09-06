@@ -99,11 +99,21 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
   const git = (cwd: string, ...args: string[]) =>
     execFileSync("git", args, { cwd, encoding: "utf8", env: ISOLATED }).trim();
 
+  // RELPTR-6 D2 — match the DECLARATION, not the value it currently holds. The first version
+  // replaced the literal string `export const CONTRIBUTION_BASE = "main";`, so the day the cutover
+  // moves that value the substitution silently stops matching. It fails loudly today (the
+  // `not.toBe(src)` below), which is why this is brittleness rather than a false green — but
+  // "update the literal to `staging`" would reintroduce the identical coupling one cutover later.
+  // Global + count-checked: a SECOND declaration would otherwise leave one copy unstubbed, and the
+  // stub would test a module that still resolves the real branch.
+  const CONTRIBUTION_BASE_DECL = /export const CONTRIBUTION_BASE = "[^"]*";/g;
+
   function scratchWithStub(stubValue: string | null) {
     const dir = mkdtempSync(join(tmpdir(), "roles-pin-"));
     const src = read("scripts/branches.mjs");
+    expect(src.match(CONTRIBUTION_BASE_DECL), "exactly one declaration to stub").toHaveLength(1);
     const branches =
-      stubValue === null ? src : src.replace('export const CONTRIBUTION_BASE = "main";', `export const CONTRIBUTION_BASE = ${JSON.stringify(stubValue)};`);
+      stubValue === null ? src : src.replace(CONTRIBUTION_BASE_DECL, `export const CONTRIBUTION_BASE = ${JSON.stringify(stubValue)};`);
     if (stubValue !== null) expect(branches, "the stub must apply").not.toBe(src);
     writeFileSync(join(dir, "branches.mjs"), branches);
     writeFileSync(join(dir, "release-candidate-guard.mjs"), read("scripts/release-candidate-guard.mjs"));
@@ -212,7 +222,7 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
 });
 
 describe("branch roles — the workflows that must follow the cutover (criteria 5, 6, 7)", () => {
-  it("aios-work-sync fires on EXACTLY the contribution base and the integration branch", () => {
+  it("aios-work-sync fires on EXACTLY the release branch and the integration branch", () => {
     // EXACT SET, not "contains both": `[main, staging, "**"]` satisfies a containment check while
     // silently widening the trigger to every branch in the repository. Codex found that.
     //
@@ -223,20 +233,117 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // branch a pull request targets, so a collaborator can make their own tree the trusted one.
     // `test/guards/pr-task-link-credential-isolation.test.ts` owns the security half; this owns the
     // RELPTR-4 half, and both must move together.
+    //
+    // RELPTR-6 D1 — THE PAIR IS `[RELEASE_BRANCH, INTEGRATION_BRANCH]`, AND IT USED TO BE
+    // `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]`. Today those evaluate identically (`["main",
+    // "staging"]`), which is exactly why the mis-wiring was invisible — the same identity trap
+    // `scripts/branches.mjs`'s header names, found in a second place. On cutover day
+    // `CONTRIBUTION_BASE` becomes `staging`, the old expectation COLLAPSES to
+    // `["staging", "staging"]`, and this guard reddens against a workflow file that is correct.
+    //
+    // WHY RELEASE AND NOT CONTRIBUTION — by elimination, which is the only argument that holds in
+    // both worlds. The trigger needs two DISTINCT branches. `[CONTRIBUTION_BASE, RELEASE_BRANCH]`
+    // collapses today (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
+    // cutover (both `staging`); `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both. That is
+    // the whole justification and it is checkable.
+    //
+    // TWO REFUTED VERSIONS, both kept so neither is re-derived. This is the one claim in this slice
+    // that three passes disagreed about, so the evidence is written down rather than the conclusion.
+    //
+    //   (1) A draft called this pair a SECURITY ALLOWLIST of trusted pull-request bases.
+    //   (2) Fable's diff review disproved (1) by arguing that on `pull_request_target` the workflow
+    //       file — `on:` filter included — is read from the pull request's BASE branch, which a
+    //       same-repo collaborator controls.
+    //
+    // (2) IS ALSO WRONG, AND IS THE OLDER MODEL. gpt-6-astra caught it and it was verified against
+    // the primary source: GitHub changed `pull_request_target` effective 2025-12-08 —
+    // "The workflow file and checkout commit will always be taken from the repository's default
+    // branch, regardless of the pull request's base branch", and "environment rules evaluate against
+    // the default branch". (github.blog/changelog/2025-11-07-actions-pull_request_target-and-
+    // environment-branch-protections-changes/)
+    //
+    // So the base branch controls neither the workflow file nor the environment evaluation. But
+    // "therefore the filter is not a security control" — a first version of this comment — is the
+    // over-correction, and Fable's re-clear caught it. The filter is not a CREDENTIAL boundary; it is
+    // the INTEGRITY control over which merges count. With `branches: ["**"]` a collaborator opens a
+    // pull request into their own unprotected branch, merges it themselves, satisfies
+    // `merged == true && same-repo` from trusted default-branch code, and `notify-brain` posts a work
+    // event that can resolve `applied` and close a task. Under the verified model the filter is MORE
+    // load-bearing, not less, because a same-repo branch can no longer edit it. The separate
+    // blast-radius control over the CREDENTIAL is the `trusted-automation` environment policy,
+    // evaluated against the DEFAULT branch — repository settings, not this file.
+    //
+    // What IS true and worth keeping: a release fast-forward is a PUSH, so it does not by itself
+    // raise `pull_request_target`. ("emits none at all" was too strong — if a `staging`→`main` pull
+    // request is open when the push lands, GitHub marks it merged and `closed` fires with
+    // `merged == true`.) `main`'s entry serves exactly those in-flight and exceptional pull
+    // requests into the release branch.
     const on = workflow("aios-work-sync.yml").on!;
     expect(Object.keys(on), "the trigger itself is part of criterion 5 now").toEqual(["pull_request_target"]);
-    expect(on.pull_request_target!.branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+    expect(on.pull_request_target!.branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
     expect(on.pull_request_target!.types).toEqual(["closed"]);
-    // …and INTEGRATION_BRANCH is `staging` TODAY, so this pins the widening now rather than
-    // collapsing to "contains main" until the cutover moves the value.
-    expect(on.pull_request_target!.branches).toContain("staging");
+  });
+
+  it("the two roles in that pair can never be the same branch", () => {
+    // The property the old pair lacked, asserted directly instead of via a `toContain("staging")`
+    // that stopped meaning anything once `staging` could be BOTH values. `[RELEASE_BRANCH,
+    // INTEGRATION_BRANCH]` is a two-branch allowlist by construction; `[CONTRIBUTION_BASE,
+    // INTEGRATION_BRANCH]` is only a two-branch allowlist by accident of today's values.
+    //
+    // ONE assertion, not two. A first version followed this with
+    // `expect([A,B]).toHaveLength(new Set([A,B]).size)` and a comment claiming it pinned the
+    // COLLAPSE of the old pair. For a 2-tuple that is the same predicate respelled, and it never
+    // mentioned `CONTRIBUTION_BASE` — a comment describing a third thing neither line did.
+    expect(RELEASE_BRANCH, "a collapsed pair is a one-branch trigger wearing a two-branch shape").not.toBe(INTEGRATION_BRANCH);
+  });
+
+  it("the workflow triggers are pinned to the RELEASE role, not the contribution base", () => {
+    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: today
+    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs are the SAME VALUE
+    // and no value or behavioural assertion can tell them apart. Measured, not assumed — reverting
+    // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves EVERY test in this
+    // file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
+    // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the
+    // alternative was a fix nothing held in place until cutover day made it loud.
+    // COMMENT LINES ARE STRIPPED FIRST. gpt-6-astra's cold review found the hole in the first
+    // version: prefixing either assertion with `//` leaves both regex checks satisfied — the string
+    // is still in the file — while removing its execution entirely, so the count certified coverage
+    // that no longer runs. Stated limits, because a guard's blind spots belong in the guard: this
+    // strips LINE comments only, so a `/* … */` block around an assertion evades it — and so does
+    // disabling the test that contains it (`it.skip`, `describe.skip`, `xit`, `it.todo`), which
+    // leaves the source text and therefore the count untouched. Same class, same acceptance: these
+    // are deliberate edits by someone reading this comment, not silent drift.
+    const src = read("test/guards/branch-roles.test.ts")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    expect(src, "the trigger assertions must name RELEASE_BRANCH").not.toMatch(/toEqual\(\[CONTRIBUTION_BASE, INTEGRATION_BRANCH\]\)/);
+    // NON-VACUOUS: forbidding a shape proves nothing unless the shape it REPLACED is present.
+    // Both trigger sites, counted — deleting or commenting out one would otherwise satisfy the
+    // line above while removing the assertion it exists to protect.
+    expect(src.match(/toEqual\(\[RELEASE_BRANCH, INTEGRATION_BRANCH\]\)/g), "both trigger sites, uncommented").toHaveLength(2);
   });
 
   it("scan-on-merge fires on EXACTLY the same two branches", () => {
-    // After the cutover `main` advances only by release fast-forward, so a `[main]`-only trigger
-    // would drop codebase readiness from per-merge to per-release without any error.
+    // RELPTR-4's original failure: a `[main]`-ONLY push trigger after contributions moved would
+    // drop codebase readiness from per-merge to per-release without any error. That is why the
+    // trigger was widened, and it is still why `staging` must be here.
+    //
+    // RELPTR-6 D1, and a REFUTATION worth keeping: a draft of that slice justified retaining
+    // `main` by claiming its removal would reduce readiness to per-release. Codex disproved it —
+    // post-cutover every merge lands on `staging`, so `staging`-only scanning is still per-merge.
+    // `main`'s entry buys release-time retry/reconciliation, at the cost of normally re-scanning a
+    // SHA already scanned on `staging`.
+    //
+    // A FIRST VERSION CALLED THAT "duplicate compute rather than a wrong result". Too strong, and
+    // gpt-6-astra produced the counterexample; re-derived here before folding. `lib/codebases/ingest.ts`
+    // upserts on `(codebase_id, head_sha)` and REFRESHES `scanned_at`, while
+    // `lib/metrics/codebases.ts` picks the latest scan by ORDERING ON `scanned_at`. So: staging
+    // scans A then B; a later release fast-forward re-scans A; A now carries the newest timestamp
+    // and wins "latest" despite B being newer by ancestry. That is a pre-existing operational risk
+    // this slice neither introduces nor fixes — recorded so the reassurance is not repeated.
     const on = workflow("scan-on-merge.yml").on!;
-    expect((on.push as { branches?: string[] }).branches).toEqual([CONTRIBUTION_BASE, INTEGRATION_BRANCH]);
+    expect((on.push as { branches?: string[] }).branches).toEqual([RELEASE_BRANCH, INTEGRATION_BRANCH]);
   });
 
   it("nothing INSIDE aios-work-sync re-narrows what the trigger widened", () => {

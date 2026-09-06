@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isOperativeLine, scanInventory, trackedInventory, report } from "../../scripts/instruction-base.mjs";
+import { CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH } from "../../scripts/branches.mjs";
 
 // Assertions derive from RELPTR-5 criteria 1–16 and its named disposition, not scan output.
 const ROOT = join(import.meta.dirname, "../..");
@@ -178,13 +179,59 @@ describe("observable shell and role identity (11, 15)", () => {
     expect(output).toContain("+feature");
     expect(output).not.toContain("+advanced");
   }));
+  /**
+   * RELPTR-6 D3 — THE SENTINEL MUST BE A VALUE NO ROLE HOLDS, and this test used to violate that.
+   *
+   * It stubbed `CONTRIBUTION_BASE = "staging"` and asserted the rendered message says
+   * `origin/staging...HEAD`. That discriminates ONLY because `staging` is not the real contribution
+   * base: if `pr-review-gate.mjs` hardcoded the branch instead of importing the role, the output
+   * would say `origin/main` and the assertions would redden. The cutover makes `staging` the REAL
+   * value — at which point a hardcoded `origin/staging` renders exactly what a correct
+   * implementation renders, all three assertions still pass, and the test proves nothing. Nothing
+   * reddens to announce the loss, which makes this the silent member of the D1/D2/D3 set.
+   *
+   * The fix is a sentinel drawn from no role's value-space, checked against every role rather than
+   * against a remembered one, plus an executed negative control below — because a stub that cannot
+   * fail is the same failure in a new spelling.
+   */
+  const BASE_SENTINEL = "contribution-sentinel";
+  const RELEASE_SENTINEL = "release-sentinel";
+  const stubbedRoles = `export const CONTRIBUTION_BASE = ${JSON.stringify(BASE_SENTINEL)}; export const RELEASE_BRANCH = ${JSON.stringify(RELEASE_SENTINEL)};`;
+  const renderMissing = (dir: string) =>
+    execFileSync("node", ["--input-type=module", "-e", `import { FAIL_MESSAGE } from ${JSON.stringify(pathToFileURL(join(dir, "pr-review-gate.mjs")).href)}; console.log(FAIL_MESSAGE.missing);`], { env: isolated, encoding: "utf8" });
+
+  it("the sentinels are values NO branch role holds, now and after the cutover", () => {
+    // Asserted, not asserted-about-in-a-comment: this is the property the whole fixture rests on,
+    // and the only thing standing between it and the vacuity it just came out of.
+    for (const role of [CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH]) {
+      expect(BASE_SENTINEL, "a sentinel equal to a real role cannot discriminate").not.toBe(role);
+      expect(RELEASE_SENTINEL).not.toBe(role);
+    }
+  });
+
   it("runtime gate follows contribution, independently of release", () => scratch(dir => {
-    writeFileSync(join(dir, "branches.mjs"), 'export const CONTRIBUTION_BASE = "staging"; export const RELEASE_BRANCH = "release-sentinel";');
+    writeFileSync(join(dir, "branches.mjs"), stubbedRoles);
     writeFileSync(join(dir, "pr-review-gate.mjs"), read("scripts/pr-review-gate.mjs"));
-    const output = execFileSync("node", ["--input-type=module", "-e", `import { FAIL_MESSAGE } from ${JSON.stringify(pathToFileURL(join(dir, "pr-review-gate.mjs")).href)}; console.log(FAIL_MESSAGE.missing);`], { env: isolated, encoding: "utf8" });
-    expect(output).toContain("origin/staging...HEAD");
-    expect(output).not.toContain("origin/main");
-    expect(output).not.toContain("release-sentinel");
+    const output = renderMissing(dir);
+    expect(output).toContain(`origin/${BASE_SENTINEL}...HEAD`);
+    // Every REAL role name must be absent — not just `main`. A gate hardcoding the post-cutover
+    // value is the regression this now catches and previously would not have.
+    for (const role of [CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH]) expect(output).not.toContain(`origin/${role}`);
+    expect(output).not.toContain(RELEASE_SENTINEL);
+  }));
+
+  it("is NON-VACUOUS: a gate that hardcodes the base instead of importing the role FAILS", () => scratch(dir => {
+    // The negative control, executed. Without it the assertions above are a claim about a mutation
+    // nobody ran — and D3 is precisely the case where the assertions kept passing against a broken
+    // implementation. Mutating to the literal `main` proves the same thing pre- and post-cutover.
+    writeFileSync(join(dir, "branches.mjs"), stubbedRoles);
+    const src = read("scripts/pr-review-gate.mjs");
+    const hardcoded = src.replace("origin/${CONTRIBUTION_BASE}...HEAD", "origin/main...HEAD");
+    expect(hardcoded, "the mutation must apply").not.toBe(src);
+    writeFileSync(join(dir, "pr-review-gate.mjs"), hardcoded);
+    const output = renderMissing(dir);
+    expect(output, "the mutant renders a hardcoded ref").toContain("origin/main...HEAD");
+    expect(output, "…and NOT the resolved role, which is what the test above pins").not.toContain(`origin/${BASE_SENTINEL}...HEAD`);
   }));
   it("fails loudly when a tracked file cannot be read", () => scratch(dir => {
     git(dir, "init", "-q");
