@@ -34,7 +34,18 @@ function classify(source: string) {
     if (ts.isIfStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)) condition(node.expression);
     if (ts.isConditionalExpression(node)) condition(node.condition);
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) add(booleans, node.left);
-    if (ts.isAsExpression(node)) add(values, node.expression);
+    // An `as` cast declares intent. A BOOLEAN-typed cast is a boolean read (so the name must be
+    // registered); anything else is a value read. Accepting every cast as a "value" — which an
+    // earlier fold did, to classify `flags.tier as "team" | "external"` — let
+    // `const w = flags.wipe as boolean; if (w) destroy();` past the guard with NO violation:
+    // not a boolean, not unregistered, not unclassified. Found by attacking my own fold.
+    if (ts.isAsExpression(node)) {
+      const t = node.type.kind;
+      const isBool = t === ts.SyntaxKind.BooleanKeyword
+        || (ts.isLiteralTypeNode(node.type)
+            && [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword].includes(node.type.literal.kind));
+      add(isBool ? booleans : values, node.expression);
+    }
     if (ts.isBinaryExpression(node)) {
       for (const [left,right] of [[node.left,node.right],[node.right,node.left]]) {
         if (ts.isTypeOfExpression(left) && ts.isStringLiteral(right) && right.text === "string") add(values, left.expression);
@@ -67,6 +78,14 @@ describe.each(cases)("AC8 $script registry", ({script,registry}) => {
   it("covers every boolean consumer and excludes value consumers", () => {
     expect(violations(source,registry)).toEqual([]);
   });
+  it("negative control: a boolean-typed `as` cast cannot launder an unregistered flag", () => {
+    for (const read of ["const w = flags.wipe as boolean; if (w) go();", "flags.wipe as true;"]) {
+      expect(violations(read, []), read).toContain("unregistered boolean: wipe");
+    }
+    // …and a non-boolean cast is still a VALUE read, which is what classifies `flags.tier`.
+    expect(violations('flags.tier as "team" | "external";', [])).toEqual([]);
+  });
+
   it("negative control: an UNCLASSIFIED read fails — the spellings that defeated the existential form", () => {
     // Each of these reintroduces the coercion trap while being invisible to every truthiness rule:
     // `--wipe false` makes the string "false", which is !== undefined and truthy.
