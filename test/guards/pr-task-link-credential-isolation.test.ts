@@ -472,12 +472,15 @@ describe("guard: pr-task-link.yml specifically", () => {
     // to be present and never required the OLD claim to be gone. Presence alone is satisfiable while
     // the refuted mechanism sits three lines below it, and a stale mechanism is worse than none —
     // the next reader re-derives the wrong ordering from it.
-    const header = read(".github/workflows/pr-task-link.yml");
+    const header = text("pr-task-link.yml");
     expect(header, "the pre-2025-12-08 model must not survive").not.toMatch(/run's ref is the pull request's target branch/);
     expect(header).not.toMatch(/pinned to `branches: \[main\]` so the two coincide/);
     // …and the correction must actually be stated, not merely the old text deleted.
     expect(header, "the current model, with its date").toContain("2025-12-08");
-    expect(header).toMatch(/environment rules evaluate against the default branch/);
+    // Contiguous on one line: the quotation wraps after "environment rules", and a regex spanning
+    // that break would fail for formatting rather than for content — a guard that reddens on a
+    // reflow teaches people to loosen it.
+    expect(header).toMatch(/evaluate against the default branch/);
   });
 
   it("fires on exactly the release branch and the contribution base", () => {
