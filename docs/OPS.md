@@ -790,6 +790,11 @@ PRET-6 refused: this fleet has content but no context substrate — upgrade thro
 
 The migration repairs a markerless fleet, but it will **not** repair one whose corpus was never
 partitioned (`items` exist, `project_context_memberships` is empty — the pre-`v0.11.0` class).
+"UNATTENDED" is doing real work in that sentence, and the earlier drafts of it were simply wrong:
+an operator CAN partition on demand — `npm run admin -- drain-context <team-slug>`, and the items
+API reconciles on write. What no operator gets is a corpus that partitions itself faster than the
+budgeted stage. So the remedy below is the reliable one, not the only conceivable one.
+
 Stated precisely, the check is "at least one partition row exists", not "the corpus is fully
 partitioned": a fleet **mid-backfill** is admitted by design, because it went through the substrate
 release and the scheduler will finish. The predicate is also **fleet-global**, not per-team — a
@@ -799,7 +804,7 @@ inside the last backfill window, and a false refusal is the exact failure this s
 remove.
 
 That is deliberate. Membership and **visibility** are different repairs: enforcement fails closed for
-an item with no context unit, and the only partitioner is the budgeted scheduler stage (batch 100,
+an item with no context unit, and the only UNATTENDED partitioner is the budgeted scheduler stage (batch 100,
 30-minute interval). Materializing such a fleet would hand you a deploy that reports success over a
 corpus nobody can see for many ticks.
 

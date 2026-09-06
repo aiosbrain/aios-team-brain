@@ -18,7 +18,7 @@ line go stale while the code moved on, so it is not restated.
   code that stamps the marker only runs *after* a successful deploy — now materializes during
   preDeploy and proceeds. **A fleet with content but no context substrate still refuses**, with a
   new and more specific error, because repairing membership is not the same as repairing visibility:
-  enforcement fails closed for an unpartitioned item and the only partitioner is budgeted, so such a
+  enforcement fails closed for an unpartitioned item and the only UNATTENDED partitioner is budgeted, so such a
   fleet would deploy "successfully" over a dark corpus. `lib/access/groups.ts` is unchanged.
 
 ## [0.12.0] — 2026-08-26

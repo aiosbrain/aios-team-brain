@@ -2977,15 +2977,15 @@ begin
     return false;
   end if;
 
-  -- Placed BEFORE the locks deliberately: this gate reads `items` and
-  -- `project_context_memberships`, neither of which is in the lock set, so the locks buy it
-  -- no consistency — and a fleet that is going to be refused should not first queue behind
-  -- DML on five tables to be told something decidable immediately.
+  -- FAIL-FAST COPY, before the locks: a fleet that is going to be refused should not first
+  -- queue behind DML on five tables to be told something decidable immediately. This copy is
+  -- an optimisation ONLY — it is NOT the authoritative check. See the second copy after the
+  -- locks and the note there.
   -- SUBSTRATE GATE (STAGINGMARK-2, diff-review HIGH). Repairing membership is not the same
   -- as repairing VISIBILITY. The unconditional marker refusal this function replaces was also
   -- the gate for the pre-flag-era fleet, whose `teams.access_enforcement` column never existed
   -- and which therefore cannot be caught by the migration's permissive readiness check either.
-  -- Enforcement fails closed for an item with no context unit, and the only partitioner is the
+  -- Enforcement fails closed for an item with no context unit, and the only UNATTENDED partitioner is the
   -- BUDGETED scheduler stage (batchSize 100, 30-minute interval) — so letting such a fleet
   -- through would report a successful deploy over a corpus that is dark for many ticks. That is
   -- the "whole corpus goes dark at cutover" hazard the original refusal was written for.
@@ -3004,6 +3004,17 @@ begin
     return false;
   end if;
 
+
+  -- AUTHORITATIVE SUBSTRATE CHECK — repeated after the locks, and it must stay repeated.
+  -- The pre-lock copy alone admits a stale read: `items` and `project_context_memberships`
+  -- both cascade from `teams` (`on delete cascade`), so a NOT-YET-COMMITTED team deletion is
+  -- invisible to that read, and by the time we have waited for its `teams` lock the only
+  -- partitioned team can be gone — leaving content with zero partition rows and this function
+  -- about to stamp over it. Locking `teams` does buy consistency here precisely BECAUSE of the
+  -- cascade; an earlier revision of this comment claimed it did not, and that was wrong.
+  if exists (select 1 from items) and not exists (select 1 from project_context_memberships) then
+    raise exception 'PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior release so the corpus is partitioned before enforcement (see docs/RELEASE-NOTES-pret6.md)';
+  end if;
 
   -- Refuse every squatter before any mutation, then CREATE absent builtins before
   -- computing want. Joining only existing groups would silently stamp empty teams.

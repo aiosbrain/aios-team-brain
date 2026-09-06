@@ -35,7 +35,7 @@ export type FleetState = {
   stagingMarker: boolean;
   /** STAGINGMARK-2: the fleet has content but nothing partitioned. The SQL function refuses this
    *  shape, because repairing membership is not repairing VISIBILITY — enforcement fails closed for
-   *  an item with no context unit and the only partitioner is budgeted. This command must refuse it
+   *  an item with no context unit and the only UNATTENDED partitioner is budgeted. This command must refuse it
    *  too: it stamps the SAME marker, and the SQL gate sits AFTER the marker short-circuit, so a
    *  stamp here would silently clear the migration's refusal and the next deploy would proceed over
    *  a dark corpus. The diff review found exactly that hole in the first version of this fold. */
@@ -179,7 +179,7 @@ export async function runMaterializeCommand(
         "✗ refusing: this fleet has content but no context substrate.",
         "  Materializing it would stamp the marker and silently clear the PRET-6 refusal, letting the",
         "  next deploy proceed over a corpus nothing can see — enforcement fails closed for an item",
-        "  with no context unit, and the only partitioner is the budgeted scheduler stage.",
+        "  with no context unit, and the only UNATTENDED partitioner is the budgeted scheduler stage.",
         "  Upgrade through the prior release so the corpus is partitioned (docs/RELEASING.md §3.4).",
       ],
       exitCode: 1,
@@ -191,7 +191,8 @@ export async function runMaterializeCommand(
     return {
       lines: [
         fleet,
-        `'${PRET4_MATERIALIZE_MARKER}' is ABSENT — this fleet refuses PRET-6 at preDeploy.`,
+        `'${PRET4_MATERIALIZE_MARKER}' is ABSENT. Since STAGINGMARK-2 the PRET-6 migration repairs`,
+        "this shape itself at preDeploy; running it here is the attended equivalent.",
         `${state.teams} team(s) would have their builtin group membership reconciled.`,
         `DRY RUN — nothing written. Re-run with ${extra} to materialize.`,
       ],

@@ -173,7 +173,7 @@ removing the unconditional refusal removed something else with it: it was also t
 pre-flag-era fleet, whose `teams.access_enforcement` column never existed and which therefore cannot
 be caught by the migration's permissive check either, because that check is column-gated. Repairing
 membership is **not** repairing visibility — enforcement fails closed for an item with no context
-unit, and the only partitioner is the budgeted scheduler stage — so that fleet would have received a
+unit, and the only UNATTENDED partitioner is the budgeted scheduler stage — so that fleet would have received a
 deploy reporting success over a corpus dark for many ticks.
 
 So the function refuses when `items` exist and `project_context_memberships` is empty, keyed on the
@@ -192,6 +192,15 @@ window — and a false refusal is exactly the failure this slice exists to remov
 `docs/RELEASING.md` to say the corpus is dark until backfill converges. Rejected by the operator: the
 slice's whole benefit is an unattended upgrade, and an upgrade that silently hides your content is
 not one.
+
+**Residual, stated rather than implied: boot and tick are NOT covered.** They call
+`materializeBuiltinMembershipOnce` directly, which stamps without consulting the substrate, and
+`lib/access/groups.ts` is outside this slice by design. Reachability is narrow but real: the app
+running with the marker absent implies a deploy that already passed the migration, so getting there
+needs a marker deletion or a database restored underneath a running app — the case the migration
+header already names. Closing it means adding the precondition to the TypeScript materializer, which
+is the same "make the two implementations agree" work Slice B exists for; it is recorded there rather
+than smuggled in here. Until then the guarantee is **migration + CLI**, not fleet-wide.
 
 **The same predicate is enforced in the attended CLI** (`lib/access/materialize-command.ts`). Without
 it the gate was trivially bypassable: `materialize-builtins` stamps the same marker, and the SQL gate
@@ -319,8 +328,11 @@ site — and becomes doubly false with a second marker writer.
   single worst outcome this slice could produce.
 - A `create or replace` that changes the function's RETURN TYPE: Postgres refuses it, so the "frozen
   signature" would need an explicit `drop function if exists` — silently, on every deploy.
-- **The marker stamped on a fleet with content and no context substrate** — by the migration, by
-  boot/tick, or by the CLI. That is the H-VANISH-shaped outcome in visibility rather than membership,
+- **The marker stamped on a fleet with content and no context substrate — by the migration or by
+  the CLI.** *Narrowed deliberately after the correlated review pointed out that an earlier draft of
+  this line named boot/tick too, which the code does not enforce: `lib/access/groups.ts` is outside
+  this slice, so `instrumentation.ts` and the scheduler tick still stamp without a substrate check.
+  See the residual below rather than reading this as a fleet-wide guarantee.* That is the H-VANISH-shaped outcome in visibility rather than membership,
   and it is the single worst thing this slice could produce.
 - Evidence that an app transaction spans two of the five locked tables: D4's deadlock-freedom premise
   would no longer hold and the lock order would need revisiting.

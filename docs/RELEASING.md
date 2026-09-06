@@ -274,6 +274,9 @@ different base.
 1. **No permissive team remains** — unchanged, and still steps 3-4 below. This is checked *first*,
    inside the column-existence gate, and refuses before any membership is touched.
 2. **The corpus has been partitioned** — at least one `project_context_memberships` row exists.
+   This condition applies **only to a fleet that has content**: a fleet with no `items` at all is
+   admitted regardless, because there is nothing to darken. An already-marked fleet skips both
+   conditions — the function returns before either is evaluated.
 
 - **A fleet whose content is already partitioned** — it has `project_context_memberships` rows, i.e.
   it went through the context substrate — now **materializes itself during preDeploy** and the deploy
