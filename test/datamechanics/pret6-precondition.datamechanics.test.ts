@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { db, seedTeam } from "./helpers";
 import { runSql } from "@/lib/db/pg/pool";
 
 // PRET-6 AC3 (docs/design/pret6-retirement.md §2.1/§4.3): the refusing precondition, proven by
 // executing the MIGRATION FILE'S OWN TEXT (never a paraphrase — the mutate-with-the-real-shape
-// rule). Three arms: a permissive team refuses; an unmaterialized fleet refuses; an
+// rule). Three arms: a permissive team refuses; an unmaterialized fleet reconciles; an
 // all-enforcing materialized fleet drops the columns — and the guard REPLAYS as a no-op after
 // the drop (the #251/#495 replay class, proven by running it twice).
 
@@ -18,6 +18,14 @@ const MIGRATION = join(
   "migrations",
   "20260818210000_pret6_retire_access_enforcement.sql"
 );
+
+beforeAll(async () => {
+  const source = readFileSync(join(import.meta.dirname, "../..", "postgres/schema.sql"), "utf8");
+  const block = source.match(/create\s+or\s+replace\s+function\s+materialize_builtin_membership_once\s*\(\s*\)[\s\S]*?\bas\s+(\$\w*\$)[\s\S]*?\1\s*;/i);
+  if (!block) throw new Error("schema materializer definition missing");
+  await runSql("drop function if exists materialize_builtin_membership_once()", []);
+  await runSql(block[0], []);
+});
 
 const migrationSql = () => readFileSync(MIGRATION, "utf8");
 
@@ -54,23 +62,24 @@ describe("PRET-6 §2.1 — the refusing precondition, executed from the migratio
     expect(await columnExists("access_enforcement"), "the column survives a refusal").toBe(true);
   });
 
-  it("REFUSES a teams-holding fleet whose PRET-4 materialization never completed (the H2 hole)", async () => {
+  it("REPAIRS a teams-holding fleet whose PRET-4 materialization never completed", async () => {
     await restoreColumns();
     const seed = await seedTeam();
     await db().from("teams").update({ access_enforcement: "enforcing" }).eq("id", seed.teamId);
     await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
-    await expect(runSql(migrationSql(), [])).rejects.toThrow(/materialization has not completed/);
-    expect(await columnExists("access_enforcement")).toBe(true);
+    await runSql(migrationSql(), []);
+    expect((await runSql("select name from migration_markers where name = 'pret4_builtin_materialize'", [])).rows).toHaveLength(1);
+    expect(await columnExists("access_enforcement")).toBe(false);
   });
 
-  it("REFUSES a PRE-FLAG-ERA fleet — teams, no marker, the column NEVER existed (diff-review HIGH: a column-gated marker check would skip this class and the whole corpus would go dark at cutover)", async () => {
-    // The fleet installed before 20260811160000 existed: no access_enforcement column, no
-    // builtin rows, real teams. The marker refusal must fire UNCONDITIONALLY.
+  it("REPAIRS a PRE-FLAG-ERA fleet even when the retired column is absent", async () => {
+    // Membership repair must not be gated on the retired column.
     await seedTeam();
     await db().from("migration_markers").delete().eq("name", "pret4_builtin_materialize");
     await runSql("alter table teams drop column if exists access_enforcement", []);
     await runSql("alter table teams drop column if exists autoflip_hold", []);
-    await expect(runSql(migrationSql(), [])).rejects.toThrow(/materialization has not completed/);
+    await runSql(migrationSql(), []);
+    expect((await runSql("select name from migration_markers where name = 'pret4_builtin_materialize'", [])).rows).toHaveLength(1);
     await restoreColumns();
   });
 

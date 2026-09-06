@@ -9,6 +9,18 @@ line go stale while the code moved on, so it is not restated.
 
 ## [Unreleased]
 
+### Changed
+
+- **STAGINGMARK-2 — the PRET-6 migration now repairs a markerless fleet instead of only refusing
+  it.** `materialize_builtin_membership_once()` is defined once in `postgres/schema.sql` and called
+  from `postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql`, so a fleet that has
+  teams but never booted the PRET-4 release — which previously could not deploy at all, because the
+  code that stamps the marker only runs *after* a successful deploy — now materializes during
+  preDeploy and proceeds. **A fleet with content but no context substrate still refuses**, with a
+  new and more specific error, because repairing membership is not the same as repairing visibility:
+  enforcement fails closed for an unpartitioned item and the only UNATTENDED partitioner is budgeted, so such a
+  fleet would deploy "successfully" over a dark corpus. `lib/access/groups.ts` is unchanged.
+
 ## [0.12.0] — 2026-08-26
 
 ### Removed

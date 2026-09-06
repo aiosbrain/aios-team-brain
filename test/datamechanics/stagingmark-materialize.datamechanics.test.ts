@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { db, seedTeam } from "./helpers";
 import { getPool } from "@/lib/db/pg/pool";
 import { ensureBuiltins, materializeBuiltinMembershipOnce } from "@/lib/access/groups";
@@ -29,6 +29,14 @@ const MIGRATION = readFileSync(
   join(import.meta.dirname, "..", "..", "postgres", "migrations", "20260818210000_pret6_retire_access_enforcement.sql"),
   "utf8"
 );
+
+beforeAll(async () => {
+  const source = readFileSync(join(import.meta.dirname, "../..", "postgres/schema.sql"), "utf8");
+  const block = source.match(/create\s+or\s+replace\s+function\s+materialize_builtin_membership_once\s*\(\s*\)[\s\S]*?\bas\s+(\$\w*\$)[\s\S]*?\1\s*;/i);
+  if (!block) throw new Error("schema materializer definition missing");
+  await getPool().query("drop function if exists materialize_builtin_membership_once()", []);
+  await getPool().query(block[0], []);
+});
 
 const MARKER = "pret4_builtin_materialize";
 
@@ -71,14 +79,13 @@ beforeEach(async () => {
 });
 
 describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () => {
-  it("AC10 — the real PRET-6 guard refuses before materialization and applies after", async () => {
+  it("AC10 — the real PRET-6 migration repairs before the attended command and applies after", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
 
-    // BEFORE: teams exist, marker absent → the migration's own text refuses.
+    // STAGINGMARK-2: the migration now repairs this fleet; rollback leaves the CLI work pending.
     const before = await runMigrationRolledBack();
-    expect(before, "the migration must refuse a markerless fleet").not.toBeNull();
-    expect(before).toContain("PRET-4 builtin materialization has not completed");
+    expect(before, "the migration must repair a markerless fleet").toBeNull();
 
     // The one-shot's effect — the same function the CLI handler is given.
     const result = await materializeBuiltinMembershipOnce(db());

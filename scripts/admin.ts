@@ -73,9 +73,12 @@ const USAGE = `Team Brain admin CLI — commands:
                                          # Explicit ids only; there is no path-prefix form here.
   materialize-builtins [--confirm] [--confirm-production]
                                          # STAGINGMARK-1: complete PRET-4's one-time builtin
-                                         # materialization WITHOUT booting the app — the recovery for
-                                         # a fleet wedged on "PRET-6 refused: the PRET-4 builtin
-                                         # materialization has not completed on this fleet".
+                                         # materialization WITHOUT booting the app. Since
+                                         # STAGINGMARK-2 the PRET-6 migration repairs a partitioned
+                                         # fleet itself at preDeploy, so this is for inspecting a
+                                         # fleet or recovering an OLDER release. REFUSES a fleet with
+                                         # content but no context substrate — stamping there would
+                                         # clear the migration's gate (docs/OPS.md).
                                          # DRY RUN by default. No-op when the marker is already
                                          # present. --confirm-production is additionally required
                                          # when the database carries no staging_marker.

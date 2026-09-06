@@ -6,7 +6,8 @@ import { join, relative } from "node:path";
  * Access-chain single-writer guard (spec §4, CLAUDE.md §2 principle 2). The edge tables
  * `groups` / `group_members` / `project_groups` ARE the permission model — every invariant the
  * writer enforces (built-ins machine-maintained, eligibility refusals, singleton = exactly its
- * person) is real only while lib/access/groups.ts is the ONLY module that writes them. Reads
+ * person) is enforced by lib/access/groups.ts for application writes. The frozen SQL
+ * historical materializer is the sole SQL exception below. Reads
  * are unrestricted (the oracle reads two of these tables); this guard flags a WRITE verb
  * chained after `.from("<edge table>")` anywhere outside the single writer.
  */
@@ -92,6 +93,19 @@ const SQL_DML = new RegExp(
   "i"
 );
 
+// Only the named historical body in schema.sql may write access edges. Match its
+// closing dollar tag, never an arbitrary next function body.
+function stripMaterializer(source: string): string {
+  return source.replace(
+    /(create\s+or\s+replace\s+function\s+materialize_builtin_membership_once\s*\(\s*\)[\s\S]*?\bas\s+)(\$\w*\$)[\s\S]*?\2\s*;/i,
+    "$1$2$2;"
+  );
+}
+function sqlWrites(file: string, source: string): boolean {
+  return SQL_DML.test(file === "postgres/schema.sql" ? stripMaterializer(source) : source);
+}
+const uncomment = (source: string) => source.replace(/--[^\n]*/g, "");
+
 describe("access-chain single writer", () => {
   it("only lib/access/groups.ts writes groups/group_members/project_groups", () => {
     const offenders: string[] = [];
@@ -121,7 +135,7 @@ describe("access-chain single writer", () => {
     expect(offenders, `access edges written outside the single writer:\n${offenders.join("\n")}`).toEqual([]);
   });
 
-  it("no SQL file seeds or mutates the access edges — built-ins are app-code-created only", () => {
+  it("SQL access writes are confined to the frozen schema materializer", () => {
     const offenders: string[] = [];
     const sqlFiles: string[] = [];
     (function walkSql(dir: string) {
@@ -139,9 +153,50 @@ describe("access-chain single writer", () => {
     })(join(ROOT, "postgres"));
     for (const file of sqlFiles) {
       const source = readFileSync(file, "utf8");
-      if (SQL_DML.test(source)) offenders.push(relative(ROOT, file));
+      if (sqlWrites(relative(ROOT, file), source)) offenders.push(relative(ROOT, file));
     }
     expect(offenders, `SQL DML against access edges:\n${offenders.join("\n")}`).toEqual([]);
+  });
+
+  it("AC7: permits only the named body, with outside, other-body and migration controls", () => {
+    const schema = readFileSync(join(ROOT, "postgres/schema.sql"), "utf8");
+    expect(schema).toMatch(/create or replace function materialize_builtin_membership_once/i);
+    expect(sqlWrites("postgres/schema.sql", schema)).toBe(false);
+    for (const write of ["insert into groups (slug) values ('bad');", "delete from group_members;"]) {
+      expect(sqlWrites("postgres/schema.sql", schema + write)).toBe(true);
+      expect(sqlWrites("postgres/schema.sql", schema.replace(/(function audit_protect\(\)[\s\S]*?as \$\$)/i, `$1\n${write}`))).toBe(true);
+      expect(sqlWrites("postgres/migrations/control.sql", write)).toBe(true);
+    }
+    const migrationPath = "postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql";
+    const migration = readFileSync(join(ROOT, migrationPath), "utf8");
+    expect(sqlWrites(migrationPath, migration + "\ndelete from group_members;")).toBe(true);
+    const tagged = "create or replace function materialize_builtin_membership_once() returns boolean language plpgsql as $historical$ begin insert into groups values (1); end $historical$;";
+    expect(sqlWrites("postgres/schema.sql", tagged)).toBe(false);
+    expect(sqlWrites("postgres/schema.sql", tagged + "delete from groups;")).toBe(true);
+  });
+
+  it("AC7/AC8: migration calls the sole definition, independently of comments", () => {
+    const migration = readFileSync(join(ROOT, "postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql"), "utf8");
+    const call = /perform\s+materialize_builtin_membership_once\s*\(\s*\)/i;
+    expect(uncomment(migration)).toMatch(call);
+    const executable = uncomment(migration);
+    expect(executable.indexOf("raise exception 'PRET-6 refused: permissive")).toBeLessThan(executable.search(call));
+    expect(executable.search(call)).toBeLessThan(executable.indexOf("alter table teams drop column"));
+    expect(uncomment(migration.replace(call, ""))).not.toMatch(call);
+    const definitions: string[] = [];
+    function scan(dir: string) {
+      for (const name of readdirSync(dir)) {
+        const file = join(dir, name);
+        if (statSync(file).isDirectory()) scan(file);
+        else if (name.endsWith(".sql")) {
+          for (const match of uncomment(readFileSync(file, "utf8")).matchAll(/create\s+(?:or\s+replace\s+)?function\s+materialize_builtin_membership_once\s*\(/gi)) {
+            if (match) definitions.push(relative(ROOT, file));
+          }
+        }
+      }
+    }
+    scan(join(ROOT, "postgres"));
+    expect(definitions).toEqual(["postgres/schema.sql"]);
   });
 
   it("non-vacuous for the substrate: each owner module DOES write its table", () => {

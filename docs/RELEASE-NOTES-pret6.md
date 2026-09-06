@@ -30,32 +30,39 @@ You may **not** jump to this release from a pre-flip installation. The required 
 
 ## If the deploy refuses
 
-The migration **refuses to apply** — and the release halts at preDeploy, with the old code
-still serving — in exactly two cases, each named in the raised error:
+The migration still refuses with **`PRET-6 refused: permissive team(s) remain`** when a
+team has not passed the readiness/flip path. Complete the ordered steps above; marker repair
+is not a substitute for readiness.
 
-- **`PRET-6 refused: permissive team(s) remain — flip them first (see docs/RELEASE-NOTES-pret6.md)`**
-  A team is still permissive. Merging/deploying anyway would have flipped it without the
-  readiness gate, silently hiding content from members the gate would have warned about
-  (the H-VANISH hazard). Do step 2 above, then redeploy.
-- **`PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.md)`**
-  Your database has teams but no `pret4_builtin_materialize` marker — typically a
-  restored-from-backup DB or a skipped release. Boot the prior release once (its startup runs
-  the materialization), then take this one.
+It also refuses with **`PRET-6 refused: this fleet has content but no context substrate`**
+(STAGINGMARK-2) when the fleet has `items` and no `project_context_memberships` at all — the
+pre-`v0.11.0` shape. This one is NOT repairable in place and is deliberately not repaired: enforcement
+fails closed for an item with no context unit, so materializing such a fleet would hand you a deploy
+that reports success over a corpus nobody can see. Upgrade through `v0.11.0` so the substrate is
+built (`docs/RELEASING.md` §3.4). `npm run admin -- materialize-builtins` refuses this shape too, and
+must not be used to clear it — see `docs/OPS.md`.
 
-  **Or stamp it directly, without booting anything** (STAGINGMARK-1) —
-  `DATABASE_URL=<the wedged database> npm run admin -- materialize-builtins`, dry-run by default.
-  Usually the shorter route: "boot the prior release" is also open to a self-hoster (check out the
-  previous tag and start it), but it means finding and running an older build, where this is one
-  command against the database. Full runbook, including which machine to run it from:
-  `docs/OPS.md` §11 "If a deploy refuses …".
+**STAGINGMARK-2 removes the missing-marker deploy loop.** A markerless fleet now creates any
+absent Everyone/External groups, reconciles every member into exactly the builtin prescribed by
+its tier, and stamps `pret4_builtin_materialize` during preDeploy. It also repairs pre-flag-era
+fleets without the retired column. An already-marked fleet is untouched, preserving deliberate
+membership edits. The single frozen SQL definition lives in `postgres/schema.sql`; the PRET-6
+migration only calls it. The attended `npm run admin -- materialize-builtins` command remains
+available for inspecting a target and older-release recovery (dry-run first; `docs/OPS.md` §11).
 
-A refused deploy is **safe**: the guard raises before the drop, so no access state changes, and the
-running version keeps serving. It is **not** an all-or-nothing abort, and this note used to say so
-wrongly: `scripts/pg-load-schema.mjs` applies `postgres/schema.sql` and then each migration in
-filename order with no wrapping transaction, so everything sorting before this migration HAS already
-replayed (idempotently) and everything after it has not. The next successful deploy completes the
-replay. Replaying the migration after a successful drop is a clean no-op, and a from-zero install
-never sees the guard fire (a fresh DB has no teams).
+A reserved-slug squatter or a reconcile/drop error fails the deploy. The PRET-6 statement rolls
+back membership, marker and drops together; earlier schema and migrations have already committed
+because the loader replays files without a wrapping transaction. Correct the reported error and
+retry. Never delete a materialization marker to trigger repair: replay could restore deliberately
+removed memberships.
+
+On a marker miss, five ordered SHARE ROW EXCLUSIVE locks serialize new callers, with a marker
+re-read after waiting. Waiting is bounded **per statement** by the loader's `lock_timeout`
+(`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s); the number of waiting statements is data-dependent,
+so there is no total bound across
+those locks and the column-drop lock upgrade, with no total-runtime or fleet-size guarantee.
+This relies on no application transaction spanning two locked tables today; old multi-statement
+TypeScript materializers remain outside that serialization protocol. Details: `docs/OPS.md` §11.
 
 ## What changes for operators
 

@@ -67,17 +67,18 @@ describe("db:test:up brings the test Postgres up from zero", () => {
       "utf8"
     );
     expect(migration).toContain("PRET-6 refused: permissive team(s) remain");
-    expect(migration).toContain("PRET-6 refused: the PRET-4 builtin materialization has not completed");
-    // Both refusals must stay unconditional. The hazard shape is a raise made SKIPPABLE by an
+    expect(migration.replace(/--[^\n]*/g, "")).toMatch(/perform\s+materialize_builtin_membership_once\s*\(\s*\)/i);
+    // The permissive refusal and materialization must stay unconditional. The hazard is
+    // either operation made SKIPPABLE by an
     // ambient signal (an env var / session GUC read in the guard), not the mere presence of
     // `current_setting`, which has legitimate uses in a migration.
-    for (const raise of migration.matchAll(/raise exception 'PRET-6[^\n]*/g)) {
-      expect(raise[0], "a refusal must not be conditioned on an env/test signal").not.toMatch(
+    for (const raise of migration.matchAll(/(?:raise exception 'PRET-6|perform\s+materialize_builtin_membership_once)[^\n]*/g)) {
+      expect(raise[0], "neither refusal nor reconciliation may depend on an env/test signal").not.toMatch(
         /current_setting|NODE_ENV|AIOS_|_TEST|CI\b/
       );
     }
     expect(migration, "no environment-keyed bypass may gate the guard block").not.toMatch(
-      /current_setting\s*\(\s*'(app|aios)\./
+      /current_setting\s*\(\s*'(app|aios)\.|NODE_ENV|AIOS_|_TEST|\bCI\b/i
     );
   });
 });
