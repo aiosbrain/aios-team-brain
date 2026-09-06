@@ -879,8 +879,10 @@ guard enforces it, it's named.
   Net effect: one laptop had a gate, nothing else did, and CI had no equivalent at all.
   **CI is now the gate** (`.github/workflows/nda-gate.yml` → `scripts/nda-scan.mjs`), with the term
   list arriving as the `NDA_TERMS` secret so it still never enters the repo. The privileged
-  `pull_request_target` workflow executes only the trusted base-branch scanner; it fetches the PR
-  head as Git objects and never checks out, imports, installs, builds, or executes untrusted PR code.
+  `pull_request_target` workflow executes only the trusted DEFAULT-branch scanner (it said
+  *base-branch*; GitHub made the workflow file and checkout commit always come from the default
+  branch on 2025-12-08); it fetches the PR head as Git objects and never checks out, imports,
+  installs, builds, or executes untrusted PR code.
   It scans the proposed and every intermediate tracked tree (content, filenames, UTF-16/binaries
   and symlink blobs; new opaque binaries and submodules fail closed), Unicode-normalized/multiline
   variants, every added commit-range path and content block (including merge commits), and commit

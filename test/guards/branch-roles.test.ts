@@ -15,8 +15,9 @@ import { CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef } from
  * a first draft of this slice was declaring the same name as `main`. Two independent pre-code reviews
  * killed that draft.
  *
- * But the sharper trap is what remains after the fix: **`RELEASE_BRANCH` and `CONTRIBUTION_BASE` are
- * both `"main"` today.** A consumer wired to the wrong one passes every value assertion — "the release
+ * But the sharper trap is what remains after the fix: **`RELEASE_BRANCH` and `CONTRIBUTION_BASE` were
+ * both `"main"` until the 2026-09-06 cutover, and `CONTRIBUTION_BASE` and `INTEGRATION_BRANCH` are
+ * both `"staging"` now** — the same trap, one role over. A consumer wired to the wrong one passes every value assertion — "the release
  * ref resolves to main" is true either way — and stays green until cutover day, when
  * `CONTRIBUTION_BASE` moves to `staging` and assertion C silently becomes "is `staging` an ancestor of
  * the candidate". That is the pre-cutover-green / post-cutover-silent shape this whole program exists
@@ -33,7 +34,7 @@ const workflow = (name: string) => parseYaml(read(`.github/workflows/${name}`)) 
 
 describe("branch roles — one owner per role (criteria 1, 2)", () => {
   it("the three roles hold the values the design says they hold", () => {
-    expect(CONTRIBUTION_BASE, "moves at the cutover").toBe("main");
+    expect(CONTRIBUTION_BASE, "MOVED at the cutover, 2026-09-06").toBe("staging");
     expect(INTEGRATION_BRANCH, "already staging — RELPTR-3 reads it").toBe("staging");
     expect(RELEASE_BRANCH, "what installers deploy").toBe("main");
     expect(remoteRef("x")).toBe("refs/remotes/origin/x");
@@ -243,7 +244,7 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     //
     // WHY RELEASE AND NOT CONTRIBUTION — by elimination, which is the only argument that holds in
     // both worlds. The trigger needs two DISTINCT branches. `[CONTRIBUTION_BASE, RELEASE_BRANCH]`
-    // collapses today (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
+    // collapsed BEFORE the cutover (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
     // cutover (both `staging`); `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both. That is
     // the whole justification and it is checkable.
     //
@@ -298,9 +299,11 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
   });
 
   it("the workflow triggers are pinned to the RELEASE role, not the contribution base", () => {
-    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: today
-    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs are the SAME VALUE
-    // and no value or behavioural assertion can tell them apart. Measured, not assumed — reverting
+    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: when this was written
+    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs were the SAME VALUE and
+    // no value or behavioural assertion could tell them apart. The cutover separated THAT pair and
+    // created the mirror one — `CONTRIBUTION_BASE === INTEGRATION_BRANCH === "staging"` — so the
+    // instrument is still needed, pointed one role over. Measured, not assumed — reverting
     // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves EVERY test in this
     // file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
     // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the
@@ -386,6 +389,88 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     // A parse returning undefined would make every assertion above vacuously pass.
     expect(workflow("aios-work-sync.yml").jobs!["notify-brain"].steps!.length).toBeGreaterThan(0);
     expect(Object.keys(workflow("scan-on-merge.yml").jobs!).length).toBeGreaterThan(0);
+  });
+});
+
+describe("branch roles — Dependabot targets the contribution base (RELPTR-7)", () => {
+  /**
+   * WHY A GUARD AT ALL. Dependabot follows the DEFAULT branch absent a `target-branch`, so before the
+   * cutover this file needed no entry and had none. After it, the default and the contribution base
+   * coincide — which means a DELETED `target-branch` is invisible: Dependabot keeps aiming at
+   * `staging` because that is the default, and nothing reddens. The day the default moves again, every
+   * dependency PR silently retargets.
+   */
+  const dependabot = () => parseYaml(read(".github/dependabot.yml")) as { updates?: { "package-ecosystem"?: string; directory?: string; "target-branch"?: string }[] };
+
+  /**
+   * The ecosystems that MUST be covered, pinned as an explicit expectation rather than derived from
+   * the file. gpt-6-astra's review broke the derived version: the count came from the same list it was
+   * checking, so deleting the `pip` and `github-actions` entries outright left both assertions green
+   * while criterion 7's coverage quietly went from three ecosystems to one.
+   *
+   * Keyed on (ecosystem, directory), not ecosystem alone: the same ecosystem in two directories is
+   * ordinary Dependabot config, and a guard that forbids it would redden on a legitimate change.
+   * Extra entries beyond these are allowed; missing ones are not.
+   */
+  const REQUIRED = [
+    { ecosystem: "npm", directory: "/" },
+    { ecosystem: "pip", directory: "/ingestion" },
+    { ecosystem: "github-actions", directory: "/" },
+  ] as const;
+
+  it("EVERY update entry targets the contribution base", () => {
+    const updates = dependabot().updates ?? [];
+    expect(updates.length, "dependabot must declare ecosystems").toBeGreaterThan(0);
+    for (const entry of updates) {
+      expect(entry["target-branch"], `${entry["package-ecosystem"]} @ ${entry.directory}`).toBe(CONTRIBUTION_BASE);
+    }
+  });
+
+  it("covers every REQUIRED ecosystem — deleting one cannot pass by shrinking the list", () => {
+    const have = (dependabot().updates ?? []).map((u) => `${u["package-ecosystem"]}@${u.directory}`);
+    for (const { ecosystem, directory } of REQUIRED) {
+      expect(have, `${ecosystem} @ ${directory} must still be covered`).toContain(`${ecosystem}@${directory}`);
+    }
+  });
+
+  it("names the CONTRIBUTION role in source — the one thing no value assertion can check", () => {
+    /**
+     * THE POST-CUTOVER IDENTITY TRAP, and it is the mirror of the one RELPTR-6 fixed.
+     * `CONTRIBUTION_BASE === INTEGRATION_BRANCH === "staging"` now, so substituting one role for the
+     * other in the assertions above changes NOTHING that any value test can see — astra demonstrated
+     * exactly that substitution passing. Dependabot must follow the CONTRIBUTION base because
+     * dependency PRs are contributions; if the contribution base moves again and this file has
+     * silently been wired to the integration branch, dependency PRs would target the wrong one with
+     * every check green.
+     *
+     * A source-token pin is the only instrument that discriminates two roles holding one value. It is
+     * evadable by an equivalent spelling — this file's own header says so — and an evadable pin still
+     * beats no pin, which is what the value assertions amount to here.
+     */
+    // BOUNDED TO THE FIRST TEST, and the tokens are BUILT rather than written. Both matter, and the
+    // first version got both wrong: reading to end-of-file made this assertion match its own
+    // `not.toContain(...)` argument, so it failed on itself — and the positive half would have been
+    // satisfied by this very line, i.e. vacuous, had the negative not reddened first.
+    const src = read("test/guards/branch-roles.test.ts");
+    const from = src.indexOf("EVERY update entry targets the contribution base");
+    const to = src.indexOf("covers every REQUIRED ecosystem", from);
+    expect(from, "anchor 1 must exist").toBeGreaterThan(-1);
+    expect(to, "anchor 2 must exist and follow it").toBeGreaterThan(from);
+    const block = src.slice(from, to);
+    const right = `toBe(${"CONTRIBUTION"}_BASE)`;
+    const wrong = `toBe(${"INTEGRATION"}_BRANCH)`;
+    expect(block, "the dependabot assertion must name the CONTRIBUTION role").toContain(right);
+    expect(block, "and must NOT have been re-wired to the integration role").not.toContain(wrong);
+    // Non-vacuous: the block is the assertion body, not an empty slice.
+    expect(block.length, "the bounded block must be real").toBeGreaterThan(80);
+  });
+
+  it("pins the ROLE in the yaml, not the literal", () => {
+    // Asserting the literal `"staging"` in dependabot.yml's guard would make this file a SECOND OWNER
+    // of the contribution base — the defect RELPTR-4 existed to kill.
+    const src = read(".github/dependabot.yml");
+    expect(src).toContain(`target-branch: "${CONTRIBUTION_BASE}"`);
+    expect(src.match(/target-branch:/g) ?? [], "exactly one per update entry").toHaveLength((dependabot().updates ?? []).length);
   });
 });
 

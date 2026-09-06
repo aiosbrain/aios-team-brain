@@ -55,15 +55,38 @@ runs, today and at every future rebuild — and that branch is trunk.
    the guard, not aspirational.)
 4. **Cut the tag on the release commit** and push it. **Pushing a tag now runs the release-candidate
    gate** (`.github/workflows/release-candidate.yml`, RELPTR-3) — `ci.yml` still fires on branches
-   only, but the gate fires on `v*` and its result attaches to the tagged commit. **Watch it**: until
-   the cutover it is expected to fail assertion D (the candidate is not yet reachable from the
-   integration branch — constraint 8), which blocks nothing because the context is not required, but a
-   failure on A, B or C means the tag itself is wrong. Do not publish past a red A/B/C. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
+   only, but the gate fires on `v*` and its result attaches to the tagged commit. **Watch it**: all
+   four assertions should now pass. (Before the 2026-09-06 cutover, D was expected to fail because the
+   candidate was not reachable from the integration branch; `main` is now an ancestor of `staging`, so
+   a red D means something real.) A failure on A, B or C means the tag itself is wrong. Do not publish
+   past a red assertion.
+5. **Fast-forward `main` onto the tagged commit — THE STEP THAT MAKES IT A RELEASE.** Everything above
+   produces a tag; nothing above moves what installers deploy. Post-cutover `main` advances ONLY this
+   way, and it was missing from this ritual entirely until Fable's review of RELPTR-7 found that
+   following §2 as written would leave installers on the pre-cutover `main` forever.
+
+   ```bash
+   git push origin "v<X.Y.Z>^{commit}:$(node scripts/branches.mjs --print release)"
+   ```
+
+   **Order matters and §3.1a records why:** push the tag, WAIT for `Release candidate gate` to go
+   green on that commit, *then* fast-forward.
+
+   ⚠️ **THE WAIT IS HUMAN DISCIPLINE TODAY — NOTHING ENFORCES IT**, and an earlier draft of this step
+   implied otherwise. Measured on `main` 2026-09-06: `Release candidate gate` is **not** a required
+   context, `required_pull_request_reviews` is present, `enforce_admins` is `false`, and there is no
+   bypass allowance. So a non-admin's fast-forward is refused by "require a pull request" whatever the
+   contexts say, and an **admin's push bypasses everything — including a pending or red gate**. The
+   sentence this replaced ("a fast-forward attempted while the context is still pending is rejected")
+   is true for neither actor.
+
+   To make the wait real, make `Release candidate gate` required on `main` and add a bypass allowance
+   for the release actor — §3.2's `release-actor-protection` pair, still open. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
    check that the release is installable from an existing database. For `v0.11.0` it is the largest
    step the lane has ever taken (**34 migration files touched: 29 added, 5 modified**;
    `postgres/schema.sql` +831/−14), so expect it to be slow and read its output. A `v*`-triggered
    verification workflow was named as follow-on work there; **RELPTR-3 shipped it** — see §3.1a.
-5. **Publish the GitHub Release** from the tag, with the CHANGELOG section as its body.
+6. **Publish the GitHub Release** from the tag, with the CHANGELOG section as its body.
 
 **Roll forward, never back.** At least one shipped migration is explicitly one-way —
 `postgres/migrations/20260819180000_task_status_in_review.sql` adds an enum value and says so: *"ONE-WAY.
@@ -72,11 +95,26 @@ checkpoint you can return to once its migrations have run.
 
 ---
 
-## 3. The cutover that has not happened yet
+## 3. The cutover — EXECUTED 2026-09-06 (RELPTR-7)
 
-The repository still deploys trunk to production and still hands trunk to installers. Fixing that
-means choosing a branch model and executing a coordinated cutover. **The design work is done and
-recorded** in `design/release-pointer-stable-branch.md`; the decision and the execution are not.
+**Option B is live.** `staging` is the default branch and the contribution base; `main` is the release
+branch and advances only by fast-forward to a tagged commit. `scripts/branches.mjs` answers `staging`
+for `--print contribution`. The design is in `design/release-pointer-stable-branch.md`; the execution
+is `design/cutover-execution.md`.
+
+**What was measured on the day, because two of these were surprises:**
+
+- `main` was **not an ancestor of `staging`** — three reviewed commits had landed on `main` after the
+  default branch moved, so no release candidate could satisfy both guard assertions at once. Fixed by
+  a back-merge (#681) *before* anything else; the ancestry that makes a fast-forward release possible
+  is a precondition, not a consequence.
+- `scan-on-merge` went red in 3 seconds with **zero steps run**, twice, because the
+  `trusted-automation` environment still permitted `main` only. That is a `push` trigger, whose ref is
+  the pushed branch — see §3.1c item 4 for why its two `pull_request_target` siblings behave
+  differently.
+
+The rest of this section is kept in its original tense where it records *why* the model was chosen,
+and corrected where it made claims that the execution disproved.
 
 The recommendation there is **option B — `main` becomes the release branch, `staging` becomes the
 integration branch** — because every artefact that names a branch today already names `main`: the
@@ -94,13 +132,13 @@ completeness.**
 | # | Constraint | Where it bites |
 |---|---|---|
 | 1 | A fast-forward push to `main` can be **rejected by a required check the candidate cannot acquire** — but this is **one context, not ten**. **MEASURED 2026-08-26** on the real merge commit `6dfddfc7` (a push to `main`): **9 of the 10 required contexts are present**, because `ci.yml` and `nda-gate.yml` both fire on `push`. The sole exception is **`PR records a diff review`**, emitted only on `pull_request` (`.github/workflows/pr-review-gate.yml`). The cutover therefore needs that one context **relocated** to the integration branch — not a release-actor bypass that defeats the other nine. *(A dated measurement, not an invariant: if protection gains an eleventh context, re-measure rather than trusting this row.)* | live protection on `main`; check-runs on `6dfddfc7` |
-| 2 | **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
+| 2 | **✅ SATISFIED 2026-09-06 (RELPTR-7): all three ecosystems now carry `target-branch: "staging"`, pinned universally by `test/guards/branch-roles.test.ts`. The measurement below is what was true BEFORE the cutover.** **Dependabot follows the default branch.** Three ecosystems, zero `target-branch` overrides (`.github/dependabot.yml`), so its PRs target the default; and security updates and alerts always follow the default branch, so a vulnerability introduced on the integration branch stays invisible until release. | `.github/dependabot.yml` |
 | 3 | **PREPARED (RELPTR-4).** `aios-work-sync` fired on `pull_request` closed against `main` only, so merges elsewhere would have emitted nothing and **nothing would have closed a ticket**. It now fires on both `main` and `staging`, landed early because it is near-inert until contributions move. `scan-on-merge` was widened for the same reason — otherwise codebase readiness silently drops from per-merge to per-release. **The decision constraint 3 demanded is made: a ticket closes at INTEGRATION, not at release** (see §3.1b). **Still human at cutover:** nothing for this constraint. | `.github/workflows/aios-work-sync.yml` |
 | 4 | **PREPARED (RELPTR-5).** A review against the release branch after contributions move carries every unreleased commit. The review gate and attestation instructions now fetch and diff the same resolved contribution base from `scripts/branches.mjs`. **Still human at cutover:** change `CONTRIBUTION_BASE` and the enumerated prose that names a branch (§3.1c); the invariant is a fresh contribution-base diff. | `CLAUDE.md` §Review gate |
-| 5 | **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
+| 5 | **✅ SATISFIED: `staging` was fast-forwarded 2026-09-05 and `main` back-merged into it 2026-09-06 (#681); `main` is now an ANCESTOR of `staging`, 0 ahead. Historical measurement follows.** **`staging` is behind `main` and 0 ahead** (249 when slice 1 measured it; **257** on 2026-08-26 — it drifts further with every merge), and is branch-protected with its own (smaller) required set, so any strategy that gives it a new role begins with a fast-forward that protection has to be opened for. | `docs/CI-ARCHITECTURE.md` §Environments |
 | 6 | **Bare `gh pr create` targets the default branch** absent a `branch.<name>.gh-merge-base` override (none is set here), and this repo's own attestation skill calls it without `--base`. Whatever the default is, tooling will follow it. | `.agents/skills/pr-review-attestation/SKILL.md` |
-| 7 | **Tags are deletable and re-pointable by anyone with write access.** Measured 2026-08-26: **zero** repository rulesets, and `repos/.../tags/protection` returns 404. Nothing in the repository can defend the facts the release-candidate gate reads — delete or move `v0.12.0` and assertions A and B are reading a different world. A **ruleset on `refs/tags/v*` denying deletion and update** is required. And note the sharp edge: installing it later does **not** invalidate a green context already minted, so it must exist **before the first candidate context is issued**. | live rulesets API (empty); `tags/protection` → 404 |
-| 8 | **Assertion D is false until `staging` is fast-forwarded.** The gate's fourth assertion — the candidate must be reachable from the integration branch — is what distinguishes "the release" from "some descendant of `main`". `staging` is **257 behind / 0 ahead**, so today every candidate fails D. That is correct and blocks nothing (the context is not required yet), but it means the fast-forward must happen **before the first release tag is cut**, or the first candidate reddens. | `scripts/release-candidate-guard.mjs`; live `git rev-list` |
+| 7 | **✅ SATISFIED 2026-09-06: a ruleset on `refs/tags/v*` (deletion / update / non-fast-forward) is `enforcement: active`. NOTE — it was first created `disabled`, which protects nothing; creating a ruleset is not enabling it. Historical measurement follows.** **Tags are deletable and re-pointable by anyone with write access.** Measured 2026-08-26: **zero** repository rulesets, and `repos/.../tags/protection` returns 404. Nothing in the repository can defend the facts the release-candidate gate reads — delete or move `v0.12.0` and assertions A and B are reading a different world. A **ruleset on `refs/tags/v*` denying deletion and update** is required. And note the sharp edge: installing it later does **not** invalidate a green context already minted, so it must exist **before the first candidate context is issued**. | live rulesets API (empty); `tags/protection` → 404 |
+| 8 | **✅ SATISFIED: `main` is an ancestor of `staging`, so a candidate reachable from `staging` satisfies both C and D. Historical measurement follows.** **Assertion D is false until `staging` is fast-forwarded.** The gate's fourth assertion — the candidate must be reachable from the integration branch — is what distinguishes "the release" from "some descendant of `main`". `staging` is **257 behind / 0 ahead**, so today every candidate fails D. That is correct and blocks nothing (the context is not required yet), but it means the fast-forward must happen **before the first release tag is cut**, or the first candidate reddens. | `scripts/release-candidate-guard.mjs`; live `git rev-list` |
 | 9 | **`statuses: write` is a third context-forging route, and it is how `nda-gate.yml` already works.** A workflow holding it can POST a commit status with ANY context name onto ANY sha, and commit statuses share the namespace branch protection reads. So a same-repository pull request adding a `pull_request` workflow that requests `statuses: write` could mint `Release candidate gate` on a commit the gate never examined, during its own PR run — structurally identical to the `contents: write` route. Mitigations today: the repo default is `read`, and `test/guards/workflow-permissions.test.ts` fails the build on any unallowlisted `contents`/`statuses`/`checks` write grant — the exemption for `nda-gate.yml` is **conditional on it keeping a `pull_request_target`-only trigger**, so a pull request that adds `pull_request:` to that file to run its own edited copy loses the exemption and reddens. **App pinning is NOT a mitigation here, and an earlier draft of this row wrongly said it was**: `GITHUB_TOKEN` is an installation token for the repository's GitHub Actions app, so a forged status and the genuine check carry the SAME app identity. Keep the app pinning for what it does buy (a third-party app cannot satisfy the context) and re-audit these grants when the gate becomes required. | `.github/workflows/nda-gate.yml`; live protection (app-pinned contexts) |
 
 ### 3.1a The release-candidate gate, and what making it required costs
@@ -166,33 +204,42 @@ file a human must change:
 2. **Prose that NAMES a branch** rather than pointing at the module — undetectable by any guard,
    because `main` is a legitimate token everywhere.
 3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
-   relocating `PR records a diff review`.
-4. **The `trusted-automation` environment's deployment branch policy — `main` only today — and it now
+   relocating `PR records a diff review`. **Status 2026-09-06:** `PR records a diff review` is
+   relocated (required on `staging`, removed from `main`) and `main` has `enforce_admins: false` so an
+   admin can perform the release fast-forward. **NOT done:** `Release candidate gate` is still not a
+   required context, and there is no bypass allowance — see §2 step 5 for what that means in practice.
+4. **The `trusted-automation` environment's deployment branch policy — now `[main, staging]`, widened 2026-09-06 BEFORE the default branch moved — and it
    gates all three `AIOS_*` consumers.** This entry has grown, and the earlier version of it is now
    wrong in a way worth naming: it said `aios-work-sync` and `scan-on-merge` "were deliberately
    pre-widened to both branches so cutover day would not have to remember them". The trigger lists
    still are. The **environment** is not, and after the credential-isolation fix all three workflows
    name it, so the policy is a cutover-day edit for every one of them:
 
-   - **`pr-task-link.yml`** — the trigger list AND the policy move together. It runs on
-     `pull_request_target`, so the run's ref is the pull request's target branch; once the environment
-     holds the credentials a `staging`-based run would be refused a `main`-only policy and go red — on
-     an advisory check that is never allowed to go red. Leaving its trigger at `[main]` instead makes
-     it go **dark** for `staging` pull requests: the safer failure, still a loss nobody would notice.
-     `test/guards/pr-task-link-credential-isolation.test.ts` pins that trigger to exactly `["main"]`
-     so the widening has to be deliberate.
-   - **`aios-work-sync.yml`** — trigger already `[main, staging]`, but it moved from `pull_request` to
-     `pull_request_target` to close the credential hole (the `merged == true` gate used to live in a
-     file the pull request could rewrite). Same consequence: the run's ref is the target branch, so a
-     `staging` merge would be refused the environment and go red having run zero steps, and **no work
-     event would post**. Loud, not silent — and inert only while nothing targets `staging`.
-   - **`scan-on-merge.yml`** — trigger already `[main, staging]`, on `push`, so the run's ref is the
-     pushed branch. A `staging` push would be refused the environment the same way. Nothing has pushed
-     `staging` since 2026-07-25.
+   ⚠️ **THE MECHANISM BELOW WAS WRONG FOR THE TWO `pull_request_target` WORKFLOWS, and the correction
+   changes what the ordering pair protects.** The original text said their run ref is *the pull
+   request's target branch*, so a `staging`-based run would be refused a `main`-only policy. GitHub
+   changed that effective **2025-12-08**: *"The workflow file and checkout commit will always be taken
+   from the repository's default branch, regardless of the pull request's base branch"*, and *"For
+   `pull_request_target`, environment rules evaluate against the default branch."*
+   ([changelog](https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/))
 
-   So the cutover-day edit is one policy change (add `staging` to the environment's branch policy)
-   plus `pr-task-link.yml`'s trigger list. Do the policy **first**: widening it is inert until a
-   branch is actually used, whereas doing it late means red merge automation on the day.
+   - **`pr-task-link.yml`** (`pull_request_target`) — the environment is evaluated against the
+     **default** branch, so the base of a pull request never decides it, and the trigger list and the
+     policy are **independent**. Widening the trigger early was therefore harmless; leaving it at
+     `[main]` after the default moved made it go **dark** for `staging` pull requests — the safer
+     failure, still a loss nobody would notice. Now `[main, staging]`.
+   - **`aios-work-sync.yml`** (`pull_request_target`) — same evaluation, same conclusion. Its move from
+     `pull_request` closed a credential hole (the `merged == true` gate used to live in a file the pull
+     request could rewrite) and is unrelated to the branch question.
+   - **`scan-on-merge.yml`** (`push`) — **the one the old mechanism was right about.** A `push` run's
+     ref IS the pushed branch, and the 2025-12-08 change does not touch `push`. MEASURED 2026-09-05:
+     two `staging` pushes were refused a `main`-only policy and went red in 3 seconds having run zero
+     steps, with no scan posted.
+
+   So the real hazard is not the trigger widening at all — it is the **default-branch move**, after
+   which *every* `pull_request_target` run evaluates against the new default and a policy lacking it
+   refuses all of them at once. Do the policy **first**: widening it is inert until the default moves
+   or a branch is actually pushed, whereas doing it late means red automation across the whole repo.
 
    A related manual step, **not** a cutover item and **not** to be done in the pull request that
    enrolled these workflows: the three values still exist as repository-level secrets, which GitHub
@@ -238,8 +285,10 @@ read failures are fatal. Exclusions: `docs/design/**` and `docs/archive/**` (his
 Not a total order — these are the adjacencies where getting it backwards causes the incident:
 
 ```yaml
-cutover: pending
+cutover: done                      # 2026-09-06, RELPTR-7
 order:
+  - widen-trusted-automation-policy: BEFORE the default branch moves   # the one that bit us
+  - reconcile-main-into-staging: before any release candidate          # main must be an ANCESTOR
   - fast-forward-staging: before retargeting any contribution flow
   - declare-tag-in-DEFAULT_TAGS: before cutting the tag
   - release-actor-protection: before the first fast-forward push to main
@@ -251,6 +300,7 @@ order:
   - fast-forward-staging: before any candidate tag is pushed
   - work-sync-and-scan-widened: DONE (RELPTR-4), before contributions move
   - dependabot-target-branch: at the cutover, never before (it would aim at a stale branch)
+  - tag-ruleset-ENFORCEMENT-active: creating the ruleset is not enabling it   # shipped `disabled`
 ```
 
 The `workflow-on-main` pair is this repository's own scar tissue: `docs/CI-ARCHITECTURE.md` records that switching on

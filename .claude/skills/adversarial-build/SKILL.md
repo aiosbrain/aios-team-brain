@@ -141,8 +141,8 @@ declined **twice** — shape was never the problem.
 
 ## 1. Write the code
 
-- Branch from the contribution base (currently `main`, declared in `scripts/branches.mjs`) — or from the prerequisite slice's branch when
-  stacking (PR base = that branch; retarget to the contribution base (currently `main`, declared in `scripts/branches.mjs`) after it merges).
+- Branch from the contribution base (currently `staging`, declared in `scripts/branches.mjs`) — or from the prerequisite slice's branch when
+  stacking (PR base = that branch; retarget to the contribution base (currently `staging`, declared in `scripts/branches.mjs`) after it merges).
 - Spec-first tests in the tier that catches the failure mode (CLAUDE.md §4);
   for access/persistence work that means real-Postgres data-mechanics, not
   FakeSupabase. Update `docs/ARCHITECTURE.md` (drift blocks + sources-of-truth
@@ -247,7 +247,7 @@ end.
 
 ## 6. Push the PR (never merge)
 
-- `git push -u origin <branch>`, then `gh pr create` — base: the contribution base (currently `main`, declared in `scripts/branches.mjs`), or the
+- `git push -u origin <branch>`, then `gh pr create` — base: the contribution base (currently `staging`, declared in `scripts/branches.mjs`), or the
   prerequisite branch when stacked.
 - PR body must carry, honestly:
   - what the slice is + what is deliberately NOT in it (next slices named);

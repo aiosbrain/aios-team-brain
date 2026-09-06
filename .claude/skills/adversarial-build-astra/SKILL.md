@@ -404,7 +404,7 @@ the signal, not the phrasing superstition.
 
 ## 5. Astra writes the code
 
-Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `main`).
+Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `staging`).
 Then hand astra the approved spec:
 
 ```bash
@@ -578,7 +578,7 @@ resolved rather than hardcoded:
 gh pr create --base "$(node scripts/branches.mjs --print contribution)"
 ```
 
-`main` today; `staging` after the option-B cutover. Hardcoding `main` here would
+`staging` since the option-B cutover (2026-09-06). Hardcoding `main` here would
 both contradict §5's "branch from the contribution base" and quietly open the PR
 against the release branch on cutover day. (`gh pr create --base` is itself listed
 in `docs/RELEASING.md` §3.1c as a cutover-day edit — resolving it is how that edit

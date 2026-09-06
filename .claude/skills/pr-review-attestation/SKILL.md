@@ -53,7 +53,7 @@ genuinely done.
 
 ## Steps
 
-1. **Get the diff — against a fresh remote ref for the contribution base (currently `main`, declared in `scripts/branches.mjs`).**
+1. **Get the diff — against a fresh remote ref for the contribution base (currently `staging`, declared in `scripts/branches.mjs`).**
    ```bash
    root="$(git rev-parse --show-toplevel)"
    base="$(node "$root/scripts/branches.mjs" --print contribution)"

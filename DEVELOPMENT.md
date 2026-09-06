@@ -94,9 +94,18 @@ Notes:
 
 ## Deploy / schema rollout
 
-Production is Postgres on Railway. After a merge that changes `postgres/schema.sql`, run
-`npm run pg:schema` against the prod `DATABASE_URL` and confirm the platform started a new build
-(CI webhooks can be dropped — re-trigger if the latest deploy predates the merge).
+Production is Postgres on Railway, and **the deploy applies the schema itself** — `railway.json`
+runs `npm run pg:schema` as its `preDeployCommand`, from the deployed artifact's tree.
+
+⛔ **Do not run `npm run pg:schema` against prod by hand.** It loads from YOUR checkout
+(`loadSchema({ cwd = process.cwd() })`), and since the 2026-09-06 cutover ordinary work lands on
+`staging` while production tracks the tagged release — so a local run applies **unreleased
+migrations** to production. This section used to instruct exactly that; it was near-safe only while
+`main` was both trunk and production, and the cutover ended that. `docs/OPS.md` and the
+`railway-deploy-verify` skill already said never to do it.
+
+Instead: confirm the platform started a new build and that its preDeploy step succeeded (CI webhooks
+get dropped — re-trigger from the Railway dashboard if the latest deploy predates the merge).
 
 ## Bootstrapping a fresh instance (first team + admin)
 
