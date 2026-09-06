@@ -49,7 +49,9 @@ retry. Never delete a materialization marker to trigger repair: replay could res
 removed memberships.
 
 On a marker miss, five ordered SHARE ROW EXCLUSIVE locks serialize new callers, with a marker
-re-read after waiting. The 15-second per-statement lock timeout allows **6 × 15 s = 90 s** across
+re-read after waiting. Waiting is bounded **per statement** by the loader's `lock_timeout`
+(`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s); the number of waiting statements is data-dependent,
+so there is no total bound across
 those locks and the column-drop lock upgrade, with no total-runtime or fleet-size guarantee.
 This relies on no application transaction spanning two locked tables today; old multi-statement
 TypeScript materializers remain outside that serialization protocol. Details: `docs/OPS.md` §11.

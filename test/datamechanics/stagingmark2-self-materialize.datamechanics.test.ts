@@ -67,6 +67,56 @@ async function exact(expected: { team_id: string; member_id: string; slug: strin
   expect(await marker()).toHaveLength(1);
 }
 
+/**
+ * Seed a corpus for the SUBSTRATE GATE. `partitioned:false` is the pre-flag-era shape the deleted
+ * unconditional refusal used to gate: content exists, but nothing is partitioned, so enforcement
+ * (which fails closed on a missing context unit) would hide the whole corpus behind a budgeted
+ * backfill after a deploy that reported success.
+ */
+async function corpus(teamId: string, opts: { partitioned: boolean }) {
+  const project = (await query("insert into projects (team_id, slug) values ($1, $2) returning id", [teamId, `p-${randomUUID().slice(0, 8)}`])).rows[0].id as string;
+  const item = (await query(
+    `insert into items (team_id, project_id, path, kind, access, content_sha256)
+     values ($1, $2, $3, 'deliverable', 'team', 'sha') returning id`,
+    [teamId, project, `docs/${randomUUID().slice(0, 8)}.md`]
+  )).rows[0].id as string;
+  if (!opts.partitioned) return;
+  // `check (unit_kind = 'item' and source_item_id is not null)` — a unit must anchor to an item.
+  const unit = (await query(
+    `insert into project_context_units (team_id, unit_key, audience, content_sha256, source_item_id)
+     values ($1, $2, 'team', 'sha', $3) returning id`, [teamId, `u-${randomUUID().slice(0, 8)}`, item]
+  )).rows[0].id as string;
+  await query("insert into project_context_memberships (team_id, project_id, context_unit_id) values ($1, $2, $3)", [teamId, project, unit]);
+}
+
+describe("STAGINGMARK-2 — the substrate gate (repairing membership is not repairing VISIBILITY)", () => {
+  it("REFUSES a fleet with content but no context substrate, and mutates nothing", async () => {
+    const { teams } = await fleet();
+    await corpus(teams[0], { partitioned: false });
+    const before = await edges();
+    await expect(query(migration)).rejects.toThrow(/no context substrate/);
+    // The inverse half: a refusal that had already written rows would be worse than the wedge.
+    expect(await edges()).toEqual(before);
+    expect(await marker()).toEqual([]);
+    expect((await query("select * from groups")).rows).toEqual([]);
+  });
+
+  it("REPAIRS the same fleet once the corpus IS partitioned", async () => {
+    const { teams, expected } = await fleet();
+    await corpus(teams[0], { partitioned: true });
+    await query(migration);
+    expect(await marker()).toHaveLength(1);
+    await exact(expected);
+  });
+
+  it("REPAIRS a fleet with NO content at all — there is no corpus to darken", async () => {
+    const { expected } = await fleet();
+    await query(migration);
+    expect(await marker()).toHaveLength(1);
+    await exact(expected);
+  });
+});
+
 describe("STAGINGMARK-2 — migration self-materialization", () => {
   it("AC1b: creates absent builtins before placing every member, including the inverse", async () => {
     const { teams, expected } = await fleet();

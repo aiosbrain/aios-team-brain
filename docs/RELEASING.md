@@ -268,17 +268,28 @@ different base.
 
 ## 3.4 Upgrading an EXISTING installation past PRET-6 — the ordered path
 
-**A pre-flip installation cannot jump to the retirement release.**
-`postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql` refuses:
+**Whether a pre-flip installation can jump to the retirement release now depends on ONE thing:
+is its corpus partitioned?** (STAGINGMARK-2 changed this; it used to be an unconditional refusal.)
+
+- **A fleet whose content is already partitioned** — it has `project_context_memberships` rows, i.e.
+  it went through the context substrate — now **materializes itself during preDeploy** and the deploy
+  proceeds. There is nothing to upgrade through. This is the restored-staging and
+  never-booted-but-otherwise-current case.
+- **A fleet with content and NO context substrate** — the `v0.10.0` class, which predates the entire
+  PRET series — still **refuses**, with a different and more specific error:
 
 ```
-PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
-                — upgrade through the prior release first
+PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior
+                release so the corpus is partitioned before enforcement
 ```
 
-That refusal is correct and fails safe — `pg:schema` aborts, Railway's preDeploy halts, and the old
-code keeps serving. But until `v0.11.0` exists there was **no release to upgrade through**: `v0.10.0`
-predates the entire PRET series.
+  That refusal is deliberate and is the one that matters. Repairing group membership is **not** the
+  same as repairing visibility: enforcement fails closed for an item with no context unit, and the
+  only partitioner is the budgeted scheduler stage (batch 100, 30-minute interval). Letting such a
+  fleet through would report a successful deploy over a corpus that is dark for many ticks.
+
+Both refusals fail safe — `pg:schema` aborts, Railway's preDeploy halts, and the old code keeps
+serving. `v0.10.0` predates the entire PRET series, which is why `v0.11.0` exists as the step.
 
 ### The path
 

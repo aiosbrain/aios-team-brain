@@ -139,7 +139,9 @@ no application transaction today spans two of those five tables — member creat
 statements, and the only `withTransaction` users are pm-sync and gateway, none of which touch these
 tables. If a future transaction does `members` → `group_members`, this becomes a deadlock-detector
 victim during the deploy window. Also stated: `lock_timeout` is **per `LOCK` statement**, so this is a bound of
-**6 × 15 s = 90 s** — five `LOCK` statements plus the `alter table … drop column`, which upgrades to
+bounded **per statement**, not in total — the waiting statement count is data-dependent (the
+pre-lock marker read and the permissive scan can wait too, and an audit insert's timeout is swallowed
+by the best-effort handler). It covers the five `LOCK`s and the `alter table … drop column`, which upgrades to
 `ACCESS EXCLUSIVE` and waits on readers under the same GUC. No fleet-size or runtime guarantee is claimed; the
 reconcile is set-based and prod is a no-op.
 

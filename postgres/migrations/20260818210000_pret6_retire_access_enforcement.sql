@@ -7,10 +7,12 @@
 -- the earlier column-creation migrations remain neutered.
 -- This DO statement is atomic: a failed reconcile or drop rolls back rows and marker.
 -- The loader's earlier schema/migrations are separately committed, not rolled back here.
--- lock_timeout is per statement: five ordered LOCKs plus the drop's ACCESS EXCLUSIVE
--- upgrade can wait up to 6 x 15 s = 90 s. This is not a runtime/fleet-size guarantee.
+-- Waiting is bounded PER STATEMENT by the loader's lock_timeout
+-- (PG_MIGRATION_LOCK_TIMEOUT_MS, default 15s) -- deliberately NOT overridden here: an
+-- operator who lowered it to fail fast, or raised it for a slow fleet, must keep that
+-- choice for exactly the ACCESS EXCLUSIVE drop the knob was written for. The number of
+-- waiting statements is data-dependent, so no total upper bound is claimed.
 do $$ begin
-  set local lock_timeout = '15s';
   if exists (select 1 from information_schema.columns
              where table_schema = current_schema() and table_name = 'teams' and column_name = 'access_enforcement') then
     if exists (select 1 from teams where access_enforcement = 'permissive') then

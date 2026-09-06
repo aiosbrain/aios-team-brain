@@ -2986,6 +2986,20 @@ begin
     return false;
   end if;
 
+  -- SUBSTRATE GATE (STAGINGMARK-2, diff-review HIGH). Repairing membership is not the same
+  -- as repairing VISIBILITY. The unconditional marker refusal this function replaces was also
+  -- the gate for the pre-flag-era fleet, whose `teams.access_enforcement` column never existed
+  -- and which therefore cannot be caught by the migration's permissive readiness check either.
+  -- Enforcement fails closed for an item with no context unit, and the only partitioner is the
+  -- BUDGETED scheduler stage (batchSize 100, 30-minute interval) — so letting such a fleet
+  -- through would report a successful deploy over a corpus that is dark for many ticks. That is
+  -- the "whole corpus goes dark at cutover" hazard the original refusal was written for.
+  -- Keyed on the INVARIANT (is the corpus partitioned?), not on the deleted column: both
+  -- PRET-6 near-misses were checks keyed on a retired artifact instead.
+  if exists (select 1 from items) and not exists (select 1 from project_context_memberships) then
+    raise exception 'PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior release so the corpus is partitioned before enforcement (see docs/RELEASE-NOTES-pret6.md)';
+  end if;
+
   -- Refuse every squatter before any mutation, then CREATE absent builtins before
   -- computing want. Joining only existing groups would silently stamp empty teams.
   if exists (select 1 from groups where slug in ('everyone', 'external') and not is_builtin) then
