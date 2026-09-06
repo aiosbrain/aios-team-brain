@@ -138,8 +138,7 @@ order, then **re-read the marker** (a caller that waited behind a completed one 
 no application transaction today spans two of those five tables — member creation is autocommit
 statements, and the only `withTransaction` users are pm-sync and gateway, none of which touch these
 tables. If a future transaction does `members` → `group_members`, this becomes a deadlock-detector
-victim during the deploy window. Also stated: `lock_timeout` is **per `LOCK` statement**, so this is a bound of
-bounded **per statement**, not in total — the waiting statement count is data-dependent (the
+victim during the deploy window. Also stated: `lock_timeout` is bounded **per statement**, not in total — the waiting statement count is data-dependent (the
 pre-lock marker read and the permissive scan can wait too, and an audit insert's timeout is swallowed
 by the best-effort handler). It covers the five `LOCK`s and the `alter table … drop column`, which upgrades to
 `ACCESS EXCLUSIVE` and waits on readers under the same GUC. No fleet-size or runtime guarantee is claimed; the
@@ -168,6 +167,36 @@ the return type is unchanged**: a stale `:iso` container holding an earlier iter
 "cannot change return type of existing function", so `beforeAll` issues
 `drop function if exists materialize_builtin_membership_once()` first — **in the test database only,
 never in `schema.sql`**, where the same hazard is a §5 falsifier rather than a fixture concern.
+
+**D7 — the SUBSTRATE GATE, and the option not taken.** Added after the diff review found that
+removing the unconditional refusal removed something else with it: it was also the gate for the
+pre-flag-era fleet, whose `teams.access_enforcement` column never existed and which therefore cannot
+be caught by the migration's permissive check either, because that check is column-gated. Repairing
+membership is **not** repairing visibility — enforcement fails closed for an item with no context
+unit, and the only partitioner is the budgeted scheduler stage — so that fleet would have received a
+deploy reporting success over a corpus dark for many ticks.
+
+So the function refuses when `items` exist and `project_context_memberships` is empty, keyed on the
+**invariant** (has this fleet been through the substrate?) rather than on the deleted column: both
+earlier PRET-6 near-misses were checks keyed on a retired artifact. The gate sits **before the
+locks** — it reads two tables that are not in the lock set, so the locks buy it no consistency, and a
+fleet about to be refused should not first queue behind DML on five tables.
+
+Stated precisely, and deliberately weaker than "the corpus is partitioned": the predicate is "at
+least one partition row exists", so a fleet **mid-backfill** is admitted (it went through the
+substrate release; the scheduler will finish). It is also **fleet-global**, not per-team. A per-team
+form would be strictly stronger but would refuse a deploy for a team created inside the last backfill
+window — and a false refusal is exactly the failure this slice exists to remove.
+
+**The option NOT taken** was to accept the jump and document the blackout, rewriting
+`docs/RELEASING.md` to say the corpus is dark until backfill converges. Rejected by the operator: the
+slice's whole benefit is an unattended upgrade, and an upgrade that silently hides your content is
+not one.
+
+**The same predicate is enforced in the attended CLI** (`lib/access/materialize-command.ts`). Without
+it the gate was trivially bypassable: `materialize-builtins` stamps the same marker, and the SQL gate
+sits *after* the marker short-circuit, so a stamp from the CLI cleared the migration's refusal and the
+next deploy proceeded over the dark corpus. A documentation sentence would not have closed that.
 
 ## 3. Scope
 
@@ -268,6 +297,16 @@ site — and becomes doubly false with a second marker writer.
   the first draft's text-equality guard between two copies, which existed only because of a premise
   that measurement refuted.*
 
+- **AC9 — the substrate gate, in all three directions (dm + unit):** with content and **zero**
+  `project_context_memberships`, the migration **raises** and `group_members`, `groups` and the
+  marker are all unchanged; the **same fleet repairs** once one partition row exists; a fleet with
+  **no content at all** repairs (there is nothing to darken). And at the CLI: `readState` reporting
+  `contentWithoutSubstrate` makes `runMaterializeCommand` refuse with a non-zero exit **before
+  `--confirm` is considered**, never reaching the materializer, while a partitioned fleet is
+  unaffected. *Reds: deleting the gate reddens the refusal case; dropping either term of the
+  predicate reddens one of the two repair cases; deleting the CLI check lets the materializer be
+  called.*
+
 ## 5. What would falsify this
 
 - The marker stamped on a fleet whose membership does not satisfy the predicate (AC2, AC4).
@@ -280,5 +319,8 @@ site — and becomes doubly false with a second marker writer.
   single worst outcome this slice could produce.
 - A `create or replace` that changes the function's RETURN TYPE: Postgres refuses it, so the "frozen
   signature" would need an explicit `drop function if exists` — silently, on every deploy.
+- **The marker stamped on a fleet with content and no context substrate** — by the migration, by
+  boot/tick, or by the CLI. That is the H-VANISH-shaped outcome in visibility rather than membership,
+  and it is the single worst thing this slice could produce.
 - Evidence that an app transaction spans two of the five locked tables: D4's deadlock-freedom premise
   would no longer hold and the lock order would need revisiting.

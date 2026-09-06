@@ -2977,15 +2977,10 @@ begin
     return false;
   end if;
 
-  lock table teams in share row exclusive mode;
-  lock table members in share row exclusive mode;
-  lock table groups in share row exclusive mode;
-  lock table group_members in share row exclusive mode;
-  lock table migration_markers in share row exclusive mode;
-  if exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
-    return false;
-  end if;
-
+  -- Placed BEFORE the locks deliberately: this gate reads `items` and
+  -- `project_context_memberships`, neither of which is in the lock set, so the locks buy it
+  -- no consistency — and a fleet that is going to be refused should not first queue behind
+  -- DML on five tables to be told something decidable immediately.
   -- SUBSTRATE GATE (STAGINGMARK-2, diff-review HIGH). Repairing membership is not the same
   -- as repairing VISIBILITY. The unconditional marker refusal this function replaces was also
   -- the gate for the pre-flag-era fleet, whose `teams.access_enforcement` column never existed
@@ -2999,6 +2994,16 @@ begin
   if exists (select 1 from items) and not exists (select 1 from project_context_memberships) then
     raise exception 'PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior release so the corpus is partitioned before enforcement (see docs/RELEASE-NOTES-pret6.md)';
   end if;
+
+  lock table teams in share row exclusive mode;
+  lock table members in share row exclusive mode;
+  lock table groups in share row exclusive mode;
+  lock table group_members in share row exclusive mode;
+  lock table migration_markers in share row exclusive mode;
+  if exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') then
+    return false;
+  end if;
+
 
   -- Refuse every squatter before any mutation, then CREATE absent builtins before
   -- computing want. Joining only existing groups would silently stamp empty teams.

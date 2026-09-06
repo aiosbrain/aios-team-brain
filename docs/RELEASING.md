@@ -268,8 +268,12 @@ different base.
 
 ## 3.4 Upgrading an EXISTING installation past PRET-6 — the ordered path
 
-**Whether a pre-flip installation can jump to the retirement release now depends on ONE thing:
-is its corpus partitioned?** (STAGINGMARK-2 changed this; it used to be an unconditional refusal.)
+**A pre-flip installation can now jump to the retirement release only if BOTH hold**
+(STAGINGMARK-2 changed the second one; it used to be an unconditional refusal):
+
+1. **No permissive team remains** — unchanged, and still steps 3-4 below. This is checked *first*,
+   inside the column-existence gate, and refuses before any membership is touched.
+2. **The corpus has been partitioned** — at least one `project_context_memberships` row exists.
 
 - **A fleet whose content is already partitioned** — it has `project_context_memberships` rows, i.e.
   it went through the context substrate — now **materializes itself during preDeploy** and the deploy
@@ -288,8 +292,9 @@ PRET-6 refused: this fleet has content but no context substrate — upgrade thro
   only partitioner is the budgeted scheduler stage (batch 100, 30-minute interval). Letting such a
   fleet through would report a successful deploy over a corpus that is dark for many ticks.
 
-Both refusals fail safe — `pg:schema` aborts, Railway's preDeploy halts, and the old code keeps
-serving. `v0.10.0` predates the entire PRET series, which is why `v0.11.0` exists as the step.
+**All three refusals fail safe** — the permissive one, the substrate one, and the reserved-slug
+one: `pg:schema` aborts, Railway's preDeploy halts, and the old code keeps serving. `v0.10.0`
+predates the entire PRET series, which is why `v0.11.0` exists as the step.
 
 ### The path
 

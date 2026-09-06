@@ -768,9 +768,9 @@ already committed: the loader has no transaction around the entire replay. Resol
 failure and retry; permissive teams still require the prior release's readiness/flip path.
 
 On a marker miss the function locks `teams`, `members`, `groups`, `group_members`, then
-`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker. The migration sets
-`lock_timeout` to 15 seconds per LOCK/drop statement: five locks plus the ACCESS EXCLUSIVE
-column-drop upgrade each wait under the loader's **per-statement** `lock_timeout`
+`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker. **The migration sets no
+`lock_timeout` of its own** — deliberately, so your knob keeps its meaning: five locks plus the
+ACCESS EXCLUSIVE column-drop upgrade each wait under the loader's **per-statement** `lock_timeout`
 (`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s). The waiting statement count is data-dependent, so no
 total bound — and certainly no fleet-size or runtime guarantee — is claimed.
 The deadlock-freedom premise is that no current application transaction spans two of those
@@ -781,7 +781,7 @@ release's multi-statement TypeScript materializer is not retroactively serialize
 materialization and can restore deliberately removed memberships. Boot/tick already had this
 behavior; preDeploy now performs it earlier.
 
-### The one refusal that REMAINS, and why you should not route around it
+### The marker-class refusal that REMAINS, and why you should not route around it
 
 ```
 PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior
@@ -790,14 +790,29 @@ PRET-6 refused: this fleet has content but no context substrate — upgrade thro
 
 The migration repairs a markerless fleet, but it will **not** repair one whose corpus was never
 partitioned (`items` exist, `project_context_memberships` is empty — the pre-`v0.11.0` class).
+Stated precisely, the check is "at least one partition row exists", not "the corpus is fully
+partitioned": a fleet **mid-backfill** is admitted by design, because it went through the substrate
+release and the scheduler will finish. The predicate is also **fleet-global**, not per-team — a
+multi-team fleet where one team is partitioned and another is not is admitted. That is the
+deliberate trade: a per-team form would be stronger, but it would refuse a deploy for a team created
+inside the last backfill window, and a false refusal is the exact failure this slice exists to
+remove.
+
 That is deliberate. Membership and **visibility** are different repairs: enforcement fails closed for
 an item with no context unit, and the only partitioner is the budgeted scheduler stage (batch 100,
 30-minute interval). Materializing such a fleet would hand you a deploy that reports success over a
 corpus nobody can see for many ticks.
 
 **The fix is to upgrade through `v0.11.0`** so the substrate is built (`docs/RELEASING.md` §3.4).
-Do **not** hand-insert a `project_context_memberships` row to clear the gate — that satisfies the
-check without partitioning anything, which is precisely the state the check exists to catch.
+
+Two ways of clearing this that do **not** work, and one that used to:
+- Hand-inserting a `project_context_memberships` row satisfies the check without partitioning
+  anything — precisely the state the check exists to catch.
+- `npm run admin -- materialize-builtins` **also refuses this shape now**. The review of this change
+  found that it would otherwise have been the easy bypass: it stamps the same marker, and the SQL
+  gate sits *after* the marker short-circuit, so a stamp from the CLI silently cleared the
+  migration's refusal and the next deploy proceeded over the dark corpus. The command carries the
+  same predicate and the same refusal.
 
 **Attended recovery remains available**, particularly for older releases that still emit
 “the PRET-4 builtin materialization has not completed” (the staging failure on 2026-09-05,

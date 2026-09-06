@@ -33,6 +33,13 @@ export type FleetState = {
    *  it to production. Measured 2026-09-05: `t` on staging, `f` on prod. Team identity does NOT
    *  discriminate — staging is a restore of prod and holds the SAME team row. */
   stagingMarker: boolean;
+  /** STAGINGMARK-2: the fleet has content but nothing partitioned. The SQL function refuses this
+   *  shape, because repairing membership is not repairing VISIBILITY — enforcement fails closed for
+   *  an item with no context unit and the only partitioner is budgeted. This command must refuse it
+   *  too: it stamps the SAME marker, and the SQL gate sits AFTER the marker short-circuit, so a
+   *  stamp here would silently clear the migration's refusal and the next deploy would proceed over
+   *  a dark corpus. The diff review found exactly that hole in the first version of this fold. */
+  contentWithoutSubstrate: boolean;
 };
 
 export type MaterializeResult = { ok: boolean; ran?: boolean; error?: string };
@@ -106,10 +113,16 @@ export function makeMaterializeDeps(db: DbClient): MaterializeDeps {
         "select to_regclass('public.staging_marker') is not null as present",
         []
       );
+      // The SAME predicate the SQL function uses, deliberately worded identically.
+      const substrate = await runSql<{ bad: boolean }>(
+        "select exists (select 1 from items) and not exists (select 1 from project_context_memberships) as bad",
+        []
+      );
       return {
         marker: marker.rows[0]?.present === true,
         teams: Number(teams.rows[0]?.n ?? "0"),
         stagingMarker: staging.rows[0]?.present === true,
+        contentWithoutSubstrate: substrate.rows[0]?.bad === true,
       };
     },
     materialize: () => materializeBuiltinMembershipOnce(db),
@@ -154,6 +167,22 @@ export async function runMaterializeCommand(
     return {
       lines: [fleet, `✓ already materialized — '${PRET4_MATERIALIZE_MARKER}' is present. Nothing to do.`],
       exitCode: 0,
+    };
+  }
+
+  // Refuse the shape the migration refuses, and refuse it BEFORE --confirm is considered: this is
+  // not a confirmation question. Stamping here would clear the migration's gate for the next deploy.
+  if (state.contentWithoutSubstrate) {
+    return {
+      lines: [
+        fleet,
+        "✗ refusing: this fleet has content but no context substrate.",
+        "  Materializing it would stamp the marker and silently clear the PRET-6 refusal, letting the",
+        "  next deploy proceed over a corpus nothing can see — enforcement fails closed for an item",
+        "  with no context unit, and the only partitioner is the budgeted scheduler stage.",
+        "  Upgrade through the prior release so the corpus is partitioned (docs/RELEASING.md §3.4).",
+      ],
+      exitCode: 1,
     };
   }
 

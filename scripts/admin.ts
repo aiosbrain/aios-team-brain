@@ -76,7 +76,9 @@ const USAGE = `Team Brain admin CLI — commands:
                                          # materialization WITHOUT booting the app. Since
                                          # STAGINGMARK-2 the PRET-6 migration repairs a partitioned
                                          # fleet itself at preDeploy, so this is for inspecting a
-                                         # fleet or recovering an OLDER release.
+                                         # fleet or recovering an OLDER release. REFUSES a fleet with
+                                         # content but no context substrate — stamping there would
+                                         # clear the migration's gate (docs/OPS.md).
                                          # DRY RUN by default. No-op when the marker is already
                                          # present. --confirm-production is additionally required
                                          # when the database carries no staging_marker.
