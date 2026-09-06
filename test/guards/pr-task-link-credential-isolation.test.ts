@@ -495,6 +495,19 @@ describe("guard: pr-task-link.yml specifically", () => {
    */
   const COMMENT_LINE = /^\s*(#|\/\/)/;
   const HISTORY_SPAN = /"[^"\n]*"|\([^)\n]*\)/g;   // quoted or parenthetical, WITHIN ONE LINE
+  /**
+   * v5 — TRAILING comments count. v4 filtered to lines that BEGIN with a marker, so
+   * `statuses: write # …the ref is always the base branch` was structurally invisible. That is not a
+   * hypothetical: `nda-gate.yml:19` was an actual carrier hiding in exactly that shape, and the file
+   * asserted the corrected model 80 lines lower — one file saying both. A comment is a comment
+   * wherever it sits.
+   *
+   * Over-inclusion is the safe direction here: a `#` inside a shell string in a `run:` body gets
+   * treated as a comment tail, which can only cause a FALSE RED — loud, and fixable by quoting.
+   * Under-inclusion is what just hid a carrier.
+   */
+  const commentPart = (line: string): string =>
+    COMMENT_LINE.test(line) ? line : (line.match(/\s(?:#|\/\/)\s?(.*)$/)?.[1] ?? "");
   const OLD_MODEL: readonly [RegExp, string][] = [
     [/ref is (?:always |ALWAYS )?the (?:pull request's )?base branch/i, "ref is the base branch"],
     [/run's ref is the pull request's target branch/i, "ref is the target branch"],
@@ -506,7 +519,7 @@ describe("guard: pr-task-link.yml specifically", () => {
   /** The claim that must be POSITIVELY made — a date alone certifies nothing. */
   const CURRENT_MODEL = /default branch,? regardless of the pull request's base|evaluate against the default branch|ref is the DEFAULT branch|from the DEFAULT branch/;
   const assertions = (src: string) =>
-    src.split("\n").filter((l) => COMMENT_LINE.test(l)).map((l) => l.replace(HISTORY_SPAN, " ")).join("\n");
+    src.split("\n").map(commentPart).map((l) => l.replace(HISTORY_SPAN, " ")).join("\n");
 
   // FOUR files carry claims about these mechanics; ALL must be free of the refuted model.
   it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"], ["scan-on-merge.yml"]])(
@@ -567,6 +580,14 @@ describe("guard: pr-task-link.yml specifically", () => {
     expect(assertions(runawayQuote), "a runaway quote must not hide a later assertion").toMatch(OLD_MODEL[0][0]);
     // …and code lines are ignored entirely, so a string literal in a script cannot trip the guard.
     expect(assertions('      - run: echo "the ref is always the base branch"'), "code is not a claim").not.toMatch(OLD_MODEL[0][0]);
+
+    // v5 control — Fable's EIGHTH carrier, which lived in a TRAILING comment and was structurally
+    // invisible to v4. `nda-gate.yml:19` was exactly this shape.
+    const trailing = "  statuses: write # on pull_request_target the ref is always the base branch";
+    expect(assertions(trailing), "a trailing comment is still a comment").toMatch(OLD_MODEL[0][0]);
+    // …and a trailing comment can retract, like any other.
+    expect(assertions('  statuses: write # it said "the ref is always the base branch" until 2025-12-08'),
+      "a trailing retraction is exempt").not.toMatch(OLD_MODEL[0][0]);
   });
 
   it("fires on exactly the release branch and the contribution base", () => {

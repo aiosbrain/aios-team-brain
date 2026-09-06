@@ -16,7 +16,8 @@ on:
 
 permissions:
   contents: read
-  statuses: write # publish the trusted verdict onto the validated PR HEAD, not pull_request_target's base SHA
+  statuses: write # publish the trusted verdict onto the validated PR HEAD, not the default-branch SHA
+  # that pull_request_target's own check attaches to (it was the BASE SHA before 2025-12-08; line ~96).
 
 concurrency:
   group: nda-gate-${{ github.event.pull_request.number || github.ref }}
