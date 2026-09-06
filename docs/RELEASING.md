@@ -167,8 +167,13 @@ in advance:
 > switch is thrown, not discovered during the first incident.
 
 **Operational note:** the tag push and the fast-forward are two acts, and the check needs time. Push
-the tag, wait for `Release candidate gate` to go green on that commit, *then* fast-forward `main`. A
-fast-forward attempted while the context is still pending is rejected.
+the tag, wait for `Release candidate gate` to go green on that commit, *then* fast-forward `main`.
+
+⚠️ **This paragraph used to end "a fast-forward attempted while the context is still pending is
+rejected", and that is FALSE for both actors** — §2 step 5 carries the measurement. The gate is not a
+required context on `main`, `enforce_admins` is false, and there is no bypass allowance: a non-admin
+is refused by "require a pull request" regardless of contexts, and an admin bypasses everything
+including a pending or red gate. The wait is discipline until RELPTR-8 lands.
 
 ### 3.1b When a ticket closes, and what this repo's automation actually does
 
@@ -300,7 +305,11 @@ order:
   - fast-forward-staging: before any candidate tag is pushed
   - work-sync-and-scan-widened: DONE (RELPTR-4), before contributions move
   - dependabot-target-branch: at the cutover, never before (it would aim at a stale branch)
-  - tag-ruleset-ENFORCEMENT-active: creating the ruleset is not enabling it   # shipped `disabled`
+  - tag-ruleset-ENFORCEMENT-active: DONE 2026-09-06   # shipped `disabled`; creating is not enabling
+  # CONSEQUENCE, now live: ruleset 22363258 over refs/tags/v* denies deletion, update and
+  # non-fast-forward with ZERO bypass actors — so a pushed `v*` tag is PERMANENT for everyone,
+  # admins included. A tag that reddens the gate burns that version number; fix forward to the next
+  # patch. `.claude/skills/cut-release` verifies B/C/D LOCALLY before the push for this reason.
 ```
 
 The `workflow-on-main` pair is this repository's own scar tissue: `docs/CI-ARCHITECTURE.md` records that switching on
