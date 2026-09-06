@@ -467,6 +467,19 @@ describe("guard: pr-task-link.yml specifically", () => {
     expect(triggers(doc())).toEqual(["pull_request_target"]);
   });
 
+  it("the header no longer claims the `[main]` pin is what prevents an environment refusal", () => {
+    // THE INVERSE, which gpt-6-astra's spec review found missing: criterion 9 required the NEW prose
+    // to be present and never required the OLD claim to be gone. Presence alone is satisfiable while
+    // the refuted mechanism sits three lines below it, and a stale mechanism is worse than none —
+    // the next reader re-derives the wrong ordering from it.
+    const header = read(".github/workflows/pr-task-link.yml");
+    expect(header, "the pre-2025-12-08 model must not survive").not.toMatch(/run's ref is the pull request's target branch/);
+    expect(header).not.toMatch(/pinned to `branches: \[main\]` so the two coincide/);
+    // …and the correction must actually be stated, not merely the old text deleted.
+    expect(header, "the current model, with its date").toContain("2025-12-08");
+    expect(header).toMatch(/environment rules evaluate against the default branch/);
+  });
+
   it("fires on exactly the release branch and the contribution base", () => {
     // WAS "pinned to `main`, which is what the environment's branch policy allows", and the
     // rationale under it was the pre-2025-12-08 event model: it said the run's ref is the PR's BASE
