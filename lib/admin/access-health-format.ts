@@ -3,8 +3,10 @@ import type { AccessHealth } from "@/lib/admin/access-health";
 /**
  * AUDITFIX-23 — the access-health verdict as TEXT, in an import-safe module.
  *
- * WHY IT IS ITS OWN FILE. The formatter lived inside `scripts/admin.ts`, which calls `main()` at
- * module scope — so importing it to test the wording RUNS THE CLI. There was no seam, and a criterion
+ * WHY IT IS ITS OWN FILE. The formatter lived inside `scripts/admin.ts`, which USED TO call `main()`
+ * at module scope — so importing it to test the wording ran the CLI. (STAGINGMARK-4 has since made
+ * that entry argv-guarded and `main(argv)` importable, so the hazard is gone; this file stays split
+ * because the wording deserves its own tested surface.) There was no seam then, and a criterion
  * asserting what an operator reads had nowhere to stand (spec round 3 HIGH 4 on the previous draft).
  *
  * WHY THE WORD CHANGED. AUDITFIX-23 widened `blockers` from lock-OUT only to "a human locked OUT, or a

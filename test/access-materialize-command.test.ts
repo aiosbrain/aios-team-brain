@@ -198,8 +198,8 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
     });
 
     it("refuses `--confirm false` — the trap that reads as CONFIRMED today", () => {
-      // parseArgs assigns the following token as a string, so `--confirm false` yields "false",
-      // and `if (!flags.confirm)` treats a non-empty string as confirmed. purge-items still does.
+      // The original tokenizer made `--confirm false` truthy as confirmation. The shared argv
+      // boundary now prevents that on purge-items; this defense still rejects malformed maps.
       const parsed = parseConfirmFlags({ confirm: "false" });
       expect(parsed.ok).toBe(false);
       if (!parsed.ok) expect(parsed.error).toMatch(/takes no value/);
