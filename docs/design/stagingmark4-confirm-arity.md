@@ -183,7 +183,17 @@ records call COUNTS; a throwing fake alone is not proof of non-invocation.
   reads; a value-classified flag truthiness-gated in an unrecognised spelling still passes. Pinned
   as an `it.fails` gap rather than claimed closed — per-occurrence strictness would require 37
   unrelated read rewrites across both CLIs (measured by the diff review: 17 of 46 in `admin.ts`,
-  20 of 57 in `brain-tasks.ts`). Without this a
+  20 of 57 in `brain-tasks.ts`).
+  **Second recorded residual — the whole-object family, deliberately NOT closed.** A flag reached
+  through an alias (`const f = flags; f.wipe`), a whole-map hand-off (`go(flags)`), an
+  assignment-pattern destructure (`({ wipe } = flags)`) or a computed index (`flags[k]`) is outside
+  a syntactic classifier by construction. Closing it needs a call-site allowlist, and both CLIs
+  legitimately pass the map whole today — `scripts/admin.ts` to `parseConfirmFlags` and
+  `scripts/brain-tasks.ts` to `readBody` — so an allowlist would be the guard's third registry to
+  drift. The one cross-file hand-off that carries a boolean is pinned instead by the
+  `CONFIRM_KEYS ⊆ registry` test. Recorded rather than widened: this guard leaked three times
+  during review, each leak inside a rule written to close the previous one, and the product fix it
+  protects has been stable and verified since the second commit. Without this a
   future boolean flag silently reintroduces the trap, and this is the criterion the first draft was
   missing entirely.*
 
