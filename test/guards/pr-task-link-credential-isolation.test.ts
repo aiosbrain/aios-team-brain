@@ -483,7 +483,18 @@ describe("guard: pr-task-link.yml specifically", () => {
    *      not.** An unquoted, unparenthesised assertion is always caught, however it is worded, and
    *      whatever retraction words share its line.
    */
-  const HISTORY_SPAN = /"[^"]*"|\([^)]*\)/g;   // quoted or parenthetical = a retraction, not a claim
+  /**
+   * v4. THE v3 STRIPPER WAS BLIND TO A THIRD OF THE FILE IT CERTIFIED, and Fable measured it: 35.3% of
+   * `pr-task-link.yml`. `/"[^"]*"/` lets `[^"]*` cross NEWLINES, and the `run:` heredoc contains odd
+   * numbers of `"` per line, so quote pairing ran away — two spans of 16 and 18 lines, executable code
+   * included, were being deleted before matching. An assertion inserted anywhere inside them was
+   * invisible. An unbalanced `(` in any comment did the same thing until the next `)`.
+   *
+   * Two changes, both narrowing: only COMMENT lines are considered at all (an assertion about the
+   * event model lives in a comment, never in code), and a span may not cross a line.
+   */
+  const COMMENT_LINE = /^\s*(#|\/\/)/;
+  const HISTORY_SPAN = /"[^"\n]*"|\([^)\n]*\)/g;   // quoted or parenthetical, WITHIN ONE LINE
   const OLD_MODEL: readonly [RegExp, string][] = [
     [/ref is (?:always |ALWAYS )?the (?:pull request's )?base branch/i, "ref is the base branch"],
     [/run's ref is the pull request's target branch/i, "ref is the target branch"],
@@ -494,18 +505,36 @@ describe("guard: pr-task-link.yml specifically", () => {
   ];
   /** The claim that must be POSITIVELY made — a date alone certifies nothing. */
   const CURRENT_MODEL = /default branch,? regardless of the pull request's base|evaluate against the default branch|ref is the DEFAULT branch|from the DEFAULT branch/;
-  const assertions = (src: string) => src.replace(HISTORY_SPAN, " ");
+  const assertions = (src: string) =>
+    src.split("\n").filter((l) => COMMENT_LINE.test(l)).map((l) => l.replace(HISTORY_SPAN, " ")).join("\n");
 
-  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"]])(
-    "%s asserts the CURRENT pull_request_target model and never the refuted one",
+  // FOUR files carry claims about these mechanics; ALL must be free of the refuted model.
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"], ["scan-on-merge.yml"]])(
+    "%s never asserts the refuted model",
     (file) => {
       const live = assertions(text(file));
       for (const [re, label] of OLD_MODEL) {
         expect(live, `refuted model survives as an assertion: ${label}`).not.toMatch(re);
       }
-      expect(text(file), "the current model must be STATED, not merely dated").toMatch(CURRENT_MODEL);
     }
   );
+
+  // Only the THREE `pull_request_target` workflows must positively state that model. `scan-on-merge`
+  // is a `push` workflow — requiring it to state a rule that does not govern it would be the guard
+  // teaching the wrong thing, so it gets its own assertion below.
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"]])(
+    "%s states the CURRENT model, not merely a date",
+    (file) => expect(text(file), "the current model must be STATED").toMatch(CURRENT_MODEL)
+  );
+
+  it("scan-on-merge.yml states that it is a `push` trigger and the change does NOT govern it", () => {
+    // The distinction is the thing most likely to be flattened by a future reader "tidying" these
+    // comments into agreement — and flattening it in either direction is a real error: the 2025-12-08
+    // change moved `pull_request_target` to the default branch and left `push` alone.
+    const src = text("scan-on-merge.yml");
+    expect(src, "must name its own trigger semantics").toMatch(/ref is the PUSHED BRANCH|run's ref is the pushed branch/i);
+    expect(src, "and must say the pull_request_target change does not apply").toMatch(/does NOT apply here|not that event/i);
+  });
 
   it("is NON-VACUOUS in both directions, including the two evasions astra found", () => {
     // Direction 1 — a live assertion is caught however it is dressed.
@@ -521,6 +550,18 @@ describe("guard: pr-task-link.yml specifically", () => {
     }
     // astra M11 — deleting the prose and keeping the date must NOT satisfy the positive half.
     expect("# 2025-12-08", "a bare date certifies nothing").not.toMatch(CURRENT_MODEL);
+
+    // FABLE's v3 BREAK, as a standing control. An assertion placed deep in the `run:` body — inside
+    // what the runaway quote-span used to swallow — must be seen. Reconstructed rather than described:
+    // a line with an odd `"` upstream, then the assertion many lines later.
+    const runawayQuote = [
+      '      # the script prints "Found work key(s): … ',
+      "      - run: node scripts/pr-work-keys.mjs",
+      "      # On pull_request_target the ref is always the base branch, so any author satisfies it.",
+    ].join("\n");
+    expect(assertions(runawayQuote), "a runaway quote must not hide a later assertion").toMatch(OLD_MODEL[0][0]);
+    // …and code lines are ignored entirely, so a string literal in a script cannot trip the guard.
+    expect(assertions('      - run: echo "the ref is always the base branch"'), "code is not a claim").not.toMatch(OLD_MODEL[0][0]);
   });
 
   it("fires on exactly the release branch and the contribution base", () => {

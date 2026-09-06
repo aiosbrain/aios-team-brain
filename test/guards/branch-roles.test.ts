@@ -15,8 +15,9 @@ import { CONTRIBUTION_BASE, INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef } from
  * a first draft of this slice was declaring the same name as `main`. Two independent pre-code reviews
  * killed that draft.
  *
- * But the sharper trap is what remains after the fix: **`RELEASE_BRANCH` and `CONTRIBUTION_BASE` are
- * both `"main"` today.** A consumer wired to the wrong one passes every value assertion — "the release
+ * But the sharper trap is what remains after the fix: **`RELEASE_BRANCH` and `CONTRIBUTION_BASE` were
+ * both `"main"` until the 2026-09-06 cutover, and `CONTRIBUTION_BASE` and `INTEGRATION_BRANCH` are
+ * both `"staging"` now** — the same trap, one role over. A consumer wired to the wrong one passes every value assertion — "the release
  * ref resolves to main" is true either way — and stays green until cutover day, when
  * `CONTRIBUTION_BASE` moves to `staging` and assertion C silently becomes "is `staging` an ancestor of
  * the candidate". That is the pre-cutover-green / post-cutover-silent shape this whole program exists
@@ -243,7 +244,7 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
     //
     // WHY RELEASE AND NOT CONTRIBUTION — by elimination, which is the only argument that holds in
     // both worlds. The trigger needs two DISTINCT branches. `[CONTRIBUTION_BASE, RELEASE_BRANCH]`
-    // collapses today (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
+    // collapsed BEFORE the cutover (both `main`); `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` collapses after the
     // cutover (both `staging`); `[RELEASE_BRANCH, INTEGRATION_BRANCH]` is distinct in both. That is
     // the whole justification and it is checkable.
     //
@@ -298,9 +299,11 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
   });
 
   it("the workflow triggers are pinned to the RELEASE role, not the contribution base", () => {
-    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: today
-    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs are the SAME VALUE
-    // and no value or behavioural assertion can tell them apart. Measured, not assumed — reverting
+    // WHY A SOURCE REGEX, WHICH THIS FILE'S OWN HEADER CALLS EVADABLE: when this was written
+    // `RELEASE_BRANCH === CONTRIBUTION_BASE === "main"`, so the two role pairs were the SAME VALUE and
+    // no value or behavioural assertion could tell them apart. The cutover separated THAT pair and
+    // created the mirror one — `CONTRIBUTION_BASE === INTEGRATION_BRANCH === "staging"` — so the
+    // instrument is still needed, pointed one role over. Measured, not assumed — reverting
     // either `toEqual` below to `[CONTRIBUTION_BASE, INTEGRATION_BRANCH]` leaves EVERY test in this
     // file green (`scripts/mutate.mjs` verdict: SURVIVED, twice). Fable's diff review found
     // exactly that gap, and this test exists because of it. An evadable pin beats no pin; the

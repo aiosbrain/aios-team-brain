@@ -437,3 +437,38 @@ class the second reviewer exists for.
 of the current model from `pr-task-link.yml` leaves the guard green — because four remain. The claim
 astra actually made (a bare date satisfies the positive half) is closed and unit-proven:
 `CURRENT_MODEL` rejects `# 2025-12-08`, and stripping *every* statement reddens.
+
+
+## RELPTR-7 re-clear (Fable, round 2) — BLOCKED, folded
+
+The round that mattered most, because it attacked the *folds*.
+
+1. **HIGH — the guard certifying the whole sweep was blind to a third of the file it read.** v3 exempted
+   history by SPAN, but `/"[^"]*"/` lets the span cross NEWLINES, and `pr-task-link.yml`'s `run:` heredoc
+   has odd numbers of `"` per line. Measured: **35.3% of the file stripped**, including two spans of 16
+   and 18 lines of executable code. An assertion placed anywhere inside them was invisible; an unbalanced
+   `(` in any comment did the same until the next `)`. *The instrument certifying "seven carriers, all
+   fixed" could not see a third of one file.* **v4:** only COMMENT lines are considered at all, and a
+   span may not cross a line. Fable's injection is now a standing negative control.
+2. **HIGH — the production-safety fix was incomplete.** `DEVELOPMENT.md` still instructed the manual prod
+   `pg:schema` run verbatim, and `CLAUDE.md` §6 twice plus `scripts/pg-load-schema.mjs`'s own header still
+   called it "the prod rollout step" — contradicting the ⛔ forty lines below, and contradicting
+   `docs/OPS.md` and the `railway-deploy-verify` skill, which already said never to do it. All four fixed.
+3. **HIGH — three surviving carriers**, two in text this slice had already edited: `CI-ARCHITECTURE.md`
+   ("the trigger here is pinned to `[main]`… the trigger list and the branch policy move together" — both
+   false), `scan-on-merge.yml` ("policy allows `main` only"), `RELEASING.md` §3.1c's item-4 heading. The
+   guard now covers **four** files, and `scan-on-merge.yml` — a `push` workflow — gets its own assertion
+   rather than being forced to state a rule that does not govern it.
+4. **MEDIUM — §2 step 5 described enforcement that does not exist.** Measured on `main`: `Release
+   candidate gate` is NOT required, `enforce_admins: false`, no bypass allowance. So a non-admin's
+   fast-forward is refused by "require a pull request" whatever the contexts say, and an **admin's push
+   bypasses everything, including a pending or red gate**. The step now says the wait is human discipline
+   and names what would make it real.
+5. **MEDIUM — the `branches.mjs` header moved to past tense; its two readers did not.** Retired in
+   `branch-roles.test.ts` and `release-candidate-guard.mjs`.
+
+**The generalisable lesson, which is why this is written down rather than summarised:** across three
+rounds the same defect recurred at three levels — a guard pinning a PHRASE, then a guard pinning a LINE,
+then a guard whose exemption SPAN ran away. Each version looked stricter than the last and each was
+blind in a way only an adversarial reader found. A guard over prose needs its blind spot measured, not
+argued.

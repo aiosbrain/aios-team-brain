@@ -228,7 +228,7 @@ npm run dev            # next dev
 npm test               # vitest (unit tier)
 npm run check:docs     # docs drift guard (also runs in CI + pre-push)
 npm run lint           # eslint
-npm run pg:schema      # load postgres/schema.sql (canonical) into DATABASE_URL — also the prod rollout step
+npm run pg:schema      # load schema.sql + migrations into DATABASE_URL. LOCAL/CI use — prod is rolled out by the deploy's preDeployCommand, never by hand (see Deploy below)
 npm run db:test:up     # RESET + start the test Postgres, then load schema (migrate-from-zero = replay guard)
 npm run test:datamechanics  # real-Postgres tier: persistence + tier isolation
 npm run test:datamechanics:iso  # SAME tier, PER-WORKTREE isolated container (see below)
@@ -258,8 +258,8 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   running against it), and a failed schema load now **removes the container** instead of leaving it
   up half-loaded.
 
-- **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it and is the
-  prod rollout step against Railway). Additive deltas live in `postgres/migrations/` (the only
+- **Schema:** canonical = `postgres/schema.sql` (idempotent; `npm run pg:schema` loads it, and the
+  DEPLOY runs it as Railway's `preDeployCommand` — it is not a manual prod step, see Deploy above). Additive deltas live in `postgres/migrations/` (the only
   migrations directory; guarded by the `migrations-numbering` guard).
 - **Adding a COLUMN to an existing table:** `schema.sql` is `create … if not exists`, so editing the
   `create table` body is a **no-op on a DB that already has the table** — prod keeps the old shape.
@@ -267,9 +267,9 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   `pg:schema` after `schema.sql`, in filename order) **and** mirror it into `schema.sql` for
   from-zero. See `postgres/migrations/README.md`. (A brand-new table needs no migration —
   `create table if not exists` in `schema.sql` covers it.)
-- **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by pushing a branch a Railway
-  environment tracks — and since the 2026-09-06 cutover there are TWO, which is the part this line used to
-  get dangerously wrong.** It said "ONLY by merging to `main`", so an agent that merged to `staging` (now
+- **Deploy:** Postgres on Railway (self-host portable). **Deploys happen ONLY by pushing a branch a Railway environment
+  tracks.** There have been two environments since AIO-483; the 2026-09-06 cutover changed WHICH ONE
+  ordinary merges reach — and that is the part this line used to get dangerously wrong. It said "ONLY by merging to `main`", so an agent that merged to `staging` (now
   the contribution base, where ordinary work lands) would have run the **production** schema load for code
   that is not on `main`.
   - **`staging` → the STAGING environment.** Ordinary merges land here. Its own Postgres, its own

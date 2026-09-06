@@ -70,9 +70,18 @@ runs, today and at every future rebuild — and that branch is trunk.
    ```
 
    **Order matters and §3.1a records why:** push the tag, WAIT for `Release candidate gate` to go
-   green on that commit, *then* fast-forward. Branch protection accepts a direct push only if the
-   commit ALREADY carries its required contexts, so a fast-forward attempted while the context is
-   still pending is rejected. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
+   green on that commit, *then* fast-forward.
+
+   ⚠️ **THE WAIT IS HUMAN DISCIPLINE TODAY — NOTHING ENFORCES IT**, and an earlier draft of this step
+   implied otherwise. Measured on `main` 2026-09-06: `Release candidate gate` is **not** a required
+   context, `required_pull_request_reviews` is present, `enforce_admins` is `false`, and there is no
+   bypass allowance. So a non-admin's fast-forward is refused by "require a pull request" whatever the
+   contexts say, and an **admin's push bypasses everything — including a pending or red gate**. The
+   sentence this replaced ("a fast-forward attempted while the context is still pending is rejected")
+   is true for neither actor.
+
+   To make the wait real, make `Release candidate gate` required on `main` and add a bypass allowance
+   for the release actor — §3.2's `release-actor-protection` pair, still open. The migration lane picks the new tag up on the **next** PR or branch push, and that is the
    check that the release is installable from an existing database. For `v0.11.0` it is the largest
    step the lane has ever taken (**34 migration files touched: 29 added, 5 modified**;
    `postgres/schema.sql` +831/−14), so expect it to be slow and read its output. A `v*`-triggered
@@ -195,8 +204,11 @@ file a human must change:
 2. **Prose that NAMES a branch** rather than pointing at the module — undetectable by any guard,
    because `main` is a legitimate token everywhere.
 3. **Every branch-protection change** — the release actor, making `Release candidate gate` required,
-   relocating `PR records a diff review`.
-4. **The `trusted-automation` environment's deployment branch policy — `main` only today — and it now
+   relocating `PR records a diff review`. **Status 2026-09-06:** `PR records a diff review` is
+   relocated (required on `staging`, removed from `main`) and `main` has `enforce_admins: false` so an
+   admin can perform the release fast-forward. **NOT done:** `Release candidate gate` is still not a
+   required context, and there is no bypass allowance — see §2 step 5 for what that means in practice.
+4. **The `trusted-automation` environment's deployment branch policy — now `[main, staging]`, widened 2026-09-06 BEFORE the default branch moved — and it
    gates all three `AIOS_*` consumers.** This entry has grown, and the earlier version of it is now
    wrong in a way worth naming: it said `aios-work-sync` and `scan-on-merge` "were deliberately
    pre-widened to both branches so cutover day would not have to remember them". The trigger lists

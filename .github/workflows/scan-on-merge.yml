@@ -50,7 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.repository == 'aiosbrain/aios-team-brain'
     # ENROLMENT, NOT ISOLATION. `trusted-automation` is a repository Environment whose deployment
-    # branch policy allows `main` only. Naming it here is a BLAST-RADIUS control: it declares which
+    # branch policy allows `[main, staging]` (it was `main` only until the 2026-09-06 cutover, which
+    # is what made this job's `staging` pushes go red — see the note on the environment below). Naming it here is a BLAST-RADIUS control: it declares which
     # workflows in this repository may reach AIOS_BRAIN_URL / AIOS_TEAM / AIOS_API_KEY. It is not a
     # trust boundary of any kind, and it does not make the credentials environment-scoped on its own —
     # an environment secret only SHADOWS a same-named repository secret. This job is the third and

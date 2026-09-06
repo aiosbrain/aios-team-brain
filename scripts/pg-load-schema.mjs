@@ -1,7 +1,11 @@
 /**
  * Load postgres/schema.sql into the database at DATABASE_URL, then apply every additive delta in
- * postgres/migrations/ (in lexical filename order). Both are idempotent, so this is safe to re-run
- * and is the prod rollout step for schema changes (`npm run pg:schema`).
+ * postgres/migrations/ (in lexical filename order). Both are idempotent, so this is safe to re-run.
+ *
+ * ⛔ IT IS THE DEPLOY'S rollout step, NOT a manual one. This header said "the prod rollout step",
+ * which reads as an invitation to run it locally against prod — and `cwd` below defaults to
+ * `process.cwd()`, so a local run ships whatever tree you happen to be standing in. Post-cutover
+ * that is routinely AHEAD of the released tag. Let the pre-deploy hook run it from the artifact.
  *
  * Pure node + the `pg` runtime dependency (NO tsx) so it runs in the pruned production image — it
  * is the Railway pre-deploy hook (railway.json `deploy.preDeployCommand`), so every deploy

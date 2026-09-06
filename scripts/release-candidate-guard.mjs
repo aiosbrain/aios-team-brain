@@ -169,7 +169,7 @@ export function main({
   // RELPTR-4: these were hardcoded here, which made this file an UNDECLARED SECOND OWNER of the
   // integration branch — two names for one concept, holding different values. They now come from
   // `scripts/branches.mjs`. Note WHICH role each takes: assertion C reads the RELEASE branch and
-  // assertion D the INTEGRATION branch, and today RELEASE_BRANCH and CONTRIBUTION_BASE are both
+  // assertion D the INTEGRATION branch. Until the 2026-09-06 cutover RELEASE_BRANCH and CONTRIBUTION_BASE were both
   // `main`, so wiring C to the contribution base would be invisible until the cutover moved it.
   // `test/guards/branch-roles.test.ts` pins that distinction with a sentinel.
   mainRef = remoteRef(RELEASE_BRANCH),
