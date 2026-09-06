@@ -123,6 +123,13 @@ const fleetLine = (state: FleetState): string =>
     : "fleet: this database does NOT carry `staging_marker` — it may be PRODUCTION.";
 
 /**
+ * WORDING DISCIPLINE, from the second diff review. Two claims this must NOT make:
+ *   • a failure cannot say "the marker is NOT stamped" — it is never re-read, and a concurrent boot
+ *     or tick may have stamped it after our read. It says what this RUN did instead.
+ *   • success cannot report `state.teams` as the number reconciled — that count came from the
+ *     pre-write read, and the materializer re-reads teams itself (lib/access/groups.ts:213), so a
+ *     team created in between is reconciled but uncounted. The count is labelled as of the check.
+ *
  * Every reachable outcome has a contract. The ones that are easy to omit, and were: a failing
  * `readState`; a `materialize` that THROWS rather than returning `{ok:false}` (boot and tick both
  * anticipate that); the race where boot/tick stamps the marker between our read and our call, so
@@ -177,12 +184,12 @@ export async function runMaterializeCommand(
   try {
     result = await deps.materialize();
   } catch (err) {
-    return { lines: [fleet, `✗ materialization threw: ${errText(err)} — the marker is NOT stamped.`], exitCode: 1 };
+    return { lines: [fleet, `✗ materialization threw: ${errText(err)} — this run did not stamp the marker.`], exitCode: 1 };
   }
 
   if (!result.ok) {
     return {
-      lines: [fleet, `✗ materialization failed: ${result.error ?? "unknown error"} — the marker is NOT stamped.`],
+      lines: [fleet, `✗ materialization failed: ${result.error ?? "unknown error"} — this run did not stamp the marker.`],
       exitCode: 1,
     };
   }
@@ -196,7 +203,7 @@ export async function runMaterializeCommand(
     return { lines: [fleet, "✓ marker stamped; zero teams reconciled."], exitCode: 0 };
   }
   return {
-    lines: [fleet, `✓ materialization ran — ${state.teams} team(s) reconciled and the marker is stamped.`],
+    lines: [fleet, `✓ materialization ran and the marker is stamped (${state.teams} team(s) at the time of the check).`],
     exitCode: 0,
   };
 }

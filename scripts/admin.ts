@@ -564,7 +564,14 @@ async function main() {
       if (!parsed.ok) die(parsed.error);
       const outcome = await runMaterializeCommand(makeMaterializeDeps(admin), parsed);
       for (const line of outcome.lines) console.log(line);
-      if (outcome.exitCode !== 0) process.exit(outcome.exitCode);
+      if (outcome.exitCode !== 0) {
+        // FLUSH BEFORE EXITING. `console.log` to a PIPE is asynchronous, and `process.exit()`
+        // does not wait for it — so a wrapper or CI job capturing this command's output could
+        // see a truncated report, or none, for a run that already touched the database. Awaiting
+        // a zero-length write drains what is queued first (second diff review).
+        await new Promise<void>((resolve) => process.stdout.write("", () => resolve()));
+        process.exit(outcome.exitCode);
+      }
       break;
     }
     case "sync-github": {

@@ -86,7 +86,7 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
     );
     expect(out.exitCode).not.toBe(0);
     expect(out.lines.join("\n")).toContain("boom");
-    expect(out.lines.join("\n")).toMatch(/NOT stamped/);
+    expect(out.lines.join("\n")).toMatch(/this run did not stamp the marker/i);
   });
 
   it("AC5 — the three outcomes are pairwise distinguishable, and only the failure reads as failure", async () => {
@@ -159,7 +159,9 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
       );
       expect(out.exitCode).not.toBe(0);
       expect(out.lines.join("\n")).toContain("pool exhausted");
-      expect(out.lines.join("\n")).toMatch(/NOT stamped/);
+      expect(out.lines.join("\n")).toMatch(/this run did not stamp the marker/i);
+      // …and it must NOT assert the marker is absent, which this run never re-read.
+      expect(out.lines.join("\n")).not.toMatch(/marker is NOT stamped/i);
     });
   });
 

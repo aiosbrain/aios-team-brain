@@ -104,30 +104,54 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
     await ensureBuiltins(db(), seed.teamId);
     await materializeBuiltinMembershipOnce(db());
 
-    const snapshot = async () => {
-      const col = await getPool().query<{ present: boolean }>(
-        `select exists (select 1 from information_schema.columns
-           where table_schema = current_schema() and table_name = 'teams'
-             and column_name = 'access_enforcement') as present`
+    const columnsPresent = async () => {
+      const { rows } = await getPool().query<{ c: string }>(
+        `select column_name as c from information_schema.columns
+          where table_schema = current_schema() and table_name = 'teams'
+            and column_name in ('access_enforcement', 'autoflip_hold')
+          order by column_name`
       );
-      const present = col.rows[0]?.present === true;
-      if (!present) return { present, value: null as string | null };
-      const val = await getPool().query<{ v: string | null }>(
-        "select access_enforcement::text as v from teams where id = $1",
-        [seed.teamId]
-      );
-      return { present, value: val.rows[0]?.v ?? null };
+      return rows.map((r) => r.c);
     };
 
-    const before = await snapshot();
-    await runMigrationRolledBack();
-    const after = await snapshot();
+    // ESTABLISH the pre-PRET-6 column shape first. The second diff review caught that without
+    // this the control cannot fail: on the normal post-PRET-6 database the columns are already
+    // gone, the migration's existence gate at :36 is false, so it performs no UPDATE and no DROP —
+    // and `before === after` holds even with `begin`/`rollback` deleted outright. The rollback is
+    // only observable against a schema that actually has something to drop.
+    await getPool().query("alter table teams add column if not exists access_enforcement text not null default 'enforcing'");
+    await getPool().query("alter table teams add column if not exists autoflip_hold boolean not null default false");
+    try {
+      const before = await columnsPresent();
+      expect(before, "precondition: both columns must exist for this control to mean anything").toEqual([
+        "access_enforcement",
+        "autoflip_hold",
+      ]);
+      const beforeValue = (
+        await getPool().query<{ v: string }>("select access_enforcement::text as v from teams where id = $1", [
+          seed.teamId,
+        ])
+      ).rows[0]?.v;
 
-    expect(after.present, "the migration's column drop must not survive the rollback").toBe(before.present);
-    expect(after.value, "the normalisation UPDATE must not survive the rollback").toBe(before.value);
-    // Recorded honestly: when the column is already absent on this database (the post-PRET-6
-    // shape), `present` is false both times and this control only proves the UPDATE did not leak.
-    // It is still the strongest observation available, and it reddens whenever the column exists.
+      const raised = await runMigrationRolledBack();
+      expect(raised, `the migration should apply once materialized, got: ${raised}`).toBeNull();
+
+      // BOTH drops must have been rolled back — the earlier version never observed autoflip_hold.
+      expect(await columnsPresent(), "the migration's column drops must not survive the rollback").toEqual([
+        "access_enforcement",
+        "autoflip_hold",
+      ]);
+      const afterValue = (
+        await getPool().query<{ v: string }>("select access_enforcement::text as v from teams where id = $1", [
+          seed.teamId,
+        ])
+      ).rows[0]?.v;
+      expect(afterValue, "the normalisation UPDATE must not survive the rollback").toBe(beforeValue);
+    } finally {
+      // Leave the shared schema exactly as found.
+      await getPool().query("alter table teams drop column if exists access_enforcement");
+      await getPool().query("alter table teams drop column if exists autoflip_hold");
+    }
   });
 
   it("AC11 — a reconcile that fails partway leaves the marker UNSTAMPED", async () => {

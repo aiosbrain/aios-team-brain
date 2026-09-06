@@ -44,13 +44,18 @@ still serving — in exactly two cases, each named in the raised error:
 
   **Or stamp it directly, without booting anything** (STAGINGMARK-1) —
   `DATABASE_URL=<the wedged database> npm run admin -- materialize-builtins`, dry-run by default.
-  This is the only route a self-hoster has, since "boot the prior release" assumes a dashboard to
-  roll back in. Full runbook, including which machine to run it from:
+  Usually the shorter route: "boot the prior release" is also open to a self-hoster (check out the
+  previous tag and start it), but it means finding and running an older build, where this is one
+  command against the database. Full runbook, including which machine to run it from:
   `docs/OPS.md` §11 "If a deploy refuses …".
 
-A refused deploy is **safe**: the guard runs before the drop, nothing is half-applied, and the
-running version keeps serving. Replaying the migration after a successful drop is a clean
-no-op, and a from-zero install never sees the guard fire (a fresh DB has no teams).
+A refused deploy is **safe**: the guard raises before the drop, so no access state changes, and the
+running version keeps serving. It is **not** an all-or-nothing abort, and this note used to say so
+wrongly: `scripts/pg-load-schema.mjs` applies `postgres/schema.sql` and then each migration in
+filename order with no wrapping transaction, so everything sorting before this migration HAS already
+replayed (idempotently) and everything after it has not. The next successful deploy completes the
+replay. Replaying the migration after a successful drop is a clean no-op, and a from-zero install
+never sees the guard fire (a fresh DB has no teams).
 
 ## What changes for operators
 

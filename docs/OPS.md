@@ -764,7 +764,7 @@ fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.
 
 **This happened to staging on 2026-09-05** (deploy `2e67246e`). It means the database has teams but no
 `pret4_builtin_materialize` marker. **The refusal is safe, and the running version keeps serving** — it
-raises before the column drop, so no access state is changed. Be precise about what "safe" means here:
+raises before the column drop, so the PRET-6 block changes nothing. Be precise about the rest:
 `scripts/pg-load-schema.mjs` replays `postgres/schema.sql` and then each migration in filename order
 with **no wrapping transaction**, so `schema.sql` and every migration sorting before
 `20260818210000_pret6_retire_access_enforcement.sql` HAVE already applied (idempotently), and the ones

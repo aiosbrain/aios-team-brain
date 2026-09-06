@@ -61,7 +61,11 @@ describe("PRET-4 explicit builtin-state call sites", () => {
     //     shape that actually matters: a case that calls the handler and THEN stamps the marker
     //     itself (`admin.from("migration_markers").upsert({ name: PRET4_MATERIALIZE_MARKER })`)
     //     passes (a), (b) and (c) while claiming a fleet was reconciled when it was not. The
-    //     marker is the thing PRET-6 trusts, so the CLI must never write it by any spelling.
+    //     marker is the thing PRET-6 trusts, so the CLI must never write it itself.
+    //     SCOPE, stated honestly (second review): this is a SUBSTRING check, not a proof. A split
+    //     literal ("migration_" + "markers") or an imported helper would pass it. It is aimed at
+    //     the idiom that actually appears in this repo, and it is the cheapest thing that reddens
+    //     on the realistic regression; a general answer needs import/AST analysis and is not here.
     expect(
       admin,
       "scripts/admin.ts must not write the PRET-4 marker itself — the marker is stamped only by the shipped materialization"
