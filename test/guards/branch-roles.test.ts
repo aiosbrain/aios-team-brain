@@ -389,6 +389,37 @@ describe("branch roles — the workflows that must follow the cutover (criteria 
   });
 });
 
+describe("branch roles — Dependabot targets the contribution base (RELPTR-7)", () => {
+  /**
+   * WHY A GUARD AT ALL. Dependabot follows the DEFAULT branch absent a `target-branch`, so before the
+   * cutover this file needed no entry and had none. After it, the default and the contribution base
+   * happen to coincide — which means a DELETED `target-branch` is invisible: Dependabot keeps aiming
+   * at `staging` because that is the default, and nothing reddens. The day the default moves again
+   * (a release-branch experiment, a fork), every dependency PR silently retargets.
+   *
+   * UNIVERSAL, NOT AGGREGATE. An earlier version of this criterion said "the count of target-branch
+   * equals the count of ecosystems". gpt-6-astra's review killed it: one ecosystem carrying two keys
+   * and another carrying none satisfies that count exactly. Every entry is checked on its own.
+   */
+  const dependabot = () => parseYaml(read(".github/dependabot.yml")) as { updates?: { "package-ecosystem"?: string; "target-branch"?: string }[] };
+
+  it("EVERY update entry targets the contribution base", () => {
+    const updates = dependabot().updates ?? [];
+    // Non-vacuous: an empty or unparsed list would make the loop below assert nothing.
+    expect(updates.length, "dependabot must declare ecosystems").toBeGreaterThan(0);
+    for (const entry of updates) {
+      expect(entry["target-branch"], `${entry["package-ecosystem"]} must name the contribution base`).toBe(CONTRIBUTION_BASE);
+    }
+  });
+
+  it("names the ROLE's value, so a future move is one edit and this guard follows it", () => {
+    // Asserted against the role rather than the literal `"staging"`: pinning the literal would make
+    // this guard the second owner of the contribution base, which is the defect RELPTR-4 existed for.
+    const ecosystems = (dependabot().updates ?? []).map((u) => u["package-ecosystem"]);
+    expect(new Set(ecosystems).size, "each ecosystem appears once").toBe(ecosystems.length);
+  });
+});
+
 describe("branch roles — the PR template states the split (criterion 8)", () => {
   const TPL = () => read(".github/pull_request_template.md");
 
