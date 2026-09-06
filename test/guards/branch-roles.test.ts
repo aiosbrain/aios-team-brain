@@ -393,39 +393,81 @@ describe("branch roles — Dependabot targets the contribution base (RELPTR-7)",
   /**
    * WHY A GUARD AT ALL. Dependabot follows the DEFAULT branch absent a `target-branch`, so before the
    * cutover this file needed no entry and had none. After it, the default and the contribution base
-   * happen to coincide — which means a DELETED `target-branch` is invisible: Dependabot keeps aiming
-   * at `staging` because that is the default, and nothing reddens. The day the default moves again
-   * (a release-branch experiment, a fork), every dependency PR silently retargets.
-   *
-   * UNIVERSAL, NOT AGGREGATE. An earlier version of this criterion said "the count of target-branch
-   * equals the count of ecosystems". gpt-6-astra's review killed it: one ecosystem carrying two keys
-   * and another carrying none satisfies that count exactly. Every entry is checked on its own.
+   * coincide — which means a DELETED `target-branch` is invisible: Dependabot keeps aiming at
+   * `staging` because that is the default, and nothing reddens. The day the default moves again, every
+   * dependency PR silently retargets.
    */
-  const dependabot = () => parseYaml(read(".github/dependabot.yml")) as { updates?: { "package-ecosystem"?: string; "target-branch"?: string }[] };
+  const dependabot = () => parseYaml(read(".github/dependabot.yml")) as { updates?: { "package-ecosystem"?: string; directory?: string; "target-branch"?: string }[] };
+
+  /**
+   * The ecosystems that MUST be covered, pinned as an explicit expectation rather than derived from
+   * the file. gpt-6-astra's review broke the derived version: the count came from the same list it was
+   * checking, so deleting the `pip` and `github-actions` entries outright left both assertions green
+   * while criterion 7's coverage quietly went from three ecosystems to one.
+   *
+   * Keyed on (ecosystem, directory), not ecosystem alone: the same ecosystem in two directories is
+   * ordinary Dependabot config, and a guard that forbids it would redden on a legitimate change.
+   * Extra entries beyond these are allowed; missing ones are not.
+   */
+  const REQUIRED = [
+    { ecosystem: "npm", directory: "/" },
+    { ecosystem: "pip", directory: "/ingestion" },
+    { ecosystem: "github-actions", directory: "/" },
+  ] as const;
 
   it("EVERY update entry targets the contribution base", () => {
     const updates = dependabot().updates ?? [];
-    // Non-vacuous: an empty or unparsed list would make the loop below assert nothing.
     expect(updates.length, "dependabot must declare ecosystems").toBeGreaterThan(0);
     for (const entry of updates) {
-      expect(entry["target-branch"], `${entry["package-ecosystem"]} must name the contribution base`).toBe(CONTRIBUTION_BASE);
+      expect(entry["target-branch"], `${entry["package-ecosystem"]} @ ${entry.directory}`).toBe(CONTRIBUTION_BASE);
     }
   });
 
-  it("pins the ROLE, not the literal — so the next move is still one edit", () => {
-    // WHAT THIS REPLACED, because the original was a guard nobody could keep: it asserted every
-    // `package-ecosystem` value was unique. Dependabot does not guarantee that — the same ecosystem
-    // in two directories (`npm` at `/` and `/website`) is ordinary config — so the guard would have
-    // reddened on a legitimate change, which is how a guard gets deleted rather than fixed.
-    //
-    // The property actually worth pinning is that this file follows the ROLE. Asserting the literal
-    // `"staging"` here would make the guard a SECOND OWNER of the contribution base, which is the
-    // exact defect RELPTR-4 existed to kill.
+  it("covers every REQUIRED ecosystem — deleting one cannot pass by shrinking the list", () => {
+    const have = (dependabot().updates ?? []).map((u) => `${u["package-ecosystem"]}@${u.directory}`);
+    for (const { ecosystem, directory } of REQUIRED) {
+      expect(have, `${ecosystem} @ ${directory} must still be covered`).toContain(`${ecosystem}@${directory}`);
+    }
+  });
+
+  it("names the CONTRIBUTION role in source — the one thing no value assertion can check", () => {
+    /**
+     * THE POST-CUTOVER IDENTITY TRAP, and it is the mirror of the one RELPTR-6 fixed.
+     * `CONTRIBUTION_BASE === INTEGRATION_BRANCH === "staging"` now, so substituting one role for the
+     * other in the assertions above changes NOTHING that any value test can see — astra demonstrated
+     * exactly that substitution passing. Dependabot must follow the CONTRIBUTION base because
+     * dependency PRs are contributions; if the contribution base moves again and this file has
+     * silently been wired to the integration branch, dependency PRs would target the wrong one with
+     * every check green.
+     *
+     * A source-token pin is the only instrument that discriminates two roles holding one value. It is
+     * evadable by an equivalent spelling — this file's own header says so — and an evadable pin still
+     * beats no pin, which is what the value assertions amount to here.
+     */
+    // BOUNDED TO THE FIRST TEST, and the tokens are BUILT rather than written. Both matter, and the
+    // first version got both wrong: reading to end-of-file made this assertion match its own
+    // `not.toContain(...)` argument, so it failed on itself — and the positive half would have been
+    // satisfied by this very line, i.e. vacuous, had the negative not reddened first.
+    const src = read("test/guards/branch-roles.test.ts");
+    const from = src.indexOf("EVERY update entry targets the contribution base");
+    const to = src.indexOf("covers every REQUIRED ecosystem", from);
+    expect(from, "anchor 1 must exist").toBeGreaterThan(-1);
+    expect(to, "anchor 2 must exist and follow it").toBeGreaterThan(from);
+    const block = src.slice(from, to);
+    const right = `toBe(${"CONTRIBUTION"}_BASE)`;
+    const wrong = `toBe(${"INTEGRATION"}_BRANCH)`;
+    expect(block, "the dependabot assertion must name the CONTRIBUTION role").toContain(right);
+    expect(block, "and must NOT have been re-wired to the integration role").not.toContain(wrong);
+    // Non-vacuous: the block is the assertion body, not an empty slice.
+    expect(block.length, "the bounded block must be real").toBeGreaterThan(80);
+  });
+
+  it("pins the ROLE in the yaml, not the literal", () => {
+    // Asserting the literal `"staging"` in dependabot.yml's guard would make this file a SECOND OWNER
+    // of the contribution base — the defect RELPTR-4 existed to kill.
     const src = read(".github/dependabot.yml");
-    expect(src, "the value must be the role's, resolved from scripts/branches.mjs").toContain(`target-branch: "${CONTRIBUTION_BASE}"`);
-    // Non-vacuous: one entry per declared ecosystem, counted against the parse rather than the text.
-    const declared = (dependabot().updates ?? []).length;
-    expect(src.match(/target-branch:/g) ?? [], "exactly one per update entry").toHaveLength(declared);
+    expect(src).toContain(`target-branch: "${CONTRIBUTION_BASE}"`);
+    expect(src.match(/target-branch:/g) ?? [], "exactly one per update entry").toHaveLength((dependabot().updates ?? []).length);
   });
 });
 

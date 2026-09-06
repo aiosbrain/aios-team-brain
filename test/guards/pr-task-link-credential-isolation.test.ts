@@ -468,50 +468,59 @@ describe("guard: pr-task-link.yml specifically", () => {
   });
 
   /**
-   * THE REFUTED pull_request_target MODEL MUST BE GONE AS A CLAIM, not merely as two phrases.
+   * THE REFUTED pull_request_target MODEL MUST BE GONE AS A CLAIM, not as a phrase and not as a line.
    *
-   * The first version of this guard forbade two exact strings. Fable's review showed it green over a
-   * file that still asserted the same thing in different words four lines higher ("the ref is always
-   * the base branch"), which is the whole failure mode: a guard that pins phrasing teaches you the
-   * text changed, not that the model did.
-   *
-   * THE WRINKLE, and why this is not a plain `not.toMatch`: the corrections deliberately QUOTE the
-   * old claim in order to retract it ("it said ALWAYS the base branch pre-2025-12-08"). A blanket
-   * ban would forbid the retraction along with the assertion and push the next author to delete the
-   * history instead of recording it. So retracted lines are stripped first, and what remains must
-   * contain no assertion of the old model.
+   * THREE VERSIONS, and each hole was found by a different reviewer, so the history is the spec:
+   *   v1 forbade two exact strings. Fable: green over a file asserting the same model four lines up
+   *      in different words. A phrase pin proves the text changed, not the model.
+   *   v2 forbade a FAMILY of phrasings, and stripped whole LINES carrying a retraction word so the
+   *      corrections could quote the old claim in order to retract it. gpt-6-astra broke it with one
+   *      line: `# The main-only policy is obsolete; the ref is always the base branch.` — "obsolete"
+   *      strips the line, live assertion and all. It also showed the positive half was satisfiable by
+   *      deleting every explanation and keeping the literal date.
+   *   v3 (this one) exempts QUOTED and PARENTHETICAL spans instead of whole lines, on a rule that is
+   *      easy to follow and easy to check: **history goes in quotes or parentheses; assertions do
+   *      not.** An unquoted, unparenthesised assertion is always caught, however it is worded, and
+   *      whatever retraction words share its line.
    */
-  const RETRACTION = /used to say|it said|USED TO SAY|pre-2025-12-08|until 2025-12-08|obsolete|refuted|WAS WRONG|no longer/i;
+  const HISTORY_SPAN = /"[^"]*"|\([^)]*\)/g;   // quoted or parenthetical = a retraction, not a claim
   const OLD_MODEL: readonly [RegExp, string][] = [
     [/ref is (?:always |ALWAYS )?the (?:pull request's )?base branch/i, "ref is the base branch"],
     [/run's ref is the pull request's target branch/i, "ref is the target branch"],
-    [/runs the BASE branch's copy/i, "workflow file comes from the base branch"],
+    [/(?:runs|executes) the BASE branch's/i, "code comes from the base branch"],
+    [/default is the base branch/i, "checkout default is the base branch"],
+    [/base.branch (?:code|scanner) only/i, "base-branch-code-only rule"],
     [/policy allows\s+`main`\s+only/i, "policy allows main only"],
   ];
+  /** The claim that must be POSITIVELY made — a date alone certifies nothing. */
+  const CURRENT_MODEL = /default branch,? regardless of the pull request's base|evaluate against the default branch|ref is the DEFAULT branch|from the DEFAULT branch/;
+  const assertions = (src: string) => src.replace(HISTORY_SPAN, " ");
 
-  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"]])(
+  it.each([["pr-task-link.yml"], ["aios-work-sync.yml"], ["nda-gate.yml"]])(
     "%s asserts the CURRENT pull_request_target model and never the refuted one",
     (file) => {
-      const live = text(file)
-        .split("\n")
-        .filter((line) => !RETRACTION.test(line))   // a quoted retraction is history, not a claim
-        .join("\n");
+      const live = assertions(text(file));
       for (const [re, label] of OLD_MODEL) {
         expect(live, `refuted model survives as an assertion: ${label}`).not.toMatch(re);
       }
-      // …and the correction must be stated, not merely the old text deleted.
-      expect(text(file), "the current model, dated").toContain("2025-12-08");
+      expect(text(file), "the current model must be STATED, not merely dated").toMatch(CURRENT_MODEL);
     }
   );
 
-  it("is NON-VACUOUS: the stripping cannot swallow a real assertion", () => {
-    // The strip is the risky half — too broad and every line becomes "history". Proven directly:
-    // an UNMARKED assertion is caught, and the identical sentence carrying a retraction marker is not.
-    const strip = (s: string) => s.split("\n").filter((l) => !RETRACTION.test(l)).join("\n");
-    const assertion = "# On pull_request_target the ref is always the base branch, so the policy is satisfied.";
-    const retracted = "# It said the ref is always the base branch; that was the pre-2025-12-08 model.";
-    expect(strip(assertion), "an unmarked assertion must survive stripping").toMatch(OLD_MODEL[0][0]);
-    expect(strip(retracted), "a retracted quotation must be stripped").not.toMatch(OLD_MODEL[0][0]);
+  it("is NON-VACUOUS in both directions, including the two evasions astra found", () => {
+    // Direction 1 — a live assertion is caught however it is dressed.
+    const plain = "# On pull_request_target the ref is always the base branch, so the policy is satisfied.";
+    const astraM10 = "# The main-only policy is obsolete; the ref is always the base branch.";
+    for (const line of [plain, astraM10]) {
+      expect(assertions(line), `must be caught: ${line}`).toMatch(OLD_MODEL[0][0]);
+    }
+    // Direction 2 — a genuine retraction is exempt, so the rule does not push authors to delete history.
+    for (const line of ['# It said "the ref is always the base branch"; that was the pre-2025-12-08 model.',
+                        "# The ref is the DEFAULT branch (it was the base branch until 2025-12-08)."]) {
+      expect(assertions(line), `must be exempt: ${line}`).not.toMatch(OLD_MODEL[0][0]);
+    }
+    // astra M11 — deleting the prose and keeping the date must NOT satisfy the positive half.
+    expect("# 2025-12-08", "a bare date certifies nothing").not.toMatch(CURRENT_MODEL);
   });
 
   it("fires on exactly the release branch and the contribution base", () => {

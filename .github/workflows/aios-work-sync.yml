@@ -29,7 +29,8 @@ name: AIOS work sync
 #      line that executes is reviewed default-branch code that no pull request can edit. The gate on
 #      the job is therefore trusted, which is the whole point.
 #   2. NOTHING from the pull request's head is checked out, fetched, installed, built or run.
-#      The checkout below carries NO `ref:` — on this trigger the default is the base branch.
+#      The checkout below carries NO `ref:` — on this trigger the default is the DEFAULT branch
+#      (GitHub, effective 2025-12-08; it was the base branch before that).
 #      Adding `ref:`, a `git fetch`/`git checkout` of a pull ref, an `npm ci` (lifecycle scripts
 #      are contributor-authored code), or an artifact download is the textbook pwn-request, and
 #      `test/guards/pr-task-link-credential-isolation.test.ts` fails the build on each of them.
@@ -116,7 +117,9 @@ jobs:
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
       AIOS_PROJECT: aios-team-brain
     steps:
-      # NO `ref:`. On `pull_request_target` the default is the base branch — the trusted copy.
+      # NO `ref:`. On `pull_request_target` the default ref is the DEFAULT branch — the trusted copy.
+      # (Was the base branch until GitHub's 2025-12-08 change; the default is the stronger of the two,
+      # because a pull request's base is contributor-selectable and the default branch is not.)
       # Adding `ref: ${{ github.event.pull_request.head.sha }}` here is precisely the
       # vulnerability this workflow was rewritten to close.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,8 +141,9 @@ jobs:
           node <<'NODE'
           // Async IIFE so the shared ESM helper can be `await import`ed from this CommonJS heredoc.
           (async () => {
-          // BASE-BRANCH CODE. `./scripts/…` resolves inside the checkout above, which on
-          // `pull_request_target` is the base branch, not the pull request.
+          // DEFAULT-BRANCH CODE. `./scripts/…` resolves inside the checkout above, which on
+          // `pull_request_target` is the DEFAULT branch, not the pull request (and not the base —
+          // that changed 2025-12-08).
           //
           // ONE matcher, shared with pr-task-link.yml (`scripts/pr-work-keys.mjs`) and unit-tested.
           // These were two inline copies: the advisory check could clear a PR whose keys THIS step —

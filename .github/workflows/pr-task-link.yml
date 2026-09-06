@@ -25,8 +25,10 @@ name: PR task link (advisory)
 # Fork safety was real and it was irrelevant; the reasoning stopped one branch short.
 #
 # WHAT MAKES THIS SHAPE SAFE. On `pull_request_target` GitHub runs the workflow file AND
-# `actions/checkout`'s default ref from the BASE branch, which no pull request can edit. Every
-# line of code that executes here is trusted `main` code. The pull request contributes DATA
+# `actions/checkout`'s default ref from the DEFAULT branch, which no pull request can edit. (This
+# said BASE branch, correct until GitHub's 2025-12-08 change; the default branch is strictly
+# stronger, since a base is contributor-selectable and a default is not.) Every line of code that
+# executes here is trusted default-branch code. The pull request contributes DATA
 # only — its title, body, branch name and number, read out of the event payload — and that data
 # is treated as attacker-controlled throughout: it is never interpolated into a `run:` block,
 # never used to construct a shell command, and never used to select what to check out or fetch.
@@ -57,7 +59,7 @@ name: PR task link (advisory)
 # mechanism moved, and a stale mechanism is the half that gets re-derived into a wrong ordering.
 #
 # So the environment cannot be the thing protecting this key. THE ONLY THING PROTECTING IT IS THE RULE
-# ABOVE: base-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
+# ABOVE: default-branch code only, no PR-head checkout/fetch/import/execute, and no attacker-controlled
 # value interpolated into a `run:` body. Treat that rule as load-bearing, because it is the whole of
 # the defence.
 #
@@ -142,7 +144,8 @@ jobs:
       AIOS_API_KEY: ${{ secrets.AIOS_API_KEY }}
       AIOS_TEAM: ${{ secrets.AIOS_TEAM }}
     steps:
-      # NO `ref:`. On `pull_request_target` the default is the base branch — the trusted copy.
+      # NO `ref:`. On `pull_request_target` the default ref is the DEFAULT branch — the trusted copy.
+      # (Was the base branch until 2025-12-08; see the header.)
       # Adding `ref: ${{ github.event.pull_request.head.sha }}` here is precisely the vulnerability
       # this workflow was rewritten to close.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

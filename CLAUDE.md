@@ -275,7 +275,19 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   - **`staging` → the STAGING environment.** Ordinary merges land here. Its own Postgres, its own
     schema load; nothing to do against prod.
   - **`main` → PRODUCTION.** Post-cutover `main` advances only by fast-forward to a tagged release
-    (`docs/RELEASING.md` §2 step 5). Only then run `npm run pg:schema` against prod for a schema change.
+    (`docs/RELEASING.md` §2 step 5).
+
+  ⛔ **DO NOT run `npm run pg:schema` against prod by hand. `railway.json` already runs it as the
+  `preDeployCommand`, from the DEPLOYED ARTIFACT'S tree.** A manual run reads YOUR checkout —
+  `loadSchema({ cwd = process.cwd() })` in `scripts/pg-load-schema.mjs` — and post-cutover your checkout
+  is routinely AHEAD of the release: tag `A` ships, local `staging` is already at `B`, and the manual
+  run applies **B's unreleased migrations to production**. Pre-cutover this was near-safe because
+  `main` was what you had just merged; the cutover is exactly what made it dangerous, and an earlier
+  version of this very section still said to do it.
+
+  **Instead, verify the release deployed:** confirm a new build started for the tagged commit and that
+  its preDeploy step succeeded. If a manual load is ever genuinely required, `git checkout` the exact
+  release tag first and say so out loud — the guarantee you need is that the tree equals the tag.
 
   Either way, **confirm the platform started a new build** (`railway deployment list`) — webhooks are
   silently dropped in practice, twice on 2026-09-05 — and re-trigger from the Railway dashboard if the

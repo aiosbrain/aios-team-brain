@@ -3,8 +3,10 @@ name: NDA confidentiality gate
 # PRIVILEGE SEPARATION IS THE SECURITY BOUNDARY.
 # `pull_request` executes the workflow and scanner from the PR merge ref. Giving that code NDA_TERMS
 # lets a same-repo branch — or a fork branch a maintainer mirrors — print the private list. This
-# privileged workflow is instead loaded from the base branch, executes only the base branch's
+# privileged workflow is instead loaded from the DEFAULT branch, executes only that branch's
 # scanner, and treats the PR head strictly as Git objects. Never check out or execute the PR tree.
+# (Said "base branch" until GitHub's 2025-12-08 change made `pull_request_target` always take the
+# workflow file and checkout commit from the default branch regardless of the pull request's base.)
 on:
   pull_request_target:
     branches: [main, staging]
@@ -94,7 +96,8 @@ jobs:
             # insufficient (add→scrub history would disappear). Scan all reachable history.
             node scripts/nda-scan.mjs --range "$HEAD_SHA"
           fi
-      # pull_request_target's own check belongs to the BASE SHA, so branch protection cannot use it
+      # pull_request_target's own check belongs to the DEFAULT-branch SHA (the BASE SHA before
+      # 2025-12-08), so branch protection cannot use it
       # for the PR head. Publish the verdict explicitly, after validating/fetching that exact head.
       - name: Publish PR-head verdict
         if: github.event_name == 'pull_request_target' && always()
