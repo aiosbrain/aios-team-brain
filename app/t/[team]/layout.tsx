@@ -50,7 +50,13 @@ export default async function TeamLayout({
 
   return (
     <div className="flex min-h-dvh flex-1 bg-surface-raised">
-      <aside className="frosted sticky top-0 flex h-dvh w-60 shrink-0 flex-col border-r border-border-subtle px-4 py-6">
+      {/* `data-staging-offset`: on staging the banner publishes `--staging-banner-h` and this shifts
+          down by exactly that, so the sidebar's footer stays on screen. Off staging the var is unset
+          and the fallback `0px` keeps today's behaviour byte-for-byte. */}
+      <aside
+        data-staging-offset
+        className="frosted sticky top-[var(--staging-banner-h,0px)] flex h-[calc(100dvh-var(--staging-banner-h,0px))] w-60 shrink-0 flex-col border-r border-border-subtle px-4 py-6"
+      >
         {/* No AIOS lockup here on purpose. This is the team's workspace, so the team name is
             the subject and AIOS is the tool it runs on — the mark lives in the favicon, the way
             Slack keeps its own logo out of a workspace sidebar. If this sidebar ever gains a
