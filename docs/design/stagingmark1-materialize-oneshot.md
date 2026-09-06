@@ -125,7 +125,9 @@ cannot carry it to prod. So:
 | carries `staging_marker` | `--confirm` |
 | does **not** carry it (may be production) | `--confirm` **and** `--confirm-production` |
 
-Both paths print which fleet they believe they are pointed at before doing anything.
+Both paths report which fleet they believe they are pointed at. Precisely: the **dry run** is where an
+operator reads that line and can still change course — on a confirmed run the handler returns its lines
+after the write, so the output is a record, not a prompt. There is no interactive abort, by design.
 
 **Behaviour lives in an import-safe module with injected dependencies** —
 `lib/access/materialize-command.ts` **(new file)**, exporting `runMaterializeCommand(deps, opts)`.

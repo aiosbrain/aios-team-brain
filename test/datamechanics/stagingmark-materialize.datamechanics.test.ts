@@ -55,8 +55,13 @@ async function runMigrationRolledBack(): Promise<string | null> {
       return err instanceof Error ? err.message : String(err);
     }
   } finally {
-    await client.query("rollback").catch(() => {});
-    client.release();
+    // release(true) DESTROYS the connection when the rollback itself failed, rather than returning
+    // a client with a possibly-open aborted transaction to the shared pool (diff-review LOW).
+    let rolledBack = true;
+    await client.query("rollback").catch(() => {
+      rolledBack = false;
+    });
+    client.release(rolledBack ? undefined : true);
   }
 }
 
@@ -88,31 +93,53 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
     expect(after, `the migration must apply once materialized, got: ${after}`).toBeNull();
   });
 
-  it("AC10b — the rolled-back run leaves the schema intact (the column drop did not persist)", async () => {
-    // Negative control for the isolation the whole AC depends on. If begin/rollback were not
-    // holding, the migration's `alter table teams drop column` would have changed the shared
-    // schema and this assertion is where that shows up.
+  it("AC10b — the rolled-back run leaks neither the column drop nor the enforcement update", async () => {
+    // NEGATIVE CONTROL for the isolation the whole AC depends on — rewritten after the diff review
+    // showed the first version could not fail: it asserted `to_regclass('public.teams')`, but the
+    // migration drops COLUMNS, never the table, so that assertion was green in the leaked world
+    // too. It now observes the two things the transaction actually changes: the presence of
+    // `teams.access_enforcement` (dropped by the migration's second half) and the value the
+    // normalisation writes.
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
     await materializeBuiltinMembershipOnce(db());
-    await runMigrationRolledBack();
 
-    const { rows } = await getPool().query<{ present: boolean }>(
-      "select to_regclass('public.teams') is not null as present"
-    );
-    expect(rows[0]?.present).toBe(true);
-    // The team row itself survives the rolled-back `update teams set access_enforcement`.
-    const { data: team } = await db().from("teams").select("id").eq("id", seed.teamId).maybeSingle();
-    expect(team).not.toBeNull();
+    const snapshot = async () => {
+      const col = await getPool().query<{ present: boolean }>(
+        `select exists (select 1 from information_schema.columns
+           where table_schema = current_schema() and table_name = 'teams'
+             and column_name = 'access_enforcement') as present`
+      );
+      const present = col.rows[0]?.present === true;
+      if (!present) return { present, value: null as string | null };
+      const val = await getPool().query<{ v: string | null }>(
+        "select access_enforcement::text as v from teams where id = $1",
+        [seed.teamId]
+      );
+      return { present, value: val.rows[0]?.v ?? null };
+    };
+
+    const before = await snapshot();
+    await runMigrationRolledBack();
+    const after = await snapshot();
+
+    expect(after.present, "the migration's column drop must not survive the rollback").toBe(before.present);
+    expect(after.value, "the normalisation UPDATE must not survive the rollback").toBe(before.value);
+    // Recorded honestly: when the column is already absent on this database (the post-PRET-6
+    // shape), `present` is false both times and this control only proves the UPDATE did not leak.
+    // It is still the strongest observation available, and it reddens whenever the column exists.
   });
 
   it("AC11 — a reconcile that fails partway leaves the marker UNSTAMPED", async () => {
     const seed = await seedTeam();
     await ensureBuiltins(db(), seed.teamId);
 
-    // Break the fleet AFTER this team: a second team whose builtin slug is occupied by a
-    // non-builtin group, so `ensureBuiltins` fails for it. The loop returns before the marker
-    // upsert, which is the marker-LAST discipline this criterion exists to pin.
+    // Squat the SECOND builtin slug, not the first. The diff review caught that squatting
+    // `everyone` makes this vacuous: `ensureBuiltins` iterates [everyone, external]
+    // (lib/access/groups.ts:110-113) and refuses on the squatter BEFORE inserting anything, so no
+    // partial write exists and the absent marker proves nothing. Squatting `external` means
+    // `everyone` IS inserted — the convergent write — and the refusal lands after it, in either
+    // team-iteration order (the `select id from teams` at :213 has no ORDER BY).
     const { data: other, error } = await db()
       .from("teams")
       .insert({ slug: `t-${randomUUID().slice(0, 8)}`, name: "partial" })
@@ -120,11 +147,22 @@ describe("STAGINGMARK-1 — the wedged fleet, against the real migration", () =>
       .single();
     if (error || !other) throw new Error(`seed second team failed: ${error?.message}`);
     const otherId = (other as { id: string }).id;
-    await db().from("groups").insert({ team_id: otherId, slug: "everyone", name: "squatter", is_builtin: false });
+    await db().from("groups").insert({ team_id: otherId, slug: "external", name: "squatter", is_builtin: false });
 
     const result = await materializeBuiltinMembershipOnce(db());
     expect(result.ok, "a fleet with an unbuildable team must not report success").toBe(false);
 
+    // BOTH halves, per the spec: the partial write landed …
+    const { data: partial } = await db()
+      .from("groups")
+      .select("id")
+      .eq("team_id", otherId)
+      .eq("slug", "everyone")
+      .eq("is_builtin", true)
+      .maybeSingle();
+    expect(partial, "the convergent write must have landed — otherwise this proves nothing about ordering").not.toBeNull();
+
+    // … and the marker did NOT.
     const { data: marker } = await db().from("migration_markers").select("name").eq("name", MARKER).maybeSingle();
     expect(marker, "a partial reconcile must NOT stamp the marker — a retry has to be able to finish").toBeNull();
   });

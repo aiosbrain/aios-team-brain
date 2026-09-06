@@ -16,12 +16,13 @@ import {
  * while doing nothing.
  */
 
-/** A materializer that FAILS THE TEST if it is ever invoked — the sharp end of AC1/AC2/AC6. */
-const forbidden = () => {
-  throw new Error("materialize must not be called in this state");
-};
-
-function spy(result: MaterializeResult | (() => never)) {
+/**
+ * A counting fake. "Was it called?" is asserted with `calls`, NEVER by having the fake throw:
+ * the diff review caught that a throwing fake proves nothing here, because the handler CATCHES a
+ * thrown materializer by design (AC6c) and turns it into exit 1 — so a "must not be called" fake
+ * that throws is silently absorbed and its test can still pass for the wrong reason.
+ */
+function spy(result: MaterializeResult) {
   let calls = 0;
   return {
     get calls() {
@@ -29,8 +30,7 @@ function spy(result: MaterializeResult | (() => never)) {
     },
     fn: async () => {
       calls++;
-      if (typeof result === "function") result();
-      return result as MaterializeResult;
+      return result;
     },
   };
 }
@@ -46,10 +46,12 @@ const staging = (over: Partial<FleetState> = {}) => async () => state(over);
 
 describe("STAGINGMARK-1 — materialize-builtins handler", () => {
   it("AC1 — an already-materialized fleet never calls the materializer", async () => {
+    const m = spy({ ok: true, ran: true });
     const out = await runMaterializeCommand(
-      { readState: staging({ marker: true }), materialize: forbidden as never },
+      { readState: staging({ marker: true }), materialize: m.fn },
       { confirm: true, confirmProduction: true }
     );
+    expect(m.calls, "the marker-present path must perform zero writes").toBe(0);
     expect(out.exitCode).toBe(0);
     expect(out.lines.join("\n")).toMatch(/already materialized/i);
   });
@@ -89,7 +91,7 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
 
   it("AC5 — the three outcomes are pairwise distinguishable, and only the failure reads as failure", async () => {
     const done = await runMaterializeCommand(
-      { readState: staging({ marker: true }), materialize: forbidden as never },
+      { readState: staging({ marker: true }), materialize: spy({ ok: true, ran: true }).fn },
       { confirm: true, confirmProduction: true }
     );
     const ran = await runMaterializeCommand(
@@ -108,15 +110,17 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
 
   describe("AC6 — the remaining non-success states exit non-zero", () => {
     it("(a) a failing readState never reaches the materializer", async () => {
+      const m = spy({ ok: true, ran: true });
       const out = await runMaterializeCommand(
         {
           readState: async () => {
             throw new Error("connection refused");
           },
-          materialize: forbidden as never,
+          materialize: m.fn,
         },
         { confirm: true, confirmProduction: true }
       );
+      expect(m.calls, "a failed state read must not reach the materializer").toBe(0);
       expect(out.exitCode).not.toBe(0);
       expect(out.lines.join("\n")).toContain("connection refused");
     });

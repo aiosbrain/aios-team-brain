@@ -42,6 +42,12 @@ still serving — in exactly two cases, each named in the raised error:
   restored-from-backup DB or a skipped release. Boot the prior release once (its startup runs
   the materialization), then take this one.
 
+  **Or stamp it directly, without booting anything** (STAGINGMARK-1) —
+  `DATABASE_URL=<the wedged database> npm run admin -- materialize-builtins`, dry-run by default.
+  This is the only route a self-hoster has, since "boot the prior release" assumes a dashboard to
+  roll back in. Full runbook, including which machine to run it from:
+  `docs/OPS.md` §11 "If a deploy refuses …".
+
 A refused deploy is **safe**: the guard runs before the drop, nothing is half-applied, and the
 running version keeps serving. Replaying the migration after a successful drop is a clean
 no-op, and a from-zero install never sees the guard fire (a fresh DB has no teams).

@@ -57,6 +57,15 @@ describe("PRET-4 explicit builtin-state call sites", () => {
       admin,
       "scripts/admin.ts must not call materializeBuiltinMembershipOnce directly — go through runMaterializeCommand"
     ).not.toMatch(/materializeBuiltinMembershipOnce/);
+    // (d) …and not reach AROUND the function either. The diff review found (c) defeated by the
+    //     shape that actually matters: a case that calls the handler and THEN stamps the marker
+    //     itself (`admin.from("migration_markers").upsert({ name: PRET4_MATERIALIZE_MARKER })`)
+    //     passes (a), (b) and (c) while claiming a fleet was reconciled when it was not. The
+    //     marker is the thing PRET-6 trusts, so the CLI must never write it by any spelling.
+    expect(
+      admin,
+      "scripts/admin.ts must not write the PRET-4 marker itself — the marker is stamped only by the shipped materialization"
+    ).not.toMatch(/migration_markers|PRET4_MATERIALIZE_MARKER/);
   });
 
   it("team creation bootstraps the access topology", () => {
