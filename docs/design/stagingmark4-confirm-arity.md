@@ -171,7 +171,8 @@ records call COUNTS; a throwing fake alone is not proof of non-invocation.
   bare `flags.x` in a condition) is IN that CLI's registry, every `as <value type>` / `typeof === "string"`
   read is NOT in it, an `as` cast is classified by its ASSERTED TYPE (boolean-only => boolean read;
   a value type => value read; `any`/`unknown`/`as const`/a type reference => UNRESOLVABLE, so the
-  forall clause fires), **any flag NAME with no classified read anywhere fails as `unclassified read:
+  forall clause fires; EVERY link of a cast chain is classified, so a disagreeing chain reports
+  `both classes`), destructured binds (`const { confirm } = flags`) are recorded as reads, **any flag NAME with no classified read anywhere fails as `unclassified read:
   <name>`** (per NAME, not per occurrence — see the recorded gap below), a name in both classes fails, and `CONFIRM_KEYS` from
   `lib/access/materialize-command.ts` is a subset of `admin.ts`'s registry (read from the
   DECLARATION via the AST — not an import and not a copied literal, so it cannot drift). *Negative controls, both required: one `flags.newflag &&` read, AND each unclassified spelling

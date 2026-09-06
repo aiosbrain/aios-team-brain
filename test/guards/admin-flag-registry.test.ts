@@ -4,6 +4,13 @@ import { describe, expect, it } from "vitest";
 import { ADMIN_BOOLEAN_FLAGS, TASK_BOOLEAN_FLAGS } from "@/lib/admin/args";
 import { parseConfirmFlags } from "@/lib/access/materialize-command";
 
+/**
+ * Seeing through casts and non-null assertions is DELIBERATE, and it makes the truthiness rules
+ * stricter as a side effect: `if (flags.x as string)`, `!(flags.x as string)` and
+ * `Boolean(flags.x as string)` now report a boolean read (and, with the cast, `both classes`)
+ * where they used to be silent value reads. That is correct — a truthiness read of a
+ * string-cast flag is exactly the trap when the flag is passed bare — so do not "fix" it.
+ */
 function unwrap(node: ts.Node): ts.Node {
   if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isNonNullExpression(node)) {
     return unwrap(node.expression);
@@ -14,10 +21,6 @@ function flagName(node: ts.Node): string | undefined {
   node = unwrap(node);
   if (ts.isPropertyAccessExpression(node) && node.expression.getText() === "flags") return node.name.text;
   if (ts.isElementAccessExpression(node) && node.expression.getText() === "flags" && ts.isStringLiteral(node.argumentExpression)) return node.argumentExpression.text;
-}
-/** The OUTERMOST cast of a chain — `x as unknown as boolean` must be judged by `boolean`. */
-function unwrapType(node: ts.AsExpression): ts.Node {
-  return node.expression;
 }
 type TypeVerdict = "boolean" | "value" | "unresolvable";
 function classifyType(t: ts.TypeNode): TypeVerdict {
@@ -54,16 +57,21 @@ function classify(source: string) {
   const visit = (node: ts.Node) => {
     const anyName = flagName(node);
     if (anyName) seen.add(anyName);
+    // `const { wipe } = flags` / `const { wipe: w } = flags` never produce a `flags.x` node, so the
+    // forall clause could not see them at all — silent, not fail-closed. Record the bound names so
+    // an undeclared one is reported like any other unclassified read.
+    if (ts.isVariableDeclaration(node) && node.initializer?.getText() === "flags" && ts.isObjectBindingPattern(node.name)) {
+      for (const el of node.name.elements) {
+        const src = el.propertyName ?? el.name;
+        if (ts.isIdentifier(src)) seen.add(src.text);
+        else if (ts.isStringLiteral(src)) seen.add(src.text);
+      }
+    }
     if (ts.isCallExpression(node) && node.expression.getText() === "Boolean") node.arguments.forEach(arg => add(booleans, arg));
     if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) add(booleans, node.operand);
     if (ts.isIfStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)) condition(node.expression);
     if (ts.isConditionalExpression(node)) condition(node.condition);
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) add(booleans, node.left);
-    // An `as` cast declares intent. A BOOLEAN-typed cast is a boolean read (so the name must be
-    // registered); anything else is a value read. Accepting every cast as a "value" — which an
-    // earlier fold did, to classify `flags.tier as "team" | "external"` — let
-    // `const w = flags.wipe as boolean; if (w) destroy();` past the guard with NO violation:
-    // not a boolean, not unregistered, not unclassified. Found by attacking my own fold.
     // An `as` cast declares intent, and the classification must FAIL CLOSED when the cast does not
     // actually declare one. Two earlier attempts both leaked, each time widening the door I had just
     // narrowed: accepting every cast as a "value" let `flags.wipe as boolean` through, and then
@@ -72,7 +80,12 @@ function classify(source: string) {
     // So: boolean-only asserted type => boolean read (must be registered); a type that is clearly a
     // value => value read; ANYTHING UNRESOLVABLE (`any`, `unknown`, `as const`, a type reference a
     // syntactic classifier cannot follow) => NEITHER, so the forall clause fires.
-    if (ts.isAsExpression(node) && !ts.isAsExpression(unwrapType(node))) {
+    // EVERY link of a chain, not just the outermost. Skipping a cast whose operand was itself a
+    // cast judged `x as A as B` by A — the INNERMOST — which is the inverse of what this comment
+    // used to claim, and it leaked: `flags.wipe as string | boolean as boolean` reported nothing
+    // while `--wipe false` took the destructive branch. Classifying every link is strictly more
+    // fail-closed: a chain whose links disagree now reports `both classes`.
+    if (ts.isAsExpression(node)) {
       const verdict = classifyType(node.type);
       if (verdict === "boolean") add(booleans, node.expression);
       else if (verdict === "value") add(values, node.expression);
@@ -140,6 +153,12 @@ describe.each(cases)("AC8 $script registry", ({script,registry}) => {
       "const w = flags.wipe as unknown; if (w) go();",
       "const w = flags.wipe as unknown as boolean; if (w) go();",
       "const w = flags.wipe as Flag; if (w) go();",
+      // chain casts — judged by every link, so a disagreeing chain cannot hide a boolean
+      "const w = flags.wipe as string | boolean as boolean; if (w) go();",
+      "const w = flags.wipe as boolean as unknown; if (w) go();",
+      // destructuring, the most idiomatic launder
+      "const { wipe } = flags; if (wipe) go();",
+      "const { wipe: w } = flags; if (w) go();",
     ]) {
       expect(violations(read, []), read).not.toEqual([]);
     }
@@ -184,6 +203,16 @@ it("materialize confirmation keys are a subset of the admin registry", () => {
   const visit = (node: ts.Node) => {
     const anyName = flagName(node);
     if (anyName) seen.add(anyName);
+    // `const { wipe } = flags` / `const { wipe: w } = flags` never produce a `flags.x` node, so the
+    // forall clause could not see them at all — silent, not fail-closed. Record the bound names so
+    // an undeclared one is reported like any other unclassified read.
+    if (ts.isVariableDeclaration(node) && node.initializer?.getText() === "flags" && ts.isObjectBindingPattern(node.name)) {
+      for (const el of node.name.elements) {
+        const src = el.propertyName ?? el.name;
+        if (ts.isIdentifier(src)) seen.add(src.text);
+        else if (ts.isStringLiteral(src)) seen.add(src.text);
+      }
+    }
     if (ts.isVariableDeclaration(node) && node.name.getText() === "CONFIRM_KEYS" && node.initializer) {
       const initializer = ts.isAsExpression(node.initializer) ? node.initializer.expression : node.initializer;
       expect(ts.isArrayLiteralExpression(initializer)).toBe(true);
