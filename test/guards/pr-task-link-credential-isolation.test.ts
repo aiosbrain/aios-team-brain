@@ -554,10 +554,15 @@ describe("guard: pr-task-link.yml specifically", () => {
     // FABLE's v3 BREAK, as a standing control. An assertion placed deep in the `run:` body — inside
     // what the runaway quote-span used to swallow — must be seen. Reconstructed rather than described:
     // a line with an odd `"` upstream, then the assertion many lines later.
+    // THE REAL SHAPE, not a paraphrase of it. A first version of this control had only ONE `"`, so
+    // `/"[^"]*"/` never closed and nothing was stripped — it passed under the BROKEN stripper too,
+    // which is a control that controls nothing. The bug needs a quote that OPENS before the assertion
+    // and CLOSES after it, so the runaway span swallows the line in between.
     const runawayQuote = [
-      '      # the script prints "Found work key(s): … ',
+      '      # the script prints "Found work key(s)',
       "      - run: node scripts/pr-work-keys.mjs",
       "      # On pull_request_target the ref is always the base branch, so any author satisfies it.",
+      '      # …and the log line ends with a closing " here',
     ].join("\n");
     expect(assertions(runawayQuote), "a runaway quote must not hide a later assertion").toMatch(OLD_MODEL[0][0]);
     // …and code lines are ignored entirely, so a string literal in a script cannot trip the guard.
