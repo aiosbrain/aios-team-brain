@@ -29,30 +29,10 @@ import { formatAccessHealth } from "@/lib/admin/access-health-format";
 // footgun stays behind the ingest callers that build their prefix from the same helper that wrote it.
 import { purgeItemIds } from "@/lib/ingest/purge";
 
-type Flags = Record<string, string | boolean>;
-
-function parseArgs(argv: string[]): { cmd: string; positionals: string[]; flags: Flags } {
-  const [cmd = "help", ...rest] = argv;
-  const positionals: string[] = [];
-  const flags: Flags = {};
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
-      const next = rest[i + 1];
-      if (next === undefined || next.startsWith("--")) flags[key] = true;
-      else {
-        flags[key] = next;
-        i++;
-      }
-    } else positionals.push(a);
-  }
-  return { cmd, positionals, flags };
-}
+import { parseAdminArgs, ADMIN_BOOLEAN_FLAGS, CliExitError } from "@/lib/admin/args";
 
 function die(msg: string): never {
-  console.error(`✗ ${msg}`);
-  process.exit(1);
+  throw new CliExitError(msg);
 }
 
 async function resolveTeam(admin: ReturnType<typeof adminClient>, ref: string) {
@@ -85,7 +65,7 @@ const USAGE = `Team Brain admin CLI — commands:
   sync-github --org <org> [--team <id|slug>]                               # list candidates (needs GITHUB_TOKEN)
   access-health <team-slug>              # standing access-violation/read-zero scan (lockouts AND unsanctioned system grants)
   drain-context <team-slug>              # partition a team's items (the demo bootstrap's post-seed step)
-  purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]
+  purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm | --dry-run]
                                          # irreversibly remove specific items + their versions/chunks/
                                          # facts, retire their graph episodes, audit, bust derived
                                          # caches. DRY RUN by default — --confirm actually deletes.
@@ -99,15 +79,15 @@ const USAGE = `Team Brain admin CLI — commands:
                                          # present. --confirm-production is additionally required
                                          # when the database carries no staging_marker.
   pg:schema                              # load postgres/schema.sql (idempotent)
+Boolean flags take no value: pass them bare to enable, or omit to disable. Put positionals first.
 Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const PURGE_USAGE = `purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm]`;
+const PURGE_USAGE = `purge-items --team <id|slug> --ids <uuid,uuid,…> --reason "<text>" [--confirm | --dry-run]`;
 
 /** Print the standing access-health verdict: blockers are what an operator must FIX — a human locked
  *  OUT (grants/backfill) or a group let IN the substrate never sanctioned (AUDITFIX-23); warnings are
- *  read-zero states worth knowing. The wording lives in an IMPORT-SAFE module because this file runs
- *  `main()` at module scope, so a test cannot reach a formatter defined here. */
+ *  read-zero states worth knowing. The wording lives in a shared import-safe formatter module. */
 function printHealth(r: AccessHealth): void {
   for (const line of formatAccessHealth(r)) console.log(line);
 }
@@ -122,8 +102,10 @@ async function memberIdByEmail(admin: ReturnType<typeof adminClient>, teamId: st
   return (data as { id: string } | null)?.id ?? null;
 }
 
-async function main() {
-  const { cmd, positionals, flags } = parseArgs(process.argv.slice(2));
+export async function main(argv: string[]) {
+  const parsedArgs = parseAdminArgs(argv, ADMIN_BOOLEAN_FLAGS);
+  if (!parsedArgs.ok) die(parsedArgs.error);
+  const { cmd, positionals, flags } = parsedArgs;
   if (cmd === "help" || flags.help) return console.log(USAGE);
 
   if (cmd === "pg:schema") {
@@ -183,7 +165,9 @@ async function main() {
       const baseUrl = (flags["base-url"] as string) || process.env.BRAIN_URL || "";
       const { token, url } = await issueLoginLink(admin, team.id, email, {
         nextPath: `/t/${team.slug}`,
-        ttlMinutes: flags["ttl-min"] ? Number(flags["ttl-min"]) : 60,
+        // Explicit legacy presence check: this is a value flag, including bare-true compatibility.
+        ttlMinutes: flags["ttl-min"] !== undefined && flags["ttl-min"] !== "" && flags["ttl-min"] !== false
+          ? Number(flags["ttl-min"] as string) : 60,
         baseUrl,
       });
       if (!token) die(`no member for ${email} (invite-only) — run create-member first`);
@@ -570,7 +554,7 @@ async function main() {
         // see a truncated report, or none, for a run that already touched the database. Awaiting
         // a zero-length write drains what is queued first (second diff review).
         await new Promise<void>((resolve) => process.stdout.write("", () => resolve()));
-        process.exit(outcome.exitCode);
+        throw new CliExitError("", outcome.exitCode);
       }
       break;
     }
@@ -587,6 +571,12 @@ async function main() {
   }
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((e) => die(e instanceof Error ? e.message : String(e)));
+// Suffix comparison also works when /tmp resolves through /private/tmp.
+if (process.argv[1]?.endsWith("/admin.ts")) {
+  main(process.argv.slice(2))
+    .then(() => process.exit(0))
+    .catch((e) => {
+      if (!(e instanceof CliExitError) || e.message) console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(e instanceof CliExitError ? e.exitCode : 1);
+    });
+}

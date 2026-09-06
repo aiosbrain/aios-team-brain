@@ -55,8 +55,8 @@ const CONFIRM_KEYS = ["confirm", "confirm-production"] as const;
  * Strict parsing of the two confirmation flags, at the CLI boundary.
  *
  * `parseArgs` (scripts/admin.ts) assigns the FOLLOWING token as a string, so `--confirm false`
- * yields the string "false" — and `if (!flags.confirm)` reads that as CONFIRMED. That trap is live
- * today on `purge-items`, a destructive command. Rather than inherit it, this command refuses any
+ * yields the string "false" — truthy as confirmation. The shared argv boundary now blocks that trap
+ * on `purge-items` too. As defense in depth, this command still refuses any
  * value form instead of guessing which way the operator meant it.
  *
  * `--confirm=false` is a DIFFERENT shape: parseArgs makes the whole token the key, so the flag

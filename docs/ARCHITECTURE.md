@@ -1435,7 +1435,9 @@ Removal is a fan-out, because an item's derivatives have three different lifetim
 | `graph_episodes` **+ the facts in Graphiti**                                                | Explicit, via `lib/graph.retireEpisodesForItems` — no FK, and the facts live outside Postgres. Deletes inline, then leaves a `pending_delete_group_id` **tombstone** so `reconcileProjectedEpisodes` retries a Graphiti blip and drops the row only once the group is verified empty |
 | `tasks.source_item_id`, `decisions.source_item_id`                                          | `set null` — deliberately kept: independently authored records that merely cite the item                                                       |
 
-**Operator entry point — `scripts/admin.ts purge-items --team <id|slug> --ids <uuid,…> --reason "<text>" [--confirm]`.**
+**Operator entry point — `scripts/admin.ts purge-items --team <id|slug> --ids <uuid,…> --reason "<text>" [--confirm | --dry-run]`.**
+Boolean flags take no value: pass `--confirm` bare to delete, or omit it to preview.
+Explicit values (including `--confirm false` and `--confirm=false`) are refused before database access.
 Until this existed the primitive had no caller outside `lib/ingest`, so removing rows from a deployed
 brain meant raw SQL — which skips every row of the table above, most damagingly `graph_episodes`
 (no FK to `items`, so the ledger orphans and the corresponding Graphiti/Neo4j nodes stay live with

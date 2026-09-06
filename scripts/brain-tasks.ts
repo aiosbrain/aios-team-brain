@@ -39,7 +39,7 @@ import {
   MEETING_TODO_PROJECT_NAME,
 } from "@/lib/meetings/extract-todos";
 
-type Flags = Record<string, string | boolean>;
+import { parseAdminArgs, TASK_BOOLEAN_FLAGS, CliExitError, type Flags } from "@/lib/admin/args";
 type Admin = ReturnType<typeof adminClient>;
 type ResolvePage = {
   team: { issues: { pageInfo: { hasNextPage: boolean; endCursor: string }; nodes: { id: string; identifier: string; url: string }[] } } | null;
@@ -51,28 +51,8 @@ type ResolvePage = {
 // the list to be local.
 const STATUSES: readonly string[] = TASK_STATUSES;
 
-function parseArgs(argv: string[]): { cmd: string; positionals: string[]; flags: Flags } {
-  const [cmd = "help", ...rest] = argv;
-  const positionals: string[] = [];
-  const flags: Flags = {};
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a.startsWith("--")) {
-      const key = a.slice(2);
-      const next = rest[i + 1];
-      if (next === undefined || next.startsWith("--")) flags[key] = true;
-      else {
-        flags[key] = next;
-        i++;
-      }
-    } else positionals.push(a);
-  }
-  return { cmd, positionals, flags };
-}
-
 function die(msg: string): never {
-  console.error(`✗ ${msg}`);
-  process.exit(1);
+  throw new CliExitError(msg);
 }
 
 async function resolveTeam(admin: Admin, ref: string) {
@@ -130,8 +110,10 @@ async function bumpFingerprint(admin: Admin, teamId: string, projectId: string, 
     .eq("row_key", rowKey);
 }
 
-async function main() {
-  const { cmd, positionals, flags } = parseArgs(process.argv.slice(2));
+export async function main(argv: string[]) {
+  const parsedArgs = parseAdminArgs(argv, TASK_BOOLEAN_FLAGS);
+  if (!parsedArgs.ok) die(parsedArgs.error);
+  const { cmd, positionals, flags } = parsedArgs;
   if (cmd === "help" || flags.help) return console.log(USAGE);
   if (!process.env.DATABASE_URL) die("DATABASE_URL is required");
 
@@ -202,8 +184,8 @@ async function main() {
         .from("tasks")
         .select("row_key, title, status, priority, sprint, parent_row_key")
         .eq("team_id", team.id);
-      if (flags.project) q = q.eq("project_id", flags.project as string);
-      if (flags.sprint) q = q.eq("sprint", flags.sprint as string);
+      if (flags.project !== undefined && flags.project !== "" && flags.project !== false) q = q.eq("project_id", flags.project as string);
+      if (flags.sprint !== undefined && flags.sprint !== "" && flags.sprint !== false) q = q.eq("sprint", flags.sprint as string);
       const { data } = await q.order("row_key");
       console.table(data ?? []);
       break;
@@ -226,7 +208,7 @@ async function main() {
     case "project": {
       const team = await resolveTeam(admin, teamSlug);
       let projectIds: string[];
-      if (flags.project) projectIds = [flags.project as string];
+      if (flags.project !== undefined && flags.project !== "" && flags.project !== false) projectIds = [flags.project as string];
       else {
         const { data } = await admin.from("projects").select("id").eq("team_id", team.id);
         projectIds = ((data ?? []) as { id: string }[]).map((p) => p.id);
@@ -379,6 +361,12 @@ async function main() {
   }
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((e) => die(e instanceof Error ? e.message : String(e)));
+// Suffix comparison also works when /tmp resolves through /private/tmp.
+if (process.argv[1]?.endsWith("/brain-tasks.ts")) {
+  main(process.argv.slice(2))
+    .then(() => process.exit(0))
+    .catch((e) => {
+      if (!(e instanceof CliExitError) || e.message) console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(e instanceof CliExitError ? e.exitCode : 1);
+    });
+}
