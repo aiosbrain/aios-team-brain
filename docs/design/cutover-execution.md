@@ -399,3 +399,39 @@ forward, because each names a defect class rather than a typo:
    retained.
 5. **The four-carrier enumeration was wrong — there were five**, and the fifth was in the file that
    documents CI itself.
+
+
+## RELPTR-7 cold review (gpt-6-astra) — BLOCKED, folded
+
+Four findings, all re-derived and all real. The two HIGHs were defects in the *folds*, which is the
+class the second reviewer exists for.
+
+1. **HIGH — the deploy fold I wrote permitted unreleased migrations against production.** `CLAUDE.md`
+   said to run `npm run pg:schema` against prod after the release fast-forward. `railway.json` already
+   runs it as the `preDeployCommand` **from the deployed artifact**, while a manual run reads YOUR
+   checkout (`loadSchema({ cwd = process.cwd() })`). Post-cutover the local checkout is routinely AHEAD
+   of the release: tag `A` ships, local `staging` is at `B`, and the manual run applies **B's
+   unreleased migrations to production**. Pre-cutover this was near-safe because `main` was what you
+   had just merged — *the cutover is what made the old instruction dangerous, and my fold repeated it*.
+   Now: do not run it by hand; verify the release's preDeploy step instead.
+2. **HIGH — the carrier sweep was incomplete and the new guard falsely certified it.** Live assertions
+   survived in `pr-task-link.yml`, `aios-work-sync.yml` and `docs/CI-ARCHITECTURE.md`, and there was a
+   **sixth** carrier (`.github/workflows/nda-gate.yml`) and a seventh (`docs/ARCHITECTURE.md`) where
+   this spec had said four. Worse, two evasions of the guard itself: a line carrying a retraction word
+   AND a live assertion was stripped whole (`# The main-only policy is obsolete; the ref is always the
+   base branch.`), and the positive half was satisfied by the literal date with every explanation
+   deleted. **Fixed by changing the exemption from lines to SPANS**, on a rule that is checkable:
+   *history goes in quotes or parentheses; assertions do not.* Both evasions are now explicit tests.
+3. **MEDIUM — Dependabot coverage could vanish while both guards passed**, because the expected count
+   was derived from the same list being checked. Required (ecosystem, directory) pairs are now pinned
+   explicitly; extra entries and repeated ecosystems in different directories remain legal.
+4. **MEDIUM — the new identity trap, demonstrated.** `CONTRIBUTION_BASE === INTEGRATION_BRANCH ===
+   "staging"`, so substituting one role for the other in the Dependabot assertions passed. A
+   source-token pin now discriminates them, with the same honest caveat RELPTR-6 recorded: it is
+   evadable by an equivalent spelling, and an evadable pin beats none when no value assertion can see
+   the difference.
+
+**One mutation SURVIVED and is recorded rather than hidden:** stripping three of the seven statements
+of the current model from `pr-task-link.yml` leaves the guard green — because four remain. The claim
+astra actually made (a bare date satisfies the positive half) is closed and unit-proven:
+`CURRENT_MODEL` rejects `# 2025-12-08`, and stripping *every* statement reddens.
