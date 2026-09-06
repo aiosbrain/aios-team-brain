@@ -251,6 +251,8 @@ have the fix. Reviewer should rule.
 | `docs/RELEASING.md` | §3 cutover status, constraint rows 1/4/5/7/8, §3.2 ordering pairs |
 | `CLAUDE.md` | **ADDED to Scope by Fable's RELPTR-7 diff review.** §6 said "Deploys happen ONLY by merging to `main`", so post-cutover an agent merging to `staging` would run the **production** schema load for code not on `main`. Out of the original fence, in-scope now: it is the file every session reads and the one stale claim with an operational blast radius |
 | `docs/CI-ARCHITECTURE.md` | **ADDED to Scope by the same review** — a FIFTH carrier of the superseded `pull_request_target` model (open finding 7 said four). Three sites: the `evil2 → evil` base-branch claim, the "run's ref is the PR's target branch" cost paragraph, and `scan-on-merge`'s `main`-only note |
+| `test/guards/releasing-runbook.test.ts` | **ADDED to Scope during the build.** It pinned §2's pre-cutover statement that a candidate is "expected to fail assertion D" — true while `main` was not an ancestor of `staging`, and the opposite of the truth now. Updated to assert the post-cutover expectation, plus new coverage for the fast-forward step Fable found missing |
+| `.github/workflows/nda-gate.yml`, `docs/ARCHITECTURE.md` | **ADDED to Scope by astra's cold review** — the SIXTH and SEVENTH carriers of the superseded `pull_request_target` model, where this spec had said four |
 | `docs/design/cutover-execution.md` | this spec |
 
 A change to any file not in this table is a finding, not a tidy-up.
