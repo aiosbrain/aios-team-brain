@@ -16,7 +16,12 @@ export class CliExitError extends Error {
 /** Validate every raw occurrence before last-wins tokenization can erase malformed input. */
 export function parseAdminArgs(argv: string[], registry: readonly string[]): AdminArgsResult {
   const booleans = new Set(registry);
-  for (let i = 1; i < argv.length; i++) {
+  // From 0, not 1. Skipping the command token means `admin --confirm false` (a leading flag, no
+  // command) escapes validation and reports whatever the next check happens to complain about —
+  // measured: "DATABASE_URL is required". Nothing destructive is reachable that way, because the
+  // command is invalid, but the diagnostic is wrong. A leading token is never a valid command, so
+  // validating it costs nothing. Found by a mutation that SURVIVED at `i = 1`.
+  for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
     if (!token.startsWith("--")) continue;
     const key = token.slice(2).split("=", 1)[0];

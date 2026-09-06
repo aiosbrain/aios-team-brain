@@ -69,3 +69,16 @@ it.each(commands)("AC6 HEAD compatibility: %s", (cmd) => {
     for (const registry of registries) expect(parseAdminArgs(equals, registry)).toEqual({ok:true,...parseArgs(equals)});
   }
 });
+
+describe("STAGINGMARK-4 — a LEADING boolean flag is validated too", () => {
+  // The command token is at argv[0]; validating from index 1 let `admin --confirm false` through
+  // to an unrelated error. A leading token is never a valid command, so it is validated as well.
+  it("refuses a registered boolean in the command position when given a value", () => {
+    const r = parseAdminArgs(["--confirm", "false"], ADMIN_BOOLEAN_FLAGS);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/takes no value/);
+  });
+  it("still accepts a bare leading boolean", () => {
+    expect(parseAdminArgs(["--help"], ADMIN_BOOLEAN_FLAGS).ok).toBe(true);
+  });
+});
