@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Instrument_Serif, Instrument_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
+import { StagingBanner } from "@/components/layout/staging-banner";
 
 const instrumentSerif = Instrument_Serif({
   variable: "--font-instrument-serif",
@@ -38,6 +39,9 @@ export default function RootLayout({
       className={`${instrumentSerif.variable} ${instrumentSans.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col bg-surface-base">
+        {/* STGENV-1: outside <Providers> and above everything, so it cannot be hidden by a
+            page-level layout and renders even if a provider below it throws. */}
+        <StagingBanner />
         <Providers>{children}</Providers>
       </body>
     </html>
