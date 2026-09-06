@@ -1,12 +1,15 @@
 ---
 name: adversarial-build-astra
 description: >
-  The adversarial build loop with the ROLES INVERTED: gpt-6-astra AUTHORS (the
-  spec, then the code) and Fable 5.1 is the independent reviewer. Spine — AIOS
-  ticket → astra writes the spec → fold → Fable reviews the SPEC → fold → cycle
-  to convergence → spec gate (`aios spec eval` must say SPEC_READY) → astra
-  writes the code → Fable reviews the DIFF → fold → astra reviews the DIFF cold
-  → fold → push the PR → update the ticket. Use when asked to build a slice with
+  The adversarial build loop with the ROLES INVERTED: the WORKTREE'S SELECTED
+  Codex model AUTHORS (the spec, then the code) — `gpt-6-astra` by default,
+  resolved from config rather than pinned — and Fable 5.1 is the independent
+  reviewer. Spine — AIOS
+  task opened FIRST → astra writes the spec → fold → Fable reviews the SPEC → fold
+  → cycle to convergence → spec gate (`aios spec eval` must say SPEC_READY) → post
+  the spec to the task and move it to in_progress → astra writes the code → Fable
+  reviews the DIFF → fold → astra reviews the DIFF cold → fold → push the PR citing
+  the task key → the task goes done only when EVERY PR carrying that key is merged. Use when asked to build a slice with
   astra as the author, or /adversarial-build-astra. The sibling skill
   `adversarial-build` is the same loop with Claude authoring; prefer that one
   unless astra is specifically wanted. Never merges; the merge word belongs to
@@ -17,14 +20,17 @@ description: >
 
 The spine:
 
-> **aios ticket → astra WRITES the spec → fold → Fable reviews the SPEC → fold →
-> cycle until convergence → spec gate (`aios spec eval`) → astra WRITES the code →
-> Fable reviews the DIFF → fold → astra reviews the DIFF (fresh session) → fold →
-> push the PR → update the ticket**
+> **open the task (`todo`) → astra WRITES the spec → fold → Fable reviews the SPEC →
+> fold → cycle until convergence → spec gate (`aios spec eval`) → POST the spec to the
+> task and move it to `in_progress` → astra WRITES the code → Fable reviews the DIFF →
+> fold → astra reviews the DIFF (fresh session) → fold → push the PR citing the task
+> key → … → when EVERY PR carrying that key is merged, the task goes `done`**
 
 **What is different from `adversarial-build`, and why it matters.** In the sibling
-skill Claude authors and two models review. Here **astra authors both the spec and
-the code**, which changes two things you must not paper over:
+skill Claude authors and two models review. Here **the worktree's selected Codex
+model authors both the spec and the code** — `gpt-6-astra` in this operator's
+config today, but §0 resolves it rather than assuming it — which changes two things
+you must not paper over:
 
 1. **Astra gets WRITE access to the worktree** (`--sandbox workspace-write`). The
    sibling skill only ever ran Codex read-only. §6 bounds that.
@@ -40,38 +46,91 @@ holding the pen.
 
 ---
 
-## 0. Prerequisite — the CLI, probed, before anything long
+## 0. Prerequisite — RESOLVE the author model, then probe it
 
-**`gpt-6-astra` needs a recent Codex CLI.** Measured 2026-09-05: `codex-cli 0.147.0`
-(Homebrew cask) returns, *after the prompt is sent*:
+**Do not pin a model id in this skill.** The author is whatever Codex is configured
+to use in this worktree, so the same loop works when the operator changes models
+without anyone editing the skill. `codex exec` **with no `--model` flag** resolves
+from `~/.codex/config.toml` (or `$CODEX_HOME`, or `--profile`, or `-c model=…`) —
+verified: omitting the flag ran `model: gpt-6-astra`, the configured value.
 
-```
-400 invalid_request_error: The 'gpt-6-astra' model requires a newer version of
-Codex. Please upgrade to the latest app or CLI and try again.
-```
-
-That is a different failure from an unsupported model — the id is real and the
-account can use it; the binary is stale. Upgrade with `brew upgrade --cask codex`.
-
-**Probe before every long run, not once ever:**
+**Resolve and RECORD it, before EVERY long run — not once ever.** The config this
+resolves from is global and mutable, so a stale record is a lie that §8 publishes.
 
 ```bash
-codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check \
-  "reply with exactly: OK" < /dev/null 2>&1 | tail -3
+# The record lives OUTSIDE the workspace on purpose: $HOME is denied to the sandbox
+# and /tmp is not (see the table below) — and §6's argument is that bounds must be
+# ENFORCED, not requested. A record astra can overwrite is not a record.
+WT=$(basename "$(git rev-parse --show-toplevel)")
+REC=~/.cache/aios-astra/author-model-$WT; mkdir -p "$(dirname "$REC")"
+codex exec --sandbox read-only --skip-git-repo-check \
+  "reply with exactly: OK" < /dev/null 2>&1 | tee "/tmp/astra-probe-$WT.out" | tail -3
+
+# GATE ON THE ANSWER, NOT THE BANNER. Codex prints `model: <id>` from CONFIG *before*
+# the request is sent, so a probe that 400s still shows an id. Measured: a deliberately
+# bogus id printed `model: bogus-model-xyz` and THEN the 400 — a check on the extracted
+# name passes happily. Only the final line proves the model actually answered.
+tail -1 "/tmp/astra-probe-$WT.out" | grep -qx OK \
+  || { echo "REFUSING: probe did not answer OK — the model did not run"; exit 1; }
+
+grep -m1 '^model:'            "/tmp/astra-probe-$WT.out" | awk '{print $2}'  > "$REC"
+grep -m1 '^reasoning effort:' "/tmp/astra-probe-$WT.out" | awk '{print $3}' >> "$REC"
+test -s "$REC" || { echo "REFUSING: banner format changed; cannot resolve the author"; exit 1; }
+cat "$REC"
 ```
 
-A clean `OK` is the only green light. Two failure shapes to tell apart, because
-they have different fixes:
+**`$REC` is the author of record** — the id *and* the reasoning effort, because an
+author at `low` effort is a materially different author from one at `high`, and the
+config sets both. If the banner format ever changes, `grep` returns nothing and the
+`test -s` stops the run; without it §8 would interpolate an empty string and publish
+an attestation naming **no model at all** — a fabricated attestation, which this repo
+treats as worse than an absent one.
 
-- `requires a newer version of Codex` → upgrade the CLI;
-- `is not supported when using Codex with a ChatGPT account` → the id is wrong for
-  this account; fall back to `gpt-5.6-sol` and **say in the PR which model actually
-  ran**. Never silently substitute a model and describe it as astra.
+**Write it to a FILE, not a shell variable.** The orchestrator's shell does **not
+persist between tool calls** — an `AUTHOR_MODEL=…` assignment here is gone by §7 and
+§8. Verified: an exported variable set in one call reads back empty in the next. For
+the same reason **every later read must re-derive the path inline**:
 
-**If astra is unavailable, use the sibling skill `adversarial-build`.** Do not run
-*this* loop with a different model holding the pen — its whole shape (the
-correlation weighting in §7, the write-access bounding in §6) is built around astra
-being the author. Swapping the author silently makes the attestation a fiction.
+```bash
+WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT
+```
+
+Never describe the run as "astra" without reading it; the whole point of resolving is
+that it can change. ("astra" is the name of the AUTHOR ROLE in this skill, not a
+promise about which id filled it.)
+
+**Every run must agree with the record.** §2, §5 and §7 each write a `.out` file whose
+banner names the model that actually ran. After each, assert it matches:
+
+```bash
+grep -m1 '^model:' /tmp/astra-<step>.out | awk '{print $2}'   # must equal line 1 of $REC
+```
+
+A mismatch means the author changed mid-loop — stop, re-probe, and disclose it. This
+is what lets §8 truthfully name the model *for the spec* and *for the code* separately;
+a re-probe at §7 reports §7's state and cannot tell you what built the diff at §5.
+
+**Per-worktree selection**, if you want two worktrees on different models: set
+`CODEX_HOME` to a worktree-local directory holding its own `config.toml`, or pass
+`--profile <name>`. Both are honoured by the flag-free invocation above, so nothing
+else in this skill changes.
+
+Two failure shapes to tell apart, because they have different fixes:
+
+- `requires a newer version of Codex` → upgrade the CLI (`brew upgrade --cask
+  codex`). Measured 2026-09-05: `gpt-6-astra` on `codex-cli 0.147.0` returned
+  `400 … requires a newer version of Codex` **after the prompt was sent**; 0.153.4
+  answered cleanly. The id was real and the account could use it — only the binary
+  was stale, which is why this is not the failure below.
+- `is not supported when using Codex with a ChatGPT account` → the configured id is
+  wrong for this account. Fix the config rather than papering over it here. A
+  probe-verified id on this account as of 2026-09-05 is **`gpt-5.6-sol`** (the sibling
+  skill §4 records why guessing `gpt-5.6` cost a round trip on GRAPHSMALL-1).
+
+**If Codex is unavailable entirely, use the sibling skill `adversarial-build`.** Do
+not run *this* loop with Claude holding the pen — its whole shape (the correlation
+weighting in §7, the write-access bounding in §6) assumes a Codex author and a
+Claude reviewer. Swapping that silently makes the attestation a fiction.
 
 Also inherited: `codex exec` **hangs without `< /dev/null`**, and quota exhaustion
 is a real mid-loop state — when it happens, name the missing reviewer in the PR
@@ -108,22 +167,103 @@ Leave every change UNCOMMITTED in the working tree.
 
 ---
 
-## 1. Ticket first (AIOS CLI)
+## 1. Open the task FIRST — it is the spine everything else hangs off
 
-- Detect first: `grep '<KEY>' ~/Projects/chetan-workspace/3-log/tasks.md`. If no
-  ticket exists, append a row; if one exists, update it. ID must match
-  `[A-Z][A-Z0-9]+-\d+` — ONE hyphen, uppercase.
+The task is created **before the spec exists**, carries the spec once it does, and is
+the thing every PR in the slice points at. Nothing else in this loop is allowed to
+start until it has a key.
+
+**Create it.** A task is a row in `~/Projects/chetan-workspace/3-log/tasks.md` that
+`aios push` projects into Linear:
+
+```
+| KEY-1 | one-line imperative description | chetan | todo |  |  |
+```
+
+- Detect first — `grep '<KEY>' ~/Projects/chetan-workspace/3-log/tasks.md`. Update an
+  existing row rather than opening a second one for the same work.
+- The ID must match `[A-Z][A-Z0-9]+-\d+` — **ONE hyphen, uppercase**. `ARC-STAB-1`
+  extracts as `STAB-1` and silently fails to close; `arc-stab-1` extracts nothing.
 - `cd ~/Projects/chetan-workspace && set -a && . ./.env && set +a`, then
-  `/opt/homebrew/bin/aios push --dry-run 3-log/tasks.md` and
-  `/opt/homebrew/bin/aios push 3-log/tasks.md`. The bare `aios` on PATH is a shell
-  function that fails outside a workspace — use the binary path.
-- **Read the projection back deterministically** — `/opt/homebrew/bin/aios status`,
-  which prints `pm projection: ok · N synced · 0 errors`, and/or the row's
-  `task_pm_links.provider_url`. A push that printed `ok` is not proof the row moved.
-  Do **not** substitute `aios query "…"` for this: that is an LLM answering from an
-  index, which can be stale, and it is not a projection check.
-- Cite the **brain row key** in the branch, PR and `AIOS-Work:` trailer — never the
-  Linear `AIO-*` key, which resolves to nothing.
+  `/opt/homebrew/bin/aios push --dry-run 3-log/tasks.md` and then without `--dry-run`.
+  The bare `aios` on PATH is a shell function that fails outside a workspace — use the
+  binary path.
+- **Check the push landed**: `/opt/homebrew/bin/aios status` prints
+  `pm projection: ok · N synced · 0 errors`. A `502` prints a `✗` line and
+  `pushed 0/1 item(s)` — **read the count**, and retry; it is the platform's deploy
+  cycle, not your payload.
+- **`aios status` does NOT read a row's status** — it reports file sync and the
+  projection, nothing per-task. Treating it as a status read-back is the proxy this
+  bullet exists to forbid. To actually read the row back, query the brain:
+  `GET /api/v1/tasks?mode=table&keys=<KEY>` — its rows carry `status`.
+- Do **not** use `aios query "…"` either: that is an LLM answering from an index,
+  which can be stale.
+
+**Open at `backlog` or `ready` — NOT `todo`.** The file contains `todo` rows, but the
+brain's canonical set is `backlog, ready, in_progress, in_review, blocked, done`
+(`lib/api/schemas.ts`), and `normalizeTaskStatus("todo")` maps to `backlog` while
+carrying `todo` as a non-canonical `raw_status`. Writing `todo` therefore lands the
+Linear issue in Backlog anyway, just with a stray raw string attached. `in_review` is
+also available if you want a "pushed, awaiting merge" state between `in_progress` and
+`done`.
+
+### Posting the spec to the task — and the cap that decides how
+
+> ⚠️ **This subsection runs AFTER §4, not here.** It lives in §1 because it is the
+> task's lifecycle, but the spec does not exist until §2 writes it, §3 converges it and
+> §4 gates it. Do steps 1–3 below once `aios spec eval` says `SPEC_READY`.
+
+**A spec does not fit in a task description. The cap is exactly 2000 characters** on
+the description field, enforced at both ends — CLI-side in the workspace parser's
+`stringWithin(row.title, 0, 2000)` and brain-side by `lib/api/item-payload-schema.ts`'s
+`z.string().max(2000)`. Exceeding it fails with `local Brain API 1.12 payload
+validation failed`, which names neither the field nor the limit. A real spec is five to
+ten times that. (An earlier draft cited "the longest row is 2001" — that counted the
+table cell's padding spaces; the longest real description is 1999.)
+
+So the spec goes to the brain **as its own document**, and the task carries a pointer:
+
+1. Write the spec to **`~/Projects/chetan-workspace/2-work/specs/<slug>.md`** with
+   `access: team` frontmatter — without it nothing syncs (default-deny). The repo copy
+   in `docs/design/<slug>.md` is what the spec gate and the PR reference; the workspace
+   copy is what the brain can retrieve. Keep them the same document.
+2. Push it — **naming both paths explicitly**, never bare:
+   `aios push --dry-run 2-work/specs/<slug>.md 3-log/tasks.md`, then without
+   `--dry-run`. A bare `aios push` sends every dirty eligible file in the workspace
+   (`0-context`, `2-work`, `4-shared`, `.claude/memory`), so an unrelated draft or a
+   memory file rides out with your spec — and this is outward-facing.
+3. **Update the task row in the same push**: rewrite its description to the spec's
+   one-paragraph summary plus the spec path, and move the status to **`in_progress`**.
+4. **Re-push the spec after the final fold in §8.** The repo copy at
+   `docs/design/<slug>.md` is CANONICAL — it is what the spec gate reads and what the
+   PR cites. The workspace copy exists so the brain can retrieve it, and it goes stale
+   every time §3, §6 or §7 amends the spec. One refresh at §8, after the last fold, is
+   the honest minimum; without it the brain serves a spec that no longer matches the
+   merged work.
+
+That is what "post the spec to the task" means here — a retrievable document plus a
+pointer that fits, rather than a truncated paste that fails validation.
+
+### Where the task ends when the loop does NOT reach a PR
+
+Two exits are reachable before any code, and leaving the row at its opening status is
+how a board fills with work nobody is doing:
+
+- **DECLINE at §3** — the design should not be built. Set the row to `blocked` with the
+  reason in the description, or delete it if the work was never real. Take the decline
+  back to the operator; do not spend rounds arguing with it.
+- **Split at §3** — the original row keeps the narrowed slice and stays `in_progress`;
+  the deferred half gets its own row at `backlog` carrying the ordering rule that
+  failed. Do not close the original as `done` — it did not ship what it described.
+
+### Every PR in the slice cites the SAME key
+
+`AIOS-Work: <KEY>` in the PR body, on its own line. **The brain row key, never the
+Linear `AIO-*` key** — a trailer citing the Linear key resolves to nothing, and a real
+but unrelated key files your work under a stranger's name. Both have happened here.
+
+A slice that takes three PRs uses one key three times. That is what makes §9's
+completion check possible.
 
 ---
 
@@ -136,7 +276,7 @@ them for exactly that, and the count was wrong three times running. Give astra t
 it to attack the *inferences*, not the numbers.
 
 ```bash
-codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
+codex exec --sandbox workspace-write --skip-git-repo-check - \
   < /tmp/astra-spec-prompt.md > /tmp/astra-spec.out 2>&1; echo "EXIT=$?" >> /tmp/astra-spec.out
 ```
 
@@ -268,7 +408,7 @@ Branch from `origin/<contribution base>` (see `scripts/branches.mjs`; today `mai
 Then hand astra the approved spec:
 
 ```bash
-codex exec --model gpt-6-astra --sandbox workspace-write --skip-git-repo-check - \
+codex exec --sandbox workspace-write --skip-git-repo-check - \
   < /tmp/astra-build-prompt.md > /tmp/astra-build.out 2>&1; echo "EXIT=$?" >> /tmp/astra-build.out
 ```
 
@@ -383,13 +523,21 @@ Fold Fable's findings with the same re-derivation discipline as §3.
 Then astra's round — and **the session must be fresh**:
 
 ```bash
-codex exec --model gpt-6-astra --sandbox read-only --skip-git-repo-check - \
+codex exec --sandbox read-only --skip-git-repo-check - \
   < /tmp/astra-review-prompt.md > /tmp/astra-review.out 2>&1; echo "EXIT=$?" >> /tmp/astra-review.out
 ```
 
 - **`--sandbox read-only`** here, not `workspace-write`. The reviewer reads.
-- **A NEW invocation, never a resumed build session.** Astra reviewing its own build
-  context is self-review; astra reading the diff cold is at least an independent
+- **No `--model`, same as every other invocation** — this round must run the SAME
+  model recorded by §0 that built the diff — read it with
+  `WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT`,
+  re-deriving `WT` inline because the shell does not persist. That is what makes it
+  the *correlated* round,
+  and the weighting below depends on it. If the config changed mid-loop so a
+  different model answers, you no longer have the round this section describes:
+  re-probe, and say in the PR which model reviewed.
+- **A NEW invocation, never a resumed build session.** The author reviewing its own
+  build context is self-review; reading the diff cold is at least an independent
   *pass*, even though it is the same model.
 - Tell it what Fable found and what was folded, and **task it explicitly with
   breaking the folds** — the second-order bug introduced by a fix is the defect
@@ -441,14 +589,18 @@ The PR body carries, honestly:
 - what the slice is, and what is deliberately NOT in it (name the next slice);
 - the verification table — tier counts, mutations run and what each reddened,
   including any that SURVIVED and what that told you;
-- **who wrote it**: state that astra authored the spec and the code. A reader
-  weighing the review evidence needs to know the author was not the reviewer;
+- **who wrote it**: name the model §0 recorded — read it with
+  `WT=$(basename "$(git rev-parse --show-toplevel)"); cat ~/.cache/aios-astra/author-model-$WT`
+  (re-derive `WT` inline; the shell does not persist) — the actual id, not the word
+  "astra", and the id each `.out` banner confirms for the spec and for the code — for the spec and for the code. A reader weighing the review
+  evidence needs to know the author was not the reviewer, and needs to know *which*
+  model, because the skill no longer pins one;
 - the `## Review` attestation, with **at least one line parsing as**
   `Reviewed by <tool> — verdict <summary>` — the required `pr-review-gate` check
   matches that exact shape, and an unedited `<tool>` placeholder is rejected.
   Name **both** rounds and their verdicts *including the BLOCKED ones*; an
-  attestation that only says CLEAR launders the process. Mark the astra round as
-  the correlated one.
+  attestation that only says CLEAR launders the process. Name the reviewing model
+  by its resolved id and mark that round as the correlated one.
 - deferrals with reasons, and `AIOS-Work: <ROW-KEY>`.
 
 **Verify the body as STORED**, not by the exit code, and read it back with
@@ -463,12 +615,68 @@ Watch checks to a terminal state. Read the brain-task check's **runtime log** fo
 
 ---
 
-## 9. Close the loop
+## 9. Close the task — only when EVERY PR carrying its key is merged
 
-After the human merges: set the row's `Status` to `done` in `3-log/tasks.md`,
-`aios push` (dry-run first), and **read the status back**. The merge automation
-deliberately does not close workspace-pushed rows — they resolve `linked`, not
-`applied` — so closing it yourself is the only thing that closes it.
+The task closes when the **work** is done, not when *a* PR is. A slice that took three
+PRs is not done because the third merged; it is done because all three did.
+
+**Enumerate them exactly.** The obvious search is wrong — measured: `gh pr list
+--search "RELPTR-6 in:body"` returned PRs for RELPTR-4, RELPTR-5, RELPTR-2 and
+SKILLASTRA-1, because GitHub tokenizes the key and matches loosely. A close driven by
+that would fire early or never. Use a quoted phrase, or filter locally on the exact
+trailer:
+
+```bash
+KEY=RELPTR-6
+gh pr list --state all --limit 1000 --json number,state,body \
+  | jq -r --arg k "$KEY" '.[] | select(.body // "" | test("AIOS-Work:[ ]*[*`]*" + $k + "\\b")) | "#\(.number) \(.state)"'
+```
+
+Three things in that line are load-bearing, and I got two of them wrong first:
+
+- **`--limit 1000`, not 100.** Measured: the repo has **673 PRs**, and `--limit 100`
+  reaches back only to **#579**. A slice whose first PR is older than that lists only
+  its recent PRs, sees them all `MERGED`, and closes the task while an earlier one is
+  still open — failing open in exactly the direction this check exists to prevent.
+- **Do NOT anchor the trailer to its own line.** Measured over the last 100 PRs: 73
+  bodies carry `AIOS-Work:`, and a `(?m)^…$` anchor matches only **68**. The five it
+  drops are real trailers written `**AIOS-Work: AUDITFIX-4**` or with backticks — and
+  the repo's own extractor (`scripts/pr-work-keys.mjs`, `lib/pm-sync/work-keys.ts`)
+  links all five, so they ARE part of their tasks. Anchoring would close a task early
+  because one author bolded a line. `[*\`]*` absorbs the decoration; `\b` stops
+  `AUDITFIX-1` matching `AUDITFIX-1x`.
+- **Do not substitute a `--search`.** `gh pr list --search "$KEY in:body"` over-matches
+  badly (it returned RELPTR-4/5/2 and SKILLASTRA-1 when asked for RELPTR-6), and the
+  quoted-phrase form `'"AIOS-Work: RELPTR-2" in:body'` also over-matches — it returns
+  #665, which merely *mentions* RELPTR-2 in prose. (An earlier draft of this section
+  credited line-anchoring for excluding #665. That was wrong: #665 is excluded because
+  its own trailer names RELPTR-3. The label requirement is what does the work.)
+
+Verified verbatim: the command above returns exactly `#662 #660` for `RELPTR-2` and
+`#678` for `RELPTR-6`.
+
+**Then, and only then:**
+
+1. every listed PR reads `MERGED`. If any is `OPEN`, the task stays `in_progress`. If
+   any is `CLOSED` **unmerged**, decide explicitly and record it in the row: either the
+   task waits for a replacement PR carrying the same key, or that PR's scope is
+   formally dropped from the slice. "Say so" is not a decision, and an abandoned PR
+   silently counted as done is how a task closes over work that never shipped;
+2. set `Status` to `done` in the row, `aios push` (dry-run first);
+3. **read the status back** and check the pushed count — a 502 reports `pushed 0/1`
+   while looking otherwise unremarkable.
+
+**Why you close it yourself.** The merge automation deliberately does **not** close a
+workspace-pushed row. `aios-work-sync` fires on the trailer and writes a `work_events`
+row, but a row pushed from `3-log/tasks.md` resolves through the team-wide fallback and
+lands **`linked`**, not `applied` — recorded, and deliberately left open, because
+completing on a team-wide match would create duplicate Linear issues. Six tasks once sat
+open with correct trailers for exactly this reason. Closing it yourself is not
+belt-and-braces; it is the only thing that closes it.
+
+And note the direction of travel: `lib/ingest/tasks` writes status straight from the
+file row, so if a task ever IS auto-closed while your local row still says
+`in_progress`, the next `aios push` clobbers it back open. Fix the row before pushing.
 
 ---
 
@@ -483,4 +691,4 @@ deliberately does not close workspace-pushed rows — they resolve `linked`, not
 | The second-order bug inside a fix | §7's "break the folds" |
 | A correlated CLEAR read as independent | §7's asymmetric weighting |
 | A fabricated attestation | §8's both-rounds-including-BLOCKED rule |
-| A model substituted silently for the one named | §0's two failure shapes |
+| A model substituted silently for the one named | §0's recorded author + the per-run banner assertion + §8's naming rule |
