@@ -179,7 +179,12 @@ deploy reporting success over a corpus dark for many ticks.
 So the function refuses when `items` exist and `project_context_memberships` is empty, keyed on the
 **invariant** (has this fleet been through the substrate?) rather than on the deleted column: both
 earlier PRET-6 near-misses were checks keyed on a retired artifact. The gate sits **before the
-locks** — it reads two tables that are not in the lock set, so the locks buy it no consistency, and a
+locks** as a FAIL-FAST copy, and **again after them as the authoritative one**. An earlier draft of
+this paragraph said the check could sit before the locks alone, "because the locks buy it no
+consistency" — that was wrong and the correlated review caught it: `items` and
+`project_context_memberships` both cascade from `teams`, so a not-yet-committed team deletion is
+invisible to the pre-lock read, and the function then waits for exactly the transaction that empties
+the substrate. The pre-lock copy is an optimisation so a
 fleet about to be refused should not first queue behind DML on five tables.
 
 Stated precisely, and deliberately weaker than "the corpus is partitioned": the predicate is "at
@@ -192,6 +197,13 @@ window — and a false refusal is exactly the failure this slice exists to remov
 `docs/RELEASING.md` to say the corpus is dark until backfill converges. Rejected by the operator: the
 slice's whole benefit is an unattended upgrade, and an upgrade that silently hides your content is
 not one.
+
+**Second residual: the CLI carries the same cascade TOCTOU the SQL now guards.** `readState` is four
+autocommit reads with no lock, and the TS materializer it then calls re-reads only the marker — so a
+team deletion committing between the substrate read and the stamp reproduces, attended, exactly the
+interleaving the post-lock check closes in SQL. Reachability needs an operator run concurrent with a
+team deletion, which is why it is recorded rather than fixed here; the durable fix is the CLI calling
+the SQL function, which is Slice B's "make the two agree" work.
 
 **Residual, stated rather than implied: boot and tick are NOT covered.** They call
 `materializeBuiltinMembershipOnce` directly, which stamps without consulting the substrate, and

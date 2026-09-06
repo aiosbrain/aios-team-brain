@@ -34,6 +34,14 @@ The migration still refuses with **`PRET-6 refused: permissive team(s) remain`**
 team has not passed the readiness/flip path. Complete the ordered steps above; marker repair
 is not a substitute for readiness.
 
+It also refuses with **`PRET-6 refused: this fleet has content but no context substrate`**
+(STAGINGMARK-2) when the fleet has `items` and no `project_context_memberships` at all — the
+pre-`v0.11.0` shape. This one is NOT repairable in place and is deliberately not repaired: enforcement
+fails closed for an item with no context unit, so materializing such a fleet would hand you a deploy
+that reports success over a corpus nobody can see. Upgrade through `v0.11.0` so the substrate is
+built (`docs/RELEASING.md` §3.4). `npm run admin -- materialize-builtins` refuses this shape too, and
+must not be used to clear it — see `docs/OPS.md`.
+
 **STAGINGMARK-2 removes the missing-marker deploy loop.** A markerless fleet now creates any
 absent Everyone/External groups, reconciles every member into exactly the builtin prescribed by
 its tier, and stamps `pret4_builtin_materialize` during preDeploy. It also repairs pre-flag-era

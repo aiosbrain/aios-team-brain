@@ -790,11 +790,6 @@ PRET-6 refused: this fleet has content but no context substrate — upgrade thro
 
 The migration repairs a markerless fleet, but it will **not** repair one whose corpus was never
 partitioned (`items` exist, `project_context_memberships` is empty — the pre-`v0.11.0` class).
-"UNATTENDED" is doing real work in that sentence, and the earlier drafts of it were simply wrong:
-an operator CAN partition on demand — `npm run admin -- drain-context <team-slug>`, and the items
-API reconciles on write. What no operator gets is a corpus that partitions itself faster than the
-budgeted stage. So the remedy below is the reliable one, not the only conceivable one.
-
 Stated precisely, the check is "at least one partition row exists", not "the corpus is fully
 partitioned": a fleet **mid-backfill** is admitted by design, because it went through the substrate
 release and the scheduler will finish. The predicate is also **fleet-global**, not per-team — a
@@ -808,9 +803,14 @@ an item with no context unit, and the only UNATTENDED partitioner is the budgete
 30-minute interval). Materializing such a fleet would hand you a deploy that reports success over a
 corpus nobody can see for many ticks.
 
+"UNATTENDED" is doing real work in that sentence, and the earlier drafts of it were simply wrong:
+an operator CAN partition on demand — `npm run admin -- drain-context <team-slug>`, and the items
+API reconciles on write. What no operator gets is a corpus that partitions itself faster than the
+budgeted stage. So the remedy below is the reliable one, not the only conceivable one.
+
 **The fix is to upgrade through `v0.11.0`** so the substrate is built (`docs/RELEASING.md` §3.4).
 
-Two ways of clearing this that do **not** work, and one that used to:
+Two ways of clearing this that do **not** work — the second of which used to:
 - Hand-inserting a `project_context_memberships` row satisfies the check without partitioning
   anything — precisely the state the check exists to catch.
 - `npm run admin -- materialize-builtins` **also refuses this shape now**. The review of this change
