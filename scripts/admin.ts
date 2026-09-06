@@ -10,6 +10,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { adminClient } from "@/lib/db/admin";
+import { makeMaterializeDeps, parseConfirmFlags, runMaterializeCommand } from "@/lib/access/materialize-command";
 import { createMember, deleteMember } from "@/lib/admin/members";
 import { syncMemberActor, removeMemberActor } from "@/lib/graph/company-actors";
 import { issueApiKey, revokeApiKey } from "@/lib/admin/keys";
@@ -89,6 +90,14 @@ const USAGE = `Team Brain admin CLI — commands:
                                          # facts, retire their graph episodes, audit, bust derived
                                          # caches. DRY RUN by default — --confirm actually deletes.
                                          # Explicit ids only; there is no path-prefix form here.
+  materialize-builtins [--confirm] [--confirm-production]
+                                         # STAGINGMARK-1: complete PRET-4's one-time builtin
+                                         # materialization WITHOUT booting the app — the recovery for
+                                         # a fleet wedged on "PRET-6 refused: the PRET-4 builtin
+                                         # materialization has not completed on this fleet".
+                                         # DRY RUN by default. No-op when the marker is already
+                                         # present. --confirm-production is additionally required
+                                         # when the database carries no staging_marker.
   pg:schema                              # load postgres/schema.sql (idempotent)
 Defaults: --team demo (accepts a team UUID too). Requires DATABASE_URL (postgres). GitHub token via GITHUB_TOKEN env only.`;
 
@@ -543,6 +552,26 @@ async function main() {
         "• derived caches: work_timeline_cache + arc_cache bust requested via bustTeamLearningCaches —\n" +
           "  best-effort, so if a bust failed the error is printed above and those surfaces self-heal on TTL."
       );
+      break;
+    }
+    case "materialize-builtins": {
+      // STAGINGMARK-1. The behaviour, and every outcome's exit code, live in
+      // lib/access/materialize-command.ts so they are testable — this case is wiring only. It
+      // reaches the underlying materialization ONLY through makeMaterializeDeps: a direct second
+      // caller here would leave the handler's tests green while the real command still wrote, and
+      // test/guards/access-bootstrap-callsites.test.ts fails the build if one appears.
+      const parsed = parseConfirmFlags(flags);
+      if (!parsed.ok) die(parsed.error);
+      const outcome = await runMaterializeCommand(makeMaterializeDeps(admin), parsed);
+      for (const line of outcome.lines) console.log(line);
+      if (outcome.exitCode !== 0) {
+        // FLUSH BEFORE EXITING. `console.log` to a PIPE is asynchronous, and `process.exit()`
+        // does not wait for it — so a wrapper or CI job capturing this command's output could
+        // see a truncated report, or none, for a run that already touched the database. Awaiting
+        // a zero-length write drains what is queued first (second diff review).
+        await new Promise<void>((resolve) => process.stdout.write("", () => resolve()));
+        process.exit(outcome.exitCode);
+      }
       break;
     }
     case "sync-github": {

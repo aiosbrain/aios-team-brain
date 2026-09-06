@@ -752,3 +752,54 @@ legs go stale in staging, but that alarm is *thresholded* and *true*).
   starts billing real extraction. Three non-test entrypoints reach it — the scheduler, the admin
   button, and `scripts/graph-window-battery/run-projection.ts`.
 - Staging is **disposable**: anything created there is destroyed by the next refresh.
+
+### If a deploy refuses with "the PRET-4 builtin materialization has not completed"
+
+The exact failure, as it appears in the Railway build log — the deploy stops at `preDeploy`:
+
+```
+schema load failed: PRET-6 refused: the PRET-4 builtin materialization has not completed on this
+fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.md)
+```
+
+**This happened to staging on 2026-09-05** (deploy `2e67246e`). It means the database has teams but no
+`pret4_builtin_materialize` marker. **The refusal is safe, and the running version keeps serving** — it
+raises before the column drop, so the PRET-6 block changes nothing. Be precise about the rest:
+`scripts/pg-load-schema.mjs` replays `postgres/schema.sql` and then each migration in filename order
+with **no wrapping transaction**, so `schema.sql` and every migration sorting before
+`20260818210000_pret6_retire_access_enforcement.sql` HAVE already applied (idempotently), and the ones
+sorting after it have not. The release is stopped part-way through an idempotent replay, which the next
+successful deploy completes — not an all-or-nothing abort.
+
+It is also a **deadlock**, which is why it needs a command rather than a retry: the marker is written
+only by application code (`instrumentation.ts` at boot, and the scheduler tick), and both of those are
+downstream of a deploy that succeeded. Redeploying the same commit will refuse again, forever.
+
+**The fix — stamp the marker directly:**
+
+```bash
+DATABASE_URL="<the wedged database's URL>" npm run admin -- materialize-builtins
+```
+
+That is a **dry run**: it reports which fleet it believes it is pointed at, whether the marker is
+absent, and how many teams would be reconciled. Nothing is written. Re-run with `--confirm` to do it.
+The dry run is where you check the fleet line — on a confirmed run the output prints after the work,
+so read it here, before committing to it.
+
+⚠️ **Run it from a checked-out tree of the release you are trying to deploy** — not from the running
+old image, which does not contain the command. Any machine with the repo and network access to the
+database works.
+
+⚠️ **`--confirm-production` is additionally required when the target carries no `staging_marker`**, i.e.
+when it may be production. The dry run tells you which case you are in. Team identity deliberately is
+**not** used for this: staging is a restore of production and holds the same team row, so a team slug
+matches both databases equally.
+
+The command is a **no-op when the marker is already present** — it reads and exits without writing —
+so running it against a healthy fleet is harmless.
+
+**The alternative, if you would rather not run a command against the database:** roll back to the
+previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
+see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
+is what `docs/RELEASE-NOTES-pret6.md` describes; the command above exists because a self-hoster has no
+dashboard to roll back in.
