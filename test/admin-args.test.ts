@@ -78,7 +78,10 @@ describe("STAGINGMARK-4 — a LEADING boolean flag is validated too", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/takes no value/);
   });
-  it("still accepts a bare leading boolean", () => {
+  it("still accepts a bare leading boolean — AT THE PARSER; the CLI's own handling is separate", () => {
+    // Named precisely after the diff review: the parser accepting `["--help"]` says nothing about
+    // whether the CLI honours it. It did not — `admin --help` fell through to the DATABASE_URL
+    // check — so scripts/admin.ts now also treats `--help` in the command position as help.
     expect(parseAdminArgs(["--help"], ADMIN_BOOLEAN_FLAGS).ok).toBe(true);
   });
 });

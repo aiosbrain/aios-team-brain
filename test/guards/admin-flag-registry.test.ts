@@ -25,13 +25,16 @@ function classify(source: string) {
       condition(node.right);
     }
   };
+  const seen = new Set<string>();
   const visit = (node: ts.Node) => {
+    const anyName = flagName(node);
+    if (anyName) seen.add(anyName);
     if (ts.isCallExpression(node) && node.expression.getText() === "Boolean") node.arguments.forEach(arg => add(booleans, arg));
     if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) add(booleans, node.operand);
     if (ts.isIfStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)) condition(node.expression);
     if (ts.isConditionalExpression(node)) condition(node.condition);
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) add(booleans, node.left);
-    if (ts.isAsExpression(node) && node.type.kind === ts.SyntaxKind.StringKeyword) add(values, node.expression);
+    if (ts.isAsExpression(node)) add(values, node.expression);
     if (ts.isBinaryExpression(node)) {
       for (const [left,right] of [[node.left,node.right],[node.right,node.left]]) {
         if (ts.isTypeOfExpression(left) && ts.isStringLiteral(right) && right.text === "string") add(values, left.expression);
@@ -40,14 +43,19 @@ function classify(source: string) {
     ts.forEachChild(node, visit);
   };
   visit(file);
-  return {booleans,values};
+  return {booleans,values,seen};
 }
 function violations(source: string, registry: readonly string[]) {
-  const {booleans,values} = classify(source);
+  const {booleans,values,seen} = classify(source);
   return [
     ...[...booleans].filter(name => !registry.includes(name)).map(name => `unregistered boolean: ${name}`),
     ...[...values].filter(name => registry.includes(name)).map(name => `registered value: ${name}`),
     ...[...booleans].filter(name => values.has(name)).map(name => `both classes: ${name}`),
+    // THE FORALL CLAUSE. Without it this guard is existential: it proves things about the
+    // spellings it recognises and says nothing about the rest, so `if (flags.wipe !== undefined)`
+    // or `const w = flags.wipe; if (w)` reintroduces the exact coercion trap while the guard stays
+    // green. Making ambiguity FAIL forces the author to declare intent in a recognised form.
+    ...[...seen].filter(name => !booleans.has(name) && !values.has(name)).map(name => `unclassified read: ${name}`),
   ];
 }
 const cases = [
@@ -59,6 +67,21 @@ describe.each(cases)("AC8 $script registry", ({script,registry}) => {
   it("covers every boolean consumer and excludes value consumers", () => {
     expect(violations(source,registry)).toEqual([]);
   });
+  it("negative control: an UNCLASSIFIED read fails — the spellings that defeated the existential form", () => {
+    // Each of these reintroduces the coercion trap while being invisible to every truthiness rule:
+    // `--wipe false` makes the string "false", which is !== undefined and truthy.
+    for (const read of [
+      "if (flags.wipe !== undefined) doSomething();",
+      "const w = flags.wipe; if (w) doSomething();",
+      "doSomething(flags.wipe ?? false);",
+      "const w = flags.wipe || false;",
+    ]) {
+      expect(violations(read, []), read).toContain("unclassified read: wipe");
+    }
+    // …and a name declared in a recognised class is NOT reported.
+    expect(violations('typeof flags.wipe === "string";', [])).toEqual([]);
+  });
+
   it("negative control: a new flags.newflag && read fails the same guard", () => {
     expect(violations(`${source}\nflags.newflag && doSomething();`,registry)).toContain("unregistered boolean: newflag");
   });
@@ -75,7 +98,10 @@ it("materialize confirmation keys are a subset of the admin registry", () => {
   // Read its declaration rather than maintain a second list; the exported defense is imported above.
   const source = ts.createSourceFile("materialize.ts",readFileSync("lib/access/materialize-command.ts","utf8"),ts.ScriptTarget.Latest,true);
   let keys: string[] | undefined;
+  const seen = new Set<string>();
   const visit = (node: ts.Node) => {
+    const anyName = flagName(node);
+    if (anyName) seen.add(anyName);
     if (ts.isVariableDeclaration(node) && node.name.getText() === "CONFIRM_KEYS" && node.initializer) {
       const initializer = ts.isAsExpression(node.initializer) ? node.initializer.expression : node.initializer;
       expect(ts.isArrayLiteralExpression(initializer)).toBe(true);

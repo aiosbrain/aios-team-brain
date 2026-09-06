@@ -1,6 +1,6 @@
 # STAGINGMARK-4 — a value on a boolean admin flag is refused, not coerced
 
-Status: spec, **round 1 folded** (Fable CLEAR-WITH-CONDITIONS — 3 HIGH + 3 MEDIUM + 3 LOW, all
+Status: spec, **rounds 1 (design) and 2 (diff) folded** (Fable CLEAR-WITH-CONDITIONS — 3 HIGH + 3 MEDIUM + 3 LOW, all
 re-derived and confirmed by measurement; one severity claim of mine corrected down). Written by
 `gpt-6-astra` (reasoning effort `low`); folded by the orchestrator. No code written.
 · Task: `STAGINGMARK-4` · Owner: chetan · Tier build-with: unit — this is argument parsing; there is
@@ -169,9 +169,13 @@ records call COUNTS; a throwing fake alone is not proof of non-invocation.
 - **AC8 — the registry is provably complete (unit guard):** ∀ over `scripts/admin.ts` AND
   `scripts/brain-tasks.ts` — every truthiness read (`Boolean(flags.x)`, `!flags.x`, `flags.x &&`,
   bare `flags.x` in a condition) is IN that CLI's registry, every `as string` / `typeof === "string"`
-  read is NOT in it, a name in both classes fails, and `CONFIRM_KEYS` from
-  `lib/access/materialize-command.ts` is a subset of `admin.ts`'s registry (by import, not by
-  copying). *Negative control: adding one `flags.newflag &&` read must redden it. Without this a
+  read is NOT in it, **any `flags.<name>` read that lands in NEITHER class fails as
+  `unclassified read: <name>`**, a name in both classes fails, and `CONFIRM_KEYS` from
+  `lib/access/materialize-command.ts` is a subset of `admin.ts`'s registry (read from the
+  DECLARATION via the AST — not an import and not a copied literal, so it cannot drift). *Negative controls, both required: one `flags.newflag &&` read, AND each unclassified spelling
+  that defeated the existential form — `flags.wipe !== undefined`, `const w = flags.wipe; if (w)`,
+  `flags.wipe ?? false`, `flags.wipe || false`. Without the unclassified clause the guard is
+  EXISTENTIAL: it proves things about the spellings it recognises and is silent on the rest. Without this a
   future boolean flag silently reintroduces the trap, and this is the criterion the first draft was
   missing entirely.*
 

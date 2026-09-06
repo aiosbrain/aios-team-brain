@@ -9,6 +9,7 @@
  *         'DATABASE_URL=$DATABASE_PUBLIC_URL npx tsx --conditions react-server scripts/admin.ts <cmd>'
  */
 import { execFileSync } from "node:child_process";
+import { basename } from "node:path";
 import { adminClient } from "@/lib/db/admin";
 import { makeMaterializeDeps, parseConfirmFlags, runMaterializeCommand } from "@/lib/access/materialize-command";
 import { createMember, deleteMember } from "@/lib/admin/members";
@@ -106,7 +107,9 @@ export async function main(argv: string[]) {
   const parsedArgs = parseAdminArgs(argv, ADMIN_BOOLEAN_FLAGS);
   if (!parsedArgs.ok) die(parsedArgs.error);
   const { cmd, positionals, flags } = parsedArgs;
-  if (cmd === "help" || flags.help) return console.log(USAGE);
+  // `--help` as the command token too: parseArgs makes it the cmd, so neither of the other two
+  // clauses match and it used to fall through to the DATABASE_URL check.
+  if (cmd === "help" || cmd === "--help" || flags.help) return console.log(USAGE);
 
   if (cmd === "pg:schema") {
     execFileSync("node", ["scripts/pg-load-schema.mjs"], { stdio: "inherit" });
@@ -166,7 +169,7 @@ export async function main(argv: string[]) {
       const { token, url } = await issueLoginLink(admin, team.id, email, {
         nextPath: `/t/${team.slug}`,
         // Explicit legacy presence check: this is a value flag, including bare-true compatibility.
-        ttlMinutes: flags["ttl-min"] !== undefined && flags["ttl-min"] !== "" && flags["ttl-min"] !== false
+        ttlMinutes: flags["ttl-min"] !== undefined && flags["ttl-min"] !== ""
           ? Number(flags["ttl-min"] as string) : 60,
         baseUrl,
       });
@@ -572,9 +575,13 @@ export async function main(argv: string[]) {
 }
 
 // Suffix comparison also works when /tmp resolves through /private/tmp.
-if (process.argv[1]?.endsWith("/admin.ts")) {
+// basename, not a suffix: `endsWith("/admin.ts")` never matches a Windows path or a renamed copy,
+// and the failure mode is SILENT SUCCESS — the module loads, does nothing, and exits 0.
+if (basename(process.argv[1] ?? "") === "admin.ts") {
   main(process.argv.slice(2))
-    .then(() => process.exit(0))
+    // Bare exit(), NOT exit(0): `access-health` reports an unhealthy team by setting
+    // process.exitCode = 1, and exit(0) discarded it — the command exited 0 while printing blockers.
+    .then(() => process.exit())
     .catch((e) => {
       if (!(e instanceof CliExitError) || e.message) console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
       process.exit(e instanceof CliExitError ? e.exitCode : 1);

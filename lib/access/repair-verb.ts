@@ -5,8 +5,10 @@ import type { RevokeResult } from "@/lib/access/groups";
  * AUDITFIX-21 — the `repair-system-edge` verb's PURE decision layer, plus the IMPORT-SAFE factory
  * that builds its real dependencies.
  *
- * WHY THE FACTORY LIVES HERE AND NOT IN `scripts/admin.ts`. That file calls `main()` at module scope,
- * so importing it to test anything RUNS THE CLI — there is no seam. The consequence a spec review
+ * WHY THE FACTORY LIVES HERE AND NOT IN `scripts/admin.ts`. That file USED TO call `main()` at module
+ * scope, so importing it to test anything ran the CLI — there was no seam. STAGINGMARK-4 added an
+ * argv-guarded entry and an importable `main(argv)`, so the seam now exists; the factory stays here
+ * because the consequence below is what actually justifies it, not the import hazard. The consequence a spec review
  * spelled out: a type-correct `resolveGroup: async () => null` satisfies every behavioural criterion
  * about the pure verb while the shipped command stays permanently broken, and nothing would have
  * caught it. The factory is testable against a fake db; a structural guard pins that the CLI arm

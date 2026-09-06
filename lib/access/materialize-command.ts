@@ -15,9 +15,11 @@ import { PRET4_MATERIALIZE_MARKER, materializeBuiltinMembershipOnce } from "@/li
  * the guard refuses, the code never boots, the marker is never stamped. Observed on staging
  * 2026-09-05 (deploy 2e67246e).
  *
- * WHY THE BEHAVIOUR LIVES HERE AND NOT IN `scripts/admin.ts`. That file calls `main()` at module
- * scope, so a test importing it would execute the CLI — the same reason `formatAccessHealth` was
- * extracted. Dependencies are INJECTED rather than imported by the handler so the real decisions
+ * WHY THE BEHAVIOUR LIVES HERE AND NOT IN `scripts/admin.ts`. That file USED TO call `main()` at
+ * module scope, so a test importing it executed the CLI — the same reason `formatAccessHealth` was
+ * extracted. Since STAGINGMARK-4 the entry is argv-guarded and `main(argv)` is importable, so that
+ * particular reason is gone; the seam stays here because the SECOND reason is the load-bearing one.
+ * Dependencies are INJECTED rather than imported by the handler so the real decisions
  * (which branch runs, what exits non-zero, whether --confirm gates the write) are observable
  * against fakes in the unit tier. A source-text guard cannot do that: a `case` whose body is only
  * a comment naming the function would satisfy it while doing nothing.

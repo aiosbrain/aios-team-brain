@@ -28,6 +28,7 @@
  * priority: none | low | medium | high | urgent              (default none)
  */
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { adminClient } from "@/lib/db/admin";
 import { uiRowKey } from "@/lib/ids";
 import { TASK_STATUSES, normalizeTaskPriority } from "@/lib/api/schemas";
@@ -71,9 +72,8 @@ function parseLabels(v: string | boolean | undefined): string[] | undefined {
 }
 
 function readBody(flags: Flags): string | undefined {
-  const f = flags["body-file"];
-  if (typeof f !== "string") return undefined;
-  return readFileSync(f, "utf8");
+  if (typeof flags["body-file"] !== "string") return undefined;
+  return readFileSync(flags["body-file"], "utf8");
 }
 
 function checkStatus(s: string | undefined): string | undefined {
@@ -134,7 +134,7 @@ export async function main(argv: string[]) {
         sprint: (flags.sprint as string) || "",
         status: checkStatus(flags.status as string) || "backlog",
         priority: normalizeTaskPriority((flags.priority as string) || "none"),
-        labels: parseLabels(flags.labels) ?? [],
+        labels: parseLabels(flags.labels as string | boolean | undefined) ?? [],
         parent_row_key: (flags.parent as string) || null,
         body: readBody(flags) ?? "",
         origin: ((flags.origin as string) || "ui") as "ui" | "sync",
@@ -157,7 +157,7 @@ export async function main(argv: string[]) {
       if (flags.title !== undefined) update.title = flags.title;
       if (flags.status !== undefined) update.status = checkStatus(flags.status as string);
       if (flags.priority !== undefined) update.priority = normalizeTaskPriority(flags.priority as string);
-      if (flags.labels !== undefined) update.labels = parseLabels(flags.labels) ?? [];
+      if (flags.labels !== undefined) update.labels = parseLabels(flags.labels as string | boolean | undefined) ?? [];
       if (flags.parent !== undefined) update.parent_row_key = (flags.parent as string) || null;
       if (flags["clear-sprint"]) update.sprint = "";
       else if (flags.sprint !== undefined) update.sprint = flags.sprint;
@@ -184,8 +184,8 @@ export async function main(argv: string[]) {
         .from("tasks")
         .select("row_key, title, status, priority, sprint, parent_row_key")
         .eq("team_id", team.id);
-      if (flags.project !== undefined && flags.project !== "" && flags.project !== false) q = q.eq("project_id", flags.project as string);
-      if (flags.sprint !== undefined && flags.sprint !== "" && flags.sprint !== false) q = q.eq("sprint", flags.sprint as string);
+      if (flags.project !== undefined && flags.project !== "") q = q.eq("project_id", flags.project as string);
+      if (flags.sprint !== undefined && flags.sprint !== "") q = q.eq("sprint", flags.sprint as string);
       const { data } = await q.order("row_key");
       console.table(data ?? []);
       break;
@@ -208,7 +208,7 @@ export async function main(argv: string[]) {
     case "project": {
       const team = await resolveTeam(admin, teamSlug);
       let projectIds: string[];
-      if (flags.project !== undefined && flags.project !== "" && flags.project !== false) projectIds = [flags.project as string];
+      if (flags.project !== undefined && flags.project !== "") projectIds = [flags.project as string];
       else {
         const { data } = await admin.from("projects").select("id").eq("team_id", team.id);
         projectIds = ((data ?? []) as { id: string }[]).map((p) => p.id);
@@ -234,7 +234,7 @@ export async function main(argv: string[]) {
     case "extract-meeting-todos": {
       const team = await resolveTeam(admin, teamSlug);
       const limitRaw = flags.limit;
-      const limit = typeof limitRaw === "string" ? Number.parseInt(limitRaw, 10) : undefined;
+      const limit = typeof flags.limit === "string" ? Number.parseInt(flags.limit, 10) : undefined;
       if (limitRaw !== undefined && (!Number.isFinite(limit) || (limit ?? 0) <= 0)) {
         die("--limit must be a positive integer");
       }
@@ -362,9 +362,10 @@ export async function main(argv: string[]) {
 }
 
 // Suffix comparison also works when /tmp resolves through /private/tmp.
-if (process.argv[1]?.endsWith("/brain-tasks.ts")) {
+// basename, not a suffix — see the note in scripts/admin.ts.
+if (basename(process.argv[1] ?? "") === "brain-tasks.ts") {
   main(process.argv.slice(2))
-    .then(() => process.exit(0))
+    .then(() => process.exit())
     .catch((e) => {
       if (!(e instanceof CliExitError) || e.message) console.error(`✗ ${e instanceof Error ? e.message : String(e)}`);
       process.exit(e instanceof CliExitError ? e.exitCode : 1);
