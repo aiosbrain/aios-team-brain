@@ -2,11 +2,15 @@
  * STGENV-1 — which deployment am I? Server-side only.
  *
  * WHY A PLATFORM VARIABLE AND NOT ONE OF OURS. Railway injects `RAILWAY_ENVIRONMENT_NAME` into every
- * deploy, and application code cannot forge it — it is the same trust basis `scripts/service-guard.mjs`
- * already relies on for `RAILWAY_PROJECT_ID` / `RAILWAY_SERVICE_NAME` when it refuses a schema load on
- * a service that is not AIOS's. A banner keyed on a variable we set ourselves would be one careless
- * `railway variables --set` away from lying in the direction that matters (production silently claiming
- * to be staging, or worse, staging claiming to be production).
+ * deploy, so application code cannot forge it. A banner keyed on a variable we set ourselves would be
+ * one careless `railway variables --set` away from lying in the direction that matters.
+ *
+ * BUT IT IS A WEAKER GUARANTEE THAN `service-guard.mjs`'s, and an earlier draft of this comment
+ * overstated it by calling them "the same trust basis". That module's argument for `RAILWAY_PROJECT_ID`
+ * is that the id is IMMUTABLE and cannot be forgotten into absence. An environment NAME is
+ * operator-chosen and renameable — the opposite property. What the two genuinely share is only
+ * "platform-injected, not settable by the app". Rename the environment and this silently stops
+ * matching, which is why the guard tests pin the exact name rather than a pattern.
  *
  * WHY NOT `NEXT_PUBLIC_*`. The only consumer is a SERVER component (`app/layout.tsx`), so the value
  * never needs to reach the client bundle. Exposing it would add a second, client-side copy that can
