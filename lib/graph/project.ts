@@ -10,6 +10,7 @@ import { sourceRules } from "@/lib/ingest/source-rules";
 import { resolveFanoutTargets } from "@/lib/projects/context/fanout-targets";
 import { purgePartitionArcCache } from "./arc-cache";
 import { evictPartitionArcMemory } from "./arcs";
+import { heldByWindow } from "./projection-window";
 import { ensureArmingRows } from "./arming-row";
 // Re-exported so the graph module's existing importers (and their specs) keep one import path.
 export { resolvePositiveInt };
@@ -388,6 +389,18 @@ export interface ProjectSummary {
   /** ITEMS projected. One item becomes 1..MAX_EPISODE_CHUNKS episodes — see `episodes`. */
   projected: number;
   /**
+   * STGENV-3: items the `work_at` window HELD — no home row and dated before the floor, so scanned
+   * and repaired but never admitted for a first push. On a completed (non-aborted) pass
+   * `scanned === projected + skipped + windowHeld`; on an ABORTED one it does not hold, because
+   * `partialSummary().scanned` reports the whole fetched page while the counters stop at the
+   * aborting row. The identity is a coverage tool, not an invariant.
+   *
+   * It exists because in steady state a bounded pass has `projected === 0` — everything eligible is
+   * already in the ledger — so without this number a run that held 700 items is indistinguishable
+   * from one that found nothing to do.
+   */
+  windowHeld: number;
+  /**
    * EPISODES pushed to Graphiti, which is what extraction actually costs per unit. Distinct from
    * `projected` because `chunkContent` splits a large item into up to `MAX_EPISODE_CHUNKS` chunks, so
    * the two differ by the corpus's chunk mix. The cost metric divides LLM calls by THIS — dividing by
@@ -703,6 +716,10 @@ export async function projectItemsToGraph(
     /** Armed fan-out pushes allowed THIS pass (PCCC-5, design §2.4 step 3) — a NEW cap, distinct
      *  from reconcile's re-queue budget. Overridable for tests; env-tunable in prod. */
     fanoutPushBudget?: number;
+    /** STGENV-3: an ISO instant. When set, an item with NO HOME ROW whose `work_at` is older than
+     *  this is HELD — scanned and repaired as usual, but never admitted for a first home push.
+     *  Absent = unbounded (production's behaviour, unchanged). See `projection-window.ts`. */
+    workAtFloor?: string;
   }
 ): Promise<ProjectSummary> {
   const client = args.client ?? new GraphitiClient();
@@ -720,7 +737,7 @@ export async function projectItemsToGraph(
   // whose kind changed to a non-projectable one (deliverable → skill) still reaches the cleanup branch
   // instead of dropping out of the projector's view with its old episodes stranded in the graph — a
   // permanent tier leak by the same mechanism B2 closes. A caller that names `kinds` explicitly
-  // (projectSlackToGraph) keeps its exact scope: it must not touch other kinds' episodes.
+  // (e.g. a transcript-only pass) keeps its exact scope: it must not touch other kinds' episodes.
   if (args.kinds) q = q.in("kind", args.kinds as string[]);
   if (args.since) q = q.gt("synced_at", args.since);
   const { data, error } = await q;
@@ -784,12 +801,14 @@ export async function projectItemsToGraph(
   let externalGroupVacated = 0;
   let fanoutThrottled = 0;
   let fanoutPushed = 0;
+  let windowHeld = 0;
   let restrictionMovesPending = 0;
   // What this pass has ALREADY done, snapshotted at abort time — every loud throw below carries it
   // (ProjectionAbortError) so the runner can record the real partial episode counts.
   const partialSummary = (): ProjectSummary => ({
     scanned: rows.length,
     projected,
+    windowHeld,
     episodes: episodesPushed,
     episodesByGroup: { ...episodesByGroup },
     skipped,
@@ -1302,6 +1321,37 @@ export async function projectItemsToGraph(
       continue;
     }
 
+    // ── STGENV-3: the WINDOW HOLD ────────────────────────────────────────────────────────────────
+    // Spec: docs/design/staging-bounded-projection.md, D3.
+    //
+    // The window gates the PUSH, never the SELECTION. Every row the projector scans today is still
+    // scanned: an earlier draft filtered the query, and any selection filter also removes an
+    // aged-out item from the tier-change cleanup below (`tierChanged && existingRow`, the B2
+    // durability fix), from kind-change cleanup, and from redaction tombstoning — re-opening the
+    // permanent old-tier leak B2 closes. The gate removes an item from EXTRACTION, never from REPAIR.
+    //
+    // THE DISCRIMINATOR IS `existingRow === null` — no HOME row — NOT "no ledger row at all".
+    // `rowsForItem` holds every row including deferred fan-out ones, and `runFanout` inserts a
+    // deferred row (zero LLM) BEFORE any extraction; keying on it would exempt a held item on the
+    // very next pass. `homeWorld` filters `!r.deferred` and `group_id ∈ {home, otherHome}`, so
+    // neither a deferred row nor an armed initiative row can make `existingRow` non-null. Stable
+    // across passes, which is the property the bound needs.
+    //
+    // PLACEMENT IS LOAD-BEARING, not tidiness. It must be BEFORE the reservation INSERT below, which
+    // fires on `existingRow === null || groupMoveMatchedNothing` — exactly a held item. A hold placed
+    // after it leaves a `''`+`[]` sentinel that reconcile deliberately skips as "never pushed"
+    // (silent), and that makes `existingRow` non-null next pass, so the item pushes. Everything from
+    // `tierChanged` to that INSERT is already a no-op when `existingRow === null`, so this is the one
+    // point where none of that has to be re-derived. A held item leaves NO rows behind.
+    //
+    // Fan-out is not held here: D3e refuses the whole run if any fan-out surface exists, because
+    // HOLDING a fan-out push leaves an unlanded obligation that makes the partition permanently
+    // unreadable. See `fanout-surface.ts`.
+    if (existingRow === null && heldByWindow(item, args.workAtFloor)) {
+      windowHeld++;
+      continue;
+    }
+
     const tierChanged = existingRow !== null && existingRow.group_id !== groupId;
     // Set when the group-move UPDATE below matched zero rows (the old-key row vanished between the
     // ledger read and the move — reconcile's re-queue DELETE can do that): the move then reserved
@@ -1633,13 +1683,6 @@ export async function projectItemsToGraph(
   // mark to page past next batch (audit H2). Without this the runner only ever re-scanned the oldest
   // `limit` rows and never reached items beyond that window.
   const lastSyncedAt = rows.length ? rows[rows.length - 1].synced_at : undefined;
-  return { scanned: rows.length, projected, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, restrictionMovesPending, lastSyncedAt, probeFallbackPages };
+  return { scanned: rows.length, projected, windowHeld, episodes: episodesPushed, episodesByGroup, skipped, externalGroupVacated, fanoutPushed, fanoutThrottled, restrictionMovesPending, lastSyncedAt, probeFallbackPages };
 }
 
-/** Back-compat: project only Slack transcripts. Prefer `projectItemsToGraph` (all ingestions). */
-export async function projectSlackToGraph(
-  db: DbClient,
-  args: { teamId: string; teamSlug: string; client?: GraphitiClient; since?: string; limit?: number }
-): Promise<ProjectSummary> {
-  return projectItemsToGraph(db, { ...args, kinds: ["transcript"] });
-}

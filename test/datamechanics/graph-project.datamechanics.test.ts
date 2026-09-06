@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GraphEpisode } from "@/lib/graph/graphiti-client";
 import {
-  projectSlackToGraph,
   projectItemsToGraph,
   deleteItemEpisodes,
   CDC_PARAMS,
@@ -54,7 +53,7 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     await ingest(seed, { kind: "transcript", path: "slack/client/2.md", body: "kickoff with acme client", access: "external" });
 
     const fake = new FakeGraphiti();
-    const res = await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake) });
+    const res = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(fake), kinds: ["transcript"] });
 
     expect(res.projected).toBe(2);
     expect(res.skipped).toBe(0);
@@ -72,11 +71,11 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     await ingest(seed, { kind: "transcript", path: "slack/eng/1.md", body: "stable thread", access: "team" });
 
     const first = new FakeGraphiti();
-    await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(first) });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(first), kinds: ["transcript"] });
     expect(first.pushes).toHaveLength(1);
 
     const second = new FakeGraphiti();
-    const res = await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(second) });
+    const res = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(second), kinds: ["transcript"] });
     expect(second.pushes).toHaveLength(0); // nothing re-pushed
     expect(res.projected).toBe(0);
     expect(res.skipped).toBe(1);
@@ -86,12 +85,12 @@ describe("Slack → Graphiti projector (real Postgres, mocked Graphiti)", () => 
     const seed = await seedTeam();
     const slug = await teamSlugFor(seed.teamId);
     await ingest(seed, { kind: "transcript", path: "slack/eng/1.md", body: "v1 of the thread", access: "team" });
-    await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()) });
+    await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(new FakeGraphiti()), kinds: ["transcript"] });
 
     // Same path, new body → item updated in place (ingest versions it).
     await ingest(seed, { kind: "transcript", path: "slack/eng/1.md", body: "v2 — decision reversed", access: "team" });
     const again = new FakeGraphiti();
-    const res = await projectSlackToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(again) });
+    const res = await projectItemsToGraph(db(), { teamId: seed.teamId, teamSlug: slug, client: client(again), kinds: ["transcript"] });
     expect(again.pushes).toHaveLength(1); // changed content re-pushed
     expect(res.projected).toBe(1);
   });

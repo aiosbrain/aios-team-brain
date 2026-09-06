@@ -93,8 +93,12 @@ export const EXCLUDED_TABLE_DATA = Object.freeze([
  * (above), every restored item looks UNPROJECTED to the projector, and `GRAPH_PROJECT_ENABLED=false`
  * does NOT stop projection — it gates the interval poller only, while the admin "Project to graph now"
  * button calls `runGraphProjection` directly, gated on `GRAPHITI_URL` alone. Unset, the projector
- * returns before it opens the database (pinned by `lib/graph/run.test.ts`). Set, one click bills real
- * extraction on the whole restored corpus.
+ * returns before it opens the database (pinned by `lib/graph/run.test.ts`).
+ *
+ * SET, one click USED TO bill real extraction on the whole restored corpus. Since STGENV-3 it does not:
+ * on a database carrying `staging_marker`, an unbounded projection is REFUSED unless
+ * `GRAPH_PROJECT_WINDOW_DAYS` is set (`lib/graph/projection-window.ts`). Unsetting `GRAPHITI_URL` is
+ * still the boundary this list declares — the refusal is the second layer, not a replacement for it.
  */
 export const STAGING_VARIABLES = Object.freeze([
   Object.freeze({ name: "GRAPHITI_URL", expected: "unset" }),
@@ -485,19 +489,22 @@ export function decideRefresh(input) {
 }
 
 /**
- * The message printed after a successful refresh. It names a hazard NO CODE HERE CAN CLOSE: the
- * exclusion of `graph_episodes` leaves staging's projection ledger empty, so the day someone sets
- * `GRAPHITI_URL` on staging to "make the graph work", the entire restored corpus looks unprojected and
- * the first tick or admin click starts paying for real entity extraction — the ~99%-of-the-LLM-bill
- * path. Stated where the person who would do it is looking, because the alternative is discovering it
- * on an invoice.
+ * The message printed after a successful refresh. It names the hazard the exclusion of `graph_episodes`
+ * creates — staging's projection ledger is empty, so every restored item looks unprojected and setting
+ * `GRAPHITI_URL` would bill real entity extraction for the entire corpus, the ~99%-of-the-LLM-bill path.
+ *
+ * This USED TO describe the hazard as one the code here was unable to close. Since STGENV-3 it IS closed: an unbounded
+ * projection on a database carrying `staging_marker` is REFUSED unless `GRAPH_PROJECT_WINDOW_DAYS` names
+ * a bounded window. The message still states the hazard — the operator should know why the refusal
+ * exists — but it now also names the variable that lifts it, because the alternative to saying so is an
+ * operator who finds the refusal and no way past it.
  */
 export function completionMessage({ excluded = EXCLUDED_TABLE_DATA } = {}) {
   return [
     "staging refresh complete.",
     `Excluded table DATA: ${[...excluded].sort().join(", ")}.`,
     "Staging now holds prod-shaped Postgres and NO graph: GRAPHITI_URL and NEO4J_URL are expected to be unset there.",
-    "HAZARD, deliberately left open and stated instead: graph_episodes is empty, so if GRAPHITI_URL is ever set on staging, every restored item looks unprojected and projection will bill real extraction for the whole corpus.",
+    "GUARDED (STGENV-3): graph_episodes is empty, so every restored item looks unprojected — setting GRAPHITI_URL here would otherwise bill real extraction for the whole corpus. An unbounded projection on this database is now REFUSED. To project a bounded window instead, set GRAPH_PROJECT_WINDOW_DAYS to a positive number of days (no default, on purpose: the amount is a spending decision). See docs/OPS.md section 11.",
     "Graph-backed surfaces (learning panel, graph-query, semantic retrieval) render empty in staging by design.",
   ].join("\n");
 }

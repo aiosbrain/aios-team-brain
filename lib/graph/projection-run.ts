@@ -27,7 +27,7 @@ export const SLOW_WALK_RECORD_MS = 60_000;
  * the threshold records an extra quiet row — a false positive that costs one row, accepted.
  */
 export function shouldRecordProjectionRun(s: {
-  projected: number; errors: string[]; requeued: number; cleaned: number;
+  projected: number; errors: string[]; requeued: number; cleaned: number; windowHeld: number;
   pendingCleanups: number; saturatedGroups: number; requeueThrottled: number;
   partialItems: number; fanoutThrottled: number; restrictionMovesPending: number;
   probeFallbackPages: number; lockedOut: number; walkMs: number;
@@ -36,6 +36,12 @@ export function shouldRecordProjectionRun(s: {
   requeueEligible: number;
 }): boolean {
   return Boolean(
+    // STGENV-3: a bounded pass in steady state has `projected === 0` — everything eligible is
+    // already in the ledger — so without this clause a run that HELD 700 items records nothing and
+    // the operator's coverage check has no row to read. `refused` is deliberately NOT a clause here:
+    // `errors.length` already carries every refusal, and adding it would make the mutation that
+    // empties `errors` stop reddening this gate — the clause would mask its own test.
+    s.windowHeld ||
     s.projected || s.errors.length || s.requeued || s.cleaned || s.pendingCleanups ||
     s.saturatedGroups || s.requeueThrottled || s.partialItems ||
     // Codex diff review M1: both were already in the summary AND the meta as stall signals (a
@@ -79,6 +85,12 @@ export function projectionRunInput(
     unchanged: summary.skipped,
     errors: summary.errors,
     meta: {
+      // STGENV-3: what the `work_at` window HELD, and WHY a run refused. Both are enumerated here
+      // explicitly because this mapper lists its meta keys — a field added to the summary and not
+      // added here is silently dropped, so the durable discriminator would have existed only in
+      // memory. `refused` is undefined on a run that proceeded.
+      windowHeld: summary.windowHeld,
+      refused: summary.refused,
       // EPISODES pushed, the denominator for calls-per-episode on the Costs page. `created` above is
       // ITEMS, which is a different unit: chunking splits one item into up to 16 episodes, so a ratio
       // over items moves with the corpus's chunk mix and can read a content shift as a model change.

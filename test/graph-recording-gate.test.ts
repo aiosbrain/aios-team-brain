@@ -38,6 +38,7 @@ const quiet: GraphProjectionSummary = {
   deepRequeueEnabled: false,
   probeFallbackPages: 0,
   lockedOut: 0,
+  windowHeld: 0,
   unreachableGroups: 0,
   unreachableCleanupGroups: 0,
   emptyListingGroups: 0,
@@ -151,5 +152,33 @@ describe("shouldRecordProjectionRun — the one durable-visibility gate", () => 
     for (const src of [scheduler, action]) {
       expect(src).not.toMatch(/if \(s\.projected \|\| s\.errors\.length/);
     }
+  });
+});
+
+// ── STGENV-3 C23 (unit arms) ──────────────────────────────────────────────────────────────────────
+// Found missing by the pre-push diff review: the dm tier proves `windowHeld` survives an ABORT, but
+// nothing outside it called the gate or the mapper, so BOTH of the mutations aimed at those legs
+// survived. C14/C15 stayed green through them because their fixture is a REFUSAL, which records via
+// `errors.length` and asserts `refused` — neither touches the held clause or the held meta key.
+describe("STGENV-3 — a bounded pass that only HELD is still durable (C23)", () => {
+  const heldOnly: GraphProjectionSummary = { ...quiet, scanned: 727, skipped: 0, windowHeld: 727 };
+
+  it("records a run whose ONLY signal is windowHeld", () => {
+    // In steady state a bounded staging pass has `projected === 0` — everything eligible is already
+    // in the ledger — so without this clause a tick that held 727 items lands no `ingest_runs` row at
+    // all, and the OPS instruction to read coverage off scanned/skipped/windowHeld has no row to read.
+    expect(shouldRecordProjectionRun(heldOnly)).toBe(true);
+    // The negative control: identical summary with nothing held is correctly quiet, so the assertion
+    // above cannot pass because the gate returns true for everything.
+    expect(shouldRecordProjectionRun({ ...heldOnly, windowHeld: 0, scanned: 0 })).toBe(false);
+  });
+
+  it("carries windowHeld into the durable meta", () => {
+    // `projectionRunInput` ENUMERATES its meta keys, so a summary field that is not listed there
+    // exists only in memory — the number an operator is told to read would never reach the row.
+    const input = projectionRunInput(heldOnly, "scheduler", Date.now() - 10, Date.now());
+    expect((input.meta as Record<string, unknown>).windowHeld).toBe(727);
+    // ...and it is GREEN: holding is the bound working, not a failure.
+    expect(input.ok).toBe(true);
   });
 });
