@@ -12,8 +12,8 @@ import { createGroup, addMemberToGroup, removeMemberFromGroup, grantProjectToGro
 it("runs the actual workspace MCP process against disposable Brain fixtures", async () => {
   const workspace = process.env.MCP_WORKSPACE_DIR;
   if (!workspace) throw new Error("MCP_WORKSPACE_DIR is required");
-  const seed = await seedTeam();
   try {
+    const seed = await seedTeam();
     const admin = db();
     const promoted = await admin.from("members").update({ role: "admin" }).eq("id", seed.memberId);
     expect(promoted.error).toBeNull();
@@ -74,10 +74,11 @@ it("runs the actual workspace MCP process against disposable Brain fixtures", as
     const client = new Client({ connectionString: process.env.DATABASE_TEST_URL });
     await client.connect();
     try {
-      await client.query("DELETE FROM teams WHERE id = $1", [seed.teamId]);
+      // Same dedicated-DB cleanup primitive as datamechanics/setup.ts. Row
+      // DELETE would correctly hit the audit log's append-only trigger.
+      await client.query("TRUNCATE teams RESTART IDENTITY CASCADE");
       for (const table of ["teams", "members", "api_keys", "items", "projects"]) {
-        const column = table === "teams" ? "id" : "team_id";
-        const result = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${column} = $1`, [seed.teamId]);
+        const result = await client.query(`SELECT count(*)::int AS n FROM ${table}`);
         expect(result.rows[0].n, `cleanup ${table}`).toBe(0);
       }
       console.log("MCP_FIXTURE_CLEANUP_OK");
