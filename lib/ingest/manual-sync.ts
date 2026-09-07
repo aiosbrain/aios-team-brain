@@ -2,6 +2,7 @@ import "server-only";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "./run";
 import { adminClient } from "@/lib/db/admin";
 import { recordIngestRun } from "./runs";
+import { runManualContextPass } from "@/lib/ingest/manual-context";
 import { runLinearInbound, type InboundRunSummary } from "@/lib/pm-sync/inbound";
 
 /**
@@ -10,6 +11,11 @@ import { runLinearInbound, type InboundRunSummary } from "@/lib/pm-sync/inbound"
  * LLM; `runManualSync` runs every enabled source for the team and returns a markdown summary that
  * streams back as the brain's "answer". This is the user-facing twin of the admin "Run … now"
  * actions and the 30-min scheduler — same single-writer ingestion underneath.
+ *
+ * Since AUDITFIX-14 it also awaits ONE bounded project-context pass (`./manual-context`) after the
+ * connector legs and the optional Linear inbound stage settle, so a small manual import is readable
+ * without waiting for a tick that may never come. The summary reports BOTH halves honestly: a
+ * pending or failed context pass is one issue, and the headline stops claiming "Scrape complete".
  */
 
 // Whole-message commands only (so a real question like "what got synced from Slack?" never triggers).
@@ -36,43 +42,67 @@ export interface ManualSyncResult {
   errors: number;
 }
 
-type RunCounts = { created: number; updated: number; integrations: number; errors: string[] } | null;
+type RunCounts = {
+  created: number;
+  updated: number;
+  integrations: number;
+  errors: string[];
+  /** Process single-flight refused this import — NOT "already up to date". */
+  skipped?: boolean;
+};
+
+/** What one connector leg did — including the case where it THREW after committing items. */
+type Leg = {
+  label: string;
+  source: "slack" | "plane" | "linear" | "github";
+  /** null ⟺ the leg threw; `thrown` then carries the diagnostic. */
+  counts: RunCounts | null;
+  thrown: string | null;
+};
 
 /** Run every enabled source for the team and summarize. One source failing never fails the others. */
 export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
-  const safe = async (p: Promise<RunCounts>): Promise<RunCounts> => {
+  const attempt = async (label: string, source: Leg["source"], p: Promise<RunCounts>): Promise<Leg> => {
     try {
-      return await p;
-    } catch {
-      return null;
+      return { label, source, counts: await p, thrown: null };
+    } catch (e) {
+      // AUDITFIX-14: a throw is neither "unconfigured" nor proof that nothing was written. The old
+      // `safe()` collapsed it to null, and the summary then OMITTED the source — so a failed import
+      // could read as a clean run next to a successful context line.
+      return { label, source, counts: null, thrown: e instanceof Error ? e.message : "the import threw" };
     }
   };
   const startedAt = Date.now();
-  const [slack, plane, linear, github] = await Promise.all([
-    safe(runSlackIngestion({ teamId })),
-    safe(runPlaneIngestion({ teamId })),
-    safe(runLinearIngestion({ teamId })),
+  const legs = await Promise.all([
+    attempt("Slack", "slack", runSlackIngestion({ teamId })),
+    attempt("Plane", "plane", runPlaneIngestion({ teamId })),
+    attempt("Linear", "linear", runLinearIngestion({ teamId })),
     // TICKFIT-1 D2f: a manual "sync now" promises a REAL pass — bypass the watermark.
-    safe(runGithubIngestion({ teamId, force: true })),
+    attempt("GitHub", "github", runGithubIngestion({ teamId, force: true })),
   ]);
+  const linear = legs.find((l) => l.source === "linear")?.counts ?? null;
 
   // Inbound Linear→brain apply/adopt (brain-api v1.4): runs AFTER the Linear ingest leg above has
   // resolved (never in parallel with it) so adopt sees freshly-imported mirror tasks. Per-team
   // opt-in — a team without inboundApply gets a quiet no-op.
   let inbound: InboundRunSummary | null = null;
+  let inboundError: string | null = null;
   if (linear?.integrations) {
     try {
       inbound = await runLinearInbound({ teamId });
       if (inbound.skipped || !inbound.teams) inbound = null;
-    } catch {
+    } catch (e) {
       inbound = null;
+      inboundError = e instanceof Error ? e.message : "the inbound stage threw";
     }
   }
 
   // Record each configured source's run so a manual /sync failure is diagnosable in the runs log.
   const runsDb = adminClient();
-  for (const [source, s] of [["slack", slack], ["plane", plane], ["linear", linear], ["github", github]] as const) {
+  for (const leg of legs) {
+    const s = leg.counts;
     if (!s || (!s.integrations && !s.errors.length)) continue; // unconfigured + clean → nothing to log
+    const source = leg.source;
     await recordIngestRun(runsDb, {
       teamId,
       source,
@@ -101,25 +131,52 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
     });
   }
 
+  // AUDITFIX-14: ONE bounded project-context pass, AFTER every leg and the optional inbound stage
+  // have settled. Deliberately NOT gated on a leg succeeding or reporting a nonzero count — a
+  // committed partial import and an older candidate backlog are both invisible in the returned
+  // counts, and with the poller disabled nothing else will partition them.
+  const context = await runManualContextPass(teamId, "manual_sync");
+
   const lines: string[] = [];
   let created = 0;
   let updated = 0;
   let errors = 0;
+  /** A leg the single-flight refused: not a failure, but not a completed scrape either. */
+  let busy = false;
 
-  const add = (label: string, s: RunCounts) => {
-    if (!s || !s.integrations) return; // source not configured for this team — omit
+  for (const leg of legs) {
+    const s = leg.counts;
+    if (!s) {
+      errors += 1;
+      lines.push(`- **${leg.label}**: import failed — ${leg.thrown ?? "the import threw"}`);
+      continue;
+    }
+    if (s.skipped) {
+      busy = true;
+      lines.push(`- **${leg.label}**: skipped — another sync is already running; try again in a moment.`);
+      continue;
+    }
+    if (!s.integrations && !s.errors.length) continue; // source not configured for this team — omit
     created += s.created;
     updated += s.updated;
     errors += s.errors.length;
-    const errNote = s.errors.length ? ` — ${s.errors.length} error${s.errors.length > 1 ? "s" : ""}` : "";
-    lines.push(`- **${label}**: +${s.created} new, ~${s.updated} updated${errNote}`);
-  };
-  add("Slack", slack);
-  add("Plane", plane);
-  add("Linear", linear);
-  add("GitHub", github);
+    const errText = s.errors.join("; ");
+    if (!s.integrations) {
+      // An error-only result with ZERO integrations keeps its label and its text. Omitting it left
+      // the "no connectors are configured" line below to describe a FAILED import as an empty team.
+      lines.push(`- **${leg.label}**: import failed — ${errText}`);
+      continue;
+    }
+    const errNote = s.errors.length
+      ? ` — ${s.errors.length} error${s.errors.length > 1 ? "s" : ""}: ${errText}`
+      : "";
+    lines.push(`- **${leg.label}**: +${s.created} new, ~${s.updated} updated${errNote}`);
+  }
 
-  if (inbound && (inbound.applied || inbound.adopted || inbound.conflicts)) {
+  if (inboundError) {
+    errors += 1;
+    lines.push(`- **Linear inbound**: failed — ${inboundError}`);
+  } else if (inbound && (inbound.applied || inbound.adopted || inbound.conflicts)) {
     errors += inbound.errors.length;
     const conflictNote = inbound.conflicts
       ? ` — ${inbound.conflicts} conflict${inbound.conflicts > 1 ? "s" : ""} (see Admin → PM sync)`
@@ -127,17 +184,25 @@ export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
     lines.push(`- **Linear inbound**: ${inbound.applied} applied, ${inbound.adopted} adopted${conflictNote}`);
   }
 
+  // Reconciliation counts are NOT imported items, so they never touch created/updated. An incomplete
+  // or failed context pass IS one issue: some imported content may not be readable yet.
+  if (context.status !== "complete") errors += 1;
+  const contextLine = `- **Project context**: ${context.message}`;
+
   let summary: string;
   if (!lines.length) {
     summary =
       "No connectors are configured for this team yet, so there was nothing to scrape. " +
-      "An admin can add **Slack / Plane / Linear / GitHub** under **Admin → Integrations**.";
+      "An admin can add **Slack / Plane / Linear / GitHub** under **Admin → Integrations**." +
+      `\n\n${contextLine}`;
   } else {
     const head =
-      created || updated
-        ? "**Scrape complete** — pulled the latest from your connectors:"
-        : "**Scrape complete** — everything was already up to date:";
-    summary = `${head}\n\n${lines.join("\n")}`;
+      errors || busy
+        ? "**Scrape finished with issues** — some work did not complete:"
+        : created || updated
+          ? "**Scrape complete** — pulled the latest from your connectors:"
+          : "**Scrape complete** — everything was already up to date:";
+    summary = `${head}\n\n${[...lines, contextLine].join("\n")}`;
   }
 
   return { summary, created, updated, errors };

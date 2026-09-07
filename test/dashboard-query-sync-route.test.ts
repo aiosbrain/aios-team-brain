@@ -145,4 +145,33 @@ describe("POST /api/dashboard/query sync command", () => {
     expect(h.getProviderKey).not.toHaveBeenCalled();
     expect(h.adminFrom).not.toHaveBeenCalled();
   });
+
+  // AUDITFIX-14: the route is a pass-through for the summary, so the new **Project context** line
+  // and the issue it contributes to `errors` must reach the SSE stream and the audit row unaltered.
+  // (The reconciliation itself is `runManualSync`'s — mocked here — which is why this asserts
+  // DELEGATION and nothing more; the observable outcome lives in the data-mechanics tier.)
+  it("streams the Project context line and audits the issue count it contributes", async () => {
+    h.runManualSync.mockResolvedValue({
+      summary:
+        "**Scrape finished with issues** — some work did not complete:\n\n" +
+        "- **Slack**: +1 new, ~0 updated\n" +
+        "- **Project context**: more project-context work may remain — run sync again to continue.",
+      created: 1,
+      updated: 0,
+      errors: 1,
+    });
+
+    const res = await POST(request("/sync"));
+    const text = await res.text();
+
+    expect(text).toContain("**Project context**");
+    expect(text).toContain("more project-context work may remain");
+    expect(h.audit).toHaveBeenCalledWith(expect.anything(), {
+      team_id: "team-1",
+      actor_kind: "member",
+      member_id: "member-1",
+      action: "ingest.manual_sync",
+      meta: { created: 1, updated: 0, errors: 1 },
+    });
+  });
 });
