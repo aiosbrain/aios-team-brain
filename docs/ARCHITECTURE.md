@@ -1564,3 +1564,21 @@ npm run check:docs   # run locally before pushing
 
 When you add/remove a route, table, or source: update the matching block here in the same
 PR. The guard verifies structure only — keep the diagrams and prose accurate by review.
+
+## Repository build skills
+
+The `astra-spec-opus-build` workflow is maintained in
+`.claude/skills/astra-spec-opus-build/SKILL.md`. It creates or reuses the task's
+Linear ticket before specification, attaches the agreed spec before implementation,
+and coordinates Astra, Fable, and Opus reviews through PR publication.
+`scripts/sync-skill-runtimes.sh astra-spec-opus-build` generates the matching
+Codex (`.agents/skills`), OpenCode (`.opencode/skills`), and Cursor (`.cursor/rules`)
+copies; `.skill-runtimes.json` registers both skills for publication. These repository files travel with the commit: new worktrees inherit
+the skill when their starting revision contains it; older revisions require
+the skill change to be brought forward.
+
+The companion `astra-spec-sol-build` skill uses GPT-5.6 Sol through the Codex CLI
+for implementation and accepted fixes, with the same Astra/Fable review stages.
+Both skills start tickets in In Progress and move them to Done only after the
+finished feature's merge into remote `main` is verified. Merge authorization
+remains separate. Both use the same canonical-source and runtime-copy mechanism.

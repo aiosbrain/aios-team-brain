@@ -31,6 +31,8 @@ gates (AIOS hub, Tessera root) apply in addition.
 
 | Trigger | Skill |
 |---|---|
+| Requested Astra-spec/Sol-build workflow | `.claude/skills/astra-spec-sol-build/SKILL.md` — same lifecycle and reviews, GPT-5.6 Sol implements |
+| Requested Astra-spec/Opus-build workflow | `.claude/skills/astra-spec-opus-build/SKILL.md` — Linear ticket first; agreed spec attached before implementation |
 | Admin/ops tasks on the brain instance | `.claude/skills/admin/SKILL.md` |
 | Branches diverged / reconcile a fork | `.claude/skills/branch-reconciliation/SKILL.md` |
 | "Is this test actually wired into CI" | `.claude/skills/test-ci-wiring-audit/SKILL.md` |
