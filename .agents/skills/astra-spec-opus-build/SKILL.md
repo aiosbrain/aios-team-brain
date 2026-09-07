@@ -1,6 +1,6 @@
 ---
 name: astra-spec-opus-build
-description: Begin a requested build with a Linear ticket, attach the agreed spec to that ticket, then proceed through Astra specification, Claude Fable 5.1 spec and code reviews, Opus 5 implementation through the Claude CLI, Astra adjudication and an independent final review, then push a branch and open a pull request. Use when the user requests this multi-model build workflow.
+description: Begin a requested build with a Linear ticket, attach the agreed spec to that ticket, then proceed through Astra specification, Claude Fable 5.1 spec and code reviews, Opus 5 implementation through the Claude CLI with automatic Sol fallback on credit or usage limits, Astra adjudication and an independent final review, then push a branch and open a pull request. Use when the user requests this multi-model build workflow.
 ---
 
 # Astra-Spec-Opus-Build
@@ -13,11 +13,11 @@ Carry the user's feature request through specification, implementation, independ
 | --- | --- | --- |
 | Spec author and decision owner | GPT-6 Astra (`gpt-6-astra`) | medium |
 | Spec reviewer | Anthropic Claude Fable 5.1 through `claude` CLI | provider default |
-| Implementer, including accepted fixes | Anthropic Claude Opus 5 (`claude-opus-5`) through `claude` CLI | high |
+| Initial implementer, including accepted fixes | Anthropic Claude Opus 5 (`claude-opus-5`) through `claude` CLI | high |
 | First code reviewer | Anthropic Claude Fable 5.1 through `claude` CLI | provider default |
 | Final independent code reviewer | GPT-6 Astra (`gpt-6-astra`) | high, fresh context |
 
-Astra decides which review findings warrant changes. Opus 5 applies accepted code changes. Astra incorporates accepted spec changes. Do not simulate another model by assigning yourself its name. If the current session is not Astra at medium reasoning, delegate specification and adjudication to an explicitly configured Astra session.
+Astra decides which review findings warrant changes. The active implementer applies accepted code changes, including after a fallback. Astra incorporates accepted spec changes. Do not simulate another model by assigning yourself its name. If the current session is not Astra at medium reasoning, delegate specification and adjudication to an explicitly configured Astra session.
 
 ## Start with a Linear ticket
 
@@ -30,9 +30,21 @@ The bundled CLI supports `create "<title>" --desc <file> --state "In Progress"` 
 ## Preparation and execution
 
 1. Read repository instructions, inspect git status, and establish the target repository and base branch. Fetch the base and record its SHA. Use an isolated worktree on a `codex/` feature branch when the existing checkout has unrelated work. Preserve user changes. Avoid pulling main into an unrelated feature branch.
-2. Check `codex exec --help`, `claude --help`, authentication availability, and model availability using installed tooling. Resolve the exact provider identifier for **Fable 5.1** from authoritative configuration or provider documentation. The `fable` alias alone does not prove version 5.1. Verify availability of the exact implementation model `claude-opus-5`; the `opus` alias alone does not prove version 5. Never silently substitute a different model or version for any assigned role. If an exact model is unavailable, report the affected stage and request a substitute before completing that stage.
+2. Check `codex exec --help`, `claude --help`, authentication availability, and model availability using installed tooling. Resolve the exact provider identifier for **Fable 5.1** from authoritative configuration or provider documentation. The `fable` alias alone does not prove version 5.1. Verify availability of the exact implementation model `claude-opus-5`; the `opus` alias alone does not prove version 5. Verify the alternate builder before its first use as well: Sol is `gpt-5.6-sol` through Codex and Opus 5 is `claude-opus-5` through Claude. The automatic builder fallback below is pre-authorized for credit or usage limits only. For other model unavailability or changes to any review role, report the affected stage and request a substitute before completing that stage.
 3. Keep a compact handoff directory outside the committed source tree, in permitted temporary storage. Record the request, base SHA, working directory, spec version, stage status, session identifiers, actual model identifiers, review findings, decisions, and verification results. Store the durable spec in the repository's usual spec location when appropriate. Keep temporary prompts and transcripts out of the PR.
 4. Run writers sequentially against the implementation worktree. Run reviews against a stable snapshot and record the reviewed commit or diff fingerprint. Each worker receives the request, relevant repository instructions, necessary artifacts, and its bounded role. Workers must not recursively invoke this whole workflow or independently push, merge, deploy, or open PRs.
+
+### Automatic builder fallback on credit or usage limits
+
+Start with the initial implementer in the model table. During implementation, accepted review fixes, or conflict resolution, automatically switch **Sol → Opus 5** when Sol exhausts credits or hits a provider usage/rate limit, and **Opus 5 → Sol** when Opus hits the same condition. This applies repeatedly to whichever builder is active; no additional confirmation is needed for these switches. Keep the replacement active until it finishes or encounters its own limit. Spec authors, adjudicators, and required reviewers retain their assigned models.
+
+Switch only on an explicit provider/CLI credit, quota, usage-limit, or rate-limit signal. Test failures, permission denials, authentication errors, unavailable model identifiers, and unrelated process failures do not establish credit exhaustion. Preserve existing permission controls and handle those failures through the normal workflow.
+
+Before switching, confirm the previous writer and its child processes have stopped. Inspect and preserve the actual working tree, including partial edits and untracked task files; do not reset or restart the build. Update the handoff with the limit evidence, any reset/retry time, outgoing and incoming model identifiers, completed work, remaining acceptance criteria, tests, and pending fixes. Give the replacement the accepted spec, repository instructions, current diff, and this handoff so it resumes unfinished work in the same worktree. Verify the replacement's actual model and results. Report each switch briefly and list the models actually used in the PR.
+
+If the alternate was previously exhausted, retry it only after its reported reset/retry time or evidence that capacity is available again. If neither builder is eligible, save the handoff and report the blocker and known reset times; do not bounce indefinitely between exhausted providers, buy credits, or consume usage-reset credits. Resume from the saved state when capacity returns. Keep completed valid stages and repeat only checks or reviews invalidated by subsequent edits.
+
+Use the matching CLI invocation below for the active implementer, with high reasoning/effort and the existing permission controls.
 
 ### Review bundle
 
@@ -54,6 +66,12 @@ For Opus 5 implementation and accepted fixes, run the Claude CLI from the implem
 
 ```sh
 claude -p --model claude-opus-5 --effort high --output-format json --no-session-persistence --permission-mode acceptEdits --tools 'Read,Glob,Grep,Edit,Write,Bash' < "$implementation_prompt"
+```
+
+For Sol fallback implementation and accepted fixes, use the same implementation worktree:
+
+```sh
+codex exec --ephemeral -C "$worktree" -m gpt-5.6-sol -c 'model_reasoning_effort="high"' -s workspace-write --json -o "$implementation_output" - < "$implementation_prompt"
 ```
 
 Inspect the process result, reported model, permission denials, actual diff, and verification results. Handle any required command approvals through the normal permission controls; a denied operation is not completed work.
@@ -99,31 +117,31 @@ After Astra resolves the spec review and the spec satisfies any repository-requi
 
 With the bundled CLI, read/export the existing description, compose the merged description in a temporary file, then use the supported `set-desc <IDENT> <file>` and `verify-desc <IDENT> <file>` commands. Re-read immediately before writing to avoid overwriting intervening edits, and verify the saved spec by reading it back. Record the ticket URL and attached spec version/hash. If implementation later requires a material spec revision, repeat the affected review/readiness gate and refresh the ticket's accepted spec before resuming implementation. Missing Linear access or a failed attachment leaves this stage incomplete; report the concrete blocker.
 
-## Stage 3: Opus 5 implementation
+## Stage 3: Implementation (Opus 5 first, automatic builder fallback)
 
-Give Opus 5 the accepted spec, repository instructions, relevant code, and acceptance criteria. Opus 5 implements the scoped change and meaningful tests, runs the relevant checks, and reports deviations or unresolved issues. If implementation reveals a material flaw in the spec, return it to Astra for resolution and repeat the affected spec review before proceeding.
+Give the active implementer the accepted spec, repository instructions, relevant code, and acceptance criteria. The active implementer implements the scoped change and meaningful tests, runs the relevant checks, and reports deviations or unresolved issues. If implementation reveals a material flaw in the spec, return it to Astra for resolution and repeat the affected spec review before proceeding.
 
 The coordinator verifies the actual diff and test results. Passing tests alone does not demonstrate spec compliance.
 
-Opus 5 fills the acceptance matrix with implementation file references and test names/results or appropriate manual evidence for every acceptance ID. Mark unmet or unverified criteria explicitly. Reviewers independently check the spec against implementation before comparing this matrix; the author's mapping is evidence to examine, not proof of coverage.
+The active implementer fills the acceptance matrix with implementation file references and test names/results or appropriate manual evidence for every acceptance ID. Mark unmet or unverified criteria explicitly. Reviewers independently check the spec against implementation before comparing this matrix; the author's mapping is evidence to examine, not proof of coverage.
 
 ## Stage 4: Fable code review and Astra adjudication
 
 Give a new Fable 5.1 session the accepted spec, base SHA, complete implementation diff, and surrounding code access. Request bugs, logical errors, architectural regressions, missing acceptance behavior, and inadequate tests. Review callers and consumers beyond changed lines. Require severity, trigger, expected versus actual behavior, evidence, and a regression-test recommendation.
 
-Astra validates findings against code and product intent. Send accepted corrections to Opus 5. Preserve a decision record for rejected findings with concrete reasons. Verify fixes and run affected tests. Obtain another Fable pass when corrections are substantial or its blocking concerns remain unresolved.
+Astra validates findings against code and product intent. Send accepted corrections to the active implementer, applying the automatic fallback policy if it hits a limit. Preserve a decision record for rejected findings with concrete reasons. Verify fixes and run affected tests. Obtain another Fable pass when corrections are substantial or its blocking concerns remain unresolved.
 
 ## Stage 5: Fresh Astra review
 
 Start a completely new Astra context with high reasoning. Supply only the user request, accepted spec, repository instructions, base SHA, and current implementation snapshot. Do not seed it with earlier reviews, author explanations, adjudication records, or conversation history. Ask it to independently examine correctness, architecture, integration behavior, and spec compliance.
 
-After independent findings are returned, the coordinating Astra reconciles them with evidence and earlier decisions. Opus 5 implements accepted fixes and verifies them. Any substantive fix after this review requires a fresh focused Astra review of the affected behavior and its interactions. Record which final snapshot was reviewed; do not claim an earlier review covers later changes.
+After independent findings are returned, the coordinating Astra reconciles them with evidence and earlier decisions. The active implementer implements accepted fixes and verifies them. Any substantive fix after this review requires a fresh focused Astra review of the affected behavior and its interactions. Record which final snapshot was reviewed; do not claim an earlier review covers later changes.
 
 ## Stage 6: Verify and publish
 
 Confirm all required acceptance criteria are satisfied and substantive findings resolved. Run repository-required checks and tests appropriate to the final diff. Report any checks that cannot run; do not describe them as passing. If a required review or correctness blocker remains, stop before publication unless the user explicitly requests a draft PR with those limitations.
 
-Fetch the target branch again before publication and compare its current SHA with the recorded review base. Inspect intervening changes for overlapping code, callers, schemas, dependencies, and assumptions. Integrate relevant base changes using the repository's normal merge/rebase practice, preserving user work and avoiding force-pushes to shared branches. Have Opus 5 resolve implementation conflicts, with Astra deciding changes to behavior. Re-run affected checks and reviews for material changes. If the base advanced without affecting the feature, record the assessed SHA and reason integration was unnecessary. Record the final implementation commit and reviewed base in the handoff and PR; disclose if the remote moves again during publication.
+Fetch the target branch again before publication and compare its current SHA with the recorded review base. Inspect intervening changes for overlapping code, callers, schemas, dependencies, and assumptions. Integrate relevant base changes using the repository's normal merge/rebase practice, preserving user work and avoiding force-pushes to shared branches. Have the active implementer resolve implementation conflicts, with Astra deciding changes to behavior. Re-run affected checks and reviews for material changes. If the base advanced without affecting the feature, record the assessed SHA and reason integration was unnecessary. Record the final implementation commit and reviewed base in the handoff and PR; disclose if the remote moves again during publication.
 
 Inspect the final diff, stage only the task's files, commit, and push the feature branch. Check for an existing PR for that branch and update it rather than creating a duplicate. Open a PR against the agreed base with the problem, resulting behavior, relevant design decisions, verification, and any migration requirements. Use a body file or structured API argument for multiline descriptions.
 

@@ -1582,3 +1582,8 @@ for implementation and accepted fixes, with the same Astra/Fable review stages.
 Both skills start tickets in In Progress and move them to Done only after the
 finished feature's merge into remote `main` is verified. Merge authorization
 remains separate. Both use the same canonical-source and runtime-copy mechanism.
+
+Both build skills automatically switch the active implementer between Sol and Opus 5
+on provider credit or usage limits, including during review fixes and conflict
+resolution. They preserve partial work and the handoff, retain assigned reviewers,
+and pause if both builders remain exhausted until capacity returns.
