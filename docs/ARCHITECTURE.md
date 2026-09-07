@@ -70,6 +70,10 @@ pause for a GitHub fork or a post-deploy `--resume` command.
 
 ## Agent skill publication
 
+`AGENTS.md` requires subscription-authenticated Claude access for coding, including
+delegated work and builder fallbacks. Anthropic API-key billing is prohibited for
+coding even when subscription access is unavailable or reaches a limit.
+
 Repository-local agent skills are authored once under `.claude/skills/`. The explicit
 publication manifest `.skill-runtimes.json` selects which canonical skills are projected
 to `.agents/skills/`, `.opencode/skills/`, and `.cursor/rules/`; merely finding a generated
