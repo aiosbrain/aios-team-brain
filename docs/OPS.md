@@ -747,11 +747,60 @@ legs go stale in staging, but that alarm is *thresholded* and *true*).
 - Staging renders prod-shaped **Postgres**. Graph-backed surfaces — the learning panel, `graph-query`,
   the semantic retrieval leg — render **empty by design**. Narrative arcs show prod's cached arcs for
   4h, then linger up to 48h before blanking.
-- **The residual hazard, which no code here closes:** the emptied `graph_episodes` ledger means that if
-  `GRAPHITI_URL` is ever set on staging, the whole restored corpus looks unprojected and projection
-  starts billing real extraction. Three non-test entrypoints reach it — the scheduler, the admin
-  button, and `scripts/graph-window-battery/run-projection.ts`.
+- **The hazard this used to leave open is now a REFUSAL (STGENV-3).** The emptied `graph_episodes`
+  ledger means every restored item looks unprojected, so setting `GRAPHITI_URL` on staging would have
+  billed real extraction for the whole corpus (~$190 measured) with nobody pressing anything — via any
+  of the three non-test entrypoints: the scheduler, the admin button, and
+  `scripts/graph-window-battery/run-projection.ts`. On a database carrying `staging_marker`, an
+  UNBOUNDED projection is now refused.
 - Staging is **disposable**: anything created there is destroyed by the next refresh.
+
+#### `GRAPH_PROJECT_WINDOW_DAYS` — how to lift the refusal for a bounded run
+
+Deliberately documented as prose, **not as a row in the variable table above**. That table is a safety
+list: the guard reads every `| \`NAME\` |` row in this section, requires the count to match
+`STAGING_VARIABLES` in `scripts/staging-refresh-decision.mjs`, and requires each expectation to be
+`unset` or `` `false` ``. This is an operator knob with neither expectation, so a row would fail the
+build. Please leave it as prose.
+
+- **Unset on a staging database means REFUSE**, not "project everything". The refusal names the marker
+  and this variable, lands a red `ingest_runs` row every tick, and shows the reason in the admin
+  "Project to graph" button.
+- **There is deliberately NO DEFAULT.** A default would silently decide how much money to spend. The
+  amount is a spending decision, so it is typed on purpose.
+- **It must be a plain positive whole number of days.** `0`, a negative, a fraction, `1e3` and any
+  non-numeric value are REFUSED as `invalid-window` — never a silent fall back to unbounded. A blank
+  value (`GRAPH_PROJECT_WINDOW_DAYS=`) counts as *unset*, not invalid.
+- **Measured cost** (prod, 2026-09-06; ~$0.062/item is a planning estimate from $189.80 over 3,049
+  ledger rows, not a measured fresh-extraction price — an item chunks up to `MAX_EPISODE_CHUNKS`,
+  default 80, so a window skewed to long items lands off that mean):
+
+  | window (days) | items | ≈ cost |
+  |---|---|---|
+  | 1 | 33 | ~$2 |
+  | 7 | 83 | ~$5 (thin but non-empty arcs) |
+  | 30 | 727 | ~$45 |
+
+  (The window column is deliberately a bare number, not `` `7` ``. The variable-table guard above
+  parses every line in this section that STARTS with `` | `NAME` | `` and requires it to be a declared
+  staging variable — a backticked token here would be read as one. Indentation happens to hide it
+  today; not depending on that is cheaper than discovering it.)
+
+- The window bounds **admission** — the first push of an item that has no home ledger row. It is not a
+  cap on total spend: an item already in the ledger still re-extracts on a body change, a tier flip, a
+  chunk-config raise or a reconcile re-queue.
+- **On production**, the variable is honoured too (a window there bounds admission the same way), but
+  it is never *required*: no marker and no window means unbounded, exactly as before. Note the
+  consequence before setting it in production — an item with no home row and an old `work_at` is held
+  for as long as the window stands, and a `synced_at` bump will not rescue it. **Recovery is to unset
+  the window and run once.**
+- **With a window set, initiative fan-out makes the run refuse** (`window-with-fanout`). Holding a
+  fan-out push would leave the partition permanently unreadable, so the interaction is refused rather
+  than guessed. Measured 2026-09-06: zero initiatives exist, so this does not fire today.
+
+> **This table describes the PRE-STGENV-4 state.** Wiring staging's own `NEO4J_URL` and `GRAPHITI_URL`
+> — which is what makes narrative arcs render there — is STGENV-4, and it re-frames the variable table
+> above. Do not set them from this section.
 
 ### Builtin materialization during deploy and attended recovery
 

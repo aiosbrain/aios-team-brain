@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { runSql } from "@/lib/db/pg/pool";
 import { PRET4_MATERIALIZE_MARKER, materializeBuiltinMembershipOnce } from "@/lib/access/groups";
+import { readStagingMarker } from "@/lib/env/staging-marker";
 
 /**
  * STAGINGMARK-1 — the operator entry point for PRET-4's one-time builtin materialization.
@@ -109,11 +110,12 @@ export function makeMaterializeDeps(db: DbClient): MaterializeDeps {
         [PRET4_MATERIALIZE_MARKER]
       );
       const teams = await runSql<{ n: string }>("select count(*)::text as n from teams", []);
-      const staging = await runSql<{ present: boolean }>(
-        "select to_regclass('public.staging_marker') is not null as present",
-        []
-      );
-      // The SAME predicate the SQL function uses, deliberately worded identically.
+      // STGENV-3: the marker query has ONE owner under `lib/` (`lib/env/staging-marker.ts`). It used
+      // to be spelled out here too, and a second copy of a discriminator is a second answer that can
+      // drift — the graph projector's refusal and this command's production check must never disagree
+      // about which database they are on.
+      const stagingMarker = await readStagingMarker();
+      // The SAME predicate the SQL function uses, deliberately worded identically. (STAGINGMARK-2.)
       const substrate = await runSql<{ bad: boolean }>(
         "select exists (select 1 from items) and not exists (select 1 from project_context_memberships) as bad",
         []
@@ -121,7 +123,7 @@ export function makeMaterializeDeps(db: DbClient): MaterializeDeps {
       return {
         marker: marker.rows[0]?.present === true,
         teams: Number(teams.rows[0]?.n ?? "0"),
-        stagingMarker: staging.rows[0]?.present === true,
+        stagingMarker,
         contentWithoutSubstrate: substrate.rows[0]?.bad === true,
       };
     },
