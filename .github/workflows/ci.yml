@@ -186,8 +186,21 @@ jobs:
   staging-paired-refresh:
     name: Staging paired refresh integration
     runs-on: ubuntu-latest
+    # The harness brings up two Postgres, two Neo4j, two ACL object stores and a real app under the
+    # startup fence; it is slow but it is the only lane that proves the export→import→application-
+    # read outcome end to end.
+    timeout-minutes: 45
+    env:
+      # Missing engines must FAIL this lane, never self-skip: a green "no databases available" is
+      # indistinguishable from a green run, which is the whole failure mode this job exists to close.
+      STAGING_PAIR_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
       - name: Run isolated four-database exporter/importer harness
         run: npm run test:staging-pair
 

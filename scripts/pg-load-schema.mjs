@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { assertServiceIdentity } from "./service-guard.mjs";
-import { acquireDataUseLock, hasExclusiveDataUseLock, readJournal } from "./staging-ops/journal.mjs";
+import { acquireDataUseLock, assertBootAdmission, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
 
 export function shouldUseSsl(databaseUrl, env = process.env) {
   return (
@@ -68,9 +68,11 @@ export async function loadSchema({
       if (connectedClient) {
         if (!(await hasExclusiveDataUseLock(client))) throw new Error("copy-mode injected schema loader requires the same session to hold the exclusive data-use lock");
       } else {
+        // Held for the WHOLE migration, and released only when this client ends (B1/AC-06).
         await acquireDataUseLock(client, "shared", true);
-        const journal = await readJournal(client);
-        if (journal.state !== "ready") throw new Error(`copy-mode schema loader refused while refresh state is ${journal.state}`);
+        // The SAME admission the startup fence applies: `ready`, or exactly the deployment this
+        // refresh selected to boot. A ready-only gate here refused the importer's own predeploy.
+        await assertBootAdmission(client, env, "copy-mode schema loader");
       }
     }
     // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —

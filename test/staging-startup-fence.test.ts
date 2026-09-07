@@ -31,7 +31,16 @@ describe("copy-mode startup fence", () => {
   });
 
   it("admits only the exact selected commit during booting", async () => {
-    const client = { connect: vi.fn(), query: vi.fn().mockResolvedValueOnce({ rows: [{}] }).mockResolvedValueOnce({ rows: [{ state: "booting", run_id: "run-2", catchup_commit: "a".repeat(40) }] }), end: vi.fn(), on: vi.fn() };
-    await expect(acquireStartupFence({ env: { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg", RAILWAY_GIT_COMMIT_SHA: "b".repeat(40) } as NodeJS.ProcessEnv, createClient: () => client })).rejects.toThrow(/booting/);
+    const journal = { state: "booting", run_id: "run-2", boot_run_id: "run-2", boot_commit: "a".repeat(40) };
+    const env = { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg", RAILWAY_GIT_COMMIT_SHA: "b".repeat(40) } as NodeJS.ProcessEnv;
+    const client = { connect: vi.fn(), query: vi.fn().mockResolvedValueOnce({ rows: [{}] }).mockResolvedValueOnce({ rows: [journal] }), end: vi.fn(), on: vi.fn() };
+    await expect(acquireStartupFence({ env, createClient: () => client }))
+      .rejects.toThrow(/not the selected booting deployment/);
+    expect(client.end).toHaveBeenCalled();
+
+    // …and the SAME journal admits the process that IS that selected deployment (B1).
+    const admitted = { connect: vi.fn(), query: vi.fn().mockResolvedValueOnce({ rows: [{}] }).mockResolvedValueOnce({ rows: [journal] }), end: vi.fn(), on: vi.fn() };
+    const fence = await acquireStartupFence({ env: { ...env, RAILWAY_GIT_COMMIT_SHA: "a".repeat(40) }, createClient: () => admitted });
+    expect(fence?.journal.run_id).toBe("run-2");
   });
 });

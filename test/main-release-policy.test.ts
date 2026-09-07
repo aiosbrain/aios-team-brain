@@ -1,6 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  PRE_EXISTING_MAIN_CONTEXTS,
+  REQUIRED_MAIN_CONTEXTS,
   buildMainRulesets,
   evaluateMainOperation,
   verifyEffectiveMainPolicy,
@@ -16,6 +19,7 @@ const CHECKS = {
   "Graph Neo4j tier (real Neo4j)": 15368,
   "Ingestion tests (pytest)": 15368,
   "NDA confidentiality gate": 15368,
+  "Staging paired refresh integration": 15368,
   "Release candidate gate": 15368,
   "Staging candidate validation": 777,
 };
@@ -33,7 +37,37 @@ describe("main release protection contract", () => {
     expect(desired[0].bypass_actors).toEqual([]);
     expect(desired[1].bypass_actors.map((x) => x.actor_id)).toEqual([222]);
     expect(desired[2].bypass_actors.map((x) => x.actor_id)).toEqual([111, 222]);
-    expect(desired[1].rules[0].parameters.required_status_checks).toHaveLength(11);
+    expect(desired[1].rules[0].parameters.required_status_checks).toHaveLength(12);
+  });
+
+  it("requires the paired refresh integration lane, and still every pre-existing context", () => {
+    // M6: shipping the CI job while leaving it out of the desired policy makes it a job that can go
+    // red without blocking a release, which is the same as not requiring it.
+    const contexts = desired[1].rules[0].parameters.required_status_checks.map((c: any) => c.context);
+    expect(contexts).toContain("Staging paired refresh integration");
+    for (const preExisting of PRE_EXISTING_MAIN_CONTEXTS) expect(contexts).toContain(preExisting);
+    expect(PRE_EXISTING_MAIN_CONTEXTS).toHaveLength(9);
+    expect(REQUIRED_MAIN_CONTEXTS).toEqual([...PRE_EXISTING_MAIN_CONTEXTS, "Staging paired refresh integration", "Release candidate gate", "Staging candidate validation"]);
+  });
+
+  it("refuses to build a policy that cannot pin the new lane's producer", () => {
+    const withoutPaired = { ...CHECKS } as Record<string, number>;
+    delete withoutPaired["Staging paired refresh integration"];
+    expect(() => buildMainRulesets({ normalAppId: 111, emergencyAppId: 222, producerIds: withoutPaired }))
+      .toThrow(/producer integration ID is required for Staging paired refresh integration/);
+  });
+
+  it("names lanes some workflow in this repository actually produces", () => {
+    // A required context nothing emits blocks every release forever; a required context misspelt
+    // blocks nothing at all. Both are cheap to catch here.
+    const workflows = ["ci.yml", "nda-gate.yml", "release-candidate.yml"]
+      .map((file) => readFileSync(`./.github/workflows/${file}`, "utf8")).join("\n");
+    for (const context of REQUIRED_MAIN_CONTEXTS) {
+      // `Staging candidate validation` is published by the release controller as a check run on the
+      // candidate SHA, not by a workflow job name.
+      if (context === "Staging candidate validation") continue;
+      expect(workflows, `no workflow job is named ${context}`).toContain(`name: ${context}`);
+    }
   });
 
   it.each([

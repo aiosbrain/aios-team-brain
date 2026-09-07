@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -8,14 +9,16 @@ import pg from "pg";
 import neo4j from "neo4j-driver";
 import { openSignedEncryptedBundle, createSignedEncryptedBundle } from "./bundle-crypto.mjs";
 import { packPair, unpackPair, validatePairManifest } from "./bundle-format.mjs";
-import { assertCompatibleBuildIdentity, migrationSetIdentity, schemaFingerprintDigest } from "./build-identity.mjs";
+import { assertCompatibleBuildIdentity, assertInstalledSchemaMatches, loaderCapabilityIdentity, schemaFingerprintDigest } from "./build-identity.mjs";
 import { credentialFingerprint, assertDistinctFingerprints } from "./credential-fingerprint.mjs";
 import {
   installStagingOps, acquireCoordinatorLock, acquireDataUseLock, releaseCoordinatorLock,
   releaseDataUseLock, readJournal, transitionJournal, markReady, recordCatchup,
-  hasCoordinatorLock, hasExclusiveDataUseLock,
+  hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark,
 } from "./journal.mjs";
-import { replaceNeo4jGraph } from "./neo4j-replace.mjs";
+import { assertActionConfiguration } from "./action-preflight.mjs";
+import { assertStagingTopology } from "./config.mjs";
+import { replaceNeo4jGraph, assertReplaceTarget } from "./neo4j-replace.mjs";
 import { captureRollbackPostgres, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
 import { canonicalObjectId, createPrivateStore, parseCanonicalObjectId } from "./object-store.mjs";
@@ -23,8 +26,9 @@ import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-poli
 import { fingerprint } from "../schema-fingerprint.mjs";
 import { RailwayMaintenance } from "./railway-maintenance.mjs";
 import { LocalMaintenance } from "./local-maintenance.mjs";
-import { exportGraph } from "./graph-bundle.mjs";
-import { snapshotExportFacts, validateLedgerAgainstSanitizedGraph } from "./exporter.mjs";
+import { exportGraph, GRAPH_CODEC_VERSION, validateGraphShape } from "./graph-bundle.mjs";
+import { decodeNeo4jValue } from "./neo4j-codec.mjs";
+import { snapshotExportFacts, validateLedgerAgainstSanitizedGraph, assertResolvedCorrectionScopes } from "./exporter.mjs";
 import { keyMaterial } from "./key-material.mjs";
 
 const exec = promisify(execFile);
@@ -71,11 +75,32 @@ export function compareEnvironmentCredentials(manifest, env = process.env) {
   return true;
 }
 
-async function currentLoaderIdentity(client) {
-  // staging_marker is deliberately outside the canonical application schema and survives restores.
-  // It must fence staging, but it must not make the same public application schema look incompatible.
-  const canonical = (await fingerprint(client)).filter((line) => !line.includes("\tstaging_marker") && !line.includes("\tstaging_marker."));
-  return { schemaFingerprint: schemaFingerprintDigest(canonical), migrationSet: migrationSetIdentity() };
+/**
+ * The canonical application-schema lines of a LIVE database, with the staging discriminator removed.
+ *
+ * `staging_marker` is deliberately outside the canonical schema (it exists on staging and nowhere
+ * else), so it must fence staging without making the same application schema look incompatible.
+ *
+ * This measures a target; it is NOT loader identity. See `loaderCapabilityIdentity` — B4.
+ */
+async function measuredSchemaLines(client) {
+  return (await fingerprint(client)).filter((line) => !line.includes("\tstaging_marker") && !line.includes("\tstaging_marker."));
+}
+
+/**
+ * M2: prove the captured graph can actually be REPLAYED before the checkpoint is accepted.
+ *
+ * "It dumped without error" is not that proof — the bootstrap checkpoint is the only thing standing
+ * between a failed first import and an unrecoverable staging, so the codec version, the shape the
+ * replayer validates, and a decode of every property through the very codec the restore will use
+ * are all exercised here, while the original data is still in place and nothing has been touched.
+ */
+export function assertReplayableGraph(graph) {
+  if (graph?.codecVersion !== GRAPH_CODEC_VERSION) throw new Error(`bootstrap capture has unsupported graph codec version ${graph?.codecVersion}`);
+  validateGraphShape(graph);
+  for (const node of graph.nodes) decodeNeo4jValue(node.properties);
+  for (const rel of graph.relationships) decodeNeo4jValue(rel.properties);
+  return { nodes: graph.nodes.length, relationships: graph.relationships.length };
 }
 
 async function reapplyTesters(env) {
@@ -100,8 +125,15 @@ async function measuredReplaceFacts({ client, maintenance, env, opened }) {
 
 export async function installOpenedPair({ client, session, opened, directory, env, maintenance }) {
   const graph = await unpackPair(opened.payload, directory, opened.manifest.checksums);
-  if (opened.manifest.databaseMode === "full") await restoreRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, env: { ...env, STAGING_DATA_MODE: opened.manifest.mode } });
-  else await restorePairedPostgres({ client, databaseUrl: env.DATABASE_URL, directory, env });
+  // Prove the pinned staging target BEFORE the first destructive Postgres write, not only before
+  // the graph delete. The same measured facts then authorise the marker repair inside the restore:
+  // re-materialising a staging discriminator is only safe on a target whose staging identity has
+  // been independently established (H1) — a database URL is not that proof.
+  const facts = await measuredReplaceFacts({ client, maintenance, env, opened });
+  assertReplaceTarget(facts);
+  const restore = { client, databaseUrl: env.DATABASE_URL, directory, verifiedStagingTarget: true };
+  if (opened.manifest.databaseMode === "full") await restoreRollbackPostgres({ ...restore, env: { ...env, STAGING_DATA_MODE: opened.manifest.mode } });
+  else await restorePairedPostgres({ ...restore, env });
   if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-postgres") throw new Error("injected harness fault after Postgres restore");
   if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS) {
     const pause = Number(env.STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS);
@@ -109,20 +141,53 @@ export async function installOpenedPair({ client, session, opened, directory, en
     await new Promise((resolve) => setTimeout(resolve, pause));
   }
   await reapplyTesters(env);
+  // Re-measured, not reused: the stop/lock facts must hold at the moment of the graph delete too.
   await replaceNeo4jGraph({ session, graph, facts: await measuredReplaceFacts({ client, maintenance, env, opened }) });
   if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-graph") throw new Error("injected harness fault after graph restore");
   return graph;
 }
 
-async function verifyInstalledPair({ client, session, graph }) {
-  const credentialCounts = await client.query(`SELECT
-    (SELECT count(*) FROM auth_tokens)+(SELECT count(*) FROM api_keys)+(SELECT count(*) FROM agent_tokens)+
-    (SELECT count(*) FROM integrations)+(SELECT count(*) FROM member_secrets)+(SELECT count(*) FROM social_jobs)+
-    (SELECT count(*) FROM llm_usage)+(SELECT count(*) FROM usage_costs) AS forbidden_count`);
-  if (Number(credentialCounts.rows[0]?.forbidden_count ?? -1) !== 0) throw new Error("post-import credential/outbound queue sanitation verification failed");
-  const [facts, installedGraph] = await Promise.all([snapshotExportFacts(client), exportGraph(session)]);
-  validateLedgerAgainstSanitizedGraph(installedGraph, facts);
+/**
+ * Verify what actually landed. Applies to BOTH kinds of pair (M2): a rollback envelope used to skip
+ * dataset verification entirely, so "the prior pair was restored" was an assertion about a restore
+ * command's exit status rather than about the data.
+ *
+ * `sanitationExpected` is the one legitimate difference: a sanitized SOURCE bundle must contain no
+ * credential/outbound rows at all, while a full staging rollback capture is expected to carry back
+ * whatever staging itself held (including its own tester credentials).
+ */
+async function verifyInstalledPair({ client, session, graph, opened, sanitationExpected = true }) {
+  if (sanitationExpected) {
+    const credentialCounts = await client.query(`SELECT
+      (SELECT count(*) FROM auth_tokens)+(SELECT count(*) FROM api_keys)+(SELECT count(*) FROM agent_tokens)+
+      (SELECT count(*) FROM integrations)+(SELECT count(*) FROM member_secrets)+(SELECT count(*) FROM social_jobs)+
+      (SELECT count(*) FROM llm_usage)+(SELECT count(*) FROM usage_costs) AS forbidden_count`);
+    if (Number(credentialCounts.rows[0]?.forbidden_count ?? -1) !== 0) throw new Error("post-import credential/outbound queue sanitation verification failed");
+  }
+  const installedGraph = await exportGraph(session);
+  // The census applies to EVERY pair: whatever was verified in the bundle is what must now be in
+  // the target, legacy or copy-ready.
   if (installedGraph.nodes.length !== graph.nodes.length || installedGraph.relationships.length !== graph.relationships.length) throw new Error("installed graph census differs from verified bundle");
+  // The ledger↔graph correspondence is a COPY-READY contract. `legacy-pg-only` has documented
+  // empty-graph semantics — its Postgres never carried `graph_episodes` — so demanding an episode
+  // per ledger row of a legacy checkpoint would fail a correct restore, and passing it silently
+  // would prove nothing. It is asked only where it means something.
+  const mode = opened.manifest.mode ?? "copy-ready";
+  if (mode !== "legacy-pg-only") {
+    const facts = await snapshotExportFacts(client);
+    assertResolvedCorrectionScopes(facts);
+    validateLedgerAgainstSanitizedGraph(installedGraph, facts);
+  } else {
+    const ledger = await client.query("SELECT count(*)::int AS rows FROM graph_episodes");
+    if (Number(ledger.rows[0]?.rows ?? -1) !== 0 || installedGraph.nodes.length !== 0) {
+      throw new Error(`legacy-pg-only checkpoint restored ${ledger.rows[0]?.rows} ledger rows and ${installedGraph.nodes.length} graph nodes; legacy mode has empty-graph semantics`);
+    }
+  }
+  // B4 "verify installed result": the catalog the app will actually run against, against the digest
+  // the payload declared. A difference is a named diagnostic, never an invented upgrade path.
+  assertInstalledSchemaMatches(opened.manifest.build?.schemaFingerprint, await measuredSchemaLines(client), {
+    context: `installed ${opened.kind} pair ${opened.manifest.runId}`,
+  });
 }
 
 export async function readStagingHead(env = process.env, fetchImpl = fetch) {
@@ -136,20 +201,57 @@ export async function readStagingHead(env = process.env, fetchImpl = fetch) {
   return commit;
 }
 
-export async function waitForImportedBoot({ maintenance, deploymentId, commit, origin, token, mode = "copy-ready", fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bootProbe, accept, fetchImpl, timeoutMs, sleep, description }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
     const deployment = await maintenance.readDeployment(deploymentId);
     if (new Set(["FAILED", "CRASHED", "REMOVED"]).has(deployment.status)) throw new Error(`fresh staging deployment failed in ${deployment.status}`);
     if (deployment.status === "SUCCESS" || deployment.status === "DEPLOYING") {
-      const response = await fetchImpl(new URL("/api/health", origin), { redirect: "manual", headers: { "x-aios-staging-health-token": token, "x-aios-staging-boot-probe": "true" }, signal: AbortSignal.timeout(10_000) }).catch(() => null);
+      const response = await fetchImpl(new URL("/api/health", origin), {
+        redirect: "manual",
+        headers: { "x-aios-staging-health-token": token, ...(bootProbe ? { "x-aios-staging-boot-probe": "true" } : {}) },
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => null);
       const body = await response?.json().catch(() => ({}));
-      if (response?.status === 202 && body?.booted === true && body?.commit === commit) return true;
-      if (mode === "legacy-pg-only" && response?.status === 200 && body?.ok === true && body?.mode === mode && body?.commit === commit) return true;
+      if (response && accept(response.status, body ?? {})) return true;
     }
     await sleep(5_000);
   }
-  throw new Error("fresh staging deployment did not pass the bounded authenticated boot probe");
+  throw new Error(`fresh staging deployment did not pass ${description}`);
+}
+
+/**
+ * INSTALL boot probe — deliberately narrow. During installation the journal is `booting`, so the
+ * app answers the privileged probe with 202 + `booted`, and only that (or the legacy 200 shape)
+ * is accepted: a plain 200 would mean the journal already says ready, which during an install
+ * means something else advanced it.
+ */
+export async function waitForImportedBoot({ maintenance, deploymentId, commit, origin, token, mode = "copy-ready", fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+  return pollDeployedHealth({
+    maintenance, deploymentId, origin, token, bootProbe: true, fetchImpl, timeoutMs, sleep,
+    description: "the bounded authenticated boot probe",
+    accept: (status, body) =>
+      (status === 202 && body.booted === true && body.commit === commit) ||
+      (mode === "legacy-pg-only" && status === 200 && body.ok === true && body.mode === mode && body.commit === commit),
+  });
+}
+
+/**
+ * CATCH-UP probe — the journal is `ready` the whole time, so the correct health answer is a 200
+ * whose mode, commit and refresh run all match what this journal says is installed.
+ *
+ * The install probe cannot be reused here: it admits only 202-booted (or legacy 200), and a
+ * caught-up app answers 200 `copy-ready`. Every catch-up therefore "timed out" after successfully
+ * deploying, burning an attempt each time and eventually exhausting the bounded budget.
+ */
+export async function waitForExpectedReady({ maintenance, deploymentId, commit, origin, token, mode, runId, fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+  if (!mode || !runId) throw new Error("an expected-ready probe requires the canonical mode and refresh run identity");
+  return pollDeployedHealth({
+    maintenance, deploymentId, origin, token, bootProbe: false, fetchImpl, timeoutMs, sleep,
+    description: `the bounded expected-ready probe for run ${runId}`,
+    accept: (status, body) =>
+      status === 200 && body.ok === true && body.commit === commit && body.mode === mode && body.refreshRunId === runId,
+  });
 }
 
 function maintenanceFor(env) {
@@ -165,7 +267,7 @@ async function openPrior({ client, journal, rollbackStore, env }) {
   const kind = encoded?.manifest?.kind === "staging-rollback" ? "rollback" : "source";
   const opened = openBundleBytes(bytes, env, kind, { ignoreExpiry: true });
   if (opened.manifest.runId !== journal.last_ready_run_id || journal.last_ready_commit !== opened.manifest.targetCommit) throw new Error("last-ready journal/object metadata mismatch");
-  assertCompatibleBuildIdentity(opened.manifest.build, await currentLoaderIdentity(client));
+  assertCompatibleBuildIdentity(opened.manifest.build, loaderCapabilityIdentity());
   return { ...opened, sourceBytes: bytes, objectId: journal.last_ready_object_id, digest: journal.last_ready_digest, kind };
 }
 
@@ -183,17 +285,39 @@ function sealReadyRollback(opened, targetCommit, env) {
 }
 
 async function bootExact({ client, maintenance, runId, objectId, digest, commit, mode, env }) {
-  await transitionJournal(client, { runId, from: ["verifying", "importing"], to: "booting", patch: { catchupCommit: commit, candidateMode: mode } });
+  // B1: `boot_run_id`/`boot_commit` are the SELECTED deployment identity that the schema loader and
+  // the startup fence both admit on. They are separate from `catchup_commit`, which means something
+  // else entirely (an outstanding branch head to deploy later) and was previously overloaded.
+  await transitionJournal(client, { runId, from: ["verifying", "importing"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: commit } });
   await releaseDataUseLock(client, "exclusive");
   const deploymentId = await maintenance.deployApp(commit);
   await waitForImportedBoot({ maintenance, deploymentId, commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
   return { deploymentId, ready: await markReady(client, { runId, objectId, digest, commit, mode }) };
 }
 
+/**
+ * Reacquire the exclusive data-use lock with a BOUNDED wait.
+ *
+ * A bare `try` fails the moment a shared holder is still finishing its shutdown — routine after a
+ * stop — and on the rollback path that turns a recoverable state into "recovery required". An
+ * unbounded `pg_advisory_lock` is the opposite failure: it would hang the runner forever behind a
+ * wedged reader. Retry on a bounded schedule, then refuse with a clear reason.
+ */
+async function acquireExclusiveDataUseLock(client, env, context, { sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+  const timeoutMs = Number(env.STAGING_DATA_LOCK_TIMEOUT_MS ?? 60_000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 600_000) throw new Error("STAGING_DATA_LOCK_TIMEOUT_MS must be 1000..600000");
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await acquireDataUseLock(client, "exclusive")) return true;
+    if (Date.now() >= deadline) throw new Error(`active staging data-use readers prevented ${context} within ${timeoutMs}ms`);
+    await sleep(1_000);
+  }
+}
+
 async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env }) {
   await transitionJournal(client, { runId: failedRunId, from: ["failed", "booting", "importing", "verifying", "draining"], to: "draining", patch: { lastSafeCheckpoint: "rollback" } }).catch(() => {});
   await maintenance.stopAndVerifyAll();
-  if (!(await acquireDataUseLock(client, "exclusive"))) throw new Error("active staging readers prevented rollback");
+  await acquireExclusiveDataUseLock(client, env, "rollback");
   const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
   const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
   try {
@@ -201,7 +325,9 @@ async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollba
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["draining", "failed"], to: "importing" });
     const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance }));
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["importing"], to: "verifying" });
-    if (prior.kind === "source") await verifyInstalledPair({ client, session, graph });
+    // M2: BOTH kinds are verified against the data that landed. A full staging capture legitimately
+    // carries staging's own credentials, so only the source-sanitation assertion is conditional.
+    await verifyInstalledPair({ client, session, graph, opened: prior, sanitationExpected: prior.kind === "source" });
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
     await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
     await rollbackStore.writePointer("last-ready", { runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, kind: prior.kind });
@@ -215,7 +341,10 @@ async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollba
 async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env }) {
   const opened = await verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env });
   compareEnvironmentCredentials(opened.manifest, env);
-  assertCompatibleBuildIdentity(opened.manifest.build, await currentLoaderIdentity(client));
+  // B4: compatibility is against this pinned runner image's OWN loader capability, never against
+  // the live target catalog — the catalog is the thing being replaced, and reading it here both
+  // blocked legitimate staging-only schema changes and made a half-installed target unrecoverable.
+  assertCompatibleBuildIdentity(opened.manifest.build, loaderCapabilityIdentity());
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
   try {
   const journal = await readJournal(client);
@@ -228,13 +357,26 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
+    // The idempotent repair path: `markReady` may have committed and the process then died before
+    // the durable pointer was written. Re-writing the pointer from the JOURNAL (the authority) is
+    // safe to repeat, and the watermark advance below is what stops discovery re-offering this run.
     await rollbackStore.writePointer("last-ready", {
       runId: journal.last_ready_run_id, objectId: journal.last_ready_object_id,
       digest: journal.last_ready_digest, commit: journal.last_ready_commit,
       mode: journal.last_ready_mode, kind: "rollback",
     });
+    await recordSourceWatermark(client, { capturedAt: opened.manifest.captureEndedAt, runId: opened.manifest.runId });
     if (objectId !== journal.last_ready_object_id) await rollbackStore.delete(objectId).catch(() => {});
     return { status: "already-ready", runId: opened.manifest.runId, objectId: journal.last_ready_object_id };
+  }
+  // B3: never install a capture older than the newest one already installed. Without a durable
+  // watermark, discovery that skipped the installed newest run simply picked the SECOND newest —
+  // an older bundle — and the next run picked the newest again, oscillating staging forever.
+  const watermark = journal.source_watermark ? Date.parse(journal.source_watermark) : null;
+  const captured = Date.parse(opened.manifest.captureEndedAt);
+  if (!Number.isFinite(captured)) throw new Error("source bundle declares no parseable capture end");
+  if (watermark !== null && Number.isFinite(watermark) && captured <= watermark) {
+    throw new Error(`source run ${opened.manifest.runId} captured at or before the installed watermark; refusing to move staging backwards`);
   }
   const targetCommit = await readStagingHead(env);
   let destructive = false;
@@ -243,20 +385,21 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     await transitionJournal(client, { runId: opened.manifest.runId, from: ["ready", "failed"], to: "draining", patch: { lastSafeCheckpoint: "ready", candidateRunId: opened.manifest.runId, candidateObjectId: objectId, candidateDigest: opened.digest, candidateMode: "copy-ready", catchupCommit: targetCommit } });
     destructive = true;
     await maintenance.stopAndVerifyAll();
-    if (!(await acquireDataUseLock(client, "exclusive"))) throw new Error("active app/predeploy sessions prevent import");
+    await acquireExclusiveDataUseLock(client, env, "import");
     await transitionJournal(client, { runId: opened.manifest.runId, from: ["draining"], to: "importing" });
     const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
     const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     try {
       const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance }));
       await transitionJournal(client, { runId: opened.manifest.runId, from: ["importing"], to: "verifying" });
-      await verifyInstalledPair({ client, session, graph });
+      await verifyInstalledPair({ client, session, graph, opened });
       const readyPair = sealReadyRollback(opened, targetCommit, env);
       await rollbackStore.putImmutable(readyPair.objectId, readyPair.sourceBytes);
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair failed durable read-back verification");
       await bootExact({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair was not durable at ready boundary");
       await rollbackStore.writePointer("last-ready", { runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", kind: "rollback" });
+      await recordSourceWatermark(client, { capturedAt: opened.manifest.captureEndedAt, runId: opened.manifest.runId });
       const catchup = await readStagingHead(env);
       if (catchup !== targetCommit) await recordCatchup(client, { commit: catchup, attempts: 0 });
       const cleanupErrors = [];
@@ -294,26 +437,46 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
   try {
     await transitionJournal(client, { runId, from: [journal.state], to: "draining", patch: { lastSafeCheckpoint: journal.state } });
     await maintenance.stopAndVerifyAll();
-    if (!(await acquireDataUseLock(client, "exclusive"))) throw new Error("active staging readers prevented rollback bootstrap");
+    await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
     const created = await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
       await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
       const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       try {
-        const graph = await exportGraph(session); const packed = await packPair(directory, graph, { includeAuthUsers: false });
+        const graph = await exportGraph(session);
+        // M2: prove the captured graph is REPLAYABLE before this checkpoint is accepted as the
+        // thing recovery depends on. Codec version, shape and a round trip through the same codec
+        // the restore will use — a checkpoint that cannot be replayed is not a checkpoint.
+        assertReplayableGraph(graph);
+        const packed = await packPair(directory, graph, { includeAuthUsers: false });
         const manifest = { kind: "staging-rollback", databaseMode: "full", formatVersion: 1, graphCodecVersion: graph.codecVersion, runId,
           captureStartedAt: new Date().toISOString(), captureEndedAt: new Date().toISOString(), expiresAt: "9999-12-31T23:59:59.999Z",
-          checksums: packed.checksums, build: { applicationCommit: current.commit, ...(await currentLoaderIdentity(client)) }, targetCommit: current.commit, mode };
+          checksums: packed.checksums,
+          // The measured deployment commit AND the measured catalog of the very database being
+          // captured. Both are facts about this checkpoint, so a later rollback can check the
+          // installed result against them rather than trusting the restore's exit status.
+          build: {
+            applicationCommit: current.commit,
+            schemaFingerprint: schemaFingerprintDigest(await measuredSchemaLines(client)),
+            migrationSet: loaderCapabilityIdentity().migrationSet,
+          },
+          targetCommit: current.commit, mode };
         const bundle = createSignedEncryptedBundle({ payload: packed.payload, manifest,
           exporterSigningPrivateKey: keyMaterial(env, "ROLLBACK_SIGNING_PRIVATE_KEY"),
           importerEncryptionPublicKey: keyMaterial(env, "ROLLBACK_ENCRYPTION_PUBLIC_KEY") });
         const bytes = Buffer.from(JSON.stringify(bundle)); const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
         await rollbackStore.putImmutable(objectId, bytes);
         if (!(await rollbackStore.verify(objectId, digest))) throw new Error("bootstrap rollback failed durable read-back verification");
+        // Read the sealed object BACK through the ordinary open path: signature, decryption,
+        // manifest validity and checksums, exactly as a real rollback would.
+        const readBack = openBundleBytes(await rollbackStore.read(objectId), env, "rollback", { ignoreExpiry: true });
+        if (readBack.manifest.runId !== runId || readBack.manifest.build?.applicationCommit !== current.commit) {
+          throw new Error("bootstrap checkpoint failed its durable read-back identity check");
+        }
         return { objectId, digest };
       } finally { await session.close(); await driver.close(); }
     });
-    await transitionJournal(client, { runId, from: ["draining"], to: "booting", patch: { candidateMode: mode } });
+    await transitionJournal(client, { runId, from: ["draining"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
     await releaseDataUseLock(client, "exclusive");
     const deploymentId = await maintenance.deployApp(current.commit);
     await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
@@ -321,11 +484,26 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
     await markReady(client, { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
     return { status: "bootstrapped", runId, objectId: created.objectId, commit: current.commit, mode };
   } catch (error) {
-    await transitionJournal(client, { runId, from: ["draining", "booting"], to: "failed", patch: { lastSafeCheckpoint: "bootstrap-failed" } }).catch(() => {});
     await releaseDataUseLock(client, "exclusive").catch(() => {});
-    const deploymentId = await maintenance.deployApp(current.commit).catch(() => null);
-    if (deploymentId) await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN }).catch(() => {});
-    throw error;
+    // Bootstrap performs no destructive database write, so recovery is exactly "put the UNCHANGED
+    // deployment back". Two things this has to get right:
+    //  - the journal must ADMIT that restart. Going straight to `failed` fences the very process
+    //    recovery depends on, because the loader and startup fence both refuse a failed journal.
+    //  - the probe must use the mode staging ACTUALLY runs in. Defaulting it to `copy-ready` meant a
+    //    legacy-pg-only baseline could never satisfy it, and a successful restart was reported as a
+    //    failed one.
+    let restored = false;
+    try {
+      await transitionJournal(client, { runId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
+      const deploymentId = await maintenance.deployApp(current.commit);
+      await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
+      restored = true;
+    } catch { restored = false; }
+    await transitionJournal(client, {
+      runId, from: ["draining", "booting", "failed"], to: "failed",
+      patch: { lastSafeCheckpoint: restored ? "bootstrap-failed-prior-restored" : "recovery-required" },
+    }).catch(() => {});
+    throw new Error(`${error instanceof Error ? error.message : String(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — run `importer rollback` or restore the deployment explicitly"})`);
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
@@ -339,14 +517,25 @@ async function serviceCatchup({ client, maintenance, env }) {
       if (journal.catchup_commit) await recordCatchup(client, { commit: null, attempts: 0 });
       return { status: "catchup-current", commit: head };
     }
-    const attempts = Number(journal.catchup_attempts ?? 0);
-    if (attempts >= Number(env.STAGING_CATCHUP_MAX_ATTEMPTS ?? 5)) throw new Error("bounded staging catch-up attempts exhausted");
+    // A SUPERSEDING head is a new target and gets its own attempt budget; the exhausted budget for
+    // the old target is not a permanent wedge that only a human can clear. Exhaustion against the
+    // SAME head stays loud and stays failed.
+    const sameTarget = journal.catchup_commit === head;
+    const attempts = sameTarget ? Number(journal.catchup_attempts ?? 0) : 0;
+    if (attempts >= Number(env.STAGING_CATCHUP_MAX_ATTEMPTS ?? 5)) throw new Error(`bounded staging catch-up attempts exhausted for ${head}`);
     await recordCatchup(client, { commit: head, attempts: attempts + 1 });
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
     const rollbackStore = createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
     const prior = await openPrior({ client, journal, rollbackStore, env });
     const id = await maintenance.deployApp(head);
-    await waitForImportedBoot({ maintenance, deploymentId: id, commit: head, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN });
+    // B2: catch-up NEVER leaves the journal, so the app answers `ready`, not `booting`. The correct
+    // acceptance is therefore the exact expected-ready shape — mode, commit AND the canonical
+    // installed run — not the install path's 202-booted probe, which no caught-up app can satisfy.
+    await waitForExpectedReady({
+      maintenance, deploymentId: id, commit: head,
+      origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN,
+      mode: journal.last_ready_mode, runId: journal.last_ready_run_id,
+    });
     const advanced = sealReadyRollback(prior, head, env);
     await rollbackStore.putImmutable(advanced.objectId, advanced.sourceBytes);
     if (!(await rollbackStore.verify(advanced.objectId, advanced.digest))) throw new Error("catch-up rollback metadata failed durable read-back verification");
@@ -361,19 +550,61 @@ async function serviceCatchup({ client, maintenance, env }) {
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
-async function discoverLatestSource(sourceStore, rollbackStore, env) {
-  const objects = await sourceStore.list(); const candidates = [];
+/**
+ * B3: pick the newest capture STRICTLY newer than the durable watermark, or nothing.
+ *
+ * The previous rule was "newest run that isn't the one the pointer names", which reads as a
+ * skip-the-installed-one rule but is a downgrade rule: when the newest run IS installed, it selects
+ * the SECOND newest — an older bundle — installs it, and the next tick selects the newest again.
+ * Staging then oscillated between two weekly bundles indefinitely. "Newest already installed" must
+ * mean idle.
+ *
+ * A candidate whose capture end is missing, unparseable or expired is never a reason to downgrade:
+ * it is skipped, and the watermark stands. Equal timestamps are ambiguous rather than newer, so
+ * they are refused too — advancing on `>=` would reintroduce the oscillation between two runs that
+ * share a capture end.
+ */
+export async function discoverLatestSource(sourceStore, journal, env) {
+  const watermark = journal?.source_watermark ? Date.parse(journal.source_watermark) : null;
+  const floor = Number.isFinite(watermark) ? watermark : null;
+  const objects = await sourceStore.list();
+  const candidates = [];
   for (const objectId of objects) {
     try {
-      const identity = parseCanonicalObjectId(objectId); const bytes = await sourceStore.read(objectId);
+      const identity = parseCanonicalObjectId(objectId);
+      const bytes = await sourceStore.read(objectId);
       if (sha(bytes) !== identity.digest) continue;
       const opened = openBundleBytes(bytes, env);
-      if (opened.manifest.runId === identity.runId) candidates.push({ objectId, ended: Date.parse(opened.manifest.captureEndedAt) });
+      if (opened.manifest.runId !== identity.runId) continue;
+      const ended = Date.parse(opened.manifest.captureEndedAt);
+      if (!Number.isFinite(ended)) continue;
+      if (floor !== null && ended <= floor) continue;
+      if (opened.manifest.runId === journal?.source_watermark_run_id) continue;
+      candidates.push({ objectId, ended });
     } catch {}
   }
   candidates.sort((a, b) => b.ended - a.ended || a.objectId.localeCompare(b.objectId));
-  const pointer = await rollbackStore.readPointer("last-ready").catch(() => null);
-  return candidates.find((candidate) => parseCanonicalObjectId(candidate.objectId).runId !== pointer?.runId)?.objectId ?? null;
+  // A tie at the top is ambiguous identity, not a newest run; refuse rather than pick arbitrarily.
+  if (candidates.length > 1 && candidates[0].ended === candidates[1].ended) {
+    throw new Error(`two source runs share capture end ${new Date(candidates[0].ended).toISOString()}; refusing an ambiguous newest-run selection`);
+  }
+  return candidates[0]?.objectId ?? null;
+}
+
+/**
+ * The read-only topology check, with a real caller.
+ *
+ * `assertStagingTopology` validates branch names, distinct pinned IDs, internal hosts and variable
+ * REFERENCE SHAPES from a supplied facts document. It reads no variable VALUES and touches no
+ * provider API, so it is safe to run from `verify`. When no document is configured, that is
+ * reported as NOT SUPPLIED — an unsupplied check must not read as a passed one.
+ */
+export function verifyConfiguredTopology(env = process.env) {
+  const file = env.STAGING_TOPOLOGY_FILE;
+  if (!file) return { status: "not-supplied", detail: "set STAGING_TOPOLOGY_FILE to the measured topology facts document" };
+  const topology = JSON.parse(readFileSync(file, "utf8"));
+  assertStagingTopology(topology);
+  return { status: "verified", file };
 }
 
 export async function importerPreflight(env = process.env, action = "install") {
@@ -384,6 +615,9 @@ export async function importerPreflight(env = process.env, action = "install") {
   const rollback = [];
   for (const name of [...common, ...(action === "verify" || action === "install-ops" ? [] : runtime), ...rollback]) if (!env[name]) throw new Error(`${name} is required`);
   for (const name of ["EXPORTER_SIGNING_PUBLIC_KEY", "IMPORTER_ENCRYPTION_PRIVATE_KEY", ...(action === "verify" ? [] : ["ROLLBACK_SIGNING_PRIVATE_KEY", "ROLLBACK_SIGNING_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PRIVATE_KEY"])]) keyMaterial(env, name);
+  // H2: the settings this ACTION reaches for later — origin, health token, tester credentials —
+  // validated here, before anything can drain, stop, restore or delete.
+  assertActionConfiguration(env, action);
   createPrivateStore({ env, scope: "source", role: "source-reader" });
   createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
   return true;
@@ -413,7 +647,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     if (action === "verify") {
       const objectId = argv[1]; if (!objectId) throw new Error("canonical immutable object ID is required");
       const opened = await verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env }); compareEnvironmentCredentials(opened.manifest, env);
-      return { status: "verified-and-pinned", runId: opened.manifest.runId, objectId };
+      return { status: "verified-and-pinned", runId: opened.manifest.runId, objectId, topology: verifyConfiguredTopology(env) };
     }
     if (action === "bootstrap-rollback") return bootstrapRollback({ client, rollbackStore, maintenance, env });
     if (action === "rollback") {
@@ -427,7 +661,9 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     }
     const tick = async () => {
       const catchup = await serviceCatchup({ client, maintenance, env });
-      const objectId = await discoverLatestSource(sourceStore, rollbackStore, env);
+      // Selection reads the watermark unlocked and `installObject` RE-CHECKS it while holding the
+      // coordinator lock, so a concurrent worker cannot install between the two.
+      const objectId = await discoverLatestSource(sourceStore, await readJournal(client), env);
       if (!objectId) return { status: "idle", catchup };
       return installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env });
     };

@@ -47,24 +47,75 @@ export async function snapshotExportFacts(client) {
       ))
       ELSE false END AS source_eligible
     FROM graph_episodes ge`);
+  // A correction episode is named `correction:<arc_id>`, NOT `correction:<arc_corrections.id>`.
+  // Keying the ledger by the row id produced a key no episode could ever match, which silently
+  // disarmed both the allow and the pending-delete EXCLUDE for every correction.
+  const correctionScope = await resolveCorrectionScopes(client);
   const allowed = new Set(); const excluded = new Set(); const ledger = [];
+  const unresolvedCorrections = [];
   for (const row of result.rows) {
-    const prefix = row.source_table === "items" ? "items:" : row.source_table === "arc_corrections" ? "correction:" : "unsupported:";
-    const key = `${prefix}${row.source_id}\0${row.group_id}`;
-    if (row.source_eligible) allowed.add(key); else excluded.add(key);
-    if (row.pending_delete_group_id) excluded.add(`${prefix}${row.source_id}\0${row.pending_delete_group_id}`);
-    ledger.push({ ...row, source_id: String(row.source_id) });
-  }
-  const corrections = await client.query(`SELECT a.id::text, a.arc_id, a.group_key, p.graph_group_id AS team_group
-    FROM arc_corrections a LEFT JOIN projects p ON p.team_id=a.team_id AND p.kind='system' AND p.slug='general'`);
-  for (const row of corrections.rows) {
-    const exactGroup = String(row.group_key ?? "").startsWith("g:")
-      ? String(row.group_key).slice(2)
-      : row.group_key === "" ? row.team_group : null;
-    if (exactGroup) allowed.add(`correction:${row.arc_id}\0${exactGroup}`);
+    // A deferred or blank-content row is not a CURRENT projection, so it is neither copied nor a
+    // reason to refuse the whole capture.
+    const current = !row.deferred && row.content_sha256 !== "";
+    let name;
+    let scopeProven = true;
+    if (row.source_table === "arc_corrections") {
+      const scope = correctionScope.get(String(row.source_id));
+      name = scope?.arcId ? `correction:${scope.arcId}` : `unresolved-correction:${row.source_id}`;
+      scopeProven = scope?.resolvedGroup === row.group_id;
+      if (current && !scopeProven) {
+        unresolvedCorrections.push(!scope?.arcId ? `${row.source_id}: ledger row has no arc_corrections row`
+          : scope.resolvedGroup ? `${scope.arcId}: stored scope ${scope.resolvedGroup} disagrees with ledger group ${row.group_id}`
+          : `${scope.arcId}: ${scope.reason}`);
+      }
+    } else name = row.source_table === "items" ? `items:${row.source_id}` : `unsupported:${row.source_id}`;
+    const key = `${name}\0${row.group_id}`;
+    // Item eligibility is the fan-out oracle; correction eligibility is a PROVEN stored scope.
+    const eligible = row.source_table === "items" ? row.source_eligible === true
+      : row.source_table === "arc_corrections" ? scopeProven
+      : false;
+    if (eligible) allowed.add(key); else excluded.add(key);
+    if (row.pending_delete_group_id) excluded.add(`${name}\0${row.pending_delete_group_id}`);
+    ledger.push({ ...row, source_id: String(row.source_id), episodeName: name });
   }
   const schemaLines = await fingerprint(client);
-  return { allowed, excluded, ledger, schemaLines };
+  return { allowed, excluded, ledger, schemaLines, unresolvedCorrections };
+}
+
+/**
+ * Resolve each correction's stored SYNTHESIS SCOPE to an exact graph group, by PROOF.
+ *
+ * Since PRET-3 the scope key is always `g:<graph_group_id>`, and the only legitimate resolution is
+ * a project in the same team that actually owns that group. Everything else — a legacy tier scope
+ * (`''`), a retired partition key (`p:<projectId>`), or a `g:` key naming a group no project owns —
+ * is UNRESOLVED. It is not mapped by resemblance and it is not quietly given the team's general
+ * group: that would move an editorial act into a scope its author never made it in, which is a tier
+ * decision dressed up as a string parse. Unresolved scopes are named and refused by the caller.
+ */
+export async function resolveCorrectionScopes(client) {
+  const result = await client.query(`SELECT a.id::text AS id, a.arc_id, a.group_key,
+      CASE WHEN a.group_key LIKE 'g:%' THEN (
+        SELECT p.graph_group_id FROM projects p
+         WHERE p.team_id = a.team_id AND p.graph_group_id = substr(a.group_key, 3)
+         LIMIT 1) END AS proven_group
+    FROM arc_corrections a`);
+  const scopes = new Map();
+  for (const row of result.rows) {
+    const key = String(row.group_key ?? "");
+    const reason = !key ? "legacy tier-scope correction has no exact graph group"
+      : !key.startsWith("g:") ? `unsupported correction scope key namespace ${key.split(":")[0]}:`
+      : !row.proven_group ? `scope key ${key} names a group no project in this team owns`
+      : null;
+    scopes.set(row.id, { arcId: row.arc_id, resolvedGroup: row.proven_group ?? null, reason });
+  }
+  return scopes;
+}
+
+/** Unknown/ambiguous correction scope is an actionable named refusal, never a silent drop. */
+export function assertResolvedCorrectionScopes(facts) {
+  const unresolved = facts?.unresolvedCorrections ?? [];
+  if (unresolved.length === 0) return true;
+  throw new Error(`correction episodes with unresolved synthesis scope refuse the bundle: ${unresolved.slice(0, 10).join("; ")}`);
 }
 
 export function validateLedgerAgainstSanitizedGraph(graph, facts) {
@@ -72,12 +123,15 @@ export function validateLedgerAgainstSanitizedGraph(graph, facts) {
   const errors = [];
   for (const row of facts.ledger) {
     if (row.deferred || row.content_sha256 === "") continue;
+    // The excluded check is per SOURCE TABLE by construction: `episodeName` already carries the
+    // exact episode naming (`items:<id>` / `correction:<arc_id>`) this ledger row projects under.
+    const stem = row.episodeName ?? `${row.source_table === "items" ? "items" : "unsupported"}:${row.source_id}`;
+    if (facts.excluded.has(`${stem}\0${row.group_id}`)) continue;
     let names;
     if (row.source_table === "items") {
-      if (facts.excluded.has(`items:${row.source_id}\0${row.group_id}`)) continue;
       const chunks = Array.isArray(row.chunk_shas) ? row.chunk_shas.length : 0;
-      names = chunks > 1 ? Array.from({ length: chunks }, (_, index) => `items:${row.source_id}#${index}`) : [`items:${row.source_id}`];
-    } else if (row.source_table === "arc_corrections" && row.correction_arc_id) names = [`correction:${row.correction_arc_id}`];
+      names = chunks > 1 ? Array.from({ length: chunks }, (_, index) => `${stem}#${index}`) : [stem];
+    } else if (row.source_table === "arc_corrections" && stem.startsWith("correction:")) names = [stem];
     else continue;
     if (!names.every((name) => episodes.has(`${name}\0${row.group_id}`))) errors.push(`${row.source_id}@${row.group_id}`);
   }
@@ -108,11 +162,15 @@ export async function runExporter(env = process.env) {
   const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
   try {
     if (process.argv.includes("--census")) return graphCensus(session);
-    const runId = env.STAGING_BUNDLE_RUN_ID || `${new Date().toISOString().replace(/[:.]/g, "-")}-${env.SOURCE_APPLICATION_COMMIT?.slice(0, 12)}`;
+    // The run ID names the MEASURED deployed commit, never the declared env var: on the Railway
+    // path `SOURCE_APPLICATION_COMMIT` is unset, and `undefined?.slice()` had been stamping the
+    // literal string "undefined" into a bundle's immutable identity.
+    const runId = env.STAGING_BUNDLE_RUN_ID || `${new Date().toISOString().replace(/[:.]/g, "-")}-${deployedBuild.commit.slice(0, 12)}`;
     const started = new Date();
     return await withPrivateTempDir("aios-staging-export-", async (directory) => {
       const captured = await capturePairedPostgres({ client, databaseUrl: env.DATABASE_URL, directory, captureSnapshotFacts: snapshotExportFacts });
       const policy = captured.snapshotFacts;
+      assertResolvedCorrectionScopes(policy);
       const rawGraph = await exportGraph(session);
       const graph = sanitizeGraphExport(rawGraph, { episodeAllowed: (episode) => {
         const name = itemEpisodeStem(episode.properties?.name) ?? String(episode.properties?.name ?? "");

@@ -24,9 +24,12 @@ export async function reapplyTesterCredentials(db: DbClient, testers: TesterCred
 }
 
 async function main() {
-  const raw = process.env.STAGING_TESTER_CREDENTIALS_JSON;
-  if (!raw) throw new Error("STAGING_TESTER_CREDENTIALS_JSON is required");
-  const count = await reapplyTesterCredentials(adminClient(), JSON.parse(raw));
+  // The SAME pure validator the importer's action preflight runs before anything drains, so this
+  // process cannot be the first place a malformed configuration is discovered. It is a shape check
+  // only: the authoritative membership/role/posture verification above still gates every write.
+  const { parseTesterCredentials } = await import("./action-preflight.mjs");
+  const testers = parseTesterCredentials(process.env.STAGING_TESTER_CREDENTIALS_JSON) as TesterCredential[];
+  const count = await reapplyTesterCredentials(adminClient(), testers);
   console.log(`reapplied ${count} allowlisted staging tester credential(s)`);
 }
 

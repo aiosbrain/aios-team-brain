@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Required mode (the CI lane sets it): a missing engine is a FAILURE, never a quiet pass. Without
+# this, "docker is not installed" and "every assertion held" are the same green tick.
+if [[ "${STAGING_PAIR_REQUIRED:-}" == "1" ]]; then
+  for binary in docker node; do
+    command -v "$binary" >/dev/null 2>&1 || { echo "staging paired refresh lane requires $binary" >&2; exit 1; }
+  done
+  docker compose version >/dev/null 2>&1 || { echo "staging paired refresh lane requires the docker compose plugin" >&2; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "staging paired refresh lane requires a running Docker engine" >&2; exit 1; }
+fi
+
 project="aios-staging-pair-${USER:-runner}-$$"
 harness_root="$(mktemp -d "${TMPDIR:-/tmp}/aios-staging-pair.XXXXXX")"
 export STAGING_HARNESS_SECRETS_DIR="$harness_root/secrets"

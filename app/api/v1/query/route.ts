@@ -8,6 +8,7 @@ import { retrieve } from "@/lib/query/retrieve";
 import { streamAnswer } from "@/lib/query/claude";
 import { pickTimezone, DEFAULT_TIMEZONE } from "@/lib/query/timezone";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 import {
   ownsConversation,
   createConversation,
@@ -43,6 +44,23 @@ export async function POST(req: NextRequest) {
   const teamId = agent?.teamId ?? auth!.teamId;
   const launcherId = agent?.memberId ?? auth!.memberId;
   const memberTier = agent?.memberTier ?? auth!.memberTier;
+
+  // AC-07 (M9): on copied staging with no explicit interactive budget, model-dependent answering is
+  // DISABLED — and that is a product state with an answer, not an exception. Ordering matters
+  // twice over:
+  //   - it is AFTER authentication and tier resolution, so an unauthenticated caller still gets 401
+  //     and this refusal never becomes a way to learn the deployment's mode without a key;
+  //   - it is BEFORE the rate-limit read, the daily-quota reads and the `query_log` insert, so a
+  //     feature that cannot run does not consume the caller's quota. `resolveAnsweringKeys` throws
+  //     on the same policy far below, by which point the attempt had already been metered and the
+  //     caller received a generic 500 that named nothing.
+  if (!copiedStagingSpendAllowed("interactive-query")) {
+    return errorResponse(
+      "answering_disabled",
+      "this deployment is a copied staging environment: model-backed answering is disabled; graph-backed and full-text reads remain available",
+      503,
+    );
+  }
 
   const db = adminClient();
   if (!(await rateLimit(db, `${launcherId}:query`, 10))) {

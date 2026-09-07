@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Client } from "pg";
 import { shouldUseSsl } from "../pg-load-schema.mjs";
-import { acquireDataUseLock, readJournal } from "./journal.mjs";
+import { acquireDataUseLock, assertBootAdmission } from "./journal.mjs";
 
 export function copyFenceRequired(env = process.env) {
   return env.STAGING_DATA_MODE === "copy-ready";
@@ -23,10 +23,13 @@ export async function acquireStartupFence({ env = process.env, createClient = (c
   });
   await client.connect();
   try {
+    // Acquire the shared lock BEFORE reading, and keep this connection alive for the child's whole
+    // lifetime: that ordering is what closes the startup TOCTOU (a refresh cannot take the exclusive
+    // lock between our read and the child starting).
     await acquireDataUseLock(client, "shared", true);
-    const journal = await readJournal(client);
-    const exactBoot = journal.state === "booting" && /^[0-9a-f]{40}$/i.test(journal.catchup_commit ?? "") && journal.catchup_commit === env.RAILWAY_GIT_COMMIT_SHA;
-    if ((!journal.run_id || journal.state !== "ready") && !exactBoot) throw new Error(`copy-mode startup refused while refresh state is ${journal.state}`);
+    // Shared with the schema loader (B1) so predeploy and startup can never disagree about whether
+    // this exact process is the deployment the refresh selected.
+    const journal = await assertBootAdmission(client, env, "copy-mode startup");
     return { client, journal };
   } catch (error) {
     await Promise.resolve(client.end()).catch(() => {});

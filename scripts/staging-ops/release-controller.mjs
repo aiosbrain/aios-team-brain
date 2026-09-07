@@ -71,25 +71,74 @@ export async function createInstallationToken({ appId, installationId, privateKe
   return result.token;
 }
 
+/**
+ * Railway's `staticUrl` is a BARE HOSTNAME (`aios-staging.up.railway.app`), not a URL, so
+ * `new URL(staticUrl)` throws. Normalise to an https origin, and refuse anything that is not a
+ * plain host — a value carrying a scheme, credentials, a port or a path is not the deployment
+ * domain this evidence is supposed to bind.
+ */
+export function normalizeDeploymentOrigin(staticUrl) {
+  const raw = String(staticUrl ?? "").trim();
+  if (!raw) return null;
+  if (/^https:\/\//i.test(raw)) {
+    try {
+      const url = new URL(raw);
+      return url.username || url.password || (url.pathname !== "/" && url.pathname !== "") ? null : url.origin;
+    } catch { return null; }
+  }
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(raw)) return null;
+  return `https://${raw.toLowerCase()}`;
+}
+
+/**
+ * The PRIVILEGED staging health contract: the staging-only token header authorises the bounded
+ * internal checks and the mode/run identity the candidate verdict binds to.
+ */
 export async function probePinnedHealth({ origin, token, fetchImpl = fetch }) {
+  if (!token || typeof token !== "string" || !token.trim()) {
+    // Without this, an unset variable is stringified into the header as the literal "undefined",
+    // which the app reads as a PRESENTED token and answers 401 — a configuration mistake wearing
+    // the costume of an authentication failure.
+    throw new Error("a staging health token is required for the privileged staging health probe");
+  }
+  return probeHealthOrigin({ origin, headers: { "x-aios-staging-health-token": token }, fetchImpl, label: "staging" });
+}
+
+/**
+ * The PRODUCTION health contract is a DIFFERENT contract: the ordinary unauthenticated endpoint,
+ * which answers 200 `{ ok, commit }` after its bounded Postgres probe.
+ *
+ * Production has no `STAGING_HEALTH_TOKEN` — it is a staging environment secret — so sending a
+ * staging-shaped header there cannot authenticate anything. It can only turn a healthy production
+ * deployment into a 401 and, through it, report a good release as
+ * `promoted-but-deployment-failed`.
+ */
+export async function probeProductionHealth({ origin, fetchImpl = fetch }) {
+  return probeHealthOrigin({ origin, headers: {}, fetchImpl, label: "production" });
+}
+
+async function probeHealthOrigin({ origin, headers, fetchImpl, label }) {
   const base = new URL(origin);
   const url = new URL("/api/health", base);
-  const response = await fetchImpl(url, {
-    redirect: "manual",
-    headers: { "x-aios-staging-health-token": token },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (response.status >= 300 && response.status < 400) throw new Error("staging health redirected; off-origin redirects are refused");
-  if (response.url && new URL(response.url).origin !== base.origin) throw new Error("staging health final origin changed");
+  const response = await fetchImpl(url, { redirect: "manual", headers, signal: AbortSignal.timeout(10_000) });
+  if (response.status >= 300 && response.status < 400) throw new Error(`${label} health redirected; off-origin redirects are refused`);
+  if (response.url && new URL(response.url).origin !== base.origin) throw new Error(`${label} health final origin changed`);
   const body = await response.json().catch(() => ({}));
   return { ...body, status: response.status, origin: base.origin, finalOrigin: response.url ? new URL(response.url).origin : base.origin };
 }
 
 export const RAILWAY_DEPLOYMENT_QUERY = `query StagingCandidateDeployment($id: String!) {
-  deployment(id: $id) { id status staticUrl meta }
+  deployment(id: $id) { id status staticUrl environmentId serviceId meta }
 }`;
 
-export async function readRailwayDeployment({ deploymentId, token, fetchImpl = fetch }) {
+/**
+ * M3: a deployment ID alone does not identify a STAGING deployment. Without asserting the
+ * environment and service, a deployment of some other service that happens to carry the same commit
+ * satisfies "Railway reports a successful deployment of this commit" — which is precisely the
+ * binding AC-02 exists to make.
+ */
+export async function readRailwayDeployment({ deploymentId, token, environmentId, serviceId, fetchImpl = fetch }) {
+  if (!environmentId || !serviceId) throw new Error("pinned staging environment and service IDs are required to bind candidate deployment evidence");
   const response = await fetchImpl("https://backboard.railway.com/graphql/v2", {
     method: "POST",
     redirect: "error",
@@ -101,12 +150,14 @@ export async function readRailwayDeployment({ deploymentId, token, fetchImpl = f
   if (!response.ok || body.errors?.length) throw new Error(`Railway deployment read failed (${response.status})`);
   const d = body.data?.deployment;
   if (!d || d.id !== deploymentId) throw new Error("Railway returned an unknown deployment");
-  return { id: d.id, status: d.status, url: d.staticUrl ?? null, commitSha: d.meta?.commitHash ?? d.meta?.repoCommit ?? null };
+  if (d.environmentId !== environmentId) throw new Error("candidate deployment belongs to a different Railway environment");
+  if (d.serviceId !== serviceId) throw new Error("candidate deployment belongs to a different Railway service");
+  return { id: d.id, status: d.status, url: normalizeDeploymentOrigin(d.staticUrl), commitSha: d.meta?.commitHash ?? d.meta?.repoCommit ?? null };
 }
 
 export const RAILWAY_PRODUCTION_DEPLOYMENTS_QUERY = `query ProductionDeployments($environmentId: String!, $serviceId: String!) {
   deployments(first: 10, input: { environmentId: $environmentId, serviceId: $serviceId }) {
-    edges { node { id status staticUrl meta } }
+    edges { node { id status staticUrl environmentId serviceId meta } }
   }
 }`;
 
@@ -121,7 +172,9 @@ export async function readLatestProductionDeployment({ environmentId, serviceId,
   if (!response.ok || body.errors?.length) throw new Error(`Railway production deployment read failed (${response.status})`);
   const node = body.data?.deployments?.edges?.[0]?.node;
   if (!node?.id) return null;
-  return { id: node.id, status: node.status, url: node.staticUrl ?? null, commitSha: node.meta?.commitHash ?? node.meta?.repoCommit ?? null };
+  // Same binding as the candidate read: an observation is about THIS service in THIS environment.
+  if (node.environmentId !== environmentId || node.serviceId !== serviceId) throw new Error("Railway returned a production deployment outside the pinned environment/service");
+  return { id: node.id, status: node.status, url: normalizeDeploymentOrigin(node.staticUrl), commitSha: node.meta?.commitHash ?? node.meta?.repoCommit ?? null };
 }
 
 export async function observeProductionDeployment({ expectedSha, readLatest, probeHealth, timeoutMs = 10 * 60_000, intervalMs = 5_000, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
@@ -130,8 +183,11 @@ export async function observeProductionDeployment({ expectedSha, readLatest, pro
   while (now() <= deadline) {
     last = await readLatest();
     if (last?.commitSha === expectedSha && last.status === "SUCCESS") {
-      const health = await probeHealth(last);
+      // A probe that cannot be performed at all (no verifiable domain, transport refusal) is
+      // reported as UNVERIFIED, not as a failed deployment and never as a reason to touch main.
+      const health = await Promise.resolve(probeHealth(last)).catch((error) => ({ status: 0, error: error instanceof Error ? error.message : String(error) }));
       if (health?.status === 200 && health?.ok === true && health?.commit === expectedSha) return { status: "verified", deployment: last, health };
+      if (health?.status === 0) return { status: "promoted-but-deployment-unverified", deployment: last, health };
       if (health?.status >= 400) return { status: "promoted-but-deployment-failed", deployment: last, health };
     }
     if (last?.commitSha === expectedSha && new Set(["FAILED", "CRASHED", "REMOVED"]).has(last.status)) {
@@ -167,6 +223,8 @@ export async function measureCandidate({
   notes,
   copyModeActivated,
   producerIds,
+  /** An operator-configured staging domain, used ONLY when Railway reports none. */
+  verifiedDeploymentDomain,
 }) {
   const encodedTag = encodeURIComponent(tagName);
   const firstRef = await githubRequest("GET", `/repos/${repository}/git/ref/tags/${encodedTag}`);
@@ -209,7 +267,14 @@ export async function measureCandidate({
 
   const finalRef = await githubRequest("GET", `/repos/${repository}/git/ref/tags/${encodedTag}`);
   const origin = new URL(health.origin);
-  const deploymentOrigin = deployment.url ? new URL(deployment.url).origin : origin.origin;
+  // M3: an ABSENT deployment domain is not evidence that the deployment serves the origin we
+  // probed. Substituting the supplied origin turned this check into self-attestation — the probe
+  // proving the value we already told it. Absent means either an independently verified domain
+  // (supplied and matching) or a refusal.
+  const deploymentOrigin = deployment.url ?? normalizeDeploymentOrigin(verifiedDeploymentDomain);
+  if (!deploymentOrigin) {
+    throw new Error("Railway reported no deployment domain and no independently verified staging domain was supplied; refusing to accept the probed origin as its own proof");
+  }
   const facts = {
     tagName,
     tagObjectType: firstRef.object.type,
@@ -293,8 +358,14 @@ async function main() {
     const producerIds = JSON.parse(process.env.RELEASE_PRODUCER_IDS_JSON ?? "{}");
     const measured = await measureCandidate({
       githubRequest: githubRead,
-      railwayRead: (id) => readRailwayDeployment({ deploymentId: id, token: process.env.RAILWAY_STAGING_READ_TOKEN }),
+      railwayRead: (id) => readRailwayDeployment({
+        deploymentId: id,
+        token: process.env.RAILWAY_STAGING_READ_TOKEN,
+        environmentId: process.env.RAILWAY_STAGING_ENVIRONMENT_ID,
+        serviceId: process.env.RAILWAY_STAGING_APP_SERVICE_ID,
+      }),
       healthProbe: () => probePinnedHealth({ origin: process.env.STAGING_ORIGIN, token: process.env.STAGING_HEALTH_TOKEN }),
+      verifiedDeploymentDomain: process.env.STAGING_VERIFIED_DOMAIN,
       repository: process.env.GITHUB_REPOSITORY,
       tagName: process.env.RELEASE_TAG,
       deploymentId: process.env.RELEASE_DEPLOYMENT_ID,
@@ -357,7 +428,14 @@ async function main() {
           serviceId: process.env.RAILWAY_PRODUCTION_APP_SERVICE_ID,
           token: process.env.RAILWAY_PRODUCTION_READ_TOKEN,
         }),
-        probeHealth: (deployment) => probePinnedHealth({ origin: deployment.url ?? process.env.PRODUCTION_ORIGIN, token: process.env.PRODUCTION_HEALTH_TOKEN }),
+        // Production speaks the ORDINARY health contract, not the privileged staging one, and the
+        // same absent-domain rule applies: an unverifiable origin refuses rather than falling back
+        // to whatever the environment claims.
+        probeHealth: (deployment) => {
+          const origin = deployment.url ?? normalizeDeploymentOrigin(process.env.PRODUCTION_VERIFIED_DOMAIN);
+          if (!origin) throw new Error("Railway reported no production deployment domain and no independently verified production domain was supplied");
+          return probeProductionHealth({ origin });
+        },
         timeoutMs: Number(process.env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
       });
       if (mutation.production.status !== "verified") {

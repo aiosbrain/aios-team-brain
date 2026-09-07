@@ -82,4 +82,69 @@ describe("deployment health", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({ ok: false, booted: true, refreshRunId: "run-boot", graph: "readable" });
   });
+
+  it("answers production with the ORDINARY contract, and only that", async () => {
+    // The production contract is the unauthenticated 200 `{ ok, commit }` after a bounded Postgres
+    // probe. It is a different contract from the privileged staging one, and it must stay usable
+    // WITHOUT a staging token — which production does not have, because that token is a staging
+    // environment secret.
+    const response = await healthResponse(new Request("http://brain/api/health"), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState: vi.fn(),
+      probeNeo4j: vi.fn(),
+      env: { RAILWAY_GIT_COMMIT_SHA: "prod-sha" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({ ok: true, commit: "prod-sha" });
+    // No mode, no run identity, no graph state on the public contract.
+    expect(Object.keys(body).sort()).toEqual(["commit", "ok"]);
+  });
+
+  it("rejects a token-shaped header that production could never satisfy", async () => {
+    // A production probe that sent a staging-shaped header would be READ as presenting a token and
+    // answered 401 — turning a healthy release into promoted-but-deployment-failed.
+    const response = await healthResponse(new Request("http://brain/api/health", {
+      headers: { "x-aios-staging-health-token": "undefined" },
+    }), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState: vi.fn(),
+      probeNeo4j: vi.fn(),
+      env: { RAILWAY_GIT_COMMIT_SHA: "prod-sha" },
+    });
+    expect(response.status).toBe(401);
+  });
+});
+
+describe("M1 — an undeclared staging mode fails CLOSED", () => {
+  const token = "t".repeat(32);
+
+  it("refuses readiness on a pinned staging deployment with no declared mode", async () => {
+    // The rollout prerequisite this states: `STAGING_DATA_MODE` must be DECLARED (and read back)
+    // before the fence-capable baseline lands on staging. Undeclared is not "carry on as before" —
+    // it is a refusal, deliberately, because a missing mode check must never enable writes.
+    const response = await healthResponse(new Request("http://brain/api/health", {
+      headers: { "x-aios-staging-health-token": token },
+    }), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState: vi.fn().mockResolvedValue({ mode: "copy-safe-refusal", ready: false, runId: null }),
+      probeNeo4j: vi.fn(),
+      env: { STAGING_HEALTH_TOKEN: token },
+    });
+    expect(response.status).toBe(503);
+  });
+
+  it("serves the declared legacy baseline", async () => {
+    const response = await healthResponse(new Request("http://brain/api/health", {
+      headers: { "x-aios-staging-health-token": token },
+    }), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState: vi.fn().mockResolvedValue({ mode: "legacy-pg-only", ready: true, runId: null }),
+      probeNeo4j: vi.fn(),
+      env: { STAGING_HEALTH_TOKEN: token, RAILWAY_GIT_COMMIT_SHA: "baseline-sha" },
+    });
+    expect(response.status).toBe(200);
+    // Legacy declares no graph readability — that is the mode's whole point.
+    expect(await response.json()).toMatchObject({ ok: true, mode: "legacy-pg-only", graph: "disabled" });
+  });
 });

@@ -67,7 +67,9 @@ flowchart TD
 | `ingestion-tests`     | `pytest -q` inside `ingestion/` — Python ingest pipeline                                                                                                         | Yes           |
 | `staging-paired-refresh` | `npm run test:staging-pair` — isolated Postgres 18/Neo4j pairs, role-separated authenticated object stores, actual exporter/importer CLIs, real Next tier-read oracle, zero-egress spy, and fault/recovery/concurrency cases | Yes |
 
-The paired-refresh job is executable CI evidence and never self-skips in its lane (`STAGING_PAIR_REQUIRED=1`). Live runner networks, schedules, policies and storage are separate activation evidence; a green local/CI harness is not a claim they are provisioned. Main's desired release ruleset remains the exact eleven-context contract in the accepted design; changing that context set requires an explicit policy migration rather than silently editing protection.
+The paired-refresh job is executable CI evidence and never self-skips in its lane: `STAGING_PAIR_REQUIRED=1` makes a missing Docker engine, compose plugin or Node a FAILURE, because "no databases available" and "every assertion held" must not be the same green tick. Live runner networks, schedules, policies and storage are separate activation evidence; a green local/CI harness is not a claim they are provisioned.
+
+Main's desired release ruleset is the **twelve-context** contract in `scripts/staging-ops/main-policy.mjs`: the nine contexts that predate this change, `Staging paired refresh integration`, `Release candidate gate` and `Staging candidate validation`. The paired-refresh lane is REQUIRED, not advisory — a required job that can go red without blocking a release is the same as no job. Changing that context set requires an explicit policy migration rather than silently editing protection.
 
 ### `migration-mirror-nightly.yml` — deletion-observability sweep (nightly, advisory)
 

@@ -60,9 +60,25 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
       incident.add(rel.start); incident.add(rel.end);
     }
   }
+  // MENTIONS is episode→entity provenance, and it is the ONE edge that can pull a node into the
+  // bundle that no retained fact vouches for. Eligibility is therefore stated on the edge itself,
+  // not inherited from `incident`: a generic "start is already incident" test admits an ENTITY start
+  // (an entity becomes incident via any retained fact) and then copies whatever that entity mentions
+  // — including a node in another group. Require: a RETAINED EPISODIC start, an Entity end, and one
+  // non-empty group shared by both.
+  const retainedEpisodeIds = new Set([...retainedEpisodes.values()].map((node) => node.exportId));
+  let excludedIneligibleMentions = 0;
   for (const rel of graph.relationships) {
-    if (rel.type !== "MENTIONS" || !incident.has(rel.start)) continue;
-    if (!original.has(rel.end)) throw new Error("MENTIONS relationship has a dangling endpoint");
+    if (rel.type !== "MENTIONS") continue;
+    if (!retainedEpisodeIds.has(rel.start)) { excludedIneligibleMentions += 1; continue; }
+    const start = original.get(rel.start);
+    const end = original.get(rel.end);
+    if (!end) throw new Error("MENTIONS relationship has a dangling endpoint");
+    if (!end.labels.includes("Entity")) throw new Error(`MENTIONS from ${start?.properties?.name ?? rel.start} does not point at an Entity`);
+    const group = start?.properties?.group_id;
+    if (!group || end.properties?.group_id !== group) {
+      throw new Error(`MENTIONS from ${start?.properties?.name ?? rel.start} crosses group ownership`);
+    }
     relationships.push({ ...rel, properties: cloneProperties(rel.properties) });
     incident.add(rel.end);
   }
@@ -79,7 +95,7 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
     codecVersion: GRAPH_CODEC_VERSION,
     nodes,
     relationships,
-    sanitation: { excludedCommunities, excludedEpisodes, excludedMixedProvenanceFacts, excludedEmptyProvenanceFacts },
+    sanitation: { excludedCommunities, excludedEpisodes, excludedMixedProvenanceFacts, excludedEmptyProvenanceFacts, excludedIneligibleMentions },
   };
 }
 

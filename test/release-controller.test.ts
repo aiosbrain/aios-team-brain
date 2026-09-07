@@ -33,7 +33,7 @@ describe("trusted release controller", () => {
       "Docs drift guard", "Static checks (lint + typecheck)", "Secret scan (gitleaks)",
       "Brain unit tests (vitest)", "Data-mechanics tests (real Postgres)", "Integration tests (HTTP)",
       "Graph Neo4j tier (real Neo4j)", "Ingestion tests (pytest)", "NDA confidentiality gate",
-      "Release candidate gate",
+      "Staging paired refresh integration", "Release candidate gate",
     ].map((name) => [name, 15368]));
     const request = vi.fn(async (_method: string, path: string) => {
       if (path.includes("/git/ref/tags/")) return { object: { type: "tag", sha: tagSha } };
@@ -55,6 +55,32 @@ describe("trusted release controller", () => {
     expect(result.facts.commitSha).toBe(candidate);
     expect(result.facts.expectedMain).toBe("c".repeat(40));
     expect(request.mock.calls.every(([, path]) => !String(path).includes("archive") && !String(path).includes("actions/artifacts"))).toBe(true);
+  });
+
+  it("refuses when Railway reports no deployment domain and none is independently verified", async () => {
+    // Substituting the probed origin for a missing deployment domain makes the probe prove the very
+    // value it was handed — self-attestation, not evidence.
+    const tagSha = "a".repeat(40);
+    const candidate = "b".repeat(40);
+    const request = vi.fn(async (_method: string, path: string) => {
+      if (path.includes("/git/ref/tags/")) return { object: { type: "tag", sha: tagSha } };
+      if (path.includes("/git/tags/")) return { object: { type: "commit", sha: candidate } };
+      if (path.includes("/contents/package.json")) return { encoding: "base64", content: Buffer.from(JSON.stringify({ version: "1.2.3" })).toString("base64") };
+      if (path.includes("/compare/main...")) return { status: "ahead", base_commit: { sha: "c".repeat(40) } };
+      if (path.includes("/compare/")) return { status: "ahead" };
+      if (path.includes("/check-runs")) return { check_runs: [] };
+      throw new Error(`unexpected ${path}`);
+    });
+    const args = {
+      githubRequest: request,
+      railwayRead: vi.fn().mockResolvedValue({ id: "dep", status: "SUCCESS", url: null, commitSha: candidate }),
+      healthProbe: vi.fn().mockResolvedValue({ status: 200, ok: true, origin: "https://staging.example.com", finalOrigin: "https://staging.example.com", commit: candidate, mode: "copy-ready", refreshRunId: "run-1" }),
+      repository: "owner/repo", tagName: "v1.2.3", deploymentId: "dep", requestedMode: "copy-ready",
+      notes: "Validated representative access paths", copyModeActivated: true, producerIds: {},
+    };
+    await expect(measureCandidate(args)).rejects.toThrow(/no independently verified staging domain/);
+    // …and an operator-supplied, independently verified domain is accepted in its place.
+    await expect(measureCandidate({ ...args, verifiedDeploymentDomain: "staging.example.com" })).resolves.toBeTruthy();
   });
 
   it("distinguishes verified, failed and finite unverified production rollout after promotion", async () => {

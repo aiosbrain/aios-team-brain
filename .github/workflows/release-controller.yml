@@ -48,9 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging-release
     steps:
+      # The TRUSTED IMMUTABLE dispatch SHA, not the moving `staging` ref. The `if` above already
+      # pins the dispatch to refs/heads/staging; checking out the branch NAME would then run
+      # whatever landed on it between dispatch and job start, with this environment's App
+      # credentials in scope. Never the candidate tag's tree.
       - uses: actions/checkout@v7
         with:
-          ref: staging
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -78,8 +82,13 @@ jobs:
           RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}
           RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
           RAILWAY_PRODUCTION_APP_SERVICE_ID: ${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}
-          PRODUCTION_ORIGIN: ${{ vars.PRODUCTION_ORIGIN }}
-          PRODUCTION_HEALTH_TOKEN: ${{ secrets.PRODUCTION_HEALTH_TOKEN }}
+          # Bind candidate deployment evidence to the pinned staging service/environment: a
+          # deployment ID alone does not identify a STAGING deployment.
+          RAILWAY_STAGING_ENVIRONMENT_ID: ${{ vars.RAILWAY_STAGING_ENVIRONMENT_ID }}
+          RAILWAY_STAGING_APP_SERVICE_ID: ${{ vars.RAILWAY_STAGING_APP_SERVICE_ID }}
+          # Used ONLY when Railway reports no deployment domain; never as a substitute for one.
+          STAGING_VERIFIED_DOMAIN: ${{ vars.STAGING_VERIFIED_DOMAIN }}
+          PRODUCTION_VERIFIED_DOMAIN: ${{ vars.PRODUCTION_VERIFIED_DOMAIN }}
         run: node scripts/staging-ops/release-controller.mjs --run
       - uses: actions/upload-artifact@v4
         if: always()
@@ -95,9 +104,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging-emergency
     steps:
+      # Same trusted immutable dispatch SHA as the normal job — a break-glass path is exactly where
+      # a moving ref would be worst.
       - uses: actions/checkout@v7
         with:
-          ref: staging
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v7

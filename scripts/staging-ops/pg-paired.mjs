@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pairedDumpArguments, transformedAuthUserProjection, transformedGraphEpisodeProjection } from "./pg-sanitize.mjs";
 import { loadSchema } from "../pg-load-schema.mjs";
@@ -7,6 +8,18 @@ import { SCRUBBED_PG_ENV } from "../staging-refresh-decision.mjs";
 
 const exec = promisify(execFile);
 const SNAPSHOT = /^[0-9A-Fa-f:-]+$/;
+
+/**
+ * Control state that must OUTLIVE a restore, and is therefore excluded from destructive
+ * enumeration (H1). `staging_marker` is deliberately absent from `postgres/schema.sql` and every
+ * migration, so nothing recreates it: neither a production archive (which never contained it) nor
+ * `loadSchema`. A cleanup that drops "all public tables" therefore deletes the discriminator that
+ * `lib/env/staging-marker.ts` reads and `lib/graph/projection-window.ts` uses to refuse
+ * production-shaped projection — and its ABSENCE reads as `false`, not as an error.
+ *
+ * `staging_ops` is a separate schema and is never touched by a `public`-only restore.
+ */
+export const PRESERVED_PUBLIC_TABLES = Object.freeze(["staging_marker"]);
 
 async function run(command, args, options = {}, execImpl = exec) {
   const env = { ...(options.env ?? process.env) };
@@ -35,9 +48,9 @@ export async function capturePairedPostgres({ client, databaseUrl, directory, ex
     await Promise.all([
       run(pgDump, [...pairedDumpArguments(snapshot, archive), databaseUrl], {}, execImpl),
       run(psql, ["-X", "--quiet", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${projection} FROM public.auth_users) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], {}, execImpl)
-        .then(({ stdout }) => import("node:fs/promises").then(({ writeFile }) => writeFile(auth, stdout, { mode: 0o600 }))),
+        .then(({ stdout }) => writeFile(auth, stdout, { mode: 0o600 })),
       run(psql, ["-X", "--quiet", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${graphProjection} FROM public.graph_episodes) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], {}, execImpl)
-        .then(({ stdout }) => import("node:fs/promises").then(({ writeFile }) => writeFile(graphLedger, stdout, { mode: 0o600 }))),
+        .then(({ stdout }) => writeFile(graphLedger, stdout, { mode: 0o600 })),
     ]);
     await client.query("COMMIT");
     return { archive, transformed: { auth_users: auth, graph_episodes: graphLedger }, snapshot, snapshotFacts };
@@ -64,23 +77,244 @@ export async function captureRollbackPostgres({ client, databaseUrl, directory, 
   }
 }
 
+// ── Archive TOC filtering ──────────────────────────────────────────────────────────────────────
+//
+// `pg_restore --clean --section=pre-data` cannot be used: FK drops live in POST-data, so a pre-data
+// clean leaves them behind and the replay fails on dependency errors (measured: 86 of them against
+// PG18). The replacement is an explicit enumerate-and-drop below, which means the archive must no
+// longer be asked to recreate objects that survive — the `public` schema itself, and (for a staging
+// rollback archive) the preserved marker table.
+
+const TOC_ENTRY = /^(\d+);\s+(\d+)\s+(\d+)\s+(.*)$/;
+
+/**
+ * Structurally drop `SCHEMA public` and its COMMENT/ACL entries from a `pg_restore -l` listing, plus
+ * any entry naming a preserved table. Everything else keeps its original order, which is the order
+ * pg_restore depends on.
+ *
+ * @param {string} listing raw `pg_restore --list` output
+ * @param {{ omitTables?: readonly string[] }} options
+ */
+export function filterRestoreList(listing, { omitTables = [] } = {}) {
+  const omitted = [];
+  const kept = [];
+  for (const line of String(listing).split("\n")) {
+    const match = TOC_ENTRY.exec(line.trim());
+    if (!match) { kept.push(line); continue; }
+    const rest = match[4];
+    const isSchemaObject = /^SCHEMA\s+-\s+public\b/.test(rest) || /^(COMMENT|ACL)\s+-\s+SCHEMA\s+public\b/.test(rest);
+    const namesPreserved = omitTables.some((table) => new RegExp(`(?:^|\\s)${escapeRegExp(table)}(?:\\s|$)`).test(rest));
+    if (isSchemaObject || namesPreserved) { omitted.push(rest); continue; }
+    kept.push(line);
+  }
+  return { text: `${kept.join("\n").replace(/\n+$/, "")}\n`, omitted };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function writeFilteredList({ archive, directory, name, omitTables, execImpl, pgRestore }) {
+  const { stdout } = await run(pgRestore, ["--list", archive], {}, execImpl);
+  const filtered = filterRestoreList(stdout, { omitTables });
+  const listPath = path.join(directory, name);
+  await writeFile(listPath, filtered.text, { mode: 0o600 });
+  return { listPath, omitted: filtered.omitted };
+}
+
+// ── Destructive cleanup ────────────────────────────────────────────────────────────────────────
+
+/**
+ * "Not owned by an installed extension." Keyed on (classid, objid) — `objid` alone is only unique
+ * within its catalog, and this predicate is the single thing standing between the cleanup and
+ * dropping an extension's own objects (citext's type, pgvector's operators).
+ */
+const notExtensionOwned = (catalog, oid) =>
+  `NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '${catalog}'::regclass AND d.objid = ${oid} AND d.deptype = 'e')`;
+
+const RELATIONS_SQL = `
+  SELECT c.relname AS name, c.relkind::text AS kind
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relkind::text = ANY($1::text[])
+     AND NOT c.relispartition
+     AND ${notExtensionOwned("pg_class", "c.oid")}
+   ORDER BY c.relname`;
+
+const FUNCTIONS_SQL = `
+  SELECT format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) AS ident,
+         p.prokind::text AS kind
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname = 'public' AND p.prokind IN ('f','p')
+     AND ${notExtensionOwned("pg_proc", "p.oid")}
+   ORDER BY 1`;
+
+const TYPES_SQL = `
+  SELECT format('%I.%I', n.nspname, t.typname) AS ident
+    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+   WHERE n.nspname = 'public' AND t.typtype IN ('e','d')
+     AND ${notExtensionOwned("pg_type", "t.oid")}
+   ORDER BY 1`;
+
+const quoted = (name) => `"${String(name).replaceAll('"', '""')}"`;
+
+/**
+ * Read the preserved marker's exact identity and contents so its survival can be VERIFIED — not
+ * assumed — after the restore. Returns null when the target has no marker (production shape).
+ */
+export async function readMarkerSnapshot(client, table = "staging_marker") {
+  const present = await client.query("SELECT to_regclass($1) IS NOT NULL AS present", [`public.${table}`]);
+  if (present.rows[0]?.present !== true) return null;
+  const rows = await client.query(`SELECT * FROM public.${quoted(table)}`);
+  return { table, rows: rows.rows, columns: rows.fields.map((field) => field.name) };
+}
+
+/**
+ * The bounded destructive step. Runs in ONE transaction on the caller's exclusive-lock-owning
+ * client, drops only the enumerated non-extension `public` application objects, and uses RESTRICT
+ * throughout so a dependency outside that set REFUSES instead of cascading into something the
+ * importer never enumerated (`staging_ops`, extensions, the preserved marker).
+ *
+ * A single quoted DROP TABLE over the WHOLE surviving set is what makes internal FK order a
+ * non-problem: Postgres resolves ordering within one statement.
+ */
+export async function cleanPublicApplicationObjects(client, { preserve = PRESERVED_PUBLIC_TABLES } = {}) {
+  const keep = new Set(preserve);
+  // Explicit boundary before the transaction: a previous injected loader run leaves this session's
+  // own temporary objects behind (migration 20260725180000 creates `temporary view slack_repath`),
+  // and a temp view over an application table blocks the DROP under RESTRICT on the SECOND restore
+  // through the same client. Resolve any failed transaction state first, then discard exactly this
+  // session's temporary namespace — never DISCARD ALL, which would drop the advisory locks the
+  // whole fence depends on.
+  await client.query("ROLLBACK").catch(() => {});
+  await client.query("DISCARD TEMP");
+
+  await client.query("BEGIN");
+  try {
+    const dropped = { views: [], tables: [], sequences: [], functions: [], types: [] };
+
+    const views = (await client.query(RELATIONS_SQL, [["v", "m"]])).rows.filter((row) => !keep.has(row.name));
+    const plainViews = views.filter((row) => row.kind === "v").map((row) => `public.${quoted(row.name)}`);
+    const matViews = views.filter((row) => row.kind === "m").map((row) => `public.${quoted(row.name)}`);
+    if (matViews.length) await client.query(`DROP MATERIALIZED VIEW ${matViews.join(", ")} RESTRICT`);
+    if (plainViews.length) await client.query(`DROP VIEW ${plainViews.join(", ")} RESTRICT`);
+    dropped.views = views.map((row) => row.name);
+
+    const tables = (await client.query(RELATIONS_SQL, [["r", "p", "f"]])).rows.filter((row) => !keep.has(row.name));
+    if (tables.length) await client.query(`DROP TABLE ${tables.map((row) => `public.${quoted(row.name)}`).join(", ")} RESTRICT`);
+    dropped.tables = tables.map((row) => row.name);
+
+    // REQUERY after the tables are gone. A cached inventory taken beforehand still lists the
+    // identity-owned sequences that the table DROP has just removed automatically, and dropping
+    // those again fails the whole transaction.
+    const sequences = (await client.query(RELATIONS_SQL, [["S"]])).rows.filter((row) => !keep.has(row.name));
+    if (sequences.length) await client.query(`DROP SEQUENCE ${sequences.map((row) => `public.${quoted(row.name)}`).join(", ")} RESTRICT`);
+    dropped.sequences = sequences.map((row) => row.name);
+
+    const functions = (await client.query(FUNCTIONS_SQL)).rows;
+    for (const row of functions) await client.query(`DROP ${row.kind === "p" ? "PROCEDURE" : "FUNCTION"} ${row.ident} RESTRICT`);
+    dropped.functions = functions.map((row) => row.ident);
+
+    const types = (await client.query(TYPES_SQL)).rows;
+    if (types.length) await client.query(`DROP TYPE ${types.map((row) => row.ident).join(", ")} RESTRICT`);
+    dropped.types = types.map((row) => row.ident);
+
+    await client.query("COMMIT");
+    return dropped;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * H1 verification: prove the marker survived with its intended contents before anything boots.
+ *
+ * Re-materialisation is a repair of last resort and is gated on INDEPENDENTLY verified staging
+ * identity — the pinned environment/service facts the importer already measures — because planting
+ * a staging marker on a database whose identity is unproven is exactly the failure this
+ * discriminator exists to prevent. A source archive that tries to SUPPLY a marker is rejected
+ * upstream by the TOC filter, so the table is never written from copied data.
+ */
+export async function assertMarkerPreserved(client, snapshot, { verifiedStagingTarget = false } = {}) {
+  if (!snapshot) return { status: "absent-before-restore" };
+  const after = await readMarkerSnapshot(client, snapshot.table);
+  // Row ORDER is not part of the contents: `select *` has no defined order, and a difference in it
+  // is not a difference in what the marker says.
+  const contents = (rows) => rows.map((row) => JSON.stringify(row)).sort().join("\n");
+  if (after) {
+    if (contents(after.rows) !== contents(snapshot.rows)) {
+      throw new Error(`${snapshot.table} survived the restore with different contents; refusing to boot on an ambiguous staging discriminator`);
+    }
+    return { status: "preserved" };
+  }
+  if (!verifiedStagingTarget) {
+    throw new Error(`${snapshot.table} did not survive the restore and this target's staging identity is not independently verified; refusing to create it`);
+  }
+  // Re-materialisation reproduces the ONE shape this repo creates. A marker with any other shape is
+  // reported rather than silently reshaped into something that reads the same but is not the same.
+  if (snapshot.columns.length !== 1 || snapshot.columns[0] !== "note") {
+    throw new Error(`${snapshot.table} has an unrecognised shape (${snapshot.columns.join(", ")}); refusing to re-create it from a guess`);
+  }
+  await client.query(`CREATE TABLE public.${quoted(snapshot.table)}(note text PRIMARY KEY)`);
+  for (const row of snapshot.rows) {
+    await client.query(`INSERT INTO public.${quoted(snapshot.table)}(note) VALUES ($1) ON CONFLICT DO NOTHING`, [row.note ?? ""]);
+  }
+  return { status: "rematerialised" };
+}
+
+// ── Section-wise install ───────────────────────────────────────────────────────────────────────
+
+async function replaceFromArchive({
+  client, databaseUrl, archive, directory, listName, omitTables,
+  execImpl, pgRestore, betweenDataAndPostData, verifiedStagingTarget,
+}) {
+  const marker = await readMarkerSnapshot(client);
+  const { listPath } = await writeFilteredList({ archive, directory, name: listName, omitTables, execImpl, pgRestore });
+  await cleanPublicApplicationObjects(client);
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=pre-data", "--dbname", databaseUrl, archive], {}, execImpl);
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=data", "--dbname", databaseUrl, archive], {}, execImpl);
+  if (betweenDataAndPostData) await betweenDataAndPostData();
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=post-data", "--dbname", databaseUrl, archive], {}, execImpl);
+  return assertMarkerPreserved(client, marker, { verifiedStagingTarget });
+}
+
 /** Section-wise install. The caller owns an exclusive lock on this exact connected client. */
-export async function restorePairedPostgres({ client, databaseUrl, directory, cwd = process.cwd(), env = process.env, execImpl, pgRestore = "pg_restore", psql = "psql" }) {
+export async function restorePairedPostgres({
+  client, databaseUrl, directory, cwd = process.cwd(), env = process.env,
+  execImpl, pgRestore = "pg_restore", psql = "psql", verifiedStagingTarget = false,
+}) {
   const archive = path.join(directory, "postgres.dump");
   const auth = path.join(directory, "auth_users.csv");
   const graphLedger = path.join(directory, "graph_episodes.csv");
-  await run(pgRestore, ["--clean", "--if-exists", "--section=pre-data", "--dbname", databaseUrl, archive], {}, execImpl);
-  await run(pgRestore, ["--section=data", "--dbname", databaseUrl, archive], {}, execImpl);
-  await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], {}, execImpl);
-  await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], {}, execImpl);
-  await run(pgRestore, ["--section=post-data", "--dbname", databaseUrl, archive], {}, execImpl);
+  const marker = await replaceFromArchive({
+    client, databaseUrl, archive, directory, listName: "restore.list",
+    // A SOURCE archive never legitimately contains the staging marker. Filtering it is belt and
+    // braces against a bundle that tries to supply one; the values themselves are never trusted.
+    omitTables: PRESERVED_PUBLIC_TABLES,
+    execImpl, pgRestore, verifiedStagingTarget,
+    betweenDataAndPostData: async () => {
+      // Projected data must land BEFORE post-data FK constraints, on the same target.
+      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], {}, execImpl);
+      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], {}, execImpl);
+    },
+  });
   await loadSchema({ cwd, databaseUrl, env: { ...env, STAGING_DATA_MODE: "copy-ready" }, connectedClient: client });
+  return { marker };
 }
 
-export async function restoreRollbackPostgres({ client, databaseUrl, directory, cwd = process.cwd(), env = process.env, execImpl, pgRestore = "pg_restore" }) {
+export async function restoreRollbackPostgres({
+  client, databaseUrl, directory, cwd = process.cwd(), env = process.env,
+  execImpl, pgRestore = "pg_restore", verifiedStagingTarget = false,
+}) {
   const archive = path.join(directory, "postgres.dump");
-  await run(pgRestore, ["--clean", "--if-exists", "--section=pre-data", "--dbname", databaseUrl, archive], {}, execImpl);
-  await run(pgRestore, ["--section=data", "--dbname", databaseUrl, archive], {}, execImpl);
-  await run(pgRestore, ["--section=post-data", "--dbname", databaseUrl, archive], {}, execImpl);
+  const marker = await replaceFromArchive({
+    client, databaseUrl, archive, directory, listName: "rollback.list",
+    // A ROLLBACK archive IS a staging dump, so it does contain the marker. One policy for both
+    // paths: the LIVE marker is the preserved object and the archive's copy is structurally
+    // omitted, so the restore can neither duplicate it nor clean it.
+    omitTables: PRESERVED_PUBLIC_TABLES,
+    execImpl, pgRestore, verifiedStagingTarget,
+  });
   await loadSchema({ cwd, databaseUrl, env: { ...env, STAGING_DATA_MODE: env.STAGING_DATA_MODE ?? "copy-ready" }, connectedClient: client });
+  return { marker };
 }

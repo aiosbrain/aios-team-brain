@@ -46,4 +46,15 @@ describe("paired refresh isolated harness", () => {
     expect(harness).toContain("kill-reader-lock");
     expect(harness).toContain("concurrent-a.log");
   });
+  it("turns a missing engine into a FAILURE in the required lane, never a quiet pass", () => {
+    // "Docker is not installed" and "every assertion held" must not be the same green tick.
+    expect(harness).toContain('if [[ "${STAGING_PAIR_REQUIRED:-}" == "1" ]]; then');
+    expect(harness).toContain("docker compose version");
+    expect(harness).toContain("docker info");
+    const ci = readFileSync(".github/workflows/ci.yml", "utf8");
+    const job = ci.slice(ci.indexOf("  staging-paired-refresh:"), ci.indexOf("  ingestion-tests:"));
+    expect(job).toContain('STAGING_PAIR_REQUIRED: "1"');
+    expect(job).toContain("npm ci");
+    expect(job).toContain("actions/setup-node");
+  });
 });

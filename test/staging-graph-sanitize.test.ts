@@ -42,3 +42,49 @@ describe("graph sanitation", () => {
     }, { episodeAllowed: () => true })).toThrow(/group/i);
   });
 });
+
+describe("M5 — MENTIONS eligibility is stated on the edge, not inherited", () => {
+  const crossGroupEntity = { exportId: "x", labels: ["Entity"], properties: { uuid: "x", name: "Other team entity", group_id: "private" } };
+
+  it("copies a MENTIONS whose start is a retained episode in the same group", () => {
+    const out = sanitizeGraphExport(graph, { episodeAllowed: (ep) => ep.properties.uuid === "ep-ok" });
+    expect(out.relationships.filter((r) => r.type === "MENTIONS")).toHaveLength(1);
+    expect(out.nodes.map((n) => n.exportId)).toContain("a");
+  });
+
+  it("does not let an ENTITY-rooted MENTIONS pull a node from another group into the bundle", () => {
+    // The defect: `incident` accumulates the endpoints of every retained FACT, so an Entity became
+    // "incident" and an `incident.has(rel.start)` test admitted an Entity-rooted MENTIONS — copying
+    // whatever that entity mentioned, including a node owned by a different group.
+    const out = sanitizeGraphExport({
+      nodes: [...graph.nodes, crossGroupEntity],
+      relationships: [graph.relationships[0], { type: "MENTIONS", start: "a", end: "x", properties: {} }],
+    }, { episodeAllowed: (ep) => ep.properties.uuid === "ep-ok" });
+    expect(out.nodes.map((n) => n.exportId)).not.toContain("x");
+    expect(out.relationships.some((r) => r.type === "MENTIONS" && r.end === "x")).toBe(false);
+    expect(out.sanitation.excludedIneligibleMentions).toBe(1);
+  });
+
+  it("refuses when a retained EPISODE mentions an entity owned by a different group", () => {
+    expect(() => sanitizeGraphExport({
+      nodes: [...graph.nodes, crossGroupEntity],
+      relationships: [graph.relationships[0], { type: "MENTIONS", start: "ep-ok", end: "x", properties: {} }],
+    }, { episodeAllowed: (ep) => ep.properties.uuid === "ep-ok" })).toThrow(/crosses group ownership/);
+  });
+
+  it("counts an ineligible MENTIONS whose start is simply not a retained episode", () => {
+    const out = sanitizeGraphExport({
+      nodes: graph.nodes,
+      relationships: [graph.relationships[0], { type: "MENTIONS", start: "ep-secret", end: "a", properties: {} }],
+    }, { episodeAllowed: (ep) => ep.properties.uuid === "ep-ok" });
+    expect(out.relationships.filter((r) => r.type === "MENTIONS")).toHaveLength(0);
+    expect(out.sanitation.excludedIneligibleMentions).toBe(1);
+  });
+
+  it("refuses a MENTIONS that points at something other than an Entity", () => {
+    expect(() => sanitizeGraphExport({
+      nodes: graph.nodes,
+      relationships: [graph.relationships[0], { type: "MENTIONS", start: "ep-ok", end: "ep-secret", properties: {} }],
+    }, { episodeAllowed: (ep) => ep.properties.uuid === "ep-ok" })).toThrow(/does not point at an Entity/);
+  });
+});

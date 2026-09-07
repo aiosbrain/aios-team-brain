@@ -15,6 +15,7 @@ import {
   appendMessage,
 } from "@/lib/chat/store";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 import { runAnswerTurn } from "@/lib/query/stream-persist";
 import { createRun } from "@/lib/query/turn-runs";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
@@ -146,6 +147,19 @@ export async function POST(req: NextRequest) {
       return errorResponse("rate_limited", "2 scrapes/min per member — try again shortly", 429);
     }
     return syncResponse(db, team.id, me.id);
+  }
+
+  // AC-07 (M9): the same explicit disabled outcome the API route returns, in the same position —
+  // after session auth, membership and posture are resolved (so it leaks nothing to a stranger),
+  // and before the rate-limit/daily-quota reads and the `query_log` insert (so a disabled feature
+  // does not spend the member's budget). Placed after the `/sync` branch so the non-LLM scrape
+  // command keeps its own existing tier and rate rules.
+  if (!copiedStagingSpendAllowed("interactive-query")) {
+    return errorResponse(
+      "answering_disabled",
+      "this deployment is a copied staging environment: model-backed answering is disabled; graph-backed and full-text reads remain available",
+      503,
+    );
   }
 
   if (!(await rateLimit(db, `${me.id}:query`, 10))) {

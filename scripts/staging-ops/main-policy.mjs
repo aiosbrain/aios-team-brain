@@ -1,4 +1,12 @@
-/** The nine contexts measured before this change, plus the two release-specific contexts. */
+/**
+ * The nine contexts measured before this change, the paired-refresh integration job this change
+ * ADDS, and the two release-specific contexts.
+ *
+ * M6: `Staging paired refresh integration` is the required lane for the export→import→application-
+ * read outcomes (AC-08). Shipping the CI job while leaving it out of the desired main policy would
+ * have made it a job that can go red without blocking a release — which is the same as not
+ * requiring it.
+ */
 export const REQUIRED_MAIN_CONTEXTS = Object.freeze([
   "Docs drift guard",
   "Static checks (lint + typecheck)",
@@ -9,9 +17,13 @@ export const REQUIRED_MAIN_CONTEXTS = Object.freeze([
   "Graph Neo4j tier (real Neo4j)",
   "Ingestion tests (pytest)",
   "NDA confidentiality gate",
+  "Staging paired refresh integration",
   "Release candidate gate",
   "Staging candidate validation",
 ]);
+
+/** The nine that predate this change — preserved, never replaced (AC-03 "migration of enforcement"). */
+export const PRE_EXISTING_MAIN_CONTEXTS = Object.freeze(REQUIRED_MAIN_CONTEXTS.slice(0, 9));
 
 const integrationBypass = (actorId) => ({ actor_type: "Integration", actor_id: actorId, bypass_mode: "always" });
 const mainOnly = { ref_name: { include: ["refs/heads/main"], exclude: [] } };

@@ -74,6 +74,16 @@ journal ready. The app/startup fence holds a shared form of the same lock. Durab
 authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
 deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
 
+**Graph identity in a copied staging is `(group_id, uuid)`, never `uuid` alone.** The replay installs
+an allowlisted schema of composite RANGE indexes and declares NO uniqueness constraint: the same UUID
+legitimately exists in more than one group, and a global unique constraint on `uuid` would either
+refuse a valid copy or merge two groups' nodes into one — a tier leak wearing a schema's clothes.
+Relationships are reconnected through a TEMPORARY indexed label (`__AiosImport` /
+`__aios_import_id`) that is created with that schema, awaited, and removed in every outcome, so
+export-local identity never becomes a property of the copied dataset. The internal build-metadata
+route (`GET /api/internal/staging-build-metadata`) is how the exporter learns the deployed source
+build's declared migration-set identity; it is token-authenticated and returns no data.
+
 `config/staging-ops/schedules.json` records the concrete but disabled service, schedule, retention,
 and least-privilege storage contract. `compose.test.staging-pair.yml` is its executable local model:
 separate role networks and key mounts, SigV4-verified object-store ACLs, exact Postgres 18/Neo4j
@@ -1346,6 +1356,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 <!-- drift:routes -->
 
 - `GET /api/health` — bounded public Postgres readiness; authenticated copied-staging Postgres/Neo4j/run evidence and boot probe
+- `GET /api/internal/staging-build-metadata` — token-authenticated declared build identity (deployed commit + migration-set hash) for the staging paired-refresh exporter
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
 - `POST /api/internal/executor-gateway/v1/authorize-and-redeem` — exact-call policy decision and post-audit request-local PAT sealing
 - `POST /api/internal/executor-gateway/v1/record-outcome` — idempotent execution settlement with one immutable outcome audit

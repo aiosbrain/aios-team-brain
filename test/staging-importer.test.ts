@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
-import { verifyAndPinSourceBundle, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
+import { assertReplayableGraph, verifyAndPinSourceBundle, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
 import { PrivateFileStore } from "../scripts/staging-ops/private-store.mjs";
 
 const roots: string[] = [];
@@ -29,5 +29,32 @@ describe("staging importer bundle boundary", () => {
     const opened = await verifyAndPinSourceBundle({ objectId, sourceStore: new PrivateFileStore({ root: sourceRoot, role: "source-reader" }), rollbackStore: new PrivateFileStore({ root: rollbackRoot, role: "rollback-owner" }), env: { EXPORTER_SIGNING_PUBLIC_KEY: sign.publicKey, IMPORTER_ENCRYPTION_PRIVATE_KEY: enc.privateKey } });
     expect(opened.manifest.runId).toBe("run-1");
     expect((await new PrivateFileStore({ root: rollbackRoot, role: "rollback-owner" }).read(objectId)).length).toBeGreaterThan(0);
+  });
+});
+
+describe("M2 — the bootstrap checkpoint is proven replayable before it is trusted", () => {
+  const replayable = {
+    codecVersion: 1,
+    nodes: [
+      { exportId: "e", labels: ["Episodic"], properties: { uuid: "e", name: "items:x", group_id: "g", created_at: { $neo4j: "DateTime", fields: { year: 2026, month: 9, day: 1, hour: 0, minute: 0, second: 0, nanosecond: 0, timeZoneOffsetSeconds: 0 } } } },
+      { exportId: "a", labels: ["Entity"], properties: { uuid: "a", group_id: "g", big: { $neo4j: "Integer", value: "9007199254740993" } } },
+    ],
+    relationships: [{ start: "e", end: "a", type: "MENTIONS", properties: {} }],
+  };
+
+  it("accepts a capture whose every property decodes through the codec the restore will use", () => {
+    // "It dumped without error" is not proof. This checkpoint is the only thing between a failed
+    // first import and an unrecoverable staging, so it is exercised while the original data is
+    // still in place and nothing has been touched.
+    expect(assertReplayableGraph(replayable)).toEqual({ nodes: 2, relationships: 1 });
+  });
+
+  it.each([
+    ["an unsupported codec version", { ...replayable, codecVersion: 99 }, /unsupported graph codec version 99/],
+    ["a dangling relationship endpoint", { ...replayable, relationships: [{ start: "e", end: "missing", type: "MENTIONS", properties: {} }] }, /dangling endpoint/],
+    ["an unsupported label", { ...replayable, nodes: [{ exportId: "z", labels: ["Mystery"], properties: {} }], relationships: [] }, /unsupported graph node label/],
+    ["a property tag the codec cannot decode", { ...replayable, nodes: [{ exportId: "z", labels: ["Entity"], properties: { odd: { $neo4j: "Quaternion", fields: {} } } }], relationships: [] }, /unsupported Neo4j codec tag/],
+  ])("refuses %s rather than sealing an unrestorable checkpoint", (_label, graph, message) => {
+    expect(() => assertReplayableGraph(graph)).toThrow(message as RegExp);
   });
 });
