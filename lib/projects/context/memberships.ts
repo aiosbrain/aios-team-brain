@@ -189,7 +189,7 @@ export async function ensureIncludeMembershipLocked(
     context.session.db,
     context.teamId,
     args.projectId,
-    (unit as { audience: string }).audience
+    context.item.access
   );
   if (!gate.ok) return gate;
 

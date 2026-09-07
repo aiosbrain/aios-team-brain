@@ -16,6 +16,7 @@ import {
   systemProjectIds,
 } from "@/lib/projects/context/reconcile-item";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
+import { selectCandidateItemIds } from "@/lib/projects/context/backfill-candidates";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
 import {
   closeMembershipInto,
@@ -842,10 +843,37 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     const seed = await seedTeam();
     const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
     const firstRows = [
-      { row_key: "A13-A", title: "A", status: "in_progress" },
-      { row_key: "A13-B", title: "B", status: "in_progress" },
+      {
+        row_key: "A13-A",
+        title: "first-A",
+        status: "in_progress",
+        pm_provider: "linear",
+        pm_external_id: "A13-FIRST-A",
+      },
+      {
+        row_key: "A13-B",
+        title: "first-B",
+        status: "in_progress",
+        pm_provider: "linear",
+        pm_external_id: "A13-FIRST-B",
+      },
     ];
-    const secondRows = [...firstRows].reverse();
+    const secondRows = [
+      {
+        row_key: "A13-B",
+        title: "second-B",
+        status: "in_progress",
+        pm_provider: "linear",
+        pm_external_id: "A13-SECOND-B",
+      },
+      {
+        row_key: "A13-A",
+        title: "second-A",
+        status: "in_progress",
+        pm_provider: "linear",
+        pm_external_id: "A13-SECOND-A",
+      },
+    ];
     const bothArrived = deferred();
     let arrivals = 0;
     let synchronize = true;
@@ -896,6 +924,60 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     expect(Math.min(...attempts)).toBe(1);
     expect(Math.max(...attempts), "retry budget is at most two total attempts").toBeLessThanOrEqual(2);
 
+    // The deadlock victim retries after the other transaction commits, so its distinct row payload
+    // is the final serialized winner. This checks both materializers, not only the item envelope.
+    const committedIndex = attempts[0] === 2 ? 0 : 1;
+    const winner = committedIndex === 0 ? firstRows : secondRows;
+    const expectedByKey = new Map(winner.map((row) => [row.row_key, row]));
+    const taskRead = await db()
+      .from("tasks")
+      .select("id, source_item_id, row_key, title, status")
+      .eq("team_id", seed.teamId)
+      .eq("project_id", outcomes[0].projectId)
+      .order("row_key", { ascending: true });
+    expect(taskRead.error).toBeNull();
+    const tasks = (taskRead.data ?? []) as {
+      id: string;
+      source_item_id: string;
+      row_key: string;
+      title: string;
+      status: string;
+    }[];
+    expect(tasks).toHaveLength(2);
+    for (const task of tasks) {
+      expect(task).toMatchObject({
+        source_item_id: outcomes[committedIndex].id,
+        row_key: task.row_key,
+        title: expectedByKey.get(task.row_key)?.title,
+        status: "in_progress",
+      });
+    }
+    const linkRead = await db()
+      .from("task_pm_links")
+      .select("task_id, row_key, provider, provider_external_id, declared_external_id")
+      .eq("team_id", seed.teamId)
+      .eq("project_id", outcomes[0].projectId)
+      .order("row_key", { ascending: true });
+    expect(linkRead.error).toBeNull();
+    const links = (linkRead.data ?? []) as {
+      task_id: string;
+      row_key: string;
+      provider: string;
+      provider_external_id: string;
+      declared_external_id: string | null;
+    }[];
+    expect(links).toHaveLength(2);
+    for (const link of links) {
+      const expected = expectedByKey.get(link.row_key);
+      const task = tasks.find((candidate) => candidate.row_key === link.row_key);
+      expect(link).toMatchObject({
+        task_id: task?.id,
+        provider: "linear",
+        provider_external_id: expected?.pm_external_id,
+        declared_external_id: expected?.pm_external_id,
+      });
+    }
+
     const { data: items } = await db()
       .from("items")
       .select("id")
@@ -908,6 +990,125 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
         .select("id")
         .eq("item_id", item.id);
       expect(versions ?? []).toHaveLength(1);
+    }
+  });
+
+  it("A13-FR1 G5: two post-link 40P01 injections exhaust retry budget and roll back task/link DML", async () => {
+    const seed = await seedTeam();
+    const suffix = randomUUID().slice(0, 8);
+    const projectSlug = `auditfix13-retry-budget-${suffix}`;
+    const path = `terminal-${suffix}.md`;
+    const rowKey = `A13-TERMINAL-${suffix}`;
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    let attempts = 0;
+    let taskWrites = 0;
+    let linkWrites = 0;
+    let injections = 0;
+    const faulted = new PgClient({
+      decorateSessionExecutor: (execute) => {
+        attempts++;
+        let injectedThisAttempt = false;
+        return async <T>(text: string, params: unknown[] = []) => {
+          const result = await execute<T>(text, params);
+          const normalized = text.replace(/\s+/g, " ").trim();
+          if (/^INSERT INTO tasks /i.test(normalized) && result.rowCount === 1) taskWrites++;
+          if (/^INSERT INTO task_pm_links /i.test(normalized) && result.rowCount === 1) {
+            linkWrites++;
+            if (!injectedThisAttempt) {
+              injectedThisAttempt = true;
+              injections++;
+              // Explicit SQLSTATE injection for terminal retry-budget coverage. The preceding test
+              // independently retains the real two-session wait-graph deadlock reproduction.
+              await execute(`do $a13$
+                begin
+                  raise exception 'A13-FR1 injected 40P01 after task and PM-link writes'
+                    using errcode = '40P01';
+                end
+              $a13$`);
+            }
+          }
+          return result;
+        };
+      },
+    });
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    try {
+      const beforeAudit = await observer.query<{ count: string }>(
+        "select count(*)::text as count from audit_log where team_id = $1",
+        [seed.teamId]
+      );
+      const body = "terminal retry budget body";
+      const outcome = await attempt(() =>
+        ingestItem(
+          faulted,
+          auth,
+          {
+            project: projectSlug,
+            kind: "task",
+            actor: "auditfix13-test",
+            frontmatter: {},
+            path,
+            body,
+            content_sha256: sha(body),
+            rows: [
+              {
+                row_key: rowKey,
+                title: "must roll back",
+                status: "in_progress",
+                pm_provider: "linear",
+                pm_external_id: `LINEAR-${suffix}`,
+              },
+            ],
+          } as IngestPayload,
+          "team"
+        )
+      );
+
+      expect(attempts, "40P01 permits exactly one whole-operation retry").toBe(2);
+      expect(injections, "both attempts reached the labeled retryable SQLSTATE injection").toBe(2);
+      expect(taskWrites, "each attempt completed real task DML before failing").toBe(2);
+      expect(linkWrites, "each attempt completed real PM-link DML before failing").toBe(2);
+      expect(outcome.result).toBeNull();
+      expect(outcome.error).toMatch(/A13-FR1 injected 40P01 after task and PM-link writes/i);
+
+      const project = await observer.query<{ id: string }>(
+        "select id from projects where team_id = $1 and slug = $2",
+        [seed.teamId, projectSlug]
+      );
+      expect(project.rowCount, "the pre-transaction source project setup actually ran").toBe(1);
+      const projectId = project.rows[0].id;
+      const items = await observer.query<{ id: string }>(
+        "select id from items where team_id = $1 and project_id = $2 and path = $3",
+        [seed.teamId, projectId, path]
+      );
+      const versions = await observer.query<{ id: string }>(
+        `select v.id from item_versions v
+          join items i on i.id = v.item_id
+         where i.team_id = $1 and i.project_id = $2 and i.path = $3`,
+        [seed.teamId, projectId, path]
+      );
+      const tasks = await observer.query<{ id: string }>(
+        "select id from tasks where team_id = $1 and project_id = $2 and row_key = $3",
+        [seed.teamId, projectId, rowKey]
+      );
+      const links = await observer.query<{ id: string }>(
+        "select id from task_pm_links where team_id = $1 and project_id = $2 and row_key = $3",
+        [seed.teamId, projectId, rowKey]
+      );
+      const afterAudit = await observer.query<{ count: string }>(
+        "select count(*)::text as count from audit_log where team_id = $1",
+        [seed.teamId]
+      );
+      expect(items.rows, "terminal failure leaves no item/body state").toEqual([]);
+      expect(versions.rows, "terminal failure leaves no version state").toEqual([]);
+      expect(tasks.rows, "terminal failure rolls back task materialization").toEqual([]);
+      expect(links.rows, "terminal failure rolls back PM-link materialization").toEqual([]);
+      expect(afterAudit.rows[0]?.count, "no success audit/postcommit effect is manufactured").toBe(
+        beforeAudit.rows[0]?.count
+      );
+    } finally {
+      await observer.end();
     }
   });
 
@@ -995,6 +1196,81 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       );
       expect(afterRollback.rows, "both successful INSERTs are absent after ok:false rollback").toEqual([]);
     } finally {
+      await observer.end();
+    }
+  });
+
+  it("A13-FR1 F2: native multirow single error rejects ignored callback success and rolls back SQL", async () => {
+    const seed = await seedTeam();
+    const suffix = randomUUID().slice(0, 8);
+    const boundSlugs = [`a13-native-bound-a-${suffix}`, `a13-native-bound-b-${suffix}`];
+    const unboundSlugs = [`a13-native-unbound-a-${suffix}`, `a13-native-unbound-b-${suffix}`];
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    let actualReturnedRows = 0;
+    let callbackSawError: string | null = null;
+    let callbackReturnedSuccess = false;
+    const capable = new PgClient({
+      // Pass through the real result. This observes that PostgreSQL inserted and returned both rows;
+      // the adapter's native .single() cardinality conversion is the only source of the envelope.
+      decorateSessionExecutor: (execute) => async <T>(text: string, params: unknown[] = []) => {
+        const result = await execute<T>(text, params);
+        if (
+          /^INSERT INTO projects /i.test(text.trim()) &&
+          boundSlugs.every((slug) => params.includes(slug))
+        ) {
+          actualReturnedRows = result.rows.length;
+          expect(result.rowCount).toBe(2);
+        }
+        return result;
+      },
+    });
+    await observer.connect();
+    try {
+      // The same native envelope remains a non-throwing public result outside a transaction.
+      const unbound = await db()
+        .from("projects")
+        .insert(unboundSlugs.map((slug) => ({ team_id: seed.teamId, slug })))
+        .select("id")
+        .single();
+      expect(unbound.data).toBeNull();
+      expect(unbound.error?.message).toMatch(/multiple rows returned/i);
+      const unboundVisible = await observer.query<{ slug: string }>(
+        "select slug from projects where team_id = $1 and slug = any($2::text[])",
+        [seed.teamId, unboundSlugs]
+      );
+      expect(unboundVisible.rows.map((row) => row.slug).sort()).toEqual([...unboundSlugs].sort());
+
+      const outcome = await attempt(() =>
+        capable.transaction(async (session) => {
+          const native = await session.db
+            .from("projects")
+            .insert(boundSlugs.map((slug) => ({ team_id: seed.teamId, slug })))
+            .select("id")
+            .single();
+          callbackSawError = native.error?.message ?? null;
+          expect(native.data).toBeNull();
+          expect(callbackSawError).toMatch(/multiple rows returned/i);
+          callbackReturnedSuccess = true;
+          // Deliberately ignore the returned error. The transaction boundary must still reject it.
+          return { ok: true as const };
+        })
+      );
+
+      expect(actualReturnedRows, "the bound INSERT returned two real rows before .single() validation").toBe(2);
+      expect(callbackReturnedSuccess).toBe(true);
+      expect(callbackSawError).toMatch(/multiple rows returned/i);
+      expect.soft(outcome.result, "ignored native error cannot manufacture callback success").toBeNull();
+      expect.soft(String(outcome.error)).toMatch(/multiple rows returned/i);
+      const boundVisible = await observer.query<{ slug: string }>(
+        "select slug from projects where team_id = $1 and slug = any($2::text[])",
+        [seed.teamId, boundSlugs]
+      );
+      expect(boundVisible.rows, "a third connection sees neither row after rejected success").toEqual([]);
+    } finally {
+      await observer.query(
+        "delete from projects where team_id = $1 and slug = any($2::text[])",
+        [seed.teamId, [...boundSlugs, ...unboundSlugs]]
+      ).catch(() => undefined);
       await observer.end();
     }
   });
@@ -1528,6 +1804,144 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     expect(wrongSlug.error).toMatch(/system project read failed/);
   });
 
+  it("A13-FR1 F1: public include gates stale mirrors from locked item authority in both directions", async () => {
+    const fixture = await seedConvergedExternalItem("auditfix13/stale-public-writer-team.md");
+    const narrowed = await ingestItem(
+      db(),
+      fixture.auth,
+      fixture.original,
+      "team",
+      undefined,
+      "team"
+    );
+    expect(narrowed.status).toBe("unchanged");
+    const teamUnitId = await unitIdFor(fixture.seed, fixture.itemId);
+
+    // Plant only the historical mirror drift under test. The locked item remains authoritative.
+    const teamDrift = await db()
+      .from("project_context_units")
+      .update({ audience: "external" })
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", teamUnitId);
+    expect(teamDrift.error).toBeNull();
+    expect(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        fixture.itemId
+      ),
+      "team item has no independent external read path before the public writer"
+    ).toBe(false);
+
+    const teamResult = await ensureIncludeMembership(db(), fixture.seed.teamId, {
+      projectId: fixture.system.externalShared,
+      contextUnitId: teamUnitId,
+    });
+    expect.soft(teamResult).toMatchObject({
+      ok: false,
+      refused: true,
+      refusalReason: "no-widening",
+    });
+    const teamMembership = await db()
+      .from("project_context_memberships")
+      .select("id")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("project_id", fixture.system.externalShared)
+      .eq("context_unit_id", teamUnitId)
+      .eq("decision", "include")
+      .is("valid_to", null);
+    expect.soft(teamMembership.error).toBeNull();
+    expect.soft(teamMembership.data ?? [], "the stale unit cannot manufacture external inclusion").toEqual([]);
+    const teamItem = await db()
+      .from("items")
+      .select("access")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", fixture.itemId)
+      .single();
+    expect.soft(teamItem.data?.access).toBe("team");
+    expect.soft(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        fixture.itemId
+      ),
+      "the external-only oracle remains denied after the refused include"
+    ).toBe(false);
+
+    const reverseBody = "external authority with a stale team mirror";
+    const reverseCreated = await ingestItem(
+      db(),
+      fixture.auth,
+      {
+        ...fixture.original,
+        path: "auditfix13/stale-public-writer-external.md",
+        body: reverseBody,
+        content_sha256: sha(reverseBody),
+      },
+      "external",
+      undefined,
+      "team"
+    );
+    expect(reverseCreated.status).toBe("created");
+    const reversePlacement = await reconcileItemContext(
+      db(),
+      fixture.seed.teamId,
+      reverseCreated.id
+    );
+    expect(reversePlacement.ok, "positive control has explicit context placement").toBe(true);
+    expect(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        reverseCreated.id
+      ),
+      "positive control: the same external principal can read valid external content"
+    ).toBe(true);
+    const reverseUnitId = await unitIdFor(fixture.seed, reverseCreated.id);
+    const closed = await db()
+      .from("project_context_memberships")
+      .update({ valid_to: new Date().toISOString() })
+      .eq("team_id", fixture.seed.teamId)
+      .eq("project_id", fixture.system.externalShared)
+      .eq("context_unit_id", reverseUnitId)
+      .is("valid_to", null);
+    expect(closed.error).toBeNull();
+    const reverseDrift = await db()
+      .from("project_context_units")
+      .update({ audience: "team" })
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", reverseUnitId);
+    expect(reverseDrift.error).toBeNull();
+    expect(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        reverseCreated.id
+      )
+    ).toBe(false);
+
+    const reverseResult = await ensureIncludeMembership(db(), fixture.seed.teamId, {
+      projectId: fixture.system.externalShared,
+      contextUnitId: reverseUnitId,
+    });
+    expect.soft(reverseResult).toMatchObject({ ok: true, created: true });
+    const reverseItem = await db()
+      .from("items")
+      .select("access")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", reverseCreated.id)
+      .single();
+    expect.soft(reverseItem.data?.access).toBe("external");
+    expect.soft(
+      await canSeeItem(
+        db(),
+        { teamId: fixture.seed.teamId, memberId: fixture.externalViewerId },
+        reverseCreated.id
+      ),
+      "reverse stale mirror follows external item authority rather than a blanket refusal"
+    ).toBe(true);
+  });
+
   it("A13-11: standalone unit/membership entry points share one item lock without recursive checkout", async () => {
     const fixture = await seedConvergedExternalItem("auditfix13/standalone-entrypoints.md");
     const unitId = await unitIdFor(fixture.seed, fixture.itemId);
@@ -1551,6 +1965,163 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
     expect(close.ok).toBe(true);
     if (close.ok) expect(close.closed).toBe(0);
   });
+
+  it.each([
+    { operation: "reconcileItemContext" as const },
+    { operation: "reconcileItemUnit" as const },
+    { operation: "ensureIncludeMembership" as const },
+    { operation: "closeMembershipInto" as const },
+  ])(
+    "A13-FR1 G4: $operation blocks on item authority and uses one checkout",
+    async ({ operation }) => {
+      const fixture = await seedConvergedExternalItem(
+        `auditfix13/standalone-contention-${operation}.md`
+      );
+      const unitId = await unitIdFor(fixture.seed, fixture.itemId);
+      if (operation === "reconcileItemContext" || operation === "reconcileItemUnit") {
+        const drift = await db()
+          .from("project_context_units")
+          .update({ audience: "team" })
+          .eq("team_id", fixture.seed.teamId)
+          .eq("id", unitId);
+        expect(drift.error).toBeNull();
+      } else if (operation === "ensureIncludeMembership") {
+        const close = await db()
+          .from("project_context_memberships")
+          .update({ valid_to: new Date().toISOString() })
+          .eq("team_id", fixture.seed.teamId)
+          .eq("project_id", fixture.system.externalShared)
+          .eq("context_unit_id", unitId)
+          .is("valid_to", null);
+        expect(close.error).toBeNull();
+      }
+
+      const holder = new Client({ connectionString: process.env.DATABASE_URL });
+      const observer = new Client({ connectionString: process.env.DATABASE_URL });
+      const authorityStarted = deferred();
+      const waiterPidReady = deferred<number>();
+      let waiterPid: number | null = null;
+      let authorityReadCompleted = false;
+      let actor: Promise<unknown> | null = null;
+      let trace: RuntimeSqlTrace | null = null;
+      let holderReleased = false;
+      await holder.connect();
+      await observer.connect();
+      try {
+        await holder.query("begin");
+        const holderPidRead = await holder.query<{ pid: number }>("select pg_backend_pid() as pid");
+        const holderPid = holderPidRead.rows[0]?.pid;
+        if (!holderPid) throw new Error("standalone contention holder PID missing");
+        await holder.query(
+          "select id from items where team_id = $1 and id = $2 for update",
+          [fixture.seed.teamId, fixture.itemId]
+        );
+
+        trace = installRuntimeSqlTrace();
+        const waitingDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
+          if (waiterPid === null) {
+            const pidRead = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+            waiterPid = pidRead.rows[0]?.pid ?? null;
+            if (!waiterPid) throw new Error("standalone contention waiter PID missing");
+            waiterPidReady.resolve(waiterPid);
+          }
+          if (isItemAuthorityRead(text)) {
+            authorityStarted.resolve();
+            const result = await execute<T>(text, params);
+            authorityReadCompleted = true;
+            return result;
+          }
+          return execute<T>(text, params);
+        });
+        if (operation === "reconcileItemContext") {
+          actor = reconcileItemContext(waitingDb, fixture.seed.teamId, fixture.itemId);
+        } else if (operation === "reconcileItemUnit") {
+          actor = reconcileItemUnit(waitingDb, fixture.seed.teamId, fixture.itemId);
+        } else if (operation === "ensureIncludeMembership") {
+          actor = ensureIncludeMembership(waitingDb, fixture.seed.teamId, {
+            projectId: fixture.system.externalShared,
+            contextUnitId: unitId,
+          });
+        } else {
+          actor = closeMembershipInto(
+            waitingDb,
+            fixture.seed.teamId,
+            unitId,
+            fixture.system.externalShared
+          );
+        }
+
+        await within(authorityStarted.promise, `${operation} to issue its item authority read`);
+        const observedWaiterPid = await within(waiterPidReady.promise, `${operation} waiter PID`);
+        const blocked = await observeAuthorityBlock(
+          observer,
+          holderPid,
+          observedWaiterPid,
+          () => authorityReadCompleted
+        );
+        expect(blocked.premature, `${operation} authority read completed while holder lock remained`).toBe(false);
+        expect(blocked.blockers, `${operation} waiter blockers; query=${blocked.query ?? "<missing>"}`).toContain(holderPid);
+
+        if (operation === "reconcileItemContext" || operation === "reconcileItemUnit") {
+          const beforeRelease = await observer.query<{ audience: string }>(
+            "select audience from project_context_units where team_id = $1 and id = $2",
+            [fixture.seed.teamId, unitId]
+          );
+          expect(beforeRelease.rows[0]?.audience, "mirror effect cannot precede authority read").toBe("team");
+        } else {
+          const beforeRelease = await observer.query<{ id: string }>(
+            `select id from project_context_memberships
+              where team_id = $1 and project_id = $2 and context_unit_id = $3
+                and decision = 'include' and valid_to is null`,
+            [fixture.seed.teamId, fixture.system.externalShared, unitId]
+          );
+          expect(
+            beforeRelease.rows.length,
+            `${operation} membership effect cannot precede authority read`
+          ).toBe(operation === "ensureIncludeMembership" ? 0 : 1);
+        }
+
+        await holder.query("commit");
+        holderReleased = true;
+        const result = await within(actor, `${operation} after holder release`);
+        expect(result).toMatchObject({ ok: true });
+        if (operation === "ensureIncludeMembership") {
+          expect(result).toMatchObject({ ok: true, created: true });
+        } else if (operation === "closeMembershipInto") {
+          expect(result).toMatchObject({ ok: true, closed: 1 });
+        }
+        expect(authorityReadCompleted).toBe(true);
+        expect(trace.transactions, `${operation} owns one transaction`).toBe(1);
+        expect(trace.checkouts, `${operation} owns one pool checkout`).toBe(1);
+        expect(trace.forbidden, `${operation} performs no nested checkout or pool query`).toEqual([]);
+        trace.restore();
+        trace = null;
+
+        if (operation === "reconcileItemContext" || operation === "reconcileItemUnit") {
+          const state = await storedState(fixture.seed, fixture.itemId);
+          expect(state.unit.audience).toBe("external");
+        } else {
+          const current = await db()
+            .from("project_context_memberships")
+            .select("id")
+            .eq("team_id", fixture.seed.teamId)
+            .eq("project_id", fixture.system.externalShared)
+            .eq("context_unit_id", unitId)
+            .eq("decision", "include")
+            .is("valid_to", null);
+          expect(current.error).toBeNull();
+          expect(current.data ?? []).toHaveLength(operation === "ensureIncludeMembership" ? 1 : 0);
+        }
+      } finally {
+        if (!holderReleased) await holder.query("rollback").catch(() => undefined);
+        if (actor) await actor.catch(() => undefined);
+        trace?.restore();
+        await observer.end();
+        await holder.end();
+      }
+    },
+    30_000
+  );
 
   it("A13-11: delete cascade winning while reconcile waits returns an established missing-item skip", async () => {
     const fixture = await seedConvergedExternalItem("auditfix13/delete-while-waiting.md");
@@ -1591,6 +2162,242 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       .maybeSingle();
     expect(unit).toBeNull();
   });
+
+  it("A13-FR1 F3: unit-only deletion during raw mirror is failure, not item-deletion skip", async () => {
+    const fixture = await seedConvergedExternalItem("auditfix13/unit-delete-race.md");
+    const unitId = await unitIdFor(fixture.seed, fixture.itemId);
+    const drift = await db()
+      .from("project_context_units")
+      .update({ audience: "team" })
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", unitId);
+    expect(drift.error).toBeNull();
+
+    const unitRead = deferred();
+    const resumeMirror = deferred();
+    let paused = false;
+    let actor: Promise<Awaited<ReturnType<typeof reconcileItemContext>>> | null = null;
+    let result: Awaited<ReturnType<typeof reconcileItemContext>> | null = null;
+    let deletedRows = 0;
+    let itemSurvivedDeletion = false;
+    const deleter = new Client({ connectionString: process.env.DATABASE_URL });
+    const racingDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
+      const normalized = text.replace(/\s+/g, " ").trim();
+      const read = await execute<T>(text, params);
+      if (
+        !paused &&
+        /^SELECT id, audience, content_sha256, occurred_at FROM project_context_units /i.test(normalized) &&
+        params.includes(fixture.itemId)
+      ) {
+        paused = true;
+        unitRead.resolve();
+        await resumeMirror.promise;
+      }
+      return read;
+    });
+    await deleter.connect();
+    try {
+      actor = reconcileItemContext(racingDb, fixture.seed.teamId, fixture.itemId);
+      await within(unitRead.promise, "reconcile unit read before raw mirror");
+      const deleted = await deleter.query<{ id: string }>(
+        "delete from project_context_units where team_id = $1 and id = $2 returning id",
+        [fixture.seed.teamId, unitId]
+      );
+      deletedRows = deleted.rowCount ?? 0;
+      const survivingItem = await deleter.query<{ id: string }>(
+        "select id from items where team_id = $1 and id = $2",
+        [fixture.seed.teamId, fixture.itemId]
+      );
+      itemSurvivedDeletion = survivingItem.rowCount === 1;
+      resumeMirror.resolve();
+      result = await within(actor, "reconcile after unit-only deletion");
+    } finally {
+      resumeMirror.resolve();
+      if (actor) await actor.catch(() => undefined);
+      await deleter.end();
+    }
+
+    expect(deletedRows, "the independent unit DELETE committed before mirror resumed").toBe(1);
+    expect(itemSurvivedDeletion, "the parent item was not deleted").toBe(true);
+    expect.soft(result).toMatchObject({ ok: false });
+    expect.soft(result?.skipped, "unit disappearance is not an established item-missing skip").not.toBe(true);
+    expect.soft(String(result?.error)).toMatch(/unit:.*vanished/i);
+    const itemRead = await db()
+      .from("items")
+      .select("id")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("id", fixture.itemId)
+      .single();
+    expect(itemRead.error).toBeNull();
+    const membershipRead = await db()
+      .from("project_context_memberships")
+      .select("id")
+      .eq("team_id", fixture.seed.teamId)
+      .eq("context_unit_id", unitId)
+      .is("valid_to", null);
+    expect(membershipRead.error).toBeNull();
+    expect(membershipRead.data ?? [], "no phantom include survives the unit deletion").toEqual([]);
+  });
+
+  it("A13-FR1 F3: backfill cursor stops at unit-only deletion and retry recreates the failed item", async () => {
+    const seed = await seedTeam();
+    const bootstrap = await ensureAccessBootstrap(db(), seed.teamId);
+    expect(bootstrap.ok).toBe(true);
+    const system = await systemProjectIds(db(), seed.teamId);
+    if (!system) throw new Error("unit deletion backfill system projects missing");
+    const externalShared = system.externalShared;
+    const viewerId = await externalMember(seed);
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const itemIds: string[] = [];
+    for (let index = 0; index < 3; index++) {
+      const body = `unit deletion backfill ${index}`;
+      const created = await ingestItem(
+        db(),
+        auth,
+        {
+          project: "auditfix13-unit-delete-backfill",
+          kind: "deliverable",
+          actor: "auditfix13-test",
+          frontmatter: {},
+          path: `unit-delete-${index}.md`,
+          body,
+          content_sha256: sha(body),
+        },
+        "external"
+      );
+      expect(created.status).toBe("created");
+      const placed = await reconcileItemContext(db(), seed.teamId, created.id);
+      expect(placed.ok, `initial backfill fixture placement for ${created.id}`).toBe(true);
+      itemIds.push(created.id);
+    }
+    const [a, b, c] = itemIds.sort();
+    const unitByItem = new Map<string, string>();
+    for (const itemId of [a, b, c]) unitByItem.set(itemId, await unitIdFor(seed, itemId));
+    const aUnit = unitByItem.get(a)!;
+    const bUnit = unitByItem.get(b)!;
+    const cUnit = unitByItem.get(c)!;
+
+    // a and c are ordinary missing-unit candidates. b is a drift candidate whose unit disappears
+    // only after its real unit read, reproducing the stale raw-mirror result.
+    const deletedEdges = await db()
+      .from("project_context_units")
+      .delete()
+      .in("id", [aUnit, cUnit]);
+    expect(deletedEdges.error).toBeNull();
+    const bDrift = await db()
+      .from("project_context_units")
+      .update({ audience: "team" })
+      .eq("team_id", seed.teamId)
+      .eq("id", bUnit);
+    expect(bDrift.error).toBeNull();
+    const bTargetClose = await db()
+      .from("project_context_memberships")
+      .update({ valid_to: new Date().toISOString() })
+      .eq("team_id", seed.teamId)
+      .eq("project_id", externalShared)
+      .eq("context_unit_id", bUnit)
+      .eq("decision", "include")
+      .is("valid_to", null)
+      .select("id");
+    expect(bTargetClose.error).toBeNull();
+    expect(
+      bTargetClose.data ?? [],
+      "b becomes a real ARM 2 candidate by closing its current target include"
+    ).toHaveLength(1);
+    const candidates = await selectCandidateItemIds(seed.teamId, {
+      afterId: null,
+      createdBefore: null,
+      limit: 10,
+    });
+    expect(candidates.ids, "the real candidate owner selects a, b and c in deterministic order").toEqual([
+      a,
+      b,
+      c,
+    ]);
+
+    const bRead = deferred();
+    const resumeB = deferred();
+    let paused = false;
+    let firstActor: Promise<Awaited<ReturnType<typeof backfillTeamContext>>> | null = null;
+    let first: Awaited<ReturnType<typeof backfillTeamContext>> | null = null;
+    let deletedBRows = 0;
+    let bItemPresentAtDelete = false;
+    const deleter = new Client({ connectionString: process.env.DATABASE_URL });
+    const racingDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
+      const normalized = text.replace(/\s+/g, " ").trim();
+      const read = await execute<T>(text, params);
+      if (
+        !paused &&
+        /^SELECT id, audience, content_sha256, occurred_at FROM project_context_units /i.test(normalized) &&
+        params.includes(b)
+      ) {
+        paused = true;
+        bRead.resolve();
+        await resumeB.promise;
+      }
+      return read;
+    });
+    await deleter.connect();
+    try {
+      firstActor = backfillTeamContext(racingDb, seed.teamId, { batchSize: 10 });
+      await within(bRead.promise, "backfill b unit read before raw mirror");
+      const deletedB = await deleter.query<{ id: string }>(
+        "delete from project_context_units where team_id = $1 and id = $2 returning id",
+        [seed.teamId, bUnit]
+      );
+      deletedBRows = deletedB.rowCount ?? 0;
+      const parent = await deleter.query<{ id: string }>(
+        "select id from items where team_id = $1 and id = $2",
+        [seed.teamId, b]
+      );
+      bItemPresentAtDelete = parent.rowCount === 1;
+      resumeB.resolve();
+      first = await within(firstActor, "backfill after b unit-only deletion");
+    } finally {
+      resumeB.resolve();
+      if (firstActor) await firstActor.catch(() => undefined);
+      await deleter.end();
+    }
+
+    const placement = async (itemId: string) => {
+      const unit = await db()
+        .from("project_context_units")
+        .select("id, audience")
+        .eq("team_id", seed.teamId)
+        .eq("source_item_id", itemId)
+        .eq("unit_kind", "item")
+        .maybeSingle();
+      if (unit.error) throw new Error(`unit deletion placement read: ${unit.error.message}`);
+      if (!unit.data) return null;
+      const memberships = await db()
+        .from("project_context_memberships")
+        .select("project_id, decision")
+        .eq("team_id", seed.teamId)
+        .eq("context_unit_id", unit.data.id)
+        .is("valid_to", null);
+      if (memberships.error) throw new Error(`unit deletion membership read: ${memberships.error.message}`);
+      return { unit: unit.data, memberships: memberships.data ?? [] };
+    };
+
+    expect(deletedBRows, "b's unit DELETE completed before the mirror resumed").toBe(1);
+    expect(bItemPresentAtDelete).toBe(true);
+    expect.soft(first).toMatchObject({ ok: false, scanned: 1, cursor: a });
+    expect.soft(String(first?.error)).toMatch(new RegExp(`${b}.*unit:.*vanished`, "i"));
+    expect(await placement(a), "a committed before b failed").not.toBeNull();
+    expect(await placement(b), "b has no partial replacement after its transaction failed").toBeNull();
+    expect(await placement(c), "c remains untouched after b fails").toBeNull();
+
+    const retry = await backfillTeamContext(db(), seed.teamId, { batchSize: 10, afterId: a });
+    expect(retry).toMatchObject({ ok: true, scanned: 2, cursor: null });
+    for (const itemId of [b, c]) {
+      const healed = await placement(itemId);
+      expect(healed?.unit.audience).toBe("external");
+      expect(healed?.memberships).toEqual([
+        { project_id: externalShared, decision: "include" },
+      ]);
+      expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: viewerId }, itemId)).toBe(true);
+    }
+  }, 30_000);
 
   it("A13-12: real backfill retries the persistent failing item without skipping its successor", async () => {
     const seed = await seedTeam();

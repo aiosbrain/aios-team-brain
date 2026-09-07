@@ -86,4 +86,39 @@ describe("PgClient executor enlistment", () => {
       message: "synthetic returned error",
     });
   });
+
+  it("A13-FR1 F2: a native cardinality error is reported once before envelope interception", async () => {
+    const calls: { text: string; params: unknown[] }[] = [];
+    const executor: SqlExecutor = async <T>(text: string, params: unknown[] = []) => {
+      calls.push({ text, params });
+      return {
+        rows: [{ id: "first" } as T, { id: "second" } as T],
+        rowCount: 2,
+      };
+    };
+    const reportFailure = vi.fn();
+    const interceptEnvelope = vi.fn((_context, result) => result);
+    const client = new PgClient({ executor, reportFailure, envelopeInterceptor: interceptEnvelope });
+
+    const result = await client
+      .from("projects")
+      .insert([
+        { team_id: "team", slug: "first" },
+        { team_id: "team", slug: "second" },
+      ])
+      .select("id")
+      .single();
+
+    expect(result).toEqual({
+      data: null,
+      error: { message: "multiple rows returned" },
+      count: null,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].text).toMatch(/^INSERT INTO projects /);
+    expect(interceptEnvelope).toHaveBeenCalledTimes(1);
+    expect(reportFailure).toHaveBeenCalledTimes(1);
+    expect(reportFailure.mock.calls[0][0]).toMatchObject({ message: "multiple rows returned" });
+    expect(reportFailure.mock.calls[0][1]).toBe(calls[0].text);
+  });
 });

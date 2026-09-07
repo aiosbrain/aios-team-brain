@@ -86,7 +86,6 @@ export async function reconcileLockedItemContext(
   projects: SystemProjectIds
 ): Promise<ReconcileItemResult> {
   const unit = await reconcileItemUnitLocked(context);
-  if (unit.stale) return { ok: true, skipped: true };
   if (!unit.ok || !unit.unitId || !unit.audience) {
     return { ok: false, error: `unit: ${unit.error ?? "missing unit result"}` };
   }

@@ -241,6 +241,12 @@ export class PgQuery<T = unknown> implements PromiseLike<PgResult<T>> {
           result = await this.runDelete();
           break;
       }
+      // Native adapter validation errors (for example .single() receiving multiple rows) happen
+      // after healthy SQL, so report them before an early return or interceptor can otherwise let
+      // an ignored error manufacture a successful transaction commit.
+      if (result.error) {
+        this.reportFailure?.(new Error(result.error.message), this.currentSql);
+      }
       if (!this.interceptEnvelope) return result;
       const intercepted = (await this.interceptEnvelope(
         { table: this.table, operation: this.op, sql: this.currentSql },
