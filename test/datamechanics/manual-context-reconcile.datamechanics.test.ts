@@ -215,6 +215,42 @@ async function currentMemberships(teamId: string, unitId: string) {
   return (data ?? []) as { id: string; project_id: string; decision: string; mode: string; method: string }[];
 }
 
+/**
+ * A FULL-ROW snapshot of one unit and its whole membership history — what AC14-06's "untouched"
+ * claim actually needs. The projections above hide the fields a regression would move: a changed
+ * `updated_at`/`content_sha256`/`audience` on the unit, a re-decided `decided_by`, a replaced row
+ * with a new `id`, or a historical generation being closed/reopened. Historical rows are INCLUDED
+ * (no `valid_to` filter) and ordered by primary key so the comparison is deterministic.
+ *
+ * A read error THROWS rather than degrading to null/[]: "the query failed" must never be able to
+ * read as "nothing changed".
+ */
+interface UnitSnapshot {
+  unit: Record<string, unknown> | null;
+  memberships: Record<string, unknown>[];
+}
+
+async function snapshotUnit(teamId: string, unitId: string): Promise<UnitSnapshot> {
+  const u = await db()
+    .from("project_context_units")
+    .select("*")
+    .eq("team_id", teamId)
+    .eq("id", unitId)
+    .maybeSingle();
+  if (u.error) throw new Error(`unit snapshot failed: ${u.error.message}`);
+  const m = await db()
+    .from("project_context_memberships")
+    .select("*")
+    .eq("team_id", teamId)
+    .eq("context_unit_id", unitId)
+    .order("id", { ascending: true });
+  if (m.error) throw new Error(`membership snapshot failed: ${m.error.message}`);
+  return {
+    unit: (u.data ?? null) as Record<string, unknown> | null,
+    memberships: (m.data ?? []) as Record<string, unknown>[],
+  };
+}
+
 async function generalProject(teamId: string): Promise<string> {
   const { data } = await db()
     .from("projects")
@@ -325,11 +361,21 @@ describe.each(ENTRY_POINTS)("AC14-01 — $name partitions its own import", ({ so
     expect(await unitOf(other.teamId, otherItemId), "a manual pass is one team's pass").toBeNull();
     expect(await canSeeItem(db(), { teamId: seed.teamId, memberId: seed.memberId }, otherItemId)).toBe(false);
 
-    // …and the pass is on the record under its own entrypoint.
+    // …and the pass is on the record under its own entrypoint, with the DURABLE progress this
+    // fixture must produce. The numbers are read off the fixture, not off the returned outcome:
+    // exactly one candidate existed (one item, freshly imported, never partitioned), so the page
+    // is one item long — short of the 25 limit, hence a drained `cursor: null`.
     const rows = await ledgerRows(seed.teamId);
     expect(rows).toHaveLength(1);
     expect(rows[0].meta.entrypoint).toBe(entrypoint);
     expect(rows[0].meta.status).toBe("complete");
+    expect(rows[0].ok).toBe(true);
+    expect(rows[0].errors).toEqual([]);
+    expect(rows[0].created, "`created` is memberships created").toBe(1);
+    expect(rows[0].meta.scanned).toBe(1);
+    expect(rows[0].meta.unitsCreated).toBe(1);
+    expect(rows[0].meta.membershipsCreated).toBe(1);
+    expect(rows[0].meta.cursor, "a short page drained the candidate query").toBeNull();
   }, 60_000);
 });
 
@@ -524,10 +570,22 @@ describe("AC14-05 — a failing candidate blocks progress at itself, not the who
     expect(r.summary).toMatch(/imported data was kept/i);
     expect(r.errors, "a failed context pass is one issue").toBeGreaterThanOrEqual(1);
 
+    // The DURABLE record of a partial failure: one candidate reconciled before the fault, and the
+    // cursor parked on THAT item — not on the failing one, which a resume must retry rather than
+    // step over. All four numbers are fixture facts (two candidates, the second one faulted).
     const failedRow = (await ledgerRows(seed.teamId))[0];
     expect(failedRow.ok).toBe(false);
     expect(failedRow.meta.status).toBe("failed");
-    expect((failedRow.errors[0] as string) ?? "").toContain("injected reconcile failure");
+    expect(failedRow.errors, "the failing item's id prefixes its own diagnostic").toEqual([
+      `${secondId}: injected reconcile failure`,
+    ]);
+    expect(failedRow.created, "`created` is memberships created").toBe(1);
+    expect(failedRow.meta.scanned).toBe(1);
+    expect(failedRow.meta.unitsCreated).toBe(1);
+    expect(failedRow.meta.membershipsCreated).toBe(1);
+    expect(failedRow.meta.cursor, "the last item that FULLY succeeded, so the retry lands on the failure").toBe(
+      firstId
+    );
 
     // Recovery: with the fault cleared, a later manual run retries the item it stopped on.
     state.failItemId = null;
@@ -581,6 +639,23 @@ describe("AC14-06 — the manual repair honours the same standing decisions the 
     const retractedUnit = (await unitOf(seed.teamId, retracted.id))!;
     await db().from("project_context_units").update({ state: "retracted" }).eq("id", retractedUnit.id);
 
+    // The EXACT rows the pass must leave alone — every column, every membership generation — taken
+    // after the fixture is fully planted and before the entry point runs.
+    const forcedSnapshot = await snapshotUnit(seed.teamId, forcedUnit.id);
+    const retractedSnapshot = await snapshotUnit(seed.teamId, retractedUnit.id);
+    const otherSnapshot = await snapshotUnit(other.teamId, otherUnit!.id);
+    // Non-vacuity: an empty/short snapshot would make "unchanged" prove nothing.
+    expect(forcedSnapshot.memberships, "the closed auto include, then the planted force_exclude").toHaveLength(2);
+    expect(retractedSnapshot.memberships).toHaveLength(1);
+    expect(retractedSnapshot.unit!.state).toBe("retracted");
+    expect(otherSnapshot.memberships).toHaveLength(1);
+
+    // Fixture validation: both are already denied to the principal, so the after-call denials below
+    // are about the pass not REVIVING them.
+    const principal = { teamId: seed.teamId, memberId: seed.memberId };
+    expect(await canSeeItem(db(), principal, forced.id), "the exclusion denies before the pass").toBe(false);
+    expect(await canSeeItem(db(), principal, retracted.id), "the retraction denies before the pass").toBe(false);
+
     // A fresh import arrives; the manual pass must repair IT without touching the two above.
     importsOneItem(seed, "slack", "s/fresh.md");
     const res = (await syncSlackNow(seed.teamSlug)) as { ok: boolean; message?: string; error?: string };
@@ -599,6 +674,28 @@ describe("AC14-06 — the manual repair honours the same standing decisions the 
 
     expect(await currentMemberships(other.teamId, otherUnit!.id), "another team's rows are untouched").toEqual(
       otherBefore
+    );
+
+    // The whole rows, not a projection: no column moved, no generation was closed or added, and no
+    // row was replaced by an equivalent-looking one with a new identity.
+    expect(
+      await snapshotUnit(seed.teamId, forcedUnit.id),
+      "the force-excluded unit and its full membership history are byte-identical"
+    ).toEqual(forcedSnapshot);
+    expect(
+      await snapshotUnit(seed.teamId, retractedUnit.id),
+      "the retracted unit and its full membership history are byte-identical"
+    ).toEqual(retractedSnapshot);
+    expect(await snapshotUnit(other.teamId, otherUnit!.id), "another team's full rows are byte-identical").toEqual(
+      otherSnapshot
+    );
+
+    // …and neither protected item became readable.
+    expect(await canSeeItem(db(), principal, forced.id), "a standing exclusion is not repaired into a read").toBe(
+      false
+    );
+    expect(await canSeeItem(db(), principal, retracted.id), "a retracted unit is not revived into a read").toBe(
+      false
     );
   }, 90_000);
 });
