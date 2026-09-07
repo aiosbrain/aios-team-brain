@@ -185,10 +185,12 @@ revisions until explicitly superseded/withdrawn, not `/api/v2`; do not use a fin
 or a non-URI `$schema`. Include independent boundary cases: count 0/20/100 admitted, 101 rejected;
 byte limit/exceeded behavior. Cases assume other payload constraints pass.
 
-The canonical brain-api doc receives a dated AUDITFIX-17 revision entry, the resource-hardening
-policy exception and endpoint limits/recovery, explicitly naming this separately versioned
-supplement. Preserve historical schemas/fixtures in their owning repos; Brain currently vendors
-and pins only the 1.23 payload artifacts. The effective contract is the existing payload shape
+The canonical brain-api doc advances its **document revision to 1.25** and receives a dated
+AUDITFIX-17 revision entry, the resource-hardening policy exception and endpoint limits/recovery,
+explicitly naming this separately versioned supplement. Document revision 1.25 is metadata:
+canonical member API remains **1.24**, Brain API remains **1.23**, and supplement revision remains
+**1**. Preserve historical schemas/fixtures in their owning repos; Brain currently vendors and pins
+only the 1.23 payload artifacts. The effective contract is the existing payload shape
 plus this admission supplement; old valid fixtures must still pass. Keep server
 `BRAIN_API_VERSION=1.23`, existing `test/fixtures/contract/brain-contract.json`, and canonical member
 feature version 1.24 honest; no parallel negotiation header or runtime version switch.
@@ -202,6 +204,13 @@ reviewed locally before server implementation; merge the canonical contract befo
 The canonical companion PR targets `aios-workspace` main, as explicitly approved by the user;
 the brain PR targets staging. Merge the canonical companion first. Do not require canonical merge
 before local code work.
+
+**Per-instance activation:** these admission limits become active on an instance only when a
+Brain build containing AUDITFIX-17 is deployed to that instance. Canonical contract publication
+alone does not activate enforcement, and a reported member API version of 1.23 alone does not
+prove the patch is present. The supplement's version range describes the supported API range;
+older instances retain their previous admission behavior until upgraded. This is a deployment
+notice, not a feature flag or a new negotiation mechanism.
 
 ## Acceptance matrix
 
