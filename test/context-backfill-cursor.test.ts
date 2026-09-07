@@ -11,18 +11,12 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 // because the property below is the one dm cannot easily construct.
 
 const reconcile = vi.fn();
-const ensureMembership = vi.fn();
-const closeOthers = vi.fn();
 const bootstrap = vi.fn();
 
-vi.mock("@/lib/projects/context/units", () => ({ reconcileItemUnit: (...a: unknown[]) => reconcile(...a) }));
-vi.mock("@/lib/projects/context/memberships", () => ({
-  ensureIncludeMembership: (...a: unknown[]) => ensureMembership(...a),
-  closeMembershipInto: (...a: unknown[]) => closeOthers(...a),
-  // AUDITFIX-4: the non-destructive preflight a NARROWING move runs before its close. This suite
-  // is about the backfill's CURSOR on failure, not about the gate, so it passes — the gate's own
-  // outcomes are pinned in the data-mechanics tier where a real project_groups row exists.
-  noWideningGate: () => Promise.resolve({ ok: true }),
+// AUDITFIX-13 moved the transaction/session factory into the public reconcile entry. This focused
+// cursor test mocks that exact operation boundary; real-PG suites prove the lock/rollback protocol.
+vi.mock("@/lib/projects/context/reconcile-item", () => ({
+  reconcileItemContext: (...args: unknown[]) => reconcile(...args),
 }));
 const candidates = vi.fn();
 vi.mock("@/lib/projects/context/backfill-candidates", () => ({
@@ -37,7 +31,7 @@ vi.mock("@/lib/access/bootstrap", () => ({
 
 // A minimal fake DbClient: only the projects lookup goes through it now — the batch comes from the
 // mocked candidate query above.
-function fakeDb() {
+function fakeDb(projectError?: string) {
   return {
     from(table: string) {
       const builder: Record<string, unknown> = {};
@@ -46,7 +40,17 @@ function fakeDb() {
       if (table === "projects") {
         // resolveSystemProjectIds awaits the builder → { data }
         (builder as { then: unknown }).then = (res: (v: unknown) => void) =>
-          res({ data: [{ id: "p-general", slug: "general" }, { id: "p-ext", slug: "external-shared" }], error: null });
+          res(
+            projectError
+              ? { data: null, error: { message: projectError } }
+              : {
+                  data: [
+                    { id: "p-general", slug: "general" },
+                    { id: "p-ext", slug: "external-shared" },
+                  ],
+                  error: null,
+                }
+          );
       }
       return builder;
     },
@@ -57,7 +61,6 @@ describe("§11 backfill error-path cursor (H2)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     bootstrap.mockResolvedValue({ ok: true });
-    closeOthers.mockResolvedValue({ ok: true, closed: 0 });
   });
 
   it("mid-batch failure returns the PRIOR success as the cursor (retry, not skip)", async () => {
@@ -66,8 +69,6 @@ describe("§11 backfill error-path cursor (H2)", () => {
     reconcile.mockImplementation((_db, _team, id: string) =>
       Promise.resolve(id === "b" ? { ok: false, error: "boom" } : { ok: true, unitId: `u-${id}`, audience: "team" })
     );
-    ensureMembership.mockResolvedValue({ ok: true, created: true });
-
     const r = await backfillTeamContext(fakeDb(), "team1", { batchSize: 3 });
     expect(r.ok).toBe(false);
     expect(r.cursor, "cursor is the last item that fully succeeded — b will be retried").toBe("a");
@@ -80,5 +81,44 @@ describe("§11 backfill error-path cursor (H2)", () => {
     const r = await backfillTeamContext(fakeDb(), "team1", { batchSize: 3, afterId: "prev" });
     expect(r.ok).toBe(false);
     expect(r.cursor, "nothing succeeded → resume from where this batch started").toBe("prev");
+  });
+
+  it("A13-12: a persistent item failure stays at last-good and the later retry converges", async () => {
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    candidates
+      .mockResolvedValueOnce({ ids: ["a", "b"] })
+      .mockResolvedValueOnce({ ids: ["b"] });
+    let fail = true;
+    reconcile.mockImplementation((_db, _team, id: string) =>
+      Promise.resolve(
+        id === "b" && fail
+          ? { ok: false, error: "persistent context failure" }
+          : { ok: true, unitId: `u-${id}`, audience: "team" }
+      )
+    );
+
+    const failed = await backfillTeamContext(fakeDb(), "team1", { batchSize: 2 });
+    expect(failed).toMatchObject({ ok: false, cursor: "a", scanned: 1 });
+    fail = false;
+    const retried = await backfillTeamContext(fakeDb(), "team1", {
+      batchSize: 2,
+      afterId: failed.cursor,
+    });
+    expect(retried).toMatchObject({ ok: true, cursor: null, scanned: 1 });
+    expect(reconcile.mock.calls.map((call) => call[2])).toEqual(["a", "b", "b"]);
+  });
+
+  it("A13-12: a topology read error is a failure, never a bootstrap skip", async () => {
+    const { backfillTeamContext } = await import("@/lib/projects/context/backfill");
+    const result = await backfillTeamContext(fakeDb("topology unavailable"), "team1", {
+      afterId: "last-good",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "topology unavailable",
+      scanned: 0,
+      cursor: "last-good",
+    });
+    expect(reconcile).not.toHaveBeenCalled();
   });
 });

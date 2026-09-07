@@ -41,12 +41,11 @@ export interface CandidatePage {
  * choice here, and the one a spec review caught.
  *
  * There are two audiences in this system: `items.access` (current) and `units.audience` (a MIRROR
- * that stays stale until reconcile re-mirrors it). The precise state this sweep exists to back up is
- * a tier flip whose `settleReclassification` fan-out failed — and that fan-out is best-effort by
- * design (`lib/ingest/reclassify`) — which leaves `items.access` flipped, `units.audience` STALE and
- * the membership sitting in the old system project. Keyed on the stale mirror, every arm below reads
- * "already correct" and the item is NEVER selected: for external→team that serves team content
- * through `external-shared` permanently.
+ * that can be stale on legacy/mixed-version rows until reconcile re-mirrors it). AUDITFIX-13 makes
+ * compliant existing-item access changes atomic with that mirror and system placement, but this
+ * sweep still repairs pre-existing drift and old writers during rollout. Keying a repair candidate
+ * on the stale mirror would read such a row as "already correct" forever; the item remains the
+ * authority regardless of how the drift originated.
  */
 const CANDIDATE_SQL = `
 with sys as (

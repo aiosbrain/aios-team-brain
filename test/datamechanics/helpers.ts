@@ -1,5 +1,11 @@
 import { randomUUID, createHash } from "node:crypto";
-import type { DbClient } from "@/lib/db/types";
+import type {
+  DbClient,
+  TransactionCapableDbClient,
+  TransactionSession,
+} from "@/lib/db/types";
+import { isTransactionCapableDbClient } from "@/lib/db/types";
+import { bindTransactionSessionAlias } from "@/lib/db/pg/tx";
 import { adminClient } from "@/lib/db/admin";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
@@ -8,6 +14,50 @@ import type { ItemPayload } from "@/lib/api/schemas";
 // pg adapter over the real test Postgres — so the real app code runs unchanged.
 export function db(): DbClient {
   return adminClient();
+}
+
+/**
+ * Preserve a `.from()` fault/barrier decorator when production creates its bound session client.
+ * This is the explicit AUDITFIX-13 proxy migration seam; it never falls back to pool execution.
+ */
+export function transactionDecoratedDb(
+  real: DbClient,
+  decorate: (bound: DbClient) => DbClient
+): TransactionCapableDbClient {
+  if (!isTransactionCapableDbClient(real)) throw new Error("test fixture requires transaction capability");
+  const outer = decorate(real);
+  return {
+    from: outer.from.bind(outer),
+    rpc:
+      typeof outer.rpc === "function"
+        ? outer.rpc.bind(outer)
+        : real.rpc.bind(real),
+    transaction: <T>(fn: (session: TransactionSession) => Promise<T>) =>
+      real.transaction((session) => {
+        const decoratedDb = decorate(session.db);
+        const decoratedSession = { ...session, db: decoratedDb };
+        bindTransactionSessionAlias(decoratedDb, decoratedSession);
+        return fn(decoratedSession);
+      }),
+  };
+}
+
+/** Decorate raw lock/mirror execution as well as the adapter for one operation. */
+export function transactionSessionDecoratedDb(
+  real: DbClient,
+  decorate: (session: TransactionSession) => TransactionSession
+): TransactionCapableDbClient {
+  if (!isTransactionCapableDbClient(real)) throw new Error("test fixture requires transaction capability");
+  return {
+    from: real.from.bind(real),
+    rpc: real.rpc.bind(real),
+    transaction: <T>(fn: (session: TransactionSession) => Promise<T>) =>
+      real.transaction((session) => {
+        const decorated = decorate(session);
+        bindTransactionSessionAlias(decorated.db, decorated);
+        return fn(decorated);
+      }),
+  };
 }
 
 export function sha(body: string): string {

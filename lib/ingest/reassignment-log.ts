@@ -1,6 +1,7 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
+import { transactionSessionFor } from "@/lib/db/pg/tx";
 
 /**
  * The ownership-transition event stream: **`item.reassigned`**. One uniform, per-item, timestamped audit
@@ -41,18 +42,29 @@ function reassignMeta(
  * this item (`item.created` / `item.reassigned` / `item.attribution_healed`, whichever last set the
  * current owner). Enables the handoff-tenure + short-tenure-mislabel heuristic without an external join.
  * Best-effort: a non-audited `member_id` change (e.g. the reattribute batch) would make this conservative;
- * null when no such event exists. `items` has no `created_at`, so the `item.created` audit is the anchor.
+ * null when no such event exists. `items.created_at` is item age, not an ownership event, so the
+ * `item.created` audit remains the ownership-window anchor.
  */
 export async function ownerWindowStart(db: DbClient, teamId: string, itemId: string): Promise<string | null> {
-  const { data } = await db
-    .from("audit_log")
-    .select("created_at")
-    .eq("team_id", teamId)
-    .eq("target_id", itemId)
-    .in("action", ["item.created", "item.reassigned", "item.attribution_healed"])
-    .order("created_at", { ascending: false })
-    .limit(1);
-  return ((data ?? [])[0] as { created_at: string } | undefined)?.created_at ?? null;
+  const read = async (): Promise<string | null> => {
+    const { data, error } = await db
+      .from("audit_log")
+      .select("created_at")
+      .eq("team_id", teamId)
+      .eq("target_id", itemId)
+      .in("action", ["item.created", "item.reassigned", "item.attribution_healed"])
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) throw new Error(`owner window audit read failed: ${error.message}`);
+    return ((data ?? [])[0] as { created_at: string } | undefined)?.created_at ?? null;
+  };
+  const session = transactionSessionFor(db);
+  if (session) return session.optionalAudit(read, null);
+  try {
+    return await read();
+  } catch {
+    return null;
+  }
 }
 
 /** Record ONE ownership transition (a source reassignment or a pusher-takeover, from the ingest paths). */

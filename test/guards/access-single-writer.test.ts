@@ -27,6 +27,7 @@ const SUBSTRATE: { table: string; writer: string }[] = [
   { table: "project_context_units", writer: join("lib", "projects", "context", "units.ts") },
   { table: "project_context_memberships", writer: join("lib", "projects", "context", "memberships.ts") },
 ];
+const FAKE_SQL_FIXTURE = join("lib", "ingest", "fake-supabase.ts");
 const WRITE_VERBS = /\.\s*(insert|upsert|update|delete)\s*\(/;
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -52,6 +53,15 @@ function writesTo(source: string, table: string): boolean {
     if (WRITE_VERBS.test(window)) return true;
   }
   return false;
+}
+
+/** Raw TypeScript SQL, including ordinary strings and tagged templates with indentation. */
+function rawSqlWritesTo(source: string, table: string): boolean {
+  const dml = new RegExp(
+    `\\b(?:insert\\s+into|update|delete\\s+from)\\s+(?:public\\.)?${table}\\b`,
+    "i"
+  );
+  return dml.test(source);
 }
 
 /**
@@ -129,6 +139,9 @@ describe("access-chain single writer", () => {
           if (rel !== writer && (writesTo(source, table) || mentionsWithWrites(rel, source, table))) {
             offenders.push(`${rel} writes/names ${table} outside ${writer}`);
           }
+          if (rel !== writer && rel !== FAKE_SQL_FIXTURE && rawSqlWritesTo(source, table)) {
+            offenders.push(`${rel} contains raw SQL DML for ${table} outside ${writer}`);
+          }
         }
       }
     }
@@ -203,6 +216,15 @@ describe("access-chain single writer", () => {
     for (const { table, writer } of SUBSTRATE) {
       const source = readFileSync(join(ROOT, writer), "utf8");
       expect(writesTo(source, table), `expected ${writer} to write ${table}`).toBe(true);
+    }
+  });
+
+  it("A13-14: raw substrate DML catches static, indented and tagged-template controls", () => {
+    for (const { table } of SUBSTRATE) {
+      expect(rawSqlWritesTo(`const q = "update ${table} set state = 'x'"`, table)).toBe(true);
+      expect(rawSqlWritesTo(`const q = \`\n    delete from ${table}\n  where id = $1\``, table)).toBe(true);
+      expect(rawSqlWritesTo(`sql\`\n  insert into ${table} (id) values (${'${id}'})\n\``, table)).toBe(true);
+      expect(rawSqlWritesTo(`select * from ${table}`, table)).toBe(false);
     }
   });
 

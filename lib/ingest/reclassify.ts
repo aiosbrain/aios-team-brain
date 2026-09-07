@@ -23,21 +23,16 @@ import { bustTeamTimeline } from "@/lib/dashboard/timeline-cache";
  * The split is an ordering requirement, not decomposition for its own sake. `ingestItem` must:
  *   1. `cascadeInheritedAudience(...)`  ← BEFORE it writes `items.access`
  *   2. write `items.access`
- *   3. `settleReclassification(...)`    ← AFTER
+ *   3. transaction-owned context move; COMMIT
+ *   4. `settleReclassification(...)`    ← AFTER confirmed commit
  * Run in that order:
- *   • step 1 throws → `items.access` is untouched, so the next sync tick still sees the tier as changed
- *     and retries the whole thing. (The other order strands the inheriting rows at the OLD tier
- *     PERMANENTLY: the retry reads the already-committed `access`, computes `accessChanged = false`, and
- *     never repairs them — a leak with no repair path and no signal beyond one 500. That is the whole
- *     reason for the split.)
- *   • step 2 throws → the inheriting rows are already at the new tier while the item is still at the old
- *     one. For a NARROWING that's stricter than required (fail-closed); for a WIDENING it's briefly
- *     wider than the item, which the source already authorized. Either way the next tick converges.
- *   • step 3 is last because it CANNOT be retried by a later push (the retry would compute
+ *   • steps 1–3 share the bound ingest transaction. Any ordinary SQL/policy failure rolls all three
+ *     back, leaving the previously committed item, inherited rows and placement together for retry.
+ *     Keeping cascade before the item write also preserves the authorization order inside that unit.
+ *   • step 4 is post-commit and may NOT be retried by a later push (the retry would compute
  *     `accessChanged = false`), so it must not be able to block the tier commit. It is safe there
- *     precisely because it can barely fail: every purge/stale helper swallows its own errors, the worst
- *     outcome is a cache that expires on its TTL instead of being purged, and when the graph is
- *     configured `lib/graph/run` re-purges once the tier move has left the Graphiti group anyway.
+ *     because `ingestItem` catches the entire confirmed-commit effect phase, including prerequisite
+ *     reads and thrown/returned helper failures. A miss is diagnosed; delivery is not claimed.
  */
 
 /** Tier-carrying tables whose rows inherit the containing item's `access`, keyed by `source_item_id`.
@@ -85,8 +80,9 @@ export async function cascadeInheritedAudience(
 }
 
 /**
- * PHASE 2 — invalidate the tier-scoped caches and audit the change. Call AFTER `items.access` is
- * committed, so a rebuild triggered by the invalidation reads the NEW tier.
+ * POST-COMMIT — invalidate the tier-scoped caches and audit the change. The durable item, inherited
+ * rows, unit and system membership have already committed atomically; every failure here is
+ * diagnostic/nonfatal and must not cause the transaction to be replayed.
  *
  * The cache handling is ASYMMETRIC, and that asymmetry is the whole point:
  *   • NARROWING (external→team) — the external-tier payloads contain content that must no longer be
@@ -104,22 +100,6 @@ export async function settleReclassification(
   } else {
     await staleArcCache(db, change.teamId);
     await bustTeamTimeline(db, change.teamId);
-  }
-
-  // §11 context: a tier change MUST re-partition the item's membership from ANY caller, not only
-  // the push route's after() hook — a connector re-sync or internal ingestItem flips access with
-  // no route, and the scheduler's converged short-circuit no longer catches it (slice-5 Codex
-  // HIGH). This is the fan-out point (the comment above claims it), so the move lives here.
-  // Best-effort: a reconcile failure must never fail the reclassification; idempotent.
-  try {
-    const { reconcileItemContext } = await import("@/lib/projects/context/reconcile-item");
-    const r = await reconcileItemContext(db, change.teamId, change.itemId);
-    if (!r.ok) console.warn(`[access] context re-partition after reclassification of ${change.itemId} failed: ${r.error}`);
-    // CLOSEMODE-1: a human's standing exclusion survived the flip — quiet by design, but named in the
-    // log so the reclassify trail shows the decision held.
-    else if (r.spared) console.info(`[access] reclassification of ${change.itemId}: ${r.spared} standing exclusion(s) spared on the opposite system project`);
-  } catch (e) {
-    console.warn(`[access] context re-partition threw for ${change.itemId}: ${e instanceof Error ? e.message : e}`);
   }
 
   // Audit the rare reclassification so the tier change isn't silent. Rare enough not to reintroduce the

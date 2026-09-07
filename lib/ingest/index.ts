@@ -26,6 +26,19 @@ import {
   cascadeInheritedAudience,
   settleReclassification,
 } from "@/lib/ingest/reclassify";
+import {
+  lockIngestIdentity,
+  lockIngestItemByPath,
+  refreshLockedItemContext,
+  runContextTransaction,
+  transactionCapability,
+} from "@/lib/projects/context/transaction";
+import {
+  reconcileLockedItemContext,
+  validatedSystemProjectIds,
+  type SystemProjectIds,
+} from "@/lib/projects/context/reconcile-item";
+import { noWideningGate } from "@/lib/projects/context/memberships";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -39,6 +52,16 @@ export interface IngestResult {
    * slice-4 H2 guards, and it arrives as `status:"unchanged"` (slice-5 Fable HIGH).
    */
   accessChanged?: boolean;
+}
+
+interface CommittedIngest {
+  result: IngestResult;
+  postCommit?: {
+    from: "team" | "external";
+    to: "team" | "external";
+    source: unknown;
+  };
+  contextRefusal?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -119,6 +142,8 @@ export async function ingestItem(
       `invalid item payload: ${parsedPayload.error.issues[0]?.message ?? "bad shape"}`
     );
   }
+  // Fail before project/pointer writes when a legacy wrapper forgot to delegate transactions.
+  transactionCapability(db);
   const payload = parsedPayload.data;
   // Authoritative change key (see contentHash). The wire `content_sha256` is advisory from here on:
   // a mismatch means the pushing client hashes something other than the body it sent, which we record
@@ -147,13 +172,17 @@ export async function ingestItem(
   const ptr = await ensureProjectGraphPointer(db, { teamId: auth.teamId, projectId: project.id as string });
   if (!ptr.ok) throw new Error(ptr.error);
 
-  const { data: existing } = await db
-    .from("items")
-    .select("id, content_sha256, member_id, member_id_locked, frontmatter, access, created_at, work_at, work_at_from_source")
-    .eq("team_id", auth.teamId)
-    .eq("project_id", project.id)
-    .eq("path", payload.path)
-    .maybeSingle();
+  const committed = await runContextTransaction(db, async (session) => {
+    const db = session.db;
+    const projectId = project.id as string;
+    await lockIngestIdentity(session, auth.teamId, projectId, payload.path);
+    const locked = await lockIngestItemByPath(
+      session,
+      auth.teamId,
+      projectId,
+      payload.path
+    );
+    const existing = locked?.item ?? null;
 
   // ── Who may set this item's tier ────────────────────────────────────────────────────────────────
   // Tier is an access-control decision, so it is resolved ONCE here and both write paths below use the
@@ -189,13 +218,22 @@ export async function ingestItem(
     ? (existingAccess ?? "external")
     : access;
   const accessChanged = existingAccess !== null && existingAccess !== effectiveAccess;
-  /** Only looked up when a reclassification actually fires (rare) — the cache keys need the slug. */
-  const teamSlug = async (): Promise<string> => {
-    const { data } = await db.from("teams").select("slug").eq("id", auth.teamId).maybeSingle();
-    const slug = (data as { slug?: string } | null)?.slug;
-    if (!slug) throw new Error("reclassification: team slug not found");
-    return slug;
-  };
+    let contextProjects: SystemProjectIds | null = null;
+    if (accessChanged) {
+      const topology = await validatedSystemProjectIds(db, auth.teamId);
+      if (topology === undefined) throw new Error("context: system project read failed");
+      contextProjects = topology;
+      // Early desired-audience preflight: before inherited/social cascade mutation. The context
+      // writer repeats this gate authoritatively after the item/unit writes.
+      if (topology && effectiveAccess === "team") {
+        const gate = await noWideningGate(db, auth.teamId, topology.general, effectiveAccess);
+        if (!gate.ok) {
+          throw new Error(
+            `context gate refusal: ${gate.error ?? "no-widening refused desired audience"}`
+          );
+        }
+      }
+    }
 
   if (existing && existing.content_sha256 === contentSha) {
     // Refresh "last seen this sync"; do NOT write an audit row (audit M4). Every 30-min sync tick
@@ -214,7 +252,7 @@ export async function ingestItem(
     // NEVER touches a LOCKED item (a deliberate admin correction — incl. correct-to-nobody), and never
     // auto-clears a set owner to null (a connector's unresolved re-push passes `authorMemberId: null`).
     // The lock is what makes source-driven re-pointing safe (it protects corrections + human self-pushes).
-    const locked =
+    const memberLocked =
       (existing as { member_id_locked?: boolean | null }).member_id_locked ===
       true;
     const patch: {
@@ -228,7 +266,7 @@ export async function ingestItem(
     const reattr = decideReattribution(
       existing.member_id,
       opts?.authorMemberId ?? null,
-      locked
+      memberLocked
     );
     if (reattr.memberId) patch.member_id = reattr.memberId;
     // HEAL ACCESS on an unchanged re-push: `content_sha256` covers only the body, so a source that
@@ -370,22 +408,45 @@ export async function ingestItem(
     }
     // Phase 2: the tier is committed, so invalidate the tier-scoped caches and audit (shared with the
     // changed-body path below, so the two can't drift).
-    if (accessChanged) {
-      await settleReclassification(db, await teamSlug(), {
-        teamId: auth.teamId,
-        itemId: existing.id,
-        from: existingAccess,
-        to: effectiveAccess,
-        source: payload.frontmatter?.source ?? null,
-      });
+    let contextRefusal: string | undefined;
+    if (accessChanged && contextProjects) {
+      if (!locked) throw new Error("context: locked existing item missing");
+      const refreshed = await refreshLockedItemContext(locked);
+      if (!refreshed) throw new Error("context: locked item vanished after unchanged-body write");
+      const contextResult = await reconcileLockedItemContext(refreshed, contextProjects);
+      if (contextResult.skipped) throw new Error("context move failed: locked unit/item vanished");
+      if (!contextResult.ok) {
+        if (contextResult.refusalReason === "protected-target-exclusion") {
+          contextRefusal = contextResult.error ?? "protected target exclusion";
+        } else {
+          throw new Error(`context move failed: ${contextResult.error ?? "unknown refusal"}`);
+        }
+      }
+      if (contextResult.spared) {
+        console.info(
+          `[access] reclassification of ${existing.id}: ${contextResult.spared} standing exclusion(s) spared on the opposite system project`
+        );
+      }
     }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return {
-      status: "unchanged",
-      id: existing.id,
-      projectId: project.id,
-      accessChanged,
-    };
+      result: {
+        status: "unchanged",
+        id: existing.id,
+        projectId,
+        accessChanged,
+      },
+      ...(accessChanged
+        ? {
+            postCommit: {
+              from: existingAccess!,
+              to: effectiveAccess,
+              source: payload.frontmatter?.source ?? null,
+            },
+          }
+        : {}),
+      ...(contextRefusal ? { contextRefusal } : {}),
+    } satisfies CommittedIngest;
   }
 
   const taskRows =
@@ -526,14 +587,25 @@ export async function ingestItem(
   // Phase 2. A body edit can carry a tier change with it, and this path is where the previous fix
   // stopped looking: `materialize*` re-stamps the audience of the rows IN THIS PUSH, but nothing
   // cascaded to rows the push omits and nothing touched the tier-scoped caches.
-  if (accessChanged) {
-    await settleReclassification(db, await teamSlug(), {
-      teamId: auth.teamId,
-      itemId,
-      from: existingAccess,
-      to: effectiveAccess,
-      source: payload.frontmatter?.source ?? null,
-    });
+  let contextRefusal: string | undefined;
+  if (accessChanged && contextProjects) {
+    if (!locked) throw new Error("context: locked existing item missing");
+    const refreshed = await refreshLockedItemContext(locked);
+    if (!refreshed) throw new Error("context: locked item vanished after changed-body write");
+    const contextResult = await reconcileLockedItemContext(refreshed, contextProjects);
+    if (contextResult.skipped) throw new Error("context move failed: locked unit/item vanished");
+    if (!contextResult.ok) {
+      if (contextResult.refusalReason === "protected-target-exclusion") {
+        contextRefusal = contextResult.error ?? "protected target exclusion";
+      } else {
+        throw new Error(`context move failed: ${contextResult.error ?? "unknown refusal"}`);
+      }
+    }
+    if (contextResult.spared) {
+      console.info(
+        `[access] reclassification of ${itemId}: ${contextResult.spared} standing exclusion(s) spared on the opposite system project`
+      );
+    }
   }
 
   await audit(db, {
@@ -592,10 +664,55 @@ export async function ingestItem(
   }
 
   return {
-    status: existing ? "updated" : "created",
-    id: itemId,
-    projectId: project.id,
-    changedTaskRowKeys,
-    accessChanged,
-  };
+    result: {
+      status: existing ? "updated" : "created",
+      id: itemId,
+      projectId,
+      changedTaskRowKeys,
+      accessChanged,
+    },
+    ...(accessChanged
+      ? {
+          postCommit: {
+            from: existingAccess!,
+            to: effectiveAccess,
+            source: payload.frontmatter?.source ?? null,
+          },
+        }
+      : {}),
+    ...(contextRefusal ? { contextRefusal } : {}),
+  } satisfies CommittedIngest;
+  });
+
+  // Confirmed-commit boundary: cache invalidation and access-healed audit are diagnostic/nonfatal.
+  // A fault here never rejects/replays the durable item/context success.
+  if (committed.postCommit) {
+    try {
+      const { data: team, error: teamError } = await db
+        .from("teams")
+        .select("slug")
+        .eq("id", auth.teamId)
+        .maybeSingle();
+      if (teamError) throw new Error(`reclassification team slug read failed: ${teamError.message}`);
+      const slug = (team as { slug?: string } | null)?.slug;
+      if (!slug) throw new Error("reclassification: team slug not found");
+      await settleReclassification(db, slug, {
+        teamId: auth.teamId,
+        itemId: committed.result.id,
+        ...committed.postCommit,
+      });
+    } catch (error) {
+      console.warn(
+        `[access] post-commit reclassification effects failed for ${committed.result.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+  if (committed.contextRefusal) {
+    console.warn(
+      `[access] item ${committed.result.id} committed with standing context refusal: ${committed.contextRefusal}`
+    );
+  }
+  return committed.result;
 }

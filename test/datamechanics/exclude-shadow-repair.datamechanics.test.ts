@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { db, ingest, seedTeam, transactionDecoratedDb, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { reconcileItemContext } from "@/lib/projects/context/reconcile-item";
 import { ensureIncludeMembership } from "@/lib/projects/context/memberships";
@@ -132,9 +132,9 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
     await plantShadow(seed, general, unit, "force_exclude");
     let intercepted = false;
     const real = db();
-    const raceDb = {
+    const raceDb = transactionDecoratedDb(real, (base) => ({
       from(table: string) {
-        const chain = real.from(table);
+        const chain = base.from(table);
         if (table === "project_context_memberships" && !intercepted) {
           // Intercept ONLY the first probe select — return "no current row" so the code
           // proceeds to the insert, which then really collides with the planted exclude.
@@ -156,7 +156,8 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
         }
         return chain;
       },
-    } as unknown as DbClient;
+      rpc: base.rpc.bind(base),
+    } as unknown as DbClient));
     const loser = await ensureIncludeMembership(raceDb, seed.teamId, { projectId: general, contextUnitId: unit });
     expect(loser.ok, "the race-loser must not read a racing exclude as convergence").toBe(false);
     expect(loser.created).not.toBe(false);
@@ -180,9 +181,9 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
       .select("id").eq("team_id", seed.teamId).eq("project_id", general).eq("context_unit_id", unit)
       .eq("decision", "exclude").order("created_at", { ascending: false }).limit(1).single();
     let fed = false;
-    const staleDb = {
+    const staleDb = transactionDecoratedDb(real, (base) => ({
       from(table: string) {
-        const chain = real.from(table);
+        const chain = base.from(table);
         if (table === "project_context_memberships" && !fed) {
           const origSelect = chain.select.bind(chain);
           return {
@@ -201,7 +202,8 @@ describe("EXCLSHADOW-1 — the auto exclude-shadow repairs; explicit excludes su
         }
         return chain;
       },
-    } as unknown as DbClient;
+      rpc: base.rpc.bind(base),
+    } as unknown as DbClient));
     const stale = await ensureIncludeMembership(staleDb, seed.teamId, { projectId: general, contextUnitId: unit });
     expect(stale.ok, "a losing repairer against a converged include reports CONVERGED, never a failure").toBe(true);
     expect(stale.created).toBe(false);
