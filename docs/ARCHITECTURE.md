@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-08-03.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-09-07.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## First-install deployment flow
@@ -60,6 +60,26 @@ self-hosted repo cannot make that check unconditional.
 The local curl installer remains the Docker/self-host path. Selecting Railway in that wizard opens
 the canonical deploy page; it does not provision through an ambient Railway CLI link and does not
 pause for a GitHub fork or a post-deploy `--resume` command.
+
+## Staging copy and release control plane
+
+The inactive-by-default staging hardening flow is owned by `scripts/staging-ops/` and specified in
+`docs/design/staging-workflow-hardening.md`. A production-network exporter performs a single
+read-only Postgres snapshot plus a fixed-read Neo4j capture, sanitizes the paired representation,
+then signs and encrypts an immutable bundle through a write-only source identity. A separately
+networked importer reads that source prefix, pins it into importer-owned rollback storage, drains
+only the configured staging app/Graphiti services, takes the exclusive data-use lock, restores both
+stores, verifies the paired result, and boots the exact observed staging commit before marking the
+journal ready. The app/startup fence holds a shared form of the same lock. Durable last-ready state,
+authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
+deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
+
+`config/staging-ops/schedules.json` records the concrete but disabled service, schedule, retention,
+and least-privilege storage contract. `compose.test.staging-pair.yml` is its executable local model:
+separate role networks and key mounts, SigV4-verified object-store ACLs, exact Postgres 18/Neo4j
+5.26.2 stores, the actual CLI entrypoints and Next read oracle, a zero-egress counter, and recovery,
+repeat, lock-loss, catch-up, rollback-failure, and concurrency cases. Nothing in these files activates
+cloud services or policy; activation remains the operator procedure in `docs/OPS.md`.
 
 ## Agent skill publication
 
@@ -1325,6 +1345,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:routes -->
 
+- `GET /api/health` — bounded public Postgres readiness; authenticated copied-staging Postgres/Neo4j/run evidence and boot probe
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
 - `POST /api/internal/executor-gateway/v1/authorize-and-redeem` — exact-call policy decision and post-audit request-local PAT sealing
 - `POST /api/internal/executor-gateway/v1/record-outcome` — idempotent execution settlement with one immutable outcome audit

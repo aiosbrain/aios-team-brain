@@ -1,0 +1,108 @@
+import { encodeNeo4jValue } from "./neo4j-codec.mjs";
+
+export const GRAPH_CODEC_VERSION = 1;
+export const SUPPORTED_NODE_LABELS = new Set(["Entity", "Episodic", "Person", "Organization", "Location", "Event", "Product", "Topic", "Community"]);
+export const SUPPORTED_RELATIONSHIP_TYPES = new Set(["RELATES_TO", "MENTIONS", "HAS_MEMBER"]);
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function cloneProperties(properties) {
+  return { ...(properties ?? {}) };
+}
+
+export function validateGraphShape(graph) {
+  const ids = new Set();
+  for (const node of graph?.nodes ?? []) {
+    if (!node.exportId || ids.has(node.exportId)) throw new Error("duplicate or missing export-local node identity");
+    ids.add(node.exportId);
+    if (!Array.isArray(node.labels) || node.labels.some((label) => !IDENTIFIER.test(label) || !SUPPORTED_NODE_LABELS.has(label))) {
+      throw new Error(`unsupported graph node label on ${node.exportId}`);
+    }
+  }
+  for (const rel of graph?.relationships ?? []) {
+    if (!SUPPORTED_RELATIONSHIP_TYPES.has(rel.type) || !IDENTIFIER.test(rel.type)) throw new Error(`unsupported graph relationship type ${rel.type}`);
+    if (!ids.has(rel.start) || !ids.has(rel.end)) throw new Error("graph relationship has a dangling endpoint");
+  }
+}
+
+export function sanitizeGraphExport(graph, { episodeAllowed }) {
+  validateGraphShape(graph);
+  const original = new Map(graph.nodes.map((node) => [node.exportId, node]));
+  const retainedEpisodes = new Map();
+  let excludedCommunities = 0;
+  let excludedEpisodes = 0;
+  for (const node of graph.nodes) {
+    if (node.labels.includes("Community")) { excludedCommunities += 1; continue; }
+    if (node.labels.includes("Episodic")) {
+      if (!episodeAllowed(node)) { excludedEpisodes += 1; continue; }
+      const uuid = node.properties?.uuid;
+      if (typeof uuid !== "string" || !uuid) throw new Error("retained episode is missing uuid");
+      retainedEpisodes.set(uuid, node);
+    }
+  }
+
+  const relationships = [];
+  const incident = new Set([...retainedEpisodes.values()].map((node) => node.exportId));
+  let excludedMixedProvenanceFacts = 0;
+  let excludedEmptyProvenanceFacts = 0;
+  for (const rel of graph.relationships) {
+    if (rel.type === "HAS_MEMBER") continue;
+    if (rel.type === "RELATES_TO") {
+      const provenance = rel.properties?.episodes;
+      if (!Array.isArray(provenance) || provenance.length === 0) { excludedEmptyProvenanceFacts += 1; continue; }
+      if (provenance.some((uuid) => !retainedEpisodes.has(uuid))) { excludedMixedProvenanceFacts += 1; continue; }
+      const start = original.get(rel.start);
+      const end = original.get(rel.end);
+      const group = rel.properties?.group_id;
+      if (!group || start?.properties?.group_id !== group || end?.properties?.group_id !== group || provenance.some((uuid) => retainedEpisodes.get(uuid)?.properties?.group_id !== group)) {
+        throw new Error(`fact ${rel.properties?.uuid ?? "unknown"} has inconsistent group ownership`);
+      }
+      relationships.push({ ...rel, properties: cloneProperties(rel.properties) });
+      incident.add(rel.start); incident.add(rel.end);
+    }
+  }
+  for (const rel of graph.relationships) {
+    if (rel.type !== "MENTIONS" || !incident.has(rel.start)) continue;
+    if (!original.has(rel.end)) throw new Error("MENTIONS relationship has a dangling endpoint");
+    relationships.push({ ...rel, properties: cloneProperties(rel.properties) });
+    incident.add(rel.end);
+  }
+
+  const nodes = graph.nodes.filter((node) => incident.has(node.exportId) && !node.labels.includes("Community")).map((node) => {
+    const properties = cloneProperties(node.properties);
+    if (node.labels.includes("Entity")) {
+      delete properties.summary;
+      delete properties.summary_embedding;
+    }
+    return { ...node, properties };
+  });
+  return {
+    codecVersion: GRAPH_CODEC_VERSION,
+    nodes,
+    relationships,
+    sanitation: { excludedCommunities, excludedEpisodes, excludedMixedProvenanceFacts, excludedEmptyProvenanceFacts },
+  };
+}
+
+/** Export uses fixed READ statements only; no caller-supplied Cypher enters. */
+export async function exportGraph(session) {
+  const nodeResult = await session.run("MATCH (n) RETURN elementId(n) AS exportId, labels(n) AS labels, properties(n) AS properties");
+  const relResult = await session.run("MATCH (a)-[r]->(b) RETURN elementId(a) AS start, elementId(b) AS end, type(r) AS type, properties(r) AS properties");
+  return {
+    codecVersion: GRAPH_CODEC_VERSION,
+    nodes: nodeResult.records.map((record) => ({ exportId: record.get("exportId"), labels: record.get("labels"), properties: encodeNeo4jValue(record.get("properties")) })),
+    relationships: relResult.records.map((record) => ({ start: record.get("start"), end: record.get("end"), type: record.get("type"), properties: encodeNeo4jValue(record.get("properties")) })),
+  };
+}
+
+/** Census-only fixed reads: aggregate shapes and name prefixes, never graph prose or raw names. */
+export async function graphCensus(session) {
+  const labels = await session.run("MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS count ORDER BY label");
+  const types = await session.run("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY type");
+  const episodes = await session.run("MATCH (n:Episodic) RETURN CASE WHEN n.name STARTS WITH 'items:' THEN 'items' WHEN n.name STARTS WITH 'correction:' THEN 'correction' ELSE 'unsupported' END AS pattern, count(*) AS count ORDER BY pattern");
+  const rows = (result, key) => result.records.map((record) => ({ [key]: record.get(key), count: Number(record.get("count").toString()) }));
+  const out = { labels: rows(labels, "label"), relationshipTypes: rows(types, "type"), episodeNamePatterns: rows(episodes, "pattern") };
+  const unsupportedLabels = out.labels.filter(({ label }) => !SUPPORTED_NODE_LABELS.has(label));
+  const unsupportedTypes = out.relationshipTypes.filter(({ type }) => !SUPPORTED_RELATIONSHIP_TYPES.has(type));
+  const unsupportedPatterns = out.episodeNamePatterns.filter(({ pattern }) => pattern === "unsupported");
+  return { ...out, unsupported: { labels: unsupportedLabels, relationshipTypes: unsupportedTypes, episodeNamePatterns: unsupportedPatterns } };
+}

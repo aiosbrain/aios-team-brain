@@ -19,6 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { assertServiceIdentity } from "./service-guard.mjs";
+import { acquireDataUseLock, hasExclusiveDataUseLock, readJournal } from "./staging-ops/journal.mjs";
 
 export function shouldUseSsl(databaseUrl, env = process.env) {
   return (
@@ -33,6 +34,7 @@ export async function loadSchema({
   databaseUrl = process.env.DATABASE_URL,
   env = process.env,
   createClient,
+  connectedClient,
   readFile = readFileSync,
   exists = existsSync,
   readDir = readdirSync,
@@ -51,7 +53,7 @@ export async function loadSchema({
   const useSsl = shouldUseSsl(databaseUrl, env);
 
   const makeClient = createClient ?? ((config) => new Client(config));
-  const client = makeClient({
+  const client = connectedClient ?? makeClient({
     connectionString: databaseUrl,
     ssl: useSsl ? { rejectUnauthorized: false } : undefined,
   });
@@ -59,8 +61,18 @@ export async function loadSchema({
   // listener, which made a migration's "reported count" claim false on the only rollout path —
   // the stranded-corrections report is a documented decision input, not decoration.
   client.on?.("notice", (n) => console.log(`[pg notice] ${n.message}`));
-  await client.connect();
+  const ownsClient = !connectedClient;
+  if (ownsClient) await client.connect();
   try {
+    if (env.STAGING_DATA_MODE === "copy-ready") {
+      if (connectedClient) {
+        if (!(await hasExclusiveDataUseLock(client))) throw new Error("copy-mode injected schema loader requires the same session to hold the exclusive data-use lock");
+      } else {
+        await acquireDataUseLock(client, "shared", true);
+        const journal = await readJournal(client);
+        if (journal.state !== "ready") throw new Error(`copy-mode schema loader refused while refresh state is ${journal.state}`);
+      }
+    }
     // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —
     // a legit long CREATE INDEX is unaffected). This runs on every deploy (Railway preDeployCommand),
     // so without it a single stuck reader holding ACCESS SHARE makes an `ALTER` wait forever at the
@@ -82,7 +94,7 @@ export async function loadSchema({
       logger.log(`✓ postgres/migrations/${f} applied`);
     }
   } finally {
-    await client.end();
+    if (ownsClient) await client.end();
   }
 }
 

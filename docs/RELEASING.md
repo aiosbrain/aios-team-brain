@@ -1,6 +1,13 @@
 # Releasing AIOS Team Brain
 
-**Status: there is no release process yet, and this file is the first half of building one.**
+**Status: the staging-first controller and enforcement contract are implemented but NOT ACTIVATED.**
+Until the activation checklist below is evidenced, the old manual procedure remains descriptive history and must not be represented as enforced.
+
+The target workflow is: merge features to `staging`, validate the exact annotated tag against its exact successful staging deployment, then dispatch `.github/workflows/release-controller.yml`. The protected `staging-release` environment supplies the normal GitHub App credential; `GITHUB_TOKEN` remains contents-read. The controller remeasures tag immutability, the eleven producer-pinned checks, main ancestry, deployment SHA and authenticated health immediately before a non-force main update. It then observes production to the same SHA and healthy state within a finite deadline; a successful push with a failed/missing deployment is reported as `promoted-but-deployment-failed` or `promoted-but-deployment-unverified`, never rolled back by rewriting main.
+
+Activation must install and verify the three rulesets emitted by `scripts/staging-ops/main-policy.mjs`: `main-integrity` has no bypass; `main-release-evidence` permits only the emergency App; `main-release-writer` permits only the distinct normal and emergency Apps. Remove conflicting classic PR/check constraints only after the active rulesets preserve every existing check. Test human/admin/normal/emergency operations on a disposable protected branch. Configure protected environment reviewers, prevent self-review, and restrict controller deployment branches to exactly `staging`. This PR performs none of those provider writes.
+
+Emergency is a separate `staging-emergency` environment and App. It requires an HTTPS incident URL, concrete reason, human authorization and a non-force descendant; audit is written before the update and completed/refused afterward. Back-merge the hotfix through a reviewed staging PR and cut a new normal release. Never reuse emergency credentials for ordinary promotion.
 
 What exists today: four tags (`v0.7.0` … `v0.10.0`), the newest cut **2026-08-03**, with `main`
 **166 commits and 34 migration files (29 added, 5 modified)** past it and `package.json` still reading

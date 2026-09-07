@@ -218,7 +218,7 @@ export async function POST(req: NextRequest) {
 
   // Per-team provider keys + models + the explicit answering-backend override (null fields → env
   // fallback in streamAnswer; `activeProvider` forces a backend, else selectLlmBackend precedence).
-  const keys = await resolveAnsweringKeys(db, team.id);
+  const keys = await resolveAnsweringKeys(db, team.id, "interactive-query");
 
   // DEFERRED, deliberately (review: "no idempotency or active-run guard"). Two tabs — or a client that
   // re-POSTs after losing the SSE — start two turns in one conversation: two answers, two spend rows,

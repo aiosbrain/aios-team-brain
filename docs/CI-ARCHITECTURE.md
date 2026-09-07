@@ -65,8 +65,9 @@ flowchart TD
 | `datamechanics-tests` | `npm run test:migrate-from-existing` + `npm run test:datamechanics` against real Postgres 16 (port 5434) — schema upgrade-from-a-released-tag, RLS, persistence, access control | Yes           |
 | `http-tests`          | `npm run build` + `npm run test:http` — the API over a real socket against Postgres 16: TCP fetch, the Next.js route runtime (cookies/headers), JSON wire format | No (advisory) |
 | `ingestion-tests`     | `pytest -q` inside `ingestion/` — Python ingest pipeline                                                                                                         | Yes           |
+| `staging-paired-refresh` | `npm run test:staging-pair` — isolated Postgres 18/Neo4j pairs, role-separated authenticated object stores, actual exporter/importer CLIs, real Next tier-read oracle, zero-egress spy, and fault/recovery/concurrency cases | Yes |
 
-The four required jobs (`docs-drift`, `brain-tests`, `datamechanics-tests`, `ingestion-tests`) must pass for a PR to merge (enforced via branch protection). `http-tests` runs `continue-on-error` (advisory) until it proves stable — see Branch Protection below.
+The paired-refresh job is executable CI evidence and never self-skips in its lane (`STAGING_PAIR_REQUIRED=1`). Live runner networks, schedules, policies and storage are separate activation evidence; a green local/CI harness is not a claim they are provisioned. Main's desired release ruleset remains the exact eleven-context contract in the accepted design; changing that context set requires an explicit policy migration rather than silently editing protection.
 
 ### `migration-mirror-nightly.yml` — deletion-observability sweep (nightly, advisory)
 

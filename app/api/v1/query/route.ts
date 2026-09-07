@@ -184,7 +184,7 @@ export async function POST(req: NextRequest) {
 
   // Per-team provider keys + models + the explicit answering-backend override (same resolver the
   // dashboard route uses, so both honor OpenRouter/OpenAI/local + `teams.answering_provider`).
-  const keys = await resolveAnsweringKeys(db, teamId);
+  const keys = await resolveAnsweringKeys(db, teamId, "interactive-query");
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({

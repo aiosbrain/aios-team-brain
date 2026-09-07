@@ -1,0 +1,215 @@
+name: aios-staging-pair
+x-runner: &runner
+  build: { context: ., dockerfile: docker/staging-ops.Dockerfile }
+  restart: "no"
+x-source-store: &source-store
+  STAGING_OBJECT_STORE: s3
+  SOURCE_S3_ENDPOINT: http://source-object-store:9000
+  SOURCE_S3_REGION: us-east-1
+  SOURCE_S3_BUCKET: staging-pair
+  SOURCE_S3_PREFIX: source
+x-rollback-store: &rollback-store
+  STAGING_OBJECT_STORE: s3
+  ROLLBACK_S3_ENDPOINT: http://rollback-object-store:9000
+  ROLLBACK_S3_REGION: us-east-1
+  ROLLBACK_S3_BUCKET: staging-pair
+  ROLLBACK_S3_PREFIX: rollback
+x-importer: &importer-env
+  STAGING_PAIR_REQUIRED: "1"
+  STAGING_OPS_ROLE: importer
+  STAGING_OPS_IMAGE_DIGEST: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  STAGING_IMPORTER_IMAGE_DIGEST: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  STAGING_MAINTENANCE_ADAPTER: local
+  STAGING_OPS_ENVIRONMENT_ID: staging-local
+  RAILWAY_ENVIRONMENT_ID: staging-local
+  RAILWAY_PROJECT_ID: local-project
+  STAGING_APP_SERVICE_ID: app-local
+  STAGING_GRAPHITI_SERVICE_ID: graphiti-local
+  STAGING_IMPORTER_SERVICE_ID: importer-local
+  STAGING_NEO4J_SERVICE_NAME: staging-neo4j
+  STAGING_NEO4J_DATABASE: neo4j
+  DATABASE_URL: postgres://app:stagingpass@staging-pg.railway.internal:5432/brain
+  NEO4J_URL: bolt://staging-neo4j.railway.internal:7687
+  NEO4J_USER: neo4j
+  NEO4J_PASSWORD: stagingtest1
+  NEO4J_DATABASE: neo4j
+  SOURCE_S3_ACCESS_KEY_ID: source-read
+  SOURCE_S3_SECRET_ACCESS_KEY: source-read-secret
+  ROLLBACK_S3_ACCESS_KEY_ID: rollback-owner
+  ROLLBACK_S3_SECRET_ACCESS_KEY: rollback-owner-secret
+  EXPORTER_SIGNING_PUBLIC_KEY_FILE: /run/staging-secrets/exporter-signing-public.pem
+  IMPORTER_ENCRYPTION_PRIVATE_KEY_FILE: /run/staging-secrets/importer-encryption-private.pem
+  ROLLBACK_SIGNING_PRIVATE_KEY_FILE: /run/staging-secrets/rollback-signing-private.pem
+  ROLLBACK_SIGNING_PUBLIC_KEY_FILE: /run/staging-secrets/rollback-signing-public.pem
+  ROLLBACK_ENCRYPTION_PRIVATE_KEY_FILE: /run/staging-secrets/rollback-encryption-private.pem
+  ROLLBACK_ENCRYPTION_PUBLIC_KEY_FILE: /run/staging-secrets/rollback-encryption-public.pem
+  STAGING_COMPARISON_KEY_BASE64: ${STAGING_COMPARISON_KEY_BASE64:?generate harness secrets first}
+  STAGING_COMPARISON_KEY_ID: harness-v1
+  AUTH_SECRET: staging-auth-secret-that-is-distinct-0123456789
+  SECRETS_KEY: staging-secrets-key-that-is-distinct-012345
+  STAGING_TESTER_CREDENTIALS_JSON: '[{"email":"internal@example.test","password":"Staging-only-Tester-Password-123!","teamId":"11111111-1111-4111-8111-111111111111","memberId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1","role":"admin","posture":"team"},{"email":"external@example.test","password":"Staging-only-External-Password-123!","teamId":"11111111-1111-4111-8111-111111111111","memberId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2","role":"member","posture":"external"}]'
+  RAILWAY_STAGING_MAINTENANCE_TOKEN: local-maintenance-token
+  LOCAL_MAINTENANCE_URL: http://maintenance:8080
+  STAGING_ORIGIN: http://maintenance:3000
+  STAGING_HEALTH_TOKEN: staging-health-token-01234567890123456789
+  STAGING_BOOTSTRAP_MODE: legacy-pg-only
+  STAGING_DATA_MODE: copy-ready
+  STAGING_BUNDLE_MAX_BYTES: "536870912"
+  STAGING_OBJECT_TIMEOUT_MS: "30000"
+
+services:
+  prod-pg:
+    image: postgres:18
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: prodpass, POSTGRES_DB: brain }
+    tmpfs: [/var/lib/postgresql]
+    networks:
+      production: { aliases: [prod-pg.railway.internal] }
+    healthcheck: { test: [CMD-SHELL, "pg_isready -U app -d brain"], interval: 2s, timeout: 3s, retries: 40 }
+  staging-pg:
+    image: postgres:18
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: stagingpass, POSTGRES_DB: brain }
+    tmpfs: [/var/lib/postgresql]
+    networks:
+      staging: { aliases: [staging-pg.railway.internal] }
+    healthcheck: { test: [CMD-SHELL, "pg_isready -U app -d brain"], interval: 2s, timeout: 3s, retries: 40 }
+  prod-neo4j:
+    image: neo4j:5.26.2
+    environment: { NEO4J_AUTH: neo4j/prodtest1 }
+    tmpfs: [/data]
+    networks:
+      production: { aliases: [prod-neo4j.railway.internal] }
+    healthcheck: { test: [CMD-SHELL, "cypher-shell -u neo4j -p prodtest1 'RETURN 1'"], interval: 3s, timeout: 5s, retries: 40 }
+  staging-neo4j:
+    image: neo4j:5.26.2
+    environment: { NEO4J_AUTH: neo4j/stagingtest1 }
+    tmpfs: [/data]
+    networks:
+      staging: { aliases: [staging-neo4j.railway.internal] }
+    healthcheck: { test: [CMD-SHELL, "cypher-shell -u neo4j -p stagingtest1 'RETURN 1'"], interval: 3s, timeout: 5s, retries: 40 }
+  source-object-store:
+    <<: *runner
+    command: [scripts/staging-ops/local-object-store-service.mjs]
+    environment:
+      PORT: "9000"
+      LOCAL_OBJECT_STORE_ROOT: /data
+      LOCAL_OBJECT_STORE_BUCKET: staging-pair
+      LOCAL_OBJECT_STORE_POLICIES_JSON: '{"source-publish":{"secret":"source-publish-secret","operations":["put"],"prefixes":["source/"]},"source-read":{"secret":"source-read-secret","operations":["get","list"],"prefixes":["source/"]},"source-control":{"secret":"source-control-secret","operations":["get","put","list"],"prefixes":["source/"]}}'
+    tmpfs: [/data:uid=1000,gid=1000,mode=0700]
+    healthcheck: { test: [CMD-SHELL, "test \"$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)\" = 404"], interval: 1s, timeout: 2s, retries: 30 }
+    networks: [source-store]
+  rollback-object-store:
+    <<: *runner
+    command: [scripts/staging-ops/local-object-store-service.mjs]
+    environment:
+      PORT: "9000"
+      LOCAL_OBJECT_STORE_ROOT: /data
+      LOCAL_OBJECT_STORE_BUCKET: staging-pair
+      LOCAL_OBJECT_STORE_POLICIES_JSON: '{"rollback-owner":{"secret":"rollback-owner-secret","operations":["get","put","list","delete"],"prefixes":["rollback/"]},"rollback-control":{"secret":"rollback-control-secret","operations":["get","put","list","delete"],"prefixes":["rollback/"]}}'
+    tmpfs: [/data:uid=1000,gid=1000,mode=0700]
+    healthcheck: { test: [CMD-SHELL, "test \"$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)\" = 404"], interval: 1s, timeout: 2s, retries: 30 }
+    networks: [rollback-store]
+  network-spy:
+    <<: *runner
+    command: [scripts/staging-ops/local-network-spy-service.mjs]
+    environment: { PORT: "7777" }
+    networks: [staging]
+  exporter:
+    <<: *runner
+    command: [scripts/staging-ops/exporter.mjs]
+    environment:
+      <<: *source-store
+      STAGING_PAIR_REQUIRED: "1"
+      STAGING_OPS_ROLE: exporter
+      STAGING_OPS_IMAGE_DIGEST: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      STAGING_MAINTENANCE_ADAPTER: local
+      PRODUCTION_EXPORT_ENVIRONMENT_ID: production-local
+      RAILWAY_ENVIRONMENT_ID: production-local
+      DATABASE_URL: postgres://app:prodpass@prod-pg.railway.internal:5432/brain
+      NEO4J_URL: bolt://prod-neo4j.railway.internal:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: prodtest1
+      NEO4J_DATABASE: neo4j
+      SOURCE_APPLICATION_COMMIT: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      SOURCE_S3_ACCESS_KEY_ID: source-publish
+      SOURCE_S3_SECRET_ACCESS_KEY: source-publish-secret
+      EXPORTER_SIGNING_PRIVATE_KEY_FILE: /run/staging-secrets/exporter-signing-private.pem
+      IMPORTER_ENCRYPTION_PUBLIC_KEY_FILE: /run/staging-secrets/importer-encryption-public.pem
+      STAGING_COMPARISON_KEY_BASE64: ${STAGING_COMPARISON_KEY_BASE64:?generate harness secrets first}
+      STAGING_COMPARISON_KEY_ID: harness-v1
+      AUTH_SECRET: production-auth-secret-that-is-distinct-012345
+      SECRETS_KEY: production-secrets-key-that-is-distinct-01
+      STAGING_EXPORT_RETENTION_DAYS: "14"
+    volumes: ["${STAGING_HARNESS_SECRETS_DIR:?generate harness secrets first}/exporter:/run/staging-secrets:ro"]
+    networks: [production, source-store]
+    depends_on:
+      prod-pg: { condition: service_healthy }
+      prod-neo4j: { condition: service_healthy }
+      source-object-store: { condition: service_healthy }
+  importer:
+    <<: *runner
+    command: [scripts/staging-ops/importer.mjs, tick]
+    environment:
+      <<: [*source-store, *rollback-store, *importer-env]
+    volumes: ["${STAGING_HARNESS_SECRETS_DIR:?generate harness secrets first}/importer:/run/staging-secrets:ro"]
+    networks: [staging, source-store, rollback-store]
+    depends_on:
+      staging-pg: { condition: service_healthy }
+      staging-neo4j: { condition: service_healthy }
+      source-object-store: { condition: service_healthy }
+      rollback-object-store: { condition: service_healthy }
+  maintenance:
+    <<: *runner
+    command: [scripts/staging-ops/local-maintenance-service.mjs]
+    environment:
+      LOCAL_MAINTENANCE_TOKEN: local-maintenance-token
+      STAGING_OPS_ENVIRONMENT_ID: staging-local
+      RAILWAY_ENVIRONMENT_ID: staging-local
+      STAGING_APP_SERVICE_ID: app-local
+      STAGING_GRAPHITI_SERVICE_ID: graphiti-local
+      STAGING_IMPORTER_SERVICE_ID: importer-local
+      STAGING_IMPORTER_IMAGE_DIGEST: sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+      DATABASE_URL: postgres://app:stagingpass@staging-pg.railway.internal:5432/brain
+      NEO4J_URL: bolt://staging-neo4j.railway.internal:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: stagingtest1
+      NEO4J_DATABASE: neo4j
+      AUTH_SECRET: staging-auth-secret-that-is-distinct-0123456789
+      SECRETS_KEY: staging-secrets-key-that-is-distinct-012345
+      STAGING_HEALTH_TOKEN: staging-health-token-01234567890123456789
+      INGEST_POLL_ENABLED: "true"
+      SOCIAL_JOBS_ENABLED: "true"
+      GRAPHITI_URL: http://network-spy:7777
+      LLM_BASE_URL: http://network-spy:7777
+      EMBEDDINGS_URL: http://network-spy:7777
+      LOCAL_INITIAL_COMMIT: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      LOCAL_STAGING_HEAD: cccccccccccccccccccccccccccccccccccccccc
+      LOCAL_INITIAL_DATA_MODE: legacy-pg-only
+      LOCAL_APP_COMMAND_JSON: '["node","scripts/staging-ops/startup-fence.mjs","--","npm","run","dev","--","--hostname","0.0.0.0","--port","3000"]'
+    networks: [staging]
+    depends_on:
+      staging-pg: { condition: service_healthy }
+      staging-neo4j: { condition: service_healthy }
+      network-spy: { condition: service_started }
+  fixture-controller:
+    <<: *runner
+    entrypoint: [node]
+    command: [scripts/staging-ops/staging-pair-fixture.mjs]
+    environment:
+      PROD_DATABASE_URL: postgres://app:prodpass@prod-pg:5432/brain
+      STAGING_DATABASE_URL: postgres://app:stagingpass@staging-pg:5432/brain
+      PROD_NEO4J_URL: bolt://prod-neo4j:7687
+      STAGING_NEO4J_URL: bolt://staging-neo4j:7687
+      STAGING_APP_ORIGIN: http://maintenance:3000
+      STAGING_NETWORK_SPY_URL: http://network-spy:7777
+    networks: [production, staging, source-store, rollback-store]
+    depends_on:
+      prod-pg: { condition: service_healthy }
+      staging-pg: { condition: service_healthy }
+      prod-neo4j: { condition: service_healthy }
+      staging-neo4j: { condition: service_healthy }
+
+networks:
+  production: { internal: true }
+  staging: { internal: true }
+  source-store: { internal: true }
+  rollback-store: { internal: true }

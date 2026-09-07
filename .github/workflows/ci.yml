@@ -183,6 +183,14 @@ jobs:
       - run: npm ci
       - run: npm run test:neo4j
 
+  staging-paired-refresh:
+    name: Staging paired refresh integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run isolated four-database exporter/importer harness
+        run: npm run test:staging-pair
+
   ingestion-tests:
     name: Ingestion tests (pytest)
     runs-on: ubuntu-latest

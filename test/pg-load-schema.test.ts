@@ -13,6 +13,7 @@ type LoadSchema = (options?: {
   databaseUrl?: string;
   env?: Record<string, string | undefined>;
   createClient?: (config: ClientConfig) => FakeClient;
+  connectedClient?: FakeClient;
   logger?: { log: (message: string) => void };
 }) => Promise<void>;
 
@@ -35,6 +36,7 @@ class FakeClient {
       throw new Error("query failed");
     }
     this.queries.push(sql);
+    return { rows: [] };
   }
 
   async end() {
@@ -165,5 +167,20 @@ describe("pg-load-schema", () => {
     expect(clients).toHaveLength(1);
     expect(clients[0].queries).toEqual(["SET lock_timeout = 15000", "create table base();"]);
     expect(clients[0].ended).toBe(true);
+  });
+
+  it("requires an injected copy-mode loader to use the exclusive-lock-owning session", async () => {
+    const { loadSchema } = await importLoader();
+    const root = makeWorkspace();
+    const client = new FakeClient({ connectionString: "postgres://unused" });
+    await expect(loadSchema({
+      cwd: root,
+      databaseUrl: "postgres://unused",
+      env: { STAGING_DATA_MODE: "copy-ready" },
+      connectedClient: client,
+      logger: { log: vi.fn() },
+    })).rejects.toThrow(/exclusive data-use lock/);
+    expect(client.connected).toBe(false);
+    expect(client.ended).toBe(false);
   });
 });

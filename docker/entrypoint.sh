@@ -14,4 +14,4 @@ fi
 
 # `exec` matters: the server must become PID 1 so `docker compose stop` / Ctrl-C signal Next
 # directly instead of killing this wrapper and orphaning it.
-exec "$@"
+exec node /app/scripts/staging-ops/startup-fence.mjs -- "$@"

@@ -1,0 +1,32 @@
+{
+  "activated": false,
+  "storage": {
+    "sourceBundles": {
+      "retentionDays": 14,
+      "publisherOperations": ["put"],
+      "importerOperations": ["get", "list"]
+    },
+    "rollbackBundles": {
+      "retention": "current-without-ttl; previous-and-candidate-until-new-ready",
+      "ownerOperations": ["get", "put", "list", "delete"]
+    }
+  },
+  "services": {
+    "aios-staging-export": {
+      "environment": "production",
+      "schedule": "0 3 * * 0",
+      "command": ["node", "scripts/staging-ops/exporter.mjs"],
+      "sourceDeployTrigger": null,
+      "automaticDeployments": false,
+      "image": "REPLACE_WITH_IMMUTABLE_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+    },
+    "aios-staging-import": {
+      "environment": "staging",
+      "schedule": "*/5 * * * *",
+      "command": ["node", "scripts/staging-ops/importer.mjs", "tick"],
+      "sourceDeployTrigger": null,
+      "automaticDeployments": false,
+      "image": "REPLACE_WITH_IMMUTABLE_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+    }
+  }
+}

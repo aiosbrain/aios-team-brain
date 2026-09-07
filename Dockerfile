@@ -58,7 +58,7 @@ EXPOSE 3000
 # bootstrap.mjs MISSING". An assertion that cannot fail is worse than none, because it reads as
 # coverage. `|| { …; exit 1; }` depends on no shell option at all, and names what is missing.
 RUN set -eu; \
-    for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs; do \
+    for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs /app/scripts/staging-ops/startup-fence.mjs; do \
       test -f "$f" || { echo "boot chain: $f is missing or not a regular file" >&2; exit 1; }; \
       test -s "$f" || { echo "boot chain: $f is empty" >&2; exit 1; }; \
       test -r "$f" || { echo "boot chain: $f is not readable" >&2; exit 1; }; \
