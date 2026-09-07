@@ -191,25 +191,46 @@ describe("redaction covers the shapes the new service logs can carry", () => {
 
 describe("the controller records what its child actually did", () => {
   const source = readFileSync("scripts/staging-ops/local-maintenance-service.mjs", "utf8");
+  /**
+   * The negative assertions below are about CODE. The comments explaining these fixes necessarily
+   * quote the defective forms they replaced (`child.killed`, `exitCode == null`), and an assertion
+   * that cannot tell a fix from its own explanation would fail for writing the explanation.
+   */
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
   it("emits the PID, the exit code and the signal — not just CRASHED", () => {
     for (const receipt of ["deployment-spawned", "deployment-spawn-failed", "deployment-exited", "deployment-stop-requested", "deployment-stop-completed"]) {
       expect(source, receipt).toContain(`emitReceipt("${receipt}"`);
     }
-    expect(source).toContain("exitSignal: signal ?? null");
-    expect(source).toContain("killedByUs: Boolean(child.killed)");
+    expect(source).toContain("exitSignal: outcome.signal");
+    // `child.killed` is signal-REQUEST metadata, never proof of termination. What we asked for is
+    // recorded when we ask; what happened comes from the settled terminal outcome.
+    expect(source).toContain("stopRequested: Boolean(deployment.stopRequested)");
+    expect(code).not.toContain("child.killed");
     // `SUCCESS` is assigned on spawn, not on readiness — recorded in the receipt so nothing
     // downstream reads it as an application health claim.
     expect(source).toContain("statusMeans: \"process spawned, NOT application readiness\"");
   });
 
-  it("changes NO lifecycle behaviour: same signal, same unbounded wait", () => {
-    // This pass is diagnostics only. A stop deadline or a process-group kill would be the
-    // speculative fix the adjudication defers until the evidence identifies the failure.
-    expect(source).toContain('deployment.child.kill("SIGTERM")');
-    expect(source).not.toMatch(/SIGKILL/);
-    expect(source).not.toMatch(/process\.kill\(-/);
-    expect(source).not.toMatch(/detached:\s*true/);
+  /**
+   * REPLACES the revision-8 "changes NO lifecycle behaviour" test. That prohibition was correct
+   * while the cause was unknown; runtime 5 measured it (a stop awaiting an exit that had already
+   * fired, and a Next descendant still holding `0.0.0.0:3000` after its wrapper's stop "completed"),
+   * and `runtime-fifth-adjudication.md` accepts group supervision as the bounded fix. Only this test
+   * changes: the diagnostic receipts, the secret exclusions and the spawn-vs-readiness distinction
+   * above are all retained.
+   */
+  it("supervises through the shared owned-workload lifecycle, never by name or by port", () => {
+    expect(source).toContain("spawnOwnedWorkload");
+    // Liveness is the settled terminal outcome. `exitCode == null` is still null for a
+    // signal-terminated child, which is what listed a dead PID 18 as active.
+    expect(source).toContain("const isActive = (deployment) => deployment.workload.terminal() === null;");
+    expect(code).not.toMatch(/exitCode\s*==\s*null/);
+    // NOTHING is killed by executable name, command substring, port occupancy or enumeration.
+    expect(code).not.toMatch(/pkill|killall|lsof|fuser|\bps\b\s+-/);
+    // An occupied address is REFUSED, and its holder is left alone.
+    expect(source).toContain('error: "address-in-use"');
+    expect(source).toContain("addressAvailable");
   });
 
   it("logs no command, no arguments and no environment", () => {

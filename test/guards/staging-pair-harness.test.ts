@@ -67,6 +67,31 @@ describe("paired refresh isolated harness", () => {
     }
   });
 
+  it("makes /app itself writable by the image's runtime user, without widening anything else", () => {
+    // The measured failure (runtime 5, `service-maintenance.log:17`): `next dev` died with
+    // `EACCES: permission denied, open '/app/next-env.d.ts'`. It CREATES that file at startup, which
+    // needs write permission on the DIRECTORY — and `WORKDIR` creates `/app` as root before the
+    // `USER` switch, while `COPY --chown` only sets ownership on what it copies. So the contents
+    // were owned by `node` and the directory was not.
+    const dockerfile = readFileSync("docker/staging-ops.Dockerfile", "utf8");
+    // The negative assertions are about INSTRUCTIONS. The comment explaining this fix necessarily
+    // names the things it rules out, and a check that cannot tell a rule from its own rationale
+    // would fail for writing the rationale down.
+    const instructions = dockerfile.replace(/^\s*#.*$/gm, "");
+    expect(instructions).toMatch(/chown node:node \/app\b/);
+    // Scoped: this directory and `.next` only. No recursive chown of `/app`, no `chmod 777`, and the
+    // container still runs as `node` — the fix must not become a permissions amnesty.
+    expect(instructions).not.toMatch(/chown\s+-R/);
+    expect(instructions).not.toMatch(/chmod\s+(-R\s+)?777/);
+    expect(instructions).not.toMatch(/^\s*USER\s+root/m);
+    expect(dockerfile).toContain("USER node");
+    expect(dockerfile.indexOf("chown node:node /app"), "ownership must be set before the USER switch")
+      .toBeLessThan(dockerfile.indexOf("USER node"));
+    // This is the HARNESS image. The production Dockerfile is a different file and is untouched —
+    // it does not run `next dev` and never had this failure.
+    expect(dockerfile).toContain("FROM node:20-bookworm-slim");
+  });
+
   it("role containers cannot route to the opposite database network", () => {
     expect(compose.services.exporter.networks).toEqual(["production", "source-store"]);
     expect(compose.services.importer.networks).toEqual(["staging", "source-store", "rollback-store"]);
