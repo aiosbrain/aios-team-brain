@@ -39,6 +39,7 @@ const state = (over: Partial<FleetState> = {}): FleetState => ({
   marker: false,
   teams: 1,
   stagingMarker: true,
+  contentWithoutSubstrate: false,
   ...over,
 });
 
@@ -186,6 +187,43 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
     });
   });
 
+  describe("STAGINGMARK-2 — the CLI refuses the shape the migration refuses", () => {
+    // The diff review found this hole: the SQL gate sits AFTER the marker short-circuit, so a stamp
+    // from this command clears the migration's refusal and the next deploy proceeds over a dark
+    // corpus. A doc sentence would not have closed it.
+    it("refuses content-without-substrate, and does NOT reach the materializer", async () => {
+      const m = spy({ ok: true, ran: true });
+      const out = await runMaterializeCommand(
+        { readState: staging({ contentWithoutSubstrate: true }), materialize: m.fn },
+        { confirm: true, confirmProduction: true }
+      );
+      expect(m.calls, "a stamp here would silently clear the PRET-6 gate").toBe(0);
+      expect(out.exitCode).not.toBe(0);
+      expect(out.lines.join("\n")).toMatch(/no context substrate/i);
+    });
+
+    it("refuses it BEFORE --confirm is considered — it is not a confirmation question", async () => {
+      const m = spy({ ok: true, ran: true });
+      const out = await runMaterializeCommand(
+        { readState: staging({ contentWithoutSubstrate: true }), materialize: m.fn },
+        { confirm: false, confirmProduction: false }
+      );
+      expect(m.calls).toBe(0);
+      expect(out.exitCode, "a dry run must not report this as merely unconfirmed").not.toBe(0);
+      expect(out.lines.join("\n")).toMatch(/no context substrate/i);
+    });
+
+    it("the INVERSE: a partitioned fleet is unaffected and still materializes", async () => {
+      const m = spy({ ok: true, ran: true });
+      const out = await runMaterializeCommand(
+        { readState: staging({ contentWithoutSubstrate: false }), materialize: m.fn },
+        { confirm: true, confirmProduction: true }
+      );
+      expect(m.calls).toBe(1);
+      expect(out.exitCode).toBe(0);
+    });
+  });
+
   describe("AC8 — --confirm is a bare flag and a value is refused", () => {
     it("accepts the bare forms", () => {
       expect(parseConfirmFlags({})).toEqual({ ok: true, confirm: false, confirmProduction: false });
@@ -198,8 +236,8 @@ describe("STAGINGMARK-1 — materialize-builtins handler", () => {
     });
 
     it("refuses `--confirm false` — the trap that reads as CONFIRMED today", () => {
-      // parseArgs assigns the following token as a string, so `--confirm false` yields "false",
-      // and `if (!flags.confirm)` treats a non-empty string as confirmed. purge-items still does.
+      // The original tokenizer made `--confirm false` truthy as confirmation. The shared argv
+      // boundary now prevents that on purge-items; this defense still rejects malformed maps.
       const parsed = parseConfirmFlags({ confirm: "false" });
       expect(parsed.ok).toBe(false);
       if (!parsed.ok) expect(parsed.error).toMatch(/takes no value/);

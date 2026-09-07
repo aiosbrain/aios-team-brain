@@ -7,9 +7,12 @@ import { projectItemsToGraph, ProjectionAbortError, FANOUT_PUSH_MAX_PER_PASS } f
 import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
 import { reconcileProjectedEpisodes, deepRequeueEnabledFromEnv, boundDeepRequeueSample, type DeepRequeueRef, type ReconcileOptions } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
+import { readStagingMarker } from "@/lib/env/staging-marker";
+import { projectionPrecondition, WINDOW_ENV, type MarkerRead, type RefusalReason } from "./projection-window";
+import { detectFanoutSurface, type FanoutSurface } from "./fanout-surface";
 
 /**
- * Graph-projection runner — the on-ramp that actually drives `projectSlackToGraph` (which is
+ * Graph-projection runner — the on-ramp that actually drives `projectItemsToGraph` (which is
  * otherwise just a library function nobody calls). Mirrors `lib/ingest/run.ts`: resolve the
  * team(s), then project each. THREE non-test callers, enumerated because a stale count of them was
  * load-bearing once: the admin "Project to graph" action (on-demand), `lib/graph/scheduler.ts`
@@ -22,12 +25,20 @@ import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 
 export interface GraphProjectionSummary {
   ok: boolean;
+  /** STGENV-3: WHY this run refused, as a discriminator a consumer can switch on rather than parse
+   *  out of `errors[0]`. Absent on a run that proceeded. Carried into `ingest_runs.meta`. */
+  refused?: RefusalReason;
+  /** STGENV-3: items the `work_at` window HELD — scanned, repaired, but not admitted for a first
+   *  home push. The no-silent-caps counter for the bound: in steady state a bounded pass has
+   *  `projected === 0`, so this is the only number that says the run did anything at all. */
+  windowHeld: number;
   /** Whether GRAPHITI_URL is set. When false nothing ran — the rest are zero. */
   configured: boolean;
   teams: number;
   scanned: number;
   projected: number;
-  /** EPISODES pushed (an item chunks into 1..16) — the unit extraction actually costs per. */
+  /** EPISODES pushed (an item chunks into 1..`MAX_EPISODE_CHUNKS`, default 80) — the unit extraction
+   *  actually costs per. (Said "1..16" until STGENV-3; the cap moved to 40 then 80 and this did not.) */
   episodes: number;
   /** `episodes` split by target group (PCCC-3) — the per-partition cost substrate, recorded
    * append-only into `ingest_runs.meta`. Row counts in `graph_episodes` cannot serve: a row is one
@@ -146,6 +157,16 @@ export async function runGraphProjection(opts?: {
   /** GRAPHSAT-1 test seams: the per-item lookup and the re-queue mode (default: env `GRAPH_DEEP_REQUEUE === "true"`). */
   lookup?: ReconcileOptions["lookup"];
   deepRequeue?: boolean;
+  /** STGENV-3 seams. `stagingMarker` MUST be injectable: the real read is raw SQL on the pool
+   *  (`to_regclass` is not expressible through `DbClient`), so it bypasses an injected `db` fake and
+   *  `getPool()` throws with no DATABASE_URL. `now` is the run clock — the window is per-RUN. */
+  stagingMarker?: () => Promise<boolean>;
+  now?: Date;
+  windowDays?: string;
+  /** D3e's detector, injectable for the same reason as `stagingMarker`: the criterion is that with no
+   *  window the detection is NOT ISSUED AT ALL, and `projects` is read by the projector anyway, so
+   *  table-name observation cannot express that. A seam can. */
+  fanoutSurface?: (teamId: string) => Promise<FanoutSurface>;
 }): Promise<GraphProjectionSummary> {
   if (inFlight) return inFlight;
   inFlight = runGraphProjectionInner(opts);
@@ -166,6 +187,10 @@ async function runGraphProjectionInner(opts?: {
   /** GRAPHSAT-1 test seams: the per-item lookup and the re-queue mode (default: env `GRAPH_DEEP_REQUEUE === "true"`). */
   lookup?: ReconcileOptions["lookup"];
   deepRequeue?: boolean;
+  stagingMarker?: () => Promise<boolean>;
+  now?: Date;
+  windowDays?: string;
+  fanoutSurface?: (teamId: string) => Promise<FanoutSurface>;
 }): Promise<GraphProjectionSummary> {
   const client = opts?.client ?? new GraphitiClient();
   const acquireLease = opts?.lease ?? acquireProjectionLease;
@@ -202,16 +227,67 @@ async function runGraphProjectionInner(opts?: {
     watermarkAnchors: 0,
     deepRequeueEnabled: opts?.deepRequeue ?? deepRequeueEnabledFromEnv(),
     lockedOut: 0,
+    windowHeld: 0,
     walkMs: 0,
     reconcileMs: 0,
     errors: [],
   };
   if (!client.configured) return summary; // nowhere to project — skip cleanly
 
+  // ── STGENV-3: the projection precondition ────────────────────────────────────────────────────
+  // AFTER the configured gate on purpose: with GRAPHITI_URL unset the runner must still be a clean
+  // no-op that never opens the database (pinned by the first test in this file's suite). Before
+  // `resolveTeams`, so a global refusal costs no query at all.
+  const windowRaw = opts?.windowDays ?? process.env[WINDOW_ENV];
+  let marker: MarkerRead;
+  try {
+    marker = { ok: true, marker: await (opts?.stagingMarker ?? readStagingMarker)() };
+  } catch (e) {
+    marker = { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+  const pre = projectionPrecondition({ marker, window: windowRaw, now: opts?.now ?? new Date() });
+  if (!pre.proceed) {
+    summary.ok = false;
+    summary.refused = pre.refused;
+    summary.errors.push(pre.error);
+    return summary;
+  }
+  const workAtFloor = pre.workAtFloor;
+
   const db = opts?.db ?? adminClient();
   const limit = opts?.limit ?? DEFAULT_LIMIT;
   const teams = await resolveTeams(db, opts?.teamId);
   summary.teams = teams.length;
+
+  // D3e: with a window active, a fan-out surface anywhere makes the RUN refuse — every team checked
+  // first, then the whole run refuses, rather than one team refusing while others project. A partial
+  // run whose summary said `refused` would misdescribe itself. No window ⇒ these queries are not
+  // issued at all, so a windowless production instance is byte-identical.
+  if (workAtFloor) {
+    for (const t of teams) {
+      const fan = await (opts?.fanoutSurface ?? ((id: string) => detectFanoutSurface(db, id)))(t.id);
+      if (!fan.ok) {
+        summary.ok = false;
+        // Its OWN reason, not `window-with-fanout`: "a fan-out surface exists" and "we could not find
+        // out" send the operator to different fixes, and the durable discriminator has to say which.
+        summary.refused = "fanout-state-unknown";
+        summary.errors.push(
+          `graph projection refused: could not determine whether ${t.slug} has initiative fan-out (${fan.error})`
+        );
+        return summary;
+      }
+      if (fan.present) {
+        summary.ok = false;
+        summary.refused = "window-with-fanout";
+        summary.errors.push(
+          `graph projection refused: ${t.slug} has initiative fan-out, whose interaction with a ` +
+            `${WINDOW_ENV} window is unspecified (a held fan-out push would leave the partition ` +
+            `permanently unreadable). Unset ${WINDOW_ENV} to project unbounded, or remove the fan-out.`
+        );
+        return summary;
+      }
+    }
+  }
 
   for (const t of teams) {
     // TICKFIT-2 (Codex diff review H1): one instance per team per pass. The in-process `inFlight`
@@ -253,6 +329,10 @@ async function runGraphProjectionInner(opts?: {
           limit,
           since,
           fanoutPushBudget: fanoutBudgetLeft,
+          // STGENV-3: forwarded on EVERY page, not just the first. Nothing else pins this — the pure
+          // decision proves a floor is produced and the projector proves one is honoured; only a
+          // multi-page end-to-end run proves the first reaches the second.
+          workAtFloor,
         });
         fanoutBudgetLeft = Math.max(0, fanoutBudgetLeft - s.fanoutPushed);
         summary.probeFallbackPages += s.probeFallbackPages;
@@ -263,6 +343,7 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += s.skipped;
+        summary.windowHeld += s.windowHeld;
         summary.fanoutThrottled += s.fanoutThrottled;
         summary.restrictionMovesPending += s.restrictionMovesPending;
         externalVacated += s.externalGroupVacated;
@@ -352,6 +433,9 @@ async function runGraphProjectionInner(opts?: {
           summary.episodesByGroup[g] = (summary.episodesByGroup[g] ?? 0) + n;
         }
         summary.skipped += e.partial.skipped;
+        // STGENV-3: an aborted pass must still report what the window HELD, for the same reason it
+        // reports what it pushed — otherwise a bounded run that aborts looks like it did nothing.
+        summary.windowHeld += e.partial.windowHeld;
         summary.fanoutThrottled += e.partial.fanoutThrottled;
         summary.restrictionMovesPending += e.partial.restrictionMovesPending;
         // TICKFIT-2: an aborted run must still report its fallbacks (the durable-visibility

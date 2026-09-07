@@ -543,11 +543,21 @@ describe("staging-refresh — what the SCRIPT may and may not contain (criteria 
     expect(code).toMatch(/rm -f "\$DUMP_FILE"/);
   });
 
-  it("prints a completion message naming the hazard no code here can close", () => {
+  it("prints a completion message naming the hazard AND the refusal that now closes it (STGENV-3)", () => {
+    // This guard used to assert the message called the hazard one "no code here can close". Code here
+    // does close it now, so the assertion moved with the behaviour rather than being left pinning a
+    // sentence that is no longer true — a guard that outlives its claim is how a doc quietly starts
+    // lying while the build stays green.
     const msg = completionMessage();
     expect(msg).toMatch(/GRAPHITI_URL/);
     expect(msg).toMatch(/graph_episodes is empty/);
     expect(msg).toMatch(/bill real extraction/);
+    // The refusal, and the ONE variable that lifts it — an operator who hits the refusal with no way
+    // past it is a worse outcome than the hazard was.
+    expect(msg).toMatch(/REFUSED/);
+    expect(msg).toMatch(/GRAPH_PROJECT_WINDOW_DAYS/);
+    // ...and no promise of a default, which is the whole point of there not being one.
+    expect(msg).not.toMatch(/default(s)? to \d/i);
     expect(code).toMatch(/completion/); // and the script actually prints it
   });
 });

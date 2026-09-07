@@ -327,17 +327,38 @@ different base.
 
 ## 3.4 Upgrading an EXISTING installation past PRET-6 — the ordered path
 
-**A pre-flip installation cannot jump to the retirement release.**
-`postgres/migrations/20260818210000_pret6_retire_access_enforcement.sql` refuses:
+**A pre-flip installation can now jump to the retirement release only if BOTH hold**
+(STAGINGMARK-2 changed the second one; it used to be an unconditional refusal):
+
+1. **No permissive team remains** — unchanged, and still steps 3-4 below. This is checked *first*,
+   inside the column-existence gate, and refuses before any membership is touched.
+2. **The corpus has been partitioned** — at least one `project_context_memberships` row exists.
+   This condition applies **only to a fleet that has content**: a fleet with no `items` at all is
+   admitted regardless, because there is nothing to darken. An already-marked fleet skips **this
+   condition only** — the function returns before evaluating it. **Condition 1 still applies**: the
+   permissive check lives in the migration, not the function, and runs before the function is ever
+   called, so a marked fleet with a permissive team is still refused.
+
+- **A fleet whose content is already partitioned** — it has `project_context_memberships` rows, i.e.
+  it went through the context substrate — now **materializes itself during preDeploy** and the deploy
+  proceeds. There is nothing to upgrade through. This is the restored-staging and
+  never-booted-but-otherwise-current case.
+- **A fleet with content and NO context substrate** — the `v0.10.0` class, which predates the entire
+  PRET series — still **refuses**, with a different and more specific error:
 
 ```
-PRET-6 refused: the PRET-4 builtin materialization has not completed on this fleet
-                — upgrade through the prior release first
+PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior
+                release so the corpus is partitioned before enforcement
 ```
 
-That refusal is correct and fails safe — `pg:schema` aborts, Railway's preDeploy halts, and the old
-code keeps serving. But until `v0.11.0` exists there was **no release to upgrade through**: `v0.10.0`
-predates the entire PRET series.
+  That refusal is deliberate and is the one that matters. Repairing group membership is **not** the
+  same as repairing visibility: enforcement fails closed for an item with no context unit, and the
+  only UNATTENDED partitioner is the budgeted scheduler stage (batch 100, 30-minute interval). Letting such a
+  fleet through would report a successful deploy over a corpus that is dark for many ticks.
+
+**All three refusals fail safe** — the permissive one, the substrate one, and the reserved-slug
+one: `pg:schema` aborts, Railway's preDeploy halts, and the old code keeps serving. `v0.10.0`
+predates the entire PRET series, which is why `v0.11.0` exists as the step.
 
 ### The path
 
@@ -364,19 +385,21 @@ predates the entire PRET series.
    npm run admin -- set-access-enforcement <team-slug> enforcing
    ```
 
-4. **Verify both preconditions directly. This query is the gate — not a log line:**
+4. **Verify the preconditions directly. This query is the gate — not a log line:**
 
    ```sql
-   select exists (select 1 from migration_markers where name = 'pret4_builtin_materialize') as marker_ok,
-          (select count(*) from teams where access_enforcement = 'permissive') as permissive_left;
+   select (select count(*) from teams where access_enforcement = 'permissive') as permissive_left,
+          (exists (select 1 from items)
+             and not exists (select 1 from project_context_memberships)) as content_without_substrate;
    ```
 
-   Proceed only on `marker_ok = t` **and** `permissive_left = 0`.
+   Proceed only on `permissive_left = 0` **and** `content_without_substrate = f`.
 
-   Why a query rather than the boot log: the boot materialization is best-effort and its retry lives in
-   the scheduler, which `instrumentation.ts` starts **only when `INGEST_POLL_ENABLED !== "false"`**. A
-   transient boot failure on a service with ingestion disabled leaves a healthy-looking instance with
-   no marker — and the next upgrade refuses exactly as before.
+   **The marker is no longer a precondition** (STAGINGMARK-2): the migration repairs a missing one
+   itself, so the old `marker_ok = t` check has been dropped from this query. What replaced it is the
+   substrate condition — the one thing repair cannot manufacture. Query rather than log line for the
+   same reason as before: the boot materialization is best-effort and its retry lives in the
+   scheduler, which `instrumentation.ts` starts **only when `INGEST_POLL_ENABLED !== "false"`**.
 
 5. **Point the service back at `main`** and deploy the retirement release.
 

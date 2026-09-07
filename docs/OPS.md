@@ -747,35 +747,130 @@ legs go stale in staging, but that alarm is *thresholded* and *true*).
 - Staging renders prod-shaped **Postgres**. Graph-backed surfaces — the learning panel, `graph-query`,
   the semantic retrieval leg — render **empty by design**. Narrative arcs show prod's cached arcs for
   4h, then linger up to 48h before blanking.
-- **The residual hazard, which no code here closes:** the emptied `graph_episodes` ledger means that if
-  `GRAPHITI_URL` is ever set on staging, the whole restored corpus looks unprojected and projection
-  starts billing real extraction. Three non-test entrypoints reach it — the scheduler, the admin
-  button, and `scripts/graph-window-battery/run-projection.ts`.
+- **The hazard this used to leave open is now a REFUSAL (STGENV-3).** The emptied `graph_episodes`
+  ledger means every restored item looks unprojected, so setting `GRAPHITI_URL` on staging would have
+  billed real extraction for the whole corpus (~$190 measured) with nobody pressing anything — via any
+  of the three non-test entrypoints: the scheduler, the admin button, and
+  `scripts/graph-window-battery/run-projection.ts`. On a database carrying `staging_marker`, an
+  UNBOUNDED projection is now refused.
 - Staging is **disposable**: anything created there is destroyed by the next refresh.
 
-### If a deploy refuses with "the PRET-4 builtin materialization has not completed"
+#### `GRAPH_PROJECT_WINDOW_DAYS` — how to lift the refusal for a bounded run
 
-The exact failure, as it appears in the Railway build log — the deploy stops at `preDeploy`:
+Deliberately documented as prose, **not as a row in the variable table above**. That table is a safety
+list: the guard reads every `| \`NAME\` |` row in this section, requires the count to match
+`STAGING_VARIABLES` in `scripts/staging-refresh-decision.mjs`, and requires each expectation to be
+`unset` or `` `false` ``. This is an operator knob with neither expectation, so a row would fail the
+build. Please leave it as prose.
+
+- **Unset on a staging database means REFUSE**, not "project everything". The refusal names the marker
+  and this variable, lands a red `ingest_runs` row every tick, and shows the reason in the admin
+  "Project to graph" button.
+- **There is deliberately NO DEFAULT.** A default would silently decide how much money to spend. The
+  amount is a spending decision, so it is typed on purpose.
+- **It must be a plain positive whole number of days.** `0`, a negative, a fraction, `1e3` and any
+  non-numeric value are REFUSED as `invalid-window` — never a silent fall back to unbounded. A blank
+  value (`GRAPH_PROJECT_WINDOW_DAYS=`) counts as *unset*, not invalid.
+- **Measured cost** (prod, 2026-09-06; ~$0.062/item is a planning estimate from $189.80 over 3,049
+  ledger rows, not a measured fresh-extraction price — an item chunks up to `MAX_EPISODE_CHUNKS`,
+  default 80, so a window skewed to long items lands off that mean):
+
+  | window (days) | items | ≈ cost |
+  |---|---|---|
+  | 1 | 33 | ~$2 |
+  | 7 | 83 | ~$5 (thin but non-empty arcs) |
+  | 30 | 727 | ~$45 |
+
+  (The window column is deliberately a bare number, not `` `7` ``. The variable-table guard above
+  parses every line in this section that STARTS with `` | `NAME` | `` and requires it to be a declared
+  staging variable — a backticked token here would be read as one. Indentation happens to hide it
+  today; not depending on that is cheaper than discovering it.)
+
+- The window bounds **admission** — the first push of an item that has no home ledger row. It is not a
+  cap on total spend: an item already in the ledger still re-extracts on a body change, a tier flip, a
+  chunk-config raise or a reconcile re-queue.
+- **On production**, the variable is honoured too (a window there bounds admission the same way), but
+  it is never *required*: no marker and no window means unbounded, exactly as before. Note the
+  consequence before setting it in production — an item with no home row and an old `work_at` is held
+  for as long as the window stands, and a `synced_at` bump will not rescue it. **Recovery is to unset
+  the window and run once.**
+- **With a window set, initiative fan-out makes the run refuse** (`window-with-fanout`). Holding a
+  fan-out push would leave the partition permanently unreadable, so the interaction is refused rather
+  than guessed. Measured 2026-09-06: zero initiatives exist, so this does not fire today.
+
+> **This table describes the PRE-STGENV-4 state.** Wiring staging's own `NEO4J_URL` and `GRAPHITI_URL`
+> — which is what makes narrative arcs render there — is STGENV-4, and it re-frames the variable table
+> above. Do not set them from this section.
+
+### Builtin materialization during deploy and attended recovery
+
+**STAGINGMARK-2 repairs markerless fleets during PRET-6 preDeploy**, including teams with
+no builtin groups and fleets that never booted PRET-4. `schema.sql` defines the frozen
+`materialize_builtin_membership_once()` function once; the migration calls it after the
+permissive-team readiness refusal and before dropping the retired columns. It creates Everyone
+and External, reconciles every member by tier in both directions, and stamps the marker last.
+An already-marked fleet returns without membership writes, audits or materializer locks.
+
+Reconcile failures (including a non-builtin group holding a reserved slug) halt the deploy.
+Reconciliation, marker and column drops roll back together. Earlier schema/migrations have
+already committed: the loader has no transaction around the entire replay. Resolve the reported
+failure and retry; permissive teams still require the prior release's readiness/flip path.
+
+On a marker miss the function locks `teams`, `members`, `groups`, `group_members`, then
+`migration_markers` in SHARE ROW EXCLUSIVE mode and re-reads the marker. **The migration sets no
+`lock_timeout` of its own** — deliberately, so your knob keeps its meaning: five locks plus the
+ACCESS EXCLUSIVE column-drop upgrade each wait under the loader's **per-statement** `lock_timeout`
+(`PG_MIGRATION_LOCK_TIMEOUT_MS`, default 15 s). The waiting statement count is data-dependent, so no
+total bound — and certainly no fleet-size or runtime guarantee — is claimed.
+The deadlock-freedom premise is that no current application transaction spans two of those
+five tables; a future `members` → `group_members` transaction would invalidate it. An older
+release's multi-statement TypeScript materializer is not retroactively serialized by these locks.
+
+**Never delete the marker as a repair recipe.** Marker loss cannot be distinguished from first
+materialization and can restore deliberately removed memberships. Boot/tick already had this
+behavior; preDeploy now performs it earlier.
+
+### The marker-class refusal that REMAINS, and why you should not route around it
 
 ```
-schema load failed: PRET-6 refused: the PRET-4 builtin materialization has not completed on this
-fleet — upgrade through the prior release first (see docs/RELEASE-NOTES-pret6.md)
+PRET-6 refused: this fleet has content but no context substrate — upgrade through the prior
+                release so the corpus is partitioned before enforcement
 ```
 
-**This happened to staging on 2026-09-05** (deploy `2e67246e`). It means the database has teams but no
-`pret4_builtin_materialize` marker. **The refusal is safe, and the running version keeps serving** — it
-raises before the column drop, so the PRET-6 block changes nothing. Be precise about the rest:
-`scripts/pg-load-schema.mjs` replays `postgres/schema.sql` and then each migration in filename order
-with **no wrapping transaction**, so `schema.sql` and every migration sorting before
-`20260818210000_pret6_retire_access_enforcement.sql` HAVE already applied (idempotently), and the ones
-sorting after it have not. The release is stopped part-way through an idempotent replay, which the next
-successful deploy completes — not an all-or-nothing abort.
+The migration repairs a markerless fleet, but it will **not** repair one whose corpus was never
+partitioned (`items` exist, `project_context_memberships` is empty — the pre-`v0.11.0` class).
+Stated precisely, the check is "at least one partition row exists", not "the corpus is fully
+partitioned": a fleet **mid-backfill** is admitted by design, because it went through the substrate
+release and the scheduler will finish. The predicate is also **fleet-global**, not per-team — a
+multi-team fleet where one team is partitioned and another is not is admitted. That is the
+deliberate trade: a per-team form would be stronger, but it would refuse a deploy for a team created
+inside the last backfill window, and a false refusal is the exact failure this slice exists to
+remove.
 
-It is also a **deadlock**, which is why it needs a command rather than a retry: the marker is written
-only by application code (`instrumentation.ts` at boot, and the scheduler tick), and both of those are
-downstream of a deploy that succeeded. Redeploying the same commit will refuse again, forever.
+That is deliberate. Membership and **visibility** are different repairs: enforcement fails closed for
+an item with no context unit, and the only UNATTENDED partitioner is the budgeted scheduler stage (batch 100,
+30-minute interval). Materializing such a fleet would hand you a deploy that reports success over a
+corpus nobody can see for many ticks.
 
-**The fix — stamp the marker directly:**
+"UNATTENDED" is doing real work in that sentence, and the earlier drafts of it were simply wrong:
+an operator CAN partition on demand — `npm run admin -- drain-context <team-slug>`, and the items
+API reconciles on write. What no operator gets is a corpus that partitions itself faster than the
+budgeted stage. So the remedy below is the reliable one, not the only conceivable one.
+
+**The fix is to upgrade through `v0.11.0`** so the substrate is built (`docs/RELEASING.md` §3.4).
+
+Two ways of clearing this that do **not** work — the second of which used to:
+- Hand-inserting a `project_context_memberships` row satisfies the check without partitioning
+  anything — precisely the state the check exists to catch.
+- `npm run admin -- materialize-builtins` **also refuses this shape now**. The review of this change
+  found that it would otherwise have been the easy bypass: it stamps the same marker, and the SQL
+  gate sits *after* the marker short-circuit, so a stamp from the CLI silently cleared the
+  migration's refusal and the next deploy proceeded over the dark corpus. The command carries the
+  same predicate and the same refusal.
+
+**Attended recovery remains available**, particularly for older releases that still emit
+“the PRET-4 builtin materialization has not completed” (the staging failure on 2026-09-05,
+deploy `2e67246e`). The command reconciles before stamping; it never merely silences a guard:
 
 ```bash
 DATABASE_URL="<the wedged database's URL>" npm run admin -- materialize-builtins
@@ -801,5 +896,4 @@ so running it against a healthy fleet is harmless.
 **The alternative, if you would rather not run a command against the database:** roll back to the
 previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
 see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
-is what `docs/RELEASE-NOTES-pret6.md` describes; the command above exists because a self-hoster has no
-dashboard to roll back in.
+is an older-release recovery option; current STAGINGMARK-2 deployments perform marker repair themselves.

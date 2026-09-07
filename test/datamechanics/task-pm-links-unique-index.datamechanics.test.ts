@@ -476,7 +476,7 @@ describe("ADOPTUNIQ-1 — the skip is AUDIBLE, and survives the real loader", ()
       // nothing. The rows are checked in.
       /**
        * The marker is stamped because the moment this test inserts a `teams` row it becomes a
-       * NON-EMPTY fleet, and `20260818210000_pret6_retire_access_enforcement.sql` REFUSES to replay
+       * NON-EMPTY fleet, and `20260818210000_pret6_retire_access_enforcement.sql` repairs rather than refusing (STAGINGMARK-2; it REFUSED to replay before that)
        * against one that has not completed the PRET-4 builtin materialization — aborting the load
        * with P0001 for a reason that has nothing to do with this index. A real fleet stamps this at
        * boot; emulating that is what makes the reload below exercise the branch under test rather
