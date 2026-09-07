@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import { transactionSessionFor } from "@/lib/db/pg/tx";
 
 export type AuditEntry = {
   team_id: string | null;
@@ -15,8 +16,8 @@ export type AuditEntry = {
 
 /** Append-only audit write via the service role. Best-effort: never throws. */
 export async function audit(db: DbClient, entry: AuditEntry) {
-  try {
-    await db.from("audit_log").insert({
+  const write = async (): Promise<void> => {
+    const { error } = await db.from("audit_log").insert({
       team_id: entry.team_id,
       actor_kind: entry.actor_kind,
       member_id: entry.member_id ?? null,
@@ -27,6 +28,16 @@ export async function audit(db: DbClient, entry: AuditEntry) {
       meta: entry.meta ?? {},
       ip: entry.ip ?? null,
     });
+    if (error) throw new Error(`audit insert failed: ${error.message}`);
+  };
+  const session = transactionSessionFor(db);
+  if (session) {
+    // A transaction-aborting audit error is recoverable only after SAVEPOINT rollback + release.
+    await session.optionalAudit(write, undefined);
+    return;
+  }
+  try {
+    await write();
   } catch {
     // auditing must never take the request down
   }

@@ -1,5 +1,6 @@
 import "server-only";
 import { Pool, types, type PoolConfig } from "pg";
+import type { SqlQueryResult } from "@/lib/db/types";
 
 /**
  * Singleton pg Pool for DB_BACKEND=postgres. Reads DATABASE_URL (Railway/any
@@ -86,14 +87,11 @@ export function getPool(): Pool {
   return pool;
 }
 
-export interface SqlResult<T> {
-  rows: T[];
-  rowCount: number;
-}
+export type SqlResult<T> = SqlQueryResult<T>;
 
 export async function runSql<T = Record<string, unknown>>(
   text: string,
-  params: unknown[]
+  params: unknown[] = []
 ): Promise<SqlResult<T>> {
   const res = await getPool().query(text, params);
   return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
