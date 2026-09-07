@@ -1,0 +1,55 @@
+{
+  "kind": "aios-codebase-request-limits",
+  "revision": 1,
+  "method": "POST",
+  "path": "/api/v1/codebases",
+  "maxBodyBytes": 2400000,
+  "maxRecentCommits": 100,
+  "bodyMeasurement": "Bytes supplied by Request.body, including JSON syntax and whitespace; inclusive limit; Content-Length is not authoritative",
+  "errors": {
+    "body": {
+      "status": 413,
+      "code": "payload_too_large",
+      "message": "body: at most 2400000 bytes per scan; reduce the scan payload and retry; do not split a snapshot across pushes"
+    },
+    "recentCommits": {
+      "status": 422,
+      "code": "invalid_payload",
+      "message": "metrics.recent_commits: at most 100 entries per scan; send a complete scan with a smaller recent-commit window; do not split a snapshot across pushes"
+    }
+  },
+  "boundaryCases": {
+    "recentCommits": [
+      {
+        "count": 0,
+        "admitted": true
+      },
+      {
+        "count": 20,
+        "admitted": true
+      },
+      {
+        "count": 100,
+        "admitted": true
+      },
+      {
+        "count": 101,
+        "admitted": false
+      }
+    ],
+    "body": [
+      {
+        "bytes": 2400000,
+        "admitted": true
+      },
+      {
+        "bytes": 2400001,
+        "admitted": false
+      }
+    ]
+  },
+  "memberApiMajor": 1,
+  "appliesFromMemberApiVersion": "1.23",
+  "applicability": "POST /api/v1/codebases for member API major 1 from 1.23 onward until explicitly superseded or withdrawn; not /api/v2",
+  "boundaryCasePrecondition": "All other existing payload constraints pass; another schema violation may supply the first invalid_payload message"
+}

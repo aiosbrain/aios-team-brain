@@ -64,6 +64,25 @@ and part of -7's predicate.
 
 **Wave 3 — re-triage** `5`, `6`, `16` against the smaller codebase.
 
+**Wave 3 also owns the cross-route request-admission follow-up — UNFILED, no key.** AUDITFIX-17
+bounded `POST /api/v1/codebases` only. Four sibling write routes still admit a request on the
+header-only pattern it replaced — `parseInt(Content-Length)` with a missing header defaulting to
+zero, so a chunked body passes ungated:
+
+- `app/api/v1/items/route.ts`
+- `app/api/v1/metrics/route.ts`
+- `app/api/v1/costs/route.ts`
+- `app/api/v1/subscriptions/route.ts`
+
+`lib/api/bounded-json.readBoundedJson` is deliberately generic and is the intended reuse, but each
+route needs its own decided ceiling, its own diagnosable message, and its own answer to whether the
+narrowing is publishable on `/api/v1` — none of which AUDITFIX-17 decided for them. **Do not
+retrofit them under -17's key**, and do not assume an existing AUDITFIX number covers this: no
+ticket exists yet, and this entry is the record of that, not an implementation plan. Whoever
+picks it up files it first (a row in `3-log/tasks.md` → `aios push`) and specs the ceilings
+against measured payloads rather than inheriting -17's 2,400,000, which was that route's own
+pre-existing number.
+
 ## Standing rules this pass produced
 
 1. **A ticket premise is a hypothesis.** Re-derive before speccing. 4-of-5 were wrong.
