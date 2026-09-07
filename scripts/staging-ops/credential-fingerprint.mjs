@@ -21,6 +21,34 @@ export function credentialFingerprint({ credentialClass, value, comparisonKey, k
   return { version: FINGERPRINT_VERSION, keyId, credentialClass, mac };
 }
 
+/**
+ * Is this a fingerprint at all — right version, a key ID of the shape the minter requires, a known
+ * class, and a MAC that decodes to the full 32 bytes?
+ *
+ * This exists because {@link fingerprintsEqual} answers `false` for a MISSING or MALFORMED input,
+ * which a caller comparing environments reads as "these credentials differ" — the exact conclusion
+ * an absent document must not produce. Callers that need "incomparable" as its own outcome ask here
+ * FIRST, and treat a false as unverified rather than as evidence of separation.
+ */
+export function fingerprintWellFormed(fp) {
+  if (!fp || typeof fp !== "object") return false;
+  if (fp.version !== FINGERPRINT_VERSION) return false;
+  if (!CLASSES.has(fp.credentialClass)) return false;
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(String(fp.keyId ?? ""))) return false;
+  if (typeof fp.mac !== "string" || !/^[A-Za-z0-9_-]+$/.test(fp.mac)) return false;
+  return Buffer.from(fp.mac, "base64url").length === 32;
+}
+
+/**
+ * Two fingerprints may be compared only when both are well formed AND were produced under the same
+ * comparison key and class. A different `keyId` yields different MACs for the SAME secret, so
+ * comparing across keys manufactures a "they differ" answer out of nothing.
+ */
+export function fingerprintsComparable(a, b) {
+  if (!fingerprintWellFormed(a) || !fingerprintWellFormed(b)) return false;
+  return a.keyId === b.keyId && a.credentialClass === b.credentialClass;
+}
+
 export function fingerprintsEqual(a, b) {
   if (!a || !b || a.version !== b.version || a.keyId !== b.keyId || a.credentialClass !== b.credentialClass) return false;
   const left = Buffer.from(String(a.mac ?? ""), "base64url");

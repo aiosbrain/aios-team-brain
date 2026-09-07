@@ -14,6 +14,12 @@ import {
 import { selectLlmBackend, type AnsweringProvider } from "@/lib/query/llm-backend";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubIngestion } from "@/lib/ingest/run";
+import {
+  adminSyncResult,
+  runManualContextPass,
+  type ManualContextEntrypoint,
+} from "@/lib/ingest/manual-context";
+import { INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import { runGraphProjection } from "@/lib/graph/run";
 import { projectionRunInput, shouldRecordProjectionRun } from "@/lib/graph/projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
@@ -153,34 +159,84 @@ export async function rotateSecret(
 }
 
 /**
+ * The shared body of the four "Run now" actions (AUDITFIX-14).
+ *
+ * Import → ONE bounded project-context pass → revalidate, in that order, on EVERY authorized attempt.
+ *
+ *   • The context pass runs even when the import returned errors, threw, was skipped or reported zero
+ *     changes: a thrown run is not proof that nothing was committed, and an older candidate backlog is
+ *     invisible in the returned counts. With `INGEST_POLL_ENABLED=false` nothing else will partition
+ *     that content, so it would be readable by nobody indefinitely.
+ *   • The revalidation now happens after the context stage for all four. Slack already revalidated
+ *     before its error return, because a confirmed-private channel reports an error AND PURGES its
+ *     items — that property is preserved and the other three gain it.
+ *   • `ok`/`error` composition lives in `adminSyncResult`, next to the reason pending work must not be
+ *     returned as `{ok:true, message}`.
+ *
+ * Authorization is the CALLER's job and happens before this is reached: an unauthorized action must
+ * invoke neither the importer nor the reconciliation, and must not revalidate.
+ *
+ * AC-07: a copied staging deployment refuses the whole thing here — after that authorization and
+ * before the import, so the "run the context pass even when the import failed" rule above never
+ * fires on a leg that failed BECAUSE the deployment is disabled. Nothing is imported, reconciled or
+ * revalidated, and the admin is told which of the two it is.
+ */
+async function runNowThenReconcile<S extends { ok: boolean; errors: string[]; skipped?: boolean }>(
+  teamId: string,
+  teamSlug: string,
+  entrypoint: ManualContextEntrypoint,
+  run: () => Promise<S>,
+  describe: (s: S) => string
+): Promise<{ ok: boolean; error?: string; message?: string }> {
+  const gate = await manualIngestionVerdict();
+  if (!gate.allowed) return { ok: false, error: gate.message ?? INGEST_DISABLED_MESSAGE };
+  let importOk = true;
+  let importError: string | null = null;
+  let importMessage: string | null = null;
+  try {
+    const s = await run();
+    if (s.skipped) {
+      // Single-flight refused the import. NEVER report this as a successful one.
+      importOk = false;
+      importError = "Import skipped — another sync is already running; try again in a moment.";
+    } else if (!s.ok && s.errors.length) {
+      importOk = false;
+      importError = s.errors.join("; ");
+    } else {
+      importMessage = describe(s);
+    }
+  } catch (e) {
+    importOk = false;
+    importError = e instanceof Error ? e.message : "sync failed";
+  }
+  const context = await runManualContextPass(teamId, entrypoint);
+  revalidatePath(`/t/${teamSlug}/admin/integrations`);
+  return adminSyncResult({ importOk, importError, importMessage, context });
+}
+
+/**
  * Run Slack ingestion now for this team (admins only). Pulls the configured
  * channels through the in-app runner and reports a one-line summary. The
  * scheduler also runs this on its interval; this is the on-demand trigger.
+ *
+ * NOTE: `s.ok` is `errors.length === 0`, so a private/unverifiable channel among otherwise healthy
+ * ones makes the whole run report as failed, with the per-channel lines as the error text. That is
+ * the intended loudness — a configured channel the brain refuses to ingest is a configuration error
+ * the admin has to resolve, not a notice to file away — and it's why the messages from
+ * `privateChannelAction` say what to do, not just what happened.
  */
 export async function syncSlackNow(
   teamSlug: string
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  try {
-    const s = await runSlackIngestion({ teamId: ctx.teamId });
-    // Revalidate BEFORE the error return: a failed run is not a no-op run — a confirmed-private
-    // channel reports as an error AND purges its items, so skipping the revalidation would show the
-    // admin the pre-purge data alongside the error.
-    revalidatePath(`/t/${teamSlug}/admin/integrations`);
-    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
-    // NOTE: `s.ok` is `errors.length === 0`, so a private/unverifiable channel among otherwise
-    // healthy ones makes the whole run report as failed above, with the per-channel lines as the
-    // error text. That is the intended loudness — a configured channel the brain refuses to ingest
-    // is a configuration error the admin has to resolve, not a notice to file away — and it's why
-    // the messages from `privateChannelAction` say what to do, not just what happened.
-    return {
-      ok: true,
-      message: `Synced ${s.channels} channel(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
-    };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
-  }
+  return runNowThenReconcile(
+    ctx.teamId,
+    teamSlug,
+    "slack",
+    () => runSlackIngestion({ teamId: ctx.teamId }),
+    (s) => `Synced ${s.channels} channel(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`
+  );
 }
 
 /**
@@ -193,17 +249,14 @@ export async function syncPlaneNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  try {
-    const s = await runPlaneIngestion({ teamId: ctx.teamId });
-    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
-    revalidatePath(`/t/${teamSlug}/admin/integrations`);
-    return {
-      ok: true,
-      message: `Imported ${s.items} work-item(s) from ${s.projects} project(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
-    };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
-  }
+  return runNowThenReconcile(
+    ctx.teamId,
+    teamSlug,
+    "plane",
+    () => runPlaneIngestion({ teamId: ctx.teamId }),
+    (s) =>
+      `Imported ${s.items} work-item(s) from ${s.projects} project(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`
+  );
 }
 
 /** Run Linear ingestion now for this team (admins only). Imports the configured team's issues. */
@@ -212,17 +265,14 @@ export async function syncLinearNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  try {
-    const s = await runLinearIngestion({ teamId: ctx.teamId });
-    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
-    revalidatePath(`/t/${teamSlug}/admin/integrations`);
-    return {
-      ok: true,
-      message: `Imported ${s.items} issue(s) from ${s.projects} team(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
-    };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
-  }
+  return runNowThenReconcile(
+    ctx.teamId,
+    teamSlug,
+    "linear",
+    () => runLinearIngestion({ teamId: ctx.teamId }),
+    (s) =>
+      `Imported ${s.items} issue(s) from ${s.projects} team(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`
+  );
 }
 
 /** Run GitHub Issues ingestion now for this team (admins only). Imports each configured repo's issues. */
@@ -231,18 +281,15 @@ export async function syncGithubNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
-  try {
+  return runNowThenReconcile(
+    ctx.teamId,
+    teamSlug,
+    "github",
     // TICKFIT-1 D2f: the admin "Run now" button promises a REAL pass — bypass the watermark.
-    const s = await runGithubIngestion({ teamId: ctx.teamId, force: true });
-    if (!s.ok && s.errors.length) return { ok: false, error: s.errors.join("; ") };
-    revalidatePath(`/t/${teamSlug}/admin/integrations`);
-    return {
-      ok: true,
-      message: `Imported ${s.items} issue(s) from ${s.projects} repo(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`,
-    };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "sync failed" };
-  }
+    () => runGithubIngestion({ teamId: ctx.teamId, force: true }),
+    (s) =>
+      `Imported ${s.items} issue(s) from ${s.projects} repo(s): +${s.created} new, ~${s.updated} updated, =${s.unchanged} unchanged.`
+  );
 }
 
 /**

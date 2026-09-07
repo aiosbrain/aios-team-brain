@@ -93,6 +93,56 @@ describe("trusted release controller", () => {
     })).resolves.toBeTruthy();
   });
 
+  it("sends the staging health token ONLY to the measured deployment domain, and never before measuring it", async () => {
+    // The accepted HIGH: the probe used to run in the same `Promise.all` as the deployment read and
+    // to target a CONFIGURED origin, so the privileged token was presented to whatever host the
+    // environment named and the binding was compared afterwards — a check that cannot prevent what
+    // it is checking. Three properties, each stated as its own observable:
+    //   (a) with no measurable domain, the probe is never CALLED at all;
+    //   (b) when it is called, it is called WITH the measured origin;
+    //   (c) a probe that answers about a different origin refuses instead of grading it unhealthy.
+    const tagSha = "a".repeat(40);
+    const candidate = "b".repeat(40);
+    const request = vi.fn(async (_method: string, path: string) => {
+      if (path.includes("/git/ref/tags/")) return { object: { type: "tag", sha: tagSha } };
+      if (path.includes("/git/tags/")) return { object: { type: "commit", sha: candidate } };
+      if (path.includes("/contents/package.json")) return { encoding: "base64", content: Buffer.from(JSON.stringify({ version: "1.2.3" })).toString("base64") };
+      if (path.includes("/compare/main...")) return { status: "ahead", base_commit: { sha: "c".repeat(40) } };
+      if (path.includes("/compare/")) return { status: "ahead" };
+      if (path.includes("/check-runs")) return { check_runs: [] };
+      throw new Error(`unexpected ${path}`);
+    });
+    const base = {
+      githubRequest: request,
+      repository: "owner/repo", tagName: "v1.2.3", deploymentId: "dep", requestedMode: "copy-ready",
+      notes: "Validated representative access paths", copyModeActivated: true, producerIds: {},
+    };
+    const measured = (url: string | null) =>
+      vi.fn().mockResolvedValue({ id: "dep", status: "SUCCESS", url, commitSha: candidate });
+
+    // (a) no measurable domain ⇒ ZERO health requests. Not "one that fails validation afterwards".
+    const neverProbe = vi.fn();
+    await expect(measureCandidate({ ...base, railwayRead: measured(null), healthProbe: neverProbe }))
+      .rejects.toThrow(/UNMEASURED/);
+    expect(neverProbe, "no token may be presented when the domain is unmeasured").not.toHaveBeenCalled();
+
+    // (b) called with the measured origin — the probe cannot choose its own target.
+    const boundProbe = vi.fn(async (origin: string) => ({
+      status: 200, ok: true, origin, finalOrigin: origin, commit: candidate, mode: "copy-ready", refreshRunId: "run-1",
+    }));
+    await measureCandidate({ ...base, railwayRead: measured("https://staging.example.com"), healthProbe: boundProbe });
+    expect(boundProbe).toHaveBeenCalledTimes(1);
+    expect(boundProbe).toHaveBeenCalledWith("https://staging.example.com");
+
+    // (c) an answer about another host is a refusal, not a health verdict.
+    const wanderingProbe = vi.fn().mockResolvedValue({
+      status: 200, ok: true, origin: "https://unrelated.example.com", finalOrigin: "https://unrelated.example.com",
+      commit: candidate, mode: "copy-ready", refreshRunId: "run-1",
+    });
+    await expect(measureCandidate({ ...base, railwayRead: measured("https://staging.example.com"), healthProbe: wanderingProbe }))
+      .rejects.toThrow(/not the measured deployment domain/);
+  });
+
   it("distinguishes verified, failed and finite unverified production rollout after promotion", async () => {
     const expected = "a".repeat(40);
     await expect(observeProductionDeployment({ expectedSha: expected, readLatest: vi.fn().mockResolvedValue({ id: "p", commitSha: expected, status: "SUCCESS" }), probeHealth: vi.fn().mockResolvedValue({ status: 200, ok: true, commit: expected }), timeoutMs: 0 })).resolves.toMatchObject({ status: "verified" });

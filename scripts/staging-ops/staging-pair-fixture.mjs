@@ -110,6 +110,44 @@ async function mutate(version) {
 }
 
 function apiKey(keyId, secret) { return { wire: `aios_${keyId}_${secret}`, hash: createHash("sha256").update(secret).digest("hex") }; }
+
+/**
+ * The GRAPH half of the version oracle, callable on its own.
+ *
+ * Everything the sanitation assertions check — names, typed values, excluded secrets — is identical
+ * in v1…v6, so they cannot tell a restored graph from a stale one. The fixture stamps the capture
+ * version into every RELATES_TO fact, and this states the oracle twice:
+ *   ∀ every version-stamped fact present carries THIS version (catches a stale or unreplaced graph);
+ *   ∃ the chunk/correction/group facts are present in their own groups (catches an empty or
+ *     partially restored one).
+ */
+async function assertGraphVersion(session, expected) {
+  const result = await session.run(`OPTIONAL MATCH ()-[r:RELATES_TO]->()
+    RETURN collect(DISTINCT [r.fact, r.group_id]) AS facts`);
+  const factPairs = result.records[0].get("facts").filter((pair) => typeof pair?.[0] === "string");
+  const stale = factPairs.filter(([fact]) => / v\d+$/.test(fact) && !fact.endsWith(` ${expected}`));
+  if (stale.length) throw new Error(`graph facts from another capture survived: ${stale.map(([fact, group]) => `${fact} (${group})`).join(", ")}`);
+  const required = [
+    [`team chunk zero ${expected}`, GRAPH_GROUPS.team],
+    [`team chunk one ${expected}`, GRAPH_GROUPS.team],
+    [`correction fact ${expected}`, GRAPH_GROUPS.team],
+    [`external fact ${expected}`, GRAPH_GROUPS.external],
+    [`private fact ${expected}`, GRAPH_GROUPS.private],
+  ];
+  const missing = required.filter(([fact, group]) => !factPairs.some(([f, g]) => f === fact && g === group));
+  if (missing.length) throw new Error(`expected ${expected} graph facts are absent from their groups: ${missing.map(([fact, group]) => `${fact} (${group})`).join(", ")}`);
+  return { facts: factPairs.length };
+}
+
+/** Graph-only version assertion — used to observe the PRIOR graph before an interruption. */
+async function assertInstalledGraphVersion(expected) {
+  const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
+  const session = driver.session({ defaultAccessMode: neo4j.session.READ });
+  try {
+    const { facts } = await assertGraphVersion(session, expected);
+    return { status: "graph-version-asserted", expected, facts };
+  } finally { await session.close(); await driver.close(); }
+}
 async function assertInstalled(expected = "v1") {
   const staging = await pgClient(process.env.STAGING_DATABASE_URL); const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
   try {
@@ -120,16 +158,27 @@ async function assertInstalled(expected = "v1") {
     const pending = await staging.query("SELECT count(*) AS n FROM graph_episodes WHERE pending_delete_group_id IS NOT NULL OR pending_delete_at IS NOT NULL");
     if (Number(pending.rows[0].n) !== 0) throw new Error("sanitized old-group cleanup metadata was not cleared with the removed graph content");
     const session = driver.session({ defaultAccessMode: neo4j.session.READ });
-    const graph = await session.run("MATCH (e:Episodic) OPTIONAL MATCH ()-[r:RELATES_TO]->() RETURN collect(e.name) AS names, collect(r.fact) AS facts");
-    const names = graph.records[0].get("names"); const facts = graph.records[0].get("facts");
+    const graph = await session.run(`MATCH (e:Episodic)
+      OPTIONAL MATCH ()-[r:RELATES_TO]->()
+      RETURN collect(DISTINCT e.name) AS names, collect(DISTINCT [r.fact, r.group_id]) AS facts`);
+    const names = graph.records[0].get("names");
+    const factPairs = graph.records[0].get("facts").filter((pair) => typeof pair?.[0] === "string");
+    const facts = factPairs.map(([fact]) => fact);
     if (facts.includes("narrowed source secret") || facts.includes("mixed provenance secret") || facts.includes("stale old-group secret")) throw new Error("unsafe narrowed, stale, or mixed graph data survived sanitation");
     if (!names.includes(`items:${ITEMS.team}#0`) || !names.includes(`items:${ITEMS.team}#1`) || !names.includes("correction:arc-1")) throw new Error("chunk or correction episodes were lost");
-    const big = await session.run("MATCH (n:Entity {uuid:'a-ep-team-0'}) RETURN n.big AS big, n.summary AS summary"); await session.close();
+    const big = await session.run("MATCH (n:Entity {uuid:'a-ep-team-0'}) RETURN n.big AS big, n.summary AS summary");
     if (big.records[0].get("big").toString() !== "9007199254740993" || big.records[0].get("summary") != null) throw new Error("typed graph value or derived-cache sanitation failed");
-    if (expected !== "v1") {
-      const row = await staging.query("SELECT body FROM items WHERE id=$1", [ITEMS.team]);
-      if (row.rows[0]?.body !== `team body ${expected}`) throw new Error(`expected ${expected} pair is not installed`);
-    }
+
+    // THE GRAPH IS PART OF THE VERSION ORACLE, not just of the sanitation oracle: everything above
+    // holds for a graph restored from ANY capture, so a refresh that replaced Postgres and left the
+    // previous graph standing — exactly the fault the recovery scenarios inject — passed unchanged.
+    await assertGraphVersion(session, expected);
+    await session.close();
+
+    // The Postgres half of the same oracle, now asked for v1 as well: the fixture seeds `team body
+    // v1`, so there was never a reason to skip the first version.
+    const row = await staging.query("SELECT body FROM items WHERE id=$1", [ITEMS.team]);
+    if (row.rows[0]?.body !== `team body ${expected}`) throw new Error(`expected ${expected} pair is not installed`);
     const internal = apiKey("internal01", "internal-secret-012345678901234567890123");
     const external = apiKey("external01", "external-secret-012345678901234567890123");
     await staging.query("INSERT INTO api_keys(team_id,member_id,key_id,key_hash,name) VALUES($1,$2,'internal01',$3,'harness'),($1,$4,'external01',$5,'harness') ON CONFLICT(key_id) DO UPDATE SET key_hash=excluded.key_hash, revoked_at=null", [TEAM, INTERNAL, internal.hash, EXTERNAL, external.hash]);
@@ -146,6 +195,29 @@ async function assertInstalled(expected = "v1") {
   } finally { await staging.end(); await driver.close(); }
 }
 
+/**
+ * The graph oracle's own negative control: rewrite ONLY the installed staging graph's fact versions
+ * and leave Postgres alone. `assert` must then refuse. Without this, a version oracle that reads the
+ * graph but compares nothing would look identical to one that does — the assertion above is exactly
+ * the kind that passes for free until something proves it can fail.
+ */
+async function corruptGraphVersion(version) {
+  const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
+  const session = driver.session({ defaultAccessMode: neo4j.session.WRITE });
+  try {
+    const result = await session.run(
+      `MATCH ()-[r:RELATES_TO]->() WHERE r.fact =~ '.* v[0-9]+$'
+       WITH r, split(r.fact, ' ') AS parts
+       SET r.fact = reduce(s = '', i IN range(0, size(parts) - 2) | s + parts[i] + ' ') + $version
+       RETURN count(r) AS rewritten`,
+      { version },
+    );
+    const rewritten = Number(result.records[0]?.get("rewritten") ?? 0);
+    if (rewritten === 0) throw new Error("no version-stamped graph facts were found to corrupt; the negative control would prove nothing");
+    return { status: "graph-version-corrupted", version, rewritten };
+  } finally { await session.close(); await driver.close(); }
+}
+
 async function killReaderLock() {
   const staging = await pgClient(process.env.STAGING_DATABASE_URL);
   try {
@@ -158,5 +230,11 @@ async function killReaderLock() {
 }
 
 const action = process.argv[2];
-const result = action === "seed" ? await seed() : action === "mutate" ? await mutate(process.argv[3] ?? "v2") : action === "assert" ? await assertInstalled(process.argv[3] ?? "v1") : action === "kill-reader-lock" ? await killReaderLock() : (() => { throw new Error("fixture action must be seed, mutate, assert, or kill-reader-lock"); })();
+const result = action === "seed" ? await seed()
+  : action === "mutate" ? await mutate(process.argv[3] ?? "v2")
+  : action === "assert" ? await assertInstalled(process.argv[3] ?? "v1")
+  : action === "assert-graph-version" ? await assertInstalledGraphVersion(process.argv[3] ?? "v1")
+  : action === "corrupt-graph-version" ? await corruptGraphVersion(process.argv[3] ?? "v99")
+  : action === "kill-reader-lock" ? await killReaderLock()
+  : (() => { throw new Error("fixture action must be seed, mutate, assert, assert-graph-version, corrupt-graph-version, or kill-reader-lock"); })();
 console.log(JSON.stringify(result ?? { status: action }));

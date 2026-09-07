@@ -12,6 +12,21 @@ describe("paired refresh isolated harness", () => {
     expect(compose.services["prod-pg"].tmpfs).toEqual(["/var/lib/postgresql"]);
     expect(compose.services["staging-pg"].tmpfs).toEqual(["/var/lib/postgresql"]);
   });
+  it("renders ONE absolute /data tmpfs mount per object store, options intact", () => {
+    // The measured failure: `tmpfs: [/data:uid=1000,gid=1000,mode=0700]` is a YAML flow SEQUENCE, so
+    // the commas inside the mount spec split it into three entries and docker refuses service
+    // creation with `invalid mount path: 'gid=1000' mount path must be absolute` — after the image
+    // builds, so the harness looks like it got much further than it did. Asserting the parsed shape
+    // (not the file text) is what distinguishes one option-bearing scalar from three broken ones.
+    for (const name of ["source-object-store", "rollback-object-store"]) {
+      const tmpfs = compose.services[name].tmpfs;
+      expect(tmpfs, name).toEqual(["/data:uid=1000,gid=1000,mode=0700"]);
+      const [path, ...options] = tmpfs[0].split(":");
+      expect(path.startsWith("/"), `${name} mount path must be absolute`).toBe(true);
+      // Owner-only, owned by the non-root runner user: the parse fix must not become a permissions fix.
+      expect(options.join(":")).toBe("uid=1000,gid=1000,mode=0700");
+    }
+  });
   it("role containers cannot route to the opposite database network", () => {
     expect(compose.services.exporter.networks).toEqual(["production", "source-store"]);
     expect(compose.services.importer.networks).toEqual(["staging", "source-store", "rollback-store"]);
@@ -46,6 +61,47 @@ describe("paired refresh isolated harness", () => {
     expect(harness).toContain("kill-reader-lock");
     expect(harness).toContain("concurrent-a.log");
   });
+  it("asserts each failure scenario by RECEIPT, with a control that must not satisfy it", () => {
+    // The accepted HIGH: `expect_failure … && assert v3` is satisfied by any nonzero exit, and v3 was
+    // installed before the scenario ran — so a preflight refusal passed the recovery test. What the
+    // harness must now contain is the positive checkpoint evidence, tied to the candidate run, plus
+    // the pre-drain control demonstrating those assertions can distinguish the two.
+    expect(harness).toContain("STAGING_FAULT_POINT=before-drain");
+    expect(harness).toContain("refuse_receipt pre-drain-control postgres-restored");
+    expect(harness).toContain("refuse_receipt pre-drain-control prior-pair-restored");
+    expect(harness).toContain("require_receipt install-fault-recovers fault-injected");
+    expect(harness).toContain("require_receipt install-fault-recovers prior-pair-restored");
+    // BOTH stores: the after-graph fault is the case where recovery has two of them to undo.
+    expect(harness).toContain("STAGING_FAULT_POINT=after-graph");
+    expect(harness).toContain("require_receipt graph-fault-recovers graph-restored");
+    expect(harness).toContain("assert-graph-version v3");
+    // A failed rollback must prove its own checkpoint, and that the whole pinned set is stopped.
+    expect(harness).toContain("require_receipt failed-rollback-stays-stopped recovery-required");
+    expect(harness).toContain("require_journal last_safe_checkpoint recovery-required");
+    expect(harness).toContain("serviceId=graphiti-local");
+    expect(harness).toContain("require_receipt explicit-recovery prior-pair-restored");
+    // The interruption waits for the POSTGRES BARRIER, not for `state=importing` (which is written
+    // before the restore, so a kill on it can land before any candidate data exists).
+    expect(harness).toContain("receipt interrupted.log postgres-restored");
+    expect(harness).not.toContain('if [[ "$state" == "importing" ]]');
+    // The graph oracle's own negative control.
+    expect(harness).toContain("corrupt-graph-version v99");
+    expect(harness).toContain("graph facts from another capture survived");
+    // Evidence outlives the harness root, without the harness root's key material.
+    expect(harness).toContain("redact-artifacts.mjs");
+    expect(harness).not.toMatch(/cp -r "\$harness_root"/);
+  });
+
+  it("cleans up reliably and REPORTS what it could not clean", () => {
+    // The measured leftover: a run whose `up` died part-way left three containers in `Created`, and
+    // `down … >/dev/null 2>&1 || true` said nothing about it — so the next run inherited them and the
+    // resulting failure looked new. Cleanup still never aborts the run; it just stops being silent.
+    expect(harness).not.toContain('down -v --remove-orphans >/dev/null 2>&1 || true');
+    expect(harness).toContain("harness cleanup: 'compose down' failed for project");
+    expect(harness).toContain('label=com.docker.compose.project=$project');
+    expect(harness).toContain("docker rm -f $leftovers");
+  });
+
   it("turns a missing engine into a FAILURE in the required lane, never a quiet pass", () => {
     // "Docker is not installed" and "every assertion held" must not be the same green tick.
     expect(harness).toContain('if [[ "${STAGING_PAIR_REQUIRED:-}" == "1" ]]; then');

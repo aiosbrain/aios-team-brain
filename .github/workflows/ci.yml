@@ -203,6 +203,18 @@ jobs:
       - run: npm ci
       - name: Run isolated four-database exporter/importer harness
         run: npm run test:staging-pair
+      # The harness root is a mktemp directory its exit trap deletes, so a failed required lane used
+      # to leave nothing to read. `redact-artifacts.mjs` copies the command logs and the fault /
+      # recovery receipts here with harness secrets, URL credentials and bearer tokens masked — it
+      # never copies the generated key material itself.
+      - name: Upload redacted harness receipts and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-pair-receipts
+          path: .staging-pair-artifacts
+          if-no-files-found: warn
+          retention-days: 7
 
   ingestion-tests:
     name: Ingestion tests (pytest)

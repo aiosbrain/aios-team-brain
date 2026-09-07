@@ -108,8 +108,10 @@ const INVENTORY: Record<string, Entry> = {
       "the four scheduled connector legs. The tick sequences them BEFORE runContextBackfill and the " +
       "sweep's cutoff is taken at STAGE start, so a scheduled leg's items are swept in their own tick",
     latency:
-      "measured 0.8-1.9 min when scheduled; next tick or later via manual sync and the four admin " +
-      "'Run now' actions; INDEFINITE when INGEST_POLL_ENABLED=false",
+      "measured 0.8-1.9 min when scheduled; since AUDITFIX-14 manual sync and the four admin " +
+      "'Run now' actions await ONE bounded 25-candidate pass of their own, so a small manual import " +
+      "is partitioned before the response — a larger backlog reports pending and needs repeated " +
+      "runs, and with INGEST_POLL_ENABLED=false those repeated runs are the only progress there is",
   },
   "lib/actions/handlers.ts": {
     sites: 1,

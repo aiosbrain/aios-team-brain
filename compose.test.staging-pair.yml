@@ -94,7 +94,9 @@ services:
       LOCAL_OBJECT_STORE_ROOT: /data
       LOCAL_OBJECT_STORE_BUCKET: staging-pair
       LOCAL_OBJECT_STORE_POLICIES_JSON: '{"source-publish":{"secret":"source-publish-secret","operations":["put"],"prefixes":["source/"]},"source-read":{"secret":"source-read-secret","operations":["get","list"],"prefixes":["source/"]},"source-control":{"secret":"source-control-secret","operations":["get","put","list"],"prefixes":["source/"]}}'
-    tmpfs: [/data:uid=1000,gid=1000,mode=0700]
+    # ONE mount spec, and it MUST stay quoted: a bare flow scalar splits on its own commas into three
+    # entries, and docker then reads "gid=1000" as a mount path ("mount path must be absolute").
+    tmpfs: ["/data:uid=1000,gid=1000,mode=0700"]
     healthcheck: { test: [CMD-SHELL, "test \"$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)\" = 404"], interval: 1s, timeout: 2s, retries: 30 }
     networks: [source-store]
   rollback-object-store:
@@ -105,7 +107,8 @@ services:
       LOCAL_OBJECT_STORE_ROOT: /data
       LOCAL_OBJECT_STORE_BUCKET: staging-pair
       LOCAL_OBJECT_STORE_POLICIES_JSON: '{"rollback-owner":{"secret":"rollback-owner-secret","operations":["get","put","list","delete"],"prefixes":["rollback/"]},"rollback-control":{"secret":"rollback-control-secret","operations":["get","put","list","delete"],"prefixes":["rollback/"]}}'
-    tmpfs: [/data:uid=1000,gid=1000,mode=0700]
+    # Quoted for the same reason as the source store above — see that comment.
+    tmpfs: ["/data:uid=1000,gid=1000,mode=0700"]
     healthcheck: { test: [CMD-SHELL, "test \"$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)\" = 404"], interval: 1s, timeout: 2s, retries: 30 }
     networks: [rollback-store]
   network-spy:

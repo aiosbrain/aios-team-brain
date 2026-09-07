@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  ACTIVATION_CHECKS, ACTIVATION_DOCUMENTS, ACTIVATION_STATUS,
-  assertActivated, assertReadOnlyDocument, evaluateActivation, formatActivationReport,
+  ACTIVATION_CHECKS, ACTIVATION_DOCUMENTS, ACTIVATION_STATUS, REQUIRED_CREDENTIAL_CLASSES,
+  assertActivationPreflightReady, assertReadOnlyDocument, evaluateActivation, formatActivationReport,
   readActivationFacts,
 } from "../scripts/staging-ops/activation-preflight.mjs";
+import { FINGERPRINT_VERSION, fingerprintsComparable } from "../scripts/staging-ops/credential-fingerprint.mjs";
 import { runImporter } from "../scripts/staging-ops/importer.mjs";
 
 /**
@@ -12,6 +13,19 @@ import { runImporter } from "../scripts/staging-ops/importer.mjs";
  * question activation turns on is what the PROVIDERS say. These tests pin the three properties
  * that distinguish the two: measured facts, an unverified verdict that refuses, and no claim
  * accepted as evidence.
+ *
+ * The Astra review of the first callable version accepted five more, each of which is a way for a
+ * check to pass on something that is not evidence, and they are pinned here as their own cases:
+ *
+ *   1. the privileged health token must be bound to the MEASURED deployment domain BEFORE it is
+ *      sent — a comparison performed afterwards cannot un-send a credential;
+ *   2. an operator's `measuredFrom` label is not provenance, and the topology file is a document of
+ *      expected pins that has to be corroborated against provider read-backs;
+ *   3. a missing, malformed or differently-keyed fingerprint is INCOMPARABLE, not "different" —
+ *      `fingerprintsEqual` answers false for all of them, and that false used to read as separation;
+ *   4. BOTH runners, named — one successful measurement satisfied a check whose text says "both";
+ *   5. the verdict may not be called `ACTIVATED` when its schedule check passes only while the
+ *      automation is switched off.
  */
 
 const TOPOLOGY = {
@@ -34,8 +48,19 @@ const TOPOLOGY = {
 };
 
 const digest = "image.example/aios-staging-ops@sha256:" + "a".repeat(64);
+const COMMIT = "c".repeat(40);
 
-/** Everything measured, everything correct — the only input that may produce ACTIVATED. */
+const fingerprint = (credentialClass: string, mac: string, over: Record<string, unknown> = {}) => ({
+  version: FINGERPRINT_VERSION, keyId: "compare-2026-09", credentialClass, mac, ...over,
+});
+
+/** 32 bytes, base64url — the only MAC shape a well-formed fingerprint may carry. */
+const mac = (fill: string) => Buffer.alloc(32, fill).toString("base64url");
+
+const fingerprintSet = (fill: string) =>
+  Object.fromEntries(REQUIRED_CREDENTIAL_CLASSES.map((c) => [c, fingerprint(c, mac(fill))]));
+
+/** Everything measured, everything correct — the only input that may produce READY TO ACTIVATE. */
 function fullyMeasured() {
   return {
     topology: { document: structuredClone(TOPOLOGY), measuredFrom: "railway project read-back 2026-09-07" },
@@ -44,16 +69,13 @@ function fullyMeasured() {
       production: { projectId: "project-a", environmentId: "env-production" },
     },
     runners: {
-      exporter: { image: digest, repo: null, autoDeploy: false },
-      importer: { image: digest, repo: null, autoDeploy: false },
+      exporter: { serviceId: "svc-exporter", expectedServiceId: "svc-exporter", image: digest, expectedImage: digest, repo: null, autoDeploy: false },
+      importer: { serviceId: "svc-importer", expectedServiceId: "svc-importer", image: digest, expectedImage: digest, repo: null, autoDeploy: false },
     },
-    appDeployment: { id: "dep-1", status: "SUCCESS", environmentId: "env-staging", serviceId: "service-app", url: "https://staging.example.com" },
-    appHealth: { status: 200, body: { ok: true, mode: "copy-ready", answering: "disabled", graph: "readable" } },
+    appDeployment: { id: "dep-1", status: "SUCCESS", environmentId: "env-staging", serviceId: "service-app", url: "https://staging.example.com", commitSha: COMMIT },
+    appHealth: { status: 200, origin: "https://staging.example.com", body: { ok: true, commit: COMMIT, mode: "copy-ready", answering: "disabled", graph: "readable" } },
     graphitiProviderCredentials: [],
-    credentialFingerprints: {
-      local: { "auth-secret": { version: 1, keyId: "k1", credentialClass: "auth-secret", mac: "a".repeat(43) } },
-      remote: { "auth-secret": { version: 1, keyId: "k1", credentialClass: "auth-secret", mac: "b".repeat(43) } },
-    },
+    credentialFingerprints: { local: fingerprintSet("a"), remote: fingerprintSet("b") },
     schedules: { activated: false },
     operatorClaims: {},
   };
@@ -75,17 +97,22 @@ describe("the verifier reads and never writes", () => {
 });
 
 describe("evaluateActivation", () => {
-  it("reports ACTIVATED only when every check is measured and passing", () => {
+  it("reports READY TO ACTIVATE — never ACTIVATED — when every check is measured and passing", () => {
     const result = evaluateActivation(fullyMeasured());
-    expect(result.status).toBe(ACTIVATION_STATUS.ACTIVATED);
+    expect(result.status).toBe(ACTIVATION_STATUS.READY);
+    // The name has to survive: a verifier whose schedule check passes only while the automation is
+    // OFF cannot report a word that means the automation is running.
+    expect(result.status).not.toBe("ACTIVATED");
+    expect(JSON.stringify(ACTIVATION_STATUS)).not.toContain('"ACTIVATED"');
     // Every check reports, always. A check that can be omitted is a check that can be skipped.
     expect(result.checks.map((c) => c.id)).toEqual([...ACTIVATION_CHECKS]);
     expect(result.checks.every((c) => c.status === "pass")).toBe(true);
+    // ...and the schedule check says out loud that it read a file, not the platform.
+    expect(result.checks.find((c) => c.id === "schedules-disabled-in-contract-file")!.detail)
+      .toMatch(/local configuration check/);
   });
 
-  it("reports UNVERIFIED — not ACTIVATED — for anything it could not measure", () => {
-    // The distinction that matters: "we could not look" must never read as "we looked and it is
-    // fine". This is the state the recovered tree's pure validator could not express at all.
+  it("reports UNVERIFIED — not READY — for anything it could not measure", () => {
     for (const drop of ["topology", "tokens", "runners", "appDeployment", "appHealth", "credentialFingerprints", "schedules"] as const) {
       const facts = fullyMeasured();
       delete (facts as Record<string, unknown>)[drop];
@@ -97,17 +124,116 @@ describe("evaluateActivation", () => {
     }
   });
 
-  it("treats a topology document with no recorded provenance as a claim, not a measurement", () => {
-    const facts = fullyMeasured();
-    facts.topology.measuredFrom = null;
-    const result = evaluateActivation(facts);
-    expect(result.status).toBe(ACTIVATION_STATUS.UNVERIFIED);
-    expect(result.checks.find((c) => c.id === "topology-identity")).toMatchObject({ status: "unverified" });
+  it("treats the topology file as CLAIMS: a provenance label corroborates nothing", () => {
+    // The accepted finding: `STAGING_TOPOLOGY_MEASURED_FROM` is an arbitrary operator string, and it
+    // used to be the whole difference between "claim" and "measurement". Corroboration is now the
+    // provider read-backs, so a document with a beautiful label and no read-backs is UNVERIFIED —
+    // and a document with read-backs that disagree is a FAIL.
+    const noReadBacks = fullyMeasured();
+    noReadBacks.topology.measuredFrom = "measured by me, honestly, on Tuesday";
+    delete (noReadBacks as Record<string, unknown>).tokens;
+    const unverified = evaluateActivation(noReadBacks).checks.find((c) => c.id === "topology-identity")!;
+    expect(unverified.status).toBe("unverified");
+    expect(unverified.detail).toMatch(/UNCORROBORATED/);
+    expect(unverified.detail).toMatch(/operator label/);
+
+    const disagrees = fullyMeasured();
+    disagrees.tokens.staging.projectId = "project-somewhere-else";
+    const failed = evaluateActivation(disagrees).checks.find((c) => c.id === "topology-identity")!;
+    expect(failed.status).toBe("fail");
+
+    // And a document with NO label still passes when the providers corroborate it — the label was
+    // never the evidence in either direction.
+    const unlabelled = fullyMeasured();
+    unlabelled.topology.measuredFrom = null;
+    expect(evaluateActivation(unlabelled).checks.find((c) => c.id === "topology-identity")).toMatchObject({ status: "pass" });
+  });
+
+  it("binds the health answer to the measured deployment, or reports it unverified", () => {
+    const wrongOrigin = fullyMeasured();
+    wrongOrigin.appHealth.origin = "https://unrelated.example.com";
+    expect(evaluateActivation(wrongOrigin).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "fail" });
+
+    const wrongCommit = fullyMeasured();
+    wrongCommit.appHealth.body.commit = "d".repeat(40);
+    expect(evaluateActivation(wrongCommit).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "fail" });
+
+    const noCommit = fullyMeasured();
+    delete (noCommit.appHealth.body as Record<string, unknown>).commit;
+    expect(evaluateActivation(noCommit).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "unverified" });
+
+    const mismatch = fullyMeasured() as Record<string, unknown>;
+    mismatch.healthOriginMismatch = true;
+    const detail = evaluateActivation(mismatch).checks.find((c) => c.id === "app-health-bound")!;
+    expect(detail.status).toBe("fail");
+    expect(detail.detail).toMatch(/no health token was presented/);
+  });
+
+  it("will not call a building or failed deployment a serving identity", () => {
+    const building = fullyMeasured();
+    building.appDeployment.status = "BUILDING";
+    expect(evaluateActivation(building).checks.find((c) => c.id === "app-deployment-measured")).toMatchObject({ status: "unverified" });
+
+    const failed = fullyMeasured();
+    failed.appDeployment.status = "FAILED";
+    expect(evaluateActivation(failed).checks.find((c) => c.id === "app-deployment-measured")).toMatchObject({ status: "fail" });
+  });
+
+  it("requires BOTH runners, the right service and the pinned artifact", () => {
+    const oneRunner = fullyMeasured();
+    delete (oneRunner.runners as Record<string, unknown>).exporter;
+    const image = evaluateActivation(oneRunner).checks.find((c) => c.id === "runner-image-pinned")!;
+    expect(image.status, "one measured runner cannot satisfy a check about both").toBe("unverified");
+    expect(image.detail).toMatch(/exporter/);
+    expect(evaluateActivation(oneRunner).checks.find((c) => c.id === "runner-autodeploy-disabled")).toMatchObject({ status: "unverified" });
+
+    const otherService = fullyMeasured();
+    otherService.runners.importer.serviceId = "svc-something-else";
+    expect(evaluateActivation(otherService).checks.find((c) => c.id === "runner-image-pinned")).toMatchObject({ status: "fail" });
+
+    const otherArtifact = fullyMeasured();
+    otherArtifact.runners.importer.image = "image.example/aios-staging-ops@sha256:" + "b".repeat(64);
+    expect(evaluateActivation(otherArtifact).checks.find((c) => c.id === "runner-image-pinned")).toMatchObject({ status: "fail" });
+
+    // An immutable digest with NOTHING pinned to compare it against is not the same as a verified
+    // artifact, and says so.
+    const unpinned = fullyMeasured();
+    unpinned.runners.importer.expectedImage = null;
+    expect(evaluateActivation(unpinned).checks.find((c) => c.id === "runner-image-pinned")).toMatchObject({ status: "unverified" });
+
+    // A MISSING autodeploy reading is unverified; only a measured `true` is a failure.
+    const unreported = fullyMeasured();
+    unreported.runners.exporter.autoDeploy = null;
+    expect(evaluateActivation(unreported).checks.find((c) => c.id === "runner-autodeploy-disabled")).toMatchObject({ status: "unverified" });
+  });
+
+  it("treats missing, forged and differently-keyed fingerprints as INCOMPARABLE, not as different", () => {
+    // The defect this replaces: `fingerprintsEqual` returns false for a missing remote key, a
+    // mismatched keyId, a wrong version and a malformed MAC alike — and "not equal" was read as
+    // "the credentials differ", so an EMPTY opposite-environment document passed the separation
+    // check outright.
+    const cases: [string, (f: ReturnType<typeof fullyMeasured>) => void][] = [
+      ["an empty opposite-environment document", (f) => { f.credentialFingerprints.remote = {}; }],
+      ["a remote document missing one class", (f) => { delete (f.credentialFingerprints.remote as Record<string, unknown>)["secrets-key"]; }],
+      ["a remote minted under another comparison key", (f) => { f.credentialFingerprints.remote = Object.fromEntries(REQUIRED_CREDENTIAL_CLASSES.map((c) => [c, fingerprint(c, mac("b"), { keyId: "some-other-key" })])); }],
+      ["a malformed MAC", (f) => { f.credentialFingerprints.remote["auth-secret"] = fingerprint("auth-secret", "not-base64url-32-bytes!!"); }],
+      ["a stale fingerprint version", (f) => { f.credentialFingerprints.remote["auth-secret"] = fingerprint("auth-secret", mac("b"), { version: "hmac-sha256-v0" }); }],
+      ["a local class this runner never held", (f) => { delete (f.credentialFingerprints.local as Record<string, unknown>)["neo4j-credential"]; }],
+    ];
+    for (const [name, mutate] of cases) {
+      const facts = fullyMeasured();
+      mutate(facts);
+      const result = evaluateActivation(facts);
+      const check = result.checks.find((c) => c.id === "credential-separation")!;
+      expect(check.status, name).toBe("unverified");
+      expect(result.status, name).toBe(ACTIVATION_STATUS.UNVERIFIED);
+    }
+    // Positive control: a genuinely comparable pair still passes, so the refusals above are about
+    // comparability and not about the fixture.
+    expect(evaluateActivation(fullyMeasured()).checks.find((c) => c.id === "credential-separation")).toMatchObject({ status: "pass" });
   });
 
   it("defaults the unmeasurable sidecar check to unverified with a named reason", () => {
-    // Reading the sidecar's variables needs provider surface this verifier deliberately does not
-    // carry. That is a KNOWN gap with a name, not a silent pass.
     const facts = fullyMeasured();
     delete (facts as Record<string, unknown>).graphitiProviderCredentials;
     const check = evaluateActivation(facts).checks.find((c) => c.id === "graphiti-no-provider-credentials");
@@ -116,17 +242,17 @@ describe("evaluateActivation", () => {
   });
 
   it.each([
-    ["a token scoped to the wrong environment", (f: ReturnType<typeof fullyMeasured>) => { f.tokens.staging.environmentId = "env-production"; }, "token-environment-scope"],
+    ["a token scoped to the wrong environment", (f: ReturnType<typeof fullyMeasured>) => { f.tokens.staging.environmentId = "env-production"; f.topology.document.staging.environmentId = "env-production"; }, "token-environment-scope"],
     ["one token seeing both environments", (f: ReturnType<typeof fullyMeasured>) => { f.tokens.production.environmentId = "env-staging"; f.topology.document.production.environmentId = "env-staging"; }, "token-environment-scope"],
     ["a runner on a mutable tag", (f: ReturnType<typeof fullyMeasured>) => { f.runners.importer.image = "image.example/aios-staging-ops:latest"; }, "runner-image-pinned"],
     ["a runner with a repository source", (f: ReturnType<typeof fullyMeasured>) => { f.runners.exporter.repo = "owner/repo"; }, "runner-image-pinned"],
     ["autodeploy left on", (f: ReturnType<typeof fullyMeasured>) => { f.runners.importer.autoDeploy = true; }, "runner-autodeploy-disabled"],
     ["a deployment in another environment", (f: ReturnType<typeof fullyMeasured>) => { f.appDeployment.environmentId = "env-production"; }, "app-deployment-measured"],
-    ["a rejected health token", (f: ReturnType<typeof fullyMeasured>) => { f.appHealth = { status: 401, body: {} }; }, "app-mode-declared"],
+    ["a rejected health token", (f: ReturnType<typeof fullyMeasured>) => { f.appHealth = { status: 401, origin: "https://staging.example.com", body: {} }; }, "app-mode-declared"],
     ["no staging mode", (f: ReturnType<typeof fullyMeasured>) => { f.appHealth.body.mode = "production"; }, "app-mode-declared"],
     ["a shared credential", (f: ReturnType<typeof fullyMeasured>) => { f.credentialFingerprints.remote = f.credentialFingerprints.local; }, "credential-separation"],
     ["a sidecar holding provider keys", (f: ReturnType<typeof fullyMeasured>) => { f.graphitiProviderCredentials = ["OPENAI_API_KEY"]; }, "graphiti-no-provider-credentials"],
-    ["schedules already enabled", (f: ReturnType<typeof fullyMeasured>) => { f.schedules.activated = true; }, "schedules-disabled"],
+    ["schedules already enabled in the contract file", (f: ReturnType<typeof fullyMeasured>) => { f.schedules.activated = true; }, "schedules-disabled-in-contract-file"],
   ])("reports NOT ACTIVATED for %s", (_name, mutate, expectedCheck) => {
     const facts = fullyMeasured();
     mutate(facts);
@@ -144,6 +270,12 @@ describe("evaluateActivation", () => {
       .toContain("staging-budgeted-interactive-query-unsupported");
   });
 
+  it("scopes the answering evidence to answering, and claims no wider no-spend coverage", () => {
+    const detail = evaluateActivation(fullyMeasured()).checks.find((c) => c.id === "app-no-model-spend")!.detail;
+    expect(detail).toMatch(/answering posture only/);
+    expect(detail).toMatch(/graph extraction/);
+  });
+
   it("records an operator's claim and lets it satisfy nothing", () => {
     const facts = fullyMeasured();
     delete (facts as Record<string, unknown>).appHealth;
@@ -155,15 +287,15 @@ describe("evaluateActivation", () => {
   });
 });
 
-describe("assertActivated", () => {
+describe("assertActivationPreflightReady", () => {
   it("refuses UNVERIFIED as firmly as NOT ACTIVATED", () => {
     const unverified = evaluateActivation({});
     expect(unverified.status).toBe(ACTIVATION_STATUS.UNVERIFIED);
-    expect(() => assertActivated(unverified)).toThrow(/staging activation is UNVERIFIED/);
+    expect(() => assertActivationPreflightReady(unverified)).toThrow(/staging activation preflight is UNVERIFIED/);
     const notActivated = fullyMeasured();
     notActivated.schedules.activated = true;
-    expect(() => assertActivated(evaluateActivation(notActivated))).toThrow(/staging activation is NOT ACTIVATED/);
-    expect(assertActivated(evaluateActivation(fullyMeasured())).status).toBe(ACTIVATION_STATUS.ACTIVATED);
+    expect(() => assertActivationPreflightReady(evaluateActivation(notActivated))).toThrow(/staging activation preflight is NOT ACTIVATED/);
+    expect(assertActivationPreflightReady(evaluateActivation(fullyMeasured())).status).toBe(ACTIVATION_STATUS.READY);
   });
 });
 
@@ -180,8 +312,6 @@ describe("the report is redacted", () => {
 
 describe("readActivationFacts", () => {
   it("measures nothing it has no credential for, and says so instead of throwing", async () => {
-    // A verifier that dies on the first missing input reports nothing about everything else, which
-    // is the same blind spot as passing silently.
     const fetchImpl = vi.fn();
     const facts = await readActivationFacts({} as NodeJS.ProcessEnv, { fetchImpl });
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -190,36 +320,121 @@ describe("readActivationFacts", () => {
     expect(evaluateActivation(facts).status).toBe(ACTIVATION_STATUS.UNVERIFIED);
   });
 
-  it("sends only listed read-only documents, with the token in the header and never in a message", async () => {
-    const fetchImpl = vi.fn(async (_url: unknown, init: { body: string }) => ({
-      ok: true,
-      status: 200,
-      json: async () => {
-        const query = String(JSON.parse(init.body).query);
-        assertReadOnlyDocument(query); // throws if anything unlisted is ever sent
-        return { data: { projectToken: { projectId: "project-a", environmentId: "env-staging" } } };
-      },
-    }));
+  it("sends only listed read-only documents, with a PROJECT token header and never in a message", async () => {
+    const seen: Record<string, string>[] = [];
+    const fetchImpl = vi.fn(async (_url: unknown, init: { body: string; headers: Record<string, string> }) => {
+      seen.push(init.headers);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => {
+          const query = String(JSON.parse(init.body).query);
+          assertReadOnlyDocument(query); // throws if anything unlisted is ever sent
+          return { data: { projectToken: { projectId: "project-a", environmentId: "env-staging" } } };
+        },
+      };
+    });
     const facts = await readActivationFacts(
       { RAILWAY_STAGING_READ_TOKEN: "staging-token-value" } as NodeJS.ProcessEnv,
       { fetchImpl: fetchImpl as unknown as typeof fetch },
     );
     expect(facts.tokens.staging).toEqual({ projectId: "project-a", environmentId: "env-staging" });
+    // The contract is an environment-scoped project token, the same header `RailwayMaintenance`
+    // uses. Sending `Authorization: Bearer` made a client mistake look like a platform finding.
+    expect(seen[0]["Project-Access-Token"]).toBe("staging-token-value");
+    expect(seen[0].Authorization).toBeUndefined();
     expect(JSON.stringify(facts.notes)).not.toContain("staging-token-value");
+  });
+
+  it("presents the health token ONLY to the measured deployment domain", async () => {
+    // The accepted HIGH: the probe fired whenever `STAGING_ORIGIN` and a token both existed, with
+    // no comparison to any measured domain, and the evaluator never compared them either. Three
+    // cases, each asserting the REQUEST that was or was not made — not merely the verdict.
+    const deploymentNode = {
+      id: "dep-1", status: "SUCCESS", environmentId: "env-staging", serviceId: "service-app",
+      staticUrl: "staging.example.com", meta: { commitHash: COMMIT },
+    };
+    const build = (env: Record<string, string>) => {
+      const health: string[] = [];
+      const fetchImpl = vi.fn(async (url: unknown, init: { body?: string; headers?: Record<string, string> }) => {
+        const href = String(url);
+        if (href.includes("/api/health")) {
+          health.push(href);
+          expect(init.headers?.["x-aios-staging-health-token"], "the token only ever goes to a bound origin").toBeTruthy();
+          return { status: 200, url: href, json: async () => ({ ok: true, commit: COMMIT, mode: "copy-ready", answering: "disabled" }) };
+        }
+        const query = String(JSON.parse(String(init.body)).query);
+        if (query.includes("ActivationProjectToken")) return { ok: true, status: 200, json: async () => ({ data: { projectToken: { projectId: "project-a", environmentId: "env-staging" } } }) };
+        if (query.includes("ActivationDeployments")) return { ok: true, status: 200, json: async () => ({ data: { deployments: { edges: [{ node: deploymentNode }] } } }) };
+        return { ok: true, status: 200, json: async () => ({ data: {} }) };
+      });
+      return { health, fetchImpl, env };
+    };
+    const topologyFile = new URL("./fixtures/activation-topology.json", import.meta.url).pathname;
+    const baseEnv = {
+      RAILWAY_STAGING_READ_TOKEN: "staging-token", STAGING_TOPOLOGY_FILE: topologyFile,
+      STAGING_HEALTH_TOKEN: "health-token-value",
+    };
+
+    // (a) agreeing configured origin ⇒ probed exactly once, at the MEASURED domain.
+    const agree = build({ ...baseEnv, STAGING_ORIGIN: "https://staging.example.com" });
+    const agreed = await readActivationFacts(agree.env as NodeJS.ProcessEnv, { fetchImpl: agree.fetchImpl as unknown as typeof fetch });
+    expect(agree.health).toEqual(["https://staging.example.com/api/health"]);
+    expect(agreed.appHealth?.origin).toBe("https://staging.example.com");
+
+    // (b) a configured origin naming ANOTHER host ⇒ ZERO health requests, and a failing bound check.
+    const wrong = build({ ...baseEnv, STAGING_ORIGIN: "https://unrelated.example.com" });
+    const refused = await readActivationFacts(wrong.env as NodeJS.ProcessEnv, { fetchImpl: wrong.fetchImpl as unknown as typeof fetch });
+    expect(wrong.health, "no token may reach an unbound host").toEqual([]);
+    expect(refused.appHealth).toBeNull();
+    expect(evaluateActivation(refused).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "fail" });
+
+    // (c) no measurable deployment domain ⇒ ZERO health requests, unverified rather than failed.
+    const domainless = build({ ...baseEnv, STAGING_ORIGIN: "https://staging.example.com" });
+    domainless.fetchImpl = vi.fn(async (url: unknown, init: { body?: string; headers?: Record<string, string> }) => {
+      const href = String(url);
+      if (href.includes("/api/health")) { domainless.health.push(href); return { status: 200, url: href, json: async () => ({}) }; }
+      const query = String(JSON.parse(String(init.body)).query);
+      if (query.includes("ActivationProjectToken")) return { ok: true, status: 200, json: async () => ({ data: { projectToken: { projectId: "project-a", environmentId: "env-staging" } } }) };
+      if (query.includes("ActivationDeployments")) return { ok: true, status: 200, json: async () => ({ data: { deployments: { edges: [{ node: { ...deploymentNode, staticUrl: null } }] } } }) };
+      return { ok: true, status: 200, json: async () => ({ data: {} }) };
+    }) as unknown as typeof fetch;
+    const unmeasured = await readActivationFacts(domainless.env as NodeJS.ProcessEnv, { fetchImpl: domainless.fetchImpl });
+    expect(domainless.health).toEqual([]);
+    expect(evaluateActivation(unmeasured).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "unverified" });
+  });
+
+  it("fingerprints no credential this runner does not hold", async () => {
+    // `${undefined}\0${undefined}` is a perfectly good HMAC input, so the absent Neo4j credential
+    // used to produce a fingerprint that differs from production's — "we hold nothing" reported as
+    // "ours is distinct".
+    const fingerprintsFile = new URL("./fixtures/activation-remote-fingerprints.json", import.meta.url).pathname;
+    const facts = await readActivationFacts({
+      STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"),
+      STAGING_COMPARISON_KEY_ID: "compare-2026-09",
+      OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: fingerprintsFile,
+      AUTH_SECRET: "local-auth-secret",
+    } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
+    expect(Object.keys(facts.credentialFingerprints!.local)).toEqual(["auth-secret"]);
+    expect(facts.notes.join(" ")).toContain("holds no secrets-key");
+    // The class this runner DOES hold is comparable against the document on disk — so the unverified
+    // verdict below is about the two absent classes and not about a malformed fixture.
+    expect(fingerprintsComparable(
+      facts.credentialFingerprints!.local["auth-secret"],
+      facts.credentialFingerprints!.remote["auth-secret"],
+    )).toBe(true);
+    expect(evaluateActivation(facts).checks.find((c) => c.id === "credential-separation")).toMatchObject({ status: "unverified" });
   });
 });
 
 describe("the verifier has a caller", () => {
   it("is reachable as an importer action that refuses an unverified activation", async () => {
-    // The recovered validator's whole problem was having no caller. This is the caller: a
-    // read-only action needing no database, no locks and no runner role — a check an operator runs
-    // BEFORE the system it authorises exists.
     const activationRunner = vi.fn(async () => {
       const result = evaluateActivation({});
       return { ...result, notes: [], report: formatActivationReport(result) };
     });
     await expect(runImporter({} as NodeJS.ProcessEnv, ["activation-preflight"], { activationRunner }))
-      .rejects.toThrow(/staging activation is UNVERIFIED/);
+      .rejects.toThrow(/staging activation preflight is UNVERIFIED/);
     expect(activationRunner).toHaveBeenCalledTimes(1);
   });
 
@@ -229,6 +444,6 @@ describe("the verifier has a caller", () => {
       return { ...result, notes: [], report: formatActivationReport(result) };
     });
     await expect(runImporter({} as NodeJS.ProcessEnv, ["activation-preflight"], { activationRunner }))
-      .resolves.toMatchObject({ status: ACTIVATION_STATUS.ACTIVATED });
+      .resolves.toMatchObject({ status: ACTIVATION_STATUS.READY });
   });
 });

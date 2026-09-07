@@ -16,6 +16,7 @@ import {
 } from "@/lib/chat/store";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
 import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
+import { INGEST_DISABLED_CODE, INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import { runAnswerTurn } from "@/lib/query/stream-persist";
 import { createRun } from "@/lib/query/turn-runs";
 import { isSyncCommand, runManualSync } from "@/lib/ingest/manual-sync";
@@ -142,6 +143,14 @@ export async function POST(req: NextRequest) {
   if (isSyncCommand(question)) {
     if (isRestrictedTier(memberTier)) {
       return errorResponse("forbidden", "scraping is available to team members only", 403);
+    }
+    // AC-07: connector ingestion is disabled on a copied staging deployment. Named JSON refusal
+    // rather than an SSE stream whose only content is the refusal, and BEFORE the rate limit — a
+    // request that cannot run must not consume the caller's scrape allowance. `runManualSync` refuses
+    // again underneath (it is also reachable from the CLI); this one exists so the surface says so.
+    const ingestGate = await manualIngestionVerdict();
+    if (!ingestGate.allowed) {
+      return errorResponse(INGEST_DISABLED_CODE, ingestGate.message ?? INGEST_DISABLED_MESSAGE, 503);
     }
     if (!(await rateLimit(db, `${me.id}:sync`, 2))) {
       return errorResponse("rate_limited", "2 scrapes/min per member — try again shortly", 429);

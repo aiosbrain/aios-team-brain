@@ -231,14 +231,32 @@ export async function measureCandidate({
   if (tagObject?.object?.type !== "commit" || !tagObject.object.sha) throw new Error("annotated tag does not point to a commit");
   const commitSha = tagObject.object.sha;
 
-  const [pkg, mainCompare, stagingCompare, checks, deployment, health] = await Promise.all([
+  const [pkg, mainCompare, stagingCompare, checks, deployment] = await Promise.all([
     githubRequest("GET", `/repos/${repository}/contents/package.json?ref=${commitSha}`),
     githubRequest("GET", `/repos/${repository}/compare/main...${commitSha}`),
     githubRequest("GET", `/repos/${repository}/compare/${commitSha}...staging`),
     githubRequest("GET", `/repos/${repository}/commits/${commitSha}/check-runs?per_page=100`),
     railwayRead(deploymentId),
-    healthProbe(),
   ]);
+
+  // BIND FIRST, THEN AUTHENTICATE. The health probe carries the privileged staging token, so the
+  // domain it is sent to has to be the one Railway reports for the pinned environment/service —
+  // measured here, before the request exists. It used to sit in the `Promise.all` above alongside
+  // the deployment read, which meant the token went to whatever origin the environment claimed and
+  // the binding was checked afterwards: too late to be a control, since the credential had already
+  // been presented to an unbound host. `probeHealth` is therefore CALLED WITH the measured origin
+  // rather than reading a configured one.
+  const deploymentOrigin = deployment.url;
+  if (!deploymentOrigin) {
+    throw new Error("Railway reported no deployment domain for the candidate; the promotion evidence is UNMEASURED and cannot be substituted by a configured value");
+  }
+  const health = await healthProbe(deploymentOrigin);
+  if (health?.origin && health.origin !== deploymentOrigin) {
+    // A probe implementation that ignored its bound argument would otherwise degrade to a `healthOk:
+    // false` verdict, which reads as "staging is unhealthy" rather than "this evidence is about a
+    // different host".
+    throw new Error(`staging health was probed at ${health.origin}, which is not the measured deployment domain ${deploymentOrigin}`);
+  }
 
   const successful = [];
   const producerErrors = [];
@@ -273,11 +291,7 @@ export async function measureCandidate({
   // `STAGING_VERIFIED_DOMAIN` fallback was named "independently verified" but was a value someone
   // typed into `vars.*`: it proves the operator's belief, not the deployment's domain, and it sat
   // on the ONE path where the substitution's whole purpose was to avoid trusting an unmeasured
-  // origin. An absent domain is now UNMEASURED, and unmeasured refuses.
-  const deploymentOrigin = deployment.url;
-  if (!deploymentOrigin) {
-    throw new Error("Railway reported no deployment domain for the candidate; the promotion evidence is UNMEASURED and cannot be substituted by a configured value");
-  }
+  // origin. An absent domain is now UNMEASURED, and unmeasured refuses — above, before the probe.
   const facts = {
     tagName,
     tagObjectType: firstRef.object.type,
@@ -367,7 +381,15 @@ async function main() {
         environmentId: process.env.RAILWAY_STAGING_ENVIRONMENT_ID,
         serviceId: process.env.RAILWAY_STAGING_APP_SERVICE_ID,
       }),
-      healthProbe: () => probePinnedHealth({ origin: process.env.STAGING_ORIGIN, token: process.env.STAGING_HEALTH_TOKEN }),
+      // Bound to the MEASURED deployment domain. A configured `STAGING_ORIGIN` is an operator's
+      // assertion, so it may only agree or refuse — never redirect the token somewhere else.
+      healthProbe: (boundOrigin) => {
+        const configured = normalizeDeploymentOrigin(process.env.STAGING_ORIGIN);
+        if (configured && configured !== boundOrigin) {
+          throw new Error(`configured STAGING_ORIGIN ${configured} is not the measured deployment domain ${boundOrigin}; refusing to present the staging health token`);
+        }
+        return probePinnedHealth({ origin: boundOrigin, token: process.env.STAGING_HEALTH_TOKEN });
+      },
       repository: process.env.GITHUB_REPOSITORY,
       tagName: process.env.RELEASE_TAG,
       deploymentId: process.env.RELEASE_DEPLOYMENT_ID,

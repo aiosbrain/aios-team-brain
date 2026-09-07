@@ -17,7 +17,8 @@ import {
   hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark,
 } from "./journal.mjs";
 import { assertActionConfiguration } from "./action-preflight.mjs";
-import { assertActivated, runActivationPreflight } from "./activation-preflight.mjs";
+import { emitReceipt } from "./receipts.mjs";
+import { assertActivationPreflightReady, runActivationPreflight } from "./activation-preflight.mjs";
 import { assertStagingTopology } from "./config.mjs";
 import { replaceNeo4jGraph, assertReplaceTarget } from "./neo4j-replace.mjs";
 import { captureRollbackPostgres, resetSessionTransactionState, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
@@ -153,7 +154,15 @@ export async function installOpenedPair({ client, session, opened, directory, en
   const restore = { client, databaseUrl: env.DATABASE_URL, directory, verifiedStagingTarget: true };
   if (opened.manifest.databaseMode === "full") await restoreRollbackPostgres({ ...restore, env: { ...env, STAGING_DATA_MODE: opened.manifest.mode } });
   else await restorePairedPostgres({ ...restore, env });
-  if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-postgres") throw new Error("injected harness fault after Postgres restore");
+  // The after-PG BARRIER, stated positively and tied to this run. The harness needs it for two
+  // things it could not previously observe: that an interruption happened after real data was
+  // written (journal `importing` precedes the restore, so killing on it can hit an empty target),
+  // and that an injected fault fired at the point the scenario names rather than somewhere earlier.
+  emitReceipt("postgres-restored", { runId: opened.manifest.runId, kind: opened.kind, mode: opened.manifest.mode ?? null });
+  if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-postgres") {
+    emitReceipt("fault-injected", { point: "after-postgres", runId: opened.manifest.runId, postgresRestored: true, graphRestored: false });
+    throw new Error("injected harness fault after Postgres restore");
+  }
   if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS) {
     const pause = Number(env.STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS);
     if (!Number.isFinite(pause) || pause < 1 || pause > 120_000) throw new Error("invalid bounded harness pause");
@@ -162,7 +171,11 @@ export async function installOpenedPair({ client, session, opened, directory, en
   await reapplyTesters(env);
   // Re-measured, not reused: the stop/lock facts must hold at the moment of the graph delete too.
   await replaceNeo4jGraph({ session, graph, facts: await measuredReplaceFacts({ client, maintenance, env, opened }) });
-  if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-graph") throw new Error("injected harness fault after graph restore");
+  emitReceipt("graph-restored", { runId: opened.manifest.runId, kind: opened.kind, nodes: graph.nodes.length, relationships: graph.relationships.length });
+  if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-graph") {
+    emitReceipt("fault-injected", { point: "after-graph", runId: opened.manifest.runId, postgresRestored: true, graphRestored: true });
+    throw new Error("injected harness fault after graph restore");
+  }
   return graph;
 }
 
@@ -342,6 +355,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
   if (reset.status !== "reset") {
     notes.push(`session reset failed: ${reset.detail}`);
     await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting", "failed", "ready"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: false });
     throw new Error(withNotes("the importer's database session is unusable, so NO rollback was attempted; staging remains fenced and recovery is required", notes));
   }
   let driver = null;
@@ -365,6 +379,13 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
     await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
     await rollbackStore.writePointer("last-ready", { runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, kind: prior.kind });
+    // The RECOVERY receipt: which run failed, which prior identity is now installed, and that BOTH
+    // stores were restored and verified (`verifyInstalledPair` above covers Postgres sanitation, the
+    // graph census and the ledger↔graph correspondence) and the pair booted ready.
+    emitReceipt("prior-pair-restored", {
+      failedRunId, priorRunId: prior.manifest.runId, priorKind: prior.kind,
+      postgres: true, graph: true, ready: true, mode: prior.manifest.mode ?? null,
+    });
     return { status: "rolled-back", runId: prior.manifest.runId, recoveryNotes: notes };
   } catch (error) {
     // The checkpoint write is itself SQL on a connection that has just failed, so reset again and
@@ -372,6 +393,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     const checkpointReset = await resetSessionTransactionState(client);
     if (checkpointReset.status !== "reset") notes.push(`session reset before the recovery checkpoint failed: ${checkpointReset.detail}`);
     await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: true });
     throw new Error(withNotes(`paired rollback failed; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
   } finally { await session?.close(); await driver?.close(); }
 }
@@ -417,6 +439,14 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     throw new Error(`source run ${opened.manifest.runId} captured at or before the installed watermark; refusing to move staging backwards`);
   }
   const targetCommit = await readStagingHead(env);
+  // The harness's NEGATIVE CONTROL. A failure BEFORE the drain touches neither store, so it must not
+  // be able to satisfy a scenario about recovering from a mid-install fault — which the old
+  // "exited non-zero and the prior data is still there" assertion could not tell apart, because
+  // nothing had been replaced in either case.
+  if (env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "before-drain") {
+    emitReceipt("fault-injected", { point: "before-drain", runId: opened.manifest.runId, postgresRestored: false, graphRestored: false });
+    throw new Error("injected harness fault before drain");
+  }
   let destructive = false;
   try {
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
@@ -686,11 +716,12 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   // The activation verifier is READ-ONLY and needs no database, no locks and no runner role: it is
   // the check an operator runs BEFORE any of this is turned on, and making it depend on the runtime
   // it is supposed to authorise would be circular. It refuses on `UNVERIFIED` as well as on
-  // `NOT ACTIVATED` — "we could not look" is not permission.
+  // `NOT ACTIVATED` — "we could not look" is not permission — and its best outcome is READY TO
+  // ACTIVATE, which is a readiness verdict about an inert system, not a claim that it is running.
   if (action === "activation-preflight") {
     const result = await activationRunner(env);
     console.log(result.report);
-    assertActivated(result);
+    assertActivationPreflightReady(result);
     return { status: result.status, checks: result.checks };
   }
   await importerPreflight(env, action);

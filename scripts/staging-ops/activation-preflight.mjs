@@ -23,17 +23,38 @@
  *
  * Redaction: this module handles credential-bearing configuration and emits NO variable VALUES.
  * It reports shapes, presence, digests and HMAC fingerprints only.
+ *
+ * ⚠️ WHAT ITS BEST OUTCOME MEANS, AND WHAT IT DOES NOT. Its schedule check passes only when the
+ * schedules contract is DISABLED, so an all-green run cannot possibly mean "the weekly automation is
+ * running" — it used to say `ACTIVATED`, which reads as exactly that. The best verdict is therefore
+ * `READY TO ACTIVATE`: every control this build can measure was measured and is correct, and the
+ * system is still inert. Live activation is a later, deliberate act with its own evidence.
+ *
+ * It is also PARTIAL by construction, and says which parts. The sidecar's provider variables, the
+ * app's outbound configuration, live schedule state, branch/reference configuration and the remote
+ * environment's credential provenance are not measurable through the read-only surface it carries;
+ * each reports `UNVERIFIED` with the reason. Missing operator credentials (an activation
+ * prerequisite) and an absent executable measurement (a limitation of this software) are named
+ * distinctly, because only one of them can be fixed by supplying a token.
  */
 
 import { readFileSync } from "node:fs";
 import { assertStagingTopology } from "./config.mjs";
-import { credentialFingerprint, fingerprintsEqual } from "./credential-fingerprint.mjs";
+import { credentialFingerprint, fingerprintsComparable, fingerprintsEqual } from "./credential-fingerprint.mjs";
 
 export const ACTIVATION_STATUS = Object.freeze({
-  ACTIVATED: "ACTIVATED",
+  /** Every measurable control is measured and correct — and the schedules are still off. */
+  READY: "READY TO ACTIVATE",
   NOT_ACTIVATED: "NOT ACTIVATED",
   UNVERIFIED: "UNVERIFIED",
 });
+
+/** The credential classes the separation check requires; a missing one is incomparable, not distinct. */
+export const REQUIRED_CREDENTIAL_CLASSES = Object.freeze(["auth-secret", "secrets-key", "neo4j-credential"]);
+
+/** Railway deployment statuses that mean "this deployment is the one currently serving". */
+const SERVING_STATUS = "SUCCESS";
+const DEAD_STATUSES = new Set(["FAILED", "CRASHED", "REMOVED", "REMOVING", "SKIPPED"]);
 
 const PASS = "pass";
 const FAIL = "fail";
@@ -46,11 +67,14 @@ export const ACTIVATION_CHECKS = Object.freeze([
   "runner-image-pinned",
   "runner-autodeploy-disabled",
   "app-deployment-measured",
+  "app-health-bound",
   "app-mode-declared",
   "app-no-model-spend",
   "graphiti-no-provider-credentials",
   "credential-separation",
-  "schedules-disabled",
+  // Deliberately NOT called `schedules-disabled`: this reads the shipped contract FILE. It is a
+  // local configuration check and is not evidence about any live schedule on the platform.
+  "schedules-disabled-in-contract-file",
 ]);
 
 /**
@@ -105,18 +129,49 @@ const IMAGE_DIGEST = /@sha256:[0-9a-f]{64}$/i;
 export function evaluateActivation(facts = {}) {
   const checks = [];
 
-  // 1. The pinned identities, branches, internal hosts and variable REFERENCE shapes. Same rules as
-  //    the pure validator — but only over a document whose provenance is recorded, because a
-  //    hand-written topology file proves nothing about the platform.
-  if (!facts.topology) checks.push(unmeasured("topology-identity", "no measured topology document was supplied"));
-  else if (!facts.topology.measuredFrom) {
-    checks.push(check("topology-identity", UNVERIFIED, "topology document records no provenance; a hand-written document is a claim"));
-  } else {
+  // 1. The pinned identities, branches, internal hosts and variable REFERENCE shapes.
+  //
+  //    ⚠️ THE TOPOLOGY FILE IS A DOCUMENT OF EXPECTED PINS — a set of claims — and it stays one no
+  //    matter what is written in it. This check previously passed on `assertStagingTopology` plus a
+  //    non-empty `STAGING_TOPOLOGY_MEASURED_FROM` string, i.e. on the operator having typed a
+  //    provenance LABEL. A label is not a measurement, so the document is now corroborated against
+  //    what the providers actually returned: both project tokens' own project/environment scope, and
+  //    the observed staging app deployment's environment/service. Facts the file asserts that
+  //    nothing here reads — branch/reference configuration, internal hostnames — remain UNVERIFIED
+  //    and are named as such.
+  const tokensForTopology = facts.tokens ?? {};
+  if (!facts.topology) checks.push(unmeasured("topology-identity", "no topology document was supplied"));
+  else {
+    let consistent = true;
     try {
       assertStagingTopology(facts.topology.document);
-      checks.push(check("topology-identity", PASS, `pinned identities consistent (measured from ${facts.topology.measuredFrom})`));
     } catch (error) {
+      consistent = false;
       checks.push(check("topology-identity", FAIL, String(error instanceof Error ? error.message : error)));
+    }
+    if (consistent) {
+      const doc = facts.topology.document ?? {};
+      const mismatches = [];
+      const uncorroborated = [];
+      for (const side of ["staging", "production"]) {
+        const scope = tokensForTopology[side];
+        const pinned = doc[side];
+        if (!pinned) { uncorroborated.push(`${side} pins`); continue; }
+        if (!scope) { uncorroborated.push(`${side} project-token read-back`); continue; }
+        if (scope.projectId !== pinned.projectId || scope.environmentId !== pinned.environmentId) {
+          mismatches.push(`${side} pinned project/environment is not what its project token reads back`);
+        }
+      }
+      const deployment = facts.appDeployment ?? null;
+      if (!deployment) uncorroborated.push("staging app deployment read-back");
+      else if (doc.staging && (deployment.environmentId !== doc.staging.environmentId || deployment.serviceId !== doc.staging.appServiceId)) {
+        mismatches.push("the observed staging app deployment is not the pinned environment/service");
+      }
+      checks.push(mismatches.length
+        ? check("topology-identity", FAIL, mismatches.join("; "))
+        : uncorroborated.length
+          ? check("topology-identity", UNVERIFIED, `the document is internally consistent but UNCORROBORATED: no ${uncorroborated.join(", no ")}. Branch/reference and internal-host pins are not read by this verifier at all${facts.topology.measuredFrom ? `; the recorded provenance "${facts.topology.measuredFrom}" is an operator label, not a measurement` : ""}`)
+          : check("topology-identity", PASS, "pinned project/environment identities corroborated by both project-token read-backs and the observed staging deployment; branch/reference and internal-host pins remain unread"));
     }
   }
 
@@ -155,22 +210,46 @@ export function evaluateActivation(facts = {}) {
 
   // 3/4. The two ops runners: an immutable pinned image and NO automatic deploy trigger. A runner
   //      that redeploys on a branch push is a moving target holding both databases' credentials.
-  const runners = facts.runners ?? null;
-  if (!runners || Object.keys(runners).length === 0) {
-    checks.push(unmeasured("runner-image-pinned", "no serviceInstance read-back for the exporter/importer runners"));
-    checks.push(unmeasured("runner-autodeploy-disabled", "no serviceInstance read-back for the exporter/importer runners"));
-  } else {
-    const imageErrors = [];
-    const autoErrors = [];
-    for (const [name, runner] of Object.entries(runners)) {
-      if (!IMAGE_DIGEST.test(String(runner?.image ?? ""))) imageErrors.push(`${name} is not pinned to an immutable image digest`);
-      if (runner?.repo) imageErrors.push(`${name} has a repository source`);
-      if (runner?.autoDeploy == null) autoErrors.push(`${name} autodeploy status was not reported`);
-      else if (runner.autoDeploy !== false) autoErrors.push(`${name} has automatic deployments enabled`);
+  //      BOTH runners, named individually. `Object.keys(runners).length === 0` let ONE successful
+  //      measurement satisfy a check whose text says "both": the exporter could be unmeasurable and
+  //      the importer alone would carry the pass. A missing runner is now UNVERIFIED by name, a
+  //      missing autodeploy READING is UNVERIFIED (only a measured `true` is a failure), and the
+  //      returned `serviceId` is validated rather than discarded — a read-back about a different
+  //      service is evidence about that service.
+  const runners = facts.runners ?? {};
+  const imageErrors = [];
+  const autoErrors = [];
+  const imageUnmeasured = [];
+  const autoUnmeasured = [];
+  for (const name of ["exporter", "importer"]) {
+    const runner = runners[name] ?? null;
+    if (!runner) {
+      imageUnmeasured.push(`${name} serviceInstance read-back`);
+      autoUnmeasured.push(`${name} autodeploy read-back`);
+      continue;
     }
-    checks.push(imageErrors.length ? check("runner-image-pinned", FAIL, imageErrors.join("; ")) : check("runner-image-pinned", PASS, "both runners are pinned to immutable image digests with no repository source"));
-    checks.push(autoErrors.length ? check("runner-autodeploy-disabled", FAIL, autoErrors.join("; ")) : check("runner-autodeploy-disabled", PASS, "automatic deployments are disabled on both runners"));
+    if (runner.expectedServiceId && runner.serviceId !== runner.expectedServiceId) {
+      imageErrors.push(`${name} read-back is for a different service than the one requested`);
+    } else if (!runner.serviceId) {
+      imageUnmeasured.push(`${name} service identity in the read-back`);
+    }
+    if (!IMAGE_DIGEST.test(String(runner.image ?? ""))) imageErrors.push(`${name} is not pinned to an immutable image digest`);
+    else if (runner.expectedImage && runner.image !== runner.expectedImage) imageErrors.push(`${name} runs a different immutable artifact than the pinned one`);
+    else if (!runner.expectedImage) imageUnmeasured.push(`${name} expected image digest (its immutability is measured; its IDENTITY is not pinned to compare against)`);
+    if (runner.repo) imageErrors.push(`${name} has a repository source`);
+    if (runner.autoDeploy == null) autoUnmeasured.push(`${name} autodeploy status (the provider reported none)`);
+    else if (runner.autoDeploy !== false) autoErrors.push(`${name} has automatic deployments enabled`);
   }
+  checks.push(imageErrors.length
+    ? check("runner-image-pinned", FAIL, imageErrors.join("; "))
+    : imageUnmeasured.length
+      ? unmeasured("runner-image-pinned", imageUnmeasured.join("; no "))
+      : check("runner-image-pinned", PASS, "both runners run the pinned immutable artifact, with no repository source"));
+  checks.push(autoErrors.length
+    ? check("runner-autodeploy-disabled", FAIL, autoErrors.join("; "))
+    : autoUnmeasured.length
+      ? unmeasured("runner-autodeploy-disabled", autoUnmeasured.join("; no "))
+      : check("runner-autodeploy-disabled", PASS, "automatic deployments are disabled on both runners"));
 
   // 5. The staging app's deployment, bound to the pinned instance, with a MEASURED domain. An
   //    absent domain is unverified — never a configured value standing in for it.
@@ -184,11 +263,48 @@ export function evaluateActivation(facts = {}) {
   else if (!pinnedStaging) checks.push(unmeasured("app-deployment-measured", "no pinned staging app identity to bind the observed deployment to"));
   else if (deployment.environmentId !== pinnedStaging.environmentId || deployment.serviceId !== pinnedStaging.appServiceId) {
     checks.push(check("app-deployment-measured", FAIL, "the observed deployment belongs to a different environment or service than the pinned staging app"));
-  } else checks.push(check("app-deployment-measured", PASS, `staging app deployment ${deployment.id} measured at its own domain`));
+  }
+  // The newest deployment edge is not necessarily a SERVING one: it may be building, or it may have
+  // failed. Reading its domain and calling that "the deployment's identity" skips the question.
+  else if (DEAD_STATUSES.has(String(deployment.status))) {
+    checks.push(check("app-deployment-measured", FAIL, `the newest staging app deployment is ${deployment.status}, so nothing is serving this identity`));
+  } else if (deployment.status !== SERVING_STATUS) {
+    checks.push(check("app-deployment-measured", UNVERIFIED, `the newest staging app deployment is ${String(deployment.status ?? "of unreported status")}, not a completed one; re-run once it settles`));
+  } else checks.push(check("app-deployment-measured", PASS, `staging app deployment ${deployment.id} is serving at its own measured domain`));
 
-  // 6/7. What the APP says about itself, over its own privileged health contract — the one place
-  //      the app's runtime posture is observable without reading its variables.
+  // 6. THE BINDING, kept as its own check because it is the one that decides whether a privileged
+  //    token may be presented at all. The acquisition used to probe whatever `STAGING_ORIGIN` named,
+  //    whenever an origin and a token both existed, and nothing ever compared that host to the
+  //    deployment — so the staging health token could be sent to an arbitrary configured domain and
+  //    that domain's own answer became the evidence. Now: no measured domain ⇒ no request; a
+  //    configured origin that disagrees ⇒ no request; and an answer that is about another origin, or
+  //    about a different commit than the deployment Railway reported, is a refusal rather than a
+  //    health verdict.
   const health = facts.appHealth ?? null;
+  if (facts.healthOriginMismatch) {
+    checks.push(check("app-health-bound", FAIL, "the configured staging origin is not the measured deployment domain; no health token was presented to either"));
+  } else if (!deployment?.url) {
+    checks.push(unmeasured("app-health-bound", "measured deployment domain to bind a health probe to; no token was presented"));
+  } else if (!health) {
+    checks.push(unmeasured("app-health-bound", "privileged health answer from the measured domain"));
+  } else if (health.origin && health.origin !== deployment.url) {
+    checks.push(check("app-health-bound", FAIL, "the health answer is about a different origin than the measured deployment domain"));
+  } else if (health.status === 200 || health.status === 202) {
+    const served = health.body?.commit ?? null;
+    checks.push(!served || !deployment.commitSha
+      ? check("app-health-bound", UNVERIFIED, "the deployment or the health answer reports no commit, so the answer cannot be tied to the observed deployment")
+      : served !== deployment.commitSha
+        ? check("app-health-bound", FAIL, "the deployment serving the measured domain reports a different commit than the observed deployment")
+        : check("app-health-bound", PASS, "the health answer came from the measured deployment domain and reports the observed deployment's commit"));
+  } else {
+    checks.push(unmeasured("app-health-bound", `usable health answer (the probe answered ${health.status})`));
+  }
+
+  // 7/8. What the APP says about itself, over its own privileged health contract — the one place
+  //      the app's runtime posture is observable without reading its variables. Note the scope:
+  //      `answering: "disabled"` is the deployment's REPORTED answering posture, and nothing more.
+  //      It is not proof of the whole no-spend policy: graph extraction, embeddings, image and
+  //      outbound-connector posture are separate controls with their own evidence.
   if (!health) {
     checks.push(unmeasured("app-mode-declared", "the privileged staging health probe was not performed"));
     checks.push(unmeasured("app-no-model-spend", "the privileged staging health probe was not performed"));
@@ -210,7 +326,7 @@ export function evaluateActivation(facts = {}) {
     // configuration took effect, so it is surfaced as its own outcome.
     const answering = health.body?.answering;
     if (answering === undefined) checks.push(check("app-no-model-spend", UNVERIFIED, "the deployment reports no answering posture; it predates the field"));
-    else if (answering === "disabled") checks.push(check("app-no-model-spend", PASS, "model-backed answering is disabled on the deployment"));
+    else if (answering === "disabled") checks.push(check("app-no-model-spend", PASS, "the deployment REPORTS model-backed answering as disabled; this one field is evidence about answering posture only, not about graph extraction, embedding, image or outbound-connector policy"));
     else if (answering === "unsupported-budgeted-mode") {
       checks.push(check("app-no-model-spend", FAIL, "staging-budgeted-interactive-query-unsupported: the deployment is configured to opt into budgeted interactive answering, which this build does not implement — no budget is enforced anywhere, so the configuration authorises nothing and must be removed"));
     } else checks.push(check("app-no-model-spend", FAIL, `the deployment reports answering posture ${String(answering)}`));
@@ -227,52 +343,85 @@ export function evaluateActivation(facts = {}) {
 
   // 9. Staging and production must not share a credential. Compared by HMAC fingerprint, so no
   //    value is read, transported or printed.
+  //     MISSING AND MALFORMED ARE INCOMPARABLE, NOT DIFFERENT. `fingerprintsEqual` answers `false`
+  //     for an absent remote key, a mismatched keyId, a wrong version or a malformed MAC — and the
+  //     previous loop read every one of those falses as "this credential differs", so an empty or
+  //     forged opposite-environment document passed the check that exists to catch a shared secret.
+  //     Every required class must now be present and comparable on BOTH sides, minted under the SAME
+  //     comparison key, before any comparison counts. (What this can never establish is the remote
+  //     document's provenance: it is a JSON file, and this build has no authenticated channel for
+  //     one, which is why a passing check says "as recorded in the supplied document".)
   const separation = facts.credentialFingerprints ?? null;
   if (!separation?.local || !separation?.remote) {
     checks.push(unmeasured("credential-separation", "no fingerprint document from the opposite environment to compare against"));
   } else {
-    const shared = Object.keys(separation.local).filter((name) => fingerprintsEqual(separation.local[name], separation.remote[name]));
+    const incomparable = [];
+    const shared = [];
+    for (const credentialClass of REQUIRED_CREDENTIAL_CLASSES) {
+      const local = separation.local[credentialClass];
+      const remote = separation.remote[credentialClass];
+      if (!fingerprintsComparable(local, remote)) {
+        incomparable.push(`${credentialClass} (${!local ? "no local fingerprint" : !remote ? "absent from the opposite-environment document" : "different comparison key, class or malformed MAC"})`);
+        continue;
+      }
+      if (fingerprintsEqual(local, remote)) shared.push(credentialClass);
+    }
     checks.push(shared.length
       ? check("credential-separation", FAIL, `staging and production share credentials: ${shared.join(", ")}`)
-      : check("credential-separation", PASS, `${Object.keys(separation.local).length} credential class(es) differ across environments`));
+      : incomparable.length
+        ? unmeasured("credential-separation", `comparable fingerprints for ${incomparable.join("; ")}`)
+        : check("credential-separation", PASS, `all ${REQUIRED_CREDENTIAL_CLASSES.length} required credential classes differ from the opposite environment, as recorded in the supplied fingerprint document`));
   }
 
-  // 10. The schedules contract ships disabled. Activation flips it deliberately, elsewhere.
+  // 11. The SHIPPED CONTRACT FILE says the schedules are disabled. This is a local configuration
+  //     check: it reads a file in this repository, not the platform, so it can never be evidence
+  //     that no schedule is live. Activation flips the real thing deliberately, elsewhere.
   checks.push(facts.schedules == null
-    ? unmeasured("schedules-disabled", "the schedules contract was not read")
+    ? unmeasured("schedules-disabled-in-contract-file", "the shipped schedules contract file was not read")
     : facts.schedules.activated === false
-      ? check("schedules-disabled", PASS, "the schedule contract is disabled, as shipped")
-      : check("schedules-disabled", FAIL, "the schedule contract declares itself activated"));
+      ? check("schedules-disabled-in-contract-file", PASS, "the shipped contract file declares the schedules disabled; this is a local configuration check and is not evidence about live platform schedules")
+      : check("schedules-disabled-in-contract-file", FAIL, "the shipped contract file declares itself activated"));
 
   const status = checks.some((c) => c.status === FAIL)
     ? ACTIVATION_STATUS.NOT_ACTIVATED
     : checks.some((c) => c.status === UNVERIFIED)
       ? ACTIVATION_STATUS.UNVERIFIED
-      : ACTIVATION_STATUS.ACTIVATED;
+      // Not "ACTIVATED": the schedule check above passes only while the automation is OFF, so the
+      // best this command can certify is that the measurable controls are correct and the system is
+      // still inert.
+      : ACTIVATION_STATUS.READY;
 
   return { status, checks, claims: facts.operatorClaims ?? {} };
 }
 
 /**
- * Fail the caller unless activation is fully verified.
+ * Fail the caller unless every measurable control passed.
  *
  * `UNVERIFIED` refuses just as `NOT ACTIVATED` does — the difference is what the operator must do
- * next, not whether they may proceed.
+ * next, not whether they may proceed. A pass means READY TO ACTIVATE, never "activated": see the
+ * module header.
  */
-export function assertActivated(result) {
-  if (result.status === ACTIVATION_STATUS.ACTIVATED) return result;
+export function assertActivationPreflightReady(result) {
+  if (result.status === ACTIVATION_STATUS.READY) return result;
   const lines = result.checks.filter((c) => c.status !== PASS).map((c) => `- ${c.id} [${c.status}]: ${c.detail}`);
-  throw new Error(`staging activation is ${result.status}:\n${lines.join("\n")}`);
+  throw new Error(`staging activation preflight is ${result.status}:\n${lines.join("\n")}`);
 }
 
 // ── Measurement ────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The tokens this verifier is given are ENVIRONMENT-SCOPED PROJECT tokens — the same kind
+ * `RailwayMaintenance` uses, and they authenticate with `Project-Access-Token`, not with an
+ * `Authorization: Bearer` account credential. Sending the wrong header produced an authentication
+ * failure that read as "the platform is configured differently than you think", which is a much more
+ * alarming and much less true conclusion than "this client sent the wrong header".
+ */
 async function railwayQuery({ document, variables, token, fetchImpl, apiUrl = "https://backboard.railway.com/graphql/v2" }) {
   assertReadOnlyDocument(document);
   const response = await fetchImpl(apiUrl, {
     method: "POST",
     redirect: "error",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { "Project-Access-Token": token, "Content-Type": "application/json" },
     body: JSON.stringify({ query: document, variables }),
     signal: AbortSignal.timeout(15_000),
   });
@@ -281,6 +430,23 @@ async function railwayQuery({ document, variables, token, fetchImpl, apiUrl = "h
   // never reaches the message.
   if (!response.ok || body?.errors?.length) throw new Error(`activation read failed (${response.status})`);
   return body?.data ?? null;
+}
+
+/**
+ * An operator-configured origin, reduced to the same shape a measured `staticUrl` produces so the
+ * two are comparable. Anything carrying credentials, a port, a path or a non-https scheme is not a
+ * deployment domain and normalises to `null` — which refuses rather than matching loosely.
+ */
+function normalizeOrigin(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return null;
+    if (url.username || url.password || url.port) return null;
+    if (url.pathname !== "/" && url.pathname !== "") return null;
+    return url.origin.toLowerCase();
+  } catch { return null; }
 }
 
 /** One measurement that may legitimately be unavailable: absence becomes `null`, never a throw. */
@@ -319,13 +485,15 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
   }
 
   const runnerSpecs = [
-    ["exporter", "production", env.PRODUCTION_EXPORTER_SERVICE_ID, topology?.document?.production],
-    ["importer", "staging", env.STAGING_IMPORTER_SERVICE_ID, topology?.document?.staging],
+    ["exporter", "production", env.PRODUCTION_EXPORTER_SERVICE_ID, topology?.document?.production, env.PRODUCTION_EXPORTER_IMAGE_DIGEST],
+    ["importer", "staging", env.STAGING_IMPORTER_SERVICE_ID, topology?.document?.staging, env.STAGING_IMPORTER_IMAGE_DIGEST],
   ];
   const runners = {};
-  for (const [name, side, serviceId, pinned] of runnerSpecs) {
+  for (const [name, side, serviceId, pinned, expectedImage] of runnerSpecs) {
     if (!serviceId || !pinned?.projectId || !pinned?.environmentId || !token(side)) {
-      notes.push(`${name} runner: pinned service/environment identity or read token missing`);
+      // An operator PREREQUISITE (supply the pinned identity / the read token), distinct from the
+      // capability gaps noted elsewhere — the two are fixed by different people.
+      notes.push(`${name} runner: prerequisite missing — pinned service/environment identity or read token not supplied`);
       continue;
     }
     const measured = await measure(`${name} runner`, async () => {
@@ -335,7 +503,11 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
         token: token(side), fetchImpl,
       });
       return {
+        // Kept, not discarded: a read-back is evidence about the service it names.
+        serviceId: data?.serviceInstance?.serviceId ?? null,
+        expectedServiceId: serviceId,
         image: data?.serviceInstance?.source?.image ?? null,
+        expectedImage: expectedImage?.trim() || null,
         repo: data?.serviceInstance?.source?.repo ?? null,
         autoDeploy: data?.serviceInstanceAutoDeployStatus?.enabled ?? null,
       };
@@ -356,35 +528,69 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
         const raw = String(node.staticUrl ?? "").trim();
         return {
           id: node.id, status: node.status, environmentId: node.environmentId, serviceId: node.serviceId,
+          commitSha: node.meta?.commitHash ?? node.meta?.repoCommit ?? null,
           // Bare hostname → https origin. Absent stays absent: see `app-deployment-measured`.
           url: raw && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(raw) ? `https://${raw.toLowerCase()}` : null,
         };
       }, notes)
     : null;
 
-  const appHealth = env.STAGING_ORIGIN && env.STAGING_HEALTH_TOKEN
-    ? await measure("staging health", async () => {
-        const response = await fetchImpl(new URL("/api/health", env.STAGING_ORIGIN), {
-          redirect: "manual",
-          headers: { "x-aios-staging-health-token": env.STAGING_HEALTH_TOKEN },
-          signal: AbortSignal.timeout(15_000),
-        });
-        return { status: response.status, body: await response.json().catch(() => ({})) };
-      }, notes)
-    : null;
-  if (!env.STAGING_ORIGIN || !env.STAGING_HEALTH_TOKEN) notes.push("staging health: origin or token not supplied");
+  // MEASURE THE DOMAIN, THEN AUTHENTICATE TO IT. The health request carries the privileged staging
+  // token, so its destination is the origin Railway reported for the pinned environment/service —
+  // never `STAGING_ORIGIN`, which is an operator assertion and may only agree or refuse. Any of:
+  // no measured domain, no token, or a configured origin naming a different host ⇒ the request is
+  // not made at all. There is no path here that presents the token to an unbound host.
+  const boundOrigin = appDeployment?.url ?? null;
+  const configuredOrigin = normalizeOrigin(env.STAGING_ORIGIN);
+  const healthOriginMismatch = Boolean(boundOrigin && configuredOrigin && configuredOrigin !== boundOrigin);
+  let appHealth = null;
+  if (healthOriginMismatch) {
+    notes.push("staging health: the configured STAGING_ORIGIN is not the measured deployment domain; no health token was presented");
+  } else if (!boundOrigin) {
+    notes.push("staging health: no measured deployment domain to bind the probe to; no health token was presented");
+  } else if (!env.STAGING_HEALTH_TOKEN) {
+    notes.push("staging health: prerequisite missing — no staging health token supplied");
+  } else {
+    appHealth = await measure("staging health", async () => {
+      const response = await fetchImpl(new URL("/api/health", boundOrigin), {
+        redirect: "manual",
+        headers: { "x-aios-staging-health-token": env.STAGING_HEALTH_TOKEN },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.status >= 300 && response.status < 400) throw new Error("staging health redirected; off-origin redirects are refused");
+      if (response.url && new URL(response.url).origin !== boundOrigin) throw new Error("staging health final origin changed");
+      return { status: response.status, origin: boundOrigin, body: await response.json().catch(() => ({})) };
+    }, notes);
+  }
 
   let credentialFingerprints = null;
   if (env.STAGING_COMPARISON_KEY_BASE64 && env.STAGING_COMPARISON_KEY_ID && env.OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE) {
     credentialFingerprints = await measure("credential separation", async () => {
       const comparisonKey = Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64");
-      const local = Object.fromEntries([
-        ["auth-secret", env.AUTH_SECRET], ["secrets-key", env.SECRETS_KEY],
-        ["neo4j-credential", `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`],
-      ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID })]));
+      // Only credentials this process ACTUALLY HOLDS are fingerprinted. Template-joining absent
+      // values produced the string "undefined\0undefined", which is a perfectly good HMAC input and
+      // therefore a fingerprint that differs from production's — "we hold no Neo4j credential"
+      // masquerading as "our Neo4j credential is distinct". A missing class is simply absent, and
+      // the evaluator reports it as incomparable.
+      const inputs = [
+        ["auth-secret", env.AUTH_SECRET],
+        ["secrets-key", env.SECRETS_KEY],
+        ["neo4j-credential", env.NEO4J_USER && env.NEO4J_PASSWORD ? `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}` : null],
+      ].filter(([credentialClass, value]) => {
+        if (typeof value === "string" && value.length) return true;
+        notes.push(`credential separation: prerequisite missing — this runner holds no ${credentialClass} to fingerprint`);
+        return false;
+      });
+      const local = Object.fromEntries(inputs.map(([credentialClass, value]) => [
+        credentialClass,
+        credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID }),
+      ]));
+      // The opposite side arrives as a plain JSON document. This build has no authenticated channel
+      // for one, so its PROVENANCE is unverified by construction; what the evaluator can insist on
+      // is that every entry is a well-formed fingerprint minted under the same comparison key.
       return { local, remote: JSON.parse(readFileSync(env.OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE, "utf8")) };
     }, notes);
-  } else notes.push("credential separation: comparison key or opposite-environment fingerprint document not supplied");
+  } else notes.push("credential separation: prerequisite missing — comparison key or opposite-environment fingerprint document not supplied");
 
   const schedules = env.STAGING_SCHEDULES_FILE
     ? await measure("schedules", async () => JSON.parse(readFileSync(env.STAGING_SCHEDULES_FILE, "utf8")), notes)
@@ -396,7 +602,7 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
     Object.keys(env).filter((name) => name.startsWith("ACTIVATION_CLAIM_")).map((name) => [name, "claimed (not evidence)"])
   );
 
-  return { topology, tokens, runners, appDeployment, appHealth, credentialFingerprints, schedules, operatorClaims, notes };
+  return { topology, tokens, runners, appDeployment, appHealth, healthOriginMismatch, credentialFingerprints, schedules, operatorClaims, notes };
 }
 
 /** Human-readable, redacted. No variable values, no tokens, no connection strings. */

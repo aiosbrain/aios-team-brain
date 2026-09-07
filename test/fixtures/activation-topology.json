@@ -1,0 +1,34 @@
+{
+  "repositoryDefaultBranch": "staging",
+  "contributionBranch": "staging",
+  "staging": {
+    "projectId": "project-a",
+    "environmentId": "env-staging",
+    "appServiceId": "service-app",
+    "graphitiServiceId": "service-graphiti",
+    "postgresServiceId": "service-postgres",
+    "neo4jServiceId": "service-neo4j",
+    "appSourceBranch": "staging",
+    "postgresHost": "postgres.railway.internal",
+    "neo4jHost": "neo4j.railway.internal",
+    "variableReferences": {
+      "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
+      "NEO4J_URL": "bolt://${{neo4j.RAILWAY_PRIVATE_DOMAIN}}:7687"
+    }
+  },
+  "production": {
+    "projectId": "project-a",
+    "environmentId": "env-production",
+    "appServiceId": "service-app",
+    "graphitiServiceId": "service-graphiti",
+    "postgresServiceId": "service-postgres",
+    "neo4jServiceId": "service-neo4j",
+    "appSourceBranch": "main",
+    "postgresHost": "postgres.railway.internal",
+    "neo4jHost": "neo4j.railway.internal",
+    "variableReferences": {
+      "DATABASE_URL": "${{Postgres.DATABASE_URL}}",
+      "NEO4J_URL": "bolt://${{neo4j.RAILWAY_PRIVATE_DOMAIN}}:7687"
+    }
+  }
+}
