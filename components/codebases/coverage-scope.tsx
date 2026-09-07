@@ -82,11 +82,14 @@ export function CoverageScope({
     // pin" is the right one. Where the scanner IS current, the scope is genuinely missing (no
     // coverage report parsed the counts) and the original wording still holds.
     const cause = scannerStalenessLabel(scannerStaleness ?? "unknown", scannerVersion);
+    const upgradeAdvice = scannerStaleness === "stale"
+      ? ` Bump this repo's scanner pin in .github/scripts/fetch-brain-scanner.sh to a build at or after ${MIN_SCANNER_VERSION} — preserve the exact-SHA verification.`
+      : "";
     return (
       <span
         title={
           cause
-            ? `${cause}. The percentage above could describe the whole repository or a small corner of it. Bump this repo's scanner pin in .github/scripts/fetch-brain-scanner.sh to a build at or after ${MIN_SCANNER_VERSION} — the exact-SHA pin is deliberate, so it is bumped, never removed.`
+            ? `${cause}. The percentage above could describe the whole repository or a small corner of it.${upgradeAdvice}`
             : "This scan ran a current scanner but did not report how many lines the coverage run measured, so the percentage above could describe the whole repository or a small corner of it."
         }
         className={`font-mono text-[10px] text-ink-tertiary italic ${className}`}
@@ -177,12 +180,15 @@ export function ScannerStalenessBadge({
 }) {
   const label = scannerStalenessLabel(staleness, scannerVersion);
   if (!label || !isScannerOutdated(staleness)) return null;
+  const advice = staleness === "stale"
+    ? ` Bump this repo's pin in .github/scripts/fetch-brain-scanner.sh to a scanner build at or after ${MIN_SCANNER_VERSION}. Preserve the exact-SHA verification.`
+    : " Check the recorded build against this repo's pin in .github/scripts/fetch-brain-scanner.sh; preserve the exact-SHA verification when updating it.";
   const provenance = scannerSha
     ? ` This scan was built from aios-team-brain commit ${scannerSha}.`
     : " This scan did not record which commit built it.";
   return (
     <span
-      title={`${label}.${provenance} Bump this repo's pin in .github/scripts/fetch-brain-scanner.sh to a scanner build at or after ${MIN_SCANNER_VERSION}. The exact-SHA pin is deliberate — it keeps another repo's code from executing in your CI unreviewed — so it is bumped, never removed.`}
+      title={`${label}.${provenance}${advice}`}
       className="inline-flex items-center gap-1 rounded-full border border-amber-400/25 bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-500/90"
     >
       <AlertTriangle className="size-2.5" />

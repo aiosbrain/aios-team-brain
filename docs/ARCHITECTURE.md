@@ -447,7 +447,8 @@ The cost of that choice, stated so it is not forgotten: **raise `minScannerVersi
 revision that requires new scanner output, or staleness detection is silently off for that field.**
 Version recognition uses ASCII digits, ECMAScript whitespace trimming, and the wire's 64-character
 bound on both producer and reader. The reader compares exact integers; large components do not
-round into equality. Both runtimes exercise the same boundary fixtures.
+round into equality. Both runtimes exercise the same boundary fixtures. The fleet summary reads `scanner_sha`
+and passes it to the card badge, so recorded provenance reaches the tooltip as well as the detail view.
 NEEDS A MIGRATION: `postgres/migrations/20260831120000_code_metrics_scanner_identity.sql`.
 Railway runs `pg:schema` automatically before deployment, including the schema mirror and this
 migration. For the AIOS instance, obtain Chetan's approval and complete the Railway rehearsal

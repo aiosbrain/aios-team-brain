@@ -1,3 +1,6 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { CodebaseCard } from "@/components/codebases/codebase-card";
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
@@ -82,6 +85,7 @@ describe("scanner identity persistence + the three states (real Postgres)", () =
       seed,
       scan(slug, {
         scanner_version: "0.1.0",
+        scanner_sha: "dd42bf421d436bf1a8993ab62f79d35e4ad63b0a",
         test_coverage_pct: 99,
         test_coverage_lines_total: null,
       }),
@@ -94,6 +98,10 @@ describe("scanner identity persistence + the three states (real Postgres)", () =
     const summary = await summaryFor(seed.teamId, slug);
     expect(summary?.scanner_version).toBe("0.1.0");
     expect(summary?.scanner_staleness).toBe("stale");
+    expect(summary).toBeDefined();
+    const card = renderToStaticMarkup(createElement(CodebaseCard, { teamSlug: "acme", cb: summary! }));
+    expect(card).toContain("dd42bf421d436bf1a8993ab62f79d35e4ad63b0a");
+    expect(card).not.toContain("did not record which commit");
     // ...and the coverage number it could not scope is still there, now with an attributable cause
     // instead of an unexplained blank.
     expect(summary?.test_coverage_pct).toBe(99);
@@ -104,7 +112,7 @@ describe("scanner identity persistence + the three states (real Postgres)", () =
     const seed = await seedTeam();
     const slug = `repo-${randomUUID().slice(0, 6)}`;
     // Exactly a pre-1.24 payload: the keys are absent from the wire entirely.
-    await push(seed, scan(slug));
+    await push(seed, scan(slug, { test_coverage_pct: 99, test_coverage_lines_total: null, loc: 100 }));
 
     // The stored value is NULL, not "" and not "0.0.0". This is the assertion that would have
     // caught the whole class of bug: an absent declaration must stay absent in the row.
@@ -124,6 +132,10 @@ describe("scanner identity persistence + the three states (real Postgres)", () =
     expect(summary?.scanner_version).toBeNull();
     expect(summary?.scanner_staleness).toBe("unknown");
     expect(summary?.scanner_staleness).not.toBe("current");
+    expect(summary).toBeDefined();
+    const card = renderToStaticMarkup(createElement(CodebaseCard, { teamSlug: "acme", cb: summary! }));
+    expect(card).toContain("scanner unknown");
+    expect(card).not.toMatch(/Bump this repo|predates brain-api|could not report/i);
   });
 
   it("THE ABSENCE CASE IS DISTINGUISHABLE from both other states, in one team, at once", async () => {

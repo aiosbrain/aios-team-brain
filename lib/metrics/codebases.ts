@@ -59,6 +59,7 @@ export interface CodebaseSummary {
    * send it, and nothing anywhere said so.
    */
   scanner_version: string | null;
+  scanner_sha: string | null;
   scanner_staleness: ScannerStaleness;
   tests_skipped: number | null;
   tests_failed: number | null;
@@ -138,6 +139,7 @@ type MetricRow = {
   tests_failed: number | string | null;
   // brain-api 1.24 (AIO-1011) — null on every row written before the column existed.
   scanner_version: string | null;
+  scanner_sha: string | null;
   ai_commit_ratio: number | string;
   readiness_level: string | null;
   readiness_pct: number | string | null;
@@ -172,7 +174,7 @@ export async function getCodebaseSummaries(
       .select(
         "codebase_id, scanned_at, agentic_score, health_score, test_coverage_pct, " +
           "test_coverage_lines_total, coverage_breadth_pct, loc, tests_total, tests_skipped, tests_failed, " +
-          "scanner_version, " +
+          "scanner_version, scanner_sha, " +
           "ai_commit_ratio, readiness_level, readiness_pct",
       )
       .eq("team_id", teamId)
@@ -247,6 +249,7 @@ export async function getCodebaseSummaries(
       // all also reads "unknown", which is the true statement: nothing has told us what would
       // scan it.
       scanner_version: latest?.scanner_version ?? null,
+      scanner_sha: latest?.scanner_sha ?? null,
       scanner_staleness: scannerStaleness(latest?.scanner_version),
       ai_commit_ratio: num(latest?.ai_commit_ratio),
       readiness_level: latest?.readiness_level ?? null,

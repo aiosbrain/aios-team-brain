@@ -109,6 +109,7 @@ export function CodebaseCard({ teamSlug, cb }: { teamSlug: string; cb: CodebaseS
             <ScannerStalenessBadge
               staleness={cb.scanner_staleness}
               scannerVersion={cb.scanner_version}
+              scannerSha={cb.scanner_sha}
             />
           ) : null}
           {cb.scanned && cb.stale ? (
