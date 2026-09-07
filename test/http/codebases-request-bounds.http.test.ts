@@ -178,25 +178,32 @@ function chunk(body: string, parts: number): string[] {
  * stable order. Deliberately NOT a whole-database snapshot: authentication updates
  * `api_keys.last_used_at` and the rate limiter writes its bucket on EVERY request including a
  * rejected one, and those are explicitly allowed by the spec. What must not move is scan state.
+ *
+ * Every row is read WHOLE (`*`), never as a column list. "No writes on rejection" is a claim
+ * about the row, and a projection can only ever prove that the columns someone thought to name
+ * did not move: a rejected request that rewrote a body, a frontmatter, a score, or any of the
+ * timestamps outside the list would still compare equal. The scope is one freshly seeded team,
+ * so the whole row costs nothing and is the only honest subject for "nothing moved at all".
  */
 async function scanInventory(teamId: string) {
   const admin = db();
-  const rows = async (table: string, cols: string) => {
+  const rows = async (table: string) => {
     const { data, error } = await admin
       .from(table)
-      .select(cols)
+      .select("*")
       .eq("team_id", teamId)
       .order("id", { ascending: true });
     if (error) throw new Error(`inventory ${table} failed: ${error.message}`);
     return (data ?? []) as Record<string, unknown>[];
   };
 
-  const items = await rows("items", "id, project_id, path, kind, content_sha256, access, member_id");
+  const items = await rows("items");
   const itemIds = items.map((row) => row.id as string);
+  // Scoped by item rather than by team: item_versions has no team_id of its own.
   const { data: versions, error: versionError } = itemIds.length
     ? await admin
         .from("item_versions")
-        .select("id, item_id, content_sha256")
+        .select("*")
         .in("item_id", itemIds)
         .order("id", { ascending: true })
     : { data: [], error: null };
@@ -204,7 +211,7 @@ async function scanInventory(teamId: string) {
 
   const { data: auditRows, error: auditError } = await admin
     .from("audit_log")
-    .select("id, action, target_type, target_id")
+    .select("*")
     .eq("team_id", teamId)
     .order("id", { ascending: true });
   if (auditError) throw new Error(`inventory audit_log failed: ${auditError.message}`);
@@ -217,23 +224,18 @@ async function scanInventory(teamId: string) {
   });
 
   return {
-    codebases: await rows("codebases", "id, slug, full_name, last_scan_at"),
-    code_metrics: await rows("code_metrics", "id, codebase_id, head_sha, recent_commits, loc"),
-    code_contributions: await rows("code_contributions", "id, codebase_id, author_key, day, commits"),
-    github_issues: await rows("github_issues", "id, codebase_id, number, state"),
-    codebase_findings: await rows("codebase_findings", "id, codebase_id, fingerprint, status"),
-    codebase_finding_events: await rows("codebase_finding_events", "id, finding_id, event_type"),
+    codebases: await rows("codebases"),
+    code_metrics: await rows("code_metrics"),
+    code_contributions: await rows("code_contributions"),
+    github_issues: await rows("github_issues"),
+    codebase_findings: await rows("codebase_findings"),
+    codebase_finding_events: await rows("codebase_finding_events"),
     items,
     item_versions: (versions ?? []) as Record<string, unknown>[],
-    projects: await rows("projects", "id, slug, kind, last_synced_at, graph_group_id"),
-    project_context_units: await rows("project_context_units", "id, source_item_id, unit_key, state"),
-    project_context_memberships: await rows(
-      "project_context_memberships",
-      "id, project_id, context_unit_id, decision, valid_to"
-    ),
-    scan_ingest_runs: (await rows("ingest_runs", "id, source, trigger, ok, updated")).filter(
-      (row) => row.source === "scan"
-    ),
+    projects: await rows("projects"),
+    project_context_units: await rows("project_context_units"),
+    project_context_memberships: await rows("project_context_memberships"),
+    scan_ingest_runs: (await rows("ingest_runs")).filter((row) => row.source === "scan"),
     scan_audit: scanAudit,
   };
 }
@@ -425,22 +427,29 @@ describe("POST /api/v1/codebases — request bounds (HTTP)", () => {
 
     // 4. neither rejection is transient, and the recovery is ONE complete smaller scan — never
     //    two partial pushes, which the (codebase_id, head_sha) upsert would silently collapse.
+    // ONE array, built once, submitted and then compared against — so the assertions below are
+    // about the commits this request actually carried, not about a second call that merely
+    // happens to be built the same way.
+    const correctedCommits = commits(100, "5");
     const corrected = await fetch(CODEBASES_URL, {
       method: "POST",
       headers,
-      body: JSON.stringify(scanPayload(slug, headShaCorrected, commits(100, "5"))),
+      body: JSON.stringify(scanPayload(slug, headShaCorrected, correctedCommits)),
     });
     expect(corrected.status).toBe(201);
 
     const after = await scanInventory(seed.teamId);
     const correctedPoint = after.code_metrics.find((row) => row.head_sha === headShaCorrected);
     expect(correctedPoint, "the corrected scan wrote no metrics point").toBeDefined();
-    const snapshot = correctedPoint!.recent_commits as unknown[];
-    expect(snapshot).toHaveLength(100);
+    // Deep equality, not a length: a count of 100 is equally satisfied by 100 truncated,
+    // reordered or substituted commits, and "one complete smaller scan" is a claim about the
+    // CONTENT surviving the round-trip. The ingest owner persists the parsed array verbatim, so
+    // the stored snapshot must be exactly what was sent, in order.
+    expect(correctedPoint!.recent_commits).toEqual(correctedCommits);
 
     // Every commit reached `items` at its own path — a partial success would show here as a
     // short count, and the 100-element ceiling is worthless if it silently drops work.
-    const expectedPaths = commits(100, "5").map((c) => `commits/${slug}/${c.sha as string}.md`);
+    const expectedPaths = correctedCommits.map((c) => `commits/${slug}/${c.sha as string}.md`);
     const actualPaths = after.items.map((row) => row.path as string);
     for (const path of expectedPaths) expect(actualPaths).toContain(path);
 
