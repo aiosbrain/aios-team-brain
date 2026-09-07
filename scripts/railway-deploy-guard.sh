@@ -37,9 +37,9 @@ except Exception: pass' 2>/dev/null || true)"
 # line/command, or after whitespace/`;`/`|`/`&`/`(`, e.g. `cd other && railway up`). A mention in
 # docs/strings/commit messages (e.g. a backtick-quoted `railway up`) is not at a boundary, so
 # writing about these commands is never blocked.
-if printf '%s' "$cmd" | grep -Eq '(^|[[:space:];|&(])railway[[:space:]]+(up|redeploy|down|delete)([[:space:]]|;|\||&|\)|$)'; then
+if printf '%s' "$cmd" | grep -Eq '(^|[[:space:];|&(])railway[[:space:]]+(up|redeploy|down|delete|ssh)([[:space:]]|;|\||&|\)|$)'; then
   cat >&2 <<'MSG'
-⛔ BLOCKED: `railway up` / `redeploy` / `down` / `delete` is forbidden in the aios-team-brain repo.
+⛔ BLOCKED: `railway up` / `redeploy` / `down` / `delete` / `ssh` is forbidden in the aios-team-brain repo.
 
 Deploy production ONLY by merging to `main` — Railway auto-deploys AIOS → aios-team-brain via the
 GitHub integration (it is bound to that project and cannot hit another one).
