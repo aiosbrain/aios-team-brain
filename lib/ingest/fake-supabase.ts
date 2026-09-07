@@ -126,6 +126,9 @@ export class FakeSupabase {
       bindTransactionSessionAlias(sessionDb, fakeSession);
       const result = await fn(fakeSession);
       if (result && typeof result === "object" && (result as { ok?: unknown }).ok === false) {
+        // Deliberate fake limitation: every ok:false restores the snapshot. Production may commit
+        // the protected-human refusal standing state, whose persistence is authoritative only in
+        // the real PostgreSQL A13-08/A13-09 data-mechanics coverage.
         this.tables = snapshot;
       }
       return result;

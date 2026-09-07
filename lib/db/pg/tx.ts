@@ -126,6 +126,26 @@ function executionError(failure: RecordedFailure, prefix = "transaction SQL fail
   });
 }
 
+function withControlFailure(
+  primary: unknown,
+  controlFailure: unknown
+): TransactionExecutionError {
+  if (controlFailure === primary && primary instanceof TransactionExecutionError) return primary;
+  const primaryError = primary instanceof Error ? primary : new Error(messageOf(primary));
+  const control = controlFailure instanceof Error
+    ? controlFailure
+    : new Error(messageOf(controlFailure));
+  return new TransactionExecutionError(
+    `${primaryError.message}; transaction control also failed: ${control.message}`,
+    {
+      cause: new AggregateError([primaryError, control], "transaction primary and control failures"),
+      code: sqlStateOf(primary),
+      sql: primary instanceof TransactionExecutionError ? primary.sql : undefined,
+      unknownCommit: primary instanceof TransactionExecutionError && primary.unknownCommit,
+    }
+  );
+}
+
 async function rollback(
   client: PoolClient,
   primary: unknown
@@ -138,7 +158,12 @@ async function rollback(
       ok: false,
       error: new TransactionExecutionError(
         `${messageOf(primary)}; rollback also failed: ${messageOf(cleanup)}`,
-        { cause: primary, code: sqlStateOf(primary) }
+        {
+          cause: primary,
+          code: sqlStateOf(primary),
+          sql: primary instanceof TransactionExecutionError ? primary.sql : undefined,
+          unknownCommit: primary instanceof TransactionExecutionError && primary.unknownCommit,
+        }
       ),
     };
   }
@@ -306,7 +331,10 @@ export async function runPgClientTransaction<T>(
       const rb = await rollback(client, primary);
       session.active = false;
       if (!rb.ok || session.fatalControlFailure || isConnectionFailure(primary)) {
-        const fatal = !rb.ok ? rb.error : (session.fatalControlFailure ?? primary);
+        const rollbackPrimary = !rb.ok ? rb.error : primary;
+        const fatal = session.fatalControlFailure
+          ? withControlFailure(rollbackPrimary, session.fatalControlFailure)
+          : rollbackPrimary;
         destroyRelease(client, fatal);
         released = true;
         throw fatal;
@@ -327,7 +355,10 @@ export async function runPgClientTransaction<T>(
       const rb = await rollback(client, primary);
       session.active = false;
       if (!rb.ok || session.fatalControlFailure || isConnectionFailure(primary)) {
-        const fatal = !rb.ok ? rb.error : primary;
+        const rollbackPrimary = !rb.ok ? rb.error : primary;
+        const fatal = failure && session.fatalControlFailure
+          ? withControlFailure(rollbackPrimary, session.fatalControlFailure)
+          : rollbackPrimary;
         destroyRelease(client, fatal);
         released = true;
         throw fatal;

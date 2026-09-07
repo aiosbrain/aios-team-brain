@@ -1,20 +1,27 @@
 import { randomUUID } from "node:crypto";
-import { Client } from "pg";
+import { Client, type PoolClient } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { canSeeItem } from "@/lib/access/enforce";
 import { ingestItem } from "@/lib/ingest";
 import { PgClient } from "@/lib/db/pg/client";
-import type { DbClient, SqlExecutor } from "@/lib/db/types";
+import { getPool } from "@/lib/db/pg/pool";
+import type {
+  DbClient,
+  SqlExecutor,
+  TransactionCapableDbClient,
+} from "@/lib/db/types";
 import {
   reconcileItemContext,
   systemProjectIds,
 } from "@/lib/projects/context/reconcile-item";
+import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { reconcileItemUnit } from "@/lib/projects/context/units";
 import {
   closeMembershipInto,
   ensureIncludeMembership,
 } from "@/lib/projects/context/memberships";
+import { addVariant, createOpportunity, createPlan } from "@/lib/social/store";
 import {
   db,
   externalMember,
@@ -79,6 +86,197 @@ function sessionClient(
   decorate: (executor: SqlExecutor) => SqlExecutor
 ): DbClient {
   return new PgClient({ decorateSessionExecutor: decorate });
+}
+
+function isItemAuthorityRead(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return /^select /i.test(normalized) &&
+    normalized.includes("member_id_locked") &&
+    / from items where team_id = \$1 and (?:id = \$2|project_id = \$2 and path = \$3)/i.test(normalized);
+}
+
+async function observeAuthorityBlock(
+  observer: Client,
+  holderPid: number,
+  waiterPid: number,
+  authorityReadCompleted: () => boolean
+): Promise<{ blockers: number[]; query: string | null; premature: boolean }> {
+  const deadline = Date.now() + 4_000;
+  let last = { blockers: [] as number[], query: null as string | null, premature: false };
+  while (Date.now() < deadline) {
+    if (authorityReadCompleted()) return { ...last, premature: true };
+    const read = await observer.query<{ blockers: number[]; query: string | null }>(
+      `select pg_blocking_pids($1::int) as blockers, query
+         from pg_stat_activity
+        where pid = $1`,
+      [waiterPid]
+    );
+    last = read.rows[0] ?? last;
+    if (last.blockers.includes(holderPid)) return { ...last, premature: false };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return { ...last, premature: authorityReadCompleted() };
+}
+
+interface RuntimeSqlTrace {
+  readonly bound: { sql: string; params: unknown[]; rowCount: number | null }[];
+  readonly poolCalls: {
+    kind: "pool.query" | "pool.connect";
+    phase: "outside-bound-phase" | "after-BEGIN-before-end";
+    sql: string;
+  }[];
+  readonly forbidden: {
+    kind: "pool.query" | "pool.connect";
+    phase: "after-BEGIN-before-end";
+    sql: string;
+  }[];
+  readonly checkouts: number;
+  readonly transactions: number;
+  restore(): void;
+}
+
+function installRuntimeSqlTrace(): RuntimeSqlTrace {
+  type QueryResultShape = { rows: unknown[]; rowCount: number | null };
+  type Callable = (...args: unknown[]) => unknown;
+  type QuerySurface = { query: Callable };
+  type PoolSurface = QuerySurface & { connect: Callable };
+
+  const pool = getPool();
+  const surface = pool as unknown as PoolSurface;
+  const poolOwnedQuery = Object.prototype.hasOwnProperty.call(surface, "query");
+  const poolOwnedConnect = Object.prototype.hasOwnProperty.call(surface, "connect");
+  const originalPoolQuery = surface.query;
+  const originalConnect = surface.connect;
+  const originalClientQueries = new Map<
+    PoolClient,
+    { query: QuerySurface["query"]; owned: boolean }
+  >();
+  const nestedCheckouts = new WeakSet<PoolClient>();
+  const bound: { sql: string; params: unknown[]; rowCount: number | null }[] = [];
+  const poolCalls: RuntimeSqlTrace["poolCalls"] extends readonly (infer Entry)[]
+    ? Entry[]
+    : never = [];
+  const forbidden: RuntimeSqlTrace["forbidden"] extends readonly (infer Entry)[]
+    ? Entry[]
+    : never = [];
+  let activeClient: PoolClient | null = null;
+  let checkouts = 0;
+  let transactions = 0;
+
+  const wrapClient = (client: PoolClient, nested = false): PoolClient => {
+    if (nested) nestedCheckouts.add(client);
+    if (originalClientQueries.has(client)) return client;
+    const clientSurface = client as unknown as QuerySurface;
+    const original = clientSurface.query;
+    originalClientQueries.set(client, {
+      query: original,
+      owned: Object.prototype.hasOwnProperty.call(clientSurface, "query"),
+    });
+    clientSurface.query = (...args: unknown[]) => {
+      const text = typeof args[0] === "string" ? args[0] : "<query-config>";
+      const params = Array.isArray(args[1]) ? args[1] : [];
+      const sql = text.replace(/\s+/g, " ").trim();
+      const beginning = /^BEGIN$/i.test(sql);
+      const wasActive = activeClient === client;
+      if (activeClient && !wasActive && nestedCheckouts.has(client)) {
+        forbidden.push({
+          kind: "pool.connect",
+          phase: "after-BEGIN-before-end",
+          sql,
+        });
+      }
+      const pending = original.apply(client, args);
+      // Bound application/control calls use pg's Promise form. Callback-form queries are pool
+      // internals outside this session and must retain their exact calling convention.
+      if (!beginning && !wasActive) return pending;
+      return Promise.resolve(pending).then((unknownResult) => {
+        const result = unknownResult as QueryResultShape;
+        if (beginning) {
+          if (activeClient) {
+            forbidden.push({
+              kind: "pool.connect",
+              phase: "after-BEGIN-before-end",
+              sql: "nested BEGIN on a second session",
+            });
+          }
+          activeClient = client;
+          transactions++;
+          bound.push({ sql, params, rowCount: result.rowCount });
+        } else {
+          bound.push({ sql, params, rowCount: result.rowCount });
+          if (/^(?:COMMIT|ROLLBACK)$/i.test(sql)) activeClient = null;
+        }
+        return unknownResult;
+      });
+    };
+    return client;
+  };
+
+  surface.query = (...args: unknown[]) => {
+    const text = typeof args[0] === "string" ? args[0] : "<query-config>";
+    const sql = text.replace(/\s+/g, " ").trim();
+    poolCalls.push({
+      kind: "pool.query",
+      phase: activeClient ? "after-BEGIN-before-end" : "outside-bound-phase",
+      sql,
+    });
+    if (activeClient) forbidden.push({ kind: "pool.query", phase: "after-BEGIN-before-end", sql });
+    return originalPoolQuery.apply(pool, args);
+  };
+  surface.connect = (...args: unknown[]) => {
+    const nested = activeClient !== null;
+    poolCalls.push({
+      kind: "pool.connect",
+      phase: nested ? "after-BEGIN-before-end" : "outside-bound-phase",
+      sql: "pool.connect()",
+    });
+    if (nested) {
+      forbidden.push({
+        kind: "pool.connect",
+        phase: "after-BEGIN-before-end",
+        sql: "nested pool checkout",
+      });
+    }
+    checkouts++;
+    if (typeof args[0] === "function") {
+      const callback = args[0] as (
+        error: unknown,
+        client?: PoolClient,
+        done?: (releaseError?: Error | boolean) => void
+      ) => void;
+      return originalConnect.call(
+        pool,
+        (error: unknown, client?: PoolClient, done?: (releaseError?: Error | boolean) => void) =>
+          callback(error, client ? wrapClient(client, nested) : client, done)
+      );
+    }
+    return Promise.resolve(originalConnect.call(pool)).then((client) =>
+      wrapClient(client as PoolClient, nested)
+    );
+  };
+
+  return {
+    bound,
+    poolCalls,
+    forbidden,
+    get checkouts() {
+      return checkouts;
+    },
+    get transactions() {
+      return transactions;
+    },
+    restore() {
+      if (poolOwnedQuery) surface.query = originalPoolQuery;
+      else delete (surface as Partial<PoolSurface>).query;
+      if (poolOwnedConnect) surface.connect = originalConnect;
+      else delete (surface as Partial<PoolSurface>).connect;
+      for (const [client, original] of originalClientQueries) {
+        const clientSurface = client as unknown as QuerySurface;
+        if (original.owned) clientSurface.query = original.query;
+        else delete (clientSurface as Partial<QuerySurface>).query;
+      }
+    },
+  };
 }
 
 function actualSqlFaultDb(pattern: RegExp): { db: DbClient; fired: () => number } {
@@ -375,38 +573,90 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       const fixture = await seedConvergedExternalItem(`auditfix13/serial-${pathKind}.md`);
       const held = deferred();
       const release = deferred();
+      const body = changed ? `${fixture.original.body}\nserialized edit` : fixture.original.body;
+      const payload = { ...fixture.original, body, content_sha256: sha(body) };
+      const waiterStarted = deferred();
+      let holderPid: number | null = null;
+      let waiterPid: number | null = null;
+      let holderAuthorityReadCompleted = false;
+      let waiterAuthorityReadCompleted = false;
       let paused = false;
+      let attempted = false;
       const holdingDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
+        if (holderPid === null) {
+          const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+          holderPid = pid.rows[0]?.pid ?? null;
+        }
         const result = await execute<T>(text, params);
-        if (!paused && /from items[\s\S]*for update/i.test(text)) {
+        if (!paused && isItemAuthorityRead(text)) {
           paused = true;
+          holderAuthorityReadCompleted = true;
           held.resolve();
           await release.promise;
         }
         return result;
       });
-
-      const body = changed ? `${fixture.original.body}\nserialized edit` : fixture.original.body;
-      const payload = { ...fixture.original, body, content_sha256: sha(body) };
-      const first = holder === "reconcile"
-        ? reconcileItemContext(holdingDb, fixture.seed.teamId, fixture.itemId)
-        : ingestItem(holdingDb, fixture.auth, payload, "team", undefined, "team");
-      await within(held.promise, "holder to acquire item lock");
-      const waiterStarted = deferred();
-      let attempted = false;
       const waitingDb = sessionClient((execute) => async <T>(text: string, params: unknown[] = []) => {
-        if (!attempted && /from items[\s\S]*for update/i.test(text)) {
+        if (waiterPid === null) {
+          const pid = await execute<{ pid: number }>("select pg_backend_pid() as pid");
+          waiterPid = pid.rows[0]?.pid ?? null;
+        }
+        if (!attempted && isItemAuthorityRead(text)) {
           attempted = true;
           waiterStarted.resolve();
+          const result = await execute<T>(text, params);
+          waiterAuthorityReadCompleted = true;
+          return result;
         }
         return execute<T>(text, params);
       });
-      const waiter = holder === "reconcile"
-        ? ingestItem(waitingDb, fixture.auth, payload, "team", undefined, "team")
-        : reconcileItemContext(waitingDb, fixture.seed.teamId, fixture.itemId);
-      await within(waiterStarted.promise, "waiter to issue item lock statement");
-      release.resolve();
-      await Promise.all([first, waiter]);
+      const observer = new Client({ connectionString: process.env.DATABASE_URL });
+      let first: Promise<unknown> | undefined;
+      let waiter: Promise<unknown> | undefined;
+
+      await observer.connect();
+      try {
+        first = holder === "reconcile"
+          ? reconcileItemContext(holdingDb, fixture.seed.teamId, fixture.itemId)
+          : ingestItem(holdingDb, fixture.auth, payload, "team", undefined, "team");
+        await within(held.promise, "holder to complete the locked authority read");
+        expect(holderAuthorityReadCompleted).toBe(true);
+        expect(holderPid, "holder backend PID was captured from its dedicated session").not.toBeNull();
+
+        waiter = holder === "reconcile"
+          ? ingestItem(waitingDb, fixture.auth, payload, "team", undefined, "team")
+          : reconcileItemContext(waitingDb, fixture.seed.teamId, fixture.itemId);
+        await within(waiterStarted.promise, "waiter to issue its authority read");
+        expect(waiterPid, "waiter backend PID was captured from its dedicated session").not.toBeNull();
+
+        const observation = await observeAuthorityBlock(
+          observer,
+          holderPid!,
+          waiterPid!,
+          () => waiterAuthorityReadCompleted
+        );
+        expect(
+          observation.premature,
+          "waiter authority read completed while the holder still owned the item lock"
+        ).toBe(false);
+        expect(
+          observation.blockers,
+          `waiter ${waiterPid} blockers while its authority SELECT was incomplete; active query: ${observation.query}`
+        ).toContain(holderPid);
+        expect(observation.query, "the blocked statement is the authority SELECT, not later DML").toMatch(
+          /from items/i
+        );
+
+        release.resolve();
+        const settled = await Promise.allSettled([first, waiter]);
+        expect(settled.every((entry) => entry.status === "fulfilled")).toBe(true);
+      } finally {
+        release.resolve();
+        await Promise.allSettled(
+          [first, waiter].filter((actor): actor is Promise<unknown> => Boolean(actor))
+        );
+        await observer.end();
+      }
 
       const after = await storedState(fixture.seed, fixture.itemId);
       expect(after.item.access).toBe("team");
@@ -704,23 +954,444 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
 
   it("A13-06/10: returned failure rolls back bound builder and raw-executor sentinels", async () => {
     const seed = await seedTeam();
-    const capable = db() as DbClient & {
-      transaction<T>(fn: (session: import("@/lib/db/types").TransactionSession) => Promise<T>): Promise<T>;
-    };
-    const slug = `a13-rollback-${randomUUID().slice(0, 8)}`;
-    const result = await capable.transaction(async (session) => {
-      await session.db.from("projects").insert({ team_id: seed.teamId, slug });
-      await session.executeSql("select 1");
-      return { ok: false, error: "forced callback refusal" };
+    const capable = db() as TransactionCapableDbClient;
+    const builderSlug = `a13-builder-rollback-${randomUUID().slice(0, 8)}`;
+    const rawSlug = `a13-raw-rollback-${randomUUID().slice(0, 8)}`;
+    const slugs = [builderSlug, rawSlug];
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    try {
+      const result = await capable.transaction(async (session) => {
+        const builderWrite = await session.db
+          .from("projects")
+          .insert({ team_id: seed.teamId, slug: builderSlug })
+          .select("id")
+          .single();
+        expect(builderWrite.error).toBeNull();
+        expect(builderWrite.data?.id, "the builder sentinel INSERT returned its durable-row id").toBeTruthy();
+
+        const rawWrite = await session.executeSql<{ id: string }>(
+          "insert into projects (team_id, slug) values ($1, $2) returning id",
+          [seed.teamId, rawSlug]
+        );
+        expect(rawWrite.rowCount, "the raw sentinel INSERT executed on the bound connection").toBe(1);
+        expect(rawWrite.rows[0]?.id).toBeTruthy();
+
+        const beforeCompletion = await observer.query<{ slug: string }>(
+          "select slug from projects where team_id = $1 and slug = any($2::text[])",
+          [seed.teamId, slugs]
+        );
+        expect(
+          beforeCompletion.rows,
+          "a separate connection cannot observe either uncommitted sentinel"
+        ).toEqual([]);
+        return { ok: false, error: "forced callback refusal" };
+      });
+      expect(result.ok).toBe(false);
+
+      const afterRollback = await observer.query<{ slug: string }>(
+        "select slug from projects where team_id = $1 and slug = any($2::text[])",
+        [seed.teamId, slugs]
+      );
+      expect(afterRollback.rows, "both successful INSERTs are absent after ok:false rollback").toEqual([]);
+    } finally {
+      await observer.end();
+    }
+  });
+
+  it("A13-06: ignored returned envelope failure rejects callback success and rolls back real SQL", async () => {
+    const seed = await seedTeam();
+    const slug = `a13-envelope-swallowed-${randomUUID().slice(0, 8)}`;
+    let injectionFired = 0;
+    let callbackReturnedSuccess = false;
+    let attempts = 0;
+    const faulted = new PgClient({
+      decorateSessionExecutor: (execute) => {
+        attempts++;
+        return execute;
+      },
+      envelopeInterceptor(context, result) {
+        if (
+          injectionFired === 0 &&
+          context.table === "projects" &&
+          context.operation === "insert" &&
+          result.error === null
+        ) {
+          injectionFired++;
+          return { ...result, data: null, error: { message: "swallowed successful INSERT envelope" } };
+        }
+        return result;
+      },
     });
-    expect(result.ok).toBe(false);
-    const { data } = await db()
-      .from("projects")
-      .select("id")
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    try {
+      const outcome = await attempt(() =>
+        faulted.transaction(async (session) => {
+          // Deliberately ignore the returned error. The transaction tracker, not this callback,
+          // must prevent a healthy PostgreSQL session from committing the successful INSERT.
+          await session.db.from("projects").insert({ team_id: seed.teamId, slug }).select("id").single();
+          callbackReturnedSuccess = true;
+          return { ok: true };
+        })
+      );
+
+      expect(injectionFired, "the envelope was replaced only after a successful real INSERT").toBe(1);
+      expect(callbackReturnedSuccess, "the callback reached and returned its manufactured success").toBe(true);
+      expect(attempts, "this nonretryable returned failure runs one whole attempt").toBe(1);
+      expect(outcome.result, "the ignored returned error cannot manufacture transaction success").toBeNull();
+      expect(outcome.error).toContain("swallowed successful INSERT envelope");
+      const persisted = await observer.query(
+        "select id from projects where team_id = $1 and slug = $2",
+        [seed.teamId, slug]
+      );
+      expect(persisted.rows, "the successful SQL is rolled back despite callback ok:true").toEqual([]);
+    } finally {
+      await observer.end();
+    }
+  });
+
+  it("A13-06: swallowed real SQL error rejects callback success and rolls back its sentinel", async () => {
+    const seed = await seedTeam();
+    const slug = `a13-raw-swallowed-${randomUUID().slice(0, 8)}`;
+    let sqlFailureCaught = 0;
+    let callbackReturnedSuccess = false;
+    let attempts = 0;
+    const faulted = new PgClient({
+      decorateSessionExecutor: (execute) => {
+        attempts++;
+        return execute;
+      },
+    });
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    try {
+      const outcome = await attempt(() =>
+        faulted.transaction(async (session) => {
+          const inserted = await session.db
+            .from("projects")
+            .insert({ team_id: seed.teamId, slug })
+            .select("id")
+            .single();
+          if (inserted.error || !inserted.data) throw new Error("raw swallowed-error fixture insert failed");
+          try {
+            await session.executeSql("select 1 / 0 as auditfix13_swallowed_real_failure");
+          } catch {
+            sqlFailureCaught++;
+          }
+          callbackReturnedSuccess = true;
+          return { ok: true };
+        })
+      );
+
+      expect(sqlFailureCaught, "PostgreSQL executed and rejected SELECT 1/0").toBe(1);
+      expect(callbackReturnedSuccess, "the callback deliberately returned ok:true after catching SQL").toBe(true);
+      expect(attempts, "the 22012 failure is not replayed").toBe(1);
+      expect(outcome.result, "an aborted PostgreSQL COMMIT must not masquerade as app success").toBeNull();
+      expect(outcome.error).toMatch(/division by zero|auditfix13_swallowed_real_failure/i);
+      const persisted = await observer.query(
+        "select id from projects where team_id = $1 and slug = $2",
+        [seed.teamId, slug]
+      );
+      expect(persisted.rows).toEqual([]);
+    } finally {
+      await observer.end();
+    }
+  });
+
+  it("A13-10: runtime trace keeps the invoked ingest/reconcile SQL closure on dedicated sessions", async () => {
+    const seed = await seedTeam();
+    const bootstrap = await ensureAccessBootstrap(db(), seed.teamId);
+    if (!bootstrap.ok) throw new Error(`runtime trace bootstrap failed: ${bootstrap.error}`);
+    const suffix = randomUUID().slice(0, 8);
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const taskBody = "external task trace body";
+    const taskPayload: IngestPayload = {
+      project: `a13-trace-task-${suffix}`,
+      kind: "task",
+      actor: "auditfix13-test",
+      frontmatter: { source: "local" },
+      path: "tasks.md",
+      body: taskBody,
+      content_sha256: sha(taskBody),
+      rows: [{ row_key: "A13-TRACE", title: "Trace task", status: "in_progress" }],
+    };
+    const task = await ingestItem(db(), auth, taskPayload, "external");
+    expect(task.status).toBe("created");
+    const context = await reconcileItemContext(db(), seed.teamId, task.id);
+    expect(context.ok).toBe(true);
+
+    const rowPayloads: IngestPayload[] = [
+      {
+        project: `a13-trace-decision-${suffix}`,
+        kind: "decision",
+        actor: "auditfix13-test",
+        frontmatter: { source: "local" },
+        path: "decisions.md",
+        body: "decision trace v1",
+        content_sha256: sha("decision trace v1"),
+        rows: [{ row_key: "A13-D", title: "Trace decision", audience: "team" }],
+      },
+      {
+        project: `a13-trace-fact-${suffix}`,
+        kind: "fact",
+        actor: "auditfix13-test",
+        frontmatter: { source: "local" },
+        path: "facts.md",
+        body: "fact trace v1",
+        content_sha256: sha("fact trace v1"),
+        rows: [{
+          row_key: "A13-F",
+          title: "Trace fact",
+          fact_type: "fact",
+          source_path: "facts.md",
+          source_quote: "trace fact quote",
+        }],
+      },
+      {
+        project: `a13-trace-stakeholder-${suffix}`,
+        kind: "stakeholder_mention",
+        actor: "auditfix13-test",
+        frontmatter: { source: "local" },
+        path: "stakeholders.md",
+        body: "stakeholder trace v1",
+        content_sha256: sha("stakeholder trace v1"),
+        rows: [{
+          row_key: "A13-S",
+          name: "Trace Stakeholder",
+          source_path: "stakeholders.md",
+          source_quote: "trace stakeholder quote",
+        }],
+      },
+      {
+        project: `a13-trace-slack-${suffix}`,
+        kind: "deliverable",
+        actor: "auditfix13-test",
+        frontmatter: { source: "slack" },
+        path: "thread.md",
+        body: "slack trace v1",
+        content_sha256: sha("slack trace v1"),
+      },
+    ];
+    for (const payload of rowPayloads) {
+      const created = await ingestItem(db(), auth, payload, "team");
+      expect(created.status).toBe("created");
+    }
+
+    const { data: taskProject, error: taskProjectError } = await db()
+      .from("items")
+      .select("project_id")
       .eq("team_id", seed.teamId)
-      .eq("slug", slug)
-      .maybeSingle();
-    expect(data).toBeNull();
+      .eq("id", task.id)
+      .single();
+    if (taskProjectError || !taskProject) throw new Error("trace task project fixture missing");
+    const fixtureRows = [
+      {
+        table: "extracted_facts",
+        row: {
+          team_id: seed.teamId,
+          project_id: taskProject.project_id,
+          source_item_id: task.id,
+          row_key: "A13-INHERITED-FACT",
+          title: "Inherited fact",
+          fact_type: "fact",
+          source_path: "tasks.md",
+          source_quote: "inherited trace fact",
+          audience: "external",
+        },
+      },
+      {
+        table: "stakeholder_mentions",
+        row: {
+          team_id: seed.teamId,
+          project_id: taskProject.project_id,
+          source_item_id: task.id,
+          row_key: "A13-INHERITED-STAKEHOLDER",
+          name: "Inherited Stakeholder",
+          source_path: "tasks.md",
+          source_quote: "inherited trace stakeholder",
+          audience: "external",
+        },
+      },
+    ];
+    for (const fixtureRow of fixtureRows) {
+      const { error } = await db().from(fixtureRow.table).insert(fixtureRow.row);
+      if (error) throw new Error(`trace inherited ${fixtureRow.table} seed failed: ${error.message}`);
+    }
+
+    const opportunity = await createOpportunity(db(), seed.teamId, {
+      access: "external",
+      sourceType: "item",
+      title: "Runtime transaction trace",
+      summary: "seeded closure trace",
+      evidence: [{ itemId: task.id, path: "tasks.md" }],
+      dedupKey: `a13-runtime-${suffix}`,
+    });
+    const plan = await createPlan(db(), seed.teamId, opportunity.id, { objective: "trace" });
+    const variant = await addVariant(db(), seed.teamId, plan.id, {
+      platform: "x",
+      format: "text",
+      body: "runtime trace variant",
+    });
+    const leafInsert = async (table: string, row: Record<string, unknown>) => {
+      const { data, error } = await db().from(table).insert(row).select("id").single();
+      if (error || !data) throw new Error(`trace ${table} seed failed: ${error?.message}`);
+      return data.id as string;
+    };
+    await leafInsert("content_approvals", {
+      team_id: seed.teamId,
+      variant_id: variant.id,
+      access: "external",
+      status: "pending",
+    });
+    await leafInsert("media_assets", {
+      team_id: seed.teamId,
+      variant_id: variant.id,
+      access: "external",
+      provider: "test",
+      model: "trace",
+      data_base64: "eA==",
+    });
+    const publicationId = await leafInsert("social_publications", {
+      team_id: seed.teamId,
+      variant_id: variant.id,
+      access: "external",
+    });
+    await leafInsert("publication_analytics", {
+      team_id: seed.teamId,
+      publication_id: publicationId,
+      access: "external",
+    });
+
+    const { data: successor, error: successorError } = await db()
+      .from("members")
+      .insert({
+        team_id: seed.teamId,
+        email: `${randomUUID()}@test.local`,
+        display_name: "Runtime Trace Successor",
+        actor_handle: `trace-${suffix}`,
+        role: "member",
+        tier: "team",
+        status: "active",
+      })
+      .select("id")
+      .single();
+    if (successorError || !successor) throw new Error("trace successor seed failed");
+    await placeMemberByTier(seed.teamId, successor.id as string, "team");
+
+    const taskUnitId = await unitIdFor(seed, task.id);
+    const { error: driftError } = await db()
+      .from("project_context_units")
+      .update({ audience: "team" })
+      .eq("team_id", seed.teamId)
+      .eq("id", taskUnitId);
+    if (driftError) throw new Error(`trace mirror drift seed failed: ${driftError.message}`);
+
+    const observer = new Client({ connectionString: process.env.DATABASE_URL });
+    await observer.connect();
+    const trace = installRuntimeSqlTrace();
+    try {
+      const repaired = await reconcileItemContext(db(), seed.teamId, task.id);
+      expect(repaired.ok, "real exported reconcile repairs the seeded raw mirror drift").toBe(true);
+
+      const narrowedTaskBody = `${taskBody}\ntrace materialization update`;
+      const narrowed = await ingestItem(
+        db(),
+        auth,
+        {
+          ...taskPayload,
+          body: narrowedTaskBody,
+          content_sha256: sha(narrowedTaskBody),
+          rows: [{ row_key: "A13-TRACE", title: "Trace task updated", status: "completed" }],
+        },
+        "team",
+        { authorMemberId: successor.id as string },
+        "team"
+      );
+      expect(narrowed).toMatchObject({ status: "updated", accessChanged: true });
+
+      for (const payload of rowPayloads) {
+        const body = `${payload.body}\ntrace update`;
+        const updated = await ingestItem(
+          db(),
+          auth,
+          { ...payload, body, content_sha256: sha(body) },
+          "team"
+        );
+        expect(updated.status).toBe("updated");
+      }
+
+      const sawWrite = (pattern: RegExp) =>
+        trace.bound.some((entry) => pattern.test(entry.sql) && (entry.rowCount ?? 0) > 0);
+      const requiredWrites: [string, RegExp][] = [
+        ["raw unit mirror", /^update project_context_units u /i],
+        ["task materialization", /^INSERT INTO tasks /i],
+        ["decision materialization", /^INSERT INTO decisions /i],
+        ["fact materialization", /^INSERT INTO extracted_facts /i],
+        ["stakeholder materialization", /^INSERT INTO stakeholder_mentions /i],
+        ["superseded Slack body forgetting", /^UPDATE item_versions SET /i],
+        ["inherited task cascade", /^UPDATE tasks SET /i],
+        ["inherited fact cascade", /^UPDATE extracted_facts SET /i],
+        ["inherited stakeholder cascade", /^UPDATE stakeholder_mentions SET /i],
+        ["social opportunity narrowing", /^UPDATE social_opportunities SET /i],
+        ["social plan narrowing", /^UPDATE content_plans SET /i],
+        ["social variant narrowing", /^UPDATE content_variants SET /i],
+        ["approval narrowing", /^UPDATE content_approvals SET /i],
+        ["media narrowing", /^UPDATE media_assets SET /i],
+        ["publication narrowing", /^UPDATE social_publications SET /i],
+        ["analytics narrowing", /^UPDATE publication_analytics SET /i],
+        ["context membership close", /^UPDATE project_context_memberships SET /i],
+        ["context membership open", /^INSERT INTO project_context_memberships /i],
+        ["audit persistence", /^INSERT INTO audit_log /i],
+      ];
+      for (const [label, pattern] of requiredWrites) {
+        expect(sawWrite(pattern), `${label} executed successful DML on a bound session`).toBe(true);
+      }
+      expect(
+        trace.bound.some(
+          (entry) => /^INSERT INTO audit_log /i.test(entry.sql) && entry.params.includes("item.reassigned")
+        ),
+        "the reassignment-log writer ran inside the owning ingest session"
+      ).toBe(true);
+      expect(trace.transactions, "the trace observed successful BEGIN boundaries").toBeGreaterThanOrEqual(6);
+      expect(trace.checkouts, "each exported operation used an initial dedicated checkout").toBeGreaterThanOrEqual(6);
+      expect(
+        trace.poolCalls.some(
+          (call) => call.kind === "pool.connect" && call.phase === "outside-bound-phase"
+        ),
+        "the pass-through trace observed permitted initial checkouts"
+      ).toBe(true);
+      expect(
+        trace.poolCalls.some(
+          (call) => call.kind === "pool.query" && call.phase === "outside-bound-phase"
+        ),
+        "the trace stayed installed across permitted pre-BEGIN/post-COMMIT pool work"
+      ).toBe(true);
+      expect(
+        trace.forbidden,
+        `pool execution escaped a bound phase: ${JSON.stringify(trace.forbidden)}`
+      ).toEqual([]);
+
+      for (const table of [
+        "social_opportunities",
+        "content_plans",
+        "content_variants",
+        "content_approvals",
+        "media_assets",
+        "social_publications",
+        "publication_analytics",
+      ]) {
+        const visible = await observer.query<{ access: string }>(
+          `select access from ${table} where team_id = $1`,
+          [seed.teamId]
+        );
+        expect(visible.rows, `${table} had a seeded row for the traced narrowing`).not.toHaveLength(0);
+        expect(visible.rows.every((row) => row.access === "team")).toBe(true);
+      }
+    } finally {
+      trace.restore();
+      await observer.end();
+    }
   });
 
   it("A13-06: a held item lock hits the scoped 10s acquisition timeout and a later call reuses healthy capacity", async () => {
@@ -919,6 +1590,119 @@ describe("AUDITFIX-13 Phase A: item/context changes are one atomic operation", (
       .eq("source_item_id", fixture.itemId)
       .maybeSingle();
     expect(unit).toBeNull();
+  });
+
+  it("A13-12: real backfill retries the persistent failing item without skipping its successor", async () => {
+    const seed = await seedTeam();
+    const bootstrap = await ensureAccessBootstrap(db(), seed.teamId);
+    expect(bootstrap.ok).toBe(true);
+    const externalViewerId = await externalMember(seed);
+    const auth = { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: randomUUID() };
+    const accessById = new Map<string, "team" | "external">();
+    for (const [index, access] of (["team", "external", "team"] as const).entries()) {
+      const body = `backfill cursor item ${index}`;
+      const created = await ingestItem(
+        db(),
+        auth,
+        {
+          project: "auditfix13-backfill",
+          kind: "deliverable",
+          actor: "auditfix13-test",
+          frontmatter: { source: "local" },
+          path: `cursor-${index}.md`,
+          body,
+          content_sha256: sha(body),
+        },
+        access
+      );
+      expect(created.status).toBe("created");
+      accessById.set(created.id, access);
+    }
+    const [a, b, c] = [...accessById.keys()].sort();
+    expect([a, b, c]).toHaveLength(3);
+
+    let faultEnabled = true;
+    let faultHits = 0;
+    const faulted = new PgClient({
+      decorateSessionExecutor: (execute) => async <T>(text: string, params: unknown[] = []) => {
+        if (
+          faultEnabled &&
+          /^INSERT INTO project_context_units /i.test(text.replace(/\s+/g, " ").trim()) &&
+          params.includes(b)
+        ) {
+          faultHits++;
+          // Persistent, targeted and transaction-aborting: unlike the one-shot helper, both failed
+          // passes execute a real 22012 on b's bound connection.
+          await execute("select 1 / 0 as auditfix13_persistent_backfill_failure");
+        }
+        return execute<T>(text, params);
+      },
+    });
+    const placement = async (itemId: string) => {
+      const { data: unit, error } = await db()
+        .from("project_context_units")
+        .select("id, audience")
+        .eq("team_id", seed.teamId)
+        .eq("source_item_id", itemId)
+        .eq("unit_kind", "item")
+        .maybeSingle();
+      if (error) throw new Error(`backfill placement read failed: ${error.message}`);
+      if (!unit) return null;
+      const { data: memberships, error: membershipError } = await db()
+        .from("project_context_memberships")
+        .select("project_id, decision, valid_to")
+        .eq("team_id", seed.teamId)
+        .eq("context_unit_id", unit.id)
+        .is("valid_to", null);
+      if (membershipError) throw new Error(`backfill membership read failed: ${membershipError.message}`);
+      return { unit, memberships: memberships ?? [] };
+    };
+
+    const first = await backfillTeamContext(faulted, seed.teamId, { batchSize: 10 });
+    expect(first).toMatchObject({ ok: false, scanned: 1, cursor: a });
+    expect(first.error).toContain(b);
+    expect(faultHits, "the first pass executed the targeted real SQL fault on b").toBe(1);
+    const firstPlacement = await placement(a);
+    expect(firstPlacement, "a commits before b fails").not.toBeNull();
+    expect(firstPlacement?.memberships, "a's unit and target membership commit together").toHaveLength(1);
+    expect(await placement(b), "b's unit and membership transaction rolls back completely").toBeNull();
+    expect(await placement(c), "c is not visited after b fails").toBeNull();
+
+    const second = await backfillTeamContext(faulted, seed.teamId, {
+      batchSize: 10,
+      afterId: a,
+    });
+    expect(second).toMatchObject({ ok: false, scanned: 0, cursor: a });
+    expect(second.error).toContain(b);
+    expect(faultHits, "the persistent fault fired again instead of accidentally healing").toBe(2);
+    expect(await placement(b)).toBeNull();
+    expect(await placement(c)).toBeNull();
+
+    faultEnabled = false;
+    const healed = await backfillTeamContext(faulted, seed.teamId, {
+      batchSize: 10,
+      afterId: a,
+    });
+    expect(healed).toMatchObject({ ok: true, scanned: 2, cursor: null });
+    expect(faultHits).toBe(2);
+    const system = await systemProjectIds(db(), seed.teamId);
+    if (!system) throw new Error("backfill system projects missing");
+    for (const itemId of [a, b, c]) {
+      const state = await placement(itemId);
+      const expectedAccess = accessById.get(itemId)!;
+      expect(state?.unit.audience, `${itemId} unit mirrors item authority`).toBe(expectedAccess);
+      expect(state?.memberships).toEqual([
+        {
+          project_id: expectedAccess === "external" ? system.externalShared : system.general,
+          decision: "include",
+          valid_to: null,
+        },
+      ]);
+      expect(
+        await canSeeItem(db(), { teamId: seed.teamId, memberId: externalViewerId }, itemId),
+        `${itemId} external visibility follows its healed audience`
+      ).toBe(expectedAccess === "external");
+    }
   });
 
   it.each([

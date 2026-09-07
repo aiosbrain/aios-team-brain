@@ -77,6 +77,37 @@ describe("dedicated transaction protocol", () => {
     expect(fixture.release).toHaveBeenCalledWith();
   });
 
+  it("A13-06: swallowed SQL and later control failures preserve both diagnostics and destroy", async () => {
+    const fixture = fakeFactory((sql) => {
+      if (sql === "BROKEN") return sqlError("primary SQL exploded", "23505");
+      if (sql.startsWith("SAVEPOINT")) return sqlError("savepoint control exploded", "08006");
+      return null;
+    });
+
+    const error = await runPgClientTransaction(fixture.factory, async (session) => {
+      await session.executeSql("BROKEN").catch(() => undefined);
+      await session.optionalAudit(async () => "written", "fallback").catch(() => "ignored");
+      return { ok: true };
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(TransactionExecutionError);
+    expect(error).toMatchObject({ code: "23505", sql: "BROKEN" });
+    expect((error as Error).message).toContain("primary SQL exploded");
+    expect((error as Error).message).toContain("savepoint control exploded");
+    const combined = (error as Error & { cause?: unknown }).cause;
+    expect(combined).toBeInstanceOf(AggregateError);
+    expect(Array.from((combined as AggregateError).errors, messageOfTestError)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("primary SQL exploded"),
+        expect.stringContaining("savepoint control exploded"),
+      ])
+    );
+    expect(fixture.sql.filter((sql) => sql === "ROLLBACK")).toHaveLength(1);
+    expect(fixture.sql).not.toContain("COMMIT");
+    expect(fixture.release).toHaveBeenCalledTimes(1);
+    expect(fixture.release.mock.calls[0][0]).toBeInstanceOf(Error);
+  });
+
   it("A13-06: a connection-class executor failure destroys even after full rollback succeeds", async () => {
     const fixture = fakeFactory((sql) =>
       sql === "BROKEN CONNECTION" ? sqlError("connection lost", "08006") : null
@@ -202,3 +233,7 @@ describe("dedicated transaction protocol", () => {
     expect((error as TransactionExecutionError).unknownCommit).toBe(true);
   });
 });
+
+function messageOfTestError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

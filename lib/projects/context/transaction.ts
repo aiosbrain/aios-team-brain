@@ -175,8 +175,9 @@ function retryable(error: unknown): boolean {
   if (code === "40001" || code === "40P01") return true;
   if (code === "membership-state-changed") return true;
   if (code === "23505") {
-    const sql = error instanceof TransactionExecutionError ? error.sql?.toLowerCase() : "";
-    return Boolean(sql?.includes("items") || sql?.includes("project_context_memberships"));
+    const sql = error instanceof TransactionExecutionError ? error.sql : undefined;
+    const target = sql?.match(/^\s*insert\s+into\s+([a-z_][a-z0-9_]*)\b/i)?.[1]?.toLowerCase();
+    return target === "items" || target === "project_context_memberships";
   }
   return false;
 }
