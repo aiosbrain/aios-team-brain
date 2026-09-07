@@ -14,6 +14,13 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 
 ## First-install deployment flow
 
+Test-only MCP acceptance (`vitest.mcp.config.ts`) reuses the production HTTP harness
+and real Postgres helpers. `test/http/mcp-tier-safety.acceptance.ts` provisions synthetic
+ingestion, keys, and project memberships, then launches the Workspace-owned stdio
+outcome suite over a private parent/child IPC channel. It exposes no HTTP control route
+and changes no production authorization. The caller owns the isolated database and
+disposable build; fixture cleanup is asserted before server/database teardown.
+
 The canonical hosted-install entry point is `https://aiosbrain.dev/deploy/team-brain/`. It resolves
 to the official Railway template described in [`RAILWAY-TEMPLATE.md`](RAILWAY-TEMPLATE.md): Team
 Brain, Postgres, Graphiti, and Neo4j. Railway reference variables keep Graphiti and Neo4j on the
