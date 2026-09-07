@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { once } from "node:events";
 import { BASE_URL, HTTP_TEST_PORT as PORT } from "./server-url";
 
 // One production Next.js server for the whole HTTP suite. We boot `next start`
@@ -14,7 +15,7 @@ async function waitForReady(): Promise<void> {
   // the route runtime is live. Poll until then (≤30s).
   for (let i = 0; i < 30; i++) {
     try {
-      const res = await fetch(`${BASE_URL}/api/v1/items`);
+      const res = await fetch(`${BASE_URL}/api/v1/items`, { signal: AbortSignal.timeout(1000) });
       if (res.status === 401) return;
     } catch {
       // connection refused while the server is still binding — keep polling
@@ -59,12 +60,16 @@ export default async function setup(): Promise<() => Promise<void>> {
   }
 
   return async () => {
-    if (server.pid) {
+    if (server.pid && server.exitCode === null && server.signalCode === null) {
+      const exited = once(server, "exit");
+      const timeout = setTimeout(() => {
+        try { process.kill(-server.pid!, "SIGKILL"); } catch { /* exit raced */ }
+      }, 5000);
       try {
         process.kill(-server.pid, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
+        await exited;
+        if (server.signalCode === "SIGKILL") throw new Error("HTTP server required forced termination");
+      } finally { clearTimeout(timeout); }
     }
   };
 }
