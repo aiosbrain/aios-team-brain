@@ -433,7 +433,7 @@ commit in its own `.github/scripts/fetch-brain-scanner.sh` and all seven pinned 
 the field. Every scan returned 200, nothing went red, and the Codebases surface showed an unexplained
 `(scope unknown)` for the whole fleet until a human noticed. The pin is a deliberate supply-chain
 control and is unchanged; what was missing was **staleness detection**. Three rules worth knowing
-before touching this: **(1) `null` means UNKNOWN and specifically "predates 1.24" — never "current"**;
+before touching this: **(1) `null` means UNKNOWN — it establishes neither age nor capability**;
 every existing `code_metrics` row is in that state and cannot be backfilled, so unknown is the COMMON
 state and renders as a caveat, not a pass. **(2) Neither field may ever reject a scan** — both are
 bounded strings with no pattern, and an unparseable value normalizes to unknown at READ time, because
@@ -445,7 +445,13 @@ branches and forks, needs a git history this server does not hold at runtime, st
 scanner ships as a package, and says nothing about whether anything the contract needs actually changed.
 The cost of that choice, stated so it is not forgotten: **raise `minScannerVersion` in the same PR as any
 revision that requires new scanner output, or staleness detection is silently off for that field.**
+Version recognition uses ASCII digits, ECMAScript whitespace trimming, and the wire's 64-character
+bound on both producer and reader. The reader compares exact integers; large components do not
+round into equality. Both runtimes exercise the same boundary fixtures.
 NEEDS A MIGRATION: `postgres/migrations/20260831120000_code_metrics_scanner_identity.sql`.
+Railway runs `pg:schema` automatically before deployment, including the schema mirror and this
+migration. For the AIOS instance, obtain Chetan's approval and complete the Railway rehearsal
+**before merging**; deferring a manual migration command does not defer the production DDL.
 
 Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
 §10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is

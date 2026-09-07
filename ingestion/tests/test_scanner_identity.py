@@ -7,6 +7,7 @@ properties that make them distinguishable, and keep the field from ever costing 
 
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -156,3 +157,9 @@ def test_a_scanner_that_cannot_identify_itself_still_scans(monkeypatch):
 
     monkeypatch.setattr(build.subprocess, "run", boom)
     assert build.scanner_sha.__wrapped__() is None
+
+
+def test_version_acceptance_matches_the_reader_boundary_cases():
+    cases = json.loads((Path(__file__).parent / "fixtures/scanner-version-cases.json").read_text())
+    for case in cases:
+        assert normalize_scanner_version(case["raw"]) == case["normalized"], case

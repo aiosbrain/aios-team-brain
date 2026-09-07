@@ -1,3 +1,4 @@
+import scannerVersionCases from "../../ingestion/tests/fixtures/scanner-version-cases.json";
 import { describe, expect, it } from "vitest";
 import {
   MIN_SCANNER_VERSION,
@@ -89,9 +90,9 @@ describe("scannerStaleness — the three states", () => {
 
 describe("parseScannerVersion — STRICT: three dotted integers, nothing else", () => {
   it("accepts exactly three dotted non-negative integers, trimmed", () => {
-    expect(parseScannerVersion("0.2.0")).toEqual([0, 2, 0]);
-    expect(parseScannerVersion(" 1.2.3 ")).toEqual([1, 2, 3]);
-    expect(parseScannerVersion("10.20.30")).toEqual([10, 20, 30]);
+    expect(parseScannerVersion("0.2.0")).toEqual([0, 2, 0].map(BigInt));
+    expect(parseScannerVersion(" 1.2.3 ")).toEqual([1, 2, 3].map(BigInt));
+    expect(parseScannerVersion("10.20.30")).toEqual([10, 20, 30].map(BigInt));
   });
 
   it("refuses anything it cannot ORDER", () => {
@@ -202,5 +203,27 @@ describe("normalizeStoredScannerField — what gets persisted", () => {
     const stored = normalizeStoredScannerField("nightly");
     expect(stored).toBe("nightly");
     expect(scannerStaleness(stored)).toBe("unknown");
+  });
+});
+
+
+describe("scanner version producer/reader agreement", () => {
+  it.each(scannerVersionCases)("normalizes $raw consistently", ({ raw, normalized }) => {
+    const parsed = parseScannerVersion(raw);
+    if (normalized === null) expect(parsed).toBeNull();
+    else expect(parsed).toEqual(normalized.split(".").map(BigInt));
+  });
+});
+
+
+describe("scanner identity claims require evidence", () => {
+  it("orders distinct large components exactly", () => {
+    expect(scannerStaleness("9007199254740992.0.0", "9007199254740993.0.0")).toBe("stale");
+    expect(scannerStaleness("0.9007199254740992.0", "0.9007199254740993.0")).toBe("stale");
+  });
+  it.each([null, "nightly"])("does not infer age or missing capabilities from %s", (version) => {
+    const label = scannerStalenessLabel("unknown", version);
+    expect(label).not.toMatch(/predates|could not|cannot report|outdated|stale/i);
+    expect(label).toContain("identify");
   });
 });

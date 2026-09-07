@@ -53,7 +53,12 @@ from . import __version__
 # the same verdict reached one hop earlier, and None is the honest reading of a build we cannot
 # identify. Cost, accepted deliberately: a real `0.2.0-rc1` build reports "unknown" rather than
 # "current". "I could not read this" is true; "this is current" would be a guess.
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# Python's \d includes Unicode digits; JavaScript's does not.
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+# Match ECMAScript trim, including BOM and excluding Python-only U+0085/U+001C–001F.
+_VERSION_WHITESPACE = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680" + "".join(
+    chr(c) for c in range(0x2000, 0x200B)
+) + "\u2028\u2029\u202f\u205f\u3000\ufeff"
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 # Both fields become bounded TEXT columns on `code_metrics`; the wire contract caps them at 64.
 # Truncating would invent a version that was never built, so an over-long value is voided.
@@ -64,7 +69,7 @@ def normalize_scanner_version(raw: str | None) -> str | None:
     """A parseable, bounded release version — or ``None`` for "we don't know"."""
     if not raw:
         return None
-    value = raw.strip()
+    value = raw.strip(_VERSION_WHITESPACE)
     if len(value) > _MAX_LEN or not _VERSION_RE.match(value):
         return None
     return value

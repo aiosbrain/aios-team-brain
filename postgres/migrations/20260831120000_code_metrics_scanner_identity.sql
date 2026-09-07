@@ -9,7 +9,7 @@
 -- by a human looking at a screenshot. Without these columns a scan from a stale scanner and a
 -- scan from today's scanner that genuinely had nothing to report are indistinguishable.
 --
--- BOTH COLUMNS ARE NULLABLE AND NULL MEANS UNKNOWN — specifically, "predates 1.24". Never
+-- BOTH COLUMNS ARE NULLABLE AND NULL MEANS UNKNOWN — age and capability are unmeasured. Never
 -- "current". `code_metrics` is a time series: every row already in this table has no scanner
 -- identity and can never acquire one, so the unknown state is the COMMON state, not an edge
 -- case. A DEFAULT of any kind here would assert a build on behalf of a scan that named none —

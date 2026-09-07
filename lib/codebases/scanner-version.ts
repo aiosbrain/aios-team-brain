@@ -86,15 +86,17 @@ export type ScannerStaleness = "current" | "stale" | "unknown";
  */
 export function parseScannerVersion(
   raw: string | null | undefined
-): [number, number, number] | null {
+): [bigint, bigint, bigint] | null {
   if (typeof raw !== "string") return null;
-  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(raw.trim());
+  const value = raw.trim();
+  if (value.length > 64) return null;
+  const m = /^([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(value);
   if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return [BigInt(m[1]), BigInt(m[2]), BigInt(m[3])];
 }
 
 /** Lexicographic on the numeric triple. -1 / 0 / 1. */
-function compare(a: [number, number, number], b: [number, number, number]): number {
+function compare(a: [bigint, bigint, bigint], b: [bigint, bigint, bigint]): number {
   for (let i = 0; i < 3; i += 1) {
     if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
   }
@@ -157,13 +159,13 @@ export function scannerStalenessLabel(
 ): string | null {
   if (staleness === "current") return null;
   if (staleness === "unknown") {
-    // Includes the case where a version arrived but could not be read — same remedy, and naming
+    // Includes a version that arrived but could not be read; naming
     // the unreadable string is more use to whoever has to fix it than "unknown" alone.
     const seen =
       typeof scannerVersion === "string" && scannerVersion.trim()
         ? ` ("${scannerVersion.trim()}")`
         : "";
-    return `scanner build unknown${seen} — this scan predates brain-api 1.24, so it could not report coverage scope`;
+    return `scanner build unknown${seen} — identify the scanner build and re-scan to check compatibility`;
   }
   return `scanner ${scannerVersion} predates ${minVersion} — this scan could not report coverage scope`;
 }
