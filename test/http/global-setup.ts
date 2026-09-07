@@ -34,13 +34,21 @@ export default async function setup(): Promise<() => Promise<void>> {
   }
 
   const nextBin = resolve("node_modules/.bin/next");
+  // The MCP outer runner owns a detached Vitest process group. Keep its server
+  // inside that group so an outer timeout also closes every inherited pipe.
+  const detached = process.env.MCP_HTTP_ATTACHED !== "1";
   const server: ChildProcess = spawn(nextBin, ["start", "-p", PORT], {
     // Inherit the backend/secret env pinned in vitest.http.config.ts; PORT is also
     // honored by `next start`. detached so we can kill the whole process group.
     env: { ...process.env, PORT },
     stdio: ["ignore", "inherit", "inherit"],
-    detached: true,
+    detached,
   });
+  const stop = (signal: NodeJS.Signals) => {
+    if (!server.pid) return;
+    if (detached) process.kill(-server.pid, signal);
+    else server.kill(signal);
+  };
 
   server.on("error", (err) => {
     throw new Error(`HTTP tier: failed to spawn next start — ${err.message}`);
@@ -51,7 +59,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   } catch (e) {
     if (server.pid) {
       try {
-        process.kill(-server.pid, "SIGKILL");
+        stop("SIGKILL");
       } catch {
         /* already gone */
       }
@@ -63,13 +71,14 @@ export default async function setup(): Promise<() => Promise<void>> {
     if (server.pid && server.exitCode === null && server.signalCode === null) {
       const exited = once(server, "exit");
       const timeout = setTimeout(() => {
-        try { process.kill(-server.pid!, "SIGKILL"); } catch { /* exit raced */ }
+        try { stop("SIGKILL"); } catch { /* exit raced */ }
       }, 5000);
       try {
-        process.kill(-server.pid, "SIGTERM");
+        stop("SIGTERM");
         await exited;
         if (server.signalCode === "SIGKILL") throw new Error("HTTP server required forced termination");
       } finally { clearTimeout(timeout); }
     }
+    console.log("HTTP_SERVER_CLEANUP_OK");
   };
 }
