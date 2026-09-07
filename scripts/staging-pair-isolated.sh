@@ -24,10 +24,27 @@ compose=(docker compose -p "$project" -f compose.test.staging-pair.yml)
 # files are copied, with harness secrets, URL credentials and bearer tokens masked.
 artifacts="${STAGING_PAIR_ARTIFACT_DIR:-$PWD/.staging-pair-artifacts}"
 
+# SERVICE LOGS, BEFORE TEARDOWN. `compose down` removes the containers and the artifact copy runs
+# after it — so on the runtime-4 failure the only things that survived were the cleanup output and
+# empty receipts. `maintenance` matters most: it spawns its children with `stdio: "inherit"`, so it
+# is the only place the app's own stdout/stderr exists at all. Everything written here goes through
+# the same secret-aware redactor as every other `*.log`. `logs` without `-f` returns on its own, and
+# a failure to read one service is reported and skipped rather than aborting the cleanup after it.
+capture_service_logs() {
+  for service in maintenance staging-pg prod-pg staging-neo4j prod-neo4j source-object-store rollback-object-store network-spy; do
+    if ! "${compose[@]}" logs --no-color --timestamps --tail 2000 "$service" >"$harness_root/service-$service.log" 2>&1; then
+      echo "harness diagnostics: could not read '$service' logs" >&2
+      echo "harness diagnostics: 'compose logs $service' failed" >>"$harness_root/service-$service.log"
+    fi
+  done
+}
+
 # Cleanup REPORTS what it could not clean up. `down … >/dev/null 2>&1 || true` silently tolerated a
 # failed teardown, and a run whose `up` died part-way left containers behind in `Created` with no
 # mention of it anywhere — so the next run inherited them and the failure looked like a new one.
 cleanup() {
+  # Collected FIRST, and never allowed to abort or replace the cleanup that follows it.
+  capture_service_logs || echo "harness diagnostics: service log capture failed" >&2
   if ! "${compose[@]}" down -v --remove-orphans >"$harness_root/cleanup.log" 2>&1; then
     echo "harness cleanup: 'compose down' failed for project $project" >&2
     sed -n '1,40p' "$harness_root/cleanup.log" >&2
@@ -41,7 +58,12 @@ cleanup() {
     # shellcheck disable=SC2086 -- deliberate word splitting: one ID per line
     docker rm -f $leftovers >>"$harness_root/cleanup.log" 2>&1 || echo "harness cleanup: could not remove every container of project $project" >&2
   fi
-  node scripts/staging-ops/redact-artifacts.mjs "$harness_root" "$STAGING_HARNESS_SECRETS_DIR" "$artifacts" >/dev/null 2>&1 || true
+  # A redaction failure must be VISIBLE: silently discarding it is how a run ends with no evidence
+  # and no explanation. The raw harness root is still removed either way — it holds the keys.
+  if ! node scripts/staging-ops/redact-artifacts.mjs "$harness_root" "$STAGING_HARNESS_SECRETS_DIR" "$artifacts" >"$harness_root/redact.log" 2>&1; then
+    echo "harness diagnostics: artifact redaction failed; no evidence was preserved for this run" >&2
+    sed -n '1,20p' "$harness_root/redact.log" >&2
+  fi
   rm -rf -- "$harness_root"
 }
 trap cleanup EXIT INT TERM
@@ -134,7 +156,22 @@ echo "[2/11] prove role network and mounted-key boundaries with non-vacuous posi
 "${compose[@]}" run --rm --no-deps importer scripts/staging-ops/secret-boundary-probe.mjs importer
 
 echo "[3/11] bootstrap a durable staging-owned rollback pair through the importer CLI"
-"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs bootstrap-rollback
+# CAPTURED SEPARATELY, because this container is `run --rm`: its output is in no service log, and on
+# the runtime-4 failure it was lost entirely — leaving "bootstrap timed out" with no phase, no
+# deployment id and no probe outcome behind it. The step's ORIGINAL exit status still decides the
+# run; it is recorded, the log is echoed, and then the status is re-raised unchanged.
+bootstrap_status=0
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs bootstrap-rollback \
+  >"$harness_root/bootstrap.log" 2>&1 || bootstrap_status=$?
+# Written to a file and then echoed, NOT piped through `tee`: a process substitution can still be
+# flushing when the next line reads the file, and the step's own exit status must not travel through
+# a pipeline.
+cat "$harness_root/bootstrap.log"
+if [[ "$bootstrap_status" -ne 0 ]]; then
+  echo "bootstrap-rollback failed (exit $bootstrap_status); its own log follows" >&2
+  sed -n '1,120p' "$harness_root/bootstrap.log" >&2
+  exit "$bootstrap_status"
+fi
 "${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' -H 'content-type: application/json' \
   -d '{"mode":"copy-ready"}' http://127.0.0.1:8080/runtime-mode >/dev/null
 
@@ -241,6 +278,33 @@ expect_failure graph-fault-recovers "${compose[@]}" run --rm -e STAGING_FAULT_PO
 require_receipt graph-fault-recovers graph-restored '"runId":"run-4"' "the candidate graph restore actually happened"
 require_receipt graph-fault-recovers fault-injected '"point":"after-graph".*"runId":"run-4"' "the injected fault fired after the graph restore"
 require_receipt graph-fault-recovers prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores after a graph-stage fault"
+"${compose[@]}" run --rm fixture-controller assert v3
+"${compose[@]}" run --rm fixture-controller assert-graph-version v3
+
+# AND THE FAILURE `resetSessionTransactionState` ACTUALLY EXISTS FOR. Both faults above are plain
+# JavaScript throws, so recovery began on a perfectly usable connection — they prove the ORDERING of
+# the reset, never that the reset works. This one runs a REAL `BEGIN` + `SELECT 1/0` on the
+# importer's OWN lock-owning session and lets the genuine 22012 propagate with the transaction still
+# aborted, which is the state in which the journal write, the lock release and the marker read all
+# fail with 25P02. Same candidate (run-4, v4) as above, so it costs one extra tick, not a new lane.
+expect_failure sql-abort-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-graph-sql-abort importer scripts/staging-ops/importer.mjs tick
+require_receipt sql-abort-recovers postgres-restored '"runId":"run-4"' "the candidate Postgres restore happened before the abort"
+require_receipt sql-abort-recovers graph-restored '"runId":"run-4"' "the candidate graph restore happened before the abort"
+require_receipt sql-abort-recovers candidate-observed '"runId":"run-4".*"pgVersion":"v4".*"graphVersions":"v4"' "BOTH stores held the candidate v4 capture at the abort boundary, so the undo below is a real two-store undo"
+require_receipt sql-abort-recovers fault-injected '"point":"after-graph-sql-abort".*"runId":"run-4".*"sqlstate":"22012".*"transactionAborted":true' "a real division-by-zero left the importer session in an aborted transaction"
+require_receipt sql-abort-recovers session-continuity '"checkpoint":"install-reset".*"coordinatorLockHeld":true.*"exclusiveDataLockHeld":true' "the install reset kept this session AND its locks — no reconnect, no DISCARD ALL"
+require_receipt sql-abort-recovers session-continuity '"checkpoint":"rollback-reset".*"coordinatorLockHeld":true' "the rollback path ran on that same fenced session"
+require_receipt sql-abort-recovers prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready THROUGH an aborted transaction"
+require_journal state ready "staging is serving again after the aborted-transaction fault"
+# One backend for the whole path. A reconnect would recover just as visibly while dropping the
+# advisory locks the fence depends on, so the PID is asserted, not assumed.
+node -e '
+const fs = require("node:fs");
+const pids = [...fs.readFileSync(process.argv[1], "utf8").matchAll(/staging-ops-receipt (?:candidate-observed|fault-injected|session-continuity) (\{.*\})/g)].map((m) => JSON.parse(m[1]).backendPid);
+if (pids.length !== 4) { console.error("expected 4 session-identity receipts (candidate, fault, two resets), saw " + pids.length); process.exit(1); }
+if (!Number.isFinite(pids[0]) || new Set(pids).size !== 1) { console.error("recovery did not stay on ONE backend: " + pids.join(",")); process.exit(1); }
+console.log("verified session continuity: backend pid " + pids[0] + " across the abort and both reset checkpoints");
+' "$harness_root/sql-abort-recovers.log"
 "${compose[@]}" run --rm fixture-controller assert v3
 "${compose[@]}" run --rm fixture-controller assert-graph-version v3
 

@@ -1,3 +1,16 @@
+import { emitReceipt } from "./receipts.mjs";
+
+/**
+ * WHICH request, and for HOW LONG. Runtime 4 reported "bootstrap timed out" without naming the
+ * operation: maintenance calls carry a 10-second timeout, object-store requests have their own
+ * deadlines, and the health poll swallows fetch timeouts — so the message was consistent with at
+ * least three different failures. This records the PATH and the DURATION of every maintenance call
+ * that fails or runs long, and nothing else: no bodies, no headers, no token, no arguments.
+ *
+ * `emitReceipt` refuses credential-shaped fields, so this cannot become a leak by accident.
+ */
+const SLOW_CALL_MS = 1_000;
+
 /** Local acceptance adapter. It queries a controller that owns and measures real child processes. */
 export class LocalMaintenance {
   constructor({ baseUrl, token, environmentId, appServiceId, graphitiServiceId, fetchImpl = fetch }) {
@@ -5,8 +18,30 @@ export class LocalMaintenance {
     this.baseUrl = baseUrl; this.token = token; this.environmentId = environmentId; this.appServiceId = appServiceId; this.graphitiServiceId = graphitiServiceId; this.fetch = fetchImpl;
   }
   async call(path, init = {}) {
-    const response = await this.fetch(new URL(path, this.baseUrl), { ...init, headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json", ...(init.headers ?? {}) }, signal: AbortSignal.timeout(10_000) });
-    const body = await response.json(); if (!response.ok) throw new Error(`local maintenance refused (${response.status})`); return body;
+    // The PATH ONLY — never the URL, which carries the base host, and never the init, which carries
+    // the body. A query string is dropped for the same reason.
+    const route = String(path).split("?")[0];
+    const started = Date.now();
+    try {
+      const response = await this.fetch(new URL(path, this.baseUrl), { ...init, headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json", ...(init.headers ?? {}) }, signal: AbortSignal.timeout(10_000) });
+      const body = await response.json();
+      const durationMs = Date.now() - started;
+      if (!response.ok) {
+        emitReceipt("maintenance-call", { route, method: init.method ?? "GET", status: response.status, durationMs, outcome: "refused" });
+        throw new Error(`local maintenance refused (${response.status}) on ${route} after ${durationMs}ms`);
+      }
+      if (durationMs >= SLOW_CALL_MS) emitReceipt("maintenance-call", { route, method: init.method ?? "GET", status: response.status, durationMs, outcome: "slow" });
+      return body;
+    } catch (error) {
+      const durationMs = Date.now() - started;
+      // A timeout and a refusal are different failures and used to read identically upstream. The
+      // name (`TimeoutError`/`AbortError`) is the discriminator, and it is not sensitive.
+      if (!(error instanceof Error) || !error.message.startsWith("local maintenance refused")) {
+        emitReceipt("maintenance-call", { route, method: init.method ?? "GET", status: null, durationMs, outcome: "failed", errorName: error?.name ?? "Error" });
+        throw new Error(`local maintenance call to ${route} failed after ${durationMs}ms (${error?.name ?? "Error"})`, { cause: error });
+      }
+      throw error;
+    }
   }
   async preflight() { const identity = await this.call("/identity"); if (identity.environmentId !== this.environmentId) throw new Error("local controller environment mismatch"); return true; }
   async tokenIdentity() { await this.preflight(); return { projectId: "local", environmentId: this.environmentId }; }

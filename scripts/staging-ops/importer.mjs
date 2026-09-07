@@ -23,6 +23,7 @@ import { assertStagingTopology } from "./config.mjs";
 import { replaceNeo4jGraph, assertReplaceTarget } from "./neo4j-replace.mjs";
 import { captureRollbackPostgres, resetSessionTransactionState, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
+import { closeAll } from "./resource-cleanup.mjs";
 import { canonicalObjectId, createPrivateStore, parseCanonicalObjectId } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
 import { fingerprint } from "../schema-fingerprint.mjs";
@@ -127,6 +128,94 @@ async function reapplyTesters(env) {
   await exec("npx", ["tsx", "--conditions", "react-server", "scripts/staging-ops/reapply-testers.ts", "--run"], { cwd: process.cwd(), env, maxBuffer: 1024 * 1024 });
 }
 
+/**
+ * HARNESS-ONLY, LOCAL-ADAPTER-ONLY: leave the importer's OWN lock-owning Postgres session in a real
+ * aborted transaction at the after-graph boundary.
+ *
+ * Why a separate seam. `after-postgres` and `after-graph` are plain JavaScript `throw`s, so when
+ * recovery starts the session is perfectly usable — which means neither of them can exercise the one
+ * failure `resetSessionTransactionState` exists for: a connection sitting in `25P02`, where the
+ * recovery journal write, the advisory-lock release and the marker read all fail. Those faults prove
+ * ORDERING; only a real `BEGIN` + a real failing statement proves RECOVERY.
+ *
+ * Fenced twice over — the required-harness flag AND the LOCAL maintenance adapter — so a fault
+ * variable that somehow reaches a Railway-adapter importer cannot reach a deliberate abort. It is
+ * also unreachable on the rollback path (see the caller's `kind !== "staging-rollback"` guard): the
+ * scenario is a failed INSTALL, and injecting again during the recovery it triggered would prove
+ * something else.
+ */
+export function sqlAbortFaultArmed(env = process.env) {
+  return env.STAGING_PAIR_REQUIRED === "1"
+    && env.STAGING_MAINTENANCE_ADAPTER === "local"
+    && env.STAGING_FAULT_POINT === "after-graph-sql-abort";
+}
+
+/**
+ * The version stamps the harness fixture writes into BOTH stores, read back from the STORES (not
+ * from the bundle object), so "the candidate landed in Postgres and in the graph before the abort"
+ * is observable evidence rather than an inference from the restore having exited zero. Harness-only:
+ * the ` vN` convention is the fixture's, and nothing outside this seam depends on it.
+ */
+async function observedStoreVersions({ client, session }) {
+  // Postgres: the fixture re-stamps ONE item body per capture and leaves the rest at their seeded
+  // v1, so the NEWEST stamp present is the capture that landed. Compared numerically — `max()` over
+  // the text would put v6 above v10.
+  const postgres = await client.query(
+    "SELECT max(substring(body from ' v([0-9]+)$')::int) AS n FROM items WHERE body ~ ' v[0-9]+$'",
+  );
+  // Graph: stamped wholesale, so a correctly replaced graph yields exactly ONE version. More than
+  // one is itself evidence of a partial replace, which is why the whole set is reported, not a max.
+  const graph = await session.run(
+    "MATCH ()-[r:RELATES_TO]->() WHERE r.fact =~ '.* v[0-9]+$' RETURN DISTINCT last(split(r.fact, ' ')) AS version ORDER BY version",
+  );
+  const newest = postgres.rows[0]?.n;
+  return {
+    pgVersion: newest == null ? "" : `v${newest}`,
+    graphVersions: graph.records.map((record) => record.get("version")).join(","),
+  };
+}
+
+export async function injectAbortedTransactionFault({ client, session, opened }) {
+  const identity = await client.query("SELECT pg_backend_pid() AS pid");
+  const backendPid = Number(identity.rows[0]?.pid);
+  const versions = await observedStoreVersions({ client, session });
+  // BEFORE the failing statement, tied to this candidate run: a scenario satisfied by some earlier
+  // refusal would never have reached this line, let alone with both stores holding the candidate.
+  emitReceipt("candidate-observed", { runId: opened.manifest.runId, backendPid, pgVersion: versions.pgVersion, graphVersions: versions.graphVersions });
+  await client.query("BEGIN");
+  try {
+    await client.query("SELECT 1/0");
+  } catch (error) {
+    // Assert the REAL database error, not a stand-in: a `22012` from Postgres is what leaves the
+    // transaction aborted, and anything else here means the scenario did not happen.
+    if (error?.code !== "22012") throw new Error(`the harness SQL abort expected SQLSTATE 22012 from the database, observed ${error?.code ?? "no SQLSTATE"}`);
+    emitReceipt("fault-injected", { point: "after-graph-sql-abort", runId: opened.manifest.runId, postgresRestored: true, graphRestored: true, sqlstate: error.code, backendPid, transactionAborted: true });
+    // NO ROLLBACK here. Handing the caller a session still inside the aborted transaction IS the
+    // scenario; resetting it would hand the recovery path the easy case the other faults already
+    // cover.
+    throw error;
+  }
+  throw new Error("the harness SQL abort did not fail; an aborted-transaction scenario whose transaction never aborts proves nothing");
+}
+
+/**
+ * Same-session evidence at a recovery checkpoint: the backend PID and which advisory locks this
+ * connection still holds. Together across checkpoints these say the reset stayed on ONE backend and
+ * kept the fence — a reconnect or a `DISCARD ALL` would show as a different PID or a dropped lock,
+ * and both would silently "work" otherwise. Harness-only, so no ordinary run changes behaviour.
+ */
+async function emitSessionContinuity(client, { checkpoint, failedRunId, env }) {
+  if (!sqlAbortFaultArmed(env)) return;
+  try {
+    const identity = await client.query("SELECT pg_backend_pid() AS pid");
+    const [coordinatorLockHeld, exclusiveDataLockHeld] = await Promise.all([hasCoordinatorLock(client), hasExclusiveDataUseLock(client)]);
+    emitReceipt("session-continuity", { checkpoint, failedRunId, backendPid: Number(identity.rows[0]?.pid), coordinatorLockHeld, exclusiveDataLockHeld });
+  } catch (error) {
+    // A checkpoint that could not be measured must not read as one that measured well.
+    emitReceipt("session-continuity", { checkpoint, failedRunId, backendPid: null, coordinatorLockHeld: false, exclusiveDataLockHeld: false, detail: errorText(error).slice(0, 200) });
+  }
+}
+
 async function measuredReplaceFacts({ client, maintenance, env, opened }) {
   const [electionLockHeld, exclusiveDataLockHeld, token, stopMeasurement] = await Promise.all([
     hasCoordinatorLock(client), hasExclusiveDataUseLock(client), maintenance.tokenIdentity(), maintenance.stopAndVerifyAll(),
@@ -176,6 +265,7 @@ export async function installOpenedPair({ client, session, opened, directory, en
     emitReceipt("fault-injected", { point: "after-graph", runId: opened.manifest.runId, postgresRestored: true, graphRestored: true });
     throw new Error("injected harness fault after graph restore");
   }
+  if (opened.manifest.kind !== "staging-rollback" && sqlAbortFaultArmed(env)) await injectAbortedTransactionFault({ client, session, opened });
   return graph;
 }
 
@@ -235,21 +325,50 @@ export async function readStagingHead(env = process.env, fetchImpl = fetch) {
 
 async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bootProbe, accept, fetchImpl, timeoutMs, sleep, description }) {
   const deadline = Date.now() + timeoutMs;
+  // WHY DID IT KEEP POLLING? The `.catch(() => null)` below swallows every fetch failure, so a
+  // health probe that timed out on every attempt and one that answered 503 every time produced the
+  // SAME message — which is why runtime 4's "bootstrap timed out" could not be attributed to any
+  // operation. The last observation of each kind is carried into the refusal. Identities and
+  // statuses only; no body, no token, no origin.
+  const observed = { attempts: 0, lastDeploymentStatus: null, lastResponseStatus: null, lastFetchError: null, lastBodyOk: null };
+  const startedAt = Date.now();
   while (Date.now() <= deadline) {
+    observed.attempts += 1;
     const deployment = await maintenance.readDeployment(deploymentId);
-    if (new Set(["FAILED", "CRASHED", "REMOVED"]).has(deployment.status)) throw new Error(`fresh staging deployment failed in ${deployment.status}`);
+    observed.lastDeploymentStatus = deployment.status ?? null;
+    if (new Set(["FAILED", "CRASHED", "REMOVED"]).has(deployment.status)) {
+      // The child's own lifecycle facts, when the controller recorded them — `CRASHED` alone
+      // describes a tracked child and says nothing about how it died.
+      const life = deployment.lifecycle ?? {};
+      emitReceipt("deployment-observed-dead", {
+        deploymentId, status: deployment.status, pid: life.pid ?? null,
+        exitCode: life.exitCode ?? null, exitSignal: life.exitSignal ?? null,
+        spawnError: life.spawnError ?? null, attempts: observed.attempts, waitedMs: Date.now() - startedAt,
+      });
+      throw new Error(`fresh staging deployment failed in ${deployment.status} (pid ${life.pid ?? "unknown"}, exit ${life.exitCode ?? "none"}${life.exitSignal ? `/${life.exitSignal}` : ""}${life.spawnError ? `, spawn error ${life.spawnError}` : ""})`);
+    }
     if (deployment.status === "SUCCESS" || deployment.status === "DEPLOYING") {
       const response = await fetchImpl(new URL("/api/health", origin), {
         redirect: "manual",
         headers: { "x-aios-staging-health-token": token, ...(bootProbe ? { "x-aios-staging-boot-probe": "true" } : {}) },
         signal: AbortSignal.timeout(10_000),
-      }).catch(() => null);
+      }).catch((error) => { observed.lastFetchError = error?.name ?? "Error"; return null; });
+      if (response) { observed.lastResponseStatus = response.status; observed.lastFetchError = null; }
       const body = await response?.json().catch(() => ({}));
+      if (response) observed.lastBodyOk = body?.ok ?? null;
       if (response && accept(response.status, body ?? {})) return true;
     }
     await sleep(5_000);
   }
-  throw new Error(`fresh staging deployment did not pass ${description}`);
+  emitReceipt("health-poll-timed-out", {
+    deploymentId, description, attempts: observed.attempts, waitedMs: Date.now() - startedAt,
+    lastDeploymentStatus: observed.lastDeploymentStatus, lastResponseStatus: observed.lastResponseStatus,
+    lastFetchError: observed.lastFetchError, lastBodyOk: observed.lastBodyOk,
+  });
+  throw new Error(
+    `fresh staging deployment did not pass ${description} after ${observed.attempts} attempt(s) over ${Date.now() - startedAt}ms `
+    + `(deployment ${observed.lastDeploymentStatus ?? "unknown"}; last probe ${observed.lastFetchError ? `failed with ${observed.lastFetchError}` : `answered ${observed.lastResponseStatus ?? "nothing"} ok=${String(observed.lastBodyOk)}`})`,
+  );
 }
 
 /**
@@ -352,6 +471,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
   // aborted transaction, in which case all three fail — and the pre-existing `.catch(() => {})`
   // around the journal write made two of those failures invisible.
   const reset = await resetSessionTransactionState(client);
+  await emitSessionContinuity(client, { checkpoint: "rollback-reset", failedRunId, env });
   if (reset.status !== "reset") {
     notes.push(`session reset failed: ${reset.detail}`);
     await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting", "failed", "ready"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
@@ -395,7 +515,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
     emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: true });
     throw new Error(withNotes(`paired rollback failed; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
-  } finally { await session?.close(); await driver?.close(); }
+  } finally { await closeAll(() => session?.close(), () => driver?.close()); }
 }
 
 async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env }) {
@@ -475,7 +595,7 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
         if (retainedId !== readyPair.objectId) await rollbackStore.delete(retainedId).catch((error) => cleanupErrors.push(String(error instanceof Error ? error.message : error)));
       }
       return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: catchup === targetCommit ? null : catchup, cleanupErrors };
-    } finally { await session.close(); await driver.close(); }
+    } finally { await closeAll(() => session.close(), () => driver.close()); }
   } catch (error) {
     if (!destructive) throw error;
     const notes = [];
@@ -485,6 +605,7 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     // fails on its own first statement — while the message below still said the prior pair had been
     // restored. The lock is released on the SAME backend, so the reset must not reconnect.
     const reset = await resetSessionTransactionState(client);
+    await emitSessionContinuity(client, { checkpoint: "install-reset", failedRunId: opened.manifest.runId, env });
     if (reset.status !== "reset") notes.push(`session reset failed: ${reset.detail}`);
     const usable = reset.status === "reset";
     await recoveryStep("failed-state journal transition", () => transitionJournal(client, { runId: opened.manifest.runId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: usable ? "ready" : "recovery-required" } }), notes);
@@ -509,16 +630,34 @@ async function currentDeployment(maintenance) {
 
 async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
-  const journal = await readJournal(client);
-  if (journal.last_ready_run_id) throw new Error("bootstrap rollback is one-time and last-ready already exists");
-  const current = await currentDeployment(maintenance);
+  // EVERYTHING after the acquisition is inside the release scope. The journal read, the deployment
+  // measurement and the mode check all sat between the acquire and the old `try`, so any of them
+  // refusing left the coordinator lock held for the life of the connection — and the next importer
+  // refused with "another importer owns the coordinator lock", naming a worker that had already died.
+  // Declared out here, assigned in there: the recovery `catch` reads all four, so they cannot be
+  // block-scoped to the try even though every statement that fills them belongs inside it.
   const mode = env.STAGING_BOOTSTRAP_MODE;
-  if (!new Set(["legacy-pg-only", "copy-ready"]).has(mode)) throw new Error("STAGING_BOOTSTRAP_MODE must describe the measured current staging mode");
   const runId = `bootstrap-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  let current = null;
+  // WHICH PHASE. Runtime 4's bootstrap "timed out" and the operation was unidentified: maintenance
+  // calls, object-store reads and the health poll all have their own deadlines, and nothing said
+  // which one was running. One receipt per phase, names only — no configuration, no arguments.
+  const phase = (name, fields = {}) => emitReceipt("bootstrap-phase", { runId, phase: name, ...fields });
   try {
+    phase("read-journal");
+    const journal = await readJournal(client);
+    if (journal.last_ready_run_id) throw new Error("bootstrap rollback is one-time and last-ready already exists");
+    phase("measure-current-deployment");
+    current = await currentDeployment(maintenance);
+    phase("measured-current-deployment", { deploymentId: current.deployment?.id ?? null, deploymentStatus: current.deployment?.status ?? null });
+    if (!new Set(["legacy-pg-only", "copy-ready"]).has(mode)) throw new Error("STAGING_BOOTSTRAP_MODE must describe the measured current staging mode");
+    phase("transition-draining", { from: journal.state });
     await transitionJournal(client, { runId, from: [journal.state], to: "draining", patch: { lastSafeCheckpoint: journal.state } });
+    phase("stop-and-verify-all");
     await maintenance.stopAndVerifyAll();
+    phase("acquire-exclusive-data-lock");
     await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
+    phase("capture-checkpoint");
     const created = await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
       await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
@@ -555,12 +694,16 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
           throw new Error("bootstrap checkpoint failed its durable read-back identity check");
         }
         return { objectId, digest };
-      } finally { await session.close(); await driver.close(); }
+      } finally { await closeAll(() => session.close(), () => driver.close()); }
     });
+    phase("captured-checkpoint", { objectId: created.objectId });
     await transitionJournal(client, { runId, from: ["draining"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
     await releaseDataUseLock(client, "exclusive");
+    phase("deploy-app");
     const deploymentId = await maintenance.deployApp(current.commit);
+    phase("await-boot", { deploymentId, mode });
     await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
+    phase("booted", { deploymentId });
     await rollbackStore.writePointer("last-ready", { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode, kind: "rollback" });
     await markReady(client, { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
     return { status: "bootstrapped", runId, objectId: created.objectId, commit: current.commit, mode };
@@ -579,8 +722,12 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
     //  - the probe must use the mode staging ACTUALLY runs in. Defaulting it to `copy-ready` meant a
     //    legacy-pg-only baseline could never satisfy it, and a successful restart was reported as a
     //    failed one.
+    phase("recovery-restart-deployment", { measuredDeployment: Boolean(current) });
     let restored = false;
     try {
+      // A failure BEFORE the deployment was measured has nothing to restart, and nothing was
+      // changed either. Said plainly, rather than as a `TypeError` on `null.commit` in a note.
+      if (!current) throw new Error("the current staging deployment was never measured, so there is nothing to restart (and nothing was changed)");
       await transitionJournal(client, { runId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
       const deploymentId = await maintenance.deployApp(current.commit);
       await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
@@ -737,25 +884,38 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     process.exit(1);
   };
   for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => { void recordSignalAbort(signal); });
-  const sourceStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "source", role: "source-reader" });
-  const rollbackStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
-  const maintenance = action === "verify" || action === "install-ops" ? null : maintenanceFor(env);
   try {
+    // Constructed INSIDE the cleanup scope. These three ran between `client.connect()` and the
+    // `try`, so a store or maintenance adapter that refused its own configuration left an open
+    // Postgres connection with nothing to close it.
+    const sourceStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "source", role: "source-reader" });
+    const rollbackStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
+    const maintenance = action === "verify" || action === "install-ops" ? null : maintenanceFor(env);
     if (action === "install-ops") { await installStagingOps(client); return { status: "installed" }; }
     if (action === "verify") {
       const objectId = argv[1]; if (!objectId) throw new Error("canonical immutable object ID is required");
       const opened = await verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env }); compareEnvironmentCredentials(opened.manifest, env);
       return { status: "verified-and-pinned", runId: opened.manifest.runId, objectId, topology: verifyConfiguredTopology(env) };
     }
-    if (action === "bootstrap-rollback") return bootstrapRollback({ client, rollbackStore, maintenance, env });
+    // ⚠️ `return await`, NOT `return`, for every branch whose promise is still running when the
+    // enclosing `finally` fires. A bare `return promise` resolves the try block IMMEDIATELY, so
+    // `finally { await client.end() }` ran while the very first coordinator-lock query was still in
+    // flight; `pg` destroys a connection that is ending with an active query, and the harness saw
+    // exactly that: bootstrap dying with `Connection terminated` before it had read anything.
+    // This applies ONLY where the promise owns enclosing cleanup — the inner `tick` helper, the
+    // health wrappers and `replaceFromArchive` own none, and are deliberately left alone.
+    if (action === "bootstrap-rollback") return await bootstrapRollback({ client, rollbackStore, maintenance, env });
     if (action === "rollback") {
       if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
-      try { const journal = await readJournal(client); const prior = await openPrior({ client, journal, rollbackStore, env }); return rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env }); }
+      // The await must be INSIDE this try, not merely inside the outer one: otherwise this `finally`
+      // releases the coordinator lock while the rollback it is fencing is still running, and a
+      // second importer can acquire it mid-recovery — a failure independent of the connection close.
+      try { const journal = await readJournal(client); const prior = await openPrior({ client, journal, rollbackStore, env }); return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env }); }
       finally { await releaseCoordinatorLock(client).catch(() => {}); }
     }
     if (action === "install") {
       if (!argv[1]) throw new Error("canonical immutable object ID is required");
-      return installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env });
+      return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env });
     }
     const tick = async () => {
       const catchup = await serviceCatchup({ client, maintenance, env });
@@ -765,7 +925,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       if (!objectId) return { status: "idle", catchup };
       return installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env });
     };
-    if (action === "tick") return tick();
+    if (action === "tick") return await tick();
     const interval = Number(env.STAGING_IMPORTER_POLL_MS ?? 300_000);
     if (!Number.isFinite(interval) || interval < 300_000) throw new Error("importer poll interval must be at least five minutes");
     for (;;) { await tick().catch((error) => console.error(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`)); await new Promise((resolve) => setTimeout(resolve, interval)); }

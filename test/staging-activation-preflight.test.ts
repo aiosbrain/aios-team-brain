@@ -50,8 +50,20 @@ const TOPOLOGY = {
 const digest = "image.example/aios-staging-ops@sha256:" + "a".repeat(64);
 const COMMIT = "c".repeat(40);
 
+/**
+ * A comparison KEY ID, not a secret — it names which comparison key minted a MAC and is meant to
+ * travel in the clear. `compare-2026-09` nevertheless tripped gitleaks' `generic-api-key` rule
+ * (5 findings across this file and `fixtures/activation-remote-fingerprints.json`), because that
+ * rule matches any `key…: "<10+ chars>"` above 3.5 bits of entropy and cannot know the difference.
+ * The value is now deliberately synthetic and low-entropy, which clears the finding without
+ * allowlisting anything or weakening a single comparison assertion below — the tests only ever
+ * depended on local and remote agreeing on this string, never on what it was.
+ * Keep it that way if you change it (`test/guards/fixture-key-id-entropy.test.ts` pins it).
+ */
+const COMPARISON_KEY_ID = "example-key";
+
 const fingerprint = (credentialClass: string, mac: string, over: Record<string, unknown> = {}) => ({
-  version: FINGERPRINT_VERSION, keyId: "compare-2026-09", credentialClass, mac, ...over,
+  version: FINGERPRINT_VERSION, keyId: COMPARISON_KEY_ID, credentialClass, mac, ...over,
 });
 
 /** 32 bytes, base64url — the only MAC shape a well-formed fingerprint may carry. */
@@ -73,9 +85,23 @@ function fullyMeasured() {
       importer: { serviceId: "svc-importer", expectedServiceId: "svc-importer", image: digest, expectedImage: digest, repo: null, autoDeploy: false },
     },
     appDeployment: { id: "dep-1", status: "SUCCESS", environmentId: "env-staging", serviceId: "service-app", url: "https://staging.example.com", commitSha: COMMIT },
-    appHealth: { status: 200, origin: "https://staging.example.com", body: { ok: true, commit: COMMIT, mode: "copy-ready", answering: "disabled", graph: "readable" } },
+    // The binding decision the ACQUISITION made before presenting a token. It is a fact like any
+    // other: the evaluator judges it, and cannot re-derive it, because whether a request was sent
+    // is not recoverable from the answer.
+    healthBinding: { bound: true, origin: "https://staging.example.com", refusal: null, kind: null },
+    // `refreshRunId` is part of the served contract, not decoration: a `copy-ready` claim with no
+    // refresh run names a dataset that was never installed.
+    appHealth: { status: 200, origin: "https://staging.example.com", body: { ok: true, commit: COMMIT, mode: "copy-ready", refreshRunId: "run-9", answering: "disabled", graph: "readable" } },
     graphitiProviderCredentials: [],
-    credentialFingerprints: { local: fingerprintSet("a"), remote: fingerprintSet("b") },
+    // Authenticated, environment-bound provenance for BOTH sides. Remote-only provenance is still
+    // "an unauthenticated local value differs from an authenticated remote one", which is not live
+    // separation. NOTHING in this build can produce either (`readActivationFacts` sets both to
+    // `null`), which is exactly why the real command cannot certify it — see the dedicated tests.
+    credentialFingerprints: {
+      local: fingerprintSet("a"), remote: fingerprintSet("b"),
+      localProvenance: { authenticated: true, environmentId: "env-staging" },
+      remoteProvenance: { authenticated: true, environmentId: "env-production" },
+    },
     schedules: { activated: false },
     operatorClaims: {},
   };
@@ -163,7 +189,7 @@ describe("evaluateActivation", () => {
     expect(evaluateActivation(noCommit).checks.find((c) => c.id === "app-health-bound")).toMatchObject({ status: "unverified" });
 
     const mismatch = fullyMeasured() as Record<string, unknown>;
-    mismatch.healthOriginMismatch = true;
+    mismatch.healthBinding = { bound: false, origin: null, kind: "contradiction", refusal: "the configured STAGING_ORIGIN is not the measured deployment domain" };
     const detail = evaluateActivation(mismatch).checks.find((c) => c.id === "app-health-bound")!;
     expect(detail.status).toBe("fail");
     expect(detail.detail).toMatch(/no health token was presented/);
@@ -411,7 +437,7 @@ describe("readActivationFacts", () => {
     const fingerprintsFile = new URL("./fixtures/activation-remote-fingerprints.json", import.meta.url).pathname;
     const facts = await readActivationFacts({
       STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"),
-      STAGING_COMPARISON_KEY_ID: "compare-2026-09",
+      STAGING_COMPARISON_KEY_ID: COMPARISON_KEY_ID,
       OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: fingerprintsFile,
       AUTH_SECRET: "local-auth-secret",
     } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });

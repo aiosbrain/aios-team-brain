@@ -51,6 +51,12 @@ export function redactText(text, secrets = []) {
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, "$1[redacted]:[redacted]@");
   out = out.replace(/(authorization:\s*Bearer\s+)\S+/gi, "$1[redacted]");
   out = out.replace(/(-H\s+['"]?authorization:\s*Bearer\s+)[^'"\s]+/gi, "$1[redacted]");
+  // The privileged staging health token travels in its OWN header, not in `Authorization`, so the
+  // bearer rules never saw it. It became reachable when the harness started preserving Compose
+  // SERVICE logs: those carry whatever a service wrote about an inbound request, and this token is
+  // a compose literal rather than a file in the secrets directory, so the literal-value masking
+  // above does not cover it either.
+  out = out.replace(/(x-aios-staging-(?:health-token|boot-probe):\s*)\S+/gi, "$1[redacted]");
   return out;
 }
 

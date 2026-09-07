@@ -12,6 +12,7 @@ import { credentialFingerprint } from "./credential-fingerprint.mjs";
 import { exportGraph, graphCensus, sanitizeGraphExport } from "./graph-bundle.mjs";
 import { capturePairedPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
+import { closeAll } from "./resource-cleanup.mjs";
 import { canonicalObjectId, createPrivateStore } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
 import { RailwayRunnerInspector } from "./railway-maintenance.mjs";
@@ -161,7 +162,10 @@ export async function runExporter(env = process.env) {
   const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
   const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
   try {
-    if (process.argv.includes("--census")) return graphCensus(session);
+    // `return await`: the census runs THREE sequential queries, and a bare `return` resolved this
+    // try block after the first one was merely started — so the `finally` closed the session, the
+    // driver and the Postgres client underneath it. Same failure shape as the importer dispatcher.
+    if (process.argv.includes("--census")) return await graphCensus(session);
     // The run ID names the MEASURED deployed commit, never the declared env var: on the Railway
     // path `SOURCE_APPLICATION_COMMIT` is unset, and `undefined?.slice()` had been stamping the
     // literal string "undefined" into a bundle's immutable identity.
@@ -204,7 +208,7 @@ export async function runExporter(env = process.env) {
       await store.putImmutable(objectId, bytes);
       return { runId, objectId, sha256: digest, manifest: { ...manifest, credentialFingerprints: Object.keys(credentialFingerprints), checksums: packed.checksums } };
     });
-  } finally { await session.close(); await driver.close(); await client.end(); }
+  } finally { await closeAll(() => session.close(), () => driver.close(), () => client.end()); }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) runExporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging exporter refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });

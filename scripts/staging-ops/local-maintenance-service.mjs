@@ -2,6 +2,24 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { emitReceipt } from "./receipts.mjs";
+
+/**
+ * CHILD-PROCESS LIFECYCLE DIAGNOSTICS (accepted scope, `runtime-fourth-adjudication.md`).
+ *
+ * Runtime 4 got past the connection termination and then timed out in bootstrap, with the recovery
+ * child observed `CRASHED`. `CRASHED` here describes THIS controller's tracked child, not the Next
+ * process or the container — and the controller recorded nothing else: no PID, no exit code, no
+ * signal, no spawn error, and no evidence that a stop ever completed. The chain is
+ * controller → startup fence → npm → Next, and `stopChild` signals only the immediate child and
+ * then waits with no internal deadline, so a stalled stop and a surviving listener are both
+ * consistent with what was observed. None of that is established; these receipts are what would
+ * establish it.
+ *
+ * Identities only — deployment id, service id, PID, exit code, signal, durations. Never the command,
+ * never its arguments, never the environment: the redactor's masking is not comprehensive for
+ * arbitrary environment dumps, so none is produced.
+ */
 
 const token = process.env.LOCAL_MAINTENANCE_TOKEN;
 const environmentId = process.env.STAGING_OPS_ENVIRONMENT_ID ?? "staging-local";
@@ -21,9 +39,29 @@ function spawnDeployment(serviceId, commitSha = null, { mode = "copy-ready" } = 
     ? JSON.parse(process.env.LOCAL_APP_COMMAND_JSON ?? `["${process.execPath}","-e","setInterval(() => {}, 1000)"]`)
     : [process.execPath, "-e", "setInterval(() => {}, 1000)"];
   const child = spawn(command[0], command.slice(1), { stdio: "inherit", env: { ...process.env, STAGING_DATA_MODE: mode, RAILWAY_GIT_COMMIT_SHA: commitSha ?? "" } });
-  const deployment = { id, serviceId, environmentId, status: "DEPLOYING", meta: { commitHash: commitSha, createdAt: new Date().toISOString() }, child };
-  child.once("spawn", () => { deployment.status = "SUCCESS"; });
-  child.once("exit", (code) => { deployment.status = code === 0 || child.killed ? "REMOVED" : "CRASHED"; }); deployments.set(id, deployment); return deployment;
+  const deployment = { id, serviceId, environmentId, status: "DEPLOYING", meta: { commitHash: commitSha, createdAt: new Date().toISOString() }, child, lifecycle: { pid: null, spawnedAt: null, exitCode: null, exitSignal: null, exitedAt: null, spawnError: null } };
+  const startedAt = Date.now();
+  child.once("spawn", () => {
+    // `SUCCESS` is assigned ON SPAWN, not on application readiness — the adjudication called this
+    // out, and the receipt says so in the same breath so nothing downstream reads it as "ready".
+    deployment.status = "SUCCESS";
+    deployment.lifecycle.pid = child.pid ?? null;
+    deployment.lifecycle.spawnedAt = new Date().toISOString();
+    emitReceipt("deployment-spawned", { deploymentId: id, serviceId, pid: child.pid ?? null, mode, statusMeans: "process spawned, NOT application readiness" });
+  });
+  child.once("error", (error) => {
+    deployment.lifecycle.spawnError = error?.code ?? error?.name ?? "Error";
+    emitReceipt("deployment-spawn-failed", { deploymentId: id, serviceId, errorCode: deployment.lifecycle.spawnError });
+  });
+  child.once("exit", (code, signal) => {
+    deployment.status = code === 0 || child.killed ? "REMOVED" : "CRASHED";
+    Object.assign(deployment.lifecycle, { exitCode: code, exitSignal: signal ?? null, exitedAt: new Date().toISOString() });
+    emitReceipt("deployment-exited", {
+      deploymentId: id, serviceId, pid: deployment.lifecycle.pid, status: deployment.status,
+      exitCode: code, exitSignal: signal ?? null, killedByUs: Boolean(child.killed), lifetimeMs: Date.now() - startedAt,
+    });
+  });
+  deployments.set(id, deployment); return deployment;
 }
 spawnDeployment(appServiceId, initialCommit, { mode: runtimeMode });
 spawnDeployment(graphitiServiceId);
@@ -31,9 +69,20 @@ spawnDeployment(graphitiServiceId);
 function json(res, status, value) { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); }
 async function stopChild(deployment) {
   if (deployment.child.exitCode != null) return;
-  const exited = new Promise((resolve) => deployment.child.once("exit", resolve));
+  // DID THE STOP COMPLETE? The wait has no internal deadline, so a stop that never returns is
+  // indistinguishable from one that returned instantly — which is exactly the ambiguity in the
+  // runtime-4 evidence. The signal is unchanged and the wait is still unbounded (changing either
+  // would be the speculative lifecycle fix this pass must not make); what is added is a record of
+  // when it started, when it finished, and what the child did.
+  const startedAt = Date.now();
+  emitReceipt("deployment-stop-requested", { deploymentId: deployment.id, serviceId: deployment.serviceId, pid: deployment.child.pid ?? null, signal: "SIGTERM" });
+  const exited = new Promise((resolve) => deployment.child.once("exit", (code, signal) => resolve({ code, signal })));
   deployment.child.kill("SIGTERM");
-  await exited;
+  const outcome = await exited;
+  emitReceipt("deployment-stop-completed", {
+    deploymentId: deployment.id, serviceId: deployment.serviceId, pid: deployment.lifecycle?.pid ?? null,
+    exitCode: outcome?.code ?? null, exitSignal: outcome?.signal ?? null, durationMs: Date.now() - startedAt,
+  });
 }
 const server = createServer(async (req, res) => {
   if (req.headers.authorization !== `Bearer ${token}` && req.url !== "/api/health") return json(res, 401, { error: "unauthorized" });

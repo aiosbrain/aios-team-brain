@@ -25,10 +25,12 @@
  * It reports shapes, presence, digests and HMAC fingerprints only.
  *
  * ⚠️ WHAT ITS BEST OUTCOME MEANS, AND WHAT IT DOES NOT. Its schedule check passes only when the
- * schedules contract is DISABLED, so an all-green run cannot possibly mean "the weekly automation is
- * running" — it used to say `ACTIVATED`, which reads as exactly that. The best verdict is therefore
- * `READY TO ACTIVATE`: every control this build can measure was measured and is correct, and the
- * system is still inert. Live activation is a later, deliberate act with its own evidence.
+ * shipped schedules contract FILE is disabled, so an all-green run cannot possibly mean "the weekly
+ * automation is running" — it used to say `ACTIVATED`, which reads as exactly that. The best verdict
+ * is therefore `READY TO ACTIVATE`: every control this build can measure was measured and is
+ * correct. It does NOT add "and the system is still inert": that is a statement about live platform
+ * schedules, and a file in this repository is not a measurement of them. Live activation is a later,
+ * deliberate act with its own evidence.
  *
  * It is also PARTIAL by construction, and says which parts. The sidecar's provider variables, the
  * app's outbound configuration, live schedule state, branch/reference configuration and the remote
@@ -43,7 +45,7 @@ import { assertStagingTopology } from "./config.mjs";
 import { credentialFingerprint, fingerprintsComparable, fingerprintsEqual } from "./credential-fingerprint.mjs";
 
 export const ACTIVATION_STATUS = Object.freeze({
-  /** Every measurable control is measured and correct — and the schedules are still off. */
+  /** Every measurable control this build can measure is measured and correct. Nothing more. */
   READY: "READY TO ACTIVATE",
   NOT_ACTIVATED: "NOT ACTIVATED",
   UNVERIFIED: "UNVERIFIED",
@@ -118,6 +120,105 @@ const check = (id, status, detail) => ({ id, status, detail });
 const unmeasured = (id, reason) => check(id, UNVERIFIED, `not measured: ${reason}`);
 
 const IMAGE_DIGEST = /@sha256:[0-9a-f]{64}$/i;
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+
+/**
+ * IS THIS HEALTH ANSWER EVIDENCE ABOUT THE OBSERVED DEPLOYMENT, OR IS IT JUST A RESPONSE?
+ *
+ * One predicate, because three checks read the same body and each used to decide separately —
+ * which is how the measured table happened:
+ *
+ *   | response                          | binding | mode | answering |
+ *   | wrong commit                      |  fail   | PASS |   PASS    |
+ *   | ok:false, no run                  |  fail   | fail |   PASS    |
+ *   | ok:true, copy-ready, no run       |  PASS   | fail |   PASS    |
+ *
+ * Every bold verdict there is a statement about a deployment whose answer had already been shown
+ * not to describe it. An overall refusal does not cure that: an operator reads the individual lines.
+ *
+ * So a verdict about what the app SAYS is only available once the answer is tied to the observed
+ * deployment (origin, `ok`, commit) AND satisfies the mode/run contract it claims. `usable: false`
+ * carries the reason and its severity, and every dependent check reports that instead of its own
+ * opinion.
+ *
+ * @returns {{usable: boolean, status?: string, reason?: string, mode?: string, refreshRunId?: string|null}}
+ */
+export function healthAnswerContract({ binding = null, health = null, deployment = null } = {}) {
+  const refuse = (status, reason) => ({ usable: false, status, reason });
+  if (!binding) return refuse(UNVERIFIED, "this acquisition recorded no binding decision, so no answer can be tied to a deployment");
+  if (!binding.bound) {
+    return binding.kind === "contradiction"
+      ? refuse(FAIL, `${binding.refusal}; no health token was presented`)
+      : refuse(UNVERIFIED, `${binding.refusal}; no health token was presented`);
+  }
+  if (!health) return refuse(UNVERIFIED, "no privileged health answer from the measured domain");
+  if (health.origin && health.origin !== binding.origin) return refuse(FAIL, "the health answer is about a different origin than the measured deployment domain");
+  if (health.status === 401) return refuse(FAIL, "the staging health token was rejected by the deployment");
+  if (health.status !== 200 && health.status !== 202) return refuse(UNVERIFIED, `no usable health answer (the probe answered ${health.status})`);
+
+  const body = health.body ?? {};
+  if (body.ok !== true) return refuse(FAIL, `the bound deployment answered ${health.status} but reports ok=${String(body.ok ?? "absent")}; it is not serving this identity`);
+  const served = body.commit ?? null;
+  if (!served || !deployment?.commitSha) return refuse(UNVERIFIED, "the deployment or the health answer reports no commit, so the answer cannot be tied to the observed deployment");
+  if (served !== deployment.commitSha) return refuse(FAIL, "the deployment serving the measured domain reports a different commit than the observed deployment");
+
+  const mode = body.mode;
+  const refreshRunId = body.refreshRunId ?? null;
+  if (mode !== "copy-ready" && mode !== "legacy-pg-only") return refuse(FAIL, `the deployment declares no supported staging mode (${String(mode ?? "absent")})`);
+  // `legacy-pg-only` has no refresh run by contract; `copy-ready` without one names a dataset that
+  // was never installed.
+  if (mode === "copy-ready" && !refreshRunId) return refuse(FAIL, "the deployment declares copy-ready but reports no refresh run, so no copied dataset is identified");
+  return { usable: true, mode, refreshRunId };
+}
+
+/**
+ * MAY THE PRIVILEGED STAGING HEALTH TOKEN BE PRESENTED AT ALL?
+ *
+ * The measured defect: a provider-returned hostname was enough. Independent mocked acquisitions
+ * sent ONE health-token request each for a wrong-scope token, an absent scope, a wrong service, a
+ * wrong environment, a `FAILED` deployment, a `BUILDING` deployment and a missing commit — and
+ * several of those then reported `app-health-bound: pass`, because the answer that came back was
+ * treated as evidence about an identity nothing had established.
+ *
+ * So the whole identity is decided BEFORE the request, and every clause is a refusal: the token's
+ * own measured scope must be the pinned staging project/environment, the deployment must be the
+ * pinned environment/service, serving, and carry a valid commit; the destination must be the domain
+ * the provider reported for THAT deployment; and a configured `STAGING_ORIGIN`, when supplied, must
+ * be a usable origin that agrees with it — an unparseable one is refused rather than ignored, which
+ * is what previously let a malformed value normalise to `null` and vanish from the comparison.
+ *
+ * `kind` separates a CONTRADICTION (something was measured and disagrees — a failure) from an
+ * ABSENCE (a prerequisite was never supplied — unverified). Both send zero requests.
+ *
+ * @returns {{bound: boolean, origin: string|null, refusal: string|null, kind: "contradiction"|"absence"|null}}
+ */
+export function healthProbeBinding({ env = {}, pin = null, tokenScope = null, deployment = null } = {}) {
+  const absent = (refusal) => ({ bound: false, origin: null, refusal, kind: "absence" });
+  const contradiction = (refusal) => ({ bound: false, origin: null, refusal, kind: "contradiction" });
+
+  if (!env.STAGING_HEALTH_TOKEN) return absent("prerequisite missing — no staging health token supplied");
+  if (!pin?.projectId || !pin?.environmentId || !pin?.appServiceId) return absent("no pinned staging project/environment/app-service identity to bind a probe to");
+  if (!tokenScope?.projectId || !tokenScope?.environmentId) return absent("the staging read token's own project/environment scope was not measured");
+  if (tokenScope.projectId !== pin.projectId || tokenScope.environmentId !== pin.environmentId) {
+    return contradiction("the staging read token is scoped to a different project/environment than the pinned staging identity");
+  }
+  if (!deployment) return absent("no staging app deployment was measured");
+  if (!deployment.environmentId || !deployment.serviceId) return absent("the measured deployment reports no environment/service identity");
+  if (deployment.environmentId !== pin.environmentId || deployment.serviceId !== pin.appServiceId) {
+    return contradiction("the measured deployment belongs to a different environment/service than the pinned staging app");
+  }
+  if (deployment.status !== SERVING_STATUS) {
+    return contradiction(`the measured deployment is ${String(deployment.status ?? "of unreported status")}, not ${SERVING_STATUS}, so nothing is serving this identity`);
+  }
+  if (!FULL_SHA.test(String(deployment.commitSha ?? ""))) return absent("the measured deployment reports no valid commit identity to tie an answer to");
+  if (!deployment.url) return absent("no measured deployment domain to bind the probe to");
+
+  const supplied = String(env.STAGING_ORIGIN ?? "").trim();
+  const configuredOrigin = normalizeOrigin(supplied);
+  if (supplied && !configuredOrigin) return contradiction("STAGING_ORIGIN was supplied but is not a usable deployment origin");
+  if (configuredOrigin && configuredOrigin !== deployment.url) return contradiction("the configured STAGING_ORIGIN is not the measured deployment domain");
+  return { bound: true, origin: deployment.url, refusal: null, kind: null };
+}
 
 /**
  * Evaluate MEASURED facts. Pure: no I/O, no clock, no environment reads — everything it judges was
@@ -281,44 +382,31 @@ export function evaluateActivation(facts = {}) {
   //    about a different commit than the deployment Railway reported, is a refusal rather than a
   //    health verdict.
   const health = facts.appHealth ?? null;
-  if (facts.healthOriginMismatch) {
-    checks.push(check("app-health-bound", FAIL, "the configured staging origin is not the measured deployment domain; no health token was presented to either"));
-  } else if (!deployment?.url) {
-    checks.push(unmeasured("app-health-bound", "measured deployment domain to bind a health probe to; no token was presented"));
-  } else if (!health) {
-    checks.push(unmeasured("app-health-bound", "privileged health answer from the measured domain"));
-  } else if (health.origin && health.origin !== deployment.url) {
-    checks.push(check("app-health-bound", FAIL, "the health answer is about a different origin than the measured deployment domain"));
-  } else if (health.status === 200 || health.status === 202) {
-    const served = health.body?.commit ?? null;
-    checks.push(!served || !deployment.commitSha
-      ? check("app-health-bound", UNVERIFIED, "the deployment or the health answer reports no commit, so the answer cannot be tied to the observed deployment")
-      : served !== deployment.commitSha
-        ? check("app-health-bound", FAIL, "the deployment serving the measured domain reports a different commit than the observed deployment")
-        : check("app-health-bound", PASS, "the health answer came from the measured deployment domain and reports the observed deployment's commit"));
-  } else {
-    checks.push(unmeasured("app-health-bound", `usable health answer (the probe answered ${health.status})`));
-  }
+  const binding = facts.healthBinding ?? null;
+  const contract = healthAnswerContract({ binding, health, deployment });
+  checks.push(contract.usable
+    ? check("app-health-bound", PASS, `the health answer came from the measured deployment domain, reports ok, carries the observed deployment's commit, and serves mode ${contract.mode}${contract.refreshRunId ? ` refresh run ${contract.refreshRunId}` : ""}`)
+    : contract.status === FAIL
+      ? check("app-health-bound", FAIL, contract.reason)
+      : unmeasured("app-health-bound", contract.reason));
 
   // 7/8. What the APP says about itself, over its own privileged health contract — the one place
   //      the app's runtime posture is observable without reading its variables. Note the scope:
   //      `answering: "disabled"` is the deployment's REPORTED answering posture, and nothing more.
   //      It is not proof of the whole no-spend policy: graph extraction, embeddings, image and
   //      outbound-connector posture are separate controls with their own evidence.
-  if (!health) {
-    checks.push(unmeasured("app-mode-declared", "the privileged staging health probe was not performed"));
-    checks.push(unmeasured("app-no-model-spend", "the privileged staging health probe was not performed"));
-  } else if (health.status === 401) {
-    checks.push(check("app-mode-declared", FAIL, "the staging health token was rejected by the deployment"));
-    checks.push(unmeasured("app-no-model-spend", "the health probe could not authenticate"));
-  } else if (health.status !== 200 && health.status !== 202) {
-    checks.push(check("app-mode-declared", FAIL, `the staging health probe answered ${health.status}`));
-    checks.push(unmeasured("app-no-model-spend", "the health probe did not answer"));
+  // BOTH of these are statements about what the app SAYS, so neither is available until the answer
+  // has been shown to describe the observed deployment. A wrong-commit response used to produce a
+  // failing binding and a PASSING declared mode and answering posture — three lines an operator
+  // reads independently, two of them about a deployment the first line said this was not.
+  if (!contract.usable) {
+    const dependent = contract.status === FAIL
+      ? (id) => check(id, FAIL, contract.reason)
+      : (id) => unmeasured(id, contract.reason);
+    checks.push(dependent("app-mode-declared"));
+    checks.push(dependent("app-no-model-spend"));
   } else {
-    const mode = health.body?.mode;
-    checks.push(mode === "copy-ready" || mode === "legacy-pg-only"
-      ? check("app-mode-declared", PASS, `the deployment declares mode ${mode}`)
-      : check("app-mode-declared", FAIL, `the deployment declares no supported staging mode (${String(mode ?? "absent")})`));
+    checks.push(check("app-mode-declared", PASS, `the deployment declares mode ${contract.mode}${contract.refreshRunId ? ` serving refresh run ${contract.refreshRunId}` : ""}`));
 
     // The honest reading of the OPTIONAL budgeted interactive mode: `unsupported-budgeted-mode`
     // means an operator asked for it and did not get it. That is not a spend risk — no call is
@@ -366,11 +454,36 @@ export function evaluateActivation(facts = {}) {
       }
       if (fingerprintsEqual(local, remote)) shared.push(credentialClass);
     }
+    // A SHARED CREDENTIAL IS STILL A FAILURE — an unauthenticated document that says "identical" is
+    // telling us something no forgery would volunteer. The reverse is NOT symmetric: "they differ"
+    // is exactly what a forged, stale or simply wrong file would also say. So a difference may only
+    // be reported as LIVE separation when the opposite side's document carries authenticated,
+    // environment-bound provenance; otherwise it is a local document diagnostic and the live
+    // property is UNVERIFIED. It used to PASS regardless, with the qualifier ("as recorded in the
+    // supplied document") carried in the sentence and lost in the verdict — so a complete set of
+    // local credentials plus an ordinary opposite-environment JSON file certified separation.
+    // `readActivationFacts` sets this provenance to `null` by construction: this build has no
+    // authenticated channel for such a document, which is a named software gap, not a passing check.
+    // BOTH SIDES, not one. Authenticated provenance for the REMOTE document says where that file
+    // came from; it says nothing about whose credentials the local half fingerprinted. This process
+    // reads `AUTH_SECRET` and friends out of its own environment — which is an assertion about a
+    // runner, not evidence about the deployed staging environment — so remote-only provenance was
+    // still "an unauthenticated local value differs from an authenticated remote one", reported as
+    // live separation. Each side must carry authenticated evidence bound to ITS OWN environment.
+    const expectedRemoteEnvironment = facts.topology?.document?.production?.environmentId ?? null;
+    const expectedLocalEnvironment = facts.topology?.document?.staging?.environmentId ?? null;
+    const boundTo = (provenance, environmentId) =>
+      provenance?.authenticated === true && Boolean(environmentId) && provenance.environmentId === environmentId;
+    const remoteBound = boundTo(separation.remoteProvenance, expectedRemoteEnvironment);
+    const localBound = boundTo(separation.localProvenance, expectedLocalEnvironment);
+    const unbound = [!localBound && "the local deployed credentials", !remoteBound && "the opposite-environment document"].filter(Boolean);
     checks.push(shared.length
       ? check("credential-separation", FAIL, `staging and production share credentials: ${shared.join(", ")}`)
       : incomparable.length
         ? unmeasured("credential-separation", `comparable fingerprints for ${incomparable.join("; ")}`)
-        : check("credential-separation", PASS, `all ${REQUIRED_CREDENTIAL_CLASSES.length} required credential classes differ from the opposite environment, as recorded in the supplied fingerprint document`));
+        : localBound && remoteBound
+          ? check("credential-separation", PASS, `all ${REQUIRED_CREDENTIAL_CLASSES.length} required credential classes differ, with authenticated provenance bound to ${expectedLocalEnvironment} locally and ${expectedRemoteEnvironment} remotely`)
+          : unmeasured("credential-separation", `live credential separation: all ${REQUIRED_CREDENTIAL_CLASSES.length} required classes differ as recorded, but ${unbound.join(" and ")} carry no authenticated, environment-bound provenance — this is a local diagnostic and the live property is unverified`));
   }
 
   // 11. The SHIPPED CONTRACT FILE says the schedules are disabled. This is a local configuration
@@ -386,9 +499,9 @@ export function evaluateActivation(facts = {}) {
     ? ACTIVATION_STATUS.NOT_ACTIVATED
     : checks.some((c) => c.status === UNVERIFIED)
       ? ACTIVATION_STATUS.UNVERIFIED
-      // Not "ACTIVATED": the schedule check above passes only while the automation is OFF, so the
-      // best this command can certify is that the measurable controls are correct and the system is
-      // still inert.
+      // Not "ACTIVATED": the best this command can certify is that the measurable controls are
+      // correct. It cannot add "and the system is still inert" — the schedule check reads a file in
+      // this repository, and a local contract file is not a measurement of live platform schedules.
       : ACTIVATION_STATUS.READY;
 
   return { status, checks, claims: facts.operatorClaims ?? {} };
@@ -535,22 +648,17 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
       }, notes)
     : null;
 
-  // MEASURE THE DOMAIN, THEN AUTHENTICATE TO IT. The health request carries the privileged staging
-  // token, so its destination is the origin Railway reported for the pinned environment/service —
-  // never `STAGING_ORIGIN`, which is an operator assertion and may only agree or refuse. Any of:
-  // no measured domain, no token, or a configured origin naming a different host ⇒ the request is
-  // not made at all. There is no path here that presents the token to an unbound host.
-  const boundOrigin = appDeployment?.url ?? null;
-  const configuredOrigin = normalizeOrigin(env.STAGING_ORIGIN);
-  const healthOriginMismatch = Boolean(boundOrigin && configuredOrigin && configuredOrigin !== boundOrigin);
+  // ESTABLISH THE IDENTITY, THEN AUTHENTICATE TO IT — never the other way round. `healthProbeBinding`
+  // decides the whole question (token scope, pinned environment/service, serving status, commit,
+  // domain, configured-origin agreement) before a single privileged byte leaves this process, so an
+  // unbound or unidentified target produces ZERO requests rather than one whose answer is then read
+  // as evidence about the identity it was never checked against.
+  const healthBinding = healthProbeBinding({ env, pin: stagingPin, tokenScope: tokens.staging, deployment: appDeployment });
   let appHealth = null;
-  if (healthOriginMismatch) {
-    notes.push("staging health: the configured STAGING_ORIGIN is not the measured deployment domain; no health token was presented");
-  } else if (!boundOrigin) {
-    notes.push("staging health: no measured deployment domain to bind the probe to; no health token was presented");
-  } else if (!env.STAGING_HEALTH_TOKEN) {
-    notes.push("staging health: prerequisite missing — no staging health token supplied");
+  if (!healthBinding.bound) {
+    notes.push(`staging health: ${healthBinding.refusal}; no health token was presented`);
   } else {
+    const boundOrigin = healthBinding.origin;
     appHealth = await measure("staging health", async () => {
       const response = await fetchImpl(new URL("/api/health", boundOrigin), {
         redirect: "manual",
@@ -585,10 +693,21 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
         credentialClass,
         credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID }),
       ]));
-      // The opposite side arrives as a plain JSON document. This build has no authenticated channel
-      // for one, so its PROVENANCE is unverified by construction; what the evaluator can insist on
-      // is that every entry is a well-formed fingerprint minted under the same comparison key.
-      return { local, remote: JSON.parse(readFileSync(env.OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE, "utf8")) };
+      // The opposite side arrives as a plain JSON document read off local disk. This build has no
+      // authenticated, environment-bound channel for one, so its PROVENANCE is `null` BY
+      // CONSTRUCTION — stated as a fact rather than left implicit, because the evaluator's verdict
+      // now turns on it: without provenance a difference is a local diagnostic, not live credential
+      // separation. Supplying provenance is a software gap to close, not a variable to set.
+      // Both provenances are `null` BY CONSTRUCTION. The remote side arrives as plain JSON over no
+      // authenticated channel; the LOCAL side is this process reading its own environment, which
+      // establishes what a runner holds and not what the deployed staging environment holds. Filling
+      // either is a software gap to close, not a variable to set.
+      return {
+        local,
+        remote: JSON.parse(readFileSync(env.OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE, "utf8")),
+        localProvenance: null,
+        remoteProvenance: null,
+      };
     }, notes);
   } else notes.push("credential separation: prerequisite missing — comparison key or opposite-environment fingerprint document not supplied");
 
@@ -602,7 +721,7 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
     Object.keys(env).filter((name) => name.startsWith("ACTIVATION_CLAIM_")).map((name) => [name, "claimed (not evidence)"])
   );
 
-  return { topology, tokens, runners, appDeployment, appHealth, healthOriginMismatch, credentialFingerprints, schedules, operatorClaims, notes };
+  return { topology, tokens, runners, appDeployment, appHealth, healthBinding, credentialFingerprints, schedules, operatorClaims, notes };
 }
 
 /** Human-readable, redacted. No variable values, no tokens, no connection strings. */

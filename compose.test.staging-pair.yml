@@ -195,8 +195,15 @@ services:
       network-spy: { condition: service_started }
   fixture-controller:
     <<: *runner
-    entrypoint: [node]
-    command: [scripts/staging-ops/staging-pair-fixture.mjs]
+    # The script belongs in the ENTRYPOINT, which `docker compose run` never replaces. With it in
+    # `command`, `run fixture-controller seed` REPLACED the command and the container executed
+    # `node seed` — `Cannot find module '/app/seed'`, after every database had come up healthy, so
+    # the harness looked like it had reached the fixture when it had never run it once. Each
+    # subcommand (seed/mutate/assert/assert-graph-version/corrupt-graph-version/kill-reader-lock,
+    # plus assert's version argument) is now an ARGUMENT to the script, where it reads them.
+    # The default stays "no implicit action": a bare `run fixture-controller` must not silently seed.
+    entrypoint: [node, scripts/staging-ops/staging-pair-fixture.mjs]
+    command: []
     environment:
       PROD_DATABASE_URL: postgres://app:prodpass@prod-pg:5432/brain
       STAGING_DATABASE_URL: postgres://app:stagingpass@staging-pg:5432/brain

@@ -1,19 +1,19 @@
 {
   "auth-secret": {
     "version": "hmac-sha256-v1",
-    "keyId": "compare-2026-09",
+    "keyId": "example-key",
     "credentialClass": "auth-secret",
     "mac": "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmI"
   },
   "secrets-key": {
     "version": "hmac-sha256-v1",
-    "keyId": "compare-2026-09",
+    "keyId": "example-key",
     "credentialClass": "secrets-key",
     "mac": "Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M"
   },
   "neo4j-credential": {
     "version": "hmac-sha256-v1",
-    "keyId": "compare-2026-09",
+    "keyId": "example-key",
     "credentialClass": "neo4j-credential",
     "mac": "ZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGQ"
   }
