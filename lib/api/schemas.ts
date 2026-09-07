@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  MAX_RECENT_COMMITS,
+  RECENT_COMMITS_LIMIT_MESSAGE,
+} from "./codebase-request-limits";
 
 export {
   decisionRowSchema,
@@ -345,7 +349,15 @@ export const codeMetricsSchema = z.object({
   // Brain API 1.23 adds optional, versioned commit observations. The surrounding commit object
   // stays open so legacy and additive scanner fields remain compatible; the two analytical
   // objects are deliberately closed to keep paths and source text out of the boundary.
-  recent_commits: z.array(recentCommitSchema),
+  //
+  // AUDITFIX-17: bounded at MAX_RECENT_COMMITS. The array stays REQUIRED and zero elements stay
+  // legal — this is an admission ceiling, not a new minimum. The count is taken here, on the RAW
+  // wire array, so duplicate SHAs and elements with no usable sha still count: `normalizeCommit`
+  // drops the latter and the upsert dedups the former, but only after the ingest owner has
+  // already done the work, so downstream skipping must not buy extra input budget.
+  recent_commits: z
+    .array(recentCommitSchema)
+    .max(MAX_RECENT_COMMITS, RECENT_COMMITS_LIMIT_MESSAGE),
   // explicit scaffolding inputs (required)
   has_claude_md: z.boolean(),
   has_agents_md: z.boolean(),

@@ -262,6 +262,24 @@ field stayed producer-only, so catching up needed no version bump). That version
 `test/fixtures/contract/brain-contract.json` (regenerated in lockstep with the canonical
 copy in `aios-workspace/docs/contract/`) — bump all of them together on a contract change.
 
+**The member API version is NOT the whole contract.** AUDITFIX-17 adds a **separately versioned
+request-admission supplement** for `POST /api/v1/codebases` — canonical
+`aios-workspace/docs/contract/codebase-request-limits-v1.json`, vendored and sha256-pinned at
+`test/fixtures/contract/codebase-request-limits-v1.json`, carrying its own `revision: 1` and
+`appliesFromMemberApiVersion: "1.23"`. The effective contract is therefore *the published payload
+shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` stays
+**1.23** deliberately: the canonical doc is at member 1.24, whose scanner-identity semantics this
+server does not implement, so bumping to 1.25 to advertise a size limit would claim 1.24's
+semantics by implication. A limit is a **resource-admission** change, and the canonical change
+policy names that as an explicit exception to "breaking semantics go to /v2" — precedent: the 1.20
+`rows` cap and the dated 2026-06-19 same-route full-metrics tightening. (That exception and the
+supplement are part of the same coordinated change and land in the workspace repo **first**; a
+rollback reverses the order — withdraw or supersede the canonical revision before the server stops
+enforcing, so a live normative cap never outlives the enforcement.) It is an intentional
+narrowing for oversized direct callers, not a claim that every previously accepted request still
+succeeds; every historical *valid* payload fixture is still accepted, and
+`test/guards/codebase-request-limits-contract.test.ts` proves that alongside the boundary itself.
+
 Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
 §10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is
 ALWAYS attenuated — retrieval filters to the token's live triple-intersection effective set and
@@ -550,6 +568,35 @@ uses valid server delta-seconds within that 1–60-second contract, and otherwis
 2 + 4 + 8 + 16 + 32 seconds before the final attempt. Jitter is additive and bounded to one second
 per wait, so it cannot erode the fallback's 62-second floor; the terminal response keeps its actual
 429/5xx error class and is never followed by another sleep.
+
+**Bounded admission on that path (AUDITFIX-17).** `POST /api/v1/codebases` is the only production
+caller of `ingestCodebaseScan`, which writes the codebase and the metrics snapshot and then
+projects **every** `metrics.recent_commits` element through `ingestItem`, one synchronous write
+each. The scanner itself stops at 20 recent commits, but the HTTP boundary did not, and its only
+size gate read `Content-Length` — a header a chunked request never sends. Both are now bounded,
+inclusively, at the seam:
+
+| Boundary | Limit | Failure |
+|---|---:|---|
+| `metrics.recent_commits` (counted on the raw wire array, before normalization/dedup) | 100 elements | `422 invalid_payload`, naming the field, the ceiling and the recovery |
+| bytes exposed by `Request.body` (JSON syntax, whitespace and unknown fields included) | 2,400,000 | `413 payload_too_large`, same posture |
+
+The order is **authenticate → team-tier → rate limit → bounded body read → JSON parse → schema →
+ingest → run record**, so 401/403/429 keep their precedence and their `Retry-After` and none of
+them consumes the body. `lib/api/bounded-json.readBoundedJson` sums each chunk's `byteLength`
+*before* retaining it and returns as soon as the total crosses the cap — it never calls `json()`,
+keeps the crossing chunk, or parses the oversized prefix, and it **releases** the reader lock
+rather than cancelling (unread-body cleanup is the runtime's). A `Content-Length` above the cap is
+an optimization that refuses without reading; a missing, unusable or misleadingly low one is
+ignored and the counter decides. At EOF it decodes the concatenated bytes the way `Request.json()`
+does (non-fatal UTF-8, BOM stripped), so a multibyte character split across chunks round-trips and
+no new strict-decoder rejection appears. Rejection is whole-request — never a silent truncation,
+never a retry — and reaches **no scan-domain write**: no `ingestCodebaseScan`, no projected
+commits, no `codebase.scanned` audit row and no scan-source `ingest_runs` row. Authentication's
+`api_keys.last_used_at` touch and the rate-limit bucket write still happen, as they do on every
+request. The bounds and both operator-facing messages live in
+`lib/api/codebase-request-limits.ts`; the wire limits are published in the admission supplement
+described above.
 
 ### PM progression loop — merged work → done in the primary PM tool (Linear)
 
@@ -1316,7 +1363,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/v1/conversations/:id` — API-key read of a thread's messages (owner-only)
 - `GET /api/v1/okf-bundle` — OKF link graph (tier-filtered, link redaction)
 - `POST /api/v1/actions` — request a policy-gated action (Organ 4)
-- `POST /api/v1/codebases` — ingest a codebase scan (raw metrics + scanner-scored AEM agent-readiness, persisted verbatim; team-tier key only, audited)
+- `POST /api/v1/codebases` — ingest a codebase scan (raw metrics + scanner-scored AEM agent-readiness, persisted verbatim; team-tier key only, audited; admission-bounded at 100 recent commits / 2,400,000 measured body bytes — AUDITFIX-17)
 - `GET /api/v1/integrations` — API-key read of a team's enabled integration selections; NON-SECRET only (no secret/secret_ciphertext), team-scoped, audited
 - `POST /api/v1/metrics` — ingest an AEM individual maturity daily snapshot (team-tier key only; brain recomputes canonical scores; audited)
 - `POST /api/v1/costs` — ingest external AI provider daily spend (Cursor dashboard + session-log estimates; team-tier key only; audited)

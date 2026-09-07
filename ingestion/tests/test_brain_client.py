@@ -259,3 +259,80 @@ async def test_codebase_scan_non_429_4xx_is_immediate_and_never_sleeps():
     assert sleeps == []
     assert exc.value.status_code == 422
     assert exc.value.code == "invalid_payload"
+
+
+# ——— AUDITFIX-17 / AIO-1136, AC17-09: the two admission rejections reach the operator ———
+#
+# The brain now bounds POST /api/v1/codebases at 100 `metrics.recent_commits` (422) and
+# 2,400,000 request bytes (413). Neither is transient: a retry of the identical scan fails
+# identically, so retrying only delays the operator seeing a message they must act on.
+#
+# The scanner appends at most 20 recent commits (analyzers/codebase.py), so it cannot itself
+# trip the count bound today — these cases are about what a caller DOES with the rejection, not
+# about characterizing the scanner. A future scanner may widen its window inside the admitted
+# 100 without touching this behaviour.
+#
+# These assert PRESERVED behaviour and are expected green at the AUDITFIX-17 baseline. Their job
+# is to fail if the enforcement work, or a later retry-policy change, turns a diagnosis the
+# operator needs into silent backoff — or drops the ceiling out of the message.
+
+_COUNT_MESSAGE = (
+    "metrics.recent_commits: at most 100 entries per scan; send a complete scan with a "
+    "smaller recent-commit window; do not split a snapshot across pushes"
+)
+_BYTES_MESSAGE = (
+    "body: at most 2400000 bytes per scan; reduce the scan payload and retry; do not split "
+    "a snapshot across pushes"
+)
+
+
+@pytest.mark.parametrize(
+    "status,code,message",
+    [
+        (422, "invalid_payload", _COUNT_MESSAGE),
+        (413, "payload_too_large", _BYTES_MESSAGE),
+    ],
+)
+async def test_codebase_scan_admission_rejection_surfaces_verbatim_without_retry(
+    status, code, message
+):
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, json={"error": {"code": code, "message": message}})
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        with pytest.raises(BrainError) as exc:
+            await c.push_codebase_scan({"scan": "payload"})
+
+    # One attempt, no backoff: the recovery is a smaller complete scan, not patience.
+    assert calls == 1
+    assert sleeps == []
+    assert exc.value.status_code == status
+    assert exc.value.code == code
+    # The ceiling and the recovery must survive into what the operator reads. A BrainError that
+    # says only "422" tells them nothing they can act on.
+    assert message in str(exc.value)
+
+
+async def test_codebase_scan_retry_behaviour_survives_the_new_admission_statuses():
+    """A 413 must not join the retryable set that 429/5xx are in — and they must stay in it."""
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            return httpx.Response(
+                503, json={"error": {"code": "upstream_unavailable", "message": "down"}}
+            )
+        return httpx.Response(201, json={"status": "ok"})
+
+    async with _scan_client(httpx.MockTransport(handler), sleeps) as c:
+        assert await c.push_codebase_scan({"scan": "payload"}) == {"status": "ok"}
+
+    assert len(attempts) == 2
+    assert sleeps == [2]
