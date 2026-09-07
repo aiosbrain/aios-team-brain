@@ -17,9 +17,9 @@ high performs final code review. The CLI gate is explicitly deterministic
 
 **Deps:** Lane A PR #694 is already merged into staging. Before server implementation, prepare
 and review the canonical contract edit and supplement in the isolated companion worktree; a
-companion merge is not required before local implementation. Canonical contract merges to staging
-before the brain merges to staging. Companion remote staging setup is a publication prerequisite
-owned by the coordinator, not a blocker to local spec/contract preparation.
+companion merge is not required before local implementation. The user explicitly approved merging
+the canonical companion contract to `aios-workspace` main before merging the brain to staging.
+No companion staging branch setup is required.
 
 ## Scope and outcomes
 
@@ -199,8 +199,9 @@ expected 100/101 cases and the pinned supplement, and reader/route tests must ex
 Update `docs/ARCHITECTURE.md` in this PR to describe the admission supplement and bounded codebase
 flow. Do not imply a full member-version upgrade. Companion contract edits must exist and be
 reviewed locally before server implementation; merge the canonical contract before the brain.
-All PR targets/merges are staging; companion remote staging setup gates publication only and is
-coordinator-owned. Do not require canonical merge before local code work.
+The canonical companion PR targets `aios-workspace` main, as explicitly approved by the user;
+the brain PR targets staging. Merge the canonical companion first. Do not require canonical merge
+before local code work.
 
 ## Acceptance matrix
 
@@ -267,8 +268,9 @@ never run shared destructive DB reset during parallel work. One HTTP suite provi
 proof here; an extra FakeSupabase or duplicate data-mechanics suite is unnecessary.
 
 No schema migration, new writes, background jobs, timeout promise, or request concurrency policy.
-Merge the companion contract first and brain enforcement second, both to staging. Review staging
-before any later promotion; never merge directly to main. A complete rollback is coordinated:
+Merge the companion contract to `aios-workspace` main first, as explicitly approved by the user,
+then merge brain enforcement to staging. Review Brain staging before any later promotion; this
+approval does not authorize a Brain main merge. A complete rollback is coordinated:
 first publish an explicit withdrawal/superseding resource revision and canonical doc update that
 removes this supplement's normative applicability, accepting the temporary stricter-server period;
 then revert server enforcement and update its vendored supplement/pin to the withdrawn/superseding
