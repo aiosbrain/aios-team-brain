@@ -303,8 +303,12 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   This is the same DB the app uses (self-host = one Postgres). **Read-only for diagnosis** — do NOT
   run schema loads or migrations through it (that's `npm run pg:schema` as the deploy step). Treat any
   write as production data mutation: confirm with the user first.
-- **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete`.** The Railway CLI is
-  **read-only** here (`status`, `logs`, `variables`, `deployment list`, `connect`). `railway up` deploys the current
+- **⛔ NEVER run `railway up` / `railway redeploy` / `railway down` / `railway delete` / `railway ssh`.** The Railway CLI is
+  **read-only** here (`status`, `logs`, `variables`, `deployment list`, `connect`). `ssh` joined the list for a
+  DIFFERENT reason than the four deploy verbs (STGENV-4): it deploys nothing, but it opens a **write-capable shell
+  inside a running container**, where `GRAPHITI_URL` plus one request is an unscoped whole-graph wipe against a
+  sidecar that has no authentication. The staging graph-reset runbook uses it deliberately and is marked
+  human-only — `docs/OPS.md` §11. A shell is read-only only if you never type anything into it. `railway up` deploys the current
   worktree's code to whatever project that directory is _linked_ to (`~/.railway/config.json`, keyed by
   absolute path) — and a Conductor worktree that drifted to the wrong link (an aios worktree linked to an
   unrelated project) once shipped this repo's code into that project and took it down (2026-06-27, the

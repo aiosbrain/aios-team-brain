@@ -17,7 +17,14 @@
  *
  * So provisioning verbs are conditionally allowed, never unconditionally:
  *
- *   FORBIDDEN     up · redeploy · down · delete — always, everywhere, no framing.
+ *   FORBIDDEN     up · redeploy · down · delete · ssh — always, everywhere, no framing.
+ *
+ *   `ssh` is forbidden for a DIFFERENT reason than the four deploy verbs, and it was added late
+ *   (STGENV-4). It does not deploy anything; it opens a WRITE-CAPABLE SHELL inside a running
+ *   container, where `GRAPHITI_URL` plus one request is an unscoped whole-graph wipe against a
+ *   sidecar that has no authentication. The staging graph-reset runbook uses it deliberately and is
+ *   marked human-only (docs/OPS.md §11). Classifying it "read-only" because it deploys nothing is
+ *   the mistake this entry corrects: a shell is read-only only if you never type anything into it.
  *                 Deploys reach production ONLY through Railway's GitHub integration, which is
  *                 bound to the right project in the dashboard and cannot target another.
  *   PROVISIONING  init · add · variables · domain · link · run — allowed only while standing up a
@@ -31,7 +38,7 @@
  */
 
 /** Never, under any framing. The four verbs that caused or could repeat that incident. */
-export const FORBIDDEN_VERBS = Object.freeze(["up", "redeploy", "down", "delete"]);
+export const FORBIDDEN_VERBS = Object.freeze(["up", "redeploy", "down", "delete", "ssh"]);
 
 /** Writes. Legal only against a freshly created, pinned project — see assertPinnedTarget. */
 export const PROVISIONING_VERBS = Object.freeze(["init", "add", "variables", "domain", "link", "run"]);

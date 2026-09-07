@@ -802,6 +802,87 @@ build. Please leave it as prose.
 > — which is what makes narrative arcs render there — is STGENV-4, and it re-frames the variable table
 > above. Do not set them from this section.
 
+#### Clearing staging's GRAPH after a refresh — required before re-projecting
+
+The refresh touches **one database**. It empties `graph_episodes`, and **nothing resets Neo4j**. Once
+staging's graph is wired, skipping this step means: every fact a previous run extracted stays in the
+graph with no ledger row owning it (and every delete path we have iterates that ledger, so nothing can
+ever clean it), and the next bounded run re-pushes the overlap — `addEpisodes` does not overwrite by
+name — so you pay for the same extraction twice and get two copies of every fact.
+
+Run these **in this order**:
+
+1. **Refresh Postgres** — `scripts/staging-refresh.sh`. The ledger comes back empty.
+2. **Clear staging's graph.** Human-only, one command:
+
+   ```
+   railway ssh -e staging -s aios-team-brain -- 'node scripts/staging-graph-clear.mjs'
+   ```
+
+   **Pass the remote command as ONE quoted argument.** The CLI joins everything after `--` with
+   spaces and wraps the result in its own `sh -c`, so a multi-word command loses its quoting. An
+   earlier version of this runbook used a `sh -c '…'` prefix; the pre-push review proved it executed
+   `sh -c 'sh -c echo …'`, ran a bare `echo`, and printed a refusal on a **correctly configured**
+   staging. It failed closed, and it never worked. There is also **no `curl` in the image**
+   (`node:20-bookworm-slim`, no `apt-get`) — the script uses Node's own `fetch`.
+
+   **What it does** (`scripts/staging-graph-clear.mjs`, unit-tested in
+   `test/staging-graph-clear.test.ts`): it refuses unless **BOTH** hold —
+   `RAILWAY_ENVIRONMENT_NAME` is `staging`, **and** `GRAPHITI_URL`'s host ends in
+   `.railway.internal` — then `POST`s `/clear`. Either being unset is a refusal, not an assumption.
+   Exit codes are distinct because a failure message must not lie: **0** cleared · **1** the request
+   failed (re-run and see) · **2** refused.
+
+   **Both checks are the safety argument, and neither is sufficient alone.** The host proves the
+   target is a *private* sidecar; the environment proves *which* one. In a production shell
+   `graphiti.railway.internal` is production's own sidecar and passes the host check — the first
+   version of this script shipped with only that, and review caught it. `POST /clear` is an
+   **unscoped whole-graph wipe** and the sidecar has **no authentication** — the credential you are
+   thinking of (`NEO4J_AUTH`) is Neo4j's, not the REST server's. Railway's private DNS is
+   environment-scoped, so a `*.railway.internal` host can only be *this* environment's sidecar; a
+   production one would need a public domain, which cannot spell that host. The check **parses** the
+   URL rather than matching a substring, so `https://evil.com/?x=.railway.internal` and
+   `http://a.railway.internal.evil.com` are both refused.
+
+   Both defend against **accident, not intent**: setting the environment variable by hand in a
+   production shell is a deliberate act and nothing here stops it.
+
+   **Before relying on this the first time**, confirm the shell carries the service's environment —
+   the CLI docs do not promise it, and either variable being unset is an exit-2 refusal:
+
+   ```
+   railway ssh -e staging -s aios-team-brain -- \
+     'node -p "[process.env.RAILWAY_ENVIRONMENT_NAME, process.env.GRAPHITI_URL]"'
+   ```
+
+   Both must be populated. If `RAILWAY_ENVIRONMENT_NAME` is missing, the fix is to make the shell
+   carry the service environment — **not** to set it by hand, which defeats the check.
+
+   *Not verified here:* that CLI verb is denied to agents (`.claude/settings.json`), so this
+   invocation has never been executed from this repo's tooling. The script's own logic is tested; the
+   plumbing around it is yours to confirm once.
+3. **Restart the staging app** (dashboard redeploy, or any push). Arcs are served **memory-first** and
+   a warm process keeps a non-empty prior for up to **48 hours** even after its cache row is gone, so
+   without a restart staging will show pre-reset arcs as fresh for two days.
+4. **Then** set `GRAPH_PROJECT_WINDOW_DAYS` and let the projector run.
+
+**Why that order.** Clearing *before* the refresh leaves ledger rows whose graph content is gone —
+reconcile reads that as mass disappearance and re-extracts. Clearing *after* re-projecting throws away
+extraction you just paid for.
+
+**What this step does NOT do, stated plainly:**
+
+- `POST /clear` wipes the **whole graph** on that sidecar, not one group. That is correct for staging
+  and is exactly why it must never become an application code path — a guard
+  (`test/guards/graph-clear-unreachable.test.ts`) fails the build if `/clear` ever becomes a request
+  path in `lib/` or `scripts/`, and `railway ssh` is denied to agents in `.claude/settings.json`.
+- It cannot be run safely while the sidecar's worker is still draining a pre-refresh queue: a late
+  `add_episode` will MERGE its nodes back. There is no quiescence signal today — re-run the script and
+  see whether content reappears.
+- It is **not automated and not scheduled**. Automating it is STGENV-5, and needs a real runner plus
+  identity conditions that bind the *graph* being deleted, which this manual step gets from the
+  operator instead. The reasoning is in `docs/design/staging-graph-reset.md`.
+
 ### Builtin materialization during deploy and attended recovery
 
 **STAGINGMARK-2 repairs markerless fleets during PRET-6 preDeploy**, including teams with
