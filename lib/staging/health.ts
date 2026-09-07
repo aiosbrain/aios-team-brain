@@ -3,12 +3,34 @@ import type { PoolClient } from "pg";
 import { getPool } from "@/lib/db/pg/pool";
 import { runRead } from "@/lib/graph/neo4j";
 import {
+  copiedStagingSpendAllowed,
+  interactiveQueryOptIn,
+  isCopiedStagingRuntime,
   readStagingRuntimeState,
   stagingHealthTokenMatches,
+  type StagingDataMode,
   type StagingRuntimeState,
 } from "@/lib/staging/runtime-policy";
 
 const DEFAULT_PROBE_MS = 2_500;
+
+/**
+ * What this deployment will actually do with a query, in one word.
+ *
+ * `unsupported-budgeted-mode` is deliberately distinct from `disabled`: the operator asked for the
+ * optional budgeted mode and did not get it, and a health report that answered plain `disabled`
+ * would leave them believing their configuration took effect.
+ */
+function answeringPosture(
+  mode: StagingDataMode,
+  env: NodeJS.ProcessEnv
+): "enabled" | "disabled" | "unsupported-budgeted-mode" {
+  // The MEASURED mode is authoritative, not just the environment the policy reads: a copy-ready
+  // journal must never report `enabled`, whatever the variables say.
+  const copyScoped = mode === "copy-ready" || isCopiedStagingRuntime(env);
+  if (!copyScoped && copiedStagingSpendAllowed("interactive-query", env)) return "enabled";
+  return interactiveQueryOptIn(env).status === "not-requested" ? "disabled" : "unsupported-budgeted-mode";
+}
 
 function positiveTimeout(raw: string | undefined, fallback = DEFAULT_PROBE_MS): number {
   const n = Number(raw);
@@ -89,5 +111,9 @@ export async function healthResponse(
     refreshRunId: state.runId,
     postgres: "ready",
     graph,
+    // Reported alongside `graph`, because "the graph is readable" is exactly the claim an operator
+    // could mistake for "queries work here". Model-backed answering is disabled in copy scope and
+    // the optional budgeted mode is not implemented, so this is the honest word for it.
+    answering: answeringPosture(state.mode, deps.env),
   }, { status: state.ready ? 200 : 202 });
 }

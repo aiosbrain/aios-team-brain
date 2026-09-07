@@ -57,9 +57,12 @@ describe("trusted release controller", () => {
     expect(request.mock.calls.every(([, path]) => !String(path).includes("archive") && !String(path).includes("actions/artifacts"))).toBe(true);
   });
 
-  it("refuses when Railway reports no deployment domain and none is independently verified", async () => {
+  it("refuses when Railway reports no deployment domain, and accepts no configured value for it", async () => {
     // Substituting the probed origin for a missing deployment domain makes the probe prove the very
-    // value it was handed — self-attestation, not evidence.
+    // value it was handed — self-attestation, not evidence. A repository variable named
+    // `STAGING_VERIFIED_DOMAIN` was the same substitution wearing the word "verified": it recorded
+    // an operator's belief about the domain, on the one path whose whole purpose is to not trust an
+    // unmeasured origin. Unmeasured now refuses, full stop.
     const tagSha = "a".repeat(40);
     const candidate = "b".repeat(40);
     const request = vi.fn(async (_method: string, path: string) => {
@@ -78,9 +81,16 @@ describe("trusted release controller", () => {
       repository: "owner/repo", tagName: "v1.2.3", deploymentId: "dep", requestedMode: "copy-ready",
       notes: "Validated representative access paths", copyModeActivated: true, producerIds: {},
     };
-    await expect(measureCandidate(args)).rejects.toThrow(/no independently verified staging domain/);
-    // …and an operator-supplied, independently verified domain is accepted in its place.
-    await expect(measureCandidate({ ...args, verifiedDeploymentDomain: "staging.example.com" })).resolves.toBeTruthy();
+    await expect(measureCandidate(args)).rejects.toThrow(/UNMEASURED and cannot be substituted/);
+    // The configured value has no effect: passing it still refuses.
+    await expect(measureCandidate({ ...args, verifiedDeploymentDomain: "staging.example.com" }))
+      .rejects.toThrow(/UNMEASURED and cannot be substituted/);
+    // Positive control — a MEASURED domain from the provider read is accepted, so the refusal above
+    // is about the domain's absence and not about the fixture failing somewhere else.
+    await expect(measureCandidate({
+      ...args,
+      railwayRead: vi.fn().mockResolvedValue({ id: "dep", status: "SUCCESS", url: "https://staging.example.com", commitSha: candidate }),
+    })).resolves.toBeTruthy();
   });
 
   it("distinguishes verified, failed and finite unverified production rollout after promotion", async () => {

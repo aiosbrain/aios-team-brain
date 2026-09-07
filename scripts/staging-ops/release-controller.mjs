@@ -223,8 +223,6 @@ export async function measureCandidate({
   notes,
   copyModeActivated,
   producerIds,
-  /** An operator-configured staging domain, used ONLY when Railway reports none. */
-  verifiedDeploymentDomain,
 }) {
   const encodedTag = encodeURIComponent(tagName);
   const firstRef = await githubRequest("GET", `/repos/${repository}/git/ref/tags/${encodedTag}`);
@@ -271,9 +269,14 @@ export async function measureCandidate({
   // probed. Substituting the supplied origin turned this check into self-attestation — the probe
   // proving the value we already told it. Absent means either an independently verified domain
   // (supplied and matching) or a refusal.
-  const deploymentOrigin = deployment.url ?? normalizeDeploymentOrigin(verifiedDeploymentDomain);
+  // ...and an operator-configured repository variable is not that verification either. The
+  // `STAGING_VERIFIED_DOMAIN` fallback was named "independently verified" but was a value someone
+  // typed into `vars.*`: it proves the operator's belief, not the deployment's domain, and it sat
+  // on the ONE path where the substitution's whole purpose was to avoid trusting an unmeasured
+  // origin. An absent domain is now UNMEASURED, and unmeasured refuses.
+  const deploymentOrigin = deployment.url;
   if (!deploymentOrigin) {
-    throw new Error("Railway reported no deployment domain and no independently verified staging domain was supplied; refusing to accept the probed origin as its own proof");
+    throw new Error("Railway reported no deployment domain for the candidate; the promotion evidence is UNMEASURED and cannot be substituted by a configured value");
   }
   const facts = {
     tagName,
@@ -365,7 +368,6 @@ async function main() {
         serviceId: process.env.RAILWAY_STAGING_APP_SERVICE_ID,
       }),
       healthProbe: () => probePinnedHealth({ origin: process.env.STAGING_ORIGIN, token: process.env.STAGING_HEALTH_TOKEN }),
-      verifiedDeploymentDomain: process.env.STAGING_VERIFIED_DOMAIN,
       repository: process.env.GITHUB_REPOSITORY,
       tagName: process.env.RELEASE_TAG,
       deploymentId: process.env.RELEASE_DEPLOYMENT_ID,
@@ -432,9 +434,8 @@ async function main() {
         // same absent-domain rule applies: an unverifiable origin refuses rather than falling back
         // to whatever the environment claims.
         probeHealth: (deployment) => {
-          const origin = deployment.url ?? normalizeDeploymentOrigin(process.env.PRODUCTION_VERIFIED_DOMAIN);
-          if (!origin) throw new Error("Railway reported no production deployment domain and no independently verified production domain was supplied");
-          return probeProductionHealth({ origin });
+          if (!deployment.url) throw new Error("Railway reported no production deployment domain; the observation is UNMEASURED and no configured value may stand in for it");
+          return probeProductionHealth({ origin: deployment.url });
         },
         timeoutMs: Number(process.env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
       });

@@ -21,12 +21,35 @@ describe("M4 — the raw retrieval transports honour the central spend policy", 
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("re-enables the reranker only under an explicit positive interactive budget", async () => {
+  it("does NOT re-enable the reranker for an opt-in, because no budget is enforced anywhere", async () => {
+    // The opt-in used to flip this gate on the strength of `Number(budget) > 0` alone. Nothing in
+    // the repository meters or refuses spend against that amount, so the flag authorised unbounded
+    // paid calls while reading like a ceiling.
     vi.stubEnv("STAGING_DATA_MODE", "copy-ready");
     vi.stubEnv("STAGING_QUERY_LLM_ENABLED", "true");
     vi.stubEnv("STAGING_QUERY_LLM_BUDGET_USD", "5");
+    vi.stubEnv("RERANK_URL", "https://rerank.example.test/v1/rerank");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("no outbound call is permitted"));
+    const { copiedStagingSpendAllowed, interactiveQueryOptIn } = await import("@/lib/staging/runtime-policy");
+    expect(copiedStagingSpendAllowed("interactive-query")).toBe(false);
+    expect(interactiveQueryOptIn().status).toBe("unsupported");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("denies even a forced provider key alongside the opt-in", async () => {
+    // Forced credentials plus the flag is the strongest configuration an operator can produce; the
+    // synchronous backstop is what stands between it and an outbound call.
+    vi.stubEnv("STAGING_DATA_MODE", "copy-ready");
+    vi.stubEnv("STAGING_QUERY_LLM_ENABLED", "true");
+    vi.stubEnv("STAGING_QUERY_LLM_BUDGET_USD", "Infinity");
+    vi.stubEnv("ANTHROPIC_API_KEY", "forced-key-must-not-be-used");
+    vi.stubEnv("OPENAI_API_KEY", "forced-key-must-not-be-used");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("no outbound call is permitted"));
     const { copiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
-    expect(copiedStagingSpendAllowed("interactive-query")).toBe(true);
+    const { resolveAnsweringKeys } = await import("@/lib/query/answering");
+    expect(copiedStagingSpendAllowed("interactive-query")).toBe(false);
+    await expect(resolveAnsweringKeys({} as never, "team", "interactive-query")).rejects.toThrow(/copied-staging-no-spend/);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("leaves production untouched: with no copy scope the policy allows every purpose", async () => {

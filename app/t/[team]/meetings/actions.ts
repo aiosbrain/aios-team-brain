@@ -7,6 +7,7 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { currentMember } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelDisabledResult, modelFeaturesEnabled } from "@/lib/staging/model-features";
 import {
   createMeetingNote,
   canSeeMeetingNotes,
@@ -63,6 +64,12 @@ export async function uploadMeetingNoteAction(
   const me = await currentMember(team.id);
   if (!me) return { ok: false, error: "not a member of this team" };
   if (!canSeeMeetingNotes(me.tier)) return { ok: false, error: "team-tier membership required" };
+
+  // M9: an upload's summary/attendee/action-item extraction is a model pass. On a copied staging
+  // deployment `resolveAnsweringKeys` throws inside the `Promise.all` below, which reaches the UI
+  // as an unexplained failed action — and the operator cannot tell it from a broken upload. Named
+  // outcome instead, after the membership and tier checks so it discloses nothing to a stranger.
+  if (!modelFeaturesEnabled("background")) return modelDisabledResult("background");
 
   const admin = adminClient();
   const [{ data: rosterRows }, keys] = await Promise.all([
@@ -169,6 +176,10 @@ export async function importPushedMeetingsAction(
   const { canAccessAdmin } = await import("@/lib/auth/admin-access");
   if (!canAccessAdmin(me)) return { ok: false, error: "admin access required" };
 
+  // M9: the backfill runs one extraction per un-noted transcript, so it is the most expensive
+  // model path here and has nothing to degrade to. Refuse by name, after the admin gate.
+  if (!modelFeaturesEnabled("background")) return modelDisabledResult("background");
+
   const admin = adminClient();
   const keys = await resolveAnsweringKeys(admin, team.id);
   try {
@@ -231,6 +242,10 @@ export async function extractMeetingActionItemsAction(
   const itemRow = item as { id: string; path: string; access: "team" | "external" } | null;
   if (!itemRow) return { ok: false, error: "transcript item not found" };
 
+  // M9: the action-item pass is LLM-first with a markdown-scanner fallback, but the fallback lives
+  // INSIDE the extractor and is never reached when key resolution throws first. Named refusal.
+  if (!modelFeaturesEnabled("background")) return modelDisabledResult("background");
+
   const [{ data: rosterRows }, keys] = await Promise.all([
     admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),
     resolveAnsweringKeys(admin, team.id),
@@ -282,6 +297,10 @@ export async function regenerateMeetingSummaryAction(
   const admin = adminClient();
   const note = await getMeetingNote(admin, team.id, noteId, { memberId: me.id, tier: me.tier });
   if (!note) return { ok: false, error: "meeting note not found" };
+
+  // M9: regeneration is best-effort by design — a failed model call leaves the stored summary
+  // untouched. "No model at all" is the same outcome and must read as such, not as a crash.
+  if (!modelFeaturesEnabled("background")) return modelDisabledResult("background");
 
   const [{ data: rosterRows }, keys] = await Promise.all([
     admin.from("members").select("id, display_name").eq("team_id", team.id).eq("status", "active"),

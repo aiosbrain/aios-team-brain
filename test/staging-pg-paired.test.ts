@@ -50,9 +50,35 @@ describe("section-wise paired Postgres capture/install", () => {
     expect(commands.join(" ")).not.toContain("--clean");
 
     const statements = client.query.mock.calls.map(([sql]) => String(sql));
-    expect(statements[0]).toContain("to_regclass");
-    expect(statements.slice(1, 4)).toEqual(["ROLLBACK", "DISCARD TEMP", "BEGIN"]);
+    // The transaction reset comes FIRST — before the marker read, which is the statement a real
+    // PG18 run was measured failing on with 25P02 after an aborted transactional migration. The
+    // cleanup then resets again and discards this session's temp objects before its own BEGIN.
+    expect(statements[0]).toBe("ROLLBACK");
+    expect(statements[1]).toContain("to_regclass");
+    expect(statements.slice(2, 5)).toEqual(["ROLLBACK", "DISCARD TEMP", "BEGIN"]);
     expect(statements).toContain("COMMIT");
+    // Neither reset may be widened into something that drops the fence's session state.
+    expect(statements).not.toContain("DISCARD ALL");
+  });
+
+  it("refuses to restore through a session whose transaction state cannot be reset", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "staging-restore-dead-"));
+    roots.push(directory);
+    const execImpl = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
+    // A connection that cannot even ROLLBACK is unusable; reading the marker through it would
+    // produce a 25P02 whose message says nothing about what actually went wrong.
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (String(sql) === "ROLLBACK") throw new Error("Connection terminated unexpectedly");
+        return { rows: [] };
+      }),
+      on: vi.fn(),
+    };
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl }))
+      .rejects.toThrow(/could not be reset before reading the staging marker/);
+    // Nothing destructive was attempted, and no restore command ran.
+    expect(client.query.mock.calls.map(([sql]) => String(sql))).toEqual(["ROLLBACK"]);
+    expect(execImpl).not.toHaveBeenCalled();
   });
 
   it("omits the public schema and the preserved marker from the replay list", async () => {

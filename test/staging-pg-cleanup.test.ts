@@ -116,14 +116,21 @@ describe("destructive cleanup of the public application objects", () => {
     expect(client.statements).not.toContain("DISCARD ALL");
   });
 
-  it("requeries sequences after the tables are gone", async () => {
+  it("requeries sequences after the tables are gone, and never before", async () => {
     const client = fakeClient({ relations });
     await cleanPublicApplicationObjects(client);
-    const order = client.statements.map((sql) => sql.split("\n")[0].trim());
-    const dropTables = order.findIndex((sql) => sql.startsWith("DROP TABLE"));
-    const sequenceQuery = order.findIndex((sql, index) => index > dropTables && sql.includes("SELECT c.relname"));
+    // Match on the CALL, not on a line of it: the enumeration SQL is a multi-line template whose
+    // first line is empty, so a first-line-only projection can never see it. The relkind parameter
+    // is what distinguishes the sequence enumeration from the view/table ones that share the SQL.
+    const calls = client.query.mock.calls.map(([sql, params]) => ({ sql: String(sql), kinds: (params?.[0] as string[]) ?? [] }));
+    const dropTables = calls.findIndex((call) => call.sql.startsWith("DROP TABLE"));
+    const isSequenceQuery = (call: { sql: string; kinds: string[] }) => call.sql.includes("SELECT c.relname") && call.kinds.includes("S");
     expect(dropTables).toBeGreaterThan(0);
-    expect(sequenceQuery).toBeGreaterThan(dropTables);
+    // The defect this pins: a sequence inventory CACHED before the table drop still lists the
+    // identity-owned sequences the drop has just removed, and re-dropping them aborts the whole
+    // transaction. So both halves matter — one after, and none before.
+    expect(calls.slice(0, dropTables).filter(isSequenceQuery)).toEqual([]);
+    expect(calls.slice(dropTables + 1).filter(isSequenceQuery).length).toBe(1);
     expect(client.statements).toContain('DROP SEQUENCE public."standalone_seq" RESTRICT');
   });
 

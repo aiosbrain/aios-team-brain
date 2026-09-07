@@ -86,9 +86,11 @@ jobs:
           # deployment ID alone does not identify a STAGING deployment.
           RAILWAY_STAGING_ENVIRONMENT_ID: ${{ vars.RAILWAY_STAGING_ENVIRONMENT_ID }}
           RAILWAY_STAGING_APP_SERVICE_ID: ${{ vars.RAILWAY_STAGING_APP_SERVICE_ID }}
-          # Used ONLY when Railway reports no deployment domain; never as a substitute for one.
-          STAGING_VERIFIED_DOMAIN: ${{ vars.STAGING_VERIFIED_DOMAIN }}
-          PRODUCTION_VERIFIED_DOMAIN: ${{ vars.PRODUCTION_VERIFIED_DOMAIN }}
+          # STAGING_VERIFIED_DOMAIN / PRODUCTION_VERIFIED_DOMAIN are deliberately GONE. They were a
+          # repository variable described as an "independently verified domain" — i.e. a value an
+          # operator typed, standing in for the one fact the promotion evidence must MEASURE. When
+          # Railway reports no deployment domain the evidence is unmeasured and the controller
+          # refuses; it does not accept a claim in its place.
         run: node scripts/staging-ops/release-controller.mjs --run
       - uses: actions/upload-artifact@v4
         if: always()

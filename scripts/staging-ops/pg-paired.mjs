@@ -158,6 +158,34 @@ const TYPES_SQL = `
 const quoted = (name) => `"${String(name).replaceAll('"', '""')}"`;
 
 /**
+ * Reset THIS session's aborted transaction, and report whether it worked.
+ *
+ * A loader/restore failure inside a transaction leaves the connection in Postgres' aborted state:
+ * every subsequent statement on it fails with `25P02 current transaction is aborted, commands
+ * ignored until end of transaction block` — measured against PG18 with a deliberately failing
+ * transactional migration, where the next thing to break was the recovery path's own
+ * `readMarkerSnapshot`. So the reset has to come BEFORE any journal, advisory-lock or marker SQL,
+ * not only inside the destructive cleanup.
+ *
+ * Deliberately just `ROLLBACK`, on the SAME backend:
+ *   - `DISCARD ALL` would drop the session advisory locks the whole fence is built on,
+ *   - reconnecting would drop them too and change the backend PID the stop-proof is bound to,
+ *   - `pg_advisory_unlock_all` would release another holder's fence.
+ * A `ROLLBACK` outside a transaction is a no-op warning, so this is safe to call defensively.
+ *
+ * It returns a verdict instead of throwing because the CALLER's decision depends on it: a session
+ * that cannot be reset cannot perform a rollback, and must never be reported as having done one.
+ */
+export async function resetSessionTransactionState(client) {
+  try {
+    await client.query("ROLLBACK");
+    return { status: "reset" };
+  } catch (error) {
+    return { status: "reset-failed", detail: String(error instanceof Error ? error.message : error).slice(0, 300) };
+  }
+}
+
+/**
  * Read the preserved marker's exact identity and contents so its survival can be VERIFIED — not
  * assumed — after the restore. Returns null when the target has no marker (production shape).
  */
@@ -268,6 +296,15 @@ async function replaceFromArchive({
   client, databaseUrl, archive, directory, listName, omitTables,
   execImpl, pgRestore, betweenDataAndPostData, verifiedStagingTarget,
 }) {
+  // Defensive entry reset. A REPEATED restore through this same client — the rollback that follows
+  // a failed refresh, or a daemon's second tick — can arrive with the connection still in the
+  // aborted state left by whatever failed, and the very first statement here is a marker read. The
+  // cleanup below resets again before its own transaction; both are needed, because the marker read
+  // happens first and is the statement PG18 was measured failing on.
+  const entry = await resetSessionTransactionState(client);
+  if (entry.status !== "reset") {
+    throw new Error(`the restore session could not be reset before reading the staging marker (${entry.detail}); refusing to restore through an unusable connection`);
+  }
   const marker = await readMarkerSnapshot(client);
   const { listPath } = await writeFilteredList({ archive, directory, name: listName, omitTables, execImpl, pgRestore });
   await cleanPublicApplicationObjects(client);

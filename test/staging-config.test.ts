@@ -8,19 +8,28 @@ import {
   type StagingTopology,
 } from "../scripts/staging-ops/config.mjs";
 
+/**
+ * The MEASURED production shape, which the previous per-role distinctness rule refused outright:
+ * one project, two environments, and the SAME global service IDs on both sides. A Railway service
+ * ID names a service definition, not a deployment of it — the same service is deployed into every
+ * environment of its project — so requiring the IDs to differ demanded duplicate resources and
+ * rejected a correctly isolated topology with four errors.
+ */
 const GOOD: StagingTopology = {
   repositoryDefaultBranch: "staging",
   contributionBranch: "staging",
   staging: {
     projectId: "project-a",
     environmentId: "environment-staging",
-    appServiceId: "app-staging",
-    graphitiServiceId: "graphiti-staging",
-    postgresServiceId: "postgres-staging",
-    neo4jServiceId: "neo4j-staging",
+    appServiceId: "service-app",
+    graphitiServiceId: "service-graphiti",
+    postgresServiceId: "service-postgres",
+    neo4jServiceId: "service-neo4j",
     appSourceBranch: "staging",
-    postgresHost: "postgres-staging.railway.internal",
-    neo4jHost: "neo4j-staging.railway.internal",
+    // Railway's private DNS is environment-scoped, so identical names on both sides address
+    // different databases. Neither identical nor distinct names are evidence either way.
+    postgresHost: "postgres.railway.internal",
+    neo4jHost: "neo4j.railway.internal",
     variableReferences: {
       DATABASE_URL: "${{Postgres.DATABASE_URL}}",
       NEO4J_URL: "bolt://${{neo4j.RAILWAY_PRIVATE_DOMAIN}}:7687",
@@ -29,13 +38,13 @@ const GOOD: StagingTopology = {
   production: {
     projectId: "project-a",
     environmentId: "environment-production",
-    appServiceId: "app-production",
-    graphitiServiceId: "graphiti-production",
-    postgresServiceId: "postgres-production",
-    neo4jServiceId: "neo4j-production",
+    appServiceId: "service-app",
+    graphitiServiceId: "service-graphiti",
+    postgresServiceId: "service-postgres",
+    neo4jServiceId: "service-neo4j",
     appSourceBranch: "main",
-    postgresHost: "postgres-production.railway.internal",
-    neo4jHost: "neo4j-production.railway.internal",
+    postgresHost: "postgres.railway.internal",
+    neo4jHost: "neo4j.railway.internal",
     variableReferences: {
       DATABASE_URL: "${{Postgres.DATABASE_URL}}",
       NEO4J_URL: "bolt://${{neo4j.RAILWAY_PRIVATE_DOMAIN}}:7687",
@@ -44,16 +53,35 @@ const GOOD: StagingTopology = {
 };
 
 describe("staging topology preflight", () => {
-  it("accepts the exact staging/main binding with distinct services and internal hosts", () => {
+  it("accepts one project with two environments sharing global service IDs", () => {
     expect(preflightStagingTopology(GOOD)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("still accepts genuinely separate projects and services", () => {
+    // The correction widens what is accepted; it must not narrow it. A two-project topology is
+    // also isolated and must keep passing.
+    const separate = structuredClone(GOOD);
+    separate.production.projectId = "project-b";
+    for (const role of ["appServiceId", "graphitiServiceId", "postgresServiceId", "neo4jServiceId"] as const) {
+      separate.production[role] = `${separate.production[role]}-b`;
+    }
+    expect(preflightStagingTopology(separate)).toEqual({ ok: true, errors: [] });
   });
 
   it.each([
     ["repository default", (x: StagingTopology) => (x.repositoryDefaultBranch = "main")],
     ["staging source", (x: StagingTopology) => (x.staging.appSourceBranch = "main")],
     ["production source", (x: StagingTopology) => (x.production.appSourceBranch = "staging")],
-    ["shared Postgres", (x: StagingTopology) => (x.staging.postgresServiceId = x.production.postgresServiceId)],
-    ["shared Neo4j", (x: StagingTopology) => (x.staging.neo4jServiceId = x.production.neo4jServiceId)],
+    // The identity that must differ is the ENVIRONMENT: one environment holding both sides is the
+    // topology where staging and production genuinely share a database.
+    ["shared environment", (x: StagingTopology) => (x.staging.environmentId = x.production.environmentId)],
+    // Role aliasing inside ONE environment. Not implied by the environment check: both sides can
+    // have distinct environments while a side pins two incompatible roles to one instance, which
+    // means at least one of them is not the service the preflight believes it is.
+    ["Postgres aliased to Neo4j", (x: StagingTopology) => (x.staging.neo4jServiceId = x.staging.postgresServiceId)],
+    ["app aliased to Graphiti", (x: StagingTopology) => (x.production.graphitiServiceId = x.production.appServiceId)],
+    ["missing staging environment", (x: StagingTopology) => (x.staging.environmentId = "")],
+    ["missing production project", (x: StagingTopology) => (x.production.projectId = "")],
     ["public target host", (x: StagingTopology) => (x.staging.neo4jHost = "neo4j.example.com")],
     ["wrong variable reference", (x: StagingTopology) => (x.staging.variableReferences.DATABASE_URL = "postgres://literal")],
   ])("refuses %s drift without echoing connection strings", (_name, mutate) => {
@@ -63,6 +91,15 @@ describe("staging topology preflight", () => {
     expect(result.ok).toBe(false);
     expect(result.errors.length).toBeGreaterThan(0);
     expect(result.errors.join(" ")).not.toContain("postgres://literal");
+  });
+
+  it("compares the whole instance tuple, so an aliasing report names both roles", () => {
+    const fixture = structuredClone(GOOD);
+    fixture.staging.neo4jServiceId = fixture.staging.postgresServiceId;
+    const { errors } = preflightStagingTopology(fixture);
+    expect(errors).toContain("staging postgresServiceId and neo4jServiceId resolve to the same service instance");
+    // ...and it does NOT complain about the production side, whose identical global IDs are fine.
+    expect(errors.filter((e: string) => e.startsWith("production"))).toEqual([]);
   });
 });
 

@@ -27,7 +27,15 @@ export function validateGraphShape(graph) {
 export function sanitizeGraphExport(graph, { episodeAllowed }) {
   validateGraphShape(graph);
   const original = new Map(graph.nodes.map((node) => [node.exportId, node]));
-  const retainedEpisodes = new Map();
+  // TWO indexes, deliberately. Membership is export-local; provenance is (group, uuid).
+  //
+  // A single UUID-keyed map conflated them, and the spec explicitly forbids assuming UUID
+  // uniqueness across groups — the replay schema indexes on `(group_id, uuid)` for exactly that
+  // reason. Measured on the recovered source: two eligible episodes with equal UUIDs in different
+  // groups produced ONE sanitized node with `excludedEpisodes: 0` (silent loss inside the helper),
+  // and the exporter's ledger validation then refused to publish a valid export.
+  const retainedEpisodes = new Map();          // exportId → node
+  const retainedByGroup = new Map();           // group_id → Map<uuid, node>  (nested, so no delimiter can be forged)
   let excludedCommunities = 0;
   let excludedEpisodes = 0;
   for (const node of graph.nodes) {
@@ -36,12 +44,20 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
       if (!episodeAllowed(node)) { excludedEpisodes += 1; continue; }
       const uuid = node.properties?.uuid;
       if (typeof uuid !== "string" || !uuid) throw new Error("retained episode is missing uuid");
-      retainedEpisodes.set(uuid, node);
+      const group = node.properties?.group_id;
+      if (typeof group !== "string" || !group) throw new Error(`retained episode ${node.exportId} carries no group identity; refusing to place it in the provenance index`);
+      retainedEpisodes.set(node.exportId, node);
+      let byUuid = retainedByGroup.get(group);
+      if (!byUuid) { byUuid = new Map(); retainedByGroup.set(group, byUuid); }
+      // WITHIN one group a UUID must name exactly one episode: two would make every fact citing it
+      // ambiguous. Refuse rather than overwrite — overwriting is precisely the defect above.
+      if (byUuid.has(uuid)) throw new Error(`two retained episodes share uuid ${uuid} within group ${group}; refusing an ambiguous provenance index`);
+      byUuid.set(uuid, node);
     }
   }
 
   const relationships = [];
-  const incident = new Set([...retainedEpisodes.values()].map((node) => node.exportId));
+  const incident = new Set(retainedEpisodes.keys());
   let excludedMixedProvenanceFacts = 0;
   let excludedEmptyProvenanceFacts = 0;
   for (const rel of graph.relationships) {
@@ -49,13 +65,20 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
     if (rel.type === "RELATES_TO") {
       const provenance = rel.properties?.episodes;
       if (!Array.isArray(provenance) || provenance.length === 0) { excludedEmptyProvenanceFacts += 1; continue; }
-      if (provenance.some((uuid) => !retainedEpisodes.has(uuid))) { excludedMixedProvenanceFacts += 1; continue; }
       const start = original.get(rel.start);
       const end = original.get(rel.end);
       const group = rel.properties?.group_id;
-      if (!group || start?.properties?.group_id !== group || end?.properties?.group_id !== group || provenance.some((uuid) => retainedEpisodes.get(uuid)?.properties?.group_id !== group)) {
+      // Ownership is established FIRST, because the provenance lookup below is scoped by it: a fact
+      // whose group cannot be established has no scope to resolve within, and guessing one is how a
+      // node from another group gets published. Missing or inconsistent identity refuses.
+      if (typeof group !== "string" || !group || start?.properties?.group_id !== group || end?.properties?.group_id !== group) {
         throw new Error(`fact ${rel.properties?.uuid ?? "unknown"} has inconsistent group ownership`);
       }
+      // Provenance resolves ONLY inside this fact's own group. An equal UUID in another group —
+      // retained or excluded — never authorises it, so authorisation cannot be borrowed across
+      // groups even when the two episodes are indistinguishable by UUID.
+      const withinGroup = retainedByGroup.get(group);
+      if (provenance.some((uuid) => typeof uuid !== "string" || !withinGroup?.has(uuid))) { excludedMixedProvenanceFacts += 1; continue; }
       relationships.push({ ...rel, properties: cloneProperties(rel.properties) });
       incident.add(rel.start); incident.add(rel.end);
     }
@@ -66,7 +89,7 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
   // (an entity becomes incident via any retained fact) and then copies whatever that entity mentions
   // — including a node in another group. Require: a RETAINED EPISODIC start, an Entity end, and one
   // non-empty group shared by both.
-  const retainedEpisodeIds = new Set([...retainedEpisodes.values()].map((node) => node.exportId));
+  const retainedEpisodeIds = new Set(retainedEpisodes.keys());
   let excludedIneligibleMentions = 0;
   for (const rel of graph.relationships) {
     if (rel.type !== "MENTIONS") continue;

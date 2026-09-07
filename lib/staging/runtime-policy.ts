@@ -23,7 +23,74 @@ export function stagingModeFromEnvironment(env: NodeJS.ProcessEnv = process.env)
   return null;
 }
 
-/** Synchronous spend backstop for raw transports which may otherwise fall back to process env keys. */
+/**
+ * Whether this build can honour the spec's OPTIONAL "separately budgeted interactive queries" mode.
+ *
+ * It cannot, and saying so in one place is the point. `STAGING_QUERY_LLM_BUDGET_USD` is read by
+ * exactly one expression in this repository — the gate below — and by nothing that meters, reserves
+ * or refuses spend against it. The provider paths carry token, rate and retry budgets and report
+ * usage after the fact; none of them is a dollar ceiling. So a configured positive amount was never
+ * an enforced cap, it was a permission bit wearing a number's clothes, and the previous
+ * `Number(...) > 0` test additionally accepted `Infinity`.
+ *
+ * Building a metering/reservation layer to back it is a separate piece of work with its own review;
+ * inventing one here would be worse than the gap. Until such a contract exists and is demonstrably
+ * enforced, the optional mode is UNSUPPORTED and copied staging serves direct graph/FTS retrieval
+ * with no model calls at all — which is the specified DEFAULT behaviour, not a degradation of it.
+ */
+export const BUDGETED_INTERACTIVE_QUERY_SUPPORTED: boolean = false;
+
+/** The one name every surface uses for this refusal, so preflight, health and docs cannot drift. */
+export const UNSUPPORTED_BUDGETED_MODE = "staging-budgeted-interactive-query-unsupported";
+
+/** A configured ceiling above this is not a ceiling; it is an unbounded authorisation. */
+const MAX_INTERACTIVE_BUDGET_USD = 10_000;
+
+export interface InteractiveQueryOptIn {
+  /** The operator asked for the optional mode. */
+  optedIn: boolean;
+  status: "not-requested" | "invalid-budget" | "unsupported";
+  budgetUsd: number | null;
+  reason: string | null;
+}
+
+/**
+ * Classify the optional interactive-query configuration WITHOUT authorising anything.
+ *
+ * Note there is no `"valid"` outcome: a well-formed opt-in is still `"unsupported"` while
+ * {@link BUDGETED_INTERACTIVE_QUERY_SUPPORTED} is false. The amount is still parsed and bounds-checked
+ * so the refusal can say which of the two problems it is — a malformed budget or an unimplemented
+ * mode — and so a future implementation inherits the validation rather than the `> 0` test.
+ */
+export function interactiveQueryOptIn(env: NodeJS.ProcessEnv = process.env): InteractiveQueryOptIn {
+  if (env.STAGING_QUERY_LLM_ENABLED !== "true") {
+    return { optedIn: false, status: "not-requested", budgetUsd: null, reason: null };
+  }
+  const raw = (env.STAGING_QUERY_LLM_BUDGET_USD ?? "").trim();
+  const amount = raw === "" ? Number.NaN : Number(raw);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_INTERACTIVE_BUDGET_USD) {
+    return {
+      optedIn: true,
+      status: "invalid-budget",
+      budgetUsd: null,
+      reason: `STAGING_QUERY_LLM_BUDGET_USD must be a finite amount in (0, ${MAX_INTERACTIVE_BUDGET_USD}]; Infinity, NaN, blank, zero and negative values are refused`,
+    };
+  }
+  return {
+    optedIn: true,
+    status: "unsupported",
+    budgetUsd: amount,
+    reason: `${UNSUPPORTED_BUDGETED_MODE}: no component of this build enforces a dollar ceiling, so a configured budget of ${amount} USD authorises nothing; copied staging answers from direct graph/FTS retrieval with no model calls`,
+  };
+}
+
+/**
+ * Synchronous spend backstop for raw transports which may otherwise fall back to process env keys.
+ *
+ * In copy scope this returns false for EVERY purpose, including `interactive-query`: see
+ * {@link BUDGETED_INTERACTIVE_QUERY_SUPPORTED}. Forced provider keys, a `true` flag and any budget
+ * value — finite, `Infinity` or otherwise — all land here.
+ */
 export function copiedStagingSpendAllowed(
   purpose: "interactive-query" | "background" | "graph-extraction" | "embedding" | "image",
   env: NodeJS.ProcessEnv = process.env
@@ -31,7 +98,11 @@ export function copiedStagingSpendAllowed(
   const copyScoped = isPinnedStagingEnvironment(env) || env.STAGING_DATA_MODE === "copy-ready";
   if (!copyScoped) return true;
   if (purpose !== "interactive-query") return false;
-  return env.STAGING_QUERY_LLM_ENABLED === "true" && Number(env.STAGING_QUERY_LLM_BUDGET_USD ?? 0) > 0;
+  if (!BUDGETED_INTERACTIVE_QUERY_SUPPORTED) return false;
+  // Reached only once an enforced budget contract exists; a well-formed opt-in is necessary then,
+  // and still not sufficient on its own — the contract itself has to authorise the call.
+  const optIn = interactiveQueryOptIn(env);
+  return optIn.optedIn && optIn.status !== "invalid-budget";
 }
 
 export function isCopiedStagingRuntime(env: NodeJS.ProcessEnv = process.env): boolean {

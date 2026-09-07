@@ -17,9 +17,10 @@ import {
   hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark,
 } from "./journal.mjs";
 import { assertActionConfiguration } from "./action-preflight.mjs";
+import { assertActivated, runActivationPreflight } from "./activation-preflight.mjs";
 import { assertStagingTopology } from "./config.mjs";
 import { replaceNeo4jGraph, assertReplaceTarget } from "./neo4j-replace.mjs";
-import { captureRollbackPostgres, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
+import { captureRollbackPostgres, resetSessionTransactionState, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
 import { canonicalObjectId, createPrivateStore, parseCanonicalObjectId } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
@@ -34,6 +35,24 @@ import { keyMaterial } from "./key-material.mjs";
 const exec = promisify(execFile);
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const FULL_SHA = /^[0-9a-f]{40}$/i;
+
+const errorText = (error) => String(error instanceof Error ? error.message : error);
+
+/**
+ * Run one best-effort recovery step and RECORD its failure instead of swallowing it.
+ *
+ * These steps are individually non-fatal — a journal transition whose `from` state no longer
+ * matches, a lock release on a lock that is already gone — which is why they were `.catch(() => {})`.
+ * But the same swallow also hid the case that matters: every one of them failing at once because
+ * the session is in an aborted transaction, while the caller went on to report a successful
+ * rollback. Collected notes travel into the thrown message so the operator sees what did not happen.
+ */
+async function recoveryStep(label, action, notes) {
+  try { await action(); return true; }
+  catch (error) { notes.push(`${label} failed: ${errorText(error).slice(0, 200)}`); return false; }
+}
+
+const withNotes = (message, notes) => (notes.length ? `${message} [recovery notes: ${notes.join("; ")}]` : message);
 
 function sourceKeys(env) {
   return {
@@ -314,13 +333,28 @@ async function acquireExclusiveDataUseLock(client, env, context, { sleep = (ms) 
   }
 }
 
-async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env }) {
-  await transitionJournal(client, { runId: failedRunId, from: ["failed", "booting", "importing", "verifying", "draining"], to: "draining", patch: { lastSafeCheckpoint: "rollback" } }).catch(() => {});
-  await maintenance.stopAndVerifyAll();
-  await acquireExclusiveDataUseLock(client, env, "rollback");
-  const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
-  const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
+export async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env, notes = [] }) {
+  // FIRST statement of the recovery path, before the journal write, before the advisory lock, and
+  // before the marker read inside the restore. Whatever failed may have left this connection in an
+  // aborted transaction, in which case all three fail — and the pre-existing `.catch(() => {})`
+  // around the journal write made two of those failures invisible.
+  const reset = await resetSessionTransactionState(client);
+  if (reset.status !== "reset") {
+    notes.push(`session reset failed: ${reset.detail}`);
+    await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting", "failed", "ready"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    throw new Error(withNotes("the importer's database session is unusable, so NO rollback was attempted; staging remains fenced and recovery is required", notes));
+  }
+  let driver = null;
+  let session = null;
   try {
+    // Stopping the services and reacquiring the exclusive lock used to sit OUTSIDE this block, so a
+    // failure in either escaped raw — after the services were already stopped — and neither reached
+    // the recovery-required checkpoint below nor said what state staging had been left in.
+    await recoveryStep("draining journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["failed", "booting", "importing", "verifying", "draining"], to: "draining", patch: { lastSafeCheckpoint: "rollback" } }), notes);
+    await maintenance.stopAndVerifyAll();
+    await acquireExclusiveDataUseLock(client, env, "rollback");
+    driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
+    session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     if (env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_ROLLBACK === "1") throw new Error("injected harness rollback failure");
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["draining", "failed"], to: "importing" });
     const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance }));
@@ -331,11 +365,15 @@ async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollba
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
     await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
     await rollbackStore.writePointer("last-ready", { runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, kind: prior.kind });
-    return { status: "rolled-back", runId: prior.manifest.runId };
+    return { status: "rolled-back", runId: prior.manifest.runId, recoveryNotes: notes };
   } catch (error) {
-    await transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }).catch(() => {});
-    throw new Error(`paired rollback failed; staging remains fenced and recovery is required: ${error instanceof Error ? error.message : String(error)}`);
-  } finally { await session.close(); await driver.close(); }
+    // The checkpoint write is itself SQL on a connection that has just failed, so reset again and
+    // report whether the checkpoint actually landed rather than assuming it did.
+    const checkpointReset = await resetSessionTransactionState(client);
+    if (checkpointReset.status !== "reset") notes.push(`session reset before the recovery checkpoint failed: ${checkpointReset.detail}`);
+    await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    throw new Error(withNotes(`paired rollback failed; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
+  } finally { await session?.close(); await driver?.close(); }
 }
 
 async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env }) {
@@ -410,10 +448,23 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     } finally { await session.close(); await driver.close(); }
   } catch (error) {
     if (!destructive) throw error;
-    await transitionJournal(client, { runId: opened.manifest.runId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "ready" } }).catch(() => {});
-    try { await releaseDataUseLock(client, "exclusive"); } catch {}
-    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env });
-    throw new Error(`paired refresh failed and the prior pair was restored: ${error instanceof Error ? error.message : String(error)}`);
+    const notes = [];
+    // BEFORE the journal write and BEFORE the lock release, both of which are SQL on the connection
+    // the failed loader/restore may have left in an aborted transaction. Measured on PG18: with the
+    // reset missing, this transition and the release both fail silently and the rollback path then
+    // fails on its own first statement — while the message below still said the prior pair had been
+    // restored. The lock is released on the SAME backend, so the reset must not reconnect.
+    const reset = await resetSessionTransactionState(client);
+    if (reset.status !== "reset") notes.push(`session reset failed: ${reset.detail}`);
+    const usable = reset.status === "reset";
+    await recoveryStep("failed-state journal transition", () => transitionJournal(client, { runId: opened.manifest.runId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: usable ? "ready" : "recovery-required" } }), notes);
+    await recoveryStep("exclusive data-use lock release", () => releaseDataUseLock(client, "exclusive"), notes);
+    if (!usable) {
+      // Never call a rollback the session cannot execute, and never describe one that did not run.
+      throw new Error(withNotes(`paired refresh failed and the importer's database session could not be reset, so the prior pair was NOT restored; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
+    }
+    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes });
+    throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
   }
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
@@ -484,7 +535,13 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
     await markReady(client, { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
     return { status: "bootstrapped", runId, objectId: created.objectId, commit: current.commit, mode };
   } catch (error) {
-    await releaseDataUseLock(client, "exclusive").catch(() => {});
+    const notes = [];
+    // Same ordering rule as the refresh path: the capture holds a read-only transaction on this
+    // client, so a failure inside it can leave the session aborted and every recovery statement
+    // below — the lock release and both journal transitions — would fail invisibly.
+    const reset = await resetSessionTransactionState(client);
+    if (reset.status !== "reset") notes.push(`session reset failed: ${reset.detail}`);
+    await recoveryStep("exclusive data-use lock release", () => releaseDataUseLock(client, "exclusive"), notes);
     // Bootstrap performs no destructive database write, so recovery is exactly "put the UNCHANGED
     // deployment back". Two things this has to get right:
     //  - the journal must ADMIT that restart. Going straight to `failed` fences the very process
@@ -498,12 +555,12 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env }) {
       const deploymentId = await maintenance.deployApp(current.commit);
       await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
       restored = true;
-    } catch { restored = false; }
-    await transitionJournal(client, {
+    } catch (restoreError) { restored = false; notes.push(`deployment restart failed: ${errorText(restoreError).slice(0, 200)}`); }
+    await recoveryStep("bootstrap checkpoint journal transition", () => transitionJournal(client, {
       runId, from: ["draining", "booting", "failed"], to: "failed",
       patch: { lastSafeCheckpoint: restored ? "bootstrap-failed-prior-restored" : "recovery-required" },
-    }).catch(() => {});
-    throw new Error(`${error instanceof Error ? error.message : String(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — run `importer rollback` or restore the deployment explicitly"})`);
+    }), notes);
+    throw new Error(withNotes(`${errorText(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — run `importer rollback` or restore the deployment explicitly"})`, notes));
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
@@ -623,9 +680,19 @@ export async function importerPreflight(env = process.env, action = "install") {
   return true;
 }
 
-export async function runImporter(env = process.env, argv = process.argv.slice(2)) {
+export async function runImporter(env = process.env, argv = process.argv.slice(2), { activationRunner = runActivationPreflight } = {}) {
   const action = argv[0];
-  if (!new Set(["install-ops", "verify", "install", "bootstrap-rollback", "rollback", "tick", "daemon"]).has(action)) throw new Error("importer action must be install-ops, verify, install, bootstrap-rollback, rollback, tick, or daemon");
+  if (!new Set(["install-ops", "verify", "install", "bootstrap-rollback", "rollback", "tick", "daemon", "activation-preflight"]).has(action)) throw new Error("importer action must be install-ops, verify, install, bootstrap-rollback, rollback, tick, daemon, or activation-preflight");
+  // The activation verifier is READ-ONLY and needs no database, no locks and no runner role: it is
+  // the check an operator runs BEFORE any of this is turned on, and making it depend on the runtime
+  // it is supposed to authorise would be circular. It refuses on `UNVERIFIED` as well as on
+  // `NOT ACTIVATED` — "we could not look" is not permission.
+  if (action === "activation-preflight") {
+    const result = await activationRunner(env);
+    console.log(result.report);
+    assertActivated(result);
+    return { status: result.status, checks: result.checks };
+  }
   await importerPreflight(env, action);
   const client = new pg.Client({ connectionString: env.DATABASE_URL }); await client.connect();
   let shuttingDown = false;

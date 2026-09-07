@@ -527,6 +527,11 @@ function reconcileShape(rel: string, src: ts.SourceFile): { calls: number; insid
  */
 const WALKED = ["app", "components", "lib", "scripts"] as const;
 const NOT_WALKED: Record<string, string> = {
+  // Added by the staging paired-refresh work: runner env EXAMPLES and the schedule/storage
+  // contract. Declarative data with no executable source — nothing here can write an item. The
+  // guard did its job: this directory arrived unclassified and failed the build until someone said
+  // which list it belongs in.
+  config: "runner configuration examples + the schedules/storage contract (no executable source)",
   docker: "container bootstrap (.mjs/.sh); calls the drain rather than the writer",
   docs: "prose",
   fixtures: "test data",

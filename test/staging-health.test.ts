@@ -54,7 +54,28 @@ describe("deployment health", () => {
       refreshRunId: "run-42",
       postgres: "ready",
       graph: "readable",
+      // "the graph is readable" is not "queries work here", and the two sat one line apart with
+      // only the first of them reported.
+      answering: "disabled",
     });
+  });
+
+  it("distinguishes an unimplemented budgeted opt-in from a plain disabled default", async () => {
+    // An operator who set the flag and a positive amount must not read `disabled` and conclude
+    // their configuration took effect: nothing in this build enforces the amount.
+    const token = "t".repeat(32);
+    const response = await healthResponse(new Request("http://brain/api/health", {
+      headers: { "x-aios-staging-health-token": token },
+    }), {
+      probePostgres: vi.fn().mockResolvedValue(true),
+      readRuntimeState: vi.fn().mockResolvedValue({ mode: "copy-ready", ready: true, runId: "run-42" }),
+      probeNeo4j: vi.fn().mockResolvedValue(true),
+      env: {
+        STAGING_HEALTH_TOKEN: token, RAILWAY_GIT_COMMIT_SHA: "candidate-sha",
+        STAGING_DATA_MODE: "copy-ready", STAGING_QUERY_LLM_ENABLED: "true", STAGING_QUERY_LLM_BUDGET_USD: "25",
+      },
+    });
+    expect(await response.json()).toMatchObject({ answering: "unsupported-budgeted-mode" });
   });
 
   it("never calls Neo4j or claims ready while the copy journal is not ready", async () => {
