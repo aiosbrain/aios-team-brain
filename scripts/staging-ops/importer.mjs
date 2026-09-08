@@ -484,8 +484,37 @@ export async function readStagingHead(env = process.env, fetchImpl = fetch) {
   return commit;
 }
 
-async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bootProbe, accept, fetchImpl, timeoutMs, sleep, description }) {
-  const deadline = Date.now() + timeoutMs;
+const HEALTH_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Wait between probes without sleeping THROUGH a cancellation.
+ *
+ * Only the injected timer is left unsettled here. Every owned read and lifecycle call in the poll
+ * below is awaited to completion before the loop consults the signal again, so cancellation never
+ * abandons an in-flight deployment read or health response.
+ */
+function abortableSleep(sleep, ms, signal) {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => { signal.removeEventListener("abort", finish); resolve(); };
+    signal.addEventListener("abort", finish, { once: true });
+    Promise.resolve(sleep(ms)).then(finish, finish);
+  });
+}
+
+/**
+ * @param {object} args
+ * @param {AbortSignal} [args.signal] the OWNING phase's cancellation scope (action, tick or the
+ *   transferred recovery scope) — never a fresh one, and never an unrelated invocation's.
+ * @param {object} [args.budget] the owning operation budget; the poll spends what REMAINS of it.
+ */
+async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bootProbe, accept, fetchImpl, timeoutMs, sleep, description, operation = description, signal, budget }) {
+  // The health wait spends the owning operation's REMAINING time rather than a fresh independent
+  // allowance: a five-minute poll begun at minute fourteen of a fifteen-minute budget outlives the
+  // operation that authorised it, and the ready commit it leads to would be submitted after that
+  // operation's own deadline had passed.
+  const deadline = Date.now() + remainingBudgetMs(budget, timeoutMs, operation);
   // WHY DID IT KEEP POLLING? The `.catch(() => null)` below swallows every fetch failure, so a
   // health probe that timed out on every attempt and one that answered 503 every time produced the
   // SAME message — which is why runtime 4's "bootstrap timed out" could not be attributed to any
@@ -494,6 +523,10 @@ async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bo
   const observed = { attempts: 0, lastDeploymentStatus: null, lastResponseStatus: null, lastFetchError: null, lastBodyOk: null };
   const startedAt = Date.now();
   while (Date.now() <= deadline) {
+    // Cancellation is checked BEFORE a new observation and again after each awaited one. Without
+    // this the poll kept retrying to the health ceiling after the owning operation had already been
+    // told to stop, and then accepted whatever answer arrived.
+    assertNotCancelled(signal, operation);
     observed.attempts += 1;
     const deployment = await maintenance.readDeployment(deploymentId);
     observed.lastDeploymentStatus = deployment.status ?? null;
@@ -508,18 +541,29 @@ async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bo
       });
       throw new Error(`fresh staging deployment failed in ${deployment.status} (pid ${life.pid ?? "unknown"}, exit ${life.exitCode ?? "none"}${life.exitSignal ? `/${life.exitSignal}` : ""}${life.spawnError ? `, spawn error ${life.spawnError}` : ""})`);
     }
+    // After the awaited deployment observation, and after the dead-deployment diagnosis above so a
+    // genuinely dead child is still reported as itself rather than as a cancellation.
+    assertNotCancelled(signal, operation);
     if (deployment.status === "SUCCESS" || deployment.status === "DEPLOYING") {
+      const probeTimeout = AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS);
       const response = await fetchImpl(new URL("/api/health", origin), {
         redirect: "manual",
         headers: { "x-aios-staging-health-token": token, ...(bootProbe ? { "x-aios-staging-boot-probe": "true" } : {}) },
-        signal: AbortSignal.timeout(10_000),
+        // The per-probe timeout AND the owning cancellation, so a shutdown does not have to be
+        // waited out by a probe the operation is no longer entitled to make.
+        signal: signal ? AbortSignal.any([signal, probeTimeout]) : probeTimeout,
       }).catch((error) => { observed.lastFetchError = error?.name ?? "Error"; return null; });
       if (response) { observed.lastResponseStatus = response.status; observed.lastFetchError = null; }
       const body = await response?.json().catch(() => ({}));
       if (response) observed.lastBodyOk = body?.ok ?? null;
+      // AFTER the awaited health observation and BEFORE it can be accepted. A known cancellation is
+      // not an ordinary retryable probe failure, and a successful response that was in flight when
+      // the shutdown arrived is not an acceptance — the caller would otherwise go on to submit a
+      // ready commit for a candidate whose permission had already been withdrawn.
+      assertNotCancelled(signal, operation);
       if (response && accept(response.status, body ?? {})) return true;
     }
-    await sleep(5_000);
+    await abortableSleep(sleep, 5_000, signal);
   }
   emitReceipt("health-poll-timed-out", {
     deploymentId, description, attempts: observed.attempts, waitedMs: Date.now() - startedAt,
@@ -538,10 +582,11 @@ async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bo
  * is accepted: a plain 200 would mean the journal already says ready, which during an install
  * means something else advanced it.
  */
-export async function waitForImportedBoot({ maintenance, deploymentId, commit, origin, token, mode = "copy-ready", fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+export async function waitForImportedBoot({ maintenance, deploymentId, commit, origin, token, mode = "copy-ready", fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), signal, budget }) {
   return pollDeployedHealth({
-    maintenance, deploymentId, origin, token, bootProbe: true, fetchImpl, timeoutMs, sleep,
+    maintenance, deploymentId, origin, token, bootProbe: true, fetchImpl, timeoutMs, sleep, signal, budget,
     description: "the bounded authenticated boot probe",
+    operation: "staging candidate boot health",
     accept: (status, body) =>
       (status === 202 && body.booted === true && body.commit === commit) ||
       (mode === "legacy-pg-only" && status === 200 && body.ok === true && body.mode === mode && body.commit === commit),
@@ -556,11 +601,12 @@ export async function waitForImportedBoot({ maintenance, deploymentId, commit, o
  * caught-up app answers 200 `copy-ready`. Every catch-up therefore "timed out" after successfully
  * deploying, burning an attempt each time and eventually exhausting the bounded budget.
  */
-export async function waitForExpectedReady({ maintenance, deploymentId, commit, origin, token, mode, runId, fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+export async function waitForExpectedReady({ maintenance, deploymentId, commit, origin, token, mode, runId, fetchImpl = fetch, timeoutMs = 300_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), signal, budget }) {
   if (!mode || !runId) throw new Error("an expected-ready probe requires the canonical mode and refresh run identity");
   return pollDeployedHealth({
-    maintenance, deploymentId, origin, token, bootProbe: false, fetchImpl, timeoutMs, sleep,
+    maintenance, deploymentId, origin, token, bootProbe: false, fetchImpl, timeoutMs, sleep, signal, budget,
     description: `the bounded expected-ready probe for run ${runId}`,
+    operation: "staging catch-up health",
     accept: (status, body) =>
       status === 200 && body.ok === true && body.commit === commit && body.mode === mode && body.refreshRunId === runId,
   });
@@ -629,14 +675,36 @@ export function sealReadyRollback(opened, targetCommit, env) {
   return { ...openBundleBytes(sourceBytes, env, "rollback", { ignoreExpiry: true }), sourceBytes, objectId: canonicalObjectId(manifest.runId, digest), digest, kind: "rollback" };
 }
 
-async function bootExact({ client, maintenance, runId, objectId, digest, commit, mode, env }) {
+/**
+ * Boot the selected pair and, if it passes health, commit it ready.
+ *
+ * ⚠️ THE OWNING SCOPE IS AN ARGUMENT, and it is the scope of whoever is entitled to this boot: the
+ * action/tick signal on the install path, the TRANSFERRED RECOVERY signal on the rollback path.
+ * Without it the health poll consulted only its own per-fetch timeout, so a SIGTERM delivered while
+ * a successful boot health response was in flight neither stopped the poll nor prevented `markReady`
+ * — the candidate was declared ready and the outer `finally` then reported the run as aborted.
+ *
+ * The narrow guarantee: cancellation observed BEFORE the ready submission prevents that submission.
+ * `markReady` is awaited to settlement and never raced against the signal, so a commit that is
+ * already in flight is honoured and reported rather than assumed rolled back.
+ */
+export async function bootExact({ client, maintenance, runId, objectId, digest, commit, mode, env, budget = null, signal }) {
+  // Before the boot transition: past this the exclusive lock is released and a deployment is issued.
+  assertNotCancelled(signal, "staging candidate boot");
+  budget?.assert("candidate boot transition");
   // B1: `boot_run_id`/`boot_commit` are the SELECTED deployment identity that the schema loader and
   // the startup fence both admit on. They are separate from `catchup_commit`, which means something
   // else entirely (an outstanding branch head to deploy later) and was previously overloaded.
   await transitionJournal(client, { runId, from: ["verifying", "importing"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: commit } });
   await releaseDataUseLock(client, "exclusive");
+  assertNotCancelled(signal, "staging candidate deployment");
   const deploymentId = await maintenance.deployApp(commit);
-  await waitForImportedBoot({ maintenance, deploymentId, commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
+  await waitForImportedBoot({ maintenance, deploymentId, commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode, signal, budget });
+  // IMMEDIATELY BEFORE THE READY SUBMISSION. Nothing has been committed yet, so a cancellation
+  // observed here is still preventable — and the caller's rollback path, on its own fresh recovery
+  // scope, is what puts the verified prior pair back.
+  assertNotCancelled(signal, "staging candidate ready commit");
+  budget?.assert("candidate ready commit");
   return { deploymentId, ready: await markReady(client, { runId, objectId, digest, commit, mode }) };
 }
 
@@ -776,7 +844,10 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     recoveryBudget.assert("recovery durable pair write");
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
     recoveryBudget.assert("recovery boot");
-    const booted = await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
+    // The RECOVERY scope, never the aborted shutdown that got us here. Restoring the verified prior
+    // pair is mandatory work: an external cancellation may not withhold it, and its health wait is
+    // bounded by the recovery budget rather than by a fresh independent allowance.
+    const booted = await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env, budget: recoveryBudget, signal });
     // M6, recovery side: same commit boundary, same ordering. A recovery budget that expires during
     // the restored pair's health poll must report bookkeeping pending, not unwind a serving rollback.
     readyCommitted = booted.ready;
@@ -888,7 +959,11 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       ? await loadRollbackTarget({ journal, rollbackStore, env })
       : await loadPrior({ journal, rollbackStore, env });
     const recoveryBudget = createOperationBudget("interrupted importer recovery", deadlines.recoveryMs, { now: operations.now });
-    const recovered = await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, (recoverySignal) => rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal }));
+    // NEVER `recoverySignal ?? signal`: falling back to the owning signal hands recovery the very
+    // shutdown that may have caused it, and every recovery step — the restore subprocesses, the
+    // prior pair's boot health — would then refuse on a signal that is aborted from birth. Absent a
+    // transferred scope, `recoveryBudget` is what bounds this.
+    const recovered = await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, (recoverySignal) => rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: recoverySignal }));
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
@@ -992,7 +1067,9 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       await rollbackStore.putImmutable(readyPair.objectId, readyPair.sourceBytes);
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair failed durable read-back verification");
       operationBudget.assert("candidate boot");
-      const booted = await boot({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
+      // The boot carries THIS install's scope: an observed cancellation may not submit a new
+      // candidate ready, and the health wait spends what remains of the install budget.
+      const booted = await boot({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env, budget: operationBudget, signal });
       // M6: ASSIGNED FIRST, asserted second. `bootExact` commits `ready` — the deployment is verified
       // serving and the canonical identity is durable — so every step after it is bookkeeping. With
       // the assert first, a budget that expired during the health poll threw with `readyCommitted`
@@ -1066,7 +1143,8 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     // import directly here left one of the two recovery entries un-substitutable, which is how the
     // ready boundary's discriminating control — an identical expiry ONE STEP EARLIER, which must
     // still roll back — was unreachable without a real two-store install.
-    await rollback({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal });
+    // Same rule as the interrupted branch above: the recovery scope only, never the owning signal.
+    await rollback({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal });
     throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
     });
   }
@@ -1369,7 +1447,11 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
     const deploymentId = await maintenance.deployApp(current.commit);
     operationBudget.assert("bootstrap health verification");
     phase("await-boot", { deploymentId, mode });
-    await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
+    // PRIMARY work, so it respects this action's cancellation and budget. A cancellation observed
+    // here reaches the catch below, whose recovery restarts the unchanged baseline under the
+    // transferred recovery scope — so the checkpoint is never marked ready after an observed
+    // shutdown, and the next `bootstrap-rollback` resumes from the retained record.
+    await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode, signal, budget: operationBudget });
     phase("booted", { deploymentId });
     await rollbackStore.writePointer("last-ready", { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode, kind: "rollback" });
     await markReady(client, { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
@@ -1396,7 +1478,7 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
     }
     const notes = [];
     const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
-    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async (_recoverySignal) => {
+    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async (recoverySignal) => {
     // Same ordering rule as the refresh path: the capture holds a read-only transaction on this
     // client, so a failure inside it can leave the session aborted and every recovery statement
     // below — the lock release and both journal transitions — would fail invisibly.
@@ -1426,7 +1508,9 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
       // probe accepts.
       await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: recoveryMode, bootRunId: bootstrapRunId, bootCommit: current.commit } });
       const deploymentId = await maintenance.deployApp(current.commit);
-      await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode: recoveryMode });
+      // The RECOVERY scope. Putting the untouched baseline back is exactly the work an external
+      // shutdown must not withhold, so this health call must not inherit that shutdown's signal.
+      await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode: recoveryMode, signal: recoverySignal, budget: recoveryBudget });
       restored = true;
     } catch (restoreError) { restored = false; notes.push(`deployment restart failed: ${errorText(restoreError).slice(0, 200)}`); }
     await recoveryStep("bootstrap checkpoint journal transition", () => transitionJournal(client, {
@@ -1441,7 +1525,7 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
-async function serviceCatchup({ client, maintenance, env, budget = null }) {
+async function serviceCatchup({ client, maintenance, env, budget = null, signal }) {
   budget?.assert("catch-up coordinator lock");
   if (!(await acquireCoordinatorLock(client))) return { status: "catchup-busy" };
   try {
@@ -1468,10 +1552,15 @@ async function serviceCatchup({ client, maintenance, env, budget = null }) {
     // B2: catch-up NEVER leaves the journal, so the app answers `ready`, not `booting`. The correct
     // acceptance is therefore the exact expected-ready shape — mode, commit AND the canonical
     // installed run — not the install path's 202-booted probe, which no caught-up app can satisfy.
+    // Catch-up's ready-state semantics are unchanged — the journal never leaves `ready` and this
+    // probe still admits only the exact expected-ready shape. What it gains is the owning tick's
+    // scope, so its health wait is bounded by the remaining tick budget and a cancellation is not
+    // swallowed as an ordinary failed probe.
     await waitForExpectedReady({
       maintenance, deploymentId: id, commit: head,
       origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN,
       mode: journal.last_ready_mode, runId: journal.last_ready_run_id,
+      signal, budget,
     });
     const advanced = sealReadyRollback(prior, head, env);
     await rollbackStore.putImmutable(advanced.objectId, advanced.sourceBytes);
@@ -1788,7 +1877,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       // Reset server-side statement/lock deadlines for THIS daemon operation. The connection and
       // daemon persist, but no individual tick inherits an expired or recovery-sized budget.
       await configurePostgresDeadline(client, tickBudget.remaining(deadlines.operationMs, "daemon tick deadline configuration"));
-      const catchup = await serviceCatchup({ client, maintenance, env, budget: tickBudget });
+      const catchup = await serviceCatchup({ client, maintenance, env, budget: tickBudget, signal: tickWatchdog.signal });
       // Selection reads the watermark unlocked and `installObject` RE-CHECKS it while holding the
       // coordinator lock, so a concurrent worker cannot install between the two.
       tickBudget.assert("source discovery journal read");
