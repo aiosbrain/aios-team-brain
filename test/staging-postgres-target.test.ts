@@ -51,16 +51,23 @@ describe("strict canonical Postgres destination", () => {
     }
   });
 
-  it("verifies the live lock-owning backend database and port", async () => {
+  it.each([
+    { family: "IPv4", socketAddress: "::ffff:10.0.0.9", serverAddress: "10.0.0.9" },
+    { family: "IPv6", socketAddress: "2001:db8::9", serverAddress: "2001:db8::9" },
+  ])("verifies the live lock-owning $family backend using the SQL host address contract", async ({ socketAddress, serverAddress }) => {
     const client = {
       connectionParameters: { host: target.hostname, port: target.port, database: target.database, user: target.username },
-      connection: { stream: { remoteAddress: "::ffff:10.0.0.9" } },
-      query: vi.fn().mockResolvedValue({ rows: [{ database: "brain", server_address: "10.0.0.9", server_port: 5432, backend_pid: 71 }] }),
+      connection: { stream: { remoteAddress: socketAddress } },
+      query: vi.fn().mockResolvedValue({ rows: [{ database: "brain", server_address: serverAddress, server_port: 5432, backend_pid: 71 }] }),
     };
-    await expect(assertLivePostgresTarget(client, target)).resolves.toMatchObject({ database: "brain", serverPort: 5432, backendPid: 71 });
+    await expect(assertLivePostgresTarget(client, target)).resolves.toMatchObject({
+      database: "brain", serverAddress, serverPort: 5432, backendPid: 71,
+    });
+    expect(client.query).toHaveBeenCalledWith(expect.stringContaining("host(inet_server_addr()) AS server_address"));
+    expect(client.query).not.toHaveBeenCalledWith(expect.stringContaining("inet_server_addr()::text"));
     await expect(assertLivePostgresTarget({ ...client, connectionParameters: { ...client.connectionParameters, database: "other" } }, target))
       .rejects.toThrow(/client configuration differs/);
-    await expect(assertLivePostgresTarget({ ...client, connection: { stream: { remoteAddress: "10.0.0.10" } } }, target))
+    await expect(assertLivePostgresTarget({ ...client, connection: { stream: { remoteAddress: "203.0.113.10" } } }, target))
       .rejects.toThrow(/live lock-owning Postgres backend differs/);
   });
 

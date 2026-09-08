@@ -96,7 +96,7 @@ export async function assertLivePostgresTarget(client, target) {
     throw new Error("the lock-owning Postgres client configuration differs from the canonical target");
   }
   const result = await client.query(`SELECT current_database() AS database,
-    inet_server_addr()::text AS server_address, inet_server_port() AS server_port,
+    host(inet_server_addr()) AS server_address, inet_server_port() AS server_port,
     pg_backend_pid() AS backend_pid`);
   const row = result.rows?.[0];
   const socketAddress = normalizedAddress(client?.connection?.stream?.remoteAddress);

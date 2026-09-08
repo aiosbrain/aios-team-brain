@@ -260,6 +260,7 @@ setInterval(() => {}, 1000);
         STAGING_CLEANUP_TIMEOUT_MS: "1000",
         STAGING_TERMINATE_GRACE_MS: "2000",
       } as NodeJS.ProcessEnv, ["bootstrap-rollback"]);
+      const outcomePromise = running.then(() => "resolved", (error: Error) => error);
       for (let attempt = 0; attempt < 200 && !existsSync(pidFile); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
@@ -273,7 +274,7 @@ setInterval(() => {}, 1000);
       expect(await journal.acquireCoordinatorLock(observer), "the operation deadline dropped the coordinator fence before containment").toBe(false);
       expect(await journal.acquireDataUseLock(observer, "exclusive"), "the operation deadline dropped the data-use fence before containment").toBe(false);
 
-      const outcome = await running.then(() => "resolved", (error: Error) => error);
+      const outcome = await outcomePromise;
       expect(outcome, "the expired bootstrap unexpectedly succeeded").toBeInstanceOf(Error);
       expect(alive(ownedPid), "the importer returned while its capture was alive").toBe(false);
       expect(await journal.acquireCoordinatorLock(observer), "the coordinator fence was not released after containment").toBe(true);

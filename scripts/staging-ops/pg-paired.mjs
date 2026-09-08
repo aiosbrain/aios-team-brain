@@ -43,7 +43,7 @@ async function run(command, args, options = {}, execImpl) {
 /** Hold the source snapshot transaction until both pg_dump and transformed COPY have finished. */
 export async function capturePairedPostgres({
   client, databaseUrl, directory, execImpl, pgDump = "pg_dump", psql = "psql", captureSnapshotFacts,
-  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, spawnImpl,
+  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null,
 }) {
   const canonicalDatabaseUrl = parseCanonicalPostgresTarget(databaseUrl, { label: "Postgres capture target", requireInternal: false }).connectionString;
   const remaining = (label) => remainingBudgetMs(budget, operationTimeoutMs, label);
@@ -69,7 +69,7 @@ export async function capturePairedPostgres({
     const auth = path.join(directory, "auth_users.csv");
     const graphLedger = path.join(directory, "graph_episodes.csv");
     const controller = new AbortController();
-    const commandOptions = { timeoutMs: remaining("Postgres capture subprocesses"), terminateGraceMs, signal: controller.signal, spawnImpl };
+    const commandOptions = { timeoutMs: remaining("Postgres capture subprocesses"), terminateGraceMs, signal: controller.signal };
     const tasks = [
       run(pgDump, [...pairedDumpArguments(snapshot, archive), canonicalDatabaseUrl], commandOptions, execImpl),
       run(psql, ["-X", "--quiet", canonicalDatabaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${projection} FROM public.auth_users) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], commandOptions, execImpl)

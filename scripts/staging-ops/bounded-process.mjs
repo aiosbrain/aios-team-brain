@@ -4,15 +4,14 @@ const redact = (value) => String(value ?? "").replace(/postgres(?:ql)?:\/\/[^\s]
 
 /**
  * Run one owned subprocess group to confirmed group absence. Timeout/abort sends SIGTERM,
- * escalates to SIGKILL, awaits `close`, and verifies no descendant remains. If absence cannot be
- * established, hard-stop the owner instead of unwinding its database locks around surviving work.
+ * escalates to SIGKILL, awaits `close`, and verifies no descendant remains. While a healthy caller
+ * still owns its fencing resources, uncertainty keeps this operation pending and retrying against
+ * only the owned group; an external container stop remains an operator action.
  */
 export async function runBoundedProcess(command, args, {
   timeoutMs, terminateGraceMs = 2_000, maxBuffer = 16 * 1024 * 1024,
   env = process.env, cwd, signal, spawnImpl = spawn, platform = process.platform,
-  hardStop = (_error) => process.kill(process.pid, "SIGKILL"),
   kill = process.kill,
-  holdUncontained = () => new Promise(() => { setInterval(() => {}, 60_000); }),
 } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60 * 60_000) throw new Error("subprocess timeout must be 1..3600000ms");
   if (!Number.isSafeInteger(terminateGraceMs) || terminateGraceMs < 1 || terminateGraceMs > 30_000) throw new Error("subprocess termination grace must be 1..30000ms");
@@ -73,26 +72,20 @@ export async function runBoundedProcess(command, args, {
     // can survive that event, so do not let a caller roll back an exported snapshot or release a
     // fence until group absence is observed. The referenced poll also keeps Node alive after the
     // tracked handle disappears.
-    if (ownedGroupAlive()) {
+    if (escalationTimer) {
+      clearTimeout(escalationTimer);
+      escalationTimer = null;
+    }
+    let containmentFailure = null;
+    while (ownedGroupAlive()) {
       try { signalOwned("SIGKILL"); }
-      catch (error) { termination = `${termination}; final SIGKILL failed: ${redact(error?.message)}`; }
+      catch (error) { containmentFailure = redact(error?.message); }
+      // This timer must remain referenced: returning would unwind the caller's healthy lock/session
+      // while descendants may still be running. Retry only this owned process group until a probe
+      // proves ESRCH; do not treat a signalling/probe callback failure as successful containment.
+      await new Promise((resolve) => setTimeout(resolve, Math.min(terminateGraceMs, 1_000)));
     }
-    const verificationDeadline = Date.now() + terminateGraceMs;
-    while (ownedGroupAlive() && Date.now() < verificationDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (ownedGroupAlive()) {
-      if (escalationTimer) clearTimeout(escalationTimer);
-      const error = Object.assign(new Error(`${command} ${termination}; owned subprocess group termination could not be confirmed; hard-stopping its owner`), {
-        code: "STAGING_OPERATION_TIMEOUT", terminationConfirmed: false,
-      });
-      // Returning this error would unwind the importer, end the lock-owning PG session, and let a
-      // surviving restore continue unfenced. The process/container boundary is the safety endpoint:
-      // invoke it synchronously and, if a test double or broken platform returns, keep a referenced
-      // handle forever so ordinary cleanup can never report/release around uncontained work.
-      try { Promise.resolve(hardStop(error)).catch(() => {}); } catch { /* holding ownership is safer than unwinding */ }
-      await holdUncontained();
-    }
+    if (containmentFailure) termination = `${termination}; SIGKILL retry failed: ${containmentFailure}`;
   }
   if (escalationTimer) clearTimeout(escalationTimer);
   const out = Buffer.concat(stdout).toString("utf8");

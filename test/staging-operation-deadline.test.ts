@@ -31,31 +31,48 @@ function executable(body: string) {
 }
 
 describe("M8 — finite operation deadlines terminate real work", () => {
-  it("hard-stops and never unwinds ownership when an owned process group remains uncontained", async () => {
+  it("keeps ownership pending until its process group is absent, then reports the original failure without self-kill", async () => {
     const child = new EventEmitter() as EventEmitter & {
       pid: number; stdout: EventEmitter; stderr: EventEmitter;
     };
     child.pid = 4242;
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    const hardStop = vi.fn();
+    let groupAlive = true;
+    let failedRetry = false;
+    const signals: Array<[number, string | number]> = [];
+    const kill = vi.fn((pid: number, signal: string | number) => {
+      signals.push([pid, signal]);
+      if (!groupAlive) throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      if (signal === "SIGKILL" && !failedRetry) {
+        failedRetry = true;
+        throw new Error("injected SIGKILL failure");
+      }
+      return true;
+    });
     const running = runBoundedProcess("synthetic", [], {
       timeoutMs: 5,
       terminateGraceMs: 5,
       spawnImpl: (() => child) as never,
-      kill: (() => true) as never,
-      hardStop,
-      // A pending Promise alone does not keep Node alive, so the production default owns the
-      // referenced handle. This seam lets the test observe the non-unwinding state without leaking.
-      holdUncontained: () => new Promise(() => {}),
+      kill: kill as never,
     });
+    const settled = running.then(() => "resolved", (error: Error & { terminationConfirmed?: boolean }) => error);
     setTimeout(() => child.emit("close", null, "SIGKILL"), 10);
     const outcome = await Promise.race([
-      running.then(() => "resolved", () => "rejected"),
+      settled,
       new Promise((resolve) => setTimeout(() => resolve("still-owned"), 80)),
     ]);
-    expect(hardStop).toHaveBeenCalledTimes(1);
     expect(outcome).toBe("still-owned");
+    expect(failedRetry, "an injected SIGKILL failure must not settle uncertain containment").toBe(true);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every(([pid]) => pid === -child.pid), "containment must target only the owned process group").toBe(true);
+    expect(signals.some(([pid]) => pid === process.pid), "the coordinator must never self-kill").toBe(false);
+
+    groupAlive = false;
+    const finalOutcome = await settled;
+    expect(finalOutcome).toMatchObject({ terminationConfirmed: true });
+    expect(finalOutcome).toBeInstanceOf(Error);
+    expect((finalOutcome as Error).message).toMatch(/operation exceeded 5ms/);
   });
 
   it("validates budgets and configures server-side Postgres cancellation", () => {
@@ -131,6 +148,19 @@ describe("M8 — finite operation deadlines terminate real work", () => {
       if (child.pid) spawnedPids.push(child.pid);
       return child;
     };
+    const execImpl = (
+      command: string,
+      args: readonly string[],
+      options: SpawnOptions & { timeout: number; terminateGraceMs?: number; maxBuffer?: number },
+    ) => runBoundedProcess(command, [...args], {
+      timeoutMs: options.timeout,
+      terminateGraceMs: options.terminateGraceMs,
+      maxBuffer: options.maxBuffer,
+      env: options.env,
+      cwd: options.cwd,
+      signal: options.signal,
+      spawnImpl,
+    });
     let allGoneAtRollback = false;
     const statements: string[] = [];
     const client = {
@@ -147,7 +177,7 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     };
     await expect(capturePairedPostgres({
       client, databaseUrl: "postgres://app:pw@source.railway.internal:5432/db", directory: root,
-      pgDump: file, psql: file, operationTimeoutMs: 1_000, terminateGraceMs: 100, spawnImpl,
+      pgDump: file, psql: file, operationTimeoutMs: 1_000, terminateGraceMs: 100, execImpl,
     })).rejects.toThrow(/termination confirmed/);
     expect(spawnedPids, "all three snapshot consumers must actually have spawned").toHaveLength(3);
     expect(statements.at(-1)).toBe("ROLLBACK");
