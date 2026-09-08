@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runExporter } from "../scripts/staging-ops/exporter.mjs";
 import { capturePairedPostgres, restorePairedPostgres } from "../scripts/staging-ops/pg-paired.mjs";
-import { postgresDeadlineConfig, stagingOperationDeadlines } from "../scripts/staging-ops/operation-deadline.mjs";
+import { armBudgetWatchdog, createOperationBudget, postgresDeadlineConfig, stagingOperationDeadlines } from "../scripts/staging-ops/operation-deadline.mjs";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
@@ -34,6 +34,29 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     const config = postgresDeadlineConfig("postgres://db/internal", 4_000, 2_000);
     expect(config).toMatchObject({ connectionTimeoutMillis: 2_000, statement_timeout: 4_000, lock_timeout: 4_000, idle_in_transaction_session_timeout: 4_000 });
     expect(config).not.toHaveProperty("query_timeout");
+  });
+
+  it("uses one monotonic allowance across sequential operations and cannot renew it through a child", () => {
+    let now = 100;
+    const run = createOperationBudget("importer tick", 1_000, { now: () => now });
+    expect(run.remaining(800, "first query")).toBe(800);
+    now += 700;
+    const restore = run.child("restore", 900);
+    expect(restore.remaining(900, "second query")).toBe(300);
+    now += 301;
+    expect(() => restore.remaining(900, "later mutation")).toThrow(/later mutation exhausted its total time budget/);
+  });
+
+  it("actively terminates an owned stalled transport at the absolute boundary and settles cancellation", async () => {
+    const terminated: string[] = [];
+    const watchdog = armBudgetWatchdog(createOperationBudget("connected database response", 10), async (error) => {
+      await Promise.resolve();
+      terminated.push(error.code);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await watchdog.disarm();
+    expect(watchdog.expired).toBe(true);
+    expect(terminated).toEqual(["STAGING_OPERATION_TIMEOUT"]);
   });
 
   it("capture cancels and awaits every actual PG subprocess before rolling back its snapshot", async () => {
@@ -122,7 +145,7 @@ describe("M8 — the actual exporter retries one whole private capture and publi
     DATABASE_URL: "postgres://u:p@postgres.railway.internal/db", NEO4J_URL: "bolt://neo4j.railway.internal",
     NEO4J_USER: "neo4j", NEO4J_PASSWORD: "prod-password", NEO4J_DATABASE: "neo4j",
     AUTH_SECRET: "prod-auth", SECRETS_KEY: "prod-secrets",
-    STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"), STAGING_COMPARISON_KEY_ID: "comparison-v1",
+    STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"), STAGING_COMPARISON_KEY_ID: "ops-v2",
     EXPORTER_SIGNING_PRIVATE_KEY: signing.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
     IMPORTER_ENCRYPTION_PUBLIC_KEY: encryption.publicKey.export({ format: "pem", type: "spki" }).toString(),
   } as NodeJS.ProcessEnv;
@@ -169,6 +192,18 @@ describe("M8 — the actual exporter retries one whole private capture and publi
     const run = harness(captureAttempt);
     await expect(runExporter(env, run.operations)).rejects.toThrow(/connection reset/);
     expect(captureAttempt).toHaveBeenCalledTimes(2);
+    expect(run.store.putImmutable).not.toHaveBeenCalled();
+  });
+
+  it("refuses publication when successful sequential capture work consumes the shared run budget", async () => {
+    let now = 0;
+    const captureAttempt = vi.fn(async () => {
+      now += 1_001;
+      return successfulCapture(1);
+    });
+    const run = harness(captureAttempt);
+    const boundedEnv = { ...env, STAGING_OPERATION_TIMEOUT_MS: "1000", STAGING_CAPTURE_TIMEOUT_MS: "1000" };
+    await expect(runExporter(boundedEnv, { ...run.operations, now: () => now })).rejects.toThrow(/capture attempt 1 completion exhausted its total time budget/);
     expect(run.store.putImmutable).not.toHaveBeenCalled();
   });
 });

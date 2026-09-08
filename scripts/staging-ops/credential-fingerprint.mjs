@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-export const FINGERPRINT_VERSION = "hmac-sha256-v1";
+export const FINGERPRINT_VERSION = "hmac-sha256-v2";
+const CONFIRMATION_BYTES = 32;
 const CLASSES = new Set(["auth-secret", "secrets-key", "postgres-credential", "neo4j-credential"]);
 export const REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES = Object.freeze(["auth-secret", "secrets-key", "neo4j-credential"]);
 
@@ -19,7 +20,19 @@ export function credentialFingerprint({ credentialClass, value, comparisonKey, k
     .update(`aios-staging-credential\0${FINGERPRINT_VERSION}\0${keyId}\0${credentialClass}\0`, "utf8")
     .update(bytes)
     .digest("base64url");
-  return { version: FINGERPRINT_VERSION, keyId, credentialClass, mac };
+  // The key ID is an operator label, not evidence that two independently configured roles hold the
+  // same random comparison key.  This separate, versioned domain binds comparability to the actual
+  // high-entropy key material without revealing it or hashing a credential.
+  const keyConfirmation = createHmac("sha256", comparisonKey)
+    .update(`aios-staging-comparison-key-confirmation\0${FINGERPRINT_VERSION}\0${keyId}\0`, "utf8")
+    .digest("base64url");
+  return { version: FINGERPRINT_VERSION, keyId, keyConfirmation, credentialClass, mac };
+}
+
+function fixedBytes(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  const bytes = Buffer.from(value, "base64url");
+  return bytes.length === CONFIRMATION_BYTES ? bytes : null;
 }
 
 /**
@@ -36,8 +49,7 @@ export function fingerprintWellFormed(fp) {
   if (fp.version !== FINGERPRINT_VERSION) return false;
   if (!CLASSES.has(fp.credentialClass)) return false;
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(String(fp.keyId ?? ""))) return false;
-  if (typeof fp.mac !== "string" || !/^[A-Za-z0-9_-]+$/.test(fp.mac)) return false;
-  return Buffer.from(fp.mac, "base64url").length === 32;
+  return Boolean(fixedBytes(fp.keyConfirmation) && fixedBytes(fp.mac));
 }
 
 /**
@@ -47,19 +59,20 @@ export function fingerprintWellFormed(fp) {
  */
 export function fingerprintsComparable(a, b) {
   if (!fingerprintWellFormed(a) || !fingerprintWellFormed(b)) return false;
-  return a.keyId === b.keyId && a.credentialClass === b.credentialClass;
+  if (a.keyId !== b.keyId || a.credentialClass !== b.credentialClass) return false;
+  const left = fixedBytes(a.keyConfirmation);
+  const right = fixedBytes(b.keyConfirmation);
+  return Boolean(left && right && timingSafeEqual(left, right));
 }
 
 export function fingerprintsEqual(a, b) {
-  if (!a || !b || a.version !== b.version || a.keyId !== b.keyId || a.credentialClass !== b.credentialClass) return false;
-  const left = Buffer.from(String(a.mac ?? ""), "base64url");
-  const right = Buffer.from(String(b.mac ?? ""), "base64url");
-  return left.length === 32 && right.length === 32 && timingSafeEqual(left, right);
+  if (!fingerprintsComparable(a, b)) return false;
+  return timingSafeEqual(fixedBytes(a.mac), fixedBytes(b.mac));
 }
 
 export function assertDistinctFingerprints(a, b, label) {
   if (!fingerprintsComparable(a, b)) {
-    throw new Error(`${label} fingerprints must be well formed and use the same versioned comparison key and credential class`);
+    throw new Error(`${label} fingerprints must be well formed and confirm the same versioned comparison key material and credential class`);
   }
   if (fingerprintsEqual(a, b)) throw new Error(`${label} must differ between production and staging`);
   return true;

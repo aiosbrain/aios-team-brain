@@ -31,3 +31,55 @@ export async function closeAll(...closers) {
   }
   throw first;
 }
+
+export function ownedCloser(close, terminate = close) {
+  return Object.freeze({ close, terminate });
+}
+
+/**
+ * Shared terminal-cleanup ceiling. On expiry an owned resource is actively terminated and its
+ * close is awaited. If termination cannot make it settle inside the configured grace, the worker
+ * exits instead of returning through a finally block and pretending its work is quiescent.
+ */
+export async function closeAllWithinBudget({ budget, terminateGraceMs = 2_000, terminateWorker = (error) => {
+  console.error(`staging cleanup could not confirm termination: ${error.message}`);
+  process.exit(1);
+}}, ...resources) {
+  const failures = [];
+  for (const resource of resources.filter(Boolean)) {
+    const descriptor = typeof resource === "function" ? ownedCloser(resource) : resource;
+    let settled = false;
+    const closing = Promise.resolve().then(descriptor.close).then(
+      (value) => { settled = true; return { status: "fulfilled", value }; },
+      (reason) => { settled = true; return { status: "rejected", reason }; },
+    );
+    const wait = async (ms) => {
+      let timer;
+      const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); timer.unref?.(); });
+      const result = await Promise.race([closing, timeout]);
+      clearTimeout(timer);
+      return result;
+    };
+    let cleanupMs = 0;
+    try { cleanupMs = budget.remaining(Number.POSITIVE_INFINITY, "terminal resource cleanup"); } catch { cleanupMs = 0; }
+    let result = await wait(Math.max(1, cleanupMs));
+    if (!result && !settled) {
+      try { await descriptor.terminate?.(); } catch (error) { failures.push(error); }
+      let terminationMs = terminateGraceMs;
+      try { terminationMs = Math.min(terminateGraceMs, budget.remaining(Number.POSITIVE_INFINITY, "terminal resource termination")); } catch { /* the finite grace is the final non-renewing reserve */ }
+      result = await wait(terminationMs).catch(() => null);
+      if (!result && !settled) {
+        const error = new Error("owned resource did not settle after bounded cleanup termination; durable reconciliation is required");
+        await terminateWorker(error);
+        throw error;
+      }
+    }
+    if (result?.status === "rejected") failures.push(result.reason);
+  }
+  if (!failures.length) return true;
+  const [first, ...rest] = failures;
+  if (rest.length && first && typeof first === "object") {
+    try { Object.defineProperty(first, "otherCleanupFailures", { value: rest, enumerable: false }); } catch { /* first still propagates */ }
+  }
+  throw first;
+}

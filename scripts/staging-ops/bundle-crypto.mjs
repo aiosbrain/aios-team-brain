@@ -29,6 +29,8 @@ function signedBytes(manifest) {
   return Buffer.from(canonicalJson(unsigned));
 }
 
+const authenticatedRollbackOpenings = new WeakSet();
+
 export function createSignedEncryptedBundle({ payload, manifest, exporterSigningPrivateKey, importerEncryptionPublicKey }) {
   const key = randomBytes(32);
   const nonce = randomBytes(12);
@@ -55,7 +57,7 @@ export function createSignedEncryptedBundle({ payload, manifest, exporterSigning
   };
 }
 
-export function openSignedEncryptedBundle({ bundle, exporterSigningPublicKey, importerEncryptionPrivateKey }) {
+export function openSignedEncryptedBundle({ bundle, exporterSigningPublicKey, importerEncryptionPrivateKey, signerPurpose = "source" }) {
   const manifest = bundle?.manifest ?? {};
   const signature = Buffer.from(String(manifest.signature ?? ""), "base64");
   if (!verify(null, signedBytes(manifest), exporterSigningPublicKey, signature)) throw new Error("bundle publisher signature verification failed");
@@ -70,8 +72,23 @@ export function openSignedEncryptedBundle({ bundle, exporterSigningPublicKey, im
     decipher.setAuthTag(Buffer.from(String(bundle.authTag ?? ""), "base64"));
     const payload = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     const { signature: _signature, ...unsigned } = manifest;
-    return { manifest: unsigned, payload };
+    const opened = { manifest: unsigned, payload };
+    if (signerPurpose === "rollback") authenticatedRollbackOpenings.add(opened);
+    return opened;
   } catch {
     throw new Error("bundle authenticated decryption failed");
   }
+}
+
+/** Opaque proof minted only after successful verification with the importer-owned rollback key. */
+export function rollbackOpeningProvenance(opened) {
+  if (!authenticatedRollbackOpenings.has(opened)) return null;
+  const token = Object.freeze({});
+  authenticatedRollbackOpenings.add(token);
+  return token;
+}
+
+/** A caller-controlled manifest kind or lookalike object can never satisfy this predicate. */
+export function isAuthenticatedRollbackProvenance(value) {
+  return Boolean(value && authenticatedRollbackOpenings.has(value));
 }

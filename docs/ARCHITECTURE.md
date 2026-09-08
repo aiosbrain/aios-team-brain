@@ -95,10 +95,13 @@ state—the advisory lock is already gone—so termination is attempted promptly
 workload is reported without a false lock-retention claim.
 
 Source admission treats credential separation as authenticated structured evidence, not unequal
-strings: each required environment credential fingerprint must be well formed and match the same
-version, comparison-key ID, and credential class before unequal MACs prove separation. This check
-runs before drain and feeds the graph replacement guard. Staging-owned rollback envelopes are not
-source bundles and may legitimately contain the current staging credentials.
+strings: each required environment credential fingerprint must be well formed and carry the same
+version, comparison-key ID, **key-material confirmation**, and credential class before unequal MACs
+prove separation. Confirmation is a separate domain-separated HMAC over the shared random comparison
+key and is checked in constant time; matching textual IDs alone prove nothing. This check runs before
+drain and feeds the graph replacement guard. Staging-owned rollback envelopes are authenticated with
+the importer-owned rollback signer and carry an opaque verified provenance into the replacement gate;
+they restore staging's own prior credentials and are never treated as fresh production sources.
 
 The sanitized Postgres graph ledger and graph bundle correspond by durable identity, not counts or
 names alone. Every completed ledger row must carry an `episode_uuid` that resolves within the same
@@ -116,7 +119,11 @@ does not claim cleanup or release containment. The importer daemon itself remain
 each tick receives these finite operation budgets. The exporter permits exactly one retry of the
 whole private capture for a classified transient failure; encryption and immutable publication occur
 only after a complete successful attempt, so neither a partial capture nor retry republishes new
-ciphertext under an existing key.
+ciphertext under an existing key. Each run/tick uses one monotonic absolute deadline: sequential
+database, graph and subprocess calls receive only its remaining time, child capture budgets can
+narrow but never renew the parent, and publication/READY boundaries refuse after expiry. Recovery
+and terminal cleanup have distinct single-use reserves; cleanup termination must settle before a
+later resource or lock-release path proceeds, otherwise the worker exits with durable fencing intact.
 
 **Graph identity in a copied staging is `(group_id, uuid)`, never `uuid` alone.** The replay installs
 an allowlisted schema of composite RANGE indexes and declares NO uniqueness constraint: the same UUID
@@ -152,6 +159,18 @@ procedure in `docs/OPS.md`, verified read-only by
 `node scripts/staging-ops/importer.mjs activation-preflight`, whose best verdict is
 `READY TO ACTIVATE` — never "activated", since its schedule check passes only while the automation
 is off.
+
+H5 acquisition is role-isolated. `exporter.mjs activation-evidence` authenticates a production-only
+environment token, performs fixed read-only deployment/configuration/snapshot/private-network reads,
+reduces the transient whole-variable-map response immediately to allowlisted identities, reference
+descriptions and three HMAC fingerprints, signs a fresh purpose/audience-bound Ed25519 envelope, and
+publishes it through the existing private source prefix. The importer has no production provider
+token: it verifies that immutable evidence, measures staging with a staging-only token, checks the
+pinned deployments/snapshots/branches/references/internal endpoints and Graphiti key-name absence,
+then binds the existing privileged health probe to that exact staging deployment. Current rendered
+variables are compared privately with the deployment snapshot and never substitute for historical
+deployed facts. Sealed/null/missing/drifted values refuse. No raw variable value enters reports,
+storage, child environments, logs, staging, or provider/model transports.
 
 ## Agent skill publication
 

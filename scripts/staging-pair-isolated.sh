@@ -229,6 +229,19 @@ run1_object="$(tail -n 1 "$harness_root/run-1.log" | node -e 'let s="";process.s
   -e PROBE_S3_ENDPOINT=http://source-object-store:9000 -e PROBE_S3_ACCESS_KEY_ID=source-read -e PROBE_S3_SECRET_ACCESS_KEY=wrong-secret \
   -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY="source/$run1_object.bundle" importer scripts/staging-ops/object-store-acl-probe.mjs expect-access-denied-get
 "${compose[@]}" run --rm --no-deps -e PROBE_S3_URL="http://source-object-store:9000/staging-pair/source/$run1_object.bundle" importer scripts/staging-ops/forged-s3-auth-probe.mjs
+
+# FIRST IMPORT, before any production-source pair has ever installed successfully. Fail only after
+# the real Postgres restore, then require the importer-owned bootstrap pair — not manufactured
+# production fingerprint evidence — to restore BOTH real stores and the serving ready identity.
+expect_failure bootstrap-first-import-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-postgres importer scripts/staging-ops/importer.mjs tick
+require_receipt bootstrap-first-import-recovers.log postgres-restored '"runId":"run-1"' "the first production source wrote Postgres before failing"
+require_receipt bootstrap-first-import-recovers.log fault-injected '"point":"after-postgres".*"runId":"run-1"' "the first import failed at its genuine post-write marker"
+require_receipt bootstrap-first-import-recovers.log prior-pair-restored '"failedRunId":"run-1".*"priorKind":"rollback".*"postgres":true.*"graph":true.*"ready":true' "the authenticated bootstrap pair restored both stores and serving readiness"
+require_journal state ready "the bootstrap recovery returned staging to ready"
+bootstrap_run="$(journal_field last_ready_run_id)"
+[[ "$bootstrap_run" == bootstrap-* ]] || { echo "first-import recovery did not retain the bootstrap run identity: $bootstrap_run" >&2; exit 1; }
+"${compose[@]}" run --rm fixture-controller assert-bootstrap
+
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
 # SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results
 # with the caller's current include memberships, so the copied pair's application reads are only

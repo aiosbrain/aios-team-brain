@@ -83,7 +83,10 @@ describe("the importer's recovery path on an aborted connection", () => {
     await expect(rollbackToPrior({ client, prior: PRIOR, failedRunId: "failed-run", maintenance, rollbackStore, env, deadlines }))
       .rejects.toThrow(/injected harness rollback failure/);
     const configured = client.query.mock.calls.find(([sql]) => String(sql).includes("set_config('statement_timeout'"));
-    expect(configured?.[1]).toEqual(["12000ms", "12000ms"]);
+    const configuredMs = Number(String(configured?.[1]?.[0]).replace("ms", ""));
+    expect(configuredMs).toBeGreaterThan(0);
+    expect(configuredMs).toBeLessThanOrEqual(12_000);
+    expect(configured?.[1]?.[1]).toBe(`${configuredMs}ms`);
     expect(client.statements.indexOf("ROLLBACK")).toBeLessThan(
       client.statements.findIndex((sql) => sql.includes("set_config('statement_timeout'")),
     );

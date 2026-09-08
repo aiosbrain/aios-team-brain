@@ -217,6 +217,35 @@ async function assertInstalledGraphVersion(expected) {
     return { status: "graph-version-asserted", expected, facts };
   } finally { await session.close(); await driver.close(); }
 }
+
+/**
+ * The genuine first-import recovery oracle.  It names facts that exist only in the staging-owned
+ * bootstrap capture, so a source install that merely failed before writing cannot satisfy it.
+ */
+async function assertBootstrapRestored() {
+  const staging = await pgClient(process.env.STAGING_DATABASE_URL);
+  const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
+  try {
+    const baseline = await staging.query("SELECT name FROM teams WHERE slug='baseline'");
+    const candidate = await staging.query("SELECT body FROM items WHERE id=$1", [ITEMS.team]);
+    if (baseline.rows[0]?.name !== "Baseline" || candidate.rows.length !== 0) {
+      throw new Error("bootstrap Postgres checkpoint was not restored after the first-import failure");
+    }
+    const session = driver.session({ defaultAccessMode: neo4j.session.READ });
+    try {
+      const graph = await session.run("MATCH (e:Episodic {uuid:'baseline-ep', group_id:'baseline'}) RETURN e.name AS name");
+      if (graph.records[0]?.get("name") !== "items:baseline") throw new Error("bootstrap Neo4j checkpoint was not restored after the first-import failure");
+    } finally { await session.close(); }
+    const response = await fetch(new URL("/api/health", process.env.STAGING_APP_ORIGIN), {
+      headers: { "x-aios-staging-health-token": process.env.STAGING_HEALTH_TOKEN }, signal: AbortSignal.timeout(60_000),
+    });
+    const health = await response.json();
+    if (!response.ok || health.ok !== true || health.mode !== "copy-ready" || !String(health.refreshRunId ?? "").startsWith("bootstrap-")) {
+      throw new Error("bootstrap deployment did not return to serving readiness after the first-import failure");
+    }
+    return { status: "bootstrap-pair-restored", refreshRunId: health.refreshRunId };
+  } finally { await staging.end(); await driver.close(); }
+}
 async function assertInstalled(expected = "v1") {
   const staging = await pgClient(process.env.STAGING_DATABASE_URL); const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
   try {
@@ -441,6 +470,7 @@ async function compareSubstrate() {
 async function runFixtureAction(action, arg) {
   return action === "seed" ? seed()
     : action === "assert-source" ? assertSourceVisibility()
+      : action === "assert-bootstrap" ? assertBootstrapRestored()
       : action === "assert-reopened-substrate" ? assertReopenedSubstrate()
         : action === "compare-substrate" ? compareSubstrate()
           : action === "close-membership" ? contextAction("close", arg ?? "team")
@@ -450,7 +480,7 @@ async function runFixtureAction(action, arg) {
                   : action === "assert-graph-version" ? assertInstalledGraphVersion(arg ?? "v1")
                     : action === "corrupt-graph-version" ? corruptGraphVersion(arg ?? "v99")
                       : action === "kill-reader-lock" ? killReaderLock()
-                        : Promise.reject(new Error("fixture action must be seed, assert-source, assert-reopened-substrate, compare-substrate, close-membership, open-membership, mutate, assert, assert-graph-version, corrupt-graph-version, or kill-reader-lock"));
+                        : Promise.reject(new Error("fixture action must be seed, assert-source, assert-bootstrap, assert-reopened-substrate, compare-substrate, close-membership, open-membership, mutate, assert, assert-graph-version, corrupt-graph-version, or kill-reader-lock"));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

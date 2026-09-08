@@ -48,6 +48,8 @@ import {
   fingerprintsEqual,
   REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES,
 } from "./credential-fingerprint.mjs";
+import { collectActivationEnvironment, pinsFromEnvironment, readVerifiedActivationEvidence } from "./activation-evidence.mjs";
+import { CONTRIBUTION_BASE } from "../branches.mjs";
 
 export const ACTIVATION_STATUS = Object.freeze({
   /** Every measurable control this build can measure is measured and correct. Nothing more. */
@@ -273,11 +275,24 @@ export function evaluateActivation(facts = {}) {
       else if (doc.staging && (deployment.environmentId !== doc.staging.environmentId || deployment.serviceId !== doc.staging.appServiceId)) {
         mismatches.push("the observed staging app deployment is not the pinned environment/service");
       }
+      const acquired = facts.topology.acquisition;
+      if (acquired) {
+        const expected = facts.topology.document;
+        if (acquired.github?.fullName !== acquired.repository || acquired.github?.defaultBranch !== "staging" || acquired.contributionBranch !== "staging") mismatches.push("authenticated repository metadata or the shipped contribution branch is not staging");
+        for (const [side, measured] of [["staging", acquired.staging], ["production", acquired.production]]) {
+          const pin = expected[side];
+          if (!measured || measured.app.source.branch !== pin.appSourceBranch || measured.app.source.repository !== acquired.repository) mismatches.push(`${side} application source branch/repository does not match its provider read-back`);
+          if (!measured || measured.app.postgresHost !== pin.postgresHost || measured.app.neo4jHost !== pin.neo4jHost) mismatches.push(`${side} internal database hosts do not match their private-endpoint read-backs`);
+          for (const name of ["DATABASE_URL", "NEO4J_URL"]) if (!measured?.app?.references?.[name]) mismatches.push(`${side} ${name} has no verified service reference`);
+        }
+      } else {
+        uncorroborated.push("authenticated branch/reference/internal-host acquisition");
+      }
       checks.push(mismatches.length
         ? check("topology-identity", FAIL, mismatches.join("; "))
         : uncorroborated.length
           ? check("topology-identity", UNVERIFIED, `the document is internally consistent but UNCORROBORATED: no ${uncorroborated.join(", no ")}. Branch/reference and internal-host pins are not read by this verifier at all${facts.topology.measuredFrom ? `; the recorded provenance "${facts.topology.measuredFrom}" is an operator label, not a measurement` : ""}`)
-          : check("topology-identity", PASS, "pinned project/environment identities corroborated by both project-token read-backs and the observed staging deployment; branch/reference and internal-host pins remain unread"));
+          : check("topology-identity", PASS, "pinned identities, repository branches, service references and private internal hosts are corroborated by authenticated provider acquisition"));
     }
   }
 
@@ -573,12 +588,76 @@ async function measure(label, read, notes) {
   catch (error) { notes.push(`${label}: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`); return null; }
 }
 
+async function githubRepository(env, fetchImpl) {
+  if (!env.STAGING_GITHUB_READ_TOKEN || !env.GITHUB_REPOSITORY) throw new Error("authenticated repository metadata prerequisites are missing");
+  const response = await fetchImpl(`https://api.github.com/repos/${env.GITHUB_REPOSITORY}`, {
+    redirect: "error", headers: { Authorization: `Bearer ${env.STAGING_GITHUB_READ_TOKEN}`, Accept: "application/vnd.github+json" }, signal: AbortSignal.timeout(15_000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body?.full_name !== env.GITHUB_REPOSITORY || body?.default_branch !== "staging") throw new Error(`repository metadata read failed (${response.status})`);
+  return { fullName: body.full_name, defaultBranch: body.default_branch };
+}
+
+async function readFullyAcquiredActivationFacts(env, { fetchImpl, evidenceStore, now, budget }, topology, notes) {
+  budget?.assert("signed production activation evidence read");
+  const remoteEvidence = await readVerifiedActivationEvidence({ env, store: evidenceStore, now });
+  const production = remoteEvidence.production;
+  const staging = await collectActivationEnvironment({
+    pins: pinsFromEnvironment(env, topology.document.staging, "staging"), token: env.RAILWAY_STAGING_READ_TOKEN,
+    comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), comparisonKeyId: env.STAGING_COMPARISON_KEY_ID,
+    includeGraphiti: true, fetchImpl, budget,
+  });
+  budget?.assert("staging deployment and repository reads");
+  const [deploymentData, github] = await Promise.all([
+    railwayQuery({ document: ACTIVATION_DOCUMENTS.deployments, variables: { environmentId: topology.document.staging.environmentId, serviceId: topology.document.staging.appServiceId }, token: env.RAILWAY_STAGING_READ_TOKEN, fetchImpl }),
+    githubRepository(env, fetchImpl),
+  ]);
+  const nodes = (deploymentData?.deployments?.edges ?? []).map((edge) => edge.node);
+  const node = nodes.find((candidate) => candidate.id === staging.app.deploymentId);
+  let appDeployment = null;
+  if (node && node.status === "SUCCESS" && node.environmentId === staging.scope.environmentId && node.serviceId === staging.app.serviceId) {
+    const commitSha = node.meta?.commitHash ?? node.meta?.repoCommit ?? null;
+    const raw = String(node.staticUrl ?? "").trim();
+    if (commitSha === staging.app.commitSha) appDeployment = { id: node.id, status: node.status, environmentId: node.environmentId, serviceId: node.serviceId,
+      commitSha, url: raw && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(raw) ? `https://${raw.toLowerCase()}` : null };
+  }
+  if (!appDeployment) notes.push("staging app deployment: deployment-domain read-back did not match the deployment-bound configuration acquisition");
+  const healthBinding = healthProbeBinding({ env, pin: topology.document.staging, tokenScope: staging.scope, deployment: appDeployment });
+  let appHealth = null;
+  if (healthBinding.bound) {
+    appHealth = await measure("staging health", async () => {
+      const response = await fetchImpl(new URL("/api/health", healthBinding.origin), { redirect: "manual", headers: { "x-aios-staging-health-token": env.STAGING_HEALTH_TOKEN }, signal: AbortSignal.timeout(15_000) });
+      if (response.status >= 300 && response.status < 400) throw new Error("staging health redirected; off-origin redirects are refused");
+      if (response.url && new URL(response.url).origin !== healthBinding.origin) throw new Error("staging health final origin changed");
+      return { status: response.status, origin: healthBinding.origin, body: await response.json().catch(() => ({})) };
+    }, notes);
+  } else notes.push(`staging health: ${healthBinding.refusal}; no health token was presented`);
+  const schedules = env.STAGING_SCHEDULES_FILE ? await measure("schedules", async () => JSON.parse(readFileSync(env.STAGING_SCHEDULES_FILE, "utf8")), notes) : null;
+  const operatorClaims = Object.fromEntries(Object.keys(env).filter((name) => name.startsWith("ACTIVATION_CLAIM_")).map((name) => [name, "claimed (not evidence)"]));
+  return {
+    topology: { ...topology, acquisition: { staging, production, github, repository: env.GITHUB_REPOSITORY, contributionBranch: CONTRIBUTION_BASE } },
+    tokens: { staging: staging.scope, production: production.scope },
+    runners: {
+      importer: { ...staging.runner, expectedServiceId: env.STAGING_IMPORTER_SERVICE_ID, expectedImage: env.STAGING_IMPORTER_IMAGE_DIGEST },
+      exporter: { ...production.runner, expectedServiceId: env.PRODUCTION_EXPORTER_SERVICE_ID, expectedImage: env.PRODUCTION_EXPORTER_IMAGE_DIGEST },
+    },
+    appDeployment, appHealth, healthBinding,
+    graphitiProviderCredentials: staging.graphitiProviderCredentials,
+    credentialFingerprints: {
+      local: staging.credentialFingerprints, remote: production.credentialFingerprints,
+      localProvenance: { authenticated: true, environmentId: staging.scope.environmentId, deploymentId: staging.app.deploymentId, snapshotId: staging.app.snapshotId },
+      remoteProvenance: { authenticated: true, environmentId: production.scope.environmentId, deploymentId: production.app.deploymentId, snapshotId: production.app.snapshotId, evidenceId: remoteEvidence.evidenceId },
+    },
+    schedules, operatorClaims, notes,
+  };
+}
+
 /**
  * Acquire the facts, read-only. Every measurement is independently optional: a missing credential
  * yields `null` for that fact and an `UNVERIFIED` check, which is the whole point — a verifier that
  * throws on the first missing input reports nothing about the rest.
  */
-export async function readActivationFacts(env = process.env, { fetchImpl = fetch } = {}) {
+export async function readActivationFacts(env = process.env, { fetchImpl = fetch, evidenceStore, now = Date.now(), budget = null } = {}) {
   const notes = [];
   const topologyFile = env.STAGING_TOPOLOGY_FILE;
   const topology = topologyFile
@@ -590,7 +669,13 @@ export async function readActivationFacts(env = process.env, { fetchImpl = fetch
       }), notes)
     : null;
 
-  const token = (side) => (side === "staging" ? env.RAILWAY_STAGING_READ_TOKEN : env.RAILWAY_PRODUCTION_READ_TOKEN);
+  if (topology && env.ACTIVATION_EVIDENCE_OBJECT_ID) {
+    return readFullyAcquiredActivationFacts(env, { fetchImpl, evidenceStore, now, budget }, topology, notes);
+  }
+
+  // The importer never receives or uses a production provider credential. Production facts arrive
+  // only through a fresh purpose-bound exporter signature in the supported path above.
+  const token = (side) => (side === "staging" ? env.RAILWAY_STAGING_READ_TOKEN : null);
   const tokens = {};
   for (const side of ["staging", "production"]) {
     tokens[side] = token(side)

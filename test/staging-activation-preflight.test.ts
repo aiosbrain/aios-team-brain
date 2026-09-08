@@ -62,20 +62,28 @@ const COMMIT = "c".repeat(40);
  */
 const COMPARISON_KEY_ID = "example-key";
 
-const fingerprint = (credentialClass: string, mac: string, over: Record<string, unknown> = {}) => ({
-  version: FINGERPRINT_VERSION, keyId: COMPARISON_KEY_ID, credentialClass, mac, ...over,
-});
-
 /** 32 bytes, base64url — the only MAC shape a well-formed fingerprint may carry. */
 const mac = (fill: string) => Buffer.alloc(32, fill).toString("base64url");
+
+const fingerprint = (credentialClass: string, credentialMac: string, over: Record<string, unknown> = {}) => ({
+  version: FINGERPRINT_VERSION, keyId: COMPARISON_KEY_ID, keyConfirmation: mac("k"), credentialClass, mac: credentialMac, ...over,
+});
 
 const fingerprintSet = (fill: string) =>
   Object.fromEntries(REQUIRED_CREDENTIAL_CLASSES.map((c) => [c, fingerprint(c, mac(fill))]));
 
 /** Everything measured, everything correct — the only input that may produce READY TO ACTIVATE. */
 function fullyMeasured() {
+  const acquiredSide = (side: "staging" | "production") => ({ app: {
+    source: { repository: "org/repo", branch: side === "staging" ? "staging" : "main" },
+    postgresHost: "postgres.railway.internal", neo4jHost: "neo4j.railway.internal",
+    references: { DATABASE_URL: { kind: "railway-service-reference" }, NEO4J_URL: { kind: "railway-service-reference" } },
+  } });
   return {
-    topology: { document: structuredClone(TOPOLOGY), measuredFrom: "railway project read-back 2026-09-07" },
+    topology: { document: structuredClone(TOPOLOGY), measuredFrom: "railway project read-back 2026-09-07", acquisition: {
+      repository: "org/repo", contributionBranch: "staging", github: { fullName: "org/repo", defaultBranch: "staging" },
+      staging: acquiredSide("staging"), production: acquiredSide("production"),
+    } },
     tokens: {
       staging: { projectId: "project-a", environmentId: "env-staging" },
       production: { projectId: "project-a", environmentId: "env-production" },

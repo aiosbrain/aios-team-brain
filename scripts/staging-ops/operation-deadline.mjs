@@ -2,6 +2,58 @@ export const OPERATION_TIMEOUT_DEFAULT_MS = 15 * 60_000;
 export const RECOVERY_TIMEOUT_DEFAULT_MS = 10 * 60_000;
 export const CLEANUP_TIMEOUT_DEFAULT_MS = 2 * 60_000;
 
+export class StagingDeadlineExceededError extends Error {
+  constructor(label) {
+    super(`${label} exhausted its total time budget`);
+    this.name = "StagingDeadlineExceededError";
+    this.code = "STAGING_OPERATION_TIMEOUT";
+  }
+}
+
+/**
+ * One non-renewing, monotonic allowance shared by every child operation in a phase.
+ * A child can narrow its parent's deadline, never extend it.
+ */
+export function createOperationBudget(label, durationMs, { parent = null, now = () => performance.now() } = {}) {
+  const bounded = finiteDeadlineMs(`${label} budget`, durationMs, OPERATION_TIMEOUT_DEFAULT_MS, { min: 1, max: 60 * 60_000 });
+  const startedAt = now();
+  const expiresAt = Math.min(startedAt + bounded, parent?.expiresAt ?? Number.POSITIVE_INFINITY);
+  const budget = {
+    label, startedAt, expiresAt,
+    remaining(capMs = Number.POSITIVE_INFINITY, operation = label) {
+      const remaining = Math.floor(expiresAt - now());
+      if (!Number.isFinite(remaining) || remaining < 1) throw new StagingDeadlineExceededError(operation);
+      const cap = Number.isFinite(capMs) ? Math.max(1, Math.floor(capMs)) : remaining;
+      return Math.min(remaining, cap);
+    },
+    assert(operation = label) { budget.remaining(Number.POSITIVE_INFINITY, operation); return budget; },
+    child(childLabel, childDurationMs) { return createOperationBudget(childLabel, childDurationMs, { parent: budget, now }); },
+  };
+  return Object.freeze(budget);
+}
+
+export function remainingBudgetMs(budget, capMs, operation) {
+  return budget ? budget.remaining(capMs, operation) : capMs;
+}
+
+/** Actively cancel owned transports at the absolute boundary; disarm waits for cancellation. */
+export function armBudgetWatchdog(budget, terminate) {
+  let expired = false;
+  let termination = Promise.resolve();
+  const timeoutMs = budget.remaining(Number.POSITIVE_INFINITY, `${budget.label} watchdog`);
+  const timer = setTimeout(() => {
+    expired = true;
+    const error = new StagingDeadlineExceededError(budget.label);
+    termination = Promise.resolve().then(() => terminate(error));
+    termination.catch(() => {});
+  }, timeoutMs);
+  timer.unref?.();
+  return Object.freeze({
+    get expired() { return expired; },
+    async disarm() { clearTimeout(timer); await termination; },
+  });
+}
+
 export function finiteDeadlineMs(name, value, defaultValue, { min = 1_000, max = 60 * 60_000 } = {}) {
   const parsed = value === undefined || value === null || value === "" ? defaultValue : Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
@@ -49,4 +101,3 @@ export async function configurePostgresDeadline(client, timeoutMs) {
 export function neo4jTransactionConfig(timeoutMs) {
   return { timeout: finiteDeadlineMs("Neo4j operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS) };
 }
-

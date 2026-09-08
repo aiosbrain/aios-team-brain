@@ -12,12 +12,13 @@ import { credentialFingerprint } from "./credential-fingerprint.mjs";
 import { exportGraph, graphCensus, sanitizeGraphExport } from "./graph-bundle.mjs";
 import { capturePairedPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
-import { closeAll } from "./resource-cleanup.mjs";
+import { closeAllWithinBudget, ownedCloser } from "./resource-cleanup.mjs";
 import { canonicalObjectId, createPrivateStore } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
 import { RailwayRunnerInspector } from "./railway-maintenance.mjs";
 import { keyMaterial } from "./key-material.mjs";
-import { postgresDeadlineConfig, stagingOperationDeadlines } from "./operation-deadline.mjs";
+import { armBudgetWatchdog, createOperationBudget, postgresDeadlineConfig, stagingOperationDeadlines } from "./operation-deadline.mjs";
+import { publishActivationEvidence } from "./activation-evidence.mjs";
 
 const sha = (v) => createHash("sha256").update(v).digest("hex");
 const FULL_SHA = /^[0-9a-f]{40}$/i;
@@ -173,10 +174,15 @@ export function isTransientCaptureFailure(error) {
 }
 
 /** Exactly one retry of the WHOLE, still-private capture. Publication happens only afterward. */
-export async function captureWithOneTransientRetry(captureAttempt, { transient = isTransientCaptureFailure } = {}) {
+export async function captureWithOneTransientRetry(captureAttempt, { transient = isTransientCaptureFailure, budget = null } = {}) {
   let firstError;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try { return { ...(await captureAttempt(attempt)), attempts: attempt }; }
+    budget?.assert(`capture attempt ${attempt}`);
+    try {
+      const captured = await captureAttempt(attempt, budget);
+      budget?.assert(`capture attempt ${attempt} completion`);
+      return { ...captured, attempts: attempt };
+    }
     catch (error) {
       if (attempt === 1 && transient(error)) { firstError = error; continue; }
       if (firstError && error && typeof error === "object") Object.defineProperty(error, "firstCaptureFailure", { value: firstError, enumerable: false });
@@ -186,24 +192,39 @@ export async function captureWithOneTransientRetry(captureAttempt, { transient =
   throw new Error("unreachable capture retry state");
 }
 
-export async function runExporter(env = process.env, operations = {}) {
+export async function runExporter(env = process.env, operations = {}, argv = process.argv.slice(2)) {
   assertRunnerRole(env, "exporter"); assertOutboundCredentialIsolation(env);
   const deadlines = stagingOperationDeadlines(env);
+  const runBudget = createOperationBudget("exporter run", deadlines.operationMs, { now: operations.now });
+  if (argv[0] === "activation-evidence") {
+    runBudget.assert("activation evidence acquisition");
+    const result = await publishActivationEvidence({ env, fetchImpl: operations.fetchImpl ?? fetch, store: operations.store, budget: runBudget });
+    runBudget.assert("activation evidence publication");
+    return result;
+  }
+  const captureBudget = runBudget.child("exporter capture", deadlines.captureMs);
   let deployed = { commit: env.SOURCE_APPLICATION_COMMIT };
   if (operations.deployedBuild) {
     deployed = { commit: operations.deployedBuild.commit };
   } else if (env.STAGING_MAINTENANCE_ADAPTER !== "local") {
     const inspector = new RailwayRunnerInspector({ projectId: env.RAILWAY_PROJECT_ID, environmentId: env.PRODUCTION_EXPORT_ENVIRONMENT_ID, serviceId: env.PRODUCTION_EXPORTER_SERVICE_ID, token: env.RAILWAY_PRODUCTION_RUNNER_READ_TOKEN });
+    runBudget.assert("exporter deployment inspection");
     await inspector.assertPinned(env.STAGING_OPS_IMAGE_DIGEST);
+    runBudget.assert("exporter deployment measurement");
     deployed = await inspector.measureSuccessfulDeployment(env.PRODUCTION_APP_SERVICE_ID);
   }
   if (!FULL_SHA.test(String(deployed.commit ?? ""))) throw new Error("source application deployment commit was not measured");
   const deployedBuild = operations.deployedBuild ?? (env.STAGING_MAINTENANCE_ADAPTER === "local"
     ? { commit: deployed.commit, migrationSet: migrationSetIdentity() }
     : await readDeployedBuildMetadata(env, deployed.commit));
+  runBudget.assert("exporter database connection");
   const client = operations.client ?? new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.operationMs, deadlines.connectionMs));
   if (!operations.client) await client.connect();
   const driver = operations.driver ?? neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
+  const watchdog = armBudgetWatchdog(runBudget, async (error) => {
+    client.connection?.stream?.destroy(error);
+    await driver.close().catch(() => {});
+  });
   let session = operations.session ?? null;
   try {
     // `return await`: the census runs THREE sequential queries, and a bare `return` resolved this
@@ -211,17 +232,19 @@ export async function runExporter(env = process.env, operations = {}) {
     // driver and the Postgres client underneath it. Same failure shape as the importer dispatcher.
     if (process.argv.includes("--census")) {
       session ??= driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
-      return await graphCensus(session, { operationTimeoutMs: deadlines.operationMs });
+      return await graphCensus(session, { operationTimeoutMs: deadlines.operationMs, budget: runBudget });
     }
     // The run ID names the MEASURED deployed commit, never the declared env var: on the Railway
     // path `SOURCE_APPLICATION_COMMIT` is unset, and `undefined?.slice()` had been stamping the
     // literal string "undefined" into a bundle's immutable identity.
     const runId = env.STAGING_BUNDLE_RUN_ID || `${new Date().toISOString().replace(/[:.]/g, "-")}-${deployedBuild.commit.slice(0, 12)}`;
     const defaultCaptureAttempt = () => withPrivateTempDir("aios-staging-export-", async (directory) => {
+      captureBudget.assert("Postgres capture");
       const started = new Date();
       const postgres = await capturePairedPostgres({
         client, databaseUrl: env.DATABASE_URL, directory, captureSnapshotFacts: snapshotExportFacts,
         operationTimeoutMs: deadlines.captureMs, terminateGraceMs: deadlines.terminateGraceMs,
+        budget: captureBudget,
       });
       const policy = postgres.snapshotFacts;
       assertResolvedCorrectionScopes(policy);
@@ -229,7 +252,7 @@ export async function runExporter(env = process.env, operations = {}) {
       // SessionExpired error cannot be repaired by issuing the same read on the dead session.
       const attemptSession = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       let rawGraph;
-      try { rawGraph = await exportGraph(attemptSession, { operationTimeoutMs: deadlines.captureMs }); }
+      try { rawGraph = await exportGraph(attemptSession, { operationTimeoutMs: deadlines.captureMs, budget: captureBudget }); }
       finally { await attemptSession.close(); }
       const graph = sanitizeGraphExport(rawGraph, { episodeAllowed: (episode) => {
         const name = itemEpisodeStem(episode.properties?.name) ?? String(episode.properties?.name ?? "");
@@ -237,9 +260,12 @@ export async function runExporter(env = process.env, operations = {}) {
         return policy.allowed.has(key) && !policy.excluded.has(key);
       } });
       validateLedgerAgainstSanitizedGraph(graph, policy);
-      return { started, ended: new Date(), graph, policy, packed: await packPair(directory, graph) };
+      captureBudget.assert("capture packing");
+      const packed = await packPair(directory, graph);
+      captureBudget.assert("capture completion");
+      return { started, ended: new Date(), graph, policy, packed };
     });
-    const captured = await captureWithOneTransientRetry(operations.captureAttempt ?? defaultCaptureAttempt);
+    const captured = await captureWithOneTransientRetry(operations.captureAttempt ?? defaultCaptureAttempt, { budget: captureBudget });
     const { started, ended, graph, policy, packed } = captured;
     const comparisonKey = Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64");
     const credentialFingerprints = Object.fromEntries([
@@ -253,6 +279,7 @@ export async function runExporter(env = process.env, operations = {}) {
       build: { applicationCommit: deployedBuild.commit, schemaFingerprint: schemaFingerprintDigest(policy.schemaLines), migrationSet: deployedBuild.migrationSet },
       credentialFingerprints,
     };
+    runBudget.assert("bundle signing");
     const bundle = createSignedEncryptedBundle({
       payload: packed.payload,
       manifest,
@@ -262,13 +289,17 @@ export async function runExporter(env = process.env, operations = {}) {
     const bytes = Buffer.from(JSON.stringify(bundle));
     const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
     const store = operations.store ?? createPrivateStore({ env, scope: "source", role: "publisher" });
+    runBudget.assert("immutable bundle publication");
     await store.putImmutable(objectId, bytes);
+    runBudget.assert("immutable bundle publication completion");
     return { runId, objectId, sha256: digest, captureAttempts: captured.attempts, manifest: { ...manifest, credentialFingerprints: Object.keys(credentialFingerprints), checksums: packed.checksums } };
   } finally {
-    await closeAll(
-      session ? () => session.close() : null,
-      operations.driver ? null : () => driver.close(),
-      operations.client ? null : () => client.end(),
+    await watchdog.disarm();
+    const cleanupBudget = createOperationBudget("exporter terminal cleanup", deadlines.cleanupMs, { now: operations.now });
+    await closeAllWithinBudget({ budget: cleanupBudget, terminateGraceMs: deadlines.terminateGraceMs },
+      session ? ownedCloser(() => session.close()) : null,
+      operations.driver ? null : ownedCloser(() => driver.close()),
+      operations.client ? null : ownedCloser(() => client.end(), () => client.connection?.stream?.destroy()),
     );
   }
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { closeAll } from "../scripts/staging-ops/resource-cleanup.mjs";
+import { closeAll, closeAllWithinBudget, ownedCloser } from "../scripts/staging-ops/resource-cleanup.mjs";
+import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
 
 /**
  * The measured failure (`runtime-lifetime-adjudication.md`): the isolated harness died at
@@ -424,5 +425,17 @@ describe("closeAll reaches every resource", () => {
     const closed: string[] = [];
     await expect(closeAll(null, undefined, async () => { closed.push("driver"); })).resolves.toBe(true);
     expect(closed).toEqual(["driver"]);
+  });
+
+  it("terminates and settles a stalled closer before attempting the next resource", async () => {
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => { release = resolve; });
+    const events: string[] = [];
+    const budget = createOperationBudget("test cleanup", 10);
+    await expect(closeAllWithinBudget({ budget, terminateGraceMs: 50, terminateWorker: async () => { throw new Error("worker termination should not be needed"); } },
+      ownedCloser(() => stalled.then(() => { events.push("first-closed"); }), async () => { events.push("first-terminated"); release(); }),
+      ownedCloser(async () => { events.push("second-closed"); }),
+    )).resolves.toBe(true);
+    expect(events).toEqual(["first-terminated", "first-closed", "second-closed"]);
   });
 });

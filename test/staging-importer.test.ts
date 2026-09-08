@@ -4,11 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
-import { assertReplayableGraph, compareEnvironmentCredentials, verifyAndPinSourceBundle, verifyInstalledPair, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
+import { assertReplayableGraph, compareEnvironmentCredentials, installObject, verifyAndPinSourceBundle, verifyInstalledPair, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
 import { PrivateFileStore } from "../scripts/staging-ops/private-store.mjs";
 import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
 import { validatePairManifest } from "../scripts/staging-ops/bundle-format.mjs";
-import { schemaFingerprintDigest } from "../scripts/staging-ops/build-identity.mjs";
+import { loaderCapabilityIdentity, schemaFingerprintDigest } from "../scripts/staging-ops/build-identity.mjs";
 import { fingerprint } from "../scripts/schema-fingerprint.mjs";
 
 const roots: string[] = [];
@@ -72,7 +72,31 @@ describe("staging importer bundle boundary", () => {
       STAGING_COMPARISON_KEY_BASE64: comparisonKey.toString("base64"), STAGING_COMPARISON_KEY_ID: "target-key",
       AUTH_SECRET: "same-auth", SECRETS_KEY: "same-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "same",
     } as NodeJS.ProcessEnv;
-    expect(() => compareEnvironmentCredentials({ credentialFingerprints: source }, env)).toThrow(/same versioned comparison key/);
+    expect(() => compareEnvironmentCredentials({ credentialFingerprints: source }, env)).toThrow(/same versioned comparison key material/);
+  });
+
+  it("refuses a genuinely signed source minted with different comparison material before lifecycle admission", async () => {
+    const sign = generateKeyPairSync("ed25519"); const enc = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const sourceRoot = mkdtempSync(path.join(os.tmpdir(), "src-key-skew-")); const rollbackRoot = mkdtempSync(path.join(os.tmpdir(), "rb-key-skew-")); roots.push(sourceRoot, rollbackRoot);
+    const sourceKey = Buffer.alloc(32, 1); const targetKey = Buffer.alloc(32, 2);
+    const credentials = [["auth-secret", "same-auth"], ["secrets-key", "same-secrets"], ["neo4j-credential", "neo4j\0same"]] as const;
+    const credentialFingerprints = Object.fromEntries(credentials.map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey: sourceKey, keyId: "same-id" })]));
+    const now = new Date();
+    const manifest = {
+      formatVersion: 1, graphCodecVersion: 1, runId: "key-skew", captureStartedAt: now.toISOString(), captureEndedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 60_000).toISOString(),
+      checksums: Object.fromEntries(["postgres", "authUsers", "graphLedger", "graph"].map((name) => [name, { sha256: "a".repeat(64) }])),
+      build: { ...loaderCapabilityIdentity(), applicationCommit: "b".repeat(40), schemaFingerprint: "c".repeat(64) }, credentialFingerprints,
+    };
+    const bytes = Buffer.from(JSON.stringify(createSignedEncryptedBundle({ payload: Buffer.from("payload"), manifest, exporterSigningPrivateKey: sign.privateKey, importerEncryptionPublicKey: enc.publicKey })));
+    const digest = createHash("sha256").update(bytes).digest("hex"); const objectId = `key-skew--${digest}`;
+    const publisher = new PrivateFileStore({ root: sourceRoot, role: "publisher" }); await publisher.putImmutable(objectId, bytes);
+    const acquire = vi.fn(async () => true);
+    await expect(installObject({
+      client: {}, objectId, sourceStore: new PrivateFileStore({ root: sourceRoot, role: "source-reader" }), rollbackStore: new PrivateFileStore({ root: rollbackRoot, role: "rollback-owner" }), maintenance: {},
+      env: { EXPORTER_SIGNING_PUBLIC_KEY: sign.publicKey, IMPORTER_ENCRYPTION_PRIVATE_KEY: enc.privateKey, STAGING_COMPARISON_KEY_BASE64: targetKey.toString("base64"), STAGING_COMPARISON_KEY_ID: "same-id", AUTH_SECRET: "same-auth", SECRETS_KEY: "same-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "same" } as unknown as NodeJS.ProcessEnv,
+      operations: { acquireCoordinatorLock: acquire },
+    })).rejects.toThrow(/key material/);
+    expect(acquire).not.toHaveBeenCalled();
   });
 
   it("admits distinct same-key-ID environment credentials", () => {

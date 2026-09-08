@@ -216,7 +216,7 @@ describe("a bound answer still has to be a SERVING answer", () => {
 describe("live credential separation is not established by a local document", () => {
   const fingerprintSet = (fill: string) => Object.fromEntries(REQUIRED_CREDENTIAL_CLASSES.map((credentialClass: string) => [
     credentialClass,
-    { version: FINGERPRINT_VERSION, keyId: "example-key", credentialClass, mac: Buffer.alloc(32, fill).toString("base64url") },
+    { version: FINGERPRINT_VERSION, keyId: "example-key", keyConfirmation: Buffer.alloc(32, "k").toString("base64url"), credentialClass, mac: Buffer.alloc(32, fill).toString("base64url") },
   ]));
   const topology = () => ({ document: JSON.parse(readFileSync(TOPOLOGY_FILE, "utf8")), measuredFrom: "read-back" });
   const separation = (credentialFingerprints: Record<string, unknown>) =>

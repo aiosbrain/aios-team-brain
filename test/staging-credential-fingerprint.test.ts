@@ -21,9 +21,23 @@ describe("ops-only credential comparison", () => {
   it("requires comparability before treating unequal MAC text as credential separation", () => {
     const source = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: key, keyId: "source-key" });
     const target = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: key, keyId: "target-key" });
-    expect(() => assertDistinctFingerprints(source, target, "AUTH_SECRET")).toThrow(/same versioned comparison key/);
+    expect(() => assertDistinctFingerprints(source, target, "AUTH_SECRET")).toThrow(/same versioned comparison key material/);
     expect(() => assertDistinctFingerprints(undefined, target, "AUTH_SECRET")).toThrow(/well formed/);
     expect(() => assertDistinctFingerprints({ ...source, mac: "malformed" }, target, "AUTH_SECRET")).toThrow(/well formed/);
+  });
+
+  it("refuses equal key IDs backed by different actual comparison keys", () => {
+    const source = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: Buffer.alloc(32, 1), keyId: "ops-v2" });
+    const target = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: Buffer.alloc(32, 2), keyId: "ops-v2" });
+    expect(source.keyConfirmation).not.toBe(target.keyConfirmation);
+    expect(() => assertDistinctFingerprints(source, target, "AUTH_SECRET")).toThrow(/key material/);
+  });
+
+  it.each(["missing", "malformed"])("refuses a %s key-material confirmation", (kind) => {
+    const source = credentialFingerprint({ credentialClass: "auth-secret", value: "prod", comparisonKey: key, keyId: "ops-v2" });
+    const target = credentialFingerprint({ credentialClass: "auth-secret", value: "staging", comparisonKey: key, keyId: "ops-v2" });
+    const changed = { ...source, keyConfirmation: kind === "missing" ? undefined : "not-fixed-bytes" };
+    expect(() => assertDistinctFingerprints(changed, target, "AUTH_SECRET")).toThrow(/well formed/);
   });
 
   it("accepts distinct credentials only under the same comparison key identity", () => {

@@ -8,6 +8,13 @@ import {
   neoInt,
   replaceNeo4jGraph,
 } from "../scripts/staging-ops/neo4j-replace.mjs";
+import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
+import { createSignedEncryptedBundle, openSignedEncryptedBundle, rollbackOpeningProvenance } from "../scripts/staging-ops/bundle-crypto.mjs";
+import { generateKeyPairSync } from "node:crypto";
+
+const comparisonKey = Buffer.alloc(32, 8);
+const sourceFingerprint = credentialFingerprint({ credentialClass: "neo4j-credential", value: "production", comparisonKey, keyId: "shared-key" });
+const targetFingerprint = credentialFingerprint({ credentialClass: "neo4j-credential", value: "staging", comparisonKey, keyId: "shared-key" });
 
 const GOOD = {
   actualEnvironmentId: "staging-env",
@@ -17,8 +24,8 @@ const GOOD = {
   pinnedNeo4jService: "neo4j-staging",
   database: "neo4j",
   pinnedDatabase: "neo4j",
-  targetCredentialFingerprint: { version: "hmac-sha256-v1", keyId: "shared-key", credentialClass: "neo4j-credential", mac: "b".repeat(43) },
-  sourceCredentialFingerprint: { version: "hmac-sha256-v1", keyId: "shared-key", credentialClass: "neo4j-credential", mac: "a".repeat(43) },
+  targetCredentialFingerprint: targetFingerprint,
+  sourceCredentialFingerprint: sourceFingerprint,
   electionLockHeld: true,
   exclusiveDataLockHeld: true,
   pinnedAppServiceId: "app-service",
@@ -54,6 +61,20 @@ function fakeSession({ deletes = [2, 0] }: { deletes?: number[] } = {}) {
 describe("staging Neo4j replacement owner", () => {
   it("accepts only the exact stopped, locked, distinct-credential internal staging target", () => {
     expect(assertReplaceTarget(GOOD)).toBe(true);
+  });
+
+  it("admits a genuinely rollback-key-authenticated target-owned checkpoint without fake production proof", () => {
+    const signing = generateKeyPairSync("ed25519");
+    const encryption = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const bundle = createSignedEncryptedBundle({ payload: Buffer.from("rollback"), manifest: { kind: "staging-rollback" }, exporterSigningPrivateKey: signing.privateKey, importerEncryptionPublicKey: encryption.publicKey });
+    const opened = openSignedEncryptedBundle({ bundle, exporterSigningPublicKey: signing.publicKey, importerEncryptionPrivateKey: encryption.privateKey, signerPurpose: "rollback" });
+    expect(assertReplaceTarget({ ...GOOD, sourceCredentialFingerprint: undefined, sourceProvenance: rollbackOpeningProvenance(opened) })).toBe(true);
+  });
+
+  it("never trusts manifest.kind or a loose provenance boolean as a rollback exception", () => {
+    for (const sourceProvenance of [{ kind: "staging-rollback" }, { authenticated: true }, true]) {
+      expect(() => assertReplaceTarget({ ...GOOD, sourceCredentialFingerprint: undefined, sourceProvenance })).toThrow(/fingerprints/);
+    }
   });
 
   it.each([

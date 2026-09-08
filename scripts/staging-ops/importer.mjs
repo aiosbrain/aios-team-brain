@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import pg from "pg";
 import neo4j from "neo4j-driver";
-import { openSignedEncryptedBundle, createSignedEncryptedBundle } from "./bundle-crypto.mjs";
+import { openSignedEncryptedBundle, createSignedEncryptedBundle, rollbackOpeningProvenance } from "./bundle-crypto.mjs";
 import { packPair, unpackPair, validatePairManifest } from "./bundle-format.mjs";
 import { assertCompatibleBuildIdentity, assertInstalledSchemaMatches, loaderCapabilityIdentity, schemaFingerprintDigest } from "./build-identity.mjs";
 import {
@@ -25,7 +25,7 @@ import { assertStagingTopology } from "./config.mjs";
 import { replaceNeo4jGraph, assertReplaceTarget } from "./neo4j-replace.mjs";
 import { captureRollbackPostgres, resetSessionTransactionState, restorePairedPostgres, restoreRollbackPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
-import { closeAll } from "./resource-cleanup.mjs";
+import { closeAllWithinBudget, ownedCloser } from "./resource-cleanup.mjs";
 import { canonicalObjectId, createPrivateStore, parseCanonicalObjectId } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
 import { fingerprint } from "../schema-fingerprint.mjs";
@@ -35,7 +35,7 @@ import { exportGraph, GRAPH_CODEC_VERSION, validateGraphShape } from "./graph-bu
 import { decodeNeo4jValue } from "./neo4j-codec.mjs";
 import { snapshotExportFacts, validateLedgerAgainstSanitizedGraph, assertResolvedCorrectionScopes } from "./exporter.mjs";
 import { keyMaterial } from "./key-material.mjs";
-import { configurePostgresDeadline, postgresDeadlineConfig, stagingOperationDeadlines } from "./operation-deadline.mjs";
+import { armBudgetWatchdog, configurePostgresDeadline, createOperationBudget, postgresDeadlineConfig, remainingBudgetMs, stagingOperationDeadlines } from "./operation-deadline.mjs";
 import { runBoundedProcess } from "./bounded-process.mjs";
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -73,10 +73,10 @@ function rollbackKeys(env) {
 }
 
 function openBundleBytes(bytes, env, kind = "source", { ignoreExpiry = false } = {}) {
-  const opened = openSignedEncryptedBundle({ bundle: JSON.parse(bytes.toString("utf8")), ...(kind === "rollback" ? rollbackKeys(env) : sourceKeys(env)) });
+  const opened = openSignedEncryptedBundle({ bundle: JSON.parse(bytes.toString("utf8")), ...(kind === "rollback" ? rollbackKeys(env) : sourceKeys(env)), signerPurpose: kind });
   const validity = validatePairManifest(opened.manifest, ignoreExpiry ? 0 : Date.now(), { allowRollback: kind === "rollback" });
   if (!validity.ok) throw new Error(`${kind} bundle refused: ${validity.errors.join("; ")}`);
-  return opened;
+  return { ...opened, sourceProvenance: rollbackOpeningProvenance(opened) };
 }
 
 export async function verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env = process.env }) {
@@ -236,21 +236,25 @@ async function measuredReplaceFacts({ client, maintenance, env, opened }) {
     pinnedGraphitiServiceId: env.STAGING_GRAPHITI_SERVICE_ID,
     targetCredentialFingerprint: credentialFingerprint({ credentialClass: "neo4j-credential", value: `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`, comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), keyId: env.STAGING_COMPARISON_KEY_ID }),
     sourceCredentialFingerprint: opened.manifest.credentialFingerprints?.["neo4j-credential"],
+    sourceProvenance: opened.sourceProvenance,
     electionLockHeld, exclusiveDataLockHeld, stopMeasurement,
   };
 }
 
-export async function installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines = stagingOperationDeadlines(env) }) {
+export async function installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines = stagingOperationDeadlines(env), budget = null, cleanupBudget = null }) {
+  budget?.assert("pair unpack");
   const graph = await unpackPair(opened.payload, directory, opened.manifest.checksums);
   // Prove the pinned staging target BEFORE the first destructive Postgres write, not only before
   // the graph delete. The same measured facts then authorise the marker repair inside the restore:
   // re-materialising a staging discriminator is only safe on a target whose staging identity has
   // been independently established (H1) — a database URL is not that proof.
+  budget?.assert("replace target measurement");
   const facts = await measuredReplaceFacts({ client, maintenance, env, opened });
   assertReplaceTarget(facts);
   const restore = {
     client, databaseUrl: env.DATABASE_URL, directory, verifiedStagingTarget: true,
     operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs,
+    budget,
   };
   if (opened.manifest.databaseMode === "full") await restoreRollbackPostgres({ ...restore, env: { ...env, STAGING_DATA_MODE: opened.manifest.mode } });
   else await restorePairedPostgres({ ...restore, env });
@@ -268,11 +272,13 @@ export async function installOpenedPair({ client, session, opened, directory, en
     if (!Number.isFinite(pause) || pause < 1 || pause > 120_000) throw new Error("invalid bounded harness pause");
     await new Promise((resolve) => setTimeout(resolve, pause));
   }
-  await reapplyTesters(env, deadlines);
+  budget?.assert("tester reprovisioning");
+  await reapplyTesters(env, { ...deadlines, operationMs: remainingBudgetMs(budget, deadlines.operationMs, "tester reprovisioning") });
   // Re-measured, not reused: the stop/lock facts must hold at the moment of the graph delete too.
   await replaceNeo4jGraph({
     session, graph, facts: await measuredReplaceFacts({ client, maintenance, env, opened }),
     operationTimeoutMs: deadlines.operationMs, cleanupTimeoutMs: deadlines.cleanupMs,
+    budget, cleanupBudget,
   });
   emitReceipt("graph-restored", { runId: opened.manifest.runId, kind: opened.kind, nodes: graph.nodes.length, relationships: graph.relationships.length });
   if (opened.manifest.kind !== "staging-rollback" && env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "after-graph") {
@@ -292,7 +298,8 @@ export async function installOpenedPair({ client, session, opened, directory, en
  * credential/outbound rows at all, while a full staging rollback capture is expected to carry back
  * whatever staging itself held (including its own tester credentials).
  */
-export async function verifyInstalledPair({ client, session, graph, opened, sanitationExpected = true, deadlines = stagingOperationDeadlines(process.env) }) {
+export async function verifyInstalledPair({ client, session, graph, opened, sanitationExpected = true, deadlines = stagingOperationDeadlines(process.env), budget = null }) {
+  budget?.assert("installed pair verification");
   if (sanitationExpected) {
     const credentialCounts = await client.query(`SELECT
       (SELECT count(*) FROM auth_tokens)+(SELECT count(*) FROM api_keys)+(SELECT count(*) FROM agent_tokens)+
@@ -300,7 +307,7 @@ export async function verifyInstalledPair({ client, session, graph, opened, sani
       (SELECT count(*) FROM llm_usage)+(SELECT count(*) FROM usage_costs) AS forbidden_count`);
     if (Number(credentialCounts.rows[0]?.forbidden_count ?? -1) !== 0) throw new Error("post-import credential/outbound queue sanitation verification failed");
   }
-  const installedGraph = await exportGraph(session, { operationTimeoutMs: deadlines.operationMs });
+  const installedGraph = await exportGraph(session, { operationTimeoutMs: deadlines.operationMs, budget });
   // The census applies to EVERY pair: whatever was verified in the bundle is what must now be in
   // the target, legacy or copy-ready.
   if (installedGraph.nodes.length !== graph.nodes.length || installedGraph.relationships.length !== graph.relationships.length) throw new Error("installed graph census differs from verified bundle");
@@ -432,12 +439,12 @@ async function openJournalPair({ journal, rollbackStore, env, prefix, label }) {
   if (!runId || !objectId || !digest) throw new Error(`no canonical verified ${label} rollback pair`);
   const bytes = await rollbackStore.read(objectId);
   if (sha(bytes) !== digest) throw new Error(`${label} rollback object failed digest verification`);
-  const encoded = JSON.parse(bytes.toString("utf8"));
-  const kind = encoded?.manifest?.kind === "staging-rollback" ? "rollback" : "source";
-  const opened = openBundleBytes(bytes, env, kind, { ignoreExpiry: true });
+  // A journal prior is, by contract, an importer-owned rollback object. Authenticate it with the
+  // rollback key directly; never let unauthenticated manifest.kind choose the trusted signer.
+  const opened = openBundleBytes(bytes, env, "rollback", { ignoreExpiry: true });
   if (opened.manifest.runId !== runId || commit !== opened.manifest.targetCommit) throw new Error(`${label} journal/object metadata mismatch`);
   assertCompatibleBuildIdentity(opened.manifest.build, loaderCapabilityIdentity());
-  return { ...opened, sourceBytes: bytes, objectId, digest, kind };
+  return { ...opened, sourceBytes: bytes, objectId, digest, kind: "rollback" };
 }
 
 async function openPrior({ journal, rollbackStore, env }) {
@@ -552,12 +559,15 @@ async function acquireExclusiveDataUseLock(client, env, context, { sleep = (ms) 
   }
 }
 
-export async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env, notes = [], deadlines = stagingOperationDeadlines(env) }) {
+export async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env, notes = [], deadlines = stagingOperationDeadlines(env), budget = null, now = undefined }) {
+  const recoveryBudget = budget ?? createOperationBudget("importer recovery", deadlines.recoveryMs, { now });
   // FIRST statement of the recovery path, before the journal write, before the advisory lock, and
   // before the marker read inside the restore. Whatever failed may have left this connection in an
   // aborted transaction, in which case all three fail — and the pre-existing `.catch(() => {})`
   // around the journal write made two of those failures invisible.
+  recoveryBudget.assert("recovery session reset");
   const reset = await resetSessionTransactionState(client);
+  recoveryBudget.assert("recovery session continuity evidence");
   await emitSessionContinuity(client, { checkpoint: "rollback-reset", failedRunId, env });
   if (reset.status !== "reset") {
     notes.push(`session reset failed: ${reset.detail}`);
@@ -565,7 +575,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: false, journalRecorded });
     throw new Error(withNotes("the importer's database session is unusable, so NO rollback was attempted; staging remains fenced and recovery is required", notes));
   }
-  try { await configurePostgresDeadline(client, deadlines.recoveryMs); }
+  try { await configurePostgresDeadline(client, recoveryBudget.remaining(deadlines.recoveryMs, "recovery deadline configuration")); }
   catch (error) {
     notes.push(`recovery deadline could not be installed: ${errorText(error)}`);
     emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-deadline-unavailable", rollbackAttempted: false, journalRecorded: false });
@@ -574,6 +584,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
 
   // Admission is a hard boundary. A refused transition cannot be converted into permission to
   // stop services. `ready` is valid only when the caller already resolved a preserved prior target.
+  recoveryBudget.assert("recovery admission transition");
   await transitionJournal(client, {
     runId: failedRunId,
     from: ["failed", "booting", "importing", "verifying", "draining", "ready"],
@@ -588,20 +599,27 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     // Stopping the services and reacquiring the exclusive lock used to sit OUTSIDE this block, so a
     // failure in either escaped raw — after the services were already stopped — and neither reached
     // the recovery-required checkpoint below nor said what state staging had been left in.
+    recoveryBudget.assert("recovery service stop");
     await maintenance.stopAndVerifyAll();
+    recoveryBudget.assert("recovery exclusive lock");
     await acquireExclusiveDataUseLock(client, env, "rollback");
     driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
     session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     if (env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_ROLLBACK === "1") throw new Error("injected harness rollback failure");
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["draining", "failed"], to: "importing" });
     const recoveryDeadlines = { ...deadlines, operationMs: deadlines.recoveryMs };
-    const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance, deadlines: recoveryDeadlines }));
+    const graphCleanupBudget = recoveryBudget.child("recovery graph cleanup", deadlines.cleanupMs);
+    const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance, deadlines: recoveryDeadlines, budget: recoveryBudget, cleanupBudget: graphCleanupBudget }));
+    recoveryBudget.assert("recovery installed transition");
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["importing"], to: "verifying" });
     // M2: BOTH kinds are verified against the data that landed. A full staging capture legitimately
     // carries staging's own credentials, so only the source-sanitation assertion is conditional.
-    await verifyInstalledPair({ client, session, graph, opened: prior, sanitationExpected: prior.kind === "source", deadlines: recoveryDeadlines });
+    await verifyInstalledPair({ client, session, graph, opened: prior, sanitationExpected: prior.kind === "source", deadlines: recoveryDeadlines, budget: recoveryBudget });
+    recoveryBudget.assert("recovery durable pair write");
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
+    recoveryBudget.assert("recovery boot");
     const booted = await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
+    recoveryBudget.assert("recovery ready bookkeeping");
     readyCommitted = booted.ready;
     await rollbackStore.writePointer("last-ready", { runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, kind: prior.kind });
     await clearRollbackTarget(client, prior.manifest.runId);
@@ -630,37 +648,64 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     const journalRecorded = await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
     emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: true, journalRecorded });
     throw new Error(withNotes(`paired rollback failed; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
-  } finally { await closeAll(() => session?.close(), () => driver?.close()); }
+  } finally {
+    const terminalBudget = createOperationBudget("recovery terminal cleanup", deadlines.cleanupMs, { now });
+    await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
+      session ? ownedCloser(() => session.close()) : null,
+      driver ? ownedCloser(() => driver.close()) : null,
+    );
+  }
 }
 
-async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env) }) {
-  const opened = await verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env });
-  compareEnvironmentCredentials(opened.manifest, env);
+export async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), operations = {} }) {
+  const operationBudget = operations.operationBudget ?? createOperationBudget("importer install", deadlines.operationMs, { now: operations.now });
+  const verifyAndPin = operations.verifyAndPinSourceBundle ?? verifyAndPinSourceBundle;
+  const compareCredentials = operations.compareEnvironmentCredentials ?? compareEnvironmentCredentials;
+  const acquireLock = operations.acquireCoordinatorLock ?? acquireCoordinatorLock;
+  const readCurrentJournal = operations.readJournal ?? readJournal;
+  const loadPrior = operations.openPrior ?? openPrior;
+  const loadRollbackTarget = operations.openRollbackTarget ?? openRollbackTarget;
+  const rollback = operations.rollbackToPrior ?? rollbackToPrior;
+  const reconcile = operations.reconcileReadyInstall ?? reconcileReadyInstall;
+  const releaseLock = operations.releaseCoordinatorLock ?? releaseCoordinatorLock;
+  operationBudget.assert("source admission");
+  const opened = await verifyAndPin({ objectId, sourceStore, rollbackStore, env });
+  compareCredentials(opened.manifest, env);
   // B4: compatibility is against this pinned runner image's OWN loader capability, never against
   // the live target catalog — the catalog is the thing being replaced, and reading it here both
   // blocked legitimate staging-only schema changes and made a half-installed target unrecoverable.
   assertCompatibleBuildIdentity(opened.manifest.build, loaderCapabilityIdentity());
-  if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
+  operationBudget.assert("coordinator lock acquisition");
+  if (!(await acquireLock(client))) throw new Error("another importer owns the coordinator lock");
   try {
-  const journal = await readJournal(client);
+  const journal = await readCurrentJournal(client);
   if (journal.state === "failed" && journal.last_safe_checkpoint === "recovery-required") {
     throw new Error("prior-pair rollback previously failed; staging remains fenced until explicit rollback recovery");
   }
   if (journal.state !== "ready") {
-    const recovered = await rollbackToPrior({ client, prior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines });
+    // Resolve the authenticated durable recovery target inside this branch, under the coordinator
+    // lock. Prefer the target snapshotted on entry to drain; fall back to canonical last-ready for
+    // older/interruption states. This preserves the intended recovery identity and avoids touching
+    // the obsolete prior during same-run ready reconciliation below.
+    operationBudget.assert("interrupted recovery target resolution");
+    const interruptedPrior = journal.rollback_target_run_id
+      ? await loadRollbackTarget({ journal, rollbackStore, env })
+      : await loadPrior({ journal, rollbackStore, env });
+    const recoveryBudget = createOperationBudget("interrupted importer recovery", deadlines.recoveryMs, { now: operations.now });
+    const recovered = await rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget });
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
     // Same-run repair derives every pointer from the JOURNAL authority and repeats the whole
     // post-ready suffix. A prior attempt may have failed at any individual bookkeeping operation.
-    const reconciled = await reconcileReadyInstall({ client, ready: journal, opened, sourceObjectId: objectId, rollbackStore, env });
+    const reconciled = await reconcile({ client, ready: journal, opened, sourceObjectId: objectId, rollbackStore, env });
     return {
       status: "already-ready", runId: opened.manifest.runId,
       objectId: journal.last_ready_object_id, catchup: reconciled.catchup,
       cleanupErrors: reconciled.cleanupErrors,
     };
   }
-  const prior = await openPrior({ journal, rollbackStore, env });
+  const prior = await loadPrior({ journal, rollbackStore, env });
   // B3: never install a capture older than the newest one already installed. Without a durable
   // watermark, discovery that skipped the installed newest run simply picked the SECOND newest —
   // an older bundle — and the next run picked the newest again, oscillating staging forever.
@@ -670,6 +715,7 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
   if (watermark !== null && Number.isFinite(watermark) && captured <= watermark) {
     throw new Error(`source run ${opened.manifest.runId} captured at or before the installed watermark; refusing to move staging backwards`);
   }
+  operationBudget.assert("staging target commit measurement");
   const targetCommit = await readStagingHead(env);
   // The harness's NEGATIVE CONTROL. A failure BEFORE the drain touches neither store, so it must not
   // be able to satisfy a scenario about recovering from a mid-install fault — which the old
@@ -682,26 +728,39 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
   let destructive = false;
   let readyCommitted = null;
   try {
+    operationBudget.assert("pinned importer verification");
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
+    operationBudget.assert("drain transition");
     await transitionJournal(client, { runId: opened.manifest.runId, from: ["ready", "failed"], to: "draining", patch: { lastSafeCheckpoint: "ready", candidateRunId: opened.manifest.runId, candidateObjectId: objectId, candidateDigest: opened.digest, candidateMode: "copy-ready", catchupCommit: targetCommit, snapshotRollbackTarget: true } });
     destructive = true;
+    operationBudget.assert("service stop");
     await maintenance.stopAndVerifyAll();
+    operationBudget.assert("exclusive data lock acquisition");
     await acquireExclusiveDataUseLock(client, env, "import");
     await transitionJournal(client, { runId: opened.manifest.runId, from: ["draining"], to: "importing" });
     const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
     const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     try {
-      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines }));
+      const graphCleanupBudget = operationBudget.child("install graph cleanup", deadlines.cleanupMs);
+      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines, budget: operationBudget, cleanupBudget: graphCleanupBudget }));
+      operationBudget.assert("installed transition");
       await transitionJournal(client, { runId: opened.manifest.runId, from: ["importing"], to: "verifying" });
-      await verifyInstalledPair({ client, session, graph, opened, deadlines });
+      await verifyInstalledPair({ client, session, graph, opened, deadlines, budget: operationBudget });
+      operationBudget.assert("ready pair sealing");
       const readyPair = sealReadyRollback(opened, targetCommit, env);
       await rollbackStore.putImmutable(readyPair.objectId, readyPair.sourceBytes);
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair failed durable read-back verification");
+      operationBudget.assert("candidate boot");
       const booted = await bootExact({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
+      operationBudget.assert("ready reconciliation");
       readyCommitted = booted.ready;
       const reconciled = await reconcileReadyInstall({ client, ready: readyCommitted, opened, sourceObjectId: objectId, rollbackStore, env });
       return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: reconciled.catchup, cleanupErrors: reconciled.cleanupErrors };
-    } finally { await closeAll(() => session.close(), () => driver.close()); }
+    } finally {
+      const terminalBudget = createOperationBudget("install terminal cleanup", deadlines.cleanupMs, { now: operations.now });
+      await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
+        ownedCloser(() => session.close()), ownedCloser(() => driver.close()));
+    }
   } catch (error) {
     if (readyCommitted) {
       // `markReady` is the commit boundary. The deployment is verified serving and canonical
@@ -722,12 +781,14 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     // reset missing, this transition and the release both fail silently and the rollback path then
     // fails on its own first statement — while the message below still said the prior pair had been
     // restored. The lock is released on the SAME backend, so the reset must not reconnect.
+    const recoveryBudget = createOperationBudget("importer recovery", deadlines.recoveryMs, { now: operations.now });
+    recoveryBudget.assert("recovery initial session reset");
     const reset = await resetSessionTransactionState(client);
     await emitSessionContinuity(client, { checkpoint: "install-reset", failedRunId: opened.manifest.runId, env });
     if (reset.status !== "reset") notes.push(`session reset failed: ${reset.detail}`);
     let usable = reset.status === "reset";
     if (usable) {
-      try { await configurePostgresDeadline(client, deadlines.recoveryMs); }
+      try { await configurePostgresDeadline(client, recoveryBudget.remaining(deadlines.recoveryMs, "recovery deadline configuration")); }
       catch (deadlineError) { usable = false; notes.push(`recovery deadline could not be installed: ${errorText(deadlineError)}`); }
     }
     await recoveryStep("failed-state journal transition", () => transitionJournal(client, { runId: opened.manifest.runId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: usable ? "ready" : "recovery-required" } }), notes);
@@ -736,10 +797,10 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
       // Never call a rollback the session cannot execute, and never describe one that did not run.
       throw new Error(withNotes(`paired refresh failed and the importer's database session could not be reset, so the prior pair was NOT restored; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
     }
-    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines });
+    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget });
     throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
   }
-  } finally { await releaseCoordinatorLock(client).catch(() => {}); }
+  } finally { await releaseLock(client).catch(() => {}); }
 }
 
 async function currentDeployment(maintenance) {
@@ -750,7 +811,9 @@ async function currentDeployment(maintenance) {
   return { deployment: current, commit };
 }
 
-async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env) }) {
+async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null }) {
+  const operationBudget = budget ?? createOperationBudget("bootstrap rollback", deadlines.operationMs);
+  operationBudget.assert("bootstrap coordinator lock");
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
   // EVERYTHING after the acquisition is inside the release scope. The journal read, the deployment
   // measurement and the mode check all sat between the acquire and the old `try`, so any of them
@@ -766,26 +829,29 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   // which one was running. One receipt per phase, names only — no configuration, no arguments.
   const phase = (name, fields = {}) => emitReceipt("bootstrap-phase", { runId, phase: name, ...fields });
   try {
+    operationBudget.assert("bootstrap journal read");
     phase("read-journal");
     const journal = await readJournal(client);
     if (journal.last_ready_run_id) throw new Error("bootstrap rollback is one-time and last-ready already exists");
     phase("measure-current-deployment");
     current = await currentDeployment(maintenance);
+    operationBudget.assert("bootstrap draining transition");
     phase("measured-current-deployment", { deploymentId: current.deployment?.id ?? null, deploymentStatus: current.deployment?.status ?? null });
     if (!new Set(["legacy-pg-only", "copy-ready"]).has(mode)) throw new Error("STAGING_BOOTSTRAP_MODE must describe the measured current staging mode");
     phase("transition-draining", { from: journal.state });
     await transitionJournal(client, { runId, from: [journal.state], to: "draining", patch: { lastSafeCheckpoint: journal.state } });
     phase("stop-and-verify-all");
     await maintenance.stopAndVerifyAll();
+    operationBudget.assert("bootstrap exclusive data lock");
     phase("acquire-exclusive-data-lock");
     await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
     phase("capture-checkpoint");
     const created = await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
-      await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs });
+      await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
       const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       try {
-        const graph = await exportGraph(session, { operationTimeoutMs: deadlines.operationMs });
+        const graph = await exportGraph(session, { operationTimeoutMs: deadlines.operationMs, budget: operationBudget });
         // M2: prove the captured graph is REPLAYABLE before this checkpoint is accepted as the
         // thing recovery depends on. Codec version, shape and a round trip through the same codec
         // the restore will use — a checkpoint that cannot be replayed is not a checkpoint.
@@ -807,6 +873,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
           exporterSigningPrivateKey: keyMaterial(env, "ROLLBACK_SIGNING_PRIVATE_KEY"),
           importerEncryptionPublicKey: keyMaterial(env, "ROLLBACK_ENCRYPTION_PUBLIC_KEY") });
         const bytes = Buffer.from(JSON.stringify(bundle)); const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
+        operationBudget.assert("bootstrap checkpoint publication");
         await rollbackStore.putImmutable(objectId, bytes);
         if (!(await rollbackStore.verify(objectId, digest))) throw new Error("bootstrap rollback failed durable read-back verification");
         // Read the sealed object BACK through the ordinary open path: signature, decryption,
@@ -816,13 +883,19 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
           throw new Error("bootstrap checkpoint failed its durable read-back identity check");
         }
         return { objectId, digest };
-      } finally { await closeAll(() => session.close(), () => driver.close()); }
+      } finally {
+        const terminalBudget = createOperationBudget("bootstrap terminal cleanup", deadlines.cleanupMs);
+        await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
+          ownedCloser(() => session.close()), ownedCloser(() => driver.close()));
+      }
     });
     phase("captured-checkpoint", { objectId: created.objectId });
+    operationBudget.assert("bootstrap boot transition");
     await transitionJournal(client, { runId, from: ["draining"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
     await releaseDataUseLock(client, "exclusive");
     phase("deploy-app");
     const deploymentId = await maintenance.deployApp(current.commit);
+    operationBudget.assert("bootstrap health verification");
     phase("await-boot", { deploymentId, mode });
     await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
     phase("booted", { deploymentId });
@@ -831,13 +904,15 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     return { status: "bootstrapped", runId, objectId: created.objectId, commit: current.commit, mode };
   } catch (error) {
     const notes = [];
+    const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
     // Same ordering rule as the refresh path: the capture holds a read-only transaction on this
     // client, so a failure inside it can leave the session aborted and every recovery statement
     // below — the lock release and both journal transitions — would fail invisibly.
+    recoveryBudget.assert("bootstrap recovery session reset");
     const reset = await resetSessionTransactionState(client);
     if (reset.status !== "reset") notes.push(`session reset failed: ${reset.detail}`);
     if (reset.status === "reset") {
-      await configurePostgresDeadline(client, deadlines.recoveryMs).catch((deadlineError) => notes.push(`recovery deadline could not be installed: ${errorText(deadlineError)}`));
+      await configurePostgresDeadline(client, recoveryBudget.remaining(deadlines.recoveryMs, "bootstrap recovery deadline configuration")).catch((deadlineError) => notes.push(`recovery deadline could not be installed: ${errorText(deadlineError)}`));
     }
     await recoveryStep("exclusive data-use lock release", () => releaseDataUseLock(client, "exclusive"), notes);
     // Bootstrap performs no destructive database write, so recovery is exactly "put the UNCHANGED
@@ -866,11 +941,14 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
-async function serviceCatchup({ client, maintenance, env }) {
+async function serviceCatchup({ client, maintenance, env, budget = null }) {
+  budget?.assert("catch-up coordinator lock");
   if (!(await acquireCoordinatorLock(client))) return { status: "catchup-busy" };
   try {
+    budget?.assert("catch-up journal read");
     const journal = await readJournal(client);
     if (journal.state !== "ready") return { status: "catchup-deferred", state: journal.state };
+    budget?.assert("catch-up head measurement");
     const head = await readStagingHead(env);
     if (head === journal.last_ready_commit) {
       if (journal.catchup_commit) await recordCatchup(client, { commit: null, attempts: 0 });
@@ -982,7 +1060,7 @@ export async function importerPreflight(env = process.env, action = "install") {
   return true;
 }
 
-export async function runImporter(env = process.env, argv = process.argv.slice(2), { activationRunner = runActivationPreflight } = {}) {
+export async function runImporter(env = process.env, argv = process.argv.slice(2), { activationRunner = runActivationPreflight, activationOptions = {}, now = undefined } = {}) {
   const action = argv[0];
   if (!new Set(["install-ops", "verify", "install", "bootstrap-rollback", "rollback", "tick", "daemon", "activation-preflight"]).has(action)) throw new Error("importer action must be install-ops, verify, install, bootstrap-rollback, rollback, tick, daemon, or activation-preflight");
   // The activation verifier is READ-ONLY and needs no database, no locks and no runner role: it is
@@ -990,17 +1068,23 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   // it is supposed to authorise would be circular. It refuses on `UNVERIFIED` as well as on
   // `NOT ACTIVATED` — "we could not look" is not permission — and its best outcome is READY TO
   // ACTIVATE, which is a readiness verdict about an inert system, not a claim that it is running.
+  const deadlines = stagingOperationDeadlines(env);
   if (action === "activation-preflight") {
-    const result = await activationRunner(env);
+    const activationBudget = createOperationBudget("activation preflight", deadlines.operationMs, { now });
+    activationBudget.assert("activation evidence verification");
+    const result = await activationRunner(env, { ...activationOptions, budget: activationBudget });
+    activationBudget.assert("activation preflight verdict");
     console.log(result.report);
     assertActivationPreflightReady(result);
     return { status: result.status, checks: result.checks };
   }
   // Validate all finite budgets before opening a DB connection or constructing a lifecycle writer.
   // A daemon gets one fresh operation budget per tick; this is not a finite daemon lifetime.
-  const deadlines = stagingOperationDeadlines(env);
+  const actionBudget = action === "daemon" ? null : createOperationBudget(`importer ${action}`, deadlines.operationMs, { now });
+  actionBudget?.assert("importer preflight");
   await importerPreflight(env, action);
-  const client = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.operationMs, deadlines.connectionMs)); await client.connect();
+  const client = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, actionBudget?.remaining(deadlines.operationMs, "Postgres connection") ?? deadlines.operationMs, deadlines.connectionMs)); await client.connect();
+  const actionWatchdog = actionBudget ? armBudgetWatchdog(actionBudget, (error) => client.connection?.stream?.destroy(error)) : null;
   let shuttingDown = false;
   const recordSignalAbort = async (signal) => {
     if (shuttingDown) return; shuttingDown = true;
@@ -1033,8 +1117,8 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     // exactly that: bootstrap dying with `Connection terminated` before it had read anything.
     // This applies ONLY where the promise owns enclosing cleanup — the inner `tick` helper, the
     // health wrappers and `replaceFromArchive` own none, and are deliberately left alone.
-    await configurePostgresDeadline(client, deadlines.operationMs);
-    if (action === "bootstrap-rollback") return await bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines });
+    await configurePostgresDeadline(client, actionBudget?.remaining(deadlines.operationMs, "importer deadline configuration") ?? deadlines.operationMs);
+    if (action === "bootstrap-rollback") return await bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines, budget: actionBudget });
     if (action === "rollback") {
       if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
       // The await must be INSIDE this try, not merely inside the outer one: otherwise this `finally`
@@ -1049,32 +1133,48 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
         const prior = hasPreservedTarget
           ? await openRollbackTarget({ journal, rollbackStore, env })
           : await openPrior({ journal, rollbackStore, env });
-        return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines });
+        const recoveryBudget = createOperationBudget("manual importer recovery", deadlines.recoveryMs, { now });
+        return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget });
       }
       finally { await releaseCoordinatorLock(client).catch(() => {}); }
     }
     if (action === "install") {
       if (!argv[1]) throw new Error("canonical immutable object ID is required");
-      return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env, deadlines });
+      return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env, deadlines, operations: { operationBudget: actionBudget, now } });
     }
     const tick = async () => {
+      const tickBudget = createOperationBudget("importer daemon tick", deadlines.operationMs, { now });
+      const tickWatchdog = armBudgetWatchdog(tickBudget, (error) => client.connection?.stream?.destroy(error));
+      try {
       // Reset server-side statement/lock deadlines for THIS daemon operation. The connection and
       // daemon persist, but no individual tick inherits an expired or recovery-sized budget.
-      await configurePostgresDeadline(client, deadlines.operationMs);
-      const catchup = await serviceCatchup({ client, maintenance, env });
+      await configurePostgresDeadline(client, tickBudget.remaining(deadlines.operationMs, "daemon tick deadline configuration"));
+      const catchup = await serviceCatchup({ client, maintenance, env, budget: tickBudget });
       // Selection reads the watermark unlocked and `installObject` RE-CHECKS it while holding the
       // coordinator lock, so a concurrent worker cannot install between the two.
+      tickBudget.assert("source discovery journal read");
       const objectId = await discoverLatestSource(sourceStore, await readJournal(client), env);
       if (!objectId) return { status: "idle", catchup };
-      return installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines });
+      return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, operations: { operationBudget: tickBudget, now } });
+      } finally { await tickWatchdog.disarm(); }
     };
     if (action === "tick") return await tick();
     const interval = Number(env.STAGING_IMPORTER_POLL_MS ?? 300_000);
     if (!Number.isFinite(interval) || interval < 300_000) throw new Error("importer poll interval must be at least five minutes");
-    for (;;) { await tick().catch((error) => console.error(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`)); await new Promise((resolve) => setTimeout(resolve, interval)); }
+    for (;;) {
+      try { await tick(); }
+      catch (error) {
+        if (error?.code === "STAGING_OPERATION_TIMEOUT" || client.connection?.stream?.destroyed) throw error;
+        console.error(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, interval));
+    }
   } finally {
+    await actionWatchdog?.disarm();
     for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
-    await client.end();
+    const terminalBudget = createOperationBudget("importer terminal cleanup", deadlines.cleanupMs, { now });
+    await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
+      ownedCloser(() => client.end(), () => client.connection?.stream?.destroy()));
   }
 }
 

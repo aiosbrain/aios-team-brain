@@ -2,7 +2,8 @@ import neo4j from "neo4j-driver";
 import { decodeNeo4jValue } from "./neo4j-codec.mjs";
 import { GRAPH_CODEC_VERSION, SUPPORTED_NODE_LABELS, SUPPORTED_RELATIONSHIP_TYPES, validateGraphShape } from "./graph-bundle.mjs";
 import { assertDistinctFingerprints } from "./credential-fingerprint.mjs";
-import { neo4jTransactionConfig, OPERATION_TIMEOUT_DEFAULT_MS } from "./operation-deadline.mjs";
+import { neo4jTransactionConfig, OPERATION_TIMEOUT_DEFAULT_MS, remainingBudgetMs } from "./operation-deadline.mjs";
+import { isAuthenticatedRollbackProvenance } from "./bundle-crypto.mjs";
 
 const INTERNAL = /(?:^|\.)railway\.internal$/i;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -18,7 +19,13 @@ export function assertReplaceTarget(facts) {
   if (!INTERNAL.test(String(facts.neo4jHost ?? ""))) throw new Error("Neo4j replace requires the pinned internal host");
   if (!facts.pinnedNeo4jService || !String(facts.neo4jHost).startsWith(`${facts.pinnedNeo4jService}.`)) throw new Error("Neo4j host does not identify the pinned staging service");
   if (!facts.pinnedDatabase || facts.database !== facts.pinnedDatabase) throw new Error("Neo4j database identity mismatch");
-  assertDistinctFingerprints(facts.sourceCredentialFingerprint, facts.targetCredentialFingerprint, "staging and production graph credentials");
+  // A verified importer-owned rollback is restoring this target's own prior data. It is not a
+  // fresh production source and must not be forced to prove it differs from itself. The exception
+  // is an opaque capability minted only after rollback-key signature verification; manifest.kind
+  // and loose booleans are intentionally ignored.
+  if (!isAuthenticatedRollbackProvenance(facts.sourceProvenance)) {
+    assertDistinctFingerprints(facts.sourceCredentialFingerprint, facts.targetCredentialFingerprint, "staging and production graph credentials");
+  }
   if (facts.electionLockHeld !== true) throw new Error("coordinator election lock is not held by the replace session");
   if (facts.exclusiveDataLockHeld !== true) throw new Error("exclusive data-use lock is not held by the replace session");
   const stop = facts.stopMeasurement;
@@ -80,18 +87,18 @@ function chunk(items, size) {
   return out;
 }
 
-export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 1000, operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, cleanupTimeoutMs = operationTimeoutMs }) {
+export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 1000, operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, cleanupTimeoutMs = operationTimeoutMs, budget = null, cleanupBudget = null }) {
   assertReplaceTarget(facts);
   if (graph?.codecVersion !== GRAPH_CODEC_VERSION) throw new Error(`unsupported graph codec version ${graph?.codecVersion}`);
   validateGraphShape(graph);
   const limit = neoInt(batchSize);
-  const transactionConfig = neo4jTransactionConfig(operationTimeoutMs);
+  const operationConfig = (label) => neo4jTransactionConfig(remainingBudgetMs(budget, operationTimeoutMs, label));
 
   let deleted;
   do {
     // Re-check every load-bearing fact before the first delete and before every retry batch.
     assertReplaceTarget(facts);
-    const result = await session.run("MATCH (n) WITH n LIMIT $limit DETACH DELETE n RETURN count(n) AS deleted", { limit }, transactionConfig);
+    const result = await session.run("MATCH (n) WITH n LIMIT $limit DETACH DELETE n RETURN count(n) AS deleted", { limit }, operationConfig("graph delete batch"));
     deleted = Number(result.records[0]?.get("deleted")?.toString?.() ?? result.records[0]?.get("deleted") ?? 0);
   } while (deleted > 0);
 
@@ -99,8 +106,9 @@ export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 100
   // The temporary identity index is created with the allowlisted schema and awaited together, so
   // replay never races an index that is still populating.
   const importIndex = `CREATE INDEX ${IMPORT_INDEX} IF NOT EXISTS FOR (n:${escapedIdentifier(IMPORT_LABEL)}) ON (n.${IMPORT_PROPERTY})`;
-  for (const statement of [...allowlistedSchemaStatements(), importIndex]) await session.run(statement, {}, transactionConfig);
-  await session.run("CALL db.awaitIndexes($seconds)", { seconds: neo4j.int(Math.max(1, Math.min(300, Math.ceil(operationTimeoutMs / 1000)))) }, transactionConfig);
+  for (const statement of [...allowlistedSchemaStatements(), importIndex]) await session.run(statement, {}, operationConfig("graph schema creation"));
+  const indexTimeoutMs = remainingBudgetMs(budget, operationTimeoutMs, "graph index wait");
+  await session.run("CALL db.awaitIndexes($seconds)", { seconds: neo4j.int(Math.max(1, Math.min(300, Math.ceil(indexTimeoutMs / 1000)))) }, neo4jTransactionConfig(indexTimeoutMs));
 
   try {
     const byLabels = new Map();
@@ -113,7 +121,7 @@ export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 100
       for (const batch of chunk(rows, batchSize)) {
         await session.run(
           `UNWIND $rows AS row CREATE (n:${labels}:${escapedIdentifier(IMPORT_LABEL)}) SET n = row.properties SET n.${IMPORT_PROPERTY} = row.exportId`,
-          { rows: batch }, transactionConfig
+          { rows: batch }, operationConfig("graph node replay batch")
         );
       }
     }
@@ -132,7 +140,7 @@ export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 100
              MATCH (b:${escapedIdentifier(IMPORT_LABEL)} {${IMPORT_PROPERTY}: row.end})
              CREATE (a)-[r:${escaped}]->(b) SET r = row.properties
              RETURN count(r) AS created`,
-          { rows: batch }, transactionConfig
+          { rows: batch }, operationConfig("graph relationship replay batch")
         );
         const created = Number(result.records[0]?.get("created")?.toString?.() ?? 0);
         if (created !== batch.length) throw new Error(`graph replay created ${created} of ${batch.length} ${type} relationships`);
@@ -143,14 +151,14 @@ export async function replaceNeo4jGraph({ session, graph, facts, batchSize = 100
     // `__aios_import_id` would become a property of the copied dataset and an abandoned index
     // would be schema this design never declared.
     let removed;
-    const cleanupConfig = neo4jTransactionConfig(cleanupTimeoutMs);
+    const cleanupConfig = (label) => neo4jTransactionConfig(remainingBudgetMs(cleanupBudget, cleanupTimeoutMs, label));
     do {
       const result = await session.run(
         `MATCH (n:${escapedIdentifier(IMPORT_LABEL)}) WITH n LIMIT $limit REMOVE n:${escapedIdentifier(IMPORT_LABEL)} REMOVE n.${IMPORT_PROPERTY} RETURN count(n) AS removed`,
-        { limit }, cleanupConfig
+        { limit }, cleanupConfig("graph temporary-label cleanup batch")
       );
       removed = Number(result.records[0]?.get("removed")?.toString?.() ?? 0);
     } while (removed > 0);
-    await session.run(`DROP INDEX ${IMPORT_INDEX} IF EXISTS`, {}, cleanupConfig);
+    await session.run(`DROP INDEX ${IMPORT_INDEX} IF EXISTS`, {}, cleanupConfig("graph temporary-index cleanup"));
   }
 }
