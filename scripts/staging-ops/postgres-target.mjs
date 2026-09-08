@@ -21,6 +21,8 @@ function decoded(value, label) {
   catch { throw new Error(`${label} contains invalid percent encoding (value redacted)`); }
 }
 
+const normalizedAddress = (value) => String(value ?? "").toLowerCase().replace(/^::ffff:/, "");
+
 /**
  * Parse one Postgres destination once, then reconstruct the only string Node and libpq may consume.
  * Identity-bearing query parameters are not merely blacklisted: every parameter outside this small,
@@ -97,11 +99,14 @@ export async function assertLivePostgresTarget(client, target) {
     inet_server_addr()::text AS server_address, inet_server_port() AS server_port,
     pg_backend_pid() AS backend_pid`);
   const row = result.rows?.[0];
+  const socketAddress = normalizedAddress(client?.connection?.stream?.remoteAddress);
+  const serverAddress = normalizedAddress(row?.server_address);
   if (!row || row.database !== target.database || Number(row.server_port) !== target.port
-    || !String(row.server_address ?? "") || !Number.isInteger(Number(row.backend_pid))) {
+    || !serverAddress || !socketAddress || socketAddress !== serverAddress
+    || !Number.isInteger(Number(row.backend_pid))) {
     throw new Error("the live lock-owning Postgres backend differs from the canonical database target");
   }
-  return Object.freeze({ database: row.database, serverAddress: String(row.server_address), serverPort: Number(row.server_port), backendPid: Number(row.backend_pid) });
+  return Object.freeze({ database: row.database, serverAddress, serverPort: Number(row.server_port), backendPid: Number(row.backend_pid) });
 }
 
 export function assertProviderPostgresTarget(evidence, target, pins) {
@@ -112,7 +117,7 @@ export function assertProviderPostgresTarget(evidence, target, pins) {
     || evidence.importerDeploymentId !== pins.importerDeploymentId) {
     throw new Error("provider Postgres evidence differs from the pinned project/environment/service-instance/deployment identity");
   }
-  if (evidence.hostname !== target.hostname || evidence.hostname !== pins.hostname
+  if (evidence.hostname !== target.hostname || evidence.hostname !== String(pins.hostname ?? "").toLowerCase()
     || evidence.database !== target.database || evidence.database !== pins.database
     || evidence.port !== target.port || evidence.currentMatchesDeployment !== true
     || evidence.importerReferenceBound !== true) {

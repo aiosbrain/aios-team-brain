@@ -68,6 +68,7 @@ vi.mock("pg", () => {
     connection = { stream: {
       destroyed: false,
       destroyCalls: 0,
+      remoteAddress: "10.0.0.9",
       destroy: (_error?: unknown) => { this.connection.stream.destroyed = true; this.connection.stream.destroyCalls += 1; },
     } };
     connectionParameters: { host: string; port: number; database: string; user: string };

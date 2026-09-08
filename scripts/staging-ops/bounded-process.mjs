@@ -3,12 +3,16 @@ import { spawn } from "node:child_process";
 const redact = (value) => String(value ?? "").replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "[redacted database URL]").slice(0, 500);
 
 /**
- * Run one owned subprocess group to a confirmed close. Timeout/abort sends SIGTERM, escalates to
- * SIGKILL, and still awaits `close`; it never resolves a Promise.race while child work survives.
+ * Run one owned subprocess group to confirmed group absence. Timeout/abort sends SIGTERM,
+ * escalates to SIGKILL, awaits `close`, and verifies no descendant remains. If absence cannot be
+ * established, hard-stop the owner instead of unwinding its database locks around surviving work.
  */
 export async function runBoundedProcess(command, args, {
   timeoutMs, terminateGraceMs = 2_000, maxBuffer = 16 * 1024 * 1024,
   env = process.env, cwd, signal, spawnImpl = spawn, platform = process.platform,
+  hardStop = (_error) => process.kill(process.pid, "SIGKILL"),
+  kill = process.kill,
+  holdUncontained = () => new Promise(() => { setInterval(() => {}, 60_000); }),
 } = {}) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60 * 60_000) throw new Error("subprocess timeout must be 1..3600000ms");
   if (!Number.isSafeInteger(terminateGraceMs) || terminateGraceMs < 1 || terminateGraceMs > 30_000) throw new Error("subprocess termination grace must be 1..30000ms");
@@ -21,12 +25,12 @@ export async function runBoundedProcess(command, args, {
 
   const signalOwned = (name) => {
     if (!child.pid) return;
-    try { process.kill(platform === "win32" ? child.pid : -child.pid, name); }
+    try { kill(platform === "win32" ? child.pid : -child.pid, name); }
     catch (error) { if (error?.code !== "ESRCH") throw error; }
   };
   const ownedGroupAlive = () => {
     if (platform === "win32" || !child.pid) return false;
-    try { process.kill(-child.pid, 0); return true; }
+    try { kill(-child.pid, 0); return true; }
     catch (error) { return error?.code !== "ESRCH"; }
   };
   const terminate = (reason) => {
@@ -79,9 +83,15 @@ export async function runBoundedProcess(command, args, {
     }
     if (ownedGroupAlive()) {
       if (escalationTimer) clearTimeout(escalationTimer);
-      throw Object.assign(new Error(`${command} ${termination}; owned subprocess group termination could not be confirmed`), {
-        code: "STAGING_OPERATION_TIMEOUT", terminationConfirmed: false, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"),
+      const error = Object.assign(new Error(`${command} ${termination}; owned subprocess group termination could not be confirmed; hard-stopping its owner`), {
+        code: "STAGING_OPERATION_TIMEOUT", terminationConfirmed: false,
       });
+      // Returning this error would unwind the importer, end the lock-owning PG session, and let a
+      // surviving restore continue unfenced. The process/container boundary is the safety endpoint:
+      // invoke it synchronously and, if a test double or broken platform returns, keep a referenced
+      // handle forever so ordinary cleanup can never report/release around uncontained work.
+      try { Promise.resolve(hardStop(error)).catch(() => {}); } catch { /* holding ownership is safer than unwinding */ }
+      await holdUncontained();
     }
   }
   if (escalationTimer) clearTimeout(escalationTimer);

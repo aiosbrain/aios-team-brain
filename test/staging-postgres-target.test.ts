@@ -54,11 +54,14 @@ describe("strict canonical Postgres destination", () => {
   it("verifies the live lock-owning backend database and port", async () => {
     const client = {
       connectionParameters: { host: target.hostname, port: target.port, database: target.database, user: target.username },
+      connection: { stream: { remoteAddress: "::ffff:10.0.0.9" } },
       query: vi.fn().mockResolvedValue({ rows: [{ database: "brain", server_address: "10.0.0.9", server_port: 5432, backend_pid: 71 }] }),
     };
     await expect(assertLivePostgresTarget(client, target)).resolves.toMatchObject({ database: "brain", serverPort: 5432, backendPid: 71 });
     await expect(assertLivePostgresTarget({ ...client, connectionParameters: { ...client.connectionParameters, database: "other" } }, target))
       .rejects.toThrow(/client configuration differs/);
+    await expect(assertLivePostgresTarget({ ...client, connection: { stream: { remoteAddress: "10.0.0.10" } } }, target))
+      .rejects.toThrow(/live lock-owning Postgres backend differs/);
   });
 
   it.each(["dbname=other", "hostaddr=203.0.113.10", "host=other.railway.internal", "port=6432"])(

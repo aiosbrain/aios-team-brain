@@ -1,5 +1,6 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runExporter } from "../scripts/staging-ops/exporter.mjs";
 import { capturePairedPostgres, restorePairedPostgres } from "../scripts/staging-ops/pg-paired.mjs";
 import { armBudgetWatchdog, createOperationBudget, createSessionWatchdogOwner, postgresDeadlineConfig, stagingOperationDeadlines } from "../scripts/staging-ops/operation-deadline.mjs";
+import { runBoundedProcess } from "../scripts/staging-ops/bounded-process.mjs";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
@@ -29,6 +31,33 @@ function executable(body: string) {
 }
 
 describe("M8 — finite operation deadlines terminate real work", () => {
+  it("hard-stops and never unwinds ownership when an owned process group remains uncontained", async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number; stdout: EventEmitter; stderr: EventEmitter;
+    };
+    child.pid = 4242;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const hardStop = vi.fn();
+    const running = runBoundedProcess("synthetic", [], {
+      timeoutMs: 5,
+      terminateGraceMs: 5,
+      spawnImpl: (() => child) as never,
+      kill: (() => true) as never,
+      hardStop,
+      // A pending Promise alone does not keep Node alive, so the production default owns the
+      // referenced handle. This seam lets the test observe the non-unwinding state without leaking.
+      holdUncontained: () => new Promise(() => {}),
+    });
+    setTimeout(() => child.emit("close", null, "SIGKILL"), 10);
+    const outcome = await Promise.race([
+      running.then(() => "resolved", () => "rejected"),
+      new Promise((resolve) => setTimeout(() => resolve("still-owned"), 80)),
+    ]);
+    expect(hardStop).toHaveBeenCalledTimes(1);
+    expect(outcome).toBe("still-owned");
+  });
+
   it("validates budgets and configures server-side Postgres cancellation", () => {
     expect(() => stagingOperationDeadlines({ STAGING_OPERATION_TIMEOUT_MS: "Infinity" } as NodeJS.ProcessEnv)).toThrow(/integer/);
     expect(() => stagingOperationDeadlines({ STAGING_RECOVERY_TIMEOUT_MS: "0" } as NodeJS.ProcessEnv)).toThrow(/STAGING_RECOVERY_TIMEOUT_MS/);

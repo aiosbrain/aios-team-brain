@@ -337,7 +337,7 @@ export class RailwayMaintenance {
     ]);
     const endpoint = endpointData?.privateNetworkEndpoint;
     if (!endpoint || endpoint.serviceInstanceId !== pins.serviceInstanceId || endpoint.deletedAt || endpoint.newDnsName
-      || endpoint.syncStatus !== "SUCCESS" || String(endpoint.dnsName ?? "").toLowerCase() !== pins.hostname) {
+      || endpoint.syncStatus !== "SUCCESS" || String(endpoint.dnsName ?? "").toLowerCase() !== String(pins.hostname ?? "").toLowerCase()) {
       throw new Error("Postgres private endpoint is not healthy and bound to the pinned service instance");
     }
     const snapshot = snapshotData?.deploymentSnapshot;
