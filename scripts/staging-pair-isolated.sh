@@ -515,8 +515,10 @@ grep -q "immutable source $run3_object already made .* automatic refresh will no
   sed -n '1,40p' "$harness_root/run3-automatic-retry-denied.log" >&2
   exit 1
 }
-# NOTHING MOVED: the refusal sits before the drain, so the recovered run-2 pair is still serving and
-# there is neither a candidate write nor a second recovery.
+# NO CANDIDATE DATA INSTALL OR RECOVERY: the refusal sits before the drain, so the recovered run-2
+# pair remains the ready data run — neither a candidate write nor a second recovery. The tick runs
+# `serviceCatchup` first, so deployment metadata or code catch-up may legitimately progress; the
+# receipts below deny the DATA drain, not every journal change.
 refuse_receipt run3-automatic-retry-denied.log postgres-restored '"runId":"run-3"' \
   "a denied automatic retry wrote candidate Postgres anyway"
 refuse_receipt run3-automatic-retry-denied.log prior-pair-restored '"failedRunId"' \

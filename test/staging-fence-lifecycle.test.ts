@@ -29,6 +29,12 @@ async function freePort(): Promise<number> {
     });
   });
 }
+/**
+ * THE PORT-RELEASE ORACLE, AND ONLY THAT. It LISTENS on the port, so polling it while the fixture is
+ * still trying to bind can own the address during the fixture's one `listen` — the CI EADDRINUSE in
+ * `adjudication-852-fence-ci.md`. Startup readiness uses the fixture's own receipt below; this is
+ * called only after a confirmed shutdown, where nothing is competing for the address.
+ */
 const canBind = async (port: number) => await new Promise<boolean>((resolve) => {
   const probe = createServer();
   probe.once("error", () => resolve(false));
@@ -86,16 +92,29 @@ function fenceClient(groupOf: () => number | null) {
   return { client, events, state };
 }
 
-/** Real spawn, with the resulting group recorded so the test can observe and clean it up. */
+/**
+ * Real spawn, with the resulting group recorded so the test can observe and clean it up, and the
+ * chain's output captured. The fixture's wrapper and child spawn with `stdio: "inherit"`, so piping
+ * the wrapper collects the grandchild's `listening` receipt AND its stderr — which is how an early
+ * failure gets NAMED instead of surfacing only as "never bound".
+ */
 function recordingSpawn() {
   let pgid: number | null = null;
+  let output = "";
   const spawnImpl = ((file: string, args: string[], options: object) => {
-    const child = spawn(file, args, options as never);
+    const child = spawn(file, args, { ...options, stdio: "pipe" } as never);
+    for (const stream of [child.stdout, child.stderr]) stream?.on("data", (chunk: unknown) => { output += String(chunk); });
     pgid = child.pid ?? null;
     if (pgid != null) groups.push(pgid);
     return child;
   }) as never;
-  return { spawnImpl, groupOf: () => pgid };
+  return { spawnImpl, groupOf: () => pgid, output: () => output };
+}
+
+/** Startup readiness WITHOUT touching the port: the fixture's own listen callback says it bound. */
+async function expectListening(started: { output: () => string }, port: number) {
+  const observed = await waitFor(() => started.output().includes(`"listening":${port}`));
+  expect(observed, `the fixture never reported listening on ${port}; captured output: ${started.output()}`).toBe(true);
 }
 
 describe.runIf(POSIX)("the fence holds its lock until the WORKLOAD is gone", () => {
@@ -119,20 +138,22 @@ describe.runIf(POSIX)("the fence holds its lock until the WORKLOAD is gone", () 
   it("terminates promptly on a lost database connection, and claims no protection", async () => {
     // The lock is ALREADY gone when the connection drops, so waiting politely protects nothing.
     const port = await freePort();
-    const { spawnImpl, groupOf } = recordingSpawn();
-    const { client, events } = fenceClient(groupOf);
+    const started = recordingSpawn();
+    const { client, events } = fenceClient(started.groupOf);
 
     const supervising = supervise([process.execPath, FIXTURE, String(port), "0", "0"], {
-      env: COPY_ENV, createClient: () => client as never, spawnImpl,
+      env: COPY_ENV, createClient: () => client as never, spawnImpl: started.spawnImpl,
     });
-    expect(await waitFor(() => canBind(port).then((free) => !free)), "the fixture never bound the port").toBe(true);
+    // Observed, not left as unhandled test work: a readiness failure below throws before the await.
+    void supervising.catch(() => {});
+    await expectListening(started, port);
 
     client.emit("error", new Error("connection terminated unexpectedly"));
 
     await supervising;
     expect(events).toContain("release-lock");
     expect(await waitFor(() => canBind(port)), "the workload outlived the lost lock").toBe(true);
-    expect(groupOf() != null && groupAlive(groupOf()!)).toBe(false);
+    expect(started.groupOf() != null && groupAlive(started.groupOf()!)).toBe(false);
   }, 30_000);
 
   it("ends the fence connection when the payload cannot be spawned at all", async () => {
@@ -154,12 +175,13 @@ describe.runIf(POSIX)("every shutdown path converges on ONE idempotent cleanup",
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
     it(`${signal} stops the whole owned workload and frees the address`, async () => {
       const port = await freePort();
-      const { spawnImpl, groupOf } = recordingSpawn();
+      const started = recordingSpawn();
       // No fence in legacy mode, so this isolates the SIGNAL path from the lock path.
       const supervising = supervise([process.execPath, FIXTURE, String(port), "0", "0"], {
-        env: { STAGING_DATA_MODE: "legacy-pg-only" } as unknown as NodeJS.ProcessEnv, spawnImpl,
+        env: { STAGING_DATA_MODE: "legacy-pg-only" } as unknown as NodeJS.ProcessEnv, spawnImpl: started.spawnImpl,
       });
-      expect(await waitFor(() => canBind(port).then((free) => !free))).toBe(true);
+      void supervising.catch(() => {});
+      await expectListening(started, port);
 
       // The fence installs `process.once(signal, …)`; emitting it drives the real handler without
       // signalling the test runner itself.
@@ -167,7 +189,7 @@ describe.runIf(POSIX)("every shutdown path converges on ONE idempotent cleanup",
 
       await supervising;
       expect(await waitFor(() => canBind(port)), `${signal} left the workload holding the address`).toBe(true);
-      expect(groupAlive(groupOf()!)).toBe(false);
+      expect(groupAlive(started.groupOf()!)).toBe(false);
     }, 30_000);
   }
 });

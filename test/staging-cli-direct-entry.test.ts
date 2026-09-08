@@ -6,7 +6,10 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 /**
- * L-A — THE THREE REMAINING CLIs CAN NO LONGER SKIP THEIR OWN BODIES.
+ * L-A — THE THREE TARGETED CLIs CAN NO LONGER SKIP THEIR OWN BODIES.
+ *
+ * Three named CLIs — the importer, the exporter and the startup fence — not a directory-wide
+ * guarantee: other tools here (the fixture loaders among them) still carry the fragile spelling.
  *
  * `fileURLToPath(import.meta.url) === path.resolve(process.argv[1])` fixes URL encoding but not
  * SYMLINKS: Node resolves a module's own path through links, so an invocation through a symlinked

@@ -449,11 +449,13 @@ describe("a cancelled importer writes NOBODY ELSE'S journal", () => {
   });
 
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
-    it(`${signal} during a pending verify-target read cancels only its own reads`, async () => {
+    it(`${signal} during a pending verify-target read settles only its owned reads and resources`, async () => {
       foreignActiveJournal();
       // Delivered WHILE the destination SELECT is in flight — `pending > 0` inside the double — which
       // is the window the handler used to fill with a second connection. Several macrotasks pass
       // before the read resolves, so a restored writer has ample room to connect, read and update.
+      // The target helper takes no signal: its finite reads SETTLE and the cleanup below then reports
+      // the cancellation — nothing here claims an underlying read was aborted mid-flight.
       pgState.duringQuery = async (sql) => {
         if (!sql.includes("inet_server_addr")) return;
         pgState.duringQuery = null;

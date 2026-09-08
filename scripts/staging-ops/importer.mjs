@@ -46,6 +46,23 @@ const FULL_SHA = /^[0-9a-f]{40}$/i;
 const errorText = (error) => String(error instanceof Error ? error.message : error);
 
 /**
+ * THE CONFIRMED READY COMMIT, carried as EXPLICIT STATE rather than a message to match on.
+ *
+ * `markReady` is the commit boundary: past it the deployment is verified serving and its identity is
+ * durable. A signal observed afterwards is not permission to report the run as a generic refusal, so
+ * every outcome that owns such a commit — the success result and the informative bookkeeping-pending
+ * error alike — carries this marker, and `runImporter`'s finalization honours it (`bookkeeping`
+ * distinguishes a completed suffix from a pending one). It is set ONLY after `markReady` returned.
+ */
+const readyCommitMark = (ready, bookkeeping) => ({
+  runId: ready?.last_ready_run_id ?? null,
+  objectId: ready?.last_ready_object_id ?? null,
+  commit: ready?.last_ready_commit ?? null,
+  bookkeeping,
+});
+const confirmedReadyCommit = (outcome) => (outcome && typeof outcome === "object" ? outcome.readyCommit ?? null : null);
+
+/**
  * Run one best-effort recovery step and RECORD its failure instead of swallowing it.
  *
  * These steps are individually non-fatal — a journal transition whose `from` state no longer
@@ -861,7 +878,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
       failedRunId, priorRunId: prior.manifest.runId, priorKind: prior.kind,
       postgres: true, graph: true, ready: true, mode: prior.manifest.mode ?? null,
     });
-    return { status: "rolled-back", runId: prior.manifest.runId, recoveryNotes: notes };
+    return { status: "rolled-back", runId: prior.manifest.runId, recoveryNotes: notes, readyCommit: readyCommitMark(readyCommitted, "completed") };
   } catch (error) {
     if (readyCommitted) {
       emitReceipt("ready-bookkeeping-pending", {
@@ -870,7 +887,8 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
         servingCommit: readyCommitted.last_ready_commit,
         detail: errorText(error).slice(0, 200),
       });
-      throw new Error(`rollback pair is ready and serving; post-ready bookkeeping remains pending: ${errorText(error)}`);
+      throw Object.assign(new Error(`rollback pair is ready and serving; post-ready bookkeeping remains pending: ${errorText(error)}`),
+        { readyCommit: readyCommitMark(readyCommitted, "pending") });
     }
     // The checkpoint write is itself SQL on a connection that has just failed, so reset again and
     // report whether the checkpoint actually landed rather than assuming it did.
@@ -1080,7 +1098,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       // Terminal on the success side. Recorded AFTER ready is committed so a later same-object
       // invocation reaches the already-ready reconciliation branch rather than a refusal.
       await finishAttempt(client, { objectId, status: "installed" });
-      return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: reconciled.catchup, cleanupErrors: reconciled.cleanupErrors };
+      return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: reconciled.catchup, cleanupErrors: reconciled.cleanupErrors, readyCommit: readyCommitMark(readyCommitted, "completed") };
     } finally {
       const terminalBudget = createOperationBudget("install terminal cleanup", deadlines.cleanupMs, { now: operations.now });
       await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
@@ -1097,7 +1115,8 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
         servingCommit: readyCommitted.last_ready_commit,
         detail: errorText(error).slice(0, 200),
       });
-      throw new Error(`paired refresh is ready and serving; post-ready bookkeeping remains pending and will reconcile on retry: ${errorText(error)}`);
+      throw Object.assign(new Error(`paired refresh is ready and serving; post-ready bookkeeping remains pending and will reconcile on retry: ${errorText(error)}`),
+        { readyCommit: readyCommitMark(readyCommitted, "pending") });
     }
     if (!destructive) {
       // POSITIVE PROOF that the drain transition never completed: nothing was stopped and neither
@@ -1804,7 +1823,10 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   // Keep the idempotent handlers installed through containment. A second signal must not fall
   // through to Node's default action and release the lock while an owned restore is still alive.
   for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
-  try {
+  // The action body, in its own scope so its OUTCOME is observable to the finalization below. A
+  // `finally` cannot see what the `try` returned, which is exactly how a confirmed ready commit came
+  // to be replaced by a generic refusal whenever a signal arrived after it.
+  const dispatch = async () => {
     // Constructed INSIDE the cleanup scope. These three ran between `client.connect()` and the
     // `try`, so a store or maintenance adapter that refused its own configuration left an open
     // Postgres connection with nothing to close it.
@@ -1903,6 +1925,16 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       // logged and retried in five minutes.
       isFatal: (error) => error?.code === "STAGING_OPERATION_TIMEOUT" || Boolean(client.connection?.stream?.destroyed),
     });
+  };
+
+  let settled = null;
+  try {
+    const result = await dispatch();
+    settled = { result };
+    return result;
+  } catch (error) {
+    settled = { error };
+    throw error;
   } finally {
     await actionWatchdog?.disarm();
     await watchdogOwner.disarmAll();
@@ -1914,7 +1946,14 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     const terminalBudget = createOperationBudget("importer terminal cleanup", deadlines.cleanupMs, { now });
     await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
       ownedCloser(() => client.end(), () => client.connection?.stream?.destroy()));
-    if (shutdown.signal.aborted) {
+    // A CONFIRMED READY COMMIT SURVIVES THE SIGNAL. Past `markReady` the deployment is serving and
+    // its identity is durable, so the action's own outcome is the truthful report — the ready result
+    // when the bookkeeping suffix completed, and the informative pending error when it did not.
+    // Everything else — a pre-ready cancellation, a read-only `verify-target`, a daemon stop — owns
+    // no commit and is still reported as the coordinated cancellation it is. This never converts a
+    // failure into success: the pending error is re-thrown as itself, unwrapped.
+    const readyCommit = confirmedReadyCommit(settled?.result) ?? confirmedReadyCommit(settled?.error);
+    if (shutdown.signal.aborted && !readyCommit) {
       throw Object.assign(new Error("staging importer stopped after coordinated signal cancellation; owned operations are settled"), {
         code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true,
       });
