@@ -6,7 +6,7 @@ RUN apt-get update \
  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg \
  && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends postgresql-client-18 \
+ && apt-get install -y --no-install-recommends postgresql-client-18 tini \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,5 +21,20 @@ COPY --chown=node:node . .
 # Scoped deliberately: this directory and `.next` only — no recursive chown, no chmod 777, no root
 # runtime, and no change to the production Dockerfile, which does not run `next dev`.
 RUN install -d -o node -g node /app/.next && chown node:node /app
+RUN set -eu; \
+    test -x /usr/bin/tini || { echo "ops runner: /usr/bin/tini is missing or not executable" >&2; exit 1; }; \
+    /usr/bin/tini --version >/dev/null || { echo "ops runner: /usr/bin/tini does not run" >&2; exit 1; }
 USER node
-ENTRYPOINT ["node"]
+# THE CHILD REAPER, on the runner that holds the fences.
+#
+# `runBoundedProcess` proves containment with `kill(-pgid, 0)`, and Linux answers success for an
+# unreaped ZOMBIE group, which SIGKILL cannot remove. Under a non-reaping PID 1 (`node`), an orphaned
+# grandchild of the only multi-level chain here — `reapplyTesters`: npx → tsx → node — leaves the
+# group permanently "alive", so the importer spins in containment holding BOTH the coordinator and
+# exclusive data-use locks, with staging stopped. Correct fail-closed behaviour, permanent outage.
+#
+# `-s` runs tini as a child subreaper, so adoption does not depend on it actually being PID 1 (on
+# Railway it may sit beneath platform supervision). The compose harness supplies `init: true` as
+# well, which is why CI cannot see this; Railway's scheduled services run
+# `config/staging-ops/schedules.json`'s command, which must carry the same prefix.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "node"]

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   normalizeDeploymentOrigin,
@@ -81,18 +82,39 @@ describe("M3 — candidate deployment evidence is bound to the pinned service an
     expect(Object.keys(headers).map((name) => name.toLowerCase())).not.toContain("authorization");
   });
 
-  it("leaves the PRODUCTION reader on its own separately documented token kind", async () => {
-    // The disjoint control for the row above. `readLatestProductionDeployment` consumes the distinct
-    // `RAILWAY_PRODUCTION_READ_TOKEN`; changing its authentication without defining that secret's
-    // contract would be a guess. If someone "fixes" both readers together, this reddens and forces
-    // that contract to be written down first.
+  it("authenticates the PRODUCTION reader with its own project token, on the same header kind", async () => {
+    // M4. `RAILWAY_PRODUCTION_READ_TOKEN` is now DEFINED — an environment-scoped project token for
+    // the production environment — so it authenticates the way every other Railway read here does.
+    // While its kind was undefined this reader sent `Authorization: Bearer`, and a token provisioned
+    // as the documented kind would have failed to authenticate: AC-03's post-promotion observation
+    // could never verify, and every promotion would end `promoted-but-deployment-unverified` after
+    // main had already moved.
     const fetchImpl = vi.fn(async () => Response.json({
       data: { deployments: { edges: [{ node: { id: "p1", status: "SUCCESS", staticUrl: "prod.up.railway.app", environmentId: "env-production", serviceId: "svc-app", meta: { commitHash: SHA } } }] } },
     }));
     await readLatestProductionDeployment({ environmentId: "env-production", serviceId: "svc-app", token: "prod-token", fetchImpl });
     const headers = (fetchImpl.mock.calls[0][1] as { headers: Record<string, string> }).headers;
-    expect(headers.Authorization).toBe("Bearer prod-token");
-    expect(Object.keys(headers)).not.toContain("Project-Access-Token");
+    expect(headers["Project-Access-Token"]).toBe("prod-token");
+    // The wrong header must be ABSENT, not merely joined by the right one: a client sending both
+    // still authenticates as an account credential wherever the platform prefers it.
+    expect(Object.keys(headers).map((name) => name.toLowerCase())).not.toContain("authorization");
+  });
+
+  it("keeps the two readers on SEPARATE secrets, so one token can never scope both environments", () => {
+    // The isolation half of M4, and the reason "align the header" is not the same as "share a
+    // token": the production observation and the staging candidate binding read different
+    // environments and must hold different environment-scoped credentials. Asserted on the source
+    // the controller actually reads, and on the workflow that supplies it.
+    const controller = readFileSync("scripts/staging-ops/release-controller.mjs", "utf8");
+    expect(controller).toContain("env.RAILWAY_PRODUCTION_READ_TOKEN");
+    expect(controller).toContain("env.RAILWAY_STAGING_READ_TOKEN");
+    const workflow = readFileSync(".github/workflows/release-controller.yml", "utf8");
+    expect(workflow).toContain("RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}");
+    expect(workflow).toContain("RAILWAY_STAGING_READ_TOKEN: ${{ secrets.RAILWAY_STAGING_READ_TOKEN }}");
+    // …and the kind is written down where an operator provisions it, not only in a code comment.
+    const example = readFileSync("config/staging-ops/importer.example.env", "utf8");
+    expect(example).toMatch(/RAILWAY_PRODUCTION_READ_TOKEN/);
+    expect(example).toMatch(/production[\s\S]{0,400}Project-Access-Token/i);
   });
 
   it("applies the same binding to the production observation", async () => {

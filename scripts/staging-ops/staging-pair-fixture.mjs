@@ -28,6 +28,21 @@ const GROUPS = {
   private: "44444444-4444-4444-8444-444444444442",
 };
 const GRAPH_GROUPS = { external: "paired_external", team: "paired_team", private: "paired_private", deferred: "paired_deferred" };
+/**
+ * STAGING'S OWN pre-existing baseline, in a team the source never mentions.
+ *
+ * The distinct team is load-bearing and must stay distinct: the configured testers
+ * (`STAGING_TESTER_CREDENTIALS_JSON`) name members of the SOURCE team, so a full bootstrap
+ * checkpoint restores a database in which those identities do not exist. That is exactly the state
+ * the credential exception is for — and the realistic auth row below is what makes "restored
+ * unchanged" an observable rather than an inference from the restore's exit status.
+ */
+const BASELINE_TEAM = "99999999-9999-4999-8999-999999999999";
+const BASELINE_AUTH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9";
+const BASELINE_MEMBER = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9";
+const BASELINE_EMAIL = "baseline-operator@example.test";
+/** A bcrypt-shaped literal: the checkpoint must return these exact bytes, not merely "some hash". */
+const BASELINE_PASSWORD_HASH = "$2b$12$stagingBaselineOperatorHashDoNotRotateOnRollback00000";
 const DIAGNOSTIC_ID_ALLOWLIST = new Set([
   TEAM, INTERNAL, EXTERNAL, AUTH_INTERNAL, AUTH_EXTERNAL,
   ...Object.values(PROJECTS), ...Object.values(ITEMS), ...Object.values(GROUPS),
@@ -158,7 +173,14 @@ async function seed() {
     await contextAction("seed");
     await assertSubstrateSeeded(prod);
     await staging.query("CREATE TABLE IF NOT EXISTS staging_marker(note text primary key)");
-    await staging.query("INSERT INTO teams(id,slug,name) VALUES('99999999-9999-4999-8999-999999999999','baseline','Baseline')");
+    await staging.query("INSERT INTO teams(id,slug,name) VALUES($1,'baseline','Baseline')", [BASELINE_TEAM]);
+    // Staging's own authentication state, in staging's own team. A full importer-authenticated
+    // checkpoint must bring this back byte-for-byte; a sanitized SOURCE install must not.
+    await staging.query("INSERT INTO auth_users(id,email,password_hash) VALUES($1,$2,$3)", [BASELINE_AUTH, BASELINE_EMAIL, BASELINE_PASSWORD_HASH]);
+    await staging.query(
+      "INSERT INTO members(id,team_id,auth_user_id,email,display_name,actor_handle,role,tier,status) VALUES($1,$2,$3,$4,'Baseline Operator','baseline','admin','team','active')",
+      [BASELINE_MEMBER, BASELINE_TEAM, BASELINE_AUTH, BASELINE_EMAIL],
+    );
     await seedGraph(prodGraph);
     const session = stagingGraph.session({ defaultAccessMode: neo4j.session.WRITE });
     await createEpisode(session, { uuid: "baseline-ep", name: "items:baseline", group: "baseline", fact: "baseline rollback" }); await session.close();
@@ -249,6 +271,25 @@ async function assertBootstrapRestored(expectedMode, expectedRunId) {
     const candidate = await staging.query("SELECT body FROM items WHERE id=$1", [ITEMS.team]);
     if (baseline.rows[0]?.name !== "Baseline" || candidate.rows.length !== 0) {
       throw new Error("bootstrap Postgres checkpoint was not restored after the first-import failure");
+    }
+    // ── THE CAPTURED-CREDENTIAL CONTRACT (AC-06) ────────────────────────────────────────────────
+    // A full importer-authenticated checkpoint restores staging's OWN authentication state
+    // unchanged. Asserted on the exact stored bytes and the exact identity, because "a hash is
+    // present" is satisfied by a rotated one and "a member exists" by a minted one.
+    const preserved = await staging.query("SELECT email, password_hash FROM auth_users WHERE id=$1", [BASELINE_AUTH]);
+    if (preserved.rows[0]?.email !== BASELINE_EMAIL || preserved.rows[0]?.password_hash !== BASELINE_PASSWORD_HASH) {
+      throw new Error("the full bootstrap checkpoint did not restore staging's captured credential identity unchanged");
+    }
+    const baselineMember = await staging.query("SELECT team_id, role, status FROM members WHERE id=$1", [BASELINE_MEMBER]);
+    if (baselineMember.rows[0]?.team_id !== BASELINE_TEAM || baselineMember.rows[0]?.role !== "admin" || baselineMember.rows[0]?.status !== "active") {
+      throw new Error("the full bootstrap checkpoint did not restore staging's captured membership identity unchanged");
+    }
+    // …and the configured SOURCE testers were not minted into the restored baseline. The distinct
+    // team is what makes this discriminating: a tester reapply against this database could only
+    // have succeeded by creating identities the restore has no authority to create.
+    const minted = await staging.query("SELECT count(*)::int AS n FROM members WHERE team_id=$1", [TEAM]);
+    if (Number(minted.rows[0]?.n) !== 0) {
+      throw new Error("incoming-source tester identities were applied to the restored staging baseline");
     }
     const session = driver.session({ defaultAccessMode: neo4j.session.READ });
     try {

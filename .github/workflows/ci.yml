@@ -87,6 +87,18 @@ jobs:
     container:
       image: node:20-bookworm
       options: --init
+    # A job CONTAINER changes which shell an implicit `run` gets: the step executes inside the image,
+    # where /bin/sh is Debian's dash, and dash has no `pipefail` — `set -euo pipefail` dies at `set`
+    # with "Illegal option -o pipefail" and exit 2, BEFORE the toolchain steps below run a single
+    # command. Measured on a cached Debian bookworm image (the staging-ops runner), not on this
+    # node:20-bookworm job image: `sh -c 'set -euo pipefail'` exits 2, `bash -c` exits 0. Both derive
+    # from bookworm and both use dash as /bin/sh, so the shell is declared rather than inherited.
+    # GitHub's `bash` shell is `bash --noprofile --norc -eo pipefail {0}`, strictly more fail-closed
+    # than the implicit default for the plain `npm …` steps too. Pinned by
+    # test/guards/datamechanics-ci-networking.test.ts.
+    defaults:
+      run:
+        shell: bash
     services:
       postgres:
         image: postgres:16

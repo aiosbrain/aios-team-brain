@@ -64,7 +64,7 @@ export function armBudgetWatchdog(budget, terminate) {
  */
 export function createSessionWatchdogOwner(cancel = () => {}, { signal = null } = {}) {
   const active = new Set();
-  const wrap = (budget) => {
+  const wrap = (budget, { inheritExternal = true } = {}) => {
     const controller = new AbortController();
     let reason = null;
     const watchdog = armBudgetWatchdog(budget, async (error) => {
@@ -72,7 +72,8 @@ export function createSessionWatchdogOwner(cancel = () => {}, { signal = null } 
       controller.abort(error);
       await cancel(error);
     });
-    const ownedSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const external = inheritExternal ? signal : null;
+    const ownedSignal = external ? AbortSignal.any([external, controller.signal]) : controller.signal;
     let disarmed = false;
     const handle = Object.freeze({
       get expired() { return watchdog.expired; },
@@ -95,9 +96,18 @@ export function createSessionWatchdogOwner(cancel = () => {}, { signal = null } 
   };
   return Object.freeze({
     arm(budget) { return wrap(budget); },
+    /**
+     * Hand the session to RECOVERY, on a cancellation scope of its own.
+     *
+     * Recovery is mandatory work: it runs precisely because the operation it follows failed, and one
+     * of the ways that operation fails is an external SIGTERM. Inheriting that already-aborted
+     * shutdown signal made every recovery subprocess abort on its first spawn, so the rollback that
+     * was supposed to put staging back never ran and the journal landed `recovery-required` with
+     * staging stopped. The recovery budget below is what bounds it instead.
+     */
     async transferTo(budget) {
       await disarmAll();
-      return wrap(budget);
+      return wrap(budget, { inheritExternal: false });
     },
     disarmAll,
     get size() { return active.size; },

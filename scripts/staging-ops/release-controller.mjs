@@ -149,9 +149,7 @@ export const RAILWAY_DEPLOYMENT_QUERY = `query StagingCandidateDeployment($id: S
  * `activation-preflight` use, and both authenticate it with this header. A project token presented
  * as a Bearer account credential fails to authenticate, and the resulting error reads as "the
  * platform is configured differently than you think" rather than "this client sent the wrong
- * header". `readLatestProductionDeployment` below is deliberately NOT changed: it consumes the
- * distinct `RAILWAY_PRODUCTION_READ_TOKEN`, whose kind is separately documented, and changing its
- * authentication without defining that secret's contract would be a guess.
+ * header".
  */
 export async function readRailwayDeployment({ deploymentId, token, environmentId, serviceId, fetchImpl = fetch }) {
   if (!environmentId || !serviceId) throw new Error("pinned staging environment and service IDs are required to bind candidate deployment evidence");
@@ -177,10 +175,22 @@ export const RAILWAY_PRODUCTION_DEPLOYMENTS_QUERY = `query ProductionDeployments
   }
 }`;
 
+/**
+ * M4: `RAILWAY_PRODUCTION_READ_TOKEN` is a PRODUCTION-environment project token.
+ *
+ * Its kind was previously defined nowhere while this reader sent `Authorization: Bearer`. Provisioned
+ * as the project token every other Railway read in this design documents — which is the natural
+ * reading of "production READ token" — that header authenticates nothing, so AC-03's post-promotion
+ * observation could never verify and every promotion (and now every emergency) would end
+ * `promoted-but-deployment-unverified` after main had already moved. The contract is now stated in
+ * `config/staging-ops/importer.example.env`, in `docs/RELEASING.md`, and here: an environment-scoped
+ * PROJECT token for the PRODUCTION environment, distinct from `RAILWAY_STAGING_READ_TOKEN`, which is
+ * the same kind of token for STAGING. Two tokens, one header kind, no shared scope.
+ */
 export async function readLatestProductionDeployment({ environmentId, serviceId, token, fetchImpl = fetch }) {
   const response = await fetchImpl("https://backboard.railway.com/graphql/v2", {
     method: "POST", redirect: "error",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { "Project-Access-Token": token, "Content-Type": "application/json" },
     body: JSON.stringify({ query: RAILWAY_PRODUCTION_DEPLOYMENTS_QUERY, variables: { environmentId, serviceId } }),
     signal: AbortSignal.timeout(10_000),
   });

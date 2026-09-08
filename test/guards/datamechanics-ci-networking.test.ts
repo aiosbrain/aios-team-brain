@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 
-type WorkflowStep = { uses?: string; run?: string };
+type WorkflowStep = { uses?: string; run?: string; name?: string; shell?: string };
 
 describe("data-mechanics CI uses the direct Postgres service destination", () => {
   const workflow = YAML.parse(readFileSync(".github/workflows/ci.yml", "utf8"));
@@ -78,5 +78,70 @@ describe("the data-mechanics job supplies the Postgres client tools its specs sp
     expect(install, "no step installs the Postgres client tools").toBeGreaterThanOrEqual(0);
     expect(verify, "the toolchain check must follow the install").toBeGreaterThan(install);
     expect(firstDatabaseStep, "a database step runs before the toolchain is checked").toBeGreaterThan(verify);
+  });
+
+  it("keeps both toolchain steps fail-closed", () => {
+    // The shell rule below only matters because these scripts abort on the first failure and on a
+    // broken pipe; if the strict-mode lines were dropped the shell question would be moot AND the
+    // install could half-succeed into a green job.
+    expect(scriptOf(isInstall), "an install that ignores a failed apt-get would leave no client behind")
+      .toContain("set -euo pipefail");
+    expect(scriptOf(isVerify), "a check that cannot fail is not a check").toContain("set -euo pipefail");
+  });
+});
+
+/**
+ * A job CONTAINER changes which interpreter an implicit `run` step gets: the script runs INSIDE the
+ * image, where Debian's /bin/sh is dash, and dash has no `pipefail`. `set -euo pipefail` therefore
+ * aborts at the `set` itself, before the step's first real command — which is how the two toolchain
+ * steps above can be perfectly correct and still install nothing.
+ *
+ * Scoped to exactly that: which shell a `set … pipefail` step RESOLVES to, under GitHub's own
+ * precedence (step `shell:` → job `defaults.run.shell` → workflow `defaults.run.shell` → the image's
+ * implicit `sh`). Deliberately not a partial bash parser for constructs no step here uses; a
+ * detector for syntax nobody wrote is untested surface that can only be wrong.
+ */
+describe("pipefail steps in the containerized data-mechanics job resolve to bash", () => {
+  const workflow = YAML.parse(readFileSync(".github/workflows/ci.yml", "utf8"));
+  const job = workflow.jobs["datamechanics-tests"];
+  const steps = (job.steps as WorkflowStep[]).filter((step) => step.run !== undefined);
+
+  /** `set -o pipefail`, in the combined (`-euo`) and separate (`-o pipefail`) spellings. */
+  const usesPipefail = (script: string) => /^\s*set\s+(-[a-zA-Z]*o\b[^\n]*pipefail|-o\s+pipefail)/m.test(script);
+  const resolveShell = (step: WorkflowStep): string | undefined =>
+    step.shell ?? job.defaults?.run?.shell ?? workflow.defaults?.run?.shell;
+  const isBash = (shell: string | undefined) => shell !== undefined && /^bash(\s|$)/.test(shell);
+  const labelOf = (step: WorkflowStep) => step.name ?? (step.run ?? "").split("\n")[0];
+
+  it("detects pipefail and nothing else", () => {
+    // Negative control: a detector matching nothing would report an empty offender list below for
+    // any workflow at all, including the broken one this guard exists to catch.
+    expect(usesPipefail("set -euo pipefail\napt-get update")).toBe(true);
+    expect(usesPipefail("set -o pipefail")).toBe(true);
+    expect(usesPipefail("set -eu\napt-get update")).toBe(false);
+    expect(usesPipefail('DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema')).toBe(false);
+  });
+
+  it("still contains the pipefail steps this rule is about", () => {
+    // Non-vacuity: rewritten into plain POSIX or deleted, the ∀ below becomes true of an empty set
+    // and stops proving anything — fail here instead.
+    const dependent = steps.filter((step) => usesPipefail(step.run ?? ""));
+    expect(dependent.map(labelOf)).toEqual(
+      expect.arrayContaining(["Install the PostgreSQL 16 client tools", "Verify the job toolchain"]),
+    );
+  });
+
+  it("resolves bash for every one of them, never the container's implicit sh", () => {
+    const offenders = steps
+      .filter((step) => usesPipefail(step.run ?? "") && !isBash(resolveShell(step)))
+      .map((step) => `${labelOf(step)} uses pipefail under shell ${resolveShell(step) ?? "«image sh (dash)»"}`);
+    expect(offenders, "a job-container step needs an explicit bash shell to use pipefail").toEqual([]);
+  });
+
+  it("declares the shell at a scope that covers steps added later", () => {
+    // The job runs in a container — the whole reason the implicit shell is dash — so the default
+    // belongs on the job. A per-step `shell:` leaves the next step to rediscover exit 2 in CI.
+    expect(job.container?.image, "this rule is about a job-container job").toBeTruthy();
+    expect(job.defaults?.run?.shell ?? workflow.defaults?.run?.shell).toMatch(/^bash(\s|$)/);
   });
 });

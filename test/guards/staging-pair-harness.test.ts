@@ -2,6 +2,58 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
 
+/**
+ * The reaper prefix every effective ops start path must carry, spelled ONCE so the image and the
+ * documented Railway override cannot drift apart. `-s` = child subreaper, so adoption works even
+ * when tini is not literally PID 1.
+ */
+const OPS_REAPER_PREFIX = ["/usr/bin/tini", "-s", "--", "node"];
+
+describe("the staging ops runner image reaps its own orphaned descendants", () => {
+  const dockerfile = readFileSync("docker/staging-ops.Dockerfile", "utf8");
+  const instructions = dockerfile.replace(/^\s*#.*$/gm, "");
+
+  it("installs tini and asserts it at BUILD time", () => {
+    // Declaring the entrypoint without installing the binary is a green build and a container that
+    // dies with `exec: no such file or directory` on its first scheduled run.
+    expect(instructions).toMatch(/apt-get install[^\n]*\btini\b/);
+    expect(instructions).toContain("test -x /usr/bin/tini");
+    expect(instructions).toContain("/usr/bin/tini --version");
+  });
+
+  it("makes the reaper the ENTRYPOINT's own program, not an argument of it", () => {
+    // Exec form, and the exact argv: `ENTRYPOINT ["node"]` is what let an orphaned grandchild of
+    // `reapplyTesters` (npx → tsx → node) become an unreapable zombie, so `kill(-pgid, 0)` kept
+    // answering "alive" and the importer spun in containment holding both fences with staging down.
+    const entrypoint = /^\s*ENTRYPOINT\s+(\[[^\]]*\])/m.exec(instructions)?.[1];
+    expect(entrypoint, "the ops image must declare a JSON exec-form ENTRYPOINT").toBeTruthy();
+    expect(JSON.parse(entrypoint!)).toEqual(OPS_REAPER_PREFIX);
+  });
+
+  it("keeps the reaper on the documented Railway override, which never runs the ENTRYPOINT", () => {
+    // Railway's scheduled services run `schedules.json`'s command, exactly as railway.json's
+    // startCommand overrides the app image's ENTRYPOINT. An entrypoint-only reaper would not appear
+    // on the hosted path at all — which is the path that actually holds the locks.
+    const schedules = JSON.parse(readFileSync("config/staging-ops/schedules.json", "utf8"));
+    for (const [name, service] of Object.entries(schedules.services as Record<string, { command: string[] }>)) {
+      expect(service.command.slice(0, OPS_REAPER_PREFIX.length), `${name} starts without the reaper`).toEqual(OPS_REAPER_PREFIX);
+      expect(service.command.length, `${name} names no script to run`).toBeGreaterThan(OPS_REAPER_PREFIX.length);
+    }
+  });
+
+  it("gives the compose runners the same guarantee, so CI is not the only place it holds", () => {
+    // Belt and braces, and deliberately so: `init: true` supplies docker-init as PID 1 in the
+    // harness, which is precisely why CI could never observe the missing reaper in the image.
+    const compose = YAML.parse(readFileSync("compose.test.staging-pair.yml", "utf8"), { merge: true });
+    for (const name of ["exporter", "importer"]) {
+      expect(compose.services[name].init, `${name} runs without an init`).toBe(true);
+      // …and it must NOT override the image entrypoint, or the image's reaper would be bypassed
+      // exactly the way the Railway override bypasses it.
+      expect(compose.services[name].entrypoint, `${name} overrides the image entrypoint`).toBeUndefined();
+    }
+  });
+});
+
 describe("paired refresh isolated harness", () => {
   const raw = readFileSync("compose.test.staging-pair.yml", "utf8");
   const compose = YAML.parse(raw, { merge: true });
@@ -111,7 +163,7 @@ describe("paired refresh isolated harness", () => {
     expect(schedules.activated).toBe(false);
     expect(schedules.services["aios-staging-export"].schedule).toBe("0 3 * * 0");
     expect(schedules.services["aios-staging-import"].schedule).toBe("*/5 * * * *");
-    expect(schedules.services["aios-staging-import"].command).toEqual(["node", "scripts/staging-ops/importer.mjs", "tick"]);
+    expect(schedules.services["aios-staging-import"].command).toEqual([...OPS_REAPER_PREFIX, "scripts/staging-ops/importer.mjs", "tick"]);
     expect(schedules.storage.sourceBundles.retentionDays).toBe(14);
     expect(schedules.storage.rollbackBundles.ownerOperations).toContain("delete");
   });

@@ -253,16 +253,50 @@ export async function markReady(client, { runId, objectId, digest, commit, mode 
 // ── H2: interrupted first-bootstrap recovery record ────────────────────────────────────────────
 
 /**
- * Persist what a REPLACEMENT worker needs to finish this bootstrap, BEFORE anything is stopped.
- *
- * The identity fields are not decoration: a fresh worker must be able to prove the record describes
- * ITS pinned environment and app service before acting on it, and refuse otherwise. Written under
- * the coordinator lock, like every other bootstrap decision.
+ * The identity a REPLACEMENT worker validates a recorded bootstrap against, checked before any
+ * statement is issued. Not decoration: a fresh worker must be able to prove the record describes ITS
+ * pinned environment and app service, and refuse otherwise.
  */
-export async function recordBootstrapRecovery(client, { runId, phase, deploymentId, commit, mode, environmentId, appServiceId, objectId = null, digest = null }) {
+function assertBootstrapRecordFields({ runId, phase, deploymentId, commit, mode, environmentId, appServiceId }) {
   if (!runId || !BOOTSTRAP_PHASES.includes(phase)) throw new Error("bootstrap recovery record requires a run and a supported phase");
   if (!FULL_SHA.test(String(commit ?? ""))) throw new Error("bootstrap recovery record requires the exact measured deployment commit");
   if (!deploymentId || !mode || !environmentId || !appServiceId) throw new Error("bootstrap recovery record requires the measured deployment and its pinned environment/service identity");
+}
+
+/**
+ * M7: write the FIRST bootstrap record and enter `draining` in ONE statement.
+ *
+ * They used to be two, and the window between them was permanent: `bootstrapResumeVerdict` requires
+ * the record's run to equal `journal.run_id`, which is not yet true until the transition lands. A
+ * kill in between therefore left a recorded bootstrap that every later run refused as "not the
+ * journal's current run", with nothing stopped and no command able to clear it.
+ *
+ * One UPDATE of the one singleton row, so the record and the run identity that validates it either
+ * both exist or neither does. `from` is still checked, so this cannot drain a state that refuses.
+ */
+export async function beginBootstrapDraining(client, { runId, deploymentId, commit, mode, environmentId, appServiceId, from, lastSafeCheckpoint = null }) {
+  assertBootstrapRecordFields({ runId, phase: "stopping", deploymentId, commit, mode, environmentId, appServiceId });
+  if (!Array.isArray(from) || from.length === 0) throw new Error("bootstrap draining admission requires the states it may proceed from");
+  const result = await client.query(
+    `UPDATE staging_ops.refresh_journal SET
+       run_id=$1, state='draining', last_safe_checkpoint=COALESCE($8, last_safe_checkpoint),
+       bootstrap_run_id=$1, bootstrap_phase='stopping', bootstrap_deployment_id=$2,
+       bootstrap_commit=$3, bootstrap_mode=$4, bootstrap_environment_id=$5, bootstrap_app_service_id=$6,
+       updated_at=now()
+     WHERE singleton=true AND state = ANY($7::text[]) RETURNING *`,
+    [runId, deploymentId, commit, mode, environmentId, appServiceId, from, lastSafeCheckpoint],
+  );
+  if (result.rows.length !== 1) throw new Error("bootstrap draining admission refused from the current journal state");
+  return result.rows[0];
+}
+
+/**
+ * ADVANCE an existing bootstrap record — today only `stopping → captured`, once the checkpoint is
+ * published, verified and read back, so a kill in the next microsecond cannot orphan a good object.
+ * The INITIAL record is written by `beginBootstrapDraining` above, atomically with the drain.
+ */
+export async function recordBootstrapRecovery(client, { runId, phase, deploymentId, commit, mode, environmentId, appServiceId, objectId = null, digest = null }) {
+  assertBootstrapRecordFields({ runId, phase, deploymentId, commit, mode, environmentId, appServiceId });
   const result = await client.query(
     `UPDATE staging_ops.refresh_journal SET
        bootstrap_run_id=$1, bootstrap_phase=$2, bootstrap_deployment_id=$3, bootstrap_commit=$4,

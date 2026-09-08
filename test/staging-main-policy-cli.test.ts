@@ -1,5 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
-import { verifyMainPolicyFromProvider } from "../scripts/staging-ops/verify-main-policy.mjs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { isDirectEntry, verifyMainPolicyFromProvider } from "../scripts/staging-ops/verify-main-policy.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 
 /**
@@ -171,5 +176,74 @@ describe("the effective main-policy verifier has an executable acquisition path"
     });
     expect(result.ok).toBe(false);
     expect(result.errors.join("; ")).toMatch(/main-release-evidence rules differs/);
+  });
+});
+
+/**
+ * L8 — the verifier must actually RUN when it is invoked, and must stay silent when imported.
+ *
+ * The old direct-entry test compared `import.meta.url` against `file://${process.argv[1]}`: an
+ * encoded URL against a raw path. From a symlinked path — or one containing a space — it matched
+ * nothing, so the process printed nothing and exited **0**, which a shell and a workflow both read
+ * as "the policy is correct". A verifier that cannot fail is exactly the false green AC-08 forbids.
+ */
+describe("the verifier's CLI fires on real invocation and only on real invocation", () => {
+  const CLI = path.resolve("scripts/staging-ops/verify-main-policy.mjs");
+  const run = promisify(execFile);
+  const roots: string[] = [];
+  afterAll(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
+
+  /** No config on purpose: the refusal is the observable, and it is the same one on both paths. */
+  const invoke = async (entry: string) => {
+    try {
+      const { stdout, stderr } = await run(process.execPath, [entry], { env: { PATH: process.env.PATH ?? "" } });
+      return { code: 0, stdout, stderr };
+    } catch (error) {
+      const failure = error as { code?: number; stdout?: string; stderr?: string };
+      return { code: failure.code ?? -1, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "" };
+    }
+  };
+
+  it("exits NONZERO with the same refusal whether invoked directly or through a symlink", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "main-policy cli-"));
+    roots.push(root);
+    // A directory with a SPACE and a SYMLINK: the two shapes the old comparison silently missed,
+    // together, in one entry path.
+    const link = path.join(root, "verify-main-policy.mjs");
+    symlinkSync(CLI, link);
+
+    const direct = await invoke(CLI);
+    const linked = await invoke(link);
+
+    // Nonzero, not merely "different from a pass": exit 0 having printed nothing was the defect.
+    expect(direct.code, `direct invocation exited 0: ${direct.stdout}`).not.toBe(0);
+    expect(linked.code, `symlinked invocation exited 0: ${linked.stdout}`).not.toBe(0);
+    // …and the SAME refusal, so the symlinked path is running the verifier rather than failing for
+    // some incidental reason of its own.
+    expect(direct.stderr).toMatch(/main policy verification refused: GITHUB_REPOSITORY/);
+    expect(linked.stderr).toBe(direct.stderr);
+  }, 30_000);
+
+  it("stays silent when the module is merely IMPORTED", async () => {
+    // The other half. This very file imports it, so a CLI that fired on import would have run
+    // against the real GitHub API during the unit tier. Asserted on the predicate too, because an
+    // importing entry point that happens to pass `--run` must not fire it either.
+    const root = mkdtempSync(path.join(tmpdir(), "main-policy-import-"));
+    roots.push(root);
+    const importer = path.join(root, "importer.mjs");
+    writeFileSync(importer, `import ${JSON.stringify(CLI)};\nconsole.log("imported cleanly");\n`);
+    const imported = await invoke(importer);
+    expect(imported.code).toBe(0);
+    expect(imported.stdout).toContain("imported cleanly");
+    expect(imported.stderr).toBe("");
+  }, 30_000);
+
+  it("discriminates: it is the resolved FILE, not an argv word", () => {
+    expect(isDirectEntry(CLI)).toBe(true);
+    expect(isDirectEntry(path.resolve("scripts/staging-ops/main-policy.mjs"))).toBe(false);
+    // An entry-less process (`node -e`, a REPL) has no argv[1] at all.
+    expect(isDirectEntry("")).toBe(false);
+    // `--run` is not this module's convention; a sibling CLI using it must not fire this one.
+    expect(isDirectEntry("--run")).toBe(false);
   });
 });
