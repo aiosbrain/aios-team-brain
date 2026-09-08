@@ -1911,6 +1911,178 @@ describe("§11 entry surfaces — the REVERSE-IMPORT INVENTORY (AUDITFIX-18)", (
     expect(supplied.closure, "metadata never becomes a graph node").not.toContain("lib/bridge/package.json");
   });
 
+  /* ── AC18-05aa…ac: the two ways a reference walked around the refusals above (Astra final r2) ────
+   *
+   * Both are SPELLING defects, and both were reproduced through the seam rather than argued: a
+   * mixed-separator specifier resolved past the manifest refusal to `lib/wrap.ts` while the analysis
+   * reported ZERO violations (P1), and a virtual fixture's supplied `package.json` — the very
+   * metadata that makes that refusal work without a filesystem — came back as an EXCLUDED SOURCE for
+   * an ordinary JSON data import (P2). Neither has an on-disk twin that can see it: real discovery
+   * never yields a `package.json`, and the source evidence host refuses the spelling, so `AC18-05w`'s
+   * JSON row passes for a reason that says nothing about the supplied half.
+   */
+
+  /**
+   * The mixed-separator specifier as the RUNTIME sees it: ONE literal backslash. Written with
+   * `String.raw` and embedded with `JSON.stringify`, so the fixture FILE holds `"../lib\\bridge"` and
+   * the parsed specifier is `../lib\bridge`. Spelling it inline in a template would make `\b` a
+   * BACKSPACE escape, and the criterion would quietly be about a different specifier entirely.
+   */
+  const MIXED_SEP_SPEC = String.raw`../lib\bridge`;
+  const SLASH_SPEC = "../lib/bridge";
+  const TOOL = "scripts/tool.ts";
+  /** IDENTICAL but for the specifier, so each pair below turns on the SPELLING and nothing else. */
+  const toolImporting = (spec: string): string =>
+    `import { bridge } from ${JSON.stringify(spec)};\nexport const run = bridge;`;
+
+  it("AC18-05aa — a MIXED-SEPARATOR specifier is normalised BEFORE the manifest probe, so spelling cannot walk past it", () => {
+    const manifestTree = {
+      ...MINI_REPO,
+      // The same shape as AC18-05t: `main` redirects INTO the ingestion wrapper, with an inert index
+      // beside it, so a resolver that quietly took the index reports NOTHING AT ALL.
+      "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+      "lib/bridge/index.ts": HARMLESS_INDEX,
+    };
+    const root = fixtureRoot({ ...manifestTree, [TOOL]: toolImporting(MIXED_SEP_SPEC) });
+    expect(
+      tsResolvesOnDisk(MIXED_SEP_SPEC, TOOL, root),
+      "the premise, from installed TypeScript over the REAL directory: the backslash spelling is not a different module — it is the same directory, and the manifest redirects into the wrapper"
+    ).toBe("lib/wrap.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "this fixture produced ZERO violations while the probe asked about `lib\\bridge`").toHaveLength(1);
+    expect(refused[0].message).toContain(TOOL);
+    expect(refused[0].message, "the specifier is quoted AS WRITTEN — normalising is for resolution, not for the reader").toContain(MIXED_SEP_SPEC);
+    expect(refused[0].message, "and the manifest is named by the NORMALISED path that was actually probed").toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual([
+      "unsupported-directory-manifest",
+    ]);
+    expect(r.closure, "the index the old fallback took is not quietly admitted as the edge").not.toContain("lib/bridge/index.ts");
+    expect(r.surfaces, "the positive anchor stands").toEqual([ANCHOR]);
+
+    // The SLASH twin, same tree: mixed separators must not open a SECOND NAMESPACE in which one
+    // spelling is refused and its twin resolves. Same rule, same manifest, same named path.
+    const slash = analyseTreeAt(fixtureRoot({ ...manifestTree, [TOOL]: toolImporting(SLASH_SPEC) }), entryInv(ANCHOR));
+    expect(slash.violations.map((v) => v.kind), "one path, one answer").toEqual(["unsupported-directory-manifest"]);
+    expect(ofKind(slash, "unsupported-directory-manifest")[0].message).toContain("lib/bridge/package.json");
+
+    // The manifest-REMOVAL twin, kept for the BACKSLASH spelling. Without it, "a specifier with a
+    // backslash in it fails" would satisfy everything above while refusing an ordinary import.
+    const removed = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, "lib/bridge/index.ts": HARMLESS_INDEX, [TOOL]: toolImporting(MIXED_SEP_SPEC) }),
+      entryInv(ANCHOR)
+    );
+    expect(removed.violations.map((v) => v.message), "with no manifest there, nothing may be refused").toEqual([]);
+    expect(removed.surfaces).toEqual([ANCHOR]);
+  });
+
+  it("AC18-05ab — a MIXED-SEPARATOR parent traversal is refused as OUTSIDE the root, not probed as a directory name", () => {
+    // The other half of normalising before segment processing: `..` only escapes the root if it is
+    // SEEN as a segment. Unnormalised, `..\..\outside\bridge` is one opaque name that exists nowhere,
+    // so the reference was reported as a missing edge — a true failure for a false reason, and one
+    // that says the boundary held when nothing checked it.
+    const mixed = String.raw`..\..\outside\bridge`;
+    const slash = "../../outside/bridge";
+    const outsideOf = (spec: string) =>
+      analyseTreeAt(fixtureRoot({ ...MINI_REPO, [TOOL]: toolImporting(spec) }), entryInv(ANCHOR));
+
+    const r = outsideOf(mixed);
+    const refused = ofKind(r, "unresolved");
+    expect(refused).toHaveLength(1);
+    expect(refused[0].message).toContain(TOOL);
+    expect(refused[0].message, "quoted as written").toContain(mixed);
+    expect(
+      refused[0].message,
+      "the NAMED reason: the reference left the repository — not 'no analysed source resolves it', which is what an unnormalised opaque segment reports"
+    ).toContain("OUTSIDE the repository root");
+    expect(r.violations.map((v) => v.kind)).toEqual(["unresolved"]);
+    expect(r.surfaces, "and the walk still found the tree").toEqual([ANCHOR]);
+
+    // The slash twin: the identical named refusal, so the two spellings are one reference here too.
+    expect(ofKind(outsideOf(slash), "unresolved")[0].message).toContain("OUTSIDE the repository root");
+  });
+
+  it("AC18-05ac — supplied METADATA answers the manifest question and is NEVER a source candidate", () => {
+    // `byRel` holds every SUPPLIED file and the existence view is built from it, so the metadata a
+    // fixture supplies for the manifest refusal was also handed to SOURCE resolution as the bare
+    // candidate — and admission, which excludes anything the walk did not yield, called an ordinary
+    // JSON data import a reference into an EXCLUDED SOURCE.
+    const r = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "package.json", code: `{"name":"fixture-repo","private":true}` },
+        // An ORDINARY JSON name beside it: the rule is that a non-source SPELLING is not a source
+        // candidate, not that `package.json` is a special case. Metadata is special to ONE question.
+        { rel: "lib/settings.json", code: `{"flag":true}` },
+        {
+          rel: ROUTE,
+          code:
+            `import { w } from "@/lib/wrap";\nimport pkg from "@/package.json";\n` +
+            `import settings from "@/lib/settings.json";\nexport async function POST(){ await w({ pkg, settings }); }`,
+        },
+      ],
+      entryInv(ROUTE)
+    );
+    expect(r.violations.map((v) => v.message), "a JSON data import is TERMINAL, not a reference into an excluded source").toEqual([]);
+    expect(r.excludedRefs, "nothing supplied as metadata is reported as a source").toEqual([]);
+    expect(r.closure, "metadata is looked at, never entered").not.toContain("package.json");
+    expect(r.closure).not.toContain("lib/settings.json");
+    expect(r.surfaces, "and the anchored route keeps its own path to the writer").toEqual([ROUTE]);
+
+    // (b) the SAME analyser and the SAME supplied-metadata mechanism, still recognised for the one
+    // thing it is FOR. Without this half, dropping metadata out of the view entirely satisfies (a).
+    const manifest = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/bridge/package.json", code: `{"main":"../wrap.ts"}` },
+        { rel: MANIFEST_ROUTE, code: MANIFEST_ROUTE_CODE },
+      ],
+      NO_ENTRIES
+    );
+    expect(
+      ofKind(manifest, "unsupported-directory-manifest"),
+      "supplied metadata still answers the manifest existence question, with no filesystem in it"
+    ).toHaveLength(1);
+
+    // (c) SOURCE BEFORE ASSETS survives — the AC18-05h escape, restated for metadata. A blanket "a
+    // `.json` specifier is an asset" short circuit passes (a) and (b) and then deletes this edge, and
+    // every surface behind it, with the ordinary JSON sitting right beside the source that wins.
+    const beside = analyseEntrySurfaces(
+      [
+        SEED,
+        { rel: "lib/config.json", code: `{"raw":true}` },
+        { rel: "lib/config.json.ts", code: `${IMPORT_CANON}\nexport const config = async (a) => ${WRITER}(a);` },
+        { rel: ROUTE, code: `import { config } from "@/lib/config.json";\nexport async function POST(){ await config({}); }` },
+      ],
+      entryInv(ROUTE)
+    );
+    expect(beside.violations.map((v) => v.message), "the SOURCE wins; the JSON beside it is not the answer").toEqual([]);
+    expect(beside.closure, "the .json-spelled specifier resolves to the .json.ts SOURCE").toContain("lib/config.json.ts");
+    expect(beside.surfaces).toEqual([ROUTE]);
+
+    // (d) the boundary in the other direction: a DECLARATION is a source spelling, so it must still
+    // RESOLVE and then fail admission. A gate written as "only files the graph would admit" turns
+    // this refusal into a silent asset, which is the reason the excluded spellings are enumerated.
+    const decl = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/kinds.d.ts", code: `export type Team = { id: string };` },
+        {
+          rel: ROUTE,
+          code: `import { w } from "@/lib/wrap";\nimport { Team } from "@/lib/kinds";\nexport async function POST(){ await w({ Team }); }`,
+        },
+      ],
+      entryInv(ROUTE)
+    );
+    const declRefs = ofKind(decl, "excluded-ref");
+    expect(declRefs, "an excluded DECLARATION still fails, and is not downgraded to an asset").toHaveLength(1);
+    expect(declRefs[0].message).toContain("lib/kinds.d.ts");
+  });
+
   // ── AC18-05m/n: an ABSOLUTE path is a local spelling, not a package name (Astra medium 2) ──────
   //
   // The external-terminal branch fires on "not `.` and not `@/`", so `/tmp/bridge.mjs` — a local

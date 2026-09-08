@@ -339,7 +339,30 @@ const dirOf = (rel: string): string => (rel.includes("/") ? rel.slice(0, rel.las
 const isAbsoluteSpecifier = (spec: string): boolean =>
   spec.startsWith("/") || spec.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(spec);
 
-/** Join a relative specifier onto a directory. `null` means it escaped the repository root. */
+/**
+ * Canonicalise a LOCAL specifier's PATH SEPARATORS — one spelling for the whole of resolution.
+ *
+ * `joinRel` below splits on `/` alone, while TypeScript's own host normalisation accepts `\` as a
+ * separator too. So `../lib\bridge` and `../lib/bridge` named the SAME file to the compiler while
+ * this analysis carried `lib\bridge` around as one opaque segment: the manifest probe, the
+ * outside-root check and the candidate enumeration all asked about a filesystem name that no POSIX
+ * tree has, and the refusal that should have fired never did. Reproduced through the real seam — the
+ * backslash spelling resolved to `lib/wrap.ts` through a directory manifest while the guard reported
+ * ZERO violations (Astra final round 2, P1). A boundary anybody can leave by changing SPELLING is
+ * not a boundary.
+ *
+ * Applied ONCE, at the top of `resolve`, so every consumer downstream shares one local identity and
+ * mixed separators cannot open a second namespace — `.` and `..` segments are then recognised
+ * however they were punctuated, rather than hiding inside a segment. It does not consult the host
+ * platform's separator (`path.sep` answers for the runner, not for the repository), decodes nothing,
+ * and runs AFTER the `#…`, `file:` and absolute-path refusals in `analyseEntrySurfaces`, so no
+ * unsupported spelling can be normalised into an allowed one. A repository file whose NAME really
+ * contains a backslash is out of scope, as it is for TypeScript.
+ */
+const normaliseSeparators = (spec: string): string => spec.replace(/\\/g, "/");
+
+/** Join a relative specifier onto a directory. `null` means it escaped the repository root. The
+ *  specifier arrives SEPARATOR-NORMALISED (above), so splitting on `/` sees every segment there is. */
 function joinRel(fromDir: string, spec: string): string | null {
   const parts = fromDir === "" ? [] : fromDir.split("/");
   for (const seg of spec.split("/")) {
@@ -460,13 +483,30 @@ function createResolver(
   const existsInView = (rel: string): boolean => byRel.has(rel) || (sourceFileExists?.(rel) ?? false);
 
   /**
+   * SUPPLIED METADATA: a file the caller handed over that is not spelled like a source (Astra final
+   * round 2, P2). It is IN the view — that is how a virtual fixture lets `manifestUnder` answer
+   * without a filesystem — and it must never be a MODULE NAME, because admission excludes anything
+   * the walk did not yield, so an ordinary `import pkg from "@/package.json"` came back as a
+   * reference into an EXCLUDED SOURCE. Availability for the one existence question and availability
+   * as a source candidate are different things, and this is the line between them.
+   *
+   * Only the SUPPLIED half needs the clause. The evidence half answers for source spellings by
+   * contract (`isProbeablePath` in `entry-surface-discovery`, which is what keeps a genuine
+   * stylesheet a terminal asset). The root-scoped evidence host owns that source-only contract;
+   * supplied virtual inputs separately allow metadata and are filtered here.
+   */
+  const isSuppliedMetadata = (rel: string): boolean => byRel.has(rel) && !isSourceSpelling(rel);
+
+  /**
    * Does the reference BASE carry a package manifest? The whole of the directory-manifest rule.
    *
    * EXACTLY the base, never an ancestor: this repository's own root `package.json` sits above every
    * import in the tree, so an ancestor walk would refuse the entire codebase. `base` arrives
-   * NORMALISED from `joinRel` — `.`, `..` and trailing-slash segments are already gone — so
-   * `@/lib/bridge/`, `./bridge` and `../lib/./bridge` ask about one path, not three. The empty base
-   * is the repository root itself, which is a directory reference like any other.
+   * NORMALISED from `joinRel` — separators, `.`, `..` and trailing-slash segments are already gone —
+   * so `@/lib/bridge/`, `./bridge`, `../lib/./bridge` and `..\lib\bridge` ask about ONE path, not
+   * four. That last one is the point: the probe is only a boundary if a different spelling of the
+   * same directory cannot walk around it. The empty base is the repository root itself, which is a
+   * directory reference like any other.
    *
    * Both halves of the existence view answer, for the same reason `existsInView` has two: a virtual
    * fixture supplies the manifest as a file, the on-disk seam supplies it as evidence. Neither can
@@ -479,13 +519,20 @@ function createResolver(
   };
 
   const host: ts.ModuleResolutionHost = {
+    // Supplied METADATA is withheld from the compiler for the same reason `candidates` does not
+    // offer it: it is in the view so `manifestUnder` can answer without a filesystem, not so that
+    // something can be resolved TO it. Under these options TypeScript would not load a `.json` name
+    // anyway (`resolveJsonModule` is off), so this states the rule where the view is served rather
+    // than leaving it to a setting that is not the rule.
     fileExists: (f) => {
       const rel = relOf(f);
-      return rel !== null && rel !== "" && existsInView(rel);
+      return rel !== null && rel !== "" && !isSuppliedMetadata(rel) && existsInView(rel);
     },
-    // SUPPLIED CONTENT ONLY — never the view. Resolution reads `package.json`, not modules, and the
-    // evidence host refuses non-source spellings, so nothing it knows about is ever readable here.
-    // A file the walk dropped stays metadata: it is resolved TO, never read, parsed or traversed.
+    // SUPPLIED CONTENT ONLY — never the view. The evidence host refuses non-source spellings, so
+    // nothing it knows about is ever readable here, and `fileExists` above withholds supplied
+    // metadata, so a manifest is not readable through this either: the manifest rule is an EXISTENCE
+    // question (`manifestUnder`) and never a content one. A file the walk dropped stays metadata: it
+    // is resolved TO, never read, parsed or traversed.
     readFile: (f) => hostFiles.get(normaliseAbs(f)),
     // Directory existence is a PRUNING optimisation inside TypeScript: answering "no" stops it
     // looking for files there at all. Enumerating only the supplied files' directories therefore
@@ -536,7 +583,16 @@ function createResolver(
       : { kind: "excluded", rel };
 
   const candidates = (base: string): string[] => {
-    const out = [base];
+    // The BARE BASE, unless it is supplied METADATA (Astra final round 2, P2): a fixture's
+    // `package.json` is in the view for `manifestUnder` and is not a module name, and enumerating it
+    // here is what made an ordinary JSON data import read as a reference into an excluded source.
+    // Real discovery cannot show this — the walk yields sources, so nothing supplies JSON there.
+    //
+    // It is a refusal to treat that ONE name as source, not a JSON short circuit: every candidate
+    // below still runs, so `./config.json` finds the source `config.json.ts` exactly as `./x.css`
+    // finds `x.css.ts`, and only a base that resolves to no source at all reaches asset handling.
+    // Declaration and test spellings end in `.ts`, so they still resolve and still fail admission.
+    const out = isSuppliedMetadata(base) ? [] : [base];
     for (const ext of GRAPH_SOURCE_EXT) out.push(`${base}${ext}`);
     // Declaration targets are enumerated ON PURPOSE. The graph must RECOGNISE a reference into a
     // `.d.ts` in order to refuse it as an excluded source; leaving it out would report the same
@@ -551,7 +607,12 @@ function createResolver(
 
   const cache = new Map<string, Resolution>();
 
-  return function resolve(fromRel: string, spec: string): Resolution {
+  return function resolve(fromRel: string, rawSpec: string): Resolution {
+    // ONE local identity for everything below — the manifest probe, the outside-root check, the
+    // candidate enumeration and TypeScript itself — so two spellings of one reference cannot get two
+    // answers, and the cache cannot hold both. The specifier AS WRITTEN is what the caller quotes in
+    // its diagnostics, so normalising here changes no message's spelling.
+    const spec = normaliseSeparators(rawSpec);
     const key = cacheKey(dirOf(fromRel), spec);
     const hit = cache.get(key);
     if (hit) return hit;
@@ -575,7 +636,9 @@ function createResolver(
     } else {
       // WHICH FILE the specifier names, decided against the whole view — installed TypeScript first,
       // the written-out rules second. Neither is filtered by admission: a target that is filtered out
-      // of the search is a target whose refusal can never be reported.
+      // of the search is a target whose refusal can never be reported. Neither half may name supplied
+      // METADATA, though: the host withholds it and `candidates` does not offer it, so the
+      // `package.json` a fixture hands over for `manifestUnder` cannot come back as a module.
       const viaTs = ts.resolveModuleName(spec, absOf(fromRel), options, host).resolvedModule?.resolvedFileName;
       const tsRel = viaTs === undefined ? null : relOf(viaTs);
       const target =
@@ -981,7 +1044,9 @@ function isSurfaceFile(rel: string, src: ts.SourceFile): boolean {
  * URL are refused as local references the graph does not resolve; a reference base carrying a
  * `package.json` is refused as an unsupported directory manifest BEFORE any source/index/asset
  * fallback; a specifier naming a source the WALK dropped is refused as an `excluded-ref` when the
- * caller supplied `sourceFileExists`. None is ever admitted as a node. Each of these is a REFUSAL
+ * caller supplied `sourceFileExists`. Local path separators are canonicalised before any of that
+ * (`normaliseSeparators`), so these rules key on the path a specifier NAMES and not on how it was
+ * punctuated. None is ever admitted as a node. Each of these is a REFUSAL
  * rather than a resolution, and the reason is always the same one: the alternative is to terminate
  * a local reference as though it were an external package, which deletes the edge and every surface
  * behind it while reporting nothing at all.
