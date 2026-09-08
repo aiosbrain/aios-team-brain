@@ -939,7 +939,16 @@ const entryInv = (...rels: string[]): Record<string, EntryRecord> => Object.from
 const NO_ENTRIES: Record<string, EntryRecord> = {};
 
 /** Kinds that mean "the analysis could not see something", as opposed to "a record is missing". */
-const DIAGNOSTIC_KINDS: EntryViolationKind[] = ["unresolved", "refused-load", "unsupported-alias", "parse", "stale-exception", "excluded-ref"];
+const DIAGNOSTIC_KINDS: EntryViolationKind[] = [
+  "unresolved",
+  "refused-load",
+  "unsupported-alias",
+  "unsupported-directory-manifest",
+  "unsupported-file-url",
+  "parse",
+  "stale-exception",
+  "excluded-ref",
+];
 const diagnostics = (r: EntrySurfaceAnalysis) => r.violations.filter((v) => DIAGNOSTIC_KINDS.includes(v.kind)).map((v) => v.message);
 const ofKind = (r: EntrySurfaceAnalysis, kind: EntryViolationKind) => r.violations.filter((v) => v.kind === kind);
 
@@ -1698,6 +1707,210 @@ describe("§11 entry surfaces — the REVERSE-IMPORT INVENTORY (AUDITFIX-18)", (
     expect(r.surfaces).toEqual([ANCHOR, included, route].sort());
   });
 
+  /* ── AC18-05t…x: a LOCAL DIRECTORY MANIFEST is REFUSED, never resolved (Astra final, P1) ────────
+   *
+   * The blindness these close is structural, not a missing candidate. The graph reads SOURCES: the
+   * walk yields them, the resolver's `readFile` serves supplied contents only, and the source
+   * evidence host refuses non-source spellings on purpose — so a real `package.json` beside a
+   * directory is invisible to every part of this seam. A directory whose manifest redirects into an
+   * ingestion wrapper therefore resolved to whatever `index` happened to sit next to it, and the
+   * edge — with every surface behind it — disappeared with NO diagnostic. The coordinator
+   * reproduced it: installed TypeScript named `lib/wrap.ts` while the analysis reported an empty
+   * violations list.
+   *
+   * The accepted fix is a REFUSAL, not a manifest resolver, and the criteria below are written
+   * against that policy rather than around it. Contents are never read, so a benign manifest is
+   * refused too (05v); the probe asks about the reference BASE alone, so this repository's own root
+   * `package.json` cannot refuse every import in the tree (05w); and an explicit source-file
+   * reference is the documented way through.
+   */
+
+  /**
+   * Installed TypeScript's answer for a REAL directory on disk, through `ts.sys` — the one host in
+   * this file that can read a manifest. Independent evidence for what a runtime resolver does with
+   * these fixtures, which is what makes "the index fallback was wrong" a fact rather than a belief.
+   *
+   * Deliberately NOT `tsResolvesTo` above: that host's `readFile` returns nothing, so it cannot see
+   * a `package.json` at all — it models the very blindness being fixed and would agree with the old
+   * behaviour for the wrong reason.
+   */
+  const tsResolvesOnDisk = (spec: string, fromRel: string, root: string): string | null => {
+    const resolved = ts.resolveModuleName(
+      spec,
+      join(root, fromRel),
+      {
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        module: ts.ModuleKind.ESNext,
+        target: ts.ScriptTarget.ESNext,
+        baseUrl: root,
+        paths: Object.fromEntries(Object.entries(PINNED_TS_PATHS).map(([k, v]) => [k, [...v]])),
+      },
+      ts.sys
+    ).resolvedModule?.resolvedFileName;
+    return resolved === undefined ? null : relative(root, resolved);
+  };
+
+  // A route of its own, not `BRIDGE_ROUTE` above: these fixtures turn on the metadata beside a
+  // directory, and reusing the precedence family's paths would make two unrelated rules share a name.
+  const MANIFEST_ROUTE = "app/api/manifest/route.ts";
+  /** IDENTICAL across the rows below, so each pair turns on the FIXTURE's metadata and nothing else. */
+  const MANIFEST_ROUTE_CODE = `import { bridge } from "@/lib/bridge";\nexport const POST = bridge;`;
+  /** Inert on purpose: it reaches nothing, so a resolver that silently took it would report NOTHING
+   *  AT ALL — the exact silence reproduced — rather than some other violation standing in for it. */
+  const HARMLESS_INDEX = `export const bridge = () => null;`;
+
+  it("AC18-05t — a directory manifest REDIRECT is refused through the real discovery seam, before any index fallback", () => {
+    const root = fixtureRoot({
+      ...MINI_REPO,
+      // `main` points AT the ingestion wrapper. This is the case the old fallback got wrong: it
+      // answered with the sibling index, which is a different module with no path to the writer.
+      "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+      "lib/bridge/index.ts": HARMLESS_INDEX,
+      [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE,
+    });
+
+    expect(
+      tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root),
+      "the premise, from installed TypeScript over the REAL directory: the manifest redirects INTO the wrapper"
+    ).toBe("lib/wrap.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "the reference must FAIL — this fixture produced ZERO violations before the fix").toHaveLength(1);
+    expect(refused[0].message).toContain(MANIFEST_ROUTE);
+    expect(refused[0].message).toContain("@/lib/bridge");
+    expect(refused[0].message, "the location, so the reader can go straight to the line").toContain(":1");
+    expect(refused[0].message, "and the manifest that caused it, by path").toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual([
+      "unsupported-directory-manifest",
+    ]);
+
+    // Refusing is not resolving, in EITHER direction. The manifest is metadata and never becomes a
+    // node, and the index the old fallback would have taken is not quietly admitted as the edge —
+    // which is what would make this criterion pass while the escape stayed open.
+    expect(r.closure, "metadata is looked at, never entered").not.toContain("lib/bridge/package.json");
+    expect(r.closure, "and the index is not silently taken as the edge").not.toContain("lib/bridge/index.ts");
+    expect(r.surfaces, "the positive anchor stands").toEqual([ANCHOR]);
+  });
+
+  it("AC18-05u — REMOVING the manifest lets the harmless index resolve, with no false refusal", () => {
+    // The removal twin, same route and same inventory. Without it, "any directory import fails"
+    // would satisfy 05t while making an ordinary directory index unwritable.
+    const root = fixtureRoot({ ...MINI_REPO, "lib/bridge/index.ts": HARMLESS_INDEX, [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE });
+    expect(
+      tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root),
+      "with no manifest present, the directory index IS the honest answer"
+    ).toBe("lib/bridge/index.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    expect(r.violations.map((v) => v.message), "with no manifest there, nothing may be refused").toEqual([]);
+    expect(r.surfaces).toEqual([ANCHOR]);
+  });
+
+  it.each([
+    {
+      n: "the manifest is entirely benign",
+      files: { "lib/bridge/package.json": `{"name":"bridge","version":"1.0.0"}`, "lib/bridge/index.ts": HARMLESS_INDEX },
+      tsTarget: "lib/bridge/index.ts",
+    },
+    {
+      n: "a same-base SOURCE file would have won anyway",
+      files: { "lib/bridge/package.json": `{"name":"bridge","version":"1.0.0"}`, "lib/bridge.ts": `export { w as bridge } from "@/lib/wrap";` },
+      tsTarget: "lib/bridge.ts",
+    },
+  ])("AC18-05v — the refusal is CONSERVATIVE and unconditional: $n", ({ files, tsTarget }) => {
+    // Both rows are references that WOULD have resolved, and the premise says to what — so these
+    // pin the accepted policy rather than an implementation convenience. Reading the manifest to
+    // decide "this one is harmless" is the thing the adjudication declined to build: it would put
+    // the guard back in the business of guessing which redirect field wins.
+    const root = fixtureRoot({ ...MINI_REPO, ...files, [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE });
+    expect(tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root), "the premise: this reference is resolvable").toBe(tsTarget);
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "the manifest's CONTENTS are never consulted, so its harmlessness cannot excuse it").toHaveLength(1);
+    expect(refused[0].message).toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind)).toEqual(["unsupported-directory-manifest"]);
+  });
+
+  it.each([
+    {
+      n: "an ordinary repository-root package.json refuses nothing",
+      files: { "package.json": `{"name":"fixture-repo","private":true}` },
+      route: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }`,
+      reaches: "lib/wrap.ts",
+    },
+    {
+      n: "an EXPLICIT source-file reference under a manifest-bearing directory keeps its edge",
+      files: {
+        "package.json": `{"name":"fixture-repo","private":true}`,
+        "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+        "lib/bridge/index.ts": `export { w as bridge } from "@/lib/wrap";`,
+      },
+      route: `import { bridge } from "@/lib/bridge/index";\nexport async function POST(){ await bridge({}); }`,
+      reaches: "lib/bridge/index.ts",
+    },
+    {
+      // A reference whose base IS a manifest is a JSON DATA import, and keeps its existing terminal
+      // treatment — the base carries no `package.json/package.json`. A refusal keyed on the NAME
+      // anywhere in the specifier, rather than on the base's contents, breaks this row alone.
+      n: "importing a package.json as DATA stays an ordinary JSON asset",
+      files: { "package.json": `{"name":"fixture-repo","private":true}` },
+      route: `import { w } from "@/lib/wrap";\nimport pkg from "@/package.json";\nexport async function POST(){ await w(pkg); }`,
+      reaches: "lib/wrap.ts",
+    },
+  ])("AC18-05w — the probe asks about the reference BASE only, never an ancestor: $n", ({ files, route, reaches }) => {
+    // The bound on the whole change, and the row that a plausible over-broad fix fails: this
+    // repository's own root `package.json` sits above EVERY import in the tree, so an ancestor walk
+    // would refuse the entire codebase — a guard that fails everything proves nothing. The second
+    // row is the documented way through, asserted rather than merely suggested by the diagnostic.
+    const r = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, ...files, [MANIFEST_ROUTE]: route }),
+      entryInv(ANCHOR, MANIFEST_ROUTE)
+    );
+    expect(r.violations.map((v) => v.message), "a manifest ABOVE the base is not this reference's manifest").toEqual([]);
+    expect(r.closure, "and the edge is genuinely followed, not merely un-refused").toContain(reaches);
+    expect(r.surfaces).toEqual([ANCHOR, MANIFEST_ROUTE].sort());
+  });
+
+  it("AC18-05x — the manifest host is OPT-IN: a virtual fixture supplies its own, and never borrows this disk's", () => {
+    // The two halves of fixture isolation for the new evidence host, as AC18-05b/p are for sources.
+    const rel = "scripts/tool.ts";
+    // `..` from `scripts/` names the REPOSITORY ROOT, where a real `package.json` genuinely sits.
+    const code = `import { w } from "../lib/wrap";\nimport "..";\nexport const run = w;`;
+
+    // (a) NO host: the analysis touches no filesystem, so the real root manifest cannot be seen. The
+    // reference is still refused — as a MISSING edge, which is the honest answer without evidence.
+    const isolated = analyseEntrySurfaces([SEED, WRAP(), { rel, code }], entryInv(rel));
+    expect(isolated.violations.map((v) => v.kind), "with no host there is no manifest to have found").toEqual([
+      "unresolved",
+    ]);
+
+    // (b) the SAME spelling through the on-disk seam, where the root manifest really is there. The
+    // pair turns on the HOST, not on the fixture's text.
+    const onDisk = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, "package.json": `{"name":"fixture-repo","private":true}`, [rel]: code }),
+      entryInv(ANCHOR, rel)
+    );
+    expect(ofKind(onDisk, "unsupported-directory-manifest"), "through the seam, the same reference finds it").toHaveLength(1);
+
+    // (c) a virtual fixture may SUPPLY the metadata as an ordinary file — and it is still metadata:
+    // looked at for the refusal, never parsed, never a node.
+    const supplied = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/bridge/package.json", code: `{"main":"../wrap.ts"}` },
+        { rel: MANIFEST_ROUTE, code: MANIFEST_ROUTE_CODE },
+      ],
+      NO_ENTRIES
+    );
+    const refused = ofKind(supplied, "unsupported-directory-manifest");
+    expect(refused, "a supplied manifest is evidence too, with no filesystem anywhere in it").toHaveLength(1);
+    expect(refused[0].message).toContain("lib/bridge/package.json");
+    expect(supplied.closure, "metadata never becomes a graph node").not.toContain("lib/bridge/package.json");
+  });
+
   // ── AC18-05m/n: an ABSOLUTE path is a local spelling, not a package name (Astra medium 2) ──────
   //
   // The external-terminal branch fires on "not `.` and not `@/`", so `/tmp/bridge.mjs` — a local
@@ -1752,6 +1965,63 @@ describe("§11 entry surfaces — the REVERSE-IMPORT INVENTORY (AUDITFIX-18)", (
       entryInv(rel)
     );
     expect(r.violations.map((v) => v.message), "a package subpath has slashes but is not a path").toEqual([]);
+    expect(r.surfaces).toEqual([rel]);
+  });
+
+  // ── AC18-05y/z: a `file:` MODULE URL is a local reference wearing a scheme (Astra final, P2) ────
+  //
+  // The same erasure as the absolute rows above, one spelling further out. The local test keys on
+  // `.` and `@/`, and `file:///tmp/bridge.mjs` is neither — so it reaches the external-package
+  // branch and terminates as a dependency: no edge, no diagnostic, every surface behind it gone.
+  // The coordinator reproduced exactly that, with a literal dynamic import in a scanned script
+  // returning an empty violations list. Refusing the SPELLING is the whole contract here: nothing
+  // decodes the URL, resolves it, or acquires any opinion about hosts, escapes or query strings.
+  const FILE_URL_REFUSED = [
+    { n: "a static import", code: `import { bridge } from "file:///tmp/bridge.mjs";`, spec: "file:///tmp/bridge.mjs" },
+    { n: "a literal dynamic import (the reproduced form)", code: `export const pending = import("file:///tmp/bridge.mjs");`, spec: "file:///tmp/bridge.mjs" },
+    { n: "a literal require", code: `export const bridge = require("file:///tmp/bridge.mjs");`, spec: "file:///tmp/bridge.mjs" },
+    { n: "an export-from declaration", code: `export { bridge } from "file:///tmp/bridge.mjs";`, spec: "file:///tmp/bridge.mjs" },
+    // Case-INSENSITIVE because URL schemes are: `FILE:` and `file:` name one protocol. A
+    // case-sensitive test refuses the lowercase spelling and waves its shouted twin through, which
+    // is an edge lost on capitalisation — the environment-dependent hole AC18-05m already refused
+    // to accept for platform path spellings.
+    { n: "an UPPERCASE scheme", code: `import { bridge } from "FILE:///tmp/bridge.mjs";`, spec: "FILE:///tmp/bridge.mjs" },
+    { n: "a mixed-case scheme", code: `import { bridge } from "File:///tmp/bridge.mjs";`, spec: "File:///tmp/bridge.mjs" },
+    // No host and no slashes, still a file URL — and still not something this graph resolves.
+    { n: "an opaque, host-less path", code: `import { bridge } from "file:bridge.mjs";`, spec: "file:bridge.mjs" },
+    // Refusing is the contract; RESOLVING file URLs is not. A URL naming a file that IS in the
+    // analysed set must still be refused, or the fix has quietly added a second resolver.
+    { n: "a file URL naming a file INSIDE the analysed set", code: `import { w as w2 } from "file:///lib/wrap.ts";`, spec: "file:///lib/wrap.ts" },
+  ];
+
+  it.each(FILE_URL_REFUSED)("AC18-05y — a `file:` module URL is refused, never terminated as a package: $n", ({ code, spec }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    const refused = ofKind(r, "unsupported-file-url");
+    expect(refused, "a file URL is a LOCAL reference; treating it as a package erases the edge in silence").toHaveLength(1);
+    expect(refused[0].message).toContain(rel);
+    expect(refused[0].message).toContain(spec);
+    expect(refused[0].message, "the location, so the reader can go straight to the line").toContain(":2");
+    expect(r.violations.map((v) => v.kind), "one rule, once — the refusal is not a cascade").toEqual(["unsupported-file-url"]);
+  });
+
+  it.each([
+    { n: "a package whose NAME begins with the same four letters", code: `import { fileTypeFromBuffer } from "file-type";` },
+    { n: "a SCOPED package whose scope is literally `file`", code: `import { load } from "@file/loader";` },
+    { n: "a node builtin carrying a scheme-ish colon", code: `import { readFile } from "node:fs/promises";` },
+    { n: "a package subpath naming a file", code: `import { helper } from "zod/lib/file.js";` },
+  ])("AC18-05z — a specifier that merely LOOKS like a file URL stays terminal: $n", ({ code }) => {
+    // The passing twins. Without them a refusal keyed on the four letters — or on "has a colon" —
+    // would satisfy every row above while making ordinary package and builtin imports unwritable.
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    expect(r.violations.map((v) => v.message), "the SCHEME is what is refused, not the letters").toEqual([]);
     expect(r.surfaces).toEqual([rel]);
   });
 

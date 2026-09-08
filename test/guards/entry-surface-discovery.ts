@@ -23,6 +23,14 @@
  * `createSourceFileProbe` answers the one narrow question that separates them ("is there a SOURCE
  * file at this repo-relative path?") for the tree that was walked. It grants nothing: eligibility to
  * be a graph node still belongs to the walk, so evidence explains a REFUSAL and never admits a node.
+ *
+ * `createManifestProbe` is the same idea for the one piece of METADATA a local reference can turn
+ * on: a `package.json` directly under the reference base. The source host cannot answer for it (a
+ * manifest is not a source spelling, and admitting it there would report metadata as an excluded
+ * source), and the resolver reads only supplied contents, so without this a directory manifest
+ * redirecting into an ingestion wrapper was invisible — the analysis took a sibling `index` and
+ * reported nothing. Existence is the whole answer: the refusal it feeds reads no contents, follows
+ * no redirect, and consults no ancestor.
  */
 
 import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -31,6 +39,7 @@ import {
   analyseEntrySurfaces,
   CANONICAL_WRITER_MODULE,
   isSourceSpelling,
+  MANIFEST_NAME,
   type EntryAnalysisOptions,
   type EntryRecord,
   type EntrySurfaceAnalysis,
@@ -118,22 +127,58 @@ export function readDiscoveredSources(root: string): SourceFile[] {
 }
 
 /**
- * Is `rel` a path this host is willing to answer about AT ALL? Three refusals, each load-bearing:
+ * The two refusals BOTH evidence hosts owe, whatever they answer about:
  *
- * - **Not a source spelling** (`isSourceSpelling`, owned by the graph so there is one list). This is
- *   the one that keeps the whole mechanism honest: `candidates(base)` offers the bare base too, so a
- *   host that answered "yes, `docs/bridge.css` is there" would classify a genuine STYLESHEET as an
- *   excluded source and make an ordinary CSS import unwritable.
  * - **Not inside the root.** Empty, absolute or `..`-climbing paths are refused rather than
- *   normalised: this host exists to describe THIS repository, and a resolver bug must not become a
+ *   normalised: these hosts exist to describe THIS repository, and a resolver bug must not become a
  *   read of somewhere else on the machine.
  * - **`node_modules`.** Dependencies are terminal by design and this slice does not crawl them; a
  *   dependency file must read as unresolved, not as a repository source somebody excluded.
  */
-const isProbeablePath = (rel: string): boolean => {
+const isInsideRoot = (rel: string): boolean => {
   if (rel === "" || rel.startsWith("/") || rel.startsWith("\\") || /^[A-Za-z]:/.test(rel)) return false;
-  if (!isSourceSpelling(rel)) return false;
   return rel.split("/").every((seg) => seg !== "" && seg !== "." && seg !== ".." && seg !== "node_modules");
+};
+
+/**
+ * The SOURCE host's third refusal, and the one that keeps the whole mechanism honest: **not a source
+ * spelling** (`isSourceSpelling`, owned by the graph so there is one list). `candidates(base)` offers
+ * the bare base too, so a host that answered "yes, `docs/bridge.css` is there" would classify a
+ * genuine STYLESHEET as an excluded source and make an ordinary CSS import unwritable.
+ */
+const isProbeablePath = (rel: string): boolean => isInsideRoot(rel) && isSourceSpelling(rel);
+
+/**
+ * The MANIFEST host's own admissible-path rule, and the counterpart to the first refusal above:
+ * this one answers for exactly `package.json`, which `isProbeablePath` must never admit. The two
+ * hosts are deliberately disjoint — a `package.json` is metadata, and letting the SOURCE host see
+ * one would report it as an excluded source; letting the manifest host see anything else would
+ * turn a narrow existence question into a second file system view. Same root, same `node_modules`
+ * refusal, same escape refusal.
+ */
+const isProbeableManifest = (rel: string): boolean =>
+  isInsideRoot(rel) && (rel === MANIFEST_NAME || rel.endsWith(`/${MANIFEST_NAME}`));
+
+/** Memoised "is there a FILE at `root/rel`, and may I answer about it at all?" — the shared body of
+ *  the two evidence hosts below. The answers cannot change inside one analysis, and both hosts are
+ *  asked about the same paths repeatedly (TypeScript's own probing, then the written-out candidate
+ *  enumeration), so caching them is free. An unreadable entry is no evidence, not a crash. */
+const createFileProbe = (root: string, admissible: (rel: string) => boolean): ((rel: string) => boolean) => {
+  const answers = new Map<string, boolean>();
+  return (rel: string): boolean => {
+    const hit = answers.get(rel);
+    if (hit !== undefined) return hit;
+    let exists = false;
+    if (admissible(rel)) {
+      try {
+        exists = statSync(join(root, rel)).isFile();
+      } catch {
+        exists = false; // absent, or an unreadable entry — either way, no evidence
+      }
+    }
+    answers.set(rel, exists);
+    return exists;
+  };
 };
 
 /**
@@ -152,21 +197,26 @@ const isProbeablePath = (rel: string): boolean => {
  * answers cannot change inside one analysis, so caching them is free.
  */
 export function createSourceFileProbe(root: string): (rel: string) => boolean {
-  const answers = new Map<string, boolean>();
-  return (rel: string): boolean => {
-    const hit = answers.get(rel);
-    if (hit !== undefined) return hit;
-    let exists = false;
-    if (isProbeablePath(rel)) {
-      try {
-        exists = statSync(join(root, rel)).isFile();
-      } catch {
-        exists = false; // absent, or an unreadable entry — either way, no evidence
-      }
-    }
-    answers.set(rel, exists);
-    return exists;
-  };
+  return createFileProbe(root, isProbeablePath);
+}
+
+/**
+ * The MANIFEST evidence host over `root`: "is there a `package.json` at this repo-relative path?"
+ * — nothing else, and nothing read (Astra final adjudication, P1).
+ *
+ * It exists because a local directory manifest is invisible to everything else in this seam: the
+ * walk yields SOURCES, the resolver reads only supplied contents, and the source probe refuses
+ * non-source spellings on purpose. So a directory whose real `package.json` redirects into an
+ * ingestion wrapper resolved to whatever `index` sat beside it, and the edge disappeared silently
+ * — reproduced against installed TypeScript, which named the wrapper while the guard reported no
+ * violation. This supplies the one fact needed to REFUSE that spelling rather than guess at it.
+ *
+ * What it is not: a manifest reader. Contents, `main`/`exports`/`types` redirects, ancestor
+ * manifests and dependency crawling are all outside this slice, and no caller can reach them
+ * through this — existence is the entire answer available.
+ */
+export function createManifestProbe(root: string): (rel: string) => boolean {
+  return createFileProbe(root, isProbeableManifest);
 }
 
 /**
@@ -198,6 +248,7 @@ export function analyseTreeWithSources(
   const analysis = analyseEntrySurfaces(files, inventory, {
     ...options,
     sourceFileExists: createSourceFileProbe(root),
+    manifestExists: createManifestProbe(root),
   });
   return { files, analysis };
 }

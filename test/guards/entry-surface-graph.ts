@@ -130,6 +130,8 @@ export type EntryViolationKind =
   | "refused-load"
   | "stale-exception"
   | "unsupported-alias"
+  | "unsupported-directory-manifest"
+  | "unsupported-file-url"
   | "unresolved"
   | "excluded-ref"
   | "parse";
@@ -238,6 +240,26 @@ export interface EntryAnalysisOptions {
    * the walk (see `isGraphSourceFile`), and this only explains WHY a reference could not be followed.
    */
   sourceFileExists?: (rel: string) => boolean;
+  /**
+   * MANIFEST EVIDENCE ONLY: "is there a `package.json` at this exact repo-relative path?" (Astra
+   * final adjudication, P1). Narrower than `sourceFileExists` in both directions — it answers for
+   * ONE filename, and it answers for a file the source probe must never see, because a
+   * `package.json` is not a source spelling and admitting one there would classify metadata as an
+   * excluded SOURCE.
+   *
+   * Why it exists at all: the graph reads SOURCES, and `readFile` serves supplied contents only, so
+   * a local directory manifest on disk is invisible to TypeScript inside this resolver. A directory
+   * whose real `package.json` redirects (`main`/`exports`) into an ingestion wrapper therefore
+   * resolved to whatever `index` happened to be there, and the edge — with every surface behind it
+   * — vanished with no diagnostic. The coordinator reproduced exactly that: installed TypeScript
+   * named `lib/wrap.ts` for `@/lib/bridge` while this analysis reported no violation at all.
+   *
+   * The fix is a REFUSAL, not a second resolver (`resolve`): this slice does not interpret manifest
+   * contents, redirects, ancestors or dependencies, so the only thing it needs to know is whether
+   * the reference base carries one. Defaults to UNDEFINED like the source probe, so a virtual
+   * fixture may SUPPLY the metadata as an ordinary file and still reaches no disk.
+   */
+  manifestExists?: (rel: string) => boolean;
 }
 
 export interface EntrySurfaceAnalysis {
@@ -347,7 +369,14 @@ type Resolution =
   | { kind: "excluded"; rel: string }
   | { kind: "asset" }
   | { kind: "outside" }
-  | { kind: "missing" };
+  | { kind: "missing" }
+  /** The reference base carries a package manifest. UNSUPPORTED — refused, never resolved. */
+  | { kind: "manifest"; manifest: string };
+
+/** The one filename a directory manifest can have. Named once and EXPORTED because two modules must
+ *  agree on it: the refusal below probes for exactly this under exactly the reference base, and the
+ *  evidence host in `entry-surface-discovery` refuses to answer about anything else. */
+export const MANIFEST_NAME = "package.json";
 
 /**
  * NODES come from the SUPPLIED FILES ONLY — but RESOLUTION does not, and conflating the two is a bug
@@ -387,7 +416,11 @@ type Resolution =
  * order, against the same view — runs second. It exists because a resolver behaviour that shifts
  * between TypeScript releases would otherwise silently delete edges rather than fail loudly.
  */
-function createResolver(byRel: ReadonlyMap<string, string>, sourceFileExists?: (rel: string) => boolean) {
+function createResolver(
+  byRel: ReadonlyMap<string, string>,
+  sourceFileExists?: (rel: string) => boolean,
+  manifestExists?: (rel: string) => boolean
+) {
   const VROOT = "/aios-entry-surface-vfs";
   const absOf = (rel: string) => `${VROOT}/${rel}`;
 
@@ -425,6 +458,25 @@ function createResolver(byRel: ReadonlyMap<string, string>, sourceFileExists?: (
    * file unresolved instead of a repository source somebody deliberately excluded.
    */
   const existsInView = (rel: string): boolean => byRel.has(rel) || (sourceFileExists?.(rel) ?? false);
+
+  /**
+   * Does the reference BASE carry a package manifest? The whole of the directory-manifest rule.
+   *
+   * EXACTLY the base, never an ancestor: this repository's own root `package.json` sits above every
+   * import in the tree, so an ancestor walk would refuse the entire codebase. `base` arrives
+   * NORMALISED from `joinRel` — `.`, `..` and trailing-slash segments are already gone — so
+   * `@/lib/bridge/`, `./bridge` and `../lib/./bridge` ask about one path, not three. The empty base
+   * is the repository root itself, which is a directory reference like any other.
+   *
+   * Both halves of the existence view answer, for the same reason `existsInView` has two: a virtual
+   * fixture supplies the manifest as a file, the on-disk seam supplies it as evidence. Neither can
+   * make it a NODE — `isGraphSourceFile` rejects the spelling, and the nodes list is built from the
+   * supplied files, so this metadata is looked at and never entered.
+   */
+  const manifestUnder = (base: string): string | null => {
+    const rel = base === "" ? MANIFEST_NAME : `${base}/${MANIFEST_NAME}`;
+    return byRel.has(rel) || (manifestExists?.(rel) ?? false) ? rel : null;
+  };
 
   const host: ts.ModuleResolutionHost = {
     fileExists: (f) => {
@@ -505,10 +557,21 @@ function createResolver(byRel: ReadonlyMap<string, string>, sourceFileExists?: (
     if (hit) return hit;
 
     const base = spec.startsWith("@/") ? joinRel("", spec.slice(2)) : joinRel(dirOf(fromRel), spec);
+    // Asked BEFORE anything is resolved, so the refusal below cannot be reached by any fallback.
+    const manifest = base === null ? null : manifestUnder(base);
     let result: Resolution;
     if (base === null) {
       // The specifier climbed out of the repository. Nothing inside the analysed set can satisfy it.
       result = { kind: "outside" };
+    } else if (manifest !== null) {
+      // DIRECTORY MANIFEST — refused before source, index or asset handling gets a turn (Astra final
+      // adjudication, P1). Deliberately unconditional: the manifest's CONTENTS are never read, so
+      // "it only declares a `types` field" and "a same-base source file would have won anyway" are
+      // both claims this refusal declines to evaluate. The alternative is to guess which redirect
+      // field wins and silently choose an index when the guess is wrong — which is the escape that
+      // produced this rule, with a manifest redirecting into an ingestion wrapper while a harmless
+      // sibling index took the edge. An explicit source-file reference makes the edge unambiguous.
+      result = { kind: "manifest", manifest };
     } else {
       // WHICH FILE the specifier names, decided against the whole view — installed TypeScript first,
       // the written-out rules second. Neither is filtered by admission: a target that is filtered out
@@ -914,9 +977,14 @@ function isSurfaceFile(rel: string, src: ts.SourceFile): boolean {
  * — not a proof against eval, aliased loaders or bundler plugins. Parse errors are reported, never
  * swallowed.
  *
- * **References that resolve to nothing analysable.** An absolute path spelling is refused as a local
- * reference the graph does not resolve; a specifier naming a source the WALK dropped is refused as
- * an `excluded-ref` when the caller supplied `sourceFileExists`. Neither is ever admitted as a node.
+ * **References that resolve to nothing analysable.** An absolute path spelling and a `file:` module
+ * URL are refused as local references the graph does not resolve; a reference base carrying a
+ * `package.json` is refused as an unsupported directory manifest BEFORE any source/index/asset
+ * fallback; a specifier naming a source the WALK dropped is refused as an `excluded-ref` when the
+ * caller supplied `sourceFileExists`. None is ever admitted as a node. Each of these is a REFUSAL
+ * rather than a resolution, and the reason is always the same one: the alternative is to terminate
+ * a local reference as though it were an external package, which deletes the edge and every surface
+ * behind it while reporting nothing at all.
  */
 export function analyseEntrySurfaces(
   files: readonly SourceFile[],
@@ -935,7 +1003,7 @@ export function analyseEntrySurfaces(
   if (!byRel.has(CANONICAL_WRITER_MODULE)) byRel.set(CANONICAL_WRITER_MODULE, "");
 
   const nodes = [...byRel.keys()].filter((rel) => rel === CANONICAL_WRITER_MODULE || isGraphSourceFile(rel));
-  const resolve = createResolver(byRel, options.sourceFileExists);
+  const resolve = createResolver(byRel, options.sourceFileExists, options.manifestExists);
   const sources = new Map<string, ts.SourceFile>();
   const imports = new Map<string, Set<string>>();
   const exceptionUsed = new Array<boolean>(exceptions.length).fill(false);
@@ -1020,6 +1088,25 @@ export function analyseEntrySurfaces(
         });
         continue;
       }
+      // A `file:` MODULE URL is a local reference wearing a scheme. The local test below keys on
+      // `.` and `@/`, so `file:///tmp/bridge.mjs` falls through to the external-package branch and
+      // terminates in silence — the same erasure an absolute path used to get, and reproduced the
+      // same way. Matched case-INSENSITIVELY because URL schemes are: `FILE:` and `File:` name the
+      // identical protocol, and a case-sensitive test would refuse the lowercase spelling while
+      // waving its shouted twin through. Nothing here decodes or resolves the URL — percent-escapes,
+      // hosts and query strings are not this slice's problem; refusing the SPELLING is.
+      if (/^file:/i.test(ref.spec)) {
+        violations.push({
+          kind: "unsupported-file-url",
+          message:
+            `${loc} imports "${ref.spec}" — a \`file:\` MODULE URL. That is a LOCAL code reference, ` +
+            `not an external package: this graph resolves relative and "@/" references inside the ` +
+            `repository only, and it does not decode or resolve URLs. Refused as UNSUPPORTED, ` +
+            `because terminating it as a package would erase the edge — and every surface behind ` +
+            `it — in silence. Spell it "@/…" or relatively.`,
+        });
+        continue;
+      }
       if (isAbsoluteSpecifier(ref.spec)) {
         violations.push({
           kind: "unresolved",
@@ -1050,6 +1137,19 @@ export function analyseEntrySurfaces(
             `the walk never yields: a non-walked root, a hidden/generated directory). A runtime ` +
             `reference across that boundary is a hole in the closure, not a note: remove the ` +
             `reference, make it \`import type\`, or change what the walk excludes deliberately.`,
+        });
+      } else if (target.kind === "manifest") {
+        violations.push({
+          kind: "unsupported-directory-manifest",
+          message:
+            `${loc} imports "${ref.spec}", whose reference base carries a package manifest ` +
+            `(${target.manifest}). LOCAL DIRECTORY-MANIFEST resolution is UNSUPPORTED here: this ` +
+            `guard does not read manifest contents, follow "main"/"exports" redirects, consult ` +
+            `ancestor manifests or crawl dependencies, so it cannot say which file the runtime ` +
+            `would load — and choosing a directory index instead would silently take the edge away ` +
+            `from a redirect target that may be an ingestion wrapper. The refusal is deliberate ` +
+            `even if the manifest is benign or a same-base source file would have won. Import the ` +
+            `source file explicitly (e.g. "${ref.spec}/<file>"), or remove the manifest.`,
         });
       } else if (target.kind === "outside") {
         violations.push({

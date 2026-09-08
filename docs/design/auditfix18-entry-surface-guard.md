@@ -5,7 +5,7 @@ spec_gate: block
 
 # AUDITFIX-18 — inventory ingestion entry surfaces through reverse imports
 
-Status: accepted by Astra after user-authorized substitute fresh Astra reviews; focused review CLEAR, 2026-09-07.
+Status: accepted by Astra after user-authorized substitute reviews; focused directory-manifest clarification review CLEAR, 2026-09-07.
 Brain task: **AUDITFIX-18**; [Linear AIO-1148](https://linear.app/je4light/issue/AIO-1148/phase-a-lane-b-enforce-ingestion-entry-surface-inventory-using-reverse).
 Base: staging `d6bdf62a834b2a5c6b22e3c1f542c28fe7990c5c`.
 Parent: `docs/specs/project-context-classification-v1.md` (internally V2), §11;
@@ -126,7 +126,19 @@ bundler-resolution behavior with the repo's relevant compiler settings and an ex
 Cover extensionless files and indexes, explicit extensions, and emitted `.js/.jsx/.mjs/.cjs` names
 resolving to applicable TS sources. Fixtures must resolve solely against supplied virtual files, not
 accidentally against real disk files. Keep local resolution inside the repository; an unresolved or
-outside-root local code reference fails with file/specifier/location. Resolve possible local source targets before treating an asset-like suffix as terminal: a reference
+outside-root local code reference fails with file/specifier/location. Literal `file:` module URLs
+are unsupported local references and must be refused before external-package handling; recognize
+the scheme case-insensitively without decoding or resolving the URL.
+
+Local directory-manifest resolution is unsupported. For an @/ or relative runtime reference,
+if package.json exists directly under its normalized reference base, fail with an
+unsupported-directory-manifest diagnostic before source/index/asset fallback. This conservative
+refusal applies irrespective of manifest contents or a competing same-base source file. Use an
+explicit source-file reference. Probe only that manifest's existence within the injected repository
+root; do not interpret redirects, inspect ancestor manifests or crawl dependencies. Metadata never
+becomes a graph node. An ordinary JSON data import and explicitly type-only references retain their
+existing treatment. Virtual fixtures can supply this metadata but never borrow ambient disk files.
+ Resolve possible local source targets before treating an asset-like suffix as terminal: a reference
 such as ./x.css that resolves to source ./x.css.ts must retain its code edge. If no source resolves,
 recognized non-code asset imports (e.g. CSS/JSON) are terminal dependencies, not writer edges.
 The unsupported # alias refusal precedes asset handling, including #theme.css. Literal external package
@@ -170,6 +182,12 @@ loader cannot borrow that exception. Parse errors and unresolved code references
   `#scan` (including the scenario where package.json maps it to a classified local wrapper) must fail
   with an unsupported-package-alias diagnostic rather than disappear as external. A literal external
   package import and node-builtin import are passing twins; known non-code assets still pass.
+  Through the actual filesystem discovery seam, a local directory manifest redirect plus harmless
+  index must fail with the named unsupported-directory-manifest diagnostic. Verify the redirect's
+  TypeScript target independently in the fixture; removal of the manifest makes the index twin pass.
+  A benign directory manifest is also refused; an explicit source-file reference and ordinary root
+  package.json must not cause an ancestor-wide refusal. Literal file-URL static/dynamic references
+  fail with importer/specifier/location; package and builtin twins remain clean.
 - **AC18-06 — exact exceptions and staleness:** nonliteral loads fail even in an otherwise unrelated
   surface. The narrowly matched external E2B fixture passes; changing its const to a local wrapper,
   adding another load or broadening its expression fails. Removing it fails the stale-exception check.
