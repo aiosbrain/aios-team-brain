@@ -268,9 +268,13 @@ volume takes an unclassified path.
 ⚠️ **And the limit, stated because round 3 found it and §3a would otherwise only imply it: this guard
 would NOT catch a new HTTP route that calls an existing, already-classified wrapper.** Add a second
 route calling `ingestCodebaseScan` and no new direct call site appears; every criterion below still
-passes. Entry surfaces are documented in §3e and are **not** build-enforced. A tripwire on direct
-writers is what is soundly checkable without a whole-program call graph; claiming more would be the
-overstatement again.
+passes.
+
+> **Update (2026-09-07, AUDITFIX-18).** That limit is closed by a SECOND inventory in the same file,
+> built from the reverse closure of module imports rather than the whole-program call graph this
+> document assumed would be required — see §3e. The sentence "entry surfaces … are **not**
+> build-enforced" no longer holds. What is written above about the DIRECT-writer half is unchanged
+> and still governs it.
 
 ---
 
@@ -374,20 +378,35 @@ checking — the same habit §6c names:
   is withdrawn — `scripts/` is in the walk.** A rule that claims every writer while excluding a
   supported writer command is the kind of quiet narrowing this whole document exists to stop.
 
-### 3e. Entry surfaces — documented, NOT enforced
+### 3e. Entry surfaces — documented here, ENFORCED since AUDITFIX-18
 
-Recorded so the gap in §2a is visible rather than latent. **Nothing below is build-checked.**
+> **Superseded (2026-09-07, AUDITFIX-18).** When this section was written the table below was prose
+> that nothing checked, and the paragraph under it said closing the gap "needs a whole-program call
+> graph". Both statements are now wrong, and the second was wrong about the mechanism as well as the
+> status: `test/guards/context-hook-callsites.test.ts` now carries a second inventory built from the
+> **reverse closure of MODULE IMPORTS** over the canonical writer (`test/guards/entry-surface-graph.ts`),
+> which needs no call graph. It follows import edges to a fixpoint and requires an `ENTRY_INVENTORY`
+> record — a class and a written reason — for every reached file under `app/`, `components/`,
+> `scripts/`, every reached root-level source, and every reached `lib/` file carrying a real
+> `use server` directive. The rows below are a readable summary; the **build-enforced** list is the
+> inventory, and it is larger, because reachability includes read-only consumers.
 
 | entry surface | reaches the writer via |
 |---|---|
 | `POST /api/v1/codebases` | → `ingestCodebaseScan` → `projectCommitsToItems` → `ingestItem` |
 | `POST /api/v1/actions` | → `runAction` → `note.create` → `ingestItem` |
 | admin approval action | → `resolveApproval` → `runAction` → … |
-| the four admin "Run … now" actions | → `runSlackIngestion` etc. → `ingestItem` (and record **no** ingest run) |
-| `/sync` chat command, `scripts/connectors.ts` | → `runManualSync` → the same four |
+| the four admin "Run … now" actions | → `runSlackIngestion` etc. → `ingestItem`, each awaiting one bounded manual context pass since AUDITFIX-14 |
+| `/sync` chat command, `scripts/connectors.ts` | → `runManualSync` → the same four, same bounded pass |
 
-Closing this properly needs a whole-program call graph from every route/action entry point. That is
-**AUDITFIX-18** and is deliberately not attempted here.
+**What the two halves each enforce, and what neither does.** The direct-writer inventory in §3 keys on
+who calls `ingestItem` and checks exact per-file call counts plus each class's structural shape. The
+entry inventory keys on who can REACH it and checks exact keys, a declared class and a non-empty
+reason — deliberately **no** textual shape check, because a reached file need not perform an ingest at
+all. Neither half proves a reconcile runs on a given branch, and the entry classes (`RECONCILES`,
+`SWEEP_DEPENDENT`, `IMPORT_ONLY`) are **review declarations**, not machine-certified execution facts.
+An `IMPORT_ONLY` record says a reviewer identified no ingest operation at that surface and named the
+import responsible for the inclusion; it does not certify that none can occur.
 
 ---
 
@@ -406,7 +425,9 @@ Closing this properly needs a whole-program call graph from every route/action e
 
 **Out, each with where it goes:**
 - **The codebases-route reconcile** — DECLINED, §6b. **AUDITFIX-16.**
-- **Entry-surface (call-graph) enforcement** — **AUDITFIX-18**, §3e.
+- **Entry-surface enforcement** — was out of scope here; **DELIVERED by AUDITFIX-18** (2026-09-07) as a
+  reverse-import closure, not the call graph this line anticipated. See §3e and
+  `docs/design/auditfix18-entry-surface-guard.md`.
 - **Manual sync + the four admin "Run … now" actions** — **AUDITFIX-14.**
 - **An automatic caller for `findUnpartitionedItems`** — **AUDITFIX-15.** The count and the blocker
   exist (`lib/projects/context/coverage.ts:36-67`, `lib/admin/access-health.ts:163-184`); the only
