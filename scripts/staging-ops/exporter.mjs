@@ -17,6 +17,7 @@ import { canonicalObjectId, createPrivateStore } from "./object-store.mjs";
 import { assertOutboundCredentialIsolation, assertRunnerRole } from "./role-policy.mjs";
 import { RailwayRunnerInspector } from "./railway-maintenance.mjs";
 import { keyMaterial } from "./key-material.mjs";
+import { postgresDeadlineConfig, stagingOperationDeadlines } from "./operation-deadline.mjs";
 
 const sha = (v) => createHash("sha256").update(v).digest("hex");
 const FULL_SHA = /^[0-9a-f]{40}$/i;
@@ -28,7 +29,7 @@ export function itemEpisodeStem(name) {
 
 export async function snapshotExportFacts(client) {
   const result = await client.query(`SELECT ge.source_table, ge.source_id::text, ge.group_id, ge.pending_delete_group_id,
-    ge.content_sha256, ge.chunk_shas, ge.deferred,
+    ge.content_sha256, ge.episode_uuid, ge.chunk_shas, ge.deferred,
     CASE WHEN ge.source_table='arc_corrections' THEN (SELECT ac.arc_id FROM arc_corrections ac WHERE ac.id=ge.source_id AND ac.team_id=ge.team_id) END AS correction_arc_id,
     CASE WHEN ge.source_table='items' THEN EXISTS(
       SELECT 1 FROM items i
@@ -120,10 +121,21 @@ export function assertResolvedCorrectionScopes(facts) {
 }
 
 export function validateLedgerAgainstSanitizedGraph(graph, facts) {
-  const episodes = new Set(graph.nodes.filter((node) => node.labels.includes("Episodic")).map((node) => `${node.properties?.name}\0${node.properties?.group_id}`));
+  const episodeNodes = graph.nodes.filter((node) => node.labels.includes("Episodic"));
+  const episodes = new Set(episodeNodes.map((node) => `${node.properties?.name}\0${node.properties?.group_id}`));
+  // UUID identity is group-scoped. The same UUID may legitimately exist in another group, so a
+  // UUID-only set would let that other group's episode satisfy this ledger row.
+  const episodeByUuid = new Map(episodeNodes.map((node) => [
+    `${node.properties?.uuid}\0${node.properties?.group_id}`,
+    String(node.properties?.name ?? ""),
+  ]));
   const errors = [];
   for (const row of facts.ledger) {
     if (row.deferred || row.content_sha256 === "") continue;
+    // No UUID means the current row has not been reconcile-confirmed yet. Preserve that pending
+    // truth rather than inventing confirmation from a same-named graph node. Once a UUID exists,
+    // both its group-scoped identity and the complete chunk-name set are mandatory.
+    if (!row.episode_uuid) continue;
     // The excluded check is per SOURCE TABLE by construction: `episodeName` already carries the
     // exact episode naming (`items:<id>` / `correction:<arc_id>`) this ledger row projects under.
     const stem = row.episodeName ?? `${row.source_table === "items" ? "items" : "unsupported"}:${row.source_id}`;
@@ -134,7 +146,11 @@ export function validateLedgerAgainstSanitizedGraph(graph, facts) {
       names = chunks > 1 ? Array.from({ length: chunks }, (_, index) => `${stem}#${index}`) : [stem];
     } else if (row.source_table === "arc_corrections" && stem.startsWith("correction:")) names = [stem];
     else continue;
-    if (!names.every((name) => episodes.has(`${name}\0${row.group_id}`))) errors.push(`${row.source_id}@${row.group_id}`);
+    const uuidEpisodeName = episodeByUuid.get(`${row.episode_uuid}\0${row.group_id}`);
+    if (!uuidEpisodeName || !names.includes(uuidEpisodeName) ||
+        !names.every((name) => episodes.has(`${name}\0${row.group_id}`))) {
+      errors.push(`${row.source_id}@${row.group_id}`);
+    }
   }
   if (errors.length) throw new Error(`sanitized graph does not satisfy current projection ledger (${errors.slice(0, 5).join(", ")})`);
 }
@@ -146,69 +162,115 @@ async function readDeployedBuildMetadata(env, measuredCommit, fetchImpl = fetch)
   return body;
 }
 
-export async function runExporter(env = process.env) {
+export function isTransientCaptureFailure(error) {
+  if (error?.transient === true) return true;
+  const code = String(error?.code ?? error?.cause?.code ?? "");
+  if (/^(ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|57P01|57P02|57P03|40001|40P01)$/.test(code)) return true;
+  const name = String(error?.name ?? error?.cause?.name ?? "");
+  if (/ServiceUnavailable|SessionExpired|TransientError/.test(name)) return true;
+  const message = String(error?.message ?? error);
+  return /sanitized graph does not satisfy current projection ledger|connection (?:reset|terminated)|snapshot.*(?:invalid|lost)|temporar(?:y|ily) unavailable/i.test(message);
+}
+
+/** Exactly one retry of the WHOLE, still-private capture. Publication happens only afterward. */
+export async function captureWithOneTransientRetry(captureAttempt, { transient = isTransientCaptureFailure } = {}) {
+  let firstError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try { return { ...(await captureAttempt(attempt)), attempts: attempt }; }
+    catch (error) {
+      if (attempt === 1 && transient(error)) { firstError = error; continue; }
+      if (firstError && error && typeof error === "object") Object.defineProperty(error, "firstCaptureFailure", { value: firstError, enumerable: false });
+      throw error;
+    }
+  }
+  throw new Error("unreachable capture retry state");
+}
+
+export async function runExporter(env = process.env, operations = {}) {
   assertRunnerRole(env, "exporter"); assertOutboundCredentialIsolation(env);
+  const deadlines = stagingOperationDeadlines(env);
   let deployed = { commit: env.SOURCE_APPLICATION_COMMIT };
-  if (env.STAGING_MAINTENANCE_ADAPTER !== "local") {
+  if (operations.deployedBuild) {
+    deployed = { commit: operations.deployedBuild.commit };
+  } else if (env.STAGING_MAINTENANCE_ADAPTER !== "local") {
     const inspector = new RailwayRunnerInspector({ projectId: env.RAILWAY_PROJECT_ID, environmentId: env.PRODUCTION_EXPORT_ENVIRONMENT_ID, serviceId: env.PRODUCTION_EXPORTER_SERVICE_ID, token: env.RAILWAY_PRODUCTION_RUNNER_READ_TOKEN });
     await inspector.assertPinned(env.STAGING_OPS_IMAGE_DIGEST);
     deployed = await inspector.measureSuccessfulDeployment(env.PRODUCTION_APP_SERVICE_ID);
   }
   if (!FULL_SHA.test(String(deployed.commit ?? ""))) throw new Error("source application deployment commit was not measured");
-  const deployedBuild = env.STAGING_MAINTENANCE_ADAPTER === "local"
+  const deployedBuild = operations.deployedBuild ?? (env.STAGING_MAINTENANCE_ADAPTER === "local"
     ? { commit: deployed.commit, migrationSet: migrationSetIdentity() }
-    : await readDeployedBuildMetadata(env, deployed.commit);
-  const client = new pg.Client({ connectionString: env.DATABASE_URL }); await client.connect();
-  const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
-  const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
+    : await readDeployedBuildMetadata(env, deployed.commit));
+  const client = operations.client ?? new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.operationMs, deadlines.connectionMs));
+  if (!operations.client) await client.connect();
+  const driver = operations.driver ?? neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
+  let session = operations.session ?? null;
   try {
     // `return await`: the census runs THREE sequential queries, and a bare `return` resolved this
     // try block after the first one was merely started — so the `finally` closed the session, the
     // driver and the Postgres client underneath it. Same failure shape as the importer dispatcher.
-    if (process.argv.includes("--census")) return await graphCensus(session);
+    if (process.argv.includes("--census")) {
+      session ??= driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
+      return await graphCensus(session, { operationTimeoutMs: deadlines.operationMs });
+    }
     // The run ID names the MEASURED deployed commit, never the declared env var: on the Railway
     // path `SOURCE_APPLICATION_COMMIT` is unset, and `undefined?.slice()` had been stamping the
     // literal string "undefined" into a bundle's immutable identity.
     const runId = env.STAGING_BUNDLE_RUN_ID || `${new Date().toISOString().replace(/[:.]/g, "-")}-${deployedBuild.commit.slice(0, 12)}`;
-    const started = new Date();
-    return await withPrivateTempDir("aios-staging-export-", async (directory) => {
-      const captured = await capturePairedPostgres({ client, databaseUrl: env.DATABASE_URL, directory, captureSnapshotFacts: snapshotExportFacts });
-      const policy = captured.snapshotFacts;
+    const defaultCaptureAttempt = () => withPrivateTempDir("aios-staging-export-", async (directory) => {
+      const started = new Date();
+      const postgres = await capturePairedPostgres({
+        client, databaseUrl: env.DATABASE_URL, directory, captureSnapshotFacts: snapshotExportFacts,
+        operationTimeoutMs: deadlines.captureMs, terminateGraceMs: deadlines.terminateGraceMs,
+      });
+      const policy = postgres.snapshotFacts;
       assertResolvedCorrectionScopes(policy);
-      const rawGraph = await exportGraph(session);
+      // A retry gets a fresh Bolt session as well as a fresh PG snapshot/temp directory. A Neo4j
+      // SessionExpired error cannot be repaired by issuing the same read on the dead session.
+      const attemptSession = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
+      let rawGraph;
+      try { rawGraph = await exportGraph(attemptSession, { operationTimeoutMs: deadlines.captureMs }); }
+      finally { await attemptSession.close(); }
       const graph = sanitizeGraphExport(rawGraph, { episodeAllowed: (episode) => {
         const name = itemEpisodeStem(episode.properties?.name) ?? String(episode.properties?.name ?? "");
         const key = `${name}\0${episode.properties?.group_id ?? ""}`;
         return policy.allowed.has(key) && !policy.excluded.has(key);
       } });
       validateLedgerAgainstSanitizedGraph(graph, policy);
-      const packed = await packPair(directory, graph);
-      const comparisonKey = Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64");
-      const credentialFingerprints = Object.fromEntries([
-        ["auth-secret", env.AUTH_SECRET], ["secrets-key", env.SECRETS_KEY], ["neo4j-credential", `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`],
-      ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID })]));
-      const ended = new Date();
-      const manifest = {
-        formatVersion: 1, graphCodecVersion: graph.codecVersion, runId,
-        captureStartedAt: started.toISOString(), captureEndedAt: ended.toISOString(),
-        expiresAt: new Date(ended.getTime() + Number(env.STAGING_EXPORT_RETENTION_DAYS ?? 14) * 86400000).toISOString(),
-        onlineCaptureInterval: true, checksums: packed.checksums, sanitation: graph.sanitation,
-        build: { applicationCommit: deployedBuild.commit, schemaFingerprint: schemaFingerprintDigest(policy.schemaLines), migrationSet: deployedBuild.migrationSet },
-        credentialFingerprints,
-      };
-      const bundle = createSignedEncryptedBundle({
-        payload: packed.payload,
-        manifest,
-        exporterSigningPrivateKey: keyMaterial(env, "EXPORTER_SIGNING_PRIVATE_KEY"),
-        importerEncryptionPublicKey: keyMaterial(env, "IMPORTER_ENCRYPTION_PUBLIC_KEY"),
-      });
-      const bytes = Buffer.from(JSON.stringify(bundle));
-      const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
-      const store = createPrivateStore({ env, scope: "source", role: "publisher" });
-      await store.putImmutable(objectId, bytes);
-      return { runId, objectId, sha256: digest, manifest: { ...manifest, credentialFingerprints: Object.keys(credentialFingerprints), checksums: packed.checksums } };
+      return { started, ended: new Date(), graph, policy, packed: await packPair(directory, graph) };
     });
-  } finally { await closeAll(() => session.close(), () => driver.close(), () => client.end()); }
+    const captured = await captureWithOneTransientRetry(operations.captureAttempt ?? defaultCaptureAttempt);
+    const { started, ended, graph, policy, packed } = captured;
+    const comparisonKey = Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64");
+    const credentialFingerprints = Object.fromEntries([
+      ["auth-secret", env.AUTH_SECRET], ["secrets-key", env.SECRETS_KEY], ["neo4j-credential", `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`],
+    ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID })]));
+    const manifest = {
+      formatVersion: 1, graphCodecVersion: graph.codecVersion, runId,
+      captureStartedAt: started.toISOString(), captureEndedAt: ended.toISOString(),
+      expiresAt: new Date(ended.getTime() + Number(env.STAGING_EXPORT_RETENTION_DAYS ?? 14) * 86400000).toISOString(),
+      onlineCaptureInterval: true, checksums: packed.checksums, sanitation: graph.sanitation,
+      build: { applicationCommit: deployedBuild.commit, schemaFingerprint: schemaFingerprintDigest(policy.schemaLines), migrationSet: deployedBuild.migrationSet },
+      credentialFingerprints,
+    };
+    const bundle = createSignedEncryptedBundle({
+      payload: packed.payload,
+      manifest,
+      exporterSigningPrivateKey: keyMaterial(env, "EXPORTER_SIGNING_PRIVATE_KEY"),
+      importerEncryptionPublicKey: keyMaterial(env, "IMPORTER_ENCRYPTION_PUBLIC_KEY"),
+    });
+    const bytes = Buffer.from(JSON.stringify(bundle));
+    const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
+    const store = operations.store ?? createPrivateStore({ env, scope: "source", role: "publisher" });
+    await store.putImmutable(objectId, bytes);
+    return { runId, objectId, sha256: digest, captureAttempts: captured.attempts, manifest: { ...manifest, credentialFingerprints: Object.keys(credentialFingerprints), checksums: packed.checksums } };
+  } finally {
+    await closeAll(
+      session ? () => session.close() : null,
+      operations.driver ? null : () => driver.close(),
+      operations.client ? null : () => client.end(),
+    );
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) runExporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging exporter refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });

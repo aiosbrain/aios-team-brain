@@ -208,6 +208,15 @@ const BRANCHES: [string, string[]][] = [
   ["rollback", ["rollback", "failed-run"]],
 ];
 
+describe("the importer entrypoint validates finite budgets before acquiring resources", () => {
+  it("refuses an infinite operation deadline before opening Postgres", async () => {
+    pgState.clients.length = 0;
+    await expect(runImporter({ ...ENV, STAGING_OPERATION_TIMEOUT_MS: "Infinity" } as NodeJS.ProcessEnv, ["tick"]))
+      .rejects.toThrow(/STAGING_OPERATION_TIMEOUT_MS must be an integer/);
+    expect(pgState.clients).toHaveLength(0);
+  });
+});
+
 describe("the dispatcher keeps Postgres open until the branch it started has finished", () => {
   for (const [label, argv] of BRANCHES) {
     it(`${label}: does not tear down the connection while the branch is still running`, async () => {
@@ -246,7 +255,9 @@ describe("the dispatcher keeps Postgres open until the branch it started has fin
     // pass through, and the first statement of the recovery itself (the session reset) is what stays
     // in flight. A boundary before `rollbackToPrior` would suspend on its own `await` and never
     // exercise the un-awaited return this case exists for.
-    const { outcome, held, client } = driveBranch(["rollback", "failed-run"], { holdAfter: 3 });
+    // One additional query now installs the finite operation budget on this SAME session before
+    // dispatch. Hold after it so the recovery's own first ROLLBACK remains the in-flight boundary.
+    const { outcome, held, client } = driveBranch(["rollback", "failed-run"], { holdAfter: 4 });
     await settle();
     const unlocked = () => client().statements.some((sql) => sql.includes("pg_advisory_unlock"));
     expect(client().statements.some((sql) => sql.includes("pg_try_advisory_lock")), "the lock was taken").toBe(true);

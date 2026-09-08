@@ -76,6 +76,19 @@ describe("resetSessionTransactionState", () => {
 });
 
 describe("the importer's recovery path on an aborted connection", () => {
+  it("installs a distinct finite recovery budget on the same lock-owning session", async () => {
+    const client = abortedClient();
+    const { maintenance, rollbackStore, env } = fakes();
+    const deadlines = { operationMs: 1_000, captureMs: 1_000, recoveryMs: 12_000, cleanupMs: 2_000, connectionMs: 1_000, terminateGraceMs: 100 };
+    await expect(rollbackToPrior({ client, prior: PRIOR, failedRunId: "failed-run", maintenance, rollbackStore, env, deadlines }))
+      .rejects.toThrow(/injected harness rollback failure/);
+    const configured = client.query.mock.calls.find(([sql]) => String(sql).includes("set_config('statement_timeout'"));
+    expect(configured?.[1]).toEqual(["12000ms", "12000ms"]);
+    expect(client.statements.indexOf("ROLLBACK")).toBeLessThan(
+      client.statements.findIndex((sql) => sql.includes("set_config('statement_timeout'")),
+    );
+  });
+
   it("resets BEFORE any journal or advisory-lock statement", async () => {
     const client = abortedClient();
     const { maintenance, rollbackStore, env } = fakes();

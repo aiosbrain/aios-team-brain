@@ -181,15 +181,63 @@ describe("group-scoped episode identity", () => {
     const facts = {
       excluded: new Set<string>(),
       ledger: [
-        { source_table: "items", source_id: "one", group_id: "group-one", episodeName: "items:one", chunk_shas: ["sha-one"], content_sha256: "sha-one", deferred: false },
-        { source_table: "items", source_id: "two", group_id: "group-two", episodeName: "items:two", chunk_shas: ["sha-two"], content_sha256: "sha-two", deferred: false },
+        { source_table: "items", source_id: "one", group_id: "group-one", episodeName: "items:one", episode_uuid: "shared-uuid", chunk_shas: ["sha-one"], content_sha256: "sha-one", deferred: false },
+        { source_table: "items", source_id: "two", group_id: "group-two", episodeName: "items:two", episode_uuid: "shared-uuid", chunk_shas: ["sha-two"], content_sha256: "sha-two", deferred: false },
       ],
     };
     const out = sanitizeGraphExport(twoGroups, { episodeAllowed: () => true });
     expect(() => validateLedgerAgainstSanitizedGraph(out, facts)).not.toThrow();
     // Negative control: the validator DOES speak up when an episode really is missing, so the
     // assertion above is not green merely because the validator never rejects anything.
-    const missing = { ...facts, ledger: [...facts.ledger, { source_table: "items", source_id: "three", group_id: "group-three", episodeName: "items:three", chunk_shas: ["sha-three"], content_sha256: "sha-three", deferred: false }] };
+    const missing = { ...facts, ledger: [...facts.ledger, { source_table: "items", source_id: "three", group_id: "group-three", episodeName: "items:three", episode_uuid: "missing-uuid", chunk_shas: ["sha-three"], content_sha256: "sha-three", deferred: false }] };
     expect(() => validateLedgerAgainstSanitizedGraph(out, missing)).toThrow(/does not satisfy current projection ledger/);
+  });
+});
+
+describe("M6 — projection ledger UUID correspondence", () => {
+  const episode = (exportId: string, uuid: string, name: string, group_id: string) => ({
+    exportId, labels: ["Episodic"], properties: { uuid, name, group_id },
+  });
+  const row = (over: Record<string, unknown> = {}) => ({
+    source_table: "items", source_id: "item", group_id: "team", episodeName: "items:item",
+    episode_uuid: "ep-1", chunk_shas: ["sha-0", "sha-1"], content_sha256: "c".repeat(64),
+    deferred: false, ...over,
+  });
+  const facts = (ledger: Record<string, unknown>[]) => ({ excluded: new Set<string>(), ledger });
+
+  it("accepts a legitimate nonzero chunk UUID while requiring every chunk name", () => {
+    const graph = { nodes: [
+      episode("zero", "ep-0", "items:item#0", "team"),
+      episode("one", "ep-1", "items:item#1", "team"),
+    ] };
+    expect(() => validateLedgerAgainstSanitizedGraph(graph, facts([row()]))).not.toThrow();
+  });
+
+  it("refuses a substituted UUID even when all expected names and groups are present", () => {
+    const graph = { nodes: [
+      episode("zero", "ep-0", "items:item#0", "team"),
+      episode("one", "ep-1", "items:item#1", "team"),
+      episode("other", "substituted", "items:other", "team"),
+    ] };
+    expect(() => validateLedgerAgainstSanitizedGraph(graph, facts([row({ episode_uuid: "substituted" })])))
+      .toThrow(/does not satisfy current projection ledger/);
+  });
+
+  it("does not borrow the ledger UUID from another group", () => {
+    const graph = { nodes: [
+      episode("zero", "ep-0", "items:item#0", "team"),
+      episode("one", "different", "items:item#1", "team"),
+      episode("wrong-group", "ep-1", "items:other", "private"),
+    ] };
+    expect(() => validateLedgerAgainstSanitizedGraph(graph, facts([row()])))
+      .toThrow(/does not satisfy current projection ledger/);
+  });
+
+  it("preserves pending, deferred, and blank-content rows without inventing confirmation", () => {
+    expect(() => validateLedgerAgainstSanitizedGraph({ nodes: [] }, facts([
+      row({ episode_uuid: null }),
+      row({ source_id: "deferred", deferred: true }),
+      row({ source_id: "blank", content_sha256: "" }),
+    ]))).not.toThrow();
   });
 });

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { publishCandidateCheck, emergencyVerdict, measureCandidate, observeProductionDeployment } from "../scripts/staging-ops/release-controller.mjs";
+import {
+  publishCandidateCheck, emergencyVerdict, measureCandidate, observeProductionDeployment,
+  runReleaseController, updateMainNonForce,
+} from "../scripts/staging-ops/release-controller.mjs";
 
 describe("trusted release controller", () => {
   it("publishes validation on the candidate SHA, never the dispatch SHA", async () => {
@@ -149,5 +152,94 @@ describe("trusted release controller", () => {
     await expect(observeProductionDeployment({ expectedSha: expected, readLatest: vi.fn().mockResolvedValue({ id: "p", commitSha: expected, status: "FAILED" }), probeHealth: vi.fn(), timeoutMs: 0 })).resolves.toMatchObject({ status: "promoted-but-deployment-failed" });
     let tick = 0;
     await expect(observeProductionDeployment({ expectedSha: expected, readLatest: vi.fn().mockResolvedValue(null), probeHealth: vi.fn(), timeoutMs: 1, now: () => tick++, sleep: vi.fn() })).resolves.toMatchObject({ status: "promoted-but-deployment-unverified" });
+  });
+
+  describe("M7 — terminal release audit", () => {
+    const sha = "b".repeat(40);
+    const main = "a".repeat(40);
+    const baseEnv = {
+      RELEASE_ACTION: "promote", GITHUB_REPOSITORY: "owner/repo", GITHUB_SHA: "d".repeat(40),
+      RELEASE_AUDIT_PATH: "/unused/audit.json", GITHUB_TOKEN: "read-token", GITHUB_ACTOR: "release-operator",
+      RELEASE_APP_ID: "1", RELEASE_APP_INSTALLATION_ID: "2", RELEASE_APP_PRIVATE_KEY: "unused",
+    } as NodeJS.ProcessEnv;
+    const measured = {
+      facts: {
+        tagName: "v1.2.3", resolvedTagObjectSha: "t".repeat(40), commitSha: sha,
+        deploymentId: "staging-dep", healthOrigin: "https://staging.example.test",
+        requestedMode: "copy-ready", healthRunId: "refresh-1", notes: "Validated representative paths",
+        expectedMain: main,
+      },
+      verdict: { ok: true, errors: [], mode: "copy-ready" },
+    };
+    const common = (over: Record<string, unknown> = {}) => {
+      const audits: Record<string, unknown>[] = [];
+      return {
+        audits,
+        operations: {
+          githubRead: vi.fn(), measureCandidate: vi.fn().mockResolvedValue(measured),
+          writeAudit: vi.fn((_path: string, body: Record<string, unknown>) => audits.push(body)),
+          createInstallationToken: vi.fn().mockResolvedValue("app-token"), appRequest: vi.fn(),
+          publishCandidateCheck: vi.fn().mockResolvedValue({ id: 1 }),
+          ...over,
+        },
+      };
+    };
+
+    it("retains the incident URL in both emergency success and authorization refusal", async () => {
+      const incidentUrl = "https://linear.app/acme/issue/AIO-997";
+      const emergencyEnv = { ...baseEnv, RELEASE_ACTION: "emergency", RELEASE_EMERGENCY_SHA: sha,
+        RELEASE_INCIDENT_URL: incidentUrl, RELEASE_NOTES: "Restore production login immediately",
+        EMERGENCY_APP_ID: "3", EMERGENCY_APP_INSTALLATION_ID: "4", EMERGENCY_APP_PRIVATE_KEY: "unused" } as NodeJS.ProcessEnv;
+      const success = common({
+        githubRead: vi.fn(async (_method: string, path: string) => path.includes("compare/") ? { status: "ahead" } : { object: { sha: main } }),
+        updateMainNonForce: vi.fn().mockResolvedValue({ status: "promoted", sha }),
+      });
+      await expect(runReleaseController(emergencyEnv, success.operations)).resolves.toMatchObject({ status: "promoted", sha });
+      expect(success.audits.at(-1)?.facts).toMatchObject({ incidentUrl });
+      expect(success.audits.at(-1)).toMatchObject({ verdict: "completed", result: { sha } });
+
+      const refused = common({ githubRead: vi.fn(async (_method: string, path: string) => path.includes("compare/") ? { status: "ahead" } : { object: { sha: main } }) });
+      await expect(runReleaseController({ ...emergencyEnv, RELEASE_NOTES: "short" } as NodeJS.ProcessEnv, refused.operations)).rejects.toThrow(/concrete emergency reason/);
+      expect(refused.audits.at(-1)).toMatchObject({ verdict: "refused", facts: { incidentUrl } });
+    });
+
+    it("records token failure as a finalized refusal with no update attempt", async () => {
+      const run = common({ createInstallationToken: vi.fn().mockRejectedValue(new Error("token exchange unavailable")) });
+      await expect(runReleaseController(baseEnv, run.operations)).rejects.toThrow(/token exchange unavailable/);
+      expect(run.operations.appRequest).not.toHaveBeenCalled();
+      expect(run.audits.at(-1)).toMatchObject({
+        verdict: "refused", result: { status: "refused", phase: "installation-token", updateAttempted: false },
+      });
+    });
+
+    it("reconciles an ambiguous PATCH by read-back and never retries the update", async () => {
+      const request = vi.fn()
+        .mockResolvedValueOnce({ object: { sha: main } })
+        .mockResolvedValueOnce({ status: "ahead" })
+        .mockRejectedValueOnce(new Error("socket closed after request body"))
+        .mockResolvedValueOnce({ object: { sha: main } });
+      await expect(updateMainNonForce({ request, repository: "owner/repo", expectedMain: main, candidateSha: sha }))
+        .resolves.toMatchObject({ status: "promotion-outcome-ambiguous", expectedSha: sha, observedMain: main });
+      expect(request.mock.calls.filter(([method]) => method === "PATCH")).toHaveLength(1);
+    });
+
+    it("finalizes the controller audit as ambiguous instead of relabeling the update a refusal", async () => {
+      const ambiguous = { status: "promotion-outcome-ambiguous", sha: null, expectedSha: sha, observedMain: null };
+      const run = common({ updateMainNonForce: vi.fn().mockResolvedValue(ambiguous) });
+      await expect(runReleaseController(baseEnv, run.operations)).rejects.toThrow(/promotion-outcome-ambiguous/);
+      expect(run.audits.at(-1)).toMatchObject({ verdict: "promotion-outcome-ambiguous", result: ambiguous });
+    });
+
+    it("retains the promoted SHA when production observation fails", async () => {
+      const run = common({
+        updateMainNonForce: vi.fn().mockResolvedValue({ status: "promoted", sha }),
+        observeProductionDeployment: vi.fn().mockResolvedValue({ status: "promoted-but-deployment-unverified", observationError: "Railway unavailable" }),
+      });
+      await expect(runReleaseController(baseEnv, run.operations)).rejects.toThrow(/promoted-but-deployment-unverified/);
+      expect(run.audits.at(-1)).toMatchObject({
+        verdict: "promoted-but-deployment-unverified",
+        result: { status: "promoted", sha, production: { status: "promoted-but-deployment-unverified" } },
+      });
+    });
   });
 });

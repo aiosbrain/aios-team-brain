@@ -11,6 +11,7 @@ describe("section-wise paired Postgres capture/install", () => {
   it("holds one exported snapshot across dump and transformed auth projection", async () => {
     const query = vi.fn()
       .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ snapshot: "00000003-0000001B-1" }] })
       .mockResolvedValueOnce({ rows: [{ column_name: "id" }, { column_name: "email" }, { column_name: "password_hash" }] })
       .mockResolvedValueOnce({ rows: [{ column_name: "id" }, { column_name: "pending_delete_group_id" }, { column_name: "pending_delete_at" }] })

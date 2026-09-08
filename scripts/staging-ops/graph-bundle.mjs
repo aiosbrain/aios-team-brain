@@ -1,4 +1,5 @@
 import { encodeNeo4jValue } from "./neo4j-codec.mjs";
+import { neo4jTransactionConfig, OPERATION_TIMEOUT_DEFAULT_MS } from "./operation-deadline.mjs";
 
 export const GRAPH_CODEC_VERSION = 1;
 export const SUPPORTED_NODE_LABELS = new Set(["Entity", "Episodic", "Person", "Organization", "Location", "Event", "Product", "Topic", "Community"]);
@@ -123,9 +124,10 @@ export function sanitizeGraphExport(graph, { episodeAllowed }) {
 }
 
 /** Export uses fixed READ statements only; no caller-supplied Cypher enters. */
-export async function exportGraph(session) {
-  const nodeResult = await session.run("MATCH (n) RETURN elementId(n) AS exportId, labels(n) AS labels, properties(n) AS properties");
-  const relResult = await session.run("MATCH (a)-[r]->(b) RETURN elementId(a) AS start, elementId(b) AS end, type(r) AS type, properties(r) AS properties");
+export async function exportGraph(session, { operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS } = {}) {
+  const config = neo4jTransactionConfig(operationTimeoutMs);
+  const nodeResult = await session.run("MATCH (n) RETURN elementId(n) AS exportId, labels(n) AS labels, properties(n) AS properties", {}, config);
+  const relResult = await session.run("MATCH (a)-[r]->(b) RETURN elementId(a) AS start, elementId(b) AS end, type(r) AS type, properties(r) AS properties", {}, config);
   return {
     codecVersion: GRAPH_CODEC_VERSION,
     nodes: nodeResult.records.map((record) => ({ exportId: record.get("exportId"), labels: record.get("labels"), properties: encodeNeo4jValue(record.get("properties")) })),
@@ -134,10 +136,11 @@ export async function exportGraph(session) {
 }
 
 /** Census-only fixed reads: aggregate shapes and name prefixes, never graph prose or raw names. */
-export async function graphCensus(session) {
-  const labels = await session.run("MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS count ORDER BY label");
-  const types = await session.run("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY type");
-  const episodes = await session.run("MATCH (n:Episodic) RETURN CASE WHEN n.name STARTS WITH 'items:' THEN 'items' WHEN n.name STARTS WITH 'correction:' THEN 'correction' ELSE 'unsupported' END AS pattern, count(*) AS count ORDER BY pattern");
+export async function graphCensus(session, { operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS } = {}) {
+  const config = neo4jTransactionConfig(operationTimeoutMs);
+  const labels = await session.run("MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS count ORDER BY label", {}, config);
+  const types = await session.run("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY type", {}, config);
+  const episodes = await session.run("MATCH (n:Episodic) RETURN CASE WHEN n.name STARTS WITH 'items:' THEN 'items' WHEN n.name STARTS WITH 'correction:' THEN 'correction' ELSE 'unsupported' END AS pattern, count(*) AS count ORDER BY pattern", {}, config);
   const rows = (result, key) => result.records.map((record) => ({ [key]: record.get(key), count: Number(record.get("count").toString()) }));
   const out = { labels: rows(labels, "label"), relationshipTypes: rows(types, "type"), episodeNamePatterns: rows(episodes, "pattern") };
   const unsupportedLabels = out.labels.filter(({ label }) => !SUPPORTED_NODE_LABELS.has(label));

@@ -11,7 +11,18 @@ The target workflow is: merge features to `staging`, validate the exact annotate
 
 Activation must install and verify the three rulesets emitted by `scripts/staging-ops/main-policy.mjs`: `main-integrity` has no bypass; `main-release-evidence` permits only the emergency App; `main-release-writer` permits only the distinct normal and emergency Apps. Remove conflicting classic PR/check constraints only after the active rulesets preserve every existing check. Test human/admin/normal/emergency operations on a disposable protected branch. Configure protected environment reviewers, prevent self-review, and restrict controller deployment branches to exactly `staging`. This PR performs none of those provider writes.
 
-Emergency is a separate `staging-emergency` environment and App. It requires an HTTPS incident URL, concrete reason, human authorization and a non-force descendant; audit is written before the update and completed/refused afterward. Back-merge the hotfix through a reviewed staging PR and cut a new normal release. Never reuse emergency credentials for ordinary promotion.
+Emergency is a separate `staging-emergency` environment and App. It requires an HTTPS incident URL, concrete reason, human authorization and a non-force descendant; that incident URL is retained in every authorization and terminal audit record. Back-merge the hotfix through a reviewed staging PR and cut a new normal release. Never reuse emergency credentials for ordinary promotion.
+
+**Every authorized controller run receives a terminal audit outcome.** Token exchange, candidate-check,
+and other pre-update failures finish as `refused` with their phase and whether an update was attempted.
+The GitHub API calls, including the uncertainty read-back, have finite request deadlines. If the one
+non-force PATCH errors, the controller reads `main` back exactly once and never retries the PATCH: a
+candidate match is a confirmed promotion; any other or unreadable result is
+`promotion-outcome-ambiguous`. Operators must investigate that state, not dispatch another blind
+promotion. Once a promotion is confirmed, a failed or incomplete Railway observation is terminally
+recorded as `promoted-but-deployment-failed` or `promoted-but-deployment-unverified`, with the
+promoted SHA preserved. It is never relabelled as a pre-update refusal and never triggers a branch
+rewrite.
 
 What exists today: four tags (`v0.7.0` … `v0.10.0`), the newest cut **2026-08-03**, with `main`
 **166 commits and 34 migration files (29 added, 5 modified)** past it and `package.json` still reading

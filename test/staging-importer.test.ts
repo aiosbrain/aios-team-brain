@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
-import { assertReplayableGraph, compareEnvironmentCredentials, verifyAndPinSourceBundle, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
+import { assertReplayableGraph, compareEnvironmentCredentials, verifyAndPinSourceBundle, verifyInstalledPair, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
 import { PrivateFileStore } from "../scripts/staging-ops/private-store.mjs";
 import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
 import { validatePairManifest } from "../scripts/staging-ops/bundle-format.mjs";
+import { schemaFingerprintDigest } from "../scripts/staging-ops/build-identity.mjs";
+import { fingerprint } from "../scripts/schema-fingerprint.mjs";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((r) => rmSync(r, { recursive: true, force: true })));
@@ -110,5 +112,38 @@ describe("M2 — the bootstrap checkpoint is proven replayable before it is trus
     ["a property tag the codec cannot decode", { ...replayable, nodes: [{ exportId: "z", labels: ["Entity"], properties: { odd: { $neo4j: "Quaternion", fields: {} } } }], relationships: [] }, /unsupported Neo4j codec tag/],
   ])("refuses %s rather than sealing an unrestorable checkpoint", (_label, graph, message) => {
     expect(() => assertReplayableGraph(graph)).toThrow(message as RegExp);
+  });
+});
+
+describe("M6 — installed-pair verification checks the restored ledger UUID", () => {
+  it("refuses a restored graph with correct names/groups but a substituted ledger UUID", async () => {
+    const installed = {
+      codecVersion: 1,
+      nodes: [{ exportId: "ep", labels: ["Episodic"], properties: { uuid: "actual-uuid", name: "items:item-1", group_id: "team" } }],
+      relationships: [],
+    };
+    const records = installed.nodes.map((node) => ({
+      get: (key: string) => node[key as keyof typeof node],
+    }));
+    const session = { run: vi.fn()
+      .mockResolvedValueOnce({ records })
+      .mockResolvedValueOnce({ records: [] }) };
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        const text = String(sql);
+        if (text.includes("forbidden_count")) return { rows: [{ forbidden_count: 0 }] };
+        if (text.includes("FROM graph_episodes ge")) return { rows: [{
+          source_table: "items", source_id: "item-1", group_id: "team", pending_delete_group_id: null,
+          content_sha256: "c".repeat(64), episode_uuid: "substituted-uuid", chunk_shas: [], deferred: false, source_eligible: true,
+        }] };
+        if (text.includes("FROM arc_corrections a")) return { rows: [] };
+        return { rows: [{ kind: "column", ident: "items.id", def: "uuid" }] };
+      }),
+    };
+    const schemaLines = await fingerprint(client);
+    const opened = { kind: "source", manifest: { runId: "run-1", mode: "copy-ready", build: { schemaFingerprint: schemaFingerprintDigest(schemaLines) } } };
+    await expect(verifyInstalledPair({ client, session, graph: installed, opened, deadlines: {
+      operationMs: 5_000, captureMs: 5_000, recoveryMs: 5_000, cleanupMs: 5_000, connectionMs: 5_000, terminateGraceMs: 100,
+    } })).rejects.toThrow(/does not satisfy current projection ledger/);
   });
 });

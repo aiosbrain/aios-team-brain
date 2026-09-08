@@ -36,11 +36,15 @@ export async function publishCandidateCheck({ request, repository, candidateSha,
   });
 }
 
-export function createApiClient({ token, baseUrl = "https://api.github.com", fetchImpl = fetch }) {
+export function createApiClient({ token, baseUrl = "https://api.github.com", fetchImpl = fetch, timeoutMs = 10_000 }) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new Error("GitHub API timeout must be an integer between 1 and 60000ms");
+  }
   return async (method, path, body) => {
     const response = await fetchImpl(`${baseUrl}${path}`, {
       method,
       redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
       headers: {
         Accept: "application/vnd.github+json",
         Authorization: `Bearer ${token}`,
@@ -178,10 +182,23 @@ export async function readLatestProductionDeployment({ environmentId, serviceId,
 }
 
 export async function observeProductionDeployment({ expectedSha, readLatest, probeHealth, timeoutMs = 10 * 60_000, intervalMs = 5_000, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 60 * 60_000) throw new Error("production deployment observation timeout must be 0..3600000ms");
   const deadline = now() + timeoutMs;
   let last = null;
-  while (now() <= deadline) {
-    last = await readLatest();
+  let observationError = null;
+  for (;;) {
+    try {
+      last = await readLatest();
+      observationError = null;
+    } catch (error) {
+      // Main may already have advanced. A Railway read failure is therefore an observation gap,
+      // never a generic refusal and never a reason to retry the push.
+      observationError = error instanceof Error ? error.message : String(error);
+      const current = now();
+      if (current >= deadline) break;
+      await sleep(Math.min(intervalMs, Math.max(0, deadline - current)));
+      continue;
+    }
     if (last?.commitSha === expectedSha && last.status === "SUCCESS") {
       // A probe that cannot be performed at all (no verifiable domain, transport refusal) is
       // reported as UNVERIFIED, not as a failed deployment and never as a reason to touch main.
@@ -193,9 +210,11 @@ export async function observeProductionDeployment({ expectedSha, readLatest, pro
     if (last?.commitSha === expectedSha && new Set(["FAILED", "CRASHED", "REMOVED"]).has(last.status)) {
       return { status: "promoted-but-deployment-failed", deployment: last };
     }
-    if (now() < deadline) await sleep(Math.min(intervalMs, Math.max(0, deadline - now())));
+    const current = now();
+    if (current >= deadline) break;
+    await sleep(Math.min(intervalMs, Math.max(0, deadline - current)));
   }
-  return { status: "promoted-but-deployment-unverified", deployment: last };
+  return { status: "promoted-but-deployment-unverified", deployment: last, observationError };
 }
 
 function decodePackageVersion(file) {
@@ -334,8 +353,27 @@ export async function updateMainNonForce({ request, repository, expectedMain, ca
   if (actual === candidateSha) return { status: "already-promoted", sha: candidateSha };
   const compare = await request("GET", `/repos/${repository}/compare/${actual}...${candidateSha}`);
   if (!compareProvesAncestor(compare)) throw new Error("candidate is not a fast-forward of current main");
-  await request("PATCH", `/repos/${repository}/git/refs/heads/main`, { sha: candidateSha, force: false });
-  return { status: "promoted", sha: candidateSha };
+  try {
+    await request("PATCH", `/repos/${repository}/git/refs/heads/main`, { sha: candidateSha, force: false });
+    return { status: "promoted", sha: candidateSha, confirmation: "patch-response" };
+  } catch (error) {
+    // The request may have reached GitHub even when its response did not reach us. Re-read once;
+    // never issue a second PATCH against an ambiguous outcome.
+    const detail = error instanceof Error ? error.message : String(error);
+    try {
+      const observed = await request("GET", `/repos/${repository}/git/ref/heads/main`);
+      const observedSha = observed?.object?.sha ?? null;
+      if (observedSha === candidateSha) {
+        return { status: "promoted", sha: candidateSha, confirmation: "read-back-after-ambiguous-patch", patchError: detail.slice(0, 200) };
+      }
+      return { status: "promotion-outcome-ambiguous", sha: null, expectedSha: candidateSha, observedMain: observedSha, patchError: detail.slice(0, 200) };
+    } catch (readError) {
+      return {
+        status: "promotion-outcome-ambiguous", sha: null, expectedSha: candidateSha, observedMain: null,
+        patchError: detail.slice(0, 200), readBackError: String(readError instanceof Error ? readError.message : readError).slice(0, 200),
+      };
+    }
+  }
 }
 
 /** Audit files contain identities and verdicts only; tokens and provider response bodies never enter. */
@@ -345,57 +383,58 @@ export function writeAudit(path, audit) {
 
 // The workflow is the supported entrypoint. The shell intentionally refuses an incomplete local
 // invocation instead of discovering ambient credentials or guessing deployment identity.
-async function main() {
-  const action = process.env.RELEASE_ACTION;
+export async function runReleaseController(env = process.env, operations = {}) {
+  const action = env.RELEASE_ACTION;
   if (!['validate', 'promote', 'emergency'].includes(action)) throw new Error("RELEASE_ACTION must be validate, promote, or emergency");
   const required = ["GITHUB_REPOSITORY", "GITHUB_SHA", "RELEASE_AUDIT_PATH"];
-  for (const name of required) if (!process.env[name]?.trim()) throw new Error(`${name} is required`);
+  for (const name of required) if (!env[name]?.trim()) throw new Error(`${name} is required`);
 
-  const readToken = process.env.GITHUB_TOKEN;
+  const readToken = env.GITHUB_TOKEN;
   if (!readToken) throw new Error("read-only GITHUB_TOKEN is required");
-  const githubRead = createApiClient({ token: readToken });
+  const makeApiClient = operations.createApiClient ?? createApiClient;
+  const githubRead = operations.githubRead ?? makeApiClient({ token: readToken });
   let facts;
   let authorization;
   if (action === "emergency") {
-    const target = process.env.RELEASE_EMERGENCY_SHA;
+    const target = env.RELEASE_EMERGENCY_SHA;
     if (!/^[0-9a-f]{40}$/i.test(String(target))) throw new Error("RELEASE_EMERGENCY_SHA must be a full commit SHA");
-    const mainRef = await githubRead("GET", `/repos/${process.env.GITHUB_REPOSITORY}/git/ref/heads/main`);
-    const comparison = await githubRead("GET", `/repos/${process.env.GITHUB_REPOSITORY}/compare/${mainRef.object.sha}...${target}`);
+    const mainRef = await githubRead("GET", `/repos/${env.GITHUB_REPOSITORY}/git/ref/heads/main`);
+    const comparison = await githubRead("GET", `/repos/${env.GITHUB_REPOSITORY}/compare/${mainRef.object.sha}...${target}`);
     facts = {
-      incidentUrl: process.env.RELEASE_INCIDENT_URL,
-      reason: process.env.RELEASE_NOTES,
-      authorizedBy: process.env.GITHUB_ACTOR,
+      incidentUrl: env.RELEASE_INCIDENT_URL,
+      reason: env.RELEASE_NOTES,
+      authorizedBy: env.GITHUB_ACTOR,
       mainIsAncestor: compareProvesAncestor(comparison),
       commitSha: target,
       expectedMain: mainRef.object.sha,
-      notes: process.env.RELEASE_NOTES,
+      notes: env.RELEASE_NOTES,
     };
     authorization = emergencyVerdict(facts);
   } else {
-    const producerIds = JSON.parse(process.env.RELEASE_PRODUCER_IDS_JSON ?? "{}");
-    const measured = await measureCandidate({
+    const producerIds = JSON.parse(env.RELEASE_PRODUCER_IDS_JSON ?? "{}");
+    const measured = await (operations.measureCandidate ?? measureCandidate)({
       githubRequest: githubRead,
       railwayRead: (id) => readRailwayDeployment({
         deploymentId: id,
-        token: process.env.RAILWAY_STAGING_READ_TOKEN,
-        environmentId: process.env.RAILWAY_STAGING_ENVIRONMENT_ID,
-        serviceId: process.env.RAILWAY_STAGING_APP_SERVICE_ID,
+        token: env.RAILWAY_STAGING_READ_TOKEN,
+        environmentId: env.RAILWAY_STAGING_ENVIRONMENT_ID,
+        serviceId: env.RAILWAY_STAGING_APP_SERVICE_ID,
       }),
       // Bound to the MEASURED deployment domain. A configured `STAGING_ORIGIN` is an operator's
       // assertion, so it may only agree or refuse — never redirect the token somewhere else.
       healthProbe: (boundOrigin) => {
-        const configured = normalizeDeploymentOrigin(process.env.STAGING_ORIGIN);
+        const configured = normalizeDeploymentOrigin(env.STAGING_ORIGIN);
         if (configured && configured !== boundOrigin) {
           throw new Error(`configured STAGING_ORIGIN ${configured} is not the measured deployment domain ${boundOrigin}; refusing to present the staging health token`);
         }
-        return probePinnedHealth({ origin: boundOrigin, token: process.env.STAGING_HEALTH_TOKEN });
+        return probePinnedHealth({ origin: boundOrigin, token: env.STAGING_HEALTH_TOKEN });
       },
-      repository: process.env.GITHUB_REPOSITORY,
-      tagName: process.env.RELEASE_TAG,
-      deploymentId: process.env.RELEASE_DEPLOYMENT_ID,
-      requestedMode: process.env.RELEASE_MODE,
-      notes: process.env.RELEASE_NOTES,
-      copyModeActivated: process.env.STAGING_COPY_MODE_ACTIVATED === "true",
+      repository: env.GITHUB_REPOSITORY,
+      tagName: env.RELEASE_TAG,
+      deploymentId: env.RELEASE_DEPLOYMENT_ID,
+      requestedMode: env.RELEASE_MODE,
+      notes: env.RELEASE_NOTES,
+      copyModeActivated: env.STAGING_COPY_MODE_ACTIVATED === "true",
       producerIds,
     });
     facts = measured.facts;
@@ -404,11 +443,12 @@ async function main() {
   const audit = {
     version: 1,
     action,
-    actor: process.env.GITHUB_ACTOR ?? "unknown",
-    workflowRun: process.env.GITHUB_RUN_ID ?? null,
-    dispatchSha: process.env.GITHUB_SHA,
-    attemptedAt: new Date().toISOString(),
+    actor: env.GITHUB_ACTOR ?? "unknown",
+    workflowRun: env.GITHUB_RUN_ID ?? null,
+    dispatchSha: env.GITHUB_SHA,
+    attemptedAt: (operations.now ?? (() => new Date()))().toISOString(),
     facts: {
+      incidentUrl: facts.incidentUrl ?? null,
       tagName: facts.tagName,
       tagObjectSha: facts.resolvedTagObjectSha,
       commitSha: facts.commitSha,
@@ -419,59 +459,85 @@ async function main() {
       notes: facts.notes,
     },
   };
-  writeAudit(process.env.RELEASE_AUDIT_PATH, { ...audit, verdict: authorization.ok ? "authorized" : "refused", errors: authorization.errors });
+  const auditWriter = operations.writeAudit ?? writeAudit;
+  const finishAudit = (verdict, { errors = [], result = null } = {}) => auditWriter(env.RELEASE_AUDIT_PATH, {
+    ...audit, verdict, errors, ...(result ? { result } : {}), completedAt: (operations.now ?? (() => new Date()))().toISOString(),
+  });
+  auditWriter(env.RELEASE_AUDIT_PATH, { ...audit, verdict: authorization.ok ? "authorized" : "refused", errors: authorization.errors });
   if (!authorization.ok) throw new Error(authorization.errors.join("; "));
 
   const emergency = action === "emergency";
-  const token = await createInstallationToken({
-    appId: process.env[emergency ? "EMERGENCY_APP_ID" : "RELEASE_APP_ID"],
-    installationId: process.env[emergency ? "EMERGENCY_APP_INSTALLATION_ID" : "RELEASE_APP_INSTALLATION_ID"],
-    privateKey: process.env[emergency ? "EMERGENCY_APP_PRIVATE_KEY" : "RELEASE_APP_PRIVATE_KEY"],
-  });
-  const appRequest = createApiClient({ token });
   let mutation = { status: "validated", sha: facts.commitSha };
-  if (!emergency) {
-    await publishCandidateCheck({
-      request: appRequest,
-      repository: process.env.GITHUB_REPOSITORY,
-      candidateSha: facts.commitSha,
-      dispatchSha: process.env.GITHUB_SHA,
-      conclusion: "success",
-      summary: `Validated ${facts.tagName} on deployment ${facts.deploymentId} in ${facts.requestedMode} mode; refresh ${facts.healthRunId ?? "not performed (legacy)"}.`,
+  let phase = "installation-token";
+  let updateConfirmed = false;
+  let finalized = false;
+  try {
+    const token = await (operations.createInstallationToken ?? createInstallationToken)({
+      appId: env[emergency ? "EMERGENCY_APP_ID" : "RELEASE_APP_ID"],
+      installationId: env[emergency ? "EMERGENCY_APP_INSTALLATION_ID" : "RELEASE_APP_INSTALLATION_ID"],
+      privateKey: env[emergency ? "EMERGENCY_APP_PRIVATE_KEY" : "RELEASE_APP_PRIVATE_KEY"],
     });
-  }
-  if (action === "promote" || action === "emergency") {
-    const expectedMain = facts.expectedMain;
-    if (!expectedMain) throw new Error("validated expected main SHA is missing; refusing a fresh-main substitution");
-    mutation = await updateMainNonForce({ request: appRequest, repository: process.env.GITHUB_REPOSITORY, expectedMain, candidateSha: facts.commitSha });
-    if (mutation.status === "promoted" && !emergency) {
-      mutation.production = await observeProductionDeployment({
-        expectedSha: facts.commitSha,
-        readLatest: () => readLatestProductionDeployment({
-          environmentId: process.env.RAILWAY_PRODUCTION_ENVIRONMENT_ID,
-          serviceId: process.env.RAILWAY_PRODUCTION_APP_SERVICE_ID,
-          token: process.env.RAILWAY_PRODUCTION_READ_TOKEN,
-        }),
-        // Production speaks the ORDINARY health contract, not the privileged staging one, and the
-        // same absent-domain rule applies: an unverifiable origin refuses rather than falling back
-        // to whatever the environment claims.
-        probeHealth: (deployment) => {
-          if (!deployment.url) throw new Error("Railway reported no production deployment domain; the observation is UNMEASURED and no configured value may stand in for it");
-          return probeProductionHealth({ origin: deployment.url });
-        },
-        timeoutMs: Number(process.env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
+    const appRequest = operations.appRequest ?? makeApiClient({ token });
+    if (!emergency) {
+      phase = "candidate-check";
+      await (operations.publishCandidateCheck ?? publishCandidateCheck)({
+        request: appRequest,
+        repository: env.GITHUB_REPOSITORY,
+        candidateSha: facts.commitSha,
+        dispatchSha: env.GITHUB_SHA,
+        conclusion: "success",
+        summary: `Validated ${facts.tagName} on deployment ${facts.deploymentId} in ${facts.requestedMode} mode; refresh ${facts.healthRunId ?? "not performed (legacy)"}.`,
       });
-      if (mutation.production.status !== "verified") {
-        writeAudit(process.env.RELEASE_AUDIT_PATH, { ...audit, verdict: mutation.production.status, errors: [], result: mutation, completedAt: new Date().toISOString() });
-        throw new Error(mutation.production.status);
+    }
+    if (action === "promote" || action === "emergency") {
+      const expectedMain = facts.expectedMain;
+      if (!expectedMain) throw new Error("validated expected main SHA is missing; refusing a fresh-main substitution");
+      phase = "main-update";
+      mutation = await (operations.updateMainNonForce ?? updateMainNonForce)({ request: appRequest, repository: env.GITHUB_REPOSITORY, expectedMain, candidateSha: facts.commitSha });
+      if (mutation.status === "promotion-outcome-ambiguous") {
+        finishAudit(mutation.status, { result: mutation }); finalized = true;
+        throw new Error(mutation.status);
+      }
+      updateConfirmed = mutation.status === "promoted" || mutation.status === "already-promoted";
+      if (mutation.status === "promoted" && !emergency) {
+        phase = "production-observation";
+        mutation.production = await (operations.observeProductionDeployment ?? observeProductionDeployment)({
+          expectedSha: facts.commitSha,
+          readLatest: operations.readLatestProductionDeployment ?? (() => readLatestProductionDeployment({
+            environmentId: env.RAILWAY_PRODUCTION_ENVIRONMENT_ID,
+            serviceId: env.RAILWAY_PRODUCTION_APP_SERVICE_ID,
+            token: env.RAILWAY_PRODUCTION_READ_TOKEN,
+          })),
+          probeHealth: operations.probeProductionHealth ?? ((deployment) => {
+            if (!deployment.url) throw new Error("Railway reported no production deployment domain; the observation is UNMEASURED and no configured value may stand in for it");
+            return probeProductionHealth({ origin: deployment.url });
+          }),
+          timeoutMs: Number(env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
+        });
+        if (mutation.production.status !== "verified") {
+          finishAudit(mutation.production.status, { result: mutation }); finalized = true;
+          throw new Error(mutation.production.status);
+        }
       }
     }
+    finishAudit("completed", { result: mutation }); finalized = true;
+    return mutation;
+  } catch (error) {
+    if (!finalized) {
+      const message = String(error instanceof Error ? error.message : error).slice(0, 300);
+      if (updateConfirmed) {
+        const result = { ...mutation, production: mutation.production ?? { status: "promoted-but-deployment-unverified", observationError: message } };
+        finishAudit("promoted-but-deployment-unverified", { errors: [message], result });
+      } else {
+        finishAudit("refused", { errors: [message], result: { status: "refused", phase, updateAttempted: phase === "main-update" } });
+      }
+    }
+    throw error;
   }
-  writeAudit(process.env.RELEASE_AUDIT_PATH, { ...audit, verdict: "completed", errors: [], result: mutation, completedAt: new Date().toISOString() });
 }
 
 if (process.argv.includes("--run")) {
-  main().catch((error) => {
+  runReleaseController().catch((error) => {
     console.error(`release controller refused: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   });

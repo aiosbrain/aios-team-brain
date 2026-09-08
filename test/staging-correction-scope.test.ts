@@ -29,6 +29,7 @@ const correctionLedgerRow = (over: Record<string, unknown> = {}) => ({
   group_id: TEAM_GROUP,
   pending_delete_group_id: null,
   content_sha256: "c".repeat(64),
+  episode_uuid: "ep-correction",
   chunk_shas: [],
   deferred: false,
   source_eligible: false,
@@ -118,7 +119,7 @@ describe("the correction ledger key names the EPISODE, not the row", () => {
       ledger: [correctionLedgerRow()],
       corrections: [{ id: "corr-1", arc_id: "arc-1", group_key: `g:${TEAM_GROUP}`, proven_group: TEAM_GROUP }],
     }));
-    const withEpisode = { nodes: [{ labels: ["Episodic"], properties: { name: "correction:arc-1", group_id: TEAM_GROUP } }] };
+    const withEpisode = { nodes: [{ labels: ["Episodic"], properties: { uuid: "ep-correction", name: "correction:arc-1", group_id: TEAM_GROUP } }] };
     expect(() => validateLedgerAgainstSanitizedGraph(withEpisode, facts)).not.toThrow();
     expect(() => validateLedgerAgainstSanitizedGraph({ nodes: [] }, facts)).toThrow(/does not satisfy current projection ledger/);
   });

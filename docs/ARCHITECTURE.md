@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-09-07.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-09-08.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## First-install deployment flow
@@ -73,6 +73,50 @@ stores, verifies the paired result, and boots the exact observed staging commit 
 journal ready. The app/startup fence holds a shared form of the same lock. Durable last-ready state,
 authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
 deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
+
+The fence is activation-aware independently of the exact data-mode string. A deployment enters the
+staging-ops inspection scope only through its pinned `STAGING_OPS_ENVIRONMENT_ID`; within that scope,
+durable enrollment means the ops journal contains a real run, boot, candidate, or last-ready
+identity. An absent control schema and the installer's empty initial journal remain compatible with
+the preactivation `legacy-pg-only` baseline. Once durable activity exists (or `copy-ready` / the
+explicit activation claim requests stricter handling), `fence-admission.mjs` requires a supported
+mode and applies the same journal boot verdict in the startup wrapper and schema loader. Thus a
+removed or corrupted mode cannot bypass fencing after activation, while the importer's schema replay
+continues on the same session that owns the exclusive lock.
+
+`markReady` is the install's durable serving commit boundary. Entering drain snapshots the prior
+last-ready identity into `rollback_target_*`; post-boot pointer, watermark, catch-up, and object
+cleanup are reconciliation work. If any of those later steps fails, the newly verified deployment
+keeps serving, the canonical ready row remains truthful, and the prior target is retained for a
+same-run retry or deliberate rollback. A healthy startup-fence session is likewise released only
+after the owned payload process group is verified absent. Failed termination leaves the supervisor
+alive, holding and retrying under the shared lock. Actual Postgres connection loss is a different
+state—the advisory lock is already gone—so termination is attempted promptly and any surviving
+workload is reported without a false lock-retention claim.
+
+Source admission treats credential separation as authenticated structured evidence, not unequal
+strings: each required environment credential fingerprint must be well formed and match the same
+version, comparison-key ID, and credential class before unequal MACs prove separation. This check
+runs before drain and feeds the graph replacement guard. Staging-owned rollback envelopes are not
+source bundles and may legitimately contain the current staging credentials.
+
+The sanitized Postgres graph ledger and graph bundle correspond by durable identity, not counts or
+names alone. Every completed ledger row must carry an `episode_uuid` that resolves within the same
+`group_id` to one of that source item's retained chunk names, and every retained chunk must be
+represented. A UUID from another episode or group is refused even when names and counts look right.
+Pending rows with no assigned UUID and deferred/blank rows remain legitimate; completed work may
+point at any retained chunk rather than being forced to chunk zero.
+
+Runner deadlines are finite and validated before resources are opened. Postgres work combines
+finite connects with server-side statement/lock/idle-transaction cancellation; Neo4j transactions
+carry finite timeouts; owned PG utility process groups receive TERM then KILL and are awaited to
+confirmed close before rollback, recovery, or lock release. Recovery is separately budgeted on the
+same lock-owning Postgres session. If safe termination cannot be confirmed, the runner intentionally
+does not claim cleanup or release containment. The importer daemon itself remains long-lived, but
+each tick receives these finite operation budgets. The exporter permits exactly one retry of the
+whole private capture for a classified transient failure; encryption and immutable publication occur
+only after a complete successful attempt, so neither a partial capture nor retry republishes new
+ciphertext under an existing key.
 
 **Graph identity in a copied staging is `(group_id, uuid)`, never `uuid` alone.** The replay installs
 an allowlisted schema of composite RANGE indexes and declares NO uniqueness constraint: the same UUID
