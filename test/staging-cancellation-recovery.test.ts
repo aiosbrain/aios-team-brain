@@ -5,6 +5,8 @@ import {
   assertNotCancelled,
   installObject,
   preservesCapturedStagingCredentials,
+  runPollingDaemon,
+  waitForAbortableInterval,
 } from "../scripts/staging-ops/importer.mjs";
 import { createSessionWatchdogOwner, createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
 import { beginBootstrapDraining, bootstrapResumeVerdict } from "../scripts/staging-ops/journal.mjs";
@@ -110,12 +112,100 @@ describe("HIGH-1 — a shutdown signal stops new destructive work and nothing el
     await recovery.disarm();
   });
 
-  it("races the idle daemon wait against the shutdown instead of sleeping through it", () => {
-    // A structural pin, and labelled as one: the behaviour needs a running daemon and a real signal,
-    // which the paired harness owns. What it catches is the shape that was wrong — a bare
-    // `setTimeout` the shutdown could not interrupt, inside a `for(;;)` with no exit.
-    expect(IMPORTER_SOURCE).toContain("shutdown.signal.addEventListener(\"abort\", finish, { once: true })");
-    expect(IMPORTER_SOURCE).toContain("while (!shutdown.signal.aborted) {");
+  it("leaves the poll loop promptly when the shutdown arrives while it is IDLE", async () => {
+    // BEHAVIOURAL, against the loop the CLI actually runs. The traced defect was a bare `setTimeout`
+    // the shutdown could not interrupt: a SIGTERM delivered between ticks was not acted on for up to
+    // five more minutes. The interval here is a minute and the assertion is that the loop returns in
+    // a fraction of it — a regression to an uninterruptible sleep fails on the test timeout rather
+    // than passing slowly.
+    const shutdown = new AbortController();
+    const ticks: number[] = [];
+    const loop = runPollingDaemon({ tick: async () => { ticks.push(Date.now()); }, intervalMs: 60_000, signal: shutdown.signal });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const abortedAt = Date.now();
+    shutdown.abort();
+    await expect(loop).resolves.toEqual({ status: "stopped", reason: "signal" });
+    expect(Date.now() - abortedAt, "the idle wait slept through the shutdown").toBeLessThan(2_000);
+    // …and it admitted no new work on the way out. One tick ran, before the signal.
+    expect(ticks).toHaveLength(1);
+  }, 10_000);
+
+  it("admits NO further tick when the shutdown lands during one", async () => {
+    // The other half, and the reason the loop condition is re-checked AFTER the wait rather than
+    // only before it: a signal that arrives mid-tick must not be followed by one more drain window.
+    const shutdown = new AbortController();
+    let calls = 0;
+    const loop = runPollingDaemon({
+      tick: async () => { calls += 1; shutdown.abort(); },
+      intervalMs: 60_000, signal: shutdown.signal,
+    });
+    await expect(loop).resolves.toEqual({ status: "stopped", reason: "signal" });
+    expect(calls, "the daemon started another tick after it had been told to stop").toBe(1);
+  }, 10_000);
+
+  it("treats a cancellation refusal as the stop it is, and an ordinary tick failure as a retry", async () => {
+    // `installObject` refuses new destructive work under cancellation BY DESIGN, so logging that as
+    // "tick failed" would report every clean shutdown as an error. An ordinary failure is the
+    // opposite: it is logged and the daemon keeps polling.
+    const shutdown = new AbortController();
+    const logged: string[] = [];
+    await runPollingDaemon({
+      tick: async () => {
+        shutdown.abort();
+        throw Object.assign(new Error("importer received SIGTERM"), { code: "STAGING_OPERATION_ABORTED" });
+      },
+      intervalMs: 60_000, signal: shutdown.signal, log: (message) => logged.push(message),
+    });
+    expect(logged, "a coordinated shutdown was reported as a tick failure").toEqual([]);
+
+    const second = new AbortController();
+    let calls = 0;
+    await runPollingDaemon({
+      tick: async () => { calls += 1; if (calls >= 2) second.abort(); throw new Error("source discovery failed"); },
+      intervalMs: 1, signal: second.signal, log: (message) => logged.push(message),
+    });
+    expect(calls, "an ordinary tick failure ended the daemon").toBe(2);
+    expect(logged).toHaveLength(2);
+    expect(logged[0]).toMatch(/staging importer tick failed: source discovery failed/);
+  }, 10_000);
+
+  it("ENDS on a fatal error rather than logging it and waiting five minutes", async () => {
+    // The daemon's own budget breach and a dead connection cannot be retried by the next tick, so
+    // they leave the loop. The CLI supplies both conditions.
+    await expect(runPollingDaemon({
+      tick: async () => { throw Object.assign(new Error("importer deadline exceeded"), { code: "STAGING_OPERATION_TIMEOUT" }); },
+      intervalMs: 60_000, signal: new AbortController().signal,
+      isFatal: (error: unknown) => (error as { code?: string })?.code === "STAGING_OPERATION_TIMEOUT",
+    })).rejects.toThrow(/importer deadline exceeded/);
+    expect(IMPORTER_SOURCE, "the CLI must still supply both fatal conditions")
+      .toContain('isFatal: (error) => error?.code === "STAGING_OPERATION_TIMEOUT" || Boolean(client.connection?.stream?.destroyed)');
+  }, 10_000);
+
+  it("does not accumulate one abort listener per tick for the life of the daemon", () => {
+    // A five-minute daemon that never leaves the loop registers one listener per idle wait. The
+    // timer path must unregister too, not only the abort path.
+    const observed = { aborted: false, added: 0, removed: 0 };
+    const signal = {
+      get aborted() { return observed.aborted; },
+      addEventListener: () => { observed.added += 1; },
+      removeEventListener: () => { observed.removed += 1; },
+    } as unknown as AbortSignal;
+    return waitForAbortableInterval(1, signal).then((reason) => {
+      expect(reason).toBe("interval");
+      expect(observed.added).toBe(1);
+      expect(observed.removed, "the timer path left its abort listener attached").toBe(1);
+    });
+  });
+
+  it("is the loop the CLI actually runs, with the five-minute floor still enforced there", () => {
+    // Pinning the FUNCTION is not pinning the DAEMON: an extraction whose call site was deleted
+    // leaves every test above green while the CLI sleeps through signals exactly as before.
+    expect(IMPORTER_SOURCE).toContain("return await runPollingDaemon({");
+    expect(IMPORTER_SOURCE, "the daemon must poll under the process shutdown signal, not a fresh one")
+      .toContain("tick, intervalMs: interval, signal: shutdown.signal,");
+    // The floor is an operator-facing validation and stays at the CLI — the loop takes whatever
+    // interval it is given, which is how a test observes a whole cycle in milliseconds.
+    expect(IMPORTER_SOURCE).toContain('throw new Error("importer poll interval must be at least five minutes")');
     expect(IMPORTER_SOURCE, "the idle wait must not be an uninterruptible sleep")
       .not.toMatch(/await new Promise\(\(resolve\) => setTimeout\(resolve, interval\)\)/);
   });
@@ -132,27 +222,32 @@ describe("HIGH-1 — a shutdown signal stops new destructive work and nothing el
 
 describe("M6 — the ready commit is recorded before the next fallible assert", () => {
   /**
-   * A SOURCE-ORDER guard, and it is weaker than the behaviour it stands for: it proves the two
-   * statements are in the right order, not that a budget expiring between them produces a
-   * `ready-bookkeeping-pending` receipt and no rollback. That property needs the real two-store
-   * install and belongs in the data-mechanics/harness tier — see the report.
+   * A SOURCE-ORDER guard, and COMPLEMENTARY now rather than the whole coverage: the install path's
+   * behaviour — a budget expiring immediately after the ready commit produces a
+   * `ready-bookkeeping-pending` receipt, no rollback and no second drain — is exercised through the
+   * real orchestration in `test/staging-ready-commit-boundary.test.ts`.
    *
-   * It is still worth pinning, because the defect was exactly an ordering: `markReady` had already
+   * What this still earns its place for is the RECOVERY path, which has the same boundary and no
+   * behavioural test, and the fact that the defect was exactly an ordering: `markReady` had already
    * committed and the deployment was verified serving, but `readyCommitted` was still null when the
    * assert threw, so the catch drained the pair it had just installed.
    */
   it.each([
-    ["install", 'operationBudget.assert("ready reconciliation")'],
-    ["recovery", 'recoveryBudget.assert("recovery ready bookkeeping")'],
-  ])("assigns readyCommitted before the %s path's post-ready assert", (_path, label) => {
+    // The boot CALL is spelled differently on the two paths — the install path goes through the
+    // `bootExact` injection seam, the recovery path calls the import. Naming the right one per path
+    // matters: searching for the import on the install path silently finds the RECOVERY path's call
+    // far above and the guard then passes while measuring the wrong boundary entirely.
+    ["install", 'operationBudget.assert("ready reconciliation")', "await boot({"],
+    ["recovery", 'recoveryBudget.assert("recovery ready bookkeeping")', "await bootExact({"],
+  ])("assigns readyCommitted before the %s path's post-ready assert", (_path, label, bootCall) => {
     const assertion = IMPORTER_SOURCE.indexOf(label);
     expect(assertion, `${label} is gone; this guard no longer covers anything`).toBeGreaterThan(-1);
     const assign = IMPORTER_SOURCE.lastIndexOf("readyCommitted = booted.ready;", assertion);
     expect(assign, "no readyCommitted assignment precedes the post-ready assert").toBeGreaterThan(-1);
-    // …and the assignment belongs to THIS boundary, not to a distant earlier one: `bootExact` must
-    // sit between them.
-    const boot = IMPORTER_SOURCE.lastIndexOf("await bootExact(", assign);
-    expect(boot).toBeGreaterThan(-1);
+    // …and the assignment belongs to THIS boundary, not to a distant earlier one: the boot must sit
+    // between them.
+    const boot = IMPORTER_SOURCE.lastIndexOf(bootCall, assign);
+    expect(boot, `${bootCall} is gone; this guard no longer identifies its own boundary`).toBeGreaterThan(-1);
     expect(assign).toBeGreaterThan(boot);
     expect(assign).toBeLessThan(assertion);
   });
@@ -287,10 +382,14 @@ describe("HIGH-2 — a bootstrap that failed ordinarily can be retried to ready"
   });
 
   it("re-enters draining and re-verifies the stop BEFORE taking the exclusive lock", () => {
-    // Structural, and labelled: the behaviour needs a live fenced app, which the harness owns. What
-    // it pins is the ordering the defect violated — the resume branch used to take the exclusive
-    // lock directly, so a retry after an ordinary failure met the baseline the failure had just
-    // REDEPLOYED, timed out on the lock, and could never reach `booting`.
+    // Structural, and COMPLEMENTARY: the behaviour needs a live fenced app, and the paired harness
+    // now owns it — `bootstrap-after-stop-throw` fails a resume ordinarily so its catch redeploys
+    // the baseline, and the following retry has to stop a genuinely serving pair before it can take
+    // the exclusive lock (`scripts/staging-pair-isolated.sh`, checked by
+    // `scripts/staging-ops/assert-bootstrap-resume-order.mjs`). What THIS pins is the ordering the
+    // defect violated — the resume branch used to take the exclusive lock directly, so a retry after
+    // an ordinary failure met the baseline the failure had just REDEPLOYED, timed out on the lock,
+    // and could never reach `booting`.
     const branch = IMPORTER_SOURCE.slice(
       IMPORTER_SOURCE.indexOf("if (verdict.resume) {"),
       IMPORTER_SOURCE.indexOf("} else {", IMPORTER_SOURCE.indexOf("if (verdict.resume) {")),
@@ -307,6 +406,27 @@ describe("HIGH-2 — a bootstrap that failed ordinarily can be retried to ready"
     // The states a resume may re-enter draining from are exactly the ones an interruption or an
     // ordinary failure can leave.
     expect(branch).toContain('from: ["draining", "booting", "failed"]');
+  });
+
+  it("gates the ordinary-failure fault on the harness, on BOTH bootstrap branches", () => {
+    // The fault that makes the harness scenario possible is an injected THROW, so unlike a SIGKILL
+    // it could in principle fire on a real runner. It must therefore be unreachable without
+    // `STAGING_PAIR_REQUIRED=1` — the same gate every other fault point carries — and it must sit
+    // after the verified stop on both branches, or the resume half of the scenario is untestable.
+    const fault = IMPORTER_SOURCE.slice(IMPORTER_SOURCE.indexOf("function bootstrapOrdinaryFailureFault("));
+    expect(fault.slice(0, 400)).toContain('env.STAGING_PAIR_REQUIRED !== "1"');
+    expect(fault.slice(0, 400)).toContain('env.STAGING_FAULT_POINT !== "bootstrap-after-stop-throw"');
+    const calls = [...IMPORTER_SOURCE.matchAll(/bootstrapOrdinaryFailureFault\(env, \{ runId: \w+, resumed: (true|false) \}\)/g)];
+    expect(calls.map((call) => call[1]).sort(), "the fault must sit on both bootstrap branches").toEqual(["false", "true"]);
+    // …and inside its branch's stop→lock window, so a failed attempt can never be what blocks the
+    // retry. "Some acquisition appears later in the file" would be satisfied by the OTHER branch's,
+    // which is why the span between the two is required to contain no further stop.
+    for (const call of calls) {
+      const acquire = IMPORTER_SOURCE.indexOf("await acquireExclusiveDataUseLock(client, env,", call.index!);
+      expect(acquire, "no exclusive-lock acquisition follows the fault at all").toBeGreaterThan(-1);
+      expect(IMPORTER_SOURCE.slice(call.index!, acquire), "the fault belongs to a different branch than the lock that follows it")
+        .not.toContain("stopAndVerifyAll");
+    }
   });
 
   it("accepts the resumed run's original identity at the boot transition", () => {

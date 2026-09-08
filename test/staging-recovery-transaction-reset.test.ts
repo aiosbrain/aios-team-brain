@@ -200,8 +200,13 @@ describe("installObject's failure path (structural supplement — not a runtime 
   it("resets the session before the journal transition, the lock release and the rollback", () => {
     const reset = catchBlock.indexOf("resetSessionTransactionState(client)");
     expect(reset).toBeGreaterThan(-1);
-    for (const later of ["transitionJournal(client", "releaseDataUseLock(client", "rollbackToPrior({"]) {
-      expect(catchBlock.indexOf(later)).toBeGreaterThan(reset);
+    // `await rollback({`, not `rollbackToPrior({`: this call goes through `installObject`'s
+    // injection seam (which DEFAULTS to `rollbackToPrior`), the same seam the interrupted-recovery
+    // branch already used. Spelled as the call site actually reads, so a rename cannot leave this
+    // ordering check matching nothing — `indexOf` returning -1 would fail here, which is the
+    // intended behaviour, but the assertion message would be about ordering rather than absence.
+    for (const later of ["transitionJournal(client", "releaseDataUseLock(client", "await rollback({"]) {
+      expect(catchBlock.indexOf(later), `${later} is not in installObject's catch block`).toBeGreaterThan(reset);
     }
   });
 

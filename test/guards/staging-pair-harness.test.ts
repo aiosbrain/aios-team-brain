@@ -58,6 +58,18 @@ describe("paired refresh isolated harness", () => {
   const raw = readFileSync("compose.test.staging-pair.yml", "utf8");
   const compose = YAML.parse(raw, { merge: true });
   const harness = readFileSync("scripts/staging-pair-isolated.sh", "utf8");
+
+  /**
+   * The harness embeds more than one inline receipt parser, and each guard below re-runs THE ONE it
+   * is about rather than restating it — a restated regex drifts, and a lifted-by-position one
+   * silently starts testing a different parser the moment another is added above it. So the lift is
+   * by CONTENT, and it refuses an ambiguous match instead of taking the first.
+   */
+  const harnessMatchAllLiteral = (needle: string) => {
+    const found = [...harness.matchAll(/matchAll\((\/.*?\/g)\)/g)].map((match) => match[1]).filter((literal) => literal.includes(needle));
+    expect(found.length, `expected exactly one harness matchAll regex mentioning ${needle}`).toBe(1);
+    return found[0];
+  };
   it("uses two Postgres 18 and two Neo4j stores without shared host ports or PG18's legacy tmpfs path", () => {
     expect(["prod-pg", "staging-pg"].map((n) => compose.services[n].image)).toEqual(["postgres:18", "postgres:18"]);
     for (const name of ["prod-pg", "staging-pg", "prod-neo4j", "staging-neo4j"]) expect(compose.services[name].ports).toBeUndefined();
@@ -230,14 +242,81 @@ describe("paired refresh isolated harness", () => {
     expect(harness).toContain('require_journal state ready "staging is serving again after the aborted-transaction fault"');
   });
 
+  it("exercises the bootstrap failure mode a SIGKILL cannot produce: an ordinary failure and its retry", () => {
+    // Both `bootstrap-after-*` windows are kills, so the catch never runs and staging stays stopped.
+    // The state the H2 resume fix exists for is the opposite one — an in-band failure whose catch
+    // REDEPLOYS the baseline — because the retry then meets a live app holding a shared reader lock
+    // and must stop it again before the exclusive lock. Neither kill scenario can reach that.
+    expect(harness).toContain("STAGING_FAULT_POINT=bootstrap-after-stop-throw");
+    expect(harness).toContain('require_receipt bootstrap-ordinary-failure.log fault-injected \'"point":"bootstrap-after-stop-throw".*"thrown":true\'');
+    // The catch RAN (a kill cannot emit this), the baseline came back, and it is measured at the
+    // maintenance API rather than inferred from the refusal message.
+    expect(harness).toContain('"phase":"recovery-restart-deployment".*"measuredDeployment":true');
+    expect(harness).toContain("prior staging deployment restored unchanged");
+    expect(harness).toContain("the ordinary bootstrap failure left no serving app deployment");
+    expect(harness).toContain('require_journal state failed "an ordinary bootstrap failure leaves the journal failed');
+    expect(harness).toContain("require_journal last_safe_checkpoint bootstrap-failed-prior-restored");
+    // The record is what the retry depends on, and it is cleared in ONE place only (after ready).
+    expect(harness).toContain("the ordinary bootstrap failure discarded the interruption record the retry depends on");
+    expect(harness).toContain("the ordinary bootstrap failure discarded the published checkpoint identity");
+    // …and the retry is asserted as an ORDER, by the checked-in checker rather than by greps.
+    expect(harness).toContain("node scripts/staging-ops/assert-bootstrap-resume-order.mjs");
+    // The scenario must stay inside the ONE chained lifecycle, between the second kill window and
+    // the run that reaches ready — `bootstrap-rollback` is one-time, so an ordinary failure placed
+    // first would make the non-resume kill window unreachable forever.
+    const killedAfterPublish = harness.indexOf("bootstrap_interrupt bootstrap-after-publish");
+    const ordinary = harness.indexOf("expect_failure bootstrap-ordinary-failure");
+    const converged = harness.indexOf('require_journal state ready "the resumed bootstrap reached');
+    expect(killedAfterPublish).toBeGreaterThan(-1);
+    expect(ordinary, "the ordinary-failure scenario must follow the second kill window").toBeGreaterThan(killedAfterPublish);
+    expect(converged, "the converging retry must follow the ordinary failure").toBeGreaterThan(ordinary);
+    // Both kill windows and the first-import recovery coverage are retained, not displaced.
+    expect(harness).toContain("bootstrap_interrupt bootstrap-after-stop bootstrap-killed-after-stop");
+    expect(harness).toContain('"point":"$point".*"kill":"SIGKILL"');
+    expect(harness).toContain("require_receipt bootstrap-first-import-recovers.log prior-pair-restored");
+  });
+
+  it("has a resume-ordering checker that passes the real sequence and REFUSES a lock-first one", async () => {
+    // The parser is the checked-in module the harness runs, not a restatement of it, and it is run
+    // both ways: a log missing a checkpoint and a log whose lock precedes the re-stop must both
+    // refuse, or the lane would go green on precisely the regression it exists for.
+    const { bootstrapResumeOrderVerdict } = await import("../../scripts/staging-ops/assert-bootstrap-resume-order.mjs");
+    const phase = (name: string, fields: Record<string, unknown> = {}) =>
+      `staging-ops-receipt bootstrap-phase ${JSON.stringify({ runId: "bootstrap-2026-09-08", phase: name, ...fields })}`;
+    const correct = [
+      phase("read-journal"),
+      phase("resume-interrupted-bootstrap", { resumedPhase: "captured" }),
+      phase("transition-draining", { from: "failed", resumed: true }),
+      phase("stop-and-verify-all", { resumed: true }),
+      phase("acquire-exclusive-data-lock"),
+      phase("capture-checkpoint", { resumedPhase: "captured" }),
+      phase("adopted-published-checkpoint", { objectId: "bootstrap-2026-09-08--" + "c".repeat(64) }),
+    ].join("\n");
+    expect(bootstrapResumeOrderVerdict(correct).ok).toBe(true);
+
+    // THE REGRESSION: the lock taken before the re-stop. Same receipts, one swap.
+    const lines = correct.split("\n");
+    const lockFirst = [...lines.slice(0, 3), lines[4], lines[3], ...lines.slice(5)].join("\n");
+    const refused = bootstrapResumeOrderVerdict(lockFirst);
+    expect(refused.ok).toBe(false);
+    expect(refused.reason).toMatch(/out of order/);
+
+    // A resume that never re-entered draining at all, and a log with no receipts, are MISSING —
+    // reported as such so "could not look" never reads as "it held".
+    expect(bootstrapResumeOrderVerdict(lines.filter((_, index) => index !== 2).join("\n")).reason).toMatch(/never emitted draining/);
+    expect(bootstrapResumeOrderVerdict("importer: nothing happened").ok).toBe(false);
+    // And a `transition-draining` that is NOT the resumed one must not satisfy the resumed slot.
+    const freshDrain = correct.replace('"from":"failed","resumed":true', '"from":"ready"');
+    expect(bootstrapResumeOrderVerdict(freshDrain).reason).toMatch(/never emitted draining/);
+  });
+
   it("has a session-continuity assertion that can actually read a receipt log — and refuse one", () => {
     // A parser that matches nothing reports "saw 0 receipts", which is indistinguishable from a run
     // that emitted none, and would fail the lane for the wrong reason forever. The regex is lifted
     // out of the harness itself (not restated) so the two cannot drift apart, then run against the
     // exact receipt shape `emitReceipt` produces.
-    const literal = /matchAll\((\/.*\/g)\)/.exec(harness)?.[1];
-    expect(literal, "the harness must still embed the continuity regex").toBeTruthy();
-    const pattern = () => new RegExp(literal!.slice(1, -2), "g");
+    const literal = harnessMatchAllLiteral("session-continuity");
+    const pattern = () => new RegExp(literal.slice(1, -2), "g");
     const line = (kind: string, fields: Record<string, unknown>) => `staging-ops-receipt ${kind} ${JSON.stringify(fields)}`;
     const log = (pid: number, lastPid = pid) => [
       "importer: installing candidate run-4",

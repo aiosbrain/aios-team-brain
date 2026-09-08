@@ -772,6 +772,24 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
   const markAttempt = operations.recordSourceAttempt ?? recordSourceAttempt;
   const finishAttempt = operations.completeSourceAttempt ?? completeSourceAttempt;
   const undoAttempt = operations.withdrawSourceAttempt ?? withdrawSourceAttempt;
+  // ── The DESTRUCTIVE-PATH boundaries, injectable for the same reason as everything above ────────
+  //
+  // These four are the only steps between the drain and the ready commit that a test cannot stand
+  // in for through `client`, `maintenance` or `rollbackStore`: they spawn `pg_restore`, talk to a
+  // real Neo4j, read the staging branch head over the network, or deploy and health-poll an app.
+  // Substituting them is what makes the post-ready boundary (M6) reachable as BEHAVIOUR — the
+  // property that a budget expiring after `markReady` must not unwind a serving pair, which no
+  // source-order guard can state.
+  //
+  // Every one defaults to the real implementation, so the production path is byte-for-byte the
+  // path under test, and there is deliberately NO environment variable: this is a test-injection
+  // seam, not a runtime bypass an operator could reach.
+  const checkPostgresDestination = operations.verifyPostgresDestination ?? verifyPostgresDestination;
+  const readHead = operations.readStagingHead ?? readStagingHead;
+  const installPair = operations.installOpenedPair ?? installOpenedPair;
+  const verifyPair = operations.verifyInstalledPair ?? verifyInstalledPair;
+  const sealReady = operations.sealReadyRollback ?? sealReadyRollback;
+  const boot = operations.bootExact ?? bootExact;
   const signal = operations.signal;
   const beginRecoveryWatchdog = operations.beginRecoveryWatchdog;
   // Nothing has been read, locked or stopped yet: a cancellation observed here costs an operator
@@ -853,7 +871,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     throw new Error(`source run ${opened.manifest.runId} captured at or before the installed watermark; refusing to move staging backwards`);
   }
   operationBudget.assert("staging target commit measurement");
-  const targetCommit = await readStagingHead(env);
+  const targetCommit = await readHead(env);
   // The harness's NEGATIVE CONTROL. A failure BEFORE the drain touches neither store, so it must not
   // be able to satisfy a scenario about recovering from a mid-install fault — which the old
   // "exited non-zero and the prior data is still there" assertion could not tell apart, because
@@ -872,7 +890,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     operationBudget.assert("pinned importer verification");
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
     operationBudget.assert("Postgres target verification before drain");
-    await verifyPostgresDestination({ client, maintenance, env });
+    await checkPostgresDestination({ client, maintenance, env });
     // MARKED BEFORE THE MUTATION IT AUTHORISES, under the coordinator lock and immediately before
     // entry into draining, so that a crash anywhere in the destructive path leaves the attempt
     // recorded rather than erased. Over-recording costs an explicit operator retry; under-recording
@@ -896,23 +914,23 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     try {
       const graphCleanupBudget = operationBudget.child("install graph cleanup", deadlines.cleanupMs);
-      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines, budget: operationBudget, cleanupBudget: graphCleanupBudget, signal }));
+      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installPair({ client, session, opened, directory, env, maintenance, deadlines, budget: operationBudget, cleanupBudget: graphCleanupBudget, signal }));
       operationBudget.assert("installed transition");
       await transitionJournal(client, { runId: opened.manifest.runId, from: ["importing"], to: "verifying" });
-      await verifyInstalledPair({ client, session, graph, opened, deadlines, budget: operationBudget });
+      await verifyPair({ client, session, graph, opened, deadlines, budget: operationBudget });
       operationBudget.assert("ready pair sealing");
-      const readyPair = sealReadyRollback(opened, targetCommit, env);
+      const readyPair = sealReady(opened, targetCommit, env);
       await rollbackStore.putImmutable(readyPair.objectId, readyPair.sourceBytes);
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair failed durable read-back verification");
       operationBudget.assert("candidate boot");
-      const booted = await bootExact({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
+      const booted = await boot({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
       // M6: ASSIGNED FIRST, asserted second. `bootExact` commits `ready` — the deployment is verified
       // serving and the canonical identity is durable — so every step after it is bookkeeping. With
       // the assert first, a budget that expired during the health poll threw with `readyCommitted`
       // still null, and the catch below drained the healthy pair it had just installed.
       readyCommitted = booted.ready;
       operationBudget.assert("ready reconciliation");
-      const reconciled = await reconcileReadyInstall({ client, ready: readyCommitted, opened, sourceObjectId: objectId, rollbackStore, env });
+      const reconciled = await reconcile({ client, ready: readyCommitted, opened, sourceObjectId: objectId, rollbackStore, env });
       // Terminal on the success side. Recorded AFTER ready is committed so a later same-object
       // invocation reaches the already-ready reconciliation branch rather than a refusal.
       await finishAttempt(client, { objectId, status: "installed" });
@@ -975,7 +993,11 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       // Never call a rollback the session cannot execute, and never describe one that did not run.
       throw new Error(withNotes(`paired refresh failed and the importer's database session could not be reset, so the prior pair was NOT restored; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
     }
-    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal });
+    // Through the SAME `rollback` seam the interrupted-recovery branch above uses. Calling the
+    // import directly here left one of the two recovery entries un-substitutable, which is how the
+    // ready boundary's discriminating control — an identical expiry ONE STEP EARLIER, which must
+    // still roll back — was unreachable without a real two-store install.
+    await rollback({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal });
     throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
     });
   }
@@ -1011,6 +1033,29 @@ async function adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, 
   }
   phase("adopted-published-checkpoint", { objectId });
   return { objectId, digest };
+}
+
+/**
+ * HARNESS FAULT — THE ORDINARY FAILURE AFTER THE VERIFIED STOP, and it is a THROW, not a kill.
+ *
+ * The two `bootstrap-after-*` faults are SIGKILLs precisely because the catch is what does NOT run
+ * when a worker dies. This one is their complement: an ordinary in-band failure, so the catch DOES
+ * run — it redeploys the untouched baseline and leaves the journal `failed` with the interruption
+ * record deliberately retained. That is the state the H2 resume fix exists for and the one no
+ * SIGKILL scenario can produce: the next `bootstrap-rollback` meets a LIVE, serving baseline
+ * holding a shared reader lock, so it must re-enter `draining` and re-run `stopAndVerifyAll`
+ * before it can take the exclusive lock. A resume that went straight for the lock (which is what
+ * the code did) blocks there forever.
+ *
+ * Placed BEFORE the exclusive lock on both branches, so the failed attempt never held it — a retry
+ * that gets stuck can then only be stuck behind the SERVING pair, which is the property under test.
+ * Gated on `STAGING_PAIR_REQUIRED` like every other fault point, and fires once per invocation
+ * because the variable is set on one `docker compose run` container only.
+ */
+function bootstrapOrdinaryFailureFault(env, { runId, resumed }) {
+  if (env.STAGING_PAIR_REQUIRED !== "1" || env.STAGING_FAULT_POINT !== "bootstrap-after-stop-throw") return;
+  emitReceipt("fault-injected", { point: "bootstrap-after-stop-throw", runId, resumed, thrown: true });
+  throw new Error("injected harness bootstrap failure after the verified stop");
 }
 
 async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null, signal, beginRecoveryWatchdog }) {
@@ -1088,6 +1133,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
       await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "draining" });
       phase("stop-and-verify-all", { resumed: true });
       await maintenance.stopAndVerifyAll();
+      bootstrapOrdinaryFailureFault(env, { runId: bootstrapRunId, resumed: true });
       operationBudget.assert("bootstrap exclusive data lock");
       phase("acquire-exclusive-data-lock");
       await acquireExclusiveDataUseLock(client, env, "rollback bootstrap resume");
@@ -1120,6 +1166,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
         emitReceipt("fault-injected", { point: "bootstrap-after-stop", runId, kill: "SIGKILL" });
         process.kill(process.pid, "SIGKILL");
       }
+      bootstrapOrdinaryFailureFault(env, { runId, resumed: false });
       operationBudget.assert("bootstrap exclusive data lock");
       phase("acquire-exclusive-data-lock");
       await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
@@ -1383,6 +1430,63 @@ export async function importerPreflight(env = process.env, action = "install") {
   return true;
 }
 
+/**
+ * The idle wait between daemon ticks, raced against the shutdown.
+ *
+ * The traced defect: a bare `setTimeout` observed NOTHING, so a SIGTERM delivered to a daemon
+ * sitting between ticks was not acted on for up to five more minutes — and the tick that eventually
+ * ran then started its work under an already-aborted signal, which is the worst of both. Resolving
+ * on either the timer or the abort is what lets the loop leave promptly, through the same cleanup
+ * that settles owned work.
+ *
+ * The listener is removed on the timer path too: a five-minute daemon that never leaves the loop
+ * would otherwise accumulate one abort listener per tick for the life of the process.
+ */
+export function waitForAbortableInterval(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve("aborted");
+    const finish = (reason) => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); resolve(reason); };
+    const onAbort = () => finish("aborted");
+    const timer = setTimeout(() => finish("interval"), ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * The daemon's poll loop, extracted so the shutdown behaviour is a testable property rather than a
+ * source shape. Two things it must guarantee, and neither is visible from a `grep`:
+ *
+ *  - A shutdown delivered while IDLE ends the loop promptly, and no further tick is admitted. The
+ *    loop condition is re-checked after the wait for exactly that reason: a signal that arrives
+ *    during the wait must not be followed by one more tick.
+ *  - A shutdown delivered DURING a tick is not an error to log and retry. `installObject` refuses
+ *    new destructive work under cancellation by design, so `STAGING_OPERATION_ABORTED` is the
+ *    daemon being asked to stop, not a tick that went wrong.
+ *
+ * The five-minute floor stays at the CLI, where the operator-facing value is validated; passing a
+ * short interval here is how a test observes a whole cycle without waiting for one.
+ *
+ * @param {object} args
+ * @param {() => Promise<unknown>} args.tick one complete unit of daemon work
+ * @param {number} args.intervalMs idle wait between ticks
+ * @param {AbortSignal} args.signal the process shutdown signal
+ * @param {(error: unknown) => boolean} [args.isFatal] errors that must END the daemon, not be logged
+ * @param {(message: string) => void} [args.log] where a non-fatal tick failure is reported
+ */
+export async function runPollingDaemon({ tick, intervalMs, signal, isFatal = () => false, log = (message) => console.error(message) }) {
+  while (!signal.aborted) {
+    try { await tick(); }
+    catch (error) {
+      if (isFatal(error)) throw error;
+      if (error?.code !== "STAGING_OPERATION_ABORTED") {
+        log(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    await waitForAbortableInterval(intervalMs, signal);
+  }
+  return { status: "stopped", reason: "signal" };
+}
+
 export async function runImporter(env = process.env, argv = process.argv.slice(2), { activationRunner = runActivationPreflight, activationOptions = {}, now = undefined } = {}) {
   const action = argv[0];
   if (!new Set(["install-ops", "verify", "install", "bootstrap-rollback", "rollback", "tick", "daemon", "activation-preflight"]).has(action)) throw new Error("importer action must be install-ops, verify, install, bootstrap-rollback, rollback, tick, daemon, or activation-preflight");
@@ -1520,29 +1624,14 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     if (action === "tick") return await tick();
     const interval = Number(env.STAGING_IMPORTER_POLL_MS ?? 300_000);
     if (!Number.isFinite(interval) || interval < 300_000) throw new Error("importer poll interval must be at least five minutes");
-    // The idle wait observed NOTHING, so a SIGTERM delivered to a daemon sitting between ticks was
-    // not acted on for up to five more minutes — and the tick that eventually ran would then start
-    // its work under an already-aborted signal. Raced against the shutdown so the loop leaves
-    // promptly and cleanly, through the same cleanup that settles owned work.
-    const waitForNextTick = (ms) => new Promise((resolve) => {
-      if (shutdown.signal.aborted) return resolve();
-      const finish = () => { clearTimeout(timer); shutdown.signal.removeEventListener("abort", finish); resolve(); };
-      const timer = setTimeout(finish, ms);
-      shutdown.signal.addEventListener("abort", finish, { once: true });
-    });
-    while (!shutdown.signal.aborted) {
-      try { await tick(); }
-      catch (error) {
-        if (error?.code === "STAGING_OPERATION_TIMEOUT" || client.connection?.stream?.destroyed) throw error;
-        // A cancellation refusal is the daemon being asked to stop, not a tick that went wrong.
-        if (error?.code !== "STAGING_OPERATION_ABORTED") {
-          console.error(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-      await waitForNextTick(interval);
-    }
     // The outer cleanup below turns this into the coordinated STAGING_OPERATION_ABORTED result.
-    return { status: "stopped", reason: "signal" };
+    return await runPollingDaemon({
+      tick, intervalMs: interval, signal: shutdown.signal,
+      // A connection whose socket is gone cannot serve another tick, and a deadline breach is the
+      // daemon's own budget, not a candidate's failure. Both must end the loop rather than be
+      // logged and retried in five minutes.
+      isFatal: (error) => error?.code === "STAGING_OPERATION_TIMEOUT" || Boolean(client.connection?.stream?.destroyed),
+    });
   } finally {
     await actionWatchdog?.disarm();
     await watchdogOwner.disarmAll();

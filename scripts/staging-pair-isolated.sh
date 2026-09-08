@@ -203,12 +203,16 @@ bootstrap_interrupt() {
   "${compose[@]}" run --rm fixture-controller assert-source
 }
 
-# BOTH WINDOWS ARE CHAINED INTO ONE BOOTSTRAP LIFECYCLE, deliberately. `bootstrap-rollback` is
+# EVERY FAILURE MODE IS CHAINED INTO ONE BOOTSTRAP LIFECYCLE, deliberately. `bootstrap-rollback` is
 # one-time — it refuses once `last_ready` exists — so a resume that ran to completion would make the
-# second window unreachable in this harness. Attempt 1 dies after the stop; attempt 2 resumes from
-# that record and dies after publication; attempt 3 adopts the published object and completes. Each
-# attempt is a separate `run --rm` container, and nothing between them touches the maintenance API,
-# the object stores or the journal.
+# later scenarios unreachable in this harness. Attempt 1 dies after the stop; attempt 2 resumes from
+# that record and dies after publication; attempt 3 resumes and FAILS ORDINARILY, so its catch
+# restores the baseline; attempt 4 must therefore stop a serving pair again before it can adopt the
+# published object and complete. Each attempt is a separate `run --rm` container, and nothing
+# between them touches the maintenance API, the object stores or the journal.
+#
+# The ordinary failure cannot come FIRST: the `bootstrap-after-stop` SIGKILL window lives in the
+# non-resume branch, so any attempt following an ordinary failure resumes and could never reach it.
 bootstrap_interrupt bootstrap-after-stop bootstrap-killed-after-stop
 require_journal state draining "a bootstrap killed after its verified stop leaves staging fenced, not ready"
 [[ "$(journal_field last_ready_run_id)" == "" ]] || { echo "the interrupted bootstrap manufactured a last-ready pointer" >&2; exit 1; }
@@ -226,8 +230,57 @@ require_journal state draining "publication alone does not advance the journal"
 published_object="$(journal_field bootstrap_object_id)"
 [[ -n "$published_object" ]] || { echo "the published bootstrap checkpoint was not recorded before the kill" >&2; exit 1; }
 
-# ATTEMPT 3: adopt the published object and converge. No external deployment or journal surgery has
-# happened at any point in this sequence.
+# ── H2, THE OTHER HALF: AN ORDINARY FAILURE, AND THE RETRY THAT MUST STOP A SERVING BASELINE ────
+#
+# Both windows above are SIGKILLs, so the catch never ran and staging stayed stopped. The failure
+# mode the resume fix actually exists for is the opposite one: an ORDINARY in-band failure runs the
+# catch, which redeploys the untouched baseline and leaves the journal `failed` — so the documented
+# remedy ("re-run bootstrap-rollback") meets a LIVE app holding a shared reader lock. The old resume
+# branch went straight for the exclusive lock and blocked there until its deadline, and nothing
+# cleared the record either (`clearBootstrapRecovery` requires `ready`), so the bootstrap was
+# unrecoverable by any supplied command.
+#
+# ATTEMPT 3 is that ordinary failure, injected AFTER the verified stop and BEFORE the exclusive lock
+# — so the retry below can only ever be blocked by the SERVING pair, never by a lock this attempt
+# leaked. It resumes the `captured` record from window 2, which is retained across it.
+expect_failure bootstrap-ordinary-failure \
+  "${compose[@]}" run --rm -e STAGING_FAULT_POINT=bootstrap-after-stop-throw \
+  importer scripts/staging-ops/importer.mjs bootstrap-rollback
+require_receipt bootstrap-ordinary-failure.log fault-injected '"point":"bootstrap-after-stop-throw".*"thrown":true' \
+  "the ordinary-failure scenario threw after its verified stop rather than being killed"
+require_receipt bootstrap-ordinary-failure.log bootstrap-phase '"phase":"stop-and-verify-all".*"resumed":true' \
+  "the failing attempt re-proved the stop on the resume branch, which is where the fault fired"
+require_receipt bootstrap-ordinary-failure.log bootstrap-phase '"phase":"recovery-restart-deployment".*"measuredDeployment":true' \
+  "the ordinary catch ran — a SIGKILL scenario cannot produce this receipt"
+grep -q "prior staging deployment restored unchanged" "$harness_root/bootstrap-ordinary-failure.log" || {
+  echo "the ordinary bootstrap failure did not restore the baseline deployment it had stopped" >&2
+  sed -n '1,120p' "$harness_root/bootstrap-ordinary-failure.log" >&2
+  exit 1
+}
+# THE BASELINE IS SERVING AGAIN — measured at the maintenance API, not inferred from the message.
+# This is what makes the retry below a real re-stop rather than a resume of a stopped world.
+restored_app="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=app-local')"
+node -e 'const x=JSON.parse(process.argv[1]);if(!x.deployments.length){console.error("the ordinary bootstrap failure left no serving app deployment");process.exit(1)}' "$restored_app"
+require_journal state failed "an ordinary bootstrap failure leaves the journal failed, with the baseline restored"
+require_journal last_safe_checkpoint bootstrap-failed-prior-restored "the failed bootstrap recorded that the prior deployment came back"
+# THE RECORD SURVIVES THE ORDINARY FAILURE. It is cleared in exactly one place — after ready is
+# committed — because an ordinary failure leaves the same baseline identity a kill would have, and
+# the retry needs it for the same reason.
+[[ "$(journal_field bootstrap_run_id)" == "$interrupted_run" ]] || {
+  echo "the ordinary bootstrap failure discarded the interruption record the retry depends on" >&2
+  exit 1
+}
+[[ "$(journal_field bootstrap_object_id)" == "$published_object" ]] || {
+  echo "the ordinary bootstrap failure discarded the published checkpoint identity" >&2
+  exit 1
+}
+[[ "$(journal_field last_ready_run_id)" == "" ]] || { echo "the failed bootstrap manufactured a last-ready pointer" >&2; exit 1; }
+"${compose[@]}" run --rm fixture-controller assert-source
+
+# ATTEMPT 4: the retry. It adopts the published object and converges — and to get there it must
+# re-enter `draining` and re-run `stopAndVerifyAll` FIRST, because the app it has to displace is the
+# one attempt 3's recovery put back. No external deployment or journal surgery has happened at any
+# point in this sequence.
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs bootstrap-rollback \
   >"$harness_root/bootstrap-resume-after-publish.log" 2>&1 || {
   echo "a replacement worker could not resume the bootstrap interrupted after publication" >&2
@@ -237,6 +290,12 @@ published_object="$(journal_field bootstrap_object_id)"
 cat "$harness_root/bootstrap-resume-after-publish.log"
 require_receipt bootstrap-resume-after-publish.log bootstrap-phase '"phase":"adopted-published-checkpoint"' \
   "the final worker ADOPTED the already-published checkpoint rather than orphaning it and capturing a second one"
+# THE ORDERING IS THE FIX, so it is asserted as an ordering and not as three independent greps. A
+# resume that took the exclusive lock first would emit `acquire-exclusive-data-lock` before the
+# re-stop — and against the serving baseline attempt 3 restored, it would never emit anything after
+# it. The checker is a file, not `node -e`, so the parser itself is exercised by a unit test in both
+# directions rather than being trusted to have matched anything.
+node scripts/staging-ops/assert-bootstrap-resume-order.mjs "$harness_root/bootstrap-resume-after-publish.log"
 require_journal state ready "the resumed bootstrap reached a verified prior pair and a serving baseline"
 require_journal last_ready_mode "$baseline_mode" "the resumed bootstrap retained the configured baseline mode"
 [[ "$(journal_field last_ready_run_id)" == "$interrupted_run" ]] || { echo "the recovered bootstrap did not retain its original run identity" >&2; exit 1; }
