@@ -1,8 +1,31 @@
-import { describe, expect, it } from "vitest";
-import { readFileSync, readdirSync, statSync, realpathSync } from "node:fs";
+import { afterAll, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join, dirname, relative, resolve as resolvePath } from "node:path";
 import ts from "typescript";
+import {
+  analyseTreeAt,
+  discoverSourcePaths,
+  NOT_WALKED_ROOTS,
+  WALK_SOURCE_EXT,
+  WALKED_ROOTS,
+} from "./entry-surface-discovery";
+import {
+  analyseEntrySurfaces,
+  isGraphSourceFile,
+  CANONICAL_WRITER_MODULE,
+  COMPUTED_LOAD_EXCEPTIONS,
+  ENTRY_CLASSES,
+  ENTRY_INVENTORY,
+  GRAPH_SOURCE_EXT,
+  PINNED_TS_PATHS,
+  type ComputedLoadException,
+  type EntryClass,
+  type EntryRecord,
+  type EntrySurfaceAnalysis,
+  type EntryViolationKind,
+} from "./entry-surface-graph";
 
 /**
  * Pin the §11 context-partition CALL SITES, and — since AUDITFIX-2 — ENUMERATE them.
@@ -26,13 +49,20 @@ import ts from "typescript";
  * nothing here validates a rationale, proves a reconcile is REACHED on a given branch, or checks
  * any latency claim. The `latency` notes are documentation for a human, not assertions.
  *
- * ## What it deliberately does NOT catch — stated, because the limit is the interesting part
+ * ## The second half — ENTRY SURFACES, by reverse import closure (AUDITFIX-18)
  *
- * A NEW ENTRY SURFACE THAT CALLS AN EXISTING, ALREADY-CLASSIFIED WRAPPER. `POST /api/v1/codebases`
- * calls `ingestCodebaseScan`, not `ingestItem`; add a second route calling the same helper and no
- * new direct call site appears and this guard stays green. Closing that needs a whole-program call
- * graph from every route/action entry point — AUDITFIX-18. The entry surfaces known today are
- * listed in the spec's §3e.
+ * The direct-writer inventory above cannot see A NEW ENTRY SURFACE THAT CALLS AN EXISTING,
+ * ALREADY-CLASSIFIED WRAPPER: `POST /api/v1/codebases` calls `ingestCodebaseScan`, not `ingestItem`,
+ * so a second route calling the same helper adds no direct call site and leaves that half green.
+ * The `describe` at the foot of this file closes it — NOT with a whole-program call graph, which is
+ * what this header used to promise, but with the reverse closure of MODULE IMPORTS from the
+ * canonical writer (`./entry-surface-graph`). It follows edges, so it names files that can REACH the
+ * writer; it does not decide which exported function runs, so each `ENTRY_INVENTORY` record is a
+ * REVIEW DECLARATION rather than a structural fact. The two inventories answer different questions
+ * and keep their own rules:
+ *
+ *   INVENTORY      — who calls `ingestItem` DIRECTLY. Exact counts + per-class structural checks.
+ *   ENTRY_INVENTORY — who can REACH it through imports. Exact keys + a written reason. No shape check.
  *
  * ## Why an AST walk and not a grep
  *
@@ -518,76 +548,18 @@ function reconcileShape(rel: string, src: ts.SourceFile): { calls: number; insid
 /* ────────────────────────── analysis over the real tree ────────────────────────── */
 
 /**
- * Directories walked, and every top-level directory NOT walked WITH ITS REASON.
- *
- * ⚠️ FABLE DIFF REVIEW, HIGH 2. The previous list was `["lib", "app", "scripts"]`, which silently
- * omitted `components/` — 109 shipped files, several already importing `lib/ingest/*` — plus every
- * ROOT-LEVEL source (`instrumentation.ts`, `proxy.ts`) and every non-`.ts` extension. A guard whose
- * coverage shrinks silently as the repo grows is the failure it exists to prevent, so the two lists
- * below must together account for the ENTIRE top level (asserted by AC9) — a new shipped directory
- * fails the build until someone decides which list it belongs in.
+ * The walk — its roots, its exclusions and its extension list — now lives in
+ * `./entry-surface-discovery` with the ROOT INJECTED, and these are the same values under the names
+ * the criteria below already used. The move is behaviour-preserving; what it buys is that a fixture
+ * can run the REAL walk against a throwaway tree (see `fixtureRoot`), which is impossible while the
+ * only caller is `ROOT`. The rationale for each list is in that module's header (Fable HIGH 2:
+ * `components/` and the root-level sources were once silently outside coverage).
  */
-const WALKED = ["app", "components", "lib", "scripts"] as const;
-const NOT_WALKED: Record<string, string> = {
-  // Added by the staging paired-refresh work: runner env EXAMPLES and the schedule/storage
-  // contract. Declarative data with no executable source — nothing here can write an item. The
-  // guard did its job: this directory arrived unclassified and failed the build until someone said
-  // which list it belongs in.
-  config: "runner configuration examples + the schedules/storage contract (no executable source)",
-  docker: "container bootstrap (.mjs/.sh); calls the drain rather than the writer",
-  docs: "prose",
-  fixtures: "test data",
-  graphiti: "the Python graph sidecar — HTTP-only to the brain",
-  ingestion: "the Python connector sidecar — HTTP-only to the brain",
-  postgres: "SQL schema + migrations",
-  public: "static assets",
-  test: "tests are not writers",
-  validation: "evaluation fixtures/reports",
-};
-const SOURCE_EXT = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"];
+const WALKED = WALKED_ROOTS;
+const NOT_WALKED = NOT_WALKED_ROOTS;
+const SOURCE_EXT = WALK_SOURCE_EXT;
 
-const SKIP_FILE = (rel: string) =>
-  /\.test\.tsx?$/.test(rel) ||
-  rel.endsWith(".d.ts") ||
-  rel === CANONICAL ||
-  // Not a writer: an in-memory PostgREST double used only by tests.
-  rel === "lib/ingest/fake-supabase.ts";
-
-function productionFiles(): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const walk = (relDir: string) => {
-    for (const name of readdirSync(join(ROOT, relDir))) {
-      if (name === "node_modules" || name.startsWith(".")) continue;
-      const rel = `${relDir}/${name}`;
-      // A broken symlink or an unreadable entry must not crash the guard (Codex LOW 1).
-      let st: ReturnType<typeof statSync>;
-      try {
-        st = statSync(join(ROOT, rel));
-      } catch {
-        continue;
-      }
-      if (st.isDirectory()) {
-        // Symlinked directories would loop or double-count; visit each real path once.
-        const real = relative(ROOT, realpathSync(join(ROOT, rel)));
-        if (seen.has(real)) continue;
-        seen.add(real);
-        walk(rel);
-      } else if (SOURCE_EXT.some((e) => rel.endsWith(e)) && !SKIP_FILE(rel)) out.push(rel);
-    }
-  };
-  for (const r of WALKED) walk(r);
-  // Root-level sources ship too (`instrumentation.ts`, `proxy.ts`) and the old walk never saw them.
-  for (const name of readdirSync(ROOT)) {
-    if (!SOURCE_EXT.some((e) => name.endsWith(e)) || SKIP_FILE(name)) continue;
-    try {
-      if (statSync(join(ROOT, name)).isFile()) out.push(name);
-    } catch {
-      /* unreadable root entry */
-    }
-  }
-  return out.sort();
-}
+const productionFiles = (): string[] => discoverSourcePaths(ROOT);
 
 export interface Violation {
   kind: "unclassified" | "stale" | "refused" | "shape";
@@ -917,5 +889,1697 @@ describe("§11 context-partition call sites", () => {
     // the two paths could partition an item differently. Pin the shared dependency.
     expect(read("lib/projects/context/backfill.ts")).toMatch(/reconcileItemContext/);
     expect(read("lib/projects/context/reconcile-item.ts")).toMatch(/closeMembershipInto/);
+  });
+});
+
+/* ═════════════ AUDITFIX-18 — the ENTRY SURFACES, by reverse import closure ═════════════ */
+
+/**
+ * The limit this file's own header names — "A NEW ENTRY SURFACE THAT CALLS AN EXISTING,
+ * ALREADY-CLASSIFIED WRAPPER" — is what the criteria below close.
+ *
+ * The analysis lives in `./entry-surface-graph` so fixtures and the real tree run the SAME code
+ * (a second copy in here would only prove the copy agrees with itself). The direct-writer half
+ * above is untouched: it keeps its exact counts and structural obligations, and the two inventories
+ * answer different questions — WHO WRITES (structural, checkable) vs WHO CAN REACH THE WRITER
+ * (a review declaration, explicitly not a claim that an ingest runs there).
+ */
+
+const SEED = { rel: CANONICAL, code: `export async function ${WRITER}(db, auth, p, team) { return { id: "i1" }; }` };
+
+/** A plain `lib/` wrapper: one hop from the seed, and never a surface itself. */
+const WRAP = (rel = "lib/wrap.ts", prefix = "") => ({
+  rel,
+  code: `${prefix}${IMPORT_CANON}\nexport type WOpts = { team: string };\nexport const w = async (a) => ${WRITER}(a);\nexport const readOnly = () => "no write here";`,
+});
+
+/** The real topology of the escape: route → ingestCodebaseScan → projectCommitsToItems → writer. */
+const WRAPPER_CHAIN = [
+  SEED,
+  {
+    rel: "lib/codebases/commits-to-items.ts",
+    code: `${IMPORT_CANON}\nexport async function projectCommitsToItems(a) { await ${WRITER}(a); }`,
+  },
+  {
+    rel: "lib/codebases/ingest.ts",
+    code: `import { projectCommitsToItems } from "@/lib/codebases/commits-to-items";\nexport async function ingestCodebaseScan(a) { await projectCommitsToItems(a); }`,
+  },
+  {
+    rel: "app/api/v1/codebases/route.ts",
+    code: `import { ingestCodebaseScan } from "@/lib/codebases/ingest";\nexport async function POST() { await ingestCodebaseScan({}); }`,
+  },
+];
+const NEW_ROUTE = {
+  rel: "app/api/v2/scans/route.ts",
+  code: `import { ingestCodebaseScan } from "@/lib/codebases/ingest";\nexport async function POST() { await ingestCodebaseScan({}); }`,
+};
+
+const REC = (cls: EntryClass = "IMPORT_ONLY", reason = "fixture: enters through lib/codebases/ingest.ts"): EntryRecord => ({ class: cls, reason });
+const entryInv = (...rels: string[]): Record<string, EntryRecord> => Object.fromEntries(rels.map((r) => [r, REC()]));
+const NO_ENTRIES: Record<string, EntryRecord> = {};
+
+/** Kinds that mean "the analysis could not see something", as opposed to "a record is missing". */
+const DIAGNOSTIC_KINDS: EntryViolationKind[] = [
+  "unresolved",
+  "refused-load",
+  "unsupported-alias",
+  "unsupported-directory-manifest",
+  "unsupported-file-url",
+  "parse",
+  "stale-exception",
+  "excluded-ref",
+];
+const diagnostics = (r: EntrySurfaceAnalysis) => r.violations.filter((v) => DIAGNOSTIC_KINDS.includes(v.kind)).map((v) => v.message);
+const ofKind = (r: EntrySurfaceAnalysis, kind: EntryViolationKind) => r.violations.filter((v) => v.kind === kind);
+
+/* ── a throwaway repository ROOT on disk, for the criteria that must exercise the REAL walk ──────
+ *
+ * Astra medium 1. The production file set is what the WALK YIELDS, and the walk is where excluded
+ * sources are dropped — so a synthetic file list can only ever model "the excluded file does not
+ * exist", never "it exists and the walk did not hand it over". Those are different inputs, and the
+ * second is the one the real path actually produces. These fixtures therefore plant a miniature
+ * repository in a temp directory and run `analyseTreeAt`, the same seam `AC18-07` runs against this
+ * repository, with the root injected.
+ *
+ * Nothing is written inside this repository, and both halves of resolution — the walk's output AND
+ * the file-existence evidence the seam supplies — are scoped to the INJECTED root, so no fixture can
+ * reach the real tree. (The virtual fixtures get no host at all; `AC18-05b` and `AC18-05p` are the
+ * two halves of that control.)
+ */
+const fixtureRoots: string[] = [];
+afterAll(() => {
+  for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true });
+});
+
+function fixtureRoot(files: Record<string, string>): string {
+  // realpath'd on creation: macOS hands out `/var/…` for a `/private/var/…` directory, and the
+  // walk's symlink de-duplication compares realpaths against the root it was given.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "auditfix18-entry-")));
+  fixtureRoots.push(root);
+  // Every walked root EXISTS, used or not: the walk reads all four unconditionally, exactly as it
+  // does here, and a fixture must not quietly require it to tolerate a missing one.
+  for (const dir of WALKED) mkdirSync(join(root, dir), { recursive: true });
+  for (const [rel, code] of Object.entries(files)) {
+    mkdirSync(join(root, dirname(rel)), { recursive: true });
+    writeFileSync(join(root, rel), code);
+  }
+  return root;
+}
+
+/** The anchor surface every on-disk fixture keeps: proof the walk found the tree at all. */
+const ANCHOR = "app/api/anchor/route.ts";
+
+/** The miniature repository each on-disk fixture starts from: seed → wrapper → one anchor surface. */
+const MINI_REPO: Record<string, string> = {
+  // The WALK skips the canonical writer (it is not one of its own callers) and the GRAPH adds it
+  // back as the seed. Planting it keeps the fixture an honest model of the real topology rather
+  // than of a repository where the writer happens not to exist.
+  "lib/ingest/index.ts": `export async function ${WRITER}(db, auth, p, team) { return { id: "i1" }; }`,
+  "lib/wrap.ts": `${IMPORT_CANON}\nexport const w = async (a) => ${WRITER}(a);`,
+  [ANCHOR]: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }`,
+};
+
+describe("§11 entry surfaces — the REVERSE-IMPORT INVENTORY (AUDITFIX-18)", () => {
+  it("AC18-02 — a NEW route through an ALREADY-CLASSIFIED wrapper fails, and the direct-writer set does not move", () => {
+    const withNew = [...WRAPPER_CHAIN, NEW_ROUTE];
+
+    // ── THE ESCAPE, stated as an equality. The old invariant literally cannot tell these apart:
+    // the second route adds no `ingestItem` call site, so AC3's set-equality stays green while a
+    // brand-new HTTP entry into the substrate ships unreviewed. If this equality ever breaks, the
+    // fixture stopped modelling the escape and the criterion below is proving something else.
+    expect(analyse(withNew, NO_INVENTORY).sites).toEqual(analyse(WRAPPER_CHAIN, NO_INVENTORY).sites);
+    expect(analyse(withNew, NO_INVENTORY).sites).toEqual({ "lib/codebases/commits-to-items.ts": 1 });
+
+    // ── and what the new analysis must do about it.
+    const r = analyseEntrySurfaces(withNew, entryInv("app/api/v1/codebases/route.ts"));
+    expect(r.surfaces, "the new route is an entry surface").toContain(NEW_ROUTE.rel);
+    const missing = ofKind(r, "unclassified-entry");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].message).toContain(NEW_ROUTE.rel);
+    // The WITNESS is the actionable half: a failure that says "unclassified" without saying how the
+    // file reaches the writer sends the reader on the search this guard was built to do for them.
+    expect(missing[0].message, "the failure must show the path to the writer").toContain("lib/codebases/ingest.ts");
+    expect(missing[0].message).toContain(CANONICAL);
+    expect(r.witness[NEW_ROUTE.rel]).toEqual([
+      NEW_ROUTE.rel,
+      "lib/codebases/ingest.ts",
+      "lib/codebases/commits-to-items.ts",
+      CANONICAL,
+    ]);
+  });
+
+  it("AC18-02b — classifying that same surface with a concrete reason makes the SAME fixture pass", () => {
+    // The positive twin. Without it, an analysis that failed everything would satisfy AC18-02.
+    const r = analyseEntrySurfaces([...WRAPPER_CHAIN, NEW_ROUTE], entryInv("app/api/v1/codebases/route.ts", NEW_ROUTE.rel));
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  it.each([
+    { n: "an empty reason", rec: { class: "IMPORT_ONLY", reason: "" } as EntryRecord, kind: "blank-reason" as EntryViolationKind },
+    { n: "a whitespace reason", rec: { class: "SWEEP_DEPENDENT", reason: "   " } as EntryRecord, kind: "blank-reason" as EntryViolationKind },
+    { n: "a class nobody defined", rec: { class: "PROBABLY_FINE" as unknown as EntryClass, reason: "it looked ok" }, kind: "unknown-class" as EntryViolationKind },
+  ])("AC18-02c — a record that is not a decision fails: $n", ({ rec, kind }) => {
+    const inv = { "app/api/v1/codebases/route.ts": REC(), [NEW_ROUTE.rel]: rec };
+    const r = analyseEntrySurfaces([...WRAPPER_CHAIN, NEW_ROUTE], inv);
+    expect(r.violations.map((v) => v.kind)).toContain(kind);
+    expect(r.violations.map((v) => v.message).join("\n")).toContain(NEW_ROUTE.rel);
+  });
+
+  it("AC18-02d — the closure comes from the GRAPH, never from the inventory", () => {
+    // Seeding from the hand-maintained list would let an OMITTED entry erase its own callers — the
+    // exact shape of the AUDITFIX-2 miss, one layer up. So the discovered set must be identical
+    // whether the inventory is empty or full; only the violations may differ.
+    const files = [...WRAPPER_CHAIN, NEW_ROUTE];
+    const empty = analyseEntrySurfaces(files, NO_ENTRIES);
+    const full = analyseEntrySurfaces(files, entryInv("app/api/v1/codebases/route.ts", NEW_ROUTE.rel));
+    expect(empty.surfaces).toEqual(full.surfaces);
+    expect(empty.closure).toEqual(full.closure);
+    expect(empty.surfaces).toEqual(["app/api/v1/codebases/route.ts", NEW_ROUTE.rel]);
+  });
+
+  it("AC18-01 — a reached `lib/` module is a graph NODE, not a second inventory entry", () => {
+    // The two inventories stay disjoint. `lib/codebases/commits-to-items.ts` is a direct writer with
+    // its own INVENTORY record and structural obligations; it is traversed here (or the route above
+    // could never be found) and it is NOT an entry surface, so it needs no entry record and the old
+    // classification keeps meaning exactly what it meant.
+    const r = analyseEntrySurfaces(WRAPPER_CHAIN, entryInv("app/api/v1/codebases/route.ts"));
+    expect(r.closure).toContain("lib/codebases/commits-to-items.ts");
+    expect(r.closure).toContain("lib/codebases/ingest.ts");
+    expect(r.surfaces).toEqual(["app/api/v1/codebases/route.ts"]);
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  // ── AC18-03: every SPELLING of a module edge reaches the seed ──────────────────────────────────
+  //
+  // AUDITFIX-1's guard was beaten three times by new spellings of one act and AUDITFIX-2's twice
+  // more; the same lesson applies to edges rather than call sites. Each row is a spelling, and the
+  // assertion is that the edge is FOLLOWED — not that the symbol is used, which this analysis
+  // deliberately does not decide.
+  const ROUTE = "app/api/x/route.ts";
+  const FORMS: { n: string; files: { rel: string; code: string }[]; reaches: string[]; surfaces: string[] }[] = [
+    { n: "01 named import", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "02 renamed import", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w as go } from "@/lib/wrap";\nexport async function POST(){ await go({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "03 default import", files: [SEED, { rel: "lib/wrap.ts", code: `${IMPORT_CANON}\nexport default async function wrap(a){ await ${WRITER}(a); }` }, { rel: ROUTE, code: `import wrap from "@/lib/wrap";\nexport async function POST(){ await wrap({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "04 namespace import", files: [SEED, WRAP(), { rel: ROUTE, code: `import * as wrap from "@/lib/wrap";\nexport async function POST(){ await wrap.w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "05 side-effect import, no bindings at all", files: [SEED, WRAP(), { rel: ROUTE, code: `import "@/lib/wrap";\nexport async function POST(){ return null; }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "06 export-from, named", files: [SEED, WRAP(), { rel: "lib/barrel.ts", code: `export { w } from "@/lib/wrap";` }, { rel: ROUTE, code: `import { w } from "@/lib/barrel";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.ts", "lib/barrel.ts"], surfaces: [ROUTE] },
+    { n: "07 export-from, renamed", files: [SEED, WRAP(), { rel: "lib/barrel.ts", code: `export { w as write } from "@/lib/wrap";` }, { rel: ROUTE, code: `import { write } from "@/lib/barrel";\nexport async function POST(){ await write({}); }` }], reaches: ["lib/wrap.ts", "lib/barrel.ts"], surfaces: [ROUTE] },
+    { n: "08 export * from", files: [SEED, WRAP(), { rel: "lib/barrel.ts", code: `export * from "@/lib/wrap";` }, { rel: ROUTE, code: `import { w } from "@/lib/barrel";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.ts", "lib/barrel.ts"], surfaces: [ROUTE] },
+    { n: "09 export * as ns from", files: [SEED, WRAP(), { rel: "lib/barrel.ts", code: `export * as wrap from "@/lib/wrap";` }, { rel: ROUTE, code: `import { wrap } from "@/lib/barrel";\nexport async function POST(){ await wrap.w({}); }` }], reaches: ["lib/wrap.ts", "lib/barrel.ts"], surfaces: [ROUTE] },
+    { n: "10 import = require()", files: [SEED, WRAP(), { rel: ROUTE, code: `import wrap = require("@/lib/wrap");\nexport async function POST(){ await wrap.w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "11 awaited literal dynamic import", files: [SEED, WRAP(), { rel: ROUTE, code: `export async function POST(){ const { w } = await import("@/lib/wrap"); await w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "12 UN-awaited literal dynamic import", files: [SEED, WRAP(), { rel: ROUTE, code: `const pending = import("@/lib/wrap");\nexport async function POST(){ return pending; }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "13 require() buried deep in the AST", files: [SEED, WRAP(), { rel: ROUTE, code: `export async function POST(cond){ if (cond) { for (const k of []) { return require("@/lib/wrap").w(k); } } }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "14 directory index", files: [SEED, WRAP("lib/wrap/index.ts"), { rel: ROUTE, code: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap/index.ts"], surfaces: [ROUTE] },
+    { n: "15 explicit .ts extension", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w } from "@/lib/wrap.ts";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "16 emitted .js name → the .ts source", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w } from "@/lib/wrap.js";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "17 emitted .jsx name → the .tsx source", files: [SEED, WRAP("lib/wrap.tsx"), { rel: ROUTE, code: `import { w } from "@/lib/wrap.jsx";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.tsx"], surfaces: [ROUTE] },
+    { n: "18 emitted .mjs name → the .mts source", files: [SEED, WRAP("lib/wrap.mts"), { rel: ROUTE, code: `import { w } from "@/lib/wrap.mjs";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.mts"], surfaces: [ROUTE] },
+    { n: "19 emitted .cjs name → the .cts source", files: [SEED, WRAP("lib/wrap.cts"), { rel: ROUTE, code: `import { w } from "@/lib/wrap.cjs";\nexport async function POST(){ await w({}); }` }], reaches: ["lib/wrap.cts"], surfaces: [ROUTE] },
+    { n: "20 RELATIVE specifier (the spelling already in this tree)", files: [SEED, WRAP(), { rel: "scripts/tool.ts", code: `import { w } from "../lib/wrap";\nawait w({});` }], reaches: ["lib/wrap.ts"], surfaces: ["scripts/tool.ts"] },
+    { n: "21 a .cjs source with require()", files: [SEED, WRAP(), { rel: "scripts/tool.cjs", code: `const { w } = require("../lib/wrap");\nw({});` }], reaches: ["lib/wrap.ts"], surfaces: ["scripts/tool.cjs"] },
+    { n: "22 an imported symbol that is NEVER CALLED still keeps the edge", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w } from "@/lib/wrap";\nexport const unused = 1;` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "23 a MIXED value/type import keeps the edge", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w, type WOpts } from "@/lib/wrap";\nexport async function POST(o: WOpts){ await w(o); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+    { n: "24 a READER imported from a writer-bearing module still enters", files: [SEED, WRAP(), { rel: ROUTE, code: `import { readOnly } from "@/lib/wrap";\nexport function GET(){ return readOnly(); }` }], reaches: ["lib/wrap.ts"], surfaces: [ROUTE] },
+  ];
+
+  it.each(FORMS)("AC18-03 — the edge is followed: $n", ({ files, reaches, surfaces }) => {
+    const r = analyseEntrySurfaces(files, NO_ENTRIES);
+    for (const rel of reaches) expect(r.closure, `${rel} must be reached`).toContain(rel);
+    for (const rel of surfaces) expect(r.surfaces, `${rel} must be an entry surface`).toContain(rel);
+    // A form that quietly REFUSED would also "not miss" the edge; separate the two outcomes.
+    expect(diagnostics(r), "this form must resolve cleanly, not be refused").toEqual([]);
+  });
+
+  it("AC18-03b — a four-edge chain declared in REVERSE order reaches the seed, with the exact closure", () => {
+    // File order is an accident of the walk; the fixpoint must not depend on it. The surface is
+    // listed FIRST and the writer LAST, which is the order a single forward pass handles worst.
+    const page = "app/t/[team]/scans/page.tsx";
+    const files = [
+      { rel: page, code: `import { d } from "@/lib/d";\nexport default function P(){ return d; }` },
+      { rel: "lib/d.ts", code: `export { c as d } from "@/lib/c";` },
+      { rel: "lib/c.ts", code: `import { b } from "@/lib/b";\nexport const c = b;` },
+      { rel: "lib/b.ts", code: `import { a } from "@/lib/a";\nexport const b = a;` },
+      { rel: "lib/a.ts", code: `${IMPORT_CANON}\nexport const a = async (x) => ${WRITER}(x);` },
+      SEED,
+    ];
+    const r = analyseEntrySurfaces(files, NO_ENTRIES);
+    expect(r.closure).toEqual([CANONICAL, page, "lib/a.ts", "lib/b.ts", "lib/c.ts", "lib/d.ts"].sort());
+    expect(r.surfaces).toEqual([page]);
+    expect(r.witness[page]).toEqual([page, "lib/d.ts", "lib/c.ts", "lib/b.ts", "lib/a.ts", CANONICAL]);
+  });
+
+  it("AC18-03c — an import CYCLE terminates, with the exact closure", () => {
+    const files = [
+      SEED,
+      { rel: "lib/cycle-a.ts", code: `${IMPORT_CANON}\nimport { b } from "@/lib/cycle-b";\nexport const a = async (x) => { await ${WRITER}(x); return b; };` },
+      { rel: "lib/cycle-b.ts", code: `import { a } from "@/lib/cycle-a";\nexport const b = a;` },
+      { rel: "scripts/run-cycle.ts", code: `import { b } from "@/lib/cycle-b";\nb();` },
+    ];
+    const r = analyseEntrySurfaces(files, NO_ENTRIES);
+    expect(r.closure).toEqual([CANONICAL, "lib/cycle-a.ts", "lib/cycle-b.ts", "scripts/run-cycle.ts"].sort());
+    expect(r.surfaces).toEqual(["scripts/run-cycle.ts"]);
+    expect(r.witness["scripts/run-cycle.ts"]).toEqual(["scripts/run-cycle.ts", "lib/cycle-b.ts", "lib/cycle-a.ts", CANONICAL]);
+  });
+
+  it("AC18-03d — the witness is the SHORTEST chain, ties broken lexicographically, order-independent", () => {
+    // Two equal-length paths exist. Without a stated tie-break the diagnostic flips between runs and
+    // between file orderings, and a flapping witness is a diagnostic nobody trusts or can diff.
+    const hop = (rel: string) => ({ rel, code: `${IMPORT_CANON}\nexport const w = async (x) => ${WRITER}(x);` });
+    const route = { rel: ROUTE, code: `import { w as z } from "@/lib/zeta";\nimport { w as a } from "@/lib/alpha";\nexport async function POST(){ await z({}); await a({}); }` };
+    const files = [SEED, hop("lib/zeta.ts"), hop("lib/alpha.ts"), route];
+    const expected = [ROUTE, "lib/alpha.ts", CANONICAL];
+    expect(analyseEntrySurfaces(files, NO_ENTRIES).witness[ROUTE]).toEqual(expected);
+    expect(analyseEntrySurfaces([...files].reverse(), NO_ENTRIES).witness[ROUTE], "reversing the input must not move the witness").toEqual(expected);
+  });
+
+  // ── AC18-04: what IS a surface, what is only a node, and what never enters at all ─────────────
+  const SURFACES: { n: string; files: { rel: string; code: string }[]; surface: string }[] = [
+    { n: "an API route", files: [SEED, WRAP(), { rel: ROUTE, code: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }], surface: ROUTE },
+    { n: "a page", files: [SEED, WRAP(), { rel: "app/t/[team]/scans/page.tsx", code: `import { w } from "@/lib/wrap";\nexport default function P(){ return w; }` }], surface: "app/t/[team]/scans/page.tsx" },
+    { n: "a layout", files: [SEED, WRAP(), { rel: "app/t/[team]/layout.tsx", code: `import { w } from "@/lib/wrap";\nexport default function L({ children }){ return children ?? w; }` }], surface: "app/t/[team]/layout.tsx" },
+    { n: "a server-action file", files: [SEED, WRAP(), { rel: "app/t/[team]/admin/x/actions.ts", code: `"use server";\nimport { w } from "@/lib/wrap";\nexport async function run(){ await w({}); }` }], surface: "app/t/[team]/admin/x/actions.ts" },
+    { n: "a component", files: [SEED, WRAP(), { rel: "components/Widget.tsx", code: `import { w } from "@/lib/wrap";\nexport function Widget(){ return null; }` }], surface: "components/Widget.tsx" },
+    { n: "a .jsx component (the extension the old walk never read)", files: [SEED, WRAP(), { rel: "components/Legacy.jsx", code: `import { w } from "@/lib/wrap";\nexport function Legacy(){ return null; }` }], surface: "components/Legacy.jsx" },
+    { n: "a CLI script", files: [SEED, WRAP(), { rel: "scripts/tool.ts", code: `import { w } from "@/lib/wrap";\nawait w({});` }], surface: "scripts/tool.ts" },
+    { n: "a script HELPER, not the entry file", files: [SEED, WRAP(), { rel: "scripts/lib/helper.ts", code: `import { w } from "@/lib/wrap";\nexport const help = () => w;` }], surface: "scripts/lib/helper.ts" },
+    { n: "a root-level source", files: [SEED, WRAP(), { rel: "boot-hook.ts", code: `export async function register(){ const { w } = await import("@/lib/wrap"); await w({}); }` }], surface: "boot-hook.ts" },
+    { n: "a lib file with a SOURCE-level `use server` directive", files: [SEED, WRAP(), { rel: "lib/x/actions.ts", code: `"use server";\nimport { w } from "@/lib/wrap";\nexport async function run(){ await w({}); }` }], surface: "lib/x/actions.ts" },
+    { n: "a lib file with a FUNCTION-BODY `use server` directive", files: [SEED, WRAP(), { rel: "lib/y/actions.ts", code: `import { w } from "@/lib/wrap";\nexport async function run(){ "use server";\n await w({}); }` }], surface: "lib/y/actions.ts" },
+    // The body-bearing forms are not just `function` declarations: an action written as an arrow
+    // (the common `export const run = async () => { "use server"; … }`) must still be a surface, so
+    // narrowing the directive walk to declarations alone reddens here.
+    { n: "a lib file with an ARROW-BODY `use server` directive", files: [SEED, WRAP(), { rel: "lib/arrow/actions.ts", code: `import { w } from "@/lib/wrap";\nexport const run = async () => { "use server";\n await w({}); };` }], surface: "lib/arrow/actions.ts" },
+    { n: "a lib file with a METHOD-BODY `use server` directive", files: [SEED, WRAP(), { rel: "lib/method/actions.ts", code: `import { w } from "@/lib/wrap";\nexport class Runner { async run(){ "use server";\n await w({}); } }` }], surface: "lib/method/actions.ts" },
+    { n: "a lib file whose directive follows a \"use strict\" prologue entry", files: [SEED, WRAP(), { rel: "lib/z/actions.ts", code: `"use strict";\n"use server";\nimport { w } from "@/lib/wrap";\nexport async function run(){ await w({}); }` }], surface: "lib/z/actions.ts" },
+  ];
+
+  it.each(SURFACES)("AC18-04 — a surface needing a record: $n", ({ files, surface }) => {
+    const unclassified = analyseEntrySurfaces(files, NO_ENTRIES);
+    expect(unclassified.surfaces).toContain(surface);
+    expect(ofKind(unclassified, "unclassified-entry").map((v) => v.message).join("\n")).toContain(surface);
+    // …and its positive twin in the same row, so a "fail everything" analysis satisfies neither half.
+    const withRecord = analyseEntrySurfaces(files, entryInv(surface));
+    expect(withRecord.violations.map((v) => v.message)).toEqual([]);
+    expect(diagnostics(unclassified)).toEqual([]);
+  });
+
+  const NODES_NOT_SURFACES: { n: string; code: string }[] = [
+    { n: "a plain lib wrapper", code: `import { w } from "@/lib/wrap";\nexport const passthrough = w;` },
+    { n: "`use server` in a COMMENT", code: `// "use server"\nimport { w } from "@/lib/wrap";\nexport const p = w;` },
+    { n: "`use server` as a TYPE", code: `import { w } from "@/lib/wrap";\nexport type Mode = "use server";\nexport const p = w;` },
+    { n: "`use server` as an arbitrary expression", code: `import { w } from "@/lib/wrap";\nexport const mode = "use server";\nexport const p = w;` },
+    { n: "`use server` AFTER a statement (not a prologue)", code: `import { w } from "@/lib/wrap";\nexport const p = w;\n"use server";` },
+    { n: "`use server` as a TEMPLATE literal (not a directive)", code: "`use server`;\nimport { w } from \"@/lib/wrap\";\nexport const p = w;" },
+    { n: "`use server` inside a function body but NOT in its prologue", code: `import { w } from "@/lib/wrap";\nexport async function run(){ const a = 1; "use server";\n await w({ a }); }` },
+  ];
+
+  it.each(NODES_NOT_SURFACES)("AC18-04b — traversed, but NOT a surface: $n", ({ code }) => {
+    const rel = "lib/candidate.ts";
+    const r = analyseEntrySurfaces([SEED, WRAP(), { rel, code }], NO_ENTRIES);
+    expect(r.closure, "it is still a graph node — the traversal must go THROUGH it").toContain(rel);
+    expect(r.surfaces).not.toContain(rel);
+    expect(r.violations.map((v) => v.message), "a non-surface node needs no entry record").toEqual([]);
+  });
+
+  const NEVER_ENTERS: { n: string; files: { rel: string; code: string }[] }[] = [
+    { n: "import type", files: [SEED, WRAP(), { rel: ROUTE, code: `import type { WOpts } from "@/lib/wrap";\nexport async function POST(o: WOpts){ return o; }` }] },
+    { n: "export type … from", files: [SEED, WRAP(), { rel: ROUTE, code: `export type { WOpts } from "@/lib/wrap";` }] },
+    { n: "a wholly type-only named import", files: [SEED, WRAP(), { rel: ROUTE, code: `import { type WOpts } from "@/lib/wrap";\nexport async function POST(o: WOpts){ return o; }` }] },
+    { n: "an import-TYPE expression", files: [SEED, WRAP(), { rel: ROUTE, code: `type M = typeof import("@/lib/wrap");\nexport const m: M | null = null;` }] },
+    { n: "an unrelated module", files: [SEED, WRAP(), { rel: "lib/other.ts", code: `export const other = 1;` }, { rel: ROUTE, code: `import { other } from "@/lib/other";\nexport async function POST(){ return other; }` }] },
+    { n: "the specifier as a STRING, not an import", files: [SEED, WRAP(), { rel: ROUTE, code: `const spec = "@/lib/wrap";\nexport async function POST(){ return spec; }` }] },
+    { n: "a LOCAL function with the wrapper's export name", files: [SEED, WRAP(), { rel: ROUTE, code: `function w(x){ return x; }\nexport async function POST(){ return w(1); }` }] },
+  ];
+
+  it.each(NEVER_ENTERS)("AC18-04c — an innocent twin that never enters the closure: $n", ({ files }) => {
+    const r = analyseEntrySurfaces(files, NO_ENTRIES);
+    expect(r.closure, "the wrapper itself is still reached").toContain("lib/wrap.ts");
+    expect(r.closure).not.toContain(ROUTE);
+    expect(r.closure).not.toContain("lib/other.ts");
+    expect(r.surfaces).toEqual([]);
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  // ── AC18-05: resolution, and every way a reference could disappear quietly ────────────────────
+  it.each([
+    { n: ".ts", rel: "lib/a.ts", ok: true },
+    { n: ".tsx", rel: "components/A.tsx", ok: true },
+    { n: ".mts", rel: "lib/a.mts", ok: true },
+    { n: ".cts", rel: "lib/a.cts", ok: true },
+    { n: ".js", rel: "scripts/a.js", ok: true },
+    { n: ".jsx (added by this slice)", rel: "components/A.jsx", ok: true },
+    { n: ".mjs", rel: "scripts/a.mjs", ok: true },
+    { n: ".cjs", rel: "scripts/a.cjs", ok: true },
+    { n: "a .d.ts declaration", rel: "lib/a.d.ts", ok: false },
+    { n: "a .d.mts declaration", rel: "lib/a.d.mts", ok: false },
+    { n: "a test source", rel: "test/guards/a.test.ts", ok: false },
+    { n: "a .tsx test source", rel: "components/a.test.tsx", ok: false },
+    { n: "the in-memory PostgREST double", rel: "lib/ingest/fake-supabase.ts", ok: false },
+    { n: "the canonical writer (the graph adds it as its SEED, not as a walked node)", rel: CANONICAL, ok: false },
+    { n: "a stylesheet", rel: "app/globals.css", ok: false },
+    { n: "a JSON fixture", rel: "fixtures/x.json", ok: false },
+  ])("AC18-05 — the graph's source predicate: $n", ({ rel, ok }) => {
+    expect(isGraphSourceFile(rel)).toBe(ok);
+  });
+
+  it("AC18-05a — the walk's extension list and the graph's are ONE list", () => {
+    // Two lists drift; this slice adds `.jsx`, and a `.jsx` component that the WALK never yields is
+    // invisible no matter how good the graph is. Single owner, asserted.
+    expect([...SOURCE_EXT].sort()).toEqual([...GRAPH_SOURCE_EXT].sort());
+    expect(GRAPH_SOURCE_EXT).toContain(".jsx");
+    expect(CANONICAL_WRITER_MODULE, "the graph's seed IS this file's canonical writer").toBe(CANONICAL);
+  });
+
+  it("AC18-05b — fixtures resolve against the SUPPLIED files only, never against the real disk", () => {
+    // `lib/query/retrieve.ts` genuinely exists in this repository. If the analysis falls back to the
+    // filesystem, every fixture silently acquires the real tree as a resolution host and the
+    // synthetic controls stop meaning what they say.
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\nimport { retrieve } from "@/lib/query/retrieve";\nexport async function POST(){ await w({}); return retrieve; }` }],
+      entryInv(rel)
+    );
+    const missing = ofKind(r, "unresolved");
+    expect(missing).toHaveLength(1);
+    expect(missing[0].message).toContain(rel);
+    expect(missing[0].message).toContain("@/lib/query/retrieve");
+    expect(missing[0].message, "the location, so the reader can go straight to the line").toContain(":2");
+    expect(r.closure).not.toContain("lib/query/retrieve.ts");
+  });
+
+  it("AC18-05c — a local reference resolving OUTSIDE the repository root fails", () => {
+    const rel = "scripts/tool.ts";
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "../lib/wrap";\nimport { x } from "../../outside/thing";\nawait w(x);` }],
+      entryInv(rel)
+    );
+    expect(ofKind(r, "unresolved")).toHaveLength(1);
+    expect(ofKind(r, "unresolved")[0].message).toContain("../../outside/thing");
+    expect(ofKind(r, "unresolved")[0].message).toContain(rel);
+  });
+
+  it("AC18-05d — a parse failure is reported, not swallowed", () => {
+    const rel = "lib/broken.ts";
+    const r = analyseEntrySurfaces([SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\nexport const = ;` }], NO_ENTRIES);
+    expect(ofKind(r, "parse")).not.toHaveLength(0);
+    expect(ofKind(r, "parse")[0].message).toContain(rel);
+  });
+
+  it.each([
+    { n: "with no local file of that name", extra: [] as { rel: string; code: string }[] },
+    // The dangerous half: a package.json `imports` map could point `#scan` AT A CLASSIFIED WRAPPER.
+    // Treating `#` as "external, therefore terminal" would make that edge — and every surface behind
+    // it — vanish. This slice does not resolve package.json imports, so it must REFUSE, loudly.
+    { n: "when it would map to a local wrapper", extra: [{ rel: "lib/scan.ts", code: `import { w } from "@/lib/wrap";\nexport const scan = w;` }] },
+  ])("AC18-05e — a `#…` specifier is refused as an unsupported package alias: $n", ({ extra }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), ...extra, { rel, code: `import { scan } from "#scan";\nexport async function POST(){ await scan({}); }` }],
+      NO_ENTRIES
+    );
+    expect(ofKind(r, "unsupported-alias")).toHaveLength(1);
+    const m = ofKind(r, "unsupported-alias")[0].message;
+    expect(m).toContain(rel);
+    expect(m).toContain("#scan");
+    expect(m).toContain(":1");
+  });
+
+  it.each([
+    { n: "a bare external package", spec: `import { z } from "zod";` },
+    { n: "a scoped external package", spec: `import * as Sentry from "@sentry/nextjs";` },
+    { n: "a node builtin, prefixed", spec: `import { join } from "node:path";` },
+    { n: "a node builtin, bare", spec: `import { join } from "path";` },
+    { n: "a stylesheet", spec: `import "./route.css";` },
+    { n: "a JSON asset", spec: `import data from "./data.json";` },
+  ])("AC18-05f — a terminal, non-repo dependency passes untouched: $n", ({ spec }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces([SEED, WRAP(), { rel, code: `${spec}\nimport { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }], entryInv(rel));
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+    expect(r.surfaces).toEqual([rel]);
+  });
+
+  it("AC18-05g — the alias configuration the graph resolves against is PINNED", () => {
+    // A new repo alias would otherwise look like a bare package specifier — terminal, no edge, no
+    // failure. Pinning the setting means adding one fails HERE rather than deleting edges in silence.
+    const tsconfig = JSON.parse(read("tsconfig.json")) as { compilerOptions: { paths: Record<string, string[]>; moduleResolution: string } };
+    expect(tsconfig.compilerOptions.paths).toEqual(PINNED_TS_PATHS);
+    expect(tsconfig.compilerOptions.moduleResolution, "the graph is specified against bundler resolution").toBe("bundler");
+  });
+
+  it("AC18-05h — an ASSET-LOOKING specifier that resolves to a SOURCE keeps its code edge", () => {
+    // Astra adjudication 2. `./x.css` is a perfectly good module name for `./x.css.ts`, so
+    // recognising an asset BY EXTENSION before trying local source resolution would delete that
+    // edge — and every surface behind it — while reporting nothing at all. Source first, then
+    // terminal assets.
+    const files = [
+      SEED,
+      { rel: "lib/theme.css.ts", code: `${IMPORT_CANON}\nexport const theme = async (a) => ${WRITER}(a);` },
+      { rel: ROUTE, code: `import { theme } from "@/lib/theme.css";\nexport async function POST(){ await theme({}); }` },
+    ];
+    const r = analyseEntrySurfaces(files, NO_ENTRIES);
+    expect(r.closure, "the .css-spelled specifier must resolve to the .css.ts SOURCE").toContain("lib/theme.css.ts");
+    expect(r.surfaces, "and the route behind it is a surface needing a record").toEqual([ROUTE]);
+    expect(ofKind(r, "unclassified-entry")).toHaveLength(1);
+    expect(diagnostics(r), "a resolvable source is not an unresolved reference").toEqual([]);
+
+    // The twin, in the same criterion: with NO source of that name, the identical spelling is a
+    // terminal non-code dependency and must pass clean. Without this half, an analysis that treated
+    // every asset as an error would satisfy the assertion above.
+    const twin = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel: ROUTE, code: `import "@/lib/theme.css";\nimport { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }],
+      entryInv(ROUTE)
+    );
+    expect(twin.violations.map((v) => v.message)).toEqual([]);
+    expect(twin.surfaces).toEqual([ROUTE]);
+  });
+
+  it("AC18-05i — the `#…` refusal comes FIRST, even when the specifier is spelled as a stylesheet", () => {
+    // Order matters and is asserted: `#theme.css` must be refused as an unsupported package alias,
+    // not absorbed by asset handling on the strength of its suffix.
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel: ROUTE, code: `import "#theme.css";\nimport { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }` }],
+      entryInv(ROUTE)
+    );
+    expect(ofKind(r, "unsupported-alias")).toHaveLength(1);
+    expect(ofKind(r, "unsupported-alias")[0].message).toContain("#theme.css");
+    expect(r.violations.map((v) => v.kind), "the alias must not be swallowed as an asset").toEqual(["unsupported-alias"]);
+  });
+
+  // ── AC18-05j: the boundary of the walk is a place edges can vanish, so it FAILS rather than
+  // reporting. Astra adjudication 4: a list nobody asserts is exactly a silent graph hole.
+  const EXCLUDED_SOURCES = [
+    { n: "a type declaration", rel: "lib/kinds.d.ts", spec: "@/lib/kinds", code: `export type Team = { id: string };`, symbol: "Team" },
+    { n: "a test source", rel: "lib/helpers.test.ts", spec: "@/lib/helpers.test", code: `export const seed = 1;`, symbol: "seed" },
+    { n: "the in-memory PostgREST double", rel: "lib/ingest/fake-supabase.ts", spec: "@/lib/ingest/fake-supabase", code: `export class FakeSupabase {}`, symbol: "FakeSupabase" },
+  ];
+
+  it.each(EXCLUDED_SOURCES)("AC18-05j — a RUNTIME reference into an EXCLUDED source fails the guard: $n", ({ rel, spec, code, symbol }) => {
+    const route = {
+      rel: ROUTE,
+      code: `import { w } from "@/lib/wrap";\nimport { ${symbol} } from "${spec}";\nexport async function POST(){ await w({ ${symbol} }); }`,
+    };
+    const r = analyseEntrySurfaces([SEED, WRAP(), { rel, code }, route], entryInv(ROUTE));
+    const refs = ofKind(r, "excluded-ref");
+    expect(refs, "the reference must FAIL, not merely be listed").toHaveLength(1);
+    expect(refs[0].message).toContain(ROUTE);
+    expect(refs[0].message, "the failure must name what it resolved to").toContain(rel);
+    expect(refs[0].message).toContain(":2");
+    expect(r.excludedRefs.map((e) => e.target)).toEqual([rel]);
+    expect(r.closure, "an excluded file never becomes a graph node").not.toContain(rel);
+
+    // The twin: the SAME file referenced TYPE-ONLY carries no runtime edge and must pass clean —
+    // otherwise this control is just "any mention of an excluded path fails", which would make
+    // ordinary type imports unwritable.
+    const twin = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel, code },
+        { rel: ROUTE, code: `import { w } from "@/lib/wrap";\nimport type { ${symbol} } from "${spec}";\nexport async function POST(){ await w({}); }` },
+      ],
+      entryInv(ROUTE)
+    );
+    expect(twin.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  // ── AC18-05k/l: the same boundary, reached through the REAL WALK ──────────────────────────────
+  //
+  // Astra medium 1. AC18-05j hands the excluded file to the analyser directly, which is an input the
+  // production path never produces: the walk DROPS excluded roots and excluded files, so by the time
+  // the analyser runs, `docs/bridge.css.ts` is not merely excluded — it is invisible. An
+  // asset-looking specifier that names it then falls through to the terminal-asset branch and the
+  // reference disappears in silence, taking every surface behind it. These two criteria run the
+  // whole seam (`analyseTreeAt`) against a throwaway root, which is the only place that gap exists.
+  it("AC18-05k — a runtime reference into an EXCLUDED ROOT fails through the REAL discovery seam", () => {
+    const bridgeRoute = "app/api/bridge/route.ts";
+    // The route is IDENTICAL in both halves below. Only the file behind `@/docs/bridge.css` changes,
+    // so the criterion turns on "is there a source there?" and on nothing else about the fixture.
+    const route = `import { w } from "@/lib/wrap";\nimport { bridge } from "@/docs/bridge.css";\nexport async function POST(){ await w({ bridge }); }`;
+    const inv = entryInv(ANCHOR, bridgeRoute);
+
+    const r = analyseTreeAt(
+      fixtureRoot({
+        ...MINI_REPO,
+        [bridgeRoute]: route,
+        // `docs/` is a NOT_WALKED root, so this file never reaches the analyser as a supplied source
+        // — and it is a genuine SOURCE that imports the wrapper, not a stylesheet.
+        "docs/bridge.css.ts": `import { w } from "@/lib/wrap";\nexport const bridge = w;`,
+      }),
+      inv
+    );
+
+    const refs = ofKind(r, "excluded-ref");
+    expect(refs, "an asset-looking specifier naming an excluded SOURCE must FAIL, not terminate as an asset").toHaveLength(1);
+    expect(refs[0].message).toContain(bridgeRoute);
+    expect(refs[0].message, "the failure must name what it resolved to").toContain("docs/bridge.css.ts");
+    expect(refs[0].message).toContain(":2");
+    expect(r.excludedRefs.map((e) => `${e.from} -> ${e.target}`)).toEqual([`${bridgeRoute} -> docs/bridge.css.ts`]);
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual(["excluded-ref"]);
+
+    // Resolution EVIDENCE is not ADMISSION. Simply walking `docs/` would satisfy the assertions
+    // above and then admit an excluded file as a graph node, a surface and a route into the closure
+    // — the wrong fix, pinned here so it cannot pass as the right one.
+    expect(r.closure, "an excluded source never becomes a graph node").not.toContain("docs/bridge.css.ts");
+    expect(r.surfaces, "and never an entry surface").toEqual([ANCHOR, bridgeRoute].sort());
+    expect(r.closure, "the positive wrapper anchor is still discovered").toContain("lib/wrap.ts");
+
+    // The twin: same root shape, same route, same inventory — the target is an ACTUAL stylesheet.
+    // Without it, "any reference into a non-walked root fails" would satisfy the half above while
+    // making an ordinary CSS import unwritable.
+    const twin = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, [bridgeRoute]: route, "docs/bridge.css": `:root { --brand: #101010; }` }),
+      inv
+    );
+    expect(twin.violations.map((v) => v.message), "a recognised non-code asset is terminal, not a hole").toEqual([]);
+    expect(twin.surfaces).toEqual([ANCHOR, bridgeRoute].sort());
+  });
+
+  // Not a `docs/` special case: the SAME evidence is owed for every exclusion the walk applies —
+  // declarations and test sources under a WALKED root, the PostgREST double, hidden/generated
+  // directories, and the named non-walked roots.
+  const EXCLUDED_ON_DISK = [
+    { n: "a type declaration under a walked root", rel: "lib/kinds.d.ts", spec: "@/lib/kinds", code: `export type Team = { id: string };`, symbol: "Team" },
+    { n: "a test source under a walked root", rel: "lib/helpers.test.ts", spec: "@/lib/helpers.test", code: `export const seed = 1;`, symbol: "seed" },
+    { n: "the in-memory PostgREST double", rel: "lib/ingest/fake-supabase.ts", spec: "@/lib/ingest/fake-supabase", code: `export class FakeSupabase {}`, symbol: "FakeSupabase" },
+    { n: "a HIDDEN generated directory", rel: "lib/.generated/client.ts", spec: "@/lib/.generated/client", code: `export const client = 1;`, symbol: "client" },
+    { n: "a NAMED non-walked root", rel: "test/support/seed.ts", spec: "@/test/support/seed", code: `export const support = 1;`, symbol: "support" },
+  ];
+
+  it.each(EXCLUDED_ON_DISK)("AC18-05l — an excluded source ON DISK is resolution evidence, and the reference fails: $n", ({ rel, spec, code, symbol }) => {
+    const target = ROUTE;
+    const inv = entryInv(ANCHOR, target);
+    const rootWith = (importLine: string) =>
+      fixtureRoot({
+        ...MINI_REPO,
+        [rel]: code,
+        [target]: `import { w } from "@/lib/wrap";\n${importLine}\nexport async function POST(){ await w({}); }`,
+      });
+
+    const r = analyseTreeAt(rootWith(`import { ${symbol} } from "${spec}";`), inv);
+    const refs = ofKind(r, "excluded-ref");
+    expect(refs, "the walk dropping a file must not downgrade the reference to 'unresolved' or to nothing").toHaveLength(1);
+    expect(refs[0].message).toContain(target);
+    expect(refs[0].message, "the failure must name what it resolved to").toContain(rel);
+    expect(refs[0].message).toContain(":2");
+    expect(r.violations.map((v) => v.kind)).toEqual(["excluded-ref"]);
+    expect(r.closure, "an excluded source never becomes a graph node").not.toContain(rel);
+    expect(r.surfaces).toEqual([ANCHOR, target].sort());
+
+    // The twin: the SAME file referenced TYPE-ONLY carries no runtime edge and must pass clean, or
+    // this control is just "any mention of an excluded path fails" and ordinary type imports break.
+    const twin = analyseTreeAt(rootWith(`import type { ${symbol} } from "${spec}";`), inv);
+    expect(twin.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  it("AC18-05o — the resolution host is NARROWLY SCOPED: a dependency is never resolution evidence", () => {
+    // The bound on the fix, in the same seam that needs it. Resolution evidence exists to explain
+    // why a REPOSITORY source could not be followed; answering for `node_modules` would turn "we do
+    // not crawl dependencies" into "we do, one candidate at a time", and would report a package file
+    // as a source somebody deliberately excluded. It must stay UNRESOLVED — refused, but for the
+    // honest reason.
+    const dep = "lib/node_modules/dep/index.ts";
+    const rel = ROUTE;
+    const r = analyseTreeAt(
+      fixtureRoot({
+        ...MINI_REPO,
+        [dep]: `export const dep = 1;`,
+        [rel]: `import { w } from "@/lib/wrap";\nimport { dep } from "@/lib/node_modules/dep";\nexport async function POST(){ await w({ dep }); }`,
+      }),
+      entryInv(ANCHOR, rel)
+    );
+    expect(r.violations.map((v) => v.kind), "a dependency file is not an excluded repository source").toEqual(["unresolved"]);
+    expect(ofKind(r, "unresolved")[0].message).toContain(rel);
+    expect(ofKind(r, "unresolved")[0].message).toContain("@/lib/node_modules/dep");
+    expect(r.closure).not.toContain(dep);
+  });
+
+  it("AC18-05p — the evidence host is OPT-IN: a virtual fixture still never reaches this disk", () => {
+    // AC18-05b pins that a virtual fixture cannot resolve a real WALKED source. This is the other
+    // half, and it is the one the evidence host could quietly break: `lib/ingest/fake-supabase.ts`
+    // genuinely exists here and is genuinely excluded, so a host wired in by DEFAULT would turn every
+    // synthetic control's resolution boundary into this repository's tree. Supplying no host means
+    // touching no filesystem, and the outcome must therefore be "no analysed source resolves it".
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        {
+          rel,
+          code: `import { w } from "@/lib/wrap";\nimport { FakeSupabase } from "@/lib/ingest/fake-supabase";\nexport async function POST(){ await w({ FakeSupabase }); }`,
+        },
+      ],
+      entryInv(rel)
+    );
+    expect(r.violations.map((v) => v.kind), "with no host supplied there is no evidence to have").toEqual(["unresolved"]);
+    expect(ofKind(r, "unresolved")[0].message).toContain("@/lib/ingest/fake-supabase");
+    expect(r.excludedRefs, "and nothing was read off disk to call excluded").toEqual([]);
+  });
+
+  /* ── AC18-05q/r/s: RESOLUTION PRECEDENCE — which candidate wins, decided before admission ───────
+   *
+   * Astra code round 2. `AC18-05k/l` prove an excluded source is FOUND when nothing else answers the
+   * specifier. They cannot see the case where something else does: a resolver that searched the
+   * supplied files first, and only asked for evidence when that search came back empty, answered a
+   * different question — "which of the files I kept could this name?" — and a LOWER-priority file
+   * that happened to survive the walk masked the higher-priority excluded one that actually wins.
+   * The reference then read as an ordinary edge into an unrelated module: no diagnostic, and the hole
+   * hidden by the very file that should have made it obvious.
+   *
+   * The three rows below are the whole rule, not just its failing half. Precedence is TypeScript's,
+   * applied to the whole repository; the guard's own exclusion policy is applied AFTERWARDS, to
+   * whatever won. So an exclusion never wins for BEING an exclusion (05s), and never loses for being
+   * one either (05q).
+   */
+
+  /**
+   * Installed TypeScript's own answer, over a host listing exactly `files` — INDEPENDENT evidence for
+   * "which candidate wins", so these criteria assert the compiler's precedence rather than the
+   * author's belief about it. Deliberately not the analyser: running that twice would only establish
+   * that it agrees with itself, which is the thing in question.
+   */
+  const PRECEDENCE_VROOT = "/auditfix18-precedence";
+  const normAbs = (p: string): string => {
+    const out: string[] = [];
+    for (const seg of p.split(/[\\/]/)) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") out.pop();
+      else out.push(seg);
+    }
+    return `/${out.join("/")}`;
+  };
+  const tsResolvesTo = (spec: string, from: string, files: readonly string[]): string | null => {
+    const present = new Set(files.map((f) => normAbs(`${PRECEDENCE_VROOT}/${f}`)));
+    const host: ts.ModuleResolutionHost = {
+      fileExists: (f) => present.has(normAbs(f)),
+      readFile: () => undefined,
+      directoryExists: () => true,
+      getDirectories: () => [],
+      getCurrentDirectory: () => PRECEDENCE_VROOT,
+      realpath: (p) => p,
+      useCaseSensitiveFileNames: true,
+    };
+    const resolved = ts.resolveModuleName(
+      spec,
+      `${PRECEDENCE_VROOT}/${from}`,
+      {
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        module: ts.ModuleKind.ESNext,
+        target: ts.ScriptTarget.ESNext,
+        allowJs: true,
+        allowImportingTsExtensions: true,
+        baseUrl: PRECEDENCE_VROOT,
+        paths: Object.fromEntries(Object.entries(PINNED_TS_PATHS).map(([k, v]) => [k, [...v]])),
+      },
+      host
+    ).resolvedModule?.resolvedFileName;
+    const abs = resolved === undefined ? null : normAbs(resolved);
+    return abs !== null && abs.startsWith(`${PRECEDENCE_VROOT}/`) ? abs.slice(PRECEDENCE_VROOT.length + 1) : null;
+  };
+
+  const BRIDGE_ROUTE = "app/api/bridge/route.ts";
+  const BRIDGE_SPEC = "@/lib/bridge.test";
+  /** Higher priority, and the WALK DROPS IT: a `.test.ts` source. */
+  const BRIDGE_EXCLUDED = "lib/bridge.test.ts";
+  /** Lower priority, and the walk KEEPS it — an unrelated module that merely shares the base name. */
+  const BRIDGE_DECOY = "lib/bridge.test/index.ts";
+  /**
+   * IDENTICAL across both halves below, as in `AC18-05k`: the route keeps its own honest path to the
+   * writer through the wrapper, so it is a surface either way and the pair turns on ONE fact — does
+   * `lib/bridge.test.ts` exist beside the directory index?
+   */
+  const BRIDGE_ROUTE_CODE =
+    `import { w } from "@/lib/wrap";\nimport { bridge } from "${BRIDGE_SPEC}";\n` +
+    `export async function POST(){ await w({ bridge }); }`;
+
+  it("AC18-05q — the WINNING candidate is resolved first, so a surviving lower-priority file cannot mask an excluded one", () => {
+    expect(
+      tsResolvesTo(BRIDGE_SPEC, BRIDGE_ROUTE, [BRIDGE_EXCLUDED, BRIDGE_DECOY]),
+      "the premise: with BOTH on disk, TypeScript names the FILE, not the directory index"
+    ).toBe(BRIDGE_EXCLUDED);
+
+    const r = analyseTreeAt(
+      fixtureRoot({
+        ...MINI_REPO,
+        // A genuine route into the writer, behind the exclusion boundary — this is what goes missing.
+        [BRIDGE_EXCLUDED]: `export { w as bridge } from "@/lib/wrap";`,
+        // Inert ON PURPOSE: it reaches nothing, so a resolver that picked it would report NOTHING AT
+        // ALL — the silence the coordinator reproduced, rather than some other violation standing in.
+        [BRIDGE_DECOY]: `export const bridge = () => null;`,
+        [BRIDGE_ROUTE]: BRIDGE_ROUTE_CODE,
+      }),
+      entryInv(ANCHOR, BRIDGE_ROUTE)
+    );
+
+    const refs = ofKind(r, "excluded-ref");
+    expect(refs, "the excluded file WINS resolution, so the reference must FAIL").toHaveLength(1);
+    expect(refs[0].message).toContain(BRIDGE_ROUTE);
+    expect(refs[0].message, "and the failure must name the file that actually won").toContain(BRIDGE_EXCLUDED);
+    expect(
+      refs[0].message,
+      "not the lower-priority directory index that merely survived the walk"
+    ).not.toContain(BRIDGE_DECOY);
+    expect(refs[0].message).toContain(":2");
+    expect(r.excludedRefs.map((e) => `${e.from} -> ${e.target}`)).toEqual([`${BRIDGE_ROUTE} -> ${BRIDGE_EXCLUDED}`]);
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual([
+      "excluded-ref",
+    ]);
+
+    // Resolving the excluded target is not ADMITTING it — the AC18-05k distinction, restated for the
+    // path where a supplied file was available to take instead.
+    expect(r.closure, "the excluded winner never becomes a graph node").not.toContain(BRIDGE_EXCLUDED);
+    expect(r.surfaces, "the route keeps its own path to the writer, and the anchor stands").toEqual(
+      [ANCHOR, BRIDGE_ROUTE].sort()
+    );
+    expect(r.closure, "and the wrapper anchor is still discovered").toContain("lib/wrap.ts");
+  });
+
+  it("AC18-05r — REMOVING the excluded file lets the unrelated index resolve, with no false excluded-ref", () => {
+    // The removal twin, same route and same inventory. Without it, "anything spelled like a test
+    // source fails" would satisfy 05q while making the ordinary directory import unwritable.
+    expect(tsResolvesTo(BRIDGE_SPEC, BRIDGE_ROUTE, [BRIDGE_DECOY])).toBe(BRIDGE_DECOY);
+
+    const r = analyseTreeAt(
+      fixtureRoot({
+        ...MINI_REPO,
+        [BRIDGE_DECOY]: `export const bridge = () => null;`,
+        [BRIDGE_ROUTE]: BRIDGE_ROUTE_CODE,
+      }),
+      entryInv(ANCHOR, BRIDGE_ROUTE)
+    );
+    expect(r.violations.map((v) => v.message), "with nothing excluded there, nothing may be refused").toEqual([]);
+    expect(
+      ofKind(r, "unresolved"),
+      "and the supplied index RESOLVES — it is not downgraded to a missing edge either"
+    ).toHaveLength(0);
+    expect(r.excludedRefs, "no evidence was invented to refuse it with").toEqual([]);
+    expect(r.surfaces, "the positive anchor and the route are both discovered").toEqual([ANCHOR, BRIDGE_ROUTE].sort());
+  });
+
+  it("AC18-05s — an INCLUDED higher-priority file beats an EXCLUDED index: the fix is not 'exclusions first'", () => {
+    // The inverse twin, and the bound on the whole change. Reversing the old ordering into an
+    // unconditional excluded-first policy would satisfy 05q and then refuse an ORDINARY included
+    // file because some lower-priority excluded name exists beside it. `fixtures/` is a NOT_WALKED
+    // root, so `fixtures/index.ts` is evidence-only; the root-level `fixtures.ts` is walked, kept,
+    // and outranks it.
+    const included = "fixtures.ts";
+    const excludedIndex = "fixtures/index.ts";
+    const route = "app/api/fixtures/route.ts";
+    expect(
+      tsResolvesTo("@/fixtures", route, [included, excludedIndex]),
+      "the premise: the FILE outranks the directory index here too"
+    ).toBe(included);
+
+    const r = analyseTreeAt(
+      fixtureRoot({
+        ...MINI_REPO,
+        [included]: `export { w as gate } from "@/lib/wrap";`,
+        [excludedIndex]: `export const gate = () => null;`,
+        [route]: `import { gate } from "@/fixtures";\nexport async function POST(){ await gate({}); }`,
+      }),
+      entryInv(ANCHOR, included, route)
+    );
+    expect(r.violations.map((v) => v.message), "an included file that WINS must resolve, not be refused").toEqual([]);
+    expect(r.excludedRefs).toEqual([]);
+    expect(r.closure, "the included winner is a node, and carries the route into the closure").toContain(included);
+    expect(r.closure, "the excluded index is never admitted").not.toContain(excludedIndex);
+    expect(r.surfaces).toEqual([ANCHOR, included, route].sort());
+  });
+
+  /* ── AC18-05t…x: a LOCAL DIRECTORY MANIFEST is REFUSED, never resolved (Astra final, P1) ────────
+   *
+   * The blindness these close is structural, not a missing candidate. The graph reads SOURCES: the
+   * walk yields them, the resolver's `readFile` serves supplied contents only, and the source
+   * evidence host refuses non-source spellings on purpose — so a real `package.json` beside a
+   * directory is invisible to every part of this seam. A directory whose manifest redirects into an
+   * ingestion wrapper therefore resolved to whatever `index` happened to sit next to it, and the
+   * edge — with every surface behind it — disappeared with NO diagnostic. The coordinator
+   * reproduced it: installed TypeScript named `lib/wrap.ts` while the analysis reported an empty
+   * violations list.
+   *
+   * The accepted fix is a REFUSAL, not a manifest resolver, and the criteria below are written
+   * against that policy rather than around it. Contents are never read, so a benign manifest is
+   * refused too (05v); the probe asks about the reference BASE alone, so this repository's own root
+   * `package.json` cannot refuse every import in the tree (05w); and an explicit source-file
+   * reference is the documented way through.
+   */
+
+  /**
+   * Installed TypeScript's answer for a REAL directory on disk, through `ts.sys` — the one host in
+   * this file that can read a manifest. Independent evidence for what a runtime resolver does with
+   * these fixtures, which is what makes "the index fallback was wrong" a fact rather than a belief.
+   *
+   * Deliberately NOT `tsResolvesTo` above: that host's `readFile` returns nothing, so it cannot see
+   * a `package.json` at all — it models the very blindness being fixed and would agree with the old
+   * behaviour for the wrong reason.
+   */
+  const tsResolvesOnDisk = (spec: string, fromRel: string, root: string): string | null => {
+    const resolved = ts.resolveModuleName(
+      spec,
+      join(root, fromRel),
+      {
+        moduleResolution: ts.ModuleResolutionKind.Bundler,
+        module: ts.ModuleKind.ESNext,
+        target: ts.ScriptTarget.ESNext,
+        baseUrl: root,
+        paths: Object.fromEntries(Object.entries(PINNED_TS_PATHS).map(([k, v]) => [k, [...v]])),
+      },
+      ts.sys
+    ).resolvedModule?.resolvedFileName;
+    return resolved === undefined ? null : relative(root, resolved);
+  };
+
+  // A route of its own, not `BRIDGE_ROUTE` above: these fixtures turn on the metadata beside a
+  // directory, and reusing the precedence family's paths would make two unrelated rules share a name.
+  const MANIFEST_ROUTE = "app/api/manifest/route.ts";
+  /** IDENTICAL across the rows below, so each pair turns on the FIXTURE's metadata and nothing else. */
+  const MANIFEST_ROUTE_CODE = `import { bridge } from "@/lib/bridge";\nexport const POST = bridge;`;
+  /** Inert on purpose: it reaches nothing, so a resolver that silently took it would report NOTHING
+   *  AT ALL — the exact silence reproduced — rather than some other violation standing in for it. */
+  const HARMLESS_INDEX = `export const bridge = () => null;`;
+
+  it("AC18-05t — a directory manifest REDIRECT is refused through the real discovery seam, before any index fallback", () => {
+    const root = fixtureRoot({
+      ...MINI_REPO,
+      // `main` points AT the ingestion wrapper. This is the case the old fallback got wrong: it
+      // answered with the sibling index, which is a different module with no path to the writer.
+      "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+      "lib/bridge/index.ts": HARMLESS_INDEX,
+      [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE,
+    });
+
+    expect(
+      tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root),
+      "the premise, from installed TypeScript over the REAL directory: the manifest redirects INTO the wrapper"
+    ).toBe("lib/wrap.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "the reference must FAIL — this fixture produced ZERO violations before the fix").toHaveLength(1);
+    expect(refused[0].message).toContain(MANIFEST_ROUTE);
+    expect(refused[0].message).toContain("@/lib/bridge");
+    expect(refused[0].message, "the location, so the reader can go straight to the line").toContain(":1");
+    expect(refused[0].message, "and the manifest that caused it, by path").toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual([
+      "unsupported-directory-manifest",
+    ]);
+
+    // Refusing is not resolving, in EITHER direction. The manifest is metadata and never becomes a
+    // node, and the index the old fallback would have taken is not quietly admitted as the edge —
+    // which is what would make this criterion pass while the escape stayed open.
+    expect(r.closure, "metadata is looked at, never entered").not.toContain("lib/bridge/package.json");
+    expect(r.closure, "and the index is not silently taken as the edge").not.toContain("lib/bridge/index.ts");
+    expect(r.surfaces, "the positive anchor stands").toEqual([ANCHOR]);
+  });
+
+  it("AC18-05u — REMOVING the manifest lets the harmless index resolve, with no false refusal", () => {
+    // The removal twin, same route and same inventory. Without it, "any directory import fails"
+    // would satisfy 05t while making an ordinary directory index unwritable.
+    const root = fixtureRoot({ ...MINI_REPO, "lib/bridge/index.ts": HARMLESS_INDEX, [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE });
+    expect(
+      tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root),
+      "with no manifest present, the directory index IS the honest answer"
+    ).toBe("lib/bridge/index.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    expect(r.violations.map((v) => v.message), "with no manifest there, nothing may be refused").toEqual([]);
+    expect(r.surfaces).toEqual([ANCHOR]);
+  });
+
+  it.each([
+    {
+      n: "the manifest is entirely benign",
+      files: { "lib/bridge/package.json": `{"name":"bridge","version":"1.0.0"}`, "lib/bridge/index.ts": HARMLESS_INDEX },
+      tsTarget: "lib/bridge/index.ts",
+    },
+    {
+      n: "a same-base SOURCE file would have won anyway",
+      files: { "lib/bridge/package.json": `{"name":"bridge","version":"1.0.0"}`, "lib/bridge.ts": `export { w as bridge } from "@/lib/wrap";` },
+      tsTarget: "lib/bridge.ts",
+    },
+  ])("AC18-05v — the refusal is CONSERVATIVE and unconditional: $n", ({ files, tsTarget }) => {
+    // Both rows are references that WOULD have resolved, and the premise says to what — so these
+    // pin the accepted policy rather than an implementation convenience. Reading the manifest to
+    // decide "this one is harmless" is the thing the adjudication declined to build: it would put
+    // the guard back in the business of guessing which redirect field wins.
+    const root = fixtureRoot({ ...MINI_REPO, ...files, [MANIFEST_ROUTE]: MANIFEST_ROUTE_CODE });
+    expect(tsResolvesOnDisk("@/lib/bridge", MANIFEST_ROUTE, root), "the premise: this reference is resolvable").toBe(tsTarget);
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "the manifest's CONTENTS are never consulted, so its harmlessness cannot excuse it").toHaveLength(1);
+    expect(refused[0].message).toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind)).toEqual(["unsupported-directory-manifest"]);
+  });
+
+  it.each([
+    {
+      n: "an ordinary repository-root package.json refuses nothing",
+      files: { "package.json": `{"name":"fixture-repo","private":true}` },
+      route: `import { w } from "@/lib/wrap";\nexport async function POST(){ await w({}); }`,
+      reaches: "lib/wrap.ts",
+    },
+    {
+      n: "an EXPLICIT source-file reference under a manifest-bearing directory keeps its edge",
+      files: {
+        "package.json": `{"name":"fixture-repo","private":true}`,
+        "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+        "lib/bridge/index.ts": `export { w as bridge } from "@/lib/wrap";`,
+      },
+      route: `import { bridge } from "@/lib/bridge/index";\nexport async function POST(){ await bridge({}); }`,
+      reaches: "lib/bridge/index.ts",
+    },
+    {
+      // A reference whose base IS a manifest is a JSON DATA import, and keeps its existing terminal
+      // treatment — the base carries no `package.json/package.json`. A refusal keyed on the NAME
+      // anywhere in the specifier, rather than on the base's contents, breaks this row alone.
+      n: "importing a package.json as DATA stays an ordinary JSON asset",
+      files: { "package.json": `{"name":"fixture-repo","private":true}` },
+      route: `import { w } from "@/lib/wrap";\nimport pkg from "@/package.json";\nexport async function POST(){ await w(pkg); }`,
+      reaches: "lib/wrap.ts",
+    },
+  ])("AC18-05w — the probe asks about the reference BASE only, never an ancestor: $n", ({ files, route, reaches }) => {
+    // The bound on the whole change, and the row that a plausible over-broad fix fails: this
+    // repository's own root `package.json` sits above EVERY import in the tree, so an ancestor walk
+    // would refuse the entire codebase — a guard that fails everything proves nothing. The second
+    // row is the documented way through, asserted rather than merely suggested by the diagnostic.
+    const r = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, ...files, [MANIFEST_ROUTE]: route }),
+      entryInv(ANCHOR, MANIFEST_ROUTE)
+    );
+    expect(r.violations.map((v) => v.message), "a manifest ABOVE the base is not this reference's manifest").toEqual([]);
+    expect(r.closure, "and the edge is genuinely followed, not merely un-refused").toContain(reaches);
+    expect(r.surfaces).toEqual([ANCHOR, MANIFEST_ROUTE].sort());
+  });
+
+  it("AC18-05x — the manifest host is OPT-IN: a virtual fixture supplies its own, and never borrows this disk's", () => {
+    // The two halves of fixture isolation for the new evidence host, as AC18-05b/p are for sources.
+    const rel = "scripts/tool.ts";
+    // `..` from `scripts/` names the REPOSITORY ROOT, where a real `package.json` genuinely sits.
+    const code = `import { w } from "../lib/wrap";\nimport "..";\nexport const run = w;`;
+
+    // (a) NO host: the analysis touches no filesystem, so the real root manifest cannot be seen. The
+    // reference is still refused — as a MISSING edge, which is the honest answer without evidence.
+    const isolated = analyseEntrySurfaces([SEED, WRAP(), { rel, code }], entryInv(rel));
+    expect(isolated.violations.map((v) => v.kind), "with no host there is no manifest to have found").toEqual([
+      "unresolved",
+    ]);
+
+    // (b) the SAME spelling through the on-disk seam, where the root manifest really is there. The
+    // pair turns on the HOST, not on the fixture's text.
+    const onDisk = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, "package.json": `{"name":"fixture-repo","private":true}`, [rel]: code }),
+      entryInv(ANCHOR, rel)
+    );
+    expect(ofKind(onDisk, "unsupported-directory-manifest"), "through the seam, the same reference finds it").toHaveLength(1);
+
+    // (c) a virtual fixture may SUPPLY the metadata as an ordinary file — and it is still metadata:
+    // looked at for the refusal, never parsed, never a node.
+    const supplied = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/bridge/package.json", code: `{"main":"../wrap.ts"}` },
+        { rel: MANIFEST_ROUTE, code: MANIFEST_ROUTE_CODE },
+      ],
+      NO_ENTRIES
+    );
+    const refused = ofKind(supplied, "unsupported-directory-manifest");
+    expect(refused, "a supplied manifest is evidence too, with no filesystem anywhere in it").toHaveLength(1);
+    expect(refused[0].message).toContain("lib/bridge/package.json");
+    expect(supplied.closure, "metadata never becomes a graph node").not.toContain("lib/bridge/package.json");
+  });
+
+  /* ── AC18-05aa…ac: the two ways a reference walked around the refusals above (Astra final r2) ────
+   *
+   * Both are SPELLING defects, and both were reproduced through the seam rather than argued: a
+   * mixed-separator specifier resolved past the manifest refusal to `lib/wrap.ts` while the analysis
+   * reported ZERO violations (P1), and a virtual fixture's supplied `package.json` — the very
+   * metadata that makes that refusal work without a filesystem — came back as an EXCLUDED SOURCE for
+   * an ordinary JSON data import (P2). Neither has an on-disk twin that can see it: real discovery
+   * never yields a `package.json`, and the source evidence host refuses the spelling, so `AC18-05w`'s
+   * JSON row passes for a reason that says nothing about the supplied half.
+   */
+
+  /**
+   * The mixed-separator specifier as the RUNTIME sees it: ONE literal backslash. Written with
+   * `String.raw` and embedded with `JSON.stringify`, so the fixture FILE holds `"../lib\\bridge"` and
+   * the parsed specifier is `../lib\bridge`. Spelling it inline in a template would make `\b` a
+   * BACKSPACE escape, and the criterion would quietly be about a different specifier entirely.
+   */
+  const MIXED_SEP_SPEC = String.raw`../lib\bridge`;
+  const SLASH_SPEC = "../lib/bridge";
+  const TOOL = "scripts/tool.ts";
+  /** IDENTICAL but for the specifier, so each pair below turns on the SPELLING and nothing else. */
+  const toolImporting = (spec: string): string =>
+    `import { bridge } from ${JSON.stringify(spec)};\nexport const run = bridge;`;
+
+  it("AC18-05aa — a MIXED-SEPARATOR specifier is normalised BEFORE the manifest probe, so spelling cannot walk past it", () => {
+    const manifestTree = {
+      ...MINI_REPO,
+      // The same shape as AC18-05t: `main` redirects INTO the ingestion wrapper, with an inert index
+      // beside it, so a resolver that quietly took the index reports NOTHING AT ALL.
+      "lib/bridge/package.json": `{"main":"../wrap.ts"}`,
+      "lib/bridge/index.ts": HARMLESS_INDEX,
+    };
+    const root = fixtureRoot({ ...manifestTree, [TOOL]: toolImporting(MIXED_SEP_SPEC) });
+    expect(
+      tsResolvesOnDisk(MIXED_SEP_SPEC, TOOL, root),
+      "the premise, from installed TypeScript over the REAL directory: the backslash spelling is not a different module — it is the same directory, and the manifest redirects into the wrapper"
+    ).toBe("lib/wrap.ts");
+
+    const r = analyseTreeAt(root, entryInv(ANCHOR));
+    const refused = ofKind(r, "unsupported-directory-manifest");
+    expect(refused, "this fixture produced ZERO violations while the probe asked about `lib\\bridge`").toHaveLength(1);
+    expect(refused[0].message).toContain(TOOL);
+    expect(refused[0].message, "the specifier is quoted AS WRITTEN — normalising is for resolution, not for the reader").toContain(MIXED_SEP_SPEC);
+    expect(refused[0].message, "and the manifest is named by the NORMALISED path that was actually probed").toContain("lib/bridge/package.json");
+    expect(r.violations.map((v) => v.kind), "exactly this rule fires, and nothing is silently accepted").toEqual([
+      "unsupported-directory-manifest",
+    ]);
+    expect(r.closure, "the index the old fallback took is not quietly admitted as the edge").not.toContain("lib/bridge/index.ts");
+    expect(r.surfaces, "the positive anchor stands").toEqual([ANCHOR]);
+
+    // The SLASH twin, same tree: mixed separators must not open a SECOND NAMESPACE in which one
+    // spelling is refused and its twin resolves. Same rule, same manifest, same named path.
+    const slash = analyseTreeAt(fixtureRoot({ ...manifestTree, [TOOL]: toolImporting(SLASH_SPEC) }), entryInv(ANCHOR));
+    expect(slash.violations.map((v) => v.kind), "one path, one answer").toEqual(["unsupported-directory-manifest"]);
+    expect(ofKind(slash, "unsupported-directory-manifest")[0].message).toContain("lib/bridge/package.json");
+
+    // The manifest-REMOVAL twin, kept for the BACKSLASH spelling. Without it, "a specifier with a
+    // backslash in it fails" would satisfy everything above while refusing an ordinary import.
+    const removed = analyseTreeAt(
+      fixtureRoot({ ...MINI_REPO, "lib/bridge/index.ts": HARMLESS_INDEX, [TOOL]: toolImporting(MIXED_SEP_SPEC) }),
+      entryInv(ANCHOR)
+    );
+    expect(removed.violations.map((v) => v.message), "with no manifest there, nothing may be refused").toEqual([]);
+    expect(removed.surfaces).toEqual([ANCHOR]);
+  });
+
+  it("AC18-05ab — a MIXED-SEPARATOR parent traversal is refused as OUTSIDE the root, not probed as a directory name", () => {
+    // The other half of normalising before segment processing: `..` only escapes the root if it is
+    // SEEN as a segment. Unnormalised, `..\..\outside\bridge` is one opaque name that exists nowhere,
+    // so the reference was reported as a missing edge — a true failure for a false reason, and one
+    // that says the boundary held when nothing checked it.
+    const mixed = String.raw`..\..\outside\bridge`;
+    const slash = "../../outside/bridge";
+    const outsideOf = (spec: string) =>
+      analyseTreeAt(fixtureRoot({ ...MINI_REPO, [TOOL]: toolImporting(spec) }), entryInv(ANCHOR));
+
+    const r = outsideOf(mixed);
+    const refused = ofKind(r, "unresolved");
+    expect(refused).toHaveLength(1);
+    expect(refused[0].message).toContain(TOOL);
+    expect(refused[0].message, "quoted as written").toContain(mixed);
+    expect(
+      refused[0].message,
+      "the NAMED reason: the reference left the repository — not 'no analysed source resolves it', which is what an unnormalised opaque segment reports"
+    ).toContain("OUTSIDE the repository root");
+    expect(r.violations.map((v) => v.kind)).toEqual(["unresolved"]);
+    expect(r.surfaces, "and the walk still found the tree").toEqual([ANCHOR]);
+
+    // The slash twin: the identical named refusal, so the two spellings are one reference here too.
+    expect(ofKind(outsideOf(slash), "unresolved")[0].message).toContain("OUTSIDE the repository root");
+  });
+
+  it("AC18-05ac — supplied METADATA answers the manifest question and is NEVER a source candidate", () => {
+    // `byRel` holds every SUPPLIED file and the existence view is built from it, so the metadata a
+    // fixture supplies for the manifest refusal was also handed to SOURCE resolution as the bare
+    // candidate — and admission, which excludes anything the walk did not yield, called an ordinary
+    // JSON data import a reference into an EXCLUDED SOURCE.
+    const r = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "package.json", code: `{"name":"fixture-repo","private":true}` },
+        // An ORDINARY JSON name beside it: the rule is that a non-source SPELLING is not a source
+        // candidate, not that `package.json` is a special case. Metadata is special to ONE question.
+        { rel: "lib/settings.json", code: `{"flag":true}` },
+        {
+          rel: ROUTE,
+          code:
+            `import { w } from "@/lib/wrap";\nimport pkg from "@/package.json";\n` +
+            `import settings from "@/lib/settings.json";\nexport async function POST(){ await w({ pkg, settings }); }`,
+        },
+      ],
+      entryInv(ROUTE)
+    );
+    expect(r.violations.map((v) => v.message), "a JSON data import is TERMINAL, not a reference into an excluded source").toEqual([]);
+    expect(r.excludedRefs, "nothing supplied as metadata is reported as a source").toEqual([]);
+    expect(r.closure, "metadata is looked at, never entered").not.toContain("package.json");
+    expect(r.closure).not.toContain("lib/settings.json");
+    expect(r.surfaces, "and the anchored route keeps its own path to the writer").toEqual([ROUTE]);
+
+    // (b) the SAME analyser and the SAME supplied-metadata mechanism, still recognised for the one
+    // thing it is FOR. Without this half, dropping metadata out of the view entirely satisfies (a).
+    const manifest = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/bridge/package.json", code: `{"main":"../wrap.ts"}` },
+        { rel: MANIFEST_ROUTE, code: MANIFEST_ROUTE_CODE },
+      ],
+      NO_ENTRIES
+    );
+    expect(
+      ofKind(manifest, "unsupported-directory-manifest"),
+      "supplied metadata still answers the manifest existence question, with no filesystem in it"
+    ).toHaveLength(1);
+
+    // (c) SOURCE BEFORE ASSETS survives — the AC18-05h escape, restated for metadata. A blanket "a
+    // `.json` specifier is an asset" short circuit passes (a) and (b) and then deletes this edge, and
+    // every surface behind it, with the ordinary JSON sitting right beside the source that wins.
+    const beside = analyseEntrySurfaces(
+      [
+        SEED,
+        { rel: "lib/config.json", code: `{"raw":true}` },
+        { rel: "lib/config.json.ts", code: `${IMPORT_CANON}\nexport const config = async (a) => ${WRITER}(a);` },
+        { rel: ROUTE, code: `import { config } from "@/lib/config.json";\nexport async function POST(){ await config({}); }` },
+      ],
+      entryInv(ROUTE)
+    );
+    expect(beside.violations.map((v) => v.message), "the SOURCE wins; the JSON beside it is not the answer").toEqual([]);
+    expect(beside.closure, "the .json-spelled specifier resolves to the .json.ts SOURCE").toContain("lib/config.json.ts");
+    expect(beside.surfaces).toEqual([ROUTE]);
+
+    // (d) the boundary in the other direction: a DECLARATION is a source spelling, so it must still
+    // RESOLVE and then fail admission. A gate written as "only files the graph would admit" turns
+    // this refusal into a silent asset, which is the reason the excluded spellings are enumerated.
+    const decl = analyseEntrySurfaces(
+      [
+        SEED,
+        WRAP(),
+        { rel: "lib/kinds.d.ts", code: `export type Team = { id: string };` },
+        {
+          rel: ROUTE,
+          code: `import { w } from "@/lib/wrap";\nimport { Team } from "@/lib/kinds";\nexport async function POST(){ await w({ Team }); }`,
+        },
+      ],
+      entryInv(ROUTE)
+    );
+    const declRefs = ofKind(decl, "excluded-ref");
+    expect(declRefs, "an excluded DECLARATION still fails, and is not downgraded to an asset").toHaveLength(1);
+    expect(declRefs[0].message).toContain("lib/kinds.d.ts");
+  });
+
+  // ── AC18-05m/n: an ABSOLUTE path is a local spelling, not a package name (Astra medium 2) ──────
+  //
+  // The external-terminal branch fires on "not `.` and not `@/`", so `/tmp/bridge.mjs` — a local
+  // absolute spelling that no package registry could ever supply — is terminated as an external
+  // package: no edge, no diagnostic, and every surface behind it gone. The spec already says an
+  // unresolved or outside-root LOCAL code reference fails; these rows are that rule, applied to the
+  // spelling the classifier currently does not recognise as local.
+  const ABSOLUTE_REFUSED = [
+    { n: "a static import", code: `import { bridge } from "/tmp/bridge.mjs";`, spec: "/tmp/bridge.mjs" },
+    { n: "a literal dynamic import", code: `export const pending = import("/tmp/bridge.mjs");`, spec: "/tmp/bridge.mjs" },
+    { n: "a literal require", code: `export const bridge = require("/tmp/bridge.mjs");`, spec: "/tmp/bridge.mjs" },
+    { n: "an export-from declaration", code: `export { bridge } from "/tmp/bridge.mjs";`, spec: "/tmp/bridge.mjs" },
+    // Refusing is the contract; RESOLVING absolute paths is not. An absolute spelling of a file that
+    // IS in the analysed set must still be refused, or the fix has quietly added a second resolver.
+    { n: "an absolute spelling of a file INSIDE the analysed set", code: `import { w as w2 } from "/lib/wrap";`, spec: "/lib/wrap" },
+    // The OTHER supported platform's spellings, asserted on THIS one. `path.isAbsolute` answers for
+    // the host it runs on, so a POSIX runner calls `C:\tmp\x.mjs` relative and waves it through as a
+    // package name — the guard would then lose edges depending on where CI happens to run, which is
+    // exactly the silent, environment-dependent hole this criterion exists to close.
+    { n: "a Windows drive path, forward slashes", code: `import { bridge } from "C:/tmp/bridge.mjs";`, spec: "C:/tmp/bridge.mjs" },
+    { n: "a Windows drive path, backslashes", code: `import { bridge } from "C:\\\\tmp\\\\bridge.mjs";`, spec: "C:\\tmp\\bridge.mjs" },
+    { n: "a Windows root-relative path", code: `import { bridge } from "\\\\tmp\\\\bridge.mjs";`, spec: "\\tmp\\bridge.mjs" },
+  ];
+
+  it.each(ABSOLUTE_REFUSED)("AC18-05m — an ABSOLUTE specifier is refused, never terminated as a package: $n", ({ code, spec }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    const refused = ofKind(r, "unresolved");
+    expect(refused, "an absolute path is a LOCAL reference; treating it as a package erases the edge in silence").toHaveLength(1);
+    expect(refused[0].message).toContain(rel);
+    expect(refused[0].message).toContain(spec);
+    expect(refused[0].message, "the location, so the reader can go straight to the line").toContain(":2");
+    expect(r.violations.map((v) => v.kind), "one rule, once — the refusal is not a cascade").toEqual(["unresolved"]);
+  });
+
+  it.each([
+    { n: "a bare external package", code: `import { z } from "zod";` },
+    { n: "a node builtin, prefixed", code: `import { join } from "node:path";` },
+    { n: "a node builtin, bare", code: `import { join } from "path";` },
+    // The rows that discriminate an over-broad fix: a package SUBPATH contains slashes and looks
+    // path-shaped, but it is still a package specifier and must stay terminal.
+    { n: "a deep path inside an external package", code: `import { helper } from "zod/lib/helpers.js";` },
+    { n: "a deep path inside a SCOPED package", code: `import { init } from "@sentry/nextjs/esm/client.js";` },
+    { n: "a literal dynamic import of a package subpath", code: `export const pending = import("@e2b/code-interpreter/dist/index.js");` },
+  ])("AC18-05n — a non-local specifier stays terminal: $n", ({ code }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    expect(r.violations.map((v) => v.message), "a package subpath has slashes but is not a path").toEqual([]);
+    expect(r.surfaces).toEqual([rel]);
+  });
+
+  // ── AC18-05y/z: a `file:` MODULE URL is a local reference wearing a scheme (Astra final, P2) ────
+  //
+  // The same erasure as the absolute rows above, one spelling further out. The local test keys on
+  // `.` and `@/`, and `file:///tmp/bridge.mjs` is neither — so it reaches the external-package
+  // branch and terminates as a dependency: no edge, no diagnostic, every surface behind it gone.
+  // The coordinator reproduced exactly that, with a literal dynamic import in a scanned script
+  // returning an empty violations list. Refusing the SPELLING is the whole contract here: nothing
+  // decodes the URL, resolves it, or acquires any opinion about hosts, escapes or query strings.
+  const FILE_URL_REFUSED = [
+    { n: "a static import", code: `import { bridge } from "file:///tmp/bridge.mjs";`, spec: "file:///tmp/bridge.mjs" },
+    { n: "a literal dynamic import (the reproduced form)", code: `export const pending = import("file:///tmp/bridge.mjs");`, spec: "file:///tmp/bridge.mjs" },
+    { n: "a literal require", code: `export const bridge = require("file:///tmp/bridge.mjs");`, spec: "file:///tmp/bridge.mjs" },
+    { n: "an export-from declaration", code: `export { bridge } from "file:///tmp/bridge.mjs";`, spec: "file:///tmp/bridge.mjs" },
+    // Case-INSENSITIVE because URL schemes are: `FILE:` and `file:` name one protocol. A
+    // case-sensitive test refuses the lowercase spelling and waves its shouted twin through, which
+    // is an edge lost on capitalisation — the environment-dependent hole AC18-05m already refused
+    // to accept for platform path spellings.
+    { n: "an UPPERCASE scheme", code: `import { bridge } from "FILE:///tmp/bridge.mjs";`, spec: "FILE:///tmp/bridge.mjs" },
+    { n: "a mixed-case scheme", code: `import { bridge } from "File:///tmp/bridge.mjs";`, spec: "File:///tmp/bridge.mjs" },
+    // No host and no slashes, still a file URL — and still not something this graph resolves.
+    { n: "an opaque, host-less path", code: `import { bridge } from "file:bridge.mjs";`, spec: "file:bridge.mjs" },
+    // Refusing is the contract; RESOLVING file URLs is not. A URL naming a file that IS in the
+    // analysed set must still be refused, or the fix has quietly added a second resolver.
+    { n: "a file URL naming a file INSIDE the analysed set", code: `import { w as w2 } from "file:///lib/wrap.ts";`, spec: "file:///lib/wrap.ts" },
+  ];
+
+  it.each(FILE_URL_REFUSED)("AC18-05y — a `file:` module URL is refused, never terminated as a package: $n", ({ code, spec }) => {
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    const refused = ofKind(r, "unsupported-file-url");
+    expect(refused, "a file URL is a LOCAL reference; treating it as a package erases the edge in silence").toHaveLength(1);
+    expect(refused[0].message).toContain(rel);
+    expect(refused[0].message).toContain(spec);
+    expect(refused[0].message, "the location, so the reader can go straight to the line").toContain(":2");
+    expect(r.violations.map((v) => v.kind), "one rule, once — the refusal is not a cascade").toEqual(["unsupported-file-url"]);
+  });
+
+  it.each([
+    { n: "a package whose NAME begins with the same four letters", code: `import { fileTypeFromBuffer } from "file-type";` },
+    { n: "a SCOPED package whose scope is literally `file`", code: `import { load } from "@file/loader";` },
+    { n: "a node builtin carrying a scheme-ish colon", code: `import { readFile } from "node:fs/promises";` },
+    { n: "a package subpath naming a file", code: `import { helper } from "zod/lib/file.js";` },
+  ])("AC18-05z — a specifier that merely LOOKS like a file URL stays terminal: $n", ({ code }) => {
+    // The passing twins. Without them a refusal keyed on the four letters — or on "has a colon" —
+    // would satisfy every row above while making ordinary package and builtin imports unwritable.
+    const rel = ROUTE;
+    const r = analyseEntrySurfaces(
+      [SEED, WRAP(), { rel, code: `import { w } from "@/lib/wrap";\n${code}\nexport async function POST(){ await w({}); }` }],
+      entryInv(rel)
+    );
+    expect(r.violations.map((v) => v.message), "the SCHEME is what is refused, not the letters").toEqual([]);
+    expect(r.surfaces).toEqual([rel]);
+  });
+
+  // ── AC18-06: computed loads, the ONE exception, and staleness ─────────────────────────────────
+  const E2B_REL = "lib/actions/sandbox/e2b.ts";
+  const e2bFile = (body: string) => ({ rel: E2B_REL, code: body });
+  const E2B_OK = `const E2B_MODULE: string = "@e2b/code-interpreter";\nasync function defaultLoader() {\n  return (await import(E2B_MODULE));\n}\nexport const load = defaultLoader;`;
+
+  it.each([
+    { n: "a computed import in a file OUTSIDE the closure", files: [{ rel: "app/api/y/route.ts", code: `export async function POST(name){ return import(name); }` }] },
+    { n: "a computed require in a file outside the closure", files: [{ rel: "scripts/loader.ts", code: `const p = process.argv[2];\nrequire(p);` }] },
+    { n: "a computed import INSIDE the closure", files: [{ rel: ROUTE, code: `import { w } from "@/lib/wrap";\nexport async function POST(name){ await w({}); return import(name); }` }] },
+    { n: "a concatenated specifier", files: [{ rel: ROUTE, code: `const BASE = "@/lib/";\nexport async function POST(n){ return import(BASE + n); }` }] },
+    { n: "a template specifier with a substitution", files: [{ rel: ROUTE, code: "export async function POST(n){ return import(`@/lib/${n}`); }" }] },
+  ])("AC18-06 — a non-literal load is REFUSED: $n", ({ files }) => {
+    // Fail-closed EVEN OUTSIDE the closure: a hidden edge that nobody follows is exactly the thing
+    // that would prevent its own discovery, so "not currently reachable" cannot be the excuse.
+    const r = analyseEntrySurfaces([SEED, WRAP(), ...files], NO_ENTRIES);
+    expect(ofKind(r, "refused-load")).toHaveLength(1);
+    expect(ofKind(r, "refused-load")[0].message).toContain(files[0].rel);
+  });
+
+  it("AC18-06b — the narrowly matched E2B exception passes", () => {
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(E2B_OK)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  it.each([
+    { n: "the const now points at a LOCAL wrapper", code: `const E2B_MODULE: string = "@/lib/wrap";\nasync function defaultLoader() {\n  return (await import(E2B_MODULE));\n}` },
+    { n: "a SECOND load of the same binding appears", code: `${E2B_OK}\nexport async function again(){ return import(E2B_MODULE); }` },
+    { n: "the expression is broadened", code: `const E2B_MODULE: string = "@e2b/code-interpreter";\nasync function defaultLoader(suffix) {\n  return (await import(E2B_MODULE + suffix));\n}` },
+    { n: "the load moved to a different function", code: `const E2B_MODULE: string = "@e2b/code-interpreter";\nasync function otherLoader() {\n  return (await import(E2B_MODULE));\n}` },
+    { n: "a NEW computed loader tries to borrow the exception", code: `${E2B_OK}\nexport async function local(name){ return import(name); }` },
+  ])("AC18-06c — the exception is EXACT, not a file-wide pass: $n", ({ code }) => {
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(code)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(r.violations.map((v) => v.kind)).toContain("refused-load");
+  });
+
+  it("AC18-06d — an exception whose load is gone goes STALE (and is not inferred from an empty closure)", () => {
+    const gone = analyseEntrySurfaces([SEED, WRAP(), e2bFile(`export const load = null;`)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(ofKind(gone, "stale-exception")).toHaveLength(1);
+    expect(ofKind(gone, "stale-exception")[0].message).toContain(E2B_REL);
+    // …and the same when the file itself is absent: no closure, no loads, therefore "nothing to
+    // except" — an unused exception is a hole nobody is watching, not a clean bill of health.
+    const absent = analyseEntrySurfaces([SEED], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(ofKind(absent, "stale-exception")).toHaveLength(1);
+    // The exception in force against the real tree is exactly the one this fixture models.
+    const only: ComputedLoadException[] = [...COMPUTED_LOAD_EXCEPTIONS];
+    expect(only).toHaveLength(1);
+    expect(only[0].file).toBe(E2B_REL);
+    expect(only[0].reason.trim().length, "an exception with no reason is a shrug").toBeGreaterThan(0);
+  });
+
+  it.each([
+    {
+      n: "the classified file is gone",
+      files: [SEED, WRAP()],
+      inv: entryInv("app/api/v9/removed/route.ts"),
+    },
+    {
+      n: "the file is still here but no longer reaches the writer",
+      files: [SEED, WRAP(), { rel: ROUTE, code: `export async function POST(){ return null; }` }],
+      inv: entryInv(ROUTE),
+    },
+    {
+      n: "the file is reached but no longer meets the surface predicate",
+      files: [SEED, WRAP(), { rel: "lib/x/actions.ts", code: `import { w } from "@/lib/wrap";\nexport const run = w;` }],
+      inv: entryInv("lib/x/actions.ts"),
+    },
+  ])("AC18-06e — a stale entry record fails: $n", ({ files, inv }) => {
+    const r = analyseEntrySurfaces(files, inv);
+    expect(r.violations.map((v) => v.kind)).toContain("stale-entry");
+    expect(r.violations.map((v) => v.message).join("\n")).toContain(Object.keys(inv)[0]);
+  });
+
+  it("AC18-06f — removing ONE edge while another path survives is NOT staleness", () => {
+    // The positive twin for the row above. A stale check keyed on the WITNESS rather than on
+    // reachability would pass every AC18-06e row and then fire on an ordinary refactor that changed
+    // nothing about the surface's obligation — a failure nobody can act on except by editing prose.
+    const rel = ROUTE;
+    const base = [
+      SEED,
+      WRAP(),
+      { rel: "lib/path-a.ts", code: `import { w } from "@/lib/wrap";\nexport const alsoA = w;` },
+      { rel: "lib/path-b.ts", code: `import { w } from "@/lib/wrap";\nexport const alsoB = w;` },
+    ];
+    const viaBoth = { rel, code: `import { alsoA } from "@/lib/path-a";\nimport { alsoB } from "@/lib/path-b";\nexport async function POST(){ await alsoA({}); await alsoB({}); }` };
+    const viaOne = { rel, code: `import { alsoB } from "@/lib/path-b";\nexport async function POST(){ await alsoB({}); }` };
+    for (const surface of [viaBoth, viaOne]) {
+      const r = analyseEntrySurfaces([...base, surface], entryInv(rel));
+      expect(r.violations.map((v) => v.message)).toEqual([]);
+      expect(r.surfaces).toEqual([rel]);
+    }
+  });
+
+  // ── AC18-06g/h: the excused load must be the APPROVED TOP-LEVEL CONST, not merely its spelling ─
+  //
+  // The exception's entire justification is "external package — it can never resolve to a repo
+  // module". That claim is true of the top-level `const E2B_MODULE = "@e2b/code-interpreter"` and of
+  // nothing else. The matcher compares the argument's SPELLING, the enclosing function's name, the
+  // load count and the const's value — none of which establish that the argument identifier RESOLVES
+  // to that const. So any binding of the same name that sits closer to the load supplies the real
+  // specifier while the untouched top-level const goes on satisfying the allow rule, and a
+  // caller-supplied REPO module loads under an exception written for a package. A concrete
+  // `defaultLoader(E2B_MODULE: string)` was run through this analyser and produced ZERO violations.
+  //
+  // Every row below keeps the approved const VERBATIM — asserted, so a later edit cannot turn these
+  // into value-mismatch refusals that pass for the wrong reason — and changes exactly one thing:
+  // which binding the load's identifier actually refers to.
+  const E2B_CONST = `const E2B_MODULE: string = "@e2b/code-interpreter";`;
+
+  it.each([
+    {
+      n: "a PARAMETER of the excused function shadows the const",
+      code: `${E2B_CONST}
+async function defaultLoader(E2B_MODULE: string) {
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a DESTRUCTURED parameter buries the spelling in a binding pattern",
+      code: `${E2B_CONST}
+async function defaultLoader({ E2B_MODULE }: { E2B_MODULE: string }) {
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a RENAMED destructure binds the spelling to an arbitrary property",
+      code: `${E2B_CONST}
+async function defaultLoader(opts: { pkg: string }) {
+  const { pkg: E2B_MODULE } = opts;
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a function-local `const` before the load shadows it",
+      code: `${E2B_CONST}
+async function defaultLoader(name: string) {
+  const E2B_MODULE = name;
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      // A `let` declared BELOW the load still owns the whole function scope — the reference is a TDZ
+      // error, not a read of the outer const. That is the point: textual position cannot decide
+      // this, so "the top-level declaration comes first" is never an argument for excusing a load.
+      n: "a function-local `let` declared AFTER the load shadows it anyway",
+      code: `${E2B_CONST}
+async function defaultLoader(name: string) {
+  const mod = await import(E2B_MODULE);
+  let E2B_MODULE = name;
+  return mod;
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a hoisted `var` declared AFTER the load shadows it anyway",
+      code: `${E2B_CONST}
+async function defaultLoader(name: string) {
+  const mod = await import(E2B_MODULE);
+  var E2B_MODULE = name;
+  return mod;
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "the ENCLOSING BLOCK binds the name",
+      code: `${E2B_CONST}
+async function defaultLoader(name: string) {
+  if (name) {
+    const E2B_MODULE = name;
+    return (await import(E2B_MODULE));
+  }
+  return null;
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a CATCH parameter binds the name",
+      code: `${E2B_CONST}
+async function defaultLoader(name: string) {
+  try {
+    return JSON.parse(name);
+  } catch (E2B_MODULE) {
+    return (await import(E2B_MODULE));
+  }
+}
+export const load = defaultLoader;`,
+    },
+    {
+      // The function NAME is the only other thing the matcher checks, and it is a spelling too: an
+      // inner arrow assigned to `defaultLoader` answers to that name while the load reads the
+      // parameter of the function around it. A same-spelled function elsewhere must not stand in as
+      // proof that the load sits in the intended binding context.
+      n: "a nested arrow answers to `defaultLoader` while an outer parameter supplies the specifier",
+      code: `${E2B_CONST}
+export function outer(E2B_MODULE: string) {
+  const defaultLoader = async () => (await import(E2B_MODULE));
+  return defaultLoader;
+}`,
+    },
+  ])("AC18-06g — a BINDING SHADOW of the excepted const is refused: $n", ({ code }) => {
+    expect(
+      code,
+      "the fixture must keep the APPROVED const verbatim, or the refusal below only proves a value mismatch"
+    ).toContain(E2B_CONST);
+
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(code)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+
+    // Pinned by KIND and COUNT, never by "violations is non-empty": the stale exception below fires
+    // in the same run, so a criterion that only counted violations would report success while the
+    // loader itself stayed excused.
+    const refused = ofKind(r, "refused-load");
+    expect(refused, "the shadowed load must be REFUSED — the approved const is not what it loads").toHaveLength(1);
+    expect(refused[0].message).toContain(E2B_REL);
+
+    // The documented companion under the exact-match contract: the approved exception now matches
+    // nothing, so it goes STALE rather than being quietly consumed by a load nobody approved.
+    expect(ofKind(r, "stale-exception"), "an exception that fits nothing is stale, not satisfied").toHaveLength(1);
+  });
+
+  it.each([
+    { n: "the genuine, unshadowed loader", code: E2B_OK },
+    {
+      // A binding confined to a SIBLING block never reaches the load, so a checker that merely
+      // scanned the function subtree for the spelling would refuse a load that is entirely correct.
+      n: "a same-spelled binding confined to a disjoint block",
+      code: `${E2B_CONST}
+async function defaultLoader(flag: boolean) {
+  if (flag) {
+    const E2B_MODULE = "./sibling";
+    void E2B_MODULE;
+  }
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a same-spelled binding confined to a nested function",
+      code: `${E2B_CONST}
+async function defaultLoader() {
+  const describe = (E2B_MODULE: string) => E2B_MODULE.length;
+  void describe;
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a same-spelled binding in an unrelated function that holds no load",
+      code: `${E2B_CONST}
+async function defaultLoader() {
+  return (await import(E2B_MODULE));
+}
+export function describeModule(E2B_MODULE: string) {
+  return E2B_MODULE.length;
+}
+export const load = defaultLoader;`,
+    },
+    {
+      n: "a nearby local whose name merely RESEMBLES the const",
+      code: `${E2B_CONST}
+async function defaultLoader() {
+  const E2B_MODULE_PATH = "./not-a-shadow";
+  void E2B_MODULE_PATH;
+  return (await import(E2B_MODULE));
+}
+export const load = defaultLoader;`,
+    },
+  ])("AC18-06h — a same-spelled binding that never reaches the load keeps the exception: $n", ({ code }) => {
+    // The positive twins. Without them, a refusal that fired on the SPELLING anywhere in the file
+    // would satisfy every AC18-06g row while breaking the one load the exception exists for.
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(code)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(r.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  // ── AC18-06i/j: the exception is for ONE LOADER, not for one identifier ────────────────────────
+  //
+  // Astra medium 3. Extraction keeps the argument identifier, the enclosing function and the source
+  // text, but not WHICH LOADER ran — so `require(E2B_MODULE)` presents the matcher with the same
+  // binding, the same function and the same count as the approved `import(E2B_MODULE)` and is
+  // excused by an exception written for a dynamic import. The binding-identity work above cannot
+  // reach this: the argument genuinely IS the approved const. It is the expression that differs,
+  // and `require` is a synchronous CommonJS load with different semantics — not the thing anybody
+  // reviewed when the exception was written.
+  it("AC18-06i — a computed REQUIRE cannot borrow the import-only E2B exception", () => {
+    const asRequire = `${E2B_CONST}
+async function defaultLoader() {
+  return require(E2B_MODULE);
+}
+export const load = defaultLoader;`;
+    // The approved const is kept VERBATIM, so a refusal here cannot be a value mismatch in disguise.
+    expect(asRequire).toContain(E2B_CONST);
+
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(asRequire)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    const refused = ofKind(r, "refused-load");
+    expect(refused, "a require of the approved binding is a DIFFERENT load, and no exception covers it").toHaveLength(1);
+    expect(refused[0].message).toContain(E2B_REL);
+    expect(refused[0].message, "the refusal must quote the REQUIRE, not some other load in the file").toContain("require(E2B_MODULE)");
+    // The documented companion under the exact-match contract: the import the exception was written
+    // for is gone, so the exception fits nothing and goes STALE rather than being consumed by a load
+    // nobody approved. Pinned by kind AND count — "violations is non-empty" would pass either way.
+    expect(ofKind(r, "stale-exception"), "an exception that fits nothing is stale, not satisfied").toHaveLength(1);
+
+    // The twin, in the same criterion: same file, same binding, same function, same count — only the
+    // loader kind differs, and the genuine dynamic import stays clean.
+    const genuine = analyseEntrySurfaces([SEED, WRAP(), e2bFile(E2B_OK)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    expect(genuine.violations.map((v) => v.message)).toEqual([]);
+  });
+
+  it("AC18-06j — a require ALONGSIDE the approved import is refused, and the import keeps its exception", () => {
+    // The occurrence count is a property of the APPROVED LOADER, not of the identifier: an unrelated
+    // require must not be able to invalidate the reviewed import by inflating its count either.
+    const both = `${E2B_OK}\nexport function sync(){ return require(E2B_MODULE); }`;
+    const r = analyseEntrySurfaces([SEED, WRAP(), e2bFile(both)], NO_ENTRIES, { exceptions: COMPUTED_LOAD_EXCEPTIONS });
+    const refused = ofKind(r, "refused-load");
+    expect(refused, "exactly the unapproved load — the reviewed import is not collateral").toHaveLength(1);
+    expect(refused[0].message).toContain("require(E2B_MODULE)");
+    expect(ofKind(r, "stale-exception"), "the approved dynamic import is still there, so nothing is stale").toHaveLength(0);
+  });
+
+  // ── AC18-07: the real tree ────────────────────────────────────────────────────────────────────
+  let realEntryCache: EntrySurfaceAnalysis | null = null;
+  // Exceptions are passed EXPLICITLY (the default is none): the real tree is the only caller that
+  // has any, and naming them here keeps "which loads are excused" a decision at the call site.
+  //
+  // Through `analyseTreeAt`, i.e. the SAME discovery-to-analysis seam the on-disk fixtures use with
+  // an injected root — the whole point of extracting it. A criterion that assembled the file list
+  // itself would leave the walk's own behaviour (which files it drops, and what the analysis is
+  // then able to say about them) reachable by nothing but this one call.
+  const realEntrySurfaces = () =>
+    (realEntryCache ??= analyseTreeAt(ROOT, ENTRY_INVENTORY, { exceptions: COMPUTED_LOAD_EXCEPTIONS }));
+
+  it("AC18-07 — the real tree passes, and the discovered surfaces are EXACTLY the reviewed inventory", () => {
+    const r = realEntrySurfaces();
+    expect(r.violations.map((v) => v.message), "every entry surface must carry a reviewed record").toEqual([]);
+    expect(r.surfaces).toEqual(Object.keys(ENTRY_INVENTORY).sort());
+    expect(r.closure, "the seed is excluded from the WALK and added explicitly by the graph").toContain(CANONICAL);
+  }, REAL_TREE_TIMEOUT_MS);
+
+  it.each([
+    { n: "the codebases scan route (the escape that motivated this slice)", rel: "app/api/v1/codebases/route.ts" },
+    { n: "the actions route", rel: "app/api/v1/actions/route.ts" },
+    { n: "the admin approvals actions", rel: "app/t/[team]/admin/approvals/actions.ts" },
+    { n: "the dashboard manual-sync query route", rel: "app/api/dashboard/query/route.ts" },
+    { n: "the admin integrations actions (the four 'Run now')", rel: "app/t/[team]/admin/integrations/actions.ts" },
+    { n: "the meetings actions", rel: "app/t/[team]/meetings/actions.ts" },
+    { n: "the boot instrumentation hook", rel: "instrumentation.ts" },
+    { n: "the connectors CLI", rel: "scripts/connectors.ts" },
+    { n: "the demo seeder", rel: "scripts/seed-demo.ts" },
+  ])("AC18-07b — a KNOWN entry surface is in the DISCOVERED set: $n", ({ rel }) => {
+    // Asserted against what the graph found, NOT against the inventory: an inventory that quietly
+    // shrank would still satisfy the set-equality above, because equality holds against whatever
+    // both sides say. These nine are named independently for exactly that reason.
+    expect(realEntrySurfaces().surfaces).toContain(rel);
+  }, REAL_TREE_TIMEOUT_MS);
+
+  it("AC18-07c — every discovered surface carries a witness chain that ends at the writer", () => {
+    const r = realEntrySurfaces();
+    const closure = new Set(r.closure);
+    expect(r.surfaces.length, "a loop over an empty set proves nothing").toBeGreaterThan(0);
+    for (const surface of r.surfaces) {
+      const chain = r.witness[surface];
+      expect(chain, `${surface} must have a witness chain`).toBeDefined();
+      expect(chain[0], `${surface}'s chain must start at the surface`).toBe(surface);
+      expect(chain[chain.length - 1], `${surface}'s chain must end at the writer`).toBe(CANONICAL);
+      expect(chain.length, `${surface}'s chain must have at least one edge`).toBeGreaterThan(1);
+      expect(new Set(chain).size, `${surface}'s chain must not revisit a file`).toBe(chain.length);
+      for (const hop of chain) expect(closure.has(hop), `${hop} must be in the closure`).toBe(true);
+    }
+  }, REAL_TREE_TIMEOUT_MS);
+
+  it("AC18-07d — every reviewed record uses a declared class and a written reason", () => {
+    const records = Object.entries(ENTRY_INVENTORY);
+    expect(records.length, "an empty inventory would satisfy every loop below").toBeGreaterThan(0);
+    for (const [rel, rec] of records) {
+      expect(ENTRY_CLASSES, `${rel} has an undeclared class`).toContain(rec.class);
+      expect(rec.reason.trim().length, `${rel}'s reason is too short to be a decision`).toBeGreaterThan(20);
+    }
+    // Reasons are written per surface, never generated and never directory-wide. Uniqueness is NOT
+    // required — two admin actions can honestly share a chain — but one sentence pasted across the
+    // whole inventory is the auto-generation tell, and it is the thing this rules out.
+    const reasons = new Set(records.map(([, rec]) => rec.reason.trim()));
+    if (records.length > 1) expect(reasons.size, "one reason reused for every surface is not a review").toBeGreaterThan(1);
   });
 });
