@@ -69,6 +69,10 @@ describe("the data-mechanics job supplies the Postgres client tools its specs sp
     // migrate-from-existing lane reads released schema states out of history.
     expect(tools).toEqual(expect.arrayContaining(["git", "psql", "pg_dump", "pg_restore"]));
     expect(verify, "the client may never trail the server major").toMatch(new RegExp(`-lt ${serviceMajor}\\b`));
+    expect(verify, "git's executable existing does not prove this checkout is readable")
+      .toContain('git -C "$GITHUB_WORKSPACE" rev-parse --show-toplevel');
+    expect(verify, "the migration lane needs tag contents, not merely a git worktree")
+      .toContain('git -C "$GITHUB_WORKSPACE" show v0.7.0:postgres/schema.sql');
   });
 
   it("provisions and checks the toolchain before any step that uses it", () => {
@@ -87,6 +91,47 @@ describe("the data-mechanics job supplies the Postgres client tools its specs sp
     expect(scriptOf(isInstall), "an install that ignores a failed apt-get would leave no client behind")
       .toContain("set -euo pipefail");
     expect(scriptOf(isVerify), "a check that cannot fail is not a check").toContain("set -euo pipefail");
+  });
+});
+
+describe("the container job trusts only its exact checked-out repository", () => {
+  const workflow = YAML.parse(readFileSync(".github/workflows/ci.yml", "utf8"));
+  const steps = workflow.jobs["datamechanics-tests"].steps as WorkflowStep[];
+  const checkout = steps.findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+  const trust = steps.findIndex((step) => step.name === "Trust the exact container checkout");
+  const verify = steps.findIndex((step) => step.name === "Verify the job toolchain");
+  const script = steps[trust]?.run ?? "";
+
+  it("establishes scoped trust immediately after checkout and before toolchain use", () => {
+    expect(checkout).toBeGreaterThanOrEqual(0);
+    expect(trust).toBe(checkout + 1);
+    expect(verify).toBeGreaterThan(trust);
+    expect(script).toContain('git config --global --add safe.directory "$GITHUB_WORKSPACE"');
+  });
+
+  it("never turns the ownership exception into wildcard trust", () => {
+    const jobScripts = steps.flatMap((step) => step.run ? [step.run] : []).join("\n");
+    expect(jobScripts).not.toMatch(/safe\.directory\s+["']?\*["']?/);
+    expect(script).toContain('test -n "${GITHUB_WORKSPACE:-}"');
+  });
+});
+
+describe("the direct-network local runner preserves the image reaper and replays schema before tests", () => {
+  const runner = readFileSync("scripts/dm-network-attached.sh", "utf8");
+  const build = runner.indexOf('docker build -q -f docker/staging-ops.Dockerfile -t "$IMAGE" .');
+  const schema = runner.indexOf('--entrypoint /usr/bin/tini "$IMAGE" \\\n  -s -- node scripts/pg-load-schema.mjs');
+  const tests = runner.indexOf('--entrypoint /usr/bin/tini "$IMAGE" \\\n  -s -- npx vitest run --config vitest.datamechanics.config.ts');
+
+  it("runs the rebuilt image's schema loader on every invocation, before the test command", () => {
+    expect(build).toBeGreaterThanOrEqual(0);
+    expect(schema, "schema replay no longer uses the tini launch path").toBeGreaterThan(build);
+    expect(tests, "the test command no longer uses the tini launch path").toBeGreaterThan(schema);
+    expect(runner).not.toContain('if [[ -n "$fresh" ]]');
+  });
+
+  it("does not bypass tini or widen cleanup beyond this worktree's named resources", () => {
+    expect(runner).not.toMatch(/--entrypoint\s+(node|npx)\b/);
+    expect(runner).not.toMatch(/docker\s+(system|volume|container)\s+prune/);
   });
 });
 

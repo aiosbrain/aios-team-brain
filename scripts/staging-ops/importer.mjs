@@ -397,10 +397,12 @@ export async function verifyInstalledPair({ client, session, graph, opened, sani
   // The census applies to EVERY pair: whatever was verified in the bundle is what must now be in
   // the target, legacy or copy-ready.
   if (installedGraph.nodes.length !== graph.nodes.length || installedGraph.relationships.length !== graph.relationships.length) throw new Error("installed graph census differs from verified bundle");
-  // The ledger↔graph correspondence is a COPY-READY contract. `legacy-pg-only` has documented
-  // empty-graph semantics — its Postgres never carried `graph_episodes` — so demanding an episode
-  // per ledger row of a legacy checkpoint would fail a correct restore, and passing it silently
-  // would prove nothing. It is asked only where it means something.
+  // The ledger↔graph correspondence is a COPY-READY contract. Ordinary `legacy-pg-only` installs
+  // have documented empty-graph semantics. The one exception is a FULL, importer-authenticated
+  // staging rollback: it restores both stores as captured, but graph use remains disabled and the
+  // captured graph/ledger are not relabelled or validated as copy-ready. Use the SAME provenance
+  // predicate as restore/credential handling; mode or databaseMode alone are caller-controlled
+  // signed claims and must never select this exception.
   const mode = opened.manifest.mode ?? "copy-ready";
   if (mode !== "legacy-pg-only") {
     const facts = await snapshotExportFacts(client);
@@ -408,7 +410,9 @@ export async function verifyInstalledPair({ client, session, graph, opened, sani
     validateLedgerAgainstSanitizedGraph(installedGraph, facts);
   } else {
     const ledger = await client.query("SELECT count(*)::int AS rows FROM graph_episodes");
-    if (Number(ledger.rows[0]?.rows ?? -1) !== 0 || installedGraph.nodes.length !== 0) {
+    const ledgerRows = Number(ledger.rows[0]?.rows ?? -1);
+    if (!Number.isInteger(ledgerRows) || ledgerRows < 0) throw new Error("legacy checkpoint ledger census could not be measured");
+    if (!preservesCapturedStagingCredentials(opened) && (ledgerRows !== 0 || installedGraph.nodes.length !== 0)) {
       throw new Error(`legacy-pg-only checkpoint restored ${ledger.rows[0]?.rows} ledger rows and ${installedGraph.nodes.length} graph nodes; legacy mode has empty-graph semantics`);
     }
   }

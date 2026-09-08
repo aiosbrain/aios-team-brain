@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
+import { createSignedEncryptedBundle, openSignedEncryptedBundle, rollbackOpeningProvenance } from "../scripts/staging-ops/bundle-crypto.mjs";
 import { assertReplayableGraph, compareEnvironmentCredentials, installObject, verifyAndPinSourceBundle, verifyInstalledPair, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
 import { PrivateFileStore } from "../scripts/staging-ops/private-store.mjs";
 import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
@@ -169,5 +169,88 @@ describe("M6 — installed-pair verification checks the restored ledger UUID", (
     await expect(verifyInstalledPair({ client, session, graph: installed, opened, deadlines: {
       operationMs: 5_000, captureMs: 5_000, recoveryMs: 5_000, cleanupMs: 5_000, connectionMs: 5_000, terminateGraceMs: 100,
     } })).rejects.toThrow(/does not satisfy current projection ledger/);
+  });
+});
+
+describe("AC-06 — full authenticated legacy rollback verifies the captured stores without copy-ready semantics", () => {
+  const signing = generateKeyPairSync("ed25519");
+  const encryption = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const deadlines = {
+    operationMs: 5_000, captureMs: 5_000, recoveryMs: 5_000, cleanupMs: 5_000, connectionMs: 5_000, terminateGraceMs: 100,
+  };
+  const captured = {
+    codecVersion: 1,
+    nodes: [
+      { exportId: "episode", labels: ["Episodic"], properties: { uuid: "legacy-episode", name: "items:legacy", group_id: "legacy_team" } },
+      { exportId: "one", labels: ["Entity"], properties: { uuid: "one", group_id: "legacy_team" } },
+      { exportId: "two", labels: ["Entity"], properties: { uuid: "two", group_id: "legacy_team" } },
+    ],
+    relationships: [
+      { start: "episode", end: "one", type: "MENTIONS", properties: {} },
+      { start: "one", end: "two", type: "RELATES_TO", properties: { group_id: "legacy_team", episodes: ["legacy-episode"] } },
+    ],
+  };
+  const schemaLine = "column\titems.id\tuuid";
+  const schemaDigest = schemaFingerprintDigest([schemaLine]);
+
+  const graphSession = (graph = captured) => ({
+    run: vi.fn(async (query: string) => {
+      const rows = query.startsWith("MATCH (n)") ? graph.nodes : graph.relationships;
+      return { records: rows.map((row) => ({ get: (key: string) => row[key as keyof typeof row] })) };
+    }),
+  });
+  const postgres = (ledgerRows = 2) => ({
+    query: vi.fn(async (sql: string) => {
+      const text = String(sql);
+      if (text.includes("count(*)::int AS rows FROM graph_episodes")) return { rows: [{ rows: ledgerRows }] };
+      if (text.includes("from pg_attribute")) return { rows: [{ kind: "column", ident: "items.id", def: "uuid" }] };
+      return { rows: [] };
+    }),
+  });
+  const opened = ({ authenticated, kind = "staging-rollback", databaseMode = "full" }: { authenticated: boolean; kind?: string; databaseMode?: string }) => {
+    const bundle = createSignedEncryptedBundle({
+      payload: Buffer.from("captured-pair"),
+      manifest: { kind, databaseMode, mode: "legacy-pg-only", runId: "bootstrap-legacy", build: { schemaFingerprint: schemaDigest } },
+      exporterSigningPrivateKey: signing.privateKey,
+      importerEncryptionPublicKey: encryption.publicKey,
+    });
+    const result = openSignedEncryptedBundle({
+      bundle,
+      exporterSigningPublicKey: signing.publicKey,
+      importerEncryptionPrivateKey: encryption.privateKey,
+      signerPurpose: authenticated ? "rollback" : "source",
+    });
+    return { ...result, kind: authenticated ? "rollback" : "source", sourceProvenance: rollbackOpeningProvenance(result) };
+  };
+
+  it("accepts a captured 3-node/2-relationship graph and non-empty ledger only for the authenticated full rollback", async () => {
+    const client = postgres(2);
+    const session = graphSession();
+    await expect(verifyInstalledPair({
+      client, session, graph: captured, opened: opened({ authenticated: true }), sanitationExpected: false, deadlines,
+    })).resolves.toBeUndefined();
+    expect(session.run, "the installed graph census was skipped").toHaveBeenCalledTimes(2);
+    expect(client.query.mock.calls.some(([sql]) => String(sql).includes("count(*)::int AS rows FROM graph_episodes")), "the restored ledger census was skipped").toBe(true);
+    expect(client.query.mock.calls.some(([sql]) => String(sql).includes("from pg_attribute")), "the installed schema was not measured").toBe(true);
+  });
+
+  it.each([
+    ["graph census", { graph: { ...captured, relationships: captured.relationships.slice(0, 1) }, schemaFingerprint: schemaDigest }, /installed graph census differs/],
+    ["schema fingerprint", { graph: captured, schemaFingerprint: "f".repeat(64) }, /catalog digest .* differs/],
+  ])("still refuses a %s mismatch", async (_label, mismatch, message) => {
+    const checkpoint = opened({ authenticated: true });
+    checkpoint.manifest.build.schemaFingerprint = mismatch.schemaFingerprint;
+    await expect(verifyInstalledPair({
+      client: postgres(2), session: graphSession(), graph: mismatch.graph, opened: checkpoint, sanitationExpected: false, deadlines,
+    })).rejects.toThrow(message as RegExp);
+  });
+
+  it.each([
+    ["non-full rollback", opened({ authenticated: true, databaseMode: "sanitized" })],
+    ["source-signed forged full rollback", opened({ authenticated: false })],
+  ])("keeps legacy empty-graph semantics strict for a %s", async (_label, candidate) => {
+    await expect(verifyInstalledPair({
+      client: postgres(2), session: graphSession(), graph: captured, opened: candidate, sanitationExpected: false, deadlines,
+    })).rejects.toThrow(/legacy mode has empty-graph semantics/);
   });
 });

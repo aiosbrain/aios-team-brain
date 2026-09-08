@@ -73,14 +73,12 @@ docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/
 
 if [[ "${AIOS_DM_NET_RESET:-}" == "1" ]]; then docker rm -f -v "$PG" >/dev/null 2>&1 || true; fi
 
-fresh=""
 if ! exists; then
   echo "[dm-network] creating $PG on $NET (no published port — service DNS only)"
   docker run -d --name "$PG" --network "$NET" --network-alias "$PG_ALIAS" \
     -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app_test \
     postgres:16 \
     -c fsync=off -c full_page_writes=off -c synchronous_commit=off -c max_wal_size=1GB >/dev/null
-  fresh=1
 else
   docker start "$PG" >/dev/null 2>&1 || true
   docker network connect "$NET" "$PG" --alias "$PG_ALIAS" >/dev/null 2>&1 || true
@@ -101,14 +99,17 @@ fi
 echo "[dm-network] building $IMAGE from docker/staging-ops.Dockerfile"
 docker build -q -f docker/staging-ops.Dockerfile -t "$IMAGE" . >/dev/null
 
-if [[ -n "$fresh" ]]; then
-  echo "[dm-network] loading schema into $URL"
-  docker run --rm --network "$NET" -e DATABASE_URL="$URL" --entrypoint node "$IMAGE" scripts/pg-load-schema.mjs
-fi
+# Replay on EVERY invocation, after the image has been rebuilt. The loader is idempotent, and a
+# build/schema failure can leave this script's named Postgres container behind: gating replay on
+# container creation made the next retry skip the very step that had failed. Override to tini, not
+# node, because any `--entrypoint` bypasses the image ENTRYPOINT entirely.
+echo "[dm-network] loading/replaying schema into $URL"
+docker run --rm --network "$NET" -e DATABASE_URL="$URL" --entrypoint /usr/bin/tini "$IMAGE" \
+  -s -- node scripts/pg-load-schema.mjs
 
 specs=("$@")
 if [[ ${#specs[@]} -eq 0 ]]; then specs=("${DEFAULT_SPECS[@]}"); fi
 
 echo "[dm-network] $IMAGE → $URL"
-exec docker run --rm --network "$NET" -e DATABASE_TEST_URL="$URL" --entrypoint npx "$IMAGE" \
-  vitest run --config vitest.datamechanics.config.ts "${specs[@]}"
+exec docker run --rm --network "$NET" -e DATABASE_TEST_URL="$URL" --entrypoint /usr/bin/tini "$IMAGE" \
+  -s -- npx vitest run --config vitest.datamechanics.config.ts "${specs[@]}"

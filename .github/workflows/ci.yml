@@ -122,6 +122,15 @@ jobs:
           # requires `git` IN the image (`node:20-bookworm` has it): without it checkout degrades to
           # an archive download, which has no history for that lane to read at all.
           fetch-depth: 0
+      # The checkout is bind-mounted into this ephemeral job container with host-runner ownership.
+      # Trust ONLY that exact checkout path here; a wildcard would hide ownership mistakes in every
+      # repository the container could see. This writes the container's disposable config, never the
+      # host runner's git configuration.
+      - name: Trust the exact container checkout
+        run: |
+          set -euo pipefail
+          test -n "${GITHUB_WORKSPACE:-}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
@@ -162,6 +171,13 @@ jobs:
             echo "pg_dump $client_major is older than the Postgres 16 service; it would refuse the dump" >&2
             exit 1
           fi
+          repo_root="$(git -C "$GITHUB_WORKSPACE" rev-parse --show-toplevel)"
+          if [ "$repo_root" != "$GITHUB_WORKSPACE" ]; then
+            echo "git resolved '$repo_root', expected the exact checkout '$GITHUB_WORKSPACE'" >&2
+            exit 1
+          fi
+          git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD^{commit} >/dev/null
+          git -C "$GITHUB_WORKSPACE" show v0.7.0:postgres/schema.sql >/dev/null
       - run: npm ci
       # migrate-from-zero into the service DB (also the replay guard)
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
