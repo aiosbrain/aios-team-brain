@@ -272,7 +272,12 @@ describe("paired refresh isolated harness", () => {
     expect(converged, "the converging retry must follow the ordinary failure").toBeGreaterThan(ordinary);
     // Both kill windows and the first-import recovery coverage are retained, not displaced.
     expect(harness).toContain("bootstrap_interrupt bootstrap-after-stop bootstrap-killed-after-stop");
-    expect(harness).toContain('"point":"$point".*"kill":"SIGKILL"');
+    // The receipt pattern is built inside a DOUBLE-quoted shell word, so `$point` interpolates and
+    // every quote of the JSON fragment is backslash-escaped. Asserting the unescaped spelling read
+    // as "the kill window is no longer required" against a helper that requires exactly that.
+    expect(harness).toContain(
+      'require_receipt "$name.log" fault-injected "\\"point\\":\\"$point\\".*\\"kill\\":\\"SIGKILL\\""',
+    );
     expect(harness).toContain("require_receipt bootstrap-first-import-recovers.log prior-pair-restored");
   });
 

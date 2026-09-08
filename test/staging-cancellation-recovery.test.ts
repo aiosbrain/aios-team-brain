@@ -416,7 +416,11 @@ describe("HIGH-2 — a bootstrap that failed ordinarily can be retried to ready"
     const fault = IMPORTER_SOURCE.slice(IMPORTER_SOURCE.indexOf("function bootstrapOrdinaryFailureFault("));
     expect(fault.slice(0, 400)).toContain('env.STAGING_PAIR_REQUIRED !== "1"');
     expect(fault.slice(0, 400)).toContain('env.STAGING_FAULT_POINT !== "bootstrap-after-stop-throw"');
-    const calls = [...IMPORTER_SOURCE.matchAll(/bootstrapOrdinaryFailureFault\(env, \{ runId: \w+, resumed: (true|false) \}\)/g)];
+    // `runId` is shorthand on the non-resume branch (`{ runId, resumed: false }`) and explicit on the
+    // resume branch (`{ runId: bootstrapRunId, … }`), because each branch names a different identity.
+    // A pattern that admitted only the explicit form matched ONE call and read as "the fault is
+    // missing from a branch" — the guard failing on production code that is correct.
+    const calls = [...IMPORTER_SOURCE.matchAll(/bootstrapOrdinaryFailureFault\(env, \{ runId(?:: \w+)?, resumed: (true|false) \}\)/g)];
     expect(calls.map((call) => call[1]).sort(), "the fault must sit on both bootstrap branches").toEqual(["false", "true"]);
     // …and inside its branch's stop→lock window, so a failed attempt can never be what blocks the
     // retry. "Some acquisition appears later in the file" would be satisfied by the OTHER branch's,

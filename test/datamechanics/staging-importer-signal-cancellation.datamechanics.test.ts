@@ -90,11 +90,17 @@ setInterval(() => {}, 1000);
     // rollback that was supposed to put staging back never runs: the journal lands
     // `recovery-required` with staging stopped and both fences held.
     //
-    // Measured as SURVIVAL, not as "did a process appear". `runBoundedProcess` spawns before it
-    // consults the signal, so a PID file is written on both paths — what distinguishes them is that
-    // the poisoned scope terminates the child immediately and a healthy one lets it run. The stub
-    // ignores SIGTERM and hangs at `pg_restore --list`, so this never reaches the destructive
-    // `cleanPublicApplicationObjects` step and cannot damage the shared test database.
+    // Measured as WORK PERFORMED, not as "did a process appear". `runBoundedProcess` spawns and
+    // only then consults the signal, so an already-aborted scope has a `child.pid` for exactly as
+    // long as it takes to signal its group — the stub is killed during `node`'s own startup, before
+    // its body runs, and never installs the SIGTERM handler that makes the healthy lane survive. So
+    // the negative control's observable is that NO restore executable ever ran and NOTHING was
+    // mutated; the earlier expectation of a PID file described a child that the abort is required to
+    // have already destroyed, and it failed for the reason it should fail.
+    //
+    // The stub ignores SIGTERM and hangs at `pg_restore --list`, which is the FIRST subprocess on
+    // the restore path, so neither lane reaches the destructive `cleanPublicApplicationObjects`
+    // step and neither can damage the shared test database — asserted below rather than assumed.
     const root = mkdtempSync(path.join(tmpdir(), "staging-recovery-scope-pg-"));
     roots.push(root);
     const refusedPidFile = path.join(root, "refused-pid");
@@ -126,16 +132,27 @@ setInterval(() => {}, 1000);
 
       // NEGATIVE CONTROL, on the real code path: under the install's own aborted scope the restore
       // is terminated and refuses as a cancellation — the exact behaviour recovery must NOT inherit.
+      const publicTables = async () => Number((await owner.query(
+        "select count(*)::int as n from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r','p','f')",
+      )).rows[0].n);
+      const tablesBefore = await publicTables();
+      expect(tablesBefore, "the shared test database has no application tables, so non-mutation would be vacuous").toBeGreaterThan(0);
       process.env.STAGING_SIGNAL_PID_FILE = refusedPidFile;
       await expect(restorePairedPostgres({
         client: owner, databaseUrl: DATABASE_URL, directory: root, pgRestore,
         operationTimeoutMs: 20_000, terminateGraceMs: 100, verifiedStagingTarget: true,
         signal: install.signal,
       })).rejects.toThrow(/operation aborted; subprocess termination confirmed/);
-      expect(existsSync(refusedPidFile), "the negative control never reached the restore executable").toBe(true);
-      expect(alive(Number(readFileSync(refusedPidFile, "utf8"))), "the cancelled restore's child outlived its refusal").toBe(false);
+      // No executable did any work — the stub's very first statement writes this file, and under an
+      // already-aborted scope it never gets to run it.
+      expect(existsSync(refusedPidFile), "an already-aborted scope let a restore executable run its body").toBe(false);
+      // …and nothing downstream of that first subprocess ran either: `cleanPublicApplicationObjects`
+      // drops every public table, so an unchanged non-zero inventory is the mutation oracle.
+      expect(await publicTables(), "the pre-aborted restore reached the destructive cleanup").toBe(tablesBefore);
 
-      // THE PROPERTY: the transferred scope is not poisoned, so the same restore RUNS.
+      // THE PROPERTY, and the exact contrast with the control above: same call, same stub, same
+      // shutdown-derived owner — but the transferred scope is not poisoned, so this one's executable
+      // gets far enough to write its PID and is still alive 300ms later.
       const recovery = await watchdogOwner.transferTo(createOperationBudget("recovery", 60_000));
       expect(recovery.signal.aborted, "recovery inherited the already-aborted shutdown signal").toBe(false);
       process.env.STAGING_SIGNAL_PID_FILE = recoveryPidFile;
