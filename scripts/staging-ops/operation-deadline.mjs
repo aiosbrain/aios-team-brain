@@ -117,8 +117,11 @@ export function stagingOperationDeadlines(env = process.env) {
 }
 
 export function postgresDeadlineConfig(connectionString, timeoutMs, connectionTimeoutMillis = Math.min(10_000, timeoutMs)) {
-  const bounded = finiteDeadlineMs("Postgres operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS);
-  const connection = finiteDeadlineMs("Postgres connection timeout", connectionTimeoutMillis, Math.min(10_000, bounded));
+  // User-configured budgets were already validated at >=1000 ms. Derived REMAINING time can
+  // legitimately be 999 ms (or less) after preflight; refusing that remainder bypasses the
+  // watchdog/recovery path instead of enforcing the actual absolute deadline.
+  const bounded = finiteDeadlineMs("Postgres operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS, { min: 1 });
+  const connection = finiteDeadlineMs("Postgres connection timeout", connectionTimeoutMillis, Math.min(10_000, bounded), { min: 1 });
   return {
     connectionString,
     connectionTimeoutMillis: connection,
@@ -132,7 +135,7 @@ export function postgresDeadlineConfig(connectionString, timeoutMs, connectionTi
 
 /** Rebudget the SAME session for recovery without reconnecting and losing its advisory locks. */
 export async function configurePostgresDeadline(client, timeoutMs) {
-  const bounded = finiteDeadlineMs("Postgres operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS);
+  const bounded = finiteDeadlineMs("Postgres operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS, { min: 1 });
   await client.query("SELECT set_config('statement_timeout',$1,false), set_config('lock_timeout',$2,false), set_config('idle_in_transaction_session_timeout',$1,false)", [
     `${bounded}ms`, `${Math.min(bounded, 60_000)}ms`,
   ]);

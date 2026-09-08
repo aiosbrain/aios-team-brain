@@ -29,7 +29,7 @@ function exporterEnv() {
   return {
     STAGING_OPS_ROLE: "exporter", STAGING_OPS_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
     RAILWAY_ENVIRONMENT_ID: "env-production", PRODUCTION_EXPORT_ENVIRONMENT_ID: "env-production",
-    DATABASE_URL: "postgres://reader@postgres.railway.internal/brain", NEO4J_URL: "bolt://neo4j.railway.internal:7687",
+    DATABASE_URL: "postgres://reader:password@postgres.railway.internal:5432/brain", NEO4J_URL: "bolt://neo4j.railway.internal:7687",
     STAGING_TOPOLOGY_FILE: TOPOLOGY_FILE, GITHUB_REPOSITORY: "org/repo",
     PRODUCTION_APP_DEPLOYMENT_ID: "prod-app-dep", PRODUCTION_EXPORTER_SERVICE_ID: "svc-exporter",
     PRODUCTION_POSTGRES_DEPLOYMENT_ID: "production-postgres-dep", PRODUCTION_NEO4J_DEPLOYMENT_ID: "production-neo4j-dep",
@@ -79,7 +79,7 @@ function providerFixture(options: FixtureOptions = {}) {
     return {
       AUTH_SECRET: options.sealedProduction && side === "production" ? null : `${prefix}-auth`, SECRETS_KEY: `${prefix}-secrets`,
       NEO4J_USER: "neo4j", NEO4J_PASSWORD: `${prefix}-neo4j`,
-      DATABASE_URL: "postgres://app:password@postgres.railway.internal/brain",
+      DATABASE_URL: "postgres://app:password@postgres.railway.internal:5432/brain",
       NEO4J_URL: "bolt://neo4j.railway.internal:7687", NEO4J_DATABASE: "neo4j", EXTRA_PROVIDER_SECRET: canary,
     };
   };

@@ -17,7 +17,7 @@ describe("section-wise paired Postgres capture/install", () => {
       .mockResolvedValueOnce({ rows: [{ column_name: "id" }, { column_name: "pending_delete_group_id" }, { column_name: "pending_delete_at" }] })
       .mockResolvedValueOnce({ rows: [] });
     const execImpl = vi.fn().mockResolvedValue({ stdout: "id,email,password_hash\n1,a@example.test,\n", stderr: "" });
-    await capturePairedPostgres({ client: { query }, databaseUrl: "postgres://source/db", directory: "/tmp", execImpl });
+    await capturePairedPostgres({ client: { query }, databaseUrl: "postgres://app:pw@source.railway.internal:5432/db", directory: "/tmp", execImpl });
     const calls = execImpl.mock.calls.map(([, args]) => args.join(" "));
     expect(calls[0]).toContain("--snapshot=00000003-0000001B-1");
     expect(calls[0]).toContain("--exclude-table-data=auth_users");
@@ -32,7 +32,7 @@ describe("section-wise paired Postgres capture/install", () => {
     const execImpl = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
     // Every enumeration answers empty, so the cleanup is a no-op and the ORDER is what is pinned.
     const client = { query: vi.fn().mockResolvedValue({ rows: [] }), on: vi.fn() };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://app:pw@target.railway.internal:5432/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/exclusive data-use lock/);
 
     const commands = execImpl.mock.calls.map(([, args]) => args.join(" "));
@@ -75,7 +75,7 @@ describe("section-wise paired Postgres capture/install", () => {
       }),
       on: vi.fn(),
     };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://app:pw@target.railway.internal:5432/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/could not be reset before reading the staging marker/);
     // Nothing destructive was attempted, and no restore command ran.
     expect(client.query.mock.calls.map(([sql]) => String(sql))).toEqual(["ROLLBACK"]);
@@ -93,7 +93,7 @@ describe("section-wise paired Postgres capture/install", () => {
     const execImpl = vi.fn(async (_cmd: string, args: string[]) =>
       args.includes("--list") ? { stdout: listing, stderr: "" } : { stdout: "", stderr: "" });
     const client = { query: vi.fn().mockResolvedValue({ rows: [] }), on: vi.fn() };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://app:pw@target.railway.internal:5432/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/exclusive data-use lock/);
     const written = readFileSync(path.join(directory, "restore.list"), "utf8");
     expect(written).toContain("TABLE public items postgres");

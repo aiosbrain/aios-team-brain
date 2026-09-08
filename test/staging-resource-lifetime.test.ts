@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { closeAll, closeAllWithinBudget, ownedCloser } from "../scripts/staging-ops/resource-cleanup.mjs";
 import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
 
@@ -70,7 +70,12 @@ vi.mock("pg", () => {
       destroyCalls: 0,
       destroy: (_error?: unknown) => { this.connection.stream.destroyed = true; this.connection.stream.destroyCalls += 1; },
     } };
-    constructor() { pgState.clients.push(this as never); }
+    connectionParameters: { host: string; port: number; database: string; user: string };
+    constructor(config: { connectionString?: string } = {}) {
+      const parsed = new URL(config.connectionString ?? "postgresql://app:pw@staging-pg.railway.internal:5432/brain");
+      this.connectionParameters = { host: parsed.hostname, port: Number(parsed.port), database: parsed.pathname.slice(1), user: parsed.username };
+      pgState.clients.push(this as never);
+    }
     async connect() { /* connected by construction */ }
     async end() {
       this.ended += 1;
@@ -81,6 +86,7 @@ vi.mock("pg", () => {
       this.statements.push(String(sql));
       this.pending += 1;
       try {
+        if (String(sql).includes("inet_server_addr")) return { rows: [{ database: this.connectionParameters.database, server_address: "10.0.0.9", server_port: this.connectionParameters.port, backend_pid: 71 }] };
         const held = gate.take();
         if (held) return await held;
         if (String(sql).includes("pg_export_snapshot")) return { rows: [{ snapshot: "00000003-0000001B-1" }] };
@@ -426,7 +432,7 @@ describe("the exporter census finishes before anything is closed", () => {
   const CENSUS_ENV = {
     STAGING_OPS_ROLE: "exporter", STAGING_MAINTENANCE_ADAPTER: "local",
     SOURCE_APPLICATION_COMMIT: "a".repeat(40),
-    DATABASE_URL: "postgres://app:pw@prod-pg:5432/brain",
+    DATABASE_URL: "postgres://app:pw@prod-pg.railway.internal:5432/brain",
     NEO4J_URL: "bolt://prod-neo4j:7687", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "pw", NEO4J_DATABASE: "neo4j",
   } as unknown as NodeJS.ProcessEnv;
 

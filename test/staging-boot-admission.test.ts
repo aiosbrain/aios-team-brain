@@ -87,7 +87,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
   });
 
   it("keeps the loader refusing every state that is neither ready nor the selected boot", async () => {
-    const client = fakeClient({ state: "importing", run_id: "run-7" });
+    const client = fakeClient({ state: "importing", run_id: "run-7", candidate_mode: "copy-ready" });
     await expect(loadSchema({
       cwd: "/nonexistent-schema-root",
       databaseUrl: "postgres://db/x",

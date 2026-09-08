@@ -39,6 +39,7 @@ import { snapshotExportFacts, validateLedgerAgainstSanitizedGraph, assertResolve
 import { keyMaterial } from "./key-material.mjs";
 import { configurePostgresDeadline, createOperationBudget, createSessionWatchdogOwner, postgresDeadlineConfig, remainingBudgetMs, stagingOperationDeadlines } from "./operation-deadline.mjs";
 import { runBoundedProcess } from "./bounded-process.mjs";
+import { assertLivePostgresTarget, parseCanonicalPostgresTarget } from "./postgres-target.mjs";
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const FULL_SHA = /^[0-9a-f]{40}$/i;
@@ -232,7 +233,33 @@ async function emitSessionContinuity(client, { checkpoint, failedRunId, env }) {
   }
 }
 
+async function verifyPostgresDestination({ client, maintenance, env }) {
+  const postgresTarget = parseCanonicalPostgresTarget(env.DATABASE_URL, {
+    label: "importer Postgres", requireInternal: env.STAGING_MAINTENANCE_ADAPTER !== "local",
+  });
+  const pins = {
+    projectId: env.RAILWAY_PROJECT_ID,
+    environmentId: env.STAGING_OPS_ENVIRONMENT_ID,
+    serviceId: env.STAGING_POSTGRES_SERVICE_ID,
+    serviceInstanceId: env.STAGING_POSTGRES_SERVICE_INSTANCE_ID,
+    deploymentId: env.STAGING_POSTGRES_DEPLOYMENT_ID,
+    hostname: env.STAGING_POSTGRES_HOST,
+    database: env.STAGING_POSTGRES_DATABASE,
+    importerServiceId: env.STAGING_IMPORTER_SERVICE_ID,
+    importerServiceInstanceId: env.STAGING_IMPORTER_SERVICE_INSTANCE_ID,
+    importerDeploymentId: env.STAGING_IMPORTER_DEPLOYMENT_ID,
+  };
+  const providerProof = env.STAGING_MAINTENANCE_ADAPTER === "local"
+    ? Promise.resolve({ kind: "local-harness", environmentId: env.STAGING_OPS_ENVIRONMENT_ID })
+    : maintenance.assertPinnedPostgresTarget(postgresTarget, pins);
+  const [livePostgres, providerPostgres] = await Promise.all([assertLivePostgresTarget(client, postgresTarget), providerProof]);
+  return { postgresTarget, livePostgres, providerPostgres };
+}
+
 async function measuredReplaceFacts({ client, maintenance, env, opened }) {
+  // Target proof precedes even service containment and is repeated immediately before each store
+  // replacement. The same lock-owning session remains connected throughout.
+  const postgres = await verifyPostgresDestination({ client, maintenance, env });
   const [electionLockHeld, exclusiveDataLockHeld, token, stopMeasurement] = await Promise.all([
     hasCoordinatorLock(client), hasExclusiveDataUseLock(client), maintenance.tokenIdentity(), maintenance.stopAndVerifyAll(),
   ]);
@@ -244,7 +271,7 @@ async function measuredReplaceFacts({ client, maintenance, env, opened }) {
     pinnedGraphitiServiceId: env.STAGING_GRAPHITI_SERVICE_ID,
     targetCredentialFingerprint: credentialFingerprint({ credentialClass: "neo4j-credential", value: `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`, comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), keyId: env.STAGING_COMPARISON_KEY_ID }),
     sourceCredentialFingerprint: opened.manifest.credentialFingerprints?.["neo4j-credential"],
-    sourceProvenance: opened.sourceProvenance,
+    sourceProvenance: opened.sourceProvenance, ...postgres,
     electionLockHeld, exclusiveDataLockHeld, stopMeasurement,
   };
 }
@@ -260,7 +287,7 @@ export async function installOpenedPair({ client, session, opened, directory, en
   const facts = await measuredReplaceFacts({ client, maintenance, env, opened });
   assertReplaceTarget(facts);
   const restore = {
-    client, databaseUrl: env.DATABASE_URL, directory, verifiedStagingTarget: true,
+    client, databaseUrl: facts.postgresTarget.connectionString, directory, verifiedStagingTarget: true,
     operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs,
     budget, signal,
   };
@@ -774,6 +801,8 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
   try {
     operationBudget.assert("pinned importer verification");
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
+    operationBudget.assert("Postgres target verification before drain");
+    await verifyPostgresDestination({ client, maintenance, env });
     // MARKED BEFORE THE MUTATION IT AUTHORISES, under the coordinator lock and immediately before
     // entry into draining, so that a crash anywhere in the destructive path leaves the attempt
     // recorded rather than erased. Over-recording costs an explicit operator retry; under-recording
@@ -928,6 +957,10 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     phase("read-journal");
     const journal = await readJournal(client);
     if (journal.last_ready_run_id) throw new Error("bootstrap rollback is one-time and last-ready already exists");
+    operationBudget.assert("bootstrap Postgres target verification");
+    // A first bootstrap legitimately has no marker. Its positive proof is the provider-bound
+    // service instance plus this live lock-owning backend, never the marker's prior existence.
+    await verifyPostgresDestination({ client, maintenance, env });
 
     // ── H2: RECONCILE AN INTERRUPTED FIRST BOOTSTRAP ────────────────────────────────────────────
     //
@@ -999,7 +1032,10 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     const created = resumed?.phase === "captured"
       ? await adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, phase })
       : await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
-      await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget, signal });
+      const postgresTarget = parseCanonicalPostgresTarget(env.DATABASE_URL, {
+        label: "bootstrap rollback Postgres", requireInternal: env.STAGING_MAINTENANCE_ADAPTER !== "local",
+      });
+      await captureRollbackPostgres({ client, databaseUrl: postgresTarget.connectionString, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget, signal });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
       const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       try {
@@ -1229,8 +1265,13 @@ export async function importerPreflight(env = process.env, action = "install") {
   if (action === "install-ops") return true;
   const common = ["STAGING_COMPARISON_KEY_BASE64", "STAGING_COMPARISON_KEY_ID", "STAGING_NEO4J_SERVICE_NAME", "STAGING_NEO4J_DATABASE"];
   const runtime = ["STAGING_OPS_ENVIRONMENT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_PROJECT_ID", "STAGING_APP_SERVICE_ID", "STAGING_GRAPHITI_SERVICE_ID", "RAILWAY_STAGING_MAINTENANCE_TOKEN", "STAGING_IMPORTER_SERVICE_ID", "STAGING_IMPORTER_IMAGE_DIGEST"];
+  const providerTarget = env.STAGING_MAINTENANCE_ADAPTER === "local" ? [] : [
+    "STAGING_IMPORTER_SERVICE_INSTANCE_ID", "STAGING_IMPORTER_DEPLOYMENT_ID",
+    "STAGING_POSTGRES_SERVICE_ID", "STAGING_POSTGRES_SERVICE_INSTANCE_ID", "STAGING_POSTGRES_DEPLOYMENT_ID",
+    "STAGING_POSTGRES_HOST", "STAGING_POSTGRES_DATABASE",
+  ];
   const rollback = [];
-  for (const name of [...common, ...(action === "verify" || action === "install-ops" ? [] : runtime), ...rollback]) if (!env[name]) throw new Error(`${name} is required`);
+  for (const name of [...common, ...(action === "verify" || action === "install-ops" ? [] : [...runtime, ...providerTarget]), ...rollback]) if (!env[name]) throw new Error(`${name} is required`);
   for (const name of ["EXPORTER_SIGNING_PUBLIC_KEY", "IMPORTER_ENCRYPTION_PRIVATE_KEY", ...(action === "verify" ? [] : ["ROLLBACK_SIGNING_PRIVATE_KEY", "ROLLBACK_SIGNING_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PRIVATE_KEY"])]) keyMaterial(env, name);
   // H2: the settings this ACTION reaches for later — origin, health token, tester credentials —
   // validated here, before anything can drain, stop, restore or delete.
@@ -1263,7 +1304,10 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   const actionBudget = action === "daemon" ? null : createOperationBudget(`importer ${action}`, deadlines.operationMs, { now });
   actionBudget?.assert("importer preflight");
   await importerPreflight(env, action);
-  const client = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, actionBudget?.remaining(deadlines.operationMs, "Postgres connection") ?? deadlines.operationMs, deadlines.connectionMs)); await client.connect();
+  const postgresTarget = parseCanonicalPostgresTarget(env.DATABASE_URL, {
+    label: "importer Postgres", requireInternal: env.STAGING_MAINTENANCE_ADAPTER !== "local",
+  });
+  const client = new pg.Client(postgresDeadlineConfig(postgresTarget.connectionString, actionBudget?.remaining(deadlines.operationMs, "Postgres connection") ?? deadlines.operationMs, deadlines.connectionMs)); await client.connect();
   const watchdogOwner = createSessionWatchdogOwner((error) => client.connection?.stream?.destroy(error));
   const actionWatchdog = actionBudget ? watchdogOwner.arm(actionBudget) : null;
   const shutdown = new AbortController();
@@ -1274,7 +1318,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     shuttingDown = true;
     shutdown.abort(Object.assign(new Error(`importer received ${signal}`), { code: "STAGING_OPERATION_ABORTED" }));
     signalAbort = (async () => {
-      const abortClient = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.cleanupMs, Math.min(5_000, deadlines.connectionMs)));
+      const abortClient = new pg.Client(postgresDeadlineConfig(postgresTarget.connectionString, deadlines.cleanupMs, Math.min(5_000, deadlines.connectionMs)));
       try {
         await abortClient.connect(); const journal = await readJournal(abortClient);
         if (journal.state !== "ready") await transitionJournal(abortClient, { runId: journal.run_id ?? `signal-${Date.now()}`, from: [journal.state], to: "failed", patch: { lastSafeCheckpoint: `aborted-${signal.toLowerCase()}` } });

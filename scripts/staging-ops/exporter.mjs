@@ -19,6 +19,7 @@ import { RailwayRunnerInspector } from "./railway-maintenance.mjs";
 import { keyMaterial } from "./key-material.mjs";
 import { armBudgetWatchdog, createOperationBudget, postgresDeadlineConfig, stagingOperationDeadlines } from "./operation-deadline.mjs";
 import { publishActivationEvidence } from "./activation-evidence.mjs";
+import { parseCanonicalPostgresTarget } from "./postgres-target.mjs";
 
 const sha = (v) => createHash("sha256").update(v).digest("hex");
 const FULL_SHA = /^[0-9a-f]{40}$/i;
@@ -194,6 +195,7 @@ export async function captureWithOneTransientRetry(captureAttempt, { transient =
 
 export async function runExporter(env = process.env, operations = {}, argv = process.argv.slice(2)) {
   assertRunnerRole(env, "exporter"); assertOutboundCredentialIsolation(env);
+  const postgresTarget = parseCanonicalPostgresTarget(env.DATABASE_URL, { label: "exporter Postgres" });
   const deadlines = stagingOperationDeadlines(env);
   const runBudget = createOperationBudget("exporter run", deadlines.operationMs, { now: operations.now });
   if (argv[0] === "activation-evidence") {
@@ -218,7 +220,7 @@ export async function runExporter(env = process.env, operations = {}, argv = pro
     ? { commit: deployed.commit, migrationSet: migrationSetIdentity() }
     : await readDeployedBuildMetadata(env, deployed.commit));
   runBudget.assert("exporter database connection");
-  const client = operations.client ?? new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.operationMs, deadlines.connectionMs));
+  const client = operations.client ?? new pg.Client(postgresDeadlineConfig(postgresTarget.connectionString, deadlines.operationMs, deadlines.connectionMs));
   if (!operations.client) await client.connect();
   const driver = operations.driver ?? neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
   const watchdog = armBudgetWatchdog(runBudget, async (error) => {
@@ -245,7 +247,7 @@ export async function runExporter(env = process.env, operations = {}, argv = pro
       captureBudget.assert("Postgres capture");
       const started = new Date();
       const postgres = await capturePairedPostgres({
-        client, databaseUrl: env.DATABASE_URL, directory, captureSnapshotFacts: snapshotExportFacts,
+        client, databaseUrl: postgresTarget.connectionString, directory, captureSnapshotFacts: snapshotExportFacts,
         operationTimeoutMs: deadlines.captureMs, terminateGraceMs: deadlines.terminateGraceMs,
         budget: captureBudget,
       });

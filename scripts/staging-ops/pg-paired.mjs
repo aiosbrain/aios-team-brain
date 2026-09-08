@@ -5,6 +5,7 @@ import { loadSchema } from "../pg-load-schema.mjs";
 import { SCRUBBED_PG_ENV } from "../staging-refresh-decision.mjs";
 import { runBoundedProcess } from "./bounded-process.mjs";
 import { OPERATION_TIMEOUT_DEFAULT_MS, remainingBudgetMs } from "./operation-deadline.mjs";
+import { parseCanonicalPostgresTarget } from "./postgres-target.mjs";
 
 const SNAPSHOT = /^[0-9A-Fa-f:-]+$/;
 
@@ -42,8 +43,9 @@ async function run(command, args, options = {}, execImpl) {
 /** Hold the source snapshot transaction until both pg_dump and transformed COPY have finished. */
 export async function capturePairedPostgres({
   client, databaseUrl, directory, execImpl, pgDump = "pg_dump", psql = "psql", captureSnapshotFacts,
-  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null,
+  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, spawnImpl,
 }) {
+  const canonicalDatabaseUrl = parseCanonicalPostgresTarget(databaseUrl, { label: "Postgres capture target", requireInternal: false }).connectionString;
   const remaining = (label) => remainingBudgetMs(budget, operationTimeoutMs, label);
   remaining("Postgres capture transaction");
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -67,12 +69,12 @@ export async function capturePairedPostgres({
     const auth = path.join(directory, "auth_users.csv");
     const graphLedger = path.join(directory, "graph_episodes.csv");
     const controller = new AbortController();
-    const commandOptions = { timeoutMs: remaining("Postgres capture subprocesses"), terminateGraceMs, signal: controller.signal };
+    const commandOptions = { timeoutMs: remaining("Postgres capture subprocesses"), terminateGraceMs, signal: controller.signal, spawnImpl };
     const tasks = [
-      run(pgDump, [...pairedDumpArguments(snapshot, archive), databaseUrl], commandOptions, execImpl),
-      run(psql, ["-X", "--quiet", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${projection} FROM public.auth_users) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], commandOptions, execImpl)
+      run(pgDump, [...pairedDumpArguments(snapshot, archive), canonicalDatabaseUrl], commandOptions, execImpl),
+      run(psql, ["-X", "--quiet", canonicalDatabaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${projection} FROM public.auth_users) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], commandOptions, execImpl)
         .then(({ stdout }) => writeFile(auth, stdout, { mode: 0o600 })),
-      run(psql, ["-X", "--quiet", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${graphProjection} FROM public.graph_episodes) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], commandOptions, execImpl)
+      run(psql, ["-X", "--quiet", canonicalDatabaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '${snapshot}'; COPY (SELECT ${graphProjection} FROM public.graph_episodes) TO STDOUT WITH (FORMAT csv, HEADER true); COMMIT;`], commandOptions, execImpl)
         .then(({ stdout }) => writeFile(graphLedger, stdout, { mode: 0o600 })),
     ].map((task) => task.catch((error) => { controller.abort(error); throw error; }));
     // Do not enter ROLLBACK while a sibling pg_dump/psql is still using the exported snapshot.
@@ -90,6 +92,7 @@ export async function capturePairedPostgres({
 
 /** Capture the complete staging database for importer-owned rollback; never used by exporter. */
 export async function captureRollbackPostgres({ client, databaseUrl, directory, execImpl, pgDump = "pg_dump", operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal }) {
+  const canonicalDatabaseUrl = parseCanonicalPostgresTarget(databaseUrl, { label: "rollback capture target", requireInternal: false }).connectionString;
   const remaining = (label) => remainingBudgetMs(budget, operationTimeoutMs, label);
   remaining("rollback capture transaction");
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -100,7 +103,7 @@ export async function captureRollbackPostgres({ client, databaseUrl, directory, 
     const snapshot = snap.rows[0]?.snapshot;
     if (!SNAPSHOT.test(String(snapshot ?? ""))) throw new Error("Postgres exported an invalid rollback snapshot identifier");
     const archive = path.join(directory, "postgres.dump");
-    await run(pgDump, ["--format=custom", "--schema=public", `--snapshot=${snapshot}`, `--file=${archive}`, databaseUrl], { timeoutMs: remaining("rollback archive capture"), terminateGraceMs, signal }, execImpl);
+    await run(pgDump, ["--format=custom", "--schema=public", `--snapshot=${snapshot}`, `--file=${archive}`, canonicalDatabaseUrl], { timeoutMs: remaining("rollback archive capture"), terminateGraceMs, signal }, execImpl);
     remaining("rollback capture commit");
     await client.query("COMMIT");
     return { archive, snapshot };
@@ -360,23 +363,24 @@ export async function restorePairedPostgres({
   execImpl, pgRestore = "pg_restore", psql = "psql", verifiedStagingTarget = false,
   operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal,
 }) {
+  const canonicalDatabaseUrl = parseCanonicalPostgresTarget(databaseUrl, { label: "paired restore target", requireInternal: false }).connectionString;
   const archive = path.join(directory, "postgres.dump");
   const auth = path.join(directory, "auth_users.csv");
   const graphLedger = path.join(directory, "graph_episodes.csv");
   const marker = await replaceFromArchive({
-    client, databaseUrl, archive, directory, listName: "restore.list",
+    client, databaseUrl: canonicalDatabaseUrl, archive, directory, listName: "restore.list",
     // A SOURCE archive never legitimately contains the staging marker. Filtering it is belt and
     // braces against a bundle that tries to supply one; the values themselves are never trusted.
     omitTables: PRESERVED_PUBLIC_TABLES,
     execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget, signal,
     betweenDataAndPostData: async () => {
       // Projected data must land BEFORE post-data FK constraints, on the same target.
-      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore authentication projection"), terminateGraceMs, signal }, execImpl);
-      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore graph ledger projection"), terminateGraceMs, signal }, execImpl);
+      await run(psql, ["-X", canonicalDatabaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore authentication projection"), terminateGraceMs, signal }, execImpl);
+      await run(psql, ["-X", canonicalDatabaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore graph ledger projection"), terminateGraceMs, signal }, execImpl);
     },
   });
   remainingBudgetMs(budget, operationTimeoutMs, "copy-ready schema load");
-  await loadSchema({ cwd, databaseUrl, env: { ...env, STAGING_DATA_MODE: "copy-ready" }, connectedClient: client });
+  await loadSchema({ cwd, databaseUrl: canonicalDatabaseUrl, env: { ...env, STAGING_DATA_MODE: "copy-ready" }, connectedClient: client });
   return { marker };
 }
 
@@ -385,9 +389,10 @@ export async function restoreRollbackPostgres({
   execImpl, pgRestore = "pg_restore", verifiedStagingTarget = false,
   operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal,
 }) {
+  const canonicalDatabaseUrl = parseCanonicalPostgresTarget(databaseUrl, { label: "rollback restore target", requireInternal: false }).connectionString;
   const archive = path.join(directory, "postgres.dump");
   const marker = await replaceFromArchive({
-    client, databaseUrl, archive, directory, listName: "rollback.list",
+    client, databaseUrl: canonicalDatabaseUrl, archive, directory, listName: "rollback.list",
     // A ROLLBACK archive IS a staging dump, so it does contain the marker. One policy for both
     // paths: the LIVE marker is the preserved object and the archive's copy is structurally
     // omitted, so the restore can neither duplicate it nor clean it.
@@ -395,6 +400,6 @@ export async function restoreRollbackPostgres({
     execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget, signal,
   });
   remainingBudgetMs(budget, operationTimeoutMs, "rollback schema load");
-  await loadSchema({ cwd, databaseUrl, env: { ...env, STAGING_DATA_MODE: env.STAGING_DATA_MODE ?? "copy-ready" }, connectedClient: client });
+  await loadSchema({ cwd, databaseUrl: canonicalDatabaseUrl, env: { ...env, STAGING_DATA_MODE: env.STAGING_DATA_MODE ?? "copy-ready" }, connectedClient: client });
   return { marker };
 }

@@ -134,12 +134,13 @@ export function spawnOwnedWorkload({
         signalErrors.push(`SIGTERM:${error.code}`);
       }
 
-      // 2. Bounded grace on the TRACKED child. The timer is CLEARED on the winning path: a pending
-      //    handle here would hold the whole controller's event loop open past its own shutdown.
+      // 2. Bounded grace on the TRACKED child. The timer is CLEARED on the winning path. While the
+      //    stop is unsettled it deliberately remains referenced: a pending Promise alone does not
+      //    keep Node alive, and exiting here would abandon group verification mid-containment.
       let graceTimer = null;
       const graced = await Promise.race([
         completion.then(() => true),
-        new Promise((resolve) => { graceTimer = setTimer(() => resolve(false), graceMs); graceTimer?.unref?.(); }),
+        new Promise((resolve) => { graceTimer = setTimer(() => resolve(false), graceMs); }),
       ]).finally(() => { if (graceTimer) clearTimer(graceTimer); });
 
       // 3. …then escalation, still limited to the owned group. This is what a surviving grandchild
@@ -158,7 +159,9 @@ export function spawnOwnedWorkload({
       //    success — the caller must not start a replacement on the strength of a hope.
       const deadline = now() + verifyMs;
       while (groupAlive(pgid, kill) && now() < deadline) {
-        await new Promise((resolve) => { const t = setTimer(resolve, pollMs); t?.unref?.(); });
+        // Contractual liveness: this referenced poll is the only handle that may remain after the
+        // tracked wrapper exits while a descendant/group still needs verification.
+        await new Promise((resolve) => { setTimer(resolve, pollMs); });
       }
       const stopped = !groupAlive(pgid, kill);
       const result = { stopped, reason: stopped ? "verified-gone" : "group-survived", durationMs: now() - startedAt, escalated, signalErrors, terminal };

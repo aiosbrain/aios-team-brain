@@ -1,9 +1,9 @@
-const INTERNAL = /(?:^|\.)railway\.internal$/i;
+import { parseCanonicalPostgresTarget } from "./postgres-target.mjs";
 
-function parseDbHost(raw, label) {
+function parseInternalHost(raw, label) {
   let url;
   try { url = new URL(raw); } catch { throw new Error(`${label} connection URL is invalid (value redacted)`); }
-  if (!INTERNAL.test(url.hostname) || url.searchParams.has("routing") || url.hostname.includes(",")) throw new Error(`${label} must use one exact internal service hostname without routing aliases`);
+  if (!/(?:^|\.)railway\.internal$/i.test(url.hostname) || url.searchParams.has("routing") || url.hostname.includes(",")) throw new Error(`${label} must use one exact internal service hostname without routing aliases`);
   return url.hostname;
 }
 
@@ -14,11 +14,11 @@ export function assertRunnerRole(env, role) {
   if (role === "exporter") {
     if (!env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_ENVIRONMENT_ID !== env.PRODUCTION_EXPORT_ENVIRONMENT_ID) throw new Error("exporter is not pinned to production environment identity");
     if (env.STAGING_DATABASE_URL || env.STAGING_NEO4J_URL) throw new Error("exporter must not receive staging database endpoints");
-    parseDbHost(env.DATABASE_URL, "exporter Postgres"); parseDbHost(env.NEO4J_URL, "exporter Neo4j");
+    parseCanonicalPostgresTarget(env.DATABASE_URL, { label: "exporter Postgres" }); parseInternalHost(env.NEO4J_URL, "exporter Neo4j");
   } else {
     if (!env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_ENVIRONMENT_ID !== env.STAGING_OPS_ENVIRONMENT_ID) throw new Error("importer is not pinned to staging environment identity");
     if (env.PRODUCTION_DATABASE_URL || env.PRODUCTION_NEO4J_URL) throw new Error("importer must not receive production database endpoints");
-    parseDbHost(env.DATABASE_URL, "importer Postgres"); parseDbHost(env.NEO4J_URL, "importer Neo4j");
+    parseCanonicalPostgresTarget(env.DATABASE_URL, { label: "importer Postgres" }); parseInternalHost(env.NEO4J_URL, "importer Neo4j");
   }
   return true;
 }

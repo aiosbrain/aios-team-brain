@@ -267,19 +267,21 @@ describe("platform ownership is explicit, never a silent fallback", () => {
     expect(supervisionSupported("linux")).toBe(true);
   });
 
-  it("signals the GROUP, never the bare pid", () => {
+  it("signals the GROUP, never the bare pid, and keeps containment timers referenced", async () => {
     // A positive pid would signal the wrapper alone and re-create the measured defect. The sign is
     // applied inside the primitive so no caller can get it wrong.
     const kill = vi.fn();
+    const unref = vi.fn();
     const child = { pid: 4242, once: vi.fn(), killed: false };
     const workload = spawnOwnedWorkload({
       command: ["node"], platform: "linux", label: "signal-shape",
       spawnImpl: () => child as never, kill: kill as never,
-      setTimer: ((fn: () => void) => { fn(); return { unref() {} }; }) as never,
+      setTimer: ((fn: () => void) => { fn(); return { unref }; }) as never,
       clearTimer: (() => {}) as never,
     });
-    void workload.stop({ graceMs: 0, verifyMs: 0 });
+    await workload.stop({ graceMs: 0, verifyMs: 0 });
     expect(kill.mock.calls.every(([pid]) => Number(pid) < 0), "a positive pid signals only the wrapper").toBe(true);
     expect(kill.mock.calls.some(([pid, signal]) => pid === -4242 && signal === "SIGTERM")).toBe(true);
+    expect(unref, "Node could exit while owned-group containment was still unsettled").not.toHaveBeenCalled();
   });
 });

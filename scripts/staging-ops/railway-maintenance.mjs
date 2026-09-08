@@ -1,10 +1,12 @@
 /**
  * The sole Railway lifecycle API owner. It is unavailable to app code and accepts only an exact
- * environment-scoped project token plus two pinned staging services. No database service operation
- * or arbitrary GraphQL document is exposed.
+ * environment-scoped project token plus pinned staging identities. Postgres access here is
+ * read-only evidence acquisition; lifecycle mutations remain limited to app/Graphiti services and
+ * no arbitrary GraphQL document is exposed.
  */
 import { emitReceipt } from "./receipts.mjs";
 import { isNonRetryableRefusal, nonRetryableRefusal } from "./maintenance-refusal.mjs";
+import { assertProviderPostgresTarget, parseCanonicalPostgresTarget, samePostgresTarget } from "./postgres-target.mjs";
 
 export const RAILWAY_OPERATIONS = Object.freeze([
   "deploymentStop",
@@ -40,6 +42,27 @@ export const DOCUMENTS = Object.freeze({
       serviceId source { image repo }
     }
     serviceInstanceAutoDeployStatus(environmentId: $environmentId, projectId: $projectId, serviceId: $serviceId) { enabled canEnable reason }
+  }`,
+  postgresService: `query StagingMaintenancePostgresService($environmentId: String!, $serviceId: String!) {
+    serviceInstance(environmentId: $environmentId, serviceId: $serviceId) {
+      id environmentId serviceId serviceName
+      activeDeployments { id projectId environmentId serviceId status snapshotId }
+    }
+  }`,
+  postgresVariables: `query StagingMaintenancePostgresVariables($projectId: String!, $environmentId: String!, $serviceId: String!) {
+    unrendered: variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId, unrendered: true)
+    rendered: variablesForServiceDeployment(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId)
+  }`,
+  postgresSnapshot: `query StagingMaintenancePostgresSnapshot($deploymentId: String!) {
+    deploymentSnapshot(deploymentId: $deploymentId) { id variables }
+  }`,
+  privateNetworks: `query StagingMaintenancePrivateNetworks($environmentId: String!) {
+    privateNetworks(environmentId: $environmentId) { publicId projectId environmentId deletedAt }
+  }`,
+  privateEndpoint: `query StagingMaintenancePrivateEndpoint($privateNetworkId: String!, $environmentId: String!, $serviceId: String!) {
+    privateNetworkEndpoint(privateNetworkId: $privateNetworkId, environmentId: $environmentId, serviceId: $serviceId) {
+      serviceInstanceId dnsName newDnsName deletedAt syncStatus
+    }
   }`,
   deploymentStop: `mutation StagingMaintenanceStop($id: String!) { deploymentStop(id: $id) }`,
   deploymentCancel: `mutation StagingMaintenanceCancel($id: String!) { deploymentCancel(id: $id) }`,
@@ -78,6 +101,27 @@ function assertPinnedRunnerFacts(data, serviceId, expectedImageDigest) {
   if (!instance || instance.serviceId !== serviceId || !image.endsWith(`@${expectedImageDigest}`) || instance.source?.repo) throw new Error("runner must use the pinned digest with no repository source");
   if (!autoDeploy || typeof autoDeploy.enabled !== "boolean" || autoDeploy.enabled !== false) throw new Error("runner automatic deployments must be read-back disabled");
   return { serviceId, imageDigest: expectedImageDigest, automaticDeployments: false };
+}
+
+function exactServiceInstance(data, pins, role) {
+  const instance = data?.serviceInstance;
+  if (!instance || instance.id !== pins[`${role}ServiceInstanceId`] || instance.environmentId !== pins.environmentId
+    || instance.serviceId !== pins[`${role}ServiceId`] || !instance.serviceName) {
+    throw new Error(`${role} service instance differs from its pinned environment/service-instance identity`);
+  }
+  return instance;
+}
+
+function exactServingDeployment(instance, pins, role) {
+  const serving = (instance?.activeDeployments ?? []).filter((deployment) => deployment.status === "SUCCESS");
+  if (serving.length !== 1) throw new Error(`${role} has no unambiguous successful active deployment`);
+  const deployment = serving[0];
+  if (deployment.id !== pins[`${role}DeploymentId`] || deployment.projectId !== pins.projectId
+    || deployment.environmentId !== pins.environmentId || deployment.serviceId !== pins[`${role}ServiceId`]
+    || !deployment.snapshotId) {
+    throw new Error(`${role} deployment differs from its pinned project/environment/service/deployment identity`);
+  }
+  return deployment;
 }
 
 export class RailwayRunnerInspector {
@@ -254,6 +298,73 @@ export class RailwayMaintenance {
     await this.preflight();
     const data = await this.call(DOCUMENTS.serviceInstance, { projectId: this.projectId, environmentId: this.environmentId, serviceId });
     return assertPinnedRunnerFacts(data, serviceId, expectedImageDigest);
+  }
+
+  /**
+   * Bind the canonical target to the active importer deployment and the exact Postgres service
+   * instance/private endpoint. Raw provider variable maps and credentials never leave this method.
+   */
+  async assertPinnedPostgresTarget(target, pins) {
+    await this.preflight();
+    if (pins.projectId !== this.projectId || pins.environmentId !== this.environmentId) throw new Error("Postgres target pins differ from the maintenance token scope");
+    const [postgresData, importerData, networksData] = await Promise.all([
+      this.call(DOCUMENTS.postgresService, { environmentId: this.environmentId, serviceId: pins.serviceId }),
+      this.call(DOCUMENTS.postgresService, { environmentId: this.environmentId, serviceId: pins.importerServiceId }),
+      this.call(DOCUMENTS.privateNetworks, { environmentId: this.environmentId }),
+    ]);
+    const normalizedPins = {
+      projectId: pins.projectId,
+      environmentId: pins.environmentId,
+      postgresServiceId: pins.serviceId,
+      postgresServiceInstanceId: pins.serviceInstanceId,
+      postgresDeploymentId: pins.deploymentId,
+      importerServiceId: pins.importerServiceId,
+      importerServiceInstanceId: pins.importerServiceInstanceId,
+      importerDeploymentId: pins.importerDeploymentId,
+    };
+    const postgres = exactServiceInstance(postgresData, normalizedPins, "postgres");
+    const importer = exactServiceInstance(importerData, normalizedPins, "importer");
+    exactServingDeployment(postgres, normalizedPins, "postgres");
+    const importerDeployment = exactServingDeployment(importer, normalizedPins, "importer");
+
+    const networks = (networksData?.privateNetworks ?? []).filter((network) => !network.deletedAt
+      && network.projectId === this.projectId && network.environmentId === this.environmentId);
+    if (networks.length !== 1) throw new Error("Postgres target verification found no unambiguous pinned private network");
+    const [endpointData, variablesData, snapshotData] = await Promise.all([
+      this.call(DOCUMENTS.privateEndpoint, { privateNetworkId: networks[0].publicId, environmentId: this.environmentId, serviceId: pins.serviceId }),
+      this.call(DOCUMENTS.postgresVariables, { projectId: this.projectId, environmentId: this.environmentId, serviceId: pins.importerServiceId }),
+      this.call(DOCUMENTS.postgresSnapshot, { deploymentId: importerDeployment.id }),
+    ]);
+    const endpoint = endpointData?.privateNetworkEndpoint;
+    if (!endpoint || endpoint.serviceInstanceId !== pins.serviceInstanceId || endpoint.deletedAt || endpoint.newDnsName
+      || endpoint.syncStatus !== "SUCCESS" || String(endpoint.dnsName ?? "").toLowerCase() !== pins.hostname) {
+      throw new Error("Postgres private endpoint is not healthy and bound to the pinned service instance");
+    }
+    const snapshot = snapshotData?.deploymentSnapshot;
+    if (!snapshot || snapshot.id !== importerDeployment.snapshotId || !snapshot.variables
+      || !variablesData?.rendered || !variablesData?.unrendered) {
+      throw new Error("importer deployment variable snapshot is missing or unbound");
+    }
+    const currentTarget = parseCanonicalPostgresTarget(variablesData.rendered.DATABASE_URL, { label: "current importer Postgres" });
+    const deployedTarget = parseCanonicalPostgresTarget(snapshot.variables.DATABASE_URL, { label: "deployed importer Postgres" });
+    const expectedReference = `\${{${postgres.serviceName}.DATABASE_URL}}`;
+    const evidence = {
+      projectId: this.projectId,
+      environmentId: this.environmentId,
+      serviceId: postgres.serviceId,
+      serviceInstanceId: postgres.id,
+      deploymentId: pins.deploymentId,
+      importerServiceId: importer.serviceId,
+      importerServiceInstanceId: importer.id,
+      importerDeploymentId: importerDeployment.id,
+      hostname: String(endpoint.dnsName).toLowerCase(),
+      port: deployedTarget.port,
+      database: deployedTarget.database,
+      currentMatchesDeployment: samePostgresTarget(currentTarget, deployedTarget) && samePostgresTarget(target, deployedTarget),
+      importerReferenceBound: variablesData.unrendered.DATABASE_URL === expectedReference,
+    };
+    assertProviderPostgresTarget(evidence, target, pins);
+    return evidence;
   }
 
   async deployApp(commitSha) {

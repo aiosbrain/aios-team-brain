@@ -1,6 +1,7 @@
 name: aios-staging-pair
 x-runner: &runner
   build: { context: ., dockerfile: docker/staging-ops.Dockerfile }
+  init: true
   restart: "no"
 x-source-store: &source-store
   STAGING_OBJECT_STORE: s3

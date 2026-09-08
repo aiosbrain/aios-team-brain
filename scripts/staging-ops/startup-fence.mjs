@@ -74,20 +74,18 @@ export async function supervise(command, {
 } = {}) {
   if (!Array.isArray(command) || command.length === 0) throw new Error("startup fence requires a child command");
   const fence = await acquireStartupFence({ env, createClient });
-  let workload;
-  try {
-    workload = spawnOwnedWorkload({ command, env, label: "startup-fence-payload", spawnImpl, kill, platform });
-  } catch (error) {
-    // Refusing to supervise must not leave the fence's connection open.
-    await Promise.resolve(fence?.client.end()).catch(() => {});
-    throw error;
-  }
-
+  let workload = null;
+  let finishWorkloadInitialization;
+  const workloadInitialized = new Promise((resolve) => { finishWorkloadInitialization = resolve; });
   let cleanup = null;
   let connectionLost = false;
   let wakeForConnectionLoss;
   const connectionLoss = new Promise((resolve) => { wakeForConnectionLoss = resolve; });
-  const endFence = async () => Promise.resolve(fence?.client.end()).catch(() => {});
+  let fenceEnding = null;
+  const endFence = async () => {
+    fenceEnding ??= Promise.resolve(fence?.client.end()).catch(() => {});
+    return fenceEnding;
+  };
 
   /** Idempotent, and the ONLY healthy-session path that voluntarily releases the lock. */
   const shutdown = async (reason) => {
@@ -97,6 +95,13 @@ export async function supervise(command, {
     }
     if (cleanup) return cleanup;
     cleanup = (async () => {
+      // A signal delivered in the narrow initialization window is remembered before the owned
+      // workload exists and joins the same cleanup once spawn has either succeeded or refused.
+      await workloadInitialized;
+      if (!workload) {
+        await endFence();
+        return { stopped: true, reason: "workload-not-started", escalated: false };
+      }
       for (let attempt = 1;; attempt += 1) {
         const lost = connectionLost;
         const attemptOptions = lost ? { ...stopOptions, graceMs: 0 } : { graceMs: 5_000, verifyMs: 2_000, ...stopOptions };
@@ -154,6 +159,17 @@ export async function supervise(command, {
   // Every signal, repeated or alternating, now routes into the one idempotent `shutdown`; the
   // listeners are removed in the `finally` below, after cleanup has actually completed.
   for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
+
+  try {
+    workload = spawnOwnedWorkload({ command, env, label: "startup-fence-payload", spawnImpl, kill, platform });
+    finishWorkloadInitialization(workload);
+  } catch (error) {
+    finishWorkloadInitialization(null);
+    for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
+    // Refusing to supervise must not leave the fence's connection open.
+    await endFence();
+    throw error;
+  }
 
   try {
     const outcome = await workload.completion;

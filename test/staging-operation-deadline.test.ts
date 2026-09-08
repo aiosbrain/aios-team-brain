@@ -1,4 +1,5 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
+import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -86,14 +87,15 @@ describe("M8 — finite operation deadlines terminate real work", () => {
 
   it("capture cancels and awaits every actual PG subprocess before rolling back its snapshot", async () => {
     const { root, file } = executable(`
-      import { appendFileSync } from "node:fs";
-      appendFileSync(process.env.STAGING_DEADLINE_PID_FILE, String(process.pid) + "\\n");
       process.on("SIGTERM", () => {});
       setInterval(() => {}, 1000);
     `);
-    const pidFile = path.join(root, "pids");
-    const old = process.env.STAGING_DEADLINE_PID_FILE;
-    process.env.STAGING_DEADLINE_PID_FILE = pidFile;
+    const spawnedPids: number[] = [];
+    const spawnImpl = (command: string, args: readonly string[], options: SpawnOptions) => {
+      const child = nodeSpawn(command, [...args], options);
+      if (child.pid) spawnedPids.push(child.pid);
+      return child;
+    };
     let allGoneAtRollback = false;
     const statements: string[] = [];
     const client = {
@@ -103,21 +105,16 @@ describe("M8 — finite operation deadlines terminate real work", () => {
         if (text.includes("table_name='auth_users'")) return { rows: ["id", "email", "password_hash"].map((column_name) => ({ column_name })) };
         if (text.includes("table_name='graph_episodes'")) return { rows: ["id", "pending_delete_group_id", "pending_delete_at"].map((column_name) => ({ column_name })) };
         if (text === "ROLLBACK") {
-          const pids = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim().split(/\s+/).filter(Boolean).map(Number) : [];
-          allGoneAtRollback = pids.length > 0 && pids.every((pid) => !alive(pid));
+          allGoneAtRollback = spawnedPids.length === 3 && spawnedPids.every((pid) => !alive(pid));
         }
         return { rows: [] };
       }),
     };
-    try {
-      await expect(capturePairedPostgres({
-        client, databaseUrl: "postgres://source/db", directory: root,
-        pgDump: file, psql: file, operationTimeoutMs: 1_000, terminateGraceMs: 100,
-      })).rejects.toThrow(/termination confirmed/);
-    } finally {
-      if (old === undefined) delete process.env.STAGING_DEADLINE_PID_FILE;
-      else process.env.STAGING_DEADLINE_PID_FILE = old;
-    }
+    await expect(capturePairedPostgres({
+      client, databaseUrl: "postgres://app:pw@source.railway.internal:5432/db", directory: root,
+      pgDump: file, psql: file, operationTimeoutMs: 1_000, terminateGraceMs: 100, spawnImpl,
+    })).rejects.toThrow(/termination confirmed/);
+    expect(spawnedPids, "all three snapshot consumers must actually have spawned").toHaveLength(3);
     expect(statements.at(-1)).toBe("ROLLBACK");
     expect(allGoneAtRollback, "ROLLBACK must follow confirmed absence of all snapshot consumers").toBe(true);
   });
@@ -146,7 +143,7 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     };
     try {
       await expect(restorePairedPostgres({
-        client, databaseUrl: "postgres://target/db", directory: root, pgRestore: file,
+        client, databaseUrl: "postgres://app:pw@target.railway.internal:5432/db", directory: root, pgRestore: file,
         operationTimeoutMs: 1_000, terminateGraceMs: 100, verifiedStagingTarget: true,
       })).rejects.toThrow(/termination confirmed/);
     } finally {
@@ -181,7 +178,7 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     };
     try {
       const restoring = restorePairedPostgres({
-        client, databaseUrl: "postgres://target/db", directory: root, pgRestore: file,
+        client, databaseUrl: "postgres://app:pw@target.railway.internal:5432/db", directory: root, pgRestore: file,
         operationTimeoutMs: 10_000, terminateGraceMs: 100, verifiedStagingTarget: true,
         signal: controller.signal,
       });
@@ -208,7 +205,7 @@ describe("M8 — the actual exporter retries one whole private capture and publi
     STAGING_OPS_ROLE: "exporter", STAGING_OPS_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
     RAILWAY_ENVIRONMENT_ID: "prod", PRODUCTION_EXPORT_ENVIRONMENT_ID: "prod",
     STAGING_MAINTENANCE_ADAPTER: "local", SOURCE_APPLICATION_COMMIT: commit,
-    DATABASE_URL: "postgres://u:p@postgres.railway.internal/db", NEO4J_URL: "bolt://neo4j.railway.internal",
+    DATABASE_URL: "postgres://u:p@postgres.railway.internal:5432/db", NEO4J_URL: "bolt://neo4j.railway.internal",
     NEO4J_USER: "neo4j", NEO4J_PASSWORD: "prod-password", NEO4J_DATABASE: "neo4j",
     AUTH_SECRET: "prod-auth", SECRETS_KEY: "prod-secrets",
     STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"), STAGING_COMPARISON_KEY_ID: "ops-v2",

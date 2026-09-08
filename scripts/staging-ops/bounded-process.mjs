@@ -24,6 +24,11 @@ export async function runBoundedProcess(command, args, {
     try { process.kill(platform === "win32" ? child.pid : -child.pid, name); }
     catch (error) { if (error?.code !== "ESRCH") throw error; }
   };
+  const ownedGroupAlive = () => {
+    if (platform === "win32" || !child.pid) return false;
+    try { process.kill(-child.pid, 0); return true; }
+    catch (error) { return error?.code !== "ESRCH"; }
+  };
   const terminate = (reason) => {
     if (termination) return;
     termination = reason;
@@ -58,8 +63,28 @@ export async function runBoundedProcess(command, args, {
     child.once("close", (code, closeSignal) => resolve({ error: spawnError, code, signal: closeSignal }));
   });
   clearTimeout(deadlineTimer);
-  if (escalationTimer) clearTimeout(escalationTimer);
   signal?.removeEventListener("abort", onAbort);
+  if (termination && platform !== "win32" && child.pid) {
+    // `close` confirms only the tracked process and its stdio. A descendant in the detached group
+    // can survive that event, so do not let a caller roll back an exported snapshot or release a
+    // fence until group absence is observed. The referenced poll also keeps Node alive after the
+    // tracked handle disappears.
+    if (ownedGroupAlive()) {
+      try { signalOwned("SIGKILL"); }
+      catch (error) { termination = `${termination}; final SIGKILL failed: ${redact(error?.message)}`; }
+    }
+    const verificationDeadline = Date.now() + terminateGraceMs;
+    while (ownedGroupAlive() && Date.now() < verificationDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (ownedGroupAlive()) {
+      if (escalationTimer) clearTimeout(escalationTimer);
+      throw Object.assign(new Error(`${command} ${termination}; owned subprocess group termination could not be confirmed`), {
+        code: "STAGING_OPERATION_TIMEOUT", terminationConfirmed: false, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"),
+      });
+    }
+  }
+  if (escalationTimer) clearTimeout(escalationTimer);
   const out = Buffer.concat(stdout).toString("utf8");
   const err = Buffer.concat(stderr).toString("utf8");
   if (termination) {
