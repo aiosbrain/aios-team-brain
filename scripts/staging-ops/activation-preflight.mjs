@@ -715,7 +715,12 @@ async function readFullyAcquiredActivationFacts(env, { fetchImpl, evidenceStore,
   const staging = await collectActivationEnvironment({
     pins: pinsFromEnvironment(env, topology.document.staging, "staging"), token: env.RAILWAY_STAGING_READ_TOKEN,
     comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), comparisonKeyId: env.STAGING_COMPARISON_KEY_ID,
-    includeGraphiti: true, fetchImpl, budget,
+    includeGraphiti: true,
+    // Keep a well-formed mismatched active digest as authenticated evidence. The evaluator turns it
+    // into the named runner-image-pinned failure and a structured NOT ACTIVATED report; the
+    // production publisher retains the stricter throw-before-signing default.
+    requireRunnerImageMatch: false,
+    fetchImpl, budget,
   });
   budget?.assert("staging deployment and repository reads");
   const [deploymentData, github] = await Promise.all([

@@ -29,7 +29,13 @@ describe("Neo4j lossless typed codec — types, not just representations", () =>
     // that round-tripped through a JS number would pass a `toString` comparison against ITSELF and
     // still have changed the value.
     expect(typeof decoded).not.toBe("number");
-    expect((decoded as any).toNumber?.() === 9223372036854775806).toBe(false);
+    const integer = decoded as ReturnType<typeof neo4j.int>;
+    // Exact driver representation, independently written down. Calling `toNumber()` here would
+    // itself round the value, and the numeric literal on the other side would be rounded by JS too.
+    expect(integer.high).toBe(2_147_483_647);
+    expect(integer.low).toBe(-2);
+    expect(integer.inSafeRange()).toBe(false);
+    expect(integer.equals(neo4j.int("9223372036854775806"))).toBe(true);
   });
 
   it("keeps a Date as a driver Date with its exact fields", () => {

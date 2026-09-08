@@ -29,6 +29,13 @@ const ROOT = join(import.meta.dirname, "..", "..");
 const DOCKERFILE = readFileSync(join(ROOT, "Dockerfile"), "utf8");
 const ENTRYPOINT_SCRIPT = readFileSync(join(ROOT, "docker", "entrypoint.sh"), "utf8");
 const RAILWAY_JSON = readFileSync(join(ROOT, "railway.json"), "utf8");
+const RAILWAY_CONFIG = JSON.parse(RAILWAY_JSON);
+const RAILWAY_START_RELATIVE = String(RAILWAY_CONFIG?.deploy?.startCommand ?? "")
+  .match(/(?:^|\s)(scripts\/[A-Za-z0-9_./-]+)(?:\s|$)/)?.[1] ?? null;
+const RAILWAY_START_SCRIPT = RAILWAY_START_RELATIVE
+  ? readFileSync(join(ROOT, RAILWAY_START_RELATIVE), "utf8")
+  : "";
+const TINI_PATH = "/usr/bin/tini";
 
 /** The image root every in-container path is resolved against (`WORKDIR /app` in the base stage). */
 const IMAGE_ROOT = "/app";
@@ -303,7 +310,8 @@ const bootPaths: string[] = (() => {
   const referenced = [
     ...ENTRYPOINT_SCRIPT.matchAll(/(\/app\/[A-Za-z0-9_./-]+)(?=["'`\s;)|&]|$)/gm),
   ].map((m) => m[1]);
-  return [...new Set([...(script ? [script] : []), ...referenced])];
+  const railwayStartPath = RAILWAY_START_RELATIVE ? `${IMAGE_ROOT}/${RAILWAY_START_RELATIVE}` : null;
+  return [...new Set([...(script ? [script] : []), ...referenced, ...(railwayStartPath ? [railwayStartPath] : [])])];
 })();
 
 /**
@@ -375,7 +383,10 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
       `test -f "$f" ${fail("is missing or not a regular file")}; ` +
       `test -s "$f" ${fail("is empty")}; ` +
       `test -r "$f" ${fail("is not readable")}; done; ` +
-      `/bin/sh -n ${entrypointArgv?.[1]}`;
+      `/bin/sh -n ${entrypointArgv?.[1]}; ` +
+      `/bin/sh -n ${RAILWAY_START_RELATIVE ? `${IMAGE_ROOT}/${RAILWAY_START_RELATIVE}` : "<no Railway start wrapper>"}; ` +
+      `test -x ${TINI_PATH} || { echo "boot chain: ${TINI_PATH} is missing or not executable" >&2; exit 1; }; ` +
+      `${TINI_PATH} --version >/dev/null || { echo "boot chain: ${TINI_PATH} does not run" >&2; exit 1; }`;
     assertAscii(finalStage.instructions[assertionIndex].args, "the boot-chain assertion");
     expect(normalise(finalStage.instructions[assertionIndex].args)).toBe(normalise(expected));
   });
@@ -405,6 +416,13 @@ describe("AC2 — the boot invocation is complete, build-asserted, and terminal"
       // disk — a generated or untracked file would pass while never entering the build context.
       expect(rel.split("/").includes(".."), `${p} escapes ${IMAGE_ROOT}`).toBe(false);
       expect(TRACKED.has(rel), `${p} maps to ${rel}, which git does not track`).toBe(true);
+    }
+  });
+
+  it("(g) both effective start wrappers place the checked reaper above the startup fence", () => {
+    for (const [name, script] of [["image entrypoint", ENTRYPOINT_SCRIPT], ["Railway start wrapper", RAILWAY_START_SCRIPT]] as const) {
+      expect(script, `${name} does not invoke the checked reaper`).toContain(`exec ${TINI_PATH} -s --`);
+      expect(script.indexOf(`exec ${TINI_PATH} -s --`), `${name} starts the fence before the reaper`).toBeLessThan(script.indexOf("startup-fence.mjs"));
     }
   });
 });

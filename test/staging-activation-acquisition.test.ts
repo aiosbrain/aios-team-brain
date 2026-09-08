@@ -320,7 +320,11 @@ describe("the runner image measurement is about the artifact actually running", 
     const { transport, result } = await publish();
     const activation = await runActivationPreflight(importerEnv(result.objectId),
       { fetchImpl: providerFixture({ runnerDeploymentDigest: wrong }).fetchImpl, evidenceStore: transport.reader });
-    expect(activation.status).not.toBe("READY TO ACTIVATE");
+    expect(activation.status).toBe("NOT ACTIVATED");
+    expect(activation.checks.find((check) => check.id === "runner-image-pinned")).toMatchObject({
+      status: "fail",
+      detail: expect.stringMatching(/RUNNING a different artifact/),
+    });
   });
 
   it("reports UNVERIFIED — never READY — when the deployment carries no usable image identity", async () => {

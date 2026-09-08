@@ -196,7 +196,7 @@ export function expectedImageDigest(image) {
  * well-formed DIFFERENT digest refuses (it is evidence of the wrong artifact). There is no fallback
  * to `meta.image`, to the configured reference, or to a freshly resolved tag.
  */
-function assertRunner(configuration, pins, role, deployment) {
+function assertRunner(configuration, pins, role, deployment, { requireImageMatch = true } = {}) {
   const expectedImage = pins[`${role}Image`];
   if (!expectedImage || configuration.instance.source?.image !== expectedImage || !/@sha256:[0-9a-f]{64}$/i.test(expectedImage)) throw new Error(`${role} runner image is not the pinned immutable artifact`);
   if (configuration.instance.source?.repo || configuration.autoDeploy !== false) throw new Error(`${role} runner has a repository source or automatic deployments enabled`);
@@ -204,7 +204,11 @@ function assertRunner(configuration, pins, role, deployment) {
   if (local.length) throw new Error(`${role} runner has a repository deploy trigger`);
   const measured = String(deployment?.meta?.imageDigest ?? "").toLowerCase();
   if (!IMAGE_CONTENT_DIGEST.test(measured)) throw new Error(`${role} runner deployment reports no well-formed active image digest, so its running artifact is UNVERIFIED`);
-  if (measured !== expectedImageDigest(expectedImage)) throw new Error(`${role} runner deployment is running a different artifact than its pinned immutable image`);
+  // The production exporter must not sign a measurement that contradicts its own pin. The staging
+  // consumer, however, has a different API contract: retain an authenticated, well-formed
+  // mismatched digest so `evaluateActivation` can return its complete structured NOT ACTIVATED
+  // report. A mismatched artifact still never reaches READY; only the reporting boundary differs.
+  if (requireImageMatch && measured !== expectedImageDigest(expectedImage)) throw new Error(`${role} runner deployment is running a different artifact than its pinned immutable image`);
   return measured;
 }
 
@@ -215,7 +219,7 @@ function assertAppTrigger(configuration, pins) {
 }
 
 /** Fixed, role-local provider acquisition. Raw variable maps never leave this function. */
-export async function collectActivationEnvironment({ pins, token, comparisonKey, comparisonKeyId, includeGraphiti = false, fetchImpl = fetch, budget = null }) {
+export async function collectActivationEnvironment({ pins, token, comparisonKey, comparisonKeyId, includeGraphiti = false, requireRunnerImageMatch = true, fetchImpl = fetch, budget = null }) {
   budget?.assert(`${pins.runnerRole} activation token scope read`);
   const scope = await activationRailwayQuery({ document: ACTIVATION_ACQUISITION_DOCUMENTS.projectToken, variables: {}, token, fetchImpl, budget }).then((data) => data.projectToken);
   if (!scope || scope.projectId !== pins.projectId || scope.environmentId !== pins.environmentId) throw new Error("activation token scope does not match the pinned project/environment");
@@ -228,7 +232,7 @@ export async function collectActivationEnvironment({ pins, token, comparisonKey,
   const postgresDeployment = servingDeployment(configurations.postgres, pins, "postgres");
   const neo4jDeployment = servingDeployment(configurations.neo4j, pins, "neo4j");
   const graphitiDeployment = includeGraphiti ? servingDeployment(configurations.graphiti, pins, "graphiti") : null;
-  const runnerImageDigest = assertRunner(configurations[pins.runnerRole], pins, pins.runnerRole, runnerDeployment);
+  const runnerImageDigest = assertRunner(configurations[pins.runnerRole], pins, pins.runnerRole, runnerDeployment, { requireImageMatch: requireRunnerImageMatch });
   const source = assertAppTrigger(configurations.app, pins);
 
   budget?.assert(`${pins.runnerRole} activation network reads`);

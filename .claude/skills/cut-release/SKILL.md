@@ -186,7 +186,7 @@ and nothing else.
 
 ---
 
-## 4. Wait for the gate — nothing enforces this wait
+## 4. Wait for the gate — the gate is still not required; MEASURE the rest
 
 ```bash
 gh run list --repo <owner>/<repo> --workflow=release-candidate.yml --limit 5 \
@@ -202,12 +202,26 @@ tagged commit · **D** the commit is reachable from the integration branch. A+B+
 alone certify *"some descendant of the release branch"*; **D** is what makes it
 the right commit.
 
-⚠️ **THE WAIT IS HUMAN DISCIPLINE.** Measured 2026-09-06: `Release candidate gate`
-is **not** a required context on the release branch, `enforce_admins` is false,
-and there is no bypass allowance. A non-admin's fast-forward is refused by
-"require a pull request" whatever the contexts say; **an admin's push bypasses
-everything, including a pending or red gate.** Do not read a green
-branch-protection UI as having checked this. RELPTR-8 tracks closing it.
+⚠️ **THE WAIT IS HUMAN DISCIPLINE — and the enforcement around it has MOVED.**
+Measured on `main` **2026-09-08** (`.context/staging-hardening-handoff/github-protection-sep8.json`):
+`Release candidate gate` is still **not** a required context, so nothing makes
+this wait; but `enforce_admins` is now **true** and `required_pull_request_reviews`
+is present, so the "an admin's push bypasses everything" sentence this replaces is
+**false today** — and Step 5's raw fast-forward is likely to be refused outright.
+
+**Do not act on either measurement. Measure the CURRENT remote state before you
+rely on it**, and read it, not a green branch-protection UI:
+
+```bash
+gh api repos/<owner>/<repo>/branches/main/protection --jq \
+  '{enforce_admins: .enforce_admins.enabled, required_pr: (.required_pull_request_reviews != null), contexts: .required_status_checks.contexts}'
+gh api repos/<owner>/<repo>/rulesets --jq '.[] | {id, name, target, enforcement}'
+```
+
+Under the staging-first workflow this step is performed by dispatching
+`.github/workflows/release-controller.yml` from `staging` once activation is
+complete (see the note at the top of this file). Before activation: stop and
+report the missing control. RELPTR-8 tracks making the gate required.
 
 **Red A/B/C means the tag is wrong — and you cannot re-tag** (see the ⛔ above).
 Fix forward on the integration branch and cut the next patch number.
@@ -215,6 +229,15 @@ Fix forward on the integration branch and cut the next patch number.
 ---
 
 ## 5. Fast-forward the release branch — the step that makes it a release
+
+⛔ **THE RAW PUSH BELOW IS HISTORICAL AND DOES NOT APPLY UNDER THIS WORKFLOW.**
+It is kept because it names exactly what the controller performs. The operative
+instruction is the note at the top of this file: after activation, steps 4–5 are
+performed ONLY by dispatching `.github/workflows/release-controller.yml` from
+`staging` with the exact annotated tag, the staging deployment ID, `copy-ready`
+mode and non-empty validation notes. Before activation, stop and report the
+missing control. As measured in Step 4, `main` currently requires a pull request
+and enforces admins, so this command is in any case likely to be refused.
 
 ```bash
 git push origin "$VERSION^{commit}:$RELEASE"

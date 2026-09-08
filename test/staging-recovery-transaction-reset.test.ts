@@ -178,14 +178,23 @@ describe("the importer's recovery path on an aborted connection", () => {
  */
 describe("installObject's failure path (structural supplement — not a runtime proof)", () => {
   const source = readFileSync(path.join(__dirname, "..", "scripts", "staging-ops", "importer.mjs"), "utf8");
-  const catchBlock = source.slice(
-    source.indexOf("    if (!destructive) throw error;"),
-    source.indexOf("  } finally { await releaseCoordinatorLock(client)"),
-  );
+  const installStart = source.indexOf("export async function installObject(");
+  const installEnd = source.indexOf("\nasync function currentDeployment(", installStart);
+  const installBody = source.slice(installStart, installEnd);
+  const catchStart = installBody.indexOf("  } catch (error) {");
+  const catchEnd = installBody.indexOf("  } finally { await releaseLock(client)", catchStart);
+  const catchBlock = installBody.slice(catchStart, catchEnd);
 
   it("has a body to read at all", () => {
-    // A slice that silently came back empty would make every assertion below vacuously true.
+    // Positive extraction controls: source reshaping must fail by name, rather than leaving a
+    // stale/empty slice whose downstream ordering checks no longer observe installObject at all.
+    expect(installStart).toBeGreaterThan(-1);
+    expect(installEnd).toBeGreaterThan(installStart);
+    expect(catchStart).toBeGreaterThan(-1);
+    expect(catchEnd).toBeGreaterThan(catchStart);
+    expect(installBody).toContain("export async function installObject");
     expect(catchBlock.length).toBeGreaterThan(200);
+    expect(catchBlock).toContain("if (!destructive)");
   });
 
   it("resets the session before the journal transition, the lock release and the rollback", () => {

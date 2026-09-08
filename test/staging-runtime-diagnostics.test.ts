@@ -145,11 +145,17 @@ describe("the harness preserves evidence BEFORE it destroys the containers", () 
     expect(capture, "logs must be captured before the containers are removed").toBeLessThan(down);
   });
 
-  it("captures the bootstrap CLI separately, because `run --rm` output is in no service log", () => {
-    expect(harness).toContain('>"$harness_root/bootstrap.log"');
-    // The step's ORIGINAL exit status decides the run — not a pipeline's, and not `tee`'s.
-    expect(harness).toContain("bootstrap_status=$?");
-    expect(harness).toContain('exit "$bootstrap_status"');
+  it("captures the successful bootstrap-resume CLI separately, because `run --rm` output is in no service log", () => {
+    const log = '"$harness_root/bootstrap-resume-after-publish.log"';
+    const redirect = harness.indexOf(`>${log} 2>&1 || {`);
+    const nextReadback = harness.indexOf(`cat ${log}`, redirect);
+    expect(redirect).toBeGreaterThan(-1);
+    expect(nextReadback).toBeGreaterThan(redirect);
+    const failureBranch = harness.slice(redirect, nextReadback);
+    // The command's ORIGINAL exit status enters the `||` branch directly — no pipeline or `tee`
+    // can replace it — and the captured output is surfaced before the harness exits non-zero.
+    expect(failureBranch).toContain(`sed -n '1,120p' ${log}`);
+    expect(failureBranch).toContain("exit 1");
     expect(harness).not.toMatch(/bootstrap-rollback[^\n]*\|\s*tee/);
   });
 

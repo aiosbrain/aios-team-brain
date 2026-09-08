@@ -9,7 +9,10 @@ const ENV = {
   DATABASE_URL,
   STAGING_OPS_ENVIRONMENT_ID: "staging-fence-test",
   RAILWAY_ENVIRONMENT_ID: "staging-fence-test",
-  // Deliberately missing STAGING_DATA_MODE: durable activated state must still enter the fence.
+  // Keep the positive-control preconditions valid so its refusal can only come from the journal
+  // classification after a real shared-lock acquisition. Missing-mode refusal is independently
+  // pinned in staging-boot-admission.test.ts.
+  STAGING_DATA_MODE: "copy-ready",
 } as NodeJS.ProcessEnv;
 
 describe("H3 — actual startup/loader admission contends on the common data fence", () => {

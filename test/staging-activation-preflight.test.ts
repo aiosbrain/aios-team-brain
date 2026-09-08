@@ -151,6 +151,14 @@ describe("the verifier reads and never writes", () => {
 });
 
 describe("evaluateActivation", () => {
+  type MeasuredProductionSubjects = {
+    app: { serviceId: string };
+    resources: {
+      postgres: { serviceId: string };
+      neo4j: { serviceId: string };
+    };
+  };
+
   it("reports READY TO ACTIVATE — never ACTIVATED — when every check is measured and passing", () => {
     const result = evaluateActivation(fullyMeasured());
     expect(result.status).toBe(ACTIVATION_STATUS.READY);
@@ -175,7 +183,7 @@ describe("evaluateActivation", () => {
     // must stop passing — the three statements the defect made simultaneously and wrongly.
     for (const pin of ["appServiceId", "postgresServiceId", "neo4jServiceId"] as const) {
       const facts = fullyMeasured();
-      const measured = facts.topology.acquisition.production as Record<string, any>;
+      const measured = facts.topology.acquisition.production as MeasuredProductionSubjects;
       if (pin === "appServiceId") measured.app.serviceId = "some-other-production-app";
       else measured.resources[pin === "postgresServiceId" ? "postgres" : "neo4j"].serviceId = `some-other-${pin}`;
       facts.productionSubjects = { bound: false, mismatches: [`the measurement describes a different ${pin} than the one pinned here`], unmeasured: [] };
