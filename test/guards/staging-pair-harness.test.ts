@@ -132,19 +132,19 @@ describe("paired refresh isolated harness", () => {
     // harness must now contain is the positive checkpoint evidence, tied to the candidate run, plus
     // the pre-drain control demonstrating those assertions can distinguish the two.
     expect(harness).toContain("STAGING_FAULT_POINT=before-drain");
-    expect(harness).toContain("refuse_receipt pre-drain-control postgres-restored");
-    expect(harness).toContain("refuse_receipt pre-drain-control prior-pair-restored");
-    expect(harness).toContain("require_receipt install-fault-recovers fault-injected");
-    expect(harness).toContain("require_receipt install-fault-recovers prior-pair-restored");
+    expect(harness).toContain("refuse_receipt pre-drain-control.log postgres-restored");
+    expect(harness).toContain("refuse_receipt pre-drain-control.log prior-pair-restored");
+    expect(harness).toContain("require_receipt install-fault-recovers.log fault-injected");
+    expect(harness).toContain("require_receipt install-fault-recovers.log prior-pair-restored");
     // BOTH stores: the after-graph fault is the case where recovery has two of them to undo.
     expect(harness).toContain("STAGING_FAULT_POINT=after-graph");
-    expect(harness).toContain("require_receipt graph-fault-recovers graph-restored");
+    expect(harness).toContain("require_receipt graph-fault-recovers.log graph-restored");
     expect(harness).toContain("assert-graph-version v3");
     // A failed rollback must prove its own checkpoint, and that the whole pinned set is stopped.
-    expect(harness).toContain("require_receipt failed-rollback-stays-stopped recovery-required");
+    expect(harness).toContain("require_receipt failed-rollback-stays-stopped.log recovery-required");
     expect(harness).toContain("require_journal last_safe_checkpoint recovery-required");
     expect(harness).toContain("serviceId=graphiti-local");
-    expect(harness).toContain("require_receipt explicit-recovery prior-pair-restored");
+    expect(harness).toContain("require_receipt explicit-recovery.log prior-pair-restored");
     // The interruption waits for the POSTGRES BARRIER, not for `state=importing` (which is written
     // before the restore, so a kill on it can land before any candidate data exists).
     expect(harness).toContain("receipt interrupted.log postgres-restored");
@@ -163,13 +163,13 @@ describe("paired refresh isolated harness", () => {
     // scenario below leaves the importer's own lock-owning session in 25P02 and requires the whole
     // two-store recovery to complete through it.
     expect(harness).toContain("STAGING_FAULT_POINT=after-graph-sql-abort");
-    expect(harness).toContain("require_receipt sql-abort-recovers candidate-observed");
+    expect(harness).toContain("require_receipt sql-abort-recovers.log candidate-observed");
     expect(harness).toContain('"sqlstate":"22012"');
     expect(harness).toContain('"transactionAborted":true');
     // Both stores held the CANDIDATE before the abort, so the restore of the prior pair is a real
     // two-store undo rather than "nothing had been replaced yet".
     expect(harness).toContain('"pgVersion":"v4".*"graphVersions":"v4"');
-    expect(harness).toContain('require_receipt sql-abort-recovers prior-pair-restored');
+    expect(harness).toContain('require_receipt sql-abort-recovers.log prior-pair-restored');
     // Same session, still fenced, at BOTH reset checkpoints — a reconnect recovers just as visibly
     // while silently dropping the advisory locks.
     expect(harness).toContain('"checkpoint":"install-reset".*"coordinatorLockHeld":true.*"exclusiveDataLockHeld":true');
