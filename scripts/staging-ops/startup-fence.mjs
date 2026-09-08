@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import { Client } from "pg";
 import { shouldUseSsl } from "../pg-load-schema.mjs";
+import { isDirectEntry } from "./direct-entry.mjs";
 import { acquireDataUseLock } from "./journal.mjs";
 import { classifyFenceAdmission, stagingFenceScope } from "./fence-admission.mjs";
 import { spawnOwnedWorkload } from "./owned-workload.mjs";
@@ -185,7 +184,10 @@ export async function supervise(command, {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+// The shared helper. This guard is the load-bearing one: a symlinked fence that never runs its body
+// exits 0 without acquiring the shared data-use lock and without supervising anything, so the boot
+// it was meant to fence proceeds unfenced — while the exit code says the fence was satisfied.
+if (isDirectEntry(import.meta.url)) {
   const separator = process.argv.indexOf("--");
   const command = separator >= 0 ? process.argv.slice(separator + 1) : [];
   supervise(command).then(({ code }) => { process.exitCode = code; }).catch((error) => {

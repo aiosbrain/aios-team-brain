@@ -57,6 +57,12 @@ const pgState = vi.hoisted(() => ({
   clients: [] as { statements: string[]; ended: number; endedWhileQueryPending: boolean; pending: number; connection: { stream: { destroyed: boolean; destroyCalls: number; destroy: (error?: unknown) => void } } }[],
   rows: [{ acquired: true }] as Record<string, unknown>[],
   journal: {} as Record<string, unknown>,
+  /**
+   * Awaited WHILE a query is in flight (`pending > 0`), before its rows are produced. The signal
+   * regressions below need a real window in which this invocation's own read has not settled, which
+   * is exactly when an out-of-band signal writer would open its second connection.
+   */
+  duringQuery: null as null | ((sql: string) => Promise<void>),
 }));
 
 vi.mock("pg", () => {
@@ -87,6 +93,7 @@ vi.mock("pg", () => {
       this.statements.push(String(sql));
       this.pending += 1;
       try {
+        if (pgState.duringQuery) await pgState.duringQuery(String(sql));
         if (String(sql).includes("inet_server_addr")) return { rows: [{ database: this.connectionParameters.database, server_address: "10.0.0.9", server_port: this.connectionParameters.port, backend_pid: 71 }] };
         const held = gate.take();
         if (held) return await held;
@@ -113,7 +120,13 @@ vi.mock("../scripts/staging-ops/object-store.mjs", async (importOriginal) => ({
   }),
 }));
 
-const maintenanceState = vi.hoisted(() => ({ stopDelayMs: 0, stopError: null as Error | null }));
+const maintenanceState = vi.hoisted(() => ({
+  stopDelayMs: 0,
+  stopError: null as Error | null,
+  /** Every lifecycle verb the adapter offers, in call order — "nothing was drained, stopped or
+   *  redeployed" is a property the signal regressions must OBSERVE rather than infer. */
+  calls: [] as string[],
+}));
 
 // Reaching `rollbackToPrior` through the REAL dispatcher means getting past `openPrior`, which
 // verifies a signed, encrypted, manifest-validated rollback bundle. None of that cryptography is
@@ -147,15 +160,17 @@ vi.mock("../scripts/staging-ops/local-maintenance.mjs", () => ({
   LocalMaintenance: class {
     appServiceId = "app-local";
     async stopAndVerifyAll() {
+      maintenanceState.calls.push("stopAndVerifyAll");
       if (maintenanceState.stopDelayMs) await new Promise((resolve) => setTimeout(resolve, maintenanceState.stopDelayMs));
       if (maintenanceState.stopError) throw maintenanceState.stopError;
       return true;
     }
-    async tokenIdentity() { return {}; }
+    async tokenIdentity() { maintenanceState.calls.push("tokenIdentity"); return {}; }
     async listActiveDeployments() {
+      maintenanceState.calls.push("listActiveDeployments");
       return [{ id: "dep-1", status: "SUCCESS", meta: { commitHash: "b".repeat(40), createdAt: "2026-09-07T00:00:00Z" } }];
     }
-    async deployApp() { return "dep-2"; }
+    async deployApp() { maintenanceState.calls.push("deployApp"); return "dep-2"; }
   },
 }));
 
@@ -208,6 +223,8 @@ const OBJECT_ID = `run-1--${"a".repeat(64)}`;
 afterEach(() => {
   maintenanceState.stopDelayMs = 0;
   maintenanceState.stopError = null;
+  maintenanceState.calls.length = 0;
+  pgState.duringQuery = null;
 });
 
 /** Start a real dispatcher branch and hold open the first async resource it reaches. */
@@ -375,6 +392,156 @@ setInterval(() => {}, 1000);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe("a cancelled importer writes NOBODY ELSE'S journal", () => {
+  /**
+   * THE ADJUDICATED HIGH (`adjudication-b8ddee3d-final.md` §1).
+   *
+   * `runImporter` installed its SIGTERM/SIGINT handlers before dispatching the action, and those
+   * handlers did more than cancel: they opened a SECOND Postgres connection, read the singleton
+   * journal, and transitioned any non-`ready` run to `failed`. They took no coordinator lock, and
+   * `transitionJournal` predicates on the singleton and the observed state — never on `run_id` — so
+   * the row they wrote was whichever run happened to own the journal.
+   *
+   * The trigger is the advertised READ-ONLY `verify-target`: an operator who Ctrl-Cs a destination
+   * check while another importer is mid-`importing` marked THAT run failed, and its expected
+   * `importing → verifying` transition could then never succeed — a healthy install forced into
+   * recovery by a command promising to change nothing.
+   *
+   * These drive the REAL `runImporter`, because the defect lives in the dispatcher: `verifyStagingTarget`
+   * itself only ever read, and every existing `runImporter` test stopped at preflight refusal, so
+   * nothing here could observe the caller's write. The load-bearing assertion is the CONNECTION
+   * COUNT — the out-of-band writer's very first act is `new pg.Client(...)`, which this double
+   * records synchronously — backed by the statements no client issued.
+   */
+  const FOREIGN_RUN = "other-import-run";
+
+  /** Arrange a journal that BELONGS TO SOMEONE ELSE and is writable by the removed writer. */
+  function foreignActiveJournal() {
+    pgState.clients.length = 0;
+    pgState.rows = [{ acquired: true }];
+    pgState.journal = { singleton: true, state: "importing", run_id: FOREIGN_RUN };
+    gate.armed = false; gate.skip = 0;
+    // The fixture is only a counterexample if the removed writer would have written it: `!== "ready"`
+    // was its whole predicate. A `ready` journal here would make every assertion below vacuous.
+    expect(pgState.journal.state, "a ready journal is out of the writer's reach, so this proves nothing").not.toBe("ready");
+    expect(pgState.journal.run_id, "the journal must belong to another run").toBe(FOREIGN_RUN);
+  }
+
+  const matching = (pattern: RegExp) => pgState.clients.flatMap((c) => c.statements.filter((sql) => pattern.test(sql)));
+  const JOURNAL_READ = /FROM staging_ops\.refresh_journal/;
+  const JOURNAL_WRITE = /UPDATE staging_ops\.refresh_journal/;
+  const journalReads = () => matching(JOURNAL_READ);
+  const journalWrites = () => matching(JOURNAL_WRITE);
+
+  it("has oracles that can actually see a journal read and a journal write", async () => {
+    // Every assertion below is `toEqual([])`, so a matcher that matches nothing would report zero
+    // and be indistinguishable from a measurement. These are the exact statements `readJournal` and
+    // `transitionJournal` issue, taken from the module under test rather than paraphrased here.
+    const { readJournal, transitionJournal } = await import("../scripts/staging-ops/journal.mjs");
+    const issued: string[] = [];
+    const probe = { query: async (sql: string) => { issued.push(String(sql)); return { rows: [{ singleton: true, state: "importing", run_id: FOREIGN_RUN }] }; } };
+    await readJournal(probe as never);
+    await transitionJournal(probe as never, { runId: FOREIGN_RUN, from: ["importing"], to: "failed", patch: {} });
+    expect(issued.some((sql) => JOURNAL_READ.test(sql)), "the read oracle cannot see readJournal").toBe(true);
+    expect(issued.some((sql) => JOURNAL_WRITE.test(sql)), "the write oracle cannot see transitionJournal").toBe(true);
+  });
+
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    it(`${signal} during a pending verify-target read cancels only its own reads`, async () => {
+      foreignActiveJournal();
+      // Delivered WHILE the destination SELECT is in flight — `pending > 0` inside the double — which
+      // is the window the handler used to fill with a second connection. Several macrotasks pass
+      // before the read resolves, so a restored writer has ample room to connect, read and update.
+      pgState.duringQuery = async (sql) => {
+        if (!sql.includes("inet_server_addr")) return;
+        pgState.duringQuery = null;
+        process.emit(signal as never);
+        await settle();
+      };
+
+      const outcome = await runImporter(ENV, ["verify-target"])
+        .then(() => null, (error: Error & { code?: string; terminationConfirmed?: boolean }) => error);
+
+      // Cancellation is REPORTED, not swallowed into a green destination verdict.
+      expect(outcome).toMatchObject({ code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true });
+      // ZERO checkpoint connections. Pre-fix this was 2, and the second one carried the write.
+      expect(pgState.clients, "the cancellation opened a connection it does not own").toHaveLength(1);
+      expect(journalWrites(), "the cancellation wrote a journal this invocation never admitted").toEqual([]);
+      expect(journalReads(), "the cancellation read the shared journal it has no business reading").toEqual([]);
+      // ZERO lifecycle calls: a read-only check that is cancelled drains, stops and redeploys nothing.
+      expect(maintenanceState.calls).toEqual([]);
+      // …and its OWN resource is still cleaned up, exactly once and not underneath its own query.
+      expect(pgState.clients[0].ended, "the verifier's own connection was leaked").toBe(1);
+      expect(pgState.clients[0].endedWhileQueryPending).toBe(false);
+    });
+
+    it(`${signal} before bootstrap admission leaves the other run's journal alone`, async () => {
+      // The second required regression: cancellation through the ACTUAL dispatch of a lifecycle
+      // action, delivered before that action has admitted anything. The helper's pre-admission
+      // refusal cannot cover this, because the signal reaches the OUTER handler regardless of what
+      // the branch below it decides — which is exactly why a helper-only test could not close this.
+      foreignActiveJournal();
+      pgState.duringQuery = async (sql) => {
+        // The finite-deadline statement: installed on this session after the handlers exist and
+        // before `bootstrapRollback` runs its first `assertNotCancelled`. Nothing is admitted yet.
+        if (!sql.includes("set_config")) return;
+        pgState.duringQuery = null;
+        process.emit(signal as never);
+        await settle();
+      };
+
+      const outcome = await runImporter(ENV, ["bootstrap-rollback"])
+        .then(() => null, (error: Error & { code?: string; terminationConfirmed?: boolean }) => error);
+
+      expect(outcome).toMatchObject({ code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true });
+      expect(pgState.clients).toHaveLength(1);
+      // Nothing admitted: no coordinator lock, no journal read, and above all no transition. (The
+      // journal ROW object is not the oracle — the double never mutates it — the STATEMENTS are.)
+      expect(pgState.clients[0].statements.some((sql) => sql.includes("pg_try_advisory_lock")),
+        "the cancelled bootstrap acquired the coordinator lock").toBe(false);
+      expect(journalWrites()).toEqual([]);
+      expect(journalReads()).toEqual([]);
+      // No drain, no stop, no redeploy.
+      expect(maintenanceState.calls).toEqual([]);
+      expect(pgState.clients[0].ended).toBe(1);
+    });
+  }
+
+  it("absorbs a repeated signal instead of leaving the second one to Node's default action", async () => {
+    // The property the removed writer's `shuttingDown` guard also carried, kept explicitly: the
+    // handlers stay installed through containment, and a second delivery is idempotent rather than
+    // a second abort — or, if the listeners had been dropped, a process kill mid-cleanup.
+    foreignActiveJournal();
+    pgState.duringQuery = async (sql) => {
+      if (!sql.includes("inet_server_addr")) return;
+      pgState.duringQuery = null;
+      process.emit("SIGTERM");
+      process.emit("SIGINT");
+      process.emit("SIGTERM");
+      await settle();
+    };
+
+    const outcome = await runImporter(ENV, ["verify-target"])
+      .then(() => null, (error: Error & { code?: string }) => error);
+
+    expect(outcome).toMatchObject({ code: "STAGING_OPERATION_ABORTED" });
+    expect(pgState.clients).toHaveLength(1);
+    expect(journalWrites()).toEqual([]);
+    expect(pgState.clients[0].ended, "repeated signals closed the owned connection more than once").toBe(1);
+  });
+
+  it("still measures the destination and reports it when NO signal arrives", async () => {
+    // The positive control. Every assertion above is about an absence, and all of them would hold
+    // just as well for a `verify-target` that had stopped working entirely.
+    foreignActiveJournal();
+    const result = await runImporter(ENV, ["verify-target"]);
+    expect(result).toMatchObject({ status: "target-verified", proof: "local-harness" });
+    expect(pgState.clients[0].statements.some((sql) => sql.includes("inet_server_addr")), "the destination was never measured").toBe(true);
+    expect(journalWrites()).toEqual([]);
+    expect(maintenanceState.calls).toEqual([]);
+  });
 });
 
 describe("nothing is constructed outside the scope that cleans it up", () => {

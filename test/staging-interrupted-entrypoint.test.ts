@@ -33,6 +33,10 @@ function interruptedScenario(journal: Record<string, unknown>) {
 }
 
 describe("the real importer install branch recovers interrupted durable states", () => {
+  // ⚠️ `aborted-sigterm` / `aborted-sigint` are LEGACY DURABLE VALUES. Nothing writes them any more:
+  // the out-of-band signal handler that did was removed for writing journals it did not own. They
+  // stay in this table because a journal persisted by an older importer can still carry them, and
+  // recovering such a row is the behaviour under test — not because a live path produces one.
   for (const [state, checkpoint] of [
     ["draining", "ready"], ["importing", "ready"], ["verifying", "ready"], ["booting", "ready"],
     ["failed", "aborted-sigterm"], ["failed", "aborted-sigint"],

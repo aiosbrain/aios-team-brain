@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { importerPreflight, runImporter, verifyStagingTarget } from "../scripts/staging-ops/importer.mjs";
 
@@ -16,7 +17,16 @@ import { importerPreflight, runImporter, verifyStagingTarget } from "../scripts/
  * and it never prints the connection string it was given.
  */
 
-const PASSWORD = "sup3rs3cret-pg-pw";
+/**
+ * GENERATED AT RUN TIME, never written down. A password-shaped literal in a public repository is
+ * indistinguishable to a scanner — and to a reader — from a leaked credential, and the only thing
+ * the assertions below need from this value is that it is the exact value embedded in the
+ * connection string. Hex is URL-safe, so it survives into `DATABASE_URL` unencoded and the bytes
+ * asserted against are the bytes the code under test was handed. The redaction checks are unchanged
+ * in strength: a verifier that echoed its connection string would still contain this.
+ */
+const PASSWORD = randomBytes(24).toString("hex");
+const DATABASE_URL = `postgres://app:${PASSWORD}@staging-pg.railway.internal:5432/brain`;
 
 const ENV = {
   STAGING_OPS_ROLE: "importer",
@@ -35,7 +45,7 @@ const ENV = {
   STAGING_POSTGRES_DEPLOYMENT_ID: "dep-pg",
   STAGING_POSTGRES_HOST: "staging-pg.railway.internal",
   STAGING_POSTGRES_DATABASE: "brain",
-  DATABASE_URL: `postgres://app:${PASSWORD}@staging-pg.railway.internal:5432/brain`,
+  DATABASE_URL,
   NEO4J_URL: "bolt://staging-neo4j.railway.internal:7687",
 } as unknown as NodeJS.ProcessEnv;
 
@@ -116,7 +126,32 @@ describe("M1 — verify-target measures the pinned destination and changes nothi
     // carrying `connectionString` would put the staging Postgres password in a log line.
     const result = await verifyStagingTarget({ client: liveClient(), maintenance: stubMaintenance(), env: ENV });
     expect(JSON.stringify(result)).not.toContain(PASSWORD);
+    // The whole connection string as well as the secret inside it — and matched by SHAPE, because
+    // `parseCanonicalPostgresTarget` normalises `postgres://` to `postgresql://`, so comparing
+    // against the exact `DATABASE_URL` literal would pass over the canonical form it actually holds.
+    expect(JSON.stringify(result), "the result carries a Postgres connection URL").not.toMatch(/postgres(ql)?:\/\//);
     expect(result.target).not.toHaveProperty("connectionString");
+  });
+
+  it("names neither the password nor the connection string when it REFUSES", async () => {
+    // The error path prints too — `console.error(... error.message)` at the CLI entry — so a refusal
+    // that quoted the target it measured would put the staging password in the same log a
+    // successful run is trusted not to.
+    // Thunks, not promises: a rejected promise sitting in an array until the loop reaches it is an
+    // unhandled rejection for a turn, which the runner is entitled to fail the file on.
+    const refusals = [
+      () => verifyStagingTarget({ client: liveClient(), env: ENV, maintenance: stubMaintenance({
+        assertPinnedPostgresTarget: vi.fn(async () => { throw new Error("provider Postgres evidence differs from the pinned project/environment/service-instance/deployment identity"); }),
+      }) }),
+      () => verifyStagingTarget({ client: liveClient({ server_address: "172.18.0.1" }), maintenance: stubMaintenance(), env: ENV }),
+    ];
+    for (const refusal of refusals) {
+      const error = await refusal().then(() => null, (caught: Error) => caught);
+      expect(error, "the refusal under test resolved instead").toBeInstanceOf(Error);
+      const text = `${error?.message}\n${error?.stack ?? ""}`;
+      expect(text).not.toContain(PASSWORD);
+      expect(text, "the refusal quoted a Postgres connection URL").not.toMatch(/postgres(ql)?:\/\//);
+    }
   });
 
   it("REFUSES when the provider evidence does not match the pins, and mutates nothing on the way out", async () => {

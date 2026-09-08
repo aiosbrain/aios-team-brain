@@ -1,8 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import pg from "pg";
 import neo4j from "neo4j-driver";
 import { openSignedEncryptedBundle, createSignedEncryptedBundle, isAuthenticatedRollbackProvenance, rollbackOpeningProvenance } from "./bundle-crypto.mjs";
@@ -21,6 +19,7 @@ import {
   readSourceAttempt, recordSourceAttempt, completeSourceAttempt, withdrawSourceAttempt, sourceAttemptAdmission,
 } from "./journal.mjs";
 import { assertActionConfiguration } from "./action-preflight.mjs";
+import { isDirectEntry } from "./direct-entry.mjs";
 import { emitReceipt } from "./receipts.mjs";
 import { assertActivationPreflightReady, runActivationPreflight } from "./activation-preflight.mjs";
 import { assertStagingTopology } from "./config.mjs";
@@ -1680,21 +1679,39 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   const watchdogOwner = createSessionWatchdogOwner(undefined, { signal: shutdown.signal });
   const actionWatchdog = actionBudget ? watchdogOwner.arm(actionBudget) : null;
   let shuttingDown = false;
-  let signalAbort = null;
-  const recordSignalAbort = async (signal) => {
-    if (shuttingDown) return signalAbort;
+  /**
+   * A SIGNAL CANCELS THIS INVOCATION'S OWN WORK. IT WRITES NO JOURNAL. ⚠️
+   *
+   * This used to open a SECOND Postgres connection out of band, read the singleton journal and
+   * transition whatever non-ready run it found to `failed`. Nothing in that path established that
+   * the row belonged to this process: it took no coordinator lock, and `transitionJournal`
+   * predicates on the singleton and the observed state only — never on the current `run_id` — so it
+   * accepted the stranger's run id it had just read and wrote it back as failed.
+   *
+   * The counterexample is the advertised READ-ONLY `verify-target`. Its handlers are installed
+   * before the dispatch at the branch below and survive its awaited reads, so an operator pressing
+   * Ctrl-C during a destination check marked ANOTHER importer's active `importing` run failed —
+   * that run's expected `importing → verifying` transition then cannot succeed, and a healthy
+   * install is forced into recovery. A cancelled read-only check must not be able to do that.
+   *
+   * What replaces it is nothing, deliberately. Every action that actually owns a run already records
+   * its own terminal checkpoint on its own lock-held connection (`installObject`'s failed-state
+   * transition, `rollbackToPrior`'s `recovery-required`, the bootstrap's failure record), and those
+   * run on the cancellation path too because cancellation surfaces there as an ordinary failure. An
+   * out-of-band writer could only ever add the case those cannot see — the one where this process
+   * owns nothing — which is precisely the case it must not write.
+   *
+   * Still guaranteed here, and asserted by the tests around this: the abort is IDEMPOTENT (a second
+   * signal is absorbed rather than falling through to Node's default action and dropping the fence
+   * while an owned restore is alive), it reaches owned subprocesses through the phase signals, and
+   * the `finally` below still closes this invocation's client within a finite cleanup budget.
+   */
+  const recordSignalAbort = (signal) => {
+    if (shuttingDown) return;
     shuttingDown = true;
     shutdown.abort(Object.assign(new Error(`importer received ${signal}`), { code: "STAGING_OPERATION_ABORTED" }));
-    signalAbort = (async () => {
-      const abortClient = new pg.Client(postgresDeadlineConfig(postgresTarget.connectionString, deadlines.cleanupMs, Math.min(5_000, deadlines.connectionMs)));
-      try {
-        await abortClient.connect(); const journal = await readJournal(abortClient);
-        if (journal.state !== "ready") await transitionJournal(abortClient, { runId: journal.run_id ?? `signal-${Date.now()}`, from: [journal.state], to: "failed", patch: { lastSafeCheckpoint: `aborted-${signal.toLowerCase()}` } });
-      } catch {} finally { await abortClient.end().catch(() => {}); }
-    })();
-    return signalAbort;
   };
-  const signalHandlers = Object.fromEntries(["SIGTERM", "SIGINT"].map((signal) => [signal, () => { void recordSignalAbort(signal); }]));
+  const signalHandlers = Object.fromEntries(["SIGTERM", "SIGINT"].map((signal) => [signal, () => { recordSignalAbort(signal); }]));
   // Keep the idempotent handlers installed through containment. A second signal must not fall
   // through to Node's default action and release the lock while an owned restore is still alive.
   for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
@@ -1800,8 +1817,11 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   } finally {
     await actionWatchdog?.disarm();
     await watchdogOwner.disarmAll();
+    // Removed only HERE, after the owned work above has settled: a handler dropped earlier would let
+    // a second signal take Node's default action and kill the fence-owning process mid-containment.
+    // There is no signal side task left to await — the abort is synchronous and owns nothing beyond
+    // this invocation — so the next statement is the one bounded cleanup of the one owned client.
     for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
-    await signalAbort?.catch(() => {});
     const terminalBudget = createOperationBudget("importer terminal cleanup", deadlines.cleanupMs, { now });
     await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
       ownedCloser(() => client.end(), () => client.connection?.stream?.destroy()));
@@ -1813,4 +1833,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) runImporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging importer refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });
+// `isDirectEntry`, not the two naive spellings — both of which fail OPEN, answering "no" for an
+// invocation that really is direct, so the CLI body never runs and the process exits 0 having
+// printed nothing. Symlinked here means the importer silently performs no import. See the helper.
+if (isDirectEntry(import.meta.url)) runImporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging importer refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });

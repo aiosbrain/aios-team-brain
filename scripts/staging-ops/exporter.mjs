@@ -1,7 +1,5 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import pg from "pg";
 import neo4j from "neo4j-driver";
 import { fingerprint } from "../schema-fingerprint.mjs";
@@ -9,6 +7,7 @@ import { migrationSetIdentity, schemaFingerprintDigest } from "./build-identity.
 import { createSignedEncryptedBundle } from "./bundle-crypto.mjs";
 import { packPair } from "./bundle-format.mjs";
 import { credentialFingerprint } from "./credential-fingerprint.mjs";
+import { isDirectEntry } from "./direct-entry.mjs";
 import { exportGraph, graphCensus, sanitizeGraphExport } from "./graph-bundle.mjs";
 import { capturePairedPostgres } from "./pg-paired.mjs";
 import { withPrivateTempDir } from "./private-store.mjs";
@@ -309,4 +308,6 @@ export async function runExporter(env = process.env, operations = {}, argv = pro
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) runExporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging exporter refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });
+// The shared helper, for the same reason as the importer's: the naive spellings fail OPEN, and a
+// symlinked exporter that exits 0 with no output is indistinguishable from a completed export.
+if (isDirectEntry(import.meta.url)) runExporter().then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(`staging exporter refused: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; });
