@@ -84,24 +84,40 @@ expect_failure() {
 # and the follow-up `assert vN` passes because the prior pair was ALREADY installed before the
 # scenario ran. So each failure scenario now also demands the specific receipts the intended
 # checkpoint emits (`scripts/staging-ops/receipts.mjs`), tied to the candidate run id.
+#
+# THE ARGUMENT IS A FILENAME, and it must say so. `expect_failure` takes a LABEL and appends `.log`;
+# these three open `$harness_root/$log` verbatim. Every caller passed the label, so `require_receipt
+# pre-drain-control …` read a file that does not exist — `grep` reported "No such file", the helper
+# returned 1, and stage 8 failed while the retained `pre-drain-control.log` showed the intended fault
+# had happened exactly as designed. A missing file is not an absent receipt, and `refuse_receipt`
+# would have "verified" the absence of a receipt in a file it never opened.
+#
+# So the file must EXIST, and the name must carry its extension. Both are refusals rather than
+# leniency: a helper that silently appended `.log` would hide a genuinely wrong filename, which is
+# the same class of bug one level along.
 receipt() {
   local log="$1" kind="$2" pattern="$3"
+  [[ "$log" == *.log ]] || { echo "receipt helper needs an explicit .log FILENAME, got the label '$log'" >&2; return 2; }
+  [[ -f "$harness_root/$log" ]] || { echo "receipt helper: '$log' does not exist in the harness root; a missing file is not an absent receipt" >&2; return 2; }
   grep -F "staging-ops-receipt $kind " "$harness_root/$log" | grep -Eq "$pattern"
 }
 
 require_receipt() {
-  local log="$1" kind="$2" pattern="$3" why="$4"
-  if ! receipt "$log" "$kind" "$pattern"; then
-    echo "missing receipt: $why (expected '$kind' matching $pattern in $log)" >&2
-    sed -n '1,80p' "$harness_root/$log" >&2
-    return 1
-  fi
-  echo "verified receipt: $why"
+  local log="$1" kind="$2" pattern="$3" why="$4" status=0
+  receipt "$log" "$kind" "$pattern" || status=$?
+  if [[ "$status" -eq 0 ]]; then echo "verified receipt: $why"; return 0; fi
+  echo "missing receipt: $why (expected '$kind' matching $pattern in $log)" >&2
+  [[ -f "$harness_root/$log" ]] && sed -n '1,80p' "$harness_root/$log" >&2
+  return 1
 }
 
 refuse_receipt() {
-  local log="$1" kind="$2" pattern="$3" why="$4"
-  if receipt "$log" "$kind" "$pattern"; then
+  local log="$1" kind="$2" pattern="$3" why="$4" status=0
+  receipt "$log" "$kind" "$pattern" || status=$?
+  # EXIT 2 IS "COULD NOT LOOK", and it must never read as "it is not there" — that is precisely how
+  # an unreadable filename would have turned into a verified absence.
+  if [[ "$status" -eq 2 ]]; then echo "cannot refuse a receipt in an unreadable log: $why" >&2; return 1; fi
+  if [[ "$status" -eq 0 ]]; then
     echo "unexpected receipt: $why (found '$kind' matching $pattern in $log)" >&2
     return 1
   fi
@@ -176,6 +192,28 @@ fi
   -d '{"mode":"copy-ready"}' http://127.0.0.1:8080/runtime-mode >/dev/null
 
 echo "[4/11] export and install the first pair through separate role CLI containers"
+# THE SOURCE-SIDE ORACLE, BEFORE THE EXPORT. Every application assertion in this harness was about
+# the RESTORED pair, so a source that was never readable produced a green restore and an empty page —
+# which is exactly what happened: the seed created items and project grants and zero context units,
+# and `GET /api/v1/items` intersects with current include memberships. Asking the real handler here,
+# against the source database, is what makes every later "the copied pair is readable" claim mean
+# something. It runs against PROD_DATABASE_URL inside the fixture container; no app is deployed there.
+"${compose[@]}" run --rm fixture-controller assert-source
+# ITS OWN NEGATIVE CONTROL, against the same real handler: close ONE include membership in the
+# source and require the oracle to REFUSE, then reopen it and require it to pass again. An oracle
+# that cannot fail proves nothing — and this one used to report `internal=0, external=0` as success.
+# `valid_to` is set rather than deleting the row; reopen creates a new current membership while the
+# closed historical membership remains part of the exported substrate.
+"${compose[@]}" run --rm fixture-controller close-membership private
+expect_failure source-oracle-refuses-narrowed "${compose[@]}" run --rm fixture-controller assert-source
+grep -q "missing" "$harness_root/source-oracle-refuses-narrowed.log" || {
+  echo "the source oracle failed for some other reason than the narrowed visible set" >&2
+  sed -n '1,40p' "$harness_root/source-oracle-refuses-narrowed.log" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller open-membership private
+"${compose[@]}" run --rm fixture-controller assert-reopened-substrate
+"${compose[@]}" run --rm fixture-controller assert-source
 "${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-1 exporter | tee "$harness_root/run-1.log"
 run1_object="$(tail -n 1 "$harness_root/run-1.log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).objectId))')"
 "${compose[@]}" run --rm --no-deps \
@@ -192,6 +230,12 @@ run1_object="$(tail -n 1 "$harness_root/run-1.log" | node -e 'let s="";process.s
   -e PROBE_S3_BUCKET=staging-pair -e PROBE_S3_KEY="source/$run1_object.bundle" importer scripts/staging-ops/object-store-acl-probe.mjs expect-access-denied-get
 "${compose[@]}" run --rm --no-deps -e PROBE_S3_URL="http://source-object-store:9000/staging-pair/source/$run1_object.bundle" importer scripts/staging-ops/forged-s3-auth-probe.mjs
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+# SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results
+# with the caller's current include memberships, so the copied pair's application reads are only
+# meaningful if that substrate survived the round trip byte-for-byte. If the source reads pass and
+# the copied reads fail, THIS is the diagnostic that separates a restore/sanitizer defect from a
+# fixture one — so it runs before any later step could paper over it.
+"${compose[@]}" run --rm fixture-controller compare-substrate
 "${compose[@]}" run --rm fixture-controller assert v1
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run1_object"
 
@@ -256,18 +300,18 @@ echo "[8/11] inject handled mid-install faults after EACH store and prove prior-
 # did, because v3 was already installed and nothing had been touched. The receipts below are what
 # tell the two apart, so their discriminating power is demonstrated here rather than assumed.
 expect_failure pre-drain-control "${compose[@]}" run --rm -e STAGING_FAULT_POINT=before-drain importer scripts/staging-ops/importer.mjs tick
-require_receipt pre-drain-control fault-injected '"point":"before-drain".*"runId":"run-4"' "the control failed at the point it claims"
-refuse_receipt pre-drain-control postgres-restored '"runId":"run-4"' "a pre-drain failure wrote no candidate Postgres"
-refuse_receipt pre-drain-control prior-pair-restored '"failedRunId":"run-4"' "a pre-drain failure triggers no recovery, so it cannot pass the recovery scenario"
+require_receipt pre-drain-control.log fault-injected '"point":"before-drain".*"runId":"run-4"' "the control failed at the point it claims"
+refuse_receipt pre-drain-control.log postgres-restored '"runId":"run-4"' "a pre-drain failure wrote no candidate Postgres"
+refuse_receipt pre-drain-control.log prior-pair-restored '"failedRunId":"run-4"' "a pre-drain failure triggers no recovery, so it cannot pass the recovery scenario"
 "${compose[@]}" run --rm fixture-controller assert v3
 
 # THE REAL SCENARIO: fail after the Postgres restore, and require the exact receipts — the fault at
 # the named point for THIS candidate run, and a recovery that restored BOTH stores to the prior
 # identity and booted it ready — plus the journal transition and the prior data itself.
 expect_failure install-fault-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-postgres importer scripts/staging-ops/importer.mjs tick
-require_receipt install-fault-recovers postgres-restored '"runId":"run-4"' "the candidate Postgres restore actually happened"
-require_receipt install-fault-recovers fault-injected '"point":"after-postgres".*"runId":"run-4"' "the injected fault fired after Postgres, not earlier"
-require_receipt install-fault-recovers prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready"
+require_receipt install-fault-recovers.log postgres-restored '"runId":"run-4"' "the candidate Postgres restore actually happened"
+require_receipt install-fault-recovers.log fault-injected '"point":"after-postgres".*"runId":"run-4"' "the injected fault fired after Postgres, not earlier"
+require_receipt install-fault-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready"
 require_journal state ready "staging is serving again after the handled fault"
 "${compose[@]}" run --rm fixture-controller assert v3
 
@@ -275,9 +319,9 @@ require_journal state ready "staging is serving again after the handled fault"
 # replaced both stores, so recovery has to undo two of them, and the graph half of the oracle is the
 # only thing that can see the difference.
 expect_failure graph-fault-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-graph importer scripts/staging-ops/importer.mjs tick
-require_receipt graph-fault-recovers graph-restored '"runId":"run-4"' "the candidate graph restore actually happened"
-require_receipt graph-fault-recovers fault-injected '"point":"after-graph".*"runId":"run-4"' "the injected fault fired after the graph restore"
-require_receipt graph-fault-recovers prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores after a graph-stage fault"
+require_receipt graph-fault-recovers.log graph-restored '"runId":"run-4"' "the candidate graph restore actually happened"
+require_receipt graph-fault-recovers.log fault-injected '"point":"after-graph".*"runId":"run-4"' "the injected fault fired after the graph restore"
+require_receipt graph-fault-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores after a graph-stage fault"
 "${compose[@]}" run --rm fixture-controller assert v3
 "${compose[@]}" run --rm fixture-controller assert-graph-version v3
 
@@ -288,13 +332,13 @@ require_receipt graph-fault-recovers prior-pair-restored '"failedRunId":"run-4".
 # aborted, which is the state in which the journal write, the lock release and the marker read all
 # fail with 25P02. Same candidate (run-4, v4) as above, so it costs one extra tick, not a new lane.
 expect_failure sql-abort-recovers "${compose[@]}" run --rm -e STAGING_FAULT_POINT=after-graph-sql-abort importer scripts/staging-ops/importer.mjs tick
-require_receipt sql-abort-recovers postgres-restored '"runId":"run-4"' "the candidate Postgres restore happened before the abort"
-require_receipt sql-abort-recovers graph-restored '"runId":"run-4"' "the candidate graph restore happened before the abort"
-require_receipt sql-abort-recovers candidate-observed '"runId":"run-4".*"pgVersion":"v4".*"graphVersions":"v4"' "BOTH stores held the candidate v4 capture at the abort boundary, so the undo below is a real two-store undo"
-require_receipt sql-abort-recovers fault-injected '"point":"after-graph-sql-abort".*"runId":"run-4".*"sqlstate":"22012".*"transactionAborted":true' "a real division-by-zero left the importer session in an aborted transaction"
-require_receipt sql-abort-recovers session-continuity '"checkpoint":"install-reset".*"coordinatorLockHeld":true.*"exclusiveDataLockHeld":true' "the install reset kept this session AND its locks — no reconnect, no DISCARD ALL"
-require_receipt sql-abort-recovers session-continuity '"checkpoint":"rollback-reset".*"coordinatorLockHeld":true' "the rollback path ran on that same fenced session"
-require_receipt sql-abort-recovers prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready THROUGH an aborted transaction"
+require_receipt sql-abort-recovers.log postgres-restored '"runId":"run-4"' "the candidate Postgres restore happened before the abort"
+require_receipt sql-abort-recovers.log graph-restored '"runId":"run-4"' "the candidate graph restore happened before the abort"
+require_receipt sql-abort-recovers.log candidate-observed '"runId":"run-4".*"pgVersion":"v4".*"graphVersions":"v4"' "BOTH stores held the candidate v4 capture at the abort boundary, so the undo below is a real two-store undo"
+require_receipt sql-abort-recovers.log fault-injected '"point":"after-graph-sql-abort".*"runId":"run-4".*"sqlstate":"22012".*"transactionAborted":true' "a real division-by-zero left the importer session in an aborted transaction"
+require_receipt sql-abort-recovers.log session-continuity '"checkpoint":"install-reset".*"coordinatorLockHeld":true.*"exclusiveDataLockHeld":true' "the install reset kept this session AND its locks — no reconnect, no DISCARD ALL"
+require_receipt sql-abort-recovers.log session-continuity '"checkpoint":"rollback-reset".*"coordinatorLockHeld":true' "the rollback path ran on that same fenced session"
+require_receipt sql-abort-recovers.log prior-pair-restored '"failedRunId":"run-4".*"postgres":true.*"graph":true.*"ready":true' "recovery restored BOTH stores and booted the prior pair ready THROUGH an aborted transaction"
 require_journal state ready "staging is serving again after the aborted-transaction fault"
 # One backend for the whole path. A reconnect would recover just as visibly while dropping the
 # advisory locks the fence depends on, so the PID is asserted, not assumed.
@@ -323,9 +367,9 @@ expect_failure failed-rollback-stays-stopped "${compose[@]}" run --rm -e STAGING
 # The intended checkpoint, again by receipt: the install fault fired where it claims, the ROLLBACK
 # then failed, and the journal is fenced at `recovery-required` — not merely "the app is stopped",
 # which a failure anywhere before the drain would also produce.
-require_receipt failed-rollback-stays-stopped fault-injected '"point":"after-postgres".*"runId":"run-5"' "the rollback-failure scenario failed mid-install, for this run"
-require_receipt failed-rollback-stays-stopped recovery-required '"failedRunId":"run-5".*"rollbackAttempted":true' "the rollback was attempted and failed, leaving staging fenced"
-refuse_receipt failed-rollback-stays-stopped prior-pair-restored '"failedRunId":"run-5"' "a failed rollback must not report a restored prior pair"
+require_receipt failed-rollback-stays-stopped.log fault-injected '"point":"after-postgres".*"runId":"run-5"' "the rollback-failure scenario failed mid-install, for this run"
+require_receipt failed-rollback-stays-stopped.log recovery-required '"failedRunId":"run-5".*"rollbackAttempted":true' "the rollback was attempted and failed, leaving staging fenced"
+refuse_receipt failed-rollback-stays-stopped.log prior-pair-restored '"failedRunId":"run-5"' "a failed rollback must not report a restored prior pair"
 require_journal state failed "a failed rollback leaves the journal failed"
 require_journal last_safe_checkpoint recovery-required "a failed rollback fences staging until an explicit recovery"
 active_app="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=app-local')"
@@ -335,7 +379,7 @@ node -e 'const x=JSON.parse(process.argv[1]);if(x.deployments.length)process.exi
 active_graphiti="$("${compose[@]}" exec -T maintenance curl -fsS -H 'authorization: Bearer local-maintenance-token' 'http://127.0.0.1:8080/deployments?serviceId=graphiti-local')"
 node -e 'const x=JSON.parse(process.argv[1]);if(x.deployments.length)process.exit(1)' "$active_graphiti"
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs rollback recovery-after-injected-failure >"$harness_root/explicit-recovery.log" 2>&1
-require_receipt explicit-recovery prior-pair-restored '"postgres":true.*"graph":true.*"ready":true' "the explicit recovery restored BOTH stores and booted ready"
+require_receipt explicit-recovery.log prior-pair-restored '"postgres":true.*"graph":true.*"ready":true' "the explicit recovery restored BOTH stores and booted ready"
 require_journal state ready "explicit recovery returns staging to ready"
 "${compose[@]}" run --rm fixture-controller assert v3
 "${compose[@]}" run --rm fixture-controller assert-graph-version v3
