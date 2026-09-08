@@ -444,7 +444,12 @@ echo "[6/11] advance staging head and catch up code without copying data again"
 
 echo "[7/11] kill an importer AFTER a real Postgres write and reconcile the journal on the next worker"
 "${compose[@]}" run --rm fixture-controller mutate v3
-"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-3 exporter
+"${compose[@]}" run --rm -e STAGING_BUNDLE_RUN_ID=run-3 exporter | tee "$harness_root/run-3.log"
+# The EXPORTER'S OWN returned identity, read the same way run-1 and run-4 read theirs. The explicit
+# retry below addresses the immutable object by ID, and the ONLY admissible ID is the one the
+# publishing run reported: a reconstructed digest or a re-published bundle would be a different
+# object, which admission would accept for the wrong reason.
+run3_object="$(tail -n 1 "$harness_root/run-3.log" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).objectId))')"
 interrupted_container="${project}-interrupted-importer"
 "${compose[@]}" run --name "$interrupted_container" -e STAGING_HARNESS_PAUSE_AFTER_POSTGRES_MS=120000 importer scripts/staging-ops/importer.mjs tick >"$harness_root/interrupted.log" 2>&1 & interrupted_pid=$!
 # THE BARRIER IS THE POSTGRES WRITE, NOT THE JOURNAL STATE. `state=importing` is written BEFORE the
@@ -472,9 +477,61 @@ fi
 docker kill --signal KILL "$interrupted_container" >/dev/null
 wait "$interrupted_pid" || true
 docker rm -f "$interrupted_container" >/dev/null 2>&1 || true
-"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+# THE FIRST POST-KILL TICK IS THE RECOVERY, and it must stay a `tick`. Interrupted-run recovery sits
+# BEFORE destructive-attempt admission in the importer, so this is the only thing that returns the
+# journal to a serving prior pair — replacing it with an explicit install would delete the test of
+# recovery-before-admission entirely. Its output is captured because `run --rm` stdout appears in no
+# service log, and because the recovery identity (run-3 undone, run-2 restored) is the evidence.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick >"$harness_root/interrupted-recovery.log" 2>&1 || {
+  echo "the replacement worker could not recover the interrupted run-3 install" >&2
+  sed -n '1,120p' "$harness_root/interrupted-recovery.log" >&2
+  exit 1
+}
+cat "$harness_root/interrupted-recovery.log"
+require_receipt interrupted-recovery.log prior-pair-restored '"failedRunId":"run-3".*"priorRunId":"run-2".*"postgres":true.*"graph":true.*"ready":true' \
+  "the replacement undid the killed run-3 write and restored the run-2 pair in BOTH stores"
+grep -q '"status":"interrupted-run-recovered".*"interruptedRunId":"run-3"' "$harness_root/interrupted-recovery.log" || {
+  echo "the post-kill tick returned some other outcome than recovering the interrupted run-3" >&2
+  sed -n '1,120p' "$harness_root/interrupted-recovery.log" >&2
+  exit 1
+}
 "${compose[@]}" run --rm fixture-controller assert v2
-"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+# Captured, not hardcoded — but required to be a real identity, or the "unchanged" check below would
+# be satisfied by two empty reads.
+recovered_run="$(journal_field last_ready_run_id)"
+[[ -n "$recovered_run" ]] || { echo "recovery left no serving run identity to compare against" >&2; exit 1; }
+
+# ⚠️ THE SECOND AUTOMATIC TICK MUST REFUSE run-3, AND THIS STEP USED TO ASSUME IT WOULD INSTALL IT.
+#
+# The killed worker could not record a terminal result, so `staging_ops.source_install_attempts`
+# holds run-3 as `attempted` — deliberately conservative, because a destructive install that got as
+# far as a real Postgres write may have failed for a reason that will repeat. Recovery clears the
+# interruption, not the attempt: releasing admission automatically here would put the five-minute
+# daemon back to draining staging for a candidate already known to have failed once.
+expect_failure run3-automatic-retry-denied "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+grep -q "immutable source $run3_object already made .* automatic refresh will not drain staging again for it" \
+  "$harness_root/run3-automatic-retry-denied.log" || {
+  echo "the automatic tick was refused for some other reason than the recorded run-3 attempt" >&2
+  sed -n '1,40p' "$harness_root/run3-automatic-retry-denied.log" >&2
+  exit 1
+}
+# NOTHING MOVED: the refusal sits before the drain, so the recovered run-2 pair is still serving and
+# there is neither a candidate write nor a second recovery.
+refuse_receipt run3-automatic-retry-denied.log postgres-restored '"runId":"run-3"' \
+  "a denied automatic retry wrote candidate Postgres anyway"
+refuse_receipt run3-automatic-retry-denied.log prior-pair-restored '"failedRunId"' \
+  "a denied automatic retry entered recovery, which means it had drained"
+require_journal state ready "the denied automatic retry left the recovered prior pair serving"
+[[ "$(journal_field last_ready_run_id)" == "$recovered_run" ]] || {
+  echo "the denied automatic retry changed the serving identity" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller assert v2
+
+# THE EXPLICIT OPERATOR RETRY of the SAME immutable object the exporter published — the one
+# sanctioned way to re-attempt a source whose destructive install already failed, and the positive
+# control for the refusal above: same object, same environment, admitted only because it is explicit.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run3_object"
 "${compose[@]}" run --rm fixture-controller assert v3
 
 echo "[8/11] inject handled mid-install faults after EACH store and prove prior-pair recovery"

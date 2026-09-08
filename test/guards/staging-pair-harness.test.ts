@@ -303,6 +303,63 @@ describe("paired refresh isolated harness", () => {
     expect(harness.indexOf('importer.mjs install "$run1_object"', explicit + 1), "the same-run no-op retry was displaced").toBeGreaterThan(explicit);
   });
 
+  it("recovers the killed run-3 install first, REFUSES the automatic retry, then retries THAT object explicitly", () => {
+    // Paired CI 34287743698. The kill lands after a real Postgres write, so the worker could never
+    // record a terminal result and `source_install_attempts` holds run-3 as `attempted`. Interrupted
+    // recovery precedes destructive-attempt admission, so the FIRST post-kill tick recovers and the
+    // SECOND is refused — the step invoked `tick` twice and expected the second to install run-3, so
+    // correct behaviour failed the lane. The whole sequence is pinned because each half is only
+    // meaningful in that order: a recovery test that installs, or a refusal reached before recovery,
+    // proves something else.
+    const step = harness.slice(harness.indexOf('echo "[7/11]'), harness.indexOf('echo "[8/11]'));
+    expect(step.length, "step 7 could not be located, so this asserts nothing").toBeGreaterThan(0);
+    const at = (needle: string) => {
+      const index = step.indexOf(needle);
+      expect(index, `step 7 no longer contains ${needle}`).toBeGreaterThan(-1);
+      return index;
+    };
+    const sequence = [
+      // The pre-kill oracles are INDEPENDENT of the importer — the candidate body read straight out
+      // of staging Postgres, the prior facts read out of the graph — so "it was killed mid-install"
+      // is observed rather than inferred from a receipt the same process emitted.
+      "STAGING_BUNDLE_RUN_ID=run-3 exporter | tee",
+      "receipt interrupted.log postgres-restored",
+      "select body from items where id=",
+      "fixture-controller assert-graph-version v2",
+      'docker kill --signal KILL "$interrupted_container"',
+      'importer.mjs tick >"$harness_root/interrupted-recovery.log"',
+      "require_receipt interrupted-recovery.log prior-pair-restored",
+      "fixture-controller assert v2",
+      "expect_failure run3-automatic-retry-denied",
+      'importer.mjs install "$run3_object"',
+      "fixture-controller assert v3",
+    ].map(at);
+    expect(sequence, "the step-7 sequence is out of order").toEqual([...sequence].sort((a, b) => a - b));
+
+    // THE RECOVERY IS A TICK, AND THERE IS EXACTLY ONE INSTALL. Replacing the first tick with an
+    // explicit install would still reach v3 while deleting the recovery-before-admission test.
+    expect(step.match(/importer\.mjs install/g), "step 7 must invoke exactly one explicit install").toHaveLength(1);
+    // Recovery evidence, tied to BOTH identities: run-3 undone, run-2 restored in both stores.
+    expect(step).toContain('\'"failedRunId":"run-3".*"priorRunId":"run-2".*"postgres":true.*"graph":true.*"ready":true\'');
+    expect(step).toContain('"status":"interrupted-run-recovered".*"interruptedRunId":"run-3"');
+    // The refusal is the ATTEMPT ADMISSION for THIS object, not any refusal that exits non-zero.
+    expect(step).toContain("immutable source $run3_object already made .* automatic refresh will not drain staging again for it");
+    // …and it moved nothing: no candidate write, no second recovery, same serving identity.
+    expect(step).toContain("refuse_receipt run3-automatic-retry-denied.log postgres-restored");
+    expect(step).toContain("refuse_receipt run3-automatic-retry-denied.log prior-pair-restored");
+    expect(step).toContain('require_journal state ready "the denied automatic retry left the recovered prior pair serving"');
+    expect(step).toContain("the denied automatic retry changed the serving identity");
+    // The v2 oracle runs on BOTH sides of the denial — after recovery, and again after the refusal.
+    expect(step.match(/fixture-controller assert v2/g), "v2 must be asserted after the recovery AND after the denial").toHaveLength(2);
+    // The retried object is the one the run-3 EXPORT returned, read the same way run-1/run-4 read
+    // theirs. A reconstructed digest or a republished bundle is a different immutable object, which
+    // admission would accept for a reason the scenario is not about.
+    expect(step).toContain('run3_object="$(tail -n 1 "$harness_root/run-3.log"');
+    // The later run-4 scenarios are downstream and unchanged, including their own automatic denial.
+    expect(harness.indexOf("expect_failure attempted-source-blocks-automatic")).toBeGreaterThan(harness.indexOf('echo "[8/11]'));
+    expect(harness).toContain('importer.mjs install "$run4_object"');
+  });
+
   it("requires the resume-order checker's SUCCESS VERDICT, not only its exit status", () => {
     // M2: the checker's entry test could answer "no" for a symlinked invocation, in which case it
     // ran no body and exited 0 having printed nothing — indistinguishable from a verified ordering
