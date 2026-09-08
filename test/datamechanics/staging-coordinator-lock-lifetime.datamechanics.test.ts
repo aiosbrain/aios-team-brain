@@ -260,11 +260,22 @@ setInterval(() => {}, 1000);
         STAGING_CLEANUP_TIMEOUT_MS: "1000",
         STAGING_TERMINATE_GRACE_MS: "2000",
       } as NodeJS.ProcessEnv, ["bootstrap-rollback"]);
-      const outcomePromise = running.then(() => "resolved", (error: Error) => error);
-      for (let attempt = 0; attempt < 200 && !existsSync(pidFile); attempt += 1) {
+      const outcomePromise: Promise<"resolved" | Error> = running.then(
+        () => "resolved" as const,
+        (error: Error) => error,
+      );
+      // Admission can refuse before pg_dump starts (for example, when CI accidentally reaches the
+      // service through host NAT). The importer outcome is already rejection-handled above; observe
+      // it here too so that failure ends the start wait promptly and reports the actual refusal.
+      let observedOutcome: "resolved" | Error | undefined;
+      void outcomePromise.then((outcome) => { observedOutcome = outcome; });
+      for (let attempt = 0; attempt < 200 && !existsSync(pidFile) && observedOutcome === undefined; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
-      expect(existsSync(pidFile), "the controlled rollback capture never started").toBe(true);
+      const earlyDetail = observedOutcome instanceof Error
+        ? `${observedOutcome.name}: ${observedOutcome.message}`
+        : observedOutcome ?? "importer still running";
+      expect(existsSync(pidFile), `the controlled rollback capture never started; ${earlyDetail}`).toBe(true);
       ownedPid = Number(readFileSync(pidFile, "utf8"));
       for (let attempt = 0; attempt < 200 && !existsSync(termFile); attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 25));

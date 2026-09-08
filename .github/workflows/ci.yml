@@ -81,6 +81,12 @@ jobs:
   datamechanics-tests:
     name: Data-mechanics tests (real Postgres)
     runs-on: ubuntu-latest
+    # The strict staging destination guard compares the live client peer with the server's own
+    # address and port. Keep this job on the service network: a host-published localhost path is
+    # Docker NAT, not the direct Postgres destination that production requires.
+    container:
+      image: node:20-bookworm
+      options: --init
     services:
       postgres:
         image: postgres:16
@@ -88,13 +94,12 @@ jobs:
           POSTGRES_USER: app
           POSTGRES_PASSWORD: app
           POSTGRES_DB: app_test
-        ports: ["5434:5432"]
         options: >-
           --health-cmd "pg_isready -U app -d app_test"
           --health-interval 2s --health-timeout 3s --health-retries 30
     env:
       # Matches vitest.datamechanics.config.ts (no-prod-fallback guard reads this).
-      DATABASE_TEST_URL: postgres://app:app@localhost:5434/app_test
+      DATABASE_TEST_URL: postgres://app:app@postgres:5432/app_test
     steps:
       - uses: actions/checkout@v7
         with:

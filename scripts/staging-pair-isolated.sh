@@ -308,8 +308,11 @@ require_receipt bootstrap-first-import-recovers.log prior-pair-restored '"failed
 require_journal state ready "the bootstrap recovery returned staging to ready"
 require_journal last_ready_mode "$baseline_mode" "first-import recovery retained the recorded bootstrap mode"
 bootstrap_run="$(journal_field last_ready_run_id)"
-[[ "$bootstrap_run" == bootstrap-* ]] || { echo "first-import recovery did not retain the bootstrap run identity: $bootstrap_run" >&2; exit 1; }
-"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$bootstrap_run"
+[[ "$bootstrap_run" == "$interrupted_run" ]] || {
+  echo "first-import recovery changed the original bootstrap run identity: expected '$interrupted_run', got '$bootstrap_run'" >&2
+  exit 1
+}
+"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"
 
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
 # SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results
