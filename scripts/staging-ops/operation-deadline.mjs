@@ -55,17 +55,29 @@ export function armBudgetWatchdog(budget, terminate) {
 }
 
 /**
- * One owner for every watchdog capable of destroying a lock-owning database session.
- * Recovery transfers ownership atomically: all enclosing action/tick timers are retired before a
- * fresh recovery timer is armed. A timer that already fired is evidence that the session may have
- * lost its locks and cannot be revived by assigning it a larger timeout.
+ * One owner for every watchdog protecting a lock-owning database session.
+ *
+ * Expiry aborts the work fenced by the session; it never destroys the session itself. The caller
+ * must await that work's containment before ordinary cleanup can release the locks. Recovery then
+ * transfers ownership atomically: every enclosing action/tick timer is retired before a fresh
+ * recovery timer and signal are installed on the SAME healthy session.
  */
-export function createSessionWatchdogOwner(terminate) {
+export function createSessionWatchdogOwner(cancel = () => {}, { signal = null } = {}) {
   const active = new Set();
-  const wrap = (watchdog) => {
+  const wrap = (budget) => {
+    const controller = new AbortController();
+    let reason = null;
+    const watchdog = armBudgetWatchdog(budget, async (error) => {
+      reason = error;
+      controller.abort(error);
+      await cancel(error);
+    });
+    const ownedSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     let disarmed = false;
     const handle = Object.freeze({
       get expired() { return watchdog.expired; },
+      get reason() { return reason; },
+      signal: ownedSignal,
       async disarm() {
         if (disarmed) return;
         disarmed = true;
@@ -82,13 +94,10 @@ export function createSessionWatchdogOwner(terminate) {
     return handles;
   };
   return Object.freeze({
-    arm(budget) { return wrap(armBudgetWatchdog(budget, terminate)); },
+    arm(budget) { return wrap(budget); },
     async transferTo(budget) {
-      const retired = await disarmAll();
-      if (retired.some((watchdog) => watchdog.expired)) {
-        throw new StagingDeadlineExceededError("the enclosing importer watchdog expired before recovery ownership transferred; same-session recovery is unsafe");
-      }
-      return wrap(armBudgetWatchdog(budget, terminate));
+      await disarmAll();
+      return wrap(budget);
     },
     disarmAll,
     get size() { return active.size; },
@@ -129,14 +138,18 @@ export function postgresDeadlineConfig(connectionString, timeoutMs, connectionTi
     // while PostgreSQL can continue working on the same session underneath recovery.
     statement_timeout: bounded,
     lock_timeout: Math.min(bounded, 60_000),
-    idle_in_transaction_session_timeout: bounded,
+    // An exported snapshot is intentionally idle while pg_dump/psql run. Expiring that idle
+    // transaction at the operation boundary drops session advisory locks before TERM/KILL and
+    // group-absence confirmation finish. The operation watchdog and subprocess budgets bound that
+    // wait; active SQL remains subject to the real server-side statement/lock timeouts above.
+    idle_in_transaction_session_timeout: 0,
   };
 }
 
 /** Rebudget the SAME session for recovery without reconnecting and losing its advisory locks. */
 export async function configurePostgresDeadline(client, timeoutMs) {
   const bounded = finiteDeadlineMs("Postgres operation timeout", timeoutMs, OPERATION_TIMEOUT_DEFAULT_MS, { min: 1 });
-  await client.query("SELECT set_config('statement_timeout',$1,false), set_config('lock_timeout',$2,false), set_config('idle_in_transaction_session_timeout',$1,false)", [
+  await client.query("SELECT set_config('statement_timeout',$1,false), set_config('lock_timeout',$2,false), set_config('idle_in_transaction_session_timeout','0',false)", [
     `${bounded}ms`, `${Math.min(bounded, 60_000)}ms`,
   ]);
   return bounded;

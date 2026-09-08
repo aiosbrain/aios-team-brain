@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Client } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -38,7 +41,11 @@ const deferred = () => {
 };
 
 /** Held open once the real recovery has entered `rollbackToPrior` and taken its first real steps. */
-const recovery = vi.hoisted(() => ({ gate: null as null | { promise: Promise<unknown>; resolve: (v: unknown) => void; reject: (r: unknown) => void }, entered: false }));
+const recovery = vi.hoisted(() => ({
+  gate: null as null | { promise: Promise<unknown>; resolve: (v: unknown) => void; reject: (r: unknown) => void },
+  entered: false,
+  bootstrapCurrent: false,
+}));
 
 const PRIOR_BYTES = vi.hoisted(() => Buffer.from(JSON.stringify({ manifest: { kind: "staging-rollback" } })));
 
@@ -82,7 +89,11 @@ vi.mock("../../scripts/staging-ops/local-maintenance.mjs", () => ({
       return true;
     }
     async tokenIdentity() { return {}; }
-    async listActiveDeployments() { return []; }
+    async listActiveDeployments() {
+      return recovery.bootstrapCurrent
+        ? [{ id: "bootstrap-dep", status: "SUCCESS", meta: { commitHash: "b".repeat(40), createdAt: "2026-09-08T00:00:00Z" } }]
+        : [];
+    }
     async deployApp() { return "dep-1"; }
   },
 }));
@@ -101,6 +112,7 @@ const ENV = Object.fromEntries([
   ["STAGING_GRAPHITI_SERVICE_ID", "graphiti-local"], ["RAILWAY_STAGING_MAINTENANCE_TOKEN", "token"],
   ["STAGING_IMPORTER_SERVICE_ID", "importer-local"], ["STAGING_IMPORTER_IMAGE_DIGEST", `sha256:${"d".repeat(64)}`],
   ["STAGING_DATA_LOCK_TIMEOUT_MS", "1000"],
+  ["STAGING_BOOTSTRAP_MODE", "copy-ready"],
 ]) as unknown as NodeJS.ProcessEnv;
 
 async function connect() {
@@ -122,6 +134,7 @@ async function seedJournal(client: Client) {
 }
 
 const settle = async () => { for (let i = 0; i < 6; i += 1) await new Promise((r) => setImmediate(r)); };
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 let observer: Client | null = null;
 afterEach(async () => {
@@ -130,6 +143,7 @@ afterEach(async () => {
   observer = null;
   recovery.gate = null;
   recovery.entered = false;
+  recovery.bootstrapCurrent = false;
 });
 
 describe("the manual rollback branch holds the real coordinator lock for the whole recovery", () => {
@@ -193,5 +207,88 @@ describe("the manual rollback branch holds the real coordinator lock for the who
       }
       expect(after, "the importer left a backend connected after returning").toBeLessThanOrEqual(before);
     } finally { await setup.end(); }
+  }, 60_000);
+});
+
+describe("an importer deadline retains both real fences through owned-process containment", () => {
+  it("refuses a second worker while the TERM-ignoring capture is alive and releases only after it is gone", async () => {
+    const setup = await connect();
+    try {
+      await journal.installStagingOps(setup);
+      await setup.query(`UPDATE staging_ops.refresh_journal SET
+        state='ready', run_id=NULL, last_safe_checkpoint=NULL,
+        last_ready_run_id=NULL, last_ready_object_id=NULL, last_ready_digest=NULL,
+        last_ready_commit=NULL, last_ready_mode=NULL,
+        rollback_target_run_id=NULL, rollback_target_object_id=NULL, rollback_target_digest=NULL,
+        rollback_target_commit=NULL, rollback_target_mode=NULL,
+        bootstrap_run_id=NULL, bootstrap_phase=NULL, bootstrap_deployment_id=NULL,
+        bootstrap_commit=NULL, bootstrap_mode=NULL, bootstrap_environment_id=NULL,
+        bootstrap_app_service_id=NULL, bootstrap_object_id=NULL, bootstrap_digest=NULL
+        WHERE singleton=true`);
+    } finally { await setup.end(); }
+
+    const directory = mkdtempSync(path.join(tmpdir(), "importer-deadline-pg-"));
+    const pidFile = path.join(directory, "owned-pid");
+    const termFile = path.join(directory, "term-received");
+    const pgDump = path.join(directory, "pg_dump");
+    writeFileSync(pgDump, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.STAGING_DEADLINE_PID_FILE, String(process.pid));
+process.on("SIGTERM", () => writeFileSync(process.env.STAGING_DEADLINE_TERM_FILE, String(Date.now())));
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+    chmodSync(pgDump, 0o700);
+    const oldPath = process.env.PATH;
+    const oldPidFile = process.env.STAGING_DEADLINE_PID_FILE;
+    const oldTermFile = process.env.STAGING_DEADLINE_TERM_FILE;
+    process.env.PATH = `${directory}:${oldPath ?? ""}`;
+    process.env.STAGING_DEADLINE_PID_FILE = pidFile;
+    process.env.STAGING_DEADLINE_TERM_FILE = termFile;
+    recovery.bootstrapCurrent = true;
+    observer = await connect();
+    let ownedPid: number | null = null;
+    try {
+      expect(await journal.acquireCoordinatorLock(observer), "the coordinator lock was already held before the run").toBe(true);
+      await journal.releaseCoordinatorLock(observer);
+      expect(await journal.acquireDataUseLock(observer, "exclusive"), "the data-use lock was already held before the run").toBe(true);
+      await journal.releaseDataUseLock(observer, "exclusive");
+
+      const running = runImporter({
+        ...ENV,
+        STAGING_OPERATION_TIMEOUT_MS: "3000",
+        STAGING_RECOVERY_TIMEOUT_MS: "2000",
+        STAGING_CLEANUP_TIMEOUT_MS: "1000",
+        STAGING_TERMINATE_GRACE_MS: "2000",
+      } as NodeJS.ProcessEnv, ["bootstrap-rollback"]);
+      for (let attempt = 0; attempt < 200 && !existsSync(pidFile); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(existsSync(pidFile), "the controlled rollback capture never started").toBe(true);
+      ownedPid = Number(readFileSync(pidFile, "utf8"));
+      for (let attempt = 0; attempt < 200 && !existsSync(termFile); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(existsSync(termFile), "the operation deadline did not cancel the active capture").toBe(true);
+      expect(alive(ownedPid), "the capture was not alive during its TERM/KILL grace").toBe(true);
+      expect(await journal.acquireCoordinatorLock(observer), "the operation deadline dropped the coordinator fence before containment").toBe(false);
+      expect(await journal.acquireDataUseLock(observer, "exclusive"), "the operation deadline dropped the data-use fence before containment").toBe(false);
+
+      const outcome = await running.then(() => "resolved", (error: Error) => error);
+      expect(outcome, "the expired bootstrap unexpectedly succeeded").toBeInstanceOf(Error);
+      expect(alive(ownedPid), "the importer returned while its capture was alive").toBe(false);
+      expect(await journal.acquireCoordinatorLock(observer), "the coordinator fence was not released after containment").toBe(true);
+      await journal.releaseCoordinatorLock(observer);
+      expect(await journal.acquireDataUseLock(observer, "exclusive"), "the data-use fence was not released after containment").toBe(true);
+      await journal.releaseDataUseLock(observer, "exclusive");
+    } finally {
+      if (ownedPid) { try { process.kill(-ownedPid, "SIGKILL"); } catch { /* already gone */ } }
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      if (oldPidFile === undefined) delete process.env.STAGING_DEADLINE_PID_FILE;
+      else process.env.STAGING_DEADLINE_PID_FILE = oldPidFile;
+      if (oldTermFile === undefined) delete process.env.STAGING_DEADLINE_TERM_FILE;
+      else process.env.STAGING_DEADLINE_TERM_FILE = oldTermFile;
+      rmSync(directory, { recursive: true, force: true });
+    }
   }, 60_000);
 });

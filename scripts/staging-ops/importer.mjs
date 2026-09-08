@@ -141,7 +141,7 @@ async function reapplyTesters(env, deadlines, signal) {
 
 async function withRecoveryWatchdog(beginRecoveryWatchdog, budget, work) {
   const watchdog = await beginRecoveryWatchdog?.(budget);
-  try { return await work(); }
+  try { return await work(watchdog?.signal); }
   finally { await watchdog?.disarm(); }
 }
 
@@ -742,7 +742,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       ? await loadRollbackTarget({ journal, rollbackStore, env })
       : await loadPrior({ journal, rollbackStore, env });
     const recoveryBudget = createOperationBudget("interrupted importer recovery", deadlines.recoveryMs, { now: operations.now });
-    const recovered = await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, () => rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal }));
+    const recovered = await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, (recoverySignal) => rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal }));
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
@@ -871,7 +871,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     // fails on its own first statement — while the message below still said the prior pair had been
     // restored. The lock is released on the SAME backend, so the reset must not reconnect.
     const recoveryBudget = createOperationBudget("importer recovery", deadlines.recoveryMs, { now: operations.now });
-    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async () => {
+    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async (recoverySignal) => {
     recoveryBudget.assert("recovery initial session reset");
     const reset = await resetSessionTransactionState(client);
     await emitSessionContinuity(client, { checkpoint: "install-reset", failedRunId: opened.manifest.runId, env });
@@ -891,7 +891,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       // Never call a rollback the session cannot execute, and never describe one that did not run.
       throw new Error(withNotes(`paired refresh failed and the importer's database session could not be reset, so the prior pair was NOT restored; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
     }
-    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal });
+    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal ?? signal });
     throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
     });
   }
@@ -1116,7 +1116,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   } catch (error) {
     const notes = [];
     const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
-    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async () => {
+    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async (_recoverySignal) => {
     // Same ordering rule as the refresh path: the capture holds a read-only transaction on this
     // client, so a failure inside it can leave the session aborted and every recovery statement
     // below — the lock release and both journal transitions — would fail invisibly.
@@ -1308,9 +1308,13 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     label: "importer Postgres", requireInternal: env.STAGING_MAINTENANCE_ADAPTER !== "local",
   });
   const client = new pg.Client(postgresDeadlineConfig(postgresTarget.connectionString, actionBudget?.remaining(deadlines.operationMs, "Postgres connection") ?? deadlines.operationMs, deadlines.connectionMs)); await client.connect();
-  const watchdogOwner = createSessionWatchdogOwner((error) => client.connection?.stream?.destroy(error));
-  const actionWatchdog = actionBudget ? watchdogOwner.arm(actionBudget) : null;
   const shutdown = new AbortController();
+  // Deadline cancellation is delivered to owned work. The lock-owning socket stays healthy until
+  // that work has either completed or proved its subprocess group absent; only the outer cleanup
+  // below may then release the fencing session. External signals share every phase signal so they
+  // retain the same containment ordering, including after recovery watchdog transfer.
+  const watchdogOwner = createSessionWatchdogOwner(undefined, { signal: shutdown.signal });
+  const actionWatchdog = actionBudget ? watchdogOwner.arm(actionBudget) : null;
   let shuttingDown = false;
   let signalAbort = null;
   const recordSignalAbort = async (signal) => {
@@ -1353,7 +1357,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     await configurePostgresDeadline(client, actionBudget?.remaining(deadlines.operationMs, "importer deadline configuration") ?? deadlines.operationMs);
     if (action === "bootstrap-rollback") return await bootstrapRollback({
       client, rollbackStore, maintenance, env, deadlines, budget: actionBudget,
-      signal: shutdown.signal, beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
+      signal: actionWatchdog?.signal ?? shutdown.signal, beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
     });
     if (action === "rollback") {
       if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
@@ -1373,7 +1377,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
         return await withRecoveryWatchdog(
           (budget) => watchdogOwner.transferTo(budget),
           recoveryBudget,
-          () => rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: shutdown.signal }),
+          (recoverySignal) => rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: recoverySignal }),
         );
       }
       finally { await releaseCoordinatorLock(client).catch(() => {}); }
@@ -1381,7 +1385,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     if (action === "install") {
       if (!argv[1]) throw new Error("canonical immutable object ID is required");
       return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env, deadlines, operations: {
-        operationBudget: actionBudget, now, signal: shutdown.signal,
+        operationBudget: actionBudget, now, signal: actionWatchdog?.signal ?? shutdown.signal,
         beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
       } });
     }
@@ -1402,7 +1406,7 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       // operator action and is deliberately not marked automatic, so it remains the one way to
       // re-attempt a source whose destructive install already failed.
       return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, automatic: true, operations: {
-        operationBudget: tickBudget, now, signal: shutdown.signal,
+        operationBudget: tickBudget, now, signal: tickWatchdog.signal,
         beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
       } });
       } finally { await tickWatchdog.disarm(); }

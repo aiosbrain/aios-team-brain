@@ -62,7 +62,7 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     expect(() => stagingOperationDeadlines({ STAGING_OPERATION_TIMEOUT_MS: "Infinity" } as NodeJS.ProcessEnv)).toThrow(/integer/);
     expect(() => stagingOperationDeadlines({ STAGING_RECOVERY_TIMEOUT_MS: "0" } as NodeJS.ProcessEnv)).toThrow(/STAGING_RECOVERY_TIMEOUT_MS/);
     const config = postgresDeadlineConfig("postgres://db/internal", 4_000, 2_000);
-    expect(config).toMatchObject({ connectionTimeoutMillis: 2_000, statement_timeout: 4_000, lock_timeout: 4_000, idle_in_transaction_session_timeout: 4_000 });
+    expect(config).toMatchObject({ connectionTimeoutMillis: 2_000, statement_timeout: 4_000, lock_timeout: 4_000, idle_in_transaction_session_timeout: 0 });
     expect(config).not.toHaveProperty("query_timeout");
   });
 
@@ -90,27 +90,33 @@ describe("M8 — finite operation deadlines terminate real work", () => {
   });
 
   it("retires every enclosing watchdog before a longer recovery budget crosses the old deadline", async () => {
-    const terminated: string[] = [];
-    const owner = createSessionWatchdogOwner((error) => { terminated.push(error.code); });
+    const cancelled: string[] = [];
+    const owner = createSessionWatchdogOwner((error) => { cancelled.push(error.code); });
     owner.arm(createOperationBudget("action", 30));
     owner.arm(createOperationBudget("daemon tick", 35));
     await new Promise((resolve) => setTimeout(resolve, 10));
     const recovery = await owner.transferTo(createOperationBudget("recovery", 150));
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(terminated, "an enclosing timer destroyed the session during recovery").toEqual([]);
+    expect(cancelled, "an enclosing timer cancelled the replacement recovery phase").toEqual([]);
     expect(owner.size).toBe(1);
     await recovery.disarm();
     expect(owner.size).toBe(0);
   });
 
-  it("refuses same-session recovery when an enclosing watchdog already fired", async () => {
-    const terminate = vi.fn();
-    const owner = createSessionWatchdogOwner(terminate);
-    owner.arm(createOperationBudget("expired action", 5));
+  it("cancels an expired phase but transfers a healthy fencing session to a bounded recovery", async () => {
+    const cancelled = vi.fn();
+    const owner = createSessionWatchdogOwner(cancelled);
+    const action = owner.arm(createOperationBudget("expired action", 5));
     await new Promise((resolve) => setTimeout(resolve, 15));
-    await expect(owner.transferTo(createOperationBudget("recovery", 100)))
-      .rejects.toThrow(/same-session recovery is unsafe/);
-    expect(terminate).toHaveBeenCalledTimes(1);
+    expect(action.signal.aborted).toBe(true);
+    expect(action.signal.reason).toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+    const recovery = await owner.transferTo(createOperationBudget("recovery", 20));
+    expect(recovery.signal.aborted, "the expired action signal leaked into recovery").toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(recovery.signal.aborted).toBe(true);
+    expect(recovery.signal.reason).toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+    await recovery.disarm();
+    expect(cancelled).toHaveBeenCalledTimes(2);
     expect(owner.size).toBe(0);
   });
 
