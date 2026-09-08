@@ -222,7 +222,26 @@ async function assertInstalledGraphVersion(expected) {
  * The genuine first-import recovery oracle.  It names facts that exist only in the staging-owned
  * bootstrap capture, so a source install that merely failed before writing cannot satisfy it.
  */
-async function assertBootstrapRestored() {
+export function assertBootstrapServingHealth({ responseOk, responseStatus, health, expectedMode, expectedRunId }) {
+  if (!new Set(["legacy-pg-only", "copy-ready"]).has(expectedMode)) {
+    throw new Error("bootstrap health oracle requires an explicit supported baseline mode");
+  }
+  if (typeof expectedRunId !== "string" || !/^bootstrap-.+/.test(expectedRunId)) {
+    throw new Error("bootstrap health oracle requires a concrete expected bootstrap run identity");
+  }
+  if (!responseOk || responseStatus !== 200 || health?.ok !== true) {
+    throw new Error("bootstrap deployment did not return an actual healthy serving response");
+  }
+  if (health.mode !== expectedMode) {
+    throw new Error(`bootstrap deployment reported mode ${String(health.mode)}, expected recorded baseline mode ${expectedMode}`);
+  }
+  if (health.refreshRunId !== expectedRunId) {
+    throw new Error(`bootstrap deployment reported run ${String(health.refreshRunId)}, expected recorded bootstrap run ${expectedRunId}`);
+  }
+  return { mode: health.mode, refreshRunId: health.refreshRunId };
+}
+
+async function assertBootstrapRestored(expectedMode, expectedRunId) {
   const staging = await pgClient(process.env.STAGING_DATABASE_URL);
   const driver = await graphDriver(process.env.STAGING_NEO4J_URL, "stagingtest1");
   try {
@@ -240,10 +259,10 @@ async function assertBootstrapRestored() {
       headers: { "x-aios-staging-health-token": process.env.STAGING_HEALTH_TOKEN }, signal: AbortSignal.timeout(60_000),
     });
     const health = await response.json();
-    if (!response.ok || health.ok !== true || health.mode !== "copy-ready" || !String(health.refreshRunId ?? "").startsWith("bootstrap-")) {
-      throw new Error("bootstrap deployment did not return to serving readiness after the first-import failure");
-    }
-    return { status: "bootstrap-pair-restored", refreshRunId: health.refreshRunId };
+    const serving = assertBootstrapServingHealth({
+      responseOk: response.ok, responseStatus: response.status, health, expectedMode, expectedRunId,
+    });
+    return { status: "bootstrap-pair-restored", ...serving };
   } finally { await staging.end(); await driver.close(); }
 }
 async function assertInstalled(expected = "v1") {
@@ -467,10 +486,10 @@ async function compareSubstrate() {
   return compareSubstrateSnapshots(source, restored);
 }
 
-async function runFixtureAction(action, arg) {
+async function runFixtureAction(action, arg, extra) {
   return action === "seed" ? seed()
     : action === "assert-source" ? assertSourceVisibility()
-      : action === "assert-bootstrap" ? assertBootstrapRestored()
+      : action === "assert-bootstrap" ? assertBootstrapRestored(arg, extra)
       : action === "assert-reopened-substrate" ? assertReopenedSubstrate()
         : action === "compare-substrate" ? compareSubstrate()
           : action === "close-membership" ? contextAction("close", arg ?? "team")
@@ -485,6 +504,6 @@ async function runFixtureAction(action, arg) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const action = process.argv[2];
-  const result = await runFixtureAction(action, process.argv[3]);
+  const result = await runFixtureAction(action, process.argv[3], process.argv[4]);
   console.log(JSON.stringify(result ?? { status: action }));
 }

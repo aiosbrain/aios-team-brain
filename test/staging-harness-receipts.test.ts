@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import YAML from "yaml";
 import { emitReceipt, parseReceipts, RECEIPT_PREFIX } from "../scripts/staging-ops/receipts.mjs";
 import { preserveArtifacts, redactText } from "../scripts/staging-ops/redact-artifacts.mjs";
 
@@ -89,5 +90,18 @@ describe("harness evidence survives cleanup, redacted", () => {
     const receipts = JSON.parse(readFileSync(join(destination, "receipts.json"), "utf8"));
     expect(receipts.map((r: { kind: string }) => r.kind)).toEqual(["fault-injected", "prior-pair-restored"]);
     expect(receipts[1].fields).toMatchObject({ failedRunId: "run-4", priorRunId: "run-3", postgres: true, graph: true });
+  });
+
+  it("uploads only the redacted hidden output directory and fails if receipts are missing", () => {
+    const workflow = YAML.parse(readFileSync(".github/workflows/ci.yml", "utf8"));
+    const steps = workflow.jobs["staging-paired-refresh"].steps as Array<Record<string, unknown>>;
+    const upload = steps.find((step) => step.name === "Upload redacted harness receipts and logs") as {
+      with: Record<string, unknown>;
+    };
+
+    expect(upload.with.path).toBe(".staging-pair-artifacts");
+    expect(upload.with["include-hidden-files"]).toBe(true);
+    expect(upload.with["if-no-files-found"]).toBe("error");
+    expect(JSON.stringify(upload.with)).not.toContain("STAGING_HARNESS_SECRETS_DIR");
   });
 });

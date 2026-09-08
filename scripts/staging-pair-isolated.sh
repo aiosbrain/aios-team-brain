@@ -13,6 +13,12 @@ fi
 
 project="aios-staging-pair-${USER:-runner}-$$"
 harness_root="$(mktemp -d "${TMPDIR:-/tmp}/aios-staging-pair.XXXXXX")"
+baseline_mode="${STAGING_PAIR_BASELINE_MODE:-legacy-pg-only}"
+case "$baseline_mode" in
+  legacy-pg-only|copy-ready) ;;
+  *) echo "STAGING_PAIR_BASELINE_MODE must be legacy-pg-only or copy-ready" >&2; exit 1 ;;
+esac
+export STAGING_PAIR_BASELINE_MODE="$baseline_mode"
 export STAGING_HARNESS_SECRETS_DIR="$harness_root/secrets"
 node scripts/staging-ops/generate-harness-secrets.mjs "$STAGING_HARNESS_SECRETS_DIR"
 export STAGING_COMPARISON_KEY_BASE64="$(tr -d '\n' < "$STAGING_HARNESS_SECRETS_DIR/exporter/comparison-key")"
@@ -232,10 +238,11 @@ cat "$harness_root/bootstrap-resume-after-publish.log"
 require_receipt bootstrap-resume-after-publish.log bootstrap-phase '"phase":"adopted-published-checkpoint"' \
   "the final worker ADOPTED the already-published checkpoint rather than orphaning it and capturing a second one"
 require_journal state ready "the resumed bootstrap reached a verified prior pair and a serving baseline"
+require_journal last_ready_mode "$baseline_mode" "the resumed bootstrap retained the configured baseline mode"
 [[ "$(journal_field last_ready_run_id)" == "$interrupted_run" ]] || { echo "the recovered bootstrap did not retain its original run identity" >&2; exit 1; }
 [[ "$(journal_field last_ready_object_id)" == "$published_object" ]] || { echo "the recovered bootstrap did not adopt the object it had already published" >&2; exit 1; }
 [[ "$(journal_field bootstrap_run_id)" == "" ]] || { echo "the interruption record was not cleared after ready was committed" >&2; exit 1; }
-"${compose[@]}" run --rm fixture-controller assert-bootstrap
+"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"
 "${compose[@]}" run --rm fixture-controller assert-source
 # The bootstrap is COMPLETE at this point — attempt 3 above is the run that reached ready, and the
 # command is one-time, so invoking it again here would only prove that it refuses. Its refusal IS
@@ -299,9 +306,10 @@ require_receipt bootstrap-first-import-recovers.log postgres-restored '"runId":"
 require_receipt bootstrap-first-import-recovers.log fault-injected '"point":"after-postgres".*"runId":"run-1"' "the first import failed at its genuine post-write marker"
 require_receipt bootstrap-first-import-recovers.log prior-pair-restored '"failedRunId":"run-1".*"priorKind":"rollback".*"postgres":true.*"graph":true.*"ready":true' "the authenticated bootstrap pair restored both stores and serving readiness"
 require_journal state ready "the bootstrap recovery returned staging to ready"
+require_journal last_ready_mode "$baseline_mode" "first-import recovery retained the recorded bootstrap mode"
 bootstrap_run="$(journal_field last_ready_run_id)"
 [[ "$bootstrap_run" == bootstrap-* ]] || { echo "first-import recovery did not retain the bootstrap run identity: $bootstrap_run" >&2; exit 1; }
-"${compose[@]}" run --rm fixture-controller assert-bootstrap
+"${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$bootstrap_run"
 
 "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
 # SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results

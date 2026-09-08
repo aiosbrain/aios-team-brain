@@ -53,7 +53,7 @@ x-importer: &importer-env
   LOCAL_MAINTENANCE_URL: http://maintenance:8080
   STAGING_ORIGIN: http://maintenance:3000
   STAGING_HEALTH_TOKEN: staging-health-token-01234567890123456789
-  STAGING_BOOTSTRAP_MODE: legacy-pg-only
+  STAGING_BOOTSTRAP_MODE: "${STAGING_PAIR_BASELINE_MODE:-legacy-pg-only}"
   STAGING_DATA_MODE: copy-ready
   STAGING_BUNDLE_MAX_BYTES: "536870912"
   STAGING_OBJECT_TIMEOUT_MS: "30000"
@@ -199,7 +199,7 @@ services:
       EMBEDDINGS_URL: http://network-spy:7777
       LOCAL_INITIAL_COMMIT: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
       LOCAL_STAGING_HEAD: cccccccccccccccccccccccccccccccccccccccc
-      LOCAL_INITIAL_DATA_MODE: legacy-pg-only
+      LOCAL_INITIAL_DATA_MODE: "${STAGING_PAIR_BASELINE_MODE:-legacy-pg-only}"
       LOCAL_APP_COMMAND_JSON: '["node","scripts/staging-ops/startup-fence.mjs","--","npm","run","dev","--","--hostname","0.0.0.0","--port","3000"]'
     networks: [staging]
     depends_on:
@@ -213,7 +213,8 @@ services:
     # `node seed` — `Cannot find module '/app/seed'`, after every database had come up healthy, so
     # the harness looked like it had reached the fixture when it had never run it once. Each
     # subcommand (seed/mutate/assert/assert-graph-version/corrupt-graph-version/kill-reader-lock,
-    # plus assert's version argument) is now an ARGUMENT to the script, where it reads them.
+    # plus assert's version and assert-bootstrap's mode/run binding) is now an ARGUMENT to the
+    # script, where it reads them.
     # The default stays "no implicit action": a bare `run fixture-controller` must not silently seed.
     entrypoint: [node, scripts/staging-ops/staging-pair-fixture.mjs]
     command: []
@@ -223,6 +224,7 @@ services:
       PROD_NEO4J_URL: bolt://prod-neo4j:7687
       STAGING_NEO4J_URL: bolt://staging-neo4j:7687
       STAGING_APP_ORIGIN: http://maintenance:3000
+      STAGING_HEALTH_TOKEN: staging-health-token-01234567890123456789
       STAGING_NETWORK_SPY_URL: http://network-spy:7777
     networks: [production, staging, source-store, rollback-store]
     depends_on:

@@ -206,14 +206,16 @@ jobs:
       # The harness root is a mktemp directory its exit trap deletes, so a failed required lane used
       # to leave nothing to read. `redact-artifacts.mjs` copies the command logs and the fault /
       # recovery receipts here with harness secrets, URL credentials and bearer tokens masked — it
-      # never copies the generated key material itself.
+      # never copies the generated key material itself. The destination is intentionally hidden, so
+      # the upload opts into that ONE path and treats an absent redacted evidence set as an error.
       - name: Upload redacted harness receipts and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: staging-pair-receipts
           path: .staging-pair-artifacts
-          if-no-files-found: warn
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 7
 
   ingestion-tests:
