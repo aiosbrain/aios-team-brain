@@ -26,3 +26,57 @@ describe("data-mechanics CI uses the direct Postgres service destination", () =>
     ]));
   });
 });
+
+/**
+ * Moving this job into a Node job container took away the Postgres client tools the ubuntu-latest
+ * runner supplied for free — and the staging data-mechanics specs spawn the REAL binaries (each spec
+ * stubs only the one whose stall it pins, so the rollback restore's two `\copy` children are real
+ * `psql` processes). A missing binary arrives inside a spec as a subprocess ENOENT, which reads like
+ * a product failure, so the job provisions the tools itself and checks them before the specs run.
+ *
+ * Everything below is derived from the job's OWN service and container images rather than restated,
+ * so bumping either without bumping the client is what fails here: Debian bookworm ships client 15,
+ * and pg_dump refuses a server newer than itself.
+ */
+describe("the data-mechanics job supplies the Postgres client tools its specs spawn", () => {
+  const workflow = YAML.parse(readFileSync(".github/workflows/ci.yml", "utf8"));
+  const job = workflow.jobs["datamechanics-tests"];
+  const steps = job.steps as WorkflowStep[];
+  const serviceMajor = /^postgres:(\d+)\b/.exec(String(job.services.postgres.image))?.[1];
+  const debianSuite = /^node:\d+-([a-z]+)$/.exec(String(job.container.image))?.[1];
+  const indexOfStep = (matches: (run: string) => boolean) =>
+    steps.findIndex((step) => step.run !== undefined && matches(step.run));
+  const scriptOf = (matches: (run: string) => boolean) => steps[indexOfStep(matches)]?.run ?? "";
+  const isInstall = (run: string) => run.includes("apt.postgresql.org");
+  const isVerify = (run: string) => run.includes("missing required tool");
+
+  it("installs the client at the service's own major from the official PostgreSQL repository", () => {
+    expect(serviceMajor, "the Postgres service image is no longer a plain major tag").toBeTruthy();
+    expect(debianSuite, "the job container image is no longer a named Debian release").toBeTruthy();
+    const install = scriptOf(isInstall);
+    expect(install, `the client must match the postgres:${serviceMajor} service`).toContain(`postgresql-client-${serviceMajor}`);
+    expect(install, "the PGDG suite must track the container's Debian release").toContain(`${debianSuite}-pgdg`);
+    expect(install, "an unsigned apt source would install an unverified client").toMatch(
+      /signed-by=\/usr\/share\/postgresql-common\/pgdg\/apt\.postgresql\.org\.asc/,
+    );
+  });
+
+  it("refuses to reach the specs when a spawned tool is absent or older than the server", () => {
+    const verify = scriptOf(isVerify);
+    expect(verify, "a check that cannot fail is not a check").toContain("set -euo pipefail");
+    const tools = /for tool in ([^;]+); do/.exec(verify)?.[1].trim().split(/\s+/) ?? [];
+    // psql/pg_dump/pg_restore are spawned by the staging specs; git is how the
+    // migrate-from-existing lane reads released schema states out of history.
+    expect(tools).toEqual(expect.arrayContaining(["git", "psql", "pg_dump", "pg_restore"]));
+    expect(verify, "the client may never trail the server major").toMatch(new RegExp(`-lt ${serviceMajor}\\b`));
+  });
+
+  it("provisions and checks the toolchain before any step that uses it", () => {
+    const install = indexOfStep(isInstall);
+    const verify = indexOfStep(isVerify);
+    const firstDatabaseStep = indexOfStep((run) => run.includes("npm run pg:schema") || run.startsWith("npm run test:"));
+    expect(install, "no step installs the Postgres client tools").toBeGreaterThanOrEqual(0);
+    expect(verify, "the toolchain check must follow the install").toBeGreaterThan(install);
+    expect(firstDatabaseStep, "a database step runs before the toolchain is checked").toBeGreaterThan(verify);
+  });
+});

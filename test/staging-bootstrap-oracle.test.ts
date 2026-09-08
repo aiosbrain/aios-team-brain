@@ -22,8 +22,23 @@ describe("paired harness bootstrap serving oracle", () => {
     expect(compose.services.maintenance.environment.LOCAL_INITIAL_DATA_MODE).toBe(configuredMode);
     expect(compose.services["fixture-controller"].environment.STAGING_HEALTH_TOKEN)
       .toBe(compose.services.maintenance.environment.STAGING_HEALTH_TOKEN);
-    expect(harness).toContain('fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"');
-    expect(harness).toContain('fixture-controller assert-bootstrap "$baseline_mode" "$bootstrap_run"');
+    // ONE baseline for both lanes: the run id recorded BEFORE the kill, read out of
+    // `bootstrap_run_id` rather than re-derived from the value under test. Re-reading
+    // `last_ready_run_id` and checking only its `bootstrap-` prefix would let a journal and a health
+    // response agree on a different, fabricated bootstrap identity and still pass.
+    const baselineCapture = 'interrupted_run="$(journal_field bootstrap_run_id)"';
+    expect(harness, "the baseline bootstrap identity is no longer captured before the kill").toContain(baselineCapture);
+    const oracleCalls = harness.match(/fixture-controller assert-bootstrap "\$baseline_mode" "\$\w+"/g) ?? [];
+    expect(oracleCalls, "both bootstrap health oracles must be handed the independent baseline").toEqual([
+      'fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"',
+      'fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"',
+    ]);
+    expect(harness.indexOf(baselineCapture), "the baseline must be captured before it is asserted against")
+      .toBeLessThan(harness.indexOf(oracleCalls[0]));
+    // The first-import lane re-reads the journal and must prove that value IS the baseline.
+    expect(harness).toContain('bootstrap_run="$(journal_field last_ready_run_id)"');
+    expect(harness, "a prefix check accepts any fabricated bootstrap-* identity")
+      .toContain('[[ "$bootstrap_run" == "$interrupted_run" ]]');
     expect(harness).toContain('require_journal last_ready_mode "$baseline_mode"');
   });
 

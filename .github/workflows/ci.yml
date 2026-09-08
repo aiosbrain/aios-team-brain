@@ -106,12 +106,50 @@ jobs:
           # The migrate-from-existing lane reads prior schema states straight out of git
           # (`git show v0.7.0:postgres/schema.sql`) instead of maintaining fixture files, so it
           # needs the full history and the TAGS. The default shallow, tagless checkout would make
-          # it fail with "unknown git tag" rather than silently pass.
+          # it fail with "unknown git tag" rather than silently pass. In a job container that also
+          # requires `git` IN the image (`node:20-bookworm` has it): without it checkout degrades to
+          # an archive download, which has no history for that lane to read at all.
           fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: "npm"
+      # The ubuntu-latest runner carried the Postgres client tools for free; this job container does
+      # not. `node:20-bookworm` is the FULL image, so git and bash come with it (buildpack-deps base),
+      # but no `psql`/`pg_dump`/`pg_restore` — and the staging data-mechanics specs spawn the real
+      # ones. Each of those specs stubs only the single binary whose stall it pins (`pg_dump` for the
+      # deadline capture, `pg_restore` for the cancellation); the rollback restore's two `\copy`
+      # children are genuine `psql` processes against the service.
+      # Debian bookworm's own `postgresql-client` is 15, and pg_dump REFUSES a server newer than
+      # itself, so the client comes from the official PostgreSQL Apt repository at the SAME major as
+      # the service image. Pinned by test/guards/datamechanics-ci-networking.test.ts.
+      - name: Install the PostgreSQL 16 client tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl
+          install -d -m 0755 /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list
+          apt-get update
+          apt-get install -y --no-install-recommends postgresql-client-16
+      # Fail HERE, naming the tool, instead of inside a spec where a missing binary arrives as an
+      # ENOENT from a subprocess the spec deliberately stubs a sibling of — which reads like a product
+      # failure. `git` is how the migrate-from-existing lane reads released schema states.
+      - name: Verify the job toolchain
+        run: |
+          set -euo pipefail
+          for tool in git bash node npm psql pg_dump pg_restore; do
+            command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
+          done
+          psql --version && pg_dump --version && pg_restore --version
+          client_major="$(pg_dump --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')"
+          if [ "$client_major" -lt 16 ]; then
+            echo "pg_dump $client_major is older than the Postgres 16 service; it would refuse the dump" >&2
+            exit 1
+          fi
       - run: npm ci
       # migrate-from-zero into the service DB (also the replay guard)
       - run: DATABASE_URL="$DATABASE_TEST_URL" npm run pg:schema
