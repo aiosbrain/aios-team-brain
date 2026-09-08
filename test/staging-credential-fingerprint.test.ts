@@ -17,4 +17,18 @@ describe("ops-only credential comparison", () => {
     const a = credentialFingerprint({ credentialClass: "neo4j-credential", value: "same", comparisonKey: key, keyId: "v1" });
     expect(() => assertDistinctFingerprints(a, a, "Neo4j credential")).toThrow(/differ/);
   });
+
+  it("requires comparability before treating unequal MAC text as credential separation", () => {
+    const source = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: key, keyId: "source-key" });
+    const target = credentialFingerprint({ credentialClass: "auth-secret", value: "same", comparisonKey: key, keyId: "target-key" });
+    expect(() => assertDistinctFingerprints(source, target, "AUTH_SECRET")).toThrow(/same versioned comparison key/);
+    expect(() => assertDistinctFingerprints(undefined, target, "AUTH_SECRET")).toThrow(/well formed/);
+    expect(() => assertDistinctFingerprints({ ...source, mac: "malformed" }, target, "AUTH_SECRET")).toThrow(/well formed/);
+  });
+
+  it("accepts distinct credentials only under the same comparison key identity", () => {
+    const source = credentialFingerprint({ credentialClass: "secrets-key", value: "source", comparisonKey: key, keyId: "shared-key" });
+    const target = credentialFingerprint({ credentialClass: "secrets-key", value: "target", comparisonKey: key, keyId: "shared-key" });
+    expect(assertDistinctFingerprints(source, target, "SECRETS_KEY")).toBe(true);
+  });
 });

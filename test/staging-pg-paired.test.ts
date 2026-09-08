@@ -31,7 +31,7 @@ describe("section-wise paired Postgres capture/install", () => {
     const execImpl = vi.fn().mockResolvedValue({ stdout: "", stderr: "" });
     // Every enumeration answers empty, so the cleanup is a no-op and the ORDER is what is pinned.
     const client = { query: vi.fn().mockResolvedValue({ rows: [] }), on: vi.fn() };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/exclusive data-use lock/);
 
     const commands = execImpl.mock.calls.map(([, args]) => args.join(" "));
@@ -74,7 +74,7 @@ describe("section-wise paired Postgres capture/install", () => {
       }),
       on: vi.fn(),
     };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/could not be reset before reading the staging marker/);
     // Nothing destructive was attempted, and no restore command ran.
     expect(client.query.mock.calls.map(([sql]) => String(sql))).toEqual(["ROLLBACK"]);
@@ -92,7 +92,7 @@ describe("section-wise paired Postgres capture/install", () => {
     const execImpl = vi.fn(async (_cmd: string, args: string[]) =>
       args.includes("--list") ? { stdout: listing, stderr: "" } : { stdout: "", stderr: "" });
     const client = { query: vi.fn().mockResolvedValue({ rows: [] }), on: vi.fn() };
-    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl }))
+    await expect(restorePairedPostgres({ client, databaseUrl: "postgres://target/db", directory, execImpl, env: { STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } }))
       .rejects.toThrow(/exclusive data-use lock/);
     const written = readFileSync(path.join(directory, "restore.list"), "utf8");
     expect(written).toContain("TABLE public items postgres");

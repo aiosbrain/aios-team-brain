@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { groupAlive, spawnOwnedWorkload, supervisionSupported } from "../scripts/staging-ops/owned-workload.mjs";
@@ -150,6 +151,28 @@ describe.runIf(POSIX)("stops are idempotent and never wait on an exit that alrea
     expect(outcome.stopped).toBe(true);
     // A repeat still returns immediately rather than hanging.
     expect((await workload.stop()).stopped).toBe(true);
+  });
+
+  it("retries a previously unverified stop instead of memoizing failure forever", async () => {
+    const child = new EventEmitter() as EventEmitter & { pid: number };
+    child.pid = 4242;
+    let alive = true;
+    const kill = vi.fn((_pid: number, signal: string | number) => {
+      if (signal === 0 && alive) return true;
+      throw Object.assign(new Error("unavailable"), { code: alive ? "EPERM" : "ESRCH" });
+    });
+    const workload = spawnOwnedWorkload({
+      command: ["synthetic"], spawnImpl: (() => child) as never, kill: kill as never,
+      label: "retryable-stop",
+    });
+    child.emit("exit", 0, null);
+    const first = await workload.stop({ graceMs: 0, verifyMs: 0 });
+    expect(first).toMatchObject({ stopped: false, reason: "group-survived" });
+
+    alive = false;
+    const second = await workload.stop({ graceMs: 0, verifyMs: 0 });
+    expect(second).toMatchObject({ stopped: true, reason: "already-terminal" });
+    expect(second).not.toBe(first);
   });
 });
 

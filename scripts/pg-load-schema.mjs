@@ -19,7 +19,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { assertServiceIdentity } from "./service-guard.mjs";
-import { acquireDataUseLock, assertBootAdmission, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
+import { acquireDataUseLock, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
+import { classifyFenceAdmission, stagingFenceScope } from "./staging-ops/fence-admission.mjs";
 
 export function shouldUseSsl(databaseUrl, env = process.env) {
   return (
@@ -64,16 +65,18 @@ export async function loadSchema({
   const ownsClient = !connectedClient;
   if (ownsClient) await client.connect();
   try {
-    if (env.STAGING_DATA_MODE === "copy-ready") {
+    const fenceScope = stagingFenceScope(env);
+    if (fenceScope.inspect) {
       if (connectedClient) {
         if (!(await hasExclusiveDataUseLock(client))) throw new Error("copy-mode injected schema loader requires the same session to hold the exclusive data-use lock");
       } else {
         // Held for the WHOLE migration, and released only when this client ends (B1/AC-06).
         await acquireDataUseLock(client, "shared", true);
-        // The SAME admission the startup fence applies: `ready`, or exactly the deployment this
-        // refresh selected to boot. A ready-only gate here refused the importer's own predeploy.
-        await assertBootAdmission(client, env, "copy-mode schema loader");
       }
+      // The SAME activation-aware admission as startup. The importer path is already protected by
+      // this session's exclusive lock; it still classifies mode/enrollment, but journal lifecycle
+      // admission belongs to the importing owner rather than to a process trying to boot.
+      await classifyFenceAdmission(client, env, "staging schema loader", { requireBootAdmission: !connectedClient });
     }
     // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —
     // a legit long CREATE INDEX is unaffected). This runs on every deploy (Railway preDeployCommand),

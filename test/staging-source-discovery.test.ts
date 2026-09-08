@@ -2,12 +2,17 @@ import { generateKeyPairSync, createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
 import { discoverLatestSource } from "../scripts/staging-ops/importer.mjs";
+import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
 
 const sign = generateKeyPairSync("ed25519");
 const enc = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const env = { EXPORTER_SIGNING_PUBLIC_KEY: sign.publicKey, IMPORTER_ENCRYPTION_PRIVATE_KEY: enc.privateKey } as unknown as NodeJS.ProcessEnv;
 
 const checksums = Object.fromEntries(["postgres", "authUsers", "graphLedger", "graph"].map((n) => [n, { sha256: "a".repeat(64) }]));
+const comparisonKey = Buffer.alloc(32, 6);
+const credentialFingerprints = Object.fromEntries([
+  ["auth-secret", "prod-auth"], ["secrets-key", "prod-secrets"], ["neo4j-credential", "neo4j\0prod"],
+].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: "shared-key" })]));
 
 // Expiry is validated against `Date.now()` inside the importer, so every fixture below is dated
 // relative to ONE pinned instant. Without the pin, "expired" is a wall-clock accident: the original
@@ -25,6 +30,7 @@ function bundleFor(runId: string, capturedAt: string, { expiresAt = NOT_YET_EXPI
     formatVersion: 1, graphCodecVersion: 1, runId,
     captureStartedAt: capturedAt, captureEndedAt: capturedAt, expiresAt, checksums,
     build: { applicationCommit: "b".repeat(40), schemaFingerprint: "c".repeat(64), migrationSet: { sha256: "d".repeat(64) } },
+    credentialFingerprints,
   };
   const bytes = Buffer.from(JSON.stringify(createSignedEncryptedBundle({
     payload: Buffer.from(runId), manifest,

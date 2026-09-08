@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const FINGERPRINT_VERSION = "hmac-sha256-v1";
 const CLASSES = new Set(["auth-secret", "secrets-key", "postgres-credential", "neo4j-credential"]);
+export const REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES = Object.freeze(["auth-secret", "secrets-key", "neo4j-credential"]);
 
 function normalize(value) {
   if (Buffer.isBuffer(value)) return value;
@@ -57,5 +58,9 @@ export function fingerprintsEqual(a, b) {
 }
 
 export function assertDistinctFingerprints(a, b, label) {
+  if (!fingerprintsComparable(a, b)) {
+    throw new Error(`${label} fingerprints must be well formed and use the same versioned comparison key and credential class`);
+  }
   if (fingerprintsEqual(a, b)) throw new Error(`${label} must differ between production and staging`);
+  return true;
 }

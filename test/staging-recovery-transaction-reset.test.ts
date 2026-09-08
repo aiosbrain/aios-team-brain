@@ -123,6 +123,33 @@ describe("the importer's recovery path on an aborted connection", () => {
     await expect(rollbackToPrior({ client, prior: PRIOR, failedRunId: "failed-run", maintenance, rollbackStore, env }))
       .rejects.toThrow(/recovery notes:.*session reset failed/s);
   });
+
+  it("aborts before lifecycle mutation when ready-to-draining admission is refused", async () => {
+    const client = abortedClient();
+    client.query.mockImplementation(async (sql: string) => {
+      client.statements.push(String(sql));
+      if (String(sql) === "ROLLBACK") return { rows: [] };
+      if (String(sql).startsWith("UPDATE staging_ops.refresh_journal")) return { rows: [] };
+      return { rows: [] };
+    });
+    const { maintenance, rollbackStore, env } = fakes();
+    await expect(rollbackToPrior({ client, prior: PRIOR, failedRunId: "manual-ready", maintenance, rollbackStore, env }))
+      .rejects.toThrow(/journal transition to draining refused/);
+    expect(maintenance.stopAndVerifyAll).not.toHaveBeenCalled();
+  });
+
+  it("admits a deliberate rollback from ready before stopping and retains the intended target on failure", async () => {
+    const client = abortedClient();
+    const { maintenance, rollbackStore, env } = fakes();
+    await expect(rollbackToPrior({ client, prior: PRIOR, failedRunId: "manual-ready", maintenance, rollbackStore, env }))
+      .rejects.toThrow(/recovery is required/);
+    const drain = client.query.mock.calls.find(([sql, params]) =>
+      String(sql).startsWith("UPDATE staging_ops.refresh_journal") && (params as unknown[])?.[1] === "draining",
+    );
+    expect((drain?.[1] as unknown[])?.at(-1)).toContain("ready");
+    expect(maintenance.stopAndVerifyAll).toHaveBeenCalledTimes(1);
+    expect(PRIOR).toMatchObject({ objectId: expect.stringContaining("prior--"), manifest: { runId: "prior-run" } });
+  });
 });
 
 /**

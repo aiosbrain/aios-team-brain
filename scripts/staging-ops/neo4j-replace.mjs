@@ -1,6 +1,7 @@
 import neo4j from "neo4j-driver";
 import { decodeNeo4jValue } from "./neo4j-codec.mjs";
 import { GRAPH_CODEC_VERSION, SUPPORTED_NODE_LABELS, SUPPORTED_RELATIONSHIP_TYPES, validateGraphShape } from "./graph-bundle.mjs";
+import { assertDistinctFingerprints } from "./credential-fingerprint.mjs";
 
 const INTERNAL = /(?:^|\.)railway\.internal$/i;
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -16,7 +17,7 @@ export function assertReplaceTarget(facts) {
   if (!INTERNAL.test(String(facts.neo4jHost ?? ""))) throw new Error("Neo4j replace requires the pinned internal host");
   if (!facts.pinnedNeo4jService || !String(facts.neo4jHost).startsWith(`${facts.pinnedNeo4jService}.`)) throw new Error("Neo4j host does not identify the pinned staging service");
   if (!facts.pinnedDatabase || facts.database !== facts.pinnedDatabase) throw new Error("Neo4j database identity mismatch");
-  if (!facts.targetCredentialFingerprint || facts.targetCredentialFingerprint === facts.sourceCredentialFingerprint) throw new Error("staging and production graph credentials must differ");
+  assertDistinctFingerprints(facts.sourceCredentialFingerprint, facts.targetCredentialFingerprint, "staging and production graph credentials");
   if (facts.electionLockHeld !== true) throw new Error("coordinator election lock is not held by the replace session");
   if (facts.exclusiveDataLockHeld !== true) throw new Error("exclusive data-use lock is not held by the replace session");
   const stop = facts.stopMeasurement;

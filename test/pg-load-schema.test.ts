@@ -176,7 +176,7 @@ describe("pg-load-schema", () => {
     await expect(loadSchema({
       cwd: root,
       databaseUrl: "postgres://unused",
-      env: { STAGING_DATA_MODE: "copy-ready" },
+      env: { STAGING_DATA_MODE: "copy-ready", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" },
       connectedClient: client,
       logger: { log: vi.fn() },
     })).rejects.toThrow(/exclusive data-use lock/);

@@ -118,7 +118,10 @@ async function stopChild(deployment) {
   const startedAt = Date.now();
   deployment.stopRequested = true;
   emitReceipt("deployment-stop-requested", { deploymentId: deployment.id, serviceId: deployment.serviceId, pid: deployment.lifecycle.pid, pgid: deployment.lifecycle.pgid, signal: "SIGTERM" });
-  const outcome = await deployment.workload.stop({ graceMs: 5_000, verifyMs: 2_000 });
+  // The app workload may itself be the startup-fence supervisor. Escalating the OUTER group would
+  // kill that healthy lock holder while its separately owned payload group survived. App shutdown
+  // therefore asks the fence to clean up and verifies its exit, but never SIGKILLs around it.
+  const outcome = await deployment.workload.stop({ graceMs: 5_000, verifyMs: 2_000, escalate: deployment.serviceId !== appServiceId });
   deployment.lifecycle.stopped = outcome.stopped;
   deployment.lifecycle.stopReason = outcome.reason;
   emitReceipt("deployment-stop-completed", {

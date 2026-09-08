@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSignedEncryptedBundle } from "../scripts/staging-ops/bundle-crypto.mjs";
-import { assertReplayableGraph, verifyAndPinSourceBundle, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
+import { assertReplayableGraph, compareEnvironmentCredentials, verifyAndPinSourceBundle, waitForImportedBoot } from "../scripts/staging-ops/importer.mjs";
 import { PrivateFileStore } from "../scripts/staging-ops/private-store.mjs";
+import { credentialFingerprint } from "../scripts/staging-ops/credential-fingerprint.mjs";
+import { validatePairManifest } from "../scripts/staging-ops/bundle-format.mjs";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((r) => rmSync(r, { recursive: true, force: true })));
@@ -20,7 +22,11 @@ describe("staging importer bundle boundary", () => {
   it("verifies publisher signature/decryption/expiry before privately pinning", async () => {
     const sign = generateKeyPairSync("ed25519"); const enc = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const sourceRoot = mkdtempSync(path.join(os.tmpdir(), "src-")); const rollbackRoot = mkdtempSync(path.join(os.tmpdir(), "rb-")); roots.push(sourceRoot, rollbackRoot);
-    const manifest = { formatVersion: 1, graphCodecVersion: 1, runId: "run-1", captureStartedAt: new Date().toISOString(), captureEndedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), checksums: Object.fromEntries(["postgres", "authUsers", "graphLedger", "graph"].map((n) => [n, { sha256: "a".repeat(64) }])), build: { applicationCommit: "b".repeat(40), schemaFingerprint: "c".repeat(64), migrationSet: { sha256: "d".repeat(64) } } };
+    const comparisonKey = Buffer.alloc(32, 9);
+    const credentialFingerprints = Object.fromEntries([
+      ["auth-secret", "auth"], ["secrets-key", "secrets"], ["neo4j-credential", "neo4j"],
+    ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: "shared-key" })]));
+    const manifest = { formatVersion: 1, graphCodecVersion: 1, runId: "run-1", captureStartedAt: new Date().toISOString(), captureEndedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), checksums: Object.fromEntries(["postgres", "authUsers", "graphLedger", "graph"].map((n) => [n, { sha256: "a".repeat(64) }])), build: { applicationCommit: "b".repeat(40), schemaFingerprint: "c".repeat(64), migrationSet: { sha256: "d".repeat(64) } }, credentialFingerprints };
     const bundle = createSignedEncryptedBundle({ payload: Buffer.from("payload"), manifest, exporterSigningPrivateKey: sign.privateKey, importerEncryptionPublicKey: enc.publicKey });
     const bytes = Buffer.from(JSON.stringify(bundle));
     const digest = createHash("sha256").update(bytes).digest("hex");
@@ -29,6 +35,54 @@ describe("staging importer bundle boundary", () => {
     const opened = await verifyAndPinSourceBundle({ objectId, sourceStore: new PrivateFileStore({ root: sourceRoot, role: "source-reader" }), rollbackStore: new PrivateFileStore({ root: rollbackRoot, role: "rollback-owner" }), env: { EXPORTER_SIGNING_PUBLIC_KEY: sign.publicKey, IMPORTER_ENCRYPTION_PRIVATE_KEY: enc.privateKey } });
     expect(opened.manifest.runId).toBe("run-1");
     expect((await new PrivateFileStore({ root: rollbackRoot, role: "rollback-owner" }).read(objectId)).length).toBeGreaterThan(0);
+  });
+
+  it("refuses missing/malformed production credential proof at signed-manifest admission", () => {
+    const comparisonKey = Buffer.alloc(32, 9);
+    const fingerprints = Object.fromEntries([
+      ["auth-secret", "auth"], ["secrets-key", "secrets"], ["neo4j-credential", "neo4j"],
+    ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: "shared-key" })]));
+    const manifest = {
+      formatVersion: 1, graphCodecVersion: 1, runId: "run-2",
+      captureStartedAt: "2026-09-08T00:00:00Z", captureEndedAt: "2026-09-08T00:00:01Z",
+      expiresAt: "2099-01-01T00:00:00Z",
+      checksums: Object.fromEntries(["postgres", "authUsers", "graphLedger", "graph"].map((name) => [name, { sha256: "a".repeat(64) }])),
+      build: { applicationCommit: "b".repeat(40), schemaFingerprint: "c".repeat(64), migrationSet: { sha256: "d".repeat(64) } },
+      credentialFingerprints: fingerprints,
+    };
+    expect(validatePairManifest(manifest).ok).toBe(true);
+    expect(validatePairManifest({ ...manifest, credentialFingerprints: {} }).errors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/auth-secret/), expect.stringMatching(/secrets-key/), expect.stringMatching(/neo4j-credential/),
+    ]));
+    expect(validatePairManifest({ ...manifest, credentialFingerprints: { ...fingerprints, "auth-secret": { ...fingerprints["auth-secret"], mac: "bad" } } }).ok).toBe(false);
+
+    // Staging-owned rollback archives intentionally contain staging credentials and are not forced
+    // through source-vs-target separation.
+    expect(validatePairManifest({ ...manifest, kind: "staging-rollback", checksums: { postgres: manifest.checksums.postgres, graph: manifest.checksums.graph }, credentialFingerprints: undefined }, Date.now(), { allowRollback: true }).ok).toBe(true);
+  });
+
+  it("refuses identical secrets minted under mismatched key IDs before lifecycle admission", () => {
+    const comparisonKey = Buffer.alloc(32, 4);
+    const source = Object.fromEntries([
+      ["auth-secret", "same-auth"], ["secrets-key", "same-secrets"], ["neo4j-credential", "neo4j\0same"],
+    ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: "source-key" })]));
+    const env = {
+      STAGING_COMPARISON_KEY_BASE64: comparisonKey.toString("base64"), STAGING_COMPARISON_KEY_ID: "target-key",
+      AUTH_SECRET: "same-auth", SECRETS_KEY: "same-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "same",
+    } as NodeJS.ProcessEnv;
+    expect(() => compareEnvironmentCredentials({ credentialFingerprints: source }, env)).toThrow(/same versioned comparison key/);
+  });
+
+  it("admits distinct same-key-ID environment credentials", () => {
+    const comparisonKey = Buffer.alloc(32, 4);
+    const source = Object.fromEntries([
+      ["auth-secret", "prod-auth"], ["secrets-key", "prod-secrets"], ["neo4j-credential", "neo4j\0prod"],
+    ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: "shared-key" })]));
+    const env = {
+      STAGING_COMPARISON_KEY_BASE64: comparisonKey.toString("base64"), STAGING_COMPARISON_KEY_ID: "shared-key",
+      AUTH_SECRET: "staging-auth", SECRETS_KEY: "staging-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "staging",
+    } as NodeJS.ProcessEnv;
+    expect(compareEnvironmentCredentials({ credentialFingerprints: source }, env)).toBe(true);
   });
 });
 

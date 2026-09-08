@@ -42,7 +42,12 @@
 
 import { readFileSync } from "node:fs";
 import { assertStagingTopology } from "./config.mjs";
-import { credentialFingerprint, fingerprintsComparable, fingerprintsEqual } from "./credential-fingerprint.mjs";
+import {
+  credentialFingerprint,
+  fingerprintsComparable,
+  fingerprintsEqual,
+  REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES,
+} from "./credential-fingerprint.mjs";
 
 export const ACTIVATION_STATUS = Object.freeze({
   /** Every measurable control this build can measure is measured and correct. Nothing more. */
@@ -52,7 +57,7 @@ export const ACTIVATION_STATUS = Object.freeze({
 });
 
 /** The credential classes the separation check requires; a missing one is incomparable, not distinct. */
-export const REQUIRED_CREDENTIAL_CLASSES = Object.freeze(["auth-secret", "secrets-key", "neo4j-credential"]);
+export const REQUIRED_CREDENTIAL_CLASSES = REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES;
 
 /** Railway deployment statuses that mean "this deployment is the one currently serving". */
 const SERVING_STATUS = "SUCCESS";

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fingerprintWellFormed, REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES } from "./credential-fingerprint.mjs";
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
@@ -40,5 +41,16 @@ export function validatePairManifest(manifest, now = Date.now(), { allowRollback
   if (rollback && !allowRollback) errors.push("importer-owned rollback bundle is not a source bundle");
   for (const name of rollback ? ["postgres", "graph"] : ["postgres", "authUsers", "graphLedger", "graph"]) if (!/^[0-9a-f]{64}$/.test(manifest?.checksums?.[name]?.sha256 ?? "")) errors.push(`missing ${name} checksum`);
   if (!manifest?.build?.applicationCommit || !manifest?.build?.schemaFingerprint || !manifest?.build?.migrationSet?.sha256) errors.push("source build identity is incomplete");
+  // A rollback envelope is staging-owned and may legitimately contain staging's own credentials.
+  // Source bundles, however, must carry complete authenticated production evidence: absence or a
+  // malformed value is incomparable, never evidence that the environments differ.
+  if (!rollback) {
+    for (const credentialClass of REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES) {
+      const value = manifest?.credentialFingerprints?.[credentialClass];
+      if (!fingerprintWellFormed(value) || value.credentialClass !== credentialClass) {
+        errors.push(`missing or malformed ${credentialClass} credential fingerprint`);
+      }
+    }
+  }
   return { ok: errors.length === 0, errors };
 }

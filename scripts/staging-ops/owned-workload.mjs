@@ -101,17 +101,21 @@ export function spawnOwnedWorkload({
 
   let stopping = null;
 
-  async function stop({ graceMs = 5_000, verifyMs = 2_000, pollMs = 50 } = {}) {
-    // ONE stop operation. Concurrent callers await the same promise; a repeat after completion
-    // returns it again. Both were unbounded waits before, on an event that had already fired.
+  async function stop({ graceMs = 5_000, verifyMs = 2_000, pollMs = 50, escalate = true } = {}) {
+    // ONE IN-FLIGHT stop operation. Concurrent callers await the same promise and a verified
+    // success remains memoized. A failed verification is deliberately retryable: permanently
+    // memoizing `group-survived` made eventual cleanup impossible even after the group disappeared.
     if (stopping) return stopping;
     stopping = (async () => {
       const startedAt = now();
+      if (pgid == null) {
+        if (terminal?.kind === "spawn-failed") {
+          return { stopped: true, reason: "spawn-failed-no-group", durationMs: now() - startedAt, escalated: false, terminal };
+        }
+        return { stopped: false, reason: "no-owned-group", durationMs: now() - startedAt, escalated: false, terminal };
+      }
       if (terminal && !groupAlive(pgid, kill)) {
         return { stopped: true, reason: "already-terminal", durationMs: now() - startedAt, escalated: false, terminal };
-      }
-      if (pgid == null) {
-        return { stopped: false, reason: "no-owned-group", durationMs: now() - startedAt, escalated: false, terminal };
       }
 
       // 1. Graceful, to the OWNED GROUP.
@@ -141,7 +145,7 @@ export function spawnOwnedWorkload({
       // 3. …then escalation, still limited to the owned group. This is what a surviving grandchild
       //    needs: the wrapper exiting is not the workload stopping.
       let escalated = false;
-      if (!graced || groupAlive(pgid, kill)) {
+      if (escalate && (!graced || groupAlive(pgid, kill))) {
         escalated = true;
         try { signalGroup(pgid, "SIGKILL", kill); }
         catch (error) {
@@ -160,7 +164,13 @@ export function spawnOwnedWorkload({
       const result = { stopped, reason: stopped ? "verified-gone" : "group-survived", durationMs: now() - startedAt, escalated, signalErrors, terminal };
       emitReceipt("workload-stop", { label, pid: child.pid ?? null, pgid, stopped, reason: result.reason, escalated, signalErrors: signalErrors.join(",") || null, durationMs: result.durationMs, exitCode: terminal?.code ?? null, exitSignal: terminal?.signal ?? null });
       return result;
-    })();
+    })().then((result) => {
+      if (!result.stopped) stopping = null;
+      return result;
+    }, (error) => {
+      stopping = null;
+      throw error;
+    });
     return stopping;
   }
 

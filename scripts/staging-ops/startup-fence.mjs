@@ -4,20 +4,18 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Client } from "pg";
 import { shouldUseSsl } from "../pg-load-schema.mjs";
-import { acquireDataUseLock, assertBootAdmission } from "./journal.mjs";
+import { acquireDataUseLock } from "./journal.mjs";
+import { classifyFenceAdmission, stagingFenceScope } from "./fence-admission.mjs";
 import { spawnOwnedWorkload } from "./owned-workload.mjs";
 import { emitReceipt } from "./receipts.mjs";
 
 export function copyFenceRequired(env = process.env) {
-  return env.STAGING_DATA_MODE === "copy-ready";
+  return stagingFenceScope(env).inspect;
 }
 
 export async function acquireStartupFence({ env = process.env, createClient = (config) => new Client(config) } = {}) {
   if (!copyFenceRequired(env)) return null;
-  if (!env.DATABASE_URL) throw new Error("copy-mode startup fence requires DATABASE_URL");
-  if (!env.STAGING_OPS_ENVIRONMENT_ID || env.STAGING_OPS_ENVIRONMENT_ID !== env.RAILWAY_ENVIRONMENT_ID) {
-    throw new Error("copy-mode startup fence environment identity mismatch");
-  }
+  if (!env.DATABASE_URL) throw new Error("staging startup fence requires DATABASE_URL");
   const client = createClient({
     connectionString: env.DATABASE_URL,
     ssl: shouldUseSsl(env.DATABASE_URL, env) ? { rejectUnauthorized: false } : undefined,
@@ -29,10 +27,10 @@ export async function acquireStartupFence({ env = process.env, createClient = (c
     // lifetime: that ordering is what closes the startup TOCTOU (a refresh cannot take the exclusive
     // lock between our read and the child starting).
     await acquireDataUseLock(client, "shared", true);
-    // Shared with the schema loader (B1) so predeploy and startup can never disagree about whether
-    // this exact process is the deployment the refresh selected.
-    const journal = await assertBootAdmission(client, env, "copy-mode startup");
-    return { client, journal };
+    // Shared with the schema loader: activation is established from durable journal activity, not
+    // from the exact mode string. The initial empty installer row remains preactivation-compatible.
+    const admission = await classifyFenceAdmission(client, env, "staging startup");
+    return { client, journal: admission.journal, admission };
   } catch (error) {
     await Promise.resolve(client.end()).catch(() => {});
     throw error;
@@ -56,12 +54,21 @@ export async function acquireStartupFence({ env = process.env, createClient = (c
  * one exception is a lost connection: the lock is already unavailable then, so the workload is
  * terminated promptly and no claim is made that the fence still protects anything.
  */
-export async function supervise(command, { env = process.env, createClient, spawnImpl = spawn, platform = process.platform } = {}) {
+export async function supervise(command, {
+  env = process.env,
+  createClient,
+  spawnImpl = spawn,
+  kill = process.kill,
+  platform = process.platform,
+  stopOptions = {},
+  cleanupRetryMs = 1_000,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
   if (!Array.isArray(command) || command.length === 0) throw new Error("startup fence requires a child command");
   const fence = await acquireStartupFence({ env, createClient });
   let workload;
   try {
-    workload = spawnOwnedWorkload({ command, env, label: "startup-fence-payload", spawnImpl, platform });
+    workload = spawnOwnedWorkload({ command, env, label: "startup-fence-payload", spawnImpl, kill, platform });
   } catch (error) {
     // Refusing to supervise must not leave the fence's connection open.
     await Promise.resolve(fence?.client.end()).catch(() => {});
@@ -69,32 +76,81 @@ export async function supervise(command, { env = process.env, createClient, spaw
   }
 
   let cleanup = null;
-  /** Idempotent, and the ONLY place the lock is released. */
+  let connectionLost = false;
+  let wakeForConnectionLoss;
+  const connectionLoss = new Promise((resolve) => { wakeForConnectionLoss = resolve; });
+  const endFence = async () => Promise.resolve(fence?.client.end()).catch(() => {});
+
+  /** Idempotent, and the ONLY healthy-session path that voluntarily releases the lock. */
   const shutdown = async (reason) => {
+    if (reason === "database-connection-lost") {
+      connectionLost = true;
+      wakeForConnectionLoss();
+    }
     if (cleanup) return cleanup;
     cleanup = (async () => {
-      const stopped = await workload.stop({ graceMs: 5_000, verifyMs: 2_000 }).catch((error) => ({ stopped: false, reason: String(error?.message ?? error).slice(0, 120) }));
-      // AFTER the workload is gone, never before.
-      await Promise.resolve(fence?.client.end()).catch(() => {});
-      emitReceipt("fence-shutdown", { reason, stopped: Boolean(stopped?.stopped), stopReason: stopped?.reason ?? null, heldLockUntilStopped: reason !== "database-connection-lost" });
-      return stopped;
+      for (let attempt = 1;; attempt += 1) {
+        const lost = connectionLost;
+        const attemptOptions = lost ? { ...stopOptions, graceMs: 0 } : { graceMs: 5_000, verifyMs: 2_000, ...stopOptions };
+        const stopped = await workload.stop(attemptOptions).catch((error) => ({
+          stopped: false,
+          reason: String(error?.message ?? error).slice(0, 120),
+          escalated: false,
+        }));
+
+        if (lost) {
+          // PostgreSQL already destroyed the lock. Do not claim retention and do not wait as though
+          // the dead session still protects readers; report containment truthfully and return.
+          await endFence();
+          emitReceipt("fence-shutdown", {
+            reason: "database-connection-lost", stopped: Boolean(stopped?.stopped),
+            stopReason: stopped?.reason ?? null, heldLockUntilStopped: false,
+            containmentPending: !stopped?.stopped, attempts: attempt,
+          });
+          return stopped;
+        }
+
+        if (stopped?.stopped) {
+          // Verified absence is the only voluntary healthy-session release boundary.
+          await endFence();
+          emitReceipt("fence-shutdown", {
+            reason, stopped: true, stopReason: stopped.reason ?? null,
+            heldLockUntilStopped: Boolean(fence), containmentPending: false, attempts: attempt,
+          });
+          return stopped;
+        }
+
+        emitReceipt("fence-containment-pending", {
+          reason, stopped: false, stopReason: stopped?.reason ?? null,
+          lockSessionHealthy: Boolean(fence), attempt,
+        });
+        // Stay alive with the healthy lock and retry. Connection loss wakes the loop immediately;
+        // it is a distinct outcome, never a relabeling of an ordinary stop failure.
+        await Promise.race([sleep(cleanupRetryMs), connectionLoss]);
+      }
     })();
     return cleanup;
   };
 
   // A lost connection means the shared lock is ALREADY gone. Terminate promptly; do not pretend the
   // fence is still protective, and do not wait for a graceful exit that has nothing fencing it.
-  fence?.client.on?.("error", () => { void shutdown("database-connection-lost"); });
-  for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => { void shutdown(signal); });
+  const onConnectionError = () => { void shutdown("database-connection-lost"); };
+  const signalHandlers = Object.fromEntries(["SIGTERM", "SIGINT"].map((signal) => [signal, () => { void shutdown(signal); }]));
+  fence?.client.on?.("error", onConnectionError);
+  for (const [signal, handler] of Object.entries(signalHandlers)) process.once(signal, handler);
 
-  const outcome = await workload.completion;
-  if (outcome.kind === "spawn-failed") {
-    await shutdown("spawn-failed");
-    throw Object.assign(new Error(`startup fence payload failed to spawn (${outcome.errorCode})`), { code: outcome.errorCode });
+  try {
+    const outcome = await workload.completion;
+    if (outcome.kind === "spawn-failed") {
+      await shutdown("spawn-failed");
+      throw Object.assign(new Error(`startup fence payload failed to spawn (${outcome.errorCode})`), { code: outcome.errorCode });
+    }
+    // The wrapper exiting is the START of cleanup, not the end of it: descendants may still be alive.
+    await shutdown("payload-exited");
+    return { code: outcome.code ?? (outcome.signal ? 1 : 0), signal: outcome.signal };
+  } finally {
+    for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
   }
-  // The wrapper exiting is the START of cleanup, not the end of it: descendants may still be alive.
-  await shutdown("payload-exited");
-  return { code: outcome.code ?? (outcome.signal ? 1 : 0), signal: outcome.signal };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

@@ -1,5 +1,6 @@
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { supervise } from "../scripts/staging-ops/startup-fence.mjs";
@@ -67,6 +68,7 @@ function fenceClient(groupOf: () => number | null) {
     connect: vi.fn(async () => { events.push("connect"); }),
     query: vi.fn(async (sql: string) => {
       if (String(sql).includes("pg_advisory_lock")) { events.push("lock"); return { rows: [{}] }; }
+      if (String(sql).includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
       if (String(sql).includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1" }] };
       return { rows: [] };
     }),
@@ -165,4 +167,44 @@ describe.runIf(POSIX)("every shutdown path converges on ONE idempotent cleanup",
       expect(groupAlive(groupOf()!)).toBe(false);
     }, 30_000);
   }
+});
+
+describe("failed healthy-fence cleanup remains contained", () => {
+  function syntheticChild(pid = 4242) {
+    const child = new EventEmitter() as EventEmitter & { pid: number };
+    child.pid = pid;
+    return child;
+  }
+
+  it.each(["EPERM", "EACCES"])("retains the healthy lock across %s signal failure and releases once after verified disappearance", async (errorCode) => {
+    const child = syntheticChild();
+    let alive = true;
+    let stopAttempts = 0;
+    const kill = vi.fn((_pid: number, signal: string | number) => {
+      if (signal === 0) {
+        if (alive) return true;
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }
+      stopAttempts += 1;
+      throw Object.assign(new Error("signal refused"), { code: errorCode });
+    });
+    const { client } = fenceClient(() => child.pid);
+    const supervising = supervise(["synthetic"], {
+      env: COPY_ENV,
+      createClient: () => client as never,
+      spawnImpl: (() => child) as never,
+      kill: kill as never,
+      stopOptions: { graceMs: 0, verifyMs: 2, pollMs: 1 },
+      cleanupRetryMs: 2,
+    });
+    expect(await waitFor(() => child.listenerCount("exit") > 0, 1_000)).toBe(true);
+    child.emit("exit", 0, null);
+
+    expect(await waitFor(() => stopAttempts >= 2, 1_000)).toBe(true);
+    expect(client.end, "a healthy lock must remain held while workload absence is unverified").not.toHaveBeenCalled();
+
+    alive = false;
+    await expect(supervising).resolves.toEqual({ code: 0, signal: null });
+    expect(client.end).toHaveBeenCalledTimes(1);
+  });
 });

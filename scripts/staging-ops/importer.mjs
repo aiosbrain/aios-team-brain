@@ -10,11 +10,15 @@ import neo4j from "neo4j-driver";
 import { openSignedEncryptedBundle, createSignedEncryptedBundle } from "./bundle-crypto.mjs";
 import { packPair, unpackPair, validatePairManifest } from "./bundle-format.mjs";
 import { assertCompatibleBuildIdentity, assertInstalledSchemaMatches, loaderCapabilityIdentity, schemaFingerprintDigest } from "./build-identity.mjs";
-import { credentialFingerprint, assertDistinctFingerprints } from "./credential-fingerprint.mjs";
+import {
+  credentialFingerprint,
+  assertDistinctFingerprints,
+  REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES,
+} from "./credential-fingerprint.mjs";
 import {
   installStagingOps, acquireCoordinatorLock, acquireDataUseLock, releaseCoordinatorLock,
   releaseDataUseLock, readJournal, transitionJournal, markReady, recordCatchup,
-  hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark,
+  hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark, clearRollbackTarget,
 } from "./journal.mjs";
 import { assertActionConfiguration } from "./action-preflight.mjs";
 import { emitReceipt } from "./receipts.mjs";
@@ -92,7 +96,9 @@ export function compareEnvironmentCredentials(manifest, env = process.env) {
   const current = Object.fromEntries([
     ["auth-secret", env.AUTH_SECRET], ["secrets-key", env.SECRETS_KEY], ["neo4j-credential", `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`],
   ].map(([credentialClass, value]) => [credentialClass, credentialFingerprint({ credentialClass, value, comparisonKey, keyId: env.STAGING_COMPARISON_KEY_ID })]));
-  for (const name of Object.keys(current)) assertDistinctFingerprints(manifest.credentialFingerprints?.[name], current[name], name);
+  for (const name of REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES) {
+    assertDistinctFingerprints(manifest.credentialFingerprints?.[name], current[name], name);
+  }
   return true;
 }
 
@@ -226,8 +232,8 @@ async function measuredReplaceFacts({ client, maintenance, env, opened }) {
     pinnedNeo4jService: env.STAGING_NEO4J_SERVICE_NAME, pinnedDatabase: env.STAGING_NEO4J_DATABASE,
     database: env.NEO4J_DATABASE, pinnedAppServiceId: env.STAGING_APP_SERVICE_ID,
     pinnedGraphitiServiceId: env.STAGING_GRAPHITI_SERVICE_ID,
-    targetCredentialFingerprint: credentialFingerprint({ credentialClass: "neo4j-credential", value: `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`, comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), keyId: env.STAGING_COMPARISON_KEY_ID }).mac,
-    sourceCredentialFingerprint: opened.manifest.credentialFingerprints?.["neo4j-credential"]?.mac,
+    targetCredentialFingerprint: credentialFingerprint({ credentialClass: "neo4j-credential", value: `${env.NEO4J_USER}\0${env.NEO4J_PASSWORD}`, comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), keyId: env.STAGING_COMPARISON_KEY_ID }),
+    sourceCredentialFingerprint: opened.manifest.credentialFingerprints?.["neo4j-credential"],
     electionLockHeld, exclusiveDataLockHeld, stopMeasurement,
   };
 }
@@ -410,16 +416,34 @@ function maintenanceFor(env) {
   return new RailwayMaintenance({ projectId: env.RAILWAY_PROJECT_ID, environmentId: env.STAGING_OPS_ENVIRONMENT_ID, appServiceId: env.STAGING_APP_SERVICE_ID, graphitiServiceId: env.STAGING_GRAPHITI_SERVICE_ID, token: env.RAILWAY_STAGING_MAINTENANCE_TOKEN });
 }
 
-async function openPrior({ client, journal, rollbackStore, env }) {
-  if (!journal.last_ready_run_id || !journal.last_ready_object_id || !journal.last_ready_digest) throw new Error("no canonical verified last-ready rollback pair; run bootstrap-rollback before the first import");
-  const bytes = await rollbackStore.read(journal.last_ready_object_id);
-  if (sha(bytes) !== journal.last_ready_digest) throw new Error("last-ready rollback object failed digest verification");
+async function openJournalPair({ journal, rollbackStore, env, prefix, label }) {
+  const runId = journal[`${prefix}_run_id`];
+  const objectId = journal[`${prefix}_object_id`];
+  const digest = journal[`${prefix}_digest`];
+  const commit = journal[`${prefix}_commit`];
+  if (!runId || !objectId || !digest) throw new Error(`no canonical verified ${label} rollback pair`);
+  const bytes = await rollbackStore.read(objectId);
+  if (sha(bytes) !== digest) throw new Error(`${label} rollback object failed digest verification`);
   const encoded = JSON.parse(bytes.toString("utf8"));
   const kind = encoded?.manifest?.kind === "staging-rollback" ? "rollback" : "source";
   const opened = openBundleBytes(bytes, env, kind, { ignoreExpiry: true });
-  if (opened.manifest.runId !== journal.last_ready_run_id || journal.last_ready_commit !== opened.manifest.targetCommit) throw new Error("last-ready journal/object metadata mismatch");
+  if (opened.manifest.runId !== runId || commit !== opened.manifest.targetCommit) throw new Error(`${label} journal/object metadata mismatch`);
   assertCompatibleBuildIdentity(opened.manifest.build, loaderCapabilityIdentity());
-  return { ...opened, sourceBytes: bytes, objectId: journal.last_ready_object_id, digest: journal.last_ready_digest, kind };
+  return { ...opened, sourceBytes: bytes, objectId, digest, kind };
+}
+
+async function openPrior({ journal, rollbackStore, env }) {
+  return openJournalPair({ journal, rollbackStore, env, prefix: "last_ready", label: "last-ready" })
+    .catch((error) => {
+      if (String(error?.message ?? error).includes("no canonical verified last-ready")) {
+        throw new Error("no canonical verified last-ready rollback pair; run bootstrap-rollback before the first import");
+      }
+      throw error;
+    });
+}
+
+async function openRollbackTarget({ journal, rollbackStore, env }) {
+  return openJournalPair({ journal, rollbackStore, env, prefix: "rollback_target", label: "preserved prior" });
 }
 
 function sealReadyRollback(opened, targetCommit, env) {
@@ -444,6 +468,61 @@ async function bootExact({ client, maintenance, runId, objectId, digest, commit,
   const deploymentId = await maintenance.deployApp(commit);
   await waitForImportedBoot({ maintenance, deploymentId, commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
   return { deploymentId, ready: await markReady(client, { runId, objectId, digest, commit, mode }) };
+}
+
+/**
+ * Everything here is AFTER the durable serving commit. A failure is repair work, not permission to
+ * stop the deployment that just passed health and committed `ready`.
+ *
+ * The rollback target is cleared only after durable artifact read-back, pointer, watermark and
+ * catch-up bookkeeping all succeed. Until then the prior object remains a named recovery target.
+ */
+export async function reconcileReadyInstall({
+  client, ready, opened, sourceObjectId, rollbackStore, env,
+  operations = {},
+}) {
+  const recordWatermark = operations.recordSourceWatermark ?? recordSourceWatermark;
+  const readHead = operations.readStagingHead ?? readStagingHead;
+  const writeCatchup = operations.recordCatchup ?? recordCatchup;
+  const clearTarget = operations.clearRollbackTarget ?? clearRollbackTarget;
+  if (ready?.state !== "ready" || ready.last_ready_run_id !== opened.manifest.runId) {
+    throw new Error("post-ready reconciliation requires the canonical ready journal identity");
+  }
+  if (!(await rollbackStore.verify(ready.last_ready_object_id, ready.last_ready_digest))) {
+    throw new Error("canonical ready rollback pair failed post-commit durable read-back verification");
+  }
+  await rollbackStore.writePointer("last-ready", {
+    runId: ready.last_ready_run_id,
+    objectId: ready.last_ready_object_id,
+    digest: ready.last_ready_digest,
+    commit: ready.last_ready_commit,
+    mode: ready.last_ready_mode,
+    kind: "rollback",
+  });
+  await recordWatermark(client, {
+    capturedAt: opened.manifest.captureEndedAt,
+    runId: opened.manifest.runId,
+  });
+  const head = await readHead(env);
+  await writeCatchup(client, {
+    commit: head === ready.last_ready_commit ? null : head,
+    attempts: 0,
+  });
+
+  // Once this succeeds, a later cleanup error cannot leave the journal pointing at an object it
+  // expects to use for rollback. Object deletion itself stays best-effort and is reported.
+  const reconciled = await clearTarget(client, ready.last_ready_run_id);
+  const cleanupErrors = [];
+  for (const retainedId of new Set([ready.rollback_target_object_id, sourceObjectId])) {
+    if (retainedId && retainedId !== ready.last_ready_object_id) {
+      await rollbackStore.delete(retainedId).catch((error) => cleanupErrors.push(errorText(error)));
+    }
+  }
+  return {
+    journal: reconciled,
+    catchup: head === ready.last_ready_commit ? null : head,
+    cleanupErrors,
+  };
 }
 
 /**
@@ -474,17 +553,27 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
   await emitSessionContinuity(client, { checkpoint: "rollback-reset", failedRunId, env });
   if (reset.status !== "reset") {
     notes.push(`session reset failed: ${reset.detail}`);
-    await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting", "failed", "ready"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
-    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: false });
+    const journalRecorded = await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting", "failed", "ready"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: false, journalRecorded });
     throw new Error(withNotes("the importer's database session is unusable, so NO rollback was attempted; staging remains fenced and recovery is required", notes));
   }
+
+  // Admission is a hard boundary. A refused transition cannot be converted into permission to
+  // stop services. `ready` is valid only when the caller already resolved a preserved prior target.
+  await transitionJournal(client, {
+    runId: failedRunId,
+    from: ["failed", "booting", "importing", "verifying", "draining", "ready"],
+    to: "draining",
+    patch: { lastSafeCheckpoint: "rollback" },
+  });
+
   let driver = null;
   let session = null;
+  let readyCommitted = null;
   try {
     // Stopping the services and reacquiring the exclusive lock used to sit OUTSIDE this block, so a
     // failure in either escaped raw — after the services were already stopped — and neither reached
     // the recovery-required checkpoint below nor said what state staging had been left in.
-    await recoveryStep("draining journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["failed", "booting", "importing", "verifying", "draining"], to: "draining", patch: { lastSafeCheckpoint: "rollback" } }), notes);
     await maintenance.stopAndVerifyAll();
     await acquireExclusiveDataUseLock(client, env, "rollback");
     driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD));
@@ -497,8 +586,10 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     // carries staging's own credentials, so only the source-sanitation assertion is conditional.
     await verifyInstalledPair({ client, session, graph, opened: prior, sanitationExpected: prior.kind === "source" });
     await rollbackStore.putImmutable(prior.objectId, prior.sourceBytes);
-    await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
+    const booted = await bootExact({ client, maintenance, runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, env });
+    readyCommitted = booted.ready;
     await rollbackStore.writePointer("last-ready", { runId: prior.manifest.runId, objectId: prior.objectId, digest: prior.digest, commit: prior.manifest.targetCommit, mode: prior.manifest.mode, kind: prior.kind });
+    await clearRollbackTarget(client, prior.manifest.runId);
     // The RECOVERY receipt: which run failed, which prior identity is now installed, and that BOTH
     // stores were restored and verified (`verifyInstalledPair` above covers Postgres sanitation, the
     // graph census and the ledger↔graph correspondence) and the pair booted ready.
@@ -508,12 +599,21 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     });
     return { status: "rolled-back", runId: prior.manifest.runId, recoveryNotes: notes };
   } catch (error) {
+    if (readyCommitted) {
+      emitReceipt("ready-bookkeeping-pending", {
+        runId: readyCommitted.last_ready_run_id,
+        objectId: readyCommitted.last_ready_object_id,
+        servingCommit: readyCommitted.last_ready_commit,
+        detail: errorText(error).slice(0, 200),
+      });
+      throw new Error(`rollback pair is ready and serving; post-ready bookkeeping remains pending: ${errorText(error)}`);
+    }
     // The checkpoint write is itself SQL on a connection that has just failed, so reset again and
     // report whether the checkpoint actually landed rather than assuming it did.
     const checkpointReset = await resetSessionTransactionState(client);
     if (checkpointReset.status !== "reset") notes.push(`session reset before the recovery checkpoint failed: ${checkpointReset.detail}`);
-    await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
-    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: true });
+    const journalRecorded = await recoveryStep("recovery-required journal transition", () => transitionJournal(client, { runId: failedRunId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: "recovery-required" } }), notes);
+    emitReceipt("recovery-required", { failedRunId, priorRunId: prior?.manifest?.runId ?? null, checkpoint: "recovery-required", rollbackAttempted: true, journalRecorded });
     throw new Error(withNotes(`paired rollback failed; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
   } finally { await closeAll(() => session?.close(), () => driver?.close()); }
 }
@@ -528,7 +628,6 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
   try {
   const journal = await readJournal(client);
-  const prior = await openPrior({ client, journal, rollbackStore, env });
   if (journal.state === "failed" && journal.last_safe_checkpoint === "recovery-required") {
     throw new Error("prior-pair rollback previously failed; staging remains fenced until explicit rollback recovery");
   }
@@ -537,18 +636,16 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
-    // The idempotent repair path: `markReady` may have committed and the process then died before
-    // the durable pointer was written. Re-writing the pointer from the JOURNAL (the authority) is
-    // safe to repeat, and the watermark advance below is what stops discovery re-offering this run.
-    await rollbackStore.writePointer("last-ready", {
-      runId: journal.last_ready_run_id, objectId: journal.last_ready_object_id,
-      digest: journal.last_ready_digest, commit: journal.last_ready_commit,
-      mode: journal.last_ready_mode, kind: "rollback",
-    });
-    await recordSourceWatermark(client, { capturedAt: opened.manifest.captureEndedAt, runId: opened.manifest.runId });
-    if (objectId !== journal.last_ready_object_id) await rollbackStore.delete(objectId).catch(() => {});
-    return { status: "already-ready", runId: opened.manifest.runId, objectId: journal.last_ready_object_id };
+    // Same-run repair derives every pointer from the JOURNAL authority and repeats the whole
+    // post-ready suffix. A prior attempt may have failed at any individual bookkeeping operation.
+    const reconciled = await reconcileReadyInstall({ client, ready: journal, opened, sourceObjectId: objectId, rollbackStore, env });
+    return {
+      status: "already-ready", runId: opened.manifest.runId,
+      objectId: journal.last_ready_object_id, catchup: reconciled.catchup,
+      cleanupErrors: reconciled.cleanupErrors,
+    };
   }
+  const prior = await openPrior({ journal, rollbackStore, env });
   // B3: never install a capture older than the newest one already installed. Without a durable
   // watermark, discovery that skipped the installed newest run simply picked the SECOND newest —
   // an older bundle — and the next run picked the newest again, oscillating staging forever.
@@ -568,9 +665,10 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
     throw new Error("injected harness fault before drain");
   }
   let destructive = false;
+  let readyCommitted = null;
   try {
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
-    await transitionJournal(client, { runId: opened.manifest.runId, from: ["ready", "failed"], to: "draining", patch: { lastSafeCheckpoint: "ready", candidateRunId: opened.manifest.runId, candidateObjectId: objectId, candidateDigest: opened.digest, candidateMode: "copy-ready", catchupCommit: targetCommit } });
+    await transitionJournal(client, { runId: opened.manifest.runId, from: ["ready", "failed"], to: "draining", patch: { lastSafeCheckpoint: "ready", candidateRunId: opened.manifest.runId, candidateObjectId: objectId, candidateDigest: opened.digest, candidateMode: "copy-ready", catchupCommit: targetCommit, snapshotRollbackTarget: true } });
     destructive = true;
     await maintenance.stopAndVerifyAll();
     await acquireExclusiveDataUseLock(client, env, "import");
@@ -584,19 +682,24 @@ async function installObject({ client, objectId, sourceStore, rollbackStore, mai
       const readyPair = sealReadyRollback(opened, targetCommit, env);
       await rollbackStore.putImmutable(readyPair.objectId, readyPair.sourceBytes);
       if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair failed durable read-back verification");
-      await bootExact({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
-      if (!(await rollbackStore.verify(readyPair.objectId, readyPair.digest))) throw new Error("candidate rollback pair was not durable at ready boundary");
-      await rollbackStore.writePointer("last-ready", { runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", kind: "rollback" });
-      await recordSourceWatermark(client, { capturedAt: opened.manifest.captureEndedAt, runId: opened.manifest.runId });
-      const catchup = await readStagingHead(env);
-      if (catchup !== targetCommit) await recordCatchup(client, { commit: catchup, attempts: 0 });
-      const cleanupErrors = [];
-      for (const retainedId of new Set([prior.objectId, objectId])) {
-        if (retainedId !== readyPair.objectId) await rollbackStore.delete(retainedId).catch((error) => cleanupErrors.push(String(error instanceof Error ? error.message : error)));
-      }
-      return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: catchup === targetCommit ? null : catchup, cleanupErrors };
+      const booted = await bootExact({ client, maintenance, runId: opened.manifest.runId, objectId: readyPair.objectId, digest: readyPair.digest, commit: targetCommit, mode: "copy-ready", env });
+      readyCommitted = booted.ready;
+      const reconciled = await reconcileReadyInstall({ client, ready: readyCommitted, opened, sourceObjectId: objectId, rollbackStore, env });
+      return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: reconciled.catchup, cleanupErrors: reconciled.cleanupErrors };
     } finally { await closeAll(() => session.close(), () => driver.close()); }
   } catch (error) {
+    if (readyCommitted) {
+      // `markReady` is the commit boundary. The deployment is verified serving and canonical
+      // identity is durable; stopping it because a pointer, watermark, head read, catch-up write or
+      // resource close failed would turn repairable bookkeeping into an outage.
+      emitReceipt("ready-bookkeeping-pending", {
+        runId: readyCommitted.last_ready_run_id,
+        objectId: readyCommitted.last_ready_object_id,
+        servingCommit: readyCommitted.last_ready_commit,
+        detail: errorText(error).slice(0, 200),
+      });
+      throw new Error(`paired refresh is ready and serving; post-ready bookkeeping remains pending and will reconcile on retry: ${errorText(error)}`);
+    }
     if (!destructive) throw error;
     const notes = [];
     // BEFORE the journal write and BEFORE the lock release, both of which are SQL on the connection
@@ -910,7 +1013,17 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       // The await must be INSIDE this try, not merely inside the outer one: otherwise this `finally`
       // releases the coordinator lock while the rollback it is fencing is still running, and a
       // second importer can acquire it mid-recovery — a failure independent of the connection close.
-      try { const journal = await readJournal(client); const prior = await openPrior({ client, journal, rollbackStore, env }); return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env }); }
+      try {
+        const journal = await readJournal(client);
+        const hasPreservedTarget = Boolean(journal.rollback_target_run_id);
+        if (journal.state === "ready" && !hasPreservedTarget) {
+          throw new Error("ready staging has no preserved prior rollback target; refusing to stop the healthy deployment");
+        }
+        const prior = hasPreservedTarget
+          ? await openRollbackTarget({ journal, rollbackStore, env })
+          : await openPrior({ journal, rollbackStore, env });
+        return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env });
+      }
       finally { await releaseCoordinatorLock(client).catch(() => {}); }
     }
     if (action === "install") {

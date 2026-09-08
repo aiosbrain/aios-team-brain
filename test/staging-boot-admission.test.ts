@@ -53,6 +53,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
   function fakeClient(journalRow: Record<string, unknown>) {
     const query = vi.fn(async (sql: string) => {
       if (String(sql).includes("pg_advisory_lock_shared")) return { rows: [{ acquired: true }] };
+      if (String(sql).includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
       if (String(sql).includes("refresh_journal")) return { rows: [journalRow] };
       return { rows: [] };
     });
@@ -95,6 +96,37 @@ describe("B1 — both admission sites apply that one verdict", () => {
       readFile: () => "",
       readDir: () => [],
       logger: { log: () => {} },
-    })).rejects.toThrow(/copy-mode schema loader refused: refresh state is importing/);
+    })).rejects.toThrow(/staging schema loader refused: refresh state is importing/);
+  });
+
+  it.each([undefined, "corrupted"])("refuses activated importing state with %s mode before schema SQL", async (mode) => {
+    const client = fakeClient({ state: "importing", run_id: "run-8", last_ready_run_id: "run-7" });
+    await expect(loadSchema({
+      cwd: "/nonexistent-schema-root",
+      databaseUrl: "postgres://db/x",
+      env: {
+        ...(mode === undefined ? {} : { STAGING_DATA_MODE: mode }),
+        STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg",
+      } as NodeJS.ProcessEnv,
+      createClient: () => client,
+      exists: () => false,
+      readFile: () => "schema mutation must not run",
+      readDir: () => [],
+      logger: { log: () => {} },
+    })).rejects.toThrow(/activated staging requires STAGING_DATA_MODE/);
+    const statements = client.query.mock.calls.map((call) => String(call[0]));
+    expect(statements.some((sql) => sql.includes("schema mutation must not run") || sql.includes("lock_timeout"))).toBe(false);
+  });
+
+  it("keeps an activated explicit legacy rollback under the common fence", async () => {
+    const client = fakeClient({ state: "ready", run_id: "legacy-ready", last_ready_run_id: "legacy-ready" });
+    await loadSchema({
+      cwd: "/nonexistent-schema-root", databaseUrl: "postgres://db/x",
+      env: { STAGING_DATA_MODE: "legacy-pg-only", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
+      createClient: () => client, exists: () => false, readFile: () => "", readDir: () => [], logger: { log: () => {} },
+    });
+    const statements = client.query.mock.calls.map((call) => String(call[0]));
+    expect(statements.some((sql) => sql.includes("pg_advisory_lock_shared"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("lock_timeout"))).toBe(true);
   });
 });

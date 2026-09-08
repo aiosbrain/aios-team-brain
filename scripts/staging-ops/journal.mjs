@@ -16,6 +16,11 @@ CREATE TABLE IF NOT EXISTS staging_ops.refresh_journal (
   last_ready_digest text,
   last_ready_commit text,
   last_ready_mode text,
+  rollback_target_run_id text,
+  rollback_target_object_id text,
+  rollback_target_digest text,
+  rollback_target_commit text,
+  rollback_target_mode text,
   candidate_run_id text,
   candidate_object_id text,
   candidate_digest text,
@@ -42,6 +47,11 @@ ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS catchup_attempt
 ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS catchup_error text;
 ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS source_watermark timestamptz;
 ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS source_watermark_run_id text;
+ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS rollback_target_run_id text;
+ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS rollback_target_object_id text;
+ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS rollback_target_digest text;
+ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS rollback_target_commit text;
+ALTER TABLE staging_ops.refresh_journal ADD COLUMN IF NOT EXISTS rollback_target_mode text;
 `;
 
 export async function installStagingOps(client) {
@@ -96,11 +106,30 @@ export async function transitionJournal(client, { runId, from, to, patch = {} })
        last_safe_checkpoint=COALESCE($3,last_safe_checkpoint), candidate_run_id=COALESCE($4,candidate_run_id),
        candidate_object_id=COALESCE($5,candidate_object_id), candidate_digest=COALESCE($6,candidate_digest),
        candidate_mode=COALESCE($7,candidate_mode), catchup_commit=COALESCE($8,catchup_commit),
-       boot_run_id=COALESCE($9,boot_run_id), boot_commit=COALESCE($10,boot_commit), updated_at=now()
-     WHERE singleton=true AND state = ANY($11::text[]) RETURNING *`,
-    [runId, to, patch.lastSafeCheckpoint ?? null, patch.candidateRunId ?? null, patch.candidateObjectId ?? null, patch.candidateDigest ?? null, patch.candidateMode ?? null, patch.catchupCommit ?? null, patch.bootRunId ?? null, patch.bootCommit ?? null, from]
+       boot_run_id=COALESCE($9,boot_run_id), boot_commit=COALESCE($10,boot_commit),
+       rollback_target_run_id=CASE WHEN $11 THEN last_ready_run_id ELSE rollback_target_run_id END,
+       rollback_target_object_id=CASE WHEN $11 THEN last_ready_object_id ELSE rollback_target_object_id END,
+       rollback_target_digest=CASE WHEN $11 THEN last_ready_digest ELSE rollback_target_digest END,
+       rollback_target_commit=CASE WHEN $11 THEN last_ready_commit ELSE rollback_target_commit END,
+       rollback_target_mode=CASE WHEN $11 THEN last_ready_mode ELSE rollback_target_mode END,
+       updated_at=now()
+     WHERE singleton=true AND state = ANY($12::text[]) RETURNING *`,
+    [runId, to, patch.lastSafeCheckpoint ?? null, patch.candidateRunId ?? null, patch.candidateObjectId ?? null, patch.candidateDigest ?? null, patch.candidateMode ?? null, patch.catchupCommit ?? null, patch.bootRunId ?? null, patch.bootCommit ?? null, patch.snapshotRollbackTarget === true, from]
   );
   if (result.rows.length !== 1) throw new Error(`journal transition to ${to} refused from current state`);
+  return result.rows[0];
+}
+
+/** Clear the prior target only after every fallible ready-boundary reconciliation step succeeds. */
+export async function clearRollbackTarget(client, runId) {
+  const result = await client.query(
+    `UPDATE staging_ops.refresh_journal SET
+       rollback_target_run_id=NULL, rollback_target_object_id=NULL, rollback_target_digest=NULL,
+       rollback_target_commit=NULL, rollback_target_mode=NULL, updated_at=now()
+     WHERE singleton=true AND state='ready' AND run_id=$1 RETURNING *`,
+    [runId],
+  );
+  if (result.rows.length !== 1) throw new Error("rollback target cleanup refused outside the canonical ready run");
   return result.rows[0];
 }
 
