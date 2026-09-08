@@ -18,6 +18,15 @@ export function assertRunnerRole(env, role) {
   } else {
     if (!env.RAILWAY_ENVIRONMENT_ID || env.RAILWAY_ENVIRONMENT_ID !== env.STAGING_OPS_ENVIRONMENT_ID) throw new Error("importer is not pinned to staging environment identity");
     if (env.PRODUCTION_DATABASE_URL || env.PRODUCTION_NEO4J_URL) throw new Error("importer must not receive production database endpoints");
+    // L5: the accepted role split says the importer holds NO production provider token. The
+    // database-endpoint refusal above never covered this one, and the importer's own example
+    // configuration used to carry the assignment (while telling the reader not to set it there) —
+    // an invitation to provision it on the wrong runner. `RAILWAY_PRODUCTION_READ_TOKEN` is the
+    // release controller's post-promotion PRODUCTION observation credential and belongs to the
+    // controller alone (`docs/RELEASING.md`). Refused by PRESENCE, fail-closed, without asking
+    // whose it is — the same conservative stance `assertOutboundCredentialIsolation` takes. This
+    // makes no claim that the importer currently uses that credential.
+    if (String(env.RAILWAY_PRODUCTION_READ_TOKEN ?? "").trim()) throw new Error("importer must not receive the production observation token RAILWAY_PRODUCTION_READ_TOKEN");
     parseCanonicalPostgresTarget(env.DATABASE_URL, { label: "importer Postgres" }); parseInternalHost(env.NEO4J_URL, "importer Neo4j");
   }
   return true;

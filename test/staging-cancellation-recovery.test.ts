@@ -8,7 +8,11 @@ import {
   runPollingDaemon,
   waitForAbortableInterval,
 } from "../scripts/staging-ops/importer.mjs";
-import { createSessionWatchdogOwner, createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
+import {
+  createSessionWatchdogOwner,
+  createOperationBudget,
+  StagingDeadlineExceededError,
+} from "../scripts/staging-ops/operation-deadline.mjs";
 import { beginBootstrapDraining, bootstrapResumeVerdict } from "../scripts/staging-ops/journal.mjs";
 import {
   createSignedEncryptedBundle,
@@ -83,6 +87,71 @@ describe("HIGH-1 — a shutdown signal stops new destructive work and nothing el
     expect(() => assertNotCancelled(controller.signal, "destructive staging install admission"))
       .toThrow(/destructive staging install admission refused/);
   });
+
+  // ── L2: a classified reason survives the refusal, and only a real shutdown is suppressed ───────
+
+  it("PRESERVES a deadline reason instead of relabelling it as an operator shutdown", () => {
+    // The signal owned work receives is `AbortSignal.any([external, watchdog])`, so the abort that
+    // reaches `assertNotCancelled` is just as often the operation's OWN budget expiring. Rewriting
+    // every reason to ABORTED erased the one classification the daemon acts on differently: TIMEOUT
+    // is fatal and ends the loop, ABORTED is the expected quiet stop. A deadline breach was
+    // therefore converted into a five-minute retry on a session that had already blown its budget.
+    const controller = new AbortController();
+    controller.abort(new StagingDeadlineExceededError("importer daemon tick"));
+    expect(() => assertNotCancelled(controller.signal, "destructive staging install admission"))
+      .toThrow(/destructive staging install admission refused: importer daemon tick exhausted its total time budget/);
+    try { assertNotCancelled(controller.signal, "destructive staging install admission"); }
+    catch (error) { expect((error as { code?: string }).code).toBe("STAGING_OPERATION_TIMEOUT"); }
+
+    // …and an UNCLASSIFIED external cancellation still synthesizes ABORTED, which is what makes the
+    // row above a distinction rather than a rename.
+    const bare = new AbortController();
+    bare.abort();
+    try { assertNotCancelled(bare.signal, "destructive staging install admission"); }
+    catch (error) { expect((error as { code?: string }).code).toBe("STAGING_OPERATION_ABORTED"); }
+  });
+
+  it("carries that classification out through the admission an installObject refuses on", async () => {
+    // Through the real orchestration, at the same pre-work boundary the first test uses: what the
+    // caller receives from a deadline-cancelled install is a TIMEOUT, and the CLI's `isFatal` then
+    // ends the daemon instead of scheduling another drain window in five minutes.
+    const controller = new AbortController();
+    controller.abort(new StagingDeadlineExceededError("importer daemon tick"));
+    const verifyAndPinSourceBundle = vi.fn();
+
+    const error = await installObject({
+      client: { query: vi.fn() }, objectId: `run-1--${"b".repeat(64)}`,
+      sourceStore: {}, rollbackStore: {}, maintenance: { stopAndVerifyAll: vi.fn() },
+      env: {} as NodeJS.ProcessEnv,
+      operations: { signal: controller.signal, verifyAndPinSourceBundle },
+    }).then(() => null, (thrown: Error) => thrown);
+
+    expect(error).toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+    expect(verifyAndPinSourceBundle).not.toHaveBeenCalled();
+    const isFatal = (thrown: unknown) => (thrown as { code?: string })?.code === "STAGING_OPERATION_TIMEOUT";
+    expect(isFatal(error), "the daemon would have logged its own deadline breach and retried").toBe(true);
+  });
+
+  it("REPORTS an ABORTED-coded tick failure that this daemon was never told to stop for", async () => {
+    // The suppression is keyed on the daemon's own external signal, not on an error's name. Keying
+    // it on the code silenced any ABORTED-coded failure — a tick cancelled by something else, a
+    // recovery scope that aborted on its own budget — into a quiet five-minute retry with no
+    // diagnostic at all. The signal is NOT aborted here, so this must be logged.
+    const shutdown = new AbortController();
+    const logged: string[] = [];
+    let calls = 0;
+    await runPollingDaemon({
+      tick: async () => {
+        calls += 1;
+        if (calls >= 2) shutdown.abort();
+        throw Object.assign(new Error("staging source install refused: cancelled"), { code: "STAGING_OPERATION_ABORTED" });
+      },
+      intervalMs: 1, signal: shutdown.signal, log: (message) => logged.push(message),
+    });
+    // Tick 1 ran with a live signal and IS reported; tick 2 coincides with the shutdown and is not.
+    expect(logged, "an unexplained cancellation was hidden from the operator").toHaveLength(1);
+    expect(logged[0]).toMatch(/staging importer tick failed: staging source install refused/);
+  }, 10_000);
 
   it("gives RECOVERY a fresh scope that an already-aborted shutdown cannot poison", async () => {
     // The second half of the same failure. Recovery runs precisely because the operation before it

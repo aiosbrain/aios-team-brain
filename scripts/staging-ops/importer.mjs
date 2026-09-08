@@ -76,8 +76,22 @@ const withNotes = (message, notes) => (notes.length ? `${message} [recovery note
  */
 export function assertNotCancelled(signal, operation) {
   if (!signal?.aborted) return false;
+  // L2: PRESERVE A CLASSIFIED REASON; synthesize only for an unclassified external cancellation.
+  //
+  // The signal handed to owned work is `AbortSignal.any([external, watchdog])`, so the abort that
+  // reaches here is just as often the operation's OWN deadline — a `StagingDeadlineExceededError`
+  // carrying `STAGING_OPERATION_TIMEOUT`. Rewriting every reason to `STAGING_OPERATION_ABORTED` told
+  // the caller a budget breach was an operator shutdown, which is the one classification the daemon
+  // acts on differently: `isFatal` recognises TIMEOUT and ends the loop, while ABORTED is the
+  // expected-shutdown case. So a deadline breach was relabelled into a quiet five-minute retry on a
+  // session that had already blown its budget.
+  const reason = signal.reason;
+  const code = typeof reason?.code === "string" && reason.code ? reason.code : null;
+  if (code) {
+    throw Object.assign(new Error(`${operation} refused: ${reason.message ?? code}`), { code, cause: reason });
+  }
   throw Object.assign(new Error(`${operation} refused: the staging operation was cancelled before it began`), {
-    code: "STAGING_OPERATION_ABORTED", cause: signal.reason,
+    code: "STAGING_OPERATION_ABORTED", cause: reason,
   });
 }
 
@@ -273,6 +287,43 @@ async function verifyPostgresDestination({ client, maintenance, env }) {
     : maintenance.assertPinnedPostgresTarget(postgresTarget, pins);
   const [livePostgres, providerPostgres] = await Promise.all([assertLivePostgresTarget(client, postgresTarget), providerProof]);
   return { postgresTarget, livePostgres, providerPostgres };
+}
+
+/**
+ * M1: THE NAMED READ-ONLY DESTINATION PROOF — `importer verify-target`.
+ *
+ * `docs/OPS.md` and `scripts/dm-network-attached.sh` both name a command to run against the live
+ * staging service before any schedule is enabled, to confirm the destination check passes on
+ * Railway's own private network. They named `importer verify`, which cannot perform it: `verify`
+ * verifies and pins a source BUNDLE, its preflight deliberately omits the runtime/provider pins, and
+ * its maintenance adapter is null — so the paragraph promised a measurement no supplied command
+ * made. `verifyPostgresDestination` was reachable only from install/bootstrap/replacement, i.e. only
+ * from paths that go on to drain staging.
+ *
+ * This is the same verifier, given a caller of its own. It MEASURES and returns; it never drains,
+ * transitions the journal, stops a deployment, restores a store or deletes a graph. Both underlying
+ * reads are reads: one `SELECT` on the lock-owning session, and read-only GraphQL queries against
+ * the pinned provider identities. There is no skip-if-unpinned branch — a missing pin fails
+ * preflight and a mismatched one fails the assertion, because a check that returns green when it
+ * could not look is the thing this exists to replace.
+ *
+ * `proof` distinguishes the two adapters honestly: the local harness has no provider to measure, so
+ * a harness pass is reported as `local-harness` and is NOT the activation evidence.
+ *
+ * The connection string is deliberately absent from the result — this value is printed by the CLI.
+ */
+export async function verifyStagingTarget({ client, maintenance, env }) {
+  const { postgresTarget, livePostgres, providerPostgres } = await verifyPostgresDestination({ client, maintenance, env });
+  return {
+    status: "target-verified",
+    proof: env.STAGING_MAINTENANCE_ADAPTER === "local" ? "local-harness" : "provider-measured",
+    target: {
+      hostname: postgresTarget.hostname, port: postgresTarget.port,
+      database: postgresTarget.database, username: postgresTarget.username,
+    },
+    live: livePostgres,
+    provider: providerPostgres,
+  };
 }
 
 async function measuredReplaceFacts({ client, maintenance, env, opened }) {
@@ -551,9 +602,24 @@ async function openRollbackTarget({ journal, rollbackStore, env }) {
   return openJournalPair({ journal, rollbackStore, env, prefix: "rollback_target", label: "preserved prior" });
 }
 
-function sealReadyRollback(opened, targetCommit, env) {
+/**
+ * M3: SEALING IS WHERE A CLAIM BECOMES PROVENANCE, so `databaseMode` is decided here, not copied.
+ *
+ * This mints an importer-signed rollback envelope, and `preservesCapturedStagingCredentials` reads
+ * `databaseMode: "full"` on such an envelope as authority to restore the whole database and skip the
+ * tester reapply. Spreading the opened manifest and defaulting only the ABSENT case therefore
+ * laundered a source claim into that authority: a source bundle declaring `full` was refused as a
+ * direct install, then re-sealed into a rollback pair the importer's own key vouches for — with a
+ * sanitized archive that has no auth rows to restore.
+ *
+ * The carry-forward is keyed on the SAME non-caller-assertable predicate the restore uses, so only
+ * an already-authenticated importer-owned FULL checkpoint (the catch-up re-seal of a bootstrap
+ * baseline) keeps its mode. Everything sealed from a source is `sanitized`, whatever it claimed.
+ */
+export function sealReadyRollback(opened, targetCommit, env) {
   const manifest = {
-    ...opened.manifest, kind: "staging-rollback", databaseMode: opened.manifest.databaseMode ?? "sanitized",
+    ...opened.manifest, kind: "staging-rollback",
+    databaseMode: preservesCapturedStagingCredentials(opened) ? opened.manifest.databaseMode : "sanitized",
     targetCommit, mode: opened.manifest.mode ?? "copy-ready", expiresAt: "9999-12-31T23:59:59.999Z",
   };
   delete manifest.signature; delete manifest.ciphertextSha256; delete manifest.encryption; delete manifest.signing;
@@ -1062,8 +1128,13 @@ function bootstrapOrdinaryFailureFault(env, { runId, resumed }) {
   throw new Error("injected harness bootstrap failure after the verified stop");
 }
 
-async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null, signal, beginRecoveryWatchdog }) {
+export async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null, signal, beginRecoveryWatchdog }) {
   const operationBudget = budget ?? createOperationBudget("bootstrap rollback", deadlines.operationMs);
+  // L1: BEFORE ANY WORK AT ALL — before the coordinator lock, the journal read and the destination
+  // measurement. A shutdown observed here costs an operator one re-run and no maintenance window;
+  // the first thing that used to observe one was a subprocess spawn inside the capture, long after
+  // the drain and the verified stop.
+  assertNotCancelled(signal, "staging bootstrap rollback");
   operationBudget.assert("bootstrap coordinator lock");
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
   // EVERYTHING after the acquisition is inside the release scope. The journal read, the deployment
@@ -1075,6 +1146,25 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   const mode = env.STAGING_BOOTSTRAP_MODE;
   const runId = `bootstrap-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   let current = null;
+  /**
+   * L1/L3: HAS THIS INVOCATION ADMITTED A MAINTENANCE WINDOW?
+   *
+   * The recovery below exists to put back a baseline THIS run took down. Before admission there is
+   * nothing to put back: no draining transition, no stop, no deployment change — so running it would
+   * write `failed` over a journal this run never moved and redeploy an app that never stopped.
+   * `current` is not that signal, because it is measured (or read from the interruption record)
+   * while everything is still untouched.
+   *
+   * Set BEFORE the admitting statement, never after: an admission that throws may already have
+   * committed, and a stop that throws may already have stopped some services. Over-recovering costs
+   * a redeploy of the unchanged baseline; under-recovering leaves staging stopped and fenced.
+   */
+  let admitted = false;
+  /**
+   * The mode RECOVERY is entitled to use. For a resume this becomes the mode the interrupted worker
+   * actually stopped (the recorded one), not whatever this worker happens to be configured for.
+   */
+  let recoveryMode = mode;
   // WHICH PHASE. Runtime 4's bootstrap "timed out" and the operation was unidentified: maintenance
   // calls, object-store reads and the health poll all have their own deadlines, and nothing said
   // which one was running. One receipt per phase, names only — no configuration, no arguments.
@@ -1116,11 +1206,20 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     if (verdict.resume) {
       resumed = verdict;
       bootstrapRunId = verdict.runId;
-      // The RECORDED baseline, not a fresh measurement. This is the identity the interrupted worker
-      // measured while a deployment was still serving, which is the only time it was measurable.
-      current = { deployment: { id: verdict.deploymentId }, commit: verdict.commit };
       phase("resume-interrupted-bootstrap", { bootstrapRunId, resumedPhase: verdict.phase, deploymentId: verdict.deploymentId });
+      // ⚠️ L3: THE MODE IS VALIDATED BEFORE `current` IS ASSIGNED, which is what keeps a refused
+      // retry out of the mutation/recovery region entirely.
+      //
+      // `current` used to be assigned first, so a rejected mode threw with a measured baseline in
+      // hand — and the catch below restarts "whenever current exists", using the CONFIGURED mode the
+      // validation had just refused. An invalid retry could therefore transition the journal and
+      // issue a deployment despite never having been admitted to anything.
       if (verdict.mode !== mode) throw new Error("the recorded interrupted bootstrap ran in a different supported staging mode than this worker is configured for");
+      // The RECORDED baseline, not a fresh measurement. This is the identity the interrupted worker
+      // measured while a deployment was still serving, which is the only time it was measurable —
+      // and its mode is what recovery is entitled to use from here on.
+      current = { deployment: { id: verdict.deploymentId }, commit: verdict.commit };
+      recoveryMode = verdict.mode;
       // ⚠️ H2: A RESUME RE-ENTERS DRAINING AND RE-PROVES THE STOP. Neither is optional.
       //
       // The resume branch used to take the exclusive lock directly, on the theory that the recorded
@@ -1133,6 +1232,13 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
       // idempotent over BOTH interruption windows and over an ordinary failure, and re-establishes
       // read-back-verified "nothing is serving" rather than inheriting a claim from a dead worker.
       operationBudget.assert("bootstrap resume draining transition");
+      // L1: THE ADMISSION BOUNDARY on the resume branch, and the last moment a shutdown may refuse
+      // for free. Everything above is read-only (journal read, destination measurement, verdict);
+      // the transition below re-enters draining and the stop that follows takes services down. A
+      // shutdown may never open a NEW maintenance window — and once past this line it may never
+      // withhold recovery either, which is why `admitted` is set here and the catch honours it.
+      assertNotCancelled(signal, "staging bootstrap resume draining admission");
+      admitted = true;
       phase("transition-draining", { from: journal.state, resumed: true });
       await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "draining" });
       phase("stop-and-verify-all", { resumed: true });
@@ -1153,6 +1259,12 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
       // and the run identity that validates it must land together, or a kill between them leaves a
       // recorded bootstrap that every later run refuses and no command can clear.
       phase("record-bootstrap-recovery", { deploymentId: current.deployment?.id ?? null });
+      // L1: the same admission boundary on the FRESH branch. The deployment measurement above is a
+      // read; `beginBootstrapDraining` is the write that opens the window, so the cancellation check
+      // belongs between them — a signal delivered after the read-only measurement must leave the
+      // journal and the serving baseline exactly as they were.
+      assertNotCancelled(signal, "staging bootstrap draining admission");
+      admitted = true;
       phase("transition-draining", { from: journal.state });
       await beginBootstrapDraining(client, {
         runId, deploymentId: current.deployment?.id ?? null, commit: current.commit, mode,
@@ -1267,6 +1379,22 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     await clearBootstrapRecovery(client, bootstrapRunId);
     return { status: resumed ? "bootstrapped-after-interruption" : "bootstrapped", runId: bootstrapRunId, objectId: created.objectId, commit: current.commit, mode, resumedFrom: resumed?.phase ?? null };
   } catch (error) {
+    // ⚠️ L1/L3: A PRE-ADMISSION REFUSAL LEAVES EVERYTHING EXACTLY AS IT WAS.
+    //
+    // No draining transition, no stop, no deployment change — so there is nothing to recover, and
+    // the block below would not be a recovery: it would write `failed` over a journal this run never
+    // moved and redeploy an app that never stopped, on a mode this run may have just refused. It
+    // would also convert an external shutdown into a lifecycle mutation, which is the opposite of
+    // what a shutdown asked for.
+    //
+    // The refusal is reported as-is. Nothing here claims the baseline is healthy or serving: this
+    // invocation did not stop it, and did not measure it afterwards either. Interrupted-state
+    // evidence (an existing bootstrap interruption record, an existing journal state) is preserved
+    // untouched for the next run to reconcile.
+    if (!admitted) {
+      phase("refused-before-admission", { resumed: Boolean(resumed), measuredDeployment: Boolean(current) });
+      throw error;
+    }
     const notes = [];
     const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
     return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async (_recoverySignal) => {
@@ -1293,9 +1421,13 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
       // A failure BEFORE the deployment was measured has nothing to restart, and nothing was
       // changed either. Said plainly, rather than as a `TypeError` on `null.commit` in a note.
       if (!current) throw new Error("the current staging deployment was never measured, so there is nothing to restart (and nothing was changed)");
-      await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: mode, bootRunId: bootstrapRunId, bootCommit: current.commit } });
+      // L3: the RECORDED mode, never the configured one. On a resume these are equal by validation;
+      // sourcing it from the record is what stops a configuration value that was refused, or that
+      // drifted after the interruption, from deciding how the baseline comes back and what the boot
+      // probe accepts.
+      await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: recoveryMode, bootRunId: bootstrapRunId, bootCommit: current.commit } });
       const deploymentId = await maintenance.deployApp(current.commit);
-      await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
+      await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode: recoveryMode });
       restored = true;
     } catch (restoreError) { restored = false; notes.push(`deployment restart failed: ${errorText(restoreError).slice(0, 200)}`); }
     await recoveryStep("bootstrap checkpoint journal transition", () => transitionJournal(client, {
@@ -1423,6 +1555,22 @@ export async function importerPreflight(env = process.env, action = "install") {
     "STAGING_POSTGRES_SERVICE_ID", "STAGING_POSTGRES_SERVICE_INSTANCE_ID", "STAGING_POSTGRES_DEPLOYMENT_ID",
     "STAGING_POSTGRES_HOST", "STAGING_POSTGRES_DATABASE",
   ];
+  // M1: `verify-target` requires the settings the destination proof ACTUALLY reads — the maintenance
+  // adapter's scope, the pinned Postgres/importer identities, and (off the local harness) the
+  // provider target pins. It deliberately requires none of the source-object, tester, origin or
+  // rollback-signing configuration: those belong to actions that install or restore a pair, and
+  // demanding them would make a read-only check unavailable exactly when an operator most needs it
+  // — before the rest of the system has been provisioned.
+  if (action === "verify-target") {
+    const destination = [
+      "RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "STAGING_OPS_ENVIRONMENT_ID",
+      "RAILWAY_STAGING_MAINTENANCE_TOKEN", "STAGING_APP_SERVICE_ID", "STAGING_GRAPHITI_SERVICE_ID",
+      "STAGING_IMPORTER_SERVICE_ID",
+    ];
+    for (const name of [...destination, ...providerTarget]) if (!env[name]) throw new Error(`${name} is required`);
+    assertActionConfiguration(env, action);
+    return true;
+  }
   const rollback = [];
   for (const name of [...common, ...(action === "verify" || action === "install-ops" ? [] : [...runtime, ...providerTarget]), ...rollback]) if (!env[name]) throw new Error(`${name} is required`);
   for (const name of ["EXPORTER_SIGNING_PUBLIC_KEY", "IMPORTER_ENCRYPTION_PRIVATE_KEY", ...(action === "verify" ? [] : ["ROLLBACK_SIGNING_PRIVATE_KEY", "ROLLBACK_SIGNING_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PUBLIC_KEY", "ROLLBACK_ENCRYPTION_PRIVATE_KEY"])]) keyMaterial(env, name);
@@ -1482,7 +1630,13 @@ export async function runPollingDaemon({ tick, intervalMs, signal, isFatal = () 
     try { await tick(); }
     catch (error) {
       if (isFatal(error)) throw error;
-      if (error?.code !== "STAGING_OPERATION_ABORTED") {
+      // L2: suppression is keyed on THIS DAEMON'S external signal, not on an error's name. Only the
+      // shutdown signal ends this loop, so only a cancellation that coincides with it is the
+      // expected quiet stop. Keying on the code alone silenced any ABORTED-coded failure — including
+      // a tick cancelled by something the daemon was never told about — into a five-minute retry
+      // with no diagnostic. An ordinary failure is still logged either way.
+      const expectedShutdown = signal.aborted && error?.code === "STAGING_OPERATION_ABORTED";
+      if (!expectedShutdown) {
         log(`staging importer tick failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
@@ -1493,7 +1647,7 @@ export async function runPollingDaemon({ tick, intervalMs, signal, isFatal = () 
 
 export async function runImporter(env = process.env, argv = process.argv.slice(2), { activationRunner = runActivationPreflight, activationOptions = {}, now = undefined } = {}) {
   const action = argv[0];
-  if (!new Set(["install-ops", "verify", "install", "bootstrap-rollback", "rollback", "tick", "daemon", "activation-preflight"]).has(action)) throw new Error("importer action must be install-ops, verify, install, bootstrap-rollback, rollback, tick, daemon, or activation-preflight");
+  if (!new Set(["install-ops", "verify", "verify-target", "install", "bootstrap-rollback", "rollback", "tick", "daemon", "activation-preflight"]).has(action)) throw new Error("importer action must be install-ops, verify, verify-target, install, bootstrap-rollback, rollback, tick, daemon, or activation-preflight");
   // The activation verifier is READ-ONLY and needs no database, no locks and no runner role: it is
   // the check an operator runs BEFORE any of this is turned on, and making it depend on the runtime
   // it is supposed to authorise would be circular. It refuses on `UNVERIFIED` as well as on
@@ -1548,10 +1702,17 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     // Constructed INSIDE the cleanup scope. These three ran between `client.connect()` and the
     // `try`, so a store or maintenance adapter that refused its own configuration left an open
     // Postgres connection with nothing to close it.
-    const sourceStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "source", role: "source-reader" });
-    const rollbackStore = action === "install-ops" ? null : createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
+    // `verify-target` measures the DESTINATION; it reads no bundle, so it constructs no object
+    // store. Building them here would make a read-only destination check depend on source/rollback
+    // storage configuration it never touches.
+    const bundleStores = action !== "install-ops" && action !== "verify-target";
+    const sourceStore = bundleStores ? createPrivateStore({ env, scope: "source", role: "source-reader" }) : null;
+    const rollbackStore = bundleStores ? createPrivateStore({ env, scope: "rollback", role: "rollback-owner" }) : null;
     const maintenance = action === "verify" || action === "install-ops" ? null : maintenanceFor(env);
     if (action === "install-ops") { await installStagingOps(client); return { status: "installed" }; }
+    // M1: READ-ONLY, and its position says so — before the deadline configuration and every
+    // lifecycle branch below. It returns the measured target; nothing here drains, stops or writes.
+    if (action === "verify-target") return await verifyStagingTarget({ client, maintenance, env });
     if (action === "verify") {
       const objectId = argv[1]; if (!objectId) throw new Error("canonical immutable object ID is required");
       const opened = await verifyAndPinSourceBundle({ objectId, sourceStore, rollbackStore, env }); compareEnvironmentCredentials(opened.manifest, env);

@@ -16,8 +16,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { isDirectEntry } from "./direct-entry.mjs";
 
 /** Every `bootstrap-phase` receipt in a captured log, in the order the importer emitted them. */
 export function bootstrapPhases(text) {
@@ -50,7 +49,15 @@ export function bootstrapResumeOrderVerdict(text) {
   return { ok: true, reason: null, positions };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+// M2: THE ENTRY TEST ITSELF WAS A WAY TO PASS WITHOUT CHECKING ANYTHING.
+//
+// `fileURLToPath(import.meta.url) === path.resolve(process.argv[1])` compares the module's REAL path
+// against the literal invocation path, and Node resolves a module's own path through symlinks — so
+// an invocation through a symlinked path never matched, the block below never ran, and the process
+// exited **0 having printed nothing**. The harness reads only the exit status, so that is
+// indistinguishable from a verified ordering. Shared, symlink-and-encoding-safe test instead; a
+// path that cannot be resolved still fails closed. Importing this module remains side-effect-free.
+if (isDirectEntry(import.meta.url)) {
   const file = process.argv[2];
   if (!file) { console.error("a captured importer log path is required"); process.exit(2); }
   const verdict = bootstrapResumeOrderVerdict(readFileSync(file, "utf8"));

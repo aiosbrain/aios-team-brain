@@ -281,6 +281,36 @@ describe("paired refresh isolated harness", () => {
     expect(harness).toContain("require_receipt bootstrap-first-import-recovers.log prior-pair-restored");
   });
 
+  it("retries the deliberately failed source EXPLICITLY, with the automatic denial as its control", () => {
+    // Paired CI 34bc6ccd. run-1's destructive install was failed on purpose and rolled back, so
+    // `staging_ops.source_install_attempts` carries a `failed` record and the automatic path must
+    // refuse it — that record exists precisely to stop the unattended loop from draining staging
+    // again for a candidate known to fail. The harness invoked `tick` at this step anyway, so
+    // CORRECT behaviour would have failed the lane: the step passed only because the automatic path
+    // admitted the retry. The denial is now the negative control and the retry is explicit.
+    const denied = harness.indexOf("expect_failure run1-automatic-retry-denied");
+    const explicit = harness.indexOf('importer.mjs install "$run1_object"');
+    expect(denied, "the automatic-denial negative control is gone").toBeGreaterThan(-1);
+    expect(explicit, "the explicit operator retry no longer follows the denial").toBeGreaterThan(denied);
+    // Denied for the RECORDED ATTEMPT, not for any refusal that happens to exit non-zero…
+    expect(harness).toContain("automatic refresh will not drain staging again for it");
+    // …and it changed nothing: same serving state, and no receipt of a maintenance window.
+    expect(harness).toContain('require_journal state ready "the denied automatic retry left the serving pair alone"');
+    expect(harness).toContain("refuse_receipt run1-automatic-retry-denied.log postgres-restored");
+    expect(harness).toContain("refuse_receipt run1-automatic-retry-denied.log prior-pair-restored");
+    // The later same-run explicit install stays a no-op check, and the run-4 automatic denial
+    // coverage elsewhere in the lane is untouched.
+    expect(harness.indexOf('importer.mjs install "$run1_object"', explicit + 1), "the same-run no-op retry was displaced").toBeGreaterThan(explicit);
+  });
+
+  it("requires the resume-order checker's SUCCESS VERDICT, not only its exit status", () => {
+    // M2: the checker's entry test could answer "no" for a symlinked invocation, in which case it
+    // ran no body and exited 0 having printed nothing — indistinguishable from a verified ordering
+    // to a caller reading only `$?`. Two checks now, and this pins the second.
+    expect(harness).toContain('grep -q "verified resume ordering" <<<"$resume_order_verdict"');
+    expect(harness).toContain("without emitting its success verdict");
+  });
+
   it("has a resume-ordering checker that passes the real sequence and REFUSES a lock-first one", async () => {
     // The parser is the checked-in module the harness runs, not a restatement of it, and it is run
     // both ways: a log missing a checkpoint and a log whose lock precedes the re-stop must both

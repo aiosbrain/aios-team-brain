@@ -30,6 +30,9 @@ const POSTURES = new Set(["team", "external"]);
 export const ACTION_REQUIREMENTS = Object.freeze({
   "install-ops": { origin: false, testers: false, head: false },
   verify: { origin: false, testers: false, head: false },
+  // M1: the read-only destination proof. It measures a Postgres target and returns; it never boots
+  // a deployment, restores a pair or reads the branch head, so it reaches for none of these.
+  "verify-target": { origin: false, testers: false, head: false },
   install: { origin: true, testers: true, head: true },
   tick: { origin: true, testers: true, head: true },
   daemon: { origin: true, testers: true, head: true },

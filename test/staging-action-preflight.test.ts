@@ -130,11 +130,15 @@ describe("H2 — every action is gated on exactly what it later reaches for", ()
   it("requires nothing extra of the read-only actions", () => {
     expect(assertActionConfiguration({} as NodeJS.ProcessEnv, "verify")).toBe(true);
     expect(assertActionConfiguration({} as NodeJS.ProcessEnv, "install-ops")).toBe(true);
+    // M1: the destination proof boots nothing, restores nothing and reads no branch head, so it
+    // reaches for none of these three settings either. Its own dependencies — the project,
+    // environment, Postgres and importer pins — are required by `importerPreflight`, not here.
+    expect(assertActionConfiguration({} as NodeJS.ProcessEnv, "verify-target")).toBe(true);
   });
 
   it("enumerates the ordinary action-requirements contract, and refuses anything outside it", () => {
     // The previous title — "covers every action the importer CLI accepts" — overstated this list.
-    // `runImporter` accepts EIGHT actions; this table has seven, and the missing one is deliberate:
+    // `runImporter` accepts NINE actions; this table has eight, and the missing one is deliberate:
     // `activation-preflight` returns from `runImporter` before `importerPreflight`, because the
     // activation verifier is read-only, needs no database, no locks and no runner role, and making
     // it depend on the runtime it authorises would be circular. `install-ops` is in the table but
@@ -145,7 +149,7 @@ describe("H2 — every action is gated on exactly what it later reaches for", ()
     // A future action that quietly inherited no requirements is the shape of this whole defect —
     // and the second assertion is what makes that failure closed rather than permissive.
     expect(Object.keys(ACTION_REQUIREMENTS).sort()).toEqual(
-      ["bootstrap-rollback", "daemon", "install", "install-ops", "rollback", "tick", "verify"]
+      ["bootstrap-rollback", "daemon", "install", "install-ops", "rollback", "tick", "verify", "verify-target"]
     );
     expect(() => assertActionConfiguration(VALID, "not-an-action")).toThrow(/unknown importer action/);
     // The intentional exception, stated as an assertion rather than only in prose: it is absent from

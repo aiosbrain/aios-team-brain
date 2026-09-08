@@ -33,8 +33,10 @@
 # `::ffff:`-mapped or as native IPv6; `normalizedAddress` folds the mapped form, but the actual
 # address family a live Railway backend reports is UNMEASURED. `assertPinnedPostgresTarget` and this
 # peer check therefore remain ACTIVATION PREREQUISITES: before enabling the schedule, run
-# `importer verify` against the live staging service and confirm the destination check passes on
-# Railway's own network. See docs/OPS.md.
+# `node scripts/staging-ops/importer.mjs verify-target` against the live staging service and confirm
+# the destination check passes on Railway's own network. NOT `verify` — that verifies and pins a
+# source BUNDLE and measures no destination; `verify-target` is the read-only destination proof, and
+# only its `proof: "provider-measured"` result is the activation evidence. See docs/OPS.md.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)" || { echo "[dm-network] not in a git repo" >&2; exit 1; }

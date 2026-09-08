@@ -111,10 +111,17 @@ describe("M3 — candidate deployment evidence is bound to the pinned service an
     const workflow = readFileSync(".github/workflows/release-controller.yml", "utf8");
     expect(workflow).toContain("RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}");
     expect(workflow).toContain("RAILWAY_STAGING_READ_TOKEN: ${{ secrets.RAILWAY_STAGING_READ_TOKEN }}");
-    // …and the kind is written down where an operator provisions it, not only in a code comment.
-    const example = readFileSync("config/staging-ops/importer.example.env", "utf8");
-    expect(example).toMatch(/RAILWAY_PRODUCTION_READ_TOKEN/);
-    expect(example).toMatch(/production[\s\S]{0,400}Project-Access-Token/i);
+    // …and the kind is written down where an operator provisions THE CONTROLLER, not only in a code
+    // comment. L5: that is the release documentation, not the importer's example environment. The
+    // importer role holds no production provider token, so documenting it on the importer's own
+    // configuration invited provisioning it on the wrong runner — and `assertRunnerRole` now
+    // refuses an importer that carries one (see `test/staging-role-policy.test.ts`).
+    const releasing = readFileSync("docs/RELEASING.md", "utf8");
+    expect(releasing).toMatch(/RAILWAY_PRODUCTION_READ_TOKEN/);
+    expect(releasing).toMatch(/production[\s\S]{0,400}Project-Access-Token/i);
+    const importerExample = readFileSync("config/staging-ops/importer.example.env", "utf8");
+    expect(importerExample, "the importer example still assigns the production observation token")
+      .not.toMatch(/^RAILWAY_PRODUCTION_READ_TOKEN=/m);
   });
 
   it("applies the same binding to the production observation", async () => {

@@ -31,6 +31,16 @@ export async function unpackPair(payload, directory, expected) {
   return JSON.parse(await readFile(path.join(directory, "graph.json"), "utf8"));
 }
 
+/**
+ * The database modes a pair may declare.
+ *
+ * `full` means "this archive contains the whole database as captured, credentials included", and it
+ * is the term `preservesCapturedStagingCredentials` reads to choose the whole-database restore and
+ * to SKIP the tester reapply. `sanitized` is everything else. There is no third value, and an
+ * unrecognised one must not reach either decision.
+ */
+const SUPPORTED_DATABASE_MODES = new Set(["sanitized", "full"]);
+
 export function validatePairManifest(manifest, now = Date.now(), { allowRollback = false } = {}) {
   const errors = [];
   if (manifest?.formatVersion !== 1 || manifest?.graphCodecVersion !== 1) errors.push("unsupported bundle/graph codec version");
@@ -39,6 +49,24 @@ export function validatePairManifest(manifest, now = Date.now(), { allowRollback
   if (Date.parse(manifest?.expiresAt ?? "") <= now) errors.push("source bundle expired before it was pinned locally");
   const rollback = manifest?.kind === "staging-rollback";
   if (rollback && !allowRollback) errors.push("importer-owned rollback bundle is not a source bundle");
+  // M3: `databaseMode` was never validated here, and the value travels: `sealReadyRollback` used to
+  // copy it out of the SOURCE manifest into the importer-signed rollback envelope, so a source that
+  // simply declared `full` came back as a provenance-valid FULL rollback — one whose archive is
+  // sanitized and therefore lacks the projected auth/ledger rows a full restore expects, and whose
+  // credential reapply and sanitation verification are both skipped.
+  //
+  // A source bundle is sanitized by construction. The current exporter omits the field entirely, so
+  // ABSENT stays supported and means sanitized (never full); an EXPLICIT non-sanitized claim on a
+  // source manifest is refused at admission rather than carried anywhere. `full` remains exclusive
+  // to importer-captured, importer-authenticated staging checkpoints.
+  const declaredMode = manifest?.databaseMode;
+  if (declaredMode !== undefined && declaredMode !== null) {
+    if (typeof declaredMode !== "string" || !SUPPORTED_DATABASE_MODES.has(declaredMode)) {
+      errors.push(`unsupported database mode ${JSON.stringify(String(declaredMode).slice(0, 32))}`);
+    } else if (!rollback && declaredMode !== "sanitized") {
+      errors.push(`source bundle declares database mode ${declaredMode}; a source capture is sanitized`);
+    }
+  }
   for (const name of rollback ? ["postgres", "graph"] : ["postgres", "authUsers", "graphLedger", "graph"]) if (!/^[0-9a-f]{64}$/.test(manifest?.checksums?.[name]?.sha256 ?? "")) errors.push(`missing ${name} checksum`);
   if (!manifest?.build?.applicationCommit || !manifest?.build?.schemaFingerprint || !manifest?.build?.migrationSet?.sha256) errors.push("source build identity is incomplete");
   // A rollback envelope is staging-owned and may legitimately contain staging's own credentials.

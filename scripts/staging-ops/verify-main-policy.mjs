@@ -37,9 +37,7 @@
  *     one ruleset does not cancel restrictions imposed by the three desired ones.
  */
 
-import { realpathSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { isDirectEntry as directEntry } from "./direct-entry.mjs";
 import { verifyEffectiveMainPolicy } from "./main-policy.mjs";
 
 const API = "https://api.github.com";
@@ -170,26 +168,19 @@ export async function verifyMainPolicyFromProvider(env = process.env, { fetchImp
 /**
  * L8: is THIS module the process entry point?
  *
- * The previous test was `import.meta.url === new URL('file://' + process.argv[1]).href`, which
- * `release-candidate-guard.mjs` documents as having shipped once and exited **0 having printed
- * nothing** — the false green this verifier exists to refuse. It compares an ENCODED URL against a
- * raw path, so a directory containing a space (or any character URL-encoding touches) never matches,
- * and it compares the literal path, so an invocation through a SYMLINK never matches either.
+ * The technique now lives in `direct-entry.mjs` because a SECOND CLI needed it and re-derived the
+ * fragile version instead (`assert-bootstrap-resume-order.mjs`, M2). The reasoning is recorded
+ * there; this wrapper keeps the local signature its callers and tests already use.
  *
- * Resolved on both sides instead: `fileURLToPath` undoes the encoding, `realpathSync` undoes the
- * symlink. `path.resolve` is the fallback for a path that does not exist on disk — that cannot match
- * a real module file, so the failure stays closed.
- *
- * Deliberately NOT the `--run` ack token that guard uses. This module is imported by tests and could
- * later be imported by another CLI; `--run` is a bare argv word, so ANY entry point invoked with it
- * would fire every imported module's CLI, and the two conventions would collide silently. The
- * documented invocation (`node scripts/staging-ops/verify-main-policy.mjs`) is unchanged, and an
- * import remains side-effect-free because a test runner's `argv[1]` is never this file.
+ * Deliberately NOT the `--run` ack token that `release-candidate-guard.mjs` uses. This module is
+ * imported by tests and could later be imported by another CLI; `--run` is a bare argv word, so ANY
+ * entry point invoked with it would fire every imported module's CLI, and the two conventions would
+ * collide silently. The documented invocation (`node scripts/staging-ops/verify-main-policy.mjs`) is
+ * unchanged, and an import remains side-effect-free because a test runner's `argv[1]` is never this
+ * file.
  */
 export function isDirectEntry(entry = process.argv[1], moduleUrl = import.meta.url) {
-  if (!entry) return false;
-  const resolved = (value) => { try { return realpathSync(value); } catch { return path.resolve(value); } };
-  return resolved(fileURLToPath(moduleUrl)) === resolved(entry);
+  return directEntry(moduleUrl, entry);
 }
 
 if (isDirectEntry()) {

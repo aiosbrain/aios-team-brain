@@ -295,7 +295,15 @@ require_receipt bootstrap-resume-after-publish.log bootstrap-phase '"phase":"ado
 # re-stop — and against the serving baseline attempt 3 restored, it would never emit anything after
 # it. The checker is a file, not `node -e`, so the parser itself is exercised by a unit test in both
 # directions rather than being trusted to have matched anything.
-node scripts/staging-ops/assert-bootstrap-resume-order.mjs "$harness_root/bootstrap-resume-after-publish.log"
+# TWO CHECKS, because exit status alone is not proof that anything was checked (M2). A CLI whose
+# entry test answers "no" runs no body and exits 0 having printed nothing — indistinguishable from a
+# verified ordering to a caller reading only `$?`. So the success verdict is required as well.
+resume_order_verdict="$(node scripts/staging-ops/assert-bootstrap-resume-order.mjs "$harness_root/bootstrap-resume-after-publish.log")"
+printf '%s\n' "$resume_order_verdict"
+grep -q "verified resume ordering" <<<"$resume_order_verdict" || {
+  echo "the resume-order checker exited zero without emitting its success verdict; it may not have run at all" >&2
+  exit 1
+}
 require_journal state ready "the resumed bootstrap reached a verified prior pair and a serving baseline"
 require_journal last_ready_mode "$baseline_mode" "the resumed bootstrap retained the configured baseline mode"
 [[ "$(journal_field last_ready_run_id)" == "$interrupted_run" ]] || { echo "the recovered bootstrap did not retain its original run identity" >&2; exit 1; }
@@ -373,7 +381,40 @@ bootstrap_run="$(journal_field last_ready_run_id)"
 }
 "${compose[@]}" run --rm fixture-controller assert-bootstrap "$baseline_mode" "$interrupted_run"
 
-"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+# ⚠️ THE AUTOMATIC PATH MUST REFUSE run-1 HERE, AND THIS STEP USED TO INVOKE IT.
+#
+# run-1's destructive install failed above (the deliberate `after-postgres` fault) and was rolled
+# back, so `staging_ops.source_install_attempts` carries a `failed` record for that immutable object
+# and the success watermark was deliberately not advanced past it. `sourceAttemptAdmission` therefore
+# blocks the unattended tick — which is the whole point of the record: without it the daemon
+# rediscovers exactly this object every five minutes and drains, stops and restores staging again for
+# a candidate already known to fail. The harness called `tick` here anyway, so a correct refusal
+# would have failed the lane and the step only passed because the automatic path admitted it.
+#
+# The negative control comes FIRST and asserts no mutation, then the retry is made the way the
+# accepted design says it must be: an explicit operator naming the object.
+expect_failure run1-automatic-retry-denied "${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs tick
+grep -q "automatic refresh will not drain staging again for it" "$harness_root/run1-automatic-retry-denied.log" || {
+  echo "the automatic tick was refused for some other reason than the recorded failed attempt" >&2
+  sed -n '1,40p' "$harness_root/run1-automatic-retry-denied.log" >&2
+  exit 1
+}
+# NOTHING MOVED. The refusal sits before the drain, so the bootstrap pair the recovery restored is
+# still the serving one and no receipt of a new maintenance window exists.
+require_journal state ready "the denied automatic retry left the serving pair alone"
+[[ "$(journal_field last_ready_run_id)" == "$bootstrap_run" ]] || {
+  echo "the denied automatic retry changed the serving identity" >&2
+  exit 1
+}
+refuse_receipt run1-automatic-retry-denied.log postgres-restored '"runId":"run-1"' \
+  "a denied automatic retry restored Postgres anyway"
+refuse_receipt run1-automatic-retry-denied.log prior-pair-restored '"failedRunId"' \
+  "a denied automatic retry entered recovery, which means it had drained"
+
+# THE EXPLICIT OPERATOR RETRY — the one sanctioned way to re-attempt a source whose destructive
+# install already failed. It keeps every signature, expiry, credential, loader, watermark, prior-pair
+# and fence check; only the automatic admission differs.
+"${compose[@]}" run --rm importer scripts/staging-ops/importer.mjs install "$run1_object"
 # SOURCE↔RESTORED SUBSTRATE, before anything repairs staging. `GET /api/v1/items` intersects results
 # with the caller's current include memberships, so the copied pair's application reads are only
 # meaningful if that substrate survived the round trip byte-for-byte. If the source reads pass and

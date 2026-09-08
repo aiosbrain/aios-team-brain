@@ -81,9 +81,60 @@ describe("immutable pair format", () => {
       { credentialFingerprints: { "auth-secret": validManifest().credentialFingerprints["auth-secret"], "secrets-key": validManifest().credentialFingerprints["secrets-key"] } },
       "missing or malformed neo4j-credential credential fingerprint",
     ],
+    [
+      "only the database mode is an explicit full claim",
+      { databaseMode: "full" },
+      "source bundle declares database mode full; a source capture is sanitized",
+    ],
+    [
+      "only the database mode is unrecognised",
+      { databaseMode: "partial" },
+      'unsupported database mode "partial"',
+    ],
   ])("refuses when %s", (_name, changed, reason) => {
     const result = validatePairManifest({ ...validManifest(), ...changed }, NOW);
     expect(result.errors).toEqual([reason]);
     expect(result.ok).toBe(false);
+  });
+
+  /**
+   * M3 — `databaseMode` decides whether a restored pair keeps its own captured credentials, so an
+   * unvalidated value is a rollback-integrity hole. The baseline above is a source manifest with the
+   * field ABSENT, which is what the current exporter emits and which means sanitized; the rows here
+   * cover the three remaining shapes on both sides of the source/rollback boundary.
+   */
+  describe("declared database mode", () => {
+    // A rollback envelope is importer-owned: it carries only the two stores it captured, and its
+    // credential fingerprints are staging's own rather than production evidence.
+    const validRollbackManifest = () => ({
+      ...validManifest(),
+      kind: "staging-rollback",
+      checksums: Object.fromEntries(["postgres", "graph"].map((n) => [n, { sha256: "a".repeat(64), bytes: 1 }])),
+      credentialFingerprints: undefined,
+    });
+
+    it("accepts an explicitly sanitized SOURCE bundle", () => {
+      expect(validatePairManifest({ ...validManifest(), databaseMode: "sanitized" }, NOW)).toEqual({ ok: true, errors: [] });
+    });
+
+    it("accepts a FULL importer-owned rollback checkpoint", () => {
+      // The one legitimate producer of `full`: a bootstrap capture of staging's own database, sealed
+      // and opened under the importer's rollback key.
+      expect(validatePairManifest({ ...validRollbackManifest(), databaseMode: "full" }, NOW, { allowRollback: true }))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it("keeps ABSENT-mode rollback compatibility, and reads it as sanitized rather than full", () => {
+      const absent = validatePairManifest(validRollbackManifest(), NOW, { allowRollback: true });
+      expect(absent, "an existing rollback envelope with no declared mode stopped opening").toEqual({ ok: true, errors: [] });
+      // Compatibility is not a promotion: nothing about the absent case may be read as `full`. That
+      // is what the seal decides, and `sealReadyRollback` writes `sanitized` for it.
+      expect(validRollbackManifest().databaseMode).toBeUndefined();
+    });
+
+    it("refuses an unrecognised mode on a rollback envelope too", () => {
+      const result = validatePairManifest({ ...validRollbackManifest(), databaseMode: "whole" }, NOW, { allowRollback: true });
+      expect(result.errors).toEqual(['unsupported database mode "whole"']);
+    });
   });
 });

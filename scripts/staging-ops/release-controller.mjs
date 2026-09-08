@@ -182,10 +182,14 @@ export const RAILWAY_PRODUCTION_DEPLOYMENTS_QUERY = `query ProductionDeployments
  * as the project token every other Railway read in this design documents — which is the natural
  * reading of "production READ token" — that header authenticates nothing, so AC-03's post-promotion
  * observation could never verify and every promotion (and now every emergency) would end
- * `promoted-but-deployment-unverified` after main had already moved. The contract is now stated in
- * `config/staging-ops/importer.example.env`, in `docs/RELEASING.md`, and here: an environment-scoped
- * PROJECT token for the PRODUCTION environment, distinct from `RAILWAY_STAGING_READ_TOKEN`, which is
- * the same kind of token for STAGING. Two tokens, one header kind, no shared scope.
+ * `promoted-but-deployment-unverified` after main had already moved. The contract is stated in
+ * `docs/RELEASING.md` and here: an environment-scoped PROJECT token for the PRODUCTION environment,
+ * distinct from `RAILWAY_STAGING_READ_TOKEN`, which is the same kind of token for STAGING. Two
+ * tokens, one header kind, no shared scope.
+ *
+ * L5: deliberately NOT documented in `config/staging-ops/importer.example.env` any more. The
+ * importer role holds no production provider token — `assertRunnerRole` refuses one — so listing it
+ * on the importer's own example configuration invited provisioning it on the wrong runner.
  */
 export async function readLatestProductionDeployment({ environmentId, serviceId, token, fetchImpl = fetch }) {
   const response = await fetchImpl("https://backboard.railway.com/graphql/v2", {

@@ -163,8 +163,12 @@ services:
       rollback-object-store: { condition: service_healthy }
   maintenance:
     <<: *runner
-    # A CHILD REAPER, and the narrowest fix for a measured defect. This image's ENTRYPOINT is
-    # `node`, so Node runs as PID 1 and does NOT reap orphans it did not spawn. The maintenance
+    # A CHILD REAPER, and the narrowest fix for a measured defect. This comment used to say the
+    # image's ENTRYPOINT is `node`; it is `["/usr/bin/tini", "-s", "--", "node"]`
+    # (`docker/staging-ops.Dockerfile`), which was changed for this very defect on the OPS RUNNER
+    # side. `init: true` stays for the reason below, and its effective behaviour is unchanged: it
+    # supplies a reaper for THIS service regardless of what the image's own PID 1 is, and Node still
+    # does not reap orphans it did not spawn. The maintenance
     # payload is a chain (`startup-fence` → `sh`/`npm` → `next`); when the wrapper and its
     # descendant die together the grandchild is reparented to PID 1 and stays an unreaped ZOMBIE.
     # `kill(-pgid, 0)` succeeds for a zombie-only group, so `owned-workload`'s strict absence check

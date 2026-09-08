@@ -44,6 +44,49 @@ describe("isolated ops runner roles", () => {
   ])("refuses ambiguous or incomplete destination %s", (databaseUrl) => {
     expect(() => parseCanonicalPostgresTarget(databaseUrl)).toThrow();
   });
+  /**
+   * L5 — the importer role holds NO production provider token.
+   *
+   * `assertRunnerRole` refused production DATABASE/NEO4J endpoints but not this one, while the
+   * importer's own example environment carried the assignment (with a comment saying not to set it
+   * there) — an invitation to provision it on the wrong runner. The contract now lives with the
+   * controller (`docs/RELEASING.md`) and the runner refuses it by presence.
+   */
+  const importerEnv = (over: Record<string, string> = {}) => ({
+    ...base, STAGING_OPS_ROLE: "importer", RAILWAY_ENVIRONMENT_ID: "stg", STAGING_OPS_ENVIRONMENT_ID: "stg",
+    DATABASE_URL: "postgres://app:pw@postgres.railway.internal:5432/brain",
+    NEO4J_URL: "bolt://neo4j.railway.internal:7687",
+    ...over,
+  });
+
+  it("refuses an IMPORTER holding the production observation token", () => {
+    const attempt = () => assertRunnerRole(importerEnv({ RAILWAY_PRODUCTION_READ_TOKEN: "synthetic-production-token" }), "importer");
+    expect(attempt).toThrow(/RAILWAY_PRODUCTION_READ_TOKEN/);
+    expect(attempt, "the refusal echoed the credential it refused").not.toThrow(/synthetic-production-token/);
+  });
+
+  it("admits an importer whose production token is absent, empty or whitespace", () => {
+    // The negative control: presence must mean presence, or the row above would pass against a
+    // runner policy that refused every importer.
+    expect(assertRunnerRole(importerEnv(), "importer")).toBe(true);
+    expect(assertRunnerRole(importerEnv({ RAILWAY_PRODUCTION_READ_TOKEN: "" }), "importer")).toBe(true);
+    expect(assertRunnerRole(importerEnv({ RAILWAY_PRODUCTION_READ_TOKEN: "  " }), "importer")).toBe(true);
+    // …and the STAGING read token is a different credential, which the importer legitimately holds.
+    expect(assertRunnerRole(importerEnv({ RAILWAY_STAGING_READ_TOKEN: "staging-token" }), "importer")).toBe(true);
+  });
+
+  it("leaves the EXPORTER role's separate contract alone", () => {
+    // Scoped deliberately: this is the importer's role policy. The exporter's own refusals
+    // (production environment pinning, no staging endpoints) are unchanged, and the exporter is not
+    // given a new one here.
+    expect(assertRunnerRole({
+      ...base, STAGING_OPS_ROLE: "exporter", RAILWAY_ENVIRONMENT_ID: "prod", PRODUCTION_EXPORT_ENVIRONMENT_ID: "prod",
+      DATABASE_URL: "postgres://x:p@prod-postgres.railway.internal:5432/db",
+      NEO4J_URL: "neo4j://prod-neo4j.railway.internal",
+      RAILWAY_PRODUCTION_READ_TOKEN: "synthetic-production-token",
+    }, "exporter")).toBe(true);
+  });
+
   it("fails preflight on production outbound/provider credentials", () => {
     expect(() => assertOutboundCredentialIsolation({ OPENAI_API_KEY: "present", RESEND_API_KEY: "present" })).toThrow(/OPENAI_API_KEY/);
   });
