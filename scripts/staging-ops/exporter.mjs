@@ -230,7 +230,10 @@ export async function runExporter(env = process.env, operations = {}, argv = pro
     // `return await`: the census runs THREE sequential queries, and a bare `return` resolved this
     // try block after the first one was merely started — so the `finally` closed the session, the
     // driver and the Postgres client underneath it. Same failure shape as the importer dispatcher.
-    if (process.argv.includes("--census")) {
+    // `argv`, NOT `process.argv`. This function takes an argv parameter and then consulted the
+    // real process arguments instead, so an injected argv could not select the census path and a
+    // caller in the same process could not run one without mutating global state.
+    if (argv.includes("--census")) {
       session ??= driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       return await graphCensus(session, { operationTimeoutMs: deadlines.operationMs, budget: runBudget });
     }

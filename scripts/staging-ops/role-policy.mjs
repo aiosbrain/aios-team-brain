@@ -23,8 +23,24 @@ export function assertRunnerRole(env, role) {
   return true;
 }
 
+/**
+ * AC-07: an ops runner must not inherit production-level outbound or provider credentials.
+ *
+ * The list is names this repository ACTUALLY READS at runtime, not a guess at a category. The four
+ * added below were omissions with real readers: `EMBEDDINGS_API_KEY` (`lib/query/embedding-key.ts`),
+ * `RETRIEVAL_AUGMENT_TOKEN` and `RERANK_TOKEN` (`lib/query/retrieve.ts`,
+ * `lib/query/external-provider.ts` — both read AND sent to an external endpoint), and `E2B_API_KEY`
+ * (`lib/actions/sandbox/e2b.ts`). `role-policy` has no production-versus-staging provenance
+ * mechanism for any of these names, so the same conservative exclusion the other nine get applies:
+ * their presence on a runner is refused without asking whose they are. This makes no claim that the
+ * runner currently invokes those transports.
+ */
 export function assertOutboundCredentialIsolation(env) {
-  const forbidden = ["RESEND_API_KEY", "SMTP_URL", "SENTRY_DSN", "NEXT_PUBLIC_SENTRY_DSN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "SLACK_BOT_TOKEN", "GITHUB_TOKEN"];
+  const forbidden = [
+    "RESEND_API_KEY", "SMTP_URL", "SENTRY_DSN", "NEXT_PUBLIC_SENTRY_DSN", "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY", "OPENROUTER_API_KEY", "SLACK_BOT_TOKEN", "GITHUB_TOKEN",
+    "EMBEDDINGS_API_KEY", "RETRIEVAL_AUGMENT_TOKEN", "RERANK_TOKEN", "E2B_API_KEY",
+  ];
   const present = forbidden.filter((name) => String(env[name] ?? "").trim());
   if (present.length) throw new Error(`ops runner inherited forbidden outbound/provider credentials: ${present.join(", ")}`);
 }

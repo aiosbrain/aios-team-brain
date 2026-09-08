@@ -11,12 +11,34 @@ describe("copy-mode startup fence", () => {
   const fakeClient = (journal: Record<string, unknown> | null) => ({
     connect: vi.fn(),
     query: vi.fn(async (sql: string) => {
-      if (sql.includes("pg_advisory_lock_shared")) return { rows: [{ acquired: true }] };
+      if (sql.includes("pg_try_advisory_lock_shared")) return { rows: [{ acquired: true }] };
       if (sql.includes("to_regclass")) return { rows: [{ journal_table: journal ? "staging_ops.refresh_journal" : null }] };
       if (sql.includes("refresh_journal")) return { rows: journal ? [journal] : [] };
       return { rows: [] };
     }),
     end: vi.fn(), on: vi.fn(),
+  });
+
+  it("M4: refuses PROMPTLY, by name, when maintenance holds the exclusive lock", async () => {
+    // It used to acquire with `wait=true`, so an ordinary boot during a refresh queued inside
+    // `pg_advisory_lock_shared` for the WHOLE import. AC-06 says admission refuses while
+    // maintenance owns the data, and a request that waits an unbounded time is not a refusal — it
+    // is the same outage with no diagnostic. The safety exclusion is unchanged; only the waiting is.
+    const client = {
+      connect: vi.fn(),
+      // `acquired: false` is exactly what `pg_try_advisory_lock_shared` returns against an
+      // exclusive holder. No statement_timeout is configured here, so nothing but the refusal
+      // itself can end this call.
+      query: vi.fn(async (sql: string) => (String(sql).includes("pg_try_advisory_lock_shared") ? { rows: [{ acquired: false }] } : { rows: [] })),
+      end: vi.fn(), on: vi.fn(),
+    };
+    await expect(acquireStartupFence({
+      env: { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
+      createClient: () => client,
+    })).rejects.toThrow(/staging maintenance holds the exclusive data-use lock/);
+    // The refusal happened BEFORE any journal classification, and did not leak the connection.
+    expect(client.query.mock.calls.length).toBe(1);
+    expect(client.end).toHaveBeenCalled();
   });
 
   it("holds a shared session lock and rechecks ready before returning", async () => {
@@ -26,7 +48,7 @@ describe("copy-mode startup fence", () => {
       createClient: () => client,
     });
     expect(result?.client).toBe(client);
-    expect(client.query.mock.calls[0][0]).toContain("pg_advisory_lock_shared");
+    expect(client.query.mock.calls[0][0]).toContain("pg_try_advisory_lock_shared");
     expect(client.end).not.toHaveBeenCalled();
   });
 
@@ -72,7 +94,7 @@ describe("copy-mode startup fence", () => {
       createClient: () => client,
     });
     expect(result?.admission).toMatchObject({ activated: false, mode: "legacy-pg-only" });
-    expect(client.query.mock.calls[0][0]).toContain("pg_advisory_lock_shared");
+    expect(client.query.mock.calls[0][0]).toContain("pg_try_advisory_lock_shared");
     expect(client.end).not.toHaveBeenCalled();
   });
 

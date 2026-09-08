@@ -1,4 +1,7 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { runExporter } from "../scripts/staging-ops/exporter.mjs";
 import { runActivationPreflight } from "../scripts/staging-ops/activation-preflight.mjs";
@@ -53,10 +56,20 @@ function importerEnv(objectId: string, overrides: Record<string, unknown> = {}) 
   } as unknown as NodeJS.ProcessEnv;
 }
 
+/** The digest the pinned immutable reference `image` names, and what a correct runner must report. */
+const imageDigest = `sha256:${"a".repeat(64)}`;
+
 type FixtureOptions = {
   productionSecrets?: string; stagingSecrets?: string; productionBranch?: string;
   stagingReference?: string; graphitiKey?: string; sealedProduction?: boolean; snapshotUnbound?: boolean;
   providerError?: boolean; currentDrift?: boolean; runnerAutoDeploy?: boolean; runnerImage?: string;
+  /**
+   * What the pinned active RUNNER deployment reports it is running. `undefined` keeps the correct
+   * digest; `null` models metadata that carries no image identity at all. Independent of
+   * `runnerImage`, which is service CONFIGURATION — separating the two is the whole point of the
+   * measurement, so the fixture has to be able to disagree with itself.
+   */
+  runnerDeploymentDigest?: string | null;
 };
 
 function providerFixture(options: FixtureOptions = {}) {
@@ -84,10 +97,15 @@ function providerFixture(options: FixtureOptions = {}) {
       const deploymentId = role === "app" ? `${side === "production" ? "prod" : "staging"}-app-dep`
         : role === "exporter" ? "prod-exporter-dep" : role === "importer" ? "staging-importer-dep" : role === "graphiti" ? "staging-graphiti-dep" : `${side}-${role}-dep`;
       const trigger = role === "app" ? [{ node: { id: `${side}-trigger`, projectId: "project-a", environmentId: envId, serviceId, branch: side === "production" ? (options.productionBranch ?? "main") : "staging", repository: "org/repo", provider: "github" } }] : [];
+      const isRunner = role === "exporter" || role === "importer";
+      // Railway's real deployment metadata for a registry-image deployment carries `imageDigest`
+      // (observed live, and registry-correlated). Only a RUNNER has one here; the app is repo-built.
+      const deploymentMeta: Record<string, unknown> = { commitHash: role === "app" ? commit : null };
+      if (isRunner && options.runnerDeploymentDigest !== null) deploymentMeta.imageDigest = options.runnerDeploymentDigest ?? imageDigest;
       return Response.json({ data: {
         serviceInstance: { id: `${envId}:${serviceId}`, environmentId: envId, serviceId, serviceName: role === "postgres" ? "Postgres" : role === "neo4j" ? "neo4j" : role,
           updatedAt: "2026-09-08T00:00:00Z", source: role === "exporter" || role === "importer" ? { image: options.runnerImage ?? image, repo: null } : { image: null, repo: role === "app" ? "org/repo" : null },
-          activeDeployments: [{ id: deploymentId, projectId: "project-a", environmentId: envId, serviceId, status: "SUCCESS", snapshotId: `${deploymentId}-snapshot`, meta: { commitHash: role === "app" ? commit : null } }],
+          activeDeployments: [{ id: deploymentId, projectId: "project-a", environmentId: envId, serviceId, status: "SUCCESS", snapshotId: `${deploymentId}-snapshot`, meta: deploymentMeta }],
           service: { repoTriggers: { edges: trigger, pageInfo: { hasNextPage: false, endCursor: null } } } },
         serviceInstanceAutoDeployStatus: { enabled: (role === "exporter" || role === "importer") && options.runnerAutoDeploy ? true : false },
       } });
@@ -202,5 +220,134 @@ describe("H5 role-isolated activation evidence acquisition", () => {
     await expect(runActivationPreflight(importerEnv(put(missing)), { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader })).rejects.toThrow(/credential fingerprints/);
 
     await expect(runActivationPreflight(importerEnv(result.objectId), { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader, now: Date.parse(original.evidence.expiresAt) + 1 })).rejects.toThrow(/stale/);
+  });
+});
+
+/**
+ * H1. A signature proves WHO supplied an observation; it does not prove the observation is ABOUT
+ * the subject this consumer expects. The exporter validates its OWN topology document; the importer
+ * holds an independent one. Nothing compared the two, so ordinary configuration drift — a replaced
+ * service, a corrected pin — produced `READY TO ACTIVATE` and `topology-identity: pass` from
+ * measurements of DIFFERENT production services, while also certifying their credential separation.
+ *
+ * These cases reproduce that exactly: the real exporter publishes ONCE, its evidence bytes are held
+ * completely unchanged, and only one consumer production pin moves per case. No forged signature,
+ * altered envelope, schema bypass or cross-role token is involved — nor needed.
+ */
+describe("H1 signed production evidence is bound to the consumer's own production pins", () => {
+  const baseTopology = JSON.parse(readFileSync(TOPOLOGY_FILE, "utf8"));
+
+  /** A consumer topology with exactly one production pin changed, written to its own temp file. */
+  function consumerTopology(change: Record<string, string> = {}) {
+    const document = { ...baseTopology, production: { ...baseTopology.production, ...change } };
+    const directory = mkdtempSync(path.join(tmpdir(), "aios-activation-topology-"));
+    const file = path.join(directory, "topology.json");
+    writeFileSync(file, JSON.stringify(document), "utf8");
+    return { file, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+  }
+
+  it("still reaches READY when nothing moved — the positive control this comparison is measured against", async () => {
+    const { transport, fixture, result } = await publish();
+    const topology = consumerTopology();
+    try {
+      const activation = await runActivationPreflight(importerEnv(result.objectId, { STAGING_TOPOLOGY_FILE: topology.file }),
+        { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader });
+      expect(activation.status).toBe("READY TO ACTIVATE");
+      expect(activation.checks.find((c) => c.id === "production-subject-identity")!.status).toBe("pass");
+    } finally { topology.cleanup(); }
+  });
+
+  it.each([
+    ["appServiceId", { appServiceId: "some-other-production-app" }],
+    ["postgresServiceId", { postgresServiceId: "some-other-production-postgres" }],
+    ["neo4jServiceId", { neo4jServiceId: "some-other-production-neo4j" }],
+  ] as const)("refuses before READY when the consumer's production %s is not what the evidence measured", async (_pin, change) => {
+    const { transport, fixture, result } = await publish();
+    const originalBytes = Buffer.from(transport.objects.get(result.objectId)!);
+    const topology = consumerTopology(change);
+    const beforeImporter = fixture.requests.length;
+    try {
+      // Through the REAL importer entrypoint, not only the pure evaluator: `runImporter`'s
+      // activation action is where the READY verdict was actually reached.
+      await expect(runImporter(importerEnv(result.objectId, { STAGING_TOPOLOGY_FILE: topology.file }), ["activation-preflight"],
+        { activationOptions: { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader } }))
+        .rejects.toThrow(/staging activation preflight is NOT ACTIVATED/);
+      // Role isolation is preserved by the refusal: the importer reached this verdict without ever
+      // presenting a production provider credential.
+      expect(fixture.requests.slice(beforeImporter).filter((request) => request.token && request.token !== "staging-token")).toEqual([]);
+
+      const activation = await runActivationPreflight(importerEnv(result.objectId, { STAGING_TOPOLOGY_FILE: topology.file }),
+        { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader });
+      expect(activation.status).not.toBe("READY TO ACTIVATE");
+      expect(activation.checks.find((c) => c.id === "production-subject-identity")!.status).toBe("fail");
+      // …and separation must NOT still be described as established for the pinned subjects. This is
+      // the second half of the defect: a correctly scoped, correctly signed fingerprint from a
+      // DIFFERENT production app was certifying separation for the app actually pinned here.
+      expect(activation.checks.find((c) => c.id === "credential-separation")!.status).not.toBe("pass");
+      // The exporter's object was never touched — the refusal is the consumer's own decision about
+      // a completely unchanged, validly signed, unexpired production measurement.
+      expect(transport.objects.get(result.objectId)!.equals(originalBytes)).toBe(true);
+    } finally { topology.cleanup(); }
+  });
+
+  it("treats an ABSENT production pin as unmeasured rather than as a pass", async () => {
+    const { transport, fixture, result } = await publish();
+    const topology = consumerTopology({ postgresServiceId: "" });
+    try {
+      const activation = await runActivationPreflight(importerEnv(result.objectId, { STAGING_TOPOLOGY_FILE: topology.file }),
+        { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader });
+      expect(activation.status).not.toBe("READY TO ACTIVATE");
+      expect(activation.checks.find((c) => c.id === "production-subject-identity")!.status).not.toBe("pass");
+      expect(activation.checks.find((c) => c.id === "credential-separation")!.status).not.toBe("pass");
+    } finally { topology.cleanup(); }
+  });
+});
+
+/**
+ * The active runner artifact. `serviceInstance.source.image` is service CONFIGURATION, and Railway
+ * documents staged changes that can be committed WITHOUT triggering a redeploy — so a correct
+ * configured reference plus a correct pinned active deployment ID still says nothing about which
+ * artifact that deployment is executing. The authenticated deployment's own `meta.imageDigest` is
+ * the observed field that does; missing or malformed metadata is UNVERIFIED, not a pass.
+ */
+describe("the runner image measurement is about the artifact actually running", () => {
+  it("refuses when configuration is exactly the pin but the active deployment runs another artifact", async () => {
+    const wrong = `sha256:${"b".repeat(64)}`;
+    // Producer side: the exporter must not sign a measurement it cannot stand behind.
+    await expect(publish({ runnerDeploymentDigest: wrong })).rejects.toThrow(/different artifact than its pinned immutable image/);
+
+    // Consumer side, through unchanged valid signed evidence: the importer's OWN runner disagrees.
+    const { transport, result } = await publish();
+    const activation = await runActivationPreflight(importerEnv(result.objectId),
+      { fetchImpl: providerFixture({ runnerDeploymentDigest: wrong }).fetchImpl, evidenceStore: transport.reader });
+    expect(activation.status).not.toBe("READY TO ACTIVATE");
+  });
+
+  it("reports UNVERIFIED — never READY — when the deployment carries no usable image identity", async () => {
+    await expect(publish({ runnerDeploymentDigest: null })).rejects.toThrow(/no well-formed active image digest/);
+    await expect(publish({ runnerDeploymentDigest: "not-a-digest" })).rejects.toThrow(/no well-formed active image digest/);
+  });
+
+  it("rejects a legacy envelope that predates the measurement instead of defaulting it to success", async () => {
+    const { transport, fixture, result } = await publish();
+    const original = JSON.parse(transport.objects.get(result.objectId)!.toString("utf8"));
+    const legacy = structuredClone(original);
+    delete legacy.evidence.production.runner.imageDigest;
+    const bytes = Buffer.from(JSON.stringify(legacy));
+    const id = `activation-legacy--${createHash("sha256").update(bytes).digest("hex")}`;
+    transport.objects.set(id, bytes);
+    await expect(runActivationPreflight(importerEnv(id), { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader }))
+      .rejects.toThrow(/runner measurement has unsupported or missing fields/);
+  });
+
+  it("refuses when the CONSUMER's expected exporter image differs from the signed measurement", async () => {
+    // The signer's own expectation is not a substitute for this consumer's. Unchanged valid
+    // evidence, one changed consumer expectation.
+    const { transport, fixture, result } = await publish();
+    const activation = await runActivationPreflight(
+      importerEnv(result.objectId, { PRODUCTION_EXPORTER_IMAGE_DIGEST: `registry.example/ops@sha256:${"c".repeat(64)}` }),
+      { fetchImpl: fixture.fetchImpl, evidenceStore: transport.reader });
+    expect(activation.status).toBe("NOT ACTIVATED");
+    expect(activation.checks.find((c) => c.id === "runner-image-pinned")!.status).toBe("fail");
   });
 });

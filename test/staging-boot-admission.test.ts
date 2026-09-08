@@ -52,7 +52,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
 
   function fakeClient(journalRow: Record<string, unknown>) {
     const query = vi.fn(async (sql: string) => {
-      if (String(sql).includes("pg_advisory_lock_shared")) return { rows: [{ acquired: true }] };
+      if (String(sql).includes("pg_try_advisory_lock_shared")) return { rows: [{ acquired: true }] };
       if (String(sql).includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
       if (String(sql).includes("refresh_journal")) return { rows: [journalRow] };
       return { rows: [] };
@@ -81,7 +81,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
     });
     // Reaching the loader body at all is the assertion: before this fix the same journal row threw.
     const statements = client.query.mock.calls.map((call) => String(call[0]));
-    expect(statements.some((sql) => sql.includes("pg_advisory_lock_shared"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("pg_try_advisory_lock_shared"))).toBe(true);
     expect(statements.some((sql) => sql.includes("lock_timeout"))).toBe(true);
   });
 
@@ -126,7 +126,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
       createClient: () => client, exists: () => false, readFile: () => "", readDir: () => [], logger: { log: () => {} },
     });
     const statements = client.query.mock.calls.map((call) => String(call[0]));
-    expect(statements.some((sql) => sql.includes("pg_advisory_lock_shared"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("pg_try_advisory_lock_shared"))).toBe(true);
     expect(statements.some((sql) => sql.includes("lock_timeout"))).toBe(true);
   });
 });

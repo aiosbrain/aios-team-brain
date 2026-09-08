@@ -86,11 +86,27 @@ function sameJson(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/**
+ * A SYNTACTIC fallback for callers that hand over a raw ruleset list with no measured applicability.
+ *
+ * ⚠️ It only sees an exact `refs/heads/main` include. Inherited organization rulesets, wildcard
+ * targets and `~DEFAULT_BRANCH` all apply to main and are all invisible to it — so filtering by this
+ * alone silently DROPS active restrictions from the evaluation and would report a clean policy while
+ * something else was also enforcing on main. Callers that can measure applicability must do so and
+ * pass `applicabilityMeasured: true`; the CLI (`verify-main-policy.mjs`) asks GitHub which rules
+ * apply to the branch rather than inferring it from a ref pattern.
+ */
 function targetsMain(ruleset) {
   return Array.isArray(ruleset?.conditions?.ref_name?.include) && ruleset.conditions.ref_name.include.includes("refs/heads/main");
 }
 
-export function verifyEffectiveMainPolicy({ applicableRulesets, classicProtection, expected }) {
+/**
+ * @param {object} args
+ * @param {boolean} [args.applicabilityMeasured] TRUE when `applicableRulesets` was determined by
+ *   asking the provider which rulesets apply to `main` (including inherited/wildcard ones), rather
+ *   than by matching a ref pattern. The list is then used as given.
+ */
+export function verifyEffectiveMainPolicy({ applicableRulesets, classicProtection, expected, applicabilityMeasured = false }) {
   const errors = [];
   let desired;
   try {
@@ -98,7 +114,8 @@ export function verifyEffectiveMainPolicy({ applicableRulesets, classicProtectio
   } catch (error) {
     return { ok: false, errors: [error instanceof Error ? error.message : String(error)] };
   }
-  const relevant = (Array.isArray(applicableRulesets) ? applicableRulesets : []).filter(targetsMain);
+  const supplied = Array.isArray(applicableRulesets) ? applicableRulesets : [];
+  const relevant = applicabilityMeasured ? supplied : supplied.filter(targetsMain);
   for (const wanted of desired) {
     const actual = relevant.find((r) => r.name === wanted.name);
     if (!actual) {

@@ -29,10 +29,19 @@ function fixture() {
   writeFileSync(join(work, "state"), "candidate");
   git(work, "commit", "-qam", "candidate");
   const candidate = git(work, "rev-parse", "HEAD");
+  // A commit that shares NO history with main — its own root. This is what makes the ancestry
+  // refusal reachable: with `expectedMain` equal to the real remote main, the main-changed guard
+  // passes and `merge-base --is-ancestor` is the only thing left to refuse.
+  git(work, "switch", "--orphan", "unrelated");
+  writeFileSync(join(work, "unrelated"), "divergent lineage");
+  git(work, "add", "unrelated");
+  git(work, "commit", "-qm", "unrelated root");
+  const divergent = git(work, "rev-parse", "HEAD");
+  git(work, "switch", "staging");
   execFileSync("git", ["clone", "-q", "--branch", "main", remote, racer], { env });
   git(racer, "config", "user.email", "race@example.test");
   git(racer, "config", "user.name", "Race Test");
-  return { remote, work, racer, base, candidate };
+  return { remote, work, racer, base, candidate, divergent };
 }
 
 afterEach(() => {
@@ -46,9 +55,34 @@ describe("exact non-force promotion", () => {
     expect(git(f.work, "ls-remote", f.remote, "refs/heads/main").split(/\s/)[0]).toBe(f.candidate);
   });
 
-  it("refuses a non-descendant without force", () => {
+  it("refuses a candidate on a divergent lineage, before pushing anything", () => {
+    // THE LOCAL ANCESTRY GUARD, actually reached. The row this replaces passed `expectedMain` =
+    // candidate while the remote main was still `base`, so it exited at the main-changed check and
+    // never evaluated ancestry at all — its `/main changed|not a fast-forward/` alternation accepted
+    // that earlier, unrelated refusal. Here the expectation MATCHES the remote, so `merge-base
+    // --is-ancestor` is the only thing that can refuse, and the message is pinned exactly.
     const f = fixture();
-    expect(() => promoteExactCommit({ cwd: f.work, remote: "origin", expectedMain: f.candidate, candidate: f.base })).toThrow(/main changed|not a fast-forward/);
+    let beforePushCalls = 0;
+    expect(() => promoteExactCommit({
+      cwd: f.work,
+      remote: "origin",
+      expectedMain: f.base,
+      candidate: f.divergent,
+      beforePush: () => { beforePushCalls += 1; },
+    })).toThrow(/^candidate is not a fast-forward of current main$/);
+    // Refused BEFORE the push seam — an ancestry refusal that had already started pushing would be
+    // a different (and much worse) behaviour wearing the same error message.
+    expect(beforePushCalls, "the push path was entered despite the ancestry refusal").toBe(0);
+    expect(git(f.work, "ls-remote", f.remote, "refs/heads/main").split(/\s/)[0]).toBe(f.base);
+  });
+
+  it("refuses a MOVED main as main-changed, distinctly from the ancestry refusal", () => {
+    // The other half of the alternation the old row conflated. Both refusals are real and they send
+    // an operator to different fixes, so each is pinned to its own message.
+    const f = fixture();
+    expect(() => promoteExactCommit({ cwd: f.work, remote: "origin", expectedMain: f.candidate, candidate: f.base }))
+      .toThrow(/^main changed: expected /);
+    expect(git(f.work, "ls-remote", f.remote, "refs/heads/main").split(/\s/)[0]).toBe(f.base);
   });
 
   it("lets the remote reject a concurrent incompatible main advance", () => {

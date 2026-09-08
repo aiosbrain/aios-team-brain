@@ -67,7 +67,10 @@ function fenceClient(groupOf: () => number | null) {
   const client = {
     connect: vi.fn(async () => { events.push("connect"); }),
     query: vi.fn(async (sql: string) => {
-      if (String(sql).includes("pg_advisory_lock")) { events.push("lock"); return { rows: [{}] }; }
+      // NON-BLOCKING acquisition (M4): the fence now asks `pg_try_advisory_lock_shared` and
+      // requires an explicit `acquired: true`, so this fake must answer the question rather than
+      // return an empty row — a shape that would now (correctly) read as "refused".
+      if (String(sql).includes("advisory_lock")) { events.push("lock"); return { rows: [{ acquired: true }] }; }
       if (String(sql).includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
       if (String(sql).includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1" }] };
       return { rows: [] };

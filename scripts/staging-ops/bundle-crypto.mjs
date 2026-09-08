@@ -10,6 +10,41 @@ import {
   constants,
 } from "node:crypto";
 
+/**
+ * Canonical bytes for signing. It must agree with what actually TRAVELS, and the transport is
+ * `JSON.stringify`.
+ *
+ * `JSON.stringify` treats `undefined` three different ways: it DROPS an object property, it emits
+ * `null` for an array hole or element, and it returns `undefined` (not a string) at the top level.
+ * This serializer walked into all three — `JSON.stringify(undefined)` returns the JavaScript value
+ * `undefined`, which template-interpolates as the literal text `undefined` and is not JSON at all.
+ * So a manifest carrying an undefined field would be signed over bytes describing a field that
+ * never leaves, and verification on the far side would be over a different document.
+ *
+ * Refused before signing rather than normalised, because there is no normalisation that is right:
+ * dropping matches the object case and contradicts the array case. Currently valid manifests are
+ * unaffected — no field is legitimately undefined, and every byte they produce is unchanged. Also
+ * refuses the other non-JSON values that would silently become `undefined` or a wrong literal:
+ * functions, symbols and BigInt (which throws), and non-finite numbers (which stringify to `null`).
+ */
+function assertJsonSerializable(value, path = "manifest") {
+  if (value === null) return;
+  const type = typeof value;
+  if (type === "undefined") throw new Error(`${path} is undefined, which JSON cannot represent consistently`);
+  if (type === "function" || type === "symbol" || type === "bigint") throw new Error(`${path} is a ${type}, which JSON cannot represent`);
+  if (type === "number" && !Number.isFinite(value)) throw new Error(`${path} is a non-finite number, which JSON cannot represent`);
+  if (Array.isArray(value)) {
+    // A HOLE is `undefined` on read but is not an own property, so `hasOwn` is the only way to see
+    // it. `[,1]` and `[undefined,1]` both stringify to `[null,1]`, and both are refused.
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) throw new Error(`${path}[${index}] is an array hole, which JSON cannot represent consistently`);
+      assertJsonSerializable(value[index], `${path}[${index}]`);
+    }
+    return;
+  }
+  if (type === "object") for (const key of Object.keys(value)) assertJsonSerializable(value[key], `${path}.${key}`);
+}
+
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") {
@@ -19,6 +54,7 @@ function canonical(value) {
 }
 
 export function canonicalJson(value) {
+  assertJsonSerializable(value);
   return canonical(value);
 }
 

@@ -36,6 +36,24 @@ RUN npm run build
 # mid-build. That instruction failed two production deploys (DOCKERPROD-2).
 FROM base AS runner
 ENV NODE_ENV=production
+
+# A CHILD REAPER, installed before the terminal boot-chain assertion below because it is part of
+# that chain. The startup fence supervises a PAYLOAD CHAIN (`sh`/`npm` → `next`). When a wrapper and
+# its descendant die together, the grandchild is reparented to PID 1; if PID 1 does not reap, it
+# stays a ZOMBIE, `kill(-pgid, 0)` keeps succeeding for that group, and the fence's strict
+# group-gone verification never completes — so it holds its healthy shared lock and refuses the
+# stop forever. Node as PID 1 does not reap processes it did not spawn.
+#
+# Both effective start paths must have this as an ancestor of the fence: this image's ENTRYPOINT
+# (local `docker compose`) and `scripts/railway-start.sh` (Railway overrides ENTRYPOINT/CMD with
+# railway.json's startCommand, so an entrypoint-only init would not cover the hosted path at all).
+# `-s` (subreaper) so orphan adoption does not depend on tini actually being PID 1 — on Railway it
+# may sit beneath platform supervision, and repository files establish nothing about that parent's
+# reaping behaviour.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app ./
 
 # next start binds 0.0.0.0 by default in a container; be explicit so port-mapping is predictable.
@@ -58,12 +76,15 @@ EXPOSE 3000
 # bootstrap.mjs MISSING". An assertion that cannot fail is worse than none, because it reads as
 # coverage. `|| { …; exit 1; }` depends on no shell option at all, and names what is missing.
 RUN set -eu; \
-    for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs /app/scripts/staging-ops/startup-fence.mjs; do \
+    for f in /app/docker/entrypoint.sh /app/docker/bootstrap.mjs /app/scripts/staging-ops/startup-fence.mjs /app/scripts/railway-start.sh; do \
       test -f "$f" || { echo "boot chain: $f is missing or not a regular file" >&2; exit 1; }; \
       test -s "$f" || { echo "boot chain: $f is empty" >&2; exit 1; }; \
       test -r "$f" || { echo "boot chain: $f is not readable" >&2; exit 1; }; \
     done; \
-    /bin/sh -n /app/docker/entrypoint.sh
+    /bin/sh -n /app/docker/entrypoint.sh; \
+    /bin/sh -n /app/scripts/railway-start.sh; \
+    test -x /usr/bin/tini || { echo "boot chain: /usr/bin/tini is missing or not executable" >&2; exit 1; }; \
+    /usr/bin/tini --version >/dev/null || { echo "boot chain: /usr/bin/tini does not run" >&2; exit 1; }
 
 # Invoked through `sh` rather than as a bare path so INVOKING the entrypoint depends on nothing
 # outside this file — not the executable bit, not `/usr/bin/env`, not PATH. (The script's own line 5

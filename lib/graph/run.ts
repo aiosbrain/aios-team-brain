@@ -8,6 +8,7 @@ import { boundPartialDetail, PARTIAL_DETAIL_LIMIT } from "./landed-state";
 import { reconcileProjectedEpisodes, deepRequeueEnabledFromEnv, boundDeepRequeueSample, type DeepRequeueRef, type ReconcileOptions } from "./reconcile";
 import { purgeExternalTierCaches } from "@/lib/cache/tier-invalidation";
 import { readStagingMarker } from "@/lib/env/staging-marker";
+import { readStagingRuntimeState, type StagingRuntimeState } from "@/lib/staging/runtime-policy";
 import { projectionPrecondition, WINDOW_ENV, type MarkerRead, type RefusalReason } from "./projection-window";
 import { detectFanoutSurface, type FanoutSurface } from "./fanout-surface";
 
@@ -161,6 +162,10 @@ export async function runGraphProjection(opts?: {
    *  (`to_regclass` is not expressible through `DbClient`), so it bypasses an injected `db` fake and
    *  `getPool()` throws with no DATABASE_URL. `now` is the run clock — the window is per-RUN. */
   stagingMarker?: () => Promise<boolean>;
+  /** M3 seam, injectable for the same reason as `stagingMarker`: the real classification reads the
+   *  ops journal over the raw pool. The criterion is that a copied runtime issues NO corpus query,
+   *  which only a seam can express. */
+  stagingRuntimeState?: () => Promise<StagingRuntimeState>;
   now?: Date;
   windowDays?: string;
   /** D3e's detector, injectable for the same reason as `stagingMarker`: the criterion is that with no
@@ -188,6 +193,7 @@ async function runGraphProjectionInner(opts?: {
   lookup?: ReconcileOptions["lookup"];
   deepRequeue?: boolean;
   stagingMarker?: () => Promise<boolean>;
+  stagingRuntimeState?: () => Promise<StagingRuntimeState>;
   now?: Date;
   windowDays?: string;
   fanoutSurface?: (teamId: string) => Promise<FanoutSurface>;
@@ -238,6 +244,26 @@ async function runGraphProjectionInner(opts?: {
   // AFTER the configured gate on purpose: with GRAPHITI_URL unset the runner must still be a clean
   // no-op that never opens the database (pinned by the first test in this file's suite). Before
   // `resolveTeams`, so a global refusal costs no query at all.
+  // ── M3: the RUNTIME precondition, before the window precondition ─────────────────────────────
+  // AC-07 requires the manual entrypoint to be policy-gated too, and this is the choke point both
+  // reach. Placed here — after the `configured` no-op, before `resolveTeams` — because everything
+  // downstream mutates or scans: `project.ts` MOVES ledger identity and RESERVES ledger entries
+  // before `client.addEpisodes`, so a copied staging instance was doing a full corpus scan and
+  // rewriting copied ledger rows on every run. The Graphiti gate still stopped the extraction
+  // itself, so no provider spend or tier disclosure was observed; the established defect is the
+  // mutated copied ledger and the unnecessary scan, and that is what this prevents.
+  //
+  // `copy-safe-refusal` refuses for the same reason `copy-ready` does: it means the staging posture
+  // could not be established, and an unestablished posture is not permission. A production runtime
+  // is untouched — `readStagingRuntimeState` returns `production` and this costs one classification.
+  const runtimeState = await (opts?.stagingRuntimeState ?? readStagingRuntimeState)();
+  if (runtimeState.mode === "copy-ready" || runtimeState.mode === "copy-safe-refusal") {
+    summary.ok = false;
+    summary.refused = "copied-staging-runtime";
+    summary.errors.push(`graph projection refused: this runtime is ${runtimeState.mode}, so projection is not its work — no corpus scan, lease or ledger write was performed`);
+    return summary;
+  }
+
   const windowRaw = opts?.windowDays ?? process.env[WINDOW_ENV];
   let marker: MarkerRead;
   try {

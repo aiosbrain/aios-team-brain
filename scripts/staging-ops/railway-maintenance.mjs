@@ -3,6 +3,9 @@
  * environment-scoped project token plus two pinned staging services. No database service operation
  * or arbitrary GraphQL document is exposed.
  */
+import { emitReceipt } from "./receipts.mjs";
+import { isNonRetryableRefusal, nonRetryableRefusal } from "./maintenance-refusal.mjs";
+
 export const RAILWAY_OPERATIONS = Object.freeze([
   "deploymentStop",
   "deploymentCancel",
@@ -163,7 +166,9 @@ export class RailwayMaintenance {
 
   assertPinnedService(serviceId) {
     if (serviceId !== this.appServiceId && serviceId !== this.graphitiServiceId) {
-      throw new Error("Railway maintenance operation refused for a service outside the pinned app/Graphiti allowlist");
+      // Marked non-retryable: an unpinned service does not become pinned by waiting, and the bounded
+      // stop loop must report this immediately rather than burn its deadline on it.
+      throw nonRetryableRefusal("Railway maintenance operation refused for a service outside the pinned app/Graphiti allowlist");
     }
   }
 
@@ -180,7 +185,7 @@ export class RailwayMaintenance {
     this.assertPinnedService(serviceId);
     if (POLL_ONLY.has(status)) return this.readDeployment(deploymentId);
     const operation = CANCELABLE.has(status) ? "deploymentCancel" : STOPPABLE.has(status) ? "deploymentStop" : null;
-    if (!operation) throw new Error(`Railway deployment status ${String(status)} has no safe stop transition`);
+    if (!operation) throw nonRetryableRefusal(`Railway deployment status ${String(status)} has no safe stop transition`);
     const data = await this.call(DOCUMENTS[operation], { id: deploymentId });
     if (data?.[operation] !== true) {
       // An unknown result is never retried blind: reconcile from readback first.
@@ -212,6 +217,7 @@ export class RailwayMaintenance {
 
   async stopAndVerifyAll({ timeoutMs = 120_000, pollMs = 1_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
     const deadline = Date.now() + timeoutMs; const observed = new Set(); const requested = new Set();
+    let lastStopFailure = null;
     while (Date.now() <= deadline) {
       const active = (await Promise.all([this.listActiveDeployments(this.appServiceId), this.listActiveDeployments(this.graphitiServiceId)])).flat();
       if (active.length === 0) {
@@ -220,13 +226,27 @@ export class RailwayMaintenance {
       for (const deployment of active) {
         observed.add(deployment.id);
         if (!requested.has(deployment.id) && !POLL_ONLY.has(deployment.status)) {
-          await this.stopDeployment({ deploymentId: deployment.id, serviceId: deployment.serviceId, status: deployment.status });
-          requested.add(deployment.id);
+          try {
+            await this.stopDeployment({ deploymentId: deployment.id, serviceId: deployment.serviceId, status: deployment.status });
+            requested.add(deployment.id);
+            lastStopFailure = null;
+          } catch (error) {
+            // See `maintenance-refusal.mjs`. A refused stop REQUEST is not an outcome: the platform
+            // may be mid-containment, and `requested` is deliberately not marked, so the next poll
+            // re-requests within the same bounded deadline. Identity/state refusals still surface at
+            // once. The listing above remains the sole arbiter of "stopped".
+            if (isNonRetryableRefusal(error)) throw error;
+            lastStopFailure = error;
+            emitReceipt("stop-request-retrying", {
+              deploymentId: deployment.id, serviceId: deployment.serviceId, status: String(deployment.status),
+              reason: String(error?.message ?? error).slice(0, 160),
+            });
+          }
         }
       }
       await sleep(pollMs);
     }
-    throw new Error("not all current app/Graphiti deployments stopped within the bounded deadline");
+    throw new Error(`not all current app/Graphiti deployments stopped within the bounded deadline${lastStopFailure ? `; last stop request failed: ${String(lastStopFailure.message ?? lastStopFailure).slice(0, 160)}` : ""}`);
   }
 
   async assertPinnedRunnerConfiguration(serviceId, expectedImageDigest) {

@@ -71,7 +71,13 @@ export async function loadSchema({
         if (!(await hasExclusiveDataUseLock(client))) throw new Error("copy-mode injected schema loader requires the same session to hold the exclusive data-use lock");
       } else {
         // Held for the WHOLE migration, and released only when this client ends (B1/AC-06).
-        await acquireDataUseLock(client, "shared", true);
+        // NON-BLOCKING (M4): a preDeploy that queues behind an in-flight exclusive import waits for
+        // the whole import with no diagnostic, which is an outage wearing a lock wait. Refuse
+        // promptly and by name instead; the deploy retries. The exclusive-owner branch above is the
+        // injected loader and is deliberately unchanged.
+        if (!(await acquireDataUseLock(client, "shared", false))) {
+          throw new Error("staging schema loader refused: staging maintenance holds the exclusive data-use lock");
+        }
       }
       // The SAME activation-aware admission as startup. The importer path is already protected by
       // this session's exclusive lock; it still classifies mode/enrollment, but journal lifecycle

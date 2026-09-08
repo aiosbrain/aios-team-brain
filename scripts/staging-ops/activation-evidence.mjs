@@ -160,12 +160,52 @@ async function endpointFor({ pins, service, network, token, fetchImpl, budget = 
   return endpoint.dnsName.toLowerCase();
 }
 
-function assertRunner(configuration, pins, role) {
+/** A well-formed OCI content digest. Nothing else is accepted as an artifact identity. */
+export const IMAGE_CONTENT_DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * The digest an immutable `repo/name@sha256:…` reference pins, or `null` if the reference is not
+ * digest-pinned. Deliberately NOT a tag resolver: resolving a tag at activation measures the
+ * registry today, not the artifact this deployment was created from.
+ */
+export function expectedImageDigest(image) {
+  const suffix = /@(sha256:[0-9a-f]{64})$/i.exec(String(image ?? ""))?.[1];
+  return suffix ? suffix.toLowerCase() : null;
+}
+
+/**
+ * Measure the artifact the runner is ACTUALLY RUNNING, not merely the one it is configured with.
+ *
+ * `serviceInstance.source.image` is SERVICE CONFIGURATION. Railway documents staged changes that
+ * can be committed without triggering a redeploy, so configuration need not describe the deployment
+ * currently serving — and pinning the deployment ID proves the deployment is the expected one, not
+ * which image it runs. The authenticated deployment node's `meta.imageDigest` is the one field
+ * observed to carry a deployment-associated artifact identity: read live from two Railway
+ * environments, and independently correlated against the public registry (a `neo4j:5.26.2`
+ * deployment's `meta.imageDigest` equalled that tag's `Docker-Content-Digest` exactly).
+ *
+ * ⚠️ THE LIMITS OF THAT EVIDENCE, stated because they bound what this check may claim.
+ * `Deployment.meta` is an opaque scalar in Railway's public schema with no documented members, so
+ * this is a PROVIDER-OBSERVED contract, not a formal guarantee — and the observed value identified
+ * the source INDEX digest, not the architecture-specific child actually executed. An index digest
+ * is a legitimate immutable pin and is what a `@sha256:` reference names, which is why it is
+ * compared against the reference's own suffix. Real digest-pinned runner commissioning remains an
+ * activation prerequisite; a fixture pass is not a live provider contract.
+ *
+ * Fails closed both ways: missing, null or malformed metadata refuses (it is not evidence), and a
+ * well-formed DIFFERENT digest refuses (it is evidence of the wrong artifact). There is no fallback
+ * to `meta.image`, to the configured reference, or to a freshly resolved tag.
+ */
+function assertRunner(configuration, pins, role, deployment) {
   const expectedImage = pins[`${role}Image`];
   if (!expectedImage || configuration.instance.source?.image !== expectedImage || !/@sha256:[0-9a-f]{64}$/i.test(expectedImage)) throw new Error(`${role} runner image is not the pinned immutable artifact`);
   if (configuration.instance.source?.repo || configuration.autoDeploy !== false) throw new Error(`${role} runner has a repository source or automatic deployments enabled`);
   const local = configuration.triggers.filter((trigger) => trigger.projectId === pins.projectId && trigger.environmentId === pins.environmentId && trigger.serviceId === pins[`${role}ServiceId`]);
   if (local.length) throw new Error(`${role} runner has a repository deploy trigger`);
+  const measured = String(deployment?.meta?.imageDigest ?? "").toLowerCase();
+  if (!IMAGE_CONTENT_DIGEST.test(measured)) throw new Error(`${role} runner deployment reports no well-formed active image digest, so its running artifact is UNVERIFIED`);
+  if (measured !== expectedImageDigest(expectedImage)) throw new Error(`${role} runner deployment is running a different artifact than its pinned immutable image`);
+  return measured;
 }
 
 function assertAppTrigger(configuration, pins) {
@@ -188,7 +228,7 @@ export async function collectActivationEnvironment({ pins, token, comparisonKey,
   const postgresDeployment = servingDeployment(configurations.postgres, pins, "postgres");
   const neo4jDeployment = servingDeployment(configurations.neo4j, pins, "neo4j");
   const graphitiDeployment = includeGraphiti ? servingDeployment(configurations.graphiti, pins, "graphiti") : null;
-  assertRunner(configurations[pins.runnerRole], pins, pins.runnerRole);
+  const runnerImageDigest = assertRunner(configurations[pins.runnerRole], pins, pins.runnerRole, runnerDeployment);
   const source = assertAppTrigger(configurations.app, pins);
 
   budget?.assert(`${pins.runnerRole} activation network reads`);
@@ -247,8 +287,11 @@ export async function collectActivationEnvironment({ pins, token, comparisonKey,
     scope, app: { serviceId: pins.appServiceId, deploymentId: appDeployment.id, snapshotId: appDeployment.snapshotId,
       commitSha: appDeployment.meta?.commitHash ?? appDeployment.meta?.repoCommit ?? null, source, references,
       postgresHost, neo4jHost, neo4jDatabase: deployed.NEO4J_DATABASE },
+    // `image` is the CONFIGURED reference; `imageDigest` is the artifact the pinned active
+    // deployment reports running. They are carried separately and deliberately: renaming
+    // configuration as runtime evidence is the thing this measurement exists to stop.
     runner: { serviceId: pins[`${pins.runnerRole}ServiceId`], deploymentId: runnerDeployment.id, snapshotId: runnerDeployment.snapshotId,
-      image: configurations[pins.runnerRole].instance.source.image, repo: null, autoDeploy: false },
+      image: configurations[pins.runnerRole].instance.source.image, imageDigest: runnerImageDigest, repo: null, autoDeploy: false },
     resources: {
       postgres: { serviceId: pins.postgresServiceId, instanceId: configurations.postgres.instance.id, deploymentId: postgresDeployment.id, snapshotId: postgresDeployment.snapshotId, host: postgresHost },
       neo4j: { serviceId: pins.neo4jServiceId, instanceId: configurations.neo4j.instance.id, deploymentId: neo4jDeployment.id, snapshotId: neo4jDeployment.snapshotId, host: neo4jHost, database: deployed.NEO4J_DATABASE },
@@ -284,7 +327,11 @@ export function validateActivationEvidence(evidence) {
   exactKeys(evidence.production.app.source, ["repository", "branch", "provider"], "production source measurement");
   exactKeys(evidence.production.app.references, ["DATABASE_URL", "NEO4J_URL"], "production reference measurement");
   for (const reference of Object.values(evidence.production.app.references)) exactKeys(reference, ["kind", "serviceName", "variableName"], "production reference descriptor");
-  exactKeys(evidence.production.runner, ["serviceId", "deploymentId", "snapshotId", "image", "repo", "autoDeploy"], "production runner measurement");
+  // `imageDigest` is REQUIRED, so an envelope produced before this measurement existed is rejected
+  // rather than given an implicit success default. `exactKeys` refuses both absence and extras.
+  exactKeys(evidence.production.runner, ["serviceId", "deploymentId", "snapshotId", "image", "imageDigest", "repo", "autoDeploy"], "production runner measurement");
+  if (!IMAGE_CONTENT_DIGEST.test(String(evidence.production.runner.imageDigest ?? ""))) throw new Error("production runner measurement has no well-formed active image digest");
+  if (evidence.production.runner.imageDigest !== expectedImageDigest(evidence.production.runner.image)) throw new Error("production runner measurement's active image digest does not match its own configured immutable reference");
   exactKeys(evidence.production.resources, ["postgres", "neo4j"], "production resource measurements");
   exactKeys(evidence.production.resources.postgres, ["serviceId", "instanceId", "deploymentId", "snapshotId", "host"], "production Postgres measurement");
   exactKeys(evidence.production.resources.neo4j, ["serviceId", "instanceId", "deploymentId", "snapshotId", "host", "database"], "production Neo4j measurement");

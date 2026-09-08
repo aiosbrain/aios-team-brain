@@ -162,6 +162,18 @@ services:
       rollback-object-store: { condition: service_healthy }
   maintenance:
     <<: *runner
+    # A CHILD REAPER, and the narrowest fix for a measured defect. This image's ENTRYPOINT is
+    # `node`, so Node runs as PID 1 and does NOT reap orphans it did not spawn. The maintenance
+    # payload is a chain (`startup-fence` → `sh`/`npm` → `next`); when the wrapper and its
+    # descendant die together the grandchild is reparented to PID 1 and stays an unreaped ZOMBIE.
+    # `kill(-pgid, 0)` succeeds for a zombie-only group, so `owned-workload`'s strict absence check
+    # reads the group as LIVE forever — SIGKILL cannot remove a zombie — and the fence correctly
+    # keeps its healthy shared lock and retries, permanently refusing a stop that had in fact
+    # completed. Proven in an isolated container: without init a sole Z-state member survived
+    # escalation; with Docker's init the group was empty and the stop verified in 25 ms.
+    # This adds an ancestor reaper ONLY. It changes no signal ownership, does not relax the
+    # group-gone verification, and does not weaken lock retention while a LIVE payload survives.
+    init: true
     command: [scripts/staging-ops/local-maintenance-service.mjs]
     environment:
       LOCAL_MAINTENANCE_TOKEN: local-maintenance-token

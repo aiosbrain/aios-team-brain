@@ -32,6 +32,8 @@ const h = vi.hoisted(() => ({
   runManualContextPass: vi.fn(),
   recordIngestRun: vi.fn(),
   revalidatePath: vi.fn(),
+  /** M3: the manual graph entrypoint's runner, so "it never started" is observable. */
+  runGraphProjection: vi.fn(),
   /** The DB seam UNDER the policy: the real policy module runs on top of these two reads. */
   readStagingMarker: vi.fn(),
   runSql: vi.fn(),
@@ -60,7 +62,8 @@ vi.mock("@/lib/ingest/manual-context", async (orig) => ({
 vi.mock("@/lib/db/admin", () => ({ adminClient: () => ({ from: vi.fn() }) }));
 
 // Unrelated dependencies of `actions.ts`, which this file imports for its four real "Run now" actions.
-vi.mock("@/lib/graph/run", () => ({ runGraphProjection: vi.fn() }));
+// `runGraphProjection` is NOT unrelated any more: `projectToGraphNow` below asserts it never starts.
+vi.mock("@/lib/graph/run", () => ({ runGraphProjection: h.runGraphProjection }));
 vi.mock("@/lib/graph/projection-run", () => ({
   projectionRunInput: vi.fn(),
   shouldRecordProjectionRun: vi.fn(() => false),
@@ -97,6 +100,7 @@ vi.mock("@/lib/api/audit", () => ({ audit: vi.fn() }));
 import { runManualSync } from "@/lib/ingest/manual-sync";
 import { INGEST_DISABLED_CODE, INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import {
+  projectToGraphNow,
   syncGithubNow,
   syncLinearNow,
   syncPlaneNow,
@@ -199,6 +203,7 @@ beforeEach(() => {
   });
   h.readStagingMarker.mockReset();
   h.runSql.mockReset();
+  h.runGraphProjection.mockReset();
 });
 
 afterEach(() => {
@@ -304,6 +309,70 @@ describe("runManualSync on a copied staging deployment", () => {
 
     expect(h.runManualContextPass).toHaveBeenCalledTimes(1);
     expect(r.summary).toContain("slack 500");
+  });
+});
+
+/**
+ * M3 — the MANUAL graph entrypoint, gated at the same policy as the runner.
+ *
+ * `runGraphProjection` refuses on its own, so this is not the only gate. It is a distinct one: a
+ * button that returned "refused" out of the runner would still have opened an `ingest_runs` row on a
+ * copied instance and told the admin nothing useful. The ordering claim — authorization, THEN the
+ * runtime policy, THEN any run accounting — is what these three rows pin.
+ */
+describe("projectToGraphNow on a copied staging deployment", () => {
+  for (const mode of ["copy-ready", "copy-safe-refusal"] as const) {
+    const arrange = mode === "copy-ready"
+      ? copyReadyDeployment
+      : () => {
+        // The posture could not be ESTABLISHED — a pinned deployment whose journal read fails.
+        // Distinct from `copy-ready` because an unestablished posture is not permission.
+        process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+        process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+        h.readStagingMarker.mockRejectedValue(new Error("connection refused"));
+      };
+
+    it(`refuses a ${mode} runtime after authorization, starting no projection and no run accounting`, async () => {
+      arrange();
+
+      const res = await projectToGraphNow("acme");
+
+      expect(res.ok).toBe(false);
+      expect(res.error, "the refusal must name the runtime, not a generic failure").toContain(mode);
+      expect(res.message).toBeUndefined();
+      expect(h.runGraphProjection, "the projection run started anyway").not.toHaveBeenCalled();
+      expect(h.recordIngestRun, "a refused click still opened an ingest_runs row").not.toHaveBeenCalled();
+      expect(h.revalidatePath).not.toHaveBeenCalled();
+    });
+  }
+
+  it("answers an UNAUTHORIZED caller as unauthorized, without disclosing the runtime posture", async () => {
+    // Authorization is answered FIRST, deliberately: "admins only" is the answer to a non-admin
+    // whatever the runtime is, and telling a stranger which mode this deployment is in is not this
+    // function's job.
+    copyReadyDeployment();
+    h.requireTeamAdmin.mockResolvedValue(null);
+
+    const res = await projectToGraphNow("acme");
+
+    expect(res).toEqual({ ok: false, error: "admins only" });
+    expect(h.runGraphProjection).not.toHaveBeenCalled();
+  });
+
+  it("PRODUCTION: still runs the projection and revalidates", async () => {
+    // The positive control. Without it, a gate that broke the button everywhere would look identical.
+    productionDeployment();
+    h.runGraphProjection.mockResolvedValue({
+      ok: true, configured: true, projected: 2, episodes: 3, skipped: 1, scanned: 4,
+      lockedOut: 0, errors: [],
+    });
+
+    const res = await projectToGraphNow("acme");
+
+    expect(h.runGraphProjection).toHaveBeenCalledTimes(1);
+    expect(h.runGraphProjection).toHaveBeenCalledWith({ teamId: "team-1" });
+    expect(res.ok).toBe(true);
+    expect(h.revalidatePath).toHaveBeenCalledWith("/t/acme/admin/integrations");
   });
 });
 

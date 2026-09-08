@@ -66,6 +66,35 @@ describe("M3 — candidate deployment evidence is bound to the pinned service an
     expect(body.query).toContain("environmentId");
   });
 
+  it("authenticates the candidate read with Project-Access-Token and no Authorization header", async () => {
+    // M2. `RAILWAY_STAGING_READ_TOKEN` is documented in `config/staging-ops/importer.example.env` as
+    // an ENVIRONMENT-SCOPED PROJECT token, and that is the header a project token authenticates
+    // with. Presented as a Bearer account credential it simply fails to authenticate, and the error
+    // reads as "the platform is configured differently than you think" rather than "this client sent
+    // the wrong header" — which is why this asserts the ACTUAL request, not the intent.
+    const fetchImpl = railway({ id: "dep-1", status: "SUCCESS", staticUrl: "x.up.railway.app", environmentId: "env-staging", serviceId: "svc-app", meta: { commitHash: SHA } });
+    await readRailwayDeployment({ ...pinned, fetchImpl });
+    const headers = (fetchImpl.mock.calls[0][1] as { headers: Record<string, string> }).headers;
+    expect(headers["Project-Access-Token"]).toBe("t");
+    // Not merely "the right header is present": the WRONG one must be absent, or a client sending
+    // both would satisfy the assertion above while still authenticating as an account credential.
+    expect(Object.keys(headers).map((name) => name.toLowerCase())).not.toContain("authorization");
+  });
+
+  it("leaves the PRODUCTION reader on its own separately documented token kind", async () => {
+    // The disjoint control for the row above. `readLatestProductionDeployment` consumes the distinct
+    // `RAILWAY_PRODUCTION_READ_TOKEN`; changing its authentication without defining that secret's
+    // contract would be a guess. If someone "fixes" both readers together, this reddens and forces
+    // that contract to be written down first.
+    const fetchImpl = vi.fn(async () => Response.json({
+      data: { deployments: { edges: [{ node: { id: "p1", status: "SUCCESS", staticUrl: "prod.up.railway.app", environmentId: "env-production", serviceId: "svc-app", meta: { commitHash: SHA } } }] } },
+    }));
+    await readLatestProductionDeployment({ environmentId: "env-production", serviceId: "svc-app", token: "prod-token", fetchImpl });
+    const headers = (fetchImpl.mock.calls[0][1] as { headers: Record<string, string> }).headers;
+    expect(headers.Authorization).toBe("Bearer prod-token");
+    expect(Object.keys(headers)).not.toContain("Project-Access-Token");
+  });
+
   it("applies the same binding to the production observation", async () => {
     const fetchImpl = vi.fn(async () => Response.json({
       data: { deployments: { edges: [{ node: { id: "p1", status: "SUCCESS", staticUrl: "prod.up.railway.app", environmentId: "env-production", serviceId: "svc-other", meta: { commitHash: SHA } } }] } },

@@ -21,6 +21,7 @@ import {
 } from "@/lib/ingest/manual-context";
 import { INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import { runGraphProjection } from "@/lib/graph/run";
+import { readStagingRuntimeState } from "@/lib/staging/runtime-policy";
 import { projectionRunInput, shouldRecordProjectionRun } from "@/lib/graph/projection-run";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import {
@@ -488,6 +489,16 @@ export async function projectToGraphNow(
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  // M3/AC-07: the MANUAL entrypoint is policy-gated too, after authorization and before any run
+  // accounting. `runGraphProjection` refuses on its own — this is not the only gate — but a button
+  // that returns "refused" out of the runner would still have opened an `ingest_runs` row and told
+  // the admin nothing useful. Authorization first, deliberately: "admins only" is the answer to a
+  // non-admin whatever the runtime is, and leaking the runtime posture to them is not this
+  // function's job. Uses the same shared classification as the runner, not a second mode detector.
+  const runtime = await readStagingRuntimeState();
+  if (runtime.mode === "copy-ready" || runtime.mode === "copy-safe-refusal") {
+    return { ok: false, error: `graph projection is disabled on this ${runtime.mode} staging runtime` };
+  }
   const startedAt = Date.now();
   try {
     const s = await runGraphProjection({ teamId: ctx.teamId });

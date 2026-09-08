@@ -132,11 +132,25 @@ describe("H2 — every action is gated on exactly what it later reaches for", ()
     expect(assertActionConfiguration({} as NodeJS.ProcessEnv, "install-ops")).toBe(true);
   });
 
-  it("covers every action the importer CLI accepts", () => {
-    // A new action that quietly inherits no requirements is the shape of this whole defect.
+  it("enumerates the ordinary action-requirements contract, and refuses anything outside it", () => {
+    // The previous title — "covers every action the importer CLI accepts" — overstated this list.
+    // `runImporter` accepts EIGHT actions; this table has seven, and the missing one is deliberate:
+    // `activation-preflight` returns from `runImporter` before `importerPreflight`, because the
+    // activation verifier is read-only, needs no database, no locks and no runner role, and making
+    // it depend on the runtime it authorises would be circular. `install-ops` is in the table but
+    // also returns early inside `importerPreflight`, which is why it requires nothing extra above.
+    //
+    // What this row actually pins is the ORDINARY contract: every action that reaches
+    // `assertActionConfiguration` has a requirements row, and an action with no row FAILS CLOSED.
+    // A future action that quietly inherited no requirements is the shape of this whole defect —
+    // and the second assertion is what makes that failure closed rather than permissive.
     expect(Object.keys(ACTION_REQUIREMENTS).sort()).toEqual(
       ["bootstrap-rollback", "daemon", "install", "install-ops", "rollback", "tick", "verify"]
     );
     expect(() => assertActionConfiguration(VALID, "not-an-action")).toThrow(/unknown importer action/);
+    // The intentional exception, stated as an assertion rather than only in prose: it is absent from
+    // the table AND it is refused here, so nothing reads its absence as a permissive fallback.
+    expect(ACTION_REQUIREMENTS).not.toHaveProperty("activation-preflight");
+    expect(() => assertActionConfiguration(VALID, "activation-preflight")).toThrow(/unknown importer action/);
   });
 });

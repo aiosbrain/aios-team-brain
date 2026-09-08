@@ -6,7 +6,10 @@ import {
   healthProbeBinding,
   readActivationFacts,
 } from "../scripts/staging-ops/activation-preflight.mjs";
-import { FINGERPRINT_VERSION } from "../scripts/staging-ops/credential-fingerprint.mjs";
+import { FINGERPRINT_VERSION, fingerprintsComparable } from "../scripts/staging-ops/credential-fingerprint.mjs";
+import {
+  SYNTHETIC_COMPARISON_KEY_BASE64, SYNTHETIC_COMPARISON_KEY_ID, writeSyntheticRemoteFingerprints,
+} from "./helpers/activation-remote-fingerprints";
 
 /**
  * The measured defect (`astra-activation-closure.md`, HEAD `0154a66e`): a provider-returned
@@ -219,8 +222,16 @@ describe("live credential separation is not established by a local document", ()
     { version: FINGERPRINT_VERSION, keyId: "example-key", keyConfirmation: Buffer.alloc(32, "k").toString("base64url"), credentialClass, mac: Buffer.alloc(32, fill).toString("base64url") },
   ]));
   const topology = () => ({ document: JSON.parse(readFileSync(TOPOLOGY_FILE, "utf8")), measuredFrom: "read-back" });
-  const separation = (credentialFingerprints: Record<string, unknown>) =>
-    evaluateActivation({ topology: topology(), credentialFingerprints }).checks.find((c) => c.id === "credential-separation")!;
+  /**
+   * H1: the signed production measurement's SUBJECTS are now a condition of this check too, so the
+   * helper supplies a bound one by default. Environment-bound provenance says which environment a
+   * fingerprint came from; it does not say which SERVICES in it, and a correctly scoped, correctly
+   * signed fingerprint from a DIFFERENT production app was certifying separation for the app this
+   * consumer actually pinned. The `subjects` override is how the cases below vary that one term.
+   */
+  const BOUND_SUBJECTS = { bound: true, mismatches: [], unmeasured: [] };
+  const separation = (credentialFingerprints: Record<string, unknown>, productionSubjects: unknown = BOUND_SUBJECTS) =>
+    evaluateActivation({ topology: topology(), credentialFingerprints, productionSubjects }).checks.find((c) => c.id === "credential-separation")!;
 
   it("reports UNVERIFIED for an unauthenticated document, however complete it is", () => {
     const verdict = separation({ local: fingerprintSet("a"), remote: fingerprintSet("b") });
@@ -269,6 +280,22 @@ describe("live credential separation is not established by a local document", ()
     expect(verdict.detail).toMatch(/bound to env-staging locally and env-production remotely/);
   });
 
+  it("refuses when the signed production measurement is about OTHER production services", () => {
+    // One term changed from the passing control above: provenance is still authenticated and bound
+    // to the right environments, and the fingerprints still differ. What is missing is that the
+    // remote measurement is about the production app/Postgres/Neo4j this consumer pinned — so
+    // "these credentials are separate" would be a claim about services nobody asked about.
+    const both = { local: fingerprintSet("a"), remote: fingerprintSet("b"), localProvenance: LOCAL, remoteProvenance: REMOTE };
+    const mismatched = separation(both, { bound: false, mismatches: ["the measurement describes a different application service than the one pinned here"], unmeasured: [] });
+    expect(mismatched.status).toBe("unverified");
+    expect(mismatched.detail).toMatch(/subject identities/);
+
+    // …and an ABSENT binding is refused the same way: this path did not run, so nothing established
+    // it. `null`, not `undefined` — the helper's default argument would otherwise supply a bound
+    // one and this case would silently assert the passing control a second time.
+    expect(separation(both, null).status).toBe("unverified");
+  });
+
   it("still FAILS on a shared credential, whatever the provenance", () => {
     // The asymmetry, stated: an unauthenticated document claiming identity is still worth acting on.
     expect(separation({ local: fingerprintSet("a"), remote: fingerprintSet("a") }).status).toBe("fail");
@@ -277,17 +304,32 @@ describe("live credential separation is not established by a local document", ()
   it("gives the real acquisition no way to produce that provenance", async () => {
     // Why the real command cannot certify live separation: the field is null BY CONSTRUCTION, not
     // merely unset in a fixture.
-    const measured = await readActivationFacts({
-      STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"),
-      STAGING_COMPARISON_KEY_ID: "example-key",
-      OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: new URL("./fixtures/activation-remote-fingerprints.json", import.meta.url).pathname,
-      AUTH_SECRET: "local-auth-secret", SECRETS_KEY: "local-secrets-key",
-      NEO4J_USER: "neo4j", NEO4J_PASSWORD: "local-neo4j-password",
-    } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
-    expect(measured.credentialFingerprints).not.toBeNull();
-    expect(measured.credentialFingerprints.remoteProvenance).toBeNull();
-    expect(measured.credentialFingerprints.localProvenance).toBeNull();
-    expect(evaluateActivation({ ...measured, topology: topology() }).checks
-      .find((c) => c.id === "credential-separation")!.status).toBe("unverified");
+    // The opposite-environment document is built at runtime from the same synthetic comparison key
+    // configured below, so all three classes stay COMPARABLE — which is what makes the unverified
+    // verdict below about missing provenance rather than about an unusable document. See
+    // test/helpers/activation-remote-fingerprints.ts for why it is no longer a tracked JSON file.
+    const remote = writeSyntheticRemoteFingerprints({ keyId: SYNTHETIC_COMPARISON_KEY_ID });
+    try {
+      const measured = await readActivationFacts({
+        STAGING_COMPARISON_KEY_BASE64: SYNTHETIC_COMPARISON_KEY_BASE64,
+        STAGING_COMPARISON_KEY_ID: SYNTHETIC_COMPARISON_KEY_ID,
+        OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: remote.file,
+        AUTH_SECRET: "local-auth-secret", SECRETS_KEY: "local-secrets-key",
+        NEO4J_USER: "neo4j", NEO4J_PASSWORD: "local-neo4j-password",
+      } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
+      expect(measured.credentialFingerprints).not.toBeNull();
+      // POSITIVE CONTROL for the generated document: every required class is comparable, so the
+      // unverified verdict cannot be coming from an incomparable-fingerprint path.
+      for (const credentialClass of REQUIRED_CREDENTIAL_CLASSES) {
+        expect(fingerprintsComparable(
+          measured.credentialFingerprints.local[credentialClass],
+          measured.credentialFingerprints.remote[credentialClass],
+        ), credentialClass).toBe(true);
+      }
+      expect(measured.credentialFingerprints.remoteProvenance).toBeNull();
+      expect(measured.credentialFingerprints.localProvenance).toBeNull();
+      expect(evaluateActivation({ ...measured, topology: topology() }).checks
+        .find((c) => c.id === "credential-separation")!.status).toBe("unverified");
+    } finally { remote.cleanup(); }
   });
 });

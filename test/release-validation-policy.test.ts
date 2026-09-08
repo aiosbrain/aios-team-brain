@@ -48,6 +48,34 @@ describe("exact candidate validation policy", () => {
     expect(result.errors).not.toEqual([]);
   });
 
+  /**
+   * ONE CHANGE FROM GOOD, and the errors are asserted EXACTLY.
+   *
+   * `expect(result.errors).not.toEqual([])` above is satisfied by any refusal, including one caused
+   * by a fixture that was already invalid for an unrelated reason. Each row here changes a single
+   * fact, names the predicate it is aiming at, and asserts that predicate is the ONLY one that
+   * fired — so removing that predicate reddens this row instead of being absorbed by a sibling.
+   */
+  it.each([
+    ["absent deployment identity", { deploymentId: null }, "staging deployment identity is missing"],
+    // Distinct from the row above on purpose: "we do not know which deployment" and "that
+    // deployment did not succeed" send an operator to different places.
+    ["a deployment status that is neither success nor failure", { deploymentStatus: "BUILDING" }, "staging deployment is not successful"],
+    // An EMPTY required set makes "every required check succeeded" vacuously true — the classic
+    // shape of a gate that passes because it is measuring nothing.
+    ["an empty required check set", { requiredChecks: [] }, "required check set is empty"],
+    ["a lightweight tag", { tagObjectType: "commit" }, "release tag must be annotated"],
+    ["a malformed tag name", { tagName: "v1.2" }, "tag must be exactly vX.Y.Z"],
+    // Requested copy-ready, health reports legacy. The run ID stays VALID here so the only thing
+    // this row can be refusing is the mode disagreement itself.
+    ["requested copy-ready against a legacy health mode", { healthMode: "legacy-pg-only" }, "health mode does not equal the explicitly requested mode"],
+  ])("refuses %s, and for exactly that reason", (_name, changed, reason) => {
+    const result = candidateValidationVerdict({ ...GOOD, ...changed } as CandidateValidationFacts);
+    expect(result.errors).toEqual([reason]);
+    expect(result.ok).toBe(false);
+    expect(result.verdict).toBe("refused");
+  });
+
   it("allows explicitly selected legacy validation only before copy activation and never calls it copy-ready", () => {
     const result = candidateValidationVerdict({
       ...GOOD,

@@ -4,8 +4,9 @@ import {
   assertActivationPreflightReady, assertReadOnlyDocument, evaluateActivation, formatActivationReport,
   readActivationFacts,
 } from "../scripts/staging-ops/activation-preflight.mjs";
-import { FINGERPRINT_VERSION, fingerprintsComparable } from "../scripts/staging-ops/credential-fingerprint.mjs";
+import { FINGERPRINT_VERSION, fingerprintsComparable, fingerprintsEqual } from "../scripts/staging-ops/credential-fingerprint.mjs";
 import { runImporter } from "../scripts/staging-ops/importer.mjs";
+import { SYNTHETIC_COMPARISON_KEY_BASE64, writeSyntheticRemoteFingerprints } from "./helpers/activation-remote-fingerprints";
 
 /**
  * H2: the recovered tree had `assertStagingTopology` — a pure validator over a supplied document,
@@ -52,13 +53,17 @@ const COMMIT = "c".repeat(40);
 
 /**
  * A comparison KEY ID, not a secret — it names which comparison key minted a MAC and is meant to
- * travel in the clear. `compare-2026-09` nevertheless tripped gitleaks' `generic-api-key` rule
- * (5 findings across this file and `fixtures/activation-remote-fingerprints.json`), because that
- * rule matches any `key…: "<10+ chars>"` above 3.5 bits of entropy and cannot know the difference.
- * The value is now deliberately synthetic and low-entropy, which clears the finding without
- * allowlisting anything or weakening a single comparison assertion below — the tests only ever
- * depended on local and remote agreeing on this string, never on what it was.
- * Keep it that way if you change it (`test/guards/fixture-key-id-entropy.test.ts` pins it).
+ * travel in the clear. `compare-2026-09` nevertheless tripped gitleaks' `generic-api-key` rule,
+ * because that rule matches any `key…: "<10+ chars>"` above 3.5 bits of entropy and cannot know the
+ * difference. The value is now deliberately synthetic and low-entropy, which clears the finding
+ * without allowlisting anything or weakening a single comparison assertion below — the tests only
+ * ever depended on local and remote agreeing on this string, never on what it was.
+ *
+ * The opposite-environment fingerprint document that used to live in
+ * `fixtures/activation-remote-fingerprints.json` failed the same rule for a different and
+ * unavoidable reason — a `keyConfirmation` IS a maximal-entropy 32-byte HMAC — and is now generated
+ * at runtime instead (`./helpers/activation-remote-fingerprints`).
+ * Keep it that way if you change it (`test/guards/fixture-key-id-entropy.test.ts` pins both).
  */
 const COMPARISON_KEY_ID = "example-key";
 
@@ -74,11 +79,20 @@ const fingerprintSet = (fill: string) =>
 
 /** Everything measured, everything correct — the only input that may produce READY TO ACTIVATE. */
 function fullyMeasured() {
-  const acquiredSide = (side: "staging" | "production") => ({ app: {
-    source: { repository: "org/repo", branch: side === "staging" ? "staging" : "main" },
-    postgresHost: "postgres.railway.internal", neo4jHost: "neo4j.railway.internal",
-    references: { DATABASE_URL: { kind: "railway-service-reference" }, NEO4J_URL: { kind: "railway-service-reference" } },
-  } });
+  // H1: an acquisition also carries the SUBJECT identities it measured — the service IDs the
+  // branch/host/reference facts above are ABOUT. `topology-identity` claims "pinned identities …
+  // are corroborated", and until these were compared that sentence was true of everything except
+  // the identities.
+  const acquiredSide = (side: "staging" | "production") => ({
+    scope: { projectId: "project-a", environmentId: side === "staging" ? "env-staging" : "env-production" },
+    app: {
+      serviceId: "service-app",
+      source: { repository: "org/repo", branch: side === "staging" ? "staging" : "main" },
+      postgresHost: "postgres.railway.internal", neo4jHost: "neo4j.railway.internal",
+      references: { DATABASE_URL: { kind: "railway-service-reference" }, NEO4J_URL: { kind: "railway-service-reference" } },
+    },
+    resources: { postgres: { serviceId: "service-postgres" }, neo4j: { serviceId: "service-neo4j" } },
+  });
   return {
     topology: { document: structuredClone(TOPOLOGY), measuredFrom: "railway project read-back 2026-09-07", acquisition: {
       repository: "org/repo", contributionBranch: "staging", github: { fullName: "org/repo", defaultBranch: "staging" },
@@ -88,9 +102,15 @@ function fullyMeasured() {
       staging: { projectId: "project-a", environmentId: "env-staging" },
       production: { projectId: "project-a", environmentId: "env-production" },
     },
+    // The signed production measurement is about the production services THIS consumer pinned.
+    // Absent or mismatched, `production-subject-identity` refuses and `credential-separation` may
+    // not pass — both covered by their own cases below and in the acquisition suite.
+    productionSubjects: { bound: true, mismatches: [], unmeasured: [] },
+    // `imageDigest` is what the pinned ACTIVE deployment reports running; `image` is only what the
+    // service is CONFIGURED with, and Railway's staged changes can advance one without the other.
     runners: {
-      exporter: { serviceId: "svc-exporter", expectedServiceId: "svc-exporter", image: digest, expectedImage: digest, repo: null, autoDeploy: false },
-      importer: { serviceId: "svc-importer", expectedServiceId: "svc-importer", image: digest, expectedImage: digest, repo: null, autoDeploy: false },
+      exporter: { serviceId: "svc-exporter", expectedServiceId: "svc-exporter", image: digest, imageDigest: `sha256:${"a".repeat(64)}`, expectedImage: digest, repo: null, autoDeploy: false },
+      importer: { serviceId: "svc-importer", expectedServiceId: "svc-importer", image: digest, imageDigest: `sha256:${"a".repeat(64)}`, expectedImage: digest, repo: null, autoDeploy: false },
     },
     appDeployment: { id: "dep-1", status: "SUCCESS", environmentId: "env-staging", serviceId: "service-app", url: "https://staging.example.com", commitSha: COMMIT },
     // The binding decision the ACQUISITION made before presenting a token. It is a fact like any
@@ -141,13 +161,56 @@ describe("evaluateActivation", () => {
     // Every check reports, always. A check that can be omitted is a check that can be skipped.
     expect(result.checks.map((c) => c.id)).toEqual([...ACTIVATION_CHECKS]);
     expect(result.checks.every((c) => c.status === "pass")).toBe(true);
+    // The two conditions added by this change are IN that passing set, so the negative cases below
+    // are one changed term away from a genuinely passing input rather than from an already-broken one.
+    expect(result.checks.find((c) => c.id === "production-subject-identity")!.status).toBe("pass");
     // ...and the schedule check says out loud that it read a file, not the platform.
     expect(result.checks.find((c) => c.id === "schedules-disabled-in-contract-file")!.detail)
       .toMatch(/local configuration check/);
   });
 
+  it("H1: refuses when the signed production measurement is about other production services", () => {
+    // ONE term changed from the passing input above. `topology-identity` must stop claiming that
+    // "pinned identities … are corroborated", the named subject check must FAIL, and separation
+    // must stop passing — the three statements the defect made simultaneously and wrongly.
+    for (const pin of ["appServiceId", "postgresServiceId", "neo4jServiceId"] as const) {
+      const facts = fullyMeasured();
+      const measured = facts.topology.acquisition.production as Record<string, any>;
+      if (pin === "appServiceId") measured.app.serviceId = "some-other-production-app";
+      else measured.resources[pin === "postgresServiceId" ? "postgres" : "neo4j"].serviceId = `some-other-${pin}`;
+      facts.productionSubjects = { bound: false, mismatches: [`the measurement describes a different ${pin} than the one pinned here`], unmeasured: [] };
+
+      const result = evaluateActivation(facts);
+      expect(result.status, pin).toBe(ACTIVATION_STATUS.NOT_ACTIVATED);
+      expect(result.checks.find((c) => c.id === "production-subject-identity")!.status, pin).toBe("fail");
+      expect(result.checks.find((c) => c.id === "topology-identity")!.status, pin).toBe("fail");
+      expect(result.checks.find((c) => c.id === "credential-separation")!.status, pin).not.toBe("pass");
+    }
+  });
+
+  it("the runner check is about the artifact RUNNING, not the one configured", () => {
+    // Configuration exactly equals the pin — the two comparisons that already existed both pass —
+    // and the pinned active deployment reports a DIFFERENT artifact. Railway documents staged
+    // changes that can be committed without redeploying, so this is not a contrived divergence.
+    const wrong = fullyMeasured();
+    wrong.runners.exporter.imageDigest = `sha256:${"b".repeat(64)}`;
+    const mismatch = evaluateActivation(wrong);
+    expect(mismatch.status).toBe(ACTIVATION_STATUS.NOT_ACTIVATED);
+    expect(mismatch.checks.find((c) => c.id === "runner-image-pinned")!.detail).toMatch(/RUNNING a different artifact/);
+
+    // Absent or malformed metadata is UNVERIFIED, never a pass: the configured reference is not
+    // evidence about the running artifact, which is the whole point of the measurement.
+    for (const value of [undefined, null, "", "latest", "sha256:short"]) {
+      const unmeasured = fullyMeasured();
+      unmeasured.runners.importer.imageDigest = value as string;
+      const result = evaluateActivation(unmeasured);
+      expect(result.status, String(value)).not.toBe(ACTIVATION_STATUS.READY);
+      expect(result.checks.find((c) => c.id === "runner-image-pinned")!.status, String(value)).toBe("unverified");
+    }
+  });
+
   it("reports UNVERIFIED — not READY — for anything it could not measure", () => {
-    for (const drop of ["topology", "tokens", "runners", "appDeployment", "appHealth", "credentialFingerprints", "schedules"] as const) {
+    for (const drop of ["topology", "tokens", "runners", "appDeployment", "appHealth", "credentialFingerprints", "schedules", "productionSubjects"] as const) {
       const facts = fullyMeasured();
       delete (facts as Record<string, unknown>)[drop];
       const result = evaluateActivation(facts);
@@ -442,22 +505,37 @@ describe("readActivationFacts", () => {
     // `${undefined}\0${undefined}` is a perfectly good HMAC input, so the absent Neo4j credential
     // used to produce a fingerprint that differs from production's — "we hold nothing" reported as
     // "ours is distinct".
-    const fingerprintsFile = new URL("./fixtures/activation-remote-fingerprints.json", import.meta.url).pathname;
-    const facts = await readActivationFacts({
-      STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"),
-      STAGING_COMPARISON_KEY_ID: COMPARISON_KEY_ID,
-      OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: fingerprintsFile,
-      AUTH_SECRET: "local-auth-secret",
-    } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
-    expect(Object.keys(facts.credentialFingerprints!.local)).toEqual(["auth-secret"]);
-    expect(facts.notes.join(" ")).toContain("holds no secrets-key");
-    // The class this runner DOES hold is comparable against the document on disk — so the unverified
-    // verdict below is about the two absent classes and not about a malformed fixture.
-    expect(fingerprintsComparable(
-      facts.credentialFingerprints!.local["auth-secret"],
-      facts.credentialFingerprints!.remote["auth-secret"],
-    )).toBe(true);
-    expect(evaluateActivation(facts).checks.find((c) => c.id === "credential-separation")).toMatchObject({ status: "unverified" });
+    // Generated at runtime under the SAME synthetic comparison key this env configures, rather
+    // than read from a tracked JSON fixture whose `keyConfirmation` values are 43-character
+    // maximal-entropy base64url and therefore trip gitleaks' `generic-api-key`. The comparability
+    // assertion below is the whole point of the document, so a repeated-byte placeholder would not
+    // do — see test/helpers/activation-remote-fingerprints.ts.
+    const remote = writeSyntheticRemoteFingerprints({ keyId: COMPARISON_KEY_ID });
+    try {
+      const facts = await readActivationFacts({
+        STAGING_COMPARISON_KEY_BASE64: SYNTHETIC_COMPARISON_KEY_BASE64,
+        STAGING_COMPARISON_KEY_ID: COMPARISON_KEY_ID,
+        OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: remote.file,
+        AUTH_SECRET: "local-auth-secret",
+      } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
+      expect(Object.keys(facts.credentialFingerprints!.local)).toEqual(["auth-secret"]);
+      expect(facts.notes.join(" ")).toContain("holds no secrets-key");
+      // The class this runner DOES hold is comparable against the document on disk — so the
+      // unverified verdict below is about the two absent classes and not about a malformed
+      // fixture. This is the POSITIVE CONTROL for the runtime generation: a document whose
+      // confirmation did not match the configured key would make this false.
+      expect(fingerprintsComparable(
+        facts.credentialFingerprints!.local["auth-secret"],
+        facts.credentialFingerprints!.remote["auth-secret"],
+      )).toBe(true);
+      // …and it is a REAL opposite-environment document: the values differ, so separation is not
+      // being certified by two copies of the same secret.
+      expect(fingerprintsEqual(
+        facts.credentialFingerprints!.local["auth-secret"],
+        facts.credentialFingerprints!.remote["auth-secret"],
+      )).toBe(false);
+      expect(evaluateActivation(facts).checks.find((c) => c.id === "credential-separation")).toMatchObject({ status: "unverified" });
+    } finally { remote.cleanup(); }
   });
 });
 

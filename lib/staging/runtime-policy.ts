@@ -95,7 +95,11 @@ export function copiedStagingSpendAllowed(
   purpose: "interactive-query" | "background" | "graph-extraction" | "embedding" | "image",
   env: NodeJS.ProcessEnv = process.env
 ): boolean {
-  const copyScoped = isPinnedStagingEnvironment(env) || env.STAGING_DATA_MODE === "copy-ready";
+  // `stagingModeFromEnvironment`, not a raw `===`: the central parser TRIMS, and these two
+  // synchronous sites compared the untrimmed text, so `STAGING_DATA_MODE=" copy-ready"` classified
+  // as not-copy here while every other reader classified it as copy-ready. Parser consistency, not
+  // a demonstrated leak — a pinned deployed environment already refuses regardless of whitespace.
+  const copyScoped = isPinnedStagingEnvironment(env) || stagingModeFromEnvironment(env) === "copy-ready";
   if (!copyScoped) return true;
   if (purpose !== "interactive-query") return false;
   if (!BUDGETED_INTERACTIVE_QUERY_SUPPORTED) return false;
@@ -106,7 +110,8 @@ export function copiedStagingSpendAllowed(
 }
 
 export function isCopiedStagingRuntime(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isPinnedStagingEnvironment(env) || env.STAGING_DATA_MODE === "copy-ready";
+  // The second untrimmed site; see `copiedStagingSpendAllowed`.
+  return isPinnedStagingEnvironment(env) || stagingModeFromEnvironment(env) === "copy-ready";
 }
 
 export function assertCopiedStagingSpendAllowed(

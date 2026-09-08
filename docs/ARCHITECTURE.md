@@ -74,6 +74,15 @@ journal ready. The app/startup fence holds a shared form of the same lock. Durab
 authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
 deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
 
+Draining is a POLL, not a single request. Both maintenance adapters
+(`scripts/staging-ops/local-maintenance.mjs`, `railway-maintenance.mjs`) re-list the active
+deployments and re-request a stop until their own deadline, and the listing is the only thing that
+decides "stopped". A stop request the controller refuses because it could not verify containment is
+therefore recorded and retried within that bound rather than ending the operation, while refusals
+about identity or state — an unpinned service, a status with no safe stop transition — surface
+immediately (`maintenance-refusal.mjs`). Absorbing a failed request cannot claim a stop; only the
+listing can.
+
 The fence is activation-aware independently of the exact data-mode string. A deployment enters the
 staging-ops inspection scope only through its pinned `STAGING_OPS_ENVIRONMENT_ID`; within that scope,
 durable enrollment means the ops journal contains a real run, boot, candidate, or last-ready
@@ -171,6 +180,31 @@ then binds the existing privileged health probe to that exact staging deployment
 variables are compared privately with the deployment snapshot and never substitute for historical
 deployed facts. Sealed/null/missing/drifted values refuse. No raw variable value enters reports,
 storage, child environments, logs, staging, or provider/model transports.
+
+**Signed evidence is bound to the CONSUMER's own production pins, and the runner measurement is
+about the artifact running.** A signature proves who supplied an observation, not what it is about:
+the exporter validates its own topology document and the importer holds an independent one, so at
+the verified-evidence boundary the importer compares the signed production app/Postgres/Neo4j
+service IDs (plus project/environment scope) against its own pins — mismatch FAILS
+(`production-subject-identity`), a missing subject or pin is UNVERIFIED, and neither leaves
+`credential-separation` passing. Separately, `serviceInstance.source.image` is CONFIGURATION, which
+Railway's staged changes can advance without redeploying; both roles therefore also require the
+pinned active runner deployment's own `meta.imageDigest` to equal the digest suffix of the expected
+immutable reference, carried as its own signed field. That field is a **provider-observed contract
+with an inference** (opaque `Deployment.meta`, correlated against the public registry), so real
+digest-pinned runner commissioning stays an activation prerequisite — see `docs/OPS.md`.
+
+**Where staging-ops control state lives.** `staging_ops.refresh_journal` is the single-row lifecycle
+authority (`scripts/staging-ops/journal.mjs`); the paired install does not restore the `staging_ops`
+schema, which is what lets two records survive the very operations that erase everything else. The
+journal's `bootstrap_*` columns are the FIRST bootstrap's own recovery record — written before
+anything is stopped, because after a verified stop the baseline deployment is no longer measurable
+by anyone — and `staging_ops.source_install_attempts` records destructive install attempts against
+the immutable source identity, so an automatic tick cannot re-drain staging for a candidate already
+known to fail. Both are read back by a REPLACEMENT worker; neither is a bypass, and both refuse
+rather than guess. Writers: `scripts/staging-ops/importer.mjs` only. Readers: the importer, plus
+`fence-admission.mjs`/`bootAdmissionVerdict` for admission and `lib/staging/runtime-policy.ts` for
+the app's own mode.
 
 ## Agent skill publication
 

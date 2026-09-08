@@ -26,7 +26,15 @@ export async function acquireStartupFence({ env = process.env, createClient = (c
     // Acquire the shared lock BEFORE reading, and keep this connection alive for the child's whole
     // lifetime: that ordering is what closes the startup TOCTOU (a refresh cannot take the exclusive
     // lock between our read and the child starting).
-    await acquireDataUseLock(client, "shared", true);
+    //
+    // NON-BLOCKING (M4). `wait=true` queued behind an exclusive holder, so an ordinary boot during a
+    // refresh sat in `pg_advisory_lock_shared` for the WHOLE import instead of refusing. AC-06 says
+    // admission refuses while maintenance owns the data, and a request that waits an unbounded time
+    // is not a refusal — it is the same outage with no diagnostic. The safety property is unchanged:
+    // this still acquires before classification and holds for the child's lifetime.
+    if (!(await acquireDataUseLock(client, "shared", false))) {
+      throw new Error("staging startup fence refused: staging maintenance holds the exclusive data-use lock");
+    }
     // Shared with the schema loader: activation is established from durable journal activity, not
     // from the exact mode string. The initial empty installer row remains preactivation-compatible.
     const admission = await classifyFenceAdmission(client, env, "staging startup");
@@ -137,7 +145,15 @@ export async function supervise(command, {
   const onConnectionError = () => { void shutdown("database-connection-lost"); };
   const signalHandlers = Object.fromEntries(["SIGTERM", "SIGINT"].map((signal) => [signal, () => { void shutdown(signal); }]));
   fence?.client.on?.("error", onConnectionError);
-  for (const [signal, handler] of Object.entries(signalHandlers)) process.once(signal, handler);
+  // `process.on`, NOT `process.once`. Delivery removes a `once` handler BEFORE invoking it, and the
+  // handler returns immediately after starting the asynchronous `shutdown` — so while containment
+  // was pending (the deliberate healthy-lock retry loop above) a SECOND SIGTERM/SIGINT found no
+  // listener and took Node's default action: terminate. That killed the lock-owning supervisor while
+  // its payload — which owns a SEPARATE process group — could still be alive and serving, which is
+  // precisely the containment AC-06 requires the shared lock to hold for the child's whole lifetime.
+  // Every signal, repeated or alternating, now routes into the one idempotent `shutdown`; the
+  // listeners are removed in the `finally` below, after cleanup has actually completed.
+  for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
 
   try {
     const outcome = await workload.completion;

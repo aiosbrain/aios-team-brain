@@ -141,12 +141,24 @@ export const RAILWAY_DEPLOYMENT_QUERY = `query StagingCandidateDeployment($id: S
  * satisfies "Railway reports a successful deployment of this commit" — which is precisely the
  * binding AC-02 exists to make.
  */
+/**
+ * M2: `Project-Access-Token`, not `Authorization: Bearer`.
+ *
+ * `token` here is `RAILWAY_STAGING_READ_TOKEN`, which `config/staging-ops/importer.example.env`
+ * documents as an ENVIRONMENT-SCOPED PROJECT token — the same kind `RailwayMaintenance` and
+ * `activation-preflight` use, and both authenticate it with this header. A project token presented
+ * as a Bearer account credential fails to authenticate, and the resulting error reads as "the
+ * platform is configured differently than you think" rather than "this client sent the wrong
+ * header". `readLatestProductionDeployment` below is deliberately NOT changed: it consumes the
+ * distinct `RAILWAY_PRODUCTION_READ_TOKEN`, whose kind is separately documented, and changing its
+ * authentication without defining that secret's contract would be a guess.
+ */
 export async function readRailwayDeployment({ deploymentId, token, environmentId, serviceId, fetchImpl = fetch }) {
   if (!environmentId || !serviceId) throw new Error("pinned staging environment and service IDs are required to bind candidate deployment evidence");
   const response = await fetchImpl("https://backboard.railway.com/graphql/v2", {
     method: "POST",
     redirect: "error",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { "Project-Access-Token": token, "Content-Type": "application/json" },
     body: JSON.stringify({ query: RAILWAY_DEPLOYMENT_QUERY, variables: { id: deploymentId } }),
     signal: AbortSignal.timeout(10_000),
   });

@@ -48,7 +48,7 @@ import {
   fingerprintsEqual,
   REQUIRED_ENVIRONMENT_CREDENTIAL_CLASSES,
 } from "./credential-fingerprint.mjs";
-import { collectActivationEnvironment, pinsFromEnvironment, readVerifiedActivationEvidence } from "./activation-evidence.mjs";
+import { collectActivationEnvironment, expectedImageDigest, IMAGE_CONTENT_DIGEST, pinsFromEnvironment, readVerifiedActivationEvidence } from "./activation-evidence.mjs";
 import { CONTRIBUTION_BASE } from "../branches.mjs";
 
 export const ACTIVATION_STATUS = Object.freeze({
@@ -73,6 +73,7 @@ const UNVERIFIED = "unverified";
 export const ACTIVATION_CHECKS = Object.freeze([
   "topology-identity",
   "token-environment-scope",
+  "production-subject-identity",
   "runner-image-pinned",
   "runner-autodeploy-disabled",
   "app-deployment-measured",
@@ -97,6 +98,59 @@ export const READ_ONLY_OPERATIONS = Object.freeze([
 ]);
 
 const MUTATION = /\bmutation\b/i;
+
+/**
+ * H1: BIND THE SIGNED PRODUCTION MEASUREMENT TO THE CONSUMER'S OWN PRODUCTION PINS.
+ *
+ * A signature proves WHO supplied an observation. It does not prove the observation is ABOUT the
+ * subject this consumer expects. The exporter validates its own topology document and publishes
+ * valid, fresh, purpose- and audience-bound evidence about the production app/Postgres/Neo4j it is
+ * configured with; the importer holds an INDEPENDENT topology document naming the production
+ * services it expects. Nothing compared the two. Measured against the real exporter → real importer
+ * path with the exporter's evidence bytes left completely unchanged, altering only one consumer pin
+ * at a time, all three of `appServiceId`, `postgresServiceId` and `neo4jServiceId` produced
+ * `READY TO ACTIVATE` with `topology-identity: pass` — i.e. the verifier certified the consumer's
+ * expected production identities, and their credential separation, from measurements of DIFFERENT
+ * services. No forged signature, tampered envelope or cross-role token was required; ordinary
+ * configuration drift (a replaced service, a corrected pin) is the whole trigger.
+ *
+ * The envelope verifier already binds project/environment SCOPE. Scope is not subject: the measured
+ * instance identity is the (project, environment, service) tuple, so two different services in the
+ * SAME production environment satisfy every scope check there is.
+ *
+ * Fails closed in both directions that matter: a subject that differs is a `mismatch` (FAIL), and a
+ * subject or a pin that is ABSENT is `unmeasured` (UNVERIFIED) — never a pass. This binds the
+ * identities the consumer actually supplies as expectations; it invents no new pins. Production
+ * Graphiti is deliberately absent from this list because the evidence schema requires
+ * `production.graphiti === null` — there is no production Graphiti measurement to bind. The
+ * production RUNNER (exporter) subject is bound separately, by the runner checks.
+ *
+ * @param {Record<string, any> | null} production the signed `evidence.production` measurement
+ * @param {Record<string, any> | null} pinned the consumer topology's `production` side
+ */
+export function bindMeasuredSubjects(measured, pinned) {
+  const mismatches = [];
+  const unmeasured = [];
+  if (!measured) return { bound: false, mismatches, unmeasured: ["environment measurement to bind"] };
+  if (!pinned) return { bound: false, mismatches, unmeasured: ["pinned identities to compare the measurement against"] };
+  const subjects = [
+    ["application service", measured.app?.serviceId, pinned.appServiceId],
+    ["Postgres service", measured.resources?.postgres?.serviceId, pinned.postgresServiceId],
+    ["Neo4j service", measured.resources?.neo4j?.serviceId, pinned.neo4jServiceId],
+    // The already-required scope, re-bound HERE so this one check is a complete statement about
+    // whose environment the measurement describes.
+    ["project", measured.scope?.projectId, pinned.projectId],
+    ["environment", measured.scope?.environmentId, pinned.environmentId],
+  ];
+  for (const [label, measured, pin] of subjects) {
+    const measuredText = typeof measured === "string" ? measured.trim() : "";
+    const pinText = typeof pin === "string" ? pin.trim() : "";
+    if (!measuredText) { unmeasured.push(`${label} identity in the measurement`); continue; }
+    if (!pinText) { unmeasured.push(`${label} pin in the consumer topology`); continue; }
+    if (measuredText !== pinText) mismatches.push(`the measurement describes a different ${label} than the one pinned here`);
+  }
+  return { bound: mismatches.length === 0 && unmeasured.length === 0, mismatches, unmeasured };
+}
 
 export function assertReadOnlyDocument(document) {
   const text = String(document ?? "");
@@ -284,6 +338,15 @@ export function evaluateActivation(facts = {}) {
           if (!measured || measured.app.source.branch !== pin.appSourceBranch || measured.app.source.repository !== acquired.repository) mismatches.push(`${side} application source branch/repository does not match its provider read-back`);
           if (!measured || measured.app.postgresHost !== pin.postgresHost || measured.app.neo4jHost !== pin.neo4jHost) mismatches.push(`${side} internal database hosts do not match their private-endpoint read-backs`);
           for (const name of ["DATABASE_URL", "NEO4J_URL"]) if (!measured?.app?.references?.[name]) mismatches.push(`${side} ${name} has no verified service reference`);
+          // H1: this sentence says "pinned identities ... are corroborated". Until now it compared
+          // branches, hosts and reference shapes and NOT the service identities those facts are
+          // about, so an acquisition describing other services in the correct environment produced
+          // exactly this pass. The `production` half is the load-bearing one — its measurement is
+          // supplied by the exporter, not collected here — but both sides are bound, because a
+          // claim of corroborated identity should not be true only by construction on one side.
+          const subjectBinding = bindMeasuredSubjects(measured ?? null, pin);
+          for (const mismatch of subjectBinding.mismatches) mismatches.push(`${side}: ${mismatch}`);
+          for (const missing of subjectBinding.unmeasured) mismatches.push(`${side} has no ${missing}`);
         }
       } else {
         uncorroborated.push("authenticated branch/reference/internal-host acquisition");
@@ -329,6 +392,19 @@ export function evaluateActivation(facts = {}) {
         : check("token-environment-scope", PASS, "each project token reads back its own pinned project/environment"));
   }
 
+  // 2b. WHOSE PRODUCTION IS THIS EVIDENCE ABOUT? See `bindMeasuredSubjects`. The check above
+  //     proves each TOKEN is scoped where it should be; this one proves the signed production
+  //     measurement describes the production SERVICES this consumer pinned, rather than some other
+  //     services in the same correctly scoped production environment.
+  const subjects = facts.productionSubjects ?? null;
+  checks.push(!subjects
+    ? unmeasured("production-subject-identity", "no signed production measurement bound to this consumer's production pins; the fully acquired evidence path did not run")
+    : subjects.mismatches.length
+      ? check("production-subject-identity", FAIL, subjects.mismatches.join("; "))
+      : subjects.unmeasured.length
+        ? unmeasured("production-subject-identity", subjects.unmeasured.join("; no "))
+        : check("production-subject-identity", PASS, "the signed production measurement is about the production application, Postgres and Neo4j services pinned by this consumer, in its pinned production project/environment"));
+
   // 3/4. The two ops runners: an immutable pinned image and NO automatic deploy trigger. A runner
   //      that redeploys on a branch push is a moving target holding both databases' credentials.
   //      BOTH runners, named individually. `Object.keys(runners).length === 0` let ONE successful
@@ -355,8 +431,23 @@ export function evaluateActivation(facts = {}) {
       imageUnmeasured.push(`${name} service identity in the read-back`);
     }
     if (!IMAGE_DIGEST.test(String(runner.image ?? ""))) imageErrors.push(`${name} is not pinned to an immutable image digest`);
-    else if (runner.expectedImage && runner.image !== runner.expectedImage) imageErrors.push(`${name} runs a different immutable artifact than the pinned one`);
+    else if (runner.expectedImage && runner.image !== runner.expectedImage) imageErrors.push(`${name} is CONFIGURED with a different immutable artifact than the pinned one`);
     else if (!runner.expectedImage) imageUnmeasured.push(`${name} expected image digest (its immutability is measured; its IDENTITY is not pinned to compare against)`);
+    else {
+      // THE ARTIFACT ACTUALLY RUNNING, not the one configured. The two lines above compare
+      // `serviceInstance.source.image` — service CONFIGURATION, which Railway's staged changes can
+      // legitimately advance without redeploying, so it is not evidence about the running
+      // deployment. `imageDigest` is measured from the pinned active deployment's own authenticated
+      // metadata. The comparison is against THIS CONSUMER's expected reference: for the exporter
+      // that measurement is supplied by the signer, and a signer's choice of expected image is not
+      // a substitute for the consumer's own expectation.
+      const measured = String(runner.imageDigest ?? "").toLowerCase();
+      const expected = expectedImageDigest(runner.expectedImage);
+      if (!expected) imageUnmeasured.push(`${name} expected artifact digest (its pinned reference carries no sha256 digest to compare against)`);
+      else if (!IMAGE_CONTENT_DIGEST.test(measured)) {
+        imageUnmeasured.push(`${name} active artifact digest — the deployment reported none, or a malformed one, so what it is RUNNING is unverified (its configured reference is not evidence of this)`);
+      } else if (measured !== expected) imageErrors.push(`${name}'s pinned active deployment is RUNNING a different artifact (${measured.slice(0, 19)}…) than its pinned immutable reference`);
+    }
     if (runner.repo) imageErrors.push(`${name} has a repository source`);
     if (runner.autoDeploy == null) autoUnmeasured.push(`${name} autodeploy status (the provider reported none)`);
     else if (runner.autoDeploy !== false) autoErrors.push(`${name} has automatic deployments enabled`);
@@ -365,7 +456,7 @@ export function evaluateActivation(facts = {}) {
     ? check("runner-image-pinned", FAIL, imageErrors.join("; "))
     : imageUnmeasured.length
       ? unmeasured("runner-image-pinned", imageUnmeasured.join("; no "))
-      : check("runner-image-pinned", PASS, "both runners run the pinned immutable artifact, with no repository source"));
+      : check("runner-image-pinned", PASS, "both runners are configured with, AND their pinned active deployments report running, the pinned immutable artifact, with no repository source"));
   checks.push(autoErrors.length
     ? check("runner-autodeploy-disabled", FAIL, autoErrors.join("; "))
     : autoUnmeasured.length
@@ -496,13 +587,24 @@ export function evaluateActivation(facts = {}) {
       provenance?.authenticated === true && Boolean(environmentId) && provenance.environmentId === environmentId;
     const remoteBound = boundTo(separation.remoteProvenance, expectedRemoteEnvironment);
     const localBound = boundTo(separation.localProvenance, expectedLocalEnvironment);
-    const unbound = [!localBound && "the local deployed credentials", !remoteBound && "the opposite-environment document"].filter(Boolean);
+    // H1 GATE. Environment-bound provenance answers "which environment did this fingerprint come
+    // from"; it does NOT answer "which SERVICES in that environment". A remote fingerprint taken
+    // from a different production app — correctly scoped, correctly signed — would otherwise
+    // certify separation for the app this consumer actually pinned, which is the exact claim this
+    // check exists to make. Separation may only be reported as established once the signed
+    // measurement is bound to the pinned production subjects.
+    const subjectsBound = facts.productionSubjects?.bound === true;
+    const unbound = [
+      !localBound && "the local deployed credentials",
+      !remoteBound && "the opposite-environment document",
+      !subjectsBound && "the signed production measurement's subject identities (see production-subject-identity)",
+    ].filter(Boolean);
     checks.push(shared.length
       ? check("credential-separation", FAIL, `staging and production share credentials: ${shared.join(", ")}`)
       : incomparable.length
         ? unmeasured("credential-separation", `comparable fingerprints for ${incomparable.join("; ")}`)
-        : localBound && remoteBound
-          ? check("credential-separation", PASS, `all ${REQUIRED_CREDENTIAL_CLASSES.length} required credential classes differ, with authenticated provenance bound to ${expectedLocalEnvironment} locally and ${expectedRemoteEnvironment} remotely`)
+        : localBound && remoteBound && subjectsBound
+          ? check("credential-separation", PASS, `all ${REQUIRED_CREDENTIAL_CLASSES.length} required credential classes differ, with authenticated provenance bound to ${expectedLocalEnvironment} locally and ${expectedRemoteEnvironment} remotely, and the remote measurement bound to the pinned production subjects`)
           : unmeasured("credential-separation", `live credential separation: all ${REQUIRED_CREDENTIAL_CLASSES.length} required classes differ as recorded, but ${unbound.join(" and ")} carry no authenticated, environment-bound provenance — this is a local diagnostic and the live property is unverified`));
   }
 
@@ -602,6 +704,14 @@ async function readFullyAcquiredActivationFacts(env, { fetchImpl, evidenceStore,
   budget?.assert("signed production activation evidence read");
   const remoteEvidence = await readVerifiedActivationEvidence({ env, store: evidenceStore, now });
   const production = remoteEvidence.production;
+  // H1: THE CONSUMER'S OWN ADMISSION DECISION, made here — at the boundary where the signed
+  // production measurement first becomes a readiness fact — and never delegated to the producer's
+  // validation of its own topology document. Computed BEFORE the production measurement is assigned
+  // to `runners`, `credentialFingerprints` or the topology acquisition below, so every downstream
+  // consumer of those facts is downstream of this binding too. It cannot silently disappear: absent
+  // subjects and absent pins land in `unmeasured` and the check reports UNVERIFIED, which refuses
+  // just as a FAIL does.
+  const productionSubjects = bindMeasuredSubjects(production, topology.document?.production ?? null);
   const staging = await collectActivationEnvironment({
     pins: pinsFromEnvironment(env, topology.document.staging, "staging"), token: env.RAILWAY_STAGING_READ_TOKEN,
     comparisonKey: Buffer.from(env.STAGING_COMPARISON_KEY_BASE64, "base64"), comparisonKeyId: env.STAGING_COMPARISON_KEY_ID,
@@ -637,6 +747,7 @@ async function readFullyAcquiredActivationFacts(env, { fetchImpl, evidenceStore,
   return {
     topology: { ...topology, acquisition: { staging, production, github, repository: env.GITHUB_REPOSITORY, contributionBranch: CONTRIBUTION_BASE } },
     tokens: { staging: staging.scope, production: production.scope },
+    productionSubjects,
     runners: {
       importer: { ...staging.runner, expectedServiceId: env.STAGING_IMPORTER_SERVICE_ID, expectedImage: env.STAGING_IMPORTER_IMAGE_DIGEST },
       exporter: { ...production.runner, expectedServiceId: env.PRODUCTION_EXPORTER_SERVICE_ID, expectedImage: env.PRODUCTION_EXPORTER_IMAGE_DIGEST },

@@ -17,6 +17,8 @@ import {
   installStagingOps, acquireCoordinatorLock, acquireDataUseLock, releaseCoordinatorLock,
   releaseDataUseLock, readJournal, transitionJournal, markReady, recordCatchup,
   hasCoordinatorLock, hasExclusiveDataUseLock, recordSourceWatermark, clearRollbackTarget,
+  bootstrapResumeVerdict, recordBootstrapRecovery, clearBootstrapRecovery,
+  readSourceAttempt, recordSourceAttempt, completeSourceAttempt, withdrawSourceAttempt, sourceAttemptAdmission,
 } from "./journal.mjs";
 import { assertActionConfiguration } from "./action-preflight.mjs";
 import { emitReceipt } from "./receipts.mjs";
@@ -657,7 +659,14 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
   }
 }
 
-export async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), operations = {} }) {
+/**
+ * @param {object} args
+ * @param {boolean} [args.automatic] TRUE for the unattended daemon/tick path, FALSE (default) for an
+ *   explicit `importer install <object-id>`. Only this distinguishes the two, and only the explicit
+ *   invocation may re-attempt a source whose destructive install already failed — see
+ *   `sourceAttemptAdmission`. It is deliberately not an environment variable or a bypass flag.
+ */
+export async function installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), automatic = false, operations = {} }) {
   const operationBudget = operations.operationBudget ?? createOperationBudget("importer install", deadlines.operationMs, { now: operations.now });
   const verifyAndPin = operations.verifyAndPinSourceBundle ?? verifyAndPinSourceBundle;
   const compareCredentials = operations.compareEnvironmentCredentials ?? compareEnvironmentCredentials;
@@ -668,6 +677,12 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
   const rollback = operations.rollbackToPrior ?? rollbackToPrior;
   const reconcile = operations.reconcileReadyInstall ?? reconcileReadyInstall;
   const releaseLock = operations.releaseCoordinatorLock ?? releaseCoordinatorLock;
+  // Injectable like every other durable operation here, so the admission decision can be exercised
+  // without a database. They are reached only AFTER the recovery/reconciliation branches below.
+  const readAttempt = operations.readSourceAttempt ?? readSourceAttempt;
+  const markAttempt = operations.recordSourceAttempt ?? recordSourceAttempt;
+  const finishAttempt = operations.completeSourceAttempt ?? completeSourceAttempt;
+  const undoAttempt = operations.withdrawSourceAttempt ?? withdrawSourceAttempt;
   operationBudget.assert("source admission");
   const opened = await verifyAndPin({ objectId, sourceStore, rollbackStore, env });
   compareCredentials(opened.manifest, env);
@@ -705,6 +720,27 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       cleanupErrors: reconciled.cleanupErrors,
     };
   }
+  // Fable HIGH-1: THE DESTRUCTIVE-ATTEMPT ADMISSION, and its position is load-bearing.
+  //
+  // It sits AFTER the recovery-required guard, the interrupted-run recovery branch and the
+  // already-ready reconciliation above — all three must stay reachable, because they are how
+  // staging gets back to a serving state and none of them starts a new drain. It sits BEFORE the
+  // watermark, the head measurement and the drain, because those are the ordinary new-attempt path.
+  //
+  // What it stops: a candidate that passes every pre-drain check (signature, credentials, loader
+  // compatibility, watermark) and then deterministically fails AFTER entering draining. Rollback
+  // restores the prior, marks it ready and clears `recovery-required`; the source watermark is
+  // never advanced past the failed candidate, so the next automatic tick rediscovers exactly that
+  // object and drains, stops and restores staging again — for a candidate already known to fail,
+  // for as long as it remains the newest unexpired source. Bounded only by expiry or supersession,
+  // which is hundreds of avoidable maintenance cycles, not a budget.
+  //
+  // Deliberately NOT solved in discovery: filtering attempted identities there would make the
+  // selector fall back to an OLDER eligible bundle, which is the oscillation `discoverLatestSource`
+  // exists to prevent. The newest identity stays selected, and stays reported as blocked.
+  operationBudget.assert("destructive install attempt admission");
+  const attemptAdmission = sourceAttemptAdmission(await readAttempt(client, objectId), { automatic });
+  if (!attemptAdmission.ok) throw new Error(`staging refresh refused: ${attemptAdmission.reason}`);
   const prior = await loadPrior({ journal, rollbackStore, env });
   // B3: never install a capture older than the newest one already installed. Without a durable
   // watermark, discovery that skipped the installed newest run simply picked the SECOND newest —
@@ -730,6 +766,13 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
   try {
     operationBudget.assert("pinned importer verification");
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
+    // MARKED BEFORE THE MUTATION IT AUTHORISES, under the coordinator lock and immediately before
+    // entry into draining, so that a crash anywhere in the destructive path leaves the attempt
+    // recorded rather than erased. Over-recording costs an explicit operator retry; under-recording
+    // costs the repeated-outage loop. It lives in `staging_ops`, which the paired install does not
+    // restore, so neither the rollback nor `markReady` can wipe it.
+    operationBudget.assert("destructive attempt record");
+    await markAttempt(client, { objectId, runId: opened.manifest.runId, digest: opened.digest });
     operationBudget.assert("drain transition");
     await transitionJournal(client, { runId: opened.manifest.runId, from: ["ready", "failed"], to: "draining", patch: { lastSafeCheckpoint: "ready", candidateRunId: opened.manifest.runId, candidateObjectId: objectId, candidateDigest: opened.digest, candidateMode: "copy-ready", catchupCommit: targetCommit, snapshotRollbackTarget: true } });
     destructive = true;
@@ -755,6 +798,9 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       operationBudget.assert("ready reconciliation");
       readyCommitted = booted.ready;
       const reconciled = await reconcileReadyInstall({ client, ready: readyCommitted, opened, sourceObjectId: objectId, rollbackStore, env });
+      // Terminal on the success side. Recorded AFTER ready is committed so a later same-object
+      // invocation reaches the already-ready reconciliation branch rather than a refusal.
+      await finishAttempt(client, { objectId, status: "installed" });
       return { status: "ready", runId: opened.manifest.runId, objectId: readyPair.objectId, sourceObjectId: objectId, commit: targetCommit, nodes: graph.nodes.length, relationships: graph.relationships.length, catchup: reconciled.catchup, cleanupErrors: reconciled.cleanupErrors };
     } finally {
       const terminalBudget = createOperationBudget("install terminal cleanup", deadlines.cleanupMs, { now: operations.now });
@@ -774,7 +820,13 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       });
       throw new Error(`paired refresh is ready and serving; post-ready bookkeeping remains pending and will reconcile on retry: ${errorText(error)}`);
     }
-    if (!destructive) throw error;
+    if (!destructive) {
+      // POSITIVE PROOF that the drain transition never completed: nothing was stopped and neither
+      // store was touched, so this attempt did not consume the candidate's automatic admission. A
+      // crash cannot reach this line, which is the case the record is conservative for.
+      await undoAttempt(client, objectId).catch(() => {});
+      throw error;
+    }
     const notes = [];
     // BEFORE the journal write and BEFORE the lock release, both of which are SQL on the connection
     // the failed loader/restore may have left in an aborted transaction. Measured on PG18: with the
@@ -791,6 +843,10 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       try { await configurePostgresDeadline(client, recoveryBudget.remaining(deadlines.recoveryMs, "recovery deadline configuration")); }
       catch (deadlineError) { usable = false; notes.push(`recovery deadline could not be installed: ${errorText(deadlineError)}`); }
     }
+    // Terminal on the failure side, recorded BEFORE the rollback below — the rollback restores the
+    // prior and marks it ready, which erases every other trace that this candidate was tried.
+    // `recoveryStep` so an unusable session records the reason instead of masking the rollback.
+    await recoveryStep("destructive attempt failure record", () => finishAttempt(client, { objectId, status: "failed", error: errorText(error) }), notes);
     await recoveryStep("failed-state journal transition", () => transitionJournal(client, { runId: opened.manifest.runId, from: ["draining", "importing", "verifying", "booting"], to: "failed", patch: { lastSafeCheckpoint: usable ? "ready" : "recovery-required" } }), notes);
     await recoveryStep("exclusive data-use lock release", () => releaseDataUseLock(client, "exclusive"), notes);
     if (!usable) {
@@ -811,6 +867,29 @@ async function currentDeployment(maintenance) {
   return { deployment: current, commit };
 }
 
+/**
+ * Re-prove a bootstrap checkpoint that a killed worker had already published, so a resume can adopt
+ * it instead of orphaning it under a fresh object ID.
+ *
+ * This trusts the RECORD for the object's NAME only. Everything that makes the object usable is
+ * measured again from the bytes: the canonical identity, the recorded digest, and a full open
+ * through the ordinary rollback path (signature, decryption, manifest, checksums) bound to the
+ * recorded run and baseline commit. A record naming an object that is absent, altered or about
+ * another baseline refuses; it never becomes permission to proceed without one.
+ */
+async function adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, phase }) {
+  const { objectId, digest, runId, commit } = resumed;
+  if (!(await rollbackStore.verify(objectId, digest))) {
+    throw new Error("the recorded interrupted bootstrap names a published checkpoint that is missing or no longer matches its digest; staging remains fenced and unchanged");
+  }
+  const readBack = openBundleBytes(await rollbackStore.read(objectId), env, "rollback", { ignoreExpiry: true });
+  if (readBack.manifest.runId !== runId || readBack.manifest.build?.applicationCommit !== commit) {
+    throw new Error("the recorded interrupted bootstrap checkpoint is about a different run or baseline commit than the record claims; staging remains fenced and unchanged");
+  }
+  phase("adopted-published-checkpoint", { objectId });
+  return { objectId, digest };
+}
+
 async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null }) {
   const operationBudget = budget ?? createOperationBudget("bootstrap rollback", deadlines.operationMs);
   operationBudget.assert("bootstrap coordinator lock");
@@ -827,26 +906,89 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   // WHICH PHASE. Runtime 4's bootstrap "timed out" and the operation was unidentified: maintenance
   // calls, object-store reads and the health poll all have their own deadlines, and nothing said
   // which one was running. One receipt per phase, names only — no configuration, no arguments.
-  const phase = (name, fields = {}) => emitReceipt("bootstrap-phase", { runId, phase: name, ...fields });
+  // Resolved below: either this worker's own new bootstrap identity, or the one a killed worker
+  // recorded and this one is resuming. Everything after the resolution uses THESE, never `runId`.
+  let bootstrapRunId = runId;
+  let resumed = null;
+  // Reports the EFFECTIVE bootstrap run, so a resumed worker's receipts are about the bootstrap
+  // being recovered rather than about the fresh identity it never used.
+  const phase = (name, fields = {}) => emitReceipt("bootstrap-phase", { runId: bootstrapRunId, phase: name, ...fields });
   try {
     operationBudget.assert("bootstrap journal read");
     phase("read-journal");
     const journal = await readJournal(client);
     if (journal.last_ready_run_id) throw new Error("bootstrap rollback is one-time and last-ready already exists");
-    phase("measure-current-deployment");
-    current = await currentDeployment(maintenance);
-    operationBudget.assert("bootstrap draining transition");
-    phase("measured-current-deployment", { deploymentId: current.deployment?.id ?? null, deploymentStatus: current.deployment?.status ?? null });
-    if (!new Set(["legacy-pg-only", "copy-ready"]).has(mode)) throw new Error("STAGING_BOOTSTRAP_MODE must describe the measured current staging mode");
-    phase("transition-draining", { from: journal.state });
-    await transitionJournal(client, { runId, from: [journal.state], to: "draining", patch: { lastSafeCheckpoint: journal.state } });
-    phase("stop-and-verify-all");
-    await maintenance.stopAndVerifyAll();
-    operationBudget.assert("bootstrap exclusive data lock");
-    phase("acquire-exclusive-data-lock");
-    await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
-    phase("capture-checkpoint");
-    const created = await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
+
+    // ── H2: RECONCILE AN INTERRUPTED FIRST BOOTSTRAP ────────────────────────────────────────────
+    //
+    // A SIGKILL after `stopAndVerifyAll()` succeeded leaves a state no supplied command could
+    // recover: the platform reports no active deployment (that is what a verified stop MEANS), so
+    // re-measuring is impossible; there is no `last_ready` and no preserved prior pair, so neither
+    // `importer rollback` nor an ordinary install can restore anything; and the in-memory `current`
+    // died with the worker. Both stores are untouched and correct, and staging is simply stopped
+    // and fenced forever. A fresh worker therefore reconciles the durable record written BEFORE the
+    // stop, rather than requiring a currently serving deployment.
+    //
+    // Refusal is fail-closed and mutates nothing: an unresumable or foreign record leaves staging
+    // exactly as it was. This never manufactures a last-ready, marks a failed capture copy-ready,
+    // guesses the branch head, clears enrollment, or restores a database a bootstrap only read.
+    const verdict = bootstrapResumeVerdict(journal, env);
+    if (journal.bootstrap_run_id && !verdict.resume) {
+      phase("resume-refused", { detail: verdict.reason });
+      throw new Error(`an interrupted bootstrap is recorded but cannot be resumed: ${verdict.reason}; staging remains fenced and unchanged`);
+    }
+    if (verdict.resume) {
+      resumed = verdict;
+      bootstrapRunId = verdict.runId;
+      // The RECORDED baseline, not a fresh measurement. This is the identity the interrupted worker
+      // measured while a deployment was still serving, which is the only time it was measurable.
+      current = { deployment: { id: verdict.deploymentId }, commit: verdict.commit };
+      phase("resume-interrupted-bootstrap", { bootstrapRunId, resumedPhase: verdict.phase, deploymentId: verdict.deploymentId });
+      if (verdict.mode !== mode) throw new Error("the recorded interrupted bootstrap ran in a different supported staging mode than this worker is configured for");
+      operationBudget.assert("bootstrap exclusive data lock");
+      phase("acquire-exclusive-data-lock");
+      await acquireExclusiveDataUseLock(client, env, "rollback bootstrap resume");
+    } else {
+      phase("measure-current-deployment");
+      current = await currentDeployment(maintenance);
+      operationBudget.assert("bootstrap draining transition");
+      phase("measured-current-deployment", { deploymentId: current.deployment?.id ?? null, deploymentStatus: current.deployment?.status ?? null });
+      if (!new Set(["legacy-pg-only", "copy-ready"]).has(mode)) throw new Error("STAGING_BOOTSTRAP_MODE must describe the measured current staging mode");
+      // ⚠️ BEFORE the drain transition and BEFORE anything is stopped. This ordering is the whole
+      // fix: after the stop the baseline is no longer measurable, so a record written later would
+      // be a record that can never exist in the window it is for.
+      phase("record-bootstrap-recovery", { deploymentId: current.deployment?.id ?? null });
+      await recordBootstrapRecovery(client, {
+        runId, phase: "stopping", deploymentId: current.deployment?.id ?? null, commit: current.commit, mode,
+        environmentId: env.RAILWAY_ENVIRONMENT_ID, appServiceId: env.STAGING_APP_SERVICE_ID,
+      });
+      phase("transition-draining", { from: journal.state });
+      await transitionJournal(client, { runId, from: [journal.state], to: "draining", patch: { lastSafeCheckpoint: journal.state } });
+      phase("stop-and-verify-all");
+      await maintenance.stopAndVerifyAll();
+      // HARNESS FAULT — INTERRUPTION WINDOW 1: verified stop complete, checkpoint not started.
+      // SIGKILL, not a thrown error: the catch is exactly what does NOT run when a worker is killed,
+      // and a throwable fault would exercise the recovery path instead of the gap. After this the
+      // platform reports no active deployment, so nothing can re-measure the baseline; only the
+      // record written above can.
+      if (env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "bootstrap-after-stop") {
+        emitReceipt("fault-injected", { point: "bootstrap-after-stop", runId, kill: "SIGKILL" });
+        process.kill(process.pid, "SIGKILL");
+      }
+      operationBudget.assert("bootstrap exclusive data lock");
+      phase("acquire-exclusive-data-lock");
+      await acquireExclusiveDataUseLock(client, env, "rollback bootstrap");
+    }
+
+    // The capture is READ-ONLY on both stores, so redoing it after an interruption changes nothing
+    // — but a checkpoint that was already published, verified and read back is durable evidence,
+    // and republishing under a fresh object ID would orphan it. A resume from `captured` therefore
+    // adopts the recorded object after re-proving its identity, and only an interruption BEFORE
+    // publication re-captures.
+    phase("capture-checkpoint", { resumedPhase: resumed?.phase ?? null });
+    const created = resumed?.phase === "captured"
+      ? await adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, phase })
+      : await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
       await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
       const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
@@ -857,7 +999,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
         // the restore will use — a checkpoint that cannot be replayed is not a checkpoint.
         assertReplayableGraph(graph);
         const packed = await packPair(directory, graph, { includeAuthUsers: false });
-        const manifest = { kind: "staging-rollback", databaseMode: "full", formatVersion: 1, graphCodecVersion: graph.codecVersion, runId,
+        const manifest = { kind: "staging-rollback", databaseMode: "full", formatVersion: 1, graphCodecVersion: graph.codecVersion, runId: bootstrapRunId,
           captureStartedAt: new Date().toISOString(), captureEndedAt: new Date().toISOString(), expiresAt: "9999-12-31T23:59:59.999Z",
           checksums: packed.checksums,
           // The measured deployment commit AND the measured catalog of the very database being
@@ -872,15 +1014,30 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
         const bundle = createSignedEncryptedBundle({ payload: packed.payload, manifest,
           exporterSigningPrivateKey: keyMaterial(env, "ROLLBACK_SIGNING_PRIVATE_KEY"),
           importerEncryptionPublicKey: keyMaterial(env, "ROLLBACK_ENCRYPTION_PUBLIC_KEY") });
-        const bytes = Buffer.from(JSON.stringify(bundle)); const digest = sha(bytes); const objectId = canonicalObjectId(runId, digest);
+        const bytes = Buffer.from(JSON.stringify(bundle)); const digest = sha(bytes); const objectId = canonicalObjectId(bootstrapRunId, digest);
         operationBudget.assert("bootstrap checkpoint publication");
         await rollbackStore.putImmutable(objectId, bytes);
         if (!(await rollbackStore.verify(objectId, digest))) throw new Error("bootstrap rollback failed durable read-back verification");
         // Read the sealed object BACK through the ordinary open path: signature, decryption,
         // manifest validity and checksums, exactly as a real rollback would.
         const readBack = openBundleBytes(await rollbackStore.read(objectId), env, "rollback", { ignoreExpiry: true });
-        if (readBack.manifest.runId !== runId || readBack.manifest.build?.applicationCommit !== current.commit) {
+        if (readBack.manifest.runId !== bootstrapRunId || readBack.manifest.build?.applicationCommit !== current.commit) {
           throw new Error("bootstrap checkpoint failed its durable read-back identity check");
+        }
+        // PERSIST THE VERIFIED OBJECT'S IDENTITY BEFORE ANYTHING RELIES ON IT. The publication is
+        // durable and the object has just proved it opens; a kill in the next microsecond would
+        // otherwise leave a perfectly good checkpoint that no replacement worker could name, and a
+        // re-capture would orphan it. This is the second interruption window the record covers.
+        await recordBootstrapRecovery(client, {
+          runId: bootstrapRunId, phase: "captured", deploymentId: current.deployment?.id ?? null, commit: current.commit, mode,
+          environmentId: env.RAILWAY_ENVIRONMENT_ID, appServiceId: env.STAGING_APP_SERVICE_ID, objectId, digest,
+        });
+        // HARNESS FAULT — INTERRUPTION WINDOW 2: the checkpoint is durably published, verified and
+        // recorded; the journal has NOT advanced to booting and nothing is serving. A replacement
+        // must adopt this exact object rather than orphan it and capture a second one.
+        if (env.STAGING_PAIR_REQUIRED === "1" && env.STAGING_FAULT_POINT === "bootstrap-after-publish") {
+          emitReceipt("fault-injected", { point: "bootstrap-after-publish", runId: bootstrapRunId, objectId, kill: "SIGKILL" });
+          process.kill(process.pid, "SIGKILL");
         }
         return { objectId, digest };
       } finally {
@@ -891,7 +1048,12 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     });
     phase("captured-checkpoint", { objectId: created.objectId });
     operationBudget.assert("bootstrap boot transition");
-    await transitionJournal(client, { runId, from: ["draining"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
+    // Idempotent across the publication → boot → pointer → ready boundaries: a resumed worker may
+    // find the journal already `booting` for this same run (killed after the transition, before
+    // ready), so `booting` is an accepted source state. The identity written is unchanged, and
+    // `bootAdmissionVerdict` still admits ONLY a process whose commit equals `bootCommit` and whose
+    // boot run equals the journal's current run — exact boot admission is not relaxed here.
+    await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting"], to: "booting", patch: { candidateMode: mode, bootRunId: bootstrapRunId, bootCommit: current.commit } });
     await releaseDataUseLock(client, "exclusive");
     phase("deploy-app");
     const deploymentId = await maintenance.deployApp(current.commit);
@@ -899,9 +1061,12 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     phase("await-boot", { deploymentId, mode });
     await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
     phase("booted", { deploymentId });
-    await rollbackStore.writePointer("last-ready", { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode, kind: "rollback" });
-    await markReady(client, { runId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
-    return { status: "bootstrapped", runId, objectId: created.objectId, commit: current.commit, mode };
+    await rollbackStore.writePointer("last-ready", { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode, kind: "rollback" });
+    await markReady(client, { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
+    // Only NOW, once ready is committed, does the interruption record stop being needed. Clearing
+    // it any earlier would remove the only way back from the very windows it exists for.
+    await clearBootstrapRecovery(client, bootstrapRunId);
+    return { status: resumed ? "bootstrapped-after-interruption" : "bootstrapped", runId: bootstrapRunId, objectId: created.objectId, commit: current.commit, mode, resumedFrom: resumed?.phase ?? null };
   } catch (error) {
     const notes = [];
     const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
@@ -928,16 +1093,19 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
       // A failure BEFORE the deployment was measured has nothing to restart, and nothing was
       // changed either. Said plainly, rather than as a `TypeError` on `null.commit` in a note.
       if (!current) throw new Error("the current staging deployment was never measured, so there is nothing to restart (and nothing was changed)");
-      await transitionJournal(client, { runId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: mode, bootRunId: runId, bootCommit: current.commit } });
+      await transitionJournal(client, { runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "booting", patch: { candidateMode: mode, bootRunId: bootstrapRunId, bootCommit: current.commit } });
       const deploymentId = await maintenance.deployApp(current.commit);
       await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode });
       restored = true;
     } catch (restoreError) { restored = false; notes.push(`deployment restart failed: ${errorText(restoreError).slice(0, 200)}`); }
     await recoveryStep("bootstrap checkpoint journal transition", () => transitionJournal(client, {
-      runId, from: ["draining", "booting", "failed"], to: "failed",
+      runId: bootstrapRunId, from: ["draining", "booting", "failed"], to: "failed",
       patch: { lastSafeCheckpoint: restored ? "bootstrap-failed-prior-restored" : "recovery-required" },
     }), notes);
-    throw new Error(withNotes(`${errorText(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — run `importer rollback` or restore the deployment explicitly"})`, notes));
+    // The interruption record is DELIBERATELY NOT cleared here. An ordinary failure leaves the same
+    // baseline identity a killed worker would have left, and the next `bootstrap-rollback` needs it
+    // for exactly the same reason. It is cleared in one place only: after ready is committed.
+    throw new Error(withNotes(`${errorText(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — re-run `importer bootstrap-rollback`, which resumes the recorded interrupted bootstrap, or restore the deployment explicitly"})`, notes));
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
@@ -1155,7 +1323,10 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       tickBudget.assert("source discovery journal read");
       const objectId = await discoverLatestSource(sourceStore, await readJournal(client), env);
       if (!objectId) return { status: "idle", catchup };
-      return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, operations: { operationBudget: tickBudget, now } });
+      // `automatic: true` — THE unattended path. `install <object-id>` below is the explicit
+      // operator action and is deliberately not marked automatic, so it remains the one way to
+      // re-attempt a source whose destructive install already failed.
+      return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, automatic: true, operations: { operationBudget: tickBudget, now } });
       } finally { await tickWatchdog.disarm(); }
     };
     if (action === "tick") return await tick();
