@@ -91,12 +91,14 @@ setInterval(() => {}, 1000);
     // `recovery-required` with staging stopped and both fences held.
     //
     // Measured as WORK PERFORMED, not as "did a process appear". `runBoundedProcess` spawns and
-    // only then consults the signal, so an already-aborted scope has a `child.pid` for exactly as
-    // long as it takes to signal its group — the stub is killed during `node`'s own startup, before
-    // its body runs, and never installs the SIGTERM handler that makes the healthy lane survive. So
-    // the negative control's observable is that NO restore executable ever ran and NOTHING was
-    // mutated; the earlier expectation of a PID file described a child that the abort is required to
-    // have already destroyed, and it failed for the reason it should fail.
+    // only then consults the signal, so an already-aborted scope still hands the child a real
+    // `child.pid` for as long as it takes to signal its group. Usually the stub is killed during
+    // `node`'s own startup, before its body runs, and never installs the SIGTERM handler that makes
+    // the healthy lane survive — but a slow parent can lose that race and let the stub record its
+    // PID first. Both outcomes are the SAME guarantee, so the negative control asserts only what
+    // does not vary with scheduling: the restore refuses as a cancellation, any process it managed
+    // to start is GONE by the time that refusal returns, and NOTHING was mutated. Requiring the PID
+    // file to be absent would pin the race instead of the guarantee, and go red on timing alone.
     //
     // The stub ignores SIGTERM and hangs at `pg_restore --list`, which is the FIRST subprocess on
     // the restore path, so neither lane reaches the destructive `cleanPublicApplicationObjects`
@@ -143,9 +145,19 @@ setInterval(() => {}, 1000);
         operationTimeoutMs: 20_000, terminateGraceMs: 100, verifiedStagingTarget: true,
         signal: install.signal,
       })).rejects.toThrow(/operation aborted; subprocess termination confirmed/);
-      // No executable did any work — the stub's very first statement writes this file, and under an
-      // already-aborted scope it never gets to run it.
-      expect(existsSync(refusedPidFile), "an already-aborted scope let a restore executable run its body").toBe(false);
+      // No executable is left doing work. The stub's very first statement writes this file, and
+      // under an already-aborted scope it usually never gets that far — an absent file is therefore
+      // allowed. But if it did win the spawn race, the abort is required to have destroyed that
+      // process before the refusal returned, exactly as the healthy lane is held to above. Process
+      // death is asserted, never relaxed; only the racy question of whether a PID was ever recorded
+      // is left open. (A file created but not yet written parses to no usable PID — that is the
+      // killed-mid-startup case, and it is not `alive(0)`, which would signal our own group.)
+      const refusedPid = existsSync(refusedPidFile)
+        ? Number(readFileSync(refusedPidFile, "utf8").trim())
+        : Number.NaN;
+      if (Number.isInteger(refusedPid) && refusedPid > 0) {
+        expect(alive(refusedPid), "an already-aborted scope left its restore executable running").toBe(false);
+      }
       // …and nothing downstream of that first subprocess ran either: `cleanPublicApplicationObjects`
       // drops every public table, so an unchanged non-zero inventory is the mutation oracle.
       expect(await publicTables(), "the pre-aborted restore reached the destructive cleanup").toBe(tablesBefore);
