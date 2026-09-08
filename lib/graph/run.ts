@@ -257,7 +257,7 @@ async function runGraphProjectionInner(opts?: {
   // could not be established, and an unestablished posture is not permission. A production runtime
   // is untouched — `readStagingRuntimeState` returns `production` and this costs one classification.
   const runtimeState = await (opts?.stagingRuntimeState ?? readStagingRuntimeState)();
-  if (runtimeState.mode === "copy-ready" || runtimeState.mode === "copy-safe-refusal") {
+  if (!runtimeState.ready || runtimeState.mode === "copy-ready" || runtimeState.mode === "copy-safe-refusal") {
     summary.ok = false;
     summary.refused = "copied-staging-runtime";
     summary.errors.push(`graph projection refused: this runtime is ${runtimeState.mode}, so projection is not its work — no corpus scan, lease or ledger write was performed`);

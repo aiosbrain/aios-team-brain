@@ -98,7 +98,9 @@ vi.mock("@/lib/query/answering", () => ({ resolveAnsweringKeys: vi.fn() }));
 vi.mock("@/lib/api/audit", () => ({ audit: vi.fn() }));
 
 import { runManualSync } from "@/lib/ingest/manual-sync";
+import { GraphitiClient } from "@/lib/graph/graphiti-client";
 import { INGEST_DISABLED_CODE, INGEST_DISABLED_MESSAGE, manualIngestionVerdict } from "@/lib/staging/ingest-policy";
+import { readStagingRuntimeState } from "@/lib/staging/runtime-policy";
 import {
   projectToGraphNow,
   syncGithubNow,
@@ -249,6 +251,70 @@ describe("manualIngestionVerdict — the mode read, fail-closed", () => {
     process.env.ANTHROPIC_API_KEY = "sk-ant-forced";
     expect((await manualIngestionVerdict()).allowed).toBe(false);
   });
+
+  it("treats a ready durable copied pair as authoritative over a stale legacy declaration", async () => {
+    copyReadyDeployment();
+    process.env.STAGING_DATA_MODE = "legacy-pg-only";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    const state = await readStagingRuntimeState();
+    expect(state).toEqual({ mode: "copy-ready", ready: true, runId: "run-7" });
+    expect(h.runSql).toHaveBeenCalledTimes(1);
+    expect((await manualIngestionVerdict()).allowed).toBe(false);
+  });
+
+  it("uses the booting candidate mode and refuses work under a conflicting legacy declaration", async () => {
+    process.env.STAGING_DATA_MODE = "legacy-pg-only";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    h.readStagingMarker.mockResolvedValue(true);
+    h.runSql.mockResolvedValue({ rows: [{
+      state: "booting", run_id: "candidate-run", candidate_run_id: "candidate-run",
+      candidate_object_id: "candidate-object", candidate_mode: "copy-ready",
+      boot_run_id: "candidate-run", boot_commit: "a".repeat(40),
+    }] });
+    expect(await readStagingRuntimeState()).toEqual({ mode: "copy-ready", ready: false, runId: "candidate-run" });
+    expect((await manualIngestionVerdict()).allowed).toBe(false);
+  });
+
+  it("preserves genuine preactivation legacy with absent control schema or the empty installer row", async () => {
+    process.env.STAGING_DATA_MODE = "legacy-pg-only";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    h.readStagingMarker.mockResolvedValue(false);
+    h.runSql.mockRejectedValue(Object.assign(new Error("relation does not exist"), { code: "42P01" }));
+    expect(await readStagingRuntimeState()).toEqual({ mode: "legacy-pg-only", ready: true, runId: null });
+
+    h.runSql.mockResolvedValue({ rows: [{ state: "failed", run_id: null, last_ready_run_id: null, candidate_run_id: null }] });
+    expect(await readStagingRuntimeState()).toEqual({ mode: "legacy-pg-only", ready: true, runId: null });
+  });
+
+  it("preserves a ready durable legacy rollback under a copy-ready declaration", async () => {
+    process.env.STAGING_DATA_MODE = "copy-ready";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    h.readStagingMarker.mockResolvedValue(true);
+    h.runSql.mockResolvedValue({ rows: [{
+      state: "ready", run_id: "legacy-run", last_ready_run_id: "legacy-run",
+      last_ready_object_id: "legacy-object", last_ready_mode: "legacy-pg-only",
+    }] });
+    expect(await readStagingRuntimeState()).toEqual({ mode: "legacy-pg-only", ready: true, runId: "legacy-run" });
+    expect((await manualIngestionVerdict()).allowed).toBe(true);
+  });
+
+  it.each([
+    ["failed evidence read", () => h.runSql.mockRejectedValue(new Error("permission denied"))],
+    ["missing singleton", () => h.runSql.mockResolvedValue({ rows: [] })],
+    ["unsupported durable mode", () => h.runSql.mockResolvedValue({ rows: [{ state: "ready", run_id: "run-7", last_ready_run_id: "run-7", last_ready_mode: "future-mode" }] })],
+    ["non-ready activated state", () => h.runSql.mockResolvedValue({ rows: [{ state: "importing", run_id: "run-8", candidate_run_id: "run-8", candidate_mode: "legacy-pg-only" }] })],
+  ] as const)("never grants mutation permission for %s", async (_label, arrange) => {
+    process.env.STAGING_DATA_MODE = "legacy-pg-only";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    h.readStagingMarker.mockResolvedValue(true);
+    arrange();
+    expect((await manualIngestionVerdict()).allowed).toBe(false);
+  });
 });
 
 describe("runManualSync on a copied staging deployment", () => {
@@ -357,6 +423,25 @@ describe("projectToGraphNow on a copied staging deployment", () => {
 
     expect(res).toEqual({ ok: false, error: "admins only" });
     expect(h.runGraphProjection).not.toHaveBeenCalled();
+  });
+
+  it("starts no projection or direct Graphiti request when durable copy state conflicts with a legacy declaration", async () => {
+    copyReadyDeployment();
+    process.env.STAGING_DATA_MODE = "legacy-pg-only";
+    process.env.STAGING_OPS_ENVIRONMENT_ID = "env-staging";
+    process.env.RAILWAY_ENVIRONMENT_ID = "env-staging";
+    const fetchImpl = vi.fn();
+    const graphiti = new GraphitiClient({ baseUrl: "http://graphiti.internal", fetchImpl });
+
+    await expect(graphiti.addEpisodes("group", [{ content: "x", timestamp: new Date().toISOString(), sourceDescription: "manual" }]))
+      .rejects.toThrow(/read-only/);
+    await expect(graphiti.deleteEpisode("episode-id")).rejects.toThrow(/read-only/);
+    const result = await projectToGraphNow("acme");
+
+    expect(result.ok).toBe(false);
+    expect(h.runGraphProjection).not.toHaveBeenCalled();
+    expect(h.recordIngestRun).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("PRODUCTION: still runs the projection and revalidates", async () => {

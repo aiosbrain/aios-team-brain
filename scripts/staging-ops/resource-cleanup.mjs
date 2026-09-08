@@ -64,15 +64,36 @@ export async function closeAllWithinBudget({ budget, terminateGraceMs = 2_000, t
     try { cleanupMs = budget.remaining(Number.POSITIVE_INFINITY, "terminal resource cleanup"); } catch { cleanupMs = 0; }
     let result = await wait(Math.max(1, cleanupMs));
     if (!result && !settled) {
-      try { await descriptor.terminate?.(); } catch (error) { failures.push(error); }
       let terminationMs = terminateGraceMs;
       try { terminationMs = Math.min(terminateGraceMs, budget.remaining(Number.POSITIVE_INFINITY, "terminal resource termination")); } catch { /* the finite grace is the final non-renewing reserve */ }
-      result = await wait(terminationMs).catch(() => null);
-      if (!result && !settled) {
+      const reserveMs = Math.max(1, terminationMs);
+      const termination = Promise.resolve().then(() => descriptor.terminate?.()).then(
+        () => ({ status: "fulfilled" }),
+        (reason) => ({ status: "rejected", reason }),
+      );
+      let timer;
+      const reserveExpired = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), reserveMs);
+        timer.unref?.();
+      });
+      // Termination invocation AND confirmation that the original close settled share one finite
+      // reserve. Neither promise is ever awaited outside it.
+      const terminatedAndClosed = Promise.all([termination, closing]);
+      const settledPair = await Promise.race([terminatedAndClosed, reserveExpired]);
+      clearTimeout(timer);
+      if (!settledPair) {
         const error = new Error("owned resource did not settle after bounded cleanup termination; durable reconciliation is required");
-        await terminateWorker(error);
+        // The real worker terminator exits synchronously. If an injected terminator returns a
+        // promise instead, do not let that promise create a new unbounded cleanup wait.
+        try {
+          const workerTermination = terminateWorker(error);
+          workerTermination?.catch?.(() => {});
+        } catch { /* process termination or a synchronous injected terminator is already terminal */ }
         throw error;
       }
+      const [terminationResult, closeResult] = settledPair;
+      if (terminationResult.status === "rejected") failures.push(terminationResult.reason);
+      result = closeResult;
     }
     if (result?.status === "rejected") failures.push(result.reason);
   }

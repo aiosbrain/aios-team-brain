@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runExporter } from "../scripts/staging-ops/exporter.mjs";
 import { capturePairedPostgres, restorePairedPostgres } from "../scripts/staging-ops/pg-paired.mjs";
-import { armBudgetWatchdog, createOperationBudget, postgresDeadlineConfig, stagingOperationDeadlines } from "../scripts/staging-ops/operation-deadline.mjs";
+import { armBudgetWatchdog, createOperationBudget, createSessionWatchdogOwner, postgresDeadlineConfig, stagingOperationDeadlines } from "../scripts/staging-ops/operation-deadline.mjs";
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })));
@@ -57,6 +57,31 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     await watchdog.disarm();
     expect(watchdog.expired).toBe(true);
     expect(terminated).toEqual(["STAGING_OPERATION_TIMEOUT"]);
+  });
+
+  it("retires every enclosing watchdog before a longer recovery budget crosses the old deadline", async () => {
+    const terminated: string[] = [];
+    const owner = createSessionWatchdogOwner((error) => { terminated.push(error.code); });
+    owner.arm(createOperationBudget("action", 30));
+    owner.arm(createOperationBudget("daemon tick", 35));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const recovery = await owner.transferTo(createOperationBudget("recovery", 150));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(terminated, "an enclosing timer destroyed the session during recovery").toEqual([]);
+    expect(owner.size).toBe(1);
+    await recovery.disarm();
+    expect(owner.size).toBe(0);
+  });
+
+  it("refuses same-session recovery when an enclosing watchdog already fired", async () => {
+    const terminate = vi.fn();
+    const owner = createSessionWatchdogOwner(terminate);
+    owner.arm(createOperationBudget("expired action", 5));
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await expect(owner.transferTo(createOperationBudget("recovery", 100)))
+      .rejects.toThrow(/same-session recovery is unsafe/);
+    expect(terminate).toHaveBeenCalledTimes(1);
+    expect(owner.size).toBe(0);
   });
 
   it("capture cancels and awaits every actual PG subprocess before rolling back its snapshot", async () => {
@@ -131,6 +156,47 @@ describe("M8 — finite operation deadlines terminate real work", () => {
     const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
     expect(pids).toHaveLength(1);
     expect(pids.every((pid) => !alive(pid)), "restore rejection must mean its child is gone").toBe(true);
+  });
+
+  it("an explicit importer cancellation signal terminates and confirms a slow restore before returning", async () => {
+    const { root, file } = executable(`
+      import { appendFileSync } from "node:fs";
+      if (process.argv.includes("--list")) {
+        console.log("215; 1259 16388 TABLE public items postgres");
+        process.exit(0);
+      }
+      appendFileSync(process.env.STAGING_DEADLINE_PID_FILE, String(process.pid) + "\\n");
+      process.on("SIGTERM", () => {});
+      setInterval(() => {}, 1000);
+    `);
+    const pidFile = path.join(root, "signal-pids");
+    const old = process.env.STAGING_DEADLINE_PID_FILE;
+    process.env.STAGING_DEADLINE_PID_FILE = pidFile;
+    const controller = new AbortController();
+    const client = {
+      query: vi.fn(async (sql: string) => String(sql).includes("to_regclass")
+        ? { rows: [{ present: false }], fields: [] }
+        : { rows: [], fields: [] }),
+      on: vi.fn(),
+    };
+    try {
+      const restoring = restorePairedPostgres({
+        client, databaseUrl: "postgres://target/db", directory: root, pgRestore: file,
+        operationTimeoutMs: 10_000, terminateGraceMs: 100, verifiedStagingTarget: true,
+        signal: controller.signal,
+      });
+      for (let attempt = 0; attempt < 200 && !existsSync(pidFile); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(existsSync(pidFile), "the destructive restore never started").toBe(true);
+      controller.abort(new Error("SIGTERM"));
+      await expect(restoring).rejects.toThrow(/operation aborted; subprocess termination confirmed/);
+      const pids = readFileSync(pidFile, "utf8").trim().split(/\s+/).map(Number);
+      expect(pids.every((pid) => !alive(pid)), "cancellation returned while the restore survived").toBe(true);
+    } finally {
+      if (old === undefined) delete process.env.STAGING_DEADLINE_PID_FILE;
+      else process.env.STAGING_DEADLINE_PID_FILE = old;
+    }
   });
 });
 

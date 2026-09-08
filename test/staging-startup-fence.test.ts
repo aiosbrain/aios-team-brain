@@ -42,7 +42,7 @@ describe("copy-mode startup fence", () => {
   });
 
   it("holds a shared session lock and rechecks ready before returning", async () => {
-    const client = fakeClient({ state: "ready", run_id: "run-1" });
+    const client = fakeClient({ state: "ready", run_id: "run-1", last_ready_run_id: "run-1", last_ready_mode: "copy-ready" });
     const result = await acquireStartupFence({
       env: { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
       createClient: () => client,
@@ -62,7 +62,7 @@ describe("copy-mode startup fence", () => {
   });
 
   it("admits only the exact selected commit during booting", async () => {
-    const journal = { state: "booting", run_id: "run-2", boot_run_id: "run-2", boot_commit: "a".repeat(40) };
+    const journal = { state: "booting", run_id: "run-2", boot_run_id: "run-2", boot_commit: "a".repeat(40), candidate_mode: "copy-ready" };
     const env = { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg", RAILWAY_GIT_COMMIT_SHA: "b".repeat(40) } as NodeJS.ProcessEnv;
     const client = fakeClient(journal);
     await expect(acquireStartupFence({ env, createClient: () => client }))
@@ -105,5 +105,38 @@ describe("copy-mode startup fence", () => {
       createClient: () => client,
     });
     expect(result?.admission).toMatchObject({ activated: false, reason: "empty-installer-journal" });
+  });
+
+  it("uses durable copy mode when a stale deployment declaration says legacy", async () => {
+    const client = fakeClient({
+      state: "ready", run_id: "copied-run", last_ready_run_id: "copied-run",
+      last_ready_object_id: "copied-object", last_ready_mode: "copy-ready",
+    });
+    const result = await acquireStartupFence({
+      env: { STAGING_DATA_MODE: "legacy-pg-only", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
+      createClient: () => client,
+    });
+    expect(result?.admission).toMatchObject({ activated: true, mode: "copy-ready", reason: "ready" });
+  });
+
+  it("uses durable legacy mode for a restored rollback under a copy-ready declaration", async () => {
+    const client = fakeClient({
+      state: "ready", run_id: "legacy-run", last_ready_run_id: "legacy-run",
+      last_ready_object_id: "legacy-object", last_ready_mode: "legacy-pg-only",
+    });
+    const result = await acquireStartupFence({
+      env: { STAGING_DATA_MODE: "copy-ready", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
+      createClient: () => client,
+    });
+    expect(result?.admission).toMatchObject({ activated: true, mode: "legacy-pg-only", reason: "ready" });
+  });
+
+  it("refuses an activated ready journal whose durable mode is missing", async () => {
+    const client = fakeClient({ state: "ready", run_id: "run-1", last_ready_run_id: "run-1" });
+    await expect(acquireStartupFence({
+      env: { STAGING_DATA_MODE: "legacy-pg-only", DATABASE_URL: "postgres://db/x", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,
+      createClient: () => client,
+    })).rejects.toThrow(/no supported effective mode/);
+    expect(client.end).toHaveBeenCalledTimes(1);
   });
 });

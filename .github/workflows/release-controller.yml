@@ -129,6 +129,10 @@ jobs:
           EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
           EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
           EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+          # Break-glass waives candidate evidence, not post-update production observation.
+          RAILWAY_PRODUCTION_READ_TOKEN: ${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}
+          RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
+          RAILWAY_PRODUCTION_APP_SERVICE_ID: ${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}
         run: node scripts/staging-ops/release-controller.mjs --run
       - uses: actions/upload-artifact@v4
         if: always()

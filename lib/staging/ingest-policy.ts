@@ -44,7 +44,7 @@ export async function manualIngestionVerdict(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<ManualIngestionVerdict> {
   const state = await readStagingRuntimeState(env);
-  if (state.mode === "copy-ready" || state.mode === "copy-safe-refusal") {
+  if (!state.ready || state.mode === "copy-ready" || state.mode === "copy-safe-refusal") {
     return { allowed: false, code: INGEST_DISABLED_CODE, message: INGEST_DISABLED_MESSAGE };
   }
   return { allowed: true, code: null, message: null };

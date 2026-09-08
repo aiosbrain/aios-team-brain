@@ -38,6 +38,14 @@ describe("trusted release-controller workflow wiring", () => {
     // handing one to the production probe could only ever produce a 401.
     expect(JSON.stringify(measure.env)).not.toContain("PRODUCTION_HEALTH_TOKEN");
   });
+  it("gives the emergency observer the same read-only production deployment identity", () => {
+    const emergency = workflow.jobs.emergency.steps.find((s: any) => s.env?.RELEASE_ACTION === "emergency");
+    expect(emergency.env).toMatchObject({
+      RAILWAY_PRODUCTION_READ_TOKEN: "${{ secrets.RAILWAY_PRODUCTION_READ_TOKEN }}",
+      RAILWAY_PRODUCTION_ENVIRONMENT_ID: "${{ vars.RAILWAY_PRODUCTION_ENVIRONMENT_ID }}",
+      RAILWAY_PRODUCTION_APP_SERVICE_ID: "${{ vars.RAILWAY_PRODUCTION_APP_SERVICE_ID }}",
+    });
+  });
   it("never executes candidate code and scopes App secrets to their own job", () => {
     expect(raw).not.toMatch(/checkout[^\n]*\$\{\{\s*inputs\.tag|ref:\s*\$\{\{\s*inputs\.tag/);
     expect(JSON.stringify(workflow.jobs.normal)).not.toContain("EMERGENCY_APP_PRIVATE_KEY");

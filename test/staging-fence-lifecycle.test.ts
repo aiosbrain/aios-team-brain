@@ -72,7 +72,7 @@ function fenceClient(groupOf: () => number | null) {
       // return an empty row — a shape that would now (correctly) read as "refused".
       if (String(sql).includes("advisory_lock")) { events.push("lock"); return { rows: [{ acquired: true }] }; }
       if (String(sql).includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
-      if (String(sql).includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1" }] };
+      if (String(sql).includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1", last_ready_run_id: "run-1", last_ready_mode: "copy-ready" }] };
       return { rows: [] };
     }),
     end: vi.fn(async () => {

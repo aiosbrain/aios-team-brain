@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { closeAll, closeAllWithinBudget, ownedCloser } from "../scripts/staging-ops/resource-cleanup.mjs";
 import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
@@ -51,7 +54,7 @@ const gate = vi.hoisted(() => ({
 }));
 
 const pgState = vi.hoisted(() => ({
-  clients: [] as { statements: string[]; ended: number; endedWhileQueryPending: boolean; pending: number }[],
+  clients: [] as { statements: string[]; ended: number; endedWhileQueryPending: boolean; pending: number; connection: { stream: { destroyed: boolean; destroyCalls: number; destroy: (error?: unknown) => void } } }[],
   rows: [{ acquired: true }] as Record<string, unknown>[],
   journal: {} as Record<string, unknown>,
 }));
@@ -62,6 +65,11 @@ vi.mock("pg", () => {
     ended = 0;
     endedWhileQueryPending = false;
     pending = 0;
+    connection = { stream: {
+      destroyed: false,
+      destroyCalls: 0,
+      destroy: (_error?: unknown) => { this.connection.stream.destroyed = true; this.connection.stream.destroyCalls += 1; },
+    } };
     constructor() { pgState.clients.push(this as never); }
     async connect() { /* connected by construction */ }
     async end() {
@@ -69,11 +77,13 @@ vi.mock("pg", () => {
       if (this.pending > 0) this.endedWhileQueryPending = true;
     }
     async query(sql: string) {
+      if (this.connection.stream.destroyed) throw new Error("connection destroyed by stale watchdog");
       this.statements.push(String(sql));
       this.pending += 1;
       try {
         const held = gate.take();
         if (held) return await held;
+        if (String(sql).includes("pg_export_snapshot")) return { rows: [{ snapshot: "00000003-0000001B-1" }] };
         if (String(sql).includes("FROM staging_ops.refresh_journal")) return { rows: [pgState.journal] };
         return { rows: pgState.rows };
       } finally { this.pending -= 1; }
@@ -95,6 +105,8 @@ vi.mock("../scripts/staging-ops/object-store.mjs", async (importOriginal) => ({
     writePointer: async () => true, delete: async () => true,
   }),
 }));
+
+const maintenanceState = vi.hoisted(() => ({ stopDelayMs: 0, stopError: null as Error | null }));
 
 // Reaching `rollbackToPrior` through the REAL dispatcher means getting past `openPrior`, which
 // verifies a signed, encrypted, manifest-validated rollback bundle. None of that cryptography is
@@ -127,7 +139,11 @@ vi.mock("../scripts/staging-ops/action-preflight.mjs", () => ({ assertActionConf
 vi.mock("../scripts/staging-ops/local-maintenance.mjs", () => ({
   LocalMaintenance: class {
     appServiceId = "app-local";
-    async stopAndVerifyAll() { return true; }
+    async stopAndVerifyAll() {
+      if (maintenanceState.stopDelayMs) await new Promise((resolve) => setTimeout(resolve, maintenanceState.stopDelayMs));
+      if (maintenanceState.stopError) throw maintenanceState.stopError;
+      return true;
+    }
     async tokenIdentity() { return {}; }
     async listActiveDeployments() {
       return [{ id: "dep-1", status: "SUCCESS", meta: { commitHash: "b".repeat(40), createdAt: "2026-09-07T00:00:00Z" } }];
@@ -181,6 +197,11 @@ const ENV = Object.fromEntries([
 ]) as unknown as NodeJS.ProcessEnv;
 
 const OBJECT_ID = `run-1--${"a".repeat(64)}`;
+
+afterEach(() => {
+  maintenanceState.stopDelayMs = 0;
+  maintenanceState.stopError = null;
+});
 
 /** Start a real dispatcher branch and hold open the first async resource it reaches. */
 function driveBranch(argv: string[], { holdAfter = 0 } = {}) {
@@ -272,6 +293,81 @@ describe("the dispatcher keeps Postgres open until the branch it started has fin
     expect(unlocked()).toBe(true);
     expect(client().ended).toBe(1);
   });
+
+  it("manual recovery keeps the session alive after the original action deadline", async () => {
+    pgState.clients.length = 0;
+    pgState.rows = [{ acquired: true }];
+    pgState.journal = {
+      state: "failed", run_id: "failed-run",
+      last_ready_run_id: "prior-run", last_ready_object_id: `prior-run--${"a".repeat(64)}`,
+      last_ready_digest: createHash("sha256").update(PRIOR_BYTES).digest("hex"),
+      last_ready_commit: "b".repeat(40), last_ready_mode: "copy-ready",
+    };
+    gate.armed = false;
+    maintenanceState.stopDelayMs = 1_150;
+    maintenanceState.stopError = new Error("controlled recovery stop refusal");
+
+    const outcome = await runImporter({
+      ...ENV, STAGING_OPERATION_TIMEOUT_MS: "1000", STAGING_RECOVERY_TIMEOUT_MS: "5000",
+      STAGING_CLEANUP_TIMEOUT_MS: "1000", STAGING_TERMINATE_GRACE_MS: "100",
+    } as NodeJS.ProcessEnv, ["rollback", "failed-run"]).then(() => null, (error: Error) => error);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome?.message).toMatch(/controlled recovery stop refusal/);
+    expect(pgState.clients[0].connection.stream.destroyCalls, "the retired action watchdog destroyed recovery's lock-owning session").toBe(0);
+    expect(pgState.clients[0].statements.some((sql) => sql === "ROLLBACK"), "recovery never started").toBe(true);
+  }, 15_000);
+});
+
+describe("the actual importer signal handler coordinates owned subprocess cancellation", () => {
+  it("keeps its owner session until a slow rollback capture is confirmed stopped, including repeated signals", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "importer-signal-cancel-"));
+    const pidFile = path.join(directory, "owned-pid");
+    const executable = path.join(directory, "pg_dump");
+    writeFileSync(executable, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.STAGING_SIGNAL_PID_FILE, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+    chmodSync(executable, 0o700);
+    const oldPath = process.env.PATH;
+    const oldPidFile = process.env.STAGING_SIGNAL_PID_FILE;
+    process.env.PATH = `${directory}:${oldPath ?? ""}`;
+    process.env.STAGING_SIGNAL_PID_FILE = pidFile;
+    pgState.clients.length = 0;
+    pgState.rows = [{ acquired: true }];
+    pgState.journal = { state: "failed", run_id: null, last_ready_run_id: null };
+    gate.armed = false;
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      const running = runImporter({
+        ...ENV, STAGING_OPERATION_TIMEOUT_MS: "10000", STAGING_RECOVERY_TIMEOUT_MS: "5000",
+        STAGING_CLEANUP_TIMEOUT_MS: "1000", STAGING_TERMINATE_GRACE_MS: "100",
+      } as NodeJS.ProcessEnv, ["bootstrap-rollback"]);
+      for (let attempt = 0; attempt < 300 && !existsSync(pidFile); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(existsSync(pidFile), "the owned rollback capture never started").toBe(true);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      expect(alive(pid)).toBe(true);
+
+      process.emit("SIGTERM");
+      process.emit("SIGTERM");
+      const outcome = await running.then(() => null, (error: Error & { code?: string; terminationConfirmed?: boolean }) => error);
+
+      expect(outcome).toMatchObject({ code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true });
+      expect(alive(pid), "the importer returned while its owned process was alive").toBe(false);
+      expect(pgState.clients[0].ended, "the owner session was not closed after containment").toBe(1);
+      expect(pgState.clients[0].statements.some((sql) => sql.includes("pg_advisory_unlock")), "the coordinator lock was never released after containment").toBe(true);
+    } finally {
+      if (oldPath === undefined) delete process.env.PATH;
+      else process.env.PATH = oldPath;
+      if (oldPidFile === undefined) delete process.env.STAGING_SIGNAL_PID_FILE;
+      else process.env.STAGING_SIGNAL_PID_FILE = oldPidFile;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("nothing is constructed outside the scope that cleans it up", () => {
@@ -437,5 +533,41 @@ describe("closeAll reaches every resource", () => {
       ownedCloser(async () => { events.push("second-closed"); }),
     )).resolves.toBe(true);
     expect(events).toEqual(["first-terminated", "first-closed", "second-closed"]);
+  });
+
+  it("hard-stops within the shared reserve when both close and terminate remain pending", async () => {
+    const never = new Promise<void>(() => {});
+    const hardStop = vi.fn();
+    const budget = createOperationBudget("stalled cleanup", 5);
+    await expect(closeAllWithinBudget({ budget, terminateGraceMs: 10, terminateWorker: hardStop },
+      ownedCloser(() => never, () => never),
+      ownedCloser(async () => { throw new Error("must not claim later ownership release after hard stop"); }),
+    )).rejects.toThrow(/did not settle after bounded cleanup termination/);
+    expect(hardStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("hard-stops when terminate settles but the original close remains pending", async () => {
+    const never = new Promise<void>(() => {});
+    const hardStop = vi.fn();
+    await expect(closeAllWithinBudget({ budget: createOperationBudget("stalled close", 5), terminateGraceMs: 10, terminateWorker: hardStop },
+      ownedCloser(() => never, async () => undefined),
+    )).rejects.toThrow(/did not settle after bounded cleanup termination/);
+    expect(hardStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds a rejected termination, preserves that failure, and still attempts later resources when close settles", async () => {
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => { release = resolve; });
+    const events: string[] = [];
+    const terminationError = new Error("termination transport refused");
+    const error = await closeAllWithinBudget({
+      budget: createOperationBudget("rejecting termination", 5), terminateGraceMs: 40,
+      terminateWorker: async () => { throw new Error("hard stop should not be needed"); },
+    },
+    ownedCloser(() => stalled, async () => { release(); throw terminationError; }),
+    ownedCloser(async () => { events.push("later-close"); }),
+    ).catch((caught: Error) => caught);
+    expect(error).toBe(terminationError);
+    expect(events).toEqual(["later-close"]);
   });
 });

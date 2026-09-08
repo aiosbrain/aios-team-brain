@@ -131,10 +131,20 @@ export function verifyEffectiveMainPolicy({ applicableRulesets, classicProtectio
     for (const bypass of ruleset.bypass_actors ?? []) {
       if (bypass.actor_type !== "Integration") errors.push(`${ruleset.name ?? "unnamed ruleset"} has an unexpected non-App bypass`);
     }
+    if (!desired.some((wanted) => wanted.name === ruleset.name)) {
+      const unsupported = (ruleset.rules ?? []).map((rule) => rule?.type)
+        .filter((type) => type !== "non_fast_forward" && type !== "deletion");
+      if (unsupported.length) {
+        errors.push(
+          `${ruleset.name ?? "unnamed ruleset"} adds unsupported restrictions (${unsupported.join(", ")}) whose compatibility with normal and emergency direct updates is not established`
+        );
+      }
+    }
   }
   if (classicProtection?.required_status_checks != null) errors.push("classic required status checks conflict with App ruleset bypasses");
   if (classicProtection?.required_pull_request_reviews != null) errors.push("classic required pull request rule conflicts with App ruleset bypasses");
   if (classicProtection?.allow_force_pushes?.enabled === true) errors.push("classic protection allows force pushes");
   if (classicProtection?.allow_deletions?.enabled === true) errors.push("classic protection allows deletion");
+  if (classicProtection?.lock_branch?.enabled === true) errors.push("classic branch lock blocks the authorized release Apps");
   return { ok: errors.length === 0, errors };
 }

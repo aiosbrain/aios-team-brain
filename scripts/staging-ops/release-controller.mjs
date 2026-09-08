@@ -2,7 +2,7 @@
 import { writeFileSync } from "node:fs";
 import { importPKCS8, SignJWT } from "jose";
 import { candidateValidationVerdict } from "./release-policy.mjs";
-import { releaseCandidateVerdict } from "../release-candidate-guard.mjs";
+import { releaseCandidateVerdict } from "../release-candidate-verdict.mjs";
 import { REQUIRED_MAIN_CONTEXTS } from "./main-policy.mjs";
 
 const PREVALIDATION_CONTEXTS = REQUIRED_MAIN_CONTEXTS.filter((name) => name !== "Staging candidate validation");
@@ -511,7 +511,7 @@ export async function runReleaseController(env = process.env, operations = {}) {
         throw new Error(mutation.status);
       }
       updateConfirmed = mutation.status === "promoted" || mutation.status === "already-promoted";
-      if (mutation.status === "promoted" && !emergency) {
+      if (mutation.status === "promoted") {
         phase = "production-observation";
         mutation.production = await (operations.observeProductionDeployment ?? observeProductionDeployment)({
           expectedSha: facts.commitSha,

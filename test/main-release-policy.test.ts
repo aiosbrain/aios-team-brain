@@ -121,4 +121,50 @@ describe("main release protection contract", () => {
       expected: { normalAppId: 111, emergencyAppId: 222, producerIds: CHECKS },
     }).ok).toBe(false);
   });
+
+  it.each([
+    ["update with no bypass", { rules: [{ type: "update" }], bypass_actors: [] }],
+    ["pull request with no bypass", { rules: [{ type: "pull_request" }], bypass_actors: [] }],
+    ["update with the wrong App", { rules: [{ type: "update" }], bypass_actors: [{ actor_type: "Integration", actor_id: 999, bypass_mode: "always" }] }],
+    ["update with pull-request-only bypass", { rules: [{ type: "update" }], bypass_actors: [{ actor_type: "Integration", actor_id: 111, bypass_mode: "pull_request" }] }],
+    ["checks emergency cannot bypass", { rules: [{ type: "required_status_checks", parameters: { required_status_checks: [] } }], bypass_actors: [{ actor_type: "Integration", actor_id: 111, bypass_mode: "always" }] }],
+  ] as const)("refuses an additional applicable %s restriction", (_label, extra) => {
+    expect(verifyEffectiveMainPolicy({
+      applicableRulesets: [...desired, {
+        name: "inherited-extra", target: "branch", enforcement: "active",
+        conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+        ...extra,
+      }],
+      classicProtection: { required_status_checks: null, required_pull_request_reviews: null },
+      expected: { normalAppId: 111, emergencyAppId: 222, producerIds: CHECKS },
+      applicabilityMeasured: true,
+    }).errors.join("; ")).toMatch(/adds unsupported restrictions/);
+  });
+
+  it("allows an additional integrity-only restriction and a permitted classic integrity profile", () => {
+    expect(verifyEffectiveMainPolicy({
+      applicableRulesets: [...desired, {
+        name: "inherited-integrity", target: "branch", enforcement: "active",
+        conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+        bypass_actors: [], rules: [{ type: "non_fast_forward" }, { type: "deletion" }],
+      }],
+      classicProtection: {
+        enforce_admins: { enabled: true }, required_status_checks: null,
+        required_pull_request_reviews: null, allow_force_pushes: { enabled: false },
+        allow_deletions: { enabled: false }, lock_branch: { enabled: false },
+      },
+      expected: { normalAppId: 111, emergencyAppId: 222, producerIds: CHECKS },
+      applicabilityMeasured: true,
+    })).toEqual({ ok: true, errors: [] });
+  });
+
+  it("refuses classic branch locking", () => {
+    const result = verifyEffectiveMainPolicy({
+      applicableRulesets: desired,
+      classicProtection: { required_status_checks: null, required_pull_request_reviews: null, lock_branch: { enabled: true } },
+      expected: { normalAppId: 111, emergencyAppId: 222, producerIds: CHECKS },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.errors.join("; ")).toMatch(/classic branch lock/);
+  });
 });

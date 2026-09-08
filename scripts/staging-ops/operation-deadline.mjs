@@ -54,6 +54,47 @@ export function armBudgetWatchdog(budget, terminate) {
   });
 }
 
+/**
+ * One owner for every watchdog capable of destroying a lock-owning database session.
+ * Recovery transfers ownership atomically: all enclosing action/tick timers are retired before a
+ * fresh recovery timer is armed. A timer that already fired is evidence that the session may have
+ * lost its locks and cannot be revived by assigning it a larger timeout.
+ */
+export function createSessionWatchdogOwner(terminate) {
+  const active = new Set();
+  const wrap = (watchdog) => {
+    let disarmed = false;
+    const handle = Object.freeze({
+      get expired() { return watchdog.expired; },
+      async disarm() {
+        if (disarmed) return;
+        disarmed = true;
+        active.delete(handle);
+        await watchdog.disarm();
+      },
+    });
+    active.add(handle);
+    return handle;
+  };
+  const disarmAll = async () => {
+    const handles = [...active];
+    await Promise.all(handles.map((handle) => handle.disarm()));
+    return handles;
+  };
+  return Object.freeze({
+    arm(budget) { return wrap(armBudgetWatchdog(budget, terminate)); },
+    async transferTo(budget) {
+      const retired = await disarmAll();
+      if (retired.some((watchdog) => watchdog.expired)) {
+        throw new StagingDeadlineExceededError("the enclosing importer watchdog expired before recovery ownership transferred; same-session recovery is unsafe");
+      }
+      return wrap(armBudgetWatchdog(budget, terminate));
+    },
+    disarmAll,
+    get size() { return active.size; },
+  });
+}
+
 export function finiteDeadlineMs(name, value, defaultValue, { min = 1_000, max = 60 * 60_000 } = {}) {
   const parsed = value === undefined || value === null || value === "" ? defaultValue : Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {

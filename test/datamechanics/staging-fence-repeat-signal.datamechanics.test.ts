@@ -118,7 +118,7 @@ describe.runIf(POSIX)("AC-06 — the real shared lock is held for the payload's 
     // past classification and actually supervises. Nothing here weakens admission — the fence still
     // makes its own decision against this row.
     await owner.query(
-      "UPDATE staging_ops.refresh_journal SET state='ready', run_id='fence-repeat-signal' WHERE singleton=true"
+      "UPDATE staging_ops.refresh_journal SET state='ready', run_id='fence-repeat-signal', last_ready_run_id='fence-repeat-signal', last_ready_mode='copy-ready' WHERE singleton=true"
     );
   });
 

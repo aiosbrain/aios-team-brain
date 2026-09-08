@@ -144,25 +144,66 @@ export async function readStagingRuntimeState(env: NodeJS.ProcessEnv = process.e
   const declared = stagingModeFromEnvironment(env);
   if (!marker && !isPinnedStagingEnvironment(env) && !declared) return { mode: "production", ready: true, runId: null };
   if (!declared) return { mode: "copy-safe-refusal", ready: false, runId: null };
-  if (declared === "legacy-pg-only") return { mode: declared, ready: true, runId: null };
 
   try {
-    const result = await runSql<{ run_id: string | null; state: string | null; catchup_commit: string | null; last_ready_mode: string | null; candidate_mode: string | null }>(
-      `select run_id, state, catchup_commit, last_ready_mode, candidate_mode from staging_ops.refresh_journal where singleton = true limit 1`,
+    const result = await runSql<{
+      run_id: string | null;
+      state: string | null;
+      last_ready_run_id: string | null;
+      last_ready_object_id: string | null;
+      last_ready_mode: string | null;
+      candidate_run_id: string | null;
+      candidate_object_id: string | null;
+      candidate_mode: string | null;
+      boot_run_id: string | null;
+      boot_commit: string | null;
+    }>(
+      `select run_id, state, last_ready_run_id, last_ready_object_id, last_ready_mode,
+              candidate_run_id, candidate_object_id, candidate_mode, boot_run_id, boot_commit
+         from staging_ops.refresh_journal where singleton = true limit 1`,
       []
     );
     const row = result.rows[0];
-    const journalMode = row?.state === "booting" ? row.candidate_mode : row?.last_ready_mode;
-    const effectiveMode = journalMode === "legacy-pg-only" || journalMode === "copy-ready" ? journalMode : declared;
-    return { mode: effectiveMode, ready: row?.state === "ready", runId: row?.run_id ?? null };
-  } catch {
+    if (!row) return { mode: "copy-safe-refusal", ready: false, runId: null };
+    const activated = Boolean(
+      row.run_id || row.last_ready_run_id || row.last_ready_object_id || row.candidate_run_id ||
+      row.candidate_object_id || row.boot_run_id || row.boot_commit
+    );
+    if (!activated) {
+      return declared === "legacy-pg-only" && env.STAGING_COPY_MODE_ACTIVATED !== "true"
+        ? { mode: "legacy-pg-only", ready: true, runId: null }
+        : { mode: "copy-safe-refusal", ready: false, runId: null };
+    }
+
+    if (row.state !== "ready" && row.state !== "booting") {
+      return { mode: "copy-safe-refusal", ready: false, runId: row.run_id ?? null };
+    }
+    const durableMode = row.state === "booting" ? row.candidate_mode : row.last_ready_mode;
+    if (durableMode !== "legacy-pg-only" && durableMode !== "copy-ready") {
+      return { mode: "copy-safe-refusal", ready: false, runId: row.run_id ?? null };
+    }
+    return {
+      mode: durableMode,
+      ready: row.state === "ready",
+      runId: row.state === "booting" ? row.boot_run_id ?? row.run_id : row.last_ready_run_id ?? row.run_id,
+    };
+  } catch (error: unknown) {
+    // Undefined-table is the one expected preactivation state. Any other failure is unreadable
+    // evidence and therefore cannot authorize graph mutation or connector work.
+    if (
+      declared === "legacy-pg-only" &&
+      env.STAGING_COPY_MODE_ACTIVATED !== "true" &&
+      typeof error === "object" && error !== null && "code" in error && error.code === "42P01"
+    ) {
+      return { mode: "legacy-pg-only", ready: true, runId: null };
+    }
     return { mode: "copy-safe-refusal", ready: false, runId: null };
   }
 }
 
 export async function assertCopiedStagingGraphMutationAllowed(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const state = await readStagingRuntimeState(env);
-  if (state.mode === "copy-ready" || state.mode === "copy-safe-refusal") {
+  if (!state.ready || state.mode === "copy-ready" || state.mode === "copy-safe-refusal") {
     throw new Error("copied-staging-read-only: graph mutations and extraction are disabled");
   }
 }

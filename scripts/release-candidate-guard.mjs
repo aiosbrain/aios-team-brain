@@ -31,74 +31,11 @@
 
 import { execFileSync } from "node:child_process";
 import { INTEGRATION_BRANCH, RELEASE_BRANCH, remoteRef } from "./branches.mjs";
+import { RELEASE_TAG, releaseCandidateVerdict } from "./release-candidate-verdict.mjs";
 
-/** A release tag is EXACTLY `vX.Y.Z`. No pre-release, no build metadata, no leading zeros. */
-const RELEASE_TAG = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
-
-/**
- * THE PURE DECISION. Every input is a fact someone else measured, so this is testable without git,
- * without a network, and without a repository in any particular state.
- *
- * Returns `{ verdict, failures }` rather than throwing: the caller decides the exit code, and the
- * failures list is what a human reads in the Actions log.
- */
-export function releaseCandidateVerdict({
-  tagName,
-  tagObjectType,
-  taggedTreeVersion,
-  mainIsAncestor,
-  reachableFromIntegration,
-}) {
-  const failures = [];
-
-  // A — the tag itself. Name first, then shape: a malformed name makes B's expectation meaningless,
-  // so reporting both would be one fixture tripping two terms and would prove only the first.
-  if (!RELEASE_TAG.test(String(tagName))) {
-    failures.push(
-      `A: ${tagName} is not exactly vX.Y.Z. Pre-release and build-metadata tags are refused rather ` +
-        `than skipped, so the refusal is LOUD — use a non-\`v\` prefix (\`rc/\`, \`cutover/\`) for ` +
-        `anything that is not a release.`
-    );
-  } else if (tagObjectType !== "tag") {
-    // The corpus is genuinely mixed — `v0.12.0` is a `tag` object, `v0.10.0` is a `commit`.
-    failures.push(
-      `A: ${tagName} is a LIGHTWEIGHT tag (object type ${tagObjectType ?? "unknown"}). A release tag ` +
-        `must be annotated, so it carries an author, a date and a message.`
-    );
-  }
-
-  // B — the tag name and the tree it points at must agree. Checked in BOTH directions: a
-  // one-directional check passes the half-cut release it exists to catch.
-  if (RELEASE_TAG.test(String(tagName))) {
-    const expected = String(tagName).slice(1);
-    if (taggedTreeVersion !== expected) {
-      failures.push(
-        `B: ${tagName} points at a tree whose package.json version is ${taggedTreeVersion ?? "absent"}, ` +
-          `not ${expected}. Either the version bump is missing or the tag is on the wrong commit.`
-      );
-    }
-  }
-
-  // C — a fast-forward is POSSIBLE. This is an early signal, not the enforcement: git's non-force
-  // push plus force-push-off is what actually makes the advance a fast-forward.
-  if (mainIsAncestor !== true) {
-    failures.push(
-      `C: the current \`main\` is not an ancestor of this commit, so advancing \`main\` to it would ` +
-        `not be a fast-forward.`
-    );
-  }
-
-  // D — it is the RIGHT commit. Without this, A+B+C accept any descendant of `main`, including a
-  // commit from a pull request that was never merged.
-  if (reachableFromIntegration !== true) {
-    failures.push(
-      `D: this commit is not reachable from the integration branch, so it never crossed integration. ` +
-        `A+B+C alone certify only "some descendant of main", not "the release".`
-    );
-  }
-
-  return { verdict: failures.length === 0 ? "PASS" : "FAIL", failures };
-}
+// Preserve the public API used by existing callers while keeping the reusable decision in a module
+// whose import can never trigger the candidate CLI.
+export { releaseCandidateVerdict } from "./release-candidate-verdict.mjs";
 
 /* ─────────────────────────── the thin measuring shell ─────────────────────────── */
 

@@ -496,7 +496,7 @@ export async function projectToGraphNow(
   // non-admin whatever the runtime is, and leaking the runtime posture to them is not this
   // function's job. Uses the same shared classification as the runner, not a second mode detector.
   const runtime = await readStagingRuntimeState();
-  if (runtime.mode === "copy-ready" || runtime.mode === "copy-safe-refusal") {
+  if (!runtime.ready || runtime.mode === "copy-ready" || runtime.mode === "copy-safe-refusal") {
     return { ok: false, error: `graph projection is disabled on this ${runtime.mode} staging runtime` };
   }
   const startedAt = Date.now();

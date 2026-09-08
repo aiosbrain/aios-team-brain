@@ -58,6 +58,25 @@ export async function readDurableFenceEnrollment(client) {
   return { activated, journal, reason: activated ? "durable-journal-identity" : "empty-installer-journal" };
 }
 
+/**
+ * Resolve the mode from the durable pair being served or booted. The deployment declaration is an
+ * enrollment/configuration claim; after a journal identity exists it cannot relabel a copied pair
+ * as legacy (or a restored legacy pair as copied).
+ */
+export function durableFenceMode(journal) {
+  const state = String(journal?.state ?? "");
+  const raw = state === "ready"
+    ? journal?.last_ready_mode
+    : state === "booting"
+      ? journal?.candidate_mode
+      : journal?.candidate_mode ?? journal?.rollback_target_mode ?? journal?.last_ready_mode;
+  const mode = String(raw ?? "");
+  if (!SUPPORTED.has(mode)) {
+    throw new Error(`activated staging journal has no supported effective mode for ${state || "unknown"} state`);
+  }
+  return mode;
+}
+
 /** Apply the same activation/mode/journal admission at startup and schema-load time. */
 export async function classifyFenceAdmission(client, env = process.env, context = "staging process", { requireBootAdmission = true } = {}) {
   const scope = stagingFenceScope(env);
@@ -77,10 +96,11 @@ export async function classifyFenceAdmission(client, env = process.env, context 
   if (!durable.journal) {
     throw new Error(`${context} refused: activated staging has no readable refresh journal`);
   }
+  const effectiveMode = durableFenceMode(durable.journal);
   if (!requireBootAdmission) {
-    return { fenced: true, activated: true, journal: durable.journal, mode: scope.declaredMode, reason: "exclusive-import-session" };
+    return { fenced: true, activated: true, journal: durable.journal, mode: effectiveMode, reason: "exclusive-import-session" };
   }
   const verdict = bootAdmissionVerdict(durable.journal, env);
   if (!verdict.ok) throw new Error(`${context} refused: ${verdict.reason}`);
-  return { fenced: true, activated: true, journal: durable.journal, mode: scope.declaredMode, reason: verdict.reason };
+  return { fenced: true, activated: true, journal: durable.journal, mode: effectiveMode, reason: verdict.reason };
 }

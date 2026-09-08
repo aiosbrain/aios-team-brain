@@ -89,7 +89,7 @@ export async function capturePairedPostgres({
 }
 
 /** Capture the complete staging database for importer-owned rollback; never used by exporter. */
-export async function captureRollbackPostgres({ client, databaseUrl, directory, execImpl, pgDump = "pg_dump", operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null }) {
+export async function captureRollbackPostgres({ client, databaseUrl, directory, execImpl, pgDump = "pg_dump", operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal }) {
   const remaining = (label) => remainingBudgetMs(budget, operationTimeoutMs, label);
   remaining("rollback capture transaction");
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -100,7 +100,7 @@ export async function captureRollbackPostgres({ client, databaseUrl, directory, 
     const snapshot = snap.rows[0]?.snapshot;
     if (!SNAPSHOT.test(String(snapshot ?? ""))) throw new Error("Postgres exported an invalid rollback snapshot identifier");
     const archive = path.join(directory, "postgres.dump");
-    await run(pgDump, ["--format=custom", "--schema=public", `--snapshot=${snapshot}`, `--file=${archive}`, databaseUrl], { timeoutMs: remaining("rollback archive capture"), terminateGraceMs }, execImpl);
+    await run(pgDump, ["--format=custom", "--schema=public", `--snapshot=${snapshot}`, `--file=${archive}`, databaseUrl], { timeoutMs: remaining("rollback archive capture"), terminateGraceMs, signal }, execImpl);
     remaining("rollback capture commit");
     await client.query("COMMIT");
     return { archive, snapshot };
@@ -147,8 +147,8 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function writeFilteredList({ archive, directory, name, omitTables, execImpl, pgRestore, operationTimeoutMs, terminateGraceMs }) {
-  const { stdout } = await run(pgRestore, ["--list", archive], { timeoutMs: operationTimeoutMs, terminateGraceMs }, execImpl);
+async function writeFilteredList({ archive, directory, name, omitTables, execImpl, pgRestore, operationTimeoutMs, terminateGraceMs, signal }) {
+  const { stdout } = await run(pgRestore, ["--list", archive], { timeoutMs: operationTimeoutMs, terminateGraceMs, signal }, execImpl);
   const filtered = filterRestoreList(stdout, { omitTables });
   const listPath = path.join(directory, name);
   await writeFile(listPath, filtered.text, { mode: 0o600 });
@@ -328,7 +328,7 @@ export async function assertMarkerPreserved(client, snapshot, { verifiedStagingT
 async function replaceFromArchive({
   client, databaseUrl, archive, directory, listName, omitTables,
   execImpl, pgRestore, betweenDataAndPostData, verifiedStagingTarget,
-  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null,
+  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal,
 }) {
   const remaining = (label) => remainingBudgetMs(budget, operationTimeoutMs, label);
   // Defensive entry reset. A REPEATED restore through this same client — the rollback that follows
@@ -343,13 +343,13 @@ async function replaceFromArchive({
   }
   remaining("restore marker snapshot");
   const marker = await readMarkerSnapshot(client);
-  const { listPath } = await writeFilteredList({ archive, directory, name: listName, omitTables, execImpl, pgRestore, operationTimeoutMs: remaining("restore archive listing"), terminateGraceMs });
+  const { listPath } = await writeFilteredList({ archive, directory, name: listName, omitTables, execImpl, pgRestore, operationTimeoutMs: remaining("restore archive listing"), terminateGraceMs, signal });
   remaining("restore destructive cleanup");
   await cleanPublicApplicationObjects(client);
-  await run(pgRestore, [`--use-list=${listPath}`, "--section=pre-data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore pre-data"), terminateGraceMs }, execImpl);
-  await run(pgRestore, [`--use-list=${listPath}`, "--section=data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore data"), terminateGraceMs }, execImpl);
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=pre-data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore pre-data"), terminateGraceMs, signal }, execImpl);
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore data"), terminateGraceMs, signal }, execImpl);
   if (betweenDataAndPostData) await betweenDataAndPostData();
-  await run(pgRestore, [`--use-list=${listPath}`, "--section=post-data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore post-data"), terminateGraceMs }, execImpl);
+  await run(pgRestore, [`--use-list=${listPath}`, "--section=post-data", "--dbname", databaseUrl, archive], { timeoutMs: remaining("restore post-data"), terminateGraceMs, signal }, execImpl);
   remaining("restore marker verification");
   return assertMarkerPreserved(client, marker, { verifiedStagingTarget });
 }
@@ -358,7 +358,7 @@ async function replaceFromArchive({
 export async function restorePairedPostgres({
   client, databaseUrl, directory, cwd = process.cwd(), env = process.env,
   execImpl, pgRestore = "pg_restore", psql = "psql", verifiedStagingTarget = false,
-  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null,
+  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal,
 }) {
   const archive = path.join(directory, "postgres.dump");
   const auth = path.join(directory, "auth_users.csv");
@@ -368,11 +368,11 @@ export async function restorePairedPostgres({
     // A SOURCE archive never legitimately contains the staging marker. Filtering it is belt and
     // braces against a bundle that tries to supply one; the values themselves are never trusted.
     omitTables: PRESERVED_PUBLIC_TABLES,
-    execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget,
+    execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget, signal,
     betweenDataAndPostData: async () => {
       // Projected data must land BEFORE post-data FK constraints, on the same target.
-      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore authentication projection"), terminateGraceMs }, execImpl);
-      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore graph ledger projection"), terminateGraceMs }, execImpl);
+      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.auth_users from '${auth.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore authentication projection"), terminateGraceMs, signal }, execImpl);
+      await run(psql, ["-X", databaseUrl, "-v", "ON_ERROR_STOP=1", "-c", `\\copy public.graph_episodes from '${graphLedger.replaceAll("'", "''")}' with (format csv, header true)`], { timeoutMs: remainingBudgetMs(budget, operationTimeoutMs, "restore graph ledger projection"), terminateGraceMs, signal }, execImpl);
     },
   });
   remainingBudgetMs(budget, operationTimeoutMs, "copy-ready schema load");
@@ -383,7 +383,7 @@ export async function restorePairedPostgres({
 export async function restoreRollbackPostgres({
   client, databaseUrl, directory, cwd = process.cwd(), env = process.env,
   execImpl, pgRestore = "pg_restore", verifiedStagingTarget = false,
-  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null,
+  operationTimeoutMs = OPERATION_TIMEOUT_DEFAULT_MS, terminateGraceMs = 2_000, budget = null, signal,
 }) {
   const archive = path.join(directory, "postgres.dump");
   const marker = await replaceFromArchive({
@@ -392,7 +392,7 @@ export async function restoreRollbackPostgres({
     // paths: the LIVE marker is the preserved object and the archive's copy is structurally
     // omitted, so the restore can neither duplicate it nor clean it.
     omitTables: PRESERVED_PUBLIC_TABLES,
-    execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget,
+    execImpl, pgRestore, verifiedStagingTarget, operationTimeoutMs, terminateGraceMs, budget, signal,
   });
   remainingBudgetMs(budget, operationTimeoutMs, "rollback schema load");
   await loadSchema({ cwd, databaseUrl, env: { ...env, STAGING_DATA_MODE: env.STAGING_DATA_MODE ?? "copy-ready" }, connectedClient: client });

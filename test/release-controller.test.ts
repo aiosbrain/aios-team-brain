@@ -1,10 +1,64 @@
 import { describe, expect, it, vi } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   publishCandidateCheck, emergencyVerdict, measureCandidate, observeProductionDeployment,
   runReleaseController, updateMainNonForce,
 } from "../scripts/staging-ops/release-controller.mjs";
 
 describe("trusted release controller", () => {
+  it.each(["validate", "promote", "emergency"] as const)(
+    "the actual --run CLI reaches the %s controller action from a staging dispatch without starting the candidate CLI",
+    (action) => {
+      const directory = mkdtempSync(path.join(tmpdir(), "release-controller-entry-"));
+      try {
+        const auditPath = path.join(directory, "audit.json");
+        const eventsPath = path.join(directory, "events.jsonl");
+        writeFileSync(eventsPath, "");
+        const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+        const producerIds = Object.fromEntries([
+          "Docs drift guard", "Static checks (lint + typecheck)", "Secret scan (gitleaks)",
+          "Brain unit tests (vitest)", "Data-mechanics tests (real Postgres)", "Integration tests (HTTP)",
+          "Graph Neo4j tier (real Neo4j)", "Ingestion tests (pytest)", "NDA confidentiality gate",
+          "Staging paired refresh integration", "Release candidate gate",
+        ].map((name) => [name, 15368]));
+        execFileSync(process.execPath, ["--import", fileURLToPath(new URL("./fixtures/release-controller-provider-preload.mjs", import.meta.url)), "scripts/staging-ops/release-controller.mjs", "--run"], {
+          cwd: path.resolve(import.meta.dirname, ".."),
+          env: {
+            ...process.env,
+            GITHUB_REF: "refs/heads/staging", GITHUB_REPOSITORY: "owner/repo", GITHUB_SHA: "d".repeat(40),
+            GITHUB_TOKEN: "read-token", GITHUB_ACTOR: "operator", RELEASE_ACTION: action,
+            RELEASE_AUDIT_PATH: auditPath, RELEASE_FIXTURE_EVENTS: eventsPath,
+            RELEASE_TAG: "v1.2.3", RELEASE_DEPLOYMENT_ID: "staging-dep", RELEASE_MODE: "copy-ready",
+            RELEASE_NOTES: "Validated representative access paths", RELEASE_INCIDENT_URL: "https://linear.app/acme/issue/AIO-997",
+            RELEASE_EMERGENCY_SHA: "b".repeat(40), RELEASE_PRODUCER_IDS_JSON: JSON.stringify(producerIds),
+            STAGING_COPY_MODE_ACTIVATED: "true", STAGING_ORIGIN: "https://staging.example.test",
+            STAGING_HEALTH_TOKEN: "h".repeat(32), RAILWAY_STAGING_READ_TOKEN: "staging-read",
+            RAILWAY_STAGING_ENVIRONMENT_ID: "staging-env", RAILWAY_STAGING_APP_SERVICE_ID: "staging-app",
+            RAILWAY_PRODUCTION_READ_TOKEN: "production-read", RAILWAY_PRODUCTION_ENVIRONMENT_ID: "production-env",
+            RAILWAY_PRODUCTION_APP_SERVICE_ID: "production-app", PRODUCTION_DEPLOY_TIMEOUT_MS: "0",
+            RELEASE_APP_ID: "1", RELEASE_APP_INSTALLATION_ID: "2",
+            RELEASE_APP_PRIVATE_KEY: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+            EMERGENCY_APP_ID: "3", EMERGENCY_APP_INSTALLATION_ID: "4",
+            EMERGENCY_APP_PRIVATE_KEY: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+          },
+          stdio: "pipe",
+        });
+        const audit = JSON.parse(readFileSync(auditPath, "utf8"));
+        expect(audit).toMatchObject({ action, verdict: "completed", result: { sha: "b".repeat(40) } });
+        const events = readFileSync(eventsPath, "utf8");
+        expect(events).not.toContain("candidate-cli-subprocess");
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   it("publishes validation on the candidate SHA, never the dispatch SHA", async () => {
     const request = vi.fn().mockResolvedValue({ id: 9, html_url: "https://github.test/check/9" });
     await publishCandidateCheck({
@@ -193,6 +247,7 @@ describe("trusted release controller", () => {
       const success = common({
         githubRead: vi.fn(async (_method: string, path: string) => path.includes("compare/") ? { status: "ahead" } : { object: { sha: main } }),
         updateMainNonForce: vi.fn().mockResolvedValue({ status: "promoted", sha }),
+        observeProductionDeployment: vi.fn().mockResolvedValue({ status: "verified" }),
       });
       await expect(runReleaseController(emergencyEnv, success.operations)).resolves.toMatchObject({ status: "promoted", sha });
       expect(success.audits.at(-1)?.facts).toMatchObject({ incidentUrl });
@@ -236,6 +291,47 @@ describe("trusted release controller", () => {
         observeProductionDeployment: vi.fn().mockResolvedValue({ status: "promoted-but-deployment-unverified", observationError: "Railway unavailable" }),
       });
       await expect(runReleaseController(baseEnv, run.operations)).rejects.toThrow(/promoted-but-deployment-unverified/);
+      expect(run.audits.at(-1)).toMatchObject({
+        verdict: "promoted-but-deployment-unverified",
+        result: { status: "promoted", sha, production: { status: "promoted-but-deployment-unverified" } },
+      });
+    });
+
+    it.each([
+      ["verified", { status: "verified" }, "completed"],
+      ["failed", { status: "promoted-but-deployment-failed" }, "promoted-but-deployment-failed"],
+      ["wrong SHA until deadline", { status: "promoted-but-deployment-unverified", deployment: { commitSha: main } }, "promoted-but-deployment-unverified"],
+    ] as const)("observes an emergency deployment that is %s without repeating the main update", async (_label, observation, verdict) => {
+      const emergencyEnv = { ...baseEnv, RELEASE_ACTION: "emergency", RELEASE_EMERGENCY_SHA: sha,
+        RELEASE_INCIDENT_URL: "https://linear.app/acme/issue/AIO-997", RELEASE_NOTES: "Restore production login immediately",
+        EMERGENCY_APP_ID: "3", EMERGENCY_APP_INSTALLATION_ID: "4", EMERGENCY_APP_PRIVATE_KEY: "unused" } as NodeJS.ProcessEnv;
+      const update = vi.fn().mockResolvedValue({ status: "promoted", sha });
+      const observe = vi.fn().mockResolvedValue(observation);
+      const run = common({
+        githubRead: vi.fn(async (_method: string, requestPath: string) => requestPath.includes("compare/") ? { status: "ahead" } : { object: { sha: main } }),
+        updateMainNonForce: update,
+        observeProductionDeployment: observe,
+      });
+      const outcome = runReleaseController(emergencyEnv, run.operations);
+      if (verdict === "completed") await expect(outcome).resolves.toMatchObject({ status: "promoted", sha, production: { status: "verified" } });
+      else await expect(outcome).rejects.toThrow(new RegExp(verdict));
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(observe).toHaveBeenCalledTimes(1);
+      expect(run.audits.at(-1)).toMatchObject({ verdict, result: { status: "promoted", sha, production: observation } });
+    });
+
+    it("records an emergency observer exception as promoted-but-unverified and never repeats the update", async () => {
+      const emergencyEnv = { ...baseEnv, RELEASE_ACTION: "emergency", RELEASE_EMERGENCY_SHA: sha,
+        RELEASE_INCIDENT_URL: "https://linear.app/acme/issue/AIO-997", RELEASE_NOTES: "Restore production login immediately",
+        EMERGENCY_APP_ID: "3", EMERGENCY_APP_INSTALLATION_ID: "4", EMERGENCY_APP_PRIVATE_KEY: "unused" } as NodeJS.ProcessEnv;
+      const update = vi.fn().mockResolvedValue({ status: "promoted", sha });
+      const run = common({
+        githubRead: vi.fn(async (_method: string, requestPath: string) => requestPath.includes("compare/") ? { status: "ahead" } : { object: { sha: main } }),
+        updateMainNonForce: update,
+        observeProductionDeployment: vi.fn().mockRejectedValue(new Error("observer transport failed")),
+      });
+      await expect(runReleaseController(emergencyEnv, run.operations)).rejects.toThrow(/observer transport failed/);
+      expect(update).toHaveBeenCalledTimes(1);
       expect(run.audits.at(-1)).toMatchObject({
         verdict: "promoted-but-deployment-unverified",
         result: { status: "promoted", sha, production: { status: "promoted-but-deployment-unverified" } },

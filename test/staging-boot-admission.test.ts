@@ -11,6 +11,7 @@ const booting = (over: Record<string, unknown> = {}) => ({
   run_id: "run-7",
   boot_run_id: "run-7",
   boot_commit: SELECTED,
+  candidate_mode: "copy-ready",
   ...over,
 });
 
@@ -119,7 +120,7 @@ describe("B1 — both admission sites apply that one verdict", () => {
   });
 
   it("keeps an activated explicit legacy rollback under the common fence", async () => {
-    const client = fakeClient({ state: "ready", run_id: "legacy-ready", last_ready_run_id: "legacy-ready" });
+    const client = fakeClient({ state: "ready", run_id: "legacy-ready", last_ready_run_id: "legacy-ready", last_ready_mode: "legacy-pg-only" });
     await loadSchema({
       cwd: "/nonexistent-schema-root", databaseUrl: "postgres://db/x",
       env: { STAGING_DATA_MODE: "legacy-pg-only", STAGING_OPS_ENVIRONMENT_ID: "stg", RAILWAY_ENVIRONMENT_ID: "stg" } as NodeJS.ProcessEnv,

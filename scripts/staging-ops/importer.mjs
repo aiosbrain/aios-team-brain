@@ -37,7 +37,7 @@ import { exportGraph, GRAPH_CODEC_VERSION, validateGraphShape } from "./graph-bu
 import { decodeNeo4jValue } from "./neo4j-codec.mjs";
 import { snapshotExportFacts, validateLedgerAgainstSanitizedGraph, assertResolvedCorrectionScopes } from "./exporter.mjs";
 import { keyMaterial } from "./key-material.mjs";
-import { armBudgetWatchdog, configurePostgresDeadline, createOperationBudget, postgresDeadlineConfig, remainingBudgetMs, stagingOperationDeadlines } from "./operation-deadline.mjs";
+import { configurePostgresDeadline, createOperationBudget, createSessionWatchdogOwner, postgresDeadlineConfig, remainingBudgetMs, stagingOperationDeadlines } from "./operation-deadline.mjs";
 import { runBoundedProcess } from "./bounded-process.mjs";
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -131,11 +131,17 @@ export function assertReplayableGraph(graph) {
   return { nodes: graph.nodes.length, relationships: graph.relationships.length };
 }
 
-async function reapplyTesters(env, deadlines) {
+async function reapplyTesters(env, deadlines, signal) {
   await runBoundedProcess("npx", ["tsx", "--conditions", "react-server", "scripts/staging-ops/reapply-testers.ts", "--run"], {
     cwd: process.cwd(), env, maxBuffer: 1024 * 1024,
-    timeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs,
+    timeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, signal,
   });
+}
+
+async function withRecoveryWatchdog(beginRecoveryWatchdog, budget, work) {
+  const watchdog = await beginRecoveryWatchdog?.(budget);
+  try { return await work(); }
+  finally { await watchdog?.disarm(); }
 }
 
 /**
@@ -243,7 +249,7 @@ async function measuredReplaceFacts({ client, maintenance, env, opened }) {
   };
 }
 
-export async function installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines = stagingOperationDeadlines(env), budget = null, cleanupBudget = null }) {
+export async function installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines = stagingOperationDeadlines(env), budget = null, cleanupBudget = null, signal }) {
   budget?.assert("pair unpack");
   const graph = await unpackPair(opened.payload, directory, opened.manifest.checksums);
   // Prove the pinned staging target BEFORE the first destructive Postgres write, not only before
@@ -256,7 +262,7 @@ export async function installOpenedPair({ client, session, opened, directory, en
   const restore = {
     client, databaseUrl: env.DATABASE_URL, directory, verifiedStagingTarget: true,
     operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs,
-    budget,
+    budget, signal,
   };
   if (opened.manifest.databaseMode === "full") await restoreRollbackPostgres({ ...restore, env: { ...env, STAGING_DATA_MODE: opened.manifest.mode } });
   else await restorePairedPostgres({ ...restore, env });
@@ -275,7 +281,7 @@ export async function installOpenedPair({ client, session, opened, directory, en
     await new Promise((resolve) => setTimeout(resolve, pause));
   }
   budget?.assert("tester reprovisioning");
-  await reapplyTesters(env, { ...deadlines, operationMs: remainingBudgetMs(budget, deadlines.operationMs, "tester reprovisioning") });
+  await reapplyTesters(env, { ...deadlines, operationMs: remainingBudgetMs(budget, deadlines.operationMs, "tester reprovisioning") }, signal);
   // Re-measured, not reused: the stop/lock facts must hold at the moment of the graph delete too.
   await replaceNeo4jGraph({
     session, graph, facts: await measuredReplaceFacts({ client, maintenance, env, opened }),
@@ -561,7 +567,7 @@ async function acquireExclusiveDataUseLock(client, env, context, { sleep = (ms) 
   }
 }
 
-export async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env, notes = [], deadlines = stagingOperationDeadlines(env), budget = null, now = undefined }) {
+export async function rollbackToPrior({ client, prior, failedRunId, maintenance, rollbackStore, env, notes = [], deadlines = stagingOperationDeadlines(env), budget = null, now = undefined, signal }) {
   const recoveryBudget = budget ?? createOperationBudget("importer recovery", deadlines.recoveryMs, { now });
   // FIRST statement of the recovery path, before the journal write, before the advisory lock, and
   // before the marker read inside the restore. Whatever failed may have left this connection in an
@@ -611,7 +617,7 @@ export async function rollbackToPrior({ client, prior, failedRunId, maintenance,
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["draining", "failed"], to: "importing" });
     const recoveryDeadlines = { ...deadlines, operationMs: deadlines.recoveryMs };
     const graphCleanupBudget = recoveryBudget.child("recovery graph cleanup", deadlines.cleanupMs);
-    const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance, deadlines: recoveryDeadlines, budget: recoveryBudget, cleanupBudget: graphCleanupBudget }));
+    const graph = await withPrivateTempDir("aios-staging-rollback-", (directory) => installOpenedPair({ client, session, opened: prior, directory, env, maintenance, deadlines: recoveryDeadlines, budget: recoveryBudget, cleanupBudget: graphCleanupBudget, signal }));
     recoveryBudget.assert("recovery installed transition");
     await transitionJournal(client, { runId: prior.manifest.runId, from: ["importing"], to: "verifying" });
     // M2: BOTH kinds are verified against the data that landed. A full staging capture legitimately
@@ -683,6 +689,8 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
   const markAttempt = operations.recordSourceAttempt ?? recordSourceAttempt;
   const finishAttempt = operations.completeSourceAttempt ?? completeSourceAttempt;
   const undoAttempt = operations.withdrawSourceAttempt ?? withdrawSourceAttempt;
+  const signal = operations.signal;
+  const beginRecoveryWatchdog = operations.beginRecoveryWatchdog;
   operationBudget.assert("source admission");
   const opened = await verifyAndPin({ objectId, sourceStore, rollbackStore, env });
   compareCredentials(opened.manifest, env);
@@ -707,7 +715,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       ? await loadRollbackTarget({ journal, rollbackStore, env })
       : await loadPrior({ journal, rollbackStore, env });
     const recoveryBudget = createOperationBudget("interrupted importer recovery", deadlines.recoveryMs, { now: operations.now });
-    const recovered = await rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget });
+    const recovered = await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, () => rollback({ client, prior: interruptedPrior, failedRunId: journal.run_id ?? `interrupted-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal }));
     return { ...recovered, status: "interrupted-run-recovered", interruptedRunId: journal.run_id };
   }
   if (journal.last_ready_run_id === opened.manifest.runId) {
@@ -785,7 +793,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.WRITE });
     try {
       const graphCleanupBudget = operationBudget.child("install graph cleanup", deadlines.cleanupMs);
-      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines, budget: operationBudget, cleanupBudget: graphCleanupBudget }));
+      const graph = await withPrivateTempDir("aios-staging-import-", (directory) => installOpenedPair({ client, session, opened, directory, env, maintenance, deadlines, budget: operationBudget, cleanupBudget: graphCleanupBudget, signal }));
       operationBudget.assert("installed transition");
       await transitionJournal(client, { runId: opened.manifest.runId, from: ["importing"], to: "verifying" });
       await verifyInstalledPair({ client, session, graph, opened, deadlines, budget: operationBudget });
@@ -834,6 +842,7 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     // fails on its own first statement — while the message below still said the prior pair had been
     // restored. The lock is released on the SAME backend, so the reset must not reconnect.
     const recoveryBudget = createOperationBudget("importer recovery", deadlines.recoveryMs, { now: operations.now });
+    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async () => {
     recoveryBudget.assert("recovery initial session reset");
     const reset = await resetSessionTransactionState(client);
     await emitSessionContinuity(client, { checkpoint: "install-reset", failedRunId: opened.manifest.runId, env });
@@ -853,8 +862,9 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
       // Never call a rollback the session cannot execute, and never describe one that did not run.
       throw new Error(withNotes(`paired refresh failed and the importer's database session could not be reset, so the prior pair was NOT restored; staging remains fenced and recovery is required: ${errorText(error)}`, notes));
     }
-    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget });
+    await rollbackToPrior({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal });
     throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
+    });
   }
   } finally { await releaseLock(client).catch(() => {}); }
 }
@@ -890,7 +900,7 @@ async function adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, 
   return { objectId, digest };
 }
 
-async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null }) {
+async function bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines = stagingOperationDeadlines(env), budget = null, signal, beginRecoveryWatchdog }) {
   const operationBudget = budget ?? createOperationBudget("bootstrap rollback", deadlines.operationMs);
   operationBudget.assert("bootstrap coordinator lock");
   if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
@@ -989,7 +999,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     const created = resumed?.phase === "captured"
       ? await adoptPublishedBootstrapCheckpoint({ rollbackStore, env, resumed, phase })
       : await withPrivateTempDir("aios-staging-bootstrap-", async (directory) => {
-      await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget });
+      await captureRollbackPostgres({ client, databaseUrl: env.DATABASE_URL, directory, operationTimeoutMs: deadlines.operationMs, terminateGraceMs: deadlines.terminateGraceMs, budget: operationBudget, signal });
       const driver = neo4j.driver(env.NEO4J_URL, neo4j.auth.basic(env.NEO4J_USER, env.NEO4J_PASSWORD), { connectionTimeout: deadlines.connectionMs });
       const session = driver.session({ database: env.NEO4J_DATABASE, defaultAccessMode: neo4j.session.READ });
       try {
@@ -1070,6 +1080,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
   } catch (error) {
     const notes = [];
     const recoveryBudget = createOperationBudget("bootstrap recovery", deadlines.recoveryMs);
+    return await withRecoveryWatchdog(beginRecoveryWatchdog, recoveryBudget, async () => {
     // Same ordering rule as the refresh path: the capture holds a read-only transaction on this
     // client, so a failure inside it can leave the session aborted and every recovery statement
     // below — the lock release and both journal transitions — would fail invisibly.
@@ -1106,6 +1117,7 @@ async function bootstrapRollback({ client, rollbackStore, maintenance, env, dead
     // baseline identity a killed worker would have left, and the next `bootstrap-rollback` needs it
     // for exactly the same reason. It is cleared in one place only: after ready is committed.
     throw new Error(withNotes(`${errorText(error)} (prior staging deployment ${restored ? "restored unchanged" : "NOT restored — re-run `importer bootstrap-rollback`, which resumes the recorded interrupted bootstrap, or restore the deployment explicitly"})`, notes));
+    });
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
@@ -1252,19 +1264,28 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
   actionBudget?.assert("importer preflight");
   await importerPreflight(env, action);
   const client = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, actionBudget?.remaining(deadlines.operationMs, "Postgres connection") ?? deadlines.operationMs, deadlines.connectionMs)); await client.connect();
-  const actionWatchdog = actionBudget ? armBudgetWatchdog(actionBudget, (error) => client.connection?.stream?.destroy(error)) : null;
+  const watchdogOwner = createSessionWatchdogOwner((error) => client.connection?.stream?.destroy(error));
+  const actionWatchdog = actionBudget ? watchdogOwner.arm(actionBudget) : null;
+  const shutdown = new AbortController();
   let shuttingDown = false;
+  let signalAbort = null;
   const recordSignalAbort = async (signal) => {
-    if (shuttingDown) return; shuttingDown = true;
-    const abortClient = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.cleanupMs, Math.min(5_000, deadlines.connectionMs)));
-    try {
-      await abortClient.connect(); const journal = await readJournal(abortClient);
-      if (journal.state !== "ready") await transitionJournal(abortClient, { runId: journal.run_id ?? `signal-${Date.now()}`, from: [journal.state], to: "failed", patch: { lastSafeCheckpoint: `aborted-${signal.toLowerCase()}` } });
-    } catch {} finally { await abortClient.end().catch(() => {}); }
-    process.exit(1);
+    if (shuttingDown) return signalAbort;
+    shuttingDown = true;
+    shutdown.abort(Object.assign(new Error(`importer received ${signal}`), { code: "STAGING_OPERATION_ABORTED" }));
+    signalAbort = (async () => {
+      const abortClient = new pg.Client(postgresDeadlineConfig(env.DATABASE_URL, deadlines.cleanupMs, Math.min(5_000, deadlines.connectionMs)));
+      try {
+        await abortClient.connect(); const journal = await readJournal(abortClient);
+        if (journal.state !== "ready") await transitionJournal(abortClient, { runId: journal.run_id ?? `signal-${Date.now()}`, from: [journal.state], to: "failed", patch: { lastSafeCheckpoint: `aborted-${signal.toLowerCase()}` } });
+      } catch {} finally { await abortClient.end().catch(() => {}); }
+    })();
+    return signalAbort;
   };
   const signalHandlers = Object.fromEntries(["SIGTERM", "SIGINT"].map((signal) => [signal, () => { void recordSignalAbort(signal); }]));
-  for (const [signal, handler] of Object.entries(signalHandlers)) process.once(signal, handler);
+  // Keep the idempotent handlers installed through containment. A second signal must not fall
+  // through to Node's default action and release the lock while an owned restore is still alive.
+  for (const [signal, handler] of Object.entries(signalHandlers)) process.on(signal, handler);
   try {
     // Constructed INSIDE the cleanup scope. These three ran between `client.connect()` and the
     // `try`, so a store or maintenance adapter that refused its own configuration left an open
@@ -1286,7 +1307,10 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     // This applies ONLY where the promise owns enclosing cleanup — the inner `tick` helper, the
     // health wrappers and `replaceFromArchive` own none, and are deliberately left alone.
     await configurePostgresDeadline(client, actionBudget?.remaining(deadlines.operationMs, "importer deadline configuration") ?? deadlines.operationMs);
-    if (action === "bootstrap-rollback") return await bootstrapRollback({ client, rollbackStore, maintenance, env, deadlines, budget: actionBudget });
+    if (action === "bootstrap-rollback") return await bootstrapRollback({
+      client, rollbackStore, maintenance, env, deadlines, budget: actionBudget,
+      signal: shutdown.signal, beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
+    });
     if (action === "rollback") {
       if (!(await acquireCoordinatorLock(client))) throw new Error("another importer owns the coordinator lock");
       // The await must be INSIDE this try, not merely inside the outer one: otherwise this `finally`
@@ -1302,17 +1326,24 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
           ? await openRollbackTarget({ journal, rollbackStore, env })
           : await openPrior({ journal, rollbackStore, env });
         const recoveryBudget = createOperationBudget("manual importer recovery", deadlines.recoveryMs, { now });
-        return await rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget });
+        return await withRecoveryWatchdog(
+          (budget) => watchdogOwner.transferTo(budget),
+          recoveryBudget,
+          () => rollbackToPrior({ client, prior, failedRunId: argv[1] ?? `manual-${Date.now()}`, maintenance, rollbackStore, env, deadlines, budget: recoveryBudget, signal: shutdown.signal }),
+        );
       }
       finally { await releaseCoordinatorLock(client).catch(() => {}); }
     }
     if (action === "install") {
       if (!argv[1]) throw new Error("canonical immutable object ID is required");
-      return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env, deadlines, operations: { operationBudget: actionBudget, now } });
+      return await installObject({ client, objectId: argv[1], sourceStore, rollbackStore, maintenance, env, deadlines, operations: {
+        operationBudget: actionBudget, now, signal: shutdown.signal,
+        beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
+      } });
     }
     const tick = async () => {
       const tickBudget = createOperationBudget("importer daemon tick", deadlines.operationMs, { now });
-      const tickWatchdog = armBudgetWatchdog(tickBudget, (error) => client.connection?.stream?.destroy(error));
+      const tickWatchdog = watchdogOwner.arm(tickBudget);
       try {
       // Reset server-side statement/lock deadlines for THIS daemon operation. The connection and
       // daemon persist, but no individual tick inherits an expired or recovery-sized budget.
@@ -1326,7 +1357,10 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
       // `automatic: true` — THE unattended path. `install <object-id>` below is the explicit
       // operator action and is deliberately not marked automatic, so it remains the one way to
       // re-attempt a source whose destructive install already failed.
-      return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, automatic: true, operations: { operationBudget: tickBudget, now } });
+      return await installObject({ client, objectId, sourceStore, rollbackStore, maintenance, env, deadlines, automatic: true, operations: {
+        operationBudget: tickBudget, now, signal: shutdown.signal,
+        beginRecoveryWatchdog: (budget) => watchdogOwner.transferTo(budget),
+      } });
       } finally { await tickWatchdog.disarm(); }
     };
     if (action === "tick") return await tick();
@@ -1342,10 +1376,17 @@ export async function runImporter(env = process.env, argv = process.argv.slice(2
     }
   } finally {
     await actionWatchdog?.disarm();
+    await watchdogOwner.disarmAll();
     for (const [signal, handler] of Object.entries(signalHandlers)) process.removeListener(signal, handler);
+    await signalAbort?.catch(() => {});
     const terminalBudget = createOperationBudget("importer terminal cleanup", deadlines.cleanupMs, { now });
     await closeAllWithinBudget({ budget: terminalBudget, terminateGraceMs: deadlines.terminateGraceMs },
       ownedCloser(() => client.end(), () => client.connection?.stream?.destroy()));
+    if (shutdown.signal.aborted) {
+      throw Object.assign(new Error("staging importer stopped after coordinated signal cancellation; owned operations are settled"), {
+        code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true,
+      });
+    }
   }
 }
 

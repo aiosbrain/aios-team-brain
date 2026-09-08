@@ -65,7 +65,7 @@ const client = {
     // throws before spawning anything and this fixture proves nothing.
     if (text.includes("advisory_lock_shared")) return { rows: [{ acquired: true }] };
     if (text.includes("to_regclass")) return { rows: [{ journal_table: "staging_ops.refresh_journal" }] };
-    if (text.includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1" }] };
+    if (text.includes("refresh_journal")) return { rows: [{ state: "ready", run_id: "run-1", last_ready_run_id: "run-1", last_ready_mode: "copy-ready" }] };
     // A query this fixture does not model is a CHANGE IN THE CONTRACT, not a default. Returning an
     // empty row for it is how the acquisition above went unnoticed; failing loudly puts the reason on
     // the driver's stderr, which the test now reports.
