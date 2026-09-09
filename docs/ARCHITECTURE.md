@@ -1295,7 +1295,16 @@ guard enforces it, it's named.
   Graphiti's queue is in-memory, so 202-accepted-but-unprocessed episodes are lost and must come back
   via reconcile. ⚠️ **The service's Custom Start Command must be EMPTY** — it overrides the image `CMD`,
   and any `uv run` variant re-syncs the venv back to 0.13.2 at boot, silently restoring both the 8192
-  ceiling and the fan-out (README §2.8b). Large items are **chunked** into one episode per chunk, so each chunk's extraction output
+  ceiling and the fan-out (README §2.8b). **AIO-997 gave that `CMD` a second job**: it now targets
+  `graph_service.staging_entry:app` (source `graphiti/staging-entry.py`), a mode selector that
+  re-exports `graph_service.main.app` UNCHANGED for production and, only when
+  `STAGING_OPS_ENVIRONMENT_ID` equals `RAILWAY_ENVIRONMENT_ID`, serves a keyless health-only app that
+  imports no provider/graph client at all — because upstream's `Settings` requires `openai_api_key`
+  and copied staging must have none. Health there answers `mode: staging-no-model`; every other path
+  and method is `403 staging_graphiti_no_model`; a contradictory pin refuses startup rather than
+  falling through to production. So an override now costs more than the venv re-sync: it also bypasses
+  the selector, which is why commissioning staging clears it (docs/OPS.md §11, AC-07 in
+  docs/design/staging-workflow-hardening.md). Large items are **chunked** into one episode per chunk, so each chunk's extraction output
   stays under the 16384 ceiling without truncating/losing content (chunking replaced the old
   single-episode `MAX_EPISODE_CHARS` cap; a malformed size/cap env falls back to the default rather than
   emitting empty/garbage episodes). Chunking is **content-defined** since PIPEFF-3/AIO-826 (`lib/graph/cdc.ts`,
