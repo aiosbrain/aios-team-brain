@@ -14,6 +14,7 @@ import {
   type SlackMethodScope,
 } from "@/lib/ingest/slack-method-budget";
 import { slackReservedRequest } from "@/lib/ingest/sources/slack-page-request";
+import { loadSchema } from "../../scripts/pg-load-schema.mjs";
 import { db, seedTeam, type Seed } from "./helpers";
 
 /**
@@ -866,6 +867,97 @@ describe("slackReservedRequest — commit, then exactly one request", () => {
     expect(JSON.stringify(result)).not.toContain("html");
   });
 
+  /**
+   * The transport is the last place a verified bots.info call could acquire a second allowance, so
+   * the refusal is asserted where it would cost a provider request: no bucket, no HTTP.
+   */
+  it("makes ZERO requests for bots.info under a verified scope, and creates no bucket", async () => {
+    const seed = await seedTeam();
+    const { impl, calls } = recordingFetch(() => {
+      throw new Error("a verified bots.info request must never reach the network");
+    });
+
+    await expect(
+      slackReservedRequest({ db: db(), scope: verified(seed), token: BOT_TOKEN }, "bots.info", {
+        bot: "B0BUDGET1",
+      }, { fetchImpl: impl })
+    ).rejects.toThrow(TypeError);
+
+    expect(calls).toHaveLength(0);
+    expect(await rowCount(seed.teamId)).toBe(0);
+
+    // …and the legitimate route is unaffected: ONE workspace bucket, whose refresh is deferred by
+    // the allowance the bootstrap call already spent.
+    const boot = bootstrap(seed);
+    expect(
+      (await slackReservedRequest({ db: db(), scope: boot, token: BOT_TOKEN }, "bots.info", { bot: "B0BUDGET1" }, {
+        fetchImpl: recordingFetch(() => jsonResponse({ ok: true, bot: { id: "B0BUDGET1", deleted: false, app_id: APP } })).impl,
+      })).outcome
+    ).toBe("ok");
+    const refresh = await slackReservedRequest(
+      { db: db(), scope: boot, token: BOT_TOKEN },
+      "bots.info",
+      { bot: "B0BUDGET1" },
+      { fetchImpl: recordingFetch(() => { throw new Error("the refresh must be deferred, not sent"); }).impl }
+    );
+    expect(refresh.outcome).toBe("deferred");
+    expect(await rowCount(seed.teamId)).toBe(1);
+  });
+
+  it("persists the FULL 48-hour cooldown a 429 asked for, and reports it", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    const c = await sql();
+    const before = new Date((await c.query<{ t: Date }>("select clock_timestamp() as t")).rows[0].t);
+    const { impl } = recordingFetch(
+      () => new Response("", { status: 429, headers: { "retry-after": "172800" } })
+    );
+
+    const result = await slackReservedRequest(
+      { db: db(), scope, token: BOT_TOKEN },
+      "conversations.history",
+      { channel: "C0BUDGET1" },
+      { fetchImpl: impl }
+    );
+
+    expect(result.outcome).toBe("rate_limited");
+    if (result.outcome !== "rate_limited") throw new Error("unreachable");
+    expect(result.retryAfterMs).toBeGreaterThan(86_400_000);
+    const stored = new Date(
+      (await rowOf(scope, "conversations.history")).next_permitted_at as string
+    ).getTime();
+    // A day-clamped implementation lands ~24 hours below this bound.
+    expect(stored).toBeGreaterThanOrEqual(before.getTime() + 172_800_000);
+    expect(new Date(result.nextPermittedAt).getTime()).toBe(stored);
+  });
+
+  it("reports an unrepresentable Retry-After as blocked, and stores no cooldown at all", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    const { impl } = recordingFetch(
+      () => new Response("", { status: 429, headers: { "retry-after": "99999999999999999999" } })
+    );
+
+    const result = await slackReservedRequest(
+      { db: db(), scope, token: BOT_TOKEN },
+      "conversations.info",
+      { channel: "C0BUDGET1" },
+      { fetchImpl: impl }
+    );
+
+    // Neither a success nor an ordinary cooldown: the deadline is exactly the one the RESERVATION
+    // set, so nothing invented a near-term retry on the provider's behalf.
+    expect(result).toEqual({
+      outcome: "blocked",
+      method: "conversations.info",
+      category: "retry_after_unrepresentable",
+    });
+    const stored = new Date(
+      (await rowOf(scope, "conversations.info")).next_permitted_at as string
+    ).getTime();
+    expect(stored).toBeLessThanOrEqual(Date.now() + SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 5_000);
+  });
+
   it("leaves the slot consumed when the request fails, and never refunds it", async () => {
     const seed = await seedTeam();
     const scope = verified(seed);
@@ -998,4 +1090,158 @@ describe("slackReservedRequest — commit, then exactly one request", () => {
     if (result.outcome !== "transport_error") throw new Error("unreachable");
     expect(result.category).toBe("malformed_response_500");
   });
+});
+
+// ── schema replay over a POPULATED pre-correction database ───────────────────
+
+describe("schema replay — consolidating the old verified bots.info buckets", () => {
+  /** The constraint as the earlier checkpoint wrote it: `verified` admitted every method. */
+  const FORMER_METHOD_SCOPE = `case scope_kind
+      when 'verified' then true
+      when 'provisional' then method = 'auth.test'
+      when 'workspace_bootstrap' then method = 'bots.info'
+      else false
+    end`;
+
+  async function budgetRows(teamIds: string[]): Promise<BudgetRow[]> {
+    const c = await sql();
+    const { rows } = await c.query<BudgetRow>(
+      `select * from slack_method_budgets where team_id = any($1::uuid[])
+        order by team_id, scope_kind, method, workspace_id, app_id nulls first`,
+      [teamIds]
+    );
+    return rows;
+  }
+
+  /**
+   * A `create table if not exists` cannot repair a CHECK on a table that already exists, so a
+   * database written under the former rule keeps rows the corrected constraint rejects — and simply
+   * re-adding the constraint would fail the whole replay. Deleting them instead would DISCARD a
+   * cooldown the provider already imposed, which is the one thing a budget table may never do: the
+   * deadline is consolidated into the bucket that keeps meaning it.
+   */
+  it(
+    "folds old verified bots.info deadlines into the workspace bucket, keeps controls, and replays twice",
+    async () => {
+      const seed = await seedTeam();
+      const other = await seedTeam();
+      const otherIntegration = await seedIntegration(other);
+      const c = await sql();
+
+      // The retired PRET-6 flag is re-added by a sibling dm spec and the harness truncates ROWS, not
+      // DDL — so a team seeded above would carry its 'permissive' default and abort the replay's
+      // migration leg. Dropping it is exactly that migration's own end state, not a new decision.
+      await c.query(`alter table teams drop column if exists access_enforcement`);
+
+      await c.query(`alter table slack_method_budgets drop constraint slack_method_budgets_method_scope`);
+      await c.query(
+        `alter table slack_method_budgets add constraint slack_method_budgets_method_scope check (${FORMER_METHOD_SCOPE})`
+      );
+
+      // Two old verified app buckets for ONE workspace, with different deadlines and creation times…
+      await c.query(
+        `insert into slack_method_budgets
+             (team_id, scope_kind, workspace_id, app_id, method, next_permitted_at, created_at)
+           values ($1,'verified',$2,$3,'bots.info', now() + interval '10 minutes', now() - interval '3 days'),
+                  ($1,'verified',$2,$4,'bots.info', now() + interval '90 minutes', now() - interval '5 days'),
+                  ($1,'verified',$5,$3,'bots.info', now() + interval '20 minutes', now() - interval '7 days'),
+                  ($6,'verified',$2,$3,'bots.info', now() + interval '77 minutes', now() - interval '2 days')`,
+        [seed.teamId, WORKSPACE, APP, OTHER_APP, OTHER_WORKSPACE, other.teamId]
+      );
+      // …an EXISTING bootstrap bucket whose own deadline is neither the largest nor the smallest…
+      await c.query(
+        `insert into slack_method_budgets
+             (team_id, scope_kind, workspace_id, method, next_permitted_at, created_at)
+           values ($1,'workspace_bootstrap',$2,'bots.info', now() + interval '30 minutes', now() - interval '1 day'),
+                  ($3,'workspace_bootstrap',$2,'bots.info', now() + interval '15 minutes', now() - interval '1 day')`,
+        [seed.teamId, WORKSPACE, other.teamId]
+      );
+      // …and controls: another method, and another team's unrelated scope.
+      await c.query(
+        `insert into slack_method_budgets
+             (team_id, scope_kind, workspace_id, app_id, method, next_permitted_at)
+           values ($1,'verified',$2,$3,'conversations.history', now() + interval '45 minutes')`,
+        [seed.teamId, WORKSPACE, APP]
+      );
+      await c.query(
+        `insert into slack_method_budgets (team_id, scope_kind, integration_id, method, next_permitted_at)
+           values ($1,'provisional',$2::uuid,'auth.test', now() + interval '5 minutes')`,
+        [other.teamId, otherIntegration]
+      );
+
+      const bootstrapIdBefore = (await rowOf(bootstrap(seed), "bots.info")).id;
+      const otherBootstrapIdBefore = (await rowOf(bootstrap(other), "bots.info")).id;
+      const controls = (await budgetRows([seed.teamId, other.teamId])).filter(
+        (r) => r.method !== "bots.info"
+      );
+      // The expected deadline is the max across EVERY bots.info bucket for that team+workspace —
+      // both scopes — read before the replay, so the assertion cannot be fitted to the result.
+      async function maxBotsInfoDeadline(teamId: string, workspace: string): Promise<number> {
+        const { rows } = await c.query<{ t: Date }>(
+          `select max(next_permitted_at) as t from slack_method_budgets
+            where team_id = $1 and workspace_id = $2 and method = 'bots.info'`,
+          [teamId, workspace]
+        );
+        return new Date(rows[0].t).getTime();
+      }
+      const seedMax = await maxBotsInfoDeadline(seed.teamId, WORKSPACE);
+      const otherMax = await maxBotsInfoDeadline(other.teamId, WORKSPACE);
+      const orphan = (
+        await c.query<{ next_permitted_at: Date; created_at: Date }>(
+          `select next_permitted_at, created_at from slack_method_budgets
+            where team_id = $1 and scope_kind = 'verified' and workspace_id = $2 and method = 'bots.info'`,
+          [seed.teamId, OTHER_WORKSPACE]
+        )
+      ).rows[0];
+      const otherWorkspaceDeadline = new Date(orphan.next_permitted_at).getTime();
+      const otherWorkspaceCreated = new Date(orphan.created_at).getTime();
+
+      await loadSchema({ logger: { log: () => {} } });
+
+      // 1. Every old verified bots.info row is gone…
+      const { rows: leftovers } = await c.query(
+        `select 1 from slack_method_budgets where scope_kind = 'verified' and method = 'bots.info'`
+      );
+      expect(leftovers).toHaveLength(0);
+
+      // 2. …its allowance survived in the bucket that keeps meaning it, at the MAX of all of them,
+      //    in the row that was already there.
+      const consolidated = await rowOf(bootstrap(seed), "bots.info");
+      expect(consolidated.id).toBe(bootstrapIdBefore);
+      expect(new Date(consolidated.next_permitted_at as string).getTime()).toBe(seedMax);
+      const otherConsolidated = await rowOf(bootstrap(other), "bots.info");
+      expect(otherConsolidated.id).toBe(otherBootstrapIdBefore);
+      expect(new Date(otherConsolidated.next_permitted_at as string).getTime()).toBe(otherMax);
+
+      // 3. A workspace with no bootstrap bucket gets one, carrying the deadline AND the earliest
+      //    creation time of what it replaces — truthful metadata, but the DEADLINE is the invariant.
+      const created = await rowOf(bootstrap(seed, OTHER_WORKSPACE), "bots.info");
+      expect(new Date(created.next_permitted_at as string).getTime()).toBe(otherWorkspaceDeadline);
+      expect(new Date(created.created_at as string).getTime()).toBe(otherWorkspaceCreated);
+
+      // 4. Unrelated methods, scopes and teams were not reset.
+      expect((await budgetRows([seed.teamId, other.teamId])).filter((r) => r.method !== "bots.info")).toEqual(
+        controls
+      );
+
+      // 5. The corrected constraint is in force, by name.
+      expect(
+        await refusal(
+          insertRaw({
+            team_id: seed.teamId,
+            scope_kind: "verified",
+            workspace_id: WORKSPACE,
+            app_id: APP,
+            method: "bots.info",
+          })
+        )
+      ).toMatchObject({ code: "23514", constraint: "slack_method_budgets_method_scope" });
+
+      // 6. Replay is idempotent — a second load changes nothing, including the consolidated rows.
+      const settled = await budgetRows([seed.teamId, other.teamId]);
+      await loadSchema({ logger: { log: () => {} } });
+      expect(await budgetRows([seed.teamId, other.teamId])).toEqual(settled);
+    },
+    180_000
+  );
 });
