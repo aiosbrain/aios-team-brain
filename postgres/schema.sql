@@ -1346,6 +1346,93 @@ create table if not exists slack_team_state (
   updated_at timestamptz not null default now()
 );
 
+-- ── Slack pending-thread work + leases (AIO-1170) ────────────────────────────
+-- Durable state for ONE unit of pending Slack work: "this thread, in this channel, in this
+-- workspace, for this AIOS team, still needs reading". Nothing schedules, hydrates or publishes yet
+-- — the single writer is `lib/ingest/slack-thread-state.ts`, and the only callers today are its
+-- data-mechanics tests.
+--
+-- ⚠️ A LEASE ON A ROW HERE PROVES OWNERSHIP OF PENDING WORK AND NOTHING ELSE. It is not evidence of
+-- source visibility, of channel permission, of namespace migration, of a complete body, or of
+-- permission to publish. There is deliberately NO terminal/acknowledged state and no `item_id`: a
+-- thread becomes an item inside the EXISTING `ingestItem` transaction, after the publication gates,
+-- and acknowledgement belongs in that transaction — a snapshot checkpoint here can never make the
+-- job complete. Adding a 'done' status or an item binding before those gates exist would create
+-- exactly the placeholder that gets switched on by accident.
+--
+-- WHY NOT `social_jobs` (`lib/jobs/store.ts`): its completion/reclaim writes are conditioned on job
+-- id + `status='running'`, with no claim-generation token, so a worker whose lease was reclaimed can
+-- still finalize the job. Fixing that generic store is out of this scope, so this table carries a
+-- `lease_generation` fence that EVERY write must match, alongside the owner token and a live expiry.
+--
+-- The columns below are the whole of this slice. Staged bodies (bounded by their own byte budget),
+-- channel metadata and its per-channel migration gate, the completed-read time, item binding and
+-- terminal acknowledgement are dependent slices; each adds its columns via
+-- `postgres/migrations/` + a mirror here, per postgres/migrations/README.md.
+create table if not exists slack_sync_threads (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  -- Scope, byte-exact as the provider stated it — the same identity discipline as `slack_messages`
+  -- (a channel id is not unique across installations, and `team_id` is a namespace above that). The
+  -- alphabet is the one `lib/ingest/sources/slack-namespace.ts` accepts for a scoped path segment;
+  -- it is restated here because app-code validation is not a storage guarantee. NOT case-folded:
+  -- folding would mint an identity the ledger does not share. Two spellings of one channel are, at
+  -- worst, one wasted claim; canonical channel provenance belongs to the channel-state slice.
+  workspace_id text not null check (workspace_id ~ '^[A-Za-z0-9]+$'),
+  channel_id text not null check (channel_id ~ '^[A-Za-z0-9]+$'),
+  -- The thread root's Slack `ts` verbatim. Syntax only, and DELIBERATELY the weaker of the two
+  -- checks: the exact rule (epoch bounds, safe-integer seconds) is `parseSlackTimestamp`, which the
+  -- writer applies and SQL cannot host. The digit cap keeps the value bigint-castable.
+  root_ts text not null check (root_ts ~ '^[0-9]{1,12}[.][0-9]{1,6}$'),
+  -- Two states, on purpose (see the terminal-state note above).
+  status text not null default 'queued' check (status in ('queued', 'running')),
+  -- Not-before for the queued lane. The DB clock decides due-ness; a caller's clock never does.
+  due_at timestamptz not null default now(),
+  attempts integer not null default 0 check (attempts >= 0),
+  -- The FENCE. Monotonic, incremented on every successful claim AND reclaim, so a replaced worker's
+  -- token is stale even while the row is `running` again under somebody else.
+  lease_generation bigint not null default 0 check (lease_generation >= 0),
+  -- An opaque claim token, minted by the database on each claim; unique so one token can never
+  -- authorize two rows. Its shape is not the DB's business beyond being a bounded, blank-free
+  -- string. Nulls do not conflict in a unique index, so unleased rows are unconstrained.
+  lease_owner text unique check (
+    lease_owner is null
+    or (length(lease_owner) between 8 and 128 and lease_owner !~ '[[:space:]]')
+  ),
+  lease_expires_at timestamptz,
+  -- PROGRESS METADATA ONLY, never evidence: the provider's opaque pagination cursor and the
+  -- generation of the snapshot it belongs to. Bounded because this column is a cursor, not staging —
+  -- no raw message content lives in this table.
+  page_cursor text check (
+    page_cursor is null or (btrim(page_cursor) <> '' and length(page_cursor) <= 1024)
+  ),
+  snapshot_generation bigint not null default 0 check (snapshot_generation >= 0),
+  checkpointed_at timestamptz,
+  -- A sanitized CATEGORY of the last failure. The syntax rule (lower-case, underscore-separated,
+  -- ≤40 chars) is what keeps a provider message or a token out of it; it is deliberately not a
+  -- closed taxonomy yet, because the vocabulary is produced by the HTTP/backoff slice that does not
+  -- exist — a list invented here would either be wrong or force that slice to migrate this column.
+  last_error_code text check (last_error_code is null or last_error_code ~ '^[a-z][a-z0-9_]{0,39}$'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- One pending-work row per thread, per scope. This is what makes enqueue idempotent.
+  unique (team_id, workspace_id, channel_id, root_ts),
+  -- A lease is all-or-nothing and exists exactly while the row is running: no orphan owner on a
+  -- queued row (which would let a stale worker's token match) and no running row without an expiry
+  -- (which would be an unreclaimable, permanent claim).
+  constraint slack_sync_threads_lease_codec check (
+    (status = 'running') = (lease_owner is not null)
+    and (status = 'running') = (lease_expires_at is not null)
+  )
+);
+-- The two claim lanes, which are the two arms of the claim predicate: queued work that has come due,
+-- and running work whose lease has expired and may be reclaimed. No reader exists yet; these are the
+-- indexes that lane will need, and they are cheap on an empty table.
+create index if not exists slack_sync_threads_due_idx
+  on slack_sync_threads (team_id, status, due_at);
+create index if not exists slack_sync_threads_lease_idx
+  on slack_sync_threads (team_id, status, lease_expires_at);
+
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
   id uuid primary key default gen_random_uuid(),

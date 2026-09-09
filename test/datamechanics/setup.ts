@@ -46,6 +46,7 @@ const DATA_TABLES = [
   // FK stays clean only until that FK changes.
   "slack_messages",
   "slack_team_state",
+  "slack_sync_threads",
   "items",
   "projects",
   "rate_limits",
