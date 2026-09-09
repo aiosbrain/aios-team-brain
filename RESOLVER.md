@@ -31,6 +31,7 @@ gates (AIOS hub, Tessera root) apply in addition.
 
 | Trigger | Skill |
 |---|---|
+| Review recent PRs or audit recent merges | `.claude/skills/review-recent-prs/SKILL.md` |
 | Admin/ops tasks on the brain instance | `.claude/skills/admin/SKILL.md` |
 | Branches diverged / reconcile a fork | `.claude/skills/branch-reconciliation/SKILL.md` |
 | "Is this test actually wired into CI" | `.claude/skills/test-ci-wiring-audit/SKILL.md` |
