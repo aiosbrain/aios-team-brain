@@ -52,3 +52,7 @@ Build with subscription-authenticated Opus only. No fallback builder, API billin
 - Required live gates block ready publication. No draft authorization is assumed. Reviewed implementation and passing fixtures alone cannot close this ticket.
 
 The next action is coordinator verification/attachment of the accepted specification, a verified durable checkpoint, then the first inert Opus helper/test packet. Keep this record updated with implementation checkpoints, reviewed hashes, test evidence and remaining gates as work proceeds.
+
+## Implementation checkpoint — pure evidence projection
+
+Opus5 subscription implementation added an unused message-evidence helper,32 new unit cases, and optional bot_id typing. Active ingestion unchanged. Coordinator captured initial missing-helper failure before implementation;20 existing tests passed. After implementation,52 tests across3 suites and npm run typecheck passed at16:03ET2026-09-09. The delegated CLI required Bash approval; coordinator ran checks through normal execution controls. The prior baseline74tests are separate. Routine projection semantics and duplicate-conflict handling remain under Astra adjudication; this checkpoint does not certify integration or live acceptance.

@@ -20,6 +20,11 @@ export interface SlackMessage {
   thread_ts?: string;
   reply_count?: number;
   subtype?: string;
+  /** Set when an APP posted the message. Present independently of `subtype: "bot_message"` — an app
+   *  posting as a user carries a `user` id too, so the id alone would credit a person for a bot's
+   *  post. Read by the contribution-evidence projection (`slack-message-evidence.ts`); nothing in
+   *  this module's rendering behaviour changes. */
+  bot_id?: string;
 }
 
 export interface FetchedThread {
