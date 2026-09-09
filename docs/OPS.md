@@ -1079,3 +1079,129 @@ so running it against a healthy fleet is harmless.
 previous release in the Railway dashboard (never `railway up` — the Railway CLI is read-only here;
 see §4 "Railway deploy safety"). That release boots, its startup materialization stamps the marker, and the blocked deploy then applies. This
 is an older-release recovery option; current STAGINGMARK-2 deployments perform marker repair themselves.
+
+---
+
+## 12. Publishing the ops runner image — `staging-ops-image.yml` (AIO-997)
+
+The ops runner (`docker/staging-ops.Dockerfile` — Node 20, PG18 clients, `tini` as a child subreaper)
+is what holds the fences during a paired refresh. Commissioning it on Railway requires **branchless
+runners pinned to immutable registry digests**; a local test image and a Railway source build are
+neither published nor addressable by digest. This workflow is the one path that produces that
+artifact.
+
+**⚠️ Publishing an image is not activation.** Nothing here deploys, promotes, restarts a service,
+changes a schedule or a service variable, moves a ref, or spends on a model — and it holds no
+credential that could. `config/staging-ops/schedules.json` stays disabled. The output is a
+**candidate** commissioning artifact until the role-specific runtime digest/identity, private
+networking and activation checks in §11 pass against it.
+
+### Running it
+
+1. **Pick the commit first, not the branch.** The workflow takes **no inputs**: the only source it
+   will publish is the immutable `github.sha` of a manual dispatch on `staging`. Dispatch only after
+   the staging commit you intend to publish has its required checks accepted, and **record which
+   commit that was** — a later push to `staging` changes neither the artifact this run built nor
+   anything already deployed.
+2. Actions → **Staging ops image publisher** → *Run workflow* → branch **`staging`**. Any other
+   branch fails in the first step, by name, before the registry is touched. That step is a red
+   failure and not a skipped job, deliberately: a green skip looks like a successful no-op.
+3. **Download the receipt artifact** (`staging-ops-image-receipt-<run>.<attempt>`) into the durable
+   commissioning packet. Its retention is **30 days** — GitHub is not the archive.
+
+### Reading the receipt
+
+The receipt names the repository, source SHA, `workflow_ref`/`workflow_sha`, run URL, platform,
+Dockerfile, package, the run-unique tag, the **registry digest**, the full `…@sha256:…` reference,
+the confirmed media type and readback status, and the measured package visibility and repository
+linkage. It carries no token, environment dump or Docker auth config.
+
+**`packageVisibility` and `packageLinkage` hold a measurement or the literal `unmeasured`** — never
+a verdict. When the metadata read answered `404` or was refused, nothing about the package's
+visibility or linkage was observed, and `unmeasured` says exactly that. The publication verdict is
+in `status`; the reason it came out that way is in `note`.
+
+- **`status: published`** — the image is in the registry at that digest, the registry served that
+  exact by-digest reference back, and the package measured **private** and linked to
+  `aiosbrain/aios-team-brain`.
+- **`status: published-unverified`** — the push SUCCEEDED and the privacy/linkage check did not.
+  The workflow FAILS and says so. The image is **not** deleted and the package is **not** made
+  public to force a pass; take it to the coordinator. Reporting this as "no write happened" would
+  be false.
+- **`status: partially-published`** — pushed, then a later step failed. A retry publishes a **new**
+  run-attempt tag; it does not roll the earlier publication back.
+- **`status: failed`** — no confirmed registry digest was produced, and nothing is claimed to have
+  been published.
+- **No receipt at all** — the run was refused by the first step, before the checkout, so the helper
+  that writes a record was not yet on disk. That refusal is the red step to read; the upload step
+  warns about the missing file rather than adding a second, less informative failure.
+
+### When the evidence does not arrive
+
+**Registry publication and evidence delivery are different facts.** A receipt can be true and still
+never reach you: the artifact upload can fail after a verified publication, or the receipt JSON can
+be written and then fail on its way into the job summary. The last step of the job — the only one
+*after* the upload — prints a **`partially-published`** workflow outcome for exactly that case, and
+states the two facts separately:
+
+- `registry publication: confirmed` (the manifest was recomputed from registry bytes and the package
+  measured private and linked, naming the by-digest reference) or `unverified` (the push succeeded,
+  so an image may be in the registry, but this run did not confirm it — `published-unverified` keeps
+  its stronger, more specific status).
+- `evidence delivery: incomplete`, naming which step failed.
+
+It **reports, it does not repair.** The measured receipt is not rewritten or demoted, nothing is
+deleted, rolled back or re-pushed, and the run stays red for its original reason. A retry publishes a
+**new** run-attempt tag. The warning always goes to the **job log**; appending it to the job summary
+is best effort, because the summary is one of the transports that may be what failed.
+
+⚠️ **A cancelled or interrupted run is UNVERIFIED, not "nothing happened."** GitHub cancellation can
+stop the runner before any later step executes — `failure()` is not true for it, and no end-of-run
+artifact delivery is promised for a forcibly terminated job. A cancelled run is not a successful
+commissioning outcome even if a registry write already occurred, and **a missing receipt never proves
+there is no image in the registry.** Before retrying, reconcile the actual run, tag and digest
+against the package itself.
+
+**Verify the run, not just the receipt.** A divergent copy of this workflow on another ref could
+delete its own guards, so the receipt's `workflow_ref`/`workflow_sha` are there to be checked
+against the actual GitHub run and against the reviewed staging source before any digest is
+commissioned. The receipt is traceability evidence; it is not a signed attestation.
+
+### What the digest does and does not prove
+
+The tag exists to be discoverable (`sha-<source-sha>-run-<id>.<attempt>` — no `latest`, and a re-run
+cannot overwrite an earlier run's tag). **Nothing follows a tag**: runners are pinned by digest.
+
+Rebuilding the identical source can legitimately produce a **different** digest, because `apt` and
+the base image move under it. Each build is its own record; a source-SHA tag is **not** immutable
+and must never be described as one.
+
+**`platform` in the receipt is the REQUESTED build target**, not a measured runtime fact. It records
+that `linux/amd64` was asked for and that the push produced a single image manifest — the platform
+recorded in `ops-image-build-state.json` for the commissioning image. Whether the pulled image's
+config actually declares that architecture/OS, and whether it runs on the target runtime, is
+established by the **live pull and smoke check** below, not by this field.
+
+⚠️ **Still live commissioning prerequisites**, in the order they get answered:
+
+- An **authenticated pull by that exact digest** succeeds, and the pulled image's config reports
+  `linux/amd64`. Smoke-check Node, the PG18 client, `tini` and the entrypoint, and check the
+  `org.opencontainers.image.source`/`revision` labels against the published source SHA.
+- Whether Railway reports this single-manifest digest in a deployment's `meta.imageDigest`. The
+  receipt records the media type so that comparison can be made honestly later. Do not substitute an
+  image/config/file hash to force the match.
+
+### Account prerequisites — not yet measured
+
+These are concrete capabilities of the GitHub organization and of Railway, and they stay explicit
+until someone measures them:
+
+- The Actions `GITHUB_TOKEN` must be permitted to **create and push** `aios-staging-ops` in the
+  `aiosbrain` namespace, and to **read that package's metadata back**. A local-token `404` says
+  *absent or inaccessible* — it is not evidence the job token can create the package.
+- Railway must be able to **pull the private package by digest** with a scoped registry credential,
+  provisioned through the existing authorized provider workflow. That credential never appears in a
+  receipt.
+
+**Do not "fix" any of these by broadening token scopes, adding a PAT, or making the package
+public.** If a prerequisite fails, the workflow refusing is the correct outcome.
