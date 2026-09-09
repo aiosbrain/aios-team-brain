@@ -44,8 +44,10 @@ import {
   assertScannerPinned,
   scannerArgs,
   scannerInterfaceFailures,
+  scannerSettings,
   scannerVersionFailures,
   summarizeFindings,
+  validateReport,
   verifyScannerDownload,
 } from "./image-audit/scanner.mjs";
 import {
@@ -72,7 +74,12 @@ export function createScratch(env = process.env, { mkTemp = mkdtempSync } = {}) 
   const workspace = env.GITHUB_WORKSPACE ? resolve(env.GITHUB_WORKSPACE) : undefined;
   const root = resolve(mkTemp(join(base, "aios-image-audit-")));
   if (workspace && (root === workspace || root.startsWith(`${workspace}/`))) {
-    throw new Error(`refusing to use scratch inside the checkout (${root}); raw image content must not enter the workspace`);
+    // The path is in the MESSAGE, which stays in the process's own error. It never reaches the
+    // evidence record: `sanitizedFailure` reads a fixed code and nothing else.
+    throw Object.assign(
+      new Error(`refusing to use scratch inside the checkout (${root}); raw image content must not enter the workspace`),
+      { code: "AUDIT_SCRATCH_IN_WORKSPACE" },
+    );
   }
   for (const child of ["scan", "layers", "source", "tools", "logs"]) mkdirSync(join(root, child), { recursive: true });
   return root;
@@ -85,19 +92,43 @@ export function createScratch(env = process.env, { mkTemp = mkdtempSync } = {}) 
  * manifests and occasionally file content in their diagnostics, and this repository's logs are
  * potentially public. On failure the caller emits a FIXED sanitized message; the real text stays in
  * `logs/`, where a bounded rerun can reach it and a public artifact cannot.
+ *
+ * THE FAILURE CODES ARE DISTINCT, because the remedies are. "The scan ran out of time", "the scan
+ * produced more diagnostic output than the buffer allowed" and "the binary would not start at all"
+ * were one `AUDIT_SUBPROCESS_START` code, and that code is the ONLY thing about the failure the
+ * public record carries — so collapsing them threw away the entire diagnosis for a coordinator who
+ * cannot read the scratch log.
  */
-export function runPrivate(command, args, { scratch, label, timeoutMs, env = process.env }) {
+const SUBPROCESS_FAILURE_CODES = Object.freeze({
+  // spawnSync kills the child at `timeout` and reports ETIMEDOUT: the deadline, not a broken binary.
+  ETIMEDOUT: "AUDIT_SUBPROCESS_TIMEOUT",
+  // `maxBuffer` exceeded. The child ran; its captured diagnostic is truncated.
+  ENOBUFS: "AUDIT_SUBPROCESS_LOG_OVERFLOW",
+});
+
+export function runPrivate(command, args, {
+  scratch,
+  label,
+  timeoutMs,
+  env = process.env,
+  maxBufferBytes = AUDIT_LIMITS.maxSubprocessLogBytes,
+}) {
   const logPath = join(scratch, "logs", `${label}.log`);
   const result = spawnSync(command, args, {
     timeout: timeoutMs,
     // `pipe`, then written to scratch by us — never `inherit`, which would put it in the job log.
     stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: AUDIT_LIMITS.maxSubprocessLogBytes,
+    maxBuffer: maxBufferBytes,
     env,
   });
   const captured = Buffer.concat([result.stdout ?? Buffer.alloc(0), result.stderr ?? Buffer.alloc(0)]);
+  // Whatever WAS captured is retained even on a truncated or timed-out run: a partial diagnostic in
+  // private scratch is the only material a bounded rerun has to start from.
   appendFileSync(logPath, captured);
-  if (result.error) throw Object.assign(new Error(`${label} failed to start`), { code: "AUDIT_SUBPROCESS_START", label });
+  if (result.error) {
+    const code = SUBPROCESS_FAILURE_CODES[result.error.code] ?? "AUDIT_SUBPROCESS_START";
+    throw Object.assign(new Error(`${label} did not complete (${code})`), { code, label });
+  }
   if (result.status !== 0) throw Object.assign(new Error(`${label} exited ${result.status}`), { code: "AUDIT_SUBPROCESS_EXIT", label });
   return result.stdout ?? Buffer.alloc(0);
 }
@@ -113,33 +144,59 @@ export function runPrivate(command, args, { scratch, label, timeoutMs, env = pro
  * A scanner whose interface differs from what this code passes would silently drop arguments, and a
  * scan run with different arguments than the evidence records is not the scan the evidence describes.
  */
-export function installScanner({ scratch, budget, scanner = SCANNER }) {
+export function installScanner({ scratch, budget, scanner = SCANNER, run = runPrivate }) {
   assertScannerPinned(scanner);
   const toolDir = join(scratch, "tools");
   const archive = join(toolDir, "scanner.tar.gz");
-  runPrivate("curl", ["-sSfL", "--retry", "2", "-o", archive, scanner.assetUrl(scanner.version)], {
+  run("curl", ["-sSfL", "--retry", "2", "-o", archive, scanner.assetUrl(scanner.version)], {
     scratch, label: "scanner-download", timeoutMs: budget.remaining(120_000, "scanner download"),
   });
   verifyScannerDownload(readFileSync(archive), scanner);
-  runPrivate("tar", ["-xzf", archive, "-C", toolDir, scanner.name], {
+  run("tar", ["-xzf", archive, "-C", toolDir, scanner.name], {
     scratch, label: "scanner-extract", timeoutMs: budget.remaining(60_000, "scanner extract"),
   });
   const binary = join(toolDir, scanner.name);
-  const version = runPrivate(binary, ["version"], { scratch, label: "scanner-version", timeoutMs: budget.remaining(30_000, "scanner version") }).toString("utf8");
-  const help = runPrivate(binary, ["detect", "--help"], { scratch, label: "scanner-help", timeoutMs: budget.remaining(30_000, "scanner help") }).toString("utf8");
+  const version = run(binary, ["version"], { scratch, label: "scanner-version", timeoutMs: budget.remaining(30_000, "scanner version") }).toString("utf8");
+  const help = run(binary, ["detect", "--help"], { scratch, label: "scanner-help", timeoutMs: budget.remaining(30_000, "scanner help") }).toString("utf8");
   const failures = [...scannerVersionFailures(version, scanner), ...scannerInterfaceFailures(help, scanner)];
   if (failures.length) throw new Error(`the pinned scanner is not the interface this audit calls:\n- ${failures.join("\n- ")}`);
   return binary;
 }
 
-/** Run the scan over staged content and read ONLY the allowlisted report fields back. */
-export function runScan({ binary, scanDir, scratch, budget, configPath }) {
+/**
+ * Run the scan over staged content and read ONLY the allowlisted report fields back.
+ *
+ * THREE WAYS A SCAN CAN FAIL TO BE EVIDENCE, all of which the subprocess can survive with exit 0:
+ * it wrote no report, it wrote something that is not JSON, or it wrote JSON that is not a findings
+ * array. Each is a REFUSAL here. None of them may become "zero findings", which is the best verdict
+ * the audit can produce and therefore the most dangerous thing to hand a broken run.
+ *
+ * A parse failure's own message is discarded: V8 quotes a slice of the input in `SyntaxError`, and
+ * the input is the scanner's report.
+ */
+export function runScan({ binary, scanDir, scratch, budget, configPath, run = runPrivate }) {
   const reportPath = join(scratch, "logs", "scanner-report.json");
-  runPrivate(binary, scannerArgs({ sourceDir: scanDir, reportPath, configPath }), {
+  run(binary, scannerArgs({ sourceDir: scanDir, reportPath, configPath }), {
     scratch, label: "scanner-detect", timeoutMs: budget.remaining(20 * 60_000, "secret scan"),
   });
-  if (!existsSync(reportPath)) throw new Error("the scanner produced no report; its coverage is unknown and cannot be reported as clean");
-  return JSON.parse(readFileSync(reportPath, "utf8"));
+  if (!existsSync(reportPath)) {
+    throw Object.assign(
+      new Error("the scanner produced no report; its coverage is unknown and cannot be reported as clean"),
+      { code: "AUDIT_SCANNER_REPORT_MISSING" },
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(reportPath, "utf8"));
+  } catch {
+    throw Object.assign(
+      new Error("the scanner report is not parseable JSON; the scan's own output is in private scratch"),
+      { code: "AUDIT_SCANNER_REPORT_UNPARSEABLE" },
+    );
+  }
+  // Shape-checked HERE, at the boundary, so nothing downstream can be handed a report that only
+  // looks like one. `validateReport` accepts a valid empty array — the genuine clean case.
+  return validateReport(parsed);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +210,10 @@ export function runScan({ binary, scanDir, scratch, budget, configPath }) {
  * image against it would answer "does the image match what we are building today", which is not the
  * question and would go green for the wrong reason on every future audit.
  */
-export function fetchOriginalSource({ scratch, budget, revision = SUBJECT.sourceRevision }) {
+export function fetchOriginalSource({ scratch, budget, revision = SUBJECT.sourceRevision, run = runPrivate }) {
   const dir = join(scratch, "source");
-  const git = (args, label, ms) => runPrivate("git", ["-C", dir, ...args], { scratch, label, timeoutMs: budget.remaining(ms, label) });
-  runPrivate("git", ["init", "--quiet", dir], { scratch, label: "source-init", timeoutMs: budget.remaining(30_000, "source init") });
+  const git = (args, label, ms) => run("git", ["-C", dir, ...args], { scratch, label, timeoutMs: budget.remaining(ms, label) });
+  run("git", ["init", "--quiet", dir], { scratch, label: "source-init", timeoutMs: budget.remaining(30_000, "source init") });
   git(["remote", "add", "origin", SOURCE_URL], "source-remote", 30_000);
   // Anonymous over HTTPS: the repository is public and this fetch must carry no credential that
   // could end up in the comparison tree.
@@ -168,8 +225,8 @@ export function fetchOriginalSource({ scratch, budget, revision = SUBJECT.source
 }
 
 /** The pinned revision's tracked inventory, with each entry's real content hashed from that tree. */
-export function readSourceTree(dir, { scratch, budget }) {
-  const listing = runPrivate("git", ["-C", dir, "ls-tree", "-r", "-z", "HEAD"], {
+export function readSourceTree(dir, { scratch, budget, run = runPrivate }) {
+  const listing = run("git", ["-C", dir, "ls-tree", "-r", "-z", "HEAD"], {
     scratch, label: "source-ls-tree", timeoutMs: budget.remaining(60_000, "source inventory"),
   }).toString("utf8");
   const entries = [];
@@ -192,12 +249,23 @@ export function readSourceTree(dir, { scratch, budget }) {
 // The audit
 // ---------------------------------------------------------------------------
 
-/** Only a path the ORIGINAL source tracks may be named in public evidence, and only if it is not itself sensitive. */
-function publicPathResolver(staged, expected) {
+/**
+ * Only a path the ORIGINAL source tracks may be named in public evidence, and only if it is not
+ * itself sensitive.
+ *
+ * The id handed in here is already normalized against the scan root by `normalizeScanLocation`, so
+ * an absolute location the scanner reported has become the staged id this audit chose — or has been
+ * refused before reaching this function.
+ */
+export function publicPathResolver(staged, expected) {
   const SENSITIVE = /(^|\/)(\.env(\.|$)|\.git\/|\.npmrc$|\.netrc$|id_[a-z0-9]+$|.*\.(pem|key|pfx|p12)$)/i;
   return (scratchId) => {
+    // The image CONFIG, staged under a fixed name of this audit's choosing rather than as a layer
+    // member. A finding here is a finding in `Env`/`Labels`/`Cmd`/history — worth a category of its
+    // own for review, and the category alone exposes none of those values.
+    if (scratchId === "image-config.json") return { category: "image-config" };
     const detail = staged.get(scratchId);
-    if (!detail) return undefined;
+    if (!detail) return { category: "unresolved" };
     if (detail.depth > 0) return { category: "nested-archive-content" };
     if (SENSITIVE.test(detail.name)) return { category: "sensitive-path" };
     if (expected.has(detail.name)) return { publicPath: detail.name, category: "public-source-path" };
@@ -206,11 +274,62 @@ function publicPathResolver(staged, expected) {
   };
 }
 
-export async function runAudit(env = process.env, { now = () => new Date() } = {}) {
+/**
+ * The final record, assembled from MEASURED pieces — including the build recipe.
+ *
+ * WHY THIS IS ITS OWN FUNCTION. `recipe.mjs` states that unknown or violated assertions block, and
+ * for a while nothing kept that promise: the recipe was written into `provenance` and never reached
+ * the readiness computation, so a violated build-recipe assertion could sit inside a `clean` verdict.
+ * Assembling both from the SAME argument makes the readiness input and the recorded evidence one
+ * thing rather than two that can disagree — and `transitionReadiness` fails closed on a missing
+ * recipe, so a caller that forgets it can only ever produce a false BLOCK.
+ */
+export function assembleAudit({
+  manifest, inspected, inventory, findings, packageInventory, identityVerified, recipe,
+  labelFailures, tagReadback, scanner, audit, startedAt, completedAt,
+}) {
+  const readiness = transitionReadiness({
+    coverage: inspected.coverage,
+    inventory,
+    findings,
+    packageInventory,
+    identityVerified,
+    recipe,
+  });
+  return buildEvidence({
+    ...readiness,
+    subject: {
+      ...SUBJECT,
+      reference: SUBJECT_REFERENCE,
+      manifestDigest: manifest.digest,
+      configDigest: inspected.config.digest,
+      layers: inspected.layers,
+    },
+    provenance: {
+      labelFailures: Object.freeze(labelFailures),
+      tagReadback,
+      originalRun: `${SUBJECT.originalRunId}.${SUBJECT.originalRunAttempt}`,
+      recipe,
+    },
+    coverage: inspected.coverage,
+    inventory: { ...inventory, shadowedPaths: inspected.merged.shadowed.length },
+    findings,
+    packageInventory,
+    scanner,
+    audit,
+    limits: AUDIT_LIMITS,
+    startedAt,
+    completedAt,
+  });
+}
+
+export async function runAudit(env = process.env, {
+  now = () => new Date(),
+  scanner = SCANNER,
+  run = runPrivate,
+  makeScratch = createScratch,
+} = {}) {
   const startedAt = now().toISOString();
-  assertSubjectShape();
-  const budget = createOperationBudget("staging ops image audit", AUDIT_LIMITS.internalDeadlineMs);
-  const scratch = createScratch(env);
   const auditIdentity = Object.freeze({
     repository: env.GITHUB_REPOSITORY,
     workflowRef: env.GITHUB_WORKFLOW_REF,
@@ -221,19 +340,43 @@ export async function runAudit(env = process.env, { now = () => new Date() } = {
     note: "this run identifies AUDIT CODE only; the audited image's source is subject.sourceRevision",
   });
   const counters = {};
+  /**
+   * WHERE the run got to, in this module's own closed vocabulary. It is the one piece of failure
+   * context the sanitized record can carry safely, and it is what tells a coordinator whether a
+   * refusal happened before any network work or half-way through the scan.
+   */
+  let stage = "prerequisites";
+  let scratch;
+  let budget;
 
   try {
+    /**
+     * THE PREREQUISITES, INSIDE the evidence path (PUB-01, PUB-04).
+     *
+     * Still first, and still before any pull, export or network call — an audit that refuses on an
+     * unrecorded checksum must refuse at second zero rather than burn a ~20-minute export first. What
+     * changed is that these three no longer throw from OUTSIDE the try: a prerequisite refusal used
+     * to produce no artifact at all, which is indistinguishable to a coordinator from a runner that
+     * died. Now it produces a sanitized `refused` record with a fixed code.
+     */
+    assertSubjectShape();
+    assertScannerPinned(scanner);
+    budget = createOperationBudget("staging ops image audit", AUDIT_LIMITS.internalDeadlineMs);
+    scratch = makeScratch(env);
+
     // 1. The registry's answer for the pinned digest, recomputed from its own bytes.
-    const rawManifest = runPrivate("docker", ["buildx", "imagetools", "inspect", "--raw", SUBJECT_REFERENCE], {
+    stage = "registry-manifest";
+    const rawManifest = run("docker", ["buildx", "imagetools", "inspect", "--raw", SUBJECT_REFERENCE], {
       scratch, label: "manifest-inspect", timeoutMs: budget.remaining(120_000, "manifest read"),
     });
     const manifest = verifyManifest(rawManifest, SUBJECT.digest);
     counters.layers = manifest.layers.length;
 
     // 2. L1 — the ORIGINAL receipt tag must still resolve to that digest.
+    stage = "tag-readback";
     let tagReadback;
     try {
-      const rawTag = runPrivate("docker", ["buildx", "imagetools", "inspect", "--raw", SUBJECT_TAG_REFERENCE], {
+      const rawTag = run("docker", ["buildx", "imagetools", "inspect", "--raw", SUBJECT_TAG_REFERENCE], {
         scratch, label: "tag-readback", timeoutMs: budget.remaining(120_000, "tag readback"),
       });
       tagReadback = classifyTagReadback(rawTag, SUBJECT.digest);
@@ -242,22 +385,26 @@ export async function runAudit(env = process.env, { now = () => new Date() } = {
     }
 
     // 3. Pull and export the EXISTING artifact. No `docker run`, ever.
+    stage = "image-export";
     const exportPath = join(scratch, "image.tar");
-    runPrivate("docker", ["pull", "--quiet", SUBJECT_REFERENCE], { scratch, label: "image-pull", timeoutMs: budget.remaining(15 * 60_000, "image pull") });
-    runPrivate("docker", ["save", "-o", exportPath, SUBJECT_REFERENCE], { scratch, label: "image-save", timeoutMs: budget.remaining(10 * 60_000, "image export") });
+    run("docker", ["pull", "--quiet", SUBJECT_REFERENCE], { scratch, label: "image-pull", timeoutMs: budget.remaining(15 * 60_000, "image pull") });
+    run("docker", ["save", "-o", exportPath, SUBJECT_REFERENCE], { scratch, label: "image-save", timeoutMs: budget.remaining(10 * 60_000, "image export") });
     const exportBytes = statSync(exportPath).size;
     if (exportBytes > AUDIT_LIMITS.maxExportBytes) throw new Error(`the export is ${exportBytes} bytes, past the audit's bound`);
 
     // 4. Identity chain + per-layer inventory + staged content.
+    stage = "layer-inspection";
     const inspected = await inspectExport({ exportPath, manifest, scratchDir: scratch, limits: AUDIT_LIMITS, platform: SUBJECT.platform });
     counters.members = inspected.coverage.members;
+    counters.stagedBytes = inspected.coverage.stagedBytes;
     // The export is the largest thing on the disk and every byte of it has now been read.
     rmSync(exportPath, { force: true });
 
     // 5. Provenance: labels, plus the original source revision itself.
+    stage = "original-source";
     const labelFailures = revisionLabelFailures(inspected.config.config, SUBJECT);
-    const sourceDir = fetchOriginalSource({ scratch, budget });
-    const sourceEntries = readSourceTree(sourceDir, { scratch, budget });
+    const sourceDir = fetchOriginalSource({ scratch, budget, run });
+    const sourceEntries = readSourceTree(sourceDir, { scratch, budget, run });
     const sourceFiles = Object.fromEntries(RECIPE_FILES.map((path) => {
       const full = join(sourceDir, path);
       return [path, existsSync(full) ? readFileSync(full, "utf8") : undefined];
@@ -265,46 +412,48 @@ export async function runAudit(env = process.env, { now = () => new Date() } = {
     const recipe = recipeEvidence(sourceFiles);
 
     // 6. `/app` inventory. Dockerignore filters the EXPECTED set only (M1).
+    stage = "app-inventory";
     const expected = expectedInventory(sourceEntries, sourceFiles[".dockerignore"] ?? "");
-    const comparison = compareInventory(latestAppMembers(inspected.appMembers), expected);
+    const comparison = compareInventory(latestAppMembers(inspected.appMembers, inspected.merged), expected);
     const inventory = inventorySummary(comparison);
 
     // 7. The scan, over every staged file of every layer.
-    const binary = installScanner({ scratch, budget });
-    const report = runScan({ binary, scanDir: inspected.scanDir, scratch, budget, configPath: join(process.cwd(), SCANNER.configPath) });
-    const findings = summarizeFindings(report, { resolvePath: publicPathResolver(inspected.staged, expected.expected) });
+    stage = "secret-scan";
+    const binary = installScanner({ scratch, budget, scanner, run });
+    const configPath = join(process.cwd(), scanner.configPath);
+    const scannerArgList = scannerArgs({ sourceDir: inspected.scanDir, reportPath: "", configPath });
+    const report = runScan({ binary, scanDir: inspected.scanDir, scratch, budget, configPath, run });
+    const findings = summarizeFindings(report, {
+      // The pinned scanner reports ABSOLUTE locations, and the ids this audit staged are relative to
+      // the scan root. Without the root there is nothing to normalise against, and every real finding
+      // resolves to `unresolved` — a category that reads like an attribution attempt that failed
+      // rather than one that never happened.
+      scanRoot: inspected.scanDir,
+      resolvePath: publicPathResolver(inspected.staged, expected.expected),
+    });
 
     // 8. The package-wide inventory (PUB-05).
+    stage = "package-inventory";
     const packageInventory = assessPackageInventory(
       await listPackageVersions({ token: env.GITHUB_TOKEN }),
       SUBJECT.digest,
     );
 
-    const identityVerified = inspected.identityVerified && labelFailures.length === 0 && tagReadback.status === "confirmed";
-    const readiness = transitionReadiness({
-      coverage: inspected.coverage,
+    stage = "evidence";
+    return writeEvidence(env, assembleAudit({
+      manifest,
+      inspected,
       inventory,
       findings,
       packageInventory,
-      identityVerified,
-    });
-
-    return writeEvidence(env, scratch, buildEvidence({
-      ...readiness,
-      subject: { ...SUBJECT, reference: SUBJECT_REFERENCE, manifestDigest: manifest.digest, configDigest: inspected.config.digest, layers: inspected.layers },
-      provenance: {
-        labelFailures: Object.freeze(labelFailures),
-        tagReadback,
-        originalRun: `${SUBJECT.originalRunId}.${SUBJECT.originalRunAttempt}`,
-        recipe,
-      },
-      coverage: inspected.coverage,
-      inventory: { ...inventory, shadowedPaths: inspected.merged.shadowed.length },
-      findings,
-      packageInventory,
-      scanner: scannerIdentity(SCANNER, readFileSync(join(process.cwd(), SCANNER.configPath), "utf8")),
+      identityVerified: inspected.identityVerified && labelFailures.length === 0 && tagReadback.status === "confirmed",
+      // MEASURED at this revision, and the single source for both the readiness computation and the
+      // recorded provenance.
+      recipe,
+      labelFailures,
+      tagReadback,
+      scanner: scannerIdentity(scanner, readFileSync(configPath, "utf8"), { settings: scannerSettings(scannerArgList) }),
       audit: auditIdentity,
-      limits: AUDIT_LIMITS,
       startedAt,
       completedAt: now().toISOString(),
     }));
@@ -312,25 +461,43 @@ export async function runAudit(env = process.env, { now = () => new Date() } = {
     // A refused/failed audit still writes evidence — sanitized, and honestly labelled `refused`. The
     // upload is `always()`, but a hard runner termination can still prevent it, so nothing here
     // claims the artifact was delivered.
-    const record = buildEvidence({
-      verdict: "refused",
-      transitionReady: false,
-      blockers: ["the audit did not complete; the package stays private"],
-      subject: { ...SUBJECT, reference: SUBJECT_REFERENCE },
-      audit: auditIdentity,
-      findings: sanitizedFailure({ stage: "run", error, counters }),
-      scanner: { name: SCANNER.name, version: SCANNER.version, sha256: SCANNER.sha256, configPath: SCANNER.configPath },
-      limits: AUDIT_LIMITS,
-      startedAt,
-      completedAt: now().toISOString(),
-    });
-    writeEvidence(env, scratch, record);
+    //
+    // IT REPORTS, IT DOES NOT REPLACE. If assembling or writing that record fails in turn, the
+    // ORIGINAL failure is still what propagates: a run must never end up red for "the leak guard
+    // rejected the failure record" while the reason it actually failed goes unmentioned.
+    try {
+      writeEvidence(env, buildEvidence({
+        verdict: "refused",
+        transitionReady: false,
+        blockers: ["the audit did not complete; the package stays private"],
+        subject: { ...SUBJECT, reference: SUBJECT_REFERENCE },
+        audit: auditIdentity,
+        // The STAGE the run reached, from this module's closed vocabulary — so a prerequisite refusal
+        // (no network work done at all) is distinguishable from a failure part-way through the scan.
+        failure: sanitizedFailure({ stage, error, counters }),
+        scanner: { name: scanner.name, version: scanner.version, sha256: scanner.sha256, configPath: scanner.configPath },
+        limits: AUDIT_LIMITS,
+        startedAt,
+        completedAt: now().toISOString(),
+      }));
+    } catch {
+      // Deliberately swallowed, and deliberately silent: the message could quote the record that
+      // failed the leak guard. The absent artifact is itself the signal, and the throw below is the
+      // account that survives.
+    }
     throw error;
   }
 }
 
-/** ONE artifact, at a fixed path. The scratch tree it was derived from is never uploaded. */
-function writeEvidence(env, scratch, record) {
+/**
+ * ONE artifact, at a fixed path in the workspace — and it is the ALLOWLISTED record, which
+ * `buildEvidence` has already refused to produce if anything sensitive reached it. The scratch tree
+ * it was derived from is never written here and never uploaded.
+ *
+ * The job summary gets the same allowlisted fields and nothing more. A summary is as public as an
+ * artifact, so "just for the operator" is not a category that exists in this repository.
+ */
+function writeEvidence(env, record) {
   const path = env.AUDIT_EVIDENCE_PATH || "staging-ops-image-audit.json";
   writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`);
   if (env.GITHUB_STEP_SUMMARY) {
@@ -338,7 +505,7 @@ function writeEvidence(env, scratch, record) {
       `- verdict: **${record.verdict}**`,
       `- transition ready: **${record.transitionReady}**`,
       ...(record.blockers ?? []).map((blocker) => `- blocker: ${blocker}`),
-      `- scratch (NOT uploaded): ${scratch.length > 0 ? "ephemeral runner temp" : "unknown"}`,
+      "- raw layer content, extracted files and scanner matches stayed in ephemeral runner scratch and were NOT uploaded",
     ].join("\n");
     appendFileSync(env.GITHUB_STEP_SUMMARY, `## Staging ops image audit\n\n${rows}\n`);
   }

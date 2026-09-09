@@ -1205,3 +1205,118 @@ until someone measures them:
 
 **Do not "fix" any of these by broadening token scopes, adding a PAT, or making the package
 public.** If a prerequisite fails, the workflow refusing is the correct outcome.
+
+---
+
+## 13. Auditing the ops runner image before making it public — `staging-ops-image-audit.yml` (AIO-997)
+
+The user's authorization to make `ghcr.io/aiosbrain/aios-staging-ops` **public** is conditional: the
+artifact must first be verified to contain no secrets or private content. This workflow is that
+verification. Data, snapshots, backups and credentials stay private regardless of its outcome.
+
+**⚠️ Making a package public is IRREVERSIBLE.** GitHub does not offer a public → private transition
+for a package. Nothing below is reached until the evidence is accepted.
+
+### What it audits, and what it cannot claim
+
+It audits **one existing digest**, pinned in reviewed source
+(`scripts/staging-ops/image-audit/subject.mjs`) as a tuple: the digest, the source revision
+`11eb039b…`, the original publication run `34398108263.1`, and that run's immutable receipt tag.
+There is **no input** — auditing a different digest is a reviewed edit to that file, not a dispatch
+parameter, and another approved digest needs a scoped subject update.
+
+- It **pulls and exports** that image and never runs it. No entrypoint, no npm script, no container.
+- It verifies the whole identity chain: registry bytes → the pinned manifest digest → the config
+  descriptor → each ordered layer's descriptor → each `rootfs.diff_ids` entry.
+- It inspects **every layer**, including files a later layer deletes or overwrites. Inspecting a
+  started container or a merged root filesystem would miss exactly those, and they remain fully
+  distributed to anyone who pulls the digest.
+- It compares `/app` byte-for-byte against the **original public source revision**, fetched into a
+  separate directory. `.dockerignore` filters the *expected* set only: an image file at an excluded
+  source path is a **finding**, never a scan skip.
+- **A PASS is not a proof of absence.** It means: no finding under the recorded scanner rules and the
+  recorded coverage. It cannot prove the absence of arbitrary private prose, an unknown credential
+  format, or an encoded secret. The recipe assertions are evidence about *configured inputs*, **not**
+  a hermeticity claim — `apt`, `curl` and `npm ci` all reach the network during the build.
+
+### Running it
+
+1. Actions → **Staging ops image audit** → *Run workflow* → branch **`staging`**. Any other branch,
+   event or repository fails in the first step, by name, before the registry is touched.
+2. It shares the publisher's concurrency group, so an audit and a publication cannot interleave.
+   **Pause publisher dispatches** for the whole inventory-to-transition window — the concurrency
+   group does *not* cover the manual browser step at the end.
+3. **Download `staging-ops-image-audit-<run>.<attempt>`** into the durable coordinator packet.
+   Retention is **30 days**; GitHub is not the archive.
+
+### Reading the evidence
+
+The artifact is built from an allowlist, so what is *absent* is deliberate. Raw layer content,
+extracted files, the full config/history and every scanner match stay in ephemeral runner scratch and
+are never uploaded or printed — **this repository is public, and an Actions artifact is potentially
+public evidence.**
+
+- **`transitionReady`** is the only field the operator gate should read. It is **derived**, not
+  asserted: any finding *or* any unmeasured thing sets it false, because "we found nothing" and "we
+  did not look" must not read the same.
+- **`blockers`** lists every reason in one pass.
+- **`coverage.limitations`** names anything that could not be fully inspected — an unexpandable
+  archive format, an oversized member, an exhausted byte budget. A bounded-coverage result can be
+  accepted only with an **explicit coordinator adjudication of the recorded gap**. An opaque-byte
+  scan is not decoded archive inspection.
+- **`findings`** is grouped by rule, with a random **per-run `occurrenceId`** per occurrence. A clear
+  `path` appears only where the location was independently established as public source/dependency
+  content that is not itself sensitive. Unsalted hashes of sensitive paths are *not* redaction and
+  are never emitted. To resolve an occurrence id, arrange a **bounded rerun / private read-only
+  inspection** through an approved channel — that is a concrete access limitation to report, never a
+  reason to clear the finding. **Public origin never clears a real credential.**
+- **`packageInventory.status`** must be `verified`. A `403`, a `404`, incomplete pagination or a
+  missing linkage is **`unverified`** — *not* an empty package. If the Actions token cannot
+  enumerate, a signed-in package administrator may supply a timestamped, complete read-only UI
+  inventory covering **all pages, tagged AND untagged version ids, and full immutable digests**; a
+  count, a screenshot of only the tagged tab, or a truncated digest is insufficient. That evidence can
+  satisfy the gate, and `apiStatus` still records that the workflow's own read failed.
+- **Any additional version stops the transition.** A clean audit of one digest does not authorize
+  exposing unaudited digests in the same package; `additionalSubjects` lists them for a bounded audit.
+  Nothing is deleted, and no alternate public package or public-push workaround is implied.
+
+If actual private content is found: **keep the package private** and take a bounded remediation
+proposal to the coordinator. Do not delete package versions or rotate credentials from this stage.
+
+### The transition, and why the publisher then refuses
+
+Order, and none of it is optional:
+
+1. Review and merge the audit-only code; run the audit on the pinned digest.
+2. Complete the package inventory and the coordinator's content adjudication.
+3. **Re-check the inventory** immediately before the operator action — a changed digest set requires
+   renewed coverage.
+4. The signed-in user with package-admin rights changes **this one package** to public in GitHub's
+   package settings, having seen the irreversibility notice. **The workflow never changes
+   visibility**; it holds `packages: read`.
+5. Record measured public visibility and linkage, plus a fresh **unauthenticated** exact-digest
+   pull/manifest readback.
+
+**The existing publisher then refuses to publish again, deliberately.** Its OP-06 precheck requires
+the package to be **private** before and after a push, and that check is unchanged by this work — so
+after the transition it fails before login/build/push. Pulling the audited public digest still works.
+Restoring publication needs a *separately specified and reviewed* build-once, inspect-before-push
+continuation; it must never push public content and audit afterwards. That PR is not a prerequisite
+for auditing or exposing the currently covered package.
+
+### Unmeasured prerequisites — the workflow refuses until these are recorded
+
+- **The scanner's download checksum.** `scripts/staging-ops/image-audit/scanner.mjs` pins the version
+  and carries `sha256: "UNRECORDED"`. It **fails closed**: a fabricated hash would launder an
+  unverified download into a verified-looking one. Record the real value from the release's official
+  checksums file *and* the asset itself before dispatching. The repo's `ci.yml` gitleaks download is
+  unpinned by checksum and on an older version — it is **not** evidence for this one, and the pinned
+  version's own flags are measured on the runner rather than inferred.
+- **The `docker save` export form.** The inspector accepts exactly the two forms whose layer identity
+  it can *prove* by hash — the compressed registry blob (verified against its descriptor, then
+  decoded per the declared media type to its `diff_id`) and the uncompressed diff (whose hash *is*
+  the `diff_id`). Anything else fails as `unsupported-export-form`. It never guesses gzip for an
+  unknown media type.
+- **Package-metadata access.** The job token must be able to pull this linked private package and
+  enumerate its versions. A failure is an explicit permission prerequisite. **Do not create a PAT,
+  broaden scopes, or make the package public to get past it.**

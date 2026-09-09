@@ -103,6 +103,29 @@ export function copyMemberToFile(exportPath, entry, outPath) {
   return streamMember(exportPath, entry, outPath, undefined);
 }
 
+/**
+ * ONE cumulative allowance for every byte staged into `scan/`, shared by all layers.
+ *
+ * WHY IT IS A SHARED OBJECT rather than a per-layer number: the bound the audit needs is the total
+ * size of the scratch tree, and that is a property of the run, not of any one layer. Reservation
+ * happens BEFORE a write, so exhaustion is detected without first filling the disk.
+ */
+export function createStagingBudget(limit = Number.POSITIVE_INFINITY) {
+  let used = 0;
+  return {
+    get used() { return used; },
+    get limit() { return limit; },
+    remaining() { return limit - used; },
+    /** Claim `bytes` of the allowance. False means the write must not happen. */
+    reserve(bytes) {
+      const size = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+      if (used + size > limit) return false;
+      used += size;
+      return true;
+    },
+  };
+}
+
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
 /** Formats this audit cannot expand. Their presence is a RECORDED coverage gap, never a silent skip. */
 const UNEXPANDABLE = /\.(zip|xz|bz2|br|zst|7z|rar|jar|whl|egg|deb|rpm|apk)$/i;
@@ -132,9 +155,10 @@ function safeExtension(name) {
  * cannot decode, is recorded as a limitation — which makes coverage incomplete and blocks the
  * transition until a coordinator adjudicates the recorded gap.
  */
-export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, prefix = "app/" }) {
+export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, prefix = "app/", stagingBudget }) {
   const source = fileSource(layerTarPath);
   mkdirSync(join(scanDir, `L${layerIndex}`), { recursive: true });
+  const budget = stagingBudget ?? createStagingBudget(limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY);
   const paths = [];
   const appMembers = [];
   const staged = new Map();
@@ -143,8 +167,15 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   let expandedBytes = 0;
   let members = 0;
 
-  /** Write bytes to scratch under an id THIS module chose, and remember the real name privately. */
-  const stage = (name, emit, depth) => {
+  /**
+   * Write bytes to scratch under an id THIS module chose, and remember the real name privately.
+   *
+   * Returns `undefined` when the CUMULATIVE staging allowance cannot cover `bytes` — the reservation
+   * happens before the sink is opened, so a refused member leaves no partial file behind for the
+   * scanner to read as though it were the whole thing.
+   */
+  const stage = (name, emit, depth, bytes) => {
+    if (!budget.reserve(bytes)) return undefined;
     const id = `L${layerIndex}/${String(sequence++).padStart(6, "0")}${safeExtension(name)}`;
     const sink = openSink(join(scanDir, id));
     try {
@@ -169,7 +200,21 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
         }
         continue;
       }
-      if (member.type !== "file") continue;
+      if (member.type !== "file") {
+        // A directory/fifo/device carries no content, so passing over it costs no coverage. A member
+        // whose TYPEFLAG this reader does not know is different: it may carry bytes nobody looked at,
+        // and dropping it silently is the same coverage hole as skipping a file.
+        if (member.type === "unsupported") {
+          limitations.push({
+            kind: "unsupported-member-type",
+            layer: layerIndex,
+            // The typeflag is one attacker-controlled byte, and limitations reach the PUBLIC evidence
+            // artifact. Anything but a plain alphanumeric is reported by category, not echoed.
+            typeflag: /^[A-Za-z0-9]$/.test(member.typeflag) ? member.typeflag : "non-printable",
+          });
+        }
+        continue;
+      }
 
       if (member.size > limits.maxMemberBytes) {
         limitations.push({ kind: "oversized-member", layer: layerIndex, bytes: member.size });
@@ -194,7 +239,14 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
           }
           write(chunk);
         }).sha256;
-      }, 0);
+      }, 0, member.size);
+      if (id === undefined) {
+        // The cumulative allowance is spent. Every remaining member of this layer would be refused
+        // too, so the layer stops here and says so — a partially staged layer reported as fully
+        // scanned is precisely the silent narrowing this audit must not do.
+        limitations.push({ kind: "total-staging-budget-exhausted", layer: layerIndex });
+        break;
+      }
       expandedBytes += member.size;
       if (name.startsWith(prefix)) appMembers.push({ path: name, type: "file", sha256: digest, scratchId: id });
 
@@ -232,7 +284,12 @@ function expandNested({ member, name, layerIndex, limitations, limits, stage }) 
     if (!looksTar(bytes)) {
       // A bare gzip of a single file. Its INFLATED bytes are what a scanner must see; the compressed
       // copy staged above is opaque to every rule.
-      stage(`${name}#inflated`, (write) => write(bytes), 1);
+      //
+      // Expansion counts against the SAME cumulative allowance: inflated bytes occupy the same disk,
+      // and a nested archive is exactly where an unbounded expansion would come from.
+      if (stage(`${name}#inflated`, (write) => write(bytes), 1, bytes.length) === undefined) {
+        limitations.push({ kind: "total-staging-budget-exhausted", layer: layerIndex });
+      }
       return;
     }
     for (const nested of readTarMembers(bufferSource(bytes), { maxMembers: limits.maxMembersPerLayer })) {
@@ -241,7 +298,10 @@ function expandNested({ member, name, layerIndex, limitations, limits, stage }) 
         limitations.push({ kind: "oversized-nested-member", layer: layerIndex, bytes: nested.size });
         continue;
       }
-      stage(`${name}#${nested.name}`, (write) => nested.content(write), 1);
+      if (stage(`${name}#${nested.name}`, (write) => nested.content(write), 1, nested.size) === undefined) {
+        limitations.push({ kind: "total-staging-budget-exhausted", layer: layerIndex });
+        break;
+      }
     }
   } catch (error) {
     // A nested archive that would not decode is a GAP, not a pass. Only the error's NAME is kept —

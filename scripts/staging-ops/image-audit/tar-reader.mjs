@@ -169,21 +169,25 @@ export function* readTarMembers(source, { maxMembers = 500_000, chunkBytes = 102
     const typeflag = String.fromCharCode(header[156]);
     const size = numericField(header.subarray(124, 136), "size");
     const dataOffset = offset + BLOCK;
-    const nextOffset = dataOffset + Math.ceil(size / BLOCK) * BLOCK;
-    if (nextOffset > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
+    /** Blocks occupied by `bytes` of member data. The stride to the next header. */
+    const strideTo = (bytes) => dataOffset + Math.ceil(bytes / BLOCK) * BLOCK;
 
+    // The extended headers below carry their OWN length in the ustar size field — a PAX `size`
+    // record describes the member the header applies to, never the header itself.
     if (typeflag === "L" || typeflag === "K") {
+      if (strideTo(size) > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
       const value = trimNul(source.read(dataOffset, size));
       if (typeflag === "L") gnuName = value;
       else gnuLink = value;
-      offset = nextOffset;
+      offset = strideTo(size);
       continue;
     }
     if (typeflag === "x" || typeflag === "g") {
+      if (strideTo(size) > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
       const records = parsePaxRecords(source.read(dataOffset, size).toString("utf8"));
       if (typeflag === "g") globalPax = { ...globalPax, ...records };
       else pax = { ...pax, ...records };
-      offset = nextOffset;
+      offset = strideTo(size);
       continue;
     }
 
@@ -193,13 +197,24 @@ export function* readTarMembers(source, { maxMembers = 500_000, chunkBytes = 102
     const merged = { ...globalPax, ...pax };
     const name = merged.path ?? gnuName ?? (prefix ? `${prefix}/${ustarName}` : ustarName);
     const link = merged.linkpath ?? gnuLink ?? linkname;
-    const declaredSize = merged.size !== undefined ? Number.parseInt(merged.size, 10) : size;
-    if (!Number.isSafeInteger(declaredSize) || declaredSize < 0) throw new TarFormatError("PAX size record is out of range");
+    /**
+     * A PAX `size` record OVERRIDES the ustar size field — that is the whole point of it, and for a
+     * member larger than the octal field can hold the ustar size is `0`.
+     *
+     * So it must drive the STRIDE to the next header, not just the content length. Taking
+     * `min(size, paxSize)` (or the ustar size alone) would read zero bytes AND land the next header
+     * read in the middle of this member's data, silently misparsing the rest of the archive into
+     * plausible garbage — an inventory that looks complete and is not.
+     */
+    const dataSize = merged.size !== undefined ? Number.parseInt(merged.size, 10) : size;
+    if (!Number.isSafeInteger(dataSize) || dataSize < 0) throw new TarFormatError("PAX size record is out of range");
+    const nextOffset = strideTo(dataSize);
+    if (nextOffset > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
 
     if (++emitted > maxMembers) throw new TarFormatError(`tar archive exceeds the ${maxMembers}-member limit`);
 
     const type = MEMBER_TYPES[typeflag] ?? "unsupported";
-    const contentSize = type === "file" ? Math.min(size, declaredSize) : 0;
+    const contentSize = type === "file" ? dataSize : 0;
     yield Object.freeze({
       name,
       type,

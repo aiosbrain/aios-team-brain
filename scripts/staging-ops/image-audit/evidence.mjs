@@ -24,6 +24,10 @@ import { redactionFailures } from "../image-publication.mjs";
 export const EVIDENCE_FIELDS = Object.freeze([
   "schema", "verdict", "transitionReady", "blockers",
   "subject", "provenance", "coverage", "inventory", "findings", "packageInventory",
+  // `failure` is its OWN field, never folded into `findings`. A refused run has no findings — it has
+  // a stage that did not complete — and writing one into the other would report "zero findings" for
+  // a run that never looked, which is the exact confusion this whole record is built to prevent.
+  "failure",
   "scanner", "audit", "limits", "startedAt", "completedAt",
 ]);
 
@@ -89,10 +93,72 @@ export function allowlistRecord(record) {
  * anything is unresolved OR unmeasured. A coverage gap and a finding block identically, because
  * "we did not look there" and "we looked and found something" are equally not a clean audit.
  */
-export function transitionReadiness({ coverage, inventory, findings, packageInventory, identityVerified }) {
+/**
+ * A coverage limitation → a READABLE blocker line.
+ *
+ * Limitations are objects, and interpolating one produced `content coverage is incomplete:
+ * [object Object]` — a blocker that names a real gap and tells the coordinator nothing about it.
+ *
+ * ONLY the fixed fields are mapped: `kind` (this module's own closed vocabulary) and the layer
+ * indices, aggregated into a count. Never a `reason`, an `extension` or any other value derived from
+ * archive content, because a blocker string goes into the PUBLIC artifact.
+ */
+export function describeLimitations(limitations = []) {
+  const byKind = new Map();
+  for (const limitation of limitations) {
+    const kind = /^[a-z][a-z0-9-]{0,60}$/.test(String(limitation?.kind ?? "")) ? limitation.kind : "unrecorded-limitation";
+    const group = byKind.get(kind) ?? { count: 0, layers: new Set() };
+    group.count += 1;
+    if (Number.isInteger(limitation?.layer)) group.layers.add(limitation.layer);
+    byKind.set(kind, group);
+  }
+  if (byKind.size === 0) return "unrecorded limitation";
+  return [...byKind.entries()].map(([kind, { count, layers }]) => {
+    const indices = [...layers].sort((a, b) => a - b);
+    // Bounded on purpose: 64 layers must not turn one blocker into a wall of numbers.
+    const shown = indices.slice(0, 4).join(",");
+    const suffix = indices.length === 0 ? "" : ` in layer${indices.length > 1 ? "s" : ""} ${shown}${indices.length > 4 ? `,+${indices.length - 4} more` : ""}`;
+    return `${count}× ${kind}${suffix}`;
+  }).join("; ");
+}
+
+/**
+ * The recipe rows, as a readiness input.
+ *
+ * `recipe.mjs` promises that unknown assertions BLOCK, and that promise was previously kept nowhere:
+ * the recipe was recorded in provenance and never reached this computation, so a violated or
+ * unverifiable build-recipe assertion could ride along with a `clean` verdict.
+ *
+ * FAIL-CLOSED BY DEFAULT, which is the part that matters structurally: a caller that forgets to pass
+ * the recipe gets a blocker, not a pass. A wiring mistake can therefore only ever cost a false
+ * BLOCK — never a false clean.
+ *
+ * A violation is NOT redefined as secret presence. It means the reviewed build recipe did not measure
+ * as expected, which is a question for coordinator adjudication.
+ */
+function recipeBlockers(recipe) {
+  if (recipe === undefined || recipe === null) return ["the build recipe assertions were not measured"];
+  const assertions = Array.isArray(recipe.assertions) ? recipe.assertions : undefined;
+  if (assertions === undefined || assertions.length === 0) return ["the build recipe measured no assertions at all"];
+  const counts = { violated: 0, unverified: 0, unknown: 0 };
+  for (const assertion of assertions) {
+    if (assertion?.status === "satisfied") continue;
+    if (assertion?.status === "violated") counts.violated += 1;
+    else if (assertion?.status === "unverified") counts.unverified += 1;
+    else counts.unknown += 1;
+  }
+  const blockers = [];
+  if (counts.violated > 0) blockers.push(`${counts.violated} build-recipe assertion(s) are VIOLATED and require coordinator adjudication`);
+  if (counts.unverified > 0) blockers.push(`${counts.unverified} build-recipe assertion(s) are unverified; an assertion nobody could evaluate is a gap, not a pass`);
+  if (counts.unknown > 0) blockers.push(`${counts.unknown} build-recipe assertion(s) carry no recognised status`);
+  return blockers;
+}
+
+export function transitionReadiness({ coverage, inventory, findings, packageInventory, identityVerified, recipe }) {
   const blockers = [];
   if (!identityVerified) blockers.push("the pinned subject's manifest/config/layer identity was not fully verified");
-  if (!coverage?.complete) blockers.push(`content coverage is incomplete: ${(coverage?.limitations ?? []).join("; ") || "unrecorded limitation"}`);
+  if (!coverage?.complete) blockers.push(`content coverage is incomplete: ${describeLimitations(coverage?.limitations)}`);
+  blockers.push(...recipeBlockers(recipe));
   if (!inventory?.complete) blockers.push(`the /app inventory comparison is incomplete: ${inventory?.counts?.missing ?? "unknown"} expected path(s) absent`);
   if ((inventory?.findings ?? 0) > 0) blockers.push(`${inventory.findings} inventory/provenance finding(s) require adjudication`);
   if ((findings?.total ?? 0) > 0) blockers.push(`${findings.total} scanner finding(s) across ${findings.rules} rule(s) require adjudication`);
@@ -116,8 +182,12 @@ export function transitionReadiness({ coverage, inventory, findings, packageInve
 export function sanitizedFailure({ stage, error, counters = {} }) {
   const code = typeof error?.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : undefined;
   const name = typeof error?.name === "string" && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : "Error";
+  // The stage is meant to come from the dispatcher's closed vocabulary of fixed slugs. Enforced
+  // rather than trusted: a future caller interpolating a path or a message into it would put that
+  // text straight into the public artifact.
+  const named = typeof stage === "string" && /^[a-z][a-z0-9-]{0,40}$/.test(stage) ? stage : "unknown";
   return Object.freeze({
-    stage: String(stage ?? "unknown"),
+    stage: named,
     errorName: name,
     ...(code ? { errorCode: code } : {}),
     counters: Object.freeze({ ...counters }),
@@ -126,14 +196,19 @@ export function sanitizedFailure({ stage, error, counters = {} }) {
   });
 }
 
-/** The scanner's identity as the record states it: version, checksum and the CONFIG's own hash. */
-export function scannerIdentity(scanner, configText) {
+/**
+ * The scanner's identity as the record states it: version, checksum, the CONFIG's own hash, and the
+ * coverage-relevant settings of the invocation (PUB-03 requires the archive-traversal and file-size
+ * settings to be documented alongside what was skipped).
+ */
+export function scannerIdentity(scanner, configText, { settings } = {}) {
   return Object.freeze({
     name: scanner.name,
     version: scanner.version,
     sha256: scanner.sha256,
     configPath: scanner.configPath,
     configSha256: createHash("sha256").update(String(configText ?? "")).digest("hex"),
+    ...(settings ? { settings } : {}),
   });
 }
 

@@ -90,6 +90,20 @@ export const AUDIT_LIMITS = Object.freeze({
   /** Members inspected per layer, and bytes expanded per layer. */
   maxMembersPerLayer: 500_000,
   maxExpandedBytesPerLayer: 6 * 1024 * 1024 * 1024,
+  /**
+   * THE CUMULATIVE STAGING BOUND — every byte written into `scan/`, across ALL layers and every
+   * nested-archive expansion inside them.
+   *
+   * The per-layer limit above is not a total: 64 layers each staying under 6 GiB is 384 GiB, so the
+   * per-layer bound alone left the audit able to fill a runner disk while every individual layer
+   * looked well-behaved. This is the one number that bounds the scratch tree.
+   *
+   * Deliberately EQUAL to the per-layer bound, so a single pathological layer can consume the whole
+   * allowance and no combination of layers can exceed it. Exhaustion is a recorded coverage
+   * limitation — the audit reports what it stopped staging and blocks the transition; it never
+   * silently scans less.
+   */
+  maxTotalStagedBytes: 6 * 1024 * 1024 * 1024,
   /** One member's decoded size. Larger members are recorded as an oversized-member limitation. */
   maxMemberBytes: 256 * 1024 * 1024,
   /** Nested archives inside a layer are expanded ONE level; deeper nesting is a recorded limitation. */
@@ -117,6 +131,13 @@ export function assertSubjectShape(subject = SUBJECT) {
     runAttempt: subject.originalRunAttempt,
   });
   if (subject.receiptTag !== expectedTag) failures.push(`subject receipt tag ${String(subject.receiptTag)} is not the publisher's tag ${expectedTag}`);
-  if (failures.length) throw new Error(`the pinned audit subject is malformed:\n- ${failures.join("\n- ")}`);
+  // A FIXED code: this refusal can happen before scratch exists, and the sanitized evidence record
+  // carries the code rather than the message.
+  if (failures.length) {
+    throw Object.assign(
+      new Error(`the pinned audit subject is malformed:\n- ${failures.join("\n- ")}`),
+      { code: "AUDIT_SUBJECT_MALFORMED" },
+    );
+  }
   return subject;
 }

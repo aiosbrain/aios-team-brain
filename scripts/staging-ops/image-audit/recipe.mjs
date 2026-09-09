@@ -88,11 +88,30 @@ export function dockerignoreAssertions(text) {
 }
 
 /**
- * The lockfile at the pinned revision: every dependency resolved to a URL and pinned by integrity.
+ * The npm registry ORIGIN every dependency of the pinned revision is expected to have resolved from.
  *
- * This says the DEPENDENCY SET was addressed by content hash. It says nothing about what those
- * packages contain — a hash-pinned dependency carrying a credential is hash-pinned and carrying a
- * credential, which is why every one of those files is still scanned in the image.
+ * Named as a constant so the evidence states WHICH origin was expected. "Some https URL" is not the
+ * measurement the spec asks for: `https://evil.example/x.tgz` is https, and a private registry URL
+ * with a token in its userinfo is https too.
+ */
+export const EXPECTED_REGISTRY_ORIGIN = "https://registry.npmjs.org";
+
+/**
+ * The lockfile at the pinned revision: where each dependency came from, and how it was pinned.
+ *
+ * MEASURED, NOT PATTERN-MATCHED. Each `resolved` value is parsed as a URL, and three separate
+ * properties are recorded: the origin IS the expected public npm registry, the URL carries no
+ * embedded credential, and an integrity hash is present. They are separate rows because they fail
+ * for different reasons and a coordinator needs to know which one did.
+ *
+ * NO VALUE IS EMITTED. A foreign origin or a credential-bearing URL is reported as a COUNT against
+ * the expected origin — never as the URL, the host or the package path, because those rows reach the
+ * public artifact and a private registry host is itself information about private infrastructure.
+ *
+ * This says the DEPENDENCY SET was addressed by content hash from a known public origin. It says
+ * nothing about what those packages contain — a hash-pinned dependency carrying a credential is
+ * hash-pinned and carrying a credential, which is why every one of those files is still scanned in
+ * the image.
  */
 export function lockfileAssertions(text) {
   if (text === undefined) return [unverified("lockfile.readable", "the lockfile could not be read at the pinned revision")];
@@ -104,20 +123,37 @@ export function lockfileAssertions(text) {
   }
   const packages = lock?.packages ?? {};
   let checked = 0;
-  const unresolved = [];
+  let foreignOrigin = 0;
+  let embeddedAuth = 0;
+  let missingIntegrity = 0;
   for (const [path, entry] of Object.entries(packages)) {
     // The root project and workspace links have no registry origin to pin, by construction.
     if (path === "" || entry?.link === true) continue;
     checked += 1;
-    const resolved = typeof entry?.resolved === "string" && entry.resolved.startsWith("https://");
-    const integrity = typeof entry?.integrity === "string" && entry.integrity.length > 0;
-    if (!resolved || !integrity) unresolved.push(path);
+    if (typeof entry?.integrity !== "string" || entry.integrity.length === 0) missingIntegrity += 1;
+    let url;
+    try {
+      url = new URL(String(entry?.resolved ?? ""));
+    } catch {
+      // An unparseable (or absent) `resolved` is not a public npm origin, and calling it one is the
+      // exact over-claim this row exists to avoid.
+      foreignOrigin += 1;
+      continue;
+    }
+    if (url.username !== "" || url.password !== "") embeddedAuth += 1;
+    if (url.origin !== EXPECTED_REGISTRY_ORIGIN) foreignOrigin += 1;
   }
-  if (checked === 0) return [unverified("lockfile.resolved-and-pinned", "the lockfile declared no resolvable package entries")];
+  if (checked === 0) return [unverified("lockfile.registry-origin", "the lockfile declared no resolvable package entries")];
   return [
-    unresolved.length === 0
-      ? satisfied("lockfile.resolved-and-pinned", `all ${checked} package entries carry an https resolved URL and an integrity hash`)
-      : violated("lockfile.resolved-and-pinned", `${unresolved.length} of ${checked} package entries lack a resolved URL or integrity hash`),
+    foreignOrigin === 0
+      ? satisfied("lockfile.registry-origin", `all ${checked} package entries resolved from ${EXPECTED_REGISTRY_ORIGIN}`)
+      : violated("lockfile.registry-origin", `${foreignOrigin} of ${checked} package entries did not resolve from ${EXPECTED_REGISTRY_ORIGIN} (origins withheld)`),
+    embeddedAuth === 0
+      ? satisfied("lockfile.no-embedded-credentials", `no resolved URL of the ${checked} entries carried userinfo`)
+      : violated("lockfile.no-embedded-credentials", `${embeddedAuth} of ${checked} resolved URLs carried an embedded credential (values withheld)`),
+    missingIntegrity === 0
+      ? satisfied("lockfile.integrity-present", `all ${checked} package entries carry an integrity hash`)
+      : violated("lockfile.integrity-present", `${missingIntegrity} of ${checked} package entries carry no integrity hash`),
   ];
 }
 

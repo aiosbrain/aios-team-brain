@@ -25,6 +25,7 @@ import {
   runReportDelivery,
   runVerifyPublication,
   validateReceipt,
+  WORKFLOW_PATH,
 } from "../scripts/staging-ops/image-publication.mjs";
 
 const SHA = "d74fe08bad532e48d6d91199093189960033f77f";
@@ -78,6 +79,38 @@ describe("OP-01 — only one dispatch context may publish", () => {
   it("refuses an empty context outright rather than defaulting to trust", () => {
     expect(dispatchContextFailures()).not.toEqual([]);
     expect(dispatchContextFailures({})).not.toEqual([]);
+  });
+
+  /**
+   * AIO-997's audit reuses this guard. The ONLY thing it may vary is the workflow path, and the
+   * publisher's behaviour with the argument omitted must be exactly what it was — which is what every
+   * case above already pins, and what these two add the other side of.
+   */
+  describe("the optional workflow path (AIO-997 audit reuse)", () => {
+    const AUDIT_PATH = ".github/workflows/staging-ops-image-audit.yml";
+
+    it("defaults to the PUBLISHER's path — an omitted option is the old behaviour verbatim", () => {
+      expect(dispatchContextFailures(trustedContext(), {})).toEqual([]);
+      expect(dispatchContextFailures(trustedContext(), { workflowPath: WORKFLOW_PATH })).toEqual([]);
+      // …and the publisher's own trusted context is REFUSED when the audit path is expected, so the
+      // parameter genuinely selects which file may be running rather than widening the check.
+      expect(dispatchContextFailures(trustedContext(), { workflowPath: AUDIT_PATH })).not.toEqual([]);
+    });
+
+    it("accepts the audit's workflow ref ONLY when the audit path is the one expected", () => {
+      const auditContext = trustedContext({ workflowRef: `${REPOSITORY}/${AUDIT_PATH}@refs/heads/staging` });
+      expect(dispatchContextFailures(auditContext, { workflowPath: AUDIT_PATH })).toEqual([]);
+      // THE MUTANT: the audit's context reaching the publisher's default. It must still refuse —
+      // otherwise the parameter would have relaxed the publisher instead of parameterising it.
+      expect(dispatchContextFailures(auditContext)).not.toEqual([]);
+    });
+
+    it("still requires every OTHER trusted-context property under a custom path", () => {
+      const auditRef = `${REPOSITORY}/${AUDIT_PATH}@refs/heads/staging`;
+      for (const over of [{ repository: "attacker/aios-team-brain" }, { eventName: "push" }, { ref: "refs/heads/main" }, { workflowSha: OTHER_SHA }]) {
+        expect(dispatchContextFailures(trustedContext({ workflowRef: auditRef, ...over }), { workflowPath: AUDIT_PATH })).not.toEqual([]);
+      }
+    });
   });
 });
 
