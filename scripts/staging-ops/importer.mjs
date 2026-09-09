@@ -582,6 +582,22 @@ async function pollDeployedHealth({ maintenance, deploymentId, origin, token, bo
     }
     await abortableSleep(sleep, 5_000, signal);
   }
+  // ⚠️ THE LOOP EXITS ON A WALL-CLOCK TEST, NOT ON A SIGNAL CHECK.
+  //
+  // `Date.now() <= deadline` can end an iteration before the in-loop `assertNotCancelled` runs
+  // again — and that deadline is capped by the SAME owning budget whose watchdog raises
+  // `STAGING_OPERATION_TIMEOUT`. So an owning budget that expires exactly as the poll gives up
+  // reported whichever won the race: the typed timeout when the watchdog callback landed first, the
+  // generic refusal below when the wall-clock test did. The daemon acts on the two differently
+  // (`isFatal` ends the loop on TIMEOUT), so the classification may not depend on that ordering.
+  //
+  // Both owning scopes are re-read here, BEFORE any generic reporting: the signal (whose reason
+  // carries its own classification) and then the budget itself, which is the case where the watchdog
+  // notification has not been processed yet. The refusal below is retained for exactly what it
+  // describes — the HEALTH ceiling expiring while the owning budget and signal are both still valid,
+  // which is an unhealthy deployment and not an operation timeout.
+  assertNotCancelled(signal, operation);
+  budget?.assert(operation);
   emitReceipt("health-poll-timed-out", {
     deploymentId, description, attempts: observed.attempts, waitedMs: Date.now() - startedAt,
     lastDeploymentStatus: observed.lastDeploymentStatus, lastResponseStatus: observed.lastResponseStatus,
@@ -1163,8 +1179,22 @@ export async function installObject({ client, objectId, sourceStore, rollbackSto
     // ready boundary's discriminating control — an identical expiry ONE STEP EARLIER, which must
     // still roll back — was unreachable without a real two-store install.
     // Same rule as the interrupted branch above: the recovery scope only, never the owning signal.
-    await rollback({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal });
-    throw new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
+    const restored = await rollback({ client, prior, failedRunId: opened.manifest.runId, maintenance, rollbackStore, env, notes, deadlines, budget: recoveryBudget, signal: recoverySignal });
+    // THE RESTORATION'S OWN CONFIRMED READY MARKER, forwarded onto this failure.
+    //
+    // The restored prior pair passed health and `markReady` committed it — `rollbackToPrior` latches
+    // exactly that row and returns its marker. Discarding it left this informative outcome
+    // indistinguishable, to `runImporter`'s finalizer, from a run that owns no commit at all: a
+    // SIGTERM observed during the restoration replaced "the prior pair was restored" with the generic
+    // coordinated abort, losing both the message and the identity that is now serving.
+    //
+    // FORWARDED EXACTLY AS RETURNED, never synthesized from the prior identity this run intended to
+    // restore: a rollback that returns no marker leaves this error unmarked, which is the truthful
+    // report. This does not convert the candidate's failure into success — the status is still a
+    // failed install, and the marker names the PRIOR run that is serving because of the recovery.
+    const restoredReadyCommit = confirmedReadyCommit(restored);
+    const failure = new Error(withNotes(`paired refresh failed and the prior pair was restored: ${errorText(error)}`, notes));
+    throw restoredReadyCommit ? Object.assign(failure, { readyCommit: restoredReadyCommit }) : failure;
     });
   }
   } finally { await releaseLock(client).catch(() => {}); }
@@ -1495,6 +1525,12 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
     //
     // The pointer write is deliberately awaited to settlement first and its published pointer is
     // left alone: a refusal here does not race, abandon or delete durable storage work.
+    //
+    // Which leaves a published private `last-ready` pointer the journal has not acknowledged. That
+    // is intended: the pointer publication is PREPARATORY and the JOURNAL's ready row remains the
+    // authority — readers resolve the installed identity from the journal, and a later resume
+    // rewrites the pointer for whatever it does commit. So no compensating storage mutation is made
+    // here; deleting the pointer would destroy evidence to correct a record nothing trusts alone.
     assertNotCancelled(signal, "bootstrap ready commit");
     operationBudget.assert("bootstrap ready commit");
     // LATCHED FROM THE RETURNED ROW, before any fallible suffix. Past this line the checkpoint is
@@ -1515,9 +1551,13 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
     // `readyCommit` protocol `installObject` and `rollbackToPrior` already use, which is what carries
     // the truth past `runImporter`'s cancellation finalizer.
     //
-    // An UNCLEARED interruption record is left exactly as it is: it is now the evidence of what the
-    // suffix did not finish, and the resume path already re-proves and adopts its published
-    // checkpoint rather than orphaning it.
+    // An UNCLEARED interruption record is left exactly as it is: it is now the RETAINED EVIDENCE of
+    // what the suffix did not finish. It is not a promise that anything retries it — "pending" means
+    // unfinished. The resume path re-proves and adopts a published checkpoint only for a bootstrap
+    // that never committed; once `markReady` has landed, the last-ready guard at the top of
+    // `bootstrapRollback` refuses a fresh `bootstrap-rollback` before it can reach this record, so
+    // clearing it is documented deferred repair debt, not an automatic one. The retained record
+    // fences nothing: the ready deployment is serving and is unaffected by its presence.
     if (readyCommitted) {
       emitReceipt("ready-bookkeeping-pending", {
         runId: readyCommitted.last_ready_run_id,
@@ -1593,7 +1633,7 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
   } finally { await releaseCoordinatorLock(client).catch(() => {}); }
 }
 
-async function serviceCatchup({ client, maintenance, env, budget = null, signal }) {
+export async function serviceCatchup({ client, maintenance, env, budget = null, signal }) {
   budget?.assert("catch-up coordinator lock");
   if (!(await acquireCoordinatorLock(client))) return { status: "catchup-busy" };
   try {
@@ -1616,6 +1656,17 @@ async function serviceCatchup({ client, maintenance, env, budget = null, signal 
     await maintenance.assertPinnedRunnerConfiguration(env.STAGING_IMPORTER_SERVICE_ID, env.STAGING_IMPORTER_IMAGE_DIGEST);
     const rollbackStore = createPrivateStore({ env, scope: "rollback", role: "rollback-owner" });
     const prior = await openPrior({ client, journal, rollbackStore, env });
+    // ⚠️ IMMEDIATELY BEFORE THE NEW DEPLOYMENT, and after every awaited admission/read above.
+    //
+    // The owning scope reached this function for the health wait only — which is a fact about a
+    // moment that has already passed by the time the attempt record, the runner pin and the prior
+    // read have settled. A shutdown or budget breach observed during any of them therefore still
+    // submitted a deployment, and only the poll that followed noticed.
+    //
+    // The consumed attempt stands: this is a cancellation boundary, not an undo. A cancelled
+    // catch-up is a spent attempt against a head that will still be there for the next tick.
+    assertNotCancelled(signal, "staging catch-up deployment");
+    budget?.assert("catch-up deployment");
     const id = await maintenance.deployApp(head);
     // B2: catch-up NEVER leaves the journal, so the app answers `ready`, not `booting`. The correct
     // acceptance is therefore the exact expected-ready shape — mode, commit AND the canonical

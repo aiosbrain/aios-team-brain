@@ -33,12 +33,20 @@ const hooks = vi.hoisted(() => ({
   duringReconciliation: null as null | (() => void),
   /** Called while the read-only destination SELECT is in flight. */
   duringDestinationRead: null as null | (() => void),
+  /**
+   * The status the platform reports for the deployment currently being polled. Defaults to a healthy
+   * deployment; the recovery-failure control answers `FAILED` for the RESTORATION's deployment only,
+   * so the prior pair's boot cannot confirm ready.
+   */
+  deploymentStatus: null as null | (() => string),
 }));
 
 const observed = vi.hoisted(() => ({
   clients: [] as { statements: string[]; ended: number; endedWhileQueryPending: boolean; pending: number; connection: { stream: { destroyed: boolean; remoteAddress: string; destroy: () => void } } }[],
   transitions: [] as string[],
   readyCommits: 0,
+  /** WHICH run each `markReady` committed — a candidate ready and the prior's are not interchangeable. */
+  readyCommitRuns: [] as string[],
   deploys: 0,
   stops: 0,
 }));
@@ -103,6 +111,7 @@ vi.mock("../scripts/staging-ops/journal.mjs", async (importOriginal) => ({
   transitionJournal: async (_client: unknown, { to }: { to: string }) => { observed.transitions.push(to); return { state: to }; },
   markReady: async (_client: unknown, { runId, objectId, digest, commit, mode }: Record<string, string>) => {
     observed.readyCommits += 1;
+    observed.readyCommitRuns.push(runId);
     return { state: "ready", run_id: runId, last_ready_run_id: runId, last_ready_object_id: objectId, last_ready_digest: digest, last_ready_commit: commit, last_ready_mode: mode };
   },
   readSourceAttempt: async () => null,
@@ -183,7 +192,7 @@ vi.mock("../scripts/staging-ops/local-maintenance.mjs", () => ({
     async stopAndVerifyAll() { observed.stops += 1; return true; }
     async tokenIdentity() { return { environmentId: "staging-local" }; }
     async listActiveDeployments() { return [{ id: "dep-1", status: "SUCCESS" }]; }
-    async readDeployment() { return { id: "dep-1", status: "SUCCESS" }; }
+    async readDeployment() { return { id: "dep-1", status: hooks.deploymentStatus?.() ?? "SUCCESS" }; }
     async deployApp() { observed.deploys += 1; return "dep-1"; }
     async assertPinnedRunnerConfiguration() { return true; }
     async readStagingHead() { return COMMIT; }
@@ -210,6 +219,26 @@ const ENV = Object.fromEntries([
 
 const healthyBoot = () => vi.stubGlobal("fetch", vi.fn(async () => Response.json({ booted: true, commit: COMMIT }, { status: 202 })));
 
+/**
+ * The CANDIDATE's boot probe, held open until the test releases it — the window a late signal lands
+ * in. Every later probe (the restoration's own boot) answers healthily and immediately, so the
+ * recovery this test is about is not itself starved by the harness.
+ */
+function heldCandidateProbe() {
+  let release!: () => void;
+  let observe!: () => void;
+  const inFlight = new Promise<void>((resolve) => { observe = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const fetchImpl = vi.fn(async () => {
+    calls += 1;
+    if (calls === 1) { observe(); await gate; }
+    return Response.json({ booted: true, commit: COMMIT }, { status: 202 });
+  });
+  vi.stubGlobal("fetch", fetchImpl);
+  return { fetchImpl, inFlight, release };
+}
+
 /** Run the real dispatcher, capturing its receipts and whichever way it settled. */
 async function install() {
   const lines: string[] = [];
@@ -225,9 +254,11 @@ const kinds = (receipts: { kind: string }[]) => receipts.map((receipt) => receip
 afterEach(() => {
   hooks.duringReconciliation = null;
   hooks.duringDestinationRead = null;
+  hooks.deploymentStatus = null;
   observed.clients.length = 0;
   observed.transitions.length = 0;
   observed.readyCommits = 0;
+  observed.readyCommitRuns.length = 0;
   observed.deploys = 0;
   observed.stops = 0;
   vi.unstubAllGlobals();
@@ -302,5 +333,89 @@ describe("a signal after the ready commit does not erase the outcome it arrived 
     expect(observed.transitions, "a read-only check wrote the journal").toEqual([]);
     expect(observed.clients).toHaveLength(1);
     expect(observed.clients[0].ended).toBe(1);
+  }, 20_000);
+});
+
+/**
+ * THE OTHER OUTCOME THAT OWNS A CONFIRMED READY COMMIT: the RESTORATION's.
+ *
+ * A signal during the candidate's boot is a failed install — but the recovery that follows boots the
+ * prior pair and `markReady` commits it, so staging IS serving a known identity when `installObject`
+ * throws "the prior pair was restored". That error carried no marker, so this same `finally` replaced
+ * the one message naming what is serving with `STAGING_OPERATION_ABORTED`.
+ *
+ * These run the REAL dispatcher: the process signal, its registered handlers, the real
+ * `installObject` recovery branch, the real `rollbackToPrior` and the real finalizer. An
+ * `installObject`-level test with a rollback double returns no marker at all and cannot see this gap.
+ */
+describe("a cancelled candidate install keeps the restoration's confirmed ready identity", () => {
+  /** Cancel the candidate's boot mid-probe, then let the restoration proceed on its fresh scope. */
+  async function cancelDuringCandidateBoot(signal: "SIGTERM" | "SIGINT") {
+    const { inFlight, release } = heldCandidateProbe();
+    const running = install();
+    await inFlight;
+    process.emit(signal as never);
+    release();
+    return running;
+  }
+
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    it(`${signal} during the candidate boot still reports the restored prior identity`, async () => {
+      const { result, error, receipts } = await cancelDuringCandidateBoot(signal);
+
+      expect(result, "a failed candidate install was reported as a success").toBeUndefined();
+      expect(error?.message).toMatch(/paired refresh failed and the prior pair was restored/);
+      expect((error as { code?: string })?.code, "the restoration outcome was replaced by the generic abort").toBeUndefined();
+      // The marker is the RESTORED PRIOR's, exactly as `rollbackToPrior` latched it — including the
+      // bookkeeping state, which completed here.
+      expect((error as { readyCommit?: unknown })?.readyCommit).toEqual({
+        runId: PRIOR_RUN, objectId: PRIOR_OBJECT, commit: COMMIT, bookkeeping: "completed",
+      });
+      // The candidate itself is NOT ready: the only commit is the one the recovery made.
+      expect(observed.readyCommitRuns).toEqual([PRIOR_RUN]);
+      expect(kinds(receipts)).toContain("prior-pair-restored");
+      expect(kinds(receipts)).not.toContain("recovery-required");
+      expect(kinds(receipts)).not.toContain("ready-bookkeeping-pending");
+      // The candidate failed and the prior pair went back through the real two-store recovery.
+      expect(observed.transitions).toEqual([
+        "draining", "importing", "verifying", "booting",
+        "failed", "draining", "importing", "verifying", "booting",
+      ]);
+      // ONE coordinated cleanup of the ONE owned client, not closed under its own query.
+      expect(observed.clients).toHaveLength(1);
+      expect(observed.clients[0].ended).toBe(1);
+      expect(observed.clients[0].endedWhileQueryPending).toBe(false);
+    }, 20_000);
+  }
+
+  it("fabricates nothing when the recovery cannot confirm ready", async () => {
+    // The negative control, and the reason the marker above is evidence rather than decoration: the
+    // SAME cancellation with a restoration that never reaches `markReady` must fail with no marker.
+    // The prior pair's own deployment is dead, so nothing is serving a known identity.
+    hooks.deploymentStatus = () => (observed.deploys >= 2 ? "FAILED" : "SUCCESS");
+    const { result, error, receipts } = await cancelDuringCandidateBoot("SIGTERM");
+
+    expect(result).toBeUndefined();
+    expect((error as { readyCommit?: unknown })?.readyCommit, "a ready marker was invented for a restoration that never committed").toBeUndefined();
+    expect(observed.readyCommitRuns, "something was committed ready after a failed restoration").toEqual([]);
+    expect(kinds(receipts)).toContain("recovery-required");
+    expect(kinds(receipts)).not.toContain("prior-pair-restored");
+    // Owning no commit at all, the run is still reported as the coordinated cancellation it is.
+    expect(error).toMatchObject({ code: "STAGING_OPERATION_ABORTED", terminationConfirmed: true });
+    expect(observed.clients).toHaveLength(1);
+    expect(observed.clients[0].ended).toBe(1);
+  }, 20_000);
+
+  it("is not vacuous: the same install with no signal never reaches the restoration at all", async () => {
+    const { fetchImpl, inFlight, release } = heldCandidateProbe();
+    const running = install();
+    await inFlight;
+    release();
+    const { result, error } = await running;
+
+    expect(error).toBeUndefined();
+    expect(result).toMatchObject({ status: "ready", runId: RUN_ID, readyCommit: { runId: RUN_ID, bookkeeping: "completed" } });
+    expect(observed.readyCommitRuns).toEqual([RUN_ID]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   }, 20_000);
 });

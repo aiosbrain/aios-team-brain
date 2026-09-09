@@ -171,6 +171,80 @@ describe("the boot health poll observes the owning cancellation", () => {
       })).rejects.toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
     } finally { await watchdog.disarm(); }
   }, 10_000);
+
+  // ── the loop's EXHAUSTION, where the exit is a wall-clock test and not a signal check ──────────
+  //
+  // The poll's deadline is capped by the SAME owning budget whose watchdog raises
+  // STAGING_OPERATION_TIMEOUT. When that budget expires as the loop gives up, the outcome used to
+  // depend on which of the two landed first: the watchdog callback (typed timeout) or
+  // `Date.now() <= deadline` going false (a codeless "did not pass health" refusal). Both orderings
+  // must classify the same way, so both are exercised — and each passes a REAL budget together with
+  // the watchdog-derived signal armed on it, which is the pairing production uses.
+
+  it("classifies an exhausted owning budget as a timeout when the watchdog notification HAS landed", async () => {
+    const clock = { ms: 0 };
+    const budget = createOperationBudget("importer daemon tick", 15, { now: () => clock.ms });
+    const owner = createSessionWatchdogOwner(() => {}, { signal: new AbortController().signal });
+    const watchdog = owner.arm(budget);
+    const fetchImpl = vi.fn(async () => Response.json({ ok: false }, { status: 503 }));
+    try {
+      const { outcome, receipts } = await captureReceipts(() => waitForImportedBoot({
+        ...probeArgs(fetchImpl, maintenance()), mode: "copy-ready", timeoutMs: 300_000,
+        // The budget's own 15ms watchdog timer fires inside this wait, so the abort is delivered
+        // before the loop re-tests its wall clock.
+        sleep: async () => { clock.ms = 1_000; await new Promise((resolve) => setTimeout(resolve, 40)); },
+        signal: watchdog.signal, budget,
+      }));
+      expect(watchdog.signal.aborted, "the watchdog never notified; this case does not cover the delivered one").toBe(true);
+      // TIMEOUT, not ABORTED and not a generic health refusal: this is the code the CLI's daemon
+      // treats as fatal (`staging-cancellation-recovery.test.ts` covers that consumer).
+      expect(outcome).toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+      expect((outcome as Error).message).not.toMatch(/did not pass/);
+      expect(receipts.map((receipt) => receipt.kind)).not.toContain("health-poll-timed-out");
+    } finally { await watchdog.disarm(); }
+  }, 10_000);
+
+  it("classifies it as a timeout even when the watchdog notification has NOT been processed yet", async () => {
+    // The scheduling case the classification may not depend on: only the clock the budget reads has
+    // moved, so the signal is still live while the owning allowance is already spent.
+    const clock = { ms: 0 };
+    const budget = createOperationBudget("importer daemon tick", 60_000, { now: () => clock.ms });
+    const owner = createSessionWatchdogOwner(() => {}, { signal: new AbortController().signal });
+    const watchdog = owner.arm(budget);
+    const fetchImpl = vi.fn(async () => Response.json({ ok: false }, { status: 503 }));
+    try {
+      const { outcome, receipts } = await captureReceipts(() => waitForImportedBoot({
+        // A health ceiling far shorter than the budget, so the loop exits on its own wall clock…
+        ...probeArgs(fetchImpl, maintenance()), mode: "copy-ready", timeoutMs: 15,
+        // …while the owning budget is exhausted with its 60s watchdog timer still pending.
+        sleep: async () => { clock.ms = 60_001; await new Promise((resolve) => setTimeout(resolve, 30)); },
+        signal: watchdog.signal, budget,
+      }));
+      expect(watchdog.signal.aborted, "the notification was delivered; this case no longer covers the unprocessed one").toBe(false);
+      expect(outcome).toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+      expect(receipts.map((receipt) => receipt.kind)).not.toContain("health-poll-timed-out");
+    } finally { await watchdog.disarm(); }
+  }, 10_000);
+
+  it("is disjoint: a shorter HEALTH ceiling under a live budget is still an ordinary health failure", async () => {
+    // The positive control. Without it, classifying every exhausted poll as an operation timeout
+    // would satisfy both rows above — and an unhealthy deployment would be reported as the daemon's
+    // own budget breach, ending the loop instead of failing the candidate.
+    const budget = createOperationBudget("importer daemon tick", 60_000);
+    const owner = createSessionWatchdogOwner(() => {}, { signal: new AbortController().signal });
+    const watchdog = owner.arm(budget);
+    const fetchImpl = vi.fn(async () => Response.json({ ok: false }, { status: 503 }));
+    try {
+      const { outcome, receipts } = await captureReceipts(() => waitForImportedBoot({
+        ...probeArgs(fetchImpl, maintenance()), mode: "copy-ready", timeoutMs: 20,
+        sleep: async () => { await new Promise((resolve) => setTimeout(resolve, 25)); },
+        signal: watchdog.signal, budget,
+      }));
+      expect((outcome as Error).message).toMatch(/did not pass the bounded authenticated boot probe/);
+      expect((outcome as { code?: string }).code, "an unhealthy deployment was reported as an operation timeout").toBeUndefined();
+      expect(receipts.map((receipt) => receipt.kind)).toContain("health-poll-timed-out");
+    } finally { await watchdog.disarm(); }
+  }, 10_000);
 });
 
 // ── the ready boundary itself, through the real bootExact ────────────────────────────────────────

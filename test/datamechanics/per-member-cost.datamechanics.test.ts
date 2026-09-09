@@ -11,6 +11,16 @@ import { db, seedTeam } from "./helpers";
 // cost; an admin sees the whole team's. These reads route through scopeQueryLog; this tier
 // proves the app-code enforcement against the real DB (there is no RLS backstop).
 
+/**
+ * YESTERDAY, IN UTC — not a fixed date.
+ *
+ * The metrics readers derive the rolling window's lower bound from `Date.now()` and filter on the
+ * contribution day, so a hard-coded seed day silently ages out of the `90d` window and the
+ * contribution rows these tests assert on simply stop being returned. This is an identity/cost-join
+ * test, not a date-boundary one: the seed only has to sit comfortably inside the requested window.
+ */
+const recentDay = () => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
 async function logQuery(
   teamId: string,
   memberId: string,
@@ -92,11 +102,12 @@ describe("getThroughputVsCost() on real Postgres (W1.2.3)", () => {
     await db().from("members").update({ email: "dev@x.test" }).eq("id", seed.memberId);
 
     const slug = `repo-${randomUUID().slice(0, 6)}`;
+    const day = recentDay();
     await ingestCodebaseScan(
       db(),
       { teamId: seed.teamId, memberId: admin.id, apiKeyId: randomUUID() },
       scan(slug, [
-        { author_key: "dev@x.test", author_email: "dev@x.test", day: "2026-06-10", commits: 10, ai_commits: 8 },
+        { author_key: "dev@x.test", author_email: "dev@x.test", day, commits: 10, ai_commits: 8 },
       ])
     );
     // the dev member spends $4 on brain queries
