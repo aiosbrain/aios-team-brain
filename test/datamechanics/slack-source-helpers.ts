@@ -273,6 +273,21 @@ export async function elapse(teamId: string, ms = 120_000): Promise<void> {
   );
 }
 
+/**
+ * Age a channel's public proof past its metadata TTL, so the next invocation actually RE-CHECKS it.
+ * Without this the recheck contracts are vacuous: a fresh proof is reused, the fixture's failing
+ * `conversations.info` handler is never called, and the assertion passes for the wrong reason.
+ */
+export async function agePublicProof(teamId: string, channelId: string, days = 7): Promise<void> {
+  const c = await rawSql();
+  await c.query(
+    `update slack_sync_channels
+        set public_checked_at = public_checked_at - ($3::int * interval '1 day')
+      where team_id = $1 and channel_id = $2 and public_checked_at is not null`,
+    [teamId, channelId, days]
+  );
+}
+
 /** Expire a channel lease in place — the reclaim arm, without waiting out a real lease. */
 export async function expireChannelLease(teamId: string, channelId: string): Promise<void> {
   const c = await rawSql();

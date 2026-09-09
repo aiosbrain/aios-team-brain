@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { discoverSlackSource, type SlackSourceDiscoveryResult } from "@/lib/ingest/slack-source-discovery";
 import { db, seedTeam, type Seed } from "./helpers";
 import {
+  agePublicProof,
   authTestBody,
   bindingRow,
   botsInfoBody,
@@ -344,16 +345,23 @@ describe("channel public proof", () => {
 
     // Pass 1: prove it public.
     await discover(seed, integrationId, fullPass());
-    const proved = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
-    expect(proved).toMatchObject({ public_state: "public" });
+    expect(await channelRow(seed.teamId, WORKSPACE, CHANNEL)).toMatchObject({ public_state: "public" });
 
-    // Pass 2: a 429 on the metadata recheck. The proof is not evidence that expired.
+    // Pass 2: the proof is past its TTL, so it is genuinely re-checked — and the recheck 429s. The
+    // ageing is what makes this non-vacuous: a fresh proof is reused and the handler never fires.
+    // BASELINE AFTER THE FIXTURE, never before it: ageing moves the very column under assertion.
+    await agePublicProof(seed.teamId, CHANNEL);
     await elapse(seed.teamId);
+    const proved = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     const flaky = fullPass({ "conversations.info": () => slackRateLimited("1") });
     await discover(seed, integrationId, flaky);
+    expect(flaky.countOf("conversations.info")).toBe(1);
     const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect(after?.public_state).toBe("public");
+    // The proof is not evidence that expired: neither the verdict nor its time was rewritten.
     expect(after?.public_checked_at).toEqual(proved?.public_checked_at);
+    // …and the channel is still readable under the surviving proof.
+    expect(flaky.countOf("conversations.history")).toBe(1);
 
     // …and a channel that was NEVER proved stays closed under the same transient failure.
     const other = await seedTeam();
