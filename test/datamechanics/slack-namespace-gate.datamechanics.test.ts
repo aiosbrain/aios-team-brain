@@ -498,7 +498,9 @@ describe("lock — a namespace capability, or a refusal; never an absence read a
     const before = await row(scope);
 
     const denied = [
-      lockArgs({ teamId: other.teamId, rawChannelId: CHANNEL }, { expectedRevision: 3 }),
+      // Team scoping, made observable: identical channel, workspace and revision — the OTHER team
+      // has no gate for that channel, while THIS team's is ready on exactly those values.
+      lockArgs({ teamId: other.teamId, rawChannelId: OTHER_CHANNEL }, { expectedRevision: 2 }),
       lockArgs(scope, { workspaceId: OTHER_WORKSPACE, expectedRevision: 2 }),
       lockArgs(scope, { expectedRevision: 1 }),
       lockArgs(scope, { expectedRevision: 3 }),
