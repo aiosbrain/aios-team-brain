@@ -51,6 +51,12 @@ vi.mock("@/lib/ingest/manual-context", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
   runManualContextPass: h.runManualContextPass,
 }));
+// This file is about an ENABLED deployment; the copied-staging refusal of these same four actions
+// (and its production positive control) is `test/manual-sync-copy-mode.test.ts`.
+vi.mock("@/lib/staging/ingest-policy", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  manualIngestionVerdict: async () => ({ allowed: true, code: null, message: null }),
+}));
 
 // Unrelated dependencies of the module under import.
 vi.mock("@/lib/db/admin", () => ({ adminClient: () => ({ from: vi.fn() }) }));

@@ -5,6 +5,7 @@ import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelFeatureVerdict } from "@/lib/staging/model-features";
 import { isExternalGroupId } from "@/lib/graph/group";
 import { recomputeArcs } from "@/lib/graph/arcs";
 import { resolveArcScope } from "@/lib/graph/partition-read";
@@ -134,6 +135,15 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // M9: unlike the arcs READ, a recompute has no non-model reading to fall back to — synthesis IS
+  // the operation. So the honest outcome is a named refusal, placed after authentication,
+  // membership, posture and the correction-visibility gate above (so it discloses nothing to a
+  // caller who would not have been allowed to recompute anyway) and before the eager key
+  // resolution, which would otherwise throw `copied-staging-no-spend` as a generic 500.
+  const answering = modelFeatureVerdict();
+  if (!answering.enabled) {
+    return errorResponse(answering.code ?? "answering_disabled", answering.message ?? "model-backed answering is disabled", 503);
+  }
   const keys = await resolveAnsweringKeys(admin, team.id);
   const { arcs: allArcs, freshness } = await recomputeArcs(
     admin,

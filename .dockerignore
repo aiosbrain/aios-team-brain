@@ -16,6 +16,9 @@ node_modules
 .claude
 .agents
 .conductor
+# Agent scratch/handoff trees. These hold whole worktree copies and review artefacts; baking one
+# into a runner image would bloat it and could carry local material into a published layer.
+.context
 coverage
 *.log
 .DS_Store

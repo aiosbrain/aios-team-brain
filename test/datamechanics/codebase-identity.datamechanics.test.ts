@@ -10,6 +10,17 @@ import { fullMetrics } from "@/test/fixtures/codebase-scan";
 
 const NOREPLY = "123+john@users.noreply.github.com";
 
+/**
+ * YESTERDAY, IN UTC — not a fixed date.
+ *
+ * `getCodebaseDetail` derives the `90d` window's lower bound from `Date.now()` and filters on the
+ * contribution day, so a hard-coded seed day silently ages out of the window and the contributor
+ * rows these tests assert on stop being returned at all. This is an identity/aliasing test, not a
+ * date-boundary one: the seed only has to sit comfortably inside the requested window, and paired
+ * alias identities must share the SAME day so aliasing collapses them onto one row.
+ */
+const recentDay = () => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
 function scan(slug: string, contributions: { author_key: string; author_email: string; day: string; commits: number }[]) {
   return codebaseScanPayloadSchema.parse({
     codebase: { slug, full_name: `acme/${slug}`, open_issues: 0 },
@@ -32,9 +43,10 @@ describe("codebase contributor identity (real Postgres)", () => {
     await db().from("members").update({ avatar_url: "https://avatars/x.png", github_login: "john" }).eq("id", john.id);
 
     const slug = `repo-${randomUUID().slice(0, 6)}`;
+    const day = recentDay();
     await ingest(seed, scan(slug, [
-      { author_key: "john@john.test", author_email: "john@john.test", day: "2026-06-10", commits: 5 },
-      { author_key: NOREPLY, author_email: NOREPLY, day: "2026-06-10", commits: 3 },
+      { author_key: "john@john.test", author_email: "john@john.test", day, commits: 5 },
+      { author_key: NOREPLY, author_email: NOREPLY, day, commits: 3 },
     ]));
 
     // Before aliasing: the noreply identity is a separate unmapped row.
@@ -82,7 +94,7 @@ describe("codebase contributor identity (real Postgres)", () => {
     await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "A", actorHandle: "aa", role: "member" });
     const b = await createMember(db(), seed.teamId, { email: "b@x.test", displayName: "B", actorHandle: "bb", role: "member" });
     const slug = `repo-${randomUUID().slice(0, 6)}`;
-    await ingest(seed, scan(slug, [{ author_key: "a@x.test", author_email: "a@x.test", day: "2026-06-10", commits: 4 }]));
+    await ingest(seed, scan(slug, [{ author_key: "a@x.test", author_email: "a@x.test", day: recentDay(), commits: 4 }]));
     // contribution is mapped to A (matches A's email). Try to claim it for B.
     const noForce = await addAuthorAlias(db(), seed.teamId, b.id, "a@x.test");
     expect(noForce.collisions).toBeGreaterThan(0);

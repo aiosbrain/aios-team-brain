@@ -3,6 +3,7 @@
   "canonical": ".claude/skills",
   "published": [
     "connect",
+    "cut-release",
     "pr-review-attestation",
     "railway-deploy-verify",
     "setup-brain"

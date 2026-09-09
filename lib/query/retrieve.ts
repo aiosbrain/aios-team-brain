@@ -16,6 +16,7 @@ import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
 import { analyzeTermSpecificity } from "./grounding";
 import { taskStatusCounts, matchingDecisions } from "./structured-extras";
+import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 
 // Types live in ./provider (the pluggable seam). Re-exported here so existing importers
 // (lib/query/claude, tests, …) keep importing them from "@/lib/query/retrieve" unchanged.
@@ -62,6 +63,12 @@ type AugmentHit = { path?: string; text?: string; score?: number; project?: stri
  */
 async function rerankSources(question: string, sources: Source[]): Promise<Source[]> {
   if (!RERANK_URL || sources.length < 2) return sources;
+  // AC-07 (M4): the reranker is a RAW transport with its own URL and token — it never passes
+  // through `resolveAnsweringKeys`, so the central spend policy could not see it. A staging image
+  // that inherits a configured `RERANK_URL` would otherwise emit a paid outbound call per query on
+  // a database that is supposed to cost nothing. Return the Postgres ordering BEFORE the fetch;
+  // an explicit interactive budget re-enables it through the same policy every other path uses.
+  if (!copiedStagingSpendAllowed("interactive-query")) return sources;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RERANK_TIMEOUT_MS);
   try {
@@ -106,6 +113,9 @@ async function fetchAugmentedSources(
   tier: "team" | "external"
 ): Promise<AugmentHit[]> {
   if (!RETRIEVAL_AUGMENT_URL) return [];
+  // Same class as the reranker above: an inherited endpoint would make copied staging call out to
+  // an external retrieval service on every query. Degrade to Postgres-only before the transport.
+  if (!copiedStagingSpendAllowed("interactive-query")) return [];
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_AUGMENT_TIMEOUT_MS);
   try {

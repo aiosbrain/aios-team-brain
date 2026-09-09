@@ -274,8 +274,10 @@ bash scripts/e2e.sh    # system-level integration: seed → push → materialize
   that is not on `main`.
   - **`staging` → the STAGING environment.** Ordinary merges land here. Its own Postgres, its own
     schema load; nothing to do against prod.
-  - **`main` → PRODUCTION.** Post-cutover `main` advances only by fast-forward to a tagged release
-    (`docs/RELEASING.md` §2 step 5).
+  - **`main` → PRODUCTION.** The implemented target is a protected-controller-only, non-force
+    fast-forward to an exactly validated annotated tag (`docs/RELEASING.md`). It is **NOT ACTIVATED**
+    until the documented Apps, environments and effective rulesets are read back. Never describe the
+    code/config in this branch as live enforcement.
 
   ⛔ **DO NOT run `npm run pg:schema` against prod by hand. `railway.json` already runs it as the
   `preDeployCommand`, from the DEPLOYED ARTIFACT'S tree.** A manual run reads YOUR checkout —

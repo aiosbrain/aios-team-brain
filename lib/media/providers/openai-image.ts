@@ -22,6 +22,8 @@ export interface ImageGenResult {
 export const DEFAULT_IMAGE_MODEL = "gpt-image-1.5";
 
 export async function generateOpenAiImage(params: ImageGenParams): Promise<ImageGenResult> {
+  const { assertCopiedStagingSpendAllowed } = await import("@/lib/staging/runtime-policy");
+  assertCopiedStagingSpendAllowed("image");
   const model = params.model ?? DEFAULT_IMAGE_MODEL;
   const res = await fetch("https://api.openai.com/v1/images/generations", {
     method: "POST",

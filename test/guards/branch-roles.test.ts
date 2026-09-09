@@ -118,6 +118,7 @@ describe("branch roles — the IDENTITY PIN (criterion 3)", () => {
     if (stubValue !== null) expect(branches, "the stub must apply").not.toBe(src);
     writeFileSync(join(dir, "branches.mjs"), branches);
     writeFileSync(join(dir, "release-candidate-guard.mjs"), read("scripts/release-candidate-guard.mjs"));
+    writeFileSync(join(dir, "release-candidate-verdict.mjs"), read("scripts/release-candidate-verdict.mjs"));
 
     git(dir, "init", "-q", "-b", "main");
     git(dir, "config", "user.email", "t@example.com");

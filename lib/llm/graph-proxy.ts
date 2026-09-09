@@ -9,6 +9,7 @@ import { resolveEmbeddingBackend } from "@/lib/query/embedding-key";
 import { EMBEDDING_DIM } from "@/lib/api/schemas";
 import { recordLlmUsage, recordLlmFailure, classifyLlmFailure, type LlmUsageSource } from "@/lib/costs/llm-usage";
 import { meterFromOpenAiResponse } from "@/lib/llm/cost";
+import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 
 /**
  * The GRAPH LLM PROXY — an OpenAI-compatible façade so the Graphiti service uses the key configured
@@ -305,6 +306,9 @@ export async function resolveGraphChatTargets(
   db: DbClient,
   teamId: string
 ): Promise<{ strong: ProxyTarget | ProxyRefusal; small: ProxyTarget | null }> {
+  if (!copiedStagingSpendAllowed("graph-extraction")) {
+    return { strong: refuse(503, "copied_staging_graph_read_only", "Copied staging refuses Graphiti chat/extraction before provider-key resolution."), small: null };
+  }
   const env = { LLM_BASE_URL: process.env.LLM_BASE_URL, LLM_MODEL: process.env.LLM_MODEL };
   const keys = await resolveAnsweringKeys(db, teamId);
   const strong = graphChatTarget(selectLlmBackend(env, keys, { role: "extraction" }));
@@ -319,6 +323,9 @@ export async function resolveGraphEmbeddingTarget(
   db: DbClient,
   teamId: string
 ): Promise<ProxyTarget | ProxyRefusal> {
+  if (!copiedStagingSpendAllowed("embedding")) {
+    return refuse(503, "copied_staging_graph_read_only", "Copied staging refuses Graphiti embeddings before provider-key resolution.");
+  }
   return graphEmbeddingTarget(await resolveEmbeddingBackend(teamId, db));
 }
 

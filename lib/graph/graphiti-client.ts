@@ -79,17 +79,23 @@ export interface GraphitiClientOptions {
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  mutationGuard?: () => Promise<void>;
 }
 
 export class GraphitiClient {
   private readonly base: string;
   private readonly fetch: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly mutationGuard: () => Promise<void>;
 
   constructor(opts: GraphitiClientOptions = {}) {
     this.base = (opts.baseUrl ?? process.env.GRAPHITI_URL ?? "").replace(/\/$/, "");
     this.fetch = opts.fetchImpl ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
+    this.mutationGuard = opts.mutationGuard ?? (async () => {
+      const { assertCopiedStagingGraphMutationAllowed } = await import("@/lib/staging/runtime-policy");
+      await assertCopiedStagingGraphMutationAllowed();
+    });
   }
 
   get configured(): boolean {
@@ -155,6 +161,7 @@ export class GraphitiClient {
   /** Add episodes to a group (async on Graphiti's side — returns once accepted). */
   async addEpisodes(groupId: string, episodes: GraphEpisode[]): Promise<void> {
     if (episodes.length === 0) return;
+    await this.mutationGuard();
     await this.post("/messages", {
       group_id: groupId,
       messages: episodes.map((e) => ({
@@ -198,6 +205,7 @@ export class GraphitiClient {
 
   /** Delete one episode by its Graphiti uuid (audit M6 — tier-reclassification cleanup). */
   async deleteEpisode(uuid: string): Promise<void> {
+    await this.mutationGuard();
     await this.request("DELETE", `/episode/${encodeURIComponent(uuid)}`);
   }
 }

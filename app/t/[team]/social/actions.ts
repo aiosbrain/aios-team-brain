@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { adminClient } from "@/lib/db/admin";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelFeatureVerdict, modelFeaturesEnabled } from "@/lib/staging/model-features";
 import { discoverOpportunities } from "@/lib/social/discover";
 import { discoverOpportunitiesFromArcs } from "@/lib/social/discover-arcs";
 import { planOpportunity } from "@/lib/social/plan";
@@ -61,6 +62,13 @@ export async function discoverNow(teamSlug: string): Promise<DiscoverResult> {
 export async function discoverFromArcsNow(teamSlug: string): Promise<DiscoverResult> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
+  // M9: arc-sourced discovery synthesizes over the arc set, so it needs a model and has nothing to
+  // degrade to. Named refusal after the admin gate, before the eager key resolution — which would
+  // otherwise throw into the catch below and be reported as "arc discovery failed", pointing the
+  // operator at the arcs rather than at the deployment's spend policy.
+  if (!modelFeaturesEnabled("background")) {
+    return { ok: false, error: modelFeatureVerdict("background").message ?? "model-backed answering is disabled" };
+  }
   try {
     const db = adminClient();
     const keys = await resolveAnsweringKeys(db, ctx.teamId);
