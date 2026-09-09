@@ -1516,24 +1516,47 @@ create table if not exists slack_channel_migration_gates (
                     and cardinality(resolved_workspace_ids) = 0
                     and completed_repair_id is null
     end
-  ),
-  -- The workspace set is a set of PROVIDER IDS, so `cardinality > 0` above cannot be satisfied by a
-  -- NULL, a blank or free text. CASE, not AND: `array_position` raises on a multidimensional array,
-  -- and only an ordered evaluation guarantees that shape is refused as a violation rather than an
-  -- error from inside the constraint.
-  constraint slack_channel_migration_gates_workspace_syntax check (
-    case
-      when array_ndims(resolved_workspace_ids) is distinct from 1
-        then cardinality(resolved_workspace_ids) = 0
-      else array_position(resolved_workspace_ids, null) is null
-       and array_to_string(resolved_workspace_ids, ',') ~ '^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$'
-    end
   )
 );
 -- The scan an admin/repair surface will need: this team's channels, blocked ones first. No reader
 -- exists yet, and it is cheap on an empty table.
 create index if not exists slack_channel_migration_gates_state_idx
   on slack_channel_migration_gates (team_id, state);
+
+-- The WORKSPACE-ID SET syntax. The set is a set of PROVIDER IDS, so `cardinality > 0` in the codec
+-- above cannot be satisfied by a NULL, a blank, free text — or by ONE element that merely spells a
+-- set. CASE, not AND: `array_position` raises on a multidimensional array, and only an ordered
+-- evaluation guarantees that shape is refused as a violation rather than an error from inside the
+-- constraint.
+--
+-- BOTH renderings are required, and neither subsumes the other. Joined on ',' the array is checked
+-- for EMPTY elements — `{"T1",""}` renders `T1,` and is refused — but that rendering is ambiguous
+-- in the other direction: the single element `T1,T2` renders exactly like the two elements `T1` and
+-- `T2`, so a separator smuggled INSIDE an element passes it. Joined on '' the elements are
+-- concatenated with nothing between them, so every byte of every element must be alphanumeric and
+-- an embedded comma (or any other non-alphanumeric byte) has nowhere to hide — while that rendering
+-- in turn cannot see an empty element, which contributes no bytes. One workspace id per element is
+-- the rule; it takes both readings to state it.
+--
+-- Named, dropped and re-added on every replay, per the convention used for `slack_sync_threads`
+-- above: building the table here is a no-op on a database that already has it, so a
+-- checkpoint-created database would otherwise keep the looser rule forever. This table has no
+-- production deployment and no application path can write a workspace set (nothing can make a gate
+-- ready), so no data migration exists or is needed. If a replay DOES meet a stored row the tightened
+-- rule refuses, this ADD fails with 23514 — that failure is the report, and the row is to be
+-- investigated, never quietly repaired or deleted here.
+alter table slack_channel_migration_gates
+  drop constraint if exists slack_channel_migration_gates_workspace_syntax;
+alter table slack_channel_migration_gates
+  add constraint slack_channel_migration_gates_workspace_syntax check (
+    case
+      when array_ndims(resolved_workspace_ids) is distinct from 1
+        then cardinality(resolved_workspace_ids) = 0
+      else array_position(resolved_workspace_ids, null) is null
+       and array_to_string(resolved_workspace_ids, ',') ~ '^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$'
+       and array_to_string(resolved_workspace_ids, '') ~ '^[A-Za-z0-9]+$'
+    end
+  );
 
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (

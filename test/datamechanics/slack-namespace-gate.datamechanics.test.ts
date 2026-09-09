@@ -33,7 +33,8 @@ import { db, seedTeam, type Seed } from "./helpers";
  *     is refused by an actual constraint, so a direct DB write cannot manufacture half a readiness.
  *  3. INVALIDATION IS ATOMIC AND SERIALIZED. Bumping the revision and clearing every readiness
  *     proof field happen in one statement on the locked row, so a competing reader can never be
- *     handed pre-invalidation readiness.
+ *     handed pre-invalidation readiness — asserted with that reader OBSERVED parked on the row lock
+ *     (`pg_blocking_pids` from a third connection), never merely started after the write.
  *  4. THE PASSED SESSION IS THE CONNECTION. An invalidation inside a caller transaction that then
  *     rolls back leaves nothing behind — the proof these functions ran on the caller's bound
  *     connection, which is what lets the later publisher compose them into its own transaction.
@@ -50,6 +51,8 @@ const CHANNEL = "C0GATE001";
 const OTHER_CHANNEL = "C0GATE002";
 const WORKSPACE = "T0AIO1170";
 const OTHER_WORKSPACE = "T0OTHERWS";
+/** Named, so a workspace-set refusal cannot be satisfied by some OTHER constraint firing first. */
+const WORKSPACE_SYNTAX = "slack_channel_migration_gates_workspace_syntax";
 
 type Scope = { teamId: string; rawChannelId: string };
 
@@ -162,6 +165,18 @@ async function seedReady(
   return { repairId, revision };
 }
 
+/**
+ * The array a literal ACTUALLY parses to, read back from Postgres. A refusal proves the intended
+ * rule only if the fixture is the shape it claims to be, and `'{"T1,T2"}'` differs from `'{T1,T2}'`
+ * by one pair of quotes while meaning one element or two — the insert is refused either way, so
+ * without this read-back a mis-quoted literal would pass the test for the wrong reason.
+ */
+async function parsedArray(literal: string): Promise<unknown> {
+  const c = await sql();
+  const { rows } = await c.query<{ a: unknown }>(`select ${literal} as a`);
+  return rows[0].a;
+}
+
 async function refusal(p: Promise<unknown>): Promise<{ code: string; constraint?: string }> {
   try {
     await p;
@@ -178,6 +193,97 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
     resolve = r;
   });
   return { promise, resolve };
+}
+
+// ── observing a REAL lock wait ───────────────────────────────────────────────
+// The interleaving the invalidation contract is about only exists while the writer holds the row
+// lock, so the concurrency test below has to know the reader is parked behind it — not assume it.
+
+const LOCK_WAIT_POLL_MS = 25;
+/** Well inside the pool's 30s `statement_timeout`, so the reader's blocked read is never killed. */
+const LOCK_WAIT_BUDGET_MS = 10_000;
+const COMPETING_SESSION_TIMEOUT_MS = 30_000;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Every wait in that test is bounded: a signal that never arrives must fail it, not hang it. */
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out after ${ms}ms waiting for ${label}`)),
+          ms
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+type Captured<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown };
+
+/**
+ * Settle-tracking that never rejects. The writer must be released and both sides settled on ANY
+ * failure path, and a promise that rejects while nothing is awaiting it would either be lost or
+ * surface as an unhandled rejection attributed to some later test.
+ */
+function capture<T>(promise: Promise<T>, onSettled?: () => void): Promise<Captured<T>> {
+  return promise.then(
+    (value) => {
+      onSettled?.();
+      return { ok: true as const, value };
+    },
+    (error) => {
+      onSettled?.();
+      return { ok: false as const, error };
+    }
+  );
+}
+
+/** The PID of the backend this session is BOUND to — read on the session, not from the pool. */
+async function backendPid(session: TransactionSession): Promise<number> {
+  const result = await session.executeSql<{ pid: number }>("select pg_backend_pid() as pid");
+  const pid = result.rows[0]?.pid;
+  if (typeof pid !== "number") {
+    throw new Error(`pg_backend_pid did not read back as a number: ${String(pid)}`);
+  }
+  return pid;
+}
+
+/**
+ * Poll `pg_blocking_pids(reader)` — the backends whose locks that backend is WAITING ON — from a
+ * third connection, until it names the writer. True means a real lock wait was observed; false
+ * means the reader either finished without ever waiting or the budget elapsed, and both of those
+ * are failures rather than passes.
+ *
+ * The interval only paces the poll. The evidence is the blocker set the database reports; no amount
+ * of elapsed time is accepted in its place.
+ */
+async function waitForLockWait(
+  blockedPid: number,
+  blockerPid: number,
+  settled: () => boolean
+): Promise<boolean> {
+  // The file's raw client — a connection OUTSIDE the app pool, so it is neither the writer nor the
+  // reader. Asking either participant would either block behind the lock or perturb what it reports.
+  const observer = await sql();
+  const deadline = Date.now() + LOCK_WAIT_BUDGET_MS;
+  for (;;) {
+    const { rows } = await observer.query<{ pids: number[] }>(
+      `select pg_blocking_pids($1::int) as pids`,
+      [blockedPid]
+    );
+    if ((rows[0]?.pids ?? []).includes(blockerPid)) return true;
+    if (settled()) return false;
+    if (Date.now() >= deadline) return false;
+    await delay(LOCK_WAIT_POLL_MS);
+  }
 }
 
 const lockArgs = (scope: Scope, over: Partial<{ workspaceId: string; expectedRevision: number }> = {}) => ({
@@ -320,9 +426,54 @@ describe("slack_channel_migration_gates — the columns this slice may own", () 
             [other.teamId, CHANNEL]
           )
         )
-      ).toMatchObject({ code: "23514" });
+      ).toMatchObject({ code: "23514", constraint: WORKSPACE_SYNTAX });
     }
     expect(await rowCount(other.teamId)).toBe(0);
+  });
+
+  /**
+   * ONE WORKSPACE ID PER ELEMENT. The rule the array-rendering checks exist for is not "the set
+   * looks alphanumeric" but "each element IS a provider id", and the two fixtures below are the
+   * ones a comma-joined rendering alone cannot tell apart: `{"T1,T2"}` renders exactly like the two
+   * elements `T1`,`T2`, and `{"T1","T2,T3"}` renders exactly like three. A publisher that read
+   * either back would hand a namespace segment carrying a separator to the path builder.
+   *
+   * ⚠️ STRUCTURAL FIXTURES. Like every direct DB write in this file (see the fixture label in the
+   * header) these say nothing about provenance; they exercise what the table will and will not
+   * store.
+   */
+  it("refuses a separator smuggled inside a workspace element, and accepts the same ids apart", async () => {
+    const seed = await seedTeam();
+    const c = await sql();
+    const insertWorkspaces = (literal: string) =>
+      c.query(
+        `insert into slack_channel_migration_gates
+           (team_id, raw_channel_id, state, revision, ready_revision,
+            resolved_workspace_ids, completed_repair_id)
+         values ($1, $2, 'ready', 0, 0, ${literal}, gen_random_uuid())`,
+        [seed.teamId, CHANNEL]
+      );
+
+    const oneElement = `'{"T1,T2"}'::text[]`;
+    const mixed = `'{"T1","T2,T3"}'::text[]`;
+    const separate = `'{"T1","T2"}'::text[]`;
+    // Read back before they are relied on — see `parsedArray`.
+    expect(await parsedArray(oneElement)).toEqual(["T1,T2"]);
+    expect(await parsedArray(mixed)).toEqual(["T1", "T2,T3"]);
+    expect(await parsedArray(separate)).toEqual(["T1", "T2"]);
+
+    for (const literal of [oneElement, mixed]) {
+      expect(await refusal(insertWorkspaces(literal))).toMatchObject({
+        code: "23514",
+        constraint: WORKSPACE_SYNTAX,
+      });
+    }
+    expect(await rowCount(seed.teamId)).toBe(0);
+
+    // Positive control: the SAME ids, one per element, are stored — so the two refusals above are
+    // refusing the embedded separator, and not the fixture's ids, state or insert shape.
+    await insertWorkspaces(separate);
+    expect((await row(scopeFor(seed))).resolved_workspace_ids).toEqual(["T1", "T2"]);
   });
 
   it("keeps one gate per team and raw channel", async () => {
@@ -724,44 +875,84 @@ describe("invalidate — one atomic step from readiness to blocked", () => {
     expect((await row(scope)).state).toBe("ready");
   });
 
+  /**
+   * THE READER IS HELD AT THE LOCK, NOT MERELY STARTED AFTER THE WRITE. The earlier version of this
+   * test signalled before the reader issued its statement, so it also passed on the schedule where
+   * the reader ran entirely AFTER the writer committed — a serial read of an already-invalidated
+   * row, which proves nothing about the concurrent case. Here the writer is released only once a
+   * third connection has seen `pg_blocking_pids(reader)` name the writer's backend, so the reader's
+   * `for update` is demonstrably parked behind the uncommitted invalidation when the commit lands.
+   * If that wait is never observed, the test FAILS rather than accepting the lucky schedule.
+   */
   it("cannot hand pre-invalidation readiness to a competing session", async () => {
     const seed = await seedTeam();
     const scope = scopeFor(seed);
     await seedReady(seed, { revision: 0 });
 
-    const invalidated = deferred();
-    const readerStarted = deferred();
+    const invalidated = deferred<number>(); // the writer's backend, after its invalidation
+    const readerBound = deferred<number>(); // the reader's backend, before its locking read
+    const releaseWriter = deferred();
+    let readerSettled = false;
 
     const writer = tx(async (session) => {
       const state = await invalidateSlackNamespaceGate(session, scope, "workspace_changed");
-      invalidated.resolve();
-      // Hold the transaction open until the reader is committed to its attempt. The reader signals
-      // BEFORE issuing its statement, so the writer can always commit and neither side can wedge.
-      await readerStarted.promise;
+      invalidated.resolve(await backendPid(session));
+      // Held open — and so holding the row lock — until the wait is observed. The `finally` below
+      // releases it on every path, so neither side can wedge.
+      await releaseWriter.promise;
       return state;
     });
 
     const reader = (async () => {
       await invalidated.promise;
       return tx(async (session) => {
-        readerStarted.resolve();
-        // Ordinarily this blocks on the row lock until the writer commits. If it instead runs after
-        // the commit, it reads the invalidated row directly — the assertion below holds either way,
-        // and there is no interleaving in which pre-invalidation readiness is returned.
+        readerBound.resolve(await backendPid(session));
+        // Blocks on the row lock the writer is holding; it resumes only after that commit.
         return lockReadySlackNamespaceGate(session, lockArgs(scope));
       });
     })();
 
-    const [written, read] = await Promise.all([writer, reader]);
+    const writerResult = capture(writer);
+    const readerResult = capture(reader, () => {
+      readerSettled = true;
+    });
 
-    expect(written.revision).toBe(1);
-    expect(read).toEqual({ outcome: "refused" });
+    let observedLockWait = false;
+    let written!: Captured<Awaited<typeof writer>>;
+    let read!: Captured<Awaited<typeof reader>>;
+    try {
+      const writerPid = await withDeadline(
+        invalidated.promise,
+        LOCK_WAIT_BUDGET_MS,
+        "the writer's invalidation"
+      );
+      const readerPid = await withDeadline(
+        readerBound.promise,
+        LOCK_WAIT_BUDGET_MS,
+        "the reader's bound session"
+      );
+      observedLockWait = await waitForLockWait(readerPid, writerPid, () => readerSettled);
+    } finally {
+      releaseWriter.resolve();
+      written = await writerResult;
+      read = await readerResult;
+    }
+
+    // A failing side is the root cause; report it before the derived assertions.
+    if (!written.ok) throw written.error;
+    if (!read.ok) throw read.error;
+    // Never a lucky schedule: false here means the reader was never seen waiting on the writer.
+    expect(observedLockWait).toBe(true);
+
+    expect(written.value.revision).toBe(1);
+    expect(read.value).toEqual({ outcome: "refused" });
     const stored = await row(scope);
     expect(stored.state).toBe("blocked");
     expect(stored.revision).toBe("1");
     expect(stored.ready_revision).toBeNull();
     expect(stored.resolved_workspace_ids).toEqual([]);
-  });
+    expect(stored.completed_repair_id).toBeNull();
+  }, COMPETING_SESSION_TIMEOUT_MS);
 
   it("serializes two concurrent invalidations into two revisions", async () => {
     const seed = await seedTeam();
