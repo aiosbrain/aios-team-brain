@@ -68,3 +68,7 @@ Checkpoint3ad7035f adds slack_messages and slack_team_state only, plus schema in
 ### Packet2 fixture correction verified
 
 Opus changed only the team-cascade fixture to minimal raw SQL rows and asserted no audit entries before deletion. Coordinator reran the isolated ledger suite:12/12tests passed at16:38ET, including from-zero/populated upgrade/replay. Audit protection and shared lifecycle helpers remain unchanged. Schema and production code are identical to3ad7035f; prior docs/typecheck checks remain applicable.
+
+## Packet 3 — namespace parser verified
+
+Checkpoint e0cbd9e0 adds an unused pure legacy/scoped path parser and validated scoped builders. Coordinator ran 74 tests across three suites, typecheck and docs drift: all passed at 16:54 ET. Tests were written before the helper; no initial-red run was captured for this new helper. Independent local review found no actionable correctness issue. Its timestamp dependency currently imports node:crypto transitively; extract a browser-compatible timestamp module if a future client component needs this helper. Current inspected data-browser is server-side and the helper has no active callers. Legacy path provenance, migration gates and publication remain pending.
