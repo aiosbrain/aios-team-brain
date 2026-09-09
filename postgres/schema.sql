@@ -1442,9 +1442,9 @@ create index if not exists slack_sync_threads_lease_idx
 -- thread identity, not noise to trim. Nothing casts this column to bigint, so the cap bought
 -- nothing and cost a rejected root.
 --
--- Named, dropped and re-added on every replay, per the convention above: `create table if not
--- exists` is a no-op on a database that already has the table, so a checkpoint-created database
--- would otherwise keep the old rule forever. This table has no production deployment (nothing
+-- Named, dropped and re-added on every replay, per the convention above: table creation here is
+-- a no-op on a database that already has the table, so a checkpoint-created database would
+-- otherwise keep the old rule forever. This table has no production deployment (nothing
 -- schedules or publishes yet) and every legal old value is still legal, so no data migration
 -- exists or is needed — the widening cannot invalidate a stored row.
 alter table slack_sync_threads drop constraint if exists slack_sync_threads_root_ts_check;
