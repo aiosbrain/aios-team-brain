@@ -96,6 +96,11 @@
     "vitest": "^4.1.8",
     "yaml": "^2.9.0"
   },
+  "overrides": {
+    "@aws-sdk/core": {
+      "fast-xml-parser": "4.5.7"
+    }
+  },
   "engines": {
     "node": ">=20"
   }

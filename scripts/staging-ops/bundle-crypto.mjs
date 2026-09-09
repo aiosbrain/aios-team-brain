@@ -104,7 +104,13 @@ export function openSignedEncryptedBundle({ bundle, exporterSigningPublicKey, im
     Buffer.from(String(bundle.sealedKey ?? ""), "base64")
   );
   try {
-    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(String(bundle.nonce ?? ""), "base64"));
+    // `authTagLength: 16` is load-bearing, not decoration. Node's GCM decipher accepts a SHORT tag
+    // by default (4, 8, 12–16 bytes), and a short tag is verified by comparing only that many
+    // bytes — so a valid 16-byte tag truncated to 4 bytes still authenticates and the bundle
+    // opens. That reduces forgery resistance from 2^-128 to 2^-32 against an attacker who can
+    // edit the transported `authTag` field. Every bundle this module produces carries the full
+    // 16-byte tag `getAuthTag()` returns, so pinning the length rejects only tampered inputs.
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(String(bundle.nonce ?? ""), "base64"), { authTagLength: 16 });
     decipher.setAuthTag(Buffer.from(String(bundle.authTag ?? ""), "base64"));
     const payload = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     const { signature: _signature, ...unsigned } = manifest;
