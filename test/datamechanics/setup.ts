@@ -48,6 +48,7 @@ const DATA_TABLES = [
   "slack_team_state",
   "slack_sync_threads",
   "slack_channel_migration_gates",
+  "slack_method_budgets",
   "items",
   "projects",
   "rate_limits",

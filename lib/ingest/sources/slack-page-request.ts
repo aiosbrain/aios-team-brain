@@ -286,10 +286,17 @@ export async function slackReservedRequest(
   }
 
   if (body.ok !== true) {
-    const code = categoryOf(body.error, `http_${response.status}`);
+    // Two different unknowns, kept apart. NO `error` field at all is a fact about the response, and
+    // the status is a bounded safe value, so it becomes the category. An `error` field that is not
+    // category-shaped is arbitrary remote text — it is REPLACED, never truncated or escaped, because
+    // a category is meant to be safe to put in a log line or a `last_error_code` column.
+    const code =
+      body.error === undefined || body.error === null
+        ? `http_${response.status}`
+        : categoryOf(body.error, "provider_error");
     return AUTH_ERRORS.has(code)
       ? { outcome: "auth_error", method, category: code }
-      : { outcome: "provider_error", method, category: categoryOf(code, "provider_error") };
+      : { outcome: "provider_error", method, category: code };
   }
 
   return { outcome: "ok", method, body, page: readPage(body) };
