@@ -462,18 +462,52 @@ describe("slack_messages — team-consistent item binding", () => {
   });
 
   it("cascades with the team, and leaves another team's ledger and state alone", async () => {
-    const a = await seedTeam();
-    const b = await seedTeam();
-    const itemA = await seedItem(a, "slack/T0AIO1170/C0LEDGER/1718900000.000100.md");
-    const itemB = await seedItem(b, "slack/T0AIO1170/C0LEDGER/1718900000.000100.md");
-    await insertRow(eligibleRow(a.teamId, itemA));
-    await insertRow(eligibleRow(b.teamId, itemB));
-
     const c = await sql();
+
+    /**
+     * The two teams are raw and minimal — deliberately NOT `seedTeam`/`ingest`. Those run the real
+     * member/builtin/ingest lifecycle, which writes `audit_log` rows, and `audit_log` is append-only
+     * by trigger: the team delete below would then be refused by the AUDIT guard before either Slack
+     * FK was reached, and this test would be measuring that trigger instead of the cascade it names.
+     */
+    const rawTeamWithItem = async (path: string): Promise<{ teamId: string; itemId: string }> => {
+      const { rows: t } = await c.query<{ id: string }>(
+        `insert into teams (slug, name) values ($1, 'Cascade') returning id`,
+        [`team-${randomUUID().slice(0, 8)}`]
+      );
+      const teamId = t[0].id;
+      const { rows: p } = await c.query<{ id: string }>(
+        `insert into projects (team_id, slug) values ($1, 'acme') returning id`,
+        [teamId]
+      );
+      const { rows: i } = await c.query<{ id: string }>(
+        `insert into items (team_id, project_id, path, kind, access, content_sha256, body)
+           values ($1, $2, $3, 'deliverable', 'team', repeat('a', 64), 'cascade body')
+           returning id`,
+        [teamId, p[0].id, path]
+      );
+      return { teamId, itemId: i[0].id };
+    };
+
+    const a = await rawTeamWithItem("slack/T0AIO1170/C0LEDGER/1718900000.000100.md");
+    const b = await rawTeamWithItem("slack/T0AIO1170/C0LEDGER/1718900000.000100.md");
+    await insertRow(eligibleRow(a.teamId, a.itemId));
+    await insertRow(eligibleRow(b.teamId, b.itemId));
+
     await c.query(
       `insert into slack_team_state (team_id, data_generation) values ($1, 4), ($2, 9)`,
       [a.teamId, b.teamId]
     );
+    // A precondition, not decoration: with no audit rows on EITHER team, the delete cascades into
+    // nothing the append-only trigger would refuse — so any refusal below can only come from the
+    // Slack side, which is what this test is about. It also reddens loudly (rather than as an
+    // opaque "audit_log is append-only") if a fixture that writes audits is ever put back.
+    const { rows: audits } = await c.query<{ c: string }>(
+      `select count(*)::text as c from audit_log where team_id = any($1)`,
+      [[a.teamId, b.teamId]]
+    );
+    expect(audits[0].c).toBe("0");
+
     await c.query(`delete from teams where id = $1`, [a.teamId]);
 
     const { rows: msgs } = await c.query<{ team_id: string }>(`select team_id from slack_messages`);
