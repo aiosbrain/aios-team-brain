@@ -1,0 +1,26 @@
+# AIO-997 — the IMAGE audit's secret-scanner configuration.
+#
+# THIS IS NOT `.gitleaks.toml`, AND IT MUST NOT BECOME IT.
+#
+# The repository config at the root allowlists `node_modules/`, `.next/`, `dist/`, `build/`,
+# `coverage/` and `.env.example`. Those exclusions are correct for scanning a source repository —
+# they skip trees that are not our source. They are exactly wrong for scanning an IMAGE, because in
+# the image those trees ARE the content: `npm ci` puts `node_modules` in the runner, and a credential
+# sitting in a dependency's fixture is distributed to everyone who pulls the digest.
+#
+# So this config has NO path allowlist and NO value allowlist. Every regular file of every layer is
+# scanned, including dependencies, build output and deleted-by-a-later-layer content. Grouping by
+# rule (in `scanner.mjs`) is what keeps a noisy dependency reviewable; suppression is not.
+#
+# Adjudicating a known-harmless finding is a COORDINATOR decision recorded against that finding's
+# rule, location and provenance — never a directory added here. A path allowlist in this file would
+# silently un-scan the next thing that lands under it.
+
+[extend]
+useDefault = true
+
+# Deliberately no [allowlist] section.
+#
+# If a future finding genuinely warrants an exception, it is adjudicated in the evidence packet with
+# its rule, its independently established public location, its provenance and the reason — because a
+# rule written here would apply to every future run of an artifact nobody has inspected yet.

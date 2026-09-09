@@ -58,8 +58,16 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/;
 /**
  * Every reason this dispatch context is not the one trusted context, as a LIST — an operator
  * fixing a misconfigured dispatch should see all of them, not the first one.
+ *
+ * `workflowPath` (AIO-997 audit) DEFAULTS TO THE PUBLISHER'S OWN PATH and is the only thing a caller
+ * may vary. The read-only audit workflow shares every other property of this guard — repository,
+ * event, ref, 40-hex SHA, `workflow_sha === sha` — but its `workflow_ref` names its own file, so a
+ * hardcoded publisher path would either reject the audit or, worse, accept a run of the WRONG
+ * workflow as though it were the audit. Nothing else about the publisher's behaviour changes: with
+ * the argument omitted this function is byte-for-byte the check it always was.
  */
-export function dispatchContextFailures(ctx = {}) {
+export function dispatchContextFailures(ctx = {}, { workflowPath = WORKFLOW_PATH } = {}) {
+  const expectedWorkflowRef = `${REPOSITORY}/${workflowPath}@${SOURCE_REF}`;
   const failures = [];
   const { repository, eventName, ref, sha, workflowSha, workflowRef } = ctx;
   if (repository !== REPOSITORY) failures.push(`repository is ${describe(repository)}, expected ${REPOSITORY}`);
@@ -70,7 +78,7 @@ export function dispatchContextFailures(ctx = {}) {
   // The workflow definition that is running must BE the commit being published. Otherwise the file
   // whose guards are being trusted is not the file that was reviewed at that commit.
   else if (workflowSha !== sha) failures.push(`workflow sha ${workflowSha} differs from source sha ${describe(sha)}`);
-  if (workflowRef !== EXPECTED_WORKFLOW_REF) failures.push(`workflow ref is ${describe(workflowRef)}, expected ${EXPECTED_WORKFLOW_REF}`);
+  if (workflowRef !== expectedWorkflowRef) failures.push(`workflow ref is ${describe(workflowRef)}, expected ${expectedWorkflowRef}`);
   return failures;
 }
 
