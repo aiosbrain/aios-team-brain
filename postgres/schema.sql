@@ -1558,6 +1558,10 @@ alter table slack_channel_migration_gates
     end
   );
 
+-- The fourth Slack table, `slack_method_budgets` (per-method request reservations), is defined
+-- further down this file, immediately after `integrations` — a provisional bucket carries an
+-- integration FK, and this section is created before that table exists.
+
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
   id uuid primary key default gen_random_uuid(),
@@ -2802,6 +2806,111 @@ create table if not exists integrations (
 create index if not exists integrations_team_type_idx on integrations (team_id, type);
 -- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
 alter table integrations add column if not exists secret_ciphertext text;
+
+-- ── Slack per-method request reservations (AIO-1170) ─────────────────────────
+-- The durable "when may the next request of this method be sent" clock. One row per
+-- (AIOS team, discriminated provider scope, method); the single writer is
+-- `lib/ingest/slack-method-budget.ts`, and the only callers today are its data-mechanics tests and
+-- the one-request adapter `lib/ingest/sources/slack-page-request.ts` (itself uncalled by the app).
+--
+-- ⚠️ IT LIVES HERE, NOT IN THE SLACK BLOCK ABOVE, ONLY BECAUSE OF THE FK. `integrations` is created
+-- further down this file than the other Slack tables, and a provisional bucket is keyed on an
+-- integration, so a from-zero load would fail if this sat next to its siblings. The Slack section
+-- above points here.
+--
+-- ⚠️ A RESERVATION IS PROVIDER ALLOWANCE AND NOTHING ELSE. Granting a slot says the local budget
+-- permits one request; it says nothing about authorization, channel permission, workspace
+-- provenance or whether the response may be stored. It also does not itself send anything: the
+-- transport commits the reservation FIRST and only then makes exactly one call, because a request
+-- Slack has already counted must survive a crash of the process that made it.
+--
+-- WHY THE KEY EXCLUDES THE TOKEN AND THE CHANNEL. Slack meters per app+workspace+method, so two
+-- tokens (or two integrations) for the same verified app in the same workspace must SHARE one
+-- allowance; keying on a token or a channel would multiply the allowance we are supposed to be
+-- respecting, silently, and the symptom would be provider 429s rather than a failing test.
+--
+-- THREE DISCRIMINATED SCOPES, EACH WITH ITS OWN LEGAL METHOD SET:
+--  • `verified`            — (team, workspace, app). The real key, once app identity is bound. Any
+--                            supported method.
+--  • `provisional`         — (team, integration). Ingestion `auth.test` ONLY: before the first
+--                            successful auth.test there is no verified workspace or app to key on.
+--  • `workspace_bootstrap` — (team, workspace). `bots.info` ONLY, for the app-identity fallback that
+--                            runs after auth.test established the workspace but before an app is
+--                            bound. ONE bucket per workspace, shared across every integration and
+--                            app in it, and RETAINED for later bots.info identity refreshes so
+--                            reaching verified state cannot reset its allowance. There is
+--                            deliberately no synthetic app id and no per-integration bots.info
+--                            bucket — either would be an allowance multiplier wearing a scope's
+--                            clothes.
+create table if not exists slack_method_budgets (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  scope_kind text not null check (
+    scope_kind in ('verified', 'provisional', 'workspace_bootstrap')
+  ),
+  -- Provider ids byte-exact, same identity discipline and alphabet as the Slack tables above.
+  workspace_id text check (workspace_id ~ '^[A-Za-z0-9]+$'),
+  app_id text check (app_id ~ '^[A-Za-z0-9]+$'),
+  integration_id uuid references integrations(id) on delete cascade,
+  -- Exactly the methods this ingestion path calls. A closed set, unlike `last_error_code` above,
+  -- because these are OUR call sites rather than a provider vocabulary: a method absent here has no
+  -- budget, and a method with no budget must fail rather than acquire an unmetered one.
+  method text not null check (
+    method in (
+      'auth.test',
+      'bots.info',
+      'conversations.info',
+      'conversations.history',
+      'conversations.replies',
+      'users.list'
+    )
+  ),
+  -- The whole point of the table. Defaults to now so a freshly created bucket is immediately due;
+  -- every grant pushes it forward by the method's interval, and provider backoff can only push it
+  -- FURTHER (never nearer). The DB clock owns it — a caller's clock never decides due-ness.
+  next_permitted_at timestamptz not null default clock_timestamp(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- Each scope is ALL of its key fields and none of any other's. Without this a row carrying both
+  -- an integration and a workspace is storable, and every reader would have to decide which half to
+  -- believe. `else false` is deliberate: a fourth `scope_kind` added to the CHECK above without a
+  -- shape stated here is refused rather than admitted keyless.
+  constraint slack_method_budgets_scope_codec check (
+    case scope_kind
+      when 'verified' then
+        workspace_id is not null and app_id is not null and integration_id is null
+      when 'provisional' then
+        integration_id is not null and workspace_id is null and app_id is null
+      when 'workspace_bootstrap' then
+        workspace_id is not null and app_id is null and integration_id is null
+      else false
+    end
+  ),
+  -- The method restriction is a STORAGE rule, not just an app rule: the two narrow scopes exist for
+  -- one bootstrap call each, and a `conversations.history` row under a provisional scope would be an
+  -- unverified-identity read budget — the exact thing those scopes are bounded to prevent.
+  constraint slack_method_budgets_method_scope check (
+    case scope_kind
+      when 'verified' then true
+      when 'provisional' then method = 'auth.test'
+      when 'workspace_bootstrap' then method = 'bots.info'
+      else false
+    end
+  )
+);
+-- One bucket per scope+method. PARTIAL unique indexes, one per scope kind, because the key columns
+-- differ per shape and NULLs do not conflict in a single combined index — under one nullable index
+-- every provisional row would be mutually non-conflicting, i.e. no uniqueness at all, which is
+-- indistinguishable from a working budget until the provider starts refusing.
+create unique index if not exists slack_method_budgets_verified_key
+  on slack_method_budgets (team_id, workspace_id, app_id, method)
+  where scope_kind = 'verified';
+create unique index if not exists slack_method_budgets_provisional_key
+  on slack_method_budgets (team_id, integration_id, method)
+  where scope_kind = 'provisional';
+create unique index if not exists slack_method_budgets_bootstrap_key
+  on slack_method_budgets (team_id, workspace_id, method)
+  where scope_kind = 'workspace_bootstrap';
 
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected

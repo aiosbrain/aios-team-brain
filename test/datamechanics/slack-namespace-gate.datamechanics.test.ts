@@ -5,6 +5,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { TransactionSession } from "@/lib/db/types";
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import * as gateModule from "@/lib/ingest/slack-namespace-gate";
+import type {
+  SlackNamespaceGateState,
+  SlackNamespaceReadyLockResult,
+} from "@/lib/ingest/slack-namespace-gate";
 import {
   ensureBlockedSlackNamespaceGate,
   invalidateSlackNamespaceGate,
@@ -187,12 +191,32 @@ async function refusal(p: Promise<unknown>): Promise<{ code: string; constraint?
   return { code: "no-error" };
 }
 
-function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+interface Settleable<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (error: unknown) => void;
+}
+
+/**
+ * A startup signal with BOTH outcomes. The earlier resolve-only version could only ever say "the
+ * writer got there"; a writer that failed before signalling therefore left the reader awaiting a
+ * promise nothing would ever settle, and the orchestration's own `finally` then blocked on that
+ * reader — so the real cause never surfaced and the test hung until its timeout killed it.
+ *
+ * The swallowing handler is attached at creation, not at each await: on the failure path the
+ * rejection is delivered to every ACTUAL awaiter, but a signal nobody happens to be waiting on (the
+ * reader's own bound-session signal, when the reader failed earlier) must not surface as an
+ * unhandled rejection attributed to some later test in this file.
+ */
+function settleable<T = void>(): Settleable<T> {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  promise.catch(() => {});
+  return { promise, resolve, reject };
 }
 
 // ── observing a REAL lock wait ───────────────────────────────────────────────
@@ -203,6 +227,12 @@ const LOCK_WAIT_POLL_MS = 25;
 /** Well inside the pool's 30s `statement_timeout`, so the reader's blocked read is never killed. */
 const LOCK_WAIT_BUDGET_MS = 10_000;
 const COMPETING_SESSION_TIMEOUT_MS = 30_000;
+/**
+ * The negative control for the harness's own failure path. Deliberately BELOW `LOCK_WAIT_BUDGET_MS`:
+ * a regression in which the writer's error is replaced by a handshake deadline cannot finish inside
+ * this budget, so that test cannot go green by waiting one out.
+ */
+const PRE_SIGNAL_FAILURE_TIMEOUT_MS = 5_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -284,6 +314,101 @@ async function waitForLockWait(
     if (Date.now() >= deadline) return false;
     await delay(LOCK_WAIT_POLL_MS);
   }
+}
+
+/** The error a captured side settled with — asserted rather than reached for through a union. */
+function failureOf<T>(captured: Captured<T>): unknown {
+  if (captured.ok) throw new Error("expected this side to fail, but it produced a value");
+  return captured.error;
+}
+
+interface CompetingRun {
+  /** What the startup handshake failed with, if anything. The writer's own error, never a deadline. */
+  readonly startupError?: unknown;
+  readonly observedLockWait: boolean;
+  readonly written: Captured<SlackNamespaceGateState>;
+  readonly read: Captured<SlackNamespaceReadyLockResult>;
+}
+
+/**
+ * Run the competing-session interleaving: a writer that holds the row lock open until a THIRD
+ * connection has observed the reader parked behind it, then commits.
+ *
+ * The writer's operation is a parameter so the harness can be exercised on its own failure path
+ * without a production test hook (see the second test below). Every wait is bounded and every side
+ * is settled before this returns — including when the startup handshake fails — so a broken writer
+ * is reported as the error it actually raised instead of as a hang or a timeout.
+ */
+async function runCompetingInvalidation(
+  scope: Scope,
+  invalidate: (session: TransactionSession) => Promise<SlackNamespaceGateState>
+): Promise<CompetingRun> {
+  const invalidated = settleable<number>(); // the writer's backend, after its invalidation
+  const readerBound = settleable<number>(); // the reader's backend, before its locking read
+  const releaseWriter = settleable();
+  let readerSettled = false;
+
+  const writer = tx(async (session) => {
+    let state: SlackNamespaceGateState;
+    try {
+      state = await invalidate(session);
+      invalidated.resolve(await backendPid(session));
+    } catch (error) {
+      // Settle the signal with the ORIGINAL failure. Everything downstream — the reader and the
+      // handshake below — then reports that error rather than waiting for a signal never coming.
+      invalidated.reject(error);
+      throw error;
+    }
+    // Held open — and so holding the row lock — until the wait is observed. The `finally` below
+    // releases it on every path, so neither side can wedge.
+    await releaseWriter.promise;
+    return state;
+  });
+
+  const reader = (async () => {
+    try {
+      await invalidated.promise;
+      return await tx(async (session) => {
+        readerBound.resolve(await backendPid(session));
+        // Blocks on the row lock the writer is holding; it resumes only after that commit.
+        return lockReadySlackNamespaceGate(session, lockArgs(scope));
+      });
+    } catch (error) {
+      // Covers both a writer that never signalled and a reader that failed before binding: either
+      // way the second handshake wait gets an outcome instead of a promise nothing settles.
+      readerBound.reject(error);
+      throw error;
+    }
+  })();
+
+  const writerResult = capture(writer);
+  const readerResult = capture(reader, () => {
+    readerSettled = true;
+  });
+
+  let startupError: unknown;
+  let observedLockWait = false;
+  try {
+    const writerPid = await withDeadline(
+      invalidated.promise,
+      LOCK_WAIT_BUDGET_MS,
+      "the writer's invalidation"
+    );
+    const readerPid = await withDeadline(
+      readerBound.promise,
+      LOCK_WAIT_BUDGET_MS,
+      "the reader's bound session"
+    );
+    observedLockWait = await waitForLockWait(readerPid, writerPid, () => readerSettled);
+  } catch (error) {
+    // Recorded, not thrown: throwing here would skip the release/settle below and leave the very
+    // wedge this harness exists to avoid. The caller reports it first among its assertions.
+    startupError = error;
+  } finally {
+    releaseWriter.resolve();
+  }
+
+  return { startupError, observedLockWait, written: await writerResult, read: await readerResult };
 }
 
 const lockArgs = (scope: Scope, over: Partial<{ workspaceId: string; expectedRevision: number }> = {}) => ({
@@ -889,63 +1014,19 @@ describe("invalidate — one atomic step from readiness to blocked", () => {
     const scope = scopeFor(seed);
     await seedReady(seed, { revision: 0 });
 
-    const invalidated = deferred<number>(); // the writer's backend, after its invalidation
-    const readerBound = deferred<number>(); // the reader's backend, before its locking read
-    const releaseWriter = deferred();
-    let readerSettled = false;
-
-    const writer = tx(async (session) => {
-      const state = await invalidateSlackNamespaceGate(session, scope, "workspace_changed");
-      invalidated.resolve(await backendPid(session));
-      // Held open — and so holding the row lock — until the wait is observed. The `finally` below
-      // releases it on every path, so neither side can wedge.
-      await releaseWriter.promise;
-      return state;
-    });
-
-    const reader = (async () => {
-      await invalidated.promise;
-      return tx(async (session) => {
-        readerBound.resolve(await backendPid(session));
-        // Blocks on the row lock the writer is holding; it resumes only after that commit.
-        return lockReadySlackNamespaceGate(session, lockArgs(scope));
-      });
-    })();
-
-    const writerResult = capture(writer);
-    const readerResult = capture(reader, () => {
-      readerSettled = true;
-    });
-
-    let observedLockWait = false;
-    let written!: Captured<Awaited<typeof writer>>;
-    let read!: Captured<Awaited<typeof reader>>;
-    try {
-      const writerPid = await withDeadline(
-        invalidated.promise,
-        LOCK_WAIT_BUDGET_MS,
-        "the writer's invalidation"
-      );
-      const readerPid = await withDeadline(
-        readerBound.promise,
-        LOCK_WAIT_BUDGET_MS,
-        "the reader's bound session"
-      );
-      observedLockWait = await waitForLockWait(readerPid, writerPid, () => readerSettled);
-    } finally {
-      releaseWriter.resolve();
-      written = await writerResult;
-      read = await readerResult;
-    }
+    const run = await runCompetingInvalidation(scope, (session) =>
+      invalidateSlackNamespaceGate(session, scope, "workspace_changed")
+    );
 
     // A failing side is the root cause; report it before the derived assertions.
-    if (!written.ok) throw written.error;
-    if (!read.ok) throw read.error;
+    if (run.startupError) throw run.startupError;
+    if (!run.written.ok) throw run.written.error;
+    if (!run.read.ok) throw run.read.error;
     // Never a lucky schedule: false here means the reader was never seen waiting on the writer.
-    expect(observedLockWait).toBe(true);
+    expect(run.observedLockWait).toBe(true);
 
-    expect(written.value.revision).toBe(1);
-    expect(read.value).toEqual({ outcome: "refused" });
+    expect(run.written.value.revision).toBe(1);
+    expect(run.read.value).toEqual({ outcome: "refused" });
     const stored = await row(scope);
     expect(stored.state).toBe("blocked");
     expect(stored.revision).toBe("1");
@@ -953,6 +1034,43 @@ describe("invalidate — one atomic step from readiness to blocked", () => {
     expect(stored.resolved_workspace_ids).toEqual([]);
     expect(stored.completed_repair_id).toBeNull();
   }, COMPETING_SESSION_TIMEOUT_MS);
+
+  /**
+   * THE HARNESS ITSELF, ON THE PATH IT USED TO HANG ON. The failure is synthetic and lives entirely
+   * in the test orchestration — the writer operation throws before the startup signal, exactly as a
+   * genuinely broken `invalidateSlackNamespaceGate` would — because a production hook that let a
+   * caller inject a failure into the gate would be a bypass, and the thing under test here is the
+   * ORCHESTRATION above, not the module.
+   *
+   * What it pins: the original cause is what comes back, both sides settle, and the run TERMINATES.
+   * Before the signal carried an error outcome, this scenario left the reader parked on a promise
+   * nothing would settle, the orchestration's own cleanup blocked on that reader, and the writer's
+   * real error was replaced by a timeout — the one shape in which a broken competing-session test
+   * reports something other than what broke.
+   *
+   * The explicit timeout is the negative control and is deliberately WELL BELOW `LOCK_WAIT_BUDGET_MS`:
+   * a regression that re-introduced the deadline path could not fit inside it, so this cannot go
+   * green by waiting.
+   */
+  it("surfaces a writer that fails BEFORE the startup signal, rather than waiting on a signal that never comes", async () => {
+    const seed = await seedTeam();
+    const scope = scopeFor(seed);
+    await seedReady(seed, { revision: 0 });
+
+    const failure = new Error("synthetic pre-signal writer failure");
+    const run = await runCompetingInvalidation(scope, async () => {
+      throw failure;
+    });
+
+    // The ORIGINAL cause, by identity — not a deadline error standing in for it.
+    expect(run.startupError).toBe(failure);
+    expect(failureOf(run.written)).toBe(failure);
+    // The reader settled too, propagating the writer's failure instead of parking on the signal.
+    expect(failureOf(run.read)).toBe(failure);
+    expect(run.observedLockWait).toBe(false);
+    // The writer transaction rolled back, so the fixture is untouched.
+    expect((await row(scope)).state).toBe("ready");
+  }, PRE_SIGNAL_FAILURE_TIMEOUT_MS);
 
   it("serializes two concurrent invalidations into two revisions", async () => {
     const seed = await seedTeam();
