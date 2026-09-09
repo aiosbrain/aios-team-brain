@@ -60,3 +60,7 @@ Opus5 subscription implementation added an unused message-evidence helper,32 new
 ### Packet1 corrections verified
 
 Astra and independent local review identified incomplete author classification and unsafe first-observation conflict selection before integration. Opus replaced conflict selection with a typed whole-batch exception containing sorted IDs only, required explicit known-human flags, and added future-reevaluation and captioned-file exclusion assertions. Coordinator captured8failing regression assertions before fixes, then65passing tests across3suites and typecheck0 at16:14ET. The helper remains unused; later integration/live ACs remain pending.
+
+## Packet2 schema checkpoint — verification pending fixture fix
+
+Checkpoint3ad7035f adds slack_messages and slack_team_state only, plus schema invariants and architecture inventory. Existing items_team_id_id_idx and its deployed migration supply the composite FK; no redundant existing-table migration added. Coordinator fresh isolated database load succeeded;11/12real-Postgres tests passed including populated upgrade/replay. Team-cascade fixture failed because ingest seeded append-only audit rows. Astra approved a test-only minimal raw-SQL fixture, preserving the audit guard and shared lifecycle helpers. Docs drift87tables and typecheck passed. Independent local review found no HIGH/blocker for the inactive backup; remaining fixture verification is not claimed complete. No active writer/reader uses these tables.
