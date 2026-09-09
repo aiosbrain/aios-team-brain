@@ -80,9 +80,8 @@ export type ScannerStaleness = "current" | "stale" | "unknown";
  * (`ingestion/aios_ingest/build.py`), which voids the same shapes to `None` at its own choke
  * point. Both sides must agree on what counts as a version: if the scanner considered a suffixed
  * string valid and sent it, the brain would read `"unknown"` and the repo would flag itself for
- * no reason. The contract deliberately does NOT pin this grammar (its `scanner_state` vectors
- * carry no suffixed cases) — it is the reader's to define, so it is defined here and covered by
- * this repo's unit tests.
+ * no reason. The brain-api 1.24 contract pins this grammar through its `scanner_state` vectors,
+ * including suffix rejection; the contract-conformance and unit tests enforce the same boundary.
  */
 export function parseScannerVersion(
   raw: string | null | undefined
