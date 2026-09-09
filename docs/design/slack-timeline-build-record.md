@@ -56,3 +56,7 @@ The next action is coordinator verification/attachment of the accepted specifica
 ## Implementation checkpoint — pure evidence projection
 
 Opus5 subscription implementation added an unused message-evidence helper,32 new unit cases, and optional bot_id typing. Active ingestion unchanged. Coordinator captured initial missing-helper failure before implementation;20 existing tests passed. After implementation,52 tests across3 suites and npm run typecheck passed at16:03ET2026-09-09. The delegated CLI required Bash approval; coordinator ran checks through normal execution controls. The prior baseline74tests are separate. Routine projection semantics and duplicate-conflict handling remain under Astra adjudication; this checkpoint does not certify integration or live acceptance.
+
+### Packet1 corrections verified
+
+Astra and independent local review identified incomplete author classification and unsafe first-observation conflict selection before integration. Opus replaced conflict selection with a typed whole-batch exception containing sorted IDs only, required explicit known-human flags, and added future-reevaluation and captioned-file exclusion assertions. Coordinator captured8failing regression assertions before fixes, then65passing tests across3suites and typecheck0 at16:14ET. The helper remains unused; later integration/live ACs remain pending.

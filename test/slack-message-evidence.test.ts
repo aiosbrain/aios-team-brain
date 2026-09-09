@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   projectSlackMessageEvidence,
+  SlackEvidenceConflictError,
   type SlackEvidenceUser,
   type SlackMessageEvidence,
 } from "@/lib/ingest/sources/slack-message-evidence";
@@ -37,15 +38,31 @@ const TS_BASE_NEXT_MICRO = "1718900000.000101";
 /** 2026-09-10T00:00:00Z — after NOW. */
 const TS_FUTURE = "1788998400.000000";
 
-const HUMAN: SlackEvidenceUser = { displayName: "Alex" };
+/**
+ * A KNOWN human: the directory was read and it stated BOTH bot flags as false. A record that merely
+ * has a display name is not a classification — see the unknown-flag fixtures below.
+ */
+const HUMAN: SlackEvidenceUser = { displayName: "Alex", isBot: false, isAppUser: false };
 const users: Record<string, SlackEvidenceUser> = {
   U1: HUMAN,
-  U2: { displayName: "Riley" },
-  UBOT: { displayName: "Deploybot", isBot: true },
-  UAPP: { displayName: "Notion", isAppUser: true },
-  UGUEST: { displayName: "Sam (guest)", isRestricted: true },
-  UGONE: { displayName: "Former Teammate", deleted: true },
+  U2: { displayName: "Riley", isBot: false, isAppUser: false },
+  UBOT: { displayName: "Deploybot", isBot: true, isAppUser: false },
+  UAPP: { displayName: "Notion", isBot: false, isAppUser: true },
+  // Flagged a bot while the OTHER flag was never read — still not a person.
+  UBOT_PARTIAL: { displayName: "Halfbot", isBot: true },
+  UAPP_PARTIAL: { displayName: "Halfapp", isAppUser: true },
+  // Present in the directory, but the adapter could not read bot classification at all…
+  UNFLAGGED: { displayName: "Pat" },
+  // …or read only one of the two flags.
+  UHALF: { displayName: "Jo", isBot: false },
+  UGUEST: { displayName: "Sam (guest)", isBot: false, isAppUser: false, isRestricted: true },
+  UGONE: { displayName: "Former Teammate", isBot: false, isAppUser: false, deleted: true },
 };
+
+/** The ledger key a `ts` gets under SCOPE. */
+function id(ts: string): string {
+  return `${SCOPE.workspaceId}:${SCOPE.channelId}:${ts}`;
+}
 
 function project(messages: readonly SlackMessage[], overrides: { now?: Date; users?: Record<string, SlackEvidenceUser> } = {}) {
   return projectSlackMessageEvidence(messages, {
@@ -169,6 +186,26 @@ describe("time — exact UTC instants, and never the ingest clock", () => {
     expect(row.occurredAt).not.toBe(NOW.toISOString());
   });
 
+  it("re-evaluates that same message to ELIGIBLE once the clock passes it — no source edit required", () => {
+    // `unresolved/future_timestamp` is a not-yet verdict, not a durable exclusion: the SAME source
+    // bytes must become creditable purely because time moved. Identity, instant, day and evidence
+    // hash are unchanged across the transition, so re-reading cannot relocate or rewrite the message
+    // — only its eligibility moves.
+    const msg: SlackMessage = { ts: TS_FUTURE, user: "U1", text: "clock skew" };
+    const before = only([msg], { now: NOW });
+    const after = only([msg], { now: new Date("2026-09-10T00:00:01.000Z") });
+
+    expect(before.status).toBe("unresolved");
+    expect(before.reason).toBe("future_timestamp");
+    expect(after.status).toBe("eligible");
+    expect(after.reason).toBeNull();
+
+    expect(after.messageId).toBe(before.messageId);
+    expect(after.occurredAt).toBe(before.occurredAt);
+    expect(after.contributionDay).toBe(before.contributionDay);
+    expect(after.sourceHash).toBe(before.sourceHash);
+  });
+
   it("has no ambient clock: the SAME messages project to the same instants under any `now`", () => {
     const msgs: SlackMessage[] = [{ ts: TS_BASE, user: "U1", text: "hi" }];
     const a = only(msgs, { now: new Date("2026-09-09T12:00:00.000Z") });
@@ -240,20 +277,114 @@ describe("deduplication — one row per exact message id", () => {
     expect(out.messages[0].status).toBe("eligible"); // a broadcast is a normal human message
     expect(out.messages[0].isRoot).toBe(false);
     expect(out.duplicateCount).toBe(1);
-    expect(out.conflictingDuplicateCount).toBe(0);
   });
 
-  it("keeps the first observation but COUNTS a duplicate that disagrees, rather than dropping it silently", () => {
-    // Overlapping pages can straddle an edit. Losing that quietly would make the ledger's change
-    // detection wrong with no trace; the count is the trace.
-    const out = project([
-      { ts: TS_BASE, user: "U1", text: "original" },
-      { ts: TS_BASE, user: "U1", text: "edited mid-scan" },
+  it("folds AGREEING repeats of several messages without complaint", () => {
+    // The negative control for the conflict rule below: repetition alone is ordinary, and a batch
+    // full of it still publishes.
+    const a: SlackMessage = { ts: TS_BASE, user: "U1", text: "one" };
+    const b: SlackMessage = { ts: TS_MIDNIGHT, user: "U2", text: "two" };
+    const out = project([a, b, { ...a }, { ...b }, { ...a }]);
+    expect(out.messages.map((m) => m.messageTs)).toEqual([TS_BASE, TS_MIDNIGHT]);
+    expect(out.duplicateCount).toBe(3);
+  });
+});
+
+describe("contradictory batch — a snapshot that disagrees with itself publishes NOTHING", () => {
+  const original: SlackMessage = { ts: TS_BASE, user: "U1", text: "original" };
+  const edited: SlackMessage = { ts: TS_BASE, user: "U1", text: "edited mid-scan" };
+
+  function conflictFrom(messages: readonly SlackMessage[]): SlackEvidenceConflictError {
+    let caught: unknown;
+    try {
+      project(messages);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SlackEvidenceConflictError);
+    return caught as SlackEvidenceConflictError;
+  }
+
+  it("fails the WHOLE projection rather than returning rows chosen by page order", () => {
+    // Picking either observation would make the published evidence depend on which page arrived
+    // first — the same batch, read in the other order, would credit differently. Neither snapshot is
+    // known-good, so neither may be published; the caller retries and the previous complete evidence
+    // stands untouched.
+    expect(() => project([original, edited])).toThrow(SlackEvidenceConflictError);
+    expect(() => project([edited, original])).toThrow(SlackEvidenceConflictError);
+  });
+
+  it("reports the SAME conflict identity set whichever order the observations arrived in", () => {
+    const forward = conflictFrom([original, edited]);
+    const reversed = conflictFrom([edited, original]);
+    expect(forward.messageIds).toEqual([id(TS_BASE)]);
+    expect(reversed.messageIds).toEqual(forward.messageIds);
+    expect(forward.conflictingMessageCount).toBe(1);
+  });
+
+  it("withholds the UNAFFECTED messages too — a partial batch is not a publishable snapshot", () => {
+    expect(() =>
+      project([{ ts: TS_BEFORE_MIDNIGHT, user: "U2", text: "untouched" }, original, edited])
+    ).toThrow(SlackEvidenceConflictError);
+  });
+
+  it("names every conflicting id, sorted, and no agreeing one", () => {
+    const err = conflictFrom([
+      original,
+      edited,
+      { ts: TS_MIDNIGHT, user: "U1", text: "same words" },
+      { ts: TS_MIDNIGHT, user: "U2", text: "same words" }, // same id, different author
+      { ts: TS_BEFORE_MIDNIGHT, user: "U1", text: "agreeing" },
+      { ts: TS_BEFORE_MIDNIGHT, user: "U1", text: "agreeing" }, // exact repeat: not a conflict
     ]);
-    expect(out.messages).toHaveLength(1);
-    expect(out.messages[0].sourceHash).toBe(only([{ ts: TS_BASE, user: "U1", text: "original" }]).sourceHash);
-    expect(out.duplicateCount).toBe(1);
-    expect(out.conflictingDuplicateCount).toBe(1);
+    expect(err.messageIds).toEqual([id(TS_BASE), id(TS_MIDNIGHT)]);
+    expect(err.messageIds).toEqual([...err.messageIds].sort()); // stable across page order
+    expect(err.conflictingMessageCount).toBe(2);
+    expect(err.messageIds).not.toContain(id(TS_BEFORE_MIDNIGHT));
+  });
+
+  it("counts one conflicting id once however many disagreeing observations there were", () => {
+    const err = conflictFrom([original, edited, { ts: TS_BASE, user: "U1", text: "edited again" }]);
+    expect(err.messageIds).toEqual([id(TS_BASE)]);
+    expect(err.conflictingMessageCount).toBe(1);
+  });
+
+  it("carries NO raw message content — only ids an operator can look up", () => {
+    const err = conflictFrom([original, edited]);
+    for (const secret of ["original", "edited mid-scan"]) {
+      expect(err.message).not.toContain(secret);
+      expect(JSON.stringify(err.messageIds)).not.toContain(secret);
+    }
+    expect(err.message).toContain(id(TS_BASE));
+    expect(err.name).toBe("SlackEvidenceConflictError");
+  });
+
+  it("conflicts on AUTHOR and on THREAD PLACEMENT, not only on text", () => {
+    // A disagreement is not necessarily an edit — a malformed or mixed page can restate the same id
+    // with a different author or a different root, and either would move the credit.
+    expect(() =>
+      project([
+        { ts: TS_BASE, user: "U1", text: "same" },
+        { ts: TS_BASE, user: "U2", text: "same" },
+      ])
+    ).toThrow(SlackEvidenceConflictError);
+    expect(() =>
+      project([
+        { ts: TS_BASE_NEXT_MICRO, thread_ts: TS_BASE, user: "U1", text: "same" },
+        { ts: TS_BASE_NEXT_MICRO, user: "U1", text: "same" },
+      ])
+    ).toThrow(SlackEvidenceConflictError);
+  });
+
+  it("does not treat a broadcast returned by two endpoints as a conflict", () => {
+    const broadcast: SlackMessage = {
+      ts: TS_BASE_NEXT_MICRO,
+      thread_ts: TS_BASE,
+      user: "U2",
+      text: "also sending to channel",
+      subtype: "thread_broadcast",
+    };
+    expect(() => project([broadcast, { ...broadcast }])).not.toThrow();
   });
 });
 
@@ -281,6 +412,21 @@ describe("eligibility — who earns a person's work credit", () => {
     expect(only([{ ts: TS_BASE, user: "UAPP", text: "page updated" }]).reason).toBe("bot_identity");
   });
 
+  it("excludes a flagged bot even when the OTHER flag was never read", () => {
+    // A positive bot signal is decisive on its own; it does not degrade to "unclassified" merely
+    // because the record is incomplete.
+    expect(only([{ ts: TS_BASE, user: "UBOT_PARTIAL", text: "deployed" }]).status).toBe("excluded");
+    expect(only([{ ts: TS_BASE, user: "UBOT_PARTIAL", text: "deployed" }]).reason).toBe("bot_identity");
+    expect(only([{ ts: TS_BASE, user: "UAPP_PARTIAL", text: "page updated" }]).reason).toBe("bot_identity");
+  });
+
+  it("credits only a KNOWN human — both bot flags read and both false", () => {
+    const row = only([{ ts: TS_BASE, user: "U1", text: "hi" }]);
+    expect(users.U1.isBot).toBe(false); // the fixture states the classification, it does not imply it
+    expect(users.U1.isAppUser).toBe(false);
+    expect(row.status).toBe("eligible");
+  });
+
   it("leaves an author it cannot classify UNRESOLVED rather than assuming human", () => {
     // Directory present but this user is absent from it…
     const missing = only([{ ts: TS_BASE, user: "UNKNOWN1", text: "hi" }]);
@@ -294,7 +440,22 @@ describe("eligibility — who earns a person's work credit", () => {
     expect(noDirectory.reason).toBe("author_unclassified");
   });
 
+  it("treats a directory record with UNREAD bot flags as unclassified — a display name is not a classification", () => {
+    // The failure this pins: an adapter that can list names but cannot read `is_bot`/`is_app_user`
+    // would otherwise hand every author in the workspace a person's credit.
+    const noFlags = only([{ ts: TS_BASE, user: "UNFLAGGED", text: "hi" }]);
+    expect(noFlags.status).toBe("unresolved");
+    expect(noFlags.reason).toBe("author_unclassified");
+
+    // Half a classification is not one either: `is_bot:false` alone leaves app-user unknown.
+    const halfRead = only([{ ts: TS_BASE, user: "UHALF", text: "hi" }]);
+    expect(halfRead.status).toBe("unresolved");
+    expect(halfRead.reason).toBe("author_unclassified");
+  });
+
   it("still credits guests and deactivated people — they are source identities, not bots", () => {
+    // Both are directory records with the bot flags READ and false; the guest/deleted flags are
+    // beside the point, which is exactly the property under test.
     expect(only([{ ts: TS_BASE, user: "UGUEST", text: "here is the spec" }]).status).toBe("eligible");
     expect(only([{ ts: TS_BASE, user: "UGONE", text: "handing over" }]).status).toBe("eligible");
   });
@@ -307,8 +468,8 @@ describe("eligibility — who earns a person's work credit", () => {
     expect(row.qualifiedAuthorId).toBeNull();
   });
 
-  it("excludes structural and file-only messages with a reason, keeping the current ingest filter", () => {
-    for (const subtype of ["channel_join", "channel_leave", "channel_topic", "file_share", "message_changed"]) {
+  it("excludes structural subtypes with a reason, keeping the current ingest filter", () => {
+    for (const subtype of ["channel_join", "channel_leave", "channel_topic", "message_changed"]) {
       const row = only([{ ts: TS_BASE, user: "U1", text: "x", subtype }]);
       expect(row.status).toBe("excluded");
       expect(row.reason).toBe("unsupported_subtype");
@@ -316,11 +477,28 @@ describe("eligibility — who earns a person's work credit", () => {
     }
   });
 
-  it("excludes a message with no renderable text (an attachment-only post)", () => {
+  it("excludes a file_share EVEN WITH A CAPTION — attachment scope is unchanged, not newly eligible", () => {
+    // A captioned file post carries real text, so this exclusion is a deliberate subtype policy, not
+    // an accident of emptiness. Broadening attachment semantics is a separate decision; until it is
+    // taken, such a post is reported as `unsupported_subtype` and never silently as "no text".
+    const captioned = only([
+      { ts: TS_BASE, user: "U1", text: "here are the Q3 numbers", subtype: "file_share" },
+    ]);
+    expect(captioned.status).toBe("excluded");
+    expect(captioned.reason).toBe("unsupported_subtype");
+    expect(captioned.subtype).toBe("file_share");
+
+    // …and the caption-less one lands on the same verdict, by subtype, not by blankness.
+    const bare = only([{ ts: TS_BASE, user: "U1", text: "", subtype: "file_share" }]);
+    expect(bare.reason).toBe("unsupported_subtype");
+  });
+
+  it("excludes a message with NO subtype and no renderable text, separately, as no_text", () => {
     for (const text of [undefined, "", "   \n "]) {
       const row = only([{ ts: TS_BASE, user: "U1", text }]);
       expect(row.status).toBe("excluded");
       expect(row.reason).toBe("no_text");
+      expect(row.subtype).toBeNull();
     }
   });
 
@@ -341,7 +519,11 @@ describe("source hash — raw evidence only", () => {
   it("does not move when a display name changes", () => {
     const before = project(thread).messages.map((m) => m.sourceHash);
     const after = project(thread, {
-      users: { ...users, U1: { displayName: "Alexandra Ruiz-Nakamura" }, U2: { displayName: "riley.k" } },
+      users: {
+        ...users,
+        U1: { ...users.U1, displayName: "Alexandra Ruiz-Nakamura" },
+        U2: { ...users.U2, displayName: "riley.k" },
+      },
     }).messages.map((m) => m.sourceHash);
     expect(after).toEqual(before);
   });

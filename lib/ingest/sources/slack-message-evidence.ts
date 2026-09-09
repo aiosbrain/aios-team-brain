@@ -35,10 +35,17 @@ export interface SlackEvidenceScope {
  * `deleted` (deactivated) and the guest flags are carried because the design requires deactivated
  * people and guests to remain creditable source identities — recording them here makes that a
  * property this module is pinned to rather than one it merely happens to have.
+ *
+ * The bot flags are optional because a directory record can be PARTIAL, and the difference matters:
+ * `false` is a classification the provider stated, `undefined` is one nobody read. A record that has
+ * only a display name says nothing about whether its owner is a person, so it cannot earn credit —
+ * see `classify`.
  */
 export interface SlackEvidenceUser {
   displayName?: string;
+  /** `false` = the directory stated "not a bot". `undefined` = unread, which is NOT "not a bot". */
   isBot?: boolean;
+  /** Same three-way reading as `isBot`. */
   isAppUser?: boolean;
   deleted?: boolean;
   isRestricted?: boolean;
@@ -103,12 +110,45 @@ export interface SlackMessageEvidence {
 export interface SlackEvidenceProjection {
   /** One row per distinct message id, ordered by instant then id. Unparseable instants sort last. */
   messages: SlackMessageEvidence[];
-  /** Observations folded into an existing row (overlapping pages, thread broadcasts). */
+  /**
+   * Observations folded into an existing row (overlapping pages, thread broadcasts). They AGREED —
+   * a batch containing any disagreement never produces a projection at all
+   * (`SlackEvidenceConflictError`).
+   */
   duplicateCount: number;
-  /** …of which disagreed on `sourceHash` — an edit straddling two pages. Counted, not hidden. */
-  conflictingDuplicateCount: number;
   /** Observations with no `ts` at all: they cannot be identified, so they cannot become rows. */
   unidentifiableCount: number;
+}
+
+/**
+ * One batch restated the same message id with DIFFERENT evidence, so the batch is not a snapshot of
+ * anything and none of it may be published.
+ *
+ * Choosing between the two observations — first, last, or by any total order over hashes — would make
+ * the published evidence a function of page arrival order: the same two pages read the other way
+ * round yield a different body, a different author, or a different thread placement, and therefore
+ * potentially different credit. Neither observation is known-good, so the caller must re-read; its
+ * job stays pending and whatever complete evidence already exists is left standing.
+ *
+ * Carries the conflicting ids ONLY — `<workspace>:<channel>:<ts>`, sorted, each once. No message text
+ * reaches an error string, a log line or a retry payload.
+ */
+export class SlackEvidenceConflictError extends Error {
+  /** Sorted, de-duplicated ledger ids that disagreed. Stable regardless of observation order. */
+  readonly messageIds: readonly string[];
+  /** How many distinct message ids disagreed — not how many observations did. */
+  readonly conflictingMessageCount: number;
+
+  constructor(messageIds: readonly string[]) {
+    const ids = [...new Set(messageIds)].sort();
+    super(
+      `slack evidence: ${ids.length} message id(s) observed with conflicting evidence in one batch; ` +
+        `nothing was projected. Re-read the source. Ids: ${ids.join(", ")}`
+    );
+    this.name = "SlackEvidenceConflictError";
+    this.messageIds = ids;
+    this.conflictingMessageCount = ids.length;
+  }
 }
 
 /** Slack `ts` is `<epoch-seconds>.<microseconds>`; anything else has no defensible instant. */
@@ -196,10 +236,20 @@ function classify(
   if (!m.text || !m.text.trim()) return { status: "excluded", reason: "no_text" };
 
   const user = opts.users?.[m.user];
-  if (user?.isBot || user?.isAppUser) return { status: "excluded", reason: "bot_identity" };
-  // No directory, or an author absent from it. Guests and deactivated people ARE creditable, so the
-  // fallback cannot be "human"; it is "not decided", which credits nobody and can be re-read later.
-  if (!user) return { status: "unresolved", reason: "author_unclassified" };
+  // A positive bot signal is decisive on its own, even from a partial record: half a record that
+  // says "bot" still says bot.
+  if (user?.isBot === true || user?.isAppUser === true) {
+    return { status: "excluded", reason: "bot_identity" };
+  }
+  // Credit requires a KNOWN human: the directory was read and stated BOTH flags false. Anything less
+  // — no directory, an author absent from it, or a record carrying only a display name — is "not
+  // decided", which credits nobody and can be re-read later. Guests and deactivated people ARE
+  // creditable, so the fallback may not be "human"; and a name is not a classification, so an adapter
+  // that can list people but cannot read `is_bot`/`is_app_user` must not thereby promote a whole
+  // workspace to human.
+  if (!user || user.isBot !== false || user.isAppUser !== false) {
+    return { status: "unresolved", reason: "author_unclassified" };
+  }
 
   // Clock skew, not a contribution. The instant is kept exactly as the source stated it — it is
   // never clamped to `now` — and the verdict is re-evaluable once the clock passes it.
@@ -234,9 +284,14 @@ function assertScope(scope: SlackEvidenceScope): void {
  *
  * Duplicates are expected, not exceptional: a `thread_broadcast` is returned by both
  * `conversations.history` and `conversations.replies`, and overlapping pages re-deliver messages by
- * design. The FIRST observation of an id wins so a batch's result never depends on page order; a
- * duplicate that disagrees is counted rather than dropped silently, because a disagreement means an
- * edit landed mid-scan and the ledger's change detection needs to know.
+ * design. Repeats that AGREE fold into one row and are counted.
+ *
+ * A repeat that DISAGREES is different in kind, and this function refuses the whole batch
+ * (`SlackEvidenceConflictError`) rather than picking one. A disagreement is not necessarily an edit
+ * that landed mid-scan — a malformed page, or two pages mixing different reads of the same thread,
+ * produce it too — so there is no observation that is known to be the current one. Publishing either
+ * would make the result depend on page order. All conflicting ids are collected before throwing, so
+ * the reported set is the same however the pages arrived.
  */
 export function projectSlackMessageEvidence(
   messages: readonly SlackMessage[],
@@ -249,8 +304,8 @@ export function projectSlackMessageEvidence(
   const { workspaceId, channelId } = opts.scope;
 
   const byId = new Map<string, { row: SlackMessageEvidence; instant: ParsedInstant | null }>();
+  const conflictingIds = new Set<string>();
   let duplicateCount = 0;
-  let conflictingDuplicateCount = 0;
   let unidentifiableCount = 0;
 
   for (const m of messages) {
@@ -266,8 +321,8 @@ export function projectSlackMessageEvidence(
 
     const seen = byId.get(messageId);
     if (seen) {
-      duplicateCount++;
-      if (seen.row.sourceHash !== hash) conflictingDuplicateCount++;
+      if (seen.row.sourceHash !== hash) conflictingIds.add(messageId);
+      else duplicateCount++;
       continue;
     }
 
@@ -294,6 +349,10 @@ export function projectSlackMessageEvidence(
     });
   }
 
+  // After the whole batch, never mid-loop: an early throw would report only the conflicts observed
+  // before it, which is precisely the order dependence this rule exists to remove.
+  if (conflictingIds.size > 0) throw new SlackEvidenceConflictError([...conflictingIds]);
+
   const ordered = [...byId.values()].sort((a, b) => {
     if (!a.instant || !b.instant) {
       if (a.instant) return -1; // unplaceable rows sort last, deterministically among themselves
@@ -308,7 +367,6 @@ export function projectSlackMessageEvidence(
   return {
     messages: ordered.map((e) => e.row),
     duplicateCount,
-    conflictingDuplicateCount,
     unidentifiableCount,
   };
 }
