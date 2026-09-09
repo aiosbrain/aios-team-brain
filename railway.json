@@ -1,6 +1,8 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
+    "healthcheckPath": "/api/health",
+    "healthcheckTimeout": 120,
     "preDeployCommand": "npm run pg:schema",
     "startCommand": "sh scripts/railway-start.sh"
   }

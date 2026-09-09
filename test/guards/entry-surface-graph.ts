@@ -1423,6 +1423,13 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "the connectors CLI `verify` leg calls runManualSync, which since AUDITFIX-14 awaits the same " +
       "bounded 25-candidate pass as the dashboard command — pending is reported, not hidden",
   },
+  "scripts/staging-ops/source-read-oracle.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "the source-side staging oracle imports only GET from app/api/v1/items/route and invokes that " +
+      "handler to verify pre-copy visibility. The route module also exports POST, which reaches " +
+      "ingestItem, but this surface performs no ingest operation",
+  },
   "scripts/backfill-meeting-summaries.ts": {
     class: "IMPORT_ONLY",
     reason:

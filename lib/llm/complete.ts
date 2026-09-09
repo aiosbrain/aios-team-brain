@@ -12,6 +12,7 @@ import {
 } from "@/lib/costs/llm-usage";
 import { estimateAnthropicCostUsd } from "@/lib/llm/cost";
 import type { DbClient } from "@/lib/db/types";
+import { assertCopiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 
 /**
  * THE single-shot text-completion primitive for every non-streaming LLM task in the brain — meeting
@@ -369,6 +370,7 @@ const httpError = (backend: { model: string; baseUrl?: string }, status: number,
   );
 
 export async function completeText(args: CompleteArgs, opts: CompleteOptions = {}): Promise<string> {
+  assertCopiedStagingSpendAllowed("background");
   const keys = opts.keys ?? {};
   const maxTokens = opts.maxTokens ?? 1024;
   const timeoutMs = opts.timeoutMs ?? 30_000;

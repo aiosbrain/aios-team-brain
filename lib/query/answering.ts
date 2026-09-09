@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { getProviderSettings } from "@/lib/integrations/manage";
 import type { AnsweringProvider, ExtractionProvider, LlmBackendKeys } from "@/lib/query/llm-backend";
+import { assertCopiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
 
 /**
  * The single place the answer path assembles a team's LLM backend keys: every provider's decrypted
@@ -39,7 +40,12 @@ export function normalizeExtractionProvider(raw: unknown): ExtractionProvider | 
     : null;
 }
 
-export async function resolveAnsweringKeys(db: DbClient, teamId: string): Promise<LlmBackendKeys> {
+export async function resolveAnsweringKeys(
+  db: DbClient,
+  teamId: string,
+  purpose: "interactive-query" | "background" = "background"
+): Promise<LlmBackendKeys> {
+  assertCopiedStagingSpendAllowed(purpose);
   const [anthropic, openai, openrouter, teamRes] = await Promise.all([
     getProviderSettings(db, teamId, "anthropic"),
     getProviderSettings(db, teamId, "openai"),

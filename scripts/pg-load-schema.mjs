@@ -19,6 +19,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { assertServiceIdentity } from "./service-guard.mjs";
+import { acquireDataUseLock, hasExclusiveDataUseLock } from "./staging-ops/journal.mjs";
+import { classifyFenceAdmission, stagingFenceScope } from "./staging-ops/fence-admission.mjs";
 
 export function shouldUseSsl(databaseUrl, env = process.env) {
   return (
@@ -33,6 +35,7 @@ export async function loadSchema({
   databaseUrl = process.env.DATABASE_URL,
   env = process.env,
   createClient,
+  connectedClient,
   readFile = readFileSync,
   exists = existsSync,
   readDir = readdirSync,
@@ -51,7 +54,7 @@ export async function loadSchema({
   const useSsl = shouldUseSsl(databaseUrl, env);
 
   const makeClient = createClient ?? ((config) => new Client(config));
-  const client = makeClient({
+  const client = connectedClient ?? makeClient({
     connectionString: databaseUrl,
     ssl: useSsl ? { rejectUnauthorized: false } : undefined,
   });
@@ -59,8 +62,28 @@ export async function loadSchema({
   // listener, which made a migration's "reported count" claim false on the only rollout path —
   // the stranded-corrections report is a documented decision input, not decoration.
   client.on?.("notice", (n) => console.log(`[pg notice] ${n.message}`));
-  await client.connect();
+  const ownsClient = !connectedClient;
+  if (ownsClient) await client.connect();
   try {
+    const fenceScope = stagingFenceScope(env);
+    if (fenceScope.inspect) {
+      if (connectedClient) {
+        if (!(await hasExclusiveDataUseLock(client))) throw new Error("copy-mode injected schema loader requires the same session to hold the exclusive data-use lock");
+      } else {
+        // Held for the WHOLE migration, and released only when this client ends (B1/AC-06).
+        // NON-BLOCKING (M4): a preDeploy that queues behind an in-flight exclusive import waits for
+        // the whole import with no diagnostic, which is an outage wearing a lock wait. Refuse
+        // promptly and by name instead; the deploy retries. The exclusive-owner branch above is the
+        // injected loader and is deliberately unchanged.
+        if (!(await acquireDataUseLock(client, "shared", false))) {
+          throw new Error("staging schema loader refused: staging maintenance holds the exclusive data-use lock");
+        }
+      }
+      // The SAME activation-aware admission as startup. The importer path is already protected by
+      // this session's exclusive lock; it still classifies mode/enrollment, but journal lifecycle
+      // admission belongs to the importing owner rather than to a process trying to boot.
+      await classifyFenceAdmission(client, env, "staging schema loader", { requireBootAdmission: !connectedClient });
+    }
     // Bound how long any DDL below will WAIT for a table lock (not how long it runs once acquired —
     // a legit long CREATE INDEX is unaffected). This runs on every deploy (Railway preDeployCommand),
     // so without it a single stuck reader holding ACCESS SHARE makes an `ALTER` wait forever at the
@@ -82,7 +105,7 @@ export async function loadSchema({
       logger.log(`✓ postgres/migrations/${f} applied`);
     }
   } finally {
-    await client.end();
+    if (ownsClient) await client.end();
   }
 }
 

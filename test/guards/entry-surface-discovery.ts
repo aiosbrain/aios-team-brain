@@ -59,6 +59,9 @@ import {
 export const WALKED_ROOTS = ["app", "components", "lib", "scripts"] as const;
 
 export const NOT_WALKED_ROOTS: Record<string, string> = {
+  // Added by the staging paired-refresh work: runner env examples and the schedule/storage
+  // contract are declarative data, so none of these files can write an item.
+  config: "runner configuration examples + the schedules/storage contract (no executable source)",
   docker: "container bootstrap (.mjs/.sh); calls the drain rather than the writer",
   docs: "prose",
   fixtures: "test data",

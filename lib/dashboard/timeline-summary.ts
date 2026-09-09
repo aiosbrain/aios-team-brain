@@ -2,6 +2,7 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { LlmBackendKeys } from "@/lib/query/llm-backend";
 import { resolveAnsweringKeys } from "@/lib/query/answering";
+import { modelFeaturesEnabled } from "@/lib/staging/model-features";
 import { completeTextOrNull, failLlmPassBeforeFirstCall, withLlmPass, type LlmPass } from "@/lib/llm/complete";
 import { summaryPromptFor, type TimelineDay } from "./timeline-group";
 
@@ -102,6 +103,12 @@ async function summarizeWithPass(
   days: TimelineDay[],
   pass: LlmPass
 ): Promise<SummaryPassResult> {
+  // M9: "this deployment has no model" is a CONFIGURATION CHOICE, and the catch below is for
+  // failures. Letting the throw land there recorded a degraded LLM pass on every timeline read of a
+  // copied staging deployment — a permanent red mark for behaving exactly as specified, and one
+  // that would mask a real resolution failure sitting next to it. Same outcome as `!llmConfigured`:
+  // summaries are off, nothing is degraded, nothing is recorded.
+  if (!modelFeaturesEnabled("background")) return { days, degraded: false };
   let keys: LlmBackendKeys;
   try {
     keys = await resolveAnsweringKeys(db, teamId);

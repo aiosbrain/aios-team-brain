@@ -3,6 +3,7 @@ import { runSlackIngestion, runPlaneIngestion, runLinearIngestion, runGithubInge
 import { adminClient } from "@/lib/db/admin";
 import { recordIngestRun } from "./runs";
 import { runManualContextPass } from "@/lib/ingest/manual-context";
+import { manualIngestionVerdict } from "@/lib/staging/ingest-policy";
 import { runLinearInbound, type InboundRunSummary } from "@/lib/pm-sync/inbound";
 
 /**
@@ -40,6 +41,11 @@ export interface ManualSyncResult {
   created: number;
   updated: number;
   errors: number;
+  /**
+   * The deployment refused the operation before it began (AC-07 copied staging). NOT an error and
+   * NOT a completed scrape: zero counts here mean "nothing ran", never "nothing to do".
+   */
+  refused?: boolean;
 }
 
 type RunCounts = {
@@ -62,6 +68,16 @@ type Leg = {
 
 /** Run every enabled source for the team and summarize. One source failing never fails the others. */
 export async function runManualSync(teamId: string): Promise<ManualSyncResult> {
+  // AC-07: on a copied staging deployment the WHOLE operation is disabled — no connector leg, no
+  // Linear inbound stage, no context pass, no ledger row. Deliberately the first statement: letting
+  // the legs run and refuse would hand the AUDITFIX-14 context stage the very trigger it is designed
+  // to act on (a failed import is not evidence that nothing was written), and a disabled deployment
+  // would then do reconciliation work it was told not to do. This also covers `scripts/connectors.ts`,
+  // which calls straight in here with no route or action above it.
+  const gate = await manualIngestionVerdict();
+  if (!gate.allowed) {
+    return { summary: `**Scrape unavailable** — ${gate.message}`, created: 0, updated: 0, errors: 0, refused: true };
+  }
   const attempt = async (label: string, source: Leg["source"], p: Promise<RunCounts>): Promise<Leg> => {
     try {
       return { label, source, counts: await p, thrown: null };

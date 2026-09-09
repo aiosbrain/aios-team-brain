@@ -45,6 +45,13 @@ vi.mock("@/lib/db/admin", () => ({ adminClient: () => ({ __marker: "admin-db" })
 vi.mock("@/lib/ingest/manual-context", () => ({
   runManualContextPass: h.runManualContextPass,
 }));
+// This file is about an ENABLED deployment. Pinned explicitly so the orchestration assertions never
+// depend on a DB read failing to reach the production verdict; the copied-staging refusal and its
+// production positive control live in `test/manual-sync-copy-mode.test.ts`.
+vi.mock("@/lib/staging/ingest-policy", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  manualIngestionVerdict: async () => ({ allowed: true, code: null, message: null }),
+}));
 
 import { runManualSync } from "@/lib/ingest/manual-sync";
 
