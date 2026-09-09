@@ -451,8 +451,9 @@ round into equality. Both runtimes exercise the same boundary fixtures. The flee
 and passes it to the card badge, so recorded provenance reaches the tooltip as well as the detail view.
 NEEDS A MIGRATION: `postgres/migrations/20260831120000_code_metrics_scanner_identity.sql`.
 Railway runs `pg:schema` automatically before deployment, including the schema mirror and this
-migration. For the AIOS instance, obtain Chetan's approval and complete the Railway rehearsal
-**before merging**; deferring a manual migration command does not defer the production DDL.
+migration. Validate the exact candidate on Railway staging before production release; integration
+uses `staging`, and production promotion follows `docs/RELEASING.md`. Deferring a manual migration
+command does not defer the deployed artifact's DDL.
 
 Brain API 1.19 opens `POST /api/v1/query` to delegated `aiosd_*` tokens (Phase B slice 3, spec
 §10/§17-B), retiring 1.18's 403 `delegation_not_supported` on that route. A delegated query is
