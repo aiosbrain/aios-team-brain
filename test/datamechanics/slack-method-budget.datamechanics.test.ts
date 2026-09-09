@@ -6,6 +6,7 @@ import type { TransactionSession } from "@/lib/db/types";
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import {
   extendSlackMethodBackoff,
+  markSlackMethodBlocked,
   reserveSlackMethodSlot,
   SLACK_BACKOFF_FLOOR_MS,
   SLACK_UNKNOWN_CATEGORY_INTERVAL_MS,
@@ -49,6 +50,8 @@ import { db, seedTeam, type Seed } from "./helpers";
 
 const WORKSPACE = "T0BUDGET1";
 const OTHER_WORKSPACE = "T0BUDGET2";
+/** A third workspace, so the replay fixture below can carry an UNBLOCKED fold as its control. */
+const THIRD_WORKSPACE = "T0BUDGET3";
 const APP = "A0BUDGET1";
 const OTHER_APP = "A0BUDGET2";
 const BOT_TOKEN = "xoxb-synthetic-not-a-real-token";
@@ -224,6 +227,9 @@ describe("slack_method_budgets — the columns this slice may own", () => {
     );
     expect(rows.map((r) => r.column_name)).toEqual([
       "app_id",
+      // A CATEGORY, never a header, a date or a payload: the one exceptional state the clock cannot
+      // express. A `blocked_until` column here would be the fabricated deadline the design refuses.
+      "blocked_reason",
       "created_at",
       "id",
       "integration_id",
@@ -314,6 +320,37 @@ describe("slack_method_budgets — the columns this slice may own", () => {
       )
     ).toMatchObject({ code: "23514" });
     expect(await rowCount(seed.teamId)).toBe(0);
+  });
+
+  /**
+   * `blocked_reason` is a CLOSED taxonomy at the database, like `method` and unlike a provider
+   * vocabulary: it exists so an exceptional state cannot be expressed as a date, and an open text
+   * column would let arbitrary provider text — or a `blocked_until` in disguise — land in it.
+   */
+  it("admits null and the one blocked category, and refuses anything else by name", async () => {
+    const seed = await seedTeam();
+    const base = {
+      team_id: seed.teamId,
+      scope_kind: "verified",
+      workspace_id: WORKSPACE,
+      app_id: APP,
+    };
+
+    // Unblocked is the DEFAULT, not something a writer has to remember to say.
+    await insertRaw({ ...base, method: "users.list" });
+    expect((await rowOf(verified(seed), "users.list")).blocked_reason).toBeNull();
+    await insertRaw({
+      ...base,
+      method: "conversations.info",
+      blocked_reason: "retry_after_unrepresentable",
+    });
+
+    for (const blocked_reason of ["", "retry_after_unrepresentable ", "blocked", "2026-09-09"]) {
+      expect(
+        await refusal(insertRaw({ ...base, method: "conversations.history", blocked_reason }))
+      ).toMatchObject({ code: "23514", constraint: "slack_method_budgets_blocked_reason" });
+    }
+    expect(await rowCount(seed.teamId)).toBe(2);
   });
 
   it("keeps one bucket per scope and method", async () => {
@@ -598,6 +635,13 @@ describe("reserve — one slot, once, decided by the database", () => {
       for (const operation of [
         () => reserveSlackMethodSlot(session, scope, "conversations.history"),
         () => extendSlackMethodBackoff(session, scope, "conversations.history", { retryAfterMs: 30_000 }),
+        () =>
+          markSlackMethodBlocked(
+            session,
+            scope,
+            "conversations.history",
+            "retry_after_unrepresentable"
+          ),
       ]) {
         try {
           inner.push({ returned: await operation() });
@@ -608,7 +652,7 @@ describe("reserve — one slot, once, decided by the database", () => {
       throw new Error("rollback");
     }).catch(() => {});
 
-    expect(inner).toHaveLength(2);
+    expect(inner).toHaveLength(3);
     for (const outcome of inner) {
       expect(outcome.threw).toBeDefined();
       expect("returned" in outcome).toBe(false);
@@ -739,6 +783,160 @@ describe("backoff — the deadline only ever moves later", () => {
     // told us to stop.
     expect(floored.retryAfterMs).toBeGreaterThan(SLACK_BACKOFF_FLOOR_MS / 2);
     expect((await tx((s) => reserveSlackMethodSlot(s, scope, "users.list"))).outcome).toBe("deferred");
+  });
+});
+
+// ── the durable block marker ─────────────────────────────────────────────────
+
+/**
+ * A BLOCK is not a long cooldown. It records that the provider stated a duration this path cannot
+ * carry, on a bucket whose only other state is a date — and the deliberate consequence is that the
+ * date stops deciding: no elapsed deadline, no ordinary write and no other caller releases it.
+ *
+ * The counterexample this section exists for: the marker used to live nowhere. The bucket kept only
+ * the reservation's own 60-second deadline, so a second process sharing that provider allowance —
+ * which is what a method bucket IS — was free to request again a minute later, inside a window the
+ * provider had refused in a unit we could not represent.
+ */
+describe("block — a marker no deadline and no ordinary write releases", () => {
+  it("marks the exact bucket without moving its deadline, and never grants it again", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    const granted = await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.history"));
+    if (granted.outcome !== "granted") throw new Error("unreachable");
+    const reserved = await rowOf(scope, "conversations.history");
+
+    const block = await tx((s) =>
+      markSlackMethodBlocked(s, scope, "conversations.history", "retry_after_unrepresentable")
+    );
+
+    expect(block).toEqual({
+      scope,
+      method: "conversations.history",
+      reason: "retry_after_unrepresentable",
+    });
+    const marked = await rowOf(scope, "conversations.history");
+    expect(marked.blocked_reason).toBe("retry_after_unrepresentable");
+    // The DEADLINE is untouched — the marker does not re-date the bucket, in either direction. A
+    // marker that also reset the clock would be the fabricated deadline this design refuses, and one
+    // that pushed it out would be a cooldown we invented a duration for.
+    expect(marked.next_permitted_at).toEqual(reserved.next_permitted_at);
+    expect(marked.id).toBe(reserved.id);
+    expect(await rowCount(seed.teamId)).toBe(1);
+
+    // ⚠️ clock fixture — the reservation's whole interval elapses, and the answer is STILL blocked.
+    // This is the exact schedule the un-persisted version got wrong.
+    await rewind(scope, "conversations.history", SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 60_000);
+    const after = await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.history"));
+    expect(after).toEqual({
+      outcome: "blocked",
+      scope,
+      method: "conversations.history",
+      reason: "retry_after_unrepresentable",
+    });
+    // No retry-at is promised, because there is nothing truthful to promise: recovery is an operator
+    // action, and a date here would be read as a schedule by the first caller that saw it.
+    expect("nextPermittedAt" in after).toBe(false);
+    expect("retryAfterMs" in after).toBe(false);
+    // A refused reservation reserved nothing either: the whole row is as the marker left it.
+    expect(await rowOf(scope, "conversations.history")).toMatchObject({
+      blocked_reason: "retry_after_unrepresentable",
+    });
+  });
+
+  /**
+   * The BLOCK IS THE BUCKET'S, and the bucket is one (team, scope, method). A block that spread
+   * wider would stop a workspace's whole ingestion over one method's refusal; one that spread
+   * narrower — per caller — is the hole this marker closes.
+   */
+  it("blocks that one bucket only, and leaves every neighbouring bucket granting", async () => {
+    const seed = await seedTeam();
+    const other = await seedTeam();
+    const scope = verified(seed);
+    await tx((s) =>
+      markSlackMethodBlocked(s, scope, "conversations.history", "retry_after_unrepresentable")
+    );
+
+    // Each differs from the blocked bucket in exactly ONE key field, so a grant is evidence about
+    // that field alone.
+    const neighbours: [SlackMethodScope, SlackBudgetedMethod][] = [
+      [scope, "conversations.replies"],
+      [verified(seed, { appId: OTHER_APP }), "conversations.history"],
+      [verified(seed, { workspaceId: OTHER_WORKSPACE }), "conversations.history"],
+      [verified(other), "conversations.history"],
+      [bootstrap(seed), "bots.info"],
+    ];
+    for (const [neighbour, method] of neighbours) {
+      expect((await tx((s) => reserveSlackMethodSlot(s, neighbour, method))).outcome).toBe("granted");
+    }
+    // …and the blocked one still is, so the five grants are not "everything grants".
+    expect((await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.history"))).outcome).toBe(
+      "blocked"
+    );
+  });
+
+  /**
+   * NO ORDINARY OPERATION CLEARS IT. There is deliberately no unblock function, no reset API and no
+   * clearing on a token or config change — the same provider bucket is still refusing — so the only
+   * paths that touch a blocked row must leave the marker exactly where it is.
+   */
+  it("survives ensure, backoff and repeated reservations", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    await tx((s) => reserveSlackMethodSlot(s, scope, "users.list"));
+    await tx((s) => markSlackMethodBlocked(s, scope, "users.list", "retry_after_unrepresentable"));
+
+    // An ordinary 429 with a perfectly readable Retry-After: it may extend the deadline, and it may
+    // not turn a blocked bucket back into a merely busy one.
+    const backoff = await tx((s) =>
+      extendSlackMethodBackoff(s, scope, "users.list", { retryAfterMs: 120_000 })
+    );
+    expect((await rowOf(scope, "users.list")).blocked_reason).toBe("retry_after_unrepresentable");
+    expect(backoff.retryAfterMs).toBeGreaterThan(SLACK_UNKNOWN_CATEGORY_INTERVAL_MS);
+
+    // A repeated mark is idempotent rather than a second, re-dated block.
+    await tx((s) => markSlackMethodBlocked(s, scope, "users.list", "retry_after_unrepresentable"));
+    const settled = await rowOf(scope, "users.list");
+
+    // Reservations after the deadline has long passed: still blocked, and the row does not drift.
+    await rewind(scope, "users.list", 86_400_000);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect((await tx((s) => reserveSlackMethodSlot(s, scope, "users.list"))).outcome).toBe("blocked");
+    }
+    expect(await rowOf(scope, "users.list")).toEqual(settled);
+    expect(await rowCount(seed.teamId)).toBe(1);
+  });
+
+  it("refuses a reason outside the taxonomy, and writes nothing", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+
+    for (const reason of ["blocked", "", "retry_after_unrepresentable ", null, undefined]) {
+      await expect(
+        tx((s) => markSlackMethodBlocked(s, scope, "users.list", reason as never))
+      ).rejects.toThrow(TypeError);
+    }
+    // Not even a bucket: a caller bug must not leave a durable row behind, blocked or otherwise.
+    expect(await rowCount(seed.teamId)).toBe(0);
+  });
+
+  it("uses the caller's session, so a rolled-back mark leaves no block", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.info"));
+
+    await tx(async (session) => {
+      await markSlackMethodBlocked(session, scope, "conversations.info", "retry_after_unrepresentable");
+      throw new Error("rollback");
+    }).catch(() => {});
+
+    // Read on the SEPARATE raw connection: a module reaching for the process-wide pool would have
+    // committed a block the caller's transaction rolled back.
+    expect((await rowOf(scope, "conversations.info")).blocked_reason).toBeNull();
+    await rewind(scope, "conversations.info", SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 1_000);
+    expect((await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.info"))).outcome).toBe(
+      "granted"
+    );
   });
 });
 
@@ -931,31 +1129,69 @@ describe("slackReservedRequest — commit, then exactly one request", () => {
     expect(new Date(result.nextPermittedAt).getTime()).toBe(stored);
   });
 
-  it("reports an unrepresentable Retry-After as blocked, and stores no cooldown at all", async () => {
+  /**
+   * THE CROSS-CALLER COUNTEREXAMPLE, end to end. A method bucket is a PROVIDER allowance shared by
+   * every process that calls it, so a block held only in the returning caller's own state is not a
+   * block at all: this test drives the second request through a separate call, after moving the
+   * reservation's own deadline into the past, which is the schedule that used to send it.
+   */
+  it("persists the block on the bucket, so a later caller sends nothing after the deadline passes", async () => {
     const seed = await seedTeam();
     const scope = verified(seed);
-    const { impl } = recordingFetch(
+    const first = recordingFetch(
       () => new Response("", { status: 429, headers: { "retry-after": "99999999999999999999" } })
     );
 
-    const result = await slackReservedRequest(
+    const blocked = await slackReservedRequest(
       { db: db(), scope, token: BOT_TOKEN },
       "conversations.info",
       { channel: "C0BUDGET1" },
-      { fetchImpl: impl }
+      { fetchImpl: first.impl }
     );
 
-    // Neither a success nor an ordinary cooldown: the deadline is exactly the one the RESERVATION
-    // set, so nothing invented a near-term retry on the provider's behalf.
-    expect(result).toEqual({
+    // Neither a success nor an ordinary cooldown, and no invented retry time: the deadline is still
+    // exactly the one the RESERVATION set, and the exceptional state is carried by the category.
+    expect(blocked).toEqual({
       outcome: "blocked",
       method: "conversations.info",
       category: "retry_after_unrepresentable",
     });
-    const stored = new Date(
-      (await rowOf(scope, "conversations.info")).next_permitted_at as string
-    ).getTime();
-    expect(stored).toBeLessThanOrEqual(Date.now() + SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 5_000);
+    const marked = await rowOf(scope, "conversations.info");
+    expect(marked.blocked_reason).toBe("retry_after_unrepresentable");
+    expect(new Date(marked.next_permitted_at as string).getTime()).toBeLessThanOrEqual(
+      Date.now() + SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 5_000
+    );
+
+    // ⚠️ clock fixture — the reservation's minute elapses. A DIFFERENT caller now asks for the same
+    // bucket; before the marker was persisted this sent a request inside the refused window.
+    await rewind(scope, "conversations.info", SLACK_UNKNOWN_CATEGORY_INTERVAL_MS + 30_000);
+    const second = recordingFetch(() => {
+      throw new Error("a blocked bucket must never reach the network");
+    });
+    const again = await slackReservedRequest(
+      { db: db(), scope, token: BOT_TOKEN },
+      "conversations.info",
+      { channel: "C0BUDGET1" },
+      { fetchImpl: second.impl }
+    );
+
+    expect(again).toEqual(blocked);
+    expect(second.calls).toHaveLength(0);
+    // ONE HTTP request in total across both callers — the 429 itself, and nothing after it.
+    expect(first.calls).toHaveLength(1);
+
+    // The negative control, on the same team: a different method under the same scope is untouched,
+    // so the persisted block is a bucket's state and not a workspace-wide stop.
+    expect(
+      (
+        await slackReservedRequest(
+          { db: db(), scope, token: BOT_TOKEN },
+          "conversations.history",
+          { channel: "C0BUDGET1" },
+          { fetchImpl: recordingFetch(() => jsonResponse({ ok: true, messages: [] })).impl }
+        )
+      ).outcome
+    ).toBe("ok");
   });
 
   it("leaves the slot consumed when the request fails, and never refunds it", async () => {
@@ -1138,22 +1374,28 @@ describe("schema replay — consolidating the old verified bots.info buckets", (
         `alter table slack_method_budgets add constraint slack_method_budgets_method_scope check (${FORMER_METHOD_SCOPE})`
       );
 
-      // Two old verified app buckets for ONE workspace, with different deadlines and creation times…
+      // Two old verified app buckets for ONE workspace, with different deadlines and creation times,
+      // and — the marker half — exactly ONE of the pair blocked, so the fold's any-blocked rule is
+      // tested against a group that also contains an unblocked row.
       await c.query(
         `insert into slack_method_budgets
-             (team_id, scope_kind, workspace_id, app_id, method, next_permitted_at, created_at)
-           values ($1,'verified',$2,$3,'bots.info', now() + interval '10 minutes', now() - interval '3 days'),
-                  ($1,'verified',$2,$4,'bots.info', now() + interval '90 minutes', now() - interval '5 days'),
-                  ($1,'verified',$5,$3,'bots.info', now() + interval '20 minutes', now() - interval '7 days'),
-                  ($6,'verified',$2,$3,'bots.info', now() + interval '77 minutes', now() - interval '2 days')`,
-        [seed.teamId, WORKSPACE, APP, OTHER_APP, OTHER_WORKSPACE, other.teamId]
+             (team_id, scope_kind, workspace_id, app_id, method, next_permitted_at, created_at,
+              blocked_reason)
+           values ($1,'verified',$2,$3,'bots.info', now() + interval '10 minutes', now() - interval '3 days', 'retry_after_unrepresentable'),
+                  ($1,'verified',$2,$4,'bots.info', now() + interval '90 minutes', now() - interval '5 days', null),
+                  ($1,'verified',$5,$3,'bots.info', now() + interval '20 minutes', now() - interval '7 days', 'retry_after_unrepresentable'),
+                  ($1,'verified',$7,$3,'bots.info', now() + interval '25 minutes', now() - interval '6 days', null),
+                  ($6,'verified',$2,$3,'bots.info', now() + interval '77 minutes', now() - interval '2 days', null)`,
+        [seed.teamId, WORKSPACE, APP, OTHER_APP, OTHER_WORKSPACE, other.teamId, THIRD_WORKSPACE]
       );
-      // …an EXISTING bootstrap bucket whose own deadline is neither the largest nor the smallest…
+      // …an EXISTING bootstrap bucket whose own deadline is neither the largest nor the smallest, and
+      // a second one that is itself BLOCKED while nothing folding into it is — the direction a fold
+      // written as a plain overwrite would erase.
       await c.query(
         `insert into slack_method_budgets
-             (team_id, scope_kind, workspace_id, method, next_permitted_at, created_at)
-           values ($1,'workspace_bootstrap',$2,'bots.info', now() + interval '30 minutes', now() - interval '1 day'),
-                  ($3,'workspace_bootstrap',$2,'bots.info', now() + interval '15 minutes', now() - interval '1 day')`,
+             (team_id, scope_kind, workspace_id, method, next_permitted_at, created_at, blocked_reason)
+           values ($1,'workspace_bootstrap',$2,'bots.info', now() + interval '30 minutes', now() - interval '1 day', null),
+                  ($3,'workspace_bootstrap',$2,'bots.info', now() + interval '15 minutes', now() - interval '1 day', 'retry_after_unrepresentable')`,
         [seed.teamId, WORKSPACE, other.teamId]
       );
       // …and controls: another method, and another team's unrelated scope.
@@ -1186,15 +1428,27 @@ describe("schema replay — consolidating the old verified bots.info buckets", (
       }
       const seedMax = await maxBotsInfoDeadline(seed.teamId, WORKSPACE);
       const otherMax = await maxBotsInfoDeadline(other.teamId, WORKSPACE);
-      const orphan = (
-        await c.query<{ next_permitted_at: Date; created_at: Date }>(
-          `select next_permitted_at, created_at from slack_method_budgets
+      /** The one verified row a workspace with no bootstrap bucket will be folded into a new one. */
+      async function soleVerifiedRow(workspace: string) {
+        const { rows } = await c.query<{
+          next_permitted_at: Date;
+          created_at: Date;
+          blocked_reason: string | null;
+        }>(
+          `select next_permitted_at, created_at, blocked_reason from slack_method_budgets
             where team_id = $1 and scope_kind = 'verified' and workspace_id = $2 and method = 'bots.info'`,
-          [seed.teamId, OTHER_WORKSPACE]
-        )
-      ).rows[0];
+          [seed.teamId, workspace]
+        );
+        if (rows.length !== 1) throw new Error(`expected one verified row, found ${rows.length}`);
+        return rows[0];
+      }
+      const orphan = await soleVerifiedRow(OTHER_WORKSPACE);
       const otherWorkspaceDeadline = new Date(orphan.next_permitted_at).getTime();
       const otherWorkspaceCreated = new Date(orphan.created_at).getTime();
+      const unblockedOrphan = await soleVerifiedRow(THIRD_WORKSPACE);
+      // Read BEFORE the replay, so the marker assertions below cannot be fitted to the outcome.
+      expect(orphan.blocked_reason).toBe("retry_after_unrepresentable");
+      expect(unblockedOrphan.blocked_reason).toBeNull();
 
       await loadSchema({ logger: { log: () => {} } });
 
@@ -1213,11 +1467,30 @@ describe("schema replay — consolidating the old verified bots.info buckets", (
       expect(otherConsolidated.id).toBe(otherBootstrapIdBefore);
       expect(new Date(otherConsolidated.next_permitted_at as string).getTime()).toBe(otherMax);
 
+      // 2b. THE MARKER SURVIVES THE FOLD, in both directions. A block is exceptional metadata with no
+      //     automatic clearing path, so a consolidation that dropped it would silently release a
+      //     provider refusal — and one that overwrote the destination's own block would do the same to
+      //     a bucket whose sources happen to be fine.
+      //     · seed/WORKSPACE: one blocked source, unblocked destination → destination is now blocked.
+      expect(consolidated.blocked_reason).toBe("retry_after_unrepresentable");
+      //     · other/WORKSPACE: blocked destination, unblocked source → its OWN block is preserved.
+      expect(otherConsolidated.blocked_reason).toBe("retry_after_unrepresentable");
+
       // 3. A workspace with no bootstrap bucket gets one, carrying the deadline AND the earliest
       //    creation time of what it replaces — truthful metadata, but the DEADLINE is the invariant.
       const created = await rowOf(bootstrap(seed, OTHER_WORKSPACE), "bots.info");
       expect(new Date(created.next_permitted_at as string).getTime()).toBe(otherWorkspaceDeadline);
       expect(new Date(created.created_at as string).getTime()).toBe(otherWorkspaceCreated);
+      // …including its block, which the INSERT leg must carry rather than only the UPDATE leg.
+      expect(created.blocked_reason).toBe("retry_after_unrepresentable");
+
+      // 3b. THE CONTROL for all three marker assertions: a fold with nothing blocked anywhere stays
+      //     unblocked. Without it, "set every consolidated row blocked" would satisfy them all.
+      const unblocked = await rowOf(bootstrap(seed, THIRD_WORKSPACE), "bots.info");
+      expect(unblocked.blocked_reason).toBeNull();
+      expect(new Date(unblocked.next_permitted_at as string).getTime()).toBe(
+        new Date(unblockedOrphan.next_permitted_at).getTime()
+      );
 
       // 4. Unrelated methods, scopes and teams were not reset.
       expect((await budgetRows([seed.teamId, other.teamId])).filter((r) => r.method !== "bots.info")).toEqual(
@@ -1241,6 +1514,61 @@ describe("schema replay — consolidating the old verified bots.info buckets", (
       const settled = await budgetRows([seed.teamId, other.teamId]);
       await loadSchema({ logger: { log: () => {} } });
       expect(await budgetRows([seed.teamId, other.teamId])).toEqual(settled);
+    },
+    180_000
+  );
+
+  /**
+   * THE ADDITIVE LEG, proven where it is the only thing that can work. `create table if not exists`
+   * is a NO-OP on a database that already has the table, so editing the create body cannot give
+   * `blocked_reason` to a checkpoint-created one — from-zero would pass with no ALTER at all. This
+   * starts from a table WITHOUT the column, and the existing rows must keep their deadlines.
+   */
+  it(
+    "adds the blocked marker and its named CHECK to a table created before them",
+    async () => {
+      const seed = await seedTeam();
+      const scope = verified(seed);
+      const c = await sql();
+      // Same reason as the sibling replay test above: a sibling dm spec re-adds the retired PRET-6
+      // flag at its permissive default, which would abort the replay's migration leg.
+      await c.query(`alter table teams drop column if exists access_enforcement`);
+
+      await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.history"));
+      const before = await rowOf(scope, "conversations.history");
+      await c.query(`alter table slack_method_budgets drop column blocked_reason`);
+      const { rows: gone } = await c.query(
+        `select 1 from information_schema.columns
+          where table_schema = 'public' and table_name = 'slack_method_budgets'
+            and column_name = 'blocked_reason'`
+      );
+      expect(gone).toHaveLength(0);
+
+      await loadSchema({ logger: { log: () => {} } });
+
+      // The column is back, defaulting to unblocked, and the pre-existing reservation is untouched:
+      // an additive repair may not re-date a bucket the provider is already metering.
+      const repaired = await rowOf(scope, "conversations.history");
+      expect(repaired.blocked_reason).toBeNull();
+      expect(repaired.next_permitted_at).toEqual(before.next_permitted_at);
+      expect(repaired.id).toBe(before.id);
+
+      // …and the CHECK came with it, by name — a column with no constraint would admit any text.
+      expect(
+        await refusal(
+          c.query(`update slack_method_budgets set blocked_reason = 'anything' where id = $1`, [
+            before.id,
+          ])
+        )
+      ).toMatchObject({ code: "23514", constraint: "slack_method_budgets_blocked_reason" });
+
+      // The negative control: the legal value IS accepted, so the refusal above is about the value.
+      await tx((s) =>
+        markSlackMethodBlocked(s, scope, "conversations.history", "retry_after_unrepresentable")
+      );
+      expect((await rowOf(scope, "conversations.history")).blocked_reason).toBe(
+        "retry_after_unrepresentable"
+      );
     },
     180_000
   );
