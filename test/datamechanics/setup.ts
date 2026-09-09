@@ -41,6 +41,11 @@ const DATA_TABLES = [
   "task_pm_links",
   "tasks",
   "item_versions",
+  // AIO-1170. Listed explicitly even though `items`/`teams` below would CASCADE into them: the
+  // cascade is a property of today's FKs, and a table whose isolation depends on somebody else's
+  // FK stays clean only until that FK changes.
+  "slack_messages",
+  "slack_team_state",
   "items",
   "projects",
   "rate_limits",

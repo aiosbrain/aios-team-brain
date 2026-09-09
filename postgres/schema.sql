@@ -1216,6 +1216,136 @@ create table if not exists item_versions (
 );
 create index if not exists item_versions_item_idx on item_versions (item_id, created_at desc);
 
+-- ── Slack source-message ledger (AIO-1170) ───────────────────────────────────
+-- Per-MESSAGE contribution evidence for Slack. The item-level `participants` frontmatter records a
+-- count plus the first/last time only, so the evidence grain the timeline needs — (thread, member,
+-- UTC day) — cannot be recovered from it: the intervening days a person actually worked are gone.
+-- Design: docs/design/slack-timeline-reliability.md.
+--
+-- ⚠️ NOTHING WRITES OR READS THESE TWO TABLES YET. This slice defines the store and its invariants
+-- so they can be pinned (test/datamechanics/slack-ledger.datamechanics.test.ts) before the publisher
+-- — one source-owned writer inside the EXISTING `ingestItem` transaction — and the query/credit legs
+-- depend on them. An empty ledger is therefore NOT evidence of an empty Slack history yet; the
+-- oracle's three-state rule only starts reading it once the publisher ships.
+--
+-- IDENTITY IS THE SOURCE'S. A row is `(team, workspace, channel, message_ts)` with every Slack
+-- string byte-exact; `message_ts` is TEXT and is never parsed to form identity. The instant is
+-- resolved separately by `lib/ingest/sources/slack-message-evidence.parseSlackTimestamp`, which
+-- keeps the seconds and the microseconds as two integers — `parseFloat(ts) * 1000` (what the current
+-- normalizer does) collapses two messages a microsecond apart onto one millisecond, and the ledger
+-- cannot carry that loss. `workspace_id` is part of the key because channel ids are NOT unique
+-- across installations, and AIOS `team_id` is an additional namespace above that.
+--
+-- No stored contribution-day column on purpose: `occurred_at at time zone 'utc'` is STABLE, not
+-- IMMUTABLE, so it cannot be a generated column, and a writer-computed copy is a second source of
+-- truth for the same fact. Readers group on `occurred_at` in UTC, which the time index below serves.
+create table if not exists slack_messages (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  -- Slack workspace/team id (`T…`) and channel id (`C…`), exactly as the provider reported them.
+  -- ':' is excluded because the qualified account identity is `WORKSPACE:USER` — a colon inside a
+  -- component would make that string ambiguous.
+  workspace_id text not null
+    check (workspace_id <> '' and workspace_id !~ '[[:space:]]' and strpos(workspace_id, ':') = 0),
+  channel_id text not null
+    check (channel_id <> '' and channel_id !~ '[[:space:]]' and strpos(channel_id, ':') = 0),
+  -- The Slack `ts` verbatim. Only NON-BLANK is required: a present-but-unparseable `ts` is a real,
+  -- identifiable message that we simply cannot place (it lands `eligible=false` /
+  -- `invalid_timestamp`), so a `^\d+\.\d{1,6}$` check here would refuse to record it at all.
+  message_ts text not null check (btrim(message_ts) <> ''),
+  -- The thread root's `ts` (equal to `message_ts` for a root).
+  root_ts text not null check (btrim(root_ts) <> ''),
+  -- The canonical thread item. The FK is COMPOSITE so a row can never point at another team's item;
+  -- cascade because a purged/deleted item's message evidence must go with it. Its target is the
+  -- EXISTING `items_team_id_id_idx` unique index above (added for the context substrate's same-team
+  -- FKs, and present on deployed databases via 20260811120000_context_substrate.sql) — no new
+  -- alteration of `items` is needed, and Postgres now records a dependency on that index, so it
+  -- cannot be dropped out from under this table.
+  item_id uuid not null,
+  -- Raw Slack user id, exact case; null when the message has no author. The ledger deliberately
+  -- stores the SOURCE identity, never a resolved member id, so a re-link/remap changes credit
+  -- without rewriting a single ledger row.
+  author_external_id text check (
+    author_external_id is null
+    or (author_external_id <> '' and author_external_id !~ '[[:space:]]'
+        and strpos(author_external_id, ':') = 0)
+  ),
+  -- The exact source instant in UTC, at Slack's microsecond precision. NULLABLE, and null means one
+  -- thing only (see the check below): the source timestamp did not parse. An ingest-clock fallback
+  -- would plant evidence on a day nobody worked.
+  occurred_at timestamptz,
+  is_root boolean not null,
+  -- Three states in two columns (packet-1 adjudication §2): eligible = credit this person;
+  -- not-eligible + 'author_unclassified'/'future_timestamp' = UNRESOLVED, which re-reading may
+  -- change; not-eligible + any other reason = a durable property of the message. This is NOT member
+  -- mapping status — an eligible message can still have no linked member.
+  eligible boolean not null,
+  exclusion_reason text,
+  -- Set when reconciliation confirmed the message is gone at the source. Kept for audited
+  -- reconciliation; readers exclude it from current evidence.
+  deleted_at timestamptz,
+  -- The team's `slack_team_state.data_generation` at the publication that last confirmed this row.
+  last_seen_generation bigint not null default 0 check (last_seen_generation >= 0),
+  -- sha256 over the RAW evidence-bearing source fields (`slack-message-evidence.sourceHash`) —
+  -- text/subtype/bot marker/author/ts/root, never a rendered display name.
+  source_hash text not null check (source_hash ~ '^[0-9a-f]{64}$'),
+  -- When this row's evidence was last written or re-confirmed.
+  observed_at timestamptz not null default now(),
+  -- Scoped message identity. Two workspaces (or two AIOS teams) may legitimately carry the same
+  -- channel id and the same `ts`; they are different messages.
+  unique (team_id, workspace_id, channel_id, message_ts),
+  -- The eligible/reason codec, so an impossible pair cannot persist.
+  constraint slack_messages_reason_codec check (eligible = (exclusion_reason is null)),
+  constraint slack_messages_reason_taxonomy check (
+    exclusion_reason is null or exclusion_reason in (
+      'invalid_timestamp', 'no_author', 'bot_message', 'tombstone', 'unsupported_subtype',
+      'no_text', 'bot_identity', 'author_unclassified', 'future_timestamp'
+    )
+  ),
+  -- A missing instant and 'invalid_timestamp' are the SAME fact, in both directions: no row may
+  -- invent a timestamp for a message whose `ts` did not parse, and no row may drop the instant of a
+  -- message whose `ts` did. `is not distinct from` (not `=`) because a null reason on the right of a
+  -- plain `=` makes the whole check UNKNOWN, which Postgres accepts — that hole would let an
+  -- eligible row through with no instant at all.
+  constraint slack_messages_instant_truth check (
+    (occurred_at is null) = (exclusion_reason is not distinct from 'invalid_timestamp')
+  ),
+  -- Credit needs somebody to credit.
+  constraint slack_messages_eligible_has_author check (not eligible or author_external_id is not null),
+  -- Root-ness is derived from the two timestamps, not asserted independently of them.
+  constraint slack_messages_root_ts_agrees check (is_root = (message_ts = root_ts)),
+  foreign key (team_id, item_id) references items (team_id, id) on delete cascade
+);
+-- The evidence read: team-scoped, by instant, newest first (the deterministic order the timeline
+-- pages on), with the item and message tie-breakers that make that order total.
+create index if not exists slack_messages_team_time_idx
+  on slack_messages (team_id, occurred_at desc, item_id, message_ts);
+-- Identity repair after a link/unlink/remap: every message of one qualified account, newest first.
+-- Scoped by workspace because the same raw user id can exist in two workspaces.
+create index if not exists slack_messages_author_idx
+  on slack_messages (team_id, workspace_id, author_external_id, occurred_at desc);
+-- Per-item ledger reads (the credit oracle's three-state rule asks "does this item have a ledger?")
+-- and the composite FK's cascade path.
+create index if not exists slack_messages_item_idx
+  on slack_messages (team_id, item_id, occurred_at desc);
+
+-- Durable Slack cache generations, one row per team. Bumped inside the caller's transaction by the
+-- source-owned generation helper: `data_generation` when semantic evidence actually changed,
+-- `identity_generation` when a link/unlink/remap/correction changed an account mapping. Cache
+-- payloads carry both stamps, so a worker that publishes new evidence invalidates every other
+-- worker's memory entry without a broadcast.
+--
+-- ABSENT ROW = generation 0 (a team that has never published Slack evidence). A FAILED read is an
+-- error and must never be read as 0 — that distinction lives in the reader, which is a later slice;
+-- there is no schema-level way to state it.
+create table if not exists slack_team_state (
+  team_id uuid primary key references teams(id) on delete cascade,
+  data_generation bigint not null default 0 check (data_generation >= 0),
+  identity_generation bigint not null default 0 check (identity_generation >= 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
   id uuid primary key default gen_random_uuid(),
