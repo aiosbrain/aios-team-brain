@@ -4,10 +4,12 @@ import { INGEST_FETCH_TIMEOUT_MS } from "@/lib/http";
 import { runContextTransaction } from "@/lib/projects/context/transaction";
 import {
   extendSlackMethodBackoff,
+  markSlackMethodBlocked,
   readRetryAfterHeader,
   reserveSlackMethodSlot,
   slackMethodPageLimit,
   type SlackBudgetedMethod,
+  type SlackMethodBlockedReason,
   type SlackMethodScope,
 } from "@/lib/ingest/slack-method-budget";
 import type { SlackMessage } from "./slack";
@@ -32,7 +34,9 @@ import type { SlackMessage } from "./slack";
  *     DB locks across a round trip, and its rollback would erase the reservation while the request
  *     is in flight. Composing a reservation into a bigger transaction is legitimate — that is what
  *     `reserveSlackMethodSlot` is for — but then the caller, not this module, must not fetch.
- *  3. A DENIED RESERVATION SENDS ZERO REQUESTS. `deferred` returns before `fetchImpl` is touched.
+ *  3. A DENIED RESERVATION SENDS ZERO REQUESTS. `deferred` and `blocked` both return before
+ *     `fetchImpl` is touched — and `blocked` stays that way however long ago the bucket's stored
+ *     deadline passed, because a durable block is not a cooldown waiting to expire.
  *  4. A 429 IS RECOGNISED BEFORE THE BODY IS PARSED. Slack's rate-limit response is frequently not
  *     JSON at all; requiring a parse first turns a cooldown into a parse error, and the cooldown is
  *     then never persisted.
@@ -145,14 +149,16 @@ export type SlackRequestResult =
       readonly retryAfterMs: number;
     }
   /**
-   * HTTP 429 whose `Retry-After` is a real duration this path cannot carry. NO cooldown was
-   * persisted — deliberately, because the only representable one would be NEARER than the provider
-   * asked for. Needs an operator, exactly like an auth refusal; a timer cannot help it.
+   * The method bucket is BLOCKED. Either this request's 429 carried a `Retry-After` that is a real
+   * duration this path cannot carry, or an earlier one did and the marker is still on the bucket —
+   * in which case no request was sent at all. No cooldown TIMESTAMP is ever written for it: the only
+   * representable one would be nearer than the provider asked for. Needs an operator, exactly like
+   * an auth refusal; a timer cannot help it, so this result deliberately carries no retry time.
    */
   | {
       readonly outcome: "blocked";
       readonly method: SlackBudgetedMethod;
-      readonly category: "retry_after_unrepresentable";
+      readonly category: SlackMethodBlockedReason;
     }
   /** The credential or its scopes. Retrying on a timer cannot fix it. */
   | { readonly outcome: "auth_error"; readonly method: SlackBudgetedMethod; readonly category: string }
@@ -288,6 +294,12 @@ export async function slackReservedRequest(
       retryAfterMs: reservation.retryAfterMs,
     };
   }
+  if (reservation.outcome === "blocked") {
+    // A block persisted by SOME earlier caller of this shared bucket — possibly in another process.
+    // ZERO HTTP, whatever the stored deadline now says: that deadline was never a promise about when
+    // the provider would accept a request again.
+    return { outcome: "blocked", method, category: reservation.reason };
+  }
 
   // ── 2. exactly one request ────────────────────────────────────────────────────────────────────
   const query = new URLSearchParams(applyPageLimit(method, params)).toString();
@@ -313,9 +325,18 @@ export async function slackReservedRequest(
     if (retryAfter.kind === "unrepresentable") {
       // The provider stated a real duration we cannot carry. Persisting the floor — or any bound we
       // invented — would release the next request inside a window it explicitly refused, and would
-      // be indistinguishable in the table from an ordinary cooldown. So: no cooldown, and a category
-      // that cannot be mistaken for one. The slot stays consumed, as on every other failure.
-      return { outcome: "blocked", method, category: "retry_after_unrepresentable" };
+      // be indistinguishable in the table from an ordinary cooldown. So: no cooldown TIMESTAMP, and
+      // a durable category on the bucket that cannot be mistaken for one.
+      //
+      // ITS OWN SHORT TRANSACTION, COMMITTED BEFORE THIS RETURNS. The bucket is the provider
+      // allowance shared by every caller of this method, so a block that existed only in this
+      // return value would leave the next process free to request again as soon as the
+      // reservation's own interval elapsed. A DB failure PROPAGATES rather than being reported as a
+      // block nothing recorded. The slot stays consumed, as on every other failure.
+      const block = await runContextTransaction(context.db, (session) =>
+        markSlackMethodBlocked(session, context.scope, method, "retry_after_unrepresentable")
+      );
+      return { outcome: "blocked", method, category: block.reason };
     }
     // A SECOND short transaction. It is separate from the reservation on purpose: the reservation
     // committed before the request, so there is no open transaction to extend, and this write must

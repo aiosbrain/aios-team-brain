@@ -33,6 +33,15 @@ import type { SqlQueryResult, TransactionSession } from "@/lib/db/types";
  *  5. NOTHING IS SWALLOWED. A SQL failure rejects. `deferred` can only mean the conditional update
  *     matched no row, because "no slot" and "the database is broken" must never be the same value —
  *     the first means wait, the second means we do not know.
+ *  6. A BLOCK IS DURABLE, AND NO DATE RELEASES IT. `blocked_reason` records the one state the clock
+ *     cannot express — a real provider cooldown in a magnitude this path cannot carry — and the
+ *     reservation refuses a marked bucket however long ago its deadline passed. It lives on the
+ *     BUCKET rather than in a caller's own state because the bucket IS the provider allowance: a
+ *     second process (a later validation pass, a cleanup, another worker) shares it, and would
+ *     otherwise request again the moment the reservation's own interval elapsed — inside the window
+ *     the provider refused. Nothing here clears it: there is no unblock function, no reset entry
+ *     point, and no clearing on a token or config change, because the same provider bucket is still
+ *     refusing. Recovery is an explicit operator action, deliberately not a fabricated date.
  *
  * A refusal is reported as `{ outcome: "deferred" }` and NEVER as `{ ok: false }`: the transaction
  * engine treats an `ok:false` return from a transaction callback as a rollback signal
@@ -146,6 +155,16 @@ export const SLACK_BACKOFF_FLOOR_MS = 60_000;
  */
 export const SLACK_BACKOFF_REPRESENTABLE_MAX_MS = 4_320_000_000_000_000;
 
+/**
+ * Why a bucket is blocked, as a CLOSED taxonomy mirrored by the SQL CHECK. One value today: the
+ * provider stated a real cooldown too large for this path to carry (`SLACK_BACKOFF_REPRESENTABLE_MAX_MS`),
+ * so there is no honest deadline to store and the nearest representable one would release the next
+ * request inside a refused window.
+ */
+export const SLACK_BLOCKED_REASONS = ["retry_after_unrepresentable"] as const;
+
+export type SlackMethodBlockedReason = (typeof SLACK_BLOCKED_REASONS)[number];
+
 export type SlackMethodReservation =
   | {
       readonly outcome: "granted";
@@ -161,7 +180,26 @@ export type SlackMethodReservation =
       readonly nextPermittedAt: string;
       /** Measured at the DATABASE, so a skewed app clock cannot turn a wait into "go now". */
       readonly retryAfterMs: number;
+    }
+  /**
+   * The bucket carries a durable block. Deliberately NO `nextPermittedAt` and no `retryAfterMs`: the
+   * stored deadline is whatever the last ordinary reservation left there and says nothing about when
+   * the provider will accept a request again, so reporting either would hand a caller a schedule we
+   * cannot stand behind. This needs an operator, exactly like an auth refusal.
+   */
+  | {
+      readonly outcome: "blocked";
+      readonly scope: SlackMethodScope;
+      readonly method: SlackBudgetedMethod;
+      readonly reason: SlackMethodBlockedReason;
     };
+
+/** What `markSlackMethodBlocked` persisted — the reason READ BACK from the row, never the argument. */
+export interface SlackMethodBlock {
+  readonly scope: SlackMethodScope;
+  readonly method: SlackBudgetedMethod;
+  readonly reason: SlackMethodBlockedReason;
+}
 
 export interface SlackMethodBackoff {
   readonly scope: SlackMethodScope;
@@ -177,9 +215,11 @@ const PROVIDER_ID = /^[A-Za-z0-9]+$/;
 interface BudgetRow {
   next_permitted_at: Date | string;
   retry_after_ms: string;
+  blocked_reason: string | null;
 }
 
 const BUDGET_COLUMNS = `next_permitted_at,
+       blocked_reason,
        greatest(0, ceil(extract(epoch from (next_permitted_at - clock_timestamp())) * 1000))::bigint::text
          as retry_after_ms`;
 
@@ -289,6 +329,30 @@ function millis(value: string): number {
   return parsed;
 }
 
+/**
+ * A reason a caller asked us to store. A value outside the taxonomy is a caller BUG and throws
+ * BEFORE anything is written: the SQL CHECK would refuse it anyway, and letting the database be the
+ * only gate means a bucket exists by then.
+ */
+function assertBlockedReason(reason: unknown): SlackMethodBlockedReason {
+  if (typeof reason !== "string" || !SLACK_BLOCKED_REASONS.includes(reason as SlackMethodBlockedReason)) {
+    throw new SlackMethodBudgetError(
+      `blocked reason must be one of ${SLACK_BLOCKED_REASONS.join(", ")} (got ${JSON.stringify(reason)})`
+    );
+  }
+  return reason as SlackMethodBlockedReason;
+}
+
+/**
+ * A reason READ BACK from a row. An unrecognised stored value THROWS rather than reading as
+ * unblocked: whatever put it there meant to stop requests, and the failure direction of "I do not
+ * understand this marker" must be refusal, not a granted slot.
+ */
+function storedBlockedReason(value: string | null): SlackMethodBlockedReason | null {
+  if (value === null || value === undefined) return null;
+  return assertBlockedReason(value);
+}
+
 /** One row or none. More than one would mean the per-scope unique index is not doing its job. */
 function single(result: SqlQueryResult<BudgetRow>): BudgetRow | undefined {
   if (result.rows.length > 1) {
@@ -337,6 +401,10 @@ async function ensureBucket(
  * A `deferred` result is a persisted fact, not advice: the deadline was already stored by whoever
  * consumed the slot, and this call does NOT extend it. Reserving a future slot on a busy bucket
  * would let a tick's worth of pollers each book a turn, which is a queue we have no way to honour.
+ *
+ * `blocked` is a THIRD outcome, not a long `deferred`, and it is checked before the deadline is:
+ * a marked bucket is refused however long ago `next_permitted_at` passed, and the result carries no
+ * retry time at all (see the `SlackMethodReservation` blocked variant).
  */
 export async function reserveSlackMethodSlot(
   session: TransactionSession,
@@ -348,11 +416,15 @@ export async function reserveSlackMethodSlot(
 
   await ensureBucket(session, scope, method);
 
+  // `blocked_reason is null` is part of the ATOMIC grant predicate, not a check before or after it:
+  // a read-then-decide would let a concurrent 429 mark the bucket between the two statements and
+  // still hand this caller a slot.
   const granted = await session.executeSql<BudgetRow>(
     `update slack_method_budgets
         set next_permitted_at = clock_timestamp() + ($7::double precision * interval '1 millisecond'),
             updated_at = clock_timestamp()
       where ${SCOPE_PREDICATE}
+        and blocked_reason is null
         and next_permitted_at <= clock_timestamp()
   returning ${BUDGET_COLUMNS}`,
     [...scopeParams(scope), method, intervalMs]
@@ -379,6 +451,13 @@ export async function reserveSlackMethodSlot(
       "the bucket vanished between ensure and read — refusing to report a slot that was not reserved"
     );
   }
+  // A block is reported BEFORE the deadline is even considered. Its `next_permitted_at` is just
+  // whatever the last ordinary reservation left behind, so a `deferred` here would promise a retry
+  // time the provider never gave — and the moment that time passed, a caller would send the request.
+  const blocked = storedBlockedReason(pending.blocked_reason);
+  if (blocked) {
+    return { outcome: "blocked", scope, method, reason: blocked };
+  }
   return {
     outcome: "deferred",
     scope,
@@ -401,6 +480,11 @@ export async function reserveSlackMethodSlot(
  * unusable would send the next request immediately, which is the opposite of the instruction. A
  * delay that is real but unrepresentable THROWS instead (`usableBackoffMs`) — the caller must treat
  * that as blocked, not silently accept a 60-second cooldown in place of the stated one.
+ *
+ * It touches the deadline and NOTHING else — in particular it never clears `blocked_reason`. An
+ * ordinary 429 arriving on a blocked bucket says the provider is still refusing; treating it as
+ * evidence that the block is over would turn the one state with no automatic recovery into one that
+ * heals itself on the very signal that created it.
  *
  * ⚠️ ITS FAILURE MUST REACH THE CALLER. If this write fails, the cooldown is not persisted, and a
  * transport that swallowed the error would report an empty page and go straight back to the
@@ -441,6 +525,61 @@ export async function extendSlackMethodBackoff(
     nextPermittedAt: instant(row.next_permitted_at),
     retryAfterMs: millis(row.retry_after_ms),
   };
+}
+
+/**
+ * Record that this bucket is BLOCKED — the provider refused for a duration this path cannot carry,
+ * so there is no deadline that would be true.
+ *
+ * Three things it deliberately does not do. It does not touch `next_permitted_at`: pushing it out
+ * would mean inventing the duration we just admitted we cannot represent, and resetting it would
+ * refund an allowance the provider has already counted. It does not store the header, the body or
+ * anything else the provider sent — only a category from a closed taxonomy. And it does not
+ * overwrite an existing marker (`coalesce`), so the FIRST cause is the one that stays recorded if
+ * the taxonomy ever grows a second value.
+ *
+ * There is no counterpart that clears it. A block outlives ordinary backoff, ensure and every later
+ * reservation; a token or config change does not touch it either, because the same provider bucket
+ * is still refusing. Recovery is an explicit operator action on a bucket someone has looked at.
+ *
+ * ⚠️ ITS FAILURE MUST REACH THE CALLER, for the same reason `extendSlackMethodBackoff`'s must, only
+ * harder: a caller that reported "blocked" while this write failed would leave the bucket holding
+ * nothing but the reservation's own short deadline, and the next process sharing that allowance
+ * would send a request the instant it elapsed.
+ */
+export async function markSlackMethodBlocked(
+  session: TransactionSession,
+  scope: SlackMethodScope,
+  method: SlackBudgetedMethod,
+  reason: SlackMethodBlockedReason
+): Promise<SlackMethodBlock> {
+  assertScopeAndMethod(scope, method);
+  const category = assertBlockedReason(reason);
+
+  await ensureBucket(session, scope, method);
+
+  const result = await session.executeSql<BudgetRow>(
+    `update slack_method_budgets
+        set blocked_reason = coalesce(blocked_reason, $7),
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+  returning ${BUDGET_COLUMNS}`,
+    [...scopeParams(scope), method, category]
+  );
+
+  const row = single(result);
+  if (!row) {
+    throw new SlackMethodBudgetError(
+      "the bucket vanished between ensure and block — refusing to report a block it did not persist"
+    );
+  }
+  const stored = storedBlockedReason(row.blocked_reason);
+  if (!stored) {
+    // The update matched and the row still reads unblocked: something is wrong with the write path
+    // itself, and reporting success would be the exact false attestation this function exists for.
+    throw new SlackMethodBudgetError("the bucket did not retain the block that was just written");
+  }
+  return { scope, method, reason: stored };
 }
 
 /**

@@ -2872,8 +2872,18 @@ create table if not exists slack_method_budgets (
   -- every grant pushes it forward by the method's interval, and provider backoff can only push it
   -- FURTHER (never nearer). The DB clock owns it — a caller's clock never decides due-ness.
   next_permitted_at timestamptz not null default clock_timestamp(),
+  -- The ONE state the clock above cannot express: the provider stated a real cooldown in a magnitude
+  -- this path cannot carry, so there is no honest deadline to store. Null = ordinary, and a blocked
+  -- bucket never grants a slot again regardless of `next_permitted_at` — recovery is an explicit
+  -- operator action, deliberately not a date. A CLOSED taxonomy, like `method` and unlike a provider
+  -- vocabulary: an open text column here would take arbitrary provider text, and a `blocked_until`
+  -- would be exactly the fabricated deadline this column exists to avoid.
+  blocked_reason text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  constraint slack_method_budgets_blocked_reason check (
+    blocked_reason is null or blocked_reason = 'retry_after_unrepresentable'
+  ),
   -- Each scope is ALL of its key fields and none of any other's. Without this a row carrying both
   -- an integration and a workspace is storable, and every reader would have to decide which half to
   -- believe. `else false` is deliberate: a fourth `scope_kind` added to the CHECK above without a
@@ -2917,10 +2927,23 @@ create unique index if not exists slack_method_budgets_bootstrap_key
   on slack_method_budgets (team_id, workspace_id, method)
   where scope_kind = 'workspace_bootstrap';
 
+-- ADDITIVE REPAIR for a checkpoint-created table, which has no `blocked_reason` column: the table
+-- body above is skipped entirely on a database that already has the table, so the column and its
+-- CHECK have to arrive as their own idempotent statements. Both are additive and re-runnable, and
+-- neither touches a deadline — every existing bucket keeps the allowance it has already spent.
+alter table slack_method_budgets add column if not exists blocked_reason text;
+-- Drop-then-add so a replay converges on ONE named constraint with today's rule, matching the method
+-- scope repair below. Safe to validate on every pass: existing rows are either null (the column was
+-- just added) or already inside the taxonomy.
+alter table slack_method_budgets drop constraint if exists slack_method_budgets_blocked_reason;
+alter table slack_method_budgets add constraint slack_method_budgets_blocked_reason check (
+  blocked_reason is null or blocked_reason = 'retry_after_unrepresentable'
+);
+
 -- REPLAY REPAIR for the earlier checkpoint shape, where `verified` admitted every method and could
--- therefore hold its own `bots.info` bucket. `create table if not exists` above is a NO-OP on a
--- database that already has the table, so the corrected CHECK never reaches it — and simply
--- re-adding the constraint would fail the whole replay on those rows.
+-- therefore hold its own `bots.info` bucket. Table creation leaves an existing table exactly as it
+-- is, so the corrected CHECK never reaches one — and simply re-adding the constraint would fail the
+-- whole replay on those rows.
 --
 -- Deleting them is not an option either: `next_permitted_at` can hold a cooldown the PROVIDER
 -- imposed, and dropping it would release a request Slack is still refusing. So each old verified
@@ -2939,9 +2962,14 @@ begin
 
   insert into slack_method_budgets
       (team_id, scope_kind, workspace_id, app_id, integration_id, method,
-       next_permitted_at, created_at, updated_at)
+       next_permitted_at, blocked_reason, created_at, updated_at)
   select team_id, 'workspace_bootstrap', workspace_id, null, null, 'bots.info',
          max(next_permitted_at),
+         -- ANY blocked row in the group blocks the bucket that inherits it. The taxonomy has one
+         -- value, so `max` IS the any-blocked rule, and it stays correct as a "some reason survives"
+         -- rule if a second one is ever added. Dropping the marker here would release a provider
+         -- refusal that nothing can re-detect, since the request it came from is never resent.
+         max(blocked_reason),
          -- Truthful metadata for a bucket that is standing in for older rows; the DEADLINE is the
          -- invariant, this is only about not claiming the allowance started now.
          min(created_at),
@@ -2953,6 +2981,10 @@ begin
   do update set
        -- The EXISTING bucket keeps its id and its own deadline unless the folded one is later.
        next_permitted_at = greatest(slack_method_budgets.next_permitted_at, excluded.next_permitted_at),
+       -- …and its own BLOCK, unconditionally: the destination's marker is about the destination's
+       -- allowance, so a plain overwrite would erase a live refusal whenever the folded rows happen
+       -- to be fine. `coalesce` is the same any-blocked rule across the two sides.
+       blocked_reason = coalesce(slack_method_budgets.blocked_reason, excluded.blocked_reason),
        updated_at = clock_timestamp();
 
   delete from slack_method_budgets where scope_kind = 'verified' and method = 'bots.info';
