@@ -208,6 +208,10 @@ the app's own mode.
 
 ## Agent skill publication
 
+The `review-recent-prs` skill provides a read-only audit of recent PRs and is
+published through `.skill-runtimes.json`. Its default target follows the contribution
+branch in `scripts/branches.mjs`; an explicit user target takes precedence.
+
 Repository-local agent skills are authored once under `.claude/skills/`. The explicit
 publication manifest `.skill-runtimes.json` selects which canonical skills are projected
 to `.agents/skills/`, `.opencode/skills/`, and `.cursor/rules/`; merely finding a generated

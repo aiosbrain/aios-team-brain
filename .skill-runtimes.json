@@ -6,6 +6,7 @@
     "cut-release",
     "pr-review-attestation",
     "railway-deploy-verify",
+    "review-recent-prs",
     "setup-brain"
   ],
   "targets": {
