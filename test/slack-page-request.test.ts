@@ -26,16 +26,19 @@ import {
  * budget functions are stubbed below precisely so this file cannot appear to prove them.
  */
 
-const { reserveSlackMethodSlot, extendSlackMethodBackoff } = vi.hoisted(() => ({
-  reserveSlackMethodSlot: vi.fn(),
-  extendSlackMethodBackoff: vi.fn(),
-}));
+const { reserveSlackMethodSlot, extendSlackMethodBackoff, markSlackMethodBlocked } = vi.hoisted(
+  () => ({
+    reserveSlackMethodSlot: vi.fn(),
+    extendSlackMethodBackoff: vi.fn(),
+    markSlackMethodBlocked: vi.fn(),
+  })
+);
 
 vi.mock("@/lib/ingest/slack-method-budget", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ingest/slack-method-budget")>();
   // The POLICY (intervals, page limit, Retry-After parsing) stays real — it is what the adapter
   // applies, and stubbing it would make the clamp assertions below vacuous.
-  return { ...actual, reserveSlackMethodSlot, extendSlackMethodBackoff };
+  return { ...actual, reserveSlackMethodSlot, extendSlackMethodBackoff, markSlackMethodBlocked };
 });
 
 // Static, not dynamic: `vi.mock` is hoisted above every import in this file, so the adapter below
@@ -106,10 +109,20 @@ function granted() {
   });
 }
 
+/** The default: the marker write succeeds and reports back the category it stored. */
+function blockPersists() {
+  markSlackMethodBlocked.mockResolvedValue({
+    scope: SCOPE,
+    method: "conversations.history",
+    reason: "retry_after_unrepresentable",
+  });
+}
+
 beforeEach(() => {
   events = [];
   reserveSlackMethodSlot.mockReset();
   extendSlackMethodBackoff.mockReset();
+  markSlackMethodBlocked.mockReset();
 });
 
 describe("slackReservedRequest — reserve, commit, then exactly one request", () => {
@@ -414,9 +427,16 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
    * A cooldown we cannot carry end to end is a BLOCKED configuration, not a slow one. Persisting the
    * 60-second floor instead would send the next request while the provider is still refusing, and it
    * would look like an ordinary deferral in the table.
+   *
+   * ⚠️ WHAT REPLACED "persists nothing". Returning blocked WITHOUT storing it left the bucket holding
+   * only the reservation's own 60-second deadline, so any other caller of the same method bucket —
+   * this is a provider allowance shared by every process, not per-worker state — was free to request
+   * again once that minute passed. The marker is therefore persisted BEFORE this returns, and still
+   * no date is fabricated: no cooldown timestamp, and no retry-at on the result.
    */
-  it("reports an unrepresentable Retry-After as blocked, and persists no near-term cooldown", async () => {
+  it("persists the block BEFORE reporting it, and fabricates no retry-at", async () => {
     granted();
+    blockPersists();
     const { impl } = fetchStub(
       () => new Response("", { status: 429, headers: { "retry-after": "99999999999999999999" } })
     );
@@ -428,11 +448,84 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
       { fetchImpl: impl }
     );
 
+    expect(markSlackMethodBlocked).toHaveBeenCalledWith(
+      expect.anything(),
+      SCOPE,
+      "conversations.history",
+      "retry_after_unrepresentable"
+    );
+    // The category is the reason the WRITER read back, not one this adapter decided on its own.
     expect(result).toEqual({
       outcome: "blocked",
       method: "conversations.history",
       category: "retry_after_unrepresentable",
     });
+    // No invented date, in either shape: no ordinary cooldown write, and no retry-at to schedule on.
+    expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
+    expect("nextPermittedAt" in result).toBe(false);
+    expect("retryAfterMs" in result).toBe(false);
+    // The marker's transaction COMMITTED before the result existed — two commits, one fetch. Without
+    // this the write could be in flight while a caller already treats the bucket as blocked.
+    expect(events).toEqual(["commit", "fetch", "commit"]);
+  });
+
+  /**
+   * The DB failure asymmetry, on the blocked path. A swallowed marker write would report a blocked
+   * configuration that nothing recorded — so the next caller of this shared bucket would go back to
+   * the provider the moment the reservation's own minute elapsed, which is exactly the hole the
+   * marker exists to close.
+   */
+  it("surfaces a failure to persist the block, never a blocked result", async () => {
+    granted();
+    const dbFailure = new Error("connection terminated unexpectedly");
+    markSlackMethodBlocked.mockRejectedValue(dbFailure);
+    const { impl } = fetchStub(
+      () => new Response("", { status: 429, headers: { "retry-after": "99999999999999999999" } })
+    );
+
+    await expect(
+      slackReservedRequest({ db: fakeDb(), scope: SCOPE, token: TOKEN }, "conversations.history", {}, {
+        fetchImpl: impl,
+      })
+    ).rejects.toBe(dbFailure);
+    expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The other half of the same contract, and the reason the marker is durable at all: a caller that
+   * finds the bucket ALREADY blocked sends nothing. This is the process that did not see the 429 —
+   * a later validation pass, a cleanup, another worker — and no elapsed deadline releases it.
+   */
+  it("sends zero requests when the bucket is already blocked, and promises no retry time", async () => {
+    reserveSlackMethodSlot.mockResolvedValue({
+      outcome: "blocked",
+      scope: SCOPE,
+      method: "conversations.history",
+      reason: "retry_after_unrepresentable",
+    });
+    const { impl, calls } = fetchStub(() => {
+      throw new Error("a blocked bucket must never reach the network");
+    });
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl }
+    );
+
+    expect(result).toEqual({
+      outcome: "blocked",
+      method: "conversations.history",
+      category: "retry_after_unrepresentable",
+    });
+    expect(calls).toHaveLength(0);
+    expect(events).toEqual(["commit"]);
+    // A blocked bucket needs an operator, so there is nothing to schedule on — and no second write
+    // that could quietly re-date the block it just read.
+    expect("nextPermittedAt" in result).toBe(false);
+    expect("retryAfterMs" in result).toBe(false);
+    expect(markSlackMethodBlocked).not.toHaveBeenCalled();
     expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
   });
 
@@ -578,6 +671,9 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
     // Nothing tried to hand the slot back: the provider counted the request, and refunding it is how
     // a failing worker turns into an unmetered request loop.
     expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
+    // …and a transient fault is not written down as a blocked configuration: that marker has no
+    // automatic clearing path, so recording one here would need an operator to undo a timeout.
+    expect(markSlackMethodBlocked).not.toHaveBeenCalled();
   });
 
   it("rejects a blank token without quoting it, and before any request", async () => {
