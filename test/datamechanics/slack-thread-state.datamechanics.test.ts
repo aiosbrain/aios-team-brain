@@ -50,6 +50,13 @@ const OTHER_WORKSPACE = "T0OTHERWS";
 const CHANNEL = "C0THREADS";
 const ROOT = "1718900000.000100";
 const OTHER_ROOT = "1718900500.000000";
+/**
+ * The same instant as ROOT once a number is made of it, and a DIFFERENT thread identity: Slack's
+ * `ts` is an opaque key that happens to look numeric, and the shared parser
+ * (`parseSlackTimestamp`) accepts any number of seconds digits. Thirteen of them is what the
+ * packet4a storage check refused.
+ */
+const PADDED_ROOT = "0001718900000.000100";
 const LEASE_MS = 60_000;
 
 // ── raw SQL client ───────────────────────────────────────────────────────────
@@ -167,6 +174,32 @@ async function refusal(p: Promise<unknown>): Promise<{ code: string; constraint?
     return { code: e.code ?? `no-code: ${String(err)}`, constraint: e.constraint };
   }
   return { code: "no-error" };
+}
+
+/**
+ * Everything a log line, a crash reporter or a serializer could pull off a thrown error: its own
+ * `String()` form, its stack, every scalar own property, and the whole `cause` chain. A validator
+ * that keeps a rejected value out of `message` alone still leaks it through any of these, so the
+ * non-echo assertion below is made against this, not against `err.message`.
+ */
+function diagnostics(err: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<object>();
+  let node: unknown = err;
+  while (node !== undefined && node !== null) {
+    parts.push(String(node));
+    if (typeof node !== "object") break;
+    if (seen.has(node)) break;
+    seen.add(node);
+    const names = Object.getOwnPropertyNames(node);
+    parts.push(names.join(","));
+    for (const name of names) {
+      const value = (node as Record<string, unknown>)[name];
+      if (typeof value !== "object" || value === null) parts.push(`${name}=${String(value)}`);
+    }
+    node = (node as { cause?: unknown }).cause;
+  }
+  return parts.join("\n");
 }
 
 async function insertRaw(values: Record<string, unknown>): Promise<unknown> {
@@ -366,6 +399,32 @@ describe("enqueue — idempotent, and never a reset", () => {
     expect(live).not.toBeNull();
     expect((await row(scopeFor(other))).status).toBe("queued");
     expect((await row(scopeFor(seed, { workspaceId: OTHER_WORKSPACE }))).status).toBe("queued");
+  });
+
+  it("stores a leading-zero root byte-exact, and never merges it with its unpadded twin", async () => {
+    const seed = await seedTeam();
+    const padded = scopeFor(seed, { rootTs: PADDED_ROOT });
+    const plain = scopeFor(seed);
+
+    const first = await enqueue(padded);
+    expect(first.inserted).toBe(true);
+    // Byte-exact on the way back out: not re-parsed, not trimmed of its zeros, not re-formatted.
+    expect(first.state.scope.rootTs).toBe(PADDED_ROOT);
+
+    const second = await enqueue(plain);
+    // TWO rows, not a conflict: the scope key is the provider's bytes. Numeric-equal spellings are
+    // distinct threads until something authoritative says otherwise, and normalizing either way here
+    // would silently merge two queues — or resurface one thread's cursor under the other's identity.
+    expect(second.inserted).toBe(true);
+    expect(await rowCount(seed.teamId)).toBe(2);
+    expect((await row(padded)).root_ts).toBe(PADDED_ROOT);
+    expect((await row(plain)).root_ts).toBe(ROOT);
+
+    // …and it is claimable under its own spelling, leaving the twin alone.
+    const live = await claim(padded);
+    expect(live?.scope.rootTs).toBe(PADDED_ROOT);
+    expect((await row(plain)).status).toBe("queued");
+    expect((await row(plain)).lease_owner).toBeNull();
   });
 });
 
@@ -641,14 +700,27 @@ describe("checkpoint — progress metadata, gated on the whole fence", () => {
     await expect(
       tx((s) => checkpointSlackThread(s, live, { pageCursor: null, snapshotGeneration: -1 }))
     ).rejects.toThrow(/generation/i);
-    await expect(
-      tx((s) =>
-        releaseSlackThreadForRetry(s, live, {
-          nextDueAt: new Date(),
-          errorCode: "invalid_auth: xoxb-1-2",
-        })
-      )
-    ).rejects.toThrow(/error/i);
+
+    // Synthetic, but shaped like the thing this rule exists for: a provider error string carrying a
+    // token. The rejection must be a VALIDATION error — raised before any statement — and it must
+    // not echo the value back, because a message that quotes what it rejected copies the token into
+    // every log that records the throw. That is the leak the sanitized category exists to prevent,
+    // so the value is checked against the whole diagnostic surface, not just `message`.
+    const leaky = "invalid_auth: xoxb-1-2";
+    let thrown: unknown;
+    try {
+      await tx((s) =>
+        releaseSlackThreadForRetry(s, live, { nextDueAt: new Date(), errorCode: leaky })
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(TypeError);
+    expect((thrown as Error).message).toMatch(/errorCode/);
+    const exposed = diagnostics(thrown);
+    for (const secret of [leaky, "xoxb-1-2", "invalid_auth"]) {
+      expect(exposed).not.toContain(secret);
+    }
 
     expect(await row(scope)).toEqual(before);
   });
@@ -899,6 +971,52 @@ describe("rollout — repeatable from zero, on upgrade, and on replay", () => {
         expect(
           await refusal(c.query(`update slack_sync_threads set lease_owner = null`))
         ).toMatchObject({ code: "23514", constraint: "slack_sync_threads_lease_codec" });
+
+        // 5. A CHECKPOINT-CREATED database, still carrying the FORMER 12-digit `root_ts` check.
+        // This DDL is test fixture, on this throwaway database only — it manufactures the state a
+        // container created from the earlier packet is already in, which is precisely the state
+        // `create table if not exists` cannot see and therefore cannot repair.
+        await c.query(
+          `alter table slack_sync_threads drop constraint if exists slack_sync_threads_root_ts_check`
+        );
+        await c.query(
+          `alter table slack_sync_threads add constraint slack_sync_threads_root_ts_check
+             check (root_ts ~ '^[0-9]{1,12}[.][0-9]{1,6}$')`
+        );
+        const insertPadded = () =>
+          c.query(
+            `insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts)
+               values ($1, $2, $3, $4)`,
+            [teamId, WORKSPACE, CHANNEL, PADDED_ROOT]
+          );
+        // The fixture is a real reproduction, not a name: the old rule rejects the padded root.
+        expect(await refusal(insertPadded())).toMatchObject({
+          code: "23514",
+          constraint: "slack_sync_threads_root_ts_check",
+        });
+
+        // 6. REPAIR. The replay must WIDEN the existing constraint, not skip the table it already
+        // found. Skipping is the failure this step exists to catch, and it is invisible from zero.
+        await load();
+        await insertPadded();
+
+        // Negative control: a "repair" that only DROPPED the old rule would satisfy the line above
+        // just as well. The widened constraint must be present, under its name, still refusing the
+        // syntax it always refused.
+        expect(
+          await refusal(
+            c.query(
+              `insert into slack_sync_threads (team_id, workspace_id, channel_id, root_ts)
+                 values ($1, $2, $3, '1718900000.0000001')`,
+              [teamId, WORKSPACE, CHANNEL]
+            )
+          )
+        ).toMatchObject({ code: "23514", constraint: "slack_sync_threads_root_ts_check" });
+
+        const after = await snapshot();
+        expect(after.filter((r) => r.root_ts === PADDED_ROOT)).toHaveLength(1);
+        // The pre-existing packet4a row — lease, cursor, counters — survived the constraint swap.
+        expect(after.filter((r) => r.root_ts === ROOT)).toEqual(before);
       } finally {
         await c.end().catch(() => {});
         const dropper = new Client({ connectionString: adminUrl });

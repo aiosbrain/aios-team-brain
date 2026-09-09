@@ -1380,10 +1380,10 @@ create table if not exists slack_sync_threads (
   -- worst, one wasted claim; canonical channel provenance belongs to the channel-state slice.
   workspace_id text not null check (workspace_id ~ '^[A-Za-z0-9]+$'),
   channel_id text not null check (channel_id ~ '^[A-Za-z0-9]+$'),
-  -- The thread root's Slack `ts` verbatim. Syntax only, and DELIBERATELY the weaker of the two
-  -- checks: the exact rule (epoch bounds, safe-integer seconds) is `parseSlackTimestamp`, which the
-  -- writer applies and SQL cannot host. The digit cap keeps the value bigint-castable.
-  root_ts text not null check (root_ts ~ '^[0-9]{1,12}[.][0-9]{1,6}$'),
+  -- The thread root's Slack `ts` verbatim. Its syntax check is NOT inline: it is stated once, below,
+  -- as a named constraint, so clean creation and the repair of an already-created table apply the
+  -- same rule from the same line.
+  root_ts text not null,
   -- Two states, on purpose (see the terminal-state note above).
   status text not null default 'queued' check (status in ('queued', 'running')),
   -- Not-before for the queued lane. The DB clock decides due-ness; a caller's clock never does.
@@ -1432,6 +1432,24 @@ create index if not exists slack_sync_threads_due_idx
   on slack_sync_threads (team_id, status, due_at);
 create index if not exists slack_sync_threads_lease_idx
   on slack_sync_threads (team_id, status, lease_expires_at);
+
+-- `root_ts` SYNTAX, aligned byte-for-byte with the shared parser's `TS_PATTERN`
+-- (`lib/ingest/sources/slack-message-evidence.ts`): any number of seconds digits, then 1–6
+-- fractional digits. It is deliberately the WEAKER of the two rules — epoch bounds and
+-- safe-integer seconds are semantics the parser owns and SQL cannot host — but it must not be
+-- NARROWER, or storage rejects a `ts` the writer accepted. The earlier `[0-9]{1,12}` cap did
+-- exactly that: `0001718900000.000100` parses, and zero-padding is the provider's spelling of a
+-- thread identity, not noise to trim. Nothing casts this column to bigint, so the cap bought
+-- nothing and cost a rejected root.
+--
+-- Named, dropped and re-added on every replay, per the convention above: `create table if not
+-- exists` is a no-op on a database that already has the table, so a checkpoint-created database
+-- would otherwise keep the old rule forever. This table has no production deployment (nothing
+-- schedules or publishes yet) and every legal old value is still legal, so no data migration
+-- exists or is needed — the widening cannot invalidate a stored row.
+alter table slack_sync_threads drop constraint if exists slack_sync_threads_root_ts_check;
+alter table slack_sync_threads add constraint slack_sync_threads_root_ts_check
+  check (root_ts ~ '^[0-9]+[.][0-9]{1,6}$');
 
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (

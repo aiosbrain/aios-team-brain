@@ -192,12 +192,24 @@ function assertPageCursor(value: string | null): void {
   }
 }
 
+/**
+ * The one validator here whose REJECTED VALUE IS ITSELF THE HAZARD.
+ *
+ * Everything this rule stops — a provider message, a bot token, a signed URL — is a thing that must
+ * not be written to `last_error_code`. A validation message that quoted the value it refused would
+ * copy that value into the throw, the stack, the error log and the crash report: the leak this
+ * column's syntax rule exists to prevent, taking the scenic route. So the message is STATIC, and no
+ * `cause` is attached (`SlackThreadStateError` sets only `message`/`name`) — there is no property on
+ * the thrown error that carries the input. The caller already holds the value it passed; what it
+ * needs from us is the rule, and the message states the rule in full.
+ */
 function assertErrorCode(value: string | null | undefined): void {
   if (value === null || value === undefined) return;
   if (typeof value !== "string" || !ERROR_CODE.test(value)) {
     throw new SlackThreadStateError(
-      `errorCode must be a sanitized lower-case category matching ${ERROR_CODE.source} ` +
-        `(got ${JSON.stringify(value)}) — never a provider message or token`
+      `errorCode must be null, omitted, or a sanitized lower-case failure CATEGORY matching ` +
+        `${ERROR_CODE.source} — never a provider message, a token or free text. The rejected value ` +
+        `is deliberately omitted from this message: it is the exact string suspected of carrying one.`
     );
   }
 }
