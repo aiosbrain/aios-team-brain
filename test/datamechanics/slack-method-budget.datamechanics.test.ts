@@ -518,6 +518,50 @@ describe("reserve — one slot, once, decided by the database", () => {
     expect(await rowCount(seed.teamId)).toBe(2);
   });
 
+  /**
+   * ONE bots.info bucket, and the verified scope is not a second one. `bots.info` under a verified
+   * scope would hand the same workspace a fresh allowance the moment an app id is bound — and a
+   * per-app one at that — so one bootstrap request could be followed immediately by another. The
+   * refusal is app-code AND storage, and it happens BEFORE a bucket exists.
+   */
+  it("refuses bots.info under a verified scope, before any row is created", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+
+    await expect(tx((s) => reserveSlackMethodSlot(s, scope, "bots.info"))).rejects.toThrow(TypeError);
+    await expect(
+      tx((s) => extendSlackMethodBackoff(s, scope, "bots.info", { retryAfterMs: 30_000 }))
+    ).rejects.toThrow(TypeError);
+    // The refusal is not a silent translation into the bootstrap bucket either: NOTHING was written.
+    expect(await rowCount(seed.teamId)).toBe(0);
+
+    // …and the database says the same thing, by name, so a writer that bypassed the module cannot
+    // store the row app code refuses to create.
+    expect(
+      await refusal(
+        insertRaw({
+          team_id: seed.teamId,
+          scope_kind: "verified",
+          workspace_id: WORKSPACE,
+          app_id: APP,
+          method: "bots.info",
+        })
+      )
+    ).toMatchObject({ code: "23514", constraint: "slack_method_budgets_method_scope" });
+
+    // The negative control: every OTHER method the verified scope exists for still works.
+    for (const method of [
+      "auth.test",
+      "conversations.info",
+      "conversations.history",
+      "conversations.replies",
+      "users.list",
+    ] as const) {
+      expect((await tx((s) => reserveSlackMethodSlot(s, scope, method))).outcome).toBe("granted");
+    }
+    expect(await rowCount(seed.teamId)).toBe(5);
+  });
+
   it("uses the caller's session: a rolled-back reservation leaves no bucket at all", async () => {
     const seed = await seedTeam();
     const scope = verified(seed);
@@ -631,6 +675,57 @@ describe("backoff — the deadline only ever moves later", () => {
     expect((await tx((s) => reserveSlackMethodSlot(s, scope, "conversations.history"))).outcome).toBe(
       "deferred"
     );
+  });
+
+  /**
+   * A VALID cooldown is persisted at its FULL duration. The bound is read off the database's own
+   * clock either side of the write, so this cannot pass by being generous about "about 48 hours":
+   * a 24-hour clamp lands a day short of the lower bound.
+   */
+  it("persists a 48-hour cooldown as 48 hours, not as a day", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    const c = await sql();
+    const before = new Date((await c.query<{ t: Date }>("select clock_timestamp() as t")).rows[0].t);
+
+    const long = await tx((s) =>
+      extendSlackMethodBackoff(s, scope, "conversations.history", { retryAfterMs: 172_800_000 })
+    );
+
+    const after = new Date((await c.query<{ t: Date }>("select clock_timestamp() as t")).rows[0].t);
+    const stored = new Date(
+      (await rowOf(scope, "conversations.history")).next_permitted_at as string
+    ).getTime();
+    expect(stored).toBeGreaterThanOrEqual(before.getTime() + 172_800_000);
+    expect(stored).toBeLessThanOrEqual(after.getTime() + 172_800_000);
+    expect(new Date(long.nextPermittedAt).getTime()).toBe(stored);
+    expect(long.retryAfterMs).toBeGreaterThan(86_400_000);
+
+    // A shorter cooldown arriving afterwards still cannot rewind it.
+    const shorter = await tx((s) =>
+      extendSlackMethodBackoff(s, scope, "conversations.history", { retryAfterMs: 3_600_000 })
+    );
+    expect(shorter.nextPermittedAt).toBe(long.nextPermittedAt);
+  });
+
+  /**
+   * A delay we cannot carry end to end must not become a near-term one. Recording the 60-second
+   * floor here would be indistinguishable, in the table, from an ordinary cooldown — and it would
+   * release the next request while the provider is still refusing.
+   */
+  it("refuses an unrepresentable delay rather than storing a shorter one", async () => {
+    const seed = await seedTeam();
+    const scope = verified(seed);
+    const granted = await tx((s) => reserveSlackMethodSlot(s, scope, "users.list"));
+    const before = await rowOf(scope, "users.list");
+
+    await expect(
+      tx((s) => extendSlackMethodBackoff(s, scope, "users.list", { retryAfterMs: 1e300 }))
+    ).rejects.toThrow(TypeError);
+
+    if (granted.outcome !== "granted") throw new Error("unreachable");
+    // Whole-row comparison: no deadline, and no metadata, moved on the way out.
+    expect(await rowOf(scope, "users.list")).toEqual(before);
   });
 
   it("takes the conservative floor when there is nothing usable to read", async () => {

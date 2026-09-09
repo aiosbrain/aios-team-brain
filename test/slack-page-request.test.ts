@@ -2,12 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DbClient, TransactionCapableDbClient, TransactionSession } from "@/lib/db/types";
 import {
-  clampBackoffMs,
-  parseRetryAfterMs,
+  readRetryAfterHeader,
   slackMethodIntervalMs,
   slackMethodPageLimit,
+  usableBackoffMs,
   SLACK_BACKOFF_FLOOR_MS,
-  SLACK_BACKOFF_MAX_MS,
+  SLACK_BACKOFF_REPRESENTABLE_MAX_MS,
   SLACK_BUDGETED_METHODS,
   SLACK_UNKNOWN_CATEGORY_INTERVAL_MS,
   SLACK_UNKNOWN_CATEGORY_PAGE_LIMIT,
@@ -378,6 +378,64 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
     ).rejects.toBe(dbFailure);
   });
 
+  it("hands a 48-hour cooldown on in full, rather than a day", async () => {
+    granted();
+    const persisted = "2026-09-11T12:00:00.000Z";
+    extendSlackMethodBackoff.mockResolvedValue({
+      scope: SCOPE,
+      method: "conversations.history",
+      nextPermittedAt: persisted,
+      retryAfterMs: 172_800_000,
+    });
+    const { impl } = fetchStub(
+      () => new Response("", { status: 429, headers: { "retry-after": "172800" } })
+    );
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      {},
+      { fetchImpl: impl }
+    );
+
+    // Shortened to 24h, the next request would go out a full day inside a cooldown the provider
+    // stated — so the whole duration has to survive both the parse and the hand-off.
+    expect(extendSlackMethodBackoff).toHaveBeenCalledWith(expect.anything(), SCOPE, "conversations.history", {
+      retryAfterMs: 172_800_000,
+    });
+    expect(result).toMatchObject({
+      outcome: "rate_limited",
+      retryAfterMs: 172_800_000,
+      nextPermittedAt: persisted,
+    });
+  });
+
+  /**
+   * A cooldown we cannot carry end to end is a BLOCKED configuration, not a slow one. Persisting the
+   * 60-second floor instead would send the next request while the provider is still refusing, and it
+   * would look like an ordinary deferral in the table.
+   */
+  it("reports an unrepresentable Retry-After as blocked, and persists no near-term cooldown", async () => {
+    granted();
+    const { impl } = fetchStub(
+      () => new Response("", { status: 429, headers: { "retry-after": "99999999999999999999" } })
+    );
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      {},
+      { fetchImpl: impl }
+    );
+
+    expect(result).toEqual({
+      outcome: "blocked",
+      method: "conversations.history",
+      category: "retry_after_unrepresentable",
+    });
+    expect(extendSlackMethodBackoff).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["invalid_auth", "auth_error"],
     ["missing_scope", "auth_error"],
@@ -400,13 +458,19 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
     expect(result).toEqual({ outcome, method: "conversations.info", category: error });
   });
 
-  it("never lets a provider error code become free text", async () => {
+  /**
+   * A category is RECOGNISED, never merely well-shaped. `synthetic_secret_token` satisfies every
+   * lower-case/underscore rule a syntax check could state, and echoing it would copy provider text
+   * into every log and `last_error_code` column that records the failure — the shape of a value says
+   * nothing about whether it is safe to keep.
+   */
+  it.each([
+    ["Rate limit exceeded for token xoxb-1-2; retry later", "xoxb-1-2"],
+    ["synthetic_secret_token", "synthetic_secret_token"],
+    ["a_code_this_path_has_never_heard_of", "a_code_this_path_has_never_heard_of"],
+  ])("replaces an unrecognised provider code (%s) instead of echoing it", async (error, leak) => {
     granted();
-    // A provider code that is not category-shaped is REPLACED, not truncated or escaped: the value
-    // is arbitrary remote content, and a category is meant to be safe to put in a log or a column.
-    const { impl } = fetchStub(() =>
-      json({ ok: false, error: "Rate limit exceeded for token xoxb-1-2; retry later" })
-    );
+    const { impl } = fetchStub(() => json({ ok: false, error }));
 
     const result = await slackReservedRequest(
       { db: fakeDb(), scope: SCOPE, token: TOKEN },
@@ -420,7 +484,77 @@ describe("slackReservedRequest — 429 before JSON, and sanitized categories", (
       method: "conversations.info",
       category: "provider_error",
     });
-    expect(JSON.stringify(result)).not.toContain("xoxb-1-2");
+    expect(JSON.stringify(result)).not.toContain(leak);
+  });
+
+  it("keeps the known cursor, channel and thread codes distinguishable for a later worker", async () => {
+    for (const error of ["invalid_cursor", "not_in_channel", "is_archived", "thread_not_found"]) {
+      granted();
+      const { impl } = fetchStub(() => json({ ok: false, error }));
+      const result = await slackReservedRequest(
+        { db: fakeDb(), scope: SCOPE, token: TOKEN },
+        "conversations.replies",
+        { channel: "C0UNIT001", ts: "1718900000.000100" },
+        { fetchImpl: impl }
+      );
+      expect(result).toEqual({ outcome: "provider_error", method: "conversations.replies", category: error });
+    }
+  });
+
+  /**
+   * HTTP FAILURE IS NEVER SUCCESS. A 5xx carrying `{"ok":true,"messages":[]}` is a broken or
+   * intercepted response; reading a page out of it would hand a worker an empty page as provider
+   * fact, and an empty page is exactly what a history scan reads as "nothing here".
+   */
+  it("refuses to call a failed HTTP status successful, whatever the body claims", async () => {
+    for (const status of [500, 502, 400, 404]) {
+      granted();
+      const { impl } = fetchStub(() => json({ ok: true, messages: [] }, status));
+      const result = await slackReservedRequest(
+        { db: fakeDb(), scope: SCOPE, token: TOKEN },
+        "conversations.history",
+        { channel: "C0UNIT001" },
+        { fetchImpl: impl }
+      );
+      expect(result).toEqual({
+        outcome: "provider_error",
+        method: "conversations.history",
+        category: `http_${status}`,
+      });
+      // No partial body fallback: a failure carries no page at all.
+      expect("page" in result).toBe(false);
+      expect("body" in result).toBe(false);
+    }
+  });
+
+  it("still reports a recognised error code on a failed status, rather than the bare status", async () => {
+    granted();
+    const { impl } = fetchStub(() => json({ ok: false, error: "missing_scope" }, 403));
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "bots.info",
+      { bot: "B0UNIT001" },
+      { fetchImpl: impl }
+    );
+
+    expect(result).toEqual({ outcome: "auth_error", method: "bots.info", category: "missing_scope" });
+  });
+
+  it("keeps a 200 with ok:true successful", async () => {
+    granted();
+    const { impl } = fetchStub(() => json({ ok: true, messages: [] }, 200));
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl }
+    );
+
+    // The negative control for the four statuses above: the status check refuses failures, and does
+    // not simply refuse everything.
+    expect(result.outcome).toBe("ok");
   });
 
   it.each([
@@ -495,9 +629,9 @@ describe("budget policy — the pure half", () => {
   });
 
   it("reads Retry-After as an integer count of SECONDS, and nothing else", () => {
-    expect(parseRetryAfterMs("120")).toBe(120_000);
-    expect(parseRetryAfterMs(" 30 ")).toBe(30_000);
-    expect(parseRetryAfterMs("0")).toBe(0);
+    expect(readRetryAfterHeader("120")).toEqual({ kind: "delay", retryAfterMs: 120_000 });
+    expect(readRetryAfterHeader(" 30 ")).toEqual({ kind: "delay", retryAfterMs: 30_000 });
+    expect(readRetryAfterHeader("0")).toEqual({ kind: "delay", retryAfterMs: 0 });
     for (const header of [
       // RFC 9110 also allows an HTTP-date; accepting one would mean trusting a remote clock to
       // schedule our own requests, so it reads as unusable and takes the floor instead.
@@ -507,26 +641,53 @@ describe("budget policy — the pure half", () => {
       "1e3",
       "",
       "   ",
-      "9999999999999",
       null,
       undefined,
       120 as unknown as string,
     ]) {
-      expect(parseRetryAfterMs(header)).toBeNull();
+      expect(readRetryAfterHeader(header)).toEqual({ kind: "unreadable" });
     }
   });
 
-  it("clamps a cooldown between the conservative floor and a day", () => {
-    expect(clampBackoffMs(null)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(undefined)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(Number.NaN)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(Number.POSITIVE_INFINITY)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(0)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(-1_000)).toBe(SLACK_BACKOFF_FLOOR_MS);
-    expect(clampBackoffMs(SLACK_BACKOFF_FLOOR_MS + 1)).toBe(SLACK_BACKOFF_FLOOR_MS + 1);
-    expect(clampBackoffMs(120_000)).toBe(120_000);
-    // A garbled or hostile year-long cooldown would park a team's ingestion with no visible cause
-    // and no recovery short of a manual DB edit.
-    expect(clampBackoffMs(SLACK_BACKOFF_MAX_MS * 10)).toBe(SLACK_BACKOFF_MAX_MS);
+  /**
+   * A VALID cooldown keeps its full duration. There is no evidence that a genuine Slack cooldown is
+   * under a day, so an upper clamp could only ever shorten a real one — and a request sent a day
+   * early during a 48-hour cooldown is the failure that clamp would cause.
+   */
+  it("keeps a long but valid Retry-After at its full duration, leading zeros included", () => {
+    expect(readRetryAfterHeader("172800")).toEqual({ kind: "delay", retryAfterMs: 172_800_000 });
+    // Leading zeros are syntax, not magnitude: this is the SAME duration as the line above.
+    expect(readRetryAfterHeader("0000172800")).toEqual({ kind: "delay", retryAfterMs: 172_800_000 });
+    expect(usableBackoffMs(172_800_000)).toBe(172_800_000);
+  });
+
+  /**
+   * A digits-only header too large to carry end to end is NOT malformed, and must not be quietly
+   * downgraded to the 60-second fallback — that would schedule a request far earlier than the
+   * provider permitted while looking like an ordinary cooldown. It is reported as its own state.
+   */
+  it("separates a digits-only but unrepresentable duration from a malformed one", () => {
+    for (const header of ["9999999999999", "99999999999999999999"]) {
+      expect(readRetryAfterHeader(header)).toEqual({ kind: "unrepresentable" });
+    }
+    expect(
+      readRetryAfterHeader(String(SLACK_BACKOFF_REPRESENTABLE_MAX_MS / 1_000))
+    ).toEqual({ kind: "delay", retryAfterMs: SLACK_BACKOFF_REPRESENTABLE_MAX_MS });
+    expect(readRetryAfterHeader(String(SLACK_BACKOFF_REPRESENTABLE_MAX_MS / 1_000 + 1))).toEqual({
+      kind: "unrepresentable",
+    });
+  });
+
+  it("floors what it cannot read, and refuses to shorten what it cannot represent", () => {
+    for (const unusable of [null, undefined, Number.NaN, Number.POSITIVE_INFINITY, 0, -1_000]) {
+      expect(usableBackoffMs(unusable)).toBe(SLACK_BACKOFF_FLOOR_MS);
+    }
+    expect(usableBackoffMs(SLACK_BACKOFF_FLOOR_MS + 1)).toBe(SLACK_BACKOFF_FLOOR_MS + 1);
+    expect(usableBackoffMs(120_000)).toBe(120_000);
+    // Not the floor, and not a fabricated maximum: an explicit refusal, because both of those would
+    // persist a deadline earlier than the one we were told to honour.
+    for (const unrepresentable of [SLACK_BACKOFF_REPRESENTABLE_MAX_MS + 1, 1e300]) {
+      expect(() => usableBackoffMs(unrepresentable)).toThrow(TypeError);
+    }
   });
 });
