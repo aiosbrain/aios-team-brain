@@ -1,4 +1,4 @@
 interface:
   display_name: "Review Recent PRs"
   short_description: "Audit recently merged repo pull requests"
-  default_prompt: "Use $review-recent-prs to audit the most recent merged PRs on main for regressions and risky changes."
+  default_prompt: "Use $review-recent-prs to audit the most recent merged PRs on the configured contribution branch (or the branch I explicitly request) for regressions and risky changes."

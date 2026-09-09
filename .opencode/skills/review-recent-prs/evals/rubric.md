@@ -8,8 +8,10 @@ PR evidence to determine whether the workflow was followed.
 ## Pass
 
 - Scopes the audit explicitly, defaulting to the 10 most recently merged PRs
-  into `main` when the user gives no range.
-- Refreshes `origin/main` before drawing conclusions.
+  into the contribution base resolved from `scripts/branches.mjs` when the user
+  gives no branch; honors an explicit branch override.
+- Refreshes the chosen remote base before drawing conclusions.
+- Selects by merge time after complete pagination, including old PRs merged recently.
 - Uses PR metadata plus actual diffs or current source reads as evidence.
 - Leads with actionable findings, with severity, impact, evidence, and a fix or
   follow-up.

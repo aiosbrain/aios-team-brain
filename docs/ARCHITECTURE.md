@@ -208,9 +208,9 @@ the app's own mode.
 
 ## Agent skill publication
 
-`AGENTS.md` also records durable recovery checkpoints, local Linear credential lookup,
-and the Opus-only subscription pause policy. The `review-recent-prs` skill provides a
-read-only audit of recent PRs and is published through the same runtime manifest.
+The `review-recent-prs` skill provides a read-only audit of recent PRs and is
+published through `.skill-runtimes.json`. Its default target follows the contribution
+branch in `scripts/branches.mjs`; an explicit user target takes precedence.
 
 Repository-local agent skills are authored once under `.claude/skills/`. The explicit
 publication manifest `.skill-runtimes.json` selects which canonical skills are projected

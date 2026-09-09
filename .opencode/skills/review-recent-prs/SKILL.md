@@ -24,27 +24,49 @@ This skill is for auditing PRs and reporting findings. It does not replace
 ## Scope defaults
 
 - If the user does not specify a range, review the **10 most recently merged PRs
-  into `main`**.
+  into the contribution base** (currently `staging`, declared in
+  `scripts/branches.mjs`). Never hardcode the branch name — resolve it.
+- If the user names a branch explicitly ("audit what merged into `main`",
+  "the last 5 PRs into `release/2026-09`"), that override wins: set `base` to
+  the branch they named and say so in the scope line.
 - If they say "recent PRs" without "merged", include open PRs only when the
   request is clearly about work still under review; otherwise default to merged
   PRs.
 - If they specify `last week`, `since <date>`, a count, authors, labels, or PR
   numbers, honor that scope and state it before reviewing.
-- Keep the workflow read-only: use `gh pr list`, `gh pr view`, `gh pr diff`,
+- Keep the workflow read-only: use `gh api` reads, `gh pr view`, `gh pr diff`,
   `git fetch`, `git show`, and local file reads. Do not edit PR bodies, labels,
   code, tasks, or comments unless explicitly asked.
 
 ## Steps
 
-1. **Refresh `main` and identify the PR set.**
+1. **Resolve the base, refresh it, and identify the PR set.**
    ```bash
-   git fetch origin main
-   gh pr list --base main --state merged --limit 10 \
-     --json number,title,author,mergedAt,mergeCommit,url,labels
+   root="$(git rev-parse --show-toplevel)"
+   base="$(node "$root/scripts/branches.mjs" --print contribution)"
+   # Explicit user override, if they named a branch: base=main
+   git -C "$root" fetch origin "$base"
+   set -o pipefail
+   gh api --paginate "repos/{owner}/{repo}/pulls?state=closed&per_page=100" --jq '.[]' \
+     | jq -s --arg base "$base" '
+         [ .[] | select(.merged_at != null and .base.ref == $base) ]
+         | sort_by(.merged_at) | reverse | .[:10]
+         | map({number, title, author: .user.login, mergedAt: .merged_at,
+                mergeCommit: .merge_commit_sha, url: .html_url, labels: [.labels[].name]})'
    ```
-   For open or closed scopes, change `--state` explicitly. If `gh` is not
-   authenticated or the network is unavailable, report that as the blocker
-   rather than guessing from local commit history.
+   **Do not substitute `gh pr list --limit 10`.** `gh pr list` sorts by PR
+   *creation* date, not merge date, so its first 10 merged PRs are the 10
+   newest-*opened* ones — a long-lived PR merged this morning is missed, and a
+   PR opened yesterday but merged weeks from now is not yet merged at all. The
+   REST `pulls` endpoint offers no `merged_at` sort either, so the ordering has
+   to be done client-side over a **complete** page walk: `--paginate` reads
+   every closed PR, and the `sort_by(.merged_at) | reverse | .[:10]` runs after
+   the full set is in hand. A bounded overfetch (`--limit 200`) still silently
+   drops any PR merged late in its life.
+
+   Do not trust partial output if pagination fails. For open or unmerged closed
+   scopes, use `gh pr list --base "$base"` with the requested state and range. If `gh` is not authenticated or the network is unavailable, report
+   that as the blocker rather than guessing from local commit history.
 
 2. **Collect evidence per PR.** For each PR in scope, read metadata and the
    actual diff:
@@ -55,7 +77,7 @@ This skill is for auditing PRs and reporting findings. It does not replace
    ```
    If a PR is large, start with `files`, `body`, and commit subjects, then pull
    focused patches for risky files. Never base findings only on PR comments or
-   summaries; verify against the diff or current `origin/main`.
+   summaries; verify against the diff or current `origin/$base`.
 
 3. **Check repo-specific gates.** Look for:
    - Missing local review evidence in the PR body (`## Review — Reviewed by …`)
@@ -83,7 +105,7 @@ This skill is for auditing PRs and reporting findings. It does not replace
 5. **Verify suspected HIGH findings independently.** Before reporting a HIGH or
    blocker, re-derive it from source:
    ```bash
-   git show origin/main:<path>
+   git show "origin/$base:<path>"
    ```
    or inspect the merged commit with:
    ```bash
@@ -106,7 +128,7 @@ This skill is for auditing PRs and reporting findings. It does not replace
    - #119 missing attestation line; #118 used ready-for-review.
 
    Scope / evidence
-   - Reviewed 10 merged PRs into main from 2026-08-01 through 2026-08-05.
+   - Reviewed 10 merged PRs into the resolved contribution base from 2026-08-01 through 2026-08-05.
    - Commands run: ...
    ```
    Keep summaries secondary. If there are no issues, say that plainly and name
@@ -121,6 +143,6 @@ This skill is for auditing PRs and reporting findings. It does not replace
   loaders, or connector syncs while reviewing recent PRs.
 - Do not treat missing tests as a finding by itself; connect it to a concrete
   unverified behavior or repo rule.
-- Do not accuse a PR based on stale local `origin/main`; fetch first.
+- Do not accuse a PR based on stale local `origin/$base`; fetch first.
 - Do not report HIGH/blocker issues from a single skim. Confirm severe findings
   against the merged diff/current code before surfacing them.

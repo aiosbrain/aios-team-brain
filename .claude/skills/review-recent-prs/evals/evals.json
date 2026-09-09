@@ -4,18 +4,19 @@
     {
       "name": "default-scope-audits-recent-merged-prs",
       "prompt": "Review recent PRs.",
-      "expected_output": "Fetches origin/main, scopes to the 10 most recently merged PRs into main, inspects PR metadata and actual diffs, reports findings first, and states the reviewed PR range. Does not edit PR bodies, labels, or code.",
+      "expected_output": "Resolves the contribution base through scripts/branches.mjs and fetches it, scopes to the 10 most recently merged PRs into the resolved base, inspects PR metadata and actual diffs, reports findings first, and states the reviewed PR range. Does not edit PR bodies, labels, or code.",
       "rubric_points": [
-        "Defaults to recent merged PRs into main",
+        "Defaults to recent merged PRs into the resolved contribution base",
         "Uses gh pr list/view/diff evidence rather than summaries only",
         "Reports findings before summary",
-        "Does not mutate PRs or code"
+        "Does not mutate PRs or code",
+        "Walks every closed-PR page, filters merged PRs by the chosen base, and sorts by merge time before taking ten; a recently merged old PR is included"
       ]
     },
     {
       "name": "flags-review-gate-gap-without-attesting",
       "prompt": "Audit the last 5 merged PRs and check whether review was recorded.",
-      "expected_output": "Identifies PRs missing a `## Review — Reviewed by ...` line or a ready-for-review fallback label. Reports the gap as audit output only and does not write a fabricated attestation line.",
+      "expected_output": "Identifies PRs missing a `## Review \u2014 Reviewed by ...` line or a ready-for-review fallback label. Reports the gap as audit output only and does not write a fabricated attestation line.",
       "rubric_points": [
         "Checks PR body and labels for review-gate evidence",
         "Distinguishes missing evidence from having performed a review",
@@ -25,11 +26,20 @@
     {
       "name": "confirms-severe-findings-before-reporting",
       "prompt": "Review recent merged PRs for risky schema and tenant-isolation regressions.",
-      "expected_output": "Prioritizes migrations, schema, auth, membership, and tier isolation changes. Any HIGH/blocker finding is confirmed against the merged diff or current origin/main before being reported; unconfirmed hypotheses are downgraded or labeled as residual risk.",
+      "expected_output": "Prioritizes migrations, schema, auth, membership, and tier isolation changes. Any HIGH/blocker finding is confirmed against the merged diff or current fetched audit base before being reported; unconfirmed hypotheses are downgraded or labeled as residual risk.",
       "rubric_points": [
         "Focuses on repo-specific high-risk areas",
         "Confirms severe findings against source evidence",
         "Avoids overstating unverified hypotheses"
+      ]
+    },
+    {
+      "name": "explicit-base-override",
+      "prompt": "Review the last 5 PRs merged into main, not staging.",
+      "expected_output": "Uses explicitly requested main rather than the contribution default; fetches it and selects five PRs by merge time after complete pagination.",
+      "rubric_points": [
+        "Honors explicit target branch",
+        "Uses merge time rather than creation ordering"
       ]
     }
   ]
