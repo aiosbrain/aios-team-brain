@@ -1451,6 +1451,90 @@ alter table slack_sync_threads drop constraint if exists slack_sync_threads_root
 alter table slack_sync_threads add constraint slack_sync_threads_root_ts_check
   check (root_ts ~ '^[0-9]+[.][0-9]{1,6}$');
 
+-- ── Slack per-channel NAMESPACE migration gate (AIO-1170) ────────────────────
+-- One durable row per (AIOS team, RAW Slack channel id): may items for this channel be published
+-- under the workspace-qualified namespace `slack/<workspace>/<channel>/<root-ts>.md` yet? The single
+-- writer is `lib/ingest/slack-namespace-gate.ts`; the only callers today are its data-mechanics
+-- tests. It is keyed on the RAW channel id — not on a workspace — precisely because the question it
+-- answers is which workspace(s) that raw id was proven to belong to.
+--
+-- ⚠️ THIS IS A NAMESPACE GATE, NOT SOURCE AUTHORIZATION. A `ready` row says the channel's legacy
+-- rows were resolved and migrated; it says nothing about channel permission, provider scope, body
+-- completeness or whether a particular item may be published. It also is NOT the channel sync-state
+-- row: provider metadata, a history cursor and method reservations belong to the later source-state
+-- packets, and an empty/default row here must never be read as standing in for them.
+--
+-- ⚠️ IT CANNOT BECOME `ready` IN THIS BUILD. The producer entitled to set readiness — the attended
+-- migration/provenance writer — does not exist, so no application path writes `state='ready'`; the
+-- columns exist because the codec that refuses a half-proved readiness has to be enforced from the
+-- first row. When that producer lands, it must lock this row BEFORE the old/new path locks, scan
+-- every relevant legacy row under that synchronization, bind each to verified integration/workspace
+-- provenance, and leave the gate blocked if any row is unknown/conflicting or any scan is partial.
+--
+-- ABSENT ROW = BLOCKED. There is no arm in which a missing row, a stale readiness or a failed read
+-- means "may publish"; that distinction lives in the reader (a failed read is an error), and there
+-- is no schema-level way to state it.
+create table if not exists slack_channel_migration_gates (
+  team_id uuid not null references teams(id) on delete cascade,
+  -- The provider's bytes, same identity discipline (and same alphabet) as `slack_sync_threads`:
+  -- app-code validation is not a storage guarantee, and case-folding would mint an identity the
+  -- rest of the Slack state does not share.
+  raw_channel_id text not null check (raw_channel_id ~ '^[A-Za-z0-9]+$'),
+  state text not null default 'blocked' check (state in ('blocked', 'ready')),
+  -- Monotonic. It changes whenever existing readiness/provenance becomes invalid, and a publisher
+  -- pins its work to the value it observed — so an invalidation that lands mid-flight is detected
+  -- rather than silently tolerated.
+  revision bigint not null default 0 check (revision >= 0),
+  -- The revision the readiness was PROVED at. Null while blocked; equal to `revision` when ready,
+  -- so readiness cannot survive the invalidation that outran it.
+  ready_revision bigint check (ready_revision is null or ready_revision >= 0),
+  -- Producer OUTPUT, never a client assertion: the workspace(s) the migration actually resolved
+  -- this raw channel to. Empty while blocked.
+  resolved_workspace_ids text[] not null default '{}',
+  -- Durable identity of the completed attended repair that proved the above. Null while blocked.
+  -- The UUID alone proves nothing here — the later producer must tie it to completed provenance
+  -- records; this column exists so that a readiness with no repair behind it cannot be stored.
+  completed_repair_id uuid,
+  -- A sanitized CATEGORY of why the channel is blocked (lower-case, underscore-separated, ≤40
+  -- chars) — never raw provider content, a message or a token. Same syntax rule, and the same
+  -- reason for it, as `slack_sync_threads.last_error_code`.
+  blocked_reason text check (blocked_reason is null or blocked_reason ~ '^[a-z][a-z0-9_]{0,39}$'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (team_id, raw_channel_id),
+  -- Readiness is ALL of its evidence or none of it. Without this, a partially-written row — a
+  -- `ready` state with a null repair id, or a readiness left behind at a stale revision — is
+  -- storable, and every later reader would have to remember to re-check the parts.
+  constraint slack_channel_migration_gates_ready_codec check (
+    case state
+      when 'ready' then ready_revision is not null
+                    and ready_revision = revision
+                    and cardinality(resolved_workspace_ids) > 0
+                    and completed_repair_id is not null
+                    and blocked_reason is null
+      else ready_revision is null
+                    and cardinality(resolved_workspace_ids) = 0
+                    and completed_repair_id is null
+    end
+  ),
+  -- The workspace set is a set of PROVIDER IDS, so `cardinality > 0` above cannot be satisfied by a
+  -- NULL, a blank or free text. CASE, not AND: `array_position` raises on a multidimensional array,
+  -- and only an ordered evaluation guarantees that shape is refused as a violation rather than an
+  -- error from inside the constraint.
+  constraint slack_channel_migration_gates_workspace_syntax check (
+    case
+      when array_ndims(resolved_workspace_ids) is distinct from 1
+        then cardinality(resolved_workspace_ids) = 0
+      else array_position(resolved_workspace_ids, null) is null
+       and array_to_string(resolved_workspace_ids, ',') ~ '^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$'
+    end
+  )
+);
+-- The scan an admin/repair surface will need: this team's channels, blocked ones first. No reader
+-- exists yet, and it is cheap on an empty table.
+create index if not exists slack_channel_migration_gates_state_idx
+  on slack_channel_migration_gates (team_id, state);
+
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
   id uuid primary key default gen_random_uuid(),
