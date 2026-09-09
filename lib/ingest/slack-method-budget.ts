@@ -348,7 +348,7 @@ function assertBlockedReason(reason: unknown): SlackMethodBlockedReason {
  * unblocked: whatever put it there meant to stop requests, and the failure direction of "I do not
  * understand this marker" must be refusal, not a granted slot.
  */
-function storedBlockedReason(value: string | null): SlackMethodBlockedReason | null {
+function storedBlockedReason(value: string | null | undefined): SlackMethodBlockedReason | null {
   if (value === null || value === undefined) return null;
   return assertBlockedReason(value);
 }

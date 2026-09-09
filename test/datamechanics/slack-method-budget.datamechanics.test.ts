@@ -896,10 +896,11 @@ describe("block — a marker no deadline and no ordinary write releases", () => 
 
     // A repeated mark is idempotent rather than a second, re-dated block.
     await tx((s) => markSlackMethodBlocked(s, scope, "users.list", "retry_after_unrepresentable"));
-    const settled = await rowOf(scope, "users.list");
 
-    // Reservations after the deadline has long passed: still blocked, and the row does not drift.
+    // ⚠️ clock fixture — the deadline moves a day into the past. `settled` is read AFTER it, so the
+    // whole-row comparison below is about what the RESERVATIONS did, not about the fixture.
     await rewind(scope, "users.list", 86_400_000);
+    const settled = await rowOf(scope, "users.list");
     for (let attempt = 0; attempt < 2; attempt += 1) {
       expect((await tx((s) => reserveSlackMethodSlot(s, scope, "users.list"))).outcome).toBe("blocked");
     }
