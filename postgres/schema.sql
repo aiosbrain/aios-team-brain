@@ -1558,9 +1558,11 @@ alter table slack_channel_migration_gates
     end
   );
 
--- The fourth Slack table, `slack_method_budgets` (per-method request reservations), is defined
--- further down this file, immediately after `integrations` — a provisional bucket carries an
--- integration FK, and this section is created before that table exists.
+-- Three more Slack tables — `slack_method_budgets` (per-method request reservations),
+-- `slack_integration_bindings` (per-integration app-identity binding) and `slack_sync_channels`
+-- (per-channel discovery state) — are defined further down this file, immediately after
+-- `integrations`: each carries an integration FK, and this section is created before that table
+-- exists.
 
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
@@ -3000,6 +3002,232 @@ begin
   );
 end
 $$;
+
+-- ── Slack per-integration SOURCE BINDING (AIO-1170) ──────────────────────────
+-- One durable row per (AIOS team, Slack integration): the app identity this integration's EFFECTIVE
+-- token was proved to belong to, and the cache-validity stamps that proof is only good under. The
+-- single writer is `lib/ingest/slack-source-binding.ts`; its only caller is the internal
+-- source-discovery entrypoint `lib/ingest/slack-source-discovery.ts`, which nothing schedules yet.
+--
+-- ⚠️ IT LIVES HERE FOR THE FK, like `slack_method_budgets` above: a binding is keyed on an
+-- integration, and `integrations` is created further down this file than the other Slack tables.
+--
+-- ⚠️ A VERIFIED BINDING IS PROVIDER IDENTITY, NOT PERMISSION. It says auth.test (and, when
+-- auth.test carried no `app_id`, bots.info for exactly the `bot_id` auth.test returned) established
+-- this workspace and app. It says nothing about channel permission, namespace migration or whether
+-- anything may be published; a channel still needs its own public proof in `slack_sync_channels`.
+--
+-- WHY THE TWO STAMPS. `config_revision` covers the integration row the selection came from
+-- (`updated_at` + its canonical selected config), and `token_fingerprint` is a SHA-256 of the
+-- EFFECTIVE token — the saved secret, or the env fallback when no secret is stored. Either changing
+-- invalidates the binding BEFORE any further source read, which is the only way an env-token
+-- rotation is detectable at all: it leaves `integrations.updated_at` untouched.
+--
+-- ⚠️ THE FINGERPRINT IS PRIVATE CACHE-VALIDITY METADATA AND NOTHING ELSE. It is never a provider
+-- identity, a bucket key, a log value or an API field, and no reader outside the writer module
+-- returns it. It is not a token-derived ID: nothing keys, scopes or names anything by it.
+create table if not exists slack_integration_bindings (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  integration_id uuid not null references integrations(id) on delete cascade,
+  -- Both stamps are sha256 hex. The syntax rule is what keeps a token, a header or free text out of
+  -- a column whose whole job is to be compared for equality.
+  config_revision text not null check (config_revision ~ '^[0-9a-f]{64}$'),
+  token_fingerprint text not null check (token_fingerprint ~ '^[0-9a-f]{64}$'),
+  -- The RESUMABLE bootstrap position. `pending_app` is the state that makes a delayed bots.info
+  -- resumable without re-running auth.test on the next wake — repeating auth each wake because a
+  -- LATER method was deferred is how a 1/min budget never finishes bootstrap.
+  state text not null default 'pending_auth' check (
+    state in ('pending_auth', 'pending_app', 'verified', 'blocked')
+  ),
+  -- Provider ids byte-exact, same identity discipline and alphabet as the Slack tables above.
+  workspace_id text check (workspace_id ~ '^[A-Za-z0-9]+$'),
+  app_id text check (app_id ~ '^[A-Za-z0-9]+$'),
+  -- The `bot_id` auth.test returned — the exact value bots.info is asked about, never derived from
+  -- the token's bytes or its prefix.
+  bot_id text check (bot_id ~ '^[A-Za-z0-9]+$'),
+  -- auth.test's `url`. HTTPS only: an http/other-scheme workspace URL is not a fact we record.
+  workspace_url text check (workspace_url ~ '^https://[^[:space:]]+$'),
+  -- The channels this integration's CURRENT config selects, canonicalized. It is the record of
+  -- which verified integrations select a shared channel state: two integrations selecting one
+  -- channel coalesce onto one `slack_sync_channels` row, and this is where "who selects it" lives.
+  selected_channel_ids text[] not null default '{}',
+  -- Not-before for the next bootstrap attempt. Only ever set from a REAL persisted deadline (the
+  -- method budget's own `next_permitted_at`) or the DB clock — never a fabricated retry time.
+  due_at timestamptz not null default now(),
+  -- A sanitized CATEGORY, same syntax rule and same reason as `slack_sync_threads.last_error_code`.
+  error_code text check (error_code is null or error_code ~ '^[a-z][a-z0-9_]{0,39}$'),
+  auth_checked_at timestamptz,
+  app_checked_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, integration_id),
+  -- Each state is ALL of its evidence. Without this, a `verified` row with no app id is storable and
+  -- every reader has to re-check the parts — which is how an unverified identity dispatches history.
+  -- `pending_app` needs the bot id because that id IS the bots.info argument; `verified` does not,
+  -- because auth.test's own `app_id` needs no fallback. `else false` refuses a state added to the
+  -- CHECK above without its shape stated here.
+  constraint slack_integration_bindings_state_codec check (
+    case state
+      when 'pending_auth' then workspace_id is null and app_id is null and bot_id is null
+                           and workspace_url is null
+      when 'pending_app' then workspace_id is not null and bot_id is not null and app_id is null
+      when 'verified' then workspace_id is not null and app_id is not null
+      when 'blocked' then error_code is not null
+      else false
+    end
+  )
+);
+-- The bootstrap lane a later scheduler will read: this team's bindings, due first.
+create index if not exists slack_integration_bindings_due_idx
+  on slack_integration_bindings (team_id, state, due_at);
+
+-- The SELECTED-CHANNEL SET syntax, by the same two-rendering argument as
+-- `slack_channel_migration_gates_workspace_syntax` above (see that comment for why BOTH renderings
+-- are required and neither subsumes the other). An empty set is legal here — an integration with no
+-- channels selected is an ordinary state, not a violation. Named and re-added on every replay
+-- because table creation is a no-op on a database that already has the table.
+alter table slack_integration_bindings
+  drop constraint if exists slack_integration_bindings_channel_syntax;
+alter table slack_integration_bindings
+  add constraint slack_integration_bindings_channel_syntax check (
+    case
+      when array_ndims(selected_channel_ids) is distinct from 1
+        then cardinality(selected_channel_ids) = 0
+      else array_position(selected_channel_ids, null) is null
+       and array_to_string(selected_channel_ids, ',') ~ '^[A-Za-z0-9]+(,[A-Za-z0-9]+)*$'
+       and array_to_string(selected_channel_ids, '') ~ '^[A-Za-z0-9]+$'
+    end
+  );
+
+-- ── Slack per-channel DISCOVERY STATE + lease (AIO-1170) ─────────────────────
+-- One durable row per (AIOS team, Slack workspace, channel): the channel's public proof, the two
+-- history scans in progress, the ONE interval whose pages are certified read, and the lease that
+-- makes a bounded wake resumable. The single writer is `lib/ingest/slack-channel-state.ts`.
+--
+-- ⚠️ IT COALESCES SELECTIONS. The key excludes the integration on purpose: two enabled integrations
+-- selecting the same channel of the same workspace share ONE frontier, because there is one provider
+-- timeline. `binding_integration_id` / `binding_config_revision` record the binding that last PROVED
+-- this channel public, and every claim and acceptance re-checks the revision — so a removed or
+-- rotated binding cannot advance, and equally cannot reset, a frontier another valid binding earned.
+--
+-- ⚠️ NO MESSAGE CONTENT LIVES HERE. Cursors, anchors and timestamps only; a staged body belongs to
+-- the thread/staging slice. And nothing here is permission to publish: a `public` proof is provider
+-- metadata, not the namespace migration gate.
+--
+-- THE TWO LANES, AND WHY THE CERTIFIED INTERVAL IS SEPARATE FROM THEM:
+--  • `newest_*`   — catch-up. Anchored (frozen) at the DB clock when the scan starts, lower-bounded
+--                   at `completed_upper_ts` so the previous boundary is re-read; the duplicate root
+--                   at the seam is deduplicated by the exact-key thread enqueue, not by trimming.
+--                   EMPTY while nothing is certified yet — there is no top to extend from, so the
+--                   lane lends its slot to the historical scan.
+--  • `historical_*` — backfill. Anchored at `completed_lower_ts` (or the clock, first time) with NO
+--                   lower bound, paging back to the provider's retention floor. Empty once
+--                   `historical_floor_reached`.
+--  • `completed_lower_ts` / `completed_upper_ts` — the only interval whose pages are all durably
+--                   recorded. A partial page NEVER moves it; only a genuinely terminal provider page
+--                   does. Progress and certification must not be the same column, because absence
+--                   inside a certified interval is later a deletion candidate and absence inside
+--                   partial progress is a hole we simply have not read.
+--
+-- `next_lane` is PERSISTED so a 1-request/minute budget still advances both lanes: a lane position
+-- recomputed per invocation would hand every slot to the same lane and starve the other forever.
+create table if not exists slack_sync_channels (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  workspace_id text not null check (workspace_id ~ '^[A-Za-z0-9]+$'),
+  channel_id text not null check (channel_id ~ '^[A-Za-z0-9]+$'),
+  -- `set null`, never `cascade`: deleting one of several integrations that select this channel must
+  -- not delete a frontier the others still need. It leaves the row un-bound, which refuses claims
+  -- until some valid binding proves the channel public again — and preserves every certified page.
+  binding_integration_id uuid references integrations(id) on delete set null,
+  binding_config_revision text check (binding_config_revision ~ '^[0-9a-f]{64}$'),
+  -- Explicit, and `unknown` by default: an unverified channel CANNOT dispatch history. `private` and
+  -- `unverifiable` are definitive refusals that block discovery; a transient 429/timeout/5xx never
+  -- writes here at all, so the last valid proof survives it.
+  public_state text not null default 'unknown' check (
+    public_state in ('unknown', 'public', 'private', 'unverifiable')
+  ),
+  public_checked_at timestamptz,
+  -- Anchors/cursors/bounds. Their `ts` syntax is stated once, below, as a named constraint.
+  newest_anchor_ts text,
+  newest_lower_ts text,
+  newest_cursor text check (
+    newest_cursor is null or (btrim(newest_cursor) <> '' and length(newest_cursor) <= 1024)
+  ),
+  newest_scan_generation bigint not null default 0 check (newest_scan_generation >= 0),
+  historical_anchor_ts text,
+  historical_cursor text check (
+    historical_cursor is null or (btrim(historical_cursor) <> '' and length(historical_cursor) <= 1024)
+  ),
+  historical_scan_generation bigint not null default 0 check (historical_scan_generation >= 0),
+  -- The oldest message the CURRENT historical scan has seen. Progress, not certification: it becomes
+  -- the certified lower bound only when that scan reaches a genuinely terminal page. There is no
+  -- newest-lane counterpart because that lane's lower bound is a value we sent, not one we observed.
+  historical_oldest_seen_ts text,
+  historical_floor_reached boolean not null default false,
+  completed_lower_ts text,
+  completed_upper_ts text,
+  -- Which lane the CURRENT lease owns, and which lane goes next. `claimed_lane` is part of the fence:
+  -- an acceptance for the other lane matches no row.
+  claimed_lane text check (claimed_lane is null or claimed_lane in ('newest', 'historical')),
+  next_lane text not null default 'newest' check (next_lane in ('newest', 'historical')),
+  -- The same lease/fence discipline as `slack_sync_threads`: a DB-minted owner token, a monotonic
+  -- generation bumped on every claim and reclaim, and a DB-clock expiry. Every write matches all
+  -- three, so a reclaimed worker's late acceptance is refused rather than applied.
+  lease_owner text unique check (
+    lease_owner is null
+    or (length(lease_owner) between 8 and 128 and lease_owner !~ '[[:space:]]')
+  ),
+  lease_generation bigint not null default 0 check (lease_generation >= 0),
+  lease_expires_at timestamptz,
+  due_at timestamptz not null default now(),
+  attempts integer not null default 0 check (attempts >= 0),
+  last_error_code text check (last_error_code is null or last_error_code ~ '^[a-z][a-z0-9_]{0,39}$'),
+  last_read_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- ONE row per channel per workspace per team. This is what makes two integrations coalesce, and
+  -- what keeps the same raw channel id in another workspace (or another team) independent.
+  unique (team_id, workspace_id, channel_id),
+  -- A lease is all-or-nothing, and the lane it owns exists exactly while it does.
+  constraint slack_sync_channels_lease_codec check (
+    (lease_owner is null) = (lease_expires_at is null)
+    and (lease_owner is null) = (claimed_lane is null)
+  ),
+  -- A proof has a time, and an unproved channel has neither.
+  constraint slack_sync_channels_public_codec check (
+    (public_state = 'unknown') = (public_checked_at is null)
+  ),
+  -- An interval is both of its ends or neither.
+  constraint slack_sync_channels_interval_codec check (
+    (completed_lower_ts is null) = (completed_upper_ts is null)
+  ),
+  -- A binding is its integration AND the revision it was proved at.
+  constraint slack_sync_channels_binding_codec check (
+    (binding_integration_id is null) = (binding_config_revision is null)
+  )
+);
+-- The two reads a bounded wake performs: due work for a selected channel set, and the reclaim lane.
+create index if not exists slack_sync_channels_due_idx
+  on slack_sync_channels (team_id, workspace_id, public_state, due_at);
+create index if not exists slack_sync_channels_lease_idx
+  on slack_sync_channels (team_id, lease_expires_at);
+
+-- Every `ts` column, under ONE named rule, aligned byte-for-byte with the shared parser's
+-- `TS_PATTERN` (`lib/ingest/sources/slack-message-evidence.ts`) and with
+-- `slack_sync_threads_root_ts_check` above: any number of seconds digits, then 1–6 fractional
+-- digits. Stated once rather than inline eight times, so the eight cannot drift apart; named and
+-- re-added on every replay because table creation is a no-op on an existing table.
+alter table slack_sync_channels drop constraint if exists slack_sync_channels_ts_syntax;
+alter table slack_sync_channels add constraint slack_sync_channels_ts_syntax check (
+  (newest_anchor_ts is null or newest_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (newest_lower_ts is null or newest_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (historical_anchor_ts is null or historical_anchor_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (historical_oldest_seen_ts is null or historical_oldest_seen_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (completed_lower_ts is null or completed_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (completed_upper_ts is null or completed_upper_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+);
 
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected
