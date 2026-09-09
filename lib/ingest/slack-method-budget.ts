@@ -69,19 +69,34 @@ export type SlackMethodScope =
       readonly appId: string;
     }
   | { readonly kind: "provisional"; readonly teamId: string; readonly integrationId: string }
+  /** The ONE `bots.info` bucket for a workspace — bootstrap and every later identity refresh. */
   | { readonly kind: "workspace_bootstrap"; readonly teamId: string; readonly workspaceId: string };
 
 export type SlackMethodScopeKind = SlackMethodScope["kind"];
 
 /**
- * Which methods each scope may budget. The two narrow scopes exist for ONE bootstrap call each; a
+ * `bots.info` is budgeted under the workspace bootstrap scope and NOWHERE else — including the
+ * verified scope, which otherwise budgets every method.
+ *
+ * ONE workspace, ONE bots.info allowance, for identity bootstrap AND every later identity refresh.
+ * If the verified scope kept its own bots.info bucket, binding an app would mint a second allowance
+ * for the same workspace (a third for the next app), so a bootstrap request could be followed
+ * immediately by a verified one — which is the shared allowance the bootstrap bucket exists to be.
+ */
+export const SLACK_BOOTSTRAP_ONLY_METHOD = "bots.info" satisfies SlackBudgetedMethod;
+
+/**
+ * Which methods each scope may budget. The narrow scopes exist for ONE bootstrap call each; a
  * history budget under an unverified identity is the thing they are bounded to prevent, so this is
  * enforced here AND restated as a SQL constraint.
+ *
+ * `verified` is DERIVED from the supported list minus the bootstrap-only method, so a method added
+ * later joins it automatically while the one exclusion stays stated in exactly one place.
  */
 const METHODS_BY_SCOPE: Record<SlackMethodScopeKind, readonly SlackBudgetedMethod[]> = {
-  verified: SLACK_BUDGETED_METHODS,
+  verified: SLACK_BUDGETED_METHODS.filter((method) => method !== SLACK_BOOTSTRAP_ONLY_METHOD),
   provisional: ["auth.test"],
-  workspace_bootstrap: ["bots.info"],
+  workspace_bootstrap: [SLACK_BOOTSTRAP_ONLY_METHOD],
 };
 
 /**
@@ -115,12 +130,21 @@ export const SLACK_UNKNOWN_CATEGORY_PAGE_LIMIT = 15;
 export const SLACK_BACKOFF_FLOOR_MS = 60_000;
 
 /**
- * An upper bound on a persisted backoff. A hostile or garbled `Retry-After` of a year would park a
- * team's ingestion effectively forever with no operator-visible cause, and the recovery would be a
- * manual DB edit. A day is far beyond any real Slack cooldown, so clamping cannot shorten a genuine
- * one.
+ * The largest delay this module can carry end to end — a REPRESENTABILITY bound, NOT a claim about
+ * how long a provider cooldown can be.
+ *
+ * ⚠️ There used to be a 24-hour cap here, justified by "no genuine Slack cooldown exceeds a day".
+ * There is no source for that, and the cap could only ever SHORTEN a real cooldown: a 48-hour
+ * `Retry-After` became 24, so the next request would have gone out a full day inside the window the
+ * provider refused. A valid delay now keeps its whole duration.
+ *
+ * What genuinely bounds it: a persisted deadline is read back through `new Date(...)`, so the
+ * ECMAScript time-value limit (±8.64e15 ms) is the ceiling on `now + delay`. Half that limit leaves
+ * room for any clock this can run on, and it is ~137,000 years — far past anything a provider could
+ * mean. A delay beyond it is REFUSED rather than shortened, because silently substituting a nearer
+ * deadline is the failure this constant replaced.
  */
-export const SLACK_BACKOFF_MAX_MS = 86_400_000;
+export const SLACK_BACKOFF_REPRESENTABLE_MAX_MS = 4_320_000_000_000_000;
 
 export type SlackMethodReservation =
   | {
@@ -211,8 +235,15 @@ function assertScopeAndMethod(scope: SlackMethodScope, method: SlackBudgetedMeth
   }
   const allowed = METHODS_BY_SCOPE[scope.kind];
   if (!allowed.includes(method)) {
+    // NOT translated to the bootstrap scope on the caller's behalf. Rewriting a scope inside the
+    // writer would hide the call site's mistake and make the shared bucket reachable under a key
+    // nothing else agrees with; the caller must ask for the scope it actually means.
+    const hint =
+      method === SLACK_BOOTSTRAP_ONLY_METHOD
+        ? ` — ${SLACK_BOOTSTRAP_ONLY_METHOD} is budgeted only under the workspace_bootstrap scope, which is shared and retained for identity refreshes`
+        : "";
     throw new SlackMethodBudgetError(
-      `the ${scope.kind} scope may budget only ${allowed.join(", ")} — refusing ${method}`
+      `the ${scope.kind} scope may budget only ${allowed.join(", ")} — refusing ${method}${hint}`
     );
   }
 }
@@ -367,7 +398,9 @@ export async function reserveSlackMethodSlot(
  *
  * A missing, malformed, negative or non-finite delay takes the conservative floor rather than being
  * rejected. The provider has just told us to stop; refusing to record that because the header was
- * unusable would send the next request immediately, which is the opposite of the instruction.
+ * unusable would send the next request immediately, which is the opposite of the instruction. A
+ * delay that is real but unrepresentable THROWS instead (`usableBackoffMs`) — the caller must treat
+ * that as blocked, not silently accept a 60-second cooldown in place of the stated one.
  *
  * ⚠️ ITS FAILURE MUST REACH THE CALLER. If this write fails, the cooldown is not persisted, and a
  * transport that swallowed the error would report an empty page and go straight back to the
@@ -380,7 +413,7 @@ export async function extendSlackMethodBackoff(
   opts: { retryAfterMs?: number | null } = {}
 ): Promise<SlackMethodBackoff> {
   assertScopeAndMethod(scope, method);
-  const delayMs = clampBackoffMs(opts.retryAfterMs);
+  const delayMs = usableBackoffMs(opts.retryAfterMs);
 
   await ensureBucket(session, scope, method);
 
@@ -413,26 +446,64 @@ export async function extendSlackMethodBackoff(
 /**
  * A usable cooldown from whatever the provider sent. Pure, so the header parsing that feeds it can
  * be tested without a database.
+ *
+ * Three inputs, three answers. Missing/malformed/negative takes the conservative FLOOR — the
+ * provider has just told us to stop, and refusing to record that would send the next request
+ * immediately. A usable delay is kept WHOLE, however long. A finite delay too large to carry is
+ * THROWN, not floored: quietly persisting 60 seconds in place of a cooldown we were told to honour
+ * is the one outcome that looks ordinary in the table and is wrong in the provider's eyes.
  */
-export function clampBackoffMs(retryAfterMs: number | null | undefined): number {
+export function usableBackoffMs(retryAfterMs: number | null | undefined): number {
   if (typeof retryAfterMs !== "number" || !Number.isFinite(retryAfterMs)) {
     return SLACK_BACKOFF_FLOOR_MS;
   }
-  return Math.min(SLACK_BACKOFF_MAX_MS, Math.max(SLACK_BACKOFF_FLOOR_MS, Math.ceil(retryAfterMs)));
+  const whole = Math.ceil(retryAfterMs);
+  if (!Number.isSafeInteger(whole) || whole > SLACK_BACKOFF_REPRESENTABLE_MAX_MS) {
+    throw new SlackMethodBudgetError(
+      `a cooldown of ${whole} ms cannot be represented — refusing to persist a shorter one instead`
+    );
+  }
+  return Math.max(SLACK_BACKOFF_FLOOR_MS, whole);
 }
 
 /**
- * Slack's `Retry-After` as milliseconds, or null when the header cannot be read as a delay.
+ * What Slack's `Retry-After` said, as one of three distinguishable states. It is not a number,
+ * because "we could not read it" and "we read it and cannot carry it" call for opposite responses:
+ * the first takes the conservative floor, the second must NOT — a near-term retry there would go out
+ * inside a cooldown the provider stated.
+ */
+export type SlackRetryAfter =
+  /** A usable delay, at its full duration. */
+  | { readonly kind: "delay"; readonly retryAfterMs: number }
+  /** Absent, or not an integer count of seconds. Routes to `SLACK_BACKOFF_FLOOR_MS`. */
+  | { readonly kind: "unreadable" }
+  /** Digits, but a duration this path cannot carry (`SLACK_BACKOFF_REPRESENTABLE_MAX_MS`). */
+  | { readonly kind: "unrepresentable" };
+
+const UNREADABLE = { kind: "unreadable" } as const;
+const UNREPRESENTABLE = { kind: "unrepresentable" } as const;
+
+/**
+ * Read Slack's `Retry-After` header.
  *
  * DELIBERATELY SECONDS-ONLY. RFC 9110 also allows an HTTP-date, but Slack documents an integer count
  * of seconds, and accepting a date here would mean trusting a remote clock to schedule our own
- * requests. Null routes to the conservative floor, which is the safe reading of "we could not tell".
+ * requests.
+ *
+ * The digit run is UNBOUNDED, unlike the 9-digit cap this replaced: a length limit is a syntax rule
+ * standing in for a magnitude rule, and it made `172800` and a 10-digit value fail for the same
+ * stated reason. Leading zeros are syntax, not magnitude, so `0000172800` is the same duration as
+ * `172800`. Magnitude is judged separately, and reported separately.
  */
-export function parseRetryAfterMs(header: string | null | undefined): number | null {
-  if (typeof header !== "string") return null;
+export function readRetryAfterHeader(header: string | null | undefined): SlackRetryAfter {
+  if (typeof header !== "string") return UNREADABLE;
   const trimmed = header.trim();
-  if (!/^\d{1,9}$/.test(trimmed)) return null;
-  return Number(trimmed) * 1_000;
+  if (!/^\d+$/.test(trimmed)) return UNREADABLE;
+  const retryAfterMs = Number(trimmed) * 1_000;
+  if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs > SLACK_BACKOFF_REPRESENTABLE_MAX_MS) {
+    return UNREPRESENTABLE;
+  }
+  return { kind: "delay", retryAfterMs };
 }
 
 /** The conservative page size for a paged method, or null for a method that does not page. */

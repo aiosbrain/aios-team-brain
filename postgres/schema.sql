@@ -2831,7 +2831,10 @@ alter table integrations add column if not exists secret_ciphertext text;
 --
 -- THREE DISCRIMINATED SCOPES, EACH WITH ITS OWN LEGAL METHOD SET:
 --  • `verified`            — (team, workspace, app). The real key, once app identity is bound. Any
---                            supported method.
+--                            supported method EXCEPT `bots.info`: that one lives in the shared
+--                            workspace bucket below, and a verified copy of it would mint a second
+--                            (then a per-app third) allowance for the same workspace the moment an
+--                            app was bound.
 --  • `provisional`         — (team, integration). Ingestion `auth.test` ONLY: before the first
 --                            successful auth.test there is no verified workspace or app to key on.
 --  • `workspace_bootstrap` — (team, workspace). `bots.info` ONLY, for the app-identity fallback that
@@ -2889,9 +2892,11 @@ create table if not exists slack_method_budgets (
   -- The method restriction is a STORAGE rule, not just an app rule: the two narrow scopes exist for
   -- one bootstrap call each, and a `conversations.history` row under a provisional scope would be an
   -- unverified-identity read budget — the exact thing those scopes are bounded to prevent.
+  -- ⚠️ `verified` excludes `bots.info` — see the scope notes above. Restated verbatim in the replay
+  -- repair below; the two must stay identical.
   constraint slack_method_budgets_method_scope check (
     case scope_kind
-      when 'verified' then true
+      when 'verified' then method <> 'bots.info'
       when 'provisional' then method = 'auth.test'
       when 'workspace_bootstrap' then method = 'bots.info'
       else false
@@ -2911,6 +2916,58 @@ create unique index if not exists slack_method_budgets_provisional_key
 create unique index if not exists slack_method_budgets_bootstrap_key
   on slack_method_budgets (team_id, workspace_id, method)
   where scope_kind = 'workspace_bootstrap';
+
+-- REPLAY REPAIR for the earlier checkpoint shape, where `verified` admitted every method and could
+-- therefore hold its own `bots.info` bucket. `create table if not exists` above is a NO-OP on a
+-- database that already has the table, so the corrected CHECK never reaches it — and simply
+-- re-adding the constraint would fail the whole replay on those rows.
+--
+-- Deleting them is not an option either: `next_permitted_at` can hold a cooldown the PROVIDER
+-- imposed, and dropping it would release a request Slack is still refusing. So each old verified
+-- bucket's deadline is FOLDED into the workspace bootstrap bucket that keeps meaning it, at the
+-- `greatest` of everything involved — the invariant is that no already-consumed allowance is
+-- forgotten and no deadline moves NEARER.
+--
+-- One statement, so it cannot be observed half-done, and idempotent: after the first pass there are
+-- no verified `bots.info` rows left, the insert selects nothing, and the constraint is replaced with
+-- an identical one. The table lock keeps a concurrent writer from inserting a row under the old rule
+-- between the fold and the new constraint. No production migration file is needed — this table was
+-- introduced in this same unreleased slice and nothing in the app writes to it yet.
+do $$
+begin
+  lock table slack_method_budgets in share row exclusive mode;
+
+  insert into slack_method_budgets
+      (team_id, scope_kind, workspace_id, app_id, integration_id, method,
+       next_permitted_at, created_at, updated_at)
+  select team_id, 'workspace_bootstrap', workspace_id, null, null, 'bots.info',
+         max(next_permitted_at),
+         -- Truthful metadata for a bucket that is standing in for older rows; the DEADLINE is the
+         -- invariant, this is only about not claiming the allowance started now.
+         min(created_at),
+         clock_timestamp()
+    from slack_method_budgets
+   where scope_kind = 'verified' and method = 'bots.info'
+   group by team_id, workspace_id
+  on conflict (team_id, workspace_id, method) where scope_kind = 'workspace_bootstrap'
+  do update set
+       -- The EXISTING bucket keeps its id and its own deadline unless the folded one is later.
+       next_permitted_at = greatest(slack_method_budgets.next_permitted_at, excluded.next_permitted_at),
+       updated_at = clock_timestamp();
+
+  delete from slack_method_budgets where scope_kind = 'verified' and method = 'bots.info';
+
+  alter table slack_method_budgets drop constraint if exists slack_method_budgets_method_scope;
+  alter table slack_method_budgets add constraint slack_method_budgets_method_scope check (
+    case scope_kind
+      when 'verified' then method <> 'bots.info'
+      when 'provisional' then method = 'auth.test'
+      when 'workspace_bootstrap' then method = 'bots.info'
+      else false
+    end
+  );
+end
+$$;
 
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected

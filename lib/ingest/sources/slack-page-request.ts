@@ -4,7 +4,7 @@ import { INGEST_FETCH_TIMEOUT_MS } from "@/lib/http";
 import { runContextTransaction } from "@/lib/projects/context/transaction";
 import {
   extendSlackMethodBackoff,
-  parseRetryAfterMs,
+  readRetryAfterHeader,
   reserveSlackMethodSlot,
   slackMethodPageLimit,
   type SlackBudgetedMethod,
@@ -39,18 +39,18 @@ import type { SlackMessage } from "./slack";
  *  5. NO SLOT IS EVER REFUNDED. A timeout, a socket error or a malformed body leaves the reservation
  *     consumed. The provider counted the request; handing the slot back is how a failing worker
  *     becomes an unmetered request loop.
+ *  6. A FAILED HTTP STATUS IS NEVER A SUCCESSFUL PAGE. `body.ok` is the provider's verdict on a
+ *     request that arrived; it cannot vouch for a 500 or a 404, and a page read out of one would
+ *     enter the pipeline as provider fact.
  *
  * DIAGNOSTICS CARRY CATEGORIES, NEVER CONTENT. No result, error or thrown value here contains the
  * token, a header, or the response body — a `category` is a short sanitized code, the same
- * discipline as `slack_sync_threads.last_error_code`. An unrecognised provider code is admitted only
- * if it already matches that shape; anything else becomes `provider_error`, because the alternative
- * is copying arbitrary provider text into every log that records the failure.
+ * discipline as `slack_sync_threads.last_error_code`. A provider code becomes a category only if it
+ * is RECOGNISED; everything else becomes `provider_error`, because the alternative is copying
+ * arbitrary provider text into every log that records the failure.
  */
 
 const SLACK_API = "https://slack.com/api";
-
-/** Sanitized failure CATEGORY shape: lower-case, underscore-separated, short. Never a message. */
-const CATEGORY = /^[a-z][a-z0-9_]{0,39}$/;
 
 /**
  * Slack error codes that mean THE CREDENTIAL OR ITS SCOPES, not a transient fault. They are called
@@ -68,6 +68,45 @@ const AUTH_ERRORS = new Set([
   "not_allowed_token_type",
   "ekm_access_denied",
 ]);
+
+/**
+ * The non-credential provider codes this ingestion path needs to tell apart, and nothing else.
+ *
+ * ⚠️ This is an ALLOWLIST because the shape of a value says nothing about whether it is safe to
+ * keep. The rule it replaces admitted any short lower-case token verbatim — which
+ * `synthetic_secret_token` satisfies exactly, so a provider payload could put arbitrary text into a
+ * `last_error_code` column and every log line that records the failure.
+ *
+ * It is scoped to what a later worker BRANCHES on — cursor validity, channel reachability, thread
+ * existence, and the transient faults worth distinguishing from a blocked configuration. It is not
+ * the start of a general error framework: a code with no behaviour behind it belongs in
+ * `provider_error` until some caller has a different response to it.
+ */
+const PROVIDER_ERRORS = new Set([
+  // paging: an anchored scan must restart with dedup rather than treat this as an empty page
+  "invalid_cursor",
+  "pagination_not_available",
+  // the channel: reachability and permission, which are not the same as a bad credential
+  "channel_not_found",
+  "not_in_channel",
+  "is_archived",
+  "restricted_action",
+  "method_not_supported_for_channel_type",
+  // the thread / message a revisit was pointed at
+  "thread_not_found",
+  "message_not_found",
+  // app-identity bootstrap (bots.info)
+  "bot_not_found",
+  "user_not_found",
+  // transient provider faults — retryable, unlike everything in AUTH_ERRORS
+  "ratelimited",
+  "internal_error",
+  "service_unavailable",
+  "fatal_error",
+  "request_timeout",
+]);
+
+const KNOWN_ERRORS = new Set([...AUTH_ERRORS, ...PROVIDER_ERRORS]);
 
 export interface SlackRequestContext {
   /**
@@ -104,6 +143,16 @@ export type SlackRequestResult =
       readonly category: "rate_limited";
       readonly nextPermittedAt: string;
       readonly retryAfterMs: number;
+    }
+  /**
+   * HTTP 429 whose `Retry-After` is a real duration this path cannot carry. NO cooldown was
+   * persisted — deliberately, because the only representable one would be NEARER than the provider
+   * asked for. Needs an operator, exactly like an auth refusal; a timer cannot help it.
+   */
+  | {
+      readonly outcome: "blocked";
+      readonly method: SlackBudgetedMethod;
+      readonly category: "retry_after_unrepresentable";
     }
   /** The credential or its scopes. Retrying on a timer cannot fix it. */
   | { readonly outcome: "auth_error"; readonly method: SlackBudgetedMethod; readonly category: string }
@@ -158,9 +207,14 @@ function applyPageLimit(
   return out;
 }
 
-/** A provider code is usable as a category only if it already has the shape of one. */
+/** A provider code is usable as a category only if this path RECOGNISES it — never by its shape. */
 function categoryOf(code: unknown, fallback: string): string {
-  return typeof code === "string" && CATEGORY.test(code) ? code : fallback;
+  return typeof code === "string" && KNOWN_ERRORS.has(code) ? code : fallback;
+}
+
+/** A body is only an answer if the transport succeeded; 2xx is the whole of that question. */
+function isSuccessStatus(status: number): boolean {
+  return status >= 200 && status < 300;
 }
 
 function assertToken(token: unknown): void {
@@ -255,12 +309,22 @@ export async function slackReservedRequest(
 
   // ── 3. 429 BEFORE any JSON is required ────────────────────────────────────────────────────────
   if (response.status === 429) {
-    const retryAfterMs = parseRetryAfterMs(response.headers?.get?.("retry-after"));
+    const retryAfter = readRetryAfterHeader(response.headers?.get?.("retry-after"));
+    if (retryAfter.kind === "unrepresentable") {
+      // The provider stated a real duration we cannot carry. Persisting the floor — or any bound we
+      // invented — would release the next request inside a window it explicitly refused, and would
+      // be indistinguishable in the table from an ordinary cooldown. So: no cooldown, and a category
+      // that cannot be mistaken for one. The slot stays consumed, as on every other failure.
+      return { outcome: "blocked", method, category: "retry_after_unrepresentable" };
+    }
     // A SECOND short transaction. It is separate from the reservation on purpose: the reservation
     // committed before the request, so there is no open transaction to extend, and this write must
     // land on its own regardless of what the request did.
     const backoff = await runContextTransaction(context.db, (session) =>
-      extendSlackMethodBackoff(session, context.scope, method, { retryAfterMs })
+      extendSlackMethodBackoff(session, context.scope, method, {
+        // `unreadable` routes to the conservative floor, which is what null means to the budget.
+        retryAfterMs: retryAfter.kind === "delay" ? retryAfter.retryAfterMs : null,
+      })
     );
     return {
       outcome: "rate_limited",
@@ -285,11 +349,15 @@ export async function slackReservedRequest(
     return { outcome: "transport_error", method, category: `malformed_response_${response.status}` };
   }
 
-  if (body.ok !== true) {
-    // Two different unknowns, kept apart. NO `error` field at all is a fact about the response, and
-    // the status is a bounded safe value, so it becomes the category. An `error` field that is not
-    // category-shaped is arbitrary remote text — it is REPLACED, never truncated or escaped, because
-    // a category is meant to be safe to put in a log line or a `last_error_code` column.
+  // ⚠️ A FAILED HTTP STATUS IS NEVER SUCCESS, whatever the body claims. A 500 carrying
+  // `{"ok":true,"messages":[]}` used to return a successful EMPTY PAGE here — and an empty page is
+  // precisely what a history scan reads as "there is nothing here", so a broken or intercepted
+  // response could look like provider fact. The body is consulted only for the diagnostic.
+  if (!isSuccessStatus(response.status) || body.ok !== true) {
+    // Two different unknowns, kept apart. NO recognised `error` code is a fact about the response,
+    // and the status is a bounded safe value, so that becomes the category. An unrecognised `error`
+    // is arbitrary remote text — REPLACED, never truncated or escaped, because a category is meant
+    // to be safe to put in a log line or a `last_error_code` column.
     const code =
       body.error === undefined || body.error === null
         ? `http_${response.status}`
