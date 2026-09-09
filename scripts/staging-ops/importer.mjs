@@ -1261,6 +1261,18 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
    * actually stopped (the recorded one), not whatever this worker happens to be configured for.
    */
   let recoveryMode = mode;
+  /**
+   * THE CONFIRMED READY ROW, latched the instant `markReady` settles and never before.
+   *
+   * Bootstrap owns the same commit boundary as `installObject` and `rollbackToPrior` but had neither
+   * of their two consequences: it discarded `markReady`'s return, so a signal arriving during the
+   * clear made the dispatcher's `finally` replace a durable bootstrap success with a generic
+   * `STAGING_OPERATION_ABORTED`; and with no latch, a `clearBootstrapRecovery` failure fell into the
+   * PRE-ready recovery below, which would redeploy the baseline and write `failed` over a bootstrap
+   * that is committed and serving. It is set ONLY from a positively returned row — never synthesized
+   * from the identity this run intended to commit.
+   */
+  let readyCommitted = null;
   // WHICH PHASE. Runtime 4's bootstrap "timed out" and the operation was unidentified: maintenance
   // calls, object-store reads and the health poll all have their own deadlines, and nothing said
   // which one was running. One receipt per phase, names only — no configuration, no arguments.
@@ -1473,12 +1485,49 @@ export async function bootstrapRollback({ client, rollbackStore, maintenance, en
     await waitForImportedBoot({ maintenance, deploymentId, commit: current.commit, origin: env.STAGING_ORIGIN, token: env.STAGING_HEALTH_TOKEN, mode, signal, budget: operationBudget });
     phase("booted", { deploymentId });
     await rollbackStore.writePointer("last-ready", { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode, kind: "rollback" });
-    await markReady(client, { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
+    // ⚠️ IMMEDIATELY BEFORE THE READY SUBMISSION, and AFTER the pointer publication was awaited.
+    //
+    // `bootExact` has carried these two checks since the late-cancellation fix; bootstrap implements
+    // its own sequence and had only the health wait's signal awareness — which is a fact about a
+    // moment that has already passed by the time the pointer write settles. A SIGTERM or a phase
+    // deadline observed WHILE that storage operation was pending therefore did not stop the new
+    // bootstrap ready submission. No await may intervene between these and `markReady`.
+    //
+    // The pointer write is deliberately awaited to settlement first and its published pointer is
+    // left alone: a refusal here does not race, abandon or delete durable storage work.
+    assertNotCancelled(signal, "bootstrap ready commit");
+    operationBudget.assert("bootstrap ready commit");
+    // LATCHED FROM THE RETURNED ROW, before any fallible suffix. Past this line the checkpoint is
+    // committed and serving, and everything below is bookkeeping the catch must not undo.
+    readyCommitted = await markReady(client, { runId: bootstrapRunId, objectId: created.objectId, digest: created.digest, commit: current.commit, mode });
     // Only NOW, once ready is committed, does the interruption record stop being needed. Clearing
     // it any earlier would remove the only way back from the very windows it exists for.
     await clearBootstrapRecovery(client, bootstrapRunId);
-    return { status: resumed ? "bootstrapped-after-interruption" : "bootstrapped", runId: bootstrapRunId, objectId: created.objectId, commit: current.commit, mode, resumedFrom: resumed?.phase ?? null };
+    return { status: resumed ? "bootstrapped-after-interruption" : "bootstrapped", runId: bootstrapRunId, objectId: created.objectId, commit: current.commit, mode, resumedFrom: resumed?.phase ?? null, readyCommit: readyCommitMark(readyCommitted, "completed") };
   } catch (error) {
+    // ⚠️ FIRST, BEFORE EVERY OTHER BRANCH: A CONFIRMED READY COMMIT IS NOT A FAILED BOOTSTRAP.
+    //
+    // The only failure that can reach here with the latch set is the one step AFTER `markReady`
+    // returned: `clearBootstrapRecovery` (the coordinator-lock release is in the `finally`, outside
+    // this try). The baseline recovery underneath is for a bootstrap that never committed — it would
+    // redeploy the deployment this run just booted and leave the journal `failed`, describing a
+    // checkpoint that is ready and serving as one that is not. So this reports the repair on the SAME
+    // `readyCommit` protocol `installObject` and `rollbackToPrior` already use, which is what carries
+    // the truth past `runImporter`'s cancellation finalizer.
+    //
+    // An UNCLEARED interruption record is left exactly as it is: it is now the evidence of what the
+    // suffix did not finish, and the resume path already re-proves and adopts its published
+    // checkpoint rather than orphaning it.
+    if (readyCommitted) {
+      emitReceipt("ready-bookkeeping-pending", {
+        runId: readyCommitted.last_ready_run_id,
+        objectId: readyCommitted.last_ready_object_id,
+        servingCommit: readyCommitted.last_ready_commit,
+        detail: errorText(error).slice(0, 200),
+      });
+      throw Object.assign(new Error(`bootstrap checkpoint is ready and serving; post-ready bookkeeping remains pending: ${errorText(error)}`),
+        { readyCommit: readyCommitMark(readyCommitted, "pending") });
+    }
     // ⚠️ L1/L3: A PRE-ADMISSION REFUSAL LEAVES EVERYTHING EXACTLY AS IT WAS.
     //
     // No draining transition, no stop, no deployment change — so there is nothing to recover, and
