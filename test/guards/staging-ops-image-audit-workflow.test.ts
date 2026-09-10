@@ -17,12 +17,41 @@ import { AUDIT_LIMITS, AUDIT_WORKFLOW_PATH, SUBJECT, SUBJECT_REFERENCE } from ".
  * to the dispatch commit.
  */
 
+/**
+ * The parsed shapes this guard reads. Narrow rather than `any`: a guard that types its subject as
+ * `any` cannot notice that the key it is asserting on stopped existing.
+ */
+interface WorkflowStep {
+  name?: string;
+  id?: string;
+  uses?: string;
+  run?: string;
+  if?: string;
+  env?: Record<string, string>;
+  with?: Record<string, string | number | boolean>;
+  "continue-on-error"?: boolean;
+}
+interface WorkflowJob {
+  name?: string;
+  if?: string;
+  "runs-on"?: string;
+  "timeout-minutes"?: number;
+  permissions: Record<string, string>;
+  steps: WorkflowStep[];
+}
+interface Workflow {
+  on: Record<string, unknown>;
+  permissions?: Record<string, string>;
+  concurrency?: { group?: string; "cancel-in-progress"?: boolean };
+  jobs: Record<string, WorkflowJob>;
+}
+
 const FILE = join(process.cwd(), ".github", "workflows", "staging-ops-image-audit.yml");
 const raw = readFileSync(FILE, "utf8");
-const workflow = YAML.parse(raw);
+const workflow: Workflow = YAML.parse(raw);
 const job = workflow.jobs.audit;
-const steps: any[] = job.steps;
-const stepIndex = (predicate: (s: any) => boolean) => steps.findIndex(predicate);
+const steps: WorkflowStep[] = job.steps;
+const stepIndex = (predicate: (s: WorkflowStep) => boolean) => steps.findIndex(predicate);
 const byRun = (fragment: string) => stepIndex((s) => typeof s.run === "string" && s.run.includes(fragment));
 const byUses = (prefix: string) => stepIndex((s) => typeof s.uses === "string" && s.uses.startsWith(prefix));
 
@@ -212,6 +241,38 @@ describe("guard: bounds, serialization and evidence (PUB-01, PUB-04)", () => {
     expect(job.name).toBe("Audit the pinned staging ops runner image");
     expect(raw).not.toContain("Release candidate gate");
     expect(raw).not.toContain("Staging candidate validation");
+  });
+});
+
+/**
+ * BUILD-FAILING GUARD on the dispatcher's one assembly call site.
+ *
+ * `assembleAudit` is behaviourally tested (a violated recipe blocks; a missing one blocks harder),
+ * and `transitionReadiness` fails closed without a recipe — so a wiring slip can only cost a false
+ * BLOCK. What this adds is the ∀ half: the readiness computation must exist in exactly ONE place in
+ * the dispatcher, so "the audit computes readiness somewhere else, without the recipe" is not a
+ * shape the file can take.
+ */
+describe("guard: readiness is computed once, from the measured recipe (M3)", () => {
+  const dispatcher = readFileSync(join(process.cwd(), "scripts", "staging-ops", "image-audit.mjs"), "utf8");
+
+  it("calls transitionReadiness exactly once, and passes the recipe to it", () => {
+    const calls = dispatcher.match(/transitionReadiness\(/g) ?? [];
+    expect(calls, "readiness is computed in more than one place, or nowhere").toHaveLength(1);
+    const call = /transitionReadiness\(\{([\s\S]*?)\}\)/.exec(dispatcher);
+    expect(call, "the readiness call is not an inline object this guard can read").not.toBeNull();
+    for (const input of ["coverage", "inventory", "findings", "packageInventory", "identityVerified", "recipe"]) {
+      expect(String(call?.[1]), `readiness is computed without ${input}`).toContain(input);
+    }
+  });
+
+  it("assembles the completed evidence through that one function, handing it the measured recipe", () => {
+    expect(dispatcher.match(/export function assembleAudit\(\{/g) ?? []).toHaveLength(1);
+    // Exactly one CALL of it (the declaration above is matched separately), so there is no second
+    // assembly path that could reach a verdict without the readiness inputs.
+    const callSites = dispatcher.match(/writeEvidence\(env, assembleAudit\(\{[\s\S]*?\n {4}\}\)\);/g) ?? [];
+    expect(callSites, "the completed-audit record is assembled somewhere else, or nowhere").toHaveLength(1);
+    expect(callSites[0], "the dispatcher assembles a record without the measured recipe").toContain("recipe,");
   });
 });
 

@@ -14,7 +14,7 @@
  * these functions can issue is a GET — the audit workflow never changes a package's visibility, and
  * the code that would be needed to do so does not exist here.
  */
-import { OWNER, PACKAGE } from "../image-publication.mjs";
+import { OWNER, PACKAGE, PACKAGE_METADATA_URL, REPOSITORY, classifyPackageMetadata } from "../image-publication.mjs";
 import { sha256 } from "./layers.mjs";
 
 export const PACKAGE_VERSIONS_URL = `https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE}/versions`;
@@ -91,18 +91,96 @@ export async function listPackageVersions({ token, fetchImpl = globalThis.fetch 
 }
 
 /**
+ * The package's own METADATA — identity, visibility and repository linkage (F4).
+ *
+ * WHY THE VERSIONS ENDPOINT IS NOT ENOUGH, which is the whole of F4. A successful versions walk says
+ * "these digests are the versions of SOME container package at this org/name path". It says nothing
+ * about whether that package is the private one linked to this repository. Two things follow, and
+ * both matter for a transition that cannot be reversed:
+ *
+ *   • If the package is ALREADY public, the transition gate is answering a question that no longer
+ *     applies, and the audit must say so rather than certify a package whose exposure it did not
+ *     measure.
+ *   • If the package is linked to a DIFFERENT repository, the `/app` provenance comparison — which is
+ *     built entirely from this repository's source revision — was comparing the image against a tree
+ *     that has no relationship to it.
+ *
+ * The classification is `image-publication.mjs`'s existing `classifyPackageMetadata`, reused
+ * unchanged and read-only: it already encodes "200 + private + linked to this repository" as the only
+ * confirmed outcome, and 403/404/anything-else as answers rather than absences. This function is a
+ * bounded single GET around it — no retries, because a 403 is an answer and this path has no push to
+ * protect.
+ */
+export async function readPackageIdentity({ token, fetchImpl = globalThis.fetch } = {}) {
+  if (!token) return Object.freeze({ status: "unverified", reason: "no token was available for the package metadata read" });
+  let res;
+  try {
+    res = await fetchImpl(PACKAGE_METADATA_URL, { headers: headers(token) });
+  } catch (error) {
+    return Object.freeze({ status: "unverified", reason: `the package metadata read failed: ${error?.message ?? "transport error"}` });
+  }
+  let body;
+  if (res.status === 200) {
+    try {
+      body = await res.json();
+    } catch {
+      return Object.freeze({ status: "unverified", reason: "the package metadata response did not parse" });
+    }
+  }
+  const classified = classifyPackageMetadata({ status: res.status, body });
+  if (classified.outcome !== "confirmed") {
+    return Object.freeze({
+      status: "unverified",
+      reason: classified.reason,
+      // Recorded when the API returned them, because "public" and "linked elsewhere" are the two
+      // answers a coordinator most needs, and neither value is sensitive.
+      ...(classified.visibility ? { visibility: classified.visibility } : {}),
+      ...(classified.linkage ? { linkage: classified.linkage } : {}),
+    });
+  }
+  return Object.freeze({
+    status: "verified",
+    visibility: classified.visibility,
+    linkage: classified.linkage,
+    expectedVisibility: "private",
+    expectedLinkage: REPOSITORY,
+  });
+}
+
+/**
  * What the inventory means for the transition, against the ONE audited digest.
  *
  * "A clean audit of the stated digest does not authorize exposing unaudited other digests in the same
  * package" — so any additional version, tagged or not, stops the transition and is returned as an
  * exact subject list for a bounded audit. It is not deleted, not ignored, and not assumed to be a
  * stale copy of the same content.
+ *
+ * `identity` is `readPackageIdentity`'s answer, and it is REQUIRED for a verified status (F4): a
+ * versions list on its own cannot establish that the enumerated package is the private one linked to
+ * this repository, so an unverified identity leaves the inventory unverified even when every page of
+ * versions was read cleanly.
  */
-export function assessPackageInventory(inventory, auditedDigest) {
+export function assessPackageInventory(inventory, auditedDigest, identity) {
+  if (identity !== undefined && identity?.status !== "verified") {
+    return Object.freeze({
+      source: "actions-api",
+      apiStatus: inventory?.status === "verified" ? "verified" : "unverified",
+      identityStatus: "unverified",
+      status: "unverified",
+      reason: `the package identity/visibility/linkage was not established: ${identity?.reason ?? "not measured"}`,
+      ...(identity?.visibility ? { visibility: identity.visibility } : {}),
+      ...(identity?.linkage ? { linkage: identity.linkage } : {}),
+      otherVersions: undefined,
+    });
+  }
+  const identityFields = identity === undefined
+    ? {}
+    : { identityStatus: "verified", visibility: identity.visibility, linkage: identity.linkage };
   if (inventory?.status !== "verified") {
     return Object.freeze({
       source: "actions-api",
       apiStatus: "unverified",
+      ...identityFields,
       status: "unverified",
       reason: inventory?.reason ?? "the package version inventory was not measured",
       otherVersions: undefined,
@@ -115,6 +193,7 @@ export function assessPackageInventory(inventory, auditedDigest) {
     return Object.freeze({
       source: "actions-api",
       apiStatus: "verified",
+      ...identityFields,
       status: "unverified",
       reason: `the audited digest ${auditedDigest} does not appear in the package's ${versions.length} version(s); the inventory and the subject disagree`,
       otherVersions: others.length,
@@ -123,6 +202,7 @@ export function assessPackageInventory(inventory, auditedDigest) {
   return Object.freeze({
     source: "actions-api",
     apiStatus: "verified",
+    ...identityFields,
     status: "verified",
     pages: inventory.pages,
     total: versions.length,
@@ -134,30 +214,66 @@ export function assessPackageInventory(inventory, auditedDigest) {
   });
 }
 
+const FULL_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * PUB-05's alternate path: a signed-in package administrator's complete read-only UI inventory.
  *
- * TWO PROPERTIES, and the second is the one a shortcut would lose. (1) Operator evidence CAN satisfy
- * the transition gate. (2) It must NEVER be written back as though the API inventory succeeded —
- * `apiStatus` is preserved exactly as measured, and `source` says which one the gate is standing on.
- * Anyone reading the record later can see that the workflow's own read failed.
+ * THREE PROPERTIES, and a shortcut loses a different one each time.
+ *
+ *  1. Operator evidence CAN satisfy the transition gate — that is the point of the path existing.
+ *  2. It must NEVER be written back as though the API inventory succeeded. `apiStatus` is preserved
+ *     exactly as measured and `source` says which reading the gate is standing on, so a later reader
+ *     can see that the workflow's own read failed.
+ *  3. **The SUBJECT is not the operator's to choose (F6).** This used to compute "other versions" by
+ *     comparing against `operatorEvidence.auditedDigest` — a value supplied by the same record it was
+ *     validating. An operator record naming a different digest would therefore have reported the real
+ *     subject as an unaudited "other version" and its own digest as the audited one, i.e. it could
+ *     retarget the gate. The audited digest is now `subjectDigest`, bound by the CALLER to the pinned
+ *     subject in reviewed source, and a record whose own `auditedDigest` disagrees is REFUSED rather
+ *     than quietly reinterpreted.
+ *
+ * What this can and cannot change: it substitutes a measured inventory for an unmeasured one. It
+ * clears no content, identity, recipe or scanner blocker, and there is no flag here that could.
  */
-export function reconcilePackageInventory(assessment, operatorEvidence) {
+export function reconcilePackageInventory(assessment, operatorEvidence, { subjectDigest } = {}) {
   if (!operatorEvidence) return assessment;
   const failures = [];
-  if (!operatorEvidence.capturedAt) failures.push("operator evidence carries no capture timestamp");
+  if (!FULL_DIGEST.test(String(subjectDigest ?? ""))) {
+    // A caller that did not bind the subject gets a refusal, not a default. Defaulting to the
+    // record's own digest is precisely the hole this parameter closes.
+    failures.push("the reconciliation was not bound to a pinned subject digest");
+  } else if (operatorEvidence.auditedDigest !== undefined && operatorEvidence.auditedDigest !== subjectDigest) {
+    failures.push("operator evidence names a different audited digest than the pinned subject");
+  }
+  if (!ISO_TIMESTAMP.test(String(operatorEvidence.capturedAt ?? ""))) {
+    failures.push("operator evidence carries no ISO-8601 capture timestamp");
+  }
   if (operatorEvidence.coversAllPages !== true) failures.push("operator evidence does not attest that every page was covered");
   if (operatorEvidence.coversUntagged !== true) failures.push("operator evidence does not attest that untagged versions were included");
-  const digests = Array.isArray(operatorEvidence.digests) ? operatorEvidence.digests : [];
-  if (digests.length === 0) failures.push("operator evidence lists no version digests");
+  // PUB-05 asks for version IDs as well as digests: a digest identifies content, an id identifies the
+  // row an administrator would have to act on, and "a screenshot of the tagged tab" has neither.
+  const versions = Array.isArray(operatorEvidence.versions) ? operatorEvidence.versions : [];
+  if (versions.length === 0) failures.push("operator evidence lists no package versions");
   // A truncated digest is the thing a screenshot of the packages page actually shows, and it cannot
   // identify a version. Asserted rather than trusted.
-  const malformed = digests.filter((digest) => !/^sha256:[0-9a-f]{64}$/.test(String(digest ?? "")));
-  if (malformed.length) failures.push(`${malformed.length} operator-supplied digest(s) are not full sha256 digests`);
+  const malformed = versions.filter((version) => !FULL_DIGEST.test(String(version?.digest ?? "")));
+  if (malformed.length) failures.push(`${malformed.length} operator-supplied version(s) carry no full sha256 digest`);
+  const idless = versions.filter((version) => !/^[0-9]+$/.test(String(version?.id ?? "")));
+  if (idless.length) failures.push(`${idless.length} operator-supplied version(s) carry no numeric version id`);
+  const untaggedUnstated = versions.filter((version) => !Array.isArray(version?.tags));
+  if (untaggedUnstated.length) failures.push(`${untaggedUnstated.length} operator-supplied version(s) do not state their tags (an untagged version has an empty list, not an absent one)`);
+  if (operatorEvidence.visibility === undefined) failures.push("operator evidence does not state the package's measured visibility");
+  if (operatorEvidence.repositoryLinkage !== REPOSITORY) failures.push("operator evidence does not state this repository as the package's linkage");
+  if (versions.length && !versions.some((version) => version?.digest === subjectDigest)) {
+    failures.push("operator evidence does not list the pinned subject digest among the package's versions");
+  }
   if (failures.length) {
     return Object.freeze({ ...assessment, operatorEvidence: Object.freeze({ accepted: false, failures: Object.freeze(failures) }) });
   }
-  const others = digests.filter((digest) => digest !== operatorEvidence.auditedDigest);
+  const digests = versions.map((version) => version.digest);
+  const others = digests.filter((digest) => digest !== subjectDigest);
   return Object.freeze({
     ...assessment,
     // PRESERVED. The workflow's own read is still reported exactly as it went.
@@ -166,8 +282,15 @@ export function reconcilePackageInventory(assessment, operatorEvidence) {
     status: "verified",
     total: digests.length,
     otherVersions: others.length,
+    untagged: versions.filter((version) => version.tags.length === 0).length,
     additionalSubjects: Object.freeze(others),
-    operatorEvidence: Object.freeze({ accepted: true, capturedAt: String(operatorEvidence.capturedAt) }),
+    visibility: operatorEvidence.visibility,
+    linkage: operatorEvidence.repositoryLinkage,
+    operatorEvidence: Object.freeze({
+      accepted: true,
+      capturedAt: String(operatorEvidence.capturedAt),
+      versionIds: Object.freeze(versions.map((version) => String(version.id))),
+    }),
   });
 }
 

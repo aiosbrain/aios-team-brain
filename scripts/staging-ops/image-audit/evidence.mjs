@@ -154,6 +154,25 @@ function recipeBlockers(recipe) {
   return blockers;
 }
 
+/**
+ * The PACKAGE-INVENTORY dimension of readiness, on its own.
+ *
+ * Extracted so the operator reconciliation (F6) can recompute exactly this dimension and retain every
+ * other blocker verbatim. Matching the original blocker strings by regex would have been the obvious
+ * shortcut and the wrong one: a reconciliation that silently failed to recognise a blocker would DROP
+ * it, and dropping a blocker is the one failure mode that path must not have. Both callers running
+ * the same function means the strings are equal by construction.
+ */
+export function packageInventoryBlockers(packageInventory) {
+  if (packageInventory?.status !== "verified") {
+    return [`the package version inventory is ${packageInventory?.status ?? "unmeasured"}, not verified`];
+  }
+  if ((packageInventory?.otherVersions ?? 0) > 0) {
+    return [`${packageInventory.otherVersions} other package version(s) exist and are unaudited`];
+  }
+  return [];
+}
+
 export function transitionReadiness({ coverage, inventory, findings, packageInventory, identityVerified, recipe }) {
   const blockers = [];
   if (!identityVerified) blockers.push("the pinned subject's manifest/config/layer identity was not fully verified");
@@ -162,8 +181,7 @@ export function transitionReadiness({ coverage, inventory, findings, packageInve
   if (!inventory?.complete) blockers.push(`the /app inventory comparison is incomplete: ${inventory?.counts?.missing ?? "unknown"} expected path(s) absent`);
   if ((inventory?.findings ?? 0) > 0) blockers.push(`${inventory.findings} inventory/provenance finding(s) require adjudication`);
   if ((findings?.total ?? 0) > 0) blockers.push(`${findings.total} scanner finding(s) across ${findings.rules} rule(s) require adjudication`);
-  if (packageInventory?.status !== "verified") blockers.push(`the package version inventory is ${packageInventory?.status ?? "unmeasured"}, not verified`);
-  else if ((packageInventory?.otherVersions ?? 0) > 0) blockers.push(`${packageInventory.otherVersions} other package version(s) exist and are unaudited`);
+  blockers.push(...packageInventoryBlockers(packageInventory));
 
   const verdict = blockers.length === 0
     ? "clean"
@@ -201,7 +219,7 @@ export function sanitizedFailure({ stage, error, counters = {} }) {
  * coverage-relevant settings of the invocation (PUB-03 requires the archive-traversal and file-size
  * settings to be documented alongside what was skipped).
  */
-export function scannerIdentity(scanner, configText, { settings } = {}) {
+export function scannerIdentity(scanner, configText, { settings, representation, canary } = {}) {
   return Object.freeze({
     name: scanner.name,
     version: scanner.version,
@@ -209,6 +227,19 @@ export function scannerIdentity(scanner, configText, { settings } = {}) {
     configPath: scanner.configPath,
     configSha256: createHash("sha256").update(String(configText ?? "")).digest("hex"),
     ...(settings ? { settings } : {}),
+    /**
+     * WHAT THE SCANNER WAS ACTUALLY GIVEN. Not the member — a fixed printable header followed by the
+     * member's exact bytes. Named and versioned here because a coverage claim is only meaningful
+     * against a stated input representation, and because a future edit to that header changes what the
+     * pinned scanner sees.
+     */
+    ...(representation ? { representation } : {}),
+    /**
+     * The MEASURED answer to "does this binary read that representation", from a synthetic sentinel in
+     * private scratch. `unverified` here is mirrored as a coverage limitation, so it blocks rather
+     * than sitting in the record as a footnote.
+     */
+    ...(canary ? { capabilityCanary: canary } : {}),
   });
 }
 

@@ -8,9 +8,10 @@
 # the image those trees ARE the content: `npm ci` puts `node_modules` in the runner, and a credential
 # sitting in a dependency's fixture is distributed to everyone who pulls the digest.
 #
-# So this config has NO path allowlist and NO value allowlist. Every regular file of every layer is
-# scanned, including dependencies, build output and deleted-by-a-later-layer content. Grouping by
-# rule (in `scanner.mjs`) is what keeps a noisy dependency reviewable; suppression is not.
+# So this file ADDS no path allowlist and no value allowlist of its own. Every regular file of every
+# layer is staged for scanning, including dependencies, build output and deleted-by-a-later-layer
+# content. Grouping by rule (in `scanner.mjs`) is what keeps a noisy dependency reviewable;
+# suppression is not.
 #
 # Adjudicating a known-harmless finding is a COORDINATOR decision recorded against that finding's
 # rule, location and provenance — never a directory added here. A path allowlist in this file would
@@ -19,8 +20,37 @@
 [extend]
 useDefault = true
 
-# Deliberately no [allowlist] section.
+# WARNING - READ THIS BEFORE TRUSTING THE LINE ABOVE.
 #
-# If a future finding genuinely warrants an exception, it is adjudicated in the evidence packet with
-# its rule, its independently established public location, its provenance and the reason — because a
-# rule written here would apply to every future run of an artifact nobody has inspected yet.
+# `useDefault = true` inherits gitleaks' DEFAULT CONFIGURATION, and that configuration carries a
+# GLOBAL ALLOWLIST. This is measured, not theoretical: with `--log-level debug` the pinned 8.28.0
+# binary printed
+#
+#     DBG skipping file: global allowlist   path=.../L0/000001.bin
+#     DBG skipping file: global allowlist   path=.../L0/000002.svg
+#
+# for two files whose bytes were IDENTICAL to a third that produced a finding, differing only by
+# suffix. An earlier version of this comment said this config "has NO path allowlist", which was true
+# of the file and false of the scan.
+#
+# WHAT THE AUDIT DOES ABOUT IT, and what it cannot do:
+#
+#  - The filename half is removed structurally, not by configuration. `scan-surface.mjs` stages every
+#    file under one neutral generated id with one fixed suffix, chosen by the audit and never
+#    inherited from the member's own name, so no inherited PATH or extension rule can select a file
+#    on the basis of what the image called it. `--gitleaks-ignore-path` is likewise pinned to an
+#    audit-owned EMPTY file so a `.gitleaksignore` in the checkout cannot suppress an image finding.
+#
+#  - The rest is a stated LIMITATION, carried into the evidence record by
+#    `SCANNER_RULE_LIMITATIONS`. The default config also brings value and stopword allowlists and its
+#    own rule set. Turning `useDefault` off would trade a known, recorded allowlist exposure for the
+#    loss of every maintained rule, which is a worse coverage position, not a better one.
+#
+# A scanner PASS therefore means "no finding under these recorded rules over the recorded scan
+# surface". It does not mean the image contains no secret, and nothing in this repository may
+# describe it that way.
+#
+# Deliberately no [allowlist] section of our own. If a future finding genuinely warrants an
+# exception, it is adjudicated in the evidence packet with its rule, its independently established
+# public location, its provenance and the reason — because a rule written here would apply to every
+# future run of an artifact nobody has inspected yet.

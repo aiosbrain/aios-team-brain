@@ -66,8 +66,43 @@ export const SCANNER = Object.freeze({
     "--report-path",
     "--exit-code",
     "--max-target-megabytes",
+    // F13. The audit points this at its OWN empty file; the flag has to exist at the pinned version
+    // for that to be true, and a silently dropped argument would restore the default `.` lookup.
+    "--gitleaks-ignore-path",
   ]),
 });
+
+/**
+ * WHAT THE PINNED SCANNER'S RULES DO NOT COVER, stated in the evidence rather than left implied.
+ *
+ * `extend.useDefault = true` inherits gitleaks' default configuration, and that configuration carries
+ * a GLOBAL ALLOWLIST — measured, not assumed: with `--log-level debug` the pinned 8.28.0 binary
+ * printed `skipping file: global allowlist` for byte-identical plaintext staged as `.bin` and `.svg`
+ * while finding the same bytes as `.txt`. This audit removes the FILENAME half of that exposure by
+ * staging every file under one neutral generated id, and it cannot remove the rest: the default
+ * config also carries value/stopword allowlists and its own rule set, and a credential shaped in a
+ * way those rules do not match is not detected by any configuration of this scanner.
+ *
+ * So the record says so. "No findings under the recorded rules and coverage" is the claim; "there
+ * are no secrets" is not, and never was.
+ */
+export const SCANNER_RULE_LIMITATIONS = Object.freeze([
+  "the pinned scanner extends its default configuration, whose global allowlist is inherited; this audit stages every file under one neutral generated id so no inherited PATH/extension rule can select it, but inherited value and stopword allowlists are not removed",
+  "detection is limited to the pinned version's rule set: a credential in a shape those rules do not match, or in an encoding this audit's byte-preserving representation does not make textual, is not detected",
+  "archive traversal stays at the pinned version's default of disabled; nested content is expanded by the audit itself, and every format or depth it cannot expand is a recorded coverage limitation",
+]);
+
+/**
+ * The audit's OWN ignore file, and the directory the scanner runs in (F13).
+ *
+ * THE DEFECT. `--gitleaks-ignore-path` defaults to `.`, i.e. the process's working directory — which
+ * on the runner is the repository checkout. A `.gitleaksignore` committed there (or added by a
+ * future PR for repository CI reasons that have nothing to do with this audit) would suppress
+ * findings in the IMAGE, silently, with no limitation recorded anywhere. The audit therefore writes
+ * an empty ignore file of its own inside scratch, points the flag at it explicitly, and runs the
+ * scanner from a scratch directory rather than from the checkout.
+ */
+export const SCANNER_IGNORE_FILE = ".gitleaksignore";
 
 /** Report fields this audit will read. Everything else in the report stays in private scratch. */
 export const REPORT_ALLOWLIST = Object.freeze(["RuleID", "File"]);
@@ -245,7 +280,7 @@ export function summarizeFindings(report, { resolvePath = () => undefined, newOc
  * as well. `--redact` is not the redaction this audit relies on — nothing from the report is echoed —
  * but it keeps the secret out of the scanner's own file too, which is one fewer place it exists.
  */
-export function scannerArgs({ sourceDir, reportPath, configPath = SCANNER.configPath }) {
+export function scannerArgs({ sourceDir, reportPath, configPath = SCANNER.configPath, ignorePath }) {
   return [
     "detect",
     "--no-git",
@@ -255,6 +290,10 @@ export function scannerArgs({ sourceDir, reportPath, configPath = SCANNER.config
     "--report-path", reportPath,
     "--redact",
     "--no-banner",
+    // F13. Explicit, and pointing at an EMPTY file this audit owns. The documented default is `.` —
+    // the working directory — so leaving it unset lets a `.gitleaksignore` in the checkout suppress
+    // findings about the image with nothing recorded to say it happened.
+    ...(ignorePath ? ["--gitleaks-ignore-path", ignorePath] : []),
     // 0 = no size cap. A silently skipped large file is exactly the "uninspected limitation" the
     // spec forbids leaving unreported, so the cap is removed here and size bounding is done by the
     // audit's own member limits, which DO report what they excluded.
@@ -285,6 +324,14 @@ export function scannerSettings(args = scannerArgs({ sourceDir: ".", reportPath:
   const maxTargetMegabytes = valueOf("--max-target-megabytes");
   const maxArchiveDepth = valueOf("--max-archive-depth");
   return Object.freeze({
+    /**
+     * PRESENCE, never the path. Whether the run pinned its own ignore file is the coverage-relevant
+     * fact; where that file lived is a scratch path, and scratch paths do not go in this artifact.
+     */
+    gitleaksIgnorePath: args.includes("--gitleaks-ignore-path")
+      ? "pinned to an audit-owned empty file in scratch"
+      : "unset (the documented default is the working directory, which may carry a .gitleaksignore)",
+    ruleLimitations: SCANNER_RULE_LIMITATIONS,
     // `0` = no size cap in gitleaks' own terms ("files larger than this will be skipped" with no
     // positive threshold). The audit's own per-member limit is what bounds size, and it RECORDS what
     // it excluded, which a scanner-side skip would not.
@@ -293,6 +340,8 @@ export function scannerSettings(args = scannerArgs({ sourceDir: ".", reportPath:
     // audit expands one nested level itself and records every format it could not expand as a
     // coverage limitation, so unexpanded content is reported rather than silently opaque.
     maxArchiveDepth: maxArchiveDepth ?? "0 (default: archive traversal disabled)",
-    archiveExpansion: "performed by the audit, one level, with unexpanded formats recorded as coverage limitations",
+    archiveExpansion:
+      "performed by the audit to its own recorded depth bound, reclassifying every expanded member at every depth; " +
+      "unexpandable formats, oversized members and the depth bound itself are recorded as coverage limitations",
   });
 }

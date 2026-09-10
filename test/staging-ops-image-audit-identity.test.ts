@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import {
@@ -169,6 +168,43 @@ describe("config identity, platform and provenance labels (PUB-02)", () => {
     expect(revisionLabelFailures(image.config, SUBJECT)).toEqual([]);
     const wrong = imageFixture({ labels: { "org.opencontainers.image.revision": "0".repeat(40) } });
     expect(revisionLabelFailures(wrong.config, SUBJECT)).toHaveLength(2);
+  });
+
+  /**
+   * F10. These failures are exported into the PUBLIC evidence artifact, and the previous version
+   * interpolated the OBSERVED label value into each message. A label is arbitrary builder-chosen
+   * text: internal hostnames, branch names, ticket references, whatever the build put there. The
+   * generic secret-shape guard is a backstop for credential-shaped values, not a filter for arbitrary
+   * private prose — and relying on it to catch a value the audit CHOSE to publish is the wrong order
+   * of defence.
+   */
+  it("reports a label failure as a FIXED code plus the expected identity, never the observed value", () => {
+    // Deliberately NOT credential-shaped: the point is that a value the secret regex would happily
+    // pass through still must not be emitted.
+    const marker = "internal-build-host-7.corp.invalid/queue/4821";
+    const wrong = imageFixture({
+      labels: {
+        "org.opencontainers.image.revision": marker,
+        "org.opencontainers.image.source": `https://github.com/${marker}`,
+      },
+    });
+    const failures = revisionLabelFailures(wrong.config, SUBJECT);
+    expect(failures).toEqual([
+      { label: "org.opencontainers.image.revision", code: "label-mismatch", expected: SUBJECT.sourceRevision },
+      { label: "org.opencontainers.image.source", code: "label-mismatch", expected: `https://github.com/${SUBJECT.repository}` },
+    ]);
+    // ∀ over the whole serialized result, not just the message of the first entry.
+    expect(JSON.stringify(failures)).not.toContain(marker);
+    expect(JSON.stringify(failures)).not.toContain("corp.invalid");
+  });
+
+  it("distinguishes a MISSING label from a mismatched one", () => {
+    // Different remedies: an absent label means the build did not stamp provenance at all, while a
+    // wrong one means it stamped something else. Collapsing them loses that.
+    const absent = imageFixture({ labels: { "org.opencontainers.image.source": `https://github.com/${SUBJECT.repository}` } });
+    expect(revisionLabelFailures(absent.config, SUBJECT)).toEqual([
+      { label: "org.opencontainers.image.revision", code: "label-missing", expected: SUBJECT.sourceRevision },
+    ]);
   });
 });
 

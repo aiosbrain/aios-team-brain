@@ -75,7 +75,9 @@ export interface UstarSplit {
  */
 export function ustarSplit(name: string): UstarSplit {
   if (bytes(name) <= 100) return { name };
-  const slashes = [...name].reduce<number[]>((at, char, index) => (char === "/" ? [...at, index] : at), []);
+  // `split("")` indexes by UTF-16 code unit, which is what `slice` below uses. Iterating code points
+  // would silently misplace the split for a multi-byte name.
+  const slashes = name.split("").flatMap((char, index) => (char === "/" ? [index] : []));
   for (const at of [...slashes].reverse()) {
     const prefix = name.slice(0, at);
     const basename = name.slice(at + 1);

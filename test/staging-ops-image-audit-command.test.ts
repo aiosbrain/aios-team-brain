@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { assembleAudit, createScratch, runAudit, runPrivate, runScan } from "../scripts/staging-ops/image-audit.mjs";
+import { assembleAudit, createScratch, runAudit, runPrivate, runScan, scannerIsolation, verifyContext } from "../scripts/staging-ops/image-audit.mjs";
 import { CHECKSUM_UNRECORDED, SCANNER } from "../scripts/staging-ops/image-audit/scanner.mjs";
 import { SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createOperationBudget } from "../scripts/staging-ops/operation-deadline.mjs";
@@ -40,9 +40,8 @@ const budget = () => createOperationBudget("audit command test", 60_000);
  * so every failure assertion below can prove the audit never echoed it.
  */
 function fakeScanner(dir: string, { report, noise = "", exitCode = 0 }: { report?: string; noise?: string; exitCode?: number }): string {
-  const path = join(dir, "fake-scanner.mjs");
-  writeFileSync(path, [
-    `#!${process.execPath}`,
+  const script = join(dir, "fake-scanner.mjs");
+  writeFileSync(script, [
     'import { writeFileSync } from "node:fs";',
     "const args = process.argv.slice(2);",
     'const reportPath = args[args.indexOf("--report-path") + 1];',
@@ -53,17 +52,29 @@ function fakeScanner(dir: string, { report, noise = "", exitCode = 0 }: { report
     `process.exit(${exitCode});`,
     "",
   ].join("\n"));
-  chmodSync(path, 0o755);
-  return path;
+
+  // A `/bin/sh` wrapper rather than a `#!<node>` shebang on the script itself: Linux caps a shebang
+  // line at 127 bytes, and a CI runner's Node path can be longer than that. The audit spawns this
+  // path exactly as it would spawn the real binary.
+  const binary = join(dir, "fake-scanner");
+  writeFileSync(binary, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`);
+  chmodSync(binary, 0o755);
+  return binary;
 }
 
+/**
+ * `runScan` returns `{ args, report }` — the argument list alongside the findings, so the evidence can
+ * record the settings of the invocation that actually ran rather than of a freshly rebuilt one. These
+ * cases are about the report, so they read that half.
+ */
 const scanFor = (dir: string, options: Parameters<typeof fakeScanner>[1]) => () => runScan({
   binary: fakeScanner(dir, options),
   scanDir: join(dir, "scan"),
   scratch: dir,
   budget: budget(),
   configPath: join(dir, "config.toml"),
-});
+  isolation: scannerIsolation(dir),
+}).report;
 
 describe("the scanner's report is read at the COMMAND boundary (PUB-03)", () => {
   it("REFUSES a run that exited 0 and wrote no report at all", () => {
@@ -235,6 +246,63 @@ describe("the measured build recipe reaches the verdict, not just the record (M3
     const record = assembleAudit(measured);
     expect(record.transitionReady).toBe(false);
     expect(record.blockers.join(" ")).toMatch(/were not measured/);
+  });
+});
+
+/**
+ * F15. The context refusal used to interpolate `dispatchContextFailures`' list into its message, and
+ * every entry of that list quotes an environment value. The CLI's handler prints only `error.code`, so
+ * nothing escaped on the intended path — but the string existed, in a program whose discipline is that
+ * a sensitive value must not be CONSTRUCTED rather than must not be printed.
+ */
+describe("the trusted-context refusal carries a fixed code and no untrusted text (F15)", () => {
+  const trusted = {
+    GITHUB_REPOSITORY: "aiosbrain/aios-team-brain",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/staging",
+    GITHUB_SHA: "b".repeat(40),
+    GITHUB_WORKFLOW_SHA: "b".repeat(40),
+    GITHUB_WORKFLOW_REF: "aiosbrain/aios-team-brain/.github/workflows/staging-ops-image-audit.yml@refs/heads/staging",
+  };
+
+  it("accepts the one trusted context and reports only values it has already validated", () => {
+    expect(verifyContext(trusted, { readHead: () => `${"b".repeat(40)}\n` }))
+      .toEqual({ repository: "aiosbrain/aios-team-brain", sha: "b".repeat(40) });
+  });
+
+  it("refuses with a FIXED code, and does not put the offending context value in its message", () => {
+    // A workflow_ref shaped like private infrastructure. The point is not that it is credential-shaped
+    // — it is that the audit must not construct a string containing a value it did not choose.
+    const marker = `internal-runner-${syntheticSecret("tag_")}`;
+    try {
+      verifyContext({ ...trusted, GITHUB_WORKFLOW_REF: `aiosbrain/${marker}/x.yml@refs/heads/staging` }, {
+        readHead: () => `${"b".repeat(40)}\n`,
+      });
+      expect.unreachable("an untrusted context was accepted");
+    } catch (error: unknown) {
+      const failure = error as { code?: string; message: string; failures?: readonly string[] };
+      expect(failure.code).toBe("AUDIT_CONTEXT_UNTRUSTED");
+      expect(failure.message).toBe("refusing an untrusted audit context");
+      expect(failure.message).not.toContain(marker);
+      // The detail is still AVAILABLE to a private log — withheld from the message, not discarded.
+      expect(failure.failures?.join(" ")).toContain(marker);
+    }
+  });
+
+  it("gives an unreadable HEAD its own code rather than surfacing git's stderr", () => {
+    try {
+      verifyContext(trusted, { readHead: () => { throw new Error("fatal: not a git repository: /Users/someone/private/path"); } });
+      expect.unreachable("an unreadable HEAD was accepted");
+    } catch (error: unknown) {
+      const failure = error as { code?: string; message: string };
+      expect(failure.code).toBe("AUDIT_CONTEXT_HEAD_UNREADABLE");
+      expect(failure.message).not.toContain("/Users/someone/private/path");
+    }
+  });
+
+  it("still refuses a checkout that is not the dispatch commit", () => {
+    expect(() => verifyContext(trusted, { readHead: () => `${"c".repeat(40)}\n` }))
+      .toThrow(/refusing an untrusted audit context/);
   });
 });
 

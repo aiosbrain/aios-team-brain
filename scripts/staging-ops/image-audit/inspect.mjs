@@ -11,7 +11,7 @@
  * `complete` is false whenever there is one. A caller cannot report a clean scan of an image whose
  * content it did not finish reading.
  */
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   classifyLayerMember,
@@ -27,7 +27,9 @@ import {
   indexExportByDigest,
   inventoryLayer,
   readIndexedMember,
+  stageConfig,
 } from "./export-walk.mjs";
+import { SCAN_HEADER, SCAN_REPRESENTATION } from "./scan-surface.mjs";
 
 /**
  * Inspect the exported image against the already-verified registry manifest.
@@ -35,12 +37,32 @@ import {
  * `manifest` MUST be the return of `verifyManifest` — i.e. bytes that hashed to the pinned subject
  * digest. Nothing here re-derives that, and nothing here would accept an export on its own say-so:
  * every blob is located by the digest the manifest declares.
+ *
+ * `deadline` is PUB-01's internal budget. It is consulted between layers, inside the decode stream
+ * and inside the member loop — not only around subprocesses — so a pathological export aborts with a
+ * fixed code while there is still time to write the sanitized record, rather than being killed by the
+ * job timeout with no artifact at all.
  */
-export async function inspectExport({ exportPath, manifest, scratchDir, limits, platform }) {
+export async function inspectExport({ exportPath, manifest, scratchDir, limits, platform, deadline }) {
   const scanDir = join(scratchDir, "scan");
   const layerDir = join(scratchDir, "layers");
   mkdirSync(scanDir, { recursive: true });
   mkdirSync(layerDir, { recursive: true });
+
+  /**
+   * The declared layer count, bounded BEFORE any decode or staging allocation (F12).
+   *
+   * `maxLayerCount` was recorded in the limits and consulted nowhere: a manifest declaring ten
+   * thousand layers would have been walked one gunzip at a time until something else ran out. The
+   * check belongs here, before the first blob is located, because that is the last moment at which
+   * refusing costs nothing.
+   */
+  if (manifest.layers.length > limits.maxLayerCount) {
+    throw Object.assign(
+      new Error(`the manifest declares ${manifest.layers.length} layers, past the audit's ${limits.maxLayerCount}-layer bound`),
+      { code: "AUDIT_LAYER_COUNT_EXCEEDED" },
+    );
+  }
 
   const source = fileSource(exportPath);
   let index;
@@ -58,25 +80,35 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     source.close();
   }
   const config = verifyConfig(configBytes, manifest, { platform });
-  /**
-   * THE CONFIG IS SCANNED CONTENT, not just metadata (PUB-03). `Env`, `Labels`, `Cmd`/`Entrypoint`
-   * and every `created_by` line of the history live in these bytes — which is where a `--build-arg`
-   * secret, an `ENV TOKEN=…` or a credential echoed into a `RUN` command ends up. A scan of the
-   * layers alone would never see any of it, and the image ships all of it to whoever pulls the
-   * digest.
-   */
-  writeFileSync(join(scanDir, "image-config.json"), configBytes);
 
   const layers = [];
   const limitations = [];
   const layerPaths = [];
   const appMembers = [];
   const staged = new Map();
+  const buildOutputs = new Map();
   // ONE allowance for the whole scan tree, shared across every layer and every nested expansion
   // inside them (PUB-01). A per-layer bound is not a total.
-  const stagingBudget = createStagingBudget(limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY);
+  const stagingBudget = createStagingBudget(
+    limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY,
+    limits.maxScanSurfaceOverheadBytes ?? Number.POSITIVE_INFINITY,
+  );
+
+  /**
+   * THE CONFIG IS SCANNED CONTENT, not just metadata (PUB-03). `Env`, `Labels`, `Cmd`/`Entrypoint`
+   * and every `created_by` line of the history live in these bytes — which is where a `--build-arg`
+   * secret, an `ENV TOKEN=…` or a credential echoed into a `RUN` command ends up. A scan of the
+   * layers alone would never see any of it, and the image ships all of it to whoever pulls the
+   * digest.
+   *
+   * Staged through the SAME representation as every layer member, under an id from the same closed
+   * vocabulary. The fixed name it used to carry (`image-config.json`) inherited a suffix this audit
+   * had not chosen from its own list, which is the identical shape of mistake F2 was about.
+   */
+  const configScanId = stageConfig({ scanDir, configBytes });
 
   for (const [layerIndex, descriptor] of manifest.layers.entries()) {
+    deadline?.assert("layer inspection");
     const diffId = config.diffIds[layerIndex];
     /**
      * WHICH REPRESENTATION IS ON DISK, and therefore whether to decode — decided by the DECLARED
@@ -109,9 +141,13 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     // The decode happens ONCE, streamed to scratch, and its measured hash is what
     // `classifyLayerMember` adjudicates. The measurement and the decision stay separate.
     const rawSha = compressed ? descriptor.digest : diffId;
+    // BOUNDED OUTPUT (F5). Nothing used to count the bytes leaving the decompressor before they hit
+    // the disk, so a small blob that inflates enormously filled the runner before any limit was
+    // consulted. A partial output is removed by `streamMember` rather than left to be read as a layer.
+    const decodeOptions = { maxOutputBytes: limits.maxLayerDecodedBytes ?? Number.POSITIVE_INFINITY, deadline };
     const measured = compressed
-      ? await gunzipMemberToFile(exportPath, entry, layerTarPath)
-      : await copyMemberToFile(exportPath, entry, layerTarPath);
+      ? await gunzipMemberToFile(exportPath, entry, layerTarPath, decodeOptions)
+      : await copyMemberToFile(exportPath, entry, layerTarPath, decodeOptions);
     // The raw-copy branch never calls `decode`, so nothing downstream would notice a copy that ended
     // early. Its own re-hash is the check: the staged tar must still BE the diff_id.
     if (!compressed && measured !== diffId) {
@@ -119,10 +155,14 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     }
     const classified = classifyLayerMember({ rawSha, descriptor, diffId, decode: () => measured });
 
-    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget });
+    const inventory = inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, stagingBudget, deadline });
     layerPaths.push(inventory.paths);
     appMembers.push(...inventory.appMembers.map((member) => ({ ...member, layer: layerIndex })));
     for (const [id, detail] of inventory.staged) staged.set(id, detail);
+    for (const [category, totals] of Object.entries(inventory.buildOutputs)) {
+      const running = buildOutputs.get(category) ?? { files: 0, bytes: 0 };
+      buildOutputs.set(category, { files: running.files + totals.files, bytes: running.bytes + totals.bytes });
+    }
     limitations.push(...inventory.limitations);
     layers.push(Object.freeze({
       index: layerIndex,
@@ -142,11 +182,21 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   const merged = mergedFilesystem(layerPaths);
   return {
     config,
+    configScanId,
     layers: Object.freeze(layers),
     appMembers,
     merged,
     staged,
     scanDir,
+    /**
+     * Outside-`/app` content, aggregated into the fixed categories of `BUILD_OUTPUT_CATEGORIES`
+     * (F8). Counts and bytes only, and only for categories actually encountered — nothing here
+     * assumes a category is present, and no path is ever named. These are provenance accounting,
+     * never a scan exemption: every one of these files was staged and is scanned.
+     */
+    buildOutputs: Object.freeze(Object.fromEntries(
+      [...buildOutputs].sort(([a], [b]) => a.localeCompare(b)).map(([category, totals]) => [category, Object.freeze(totals)]),
+    )),
     coverage: Object.freeze({
       complete: limitations.length === 0,
       layers: layers.length,
@@ -156,6 +206,18 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       // `Infinity` does not survive JSON, so an unbounded budget says so in words rather than
       // serializing as `null` and reading like a missing measurement.
       stagedByteLimit: Number.isFinite(stagingBudget.limit) ? stagingBudget.limit : "unbounded",
+      /**
+       * The scanner's INPUT, stated as two numbers rather than one. `stagedBytes` is the image's own
+       * content; `scanSurfaceBytes` is what the scanner was actually pointed at, which is larger by
+       * exactly the fixed header of every staged file. Reporting only the second would overstate how
+       * much image was read; reporting only the first would hide that the scanner's input is not
+       * byte-identical to the member. The representation is named so a reader can reconstruct it.
+       */
+      representation: SCAN_REPRESENTATION.version,
+      /** The image config's own bytes — always staged, and bounded separately from the layer allowance. */
+      configBytes: configBytes.length,
+      scanSurfaceBytes: stagingBudget.used + configBytes.length + stagingBudget.overheadUsed + SCAN_HEADER.length,
+      representationOverheadBytes: stagingBudget.overheadUsed + SCAN_HEADER.length,
       limitations: Object.freeze(limitations.map((limitation) => Object.freeze(limitation))),
     }),
     identityVerified: layers.length === manifest.layers.length && layers.every((layer) => layer.form),

@@ -9,7 +9,19 @@ import {
 } from "../scripts/staging-ops/image-audit/registry.mjs";
 import { SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { sha256 } from "../scripts/staging-ops/image-audit/layers.mjs";
-import { recipeEvidence } from "../scripts/staging-ops/image-audit/recipe.mjs";
+import { EXPECTED_REGISTRY_ORIGIN, recipeEvidence } from "../scripts/staging-ops/image-audit/recipe.mjs";
+import { syntheticSecret } from "./helpers/tar-fixture";
+
+/** The shapes this file reads back. Narrow local types, so no fixture needs `any`. */
+interface RecipeAssertion {
+  id: string;
+  status: "satisfied" | "violated" | "unverified";
+  detail: string;
+}
+interface PackageVersion {
+  digest: string;
+  untagged: boolean;
+}
 
 /**
  * PUB-05's inventory rows and M3's recipe rows.
@@ -41,7 +53,7 @@ describe("package version pagination is walked to its end (PUB-05)", () => {
     const result = await listPackageVersions({ token: "t", fetchImpl: async () => pages.shift() });
     expect(result.status).toBe("verified");
     expect(result.pages).toBe(2);
-    expect(result.versions.map((v: any) => v.digest)).toEqual([AUDITED, digest("b")]);
+    expect(result.versions.map((v: PackageVersion) => v.digest)).toEqual([AUDITED, digest("b")]);
   });
 
   /** THE MUTANT: stopping after page one. It returns a plausible, complete-looking, wrong inventory. */
@@ -203,6 +215,9 @@ describe("recipe assertions are measured, and capped honestly (M3)", () => {
     "      - uses: docker/build-push-action@def\n        with:\n          context: .",
   ].join("\n");
 
+  const statuses = (evidence: { assertions: RecipeAssertion[] }) =>
+    Object.fromEntries(evidence.assertions.map((a) => [a.id, a.status]));
+
   it("records satisfied rows for a recipe with no secret, arg or mount", () => {
     const evidence = recipeEvidence({
       ".github/workflows/staging-ops-image.yml": publisher,
@@ -210,7 +225,9 @@ describe("recipe assertions are measured, and capped honestly (M3)", () => {
       ".dockerignore": ".git\n.env\n.context\n",
       "package-lock.json": JSON.stringify({ packages: { "": {}, "node_modules/x": { version: "1", resolved: "https://registry.npmjs.org/x", integrity: "sha512-a" } } }),
     });
-    expect(evidence.counts).toEqual({ satisfied: 8 });
+    // Four workflow rows, two Dockerfile rows, one dockerignore row and the three lockfile rows the
+    // spec asks to be measured separately: origin, embedded auth, integrity.
+    expect(evidence.counts).toEqual({ satisfied: 10 });
     expect(evidence.sourceHashes[".dockerignore"]).toMatch(/^sha256:[0-9a-f]{64}$/);
   });
 
@@ -221,14 +238,53 @@ describe("recipe assertions are measured, and capped honestly (M3)", () => {
       ".dockerignore": "node_modules\n",
       "package-lock.json": JSON.stringify({ packages: { "node_modules/y": { version: "1" } } }),
     });
-    const byId = Object.fromEntries(evidence.assertions.map((a: any) => [a.id, a.status]));
+    const byId = statuses(evidence);
     expect(byId["workflow.no-secret-refs"]).toBe("violated");
     expect(byId["workflow.checkout-credentials-off"]).toBe("violated");
     expect(byId["workflow.no-build-secret-forwarding"]).toBe("violated");
     expect(byId["dockerfile.no-build-args"]).toBe("violated");
     expect(byId["dockerfile.no-secret-mounts"]).toBe("violated");
     expect(byId["dockerignore.excludes-sensitive-trees"]).toBe("violated");
-    expect(byId["lockfile.resolved-and-pinned"]).toBe("violated");
+    expect(byId["lockfile.registry-origin"]).toBe("violated");
+    expect(byId["lockfile.integrity-present"]).toBe("violated");
+    // An entry with NO resolved URL cannot be shown to carry no credential either. "There was nothing
+    // to check" is not a pass.
+    expect(byId["lockfile.no-embedded-credentials"]).toBe("unverified");
+  });
+
+  /**
+   * THE OVER-CLAIM THIS REPLACES. The lockfile row used to accept ANY `https://…` as a measured npm
+   * origin, so `https://packages.internal.example/x.tgz` — or a URL with a token in its userinfo —
+   * satisfied a row the spec wanted to say "resolved from the public npm registry".
+   */
+  it("MEASURES the npm registry origin and embedded credentials, without emitting either", () => {
+    const token = syntheticSecret();
+    const evidence = recipeEvidence({
+      "package-lock.json": JSON.stringify({
+        packages: {
+          "": {},
+          "node_modules/ok": { resolved: `${EXPECTED_REGISTRY_ORIGIN}/ok/-/ok-1.0.0.tgz`, integrity: "sha512-a" },
+          "node_modules/elsewhere": { resolved: "https://packages.internal.example/elsewhere.tgz", integrity: "sha512-b" },
+          "node_modules/withauth": { resolved: `https://ci:${token}@registry.npmjs.org/withauth.tgz`, integrity: "sha512-c" },
+          // A workspace link has no registry origin to pin, by construction, and is not counted.
+          "packages/local": { link: true },
+        },
+      }),
+    });
+    const byId = statuses(evidence);
+    expect(byId["lockfile.registry-origin"]).toBe("violated");
+    expect(byId["lockfile.no-embedded-credentials"]).toBe("violated");
+    expect(byId["lockfile.integrity-present"]).toBe("satisfied");
+
+    const serialized = JSON.stringify(evidence);
+    // Counts against a NAMED expected origin — never the foreign host, the package path or the URL.
+    expect(serialized).toContain(EXPECTED_REGISTRY_ORIGIN);
+    for (const withheld of [token, "packages.internal.example", "node_modules/elsewhere", "withauth"]) {
+      expect(serialized, `the recipe evidence emits ${withheld}`).not.toContain(withheld);
+    }
+    // Three counted entries: the two foreign/auth-bearing ones and the good one. The link is not one.
+    expect(byId["lockfile.registry-origin"]).toBe("violated");
+    expect(serialized).toContain("of 3 package entries");
   });
 
   it("records UNVERIFIED — not satisfied — for a file it could not read or parse", () => {

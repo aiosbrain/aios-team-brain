@@ -22,10 +22,24 @@
  * is the property that matters for an audit.
  */
 
-/** Path categories that account for a member without a Git blob. Accounting only — never a skip. */
+/**
+ * Path categories that account for a member without a Git blob. Accounting only — never a skip.
+ *
+ * `.next` IS THE EMPTY DIRECTORY, NOT A TREE (F9). PUB-02 accounts for "node_modules (including its
+ * .package-lock.json) and **empty** .next": the reviewed Dockerfile creates `.next` so the runtime has
+ * somewhere to write, and the audited image is not expected to contain a build. The previous test
+ * accepted `.next/` and everything beneath it, which meant a real Next.js build inside the image —
+ * pages, chunks, the server manifest, a `.next/cache` full of whatever the build touched — would have
+ * been accounted for as expected generated output and produced no finding at all. Every child is now
+ * `unexpected` unless the source tree independently tracks that path, which is the shape that makes
+ * an unanticipated build a question rather than a category.
+ *
+ * `node_modules` is deliberately NOT narrowed with it: a locked dependency tree is thousands of files
+ * legitimately present with no Git blob behind them, and the spec names that category separately.
+ */
 export const PROVENANCE_CATEGORIES = Object.freeze([
   { category: "npm-dependency", test: (path) => path === "node_modules" || path.startsWith("node_modules/") },
-  { category: "next-build-dir", test: (path) => path === ".next" || path.startsWith(".next/") },
+  { category: "next-build-dir", test: (path) => path === ".next" },
 ]);
 
 const SEGMENT = (pattern) => pattern.replace(/^\/+/, "").replace(/\/+$/, "").split("/");

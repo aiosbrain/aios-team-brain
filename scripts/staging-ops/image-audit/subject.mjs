@@ -83,10 +83,37 @@ export const AUDIT_LIMITS = Object.freeze({
   jobTimeoutMinutes: 60,
   /** Internal deadline: 45 min of work, 15 min reserved for sanitized failure evidence + upload. */
   internalDeadlineMs: 45 * 60_000,
+  /**
+   * The remainder, stated as its own number rather than left implicit in the subtraction above.
+   *
+   * PUB-01 requires the internal deadline to expire with time reserved for a sanitized incomplete
+   * record AND the always-conditioned upload. Two constants that happen to add up are not a
+   * guarantee; naming the reserve lets a guard assert `internalDeadlineMs + evidenceReserveMs <=
+   * jobTimeoutMinutes` and fail the build when a future edit to either one breaks it.
+   */
+  evidenceReserveMs: 15 * 60_000,
   /** One `docker save` export. Larger than the ~1.5 GB runner image, small enough to bound the disk. */
   maxExportBytes: 8 * 1024 * 1024 * 1024,
-  /** Ordered layers. The reviewed Dockerfile produces well under this. */
+  /** Ordered layers. Enforced BEFORE any decode or staging allocation (F12), not merely recorded. */
   maxLayerCount: 64,
+  /**
+   * THE DECODE CEILING (F5). One layer's decompressed output, counted as it streams to scratch.
+   *
+   * Separate from `maxExpandedBytesPerLayer`, which bounds how much of an already-decoded layer is
+   * STAGED for the scanner. That budget is only consulted once the decoded tar exists, so it cannot
+   * bound the decode itself: a 20 KB gzip blob declaring a 200 GB expansion filled the disk before
+   * anything counted. This is the number that stops it, and passing it aborts with a fixed code.
+   */
+  maxLayerDecodedBytes: 8 * 1024 * 1024 * 1024,
+  /**
+   * The fixed per-file header of the scan representation, bounded ACROSS the whole run.
+   *
+   * Not image content, so it must not inflate the coverage figure — and not free either, so it must
+   * not be unbounded: 23 bytes across the theoretical 32 M member ceiling is three quarters of a
+   * gigabyte of disk nobody budgeted. Exhausting it is a recorded coverage limitation, exactly like
+   * exhausting the content allowance.
+   */
+  maxScanSurfaceOverheadBytes: 256 * 1024 * 1024,
   /** Members inspected per layer, and bytes expanded per layer. */
   maxMembersPerLayer: 500_000,
   maxExpandedBytesPerLayer: 6 * 1024 * 1024 * 1024,

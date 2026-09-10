@@ -126,6 +126,7 @@ export function lockfileAssertions(text) {
   let foreignOrigin = 0;
   let embeddedAuth = 0;
   let missingIntegrity = 0;
+  let unparseable = 0;
   for (const [path, entry] of Object.entries(packages)) {
     // The root project and workspace links have no registry origin to pin, by construction.
     if (path === "" || entry?.link === true) continue;
@@ -136,8 +137,10 @@ export function lockfileAssertions(text) {
       url = new URL(String(entry?.resolved ?? ""));
     } catch {
       // An unparseable (or absent) `resolved` is not a public npm origin, and calling it one is the
-      // exact over-claim this row exists to avoid.
+      // exact over-claim this row exists to avoid. It also leaves the credential question
+      // UNEVALUABLE for that entry, which is tracked separately below rather than counted as a pass.
       foreignOrigin += 1;
+      unparseable += 1;
       continue;
     }
     if (url.username !== "" || url.password !== "") embeddedAuth += 1;
@@ -148,9 +151,13 @@ export function lockfileAssertions(text) {
     foreignOrigin === 0
       ? satisfied("lockfile.registry-origin", `all ${checked} package entries resolved from ${EXPECTED_REGISTRY_ORIGIN}`)
       : violated("lockfile.registry-origin", `${foreignOrigin} of ${checked} package entries did not resolve from ${EXPECTED_REGISTRY_ORIGIN} (origins withheld)`),
-    embeddedAuth === 0
-      ? satisfied("lockfile.no-embedded-credentials", `no resolved URL of the ${checked} entries carried userinfo`)
-      : violated("lockfile.no-embedded-credentials", `${embeddedAuth} of ${checked} resolved URLs carried an embedded credential (values withheld)`),
+    embeddedAuth > 0
+      ? violated("lockfile.no-embedded-credentials", `${embeddedAuth} of ${checked} resolved URLs carried an embedded credential (values withheld)`)
+      : unparseable > 0
+        // "No URL at all" is not evidence that no URL carried a credential. Recording it as satisfied
+        // would turn a lockfile nobody could evaluate into a passing row.
+        ? unverified("lockfile.no-embedded-credentials", `${unparseable} of ${checked} package entries have no parseable resolved URL, so userinfo could not be evaluated for them`)
+        : satisfied("lockfile.no-embedded-credentials", `no resolved URL of the ${checked} entries carried userinfo`),
     missingIntegrity === 0
       ? satisfied("lockfile.integrity-present", `all ${checked} package entries carry an integrity hash`)
       : violated("lockfile.integrity-present", `${missingIntegrity} of ${checked} package entries carry no integrity hash`),

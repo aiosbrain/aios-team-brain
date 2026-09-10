@@ -106,14 +106,37 @@ export function verifyConfig(configBytes, manifest, { platform } = {}) {
  * PUB-02's provenance labels. A label is a CLAIM the builder wrote, so this is one input among the
  * receipt tag readback and the original run — "a source label alone is insufficient provenance" is
  * the spec's line, and the audit records all three rather than letting this one stand in for them.
+ *
+ * THE PRIVACY DEFECT THIS SHAPE EXISTS FOR (F10). These failures are exported by `runAudit` into the
+ * PUBLIC evidence artifact, and the previous version interpolated the OBSERVED label value into each
+ * message. Labels are arbitrary strings a builder chose: `OCI` labels routinely carry internal
+ * hostnames, branch names, ticket references and — in the case this check is for, a build that did
+ * something unexpected — whatever the builder put there. The generic secret-shape guard in
+ * `evidence.mjs` is a backstop for credential-shaped values, not a filter for arbitrary private
+ * prose, and relying on it to catch a value the audit chose to publish is the wrong order of defence.
+ *
+ * So each failure is a FIXED CODE plus the EXPECTED identity, which is already public: it is in
+ * reviewed source, in the pinned subject, and in this repository's URL. Nothing observed is emitted.
+ * A coordinator who needs the actual value reads it from private scratch in a bounded rerun, which is
+ * the same access limitation every other unresolved occurrence carries.
  */
 export function revisionLabelFailures(config, subject) {
   const labels = config?.config?.Labels ?? config?.Labels ?? {};
+  const expected = {
+    "org.opencontainers.image.revision": subject.sourceRevision,
+    "org.opencontainers.image.source": `https://github.com/${subject.repository}`,
+  };
   const failures = [];
-  const revision = labels["org.opencontainers.image.revision"];
-  const source = labels["org.opencontainers.image.source"];
-  if (revision !== subject.sourceRevision) failures.push(`image revision label is ${JSON.stringify(String(revision ?? ""))}, expected the pinned source ${subject.sourceRevision}`);
-  if (source !== `https://github.com/${subject.repository}`) failures.push(`image source label is ${JSON.stringify(String(source ?? ""))}, expected https://github.com/${subject.repository}`);
+  for (const [label, want] of Object.entries(expected)) {
+    const observed = labels[label];
+    if (typeof observed !== "string" || observed === "") {
+      failures.push(Object.freeze({ label, code: "label-missing", expected: want }));
+    } else if (observed !== want) {
+      // `code` says WHICH way it failed; `expected` says what the audit required. The observed value
+      // is deliberately absent — that is the whole point of this function's shape.
+      failures.push(Object.freeze({ label, code: "label-mismatch", expected: want }));
+    }
+  }
   return failures;
 }
 

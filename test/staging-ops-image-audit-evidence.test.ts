@@ -357,8 +357,8 @@ describe("a finding's location is normalized against the scan root (PUB-03)", ()
   it("REFUSES an empty or NUL-bearing location", () => {
     expect(normalizeScanLocation("", { scanRoot: root }).outcome).toBe("malformed");
     expect(normalizeScanLocation(undefined, { scanRoot: root }).outcome).toBe("malformed");
-    // The NUL is written as an ESCAPE. A literal control byte is invisible in review, and one in a
-    // source file makes git treat it as binary.
+    // The NUL is CONSTRUCTED, never typed as a literal byte: a raw control character is invisible in
+    // review, and one in a source file makes git treat it as binary.
     const nulBearing = `L0/000000${String.fromCharCode(0)}.json`;
     expect(normalizeScanLocation(nulBearing, { scanRoot: root }).outcome).toBe("malformed");
   });

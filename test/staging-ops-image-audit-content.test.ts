@@ -13,6 +13,7 @@ import {
   inventorySummary,
   provenanceCategory,
 } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
+import { CONFIG_SCAN_GROUP, SCAN_HEADER, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -229,7 +230,11 @@ describe("the image CONFIG and HISTORY are scanned content, not metadata (PUB-03
       env: ["PATH=/usr/local/bin", `REGISTRY_TOKEN=${secret}`],
     });
     const result = await inspect(image);
-    expect(readFileSync(join(result.scanDir, "image-config.json"), "utf8")).toContain(secret);
+    // Read through the id the inspector REPORTS, not a name this test assumes. The config is staged
+    // under the same neutral vocabulary as every layer member (F2), so hardcoding `image-config.json`
+    // would pass or fail for reasons about this file rather than about the audit.
+    expect(result.configScanId).toBe(`${CONFIG_SCAN_GROUP}/000000${SCAN_REPRESENTATION.suffix}`);
+    expect(readFileSync(join(result.scanDir, result.configScanId), "utf8")).toContain(secret);
   });
 
   it("stages history `created_by` lines for the scanner", async () => {
@@ -355,7 +360,13 @@ describe("coverage gaps are REPORTED, never silently narrowed (PUB-03)", () => {
       // expansion that ignored the budget is how a decompression bomb fills a runner disk.
       limits: { ...AUDIT_LIMITS, maxTotalStagedBytes: 64 + nested.length },
     });
-    expect(result.coverage.limitations).toContainEqual({ kind: "total-staging-budget-exhausted", layer: 0 });
+    // `depth: 1` is asserted, not omitted: it is what says the refusal happened INSIDE the nested
+    // expansion rather than while staging a top-level member, and those are different gaps.
+    expect(result.coverage.limitations).toContainEqual({ kind: "total-staging-budget-exhausted", layer: 0, depth: 1 });
+    // The two layer members were staged; the archive's INFLATED contents were not. Counted rather
+    // than searched for the secret: the staged `.gz` is compressed bytes, so its absence from a utf8
+    // read would prove nothing about whether the expansion happened.
+    expect(readdirSync(join(result.scanDir, "L0"))).toHaveLength(2);
     expect(scanSurface(result.scanDir)).not.toContain(secret);
   });
 
@@ -424,8 +435,31 @@ describe("the /app inventory: dockerignore filters the EXPECTED set only (M1)", 
     // that surface is proved separately by the nested-archive case above.
     expect(provenanceCategory("app/node_modules/react/index.js")).toBe("npm-dependency");
     expect(provenanceCategory("app/node_modules/.package-lock.json")).toBe("npm-dependency");
-    expect(provenanceCategory("app/.next/BUILD_ID")).toBe("next-build-dir");
     expect(provenanceCategory("app/src/unexpected-generated.js")).toBeUndefined();
+  });
+
+  /**
+   * F9. PUB-02 accounts for `node_modules` and an **EMPTY** `.next`. The category used to accept
+   * `.next/` and everything under it, so a real Next.js build inside the audited image — pages,
+   * chunks, the server manifest, whatever `.next/cache` collected — would have been filed as expected
+   * generated output and produced no finding at all.
+   */
+  it("accepts .next as an EMPTY DIRECTORY only; a child is a provenance finding", () => {
+    expect(provenanceCategory("app/.next")).toBe("next-build-dir");
+    for (const child of ["app/.next/BUILD_ID", "app/.next/server/pages-manifest.json", "app/.next/cache/x"]) {
+      expect(provenanceCategory(child), `${child} is still accounted for as build output`).toBeUndefined();
+    }
+    // …and the child therefore reaches the summary as a finding, not as a category count.
+    const expected = expectedInventory(sourceEntries, dockerignore);
+    const summary = inventorySummary(compareInventory([
+      { path: "app/.next/BUILD_ID", type: "file", sha256: "abc" },
+    ], expected));
+    expect(summary.counts.unexpected).toBe(1);
+    // The dependency category is deliberately NOT narrowed with it: a locked tree is thousands of
+    // files legitimately present without a Git blob, and the spec names it separately.
+    expect(inventorySummary(compareInventory([
+      { path: "app/node_modules/react/index.js", type: "file", sha256: "abc" },
+    ], expected)).counts.unexpected).toBeUndefined();
   });
 
   it("reports an unexpected generated path and a missing expected path as findings", () => {

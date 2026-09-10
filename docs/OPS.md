@@ -1261,9 +1261,27 @@ public evidence.**
   did not look" must not read the same.
 - **`blockers`** lists every reason in one pass.
 - **`coverage.limitations`** names anything that could not be fully inspected — an unexpandable
-  archive format, an oversized member, an exhausted byte budget. A bounded-coverage result can be
-  accepted only with an **explicit coordinator adjudication of the recorded gap**. An opaque-byte
-  scan is not decoded archive inspection.
+  archive format, an oversized member, an exhausted per-layer or **cumulative** staging budget
+  (`total-staging-budget-exhausted`; `coverage.stagedBytes` against `stagedByteLimit` is the measured
+  total across every layer and nested expansion). A bounded-coverage result can be accepted only with
+  an **explicit coordinator adjudication of the recorded gap**. An opaque-byte scan is not decoded
+  archive inspection. Blockers describe a gap by **kind, layer and count** only — never by an
+  archive-derived extension, reason or byte count.
+- **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
+  blocks `transitionReady` and lands the verdict on **`unresolved`** — a question for coordinator
+  adjudication, deliberately *not* re-labelled as secret presence. A missing recipe blocks too, so a
+  wiring slip can only ever cost a false block. The lockfile rows measure the **npm registry origin**,
+  **absent embedded credentials** and **integrity presence** separately, as counts against the named
+  expected origin; a foreign host, a package path or a URL is never emitted.
+- **`scanner.settings`** records the coverage-relevant flags read back from the invocation that ran:
+  no file-size cap (`--max-target-megabytes 0`), and the scanner's own archive traversal left at the
+  8.28.0 default of disabled — the audit expands one nested level itself and records every format it
+  could not expand.
+- **`failure`** appears only on a refused run, and carries a fixed `stage` from a closed vocabulary
+  plus an error **code**, never a message. `AUDIT_SUBPROCESS_TIMEOUT`, `AUDIT_SUBPROCESS_LOG_OVERFLOW`
+  and `AUDIT_SUBPROCESS_START` are distinct because the remedies are. A prerequisite refusal
+  (`stage: "prerequisites"`) writes this record even though scratch never existed — an absent
+  artifact would be indistinguishable from a runner that died.
 - **`findings`** is grouped by rule, with a random **per-run `occurrenceId`** per occurrence. A clear
   `path` appears only where the location was independently established as public source/dependency
   content that is not itself sensitive. Unsalted hashes of sensitive paths are *not* redaction and
@@ -1306,17 +1324,24 @@ for auditing or exposing the currently covered package.
 
 ### Unmeasured prerequisites — the workflow refuses until these are recorded
 
-- **The scanner's download checksum.** `scripts/staging-ops/image-audit/scanner.mjs` pins the version
-  and carries `sha256: "UNRECORDED"`. It **fails closed**: a fabricated hash would launder an
-  unverified download into a verified-looking one. Record the real value from the release's official
-  checksums file *and* the asset itself before dispatching. The repo's `ci.yml` gitleaks download is
-  unpinned by checksum and on an older version — it is **not** evidence for this one, and the pinned
-  version's own flags are measured on the runner rather than inferred.
-- **The `docker save` export form.** The inspector accepts exactly the two forms whose layer identity
-  it can *prove* by hash — the compressed registry blob (verified against its descriptor, then
-  decoded per the declared media type to its `diff_id`) and the uncompressed diff (whose hash *is*
-  the `diff_id`). Anything else fails as `unsupported-export-form`. It never guesses gzip for an
-  unknown media type.
+- **The scanner's download checksum — RECORDED.** `scripts/staging-ops/image-audit/scanner.mjs` pins
+  gitleaks **8.28.0** and the sha256 of `gitleaks_8.28.0_linux_x64.tar.gz`
+  (`a65b5253…6a840eb`), taken from the release's official checksums file with the downloaded asset
+  agreeing. The fail-closed sentinel is **retained** — an unrecorded or malformed pin still refuses,
+  with code `AUDIT_SCANNER_UNPINNED`, before any pull or export — and the negative cases are injected
+  in tests rather than shipped. The runner **re-verifies** the checksum and measures the binary's own
+  `version` and `detect --help` before scanning, because the flags were probed on the darwin asset of
+  the same version and executing this exact linux_x64 binary is a separate measurement. The repo's
+  `ci.yml` gitleaks download is unpinned by checksum and on an older version — it is **not** evidence
+  for this one.
+- **The `docker save` export form.** How a layer is decoded is decided by its **declared media type**,
+  never by which digest the export happens to contain: for an uncompressed `…layer.v1.tar` layer the
+  descriptor digest *is* the `diff_id`, so "the export has a member hashing to the descriptor" is true
+  of a plain tar and cannot mean "this is compressed". The inspector accepts exactly the two forms
+  whose layer identity it can *prove* by hash — the compressed registry blob (verified against its
+  descriptor, then gunzipped to its `diff_id`) and the uncompressed diff (copied raw, then re-hashed
+  to its `diff_id`). Anything else fails as `unsupported-export-form`, and an uncompressed layer whose
+  descriptor digest is not its `diff_id` fails as an inconsistent manifest/config pair.
 - **Package-metadata access.** The job token must be able to pull this linked private package and
   enumerate its versions. A failure is an explicit permission prerequisite. **Do not create a PAT,
   broaden scopes, or make the package public to get past it.**
