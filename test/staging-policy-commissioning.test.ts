@@ -1,22 +1,32 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
+import { deflateRawSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ALLOWED_OPERATIONS, ALLOWED_REQUEST_SCOPES, COMMISSIONING_REPOSITORY, COMMISSIONING_WORKFLOW_PATH,
-  ENVIRONMENT_CONTROL_KEYS, PROTECTED_JOBS, RESULT_SCHEMA_VERSION, ROLE_APP_PERMISSIONS,
+  CLOUD_CASE_SEQUENCE, ENVIRONMENT_CONTROL_KEYS, ENVIRONMENT_CONTROL_SCHEMAS, OWNER_LOGIN,
+  OWNER_USER_ID, PROTECTED_JOBS, REQUIRED_WITNESS_PUBLICATIONS, RESULT_SCHEMA_VERSION,
+  ROLE_APP_PERMISSIONS, ROLE_BINDINGS,
   assertAllowedRequest, assertCasePrecondition, assertDerivedRef, assertManifestBinding,
-  assessEvidence, awaitManifestFromRef, buildActorMatrix, buildGraphPlan, classifyCaseOutcome,
+  assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
+  assertPublisherContext, assertResponseBinding, assertRoleBinding, assertRunContext, assessEvidence,
+  awaitManifestFromRef, buildChallenge, buildGovernedSnapshot, buildResponse, buildActorMatrix,
+  buildGraphPlan, openWitnessSession, publishWitnessResponse, readWitnessEnvelopeFromEvent,
+  runWitnessPhase, serializeDispatchEnvelope, validateGovernedSnapshot,
+  challengeArtifactName, classifyCaseOutcome,
   collectSentinels, comparePermissions, createRedactor, deriveCaseVerdict, derivedContextNames,
   derivedRef, derivedRefs, derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug,
-  assertPlannedPolicyInForce, assertSyntheticPullTarget, governedFingerprint, invertDisposable,
-  evidenceFileName, main, mintAppJwt, parseArgs, readAllPages,
-  readApplicableBranchRulesets, readEvidenceFile, runCloudTestsPhase, runFixtureChecks,
-  runHumanTestsPhase, runIntentPhase, runPhase, transformToDisposable, validateEnvironmentControl,
-  validateEvidenceBinding, writeEvidenceFile,
+  assertPlannedPolicyApplies, assertSyntheticPullTarget, governedFingerprint, invertDisposable,
+  evidenceFileName, main, mintActorCredential, mintAppJwt, parseArgs, projectGovernedRuleset, readAllPages,
+  readApplicableBranchRulesets, readEvidenceFile, readSingleEntryZip, recomputeCheckState,
+  responseArtifactName, runCaseStage, runCloudTestsPhase, runFixtureChecks,
+  runHumanTestsPhase, runIntentPhase, runNormalCheckPublication, runPhase, runRehearsalStage,
+  runWitnessPublisherJob, serveWitnessItem, transformToDisposable, unresolvedCreateIntents,
+  validateEnvironmentControl, validateEvidenceBinding, verifyWitnessedPolicy, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
@@ -51,6 +61,85 @@ const PRODUCER_IDS = Object.fromEntries(REQUIRED_MAIN_CONTEXTS.map((context, ind
 const SENTINEL_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEsentinelKEYMATERIAL0123456789\n-----END RSA PRIVATE KEY-----";
 
 const sha = (seed: string) => createHash("sha1").update(seed).digest("hex");
+
+/** The two identities the transport distinguishes: the human operator and the dispatcher App. */
+const OWNER_IDENTITY = { login: OWNER_LOGIN, id: OWNER_USER_ID, type: "User" };
+const DISPATCHER_IDENTITY = { login: "aios-commissioning-dispatcher[bot]", id: 987654, type: "Bot" };
+
+/**
+ * A minimal ZIP writer, so the suite can hand the runner a REAL archive.
+ *
+ * Written here rather than mocked away because {@link readSingleEntryZip} is a security boundary: the
+ * archive-attack cases below (two entries, a symlink entry, a traversal name, a bad CRC, a zip64 size
+ * marker) can only be tested against bytes. `method` covers both accepted compressions — store and
+ * deflate — because a reader that only ever saw one of them would be half-tested.
+ */
+function buildZip(entryName: string, content: Buffer, method: 0 | 8 = 0, overrides: {
+  entries?: { name: string; content: Buffer }[]; crc?: number; uncompressedSize?: number;
+  externalAttributes?: number; totalEntries?: number; comment?: Buffer;
+} = {}): Buffer {
+  const crcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let index = 0; index < 256; index += 1) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+      table[index] = value >>> 0;
+    }
+    return table;
+  })();
+  const crc32 = (buffer: Buffer) => {
+    let crc = 0xffffffff;
+    for (const byte of buffer) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const entries = overrides.entries ?? [{ name: entryName, content }];
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const nameBytes = Buffer.from(entry.name, "utf8");
+    const raw = method === 8 ? deflateRawSync(entry.content) : entry.content;
+    const crc = overrides.crc ?? crc32(entry.content);
+    const uncompressed = overrides.uncompressedSize ?? entry.content.length;
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(raw.length, 18);
+    local.writeUInt32LE(uncompressed, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    nameBytes.copy(local, 30);
+    const central = Buffer.alloc(46 + nameBytes.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(method, 10);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(raw.length, 20);
+    central.writeUInt32LE(uncompressed, 24);
+    central.writeUInt16LE(nameBytes.length, 28);
+    central.writeUInt32LE((overrides.externalAttributes ?? (0o100644 << 16)) >>> 0, 38);
+    central.writeUInt32LE(offset, 42);
+    nameBytes.copy(central, 46);
+    locals.push(local, raw);
+    centrals.push(central);
+    offset += local.length + raw.length;
+  }
+  const centralBytes = Buffer.concat(centrals);
+  const comment = overrides.comment ?? Buffer.alloc(0);
+  const eocd = Buffer.alloc(22 + comment.length);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(overrides.totalEntries ?? entries.length, 8);
+  eocd.writeUInt16LE(overrides.totalEntries ?? entries.length, 10);
+  eocd.writeUInt32LE(centralBytes.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(comment.length, 20);
+  comment.copy(eocd, 22);
+  return Buffer.concat([...locals, centralBytes, eocd]);
+}
 
 type Actor = { kind: string; appId: number | null };
 const ACTORS: Record<string, Actor> = {
@@ -215,6 +304,18 @@ interface FakeOptions {
   appPermissions?: Record<string, Permissions>;
   /** Override the installation's repository selection or suspension, per role. */
   installationOverrides?: Record<string, Record<string, unknown>>;
+  /** The local `gh` identity `/user` reports — the only way the F6 wrong-admin case is falsifiable. */
+  operatorLogin?: string;
+  operatorId?: number;
+  operatorType?: string;
+  operatorPermission?: string;
+  /** The identities the provider reports for the SOURCE run, which is where the dispatcher is read. */
+  runActor?: { login: string; id: number; type: string };
+  runTriggeringActor?: { login: string; id: number; type: string };
+  /** Swallow the witness dispatch, to model a publication that never happens. */
+  suppressPublisher?: boolean;
+  /** Which accepted ZIP compression the publisher's artifact uses. */
+  zipMethod?: 0 | 8;
 }
 
 /**
@@ -246,11 +347,65 @@ function createFakeGitHub(options: FakeOptions = {}) {
   /** Empty until a human approves. Nothing in the harness may add to this. */
   const approvals: ApprovalEntry[] = [];
   const faults = { approvals: options.approvalsStatus ?? 0, jobs: options.jobsStatus ?? 0 };
-  /** What a human approval does: records a review, and lets the parked job run to completion. */
-  const approve = (job: string, login = "johnellison", type = "User") => {
-    approvals.push({ state: "approved", user: { login, type }, environments: [{ name: JOB_ENVIRONMENTS[job] }] });
-    jobState.set(job, { status: "completed", conclusion: "success" });
+
+  /**
+   * The witness transport's state: artifacts, the publisher runs that own them, and every dispatch
+   * body the local witness sent. Modelled, because the actor's whole provenance check is about the
+   * OWNING RUN's actor, attempt, path, head SHA and job set — a stubbed "here is your response" would
+   * skip precisely the part that matters.
+   */
+  const artifacts = new Map<number, { id: number; name: string; runId: number; zip: Buffer }>();
+  const publisherRuns = new Map<number, Record<string, unknown>>();
+  const rehearsalRuns = new Map<number, Record<string, unknown>>();
+  const dispatches: unknown[] = [];
+  let nextArtifact = 6100;
+  let nextRun = 77000;
+
+  /** Register an artifact as though an upload step had published it. */
+  const addArtifact = (name: string, entryName: string, bytes: Buffer, runId: number, method: 0 | 8 = 0) => {
+    const id = (nextArtifact += 1);
+    artifacts.set(id, { id, name, runId, zip: buildZip(entryName, bytes, method) });
+    return id;
   };
+
+  /** What the `policy-witness` job does when the local witness dispatches: republish the bytes. */
+  const publishWitness = (envelope: string) => {
+    let response: { original_run_id: string; original_attempt: string; role: string; case_ordinal: number; direction: string; challenge_nonce: string };
+    try { response = JSON.parse(envelope); } catch { return null; }
+    const runId = (nextRun += 1);
+    publisherRuns.set(runId, {
+      id: runId, head_sha: WORKFLOW_SHA, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+      head_branch: "staging", run_attempt: 1, status: "completed", conclusion: "success",
+      actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY,
+    });
+    const name = responseArtifactName({
+      runId: response.original_run_id, attempt: response.original_attempt, role: response.role,
+      ordinal: response.case_ordinal, direction: response.direction, nonce: response.challenge_nonce,
+    });
+    return addArtifact(name, "witness.json", Buffer.from(envelope, "utf8"), runId, options.zipMethod ?? 0);
+  };
+
+  /** The bounded BINARY transport the runner uses for an artifact archive. */
+  const archiveImpl = async (method: string, requestPath: string) => {
+    calls.push({ actor: "archive", method, path: requestPath.split("?")[0] });
+    const id = Number(/\/actions\/artifacts\/(\d+)\/zip$/.exec(requestPath.split("?")[0])?.[1]);
+    const entry = artifacts.get(id);
+    if (!entry) return { status: 404, bytes: null, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } };
+    return { status: 200, bytes: entry.zip, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } };
+  };
+  /**
+   * What a human approval does: records a review, and lets the parked job START.
+   *
+   * `in_progress`, not `completed` — the distinction is load-bearing for the F1 transport. The local
+   * witness serves a response only to a job that is ACTUALLY RUNNING this attempt, so a fake that
+   * jumped straight to `completed` would make every witness service refuse for the right reason at
+   * the wrong time. {@link finish} is the separate event of the job ending.
+   */
+  const approve = (job: string, login = OWNER_LOGIN, type = "User", id = OWNER_USER_ID) => {
+    approvals.push({ state: "approved", user: { login, type, id }, environments: [{ name: JOB_ENVIRONMENTS[job] }] });
+    jobState.set(job, { status: "in_progress", conclusion: null });
+  };
+  const finish = (job: string, conclusion = "success") => jobState.set(job, { status: "completed", conclusion });
   /** What the fixture finishing does: GitHub can finally create `normal`, parked for its human. */
   const createNormalJob = () => jobState.set("normal", { status: "waiting", conclusion: null });
   let nextId = 7000;
@@ -321,7 +476,10 @@ function createFakeGitHub(options: FakeOptions = {}) {
     const rel = pathname.startsWith(`/repos/${COMMISSIONING_REPOSITORY}`) ? pathname.slice(`/repos/${COMMISSIONING_REPOSITORY}`.length) : null;
     const json = (status: number, value: unknown) => ({ status, body: value });
 
-    if (pathname === "/user") return json(200, { login: "johnellison", type: "User", id: 4242 });
+    // The ONE authorized operator, by numeric ID as well as login (F6). `OWNER_USER_ID` is imported
+    // from the runner rather than retyped, so a change to the authorized identity is a red test here
+    // rather than a fixture that quietly disagrees with the code.
+    if (pathname === "/user") return json(200, { login: options.operatorLogin ?? OWNER_LOGIN, type: options.operatorType ?? "User", id: options.operatorId ?? OWNER_USER_ID });
     if (pathname === "/installation/repositories") {
       // EXACTLY the documented shape: `total_count` + `repositories`. No `repository_selection` —
       // that field lives on the installation, and asking this endpoint for it was the bug.
@@ -347,20 +505,65 @@ function createFakeGitHub(options: FakeOptions = {}) {
       });
     }
     if (rel === "") return json(200, { id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY });
-    if (rel === "/collaborators/johnellison/permission") return json(200, { permission: "admin" });
+    if (rel?.startsWith("/collaborators/") && rel.endsWith("/permission")) return json(200, { permission: options.operatorPermission ?? "admin" });
+
+    // ── the witness transport's provider surface (F1) ───────────────────────────────────────────
+    if (rel === "/actions/artifacts" && method === "GET") {
+      const wanted = new URLSearchParams(rawPath.split("?")[1] ?? "").get("name");
+      const rows = [...artifacts.values()].filter((entry) => !wanted || entry.name === wanted)
+        .map((entry) => ({ id: entry.id, name: entry.name, expired: false, workflow_run: { id: entry.runId } }));
+      return json(200, { total_count: rows.length, artifacts: rows });
+    }
+    const artifactMatch = /^\/actions\/artifacts\/(\d+)$/.exec(rel ?? "");
+    if (artifactMatch) {
+      const entry = artifacts.get(Number(artifactMatch[1]));
+      return entry ? json(200, { id: entry.id, name: entry.name, expired: false, workflow_run: { id: entry.runId } }) : json(404, { message: "Not Found" });
+    }
+    if (rel === `/actions/workflows/release-policy-commissioning.yml/dispatches` && method === "POST") {
+      // What a witness dispatch DOES: it creates a `policy-witness` run whose one publisher job
+      // republishes the envelope bytes as a single-entry artifact. Modelled rather than stubbed,
+      // because the actor then verifies that run's actor, attempt, path, head SHA and job set.
+      dispatches.push(structuredClone(body));
+      if (!options.suppressPublisher) publishWitness(String(body?.inputs?.witness_envelope ?? ""));
+      return json(204, null);
+    }
+    if (rel === `/actions/workflows/release-policy-commissioning.yml/runs` && method === "GET") {
+      return json(200, { total_count: publisherRuns.size, workflow_runs: [...publisherRuns.values()] });
+    }
     if (rel?.startsWith("/actions/runs/")) {
       if (rel.endsWith("/jobs")) {
         if (faults.jobs) return json(faults.jobs, { message: "Not Found" });
+        const runMatch = /^\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs$/.exec(rel);
+        const runId = runMatch ? Number(runMatch[1]) : Number(RUN_ID);
+        if (publisherRuns.has(runId)) {
+          return json(200, { total_count: 2, jobs: [
+            { id: runId * 10 + 1, name: "Local policy witness publisher (no secrets)", status: "completed", conclusion: "success", run_attempt: 1 },
+            { id: runId * 10 + 2, name: "Normal App actor tests (protected)", status: "completed", conclusion: "skipped", run_attempt: 1 },
+          ] });
+        }
+        if (rehearsalRuns.has(runId)) {
+          return json(200, { total_count: 1, jobs: [{ id: runId * 10 + 1, name: "Transport rehearsal (inert, no secrets)", status: "in_progress", conclusion: null, run_attempt: 1 }] });
+        }
         const rows = options.jobStatus
-          ? Object.keys(JOB_NAMES).map((id) => ({ name: JOB_NAMES[id], status: options.jobStatus, conclusion: null }))
-          : [...jobState.entries()].map(([id, value]) => ({ name: JOB_NAMES[id], status: value.status, conclusion: value.conclusion }));
+          ? Object.keys(JOB_NAMES).map((id) => ({ id: 900 + Object.keys(JOB_NAMES).indexOf(id), name: JOB_NAMES[id], status: options.jobStatus, conclusion: null, run_attempt: Number(ATTEMPT) }))
+          : [...jobState.entries()].map(([id, value]) => ({ id: 900 + Object.keys(JOB_NAMES).indexOf(id), name: JOB_NAMES[id], status: value.status, conclusion: value.conclusion, run_attempt: Number(ATTEMPT) }));
         return json(200, { total_count: rows.length, jobs: rows });
       }
       if (rel.endsWith("/approvals")) {
         if (faults.approvals) return json(faults.approvals, { message: "Not Found" });
         return json(200, structuredClone(approvals));
       }
-      return json(200, { head_sha: WORKFLOW_SHA, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch", head_branch: "staging" });
+      const attemptMatch = /^\/actions\/runs\/(\d+)\/attempts\/(\d+)$/.exec(rel);
+      const runId = attemptMatch ? Number(attemptMatch[1]) : Number(RUN_ID);
+      if (publisherRuns.has(runId)) return json(200, publisherRuns.get(runId));
+      if (rehearsalRuns.has(runId)) return json(200, rehearsalRuns.get(runId));
+      return json(200, {
+        id: runId, head_sha: WORKFLOW_SHA, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+        head_branch: "staging", run_attempt: Number(attemptMatch ? attemptMatch[2] : ATTEMPT),
+        status: "in_progress", conclusion: null,
+        actor: options.runActor ?? DISPATCHER_IDENTITY,
+        triggering_actor: options.runTriggeringActor ?? options.runActor ?? DISPATCHER_IDENTITY,
+      });
     }
     if (rel === "/branches/main/protection") {
       return options.mainProtection ? json(200, options.mainProtection) : json(404, { message: "Branch not protected" });
@@ -455,6 +658,12 @@ function createFakeGitHub(options: FakeOptions = {}) {
     }
     const checkRunsMatch = /^\/commits\/([0-9a-f]{40})\/check-runs$/.exec(rel ?? "");
     if (checkRunsMatch) return json(200, { check_runs: checks.get(checkRunsMatch[1]) ?? [] });
+    if (rel === "/pulls" && method === "GET") {
+      // The bounded reconciliation read (F5): this run's own derived head, and nothing else.
+      const head = new URLSearchParams(rawPath.split("?")[1] ?? "").get("head") ?? "";
+      const branch = head.split(":")[1] ?? "";
+      return json(200, [...pulls.values()].filter((pull) => pull.head.ref === branch));
+    }
     if (rel === "/pulls" && method === "POST") {
       const number = (nextPull += 1);
       pulls.set(number, {
@@ -526,7 +735,13 @@ function createFakeGitHub(options: FakeOptions = {}) {
 
   return {
     fetchImpl, spawnImpl, refs, rulesets, checks, commits, pulls, calls, handle, isFastForward,
-    approvals, jobState, approve, createNormalJob, faults,
+    approvals, jobState, approve, finish, createNormalJob, faults,
+    artifacts, publisherRuns, rehearsalRuns, dispatches, addArtifact, publishWitness, archiveImpl,
+    registerRehearsalRun: (runId: number) => rehearsalRuns.set(runId, {
+      id: runId, head_sha: WORKFLOW_SHA, path: COMMISSIONING_WORKFLOW_PATH, event: "workflow_dispatch",
+      head_branch: "staging", run_attempt: 1, status: "in_progress", conclusion: null,
+      actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY,
+    }),
   };
 }
 
@@ -564,8 +779,10 @@ const cloudEnv = (job: string, extra: Record<string, string> = {}) => ({
   GITHUB_RUN_ID: RUN_ID,
   GITHUB_RUN_ATTEMPT: ATTEMPT,
   GITHUB_JOB: job,
-  GITHUB_ACTOR: "aios-commissioning-dispatcher[bot]",
+  GITHUB_ACTOR: DISPATCHER_IDENTITY.login,
   GITHUB_TOKEN: "fixture-token",
+  // The runner's own mode admission, independent of the workflow's `if:`.
+  COMMISSIONING_MODE: "commission",
   // Platform-injected, and the only identity fact the credential-free intent phase can cross-check
   // without a provider call.
   GITHUB_REPOSITORY_ID: String(REPOSITORY_ID),
@@ -610,6 +827,72 @@ async function intentAndSetup(github: ReturnType<typeof createFakeGitHub>) {
   return { intent, setup };
 }
 
+/**
+ * ── THE STAGED ACTOR FLOW, AS THE WORKFLOW RUNS IT ────────────────────────────────────────────────
+ *
+ * Each case is five steps, two of which are `actions/upload-artifact`. The runner owns three; the
+ * suite plays the other two — {@link publishChallenge} is the upload step, and the local witness is
+ * driven item-by-item with {@link serveWitnessItem} so the test does not have to run a blocking
+ * process concurrently with the job it is serving. `runWitnessPhase` is exercised separately, against
+ * a source run whose challenges are all already published.
+ */
+const cloudDir = (name: "challenges" | "state") => path.join(evidenceDir, name);
+
+/** The upload step: take the challenge file the stage wrote and register it as an artifact. */
+const publishChallenge = (github: ReturnType<typeof createFakeGitHub>, role: string, ordinal: number, direction: "pre" | "post") => {
+  const name = challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role, ordinal, direction });
+  const bytes = readFileSync(path.join(cloudDir("challenges"), `${name}.json`));
+  return github.addArtifact(name, `${name}.json`, bytes, Number(RUN_ID));
+};
+
+/** The local witness, serving exactly one work item — the read-only half of the transport. */
+async function serveOne(github: ReturnType<typeof createFakeGitHub>, item: { role: string; caseId: string; ordinal: number; direction: "pre" | "post" }, overrides: Record<string, unknown> = {}) {
+  const session = await openWitnessSession({
+    runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+    deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl },
+  });
+  try {
+    return await serveWitnessItem({
+      request: session.request, requestArchive: session.requestArchive, ctx: session.ctx, journal: session.journal,
+      item, operator: session.operator, domain: session.domain, setupBindings: session.setupBindings,
+      now: () => new Date(), sleep: async () => {}, intervalMs: 1, ...overrides,
+    });
+  } finally { session.lock.release(); }
+}
+
+/** Run one case end to end: prepare → upload → serve → execute → upload → serve → finalize. */
+async function runCase(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency", caseId: string) {
+  const ordinal = CLOUD_CASE_SEQUENCE[role].indexOf(caseId) + 1;
+  const env = cloudEnv(role, { ...(role === "normal" ? NORMAL_JOB_ENV : EMERGENCY_JOB_ENV), COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+  const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+  await runCaseStage({ stage: "prepare", caseId, env, deps });
+  publishChallenge(github, role, ordinal, "pre");
+  await serveOne(github, { role, caseId, ordinal, direction: "pre" });
+  await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+  publishChallenge(github, role, ordinal, "post");
+  await serveOne(github, { role, caseId, ordinal, direction: "post" });
+  return runCaseStage({ stage: "await-and-finalize", caseId, env, deps });
+}
+
+/**
+ * Every case a role owns, stopping at the first that refuses — which is what the workflow does, since
+ * a failing step ends the job's remaining steps. The finalizer then still runs under `if: always()`.
+ */
+async function runRoleCasesUntilRefusal(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency") {
+  for (const caseId of CLOUD_CASE_SEQUENCE[role]) {
+    try { await runCase(github, role, caseId); }
+    catch (error) { return { stoppedAt: caseId, error: error as Error }; }
+  }
+  return { stoppedAt: null, error: null };
+}
+
+/** Every case a role owns, in its closed sequence order. */
+async function runRoleCases(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency") {
+  const results = [];
+  for (const caseId of CLOUD_CASE_SEQUENCE[role]) results.push(await runCase(github, role, caseId));
+  return results;
+}
+
 /** The whole reviewed order: intent → setup → fixture → normal → human → emergency → cleanup. */
 async function commissionEverything(github: ReturnType<typeof createFakeGitHub>) {
   await intentAndSetup(github);
@@ -618,11 +901,25 @@ async function commissionEverything(github: ReturnType<typeof createFakeGitHub>)
   // `normal` be created at all, and only then can anyone approve it.
   github.createNormalJob();
   github.approve("normal");
+  await runNormalCheckPublication({
+    env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }),
+    deps: cloudDeps(github),
+  });
+  await runRoleCases(github, "normal");
+  github.finish("normal");
   const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
   const human = await runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
   github.approve("emergency");
+  await runRoleCases(github, "emergency");
+  github.finish("emergency");
   const emergency = await runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: cloudDeps(github) });
-  return { fixture, normal, human, emergency };
+  // The local witness process's own summary. Every response is already published, so this RECONCILES
+  // all 22 rather than dispatching again — which is the property that makes a restarted witness safe.
+  const witness = await runPhase({
+    phase: "witness", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+    deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 },
+  });
+  return { fixture, normal, human, emergency, witness };
 }
 
 /**
@@ -633,16 +930,25 @@ async function commissionEverything(github: ReturnType<typeof createFakeGitHub>)
  */
 const environmentControls = (dir: string, mutate: (controls: Record<string, Record<string, unknown>>) => void = () => {}) => {
   const controls: Record<string, Record<string, unknown>> = {};
+  const schemas = ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { sources: string[]; expected: unknown; run_bound: boolean }>;
   for (const key of ENVIRONMENT_CONTROL_KEYS as string[]) {
     controls[key] = {};
-    for (const spec of PROTECTED_JOBS as { environment: string }[]) {
+    for (const [index, spec] of (PROTECTED_JOBS as { environment: string }[]).entries()) {
+      const schema = schemas[key];
       const name = `env-${key}-${spec.environment}.json`;
-      const bytes = Buffer.from(`${JSON.stringify({ control: key, environment: spec.environment, observed: true }, null, 2)}\n`, "utf8");
+      // The artifact must be ABOUT this control on this environment, with this measurement: reusing
+      // one file across controls or environments is a refusal, which is the F2 correction.
+      const bytes = Buffer.from(`${JSON.stringify({ control: key, environment: spec.environment, measured: schema.expected }, null, 2)}\n`, "utf8");
       writeFileSync(path.join(dir, name), bytes);
       controls[key][spec.environment] = {
-        status: "verified", source: "provider-api", measured_at: "2026-09-10T09:00:00.000Z",
+        status: "verified", source: schema.sources[0],
+        environment_name: spec.environment, environment_id: 4400 + index,
+        expected: schema.expected, measured: schema.expected,
+        // Inside the run's window — the journal's first record is stamped by the run itself, so a
+        // date far in the future is the safe side of the staleness check for a fixture.
+        measured_at: "2099-01-01T00:00:00.000Z",
+        ...(schema.run_bound ? { run_id: RUN_ID, attempt: ATTEMPT } : {}),
         artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex"),
-        observed: { environment: spec.environment, field: key, value: true },
       };
     }
   }
@@ -834,11 +1140,24 @@ describe("PC-02/PC-03 immutable run identity, ordered bootstrap and the credenti
 
   it("refuses a protected job that can see BOTH release keys, or whose App ID is not the configured identity", async () => {
     const github = createFakeGitHub();
-    await intentAndSetup(github);
-    await expect(runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", { ...NORMAL_JOB_ENV, EMERGENCY_APP_PRIVATE_KEY: SENTINEL_KEY }), deps: cloudDeps(github) }))
-      .rejects.toThrow(/must not share a job/);
-    await expect(runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", { ...NORMAL_JOB_ENV, RELEASE_APP_ID: "999" }), deps: cloudDeps(github) }))
-      .rejects.toThrow(/not the identity/);
+    const ctx = { runId: RUN_ID, attempt: ATTEMPT, repositoryId: REPOSITORY_ID, normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS };
+    // The credential admission checks run BEFORE any request — so they are exercised where they
+    // live, at the just-in-time mint, rather than through a whole phase that would reach the
+    // provider first.
+    await expect(mintActorCredential({
+      role: "normal", ctx, redact: createRedactor(), deps: cloudDeps(github),
+      env: cloudEnv("normal", { ...NORMAL_JOB_ENV, EMERGENCY_APP_PRIVATE_KEY: SENTINEL_KEY }),
+    })).rejects.toThrow(/must not share a job/);
+    await expect(mintActorCredential({
+      role: "normal", ctx, redact: createRedactor(), deps: cloudDeps(github),
+      env: cloudEnv("normal", { ...NORMAL_JOB_ENV, RELEASE_APP_ID: "999" }),
+    })).rejects.toThrow(/not the identity/);
+    // And a NON-actor role can never exchange an App credential at all: the refusal is a property of
+    // the closed role table, not of a conditional at the call site (F7).
+    for (const role of ["intent", "fixture", "witness-publisher", "rehearsal"]) {
+      await expect(mintActorCredential({ role, ctx, redact: createRedactor(), deps: cloudDeps(github), env: cloudEnv("normal", NORMAL_JOB_ENV) }))
+        .rejects.toThrow(/not an actor role/);
+    }
   });
 
   it("refuses to start when a protected job has already left the waiting state", async () => {
@@ -1059,9 +1378,14 @@ describe("PC-04 the disposable transformation is closed and invertible, and appl
     await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
     github.createNormalJob();
     github.approve("normal");
-    const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
-    expect(normal.status).toBe("passed");
-    const grants = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")).actor.grants;
+    // The normal role's FIRST credentialed step, which is also its installation-level positive
+    // control: the grant reads happen inside it, before the check publication it performs.
+    const liveness = await runNormalCheckPublication({
+      env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }),
+      deps: cloudDeps(github),
+    });
+    expect(liveness.status).toBe("published");
+    const grants = liveness.grants;
     // MEASURED, from the endpoints that document each field — not a placeholder string, and not
     // `repository_selection` scraped off an endpoint that never returns it.
     expect(grants).toMatchObject({
@@ -1095,7 +1419,7 @@ describe("PC-04 the disposable transformation is closed and invertible, and appl
       await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: INTENT_ENV() });
       await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: LOCAL_ENV, deps: localDeps(github) });
       await expect(
-        runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) }),
+        runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: dir }), deps: cloudDeps(github) }),
         label,
       ).rejects.toThrow(expected);
       // NOTHING was written with the App credential: no check minted, no ref moved.
@@ -1118,7 +1442,10 @@ describe("PC-04 the disposable transformation is closed and invertible, and appl
         return github.fetchImpl(input as string, init);
       }) as unknown as typeof fetch;
       await expect(
-        runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: { fetchImpl, createInstallationToken: mintToken, mintAppJwt: mintAppJwtStub } }),
+        runNormalCheckPublication({
+          env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }),
+          deps: { fetchImpl, createInstallationToken: mintToken, mintAppJwt: mintAppJwtStub },
+        }),
         label,
       ).rejects.toThrow(/installation token|documented shape/);
     }
@@ -1273,6 +1600,10 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
     await intentAndSetup(github);
     await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
     github.approve("emergency");
+    const stopped = await runRoleCasesUntilRefusal(github, "emergency");
+    expect(stopped.stoppedAt, String(stopped.error?.message)).toBe("emergency-force-rewind");
+    expect(stopped.error!.message).toMatch(/unexpected-success|must refuse/);
+    github.finish("emergency");
     await expect(runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: cloudDeps(github) }))
       .rejects.toThrow(/did not record their expected provider outcome/);
     const evidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "emergency"));
@@ -1412,10 +1743,16 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     const approvals = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "approvals"));
     for (const spec of PROTECTED_JOBS as { environment: string }[]) {
       expect(approvals.environments[spec.environment]).toMatchObject({ approved: true, approval_measured: true, job_status: "completed" });
-      expect(approvals.environments[spec.environment].reviewers).toEqual([{ login: "johnellison", type: "User", is_dispatcher: false }]);
+      expect(approvals.environments[spec.environment].reviewers).toEqual([{ login: OWNER_LOGIN, id: OWNER_USER_ID, type: "User", is_dispatcher: false }]);
     }
     // The dispatcher is recorded and is explicitly NOT the approver. GITHUB_ACTOR may be a bot.
-    expect(approvals.dispatcher).toBe("aios-commissioning-dispatcher[bot]");
+    // The dispatcher is MEASURED from the provider's own run metadata (F6), not read out of the
+    // intent artifact's `GITHUB_ACTOR` — and the declared value is kept beside it, labelled, so the
+    // two can be compared rather than conflated.
+    expect(approvals.measured_dispatcher).toEqual(DISPATCHER_IDENTITY);
+    expect(approvals.declared_dispatcher).toBe(DISPATCHER_IDENTITY.login);
+    expect(approvals.declared_dispatcher_matches_measured).toBe(true);
+    expect(approvals.run_measured).toBe(true);
     expect(approvals.dispatcher_is_the_approver).toBe(false);
   });
 
@@ -1426,14 +1763,23 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     github.createNormalJob();
     // The same identity that dispatched the run approving its own protected job. The run happened;
     // it is simply not the two-identity evidence PC-06 asks for.
-    github.approve("normal", "aios-commissioning-dispatcher[bot]", "Bot");
+    github.approve("normal", DISPATCHER_IDENTITY.login, DISPATCHER_IDENTITY.type, DISPATCHER_IDENTITY.id);
     github.approve("emergency");
     await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
     environmentControls(evidenceDir);
     const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
     const selfReview = (blockers as Blocker[]).filter((entry) => entry.kind === "failed" && /self-review/.test(entry.detail));
-    expect(selfReview).toHaveLength(1);
-    expect(selfReview[0].gate).toBe("PC-06");
+    // TWO distinct signals, and both are reported: the identity comparison this gate RE-DERIVES from
+    // the measured dispatcher, and the record's own `is_dispatcher` claim. The first is the one that
+    // matters — a packet controls the boolean but not the provider's run metadata — and the second
+    // is kept because a file that admits a self-review should not be quietly agreed with either.
+    expect(selfReview.map((entry) => entry.gate)).toEqual(["PC-06", "PC-06"]);
+    expect(selfReview.some((entry) => /measured dispatcher itself/.test(entry.detail))).toBe(true);
+    expect(selfReview.some((entry) => /own record marks its approver/.test(entry.detail))).toBe(true);
+    // And the bot reviewer is ALSO a failure in its own right (F6): a bot approval is not the human
+    // gate PC-06 asks for, and the previous build accepted any plain login including a `[bot]` one.
+    const nonHuman = (blockers as Blocker[]).filter((entry) => entry.kind === "failed" && /non-User reviewer|configured human reviewer/.test(entry.detail));
+    expect(nonHuman.length).toBeGreaterThanOrEqual(2);
   });
 
   it("keeps an UNMEASURABLE approval history distinct from a refused one", async () => {
@@ -1518,27 +1864,71 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
       .some((entry: Blocker) => entry.kind === "invalid" && /outside the closed PC-06 list/.test(entry.detail))).toBe(true);
   });
 
-  it("validates one control record in isolation, so every refusal reason is its own", () => {
-    const bytes = Buffer.from("proof\n", "utf8");
-    writeFileSync(path.join(evidenceDir, "proof.json"), bytes);
-    const digest = createHash("sha256").update(bytes).digest("hex");
-    const good = {
-      status: "verified", source: "provider-api", measured_at: "2026-09-10T09:00:00.000Z",
-      artifact: "proof.json", artifact_sha256: digest, observed: { prevent_self_review: true },
+  /**
+   * F2 · one control record, against ITS OWN closed schema.
+   *
+   * The independent review executed the previous validator against a record whose observation was
+   * `{"prevent_self_review": false}`, timestamped 2020, with one artifact reused for every control in
+   * both environments — and it returned `null` (accepted). Every one of those is a refusal here, and
+   * the first case below is that exact packet.
+   */
+  it("validates one control record against its own closed schema, so a FALSE or reused observation is refused", () => {
+    const key = "prevent_self_review_enabled";
+    const environment = "staging-release";
+    const expected = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[key].expected;
+    const artifactFor = (name: string, body: unknown) => {
+      const bytes = Buffer.from(`${JSON.stringify(body, null, 2)}\n`, "utf8");
+      writeFileSync(path.join(evidenceDir, name), bytes);
+      return { artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex") };
     };
-    expect(validateEnvironmentControl(good, { dir: evidenceDir })).toBeNull();
+    const proof = artifactFor("proof.json", { control: key, environment, measured: expected });
+    const context = { dir: evidenceDir, key, environment, runId: RUN_ID, attempt: ATTEMPT, window: { start: "2026-01-01T00:00:00.000Z" } };
+    const good = {
+      status: "verified", source: "provider-api", environment_name: environment, environment_id: 4401,
+      expected, measured: expected, measured_at: "2026-09-10T09:00:00.000Z", ...proof,
+    };
+    expect(validateEnvironmentControl(good, context)).toBeNull();
+
+    const falseProof = artifactFor("false-proof.json", { control: key, environment, measured: { prevent_self_review: false } });
+    const otherControlProof = artifactFor("other-control.json", { control: "administrators_cannot_bypass", environment, measured: expected });
+    const otherEnvProof = artifactFor("other-env.json", { control: key, environment: "staging-emergency", measured: expected });
     const cases: [string, Record<string, unknown>, RegExp][] = [
+      // THE REVIEWED PACKET: a measurement that says the control is OFF, dated years ago.
+      ["the reviewed hostile record: a FALSE measurement", { ...good, measured: { prevent_self_review: false }, ...falseProof }, /not the required outcome/],
+      ["a historical capture time", { ...good, measured_at: "2020-01-01T00:00:00.000Z" }, /before this run's window opened/],
+      ["an artifact recording a DIFFERENT control", { ...good, ...otherControlProof }, /artifact recording the control/],
+      ["an artifact recording a DIFFERENT environment", { ...good, ...otherEnvProof }, /artifact recording environment/],
+      ["a swapped environment name", { ...good, environment_name: "staging-emergency" }, /measured on environment/],
+      ["no numeric environment ID", { ...good, environment_id: undefined }, /no numeric environment ID/],
+      ["its own weaker expectation", { ...good, expected: { prevent_self_review: false } }, /expected control outcome that is not the one this build requires/],
+      ["no measurement at all", { ...good, measured: undefined }, /no measured control value/],
       ["a boolean instead of a record", { status: true }, /is /],
       ["an unverified status", { ...good, status: "unverified" }, /is unverified/],
-      ["an unknown source", { ...good, source: "i-checked" }, /not one of provider-api\/provider-ui/],
+      ["an unknown source", { ...good, source: "i-checked" }, /this control does not accept/],
       ["no timestamp", { ...good, measured_at: "whenever" }, /no parseable measured_at/],
-      ["no observed fields", { ...good, observed: {} }, /no observed provider fields/],
       ["a path instead of a basename", { ...good, artifact: "../elsewhere.json" }, /plain retained artifact file/],
       ["a short digest", { ...good, artifact_sha256: "abc" }, /no SHA-256 digest/],
     ];
-    for (const [label, record, expected] of cases) {
-      expect(validateEnvironmentControl(record, { dir: evidenceDir }), label).toMatch(expected);
+    for (const [label, record, expectedReason] of cases) {
+      expect(validateEnvironmentControl(record, context), label).toMatch(expectedReason);
     }
+    // An unknown control key is refused by name rather than validated against nothing.
+    expect(validateEnvironmentControl(good, { ...context, key: "make-it-up" })).toMatch(/outside the closed PC-06 list/);
+    // `administrators_cannot_bypass` is UI-ONLY: the environments API does not return that field, so
+    // an API-sourced claim about it would be a claim about something nobody read.
+    const uiOnly = "administrators_cannot_bypass";
+    const uiExpected = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[uiOnly].expected;
+    const uiProof = artifactFor("ui-proof.json", { control: uiOnly, environment, measured: uiExpected });
+    const uiRecord = { ...good, expected: uiExpected, measured: uiExpected, ...uiProof };
+    expect(validateEnvironmentControl({ ...uiRecord, source: "provider-api" }, { ...context, key: uiOnly })).toMatch(/does not accept/);
+    expect(validateEnvironmentControl({ ...uiRecord, source: "provider-ui" }, { ...context, key: uiOnly })).toBeNull();
+    // A run-bound negative case must name the attempt it was produced in.
+    const bound = "self_review_refused";
+    const boundExpected = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[bound].expected;
+    const boundProof = artifactFor("bound-proof.json", { control: bound, environment, measured: boundExpected });
+    const boundRecord = { ...good, expected: boundExpected, measured: boundExpected, ...boundProof, run_id: RUN_ID, attempt: ATTEMPT };
+    expect(validateEnvironmentControl(boundRecord, { ...context, key: bound })).toBeNull();
+    expect(validateEnvironmentControl({ ...boundRecord, attempt: "9" }, { ...context, key: bound })).toMatch(/names a different attempt/);
   });
 
   it("cannot reach a full PASS while PC-06 is unverified, even with the whole actor matrix green", async () => {
@@ -1847,11 +2237,23 @@ describe("PC-08 the closed CLI contract: one status word and one exit code per o
     await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
     github.createNormalJob();
     github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    await runRoleCases(github, "normal");
+    github.finish("normal");
     await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
     expect(await run(["human-tests", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir])).toBe(0);
     expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "human-tests", status: "passed" });
     github.approve("emergency");
+    await runRoleCases(github, "emergency");
+    github.finish("emergency");
     await runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: cloudDeps(github) });
+    // The local witness. In a real run it is ONE long-running process started before the first
+    // approval, serving all 22 responses and polling for work it has not seen yet; here every
+    // response is already published, so the same phase RECONCILES them without dispatching again.
+    // Its exit 0 means "all assigned responses published and reconciled" — never a global pass.
+    expect(await run(["witness", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir],
+      LOCAL_ENV, { archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 })).toBe(0);
+    expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "witness", status: "published", publications: REQUIRED_WITNESS_PUBLICATIONS });
 
     // `collect` BEFORE cleanup gathers what exists and still reports incomplete.
     expect(await run(["collect", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir])).toBe(3);
@@ -1947,7 +2349,16 @@ describe("the request allowlist has no dead surface", () => {
      * an inherited rule to be RESOLVED and evaluated rather than inferred from our own names. Its
      * behaviour is covered by the PC-04 inherited-ruleset case above.
      */
-    const errorPathOnly = ["read-organization-ruleset"];
+    const errorPathOnly = [
+      "read-organization-ruleset",
+      /**
+       * RECONCILIATION-ONLY: it is issued when a synthetic pull-request create response was LOST, so
+       * a clean run never reaches it. Its behaviour — and the exact-query guard that stops it from
+       * becoming a way to enumerate the repository's pull requests — is covered by the F5
+       * response-lost case below.
+       */
+      "list-synthetic-pulls-by-head",
+    ];
     const declared = ALLOWED_OPERATIONS.map((operation) => operation.id);
     // An allowlisted operation nothing ever issues is either dead surface or an untested path. Both
     // are worth naming out loud rather than leaving in a list nobody re-reads.
@@ -2055,46 +2466,137 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     expect(details).toMatch(/protected-environment control required_reviewer_is_owner has no per-environment records/);
   });
 
-  it("F3 · derives every case verdict from what the record measured, not from its `passed` field", () => {
+  /**
+   * F3 · a case verdict is DERIVED from the frozen graph, not read off the record.
+   *
+   * The independent review executed the previous version of this gate against records for
+   * `normal-update-all-green` and `normal-force-rewind` with `before == requested == after` — a no-op
+   * recorded as a permitted write, and a force flag on a ref that never moved recorded as a denied
+   * non-fast-forward — and it returned NO problems for either. Both are the first two cases below.
+   */
+  it("F3 · derives every case verdict from the frozen graph, and rejects no-op positives and force no-ops", () => {
+    // The graph, keyed the way the verified journal records it, so the identities in a record can be
+    // bound to a node rather than merely to a well-formed SHA.
+    const graph = Object.fromEntries(buildGraphPlan(RUN_ID, ATTEMPT).map((node) => [node.key, sha(node.key)]));
+    const contexts = derivedContextNames(RUN_ID, ATTEMPT);
+    const last = contexts.length - 1;
+    /** A per-context measurement matching a declared expectation, as `assertCheckState` records it. */
+    const checkState = (expectation: string) => ({
+      expectation, measured: true, present: 0, producers: [NORMAL_APP],
+      contexts: contexts.map((name, ordinal) => {
+        const absent = expectation === "one-required-check-absent" && ordinal === last;
+        const failed = expectation === "one-required-check-failed" && ordinal === last;
+        if (expectation === "none" || absent) return { ordinal, name, present: false, status: null, conclusion: null, app_id: null };
+        return {
+          ordinal, name, present: true, status: "completed",
+          conclusion: failed ? "failure" : "success",
+          app_id: expectation === "all-green-wrong-producer" ? ACTIONS_APP : NORMAL_APP,
+        };
+      }),
+    });
+    const context = { runId: RUN_ID, attempt: ATTEMPT, graph, normalAppId: NORMAL_APP };
     const kase = buildActorMatrix().find((entry) => entry.id === "normal-update-missing-check")!;
     const ref = derivedRef(RUN_ID, ATTEMPT, "normal");
     const sound = {
       case: kase.id, actor: "normal", operation: "update", force: false, expected: "denied", ref,
-      outcome: "denied", passed: true, before_sha: sha("A"), after_sha: sha("A"), requested_sha: sha("N1"),
+      outcome: "denied", passed: true, before_sha: graph.A, after_sha: graph.A, requested_sha: graph.N1,
       http_status: 422, diagnostic: { status: 422, category: "repository-rule-violation", ruleIds: ["repository-rule-violation"], policyDenial: true },
-      check_state: { expectation: kase.checks, measured: true },
+      check_state: checkState(kase.checks),
     };
-    expect(deriveCaseVerdict(sound, kase, { runId: RUN_ID, attempt: ATTEMPT })).toEqual([]);
+    expect(deriveCaseVerdict(sound, kase, context)).toEqual([]);
+
+    // ── THE TWO REVIEWED NO-OPS ──────────────────────────────────────────────────────────────────
+    const green = buildActorMatrix().find((entry) => entry.id === "normal-update-all-green")!;
+    const noopAccept = {
+      case: green.id, actor: "normal", operation: "update", force: false, expected: "accepted", ref,
+      outcome: "accepted", passed: true, before_sha: graph.A, requested_sha: graph.A, after_sha: graph.A,
+      http_status: 200, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false },
+      check_state: checkState(green.checks),
+    };
+    expect(deriveCaseVerdict(noopAccept, green, context).join("; "))
+      .toMatch(/requests the commit the ref is already at, which is a no-op/);
+    const rewind = buildActorMatrix().find((entry) => entry.id === "normal-force-rewind")!;
+    const noopForce = {
+      case: rewind.id, actor: "normal", operation: "force", force: true, expected: "denied", ref,
+      outcome: "denied", passed: true, before_sha: graph.N4, after_sha: graph.N4, requested_sha: graph.N4,
+      http_status: 422, diagnostic: { status: 422, category: "non-fast-forward-rejected", ruleIds: ["non-fast-forward-rejected"], policyDenial: true },
+      check_state: { expectation: "irrelevant", measured: false },
+    };
+    expect(deriveCaseVerdict(noopForce, rewind, context).join("; "))
+      .toMatch(/no-op rather than a measurement|neither a real rewind nor a divergent commit/);
+    // A record that cannot be bound to a graph at all is unverifiable, not acceptable.
+    expect(deriveCaseVerdict(sound, kase, { runId: RUN_ID, attempt: ATTEMPT, graph: null }).join("; "))
+      .toMatch(/cannot be bound to this run's synthetic graph/);
+
     // The bare claim is checked WHOLE, not merged over a sound record: `{case, passed: true}` is
     // exactly the shape the adversarial packet used, and merging it over good fields would test
     // nothing.
-    expect(deriveCaseVerdict({ case: kase.id, passed: true }, kase, { runId: RUN_ID, attempt: ATTEMPT }).join("; "))
+    expect(deriveCaseVerdict({ case: kase.id, passed: true }, kase, context).join("; "))
       .toMatch(/records the unknown outcome/);
     const perturbations: [string, Record<string, unknown>, RegExp][] = [
       ["another actor's case", { actor: "human" }, /claims actor "human"/],
       ["a ref this run did not derive", { ref: "refs/heads/main" }, /did not derive/],
-      ["a denial the diagnostic does not attribute to a rule", { diagnostic: { ...sound.diagnostic, policyDenial: false } }, /does not attribute to a policy rule/],
-      ["a denial on a ref that moved", { after_sha: sha("N1") }, /denial on a ref that moved/],
+      // The diagnostic BOOLEAN is no longer consulted: the category is re-classified against this
+      // build's closed table, so flipping the flag changes nothing and inventing a category refuses.
+      ["a fabricated diagnostic category", { diagnostic: { ...sound.diagnostic, category: "totally-denied", ruleIds: ["totally-denied"] } }, /not one this build classifies/],
+      ["a non-policy diagnostic dressed as a policy denial", { diagnostic: { status: 403, category: "credential-failure", ruleIds: ["credential-failure"], policyDenial: true } }, /not attributable to a policy rule/],
+      ["a denial on a ref that moved", { after_sha: graph.N1 }, /denial on a ref that moved/],
       ["a denial that is not a client refusal", { http_status: 200 }, /not a client refusal/],
+      ["a before SHA that is not its graph node", { before_sha: graph.B }, /not the journaled synthetic node A/],
+      ["a requested SHA that is not its graph node", { requested_sha: graph.N2 }, /not the journaled synthetic node N1/],
       ["an unmeasured check state", { check_state: { expectation: kase.checks, measured: false } }, /check state was measured/],
+      // The declared expectation is RECOMPUTED from the per-context rows: `measured: true` beside a
+      // contradictory measurement was previously sufficient.
+      ["a check measurement that contradicts its own expectation", { check_state: { ...checkState(kase.checks), contexts: checkState("all-green-expected-producer").contexts } }, /requires to be absent as present/],
       ["a `passed` that disagrees with its own outcome", { passed: false }, /says passed=false for outcome denied/],
       ["an acceptance with no matching readback", { outcome: "accepted", passed: false, expected: "denied" }, /recorded accepted/],
     ];
     for (const [label, override, expected] of perturbations) {
-      const problems = deriveCaseVerdict({ ...sound, ...override }, kase, { runId: RUN_ID, attempt: ATTEMPT });
+      const problems = deriveCaseVerdict({ ...sound, ...override }, kase, context);
       expect(problems.join("; "), label).toMatch(expected);
     }
-    // The acceptance invariant, on the case that is actually an acceptance.
-    const green = buildActorMatrix().find((entry) => entry.id === "normal-update-all-green")!;
-    const accepted = {
-      case: green.id, actor: "normal", operation: "update", force: false, expected: "accepted", ref,
-      outcome: "accepted", passed: true, before_sha: sha("A"), requested_sha: sha("N4"), after_sha: sha("N4"),
-      http_status: 200, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false },
-      check_state: { expectation: green.checks, measured: true },
-    };
-    expect(deriveCaseVerdict(accepted, green, { runId: RUN_ID, attempt: ATTEMPT })).toEqual([]);
-    expect(deriveCaseVerdict({ ...accepted, after_sha: sha("A") }, green, { runId: RUN_ID, attempt: ATTEMPT }).join("; "))
+    // The acceptance invariant, on the case that is actually an acceptance and actually moves.
+    const accepted = { ...noopAccept, requested_sha: graph.N4, after_sha: graph.N4 };
+    expect(deriveCaseVerdict(accepted, green, context)).toEqual([]);
+    expect(deriveCaseVerdict({ ...accepted, after_sha: graph.A }, green, context).join("; "))
       .toMatch(/readback is not the requested commit/);
+    // A real rewind and a real divergent force both pass; the graph decides which is which.
+    const realRewind = { ...noopForce, before_sha: graph.N4, requested_sha: graph.A, after_sha: graph.N4 };
+    expect(deriveCaseVerdict(realRewind, rewind, context)).toEqual([]);
+    const divergent = buildActorMatrix().find((entry) => entry.id === "normal-force-divergent")!;
+    expect(deriveCaseVerdict({ ...realRewind, case: divergent.id, requested_sha: graph.D }, divergent, context)).toEqual([]);
+  });
+
+  /** F3 · the per-context recomputation, on its own, for every declared expectation. */
+  it("F3 · recomputes each declared check expectation from its own per-context measurement", () => {
+    const contexts = derivedContextNames(RUN_ID, ATTEMPT);
+    const last = contexts.length - 1;
+    const rows = (mutate: (row: Record<string, unknown>, ordinal: number) => Record<string, unknown>) =>
+      contexts.map((name, ordinal) => mutate({ ordinal, name, present: true, status: "completed", conclusion: "success", app_id: NORMAL_APP }, ordinal));
+    const base = { runId: RUN_ID, attempt: ATTEMPT, normalAppId: NORMAL_APP };
+    const state = (expectation: string, contextRows: unknown[]) => ({ expectation, measured: true, contexts: contextRows });
+
+    expect(recomputeCheckState(state("all-green-expected-producer", rows((row) => row)), { ...base, expectation: "all-green-expected-producer" })).toEqual([]);
+    expect(recomputeCheckState(state("all-green-wrong-producer", rows((row) => ({ ...row, app_id: ACTIONS_APP }))), { ...base, expectation: "all-green-wrong-producer" })).toEqual([]);
+    expect(recomputeCheckState(state("none", rows((row) => ({ ...row, present: false, status: null, conclusion: null, app_id: null }))), { ...base, expectation: "none" })).toEqual([]);
+    expect(recomputeCheckState(
+      state("one-required-check-absent", rows((row, ordinal) => (ordinal === last ? { ...row, present: false, status: null, conclusion: null, app_id: null } : row))),
+      { ...base, expectation: "one-required-check-absent" },
+    )).toEqual([]);
+    expect(recomputeCheckState(
+      state("one-required-check-failed", rows((row, ordinal) => (ordinal === last ? { ...row, conclusion: "failure" } : row))),
+      { ...base, expectation: "one-required-check-failed" },
+    )).toEqual([]);
+    // The wrong-producer control must NOT also carry the expected producer, or a denial would not
+    // isolate the producer mismatch.
+    expect(recomputeCheckState(state("all-green-wrong-producer", rows((row, ordinal) => ({ ...row, app_id: ordinal === 0 ? NORMAL_APP : ACTIONS_APP }))), { ...base, expectation: "all-green-wrong-producer" }).join("; "))
+      .toMatch(/expected producer also published|would not isolate/);
+    // Arbitrary measured fields are not evidence: a state with no per-context rows cannot support any
+    // expectation, however confidently it declares `measured: true`.
+    expect(recomputeCheckState({ expectation: "all-green-expected-producer", measured: true, present: 12, producers: [NORMAL_APP] }, { ...base, expectation: "all-green-expected-producer" }).join("; "))
+      .toMatch(/no per-context check measurement/);
+    expect(recomputeCheckState({ expectation: "none", measured: true, contexts: [] }, { ...base, expectation: "irrelevant" }).join("; "))
+      .toMatch(/measured check state for a case whose checks are irrelevant/);
   });
 
   it("F3 · requires cleanup to cover every resource the verified journal records this run creating", async () => {
@@ -2280,10 +2782,13 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     const evidenceRuleset = [...github.rulesets.values()].find((ruleset) => ruleset.name.includes("-normal-main-release-evidence"))!;
     const rule = evidenceRuleset.rules!.find((entry) => entry.type === "required_status_checks")!;
     rule.parameters!.strict_required_status_checks_policy = false;
-    await expect(runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) }))
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const writesBefore = github.calls.filter((call) => call.actor === "normal" && call.method !== "GET").length;
+    await expect(runCase(github, "normal", "normal-update-missing-check"))
       .rejects.toThrow(/not the reviewed disposable policy/);
-    // And it refused BEFORE writing: no check was minted and no ref moved with the App credential.
-    expect(github.calls.filter((call) => call.actor === "normal" && call.method !== "GET")).toEqual([]);
+    // And it refused BEFORE the mutation: the App credential made no write beyond the earlier
+    // installation-level positive control, so the ONE thing this case could have done, it did not.
+    expect(github.calls.filter((call) => call.actor === "normal" && call.method !== "GET").length).toBe(writesBefore);
   });
 
   it("F8 · refuses a manifest whose declared plan is not the one the job derives, and records what it measured", async () => {
@@ -2292,24 +2797,28 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
     github.createNormalJob();
     github.approve("normal");
-    const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
-    expect(normal.status).toBe("passed");
-    const policy = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")).policy_in_force;
-    // The evidence records the measured BODY fingerprints and the compatibility verdict, not a
-    // count of matching names.
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    await runCase(github, "normal", "normal-update-missing-check");
+    // The case verdict lives in the job's PRIVATE per-case state, not in a published artifact.
+    const policy = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-normal-01.json`), "utf8")).record.policy_in_force;
+    // The verdict now comes from the WITNESS's complete governed measurement, run through the
+    // unchanged production verifier — not from a body the read-only cloud token could not see.
     expect(policy.verdict).toBe("compatible");
-    // And it says which dimension it did NOT cover, rather than implying it covered everything.
-    expect(policy.classic_protection_scope).toMatch(/measured-by-local-setup-under-admin/);
-    expect(Object.keys(policy.body_fingerprints).sort()).toEqual(policy.planned);
-    for (const fingerprint of Object.values(policy.body_fingerprints)) expect(String(fingerprint)).toMatch(/^[0-9a-f]{64}$/);
+    expect(policy.governed_fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(policy.classic_protection).toEqual({ present: false, status: 404 });
+    // And the claim is stated at its true strength, every time it is recorded.
+    expect(policy.guarantee).toMatch(/NOT an atomic policy-at-mutation proof/);
     // An additional effective rule is preserved and named rather than dropped as "not ours".
-    expect(policy.additional_effective_rules).toEqual([]);
+    expect(policy.foreign).toEqual([]);
 
+    // A manifest that declares a plan this job does not derive is refused, whichever path reads it.
     const manifest = { policy_plan: { normal: [{ name: "commissioning-9001-2-normal-main-integrity", target_ref: derivedRef(RUN_ID, ATTEMPT, "normal"), hash: "0".repeat(64) }] } };
     const ctx = { runId: RUN_ID, attempt: ATTEMPT, normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS };
     const request = Object.assign(async () => ({ status: 200, body: [] }), { issued: [] as string[] });
-    await expect(assertPlannedPolicyInForce({ request, ctx, actor: "normal", manifest }))
+    await expect(assertPlannedPolicyApplies({ request, ctx, actor: "normal", manifest }))
       .rejects.toThrow(/not the one this job derives from its own measured identities/);
+    expect(() => verifyWitnessedPolicy({ ctx, actor: "normal", manifest, snapshot: { inert: true } }))
+      .toThrow(/not the one this job derives from its own measured identities/);
   });
 });
 
@@ -2380,5 +2889,803 @@ describe("the final evidence check against a hostile packet", () => {
     const failure = JSON.parse(emitted.at(-1)!);
     expect(failure.status).toBe("failed");
     expect(JSON.stringify(failure.blockers)).toMatch(/human-force-rewind recorded unexpected-success/);
+  });
+});
+
+// ── correction pass 2 ─────────────────────────────────────────────────────────
+
+/**
+ * The seven findings of the exact full-diff review, each with the DEFECT IT DEMONSTRATED.
+ *
+ * Every case in this block was executed against the previous build and ACCEPTED. They are written
+ * from the reproductions the review retained — `AIO-1124-full-diff-astra-repro.json` and
+ * `AIO-1124-full-diff-astra-hostile-packet-result.json` — so a regression restores a documented
+ * failure rather than an imagined one.
+ *
+ * Nothing here is evidence that the live policy enforces anything: these are the harness's own
+ * invariants, and the actor matrix is only real once the reviewed workflow has been dispatched
+ * against provisioned Apps and protected environments.
+ */
+describe("correction pass 2 — F1: the local witness transport and its refusals", () => {
+  const zipOf = (name: string, body: unknown, method: 0 | 8 = 0) =>
+    buildZip(name, Buffer.from(`${JSON.stringify(body)}\n`, "utf8"), method);
+
+  it("reads a single-entry archive of EITHER accepted compression, and refuses every archive attack", () => {
+    const payload = { kind: "commissioning-witness-response" };
+    for (const method of [0, 8] as const) {
+      const entry = readSingleEntryZip(zipOf("witness.json", payload, method));
+      expect(JSON.parse(entry.bytes.toString("utf8"))).toEqual(payload);
+      expect(entry.digest).toMatch(/^[0-9a-f]{64}$/);
+    }
+    const bytes = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
+    const attacks: [string, Buffer, RegExp][] = [
+      // TWO ENTRIES: which one did the publisher mean? The reviewed wiring uploads exactly one.
+      ["a second entry", buildZip("witness.json", bytes, 0, { entries: [{ name: "witness.json", content: bytes }, { name: "extra.json", content: bytes }] }), /declares 2 entries/],
+      ["a nested archive under the expected name", buildZip("witness.zip", bytes), /single entry is "witness.zip"/],
+      ["a traversal path", buildZip("../../witness.json", bytes), /single entry is "\.\.\/\.\.\/witness\.json"/],
+      ["an absolute path", buildZip("/etc/witness.json", bytes), /single entry is "\/etc\/witness\.json"/],
+      // A SYMLINK entry is a pointer at the runner's filesystem rather than a document.
+      ["a symlink entry", buildZip("witness.json", bytes, 0, { externalAttributes: (0o120777 << 16) >>> 0 }), /symbolic link/],
+      ["a CRC that does not match the bytes", buildZip("witness.json", bytes, 0, { crc: 12345 }), /CRC does not match/],
+      ["a zip64 size marker", buildZip("witness.json", bytes, 0, { uncompressedSize: 0xffffffff }), /zip64 sizes/],
+      ["an entry beyond the size bound", buildZip("witness.json", Buffer.alloc(70_000, 0x41)), /beyond the 60000-byte bound/],
+      ["an archive comment, which turns the EOCD scan into a search over attacker bytes", buildZip("witness.json", bytes, 0, { comment: Buffer.from("pad") }), /no end-of-central-directory record/],
+      ["an entry count that disagrees with the directory", buildZip("witness.json", bytes, 0, { totalEntries: 2 }), /declares 2 entries/],
+      ["an empty archive", Buffer.alloc(0), /it is empty/],
+      ["an archive beyond the transport bound", Buffer.alloc(200_000, 0x50), /beyond the 131072-byte bound/],
+    ];
+    for (const [label, archive, expected] of attacks) {
+      expect(() => readSingleEntryZip(archive), label).toThrow(expected);
+    }
+  });
+
+  it("refuses to publish anything outside the CLOSED governed projection", () => {
+    const runId = RUN_ID;
+    const attempt = ATTEMPT;
+    const target = derivedRef(runId, attempt, "normal");
+    const contexts = derivedContextNames(runId, attempt);
+    const allowed = {
+      rulesetNames: new Set([derivedRulesetName(runId, attempt, "normal", "main-release-writer")]),
+      refPatterns: new Set([target]),
+      contexts: new Set(contexts),
+      producerIds: new Set([NORMAL_APP, ...Object.values(PRODUCER_IDS)]),
+      bypassAppIds: new Set([NORMAL_APP, EMERGENCY_APP]),
+      sources: new Set([COMMISSIONING_REPOSITORY, "aiosbrain"]),
+    };
+    const sound = {
+      id: 7001, source_type: "Repository", source: COMMISSIONING_REPOSITORY,
+      name: derivedRulesetName(runId, attempt, "normal", "main-release-writer"),
+      target: "branch", enforcement: "active",
+      conditions: { ref_name: { include: [target], exclude: [] } },
+      bypass_actors: [{ actor_type: "Integration", actor_id: NORMAL_APP, bypass_mode: "always" }],
+      rules: [{ type: "update" }, { type: "pull_request" }],
+    };
+    expect(projectGovernedRuleset(sound, allowed).governed.name).toBe(sound.name);
+    // The provider EXPANDS defaults, and the projection must carry them rather than trim them — the
+    // resulting difference is reported as a `provider-normalization` gap, not hidden.
+    expect(projectGovernedRuleset({ ...sound, rules: [{ type: "update", parameters: { update_allows_fetch_and_merge: true } }] }, allowed)
+      .governed.rules[0].parameters).toEqual({ update_allows_fetch_and_merge: true });
+
+    const refusals: [string, Record<string, unknown>, RegExp][] = [
+      ["an unrecognised top-level field", { ...sound, mystery: 1 }, /unrecognised field\(s\) mystery/],
+      ["a ruleset name this run did not generate", { ...sound, name: "someone-elses-policy" }, /is not one of the names this run generated/],
+      ["an ungoverned condition key", { ...sound, conditions: { ref_name: sound.conditions.ref_name, repository_name: { include: ["*"] } } }, /ungoverned condition key/],
+      ["a ref pattern this run did not derive", { ...sound, conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } } }, /ref pattern "refs\/heads\/main"/],
+      ["an ungoverned rule type", { ...sound, rules: [{ type: "code_scanning" }] }, /ungoverned rule type "code_scanning"/],
+      ["an ungoverned rule parameter", { ...sound, rules: [{ type: "update", parameters: { allow_everything: true } }] }, /ungoverned parameter "allow_everything"/],
+      // A TEAM or ADMIN bypass is not publishable, and is not silently dropped: it stops the run.
+      ["a non-App bypass identity", { ...sound, bypass_actors: [{ actor_type: "OrganizationAdmin", actor_id: 1, bypass_mode: "always" }] }, /grants a OrganizationAdmin bypass/],
+      ["an unplanned App bypass", { ...sound, bypass_actors: [{ actor_type: "Integration", actor_id: 999, bypass_mode: "always" }] }, /bypass to App 999/],
+      ["a required context this run did not generate", { ...sound, rules: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "Deploy", integration_id: NORMAL_APP }] } }] }, /requires the context "Deploy"/],
+      ["a producer that is not a measured identity", { ...sound, rules: [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: contexts[0], integration_id: 4242 }] } }] }, /check from producer 4242/],
+      ["an unknown enforcement value", { ...sound, enforcement: "advisory" }, /unknown enforcement "advisory"/],
+      ["a source this run never approved", { ...sound, source: "someone/else" }, /names the source "someone\/else"/],
+    ];
+    for (const [label, ruleset, expected] of refusals) {
+      expect(() => projectGovernedRuleset(ruleset, allowed), label).toThrow(expected);
+    }
+    // A NON-EMPTY classic protection is not projectable at all: only a measured 404 may be published,
+    // so a protected branch stops the run BEFORE any witness dispatch rather than being summarised.
+    expect(() => buildGovernedSnapshot({
+      rulesets: [sound], classicStatus: 200, classicBody: { required_status_checks: {} }, allowed,
+      startedAt: "2026-09-10T09:00:00.000Z", completedAt: "2026-09-10T09:00:01.000Z", pages: 1, sourceIdentities: [],
+    })).toThrow(/only a measured no-classic-protection 404 representation is publishable/);
+    // And a local read that took too long is not contemporaneous.
+    expect(() => buildGovernedSnapshot({
+      rulesets: [sound], classicStatus: 404, classicBody: null, allowed,
+      startedAt: "2026-09-10T09:00:00.000Z", completedAt: "2026-09-10T09:00:30.000Z", pages: 1, sourceIdentities: [],
+    })).toThrow(/beyond the 15000ms contemporaneity bound/);
+  });
+
+  it("refuses a witness snapshot that is a verdict, a digest, or an inert rehearsal observation", () => {
+    const ctx = { runId: RUN_ID, attempt: ATTEMPT, repositoryId: REPOSITORY_ID, normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS };
+    const production = buildMainRulesets({ normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS });
+    const derived = transformToDisposable(production, { runId: RUN_ID, attempt: ATTEMPT, actor: "normal", normalAppId: NORMAL_APP });
+    const manifest = { policy_plan: { normal: derived.map((r) => ({ name: r.name, target_ref: r.conditions.ref_name.include[0], hash: createHash("sha256").update(JSON.stringify(r)).digest("hex") })) } };
+    // The manifest must agree with the job's own derivation; build it the way the runner does.
+    const plan = { policy_plan: { normal: derived.map((r) => ({ name: r.name, target_ref: r.conditions.ref_name.include[0], hash: "" })) } };
+    void manifest; void plan;
+    for (const [label, snapshot, expected] of [
+      ["a bare success boolean", { ok: true }, /carries no complete governed ruleset set/],
+      ["a digest with no governed set", { projected_governed_digest: "a".repeat(64), classic_protection: { present: false, status: 404 } }, /carries no complete governed ruleset set/],
+      ["an inert rehearsal observation", { inert: true }, /inert rehearsal observation/],
+      ["a snapshot with no measured classic representation", { governed_rulesets: [{ governed: {} }] }, /does not carry the measured no-classic-protection representation/],
+    ] as [string, unknown, RegExp][]) {
+      expect(() => validateGovernedSnapshot(snapshot, {
+        rulesetNames: new Set(), refPatterns: new Set(), contexts: new Set(),
+        producerIds: new Set(), bypassAppIds: new Set(), sources: new Set(),
+      }), label).toThrow(expected);
+    }
+    void ctx;
+  });
+
+  it("bounds the dispatch envelope AFTER serialization, including its JSON overhead", () => {
+    const response = {
+      schema_version: 1, kind: "commissioning-witness-response",
+      challenge_nonce: "a".repeat(64), challenge_digest: "b".repeat(64),
+      challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
+      witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
+      observation: { padding: "x".repeat(80_000) },
+    };
+    expect(() => serializeDispatchEnvelope({ response })).toThrow(/beyond this harness's 60000-byte bound/);
+    const small = { ...response, observation: { padding: "x" } };
+    const envelope = serializeDispatchEnvelope({ response: small });
+    expect(envelope.bytes).toBeLessThan(60_000);
+    // The bound is measured on the WHOLE serialized body, not on the inner witness string.
+    expect(envelope.serialized.length).toBeGreaterThan(envelope.witness.length);
+    expect(() => serializeDispatchEnvelope({ response: small, mode: "commission" })).toThrow(/runs only in policy-witness mode/);
+  });
+
+  it("refuses a response whose nonce, binding, ordering or expiry does not hold", () => {
+    const created = "2026-09-10T09:00:00.000Z";
+    const binding = {
+      domain: "commission", repository: COMMISSIONING_REPOSITORY, repository_id: REPOSITORY_ID,
+      source_mode: "commission", original_run_id: RUN_ID, original_attempt: ATTEMPT,
+      workflow_path: COMMISSIONING_WORKFLOW_PATH, source_sha: WORKFLOW_SHA,
+      role: "normal", job_id: "normal", case_id: "normal-update-missing-check", case_ordinal: 1,
+      direction: "pre", target_ref: derivedRef(RUN_ID, ATTEMPT, "normal"),
+      intended_app_id: NORMAL_APP, intended_installation_id: "5001",
+      manifest_sha256: "c".repeat(64), graph_sha256: "d".repeat(64),
+    };
+    const nonce = "e".repeat(64);
+    const challenge = buildChallenge({ binding, nonce, createdAt: created, extra: { before_sha: sha("A"), requested_sha: sha("N1") } });
+    const digest = createHash("sha256").update("challenge-bytes").digest("hex");
+    const observation = { started_at: created, completed_at: created, span_ms: 0, governed_rulesets: [], classic_protection: { present: false, status: 404 } };
+    const identity = { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" };
+    const response = buildResponse({ challenge, challengeDigest: digest, observation, witnessIdentity: identity, createdAt: created });
+    expect(assertResponseBinding(response, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: "2026-09-10T09:01:00.000Z" })).toBe(true);
+
+    // A NONCE this job never created — the replay of a valid response to another challenge.
+    expect(() => assertResponseBinding({ ...response, challenge_nonce: "f".repeat(64) }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
+      .toThrow(/answers a nonce this job did not create/);
+    // Challenge BYTES this job never published.
+    expect(() => assertResponseBinding({ ...response, challenge_digest: "0".repeat(64) }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
+      .toThrow(/answers challenge bytes this job did not publish/);
+    // Every binding field, one at a time.
+    for (const [field, value] of [
+      ["case_id", "normal-delete"], ["direction", "post"], ["role", "emergency"],
+      ["source_sha", sha("moved")], ["original_attempt", "9"], ["intended_app_id", EMERGENCY_APP],
+      ["manifest_sha256", "9".repeat(64)], ["graph_sha256", "9".repeat(64)], ["job_id", "emergency"],
+      ["source_mode", "transport-rehearsal"], ["domain", "rehearsal"],
+    ] as [string, unknown][]) {
+      expect(() => assertResponseBinding({ ...response, [field]: value }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }), field)
+        .toThrow(new RegExp(`response's ${field} is not the value this job derived`));
+    }
+    // CLOCK ORDER: a response created before the challenge it answers is impossible, and impossible
+    // is a refusal rather than a tolerance to widen. No positive skew allowance exists.
+    expect(() => assertResponseBinding({ ...response, created_at: "2026-09-10T08:59:00.000Z" }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
+      .toThrow(/predates the challenge it answers/);
+    // QUEUE EXPIRY: arriving late is INCOMPLETE, and the expiry is never extended.
+    expect(() => assertResponseBinding(response, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: "2026-09-10T09:05:00.000Z" }))
+      .toThrow(/after its 180000ms challenge expiry/);
+    // A response that does not name the one authorized measuring identity is unusable.
+    expect(() => assertResponseBinding({ ...response, witness_identity: { login: "someone", user_id: 1, type: "User" } }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
+      .toThrow(/one authorized local measuring identity/);
+    // A challenge whose lifetime is not the FIXED TTL is an extension by another name.
+    expect(() => assertChallengeShape({ ...challenge, expires_at: "2026-09-10T09:30:00.000Z" }))
+      .toThrow(/lifetime is not the fixed 180000ms/);
+    // The 90-second sequencing bounds, both directions.
+    expect(() => assertObservationProximity({ observedAt: created, actedAt: "2026-09-10T09:05:00.000Z", label: "the mutation" }))
+      .toThrow(/beyond the 90000ms bound/);
+    expect(() => assertObservationProximity({ observedAt: created, actedAt: "2026-09-10T08:59:00.000Z", label: "the mutation" }))
+      .toThrow(/before the observation it depends on/);
+  });
+
+  it("refuses a publisher run that is a rerun, a wrong actor, a wrong job or not exclusively the publisher", () => {
+    const expected = { repository: COMMISSIONING_REPOSITORY, dispatchRef: "refs/heads/staging", workflowPath: COMMISSIONING_WORKFLOW_PATH };
+    const env = {
+      GITHUB_REPOSITORY: COMMISSIONING_REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: "refs/heads/staging", GITHUB_JOB: "policy-witness", GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_SHA: WORKFLOW_SHA, GITHUB_RUN_ID: "77001",
+      GITHUB_WORKFLOW_REF: `${COMMISSIONING_REPOSITORY}/${COMMISSIONING_WORKFLOW_PATH}@refs/heads/staging`,
+    };
+    const run = { actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY, event: "workflow_dispatch", path: COMMISSIONING_WORKFLOW_PATH, head_sha: WORKFLOW_SHA, run_attempt: 1 };
+    expect(assertPublisherContext({ env, run, expected }).sourceSha).toBe(WORKFLOW_SHA);
+    // `actor` AND `triggering_actor`, because a re-run keeps the first and changes the second.
+    expect(() => assertPublisherContext({ env, run: { ...run, triggering_actor: DISPATCHER_IDENTITY }, expected })).toThrow(/measured triggering_actor is not the one authorized/);
+    expect(() => assertPublisherContext({ env, run: { ...run, actor: DISPATCHER_IDENTITY }, expected })).toThrow(/measured actor is not the one authorized/);
+    expect(() => assertPublisherContext({ env: { ...env, GITHUB_RUN_ATTEMPT: "2" }, run, expected })).toThrow(/it is a re-run/);
+    expect(() => assertPublisherContext({ env: { ...env, GITHUB_JOB: "normal" }, run, expected })).toThrow(/not the fixed policy-witness job/);
+    expect(() => assertPublisherContext({ env, run: { ...run, head_sha: sha("other") }, expected })).toThrow(/not the immutable source it checked out/);
+
+    const artifact = { id: 6101, name: "commissioning-witness-9001-2-normal-01-pre-abc", workflow_run: { id: 77001 }, expired: false };
+    const publisherRun = { id: 77001, ...run, status: "completed", conclusion: "success" };
+    const jobsOk = [{ id: 1, conclusion: "success" }, { id: 2, conclusion: "skipped" }];
+    const provenance = assertPublisherArtifactProvenance({ artifact, run: publisherRun, jobs: jobsOk, expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA } });
+    // Job IDs are reported for CORRELATION, and the evidence says so rather than implying provenance.
+    expect(provenance.provenance_basis).toMatch(/reviewed-immutable-workflow-exclusive-upload-wiring/);
+    expect(() => assertPublisherArtifactProvenance({ artifact, run: { ...publisherRun, run_attempt: 2 }, jobs: jobsOk, expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA } }))
+      .toThrow(/publisher run is a re-run/);
+    expect(() => assertPublisherArtifactProvenance({ artifact, run: { ...publisherRun, conclusion: "failure" }, jobs: jobsOk, expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA } }))
+      .toThrow(/pinned to a SUCCESSFUL publisher run/);
+    // EXCLUSIVITY: exactly one job may execute in a witness-mode run.
+    expect(() => assertPublisherArtifactProvenance({ artifact, run: publisherRun, jobs: [{ id: 1, conclusion: "success" }, { id: 2, conclusion: "success" }], expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA } }))
+      .toThrow(/executed 2 jobs; exactly one publisher job/);
+    expect(() => assertPublisherArtifactProvenance({ artifact, run: publisherRun, jobs: jobsOk, expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: sha("moved") } }))
+      .toThrow(/did not run the immutable source this attempt is bound to/);
+    expect(() => assertPublisherArtifactProvenance({ artifact: { ...artifact, expired: true }, run: publisherRun, jobs: jobsOk, expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA } }))
+      .toThrow(/has expired/);
+  });
+
+  it("the publisher reads its envelope as DATA and refuses a wrong mode, a bad payload or an oversize one", () => {
+    const ok = {
+      schema_version: 1, kind: "commissioning-witness-response",
+      challenge_nonce: "a".repeat(64), challenge_digest: "b".repeat(64),
+      challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
+      witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
+      observation: { inert: true },
+    };
+    const event = (inputs: unknown) => JSON.stringify({ inputs });
+    expect(readWitnessEnvelopeFromEvent(event({ mode: "policy-witness", witness_envelope: JSON.stringify(ok) })).response.kind).toBe("commissioning-witness-response");
+    expect(() => readWitnessEnvelopeFromEvent(event({ mode: "commission", witness_envelope: JSON.stringify(ok) }))).toThrow(/mode is not policy-witness/);
+    expect(() => readWitnessEnvelopeFromEvent(event({ mode: "policy-witness", witness_envelope: "" }))).toThrow(/no witness envelope string/);
+    expect(() => readWitnessEnvelopeFromEvent(event({ mode: "policy-witness", witness_envelope: "not json" }))).toThrow(/not valid JSON/);
+    expect(() => readWitnessEnvelopeFromEvent(event({ mode: "policy-witness", witness_envelope: "x".repeat(70_000) }))).toThrow(/exceeds the bounded dispatch size/);
+    expect(() => readWitnessEnvelopeFromEvent("not json")).toThrow(/event payload is not valid JSON/);
+    expect(() => readWitnessEnvelopeFromEvent(JSON.stringify({}))).toThrow(/no inputs object/);
+    // The publisher writes the EXACT received bytes: the digest both sides cross-check is of these.
+    const written: { name: string; bytes: Buffer }[] = [];
+    const envelope = JSON.stringify(ok);
+    const result = publishWitnessResponse({
+      response: { ...ok, repository: COMMISSIONING_REPOSITORY, workflow_path: COMMISSIONING_WORKFLOW_PATH, source_sha: WORKFLOW_SHA, original_run_id: RUN_ID, original_attempt: ATTEMPT, role: "normal", case_ordinal: 1, direction: "pre", case_id: "x", domain: "commission" },
+      envelope, publisherRunId: "77001",
+      expected: { repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA },
+      writeEntry: (name, bytes) => { written.push({ name, bytes }); return `/tmp/${name}`; },
+    });
+    expect(written).toHaveLength(1);
+    expect(written[0].name).toBe("witness.json");
+    expect(written[0].bytes.toString("utf8")).toBe(envelope);
+    expect(result.entry_digest).toBe(createHash("sha256").update(Buffer.from(envelope, "utf8")).digest("hex"));
+    expect(result.note).toMatch(/does not attest that the measurement inside is true/);
+    // A source that is not the one this publisher ran is refused before a byte is written.
+    expect(() => publishWitnessResponse({
+      response: { ...ok, repository: COMMISSIONING_REPOSITORY, workflow_path: COMMISSIONING_WORKFLOW_PATH, source_sha: sha("moved"), original_run_id: RUN_ID, original_attempt: ATTEMPT, role: "normal", case_ordinal: 1, direction: "pre", case_id: "x", domain: "commission" },
+      envelope, publisherRunId: "77001",
+      expected: { repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA },
+      writeEntry: () => "/tmp/x",
+    })).toThrow(/immutable source is not the source this publisher ran/);
+  });
+
+  it("refuses a DUPLICATE witness publication rather than selecting between two", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const caseId = CLOUD_CASE_SEQUENCE.normal[0];
+    const env = cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, "normal", 1, "pre");
+    const served = await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "pre" });
+    // A SECOND artifact under the same derived name. `never select the latest by name` means this is
+    // a refusal, not a tie-break — and the duplicate is what a republished nonce would look like.
+    const original = github.artifacts.get(served.artifact_id)!;
+    github.addArtifact(original.name, "witness.json", Buffer.from(JSON.stringify({ duplicate: true }), "utf8"), 77999);
+    await expect(runCaseStage({ stage: "await-and-execute", caseId, env, deps }))
+      .rejects.toThrow(/2 artifacts are named .*commissioning never selects between duplicate/);
+  });
+
+  it("consumes a witness nonce ONCE, durably, so a replay is refused rather than believed", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const caseId = CLOUD_CASE_SEQUENCE.normal[0];
+    const env = cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, "normal", 1, "pre");
+    await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "pre" });
+    await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+    // The pre nonce is consumed. Re-running the execute stage is refused by the state machine before
+    // anything else — a second mutation after an ambiguous one is exactly what must never happen.
+    await expect(runCaseStage({ stage: "await-and-execute", caseId, env, deps }))
+      .rejects.toThrow(/expected prepare state, found "await-and-execute"/);
+    const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-normal-01.json`), "utf8"));
+    expect(state.mutation_used).toBe(true);
+    expect(state.consumed).toHaveLength(1);
+    // NEITHER the nonce nor any credential is serialized into the challenge or the state's evidence.
+    expect(JSON.stringify(state)).not.toContain(SENTINEL_KEY);
+    expect(JSON.stringify(state)).not.toContain("normal-token");
+  });
+
+  it("refuses to finalize a case whose COMPLETE governed policy changed across its mutation window", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const caseId = CLOUD_CASE_SEQUENCE.normal[0];
+    const env = cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, "normal", 1, "pre");
+    await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "pre" });
+    await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+    // The bypass matrix is edited between the mutation and the POST observation. The pre/post pair is
+    // exactly what this bounds — and the boundary is stated, not overclaimed: a change that was made
+    // and REVERTED inside the window is outside the guarantee, which is why the evidence says so.
+    const writer = [...github.rulesets.values()].find((ruleset) => ruleset.name.includes("-normal-main-release-writer"))!;
+    writer.bypass_actors = [{ actor_type: "Integration", actor_id: EMERGENCY_APP, bypass_mode: "always" }];
+    publishChallenge(github, "normal", 1, "post");
+    await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "post" });
+    await expect(runCaseStage({ stage: "await-and-finalize", caseId, env, deps }))
+      .rejects.toThrow(/changed across case .* mutation window|not the reviewed disposable policy/);
+  });
+
+  it("the local witness refuses a challenge from a MOVED source, another run, or an expired window", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    // The domain is stated here rather than probed: this case examines the CHALLENGE checks, and the
+    // probe's own "no challenge yet" behaviour — which is retryable, because the witness is started
+    // before the first case publishes — is exercised by the `witness` CLI case instead.
+    const session = await openWitnessSession({
+      runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, domain: "commission" },
+    });
+    try {
+      const item = { role: "normal", caseId: CLOUD_CASE_SEQUENCE.normal[0], ordinal: 1, direction: "pre" as const };
+      const name = challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: item.role, ordinal: item.ordinal, direction: item.direction });
+      const sound = {
+        schema_version: 1, kind: "commissioning-witness-challenge", domain: "commission",
+        repository: COMMISSIONING_REPOSITORY, repository_id: REPOSITORY_ID, source_mode: "commission",
+        original_run_id: RUN_ID, original_attempt: ATTEMPT, workflow_path: COMMISSIONING_WORKFLOW_PATH,
+        source_sha: WORKFLOW_SHA, role: item.role, job_id: "normal", case_id: item.caseId, case_ordinal: 1,
+        direction: "pre", target_ref: derivedRef(RUN_ID, ATTEMPT, "normal"),
+        intended_app_id: NORMAL_APP, intended_installation_id: "5001",
+        manifest_sha256: session.setupBindings.manifest_sha256, graph_sha256: session.setupBindings.graph_sha256,
+        nonce: "a".repeat(64),
+        created_at: new Date(Date.now()).toISOString(), expires_at: new Date(Date.now() + 180_000).toISOString(),
+      };
+      const serve = (challenge: unknown) => {
+        for (const id of [...github.artifacts.keys()]) github.artifacts.delete(id);
+        github.addArtifact(name, `${name}.json`, Buffer.from(`${JSON.stringify(challenge)}\n`, "utf8"), Number(RUN_ID));
+        return serveWitnessItem({
+          request: session.request, requestArchive: session.requestArchive, ctx: session.ctx,
+          journal: session.journal, item, operator: session.operator, domain: "commission",
+          setupBindings: session.setupBindings, now: () => new Date(), sleep: async () => {}, intervalMs: 1,
+        });
+      };
+      // SOURCE MOVEMENT interrupts the attempt: the challenge was created against a different tree.
+      await expect(serve({ ...sound, source_sha: sha("moved") })).rejects.toThrow(/created against a different immutable source/);
+      await expect(serve({ ...sound, original_run_id: "9999" })).rejects.toThrow(/names a different original run/);
+      await expect(serve({ ...sound, case_id: "normal-delete" })).rejects.toThrow(/does not describe the work item this witness expected/);
+      await expect(serve({ ...sound, manifest_sha256: "0".repeat(64) })).rejects.toThrow(/names a manifest this run did not publish/);
+      await expect(serve({ ...sound, graph_sha256: "0".repeat(64) })).rejects.toThrow(/names a synthetic graph this run did not create/);
+      await expect(serve({ ...sound, domain: "rehearsal", source_mode: "transport-rehearsal", target_ref: "rehearsal", manifest_sha256: null, graph_sha256: null }))
+        .rejects.toThrow(/declares domain "rehearsal"/);
+      // An EXPIRED challenge is never served late, and the expiry is never extended.
+      const stale = { ...sound, created_at: new Date(Date.now() - 400_000).toISOString(), expires_at: new Date(Date.now() - 220_000).toISOString() };
+      await expect(serve(stale)).rejects.toThrow(/expired before this witness could serve it/);
+      // And a challenge artifact owned by ANOTHER run cannot be adopted.
+      for (const id of [...github.artifacts.keys()]) github.artifacts.delete(id);
+      github.addArtifact(name, `${name}.json`, Buffer.from(`${JSON.stringify(sound)}\n`, "utf8"), 424242);
+      await expect(serveWitnessItem({
+        request: session.request, requestArchive: session.requestArchive, ctx: session.ctx,
+        journal: session.journal, item, operator: session.operator, domain: "commission",
+        setupBindings: session.setupBindings, now: () => new Date(), sleep: async () => {}, intervalMs: 1,
+      })).rejects.toThrow(/belongs to run 424242, not the source run this witness serves/);
+    } finally {
+      session.lock.release();
+    }
+  });
+
+  it("the inert rehearsal shares the transport and can satisfy NO actor case", async () => {
+    const github = createFakeGitHub();
+    const rehearsalEnv = {
+      GITHUB_REPOSITORY: COMMISSIONING_REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: "refs/heads/staging", GITHUB_SHA: WORKFLOW_SHA,
+      GITHUB_WORKFLOW_REF: `${COMMISSIONING_REPOSITORY}/${COMMISSIONING_WORKFLOW_PATH}@refs/heads/staging`,
+      GITHUB_RUN_ID: "88001", GITHUB_RUN_ATTEMPT: "1", GITHUB_JOB: "transport-rehearsal",
+      GITHUB_TOKEN: "rehearsal-token", COMMISSIONING_MODE: "transport-rehearsal",
+      GITHUB_REPOSITORY_ID: String(REPOSITORY_ID), COMMISSIONING_REPOSITORY_ID: String(REPOSITORY_ID),
+      COMMISSIONING_EVIDENCE_DIR: evidenceDir,
+    } as unknown as NodeJS.ProcessEnv;
+    github.registerRehearsalRun(88001);
+    const deps = { fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    // NO synthetic graph, NO derived ref, NO resource journal — the rehearsal runs before any of
+    // them exist, which is the whole reason it can measure the transport before an approval.
+    const prepared = await runRehearsalStage({ stage: "challenge", env: rehearsalEnv, deps });
+    expect(prepared.status).toBe("prepared");
+    const challengeName = `commissioning-challenge-88001-1-rehearsal-00-pre`;
+    const bytes = readFileSync(path.join(evidenceDir, "challenges", `${challengeName}.json`));
+    const challenge = JSON.parse(bytes.toString("utf8"));
+    expect(challenge.domain).toBe("rehearsal");
+    expect(challenge.target_ref).toBe("rehearsal");
+    expect(challenge.manifest_sha256).toBeNull();
+    expect(challenge.graph_sha256).toBeNull();
+    github.addArtifact(challengeName, `${challengeName}.json`, bytes, 88001);
+    // The local witness serves it with an INERT observation: no policy read at all.
+    const witnessSession = await openWitnessSession({
+      runId: "88001", attempt: "1", evidenceDir, env: LOCAL_ENV,
+      deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl },
+    });
+    expect(witnessSession.domain).toBe("rehearsal");
+    try {
+      await serveWitnessItem({
+        request: witnessSession.request, requestArchive: witnessSession.requestArchive, ctx: witnessSession.ctx,
+        journal: witnessSession.journal, item: { role: "rehearsal", caseId: "transport-rehearsal", ordinal: 0, direction: "pre" },
+        operator: witnessSession.operator, domain: "rehearsal", setupBindings: witnessSession.setupBindings,
+        now: () => new Date(), sleep: async () => {}, intervalMs: 1,
+      });
+    } finally { witnessSession.lock.release(); }
+    const consumed = await runRehearsalStage({ stage: "consume", env: rehearsalEnv, deps });
+    expect(consumed.status).toBe("rehearsed");
+    expect(consumed.note).toMatch(/NO enforcement verdict, NO policy measurement and NO actor authority/);
+    expect(consumed.domain).toBe("rehearsal");
+    // The rehearsal's response is an INERT observation, so no actor could reason about it as policy.
+    const response = JSON.parse(readSingleEntryZip([...github.artifacts.values()].find((a) => a.name.startsWith("commissioning-witness-88001"))!.zip).bytes.toString("utf8"));
+    expect(response.observation.inert).toBe(true);
+    expect(response.observation.governed_rulesets).toBeUndefined();
+    expect(() => validateGovernedSnapshot(response.observation, {
+      rulesetNames: new Set(), refPatterns: new Set(), contexts: new Set(),
+      producerIds: new Set(), bypassAppIds: new Set(), sources: new Set(),
+    })).toThrow(/inert rehearsal observation and carries no policy measurement/);
+    // And the rehearsal job may hold no App key, by its own admission check.
+    await expect(runRehearsalStage({ stage: "challenge", env: { ...rehearsalEnv, RELEASE_APP_PRIVATE_KEY: SENTINEL_KEY }, deps }))
+      .rejects.toThrow(/no-secrets job by design/);
+  });
+
+  it("tolerates being STARTED BEFORE the work exists, which is the reviewed order", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    // The reviewed sequence is "start the separate local witness process, THEN explicit protected
+    // human approvals and actor phases". So at start-up there is no challenge and no domain to
+    // probe — and that must be a poll, not a refusal, or the process could never be started on time.
+    const deps = { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, processDeadlineMs: 5 };
+    await expect(runPhase({ phase: "witness", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps }))
+      .rejects.toThrow(/ceiling before the source run published any challenge/);
+    // …and once the first challenge exists, the same phase proceeds. (It then waits for the rest,
+    // which the ceiling bounds — the point here is that the START is not the refusal.)
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    await runCaseStage({
+      stage: "prepare", caseId: CLOUD_CASE_SEQUENCE.normal[0],
+      env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }),
+      deps: { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 },
+    });
+    publishChallenge(github, "normal", 1, "pre");
+    await expect(runPhase({ phase: "witness", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps }))
+      .rejects.toThrow(/ceiling after serving \d+ of 22 responses/);
+  });
+
+  it("records an INTERRUPTED case as inconclusive, and never as a matrix with fewer entries", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const caseId = CLOUD_CASE_SEQUENCE.normal[0];
+    const env = cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, "normal", 1, "pre");
+    await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "pre" });
+    await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+    // The mutation HAPPENED and the post witness never arrived — a runner killed between steps 3 and
+    // 5. The finalizer must report that case as INCONCLUSIVE with its mutation recorded as used, and
+    // every later case as `not-run`, rather than shipping a shorter matrix.
+    github.finish("normal");
+    await expect(runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) }))
+      .rejects.toThrow(/could not be measured|did not record their expected provider outcome/);
+    const evidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"));
+    const byCase = new Map((evidence.cases as CaseRecord[]).map((record) => [record.case, record]));
+    expect(byCase.size).toBe(CLOUD_CASE_SEQUENCE.normal.length);
+    expect(byCase.get(caseId)!.outcome).toBe("inconclusive");
+    expect(byCase.get(caseId)!.reason).toMatch(/stopped at stage await-and-execute/);
+    for (const later of CLOUD_CASE_SEQUENCE.normal.slice(1)) {
+      expect(byCase.get(later)!.outcome, later).toBe("not-run");
+    }
+    // And the offline gate refuses the packet rather than counting six clean cases.
+    environmentControls(evidenceDir);
+    const blockers = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+    // The interrupted file carries no policy measurement to bind its cases to, so it is REJECTED as
+    // a whole — and the rejection and the consequent loss of case coverage are reported as two
+    // different facts, which is what a reader needs: "the file was refused" and "these cases are
+    // therefore unmeasured" are not the same statement.
+    expect(blockers.some((entry) => entry.kind === "invalid"
+      && /normal-tests evidence file is missing the required field\(s\).*policy_in_force/.test(entry.detail)), JSON.stringify(blockers, null, 2)).toBe(true);
+    expect(blockers.some((entry) => entry.gate === "PC-05"
+      && /normal case\(s\) have no usable recorded outcome/.test(entry.detail))).toBe(true);
+  });
+
+  it("cannot be read as an ATOMIC policy-at-mutation proof, and refuses a packet that claims one", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers).toEqual([]);
+    const normal = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"));
+    // The bound is CARRIED, in the evidence, on every policy measurement — so a reader cannot
+    // upgrade a bounded pre/post measurement under administrative quiescence into an atomic one.
+    expect(normal.policy_in_force.guarantee).toMatch(/bounded-contemporaneous-pre-post-measurement-under-administrative-quiescence/);
+    expect(normal.policy_in_force.guarantee).toMatch(/NOT an atomic policy-at-mutation proof/);
+    for (const record of normal.cases as { witness?: { guarantee?: string } }[]) {
+      expect(record.witness?.guarantee).toMatch(/NOT an atomic policy-at-mutation proof/);
+    }
+    const witness = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "witness-process"));
+    expect(witness.guarantee).toMatch(/NOT an atomic policy-at-mutation proof/);
+    expect(witness.note).toMatch(/NOT a global PASS/);
+    // A packet that DROPS the bound — or restates it as an atomicity claim — is refused.
+    const target = path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, "normal"));
+    for (const guarantee of [undefined, "atomic policy-at-mutation proof"]) {
+      writeFileSync(target, `${JSON.stringify({ ...normal, policy_in_force: { ...normal.policy_in_force, guarantee } }, null, 2)}\n`, { mode: 0o600 });
+      expect((assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[])
+        .some((entry) => /does not carry the bounded pre\/post guarantee/.test(entry.detail)), String(guarantee)).toBe(true);
+    }
+  });
+
+  it("keeps every credential out of the challenge, the dispatch envelope and the case state", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    // The sentinel private key, the installation tokens and the App JWTs must appear in NOTHING the
+    // transport writes down — the challenge files, the dispatch envelopes, the case state or the
+    // published evidence. The transport is a publication path, so this is its leakage boundary.
+    const secrets = [SENTINEL_KEY, "normal-token", "emergency-token", "normal-jwt", "emergency-jwt"];
+    const surfaces: [string, string][] = [
+      ["the dispatch envelopes", JSON.stringify(github.dispatches)],
+      ["the published artifacts", [...github.artifacts.values()].map((a) => a.zip.toString("latin1")).join("")],
+      ["the case state", readdirSync(cloudDir("state")).map((name) => readFileSync(path.join(cloudDir("state"), name), "utf8")).join("")],
+      ["the challenge files", readdirSync(cloudDir("challenges")).map((name) => readFileSync(path.join(cloudDir("challenges"), name), "utf8")).join("")],
+    ];
+    for (const [label, text] of surfaces) {
+      for (const secret of secrets) expect(text, `${label} leaked ${secret.slice(0, 12)}`).not.toContain(secret);
+    }
+  });
+});
+
+describe("correction pass 2 — F4/F5/F6/F7: the retained hostile packet and the identity gates", () => {
+  const write = (key: string, payload: unknown) => {
+    const target = path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, key));
+    writeFileSync(target, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  };
+
+  /**
+   * F4 · THE RETAINED HOSTILE PACKET.
+   *
+   * Every required key present, every substantive value contradicting it. The independent review
+   * executed this exact combination against the previous `assessEvidence` and it returned
+   * `blockers: []` — recorded in `AIO-1124-full-diff-astra-hostile-packet-result.json`. Each of the
+   * eight conditions below is now a named blocker.
+   */
+  it("F4 · returns a blocker for EVERY condition of the reviewed hostile packet", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    // The packet is clean first, so every blocker below is attributable to exactly one perturbation.
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers).toEqual([]);
+
+    const setup = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup"));
+    const normal = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"));
+    const emergency = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "emergency"));
+    const cleanup = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup"));
+    const approvals = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "approvals"));
+
+    // 1. All case SHAs equal: a no-op recorded as a permitted write, and a force on a ref that never
+    //    moved recorded as a denied non-fast-forward.
+    write("normal", {
+      ...normal,
+      cases: (normal.cases as CaseRecord[]).map((record) => ({
+        ...record, before_sha: sha("A"), requested_sha: sha("A"), after_sha: sha("A"),
+      })),
+    });
+    // 2. The SAME App ID for both actors, and neither the one the immutable intent configured.
+    write("emergency", { ...emergency, actor: { ...emergency.actor, app_id: 9999, grants: { ...emergency.actor.grants, app_id: 9999, installation_app_id: 9999 } } });
+    // 3. `policy_in_force.verdict: mismatch` — a field the previous gate never read at all.
+    write("normal", {
+      ...readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")),
+      policy_in_force: { ...normal.policy_in_force, verdict: "mismatch", gap: "semantic" },
+    });
+    // 4. No published checks, so the installation-level positive control is unestablished.
+    write("normal", { ...readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")), check_publication: { count: 0, measured_producer_app_ids: [], nodes: [], published: [] } });
+    // 5. No graph or ruleset resources reported by setup, and an invalid manifest digest.
+    write("setup", { ...setup, synthetic_graph: {}, disposable_rulesets: { normal: [], emergency: [], human: [] }, manifest_sha256: "not-a-digest" });
+    // 6. A bot approver with a failed job conclusion.
+    write("approvals", {
+      ...approvals,
+      environments: Object.fromEntries(Object.entries(approvals.environments as Record<string, Record<string, unknown>>).map(([name, value]) => [name, {
+        ...value, reviewers: [{ login: "some-bot[bot]", id: 5, type: "Bot", is_dispatcher: false }], job_conclusion: "failure",
+      }])),
+    });
+    // 7. Main SHA drift paired with an EMPTY `production_drift`.
+    write("cleanup", { ...cleanup, production_baseline_after: { ...cleanup.production_baseline_after, main_sha: sha("moved main") }, production_drift: [] });
+    // 8. Every environment control observed FALSE, with one stale artifact reused throughout.
+    const staleBytes = Buffer.from(`${JSON.stringify({ control: "any", environment: "any", measured: false }, null, 2)}\n`, "utf8");
+    writeFileSync(path.join(evidenceDir, "stale.json"), staleBytes);
+    environmentControls(evidenceDir, (controls) => {
+      for (const key of Object.keys(controls)) {
+        for (const environment of Object.keys(controls[key])) {
+          controls[key][environment] = {
+            status: "verified", source: "provider-api", environment_name: environment, environment_id: 1,
+            expected: { any: false }, measured: { any: false }, measured_at: "2020-01-01T00:00:00.000Z",
+            artifact: "stale.json", artifact_sha256: createHash("sha256").update(staleBytes).digest("hex"),
+          };
+        }
+      }
+    });
+
+    const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    const detail = (blockers as Blocker[]).map((entry) => `${entry.gate} ${entry.kind}: ${entry.detail}`).join("\n");
+    // NOT merely non-empty: each of the eight conditions must be NAMED, so a single catch-all
+    // blocker cannot stand in for eight distinct failures.
+    for (const [condition, expected] of [
+      ["no-op case identities", /no-op rather than a measurement|not the journaled synthetic node/],
+      ["the same App for both actors", /measured App 9999, not the/],
+      ["a mismatched policy in force", /recorded as "mismatch"/],
+      ["no published TEST-ONLY checks", /records no published checks|positive-write liveness/],
+      ["setup resources that the journal contradicts", /synthetic graph is not the one the verified journal records/],
+      ["a manifest digest that is not a digest", /carries no manifest digest/],
+      ["a bot approver", /non-User reviewer|configured human reviewer/],
+      ["a failed protected job", /concluded "failure"/],
+      ["drift with an empty drift list", /recomputing the cleanup baselines shows production moved/],
+      ["environment controls measured false", /not the required outcome|expected control outcome that is not the one this build requires/],
+    ] as [string, RegExp][]) {
+      expect(detail, `the hostile packet's "${condition}" is not reported`).toMatch(expected);
+    }
+    // And the packet is a MEASURED failure, not merely incomplete.
+    expect((blockers as Blocker[]).some((entry) => entry.kind === "failed")).toBe(true);
+  });
+
+  /**
+   * F5 · a create whose response is LOST is journaled, reconciled, and never repeated.
+   *
+   * The review's reproduction created rulesets 701 AND 702 across a retry while journaling only 702,
+   * leaving 701 unaccountable to cleanup. Here the same interruption yields ONE ruleset, journaled
+   * with its exact ID, and a resume that reconciles rather than re-POSTs.
+   */
+  it("F5 · journals a created ruleset's identity BEFORE the readback that can fail, and never re-POSTs", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    // The exact reviewed interruption: POST 201, then the ownership readback fails.
+    let failReadback = true;
+    const spawnImpl = ((command: string, args: string[]) => {
+      const method = args[args.indexOf("--method") + 1];
+      const requestPath = args.find((arg, index) => arg.startsWith("/") && args[index - 1] !== "-H")!;
+      if (failReadback && method === "GET" && /\/rulesets\/\d+$/.test(requestPath)) {
+        const fake = new EventEmitter() as FakeChild;
+        fake.pid = 1; fake.kill = () => {};
+        fake.stdout = new PassThrough(); fake.stderr = new PassThrough();
+        fake.stdin = new Writable({ write(_c, _e, cb) { cb(); } });
+        fake.stdin.on("finish", () => {
+          fake.stdout.on("end", () => fake.emit("close", 1));
+          fake.stdout.end("HTTP/2.0 503 Service Unavailable\r\n\r\n{}");
+        });
+        return fake;
+      }
+      return github.spawnImpl(command, args);
+    }) as typeof github.spawnImpl;
+
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl } }))
+      .rejects.toThrow(/could not be read back after creation \(503\); it is journaled as owned/);
+    const afterFailure = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    const created = afterFailure.filter((record) => record.type === "resource-created" && record.data.kind === "ruleset");
+    // THE CORRECTION: the created ruleset's ID is on disk, fsynced, before the readback ran.
+    expect(created).toHaveLength(1);
+    expect(Number(created[0].data.id)).toBeGreaterThan(0);
+    expect(afterFailure.some((record) => record.type === "mutation-result" && record.data.kind === "ruleset" && Number(record.data.id) > 0)).toBe(true);
+    const rulesetsAfterFailure = github.rulesets.size;
+
+    // The resume ADOPTS that exact ID rather than creating a second ruleset under the same name.
+    failReadback = false;
+    const resumed = await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl } });
+    expect(resumed.status).toBe("prepared");
+    const names = [...github.rulesets.values()].map((ruleset) => ruleset.name);
+    expect(new Set(names).size, "a name was created twice").toBe(names.length);
+    expect(github.rulesets.size).toBeGreaterThanOrEqual(rulesetsAfterFailure);
+    // Every journaled ruleset now has a measured provider-shape fingerprint, whatever stage measured it.
+    const journal = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    const owned = journal.filter((r) => r.type === "resource-created" && r.data.kind === "ruleset").map((r) => String(r.data.name));
+    const fingerprinted = journal.filter((r) => r.type === "resource-fingerprinted").map((r) => String(r.data.key));
+    for (const name of owned) expect(fingerprinted, `${name} has no measured fingerprint`).toContain(name);
+    // And nothing is left unresolved.
+    expect(unresolvedCreateIntents(journal).filter((entry) => entry.state === "response-lost")).toEqual([]);
+  });
+
+  it("F6 · refuses any local identity but the one authorized operator, before creating anything", async () => {
+    for (const [label, options, expected] of [
+      ["a different admin", { operatorLogin: "someone-else", operatorId: 424242 }, /commissioning runs only as the one authorized operator/],
+      ["the right login with the wrong numeric ID", { operatorId: 999 }, /commissioning runs only as the one authorized operator/],
+      ["an organization identity", { operatorType: "Organization" }, /not the User this harness names/],
+      ["an identity without repository admin", { operatorPermission: "write" }, /does not hold repository admin/],
+    ] as [string, FakeOptions, RegExp][]) {
+      const dir = mkdtempSync(path.join(tmpdir(), "aio1124-"));
+      created.push(dir);
+      const github = createFakeGitHub(options);
+      await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: INTENT_ENV() });
+      await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: LOCAL_ENV, deps: localDeps(github) }), label)
+        .rejects.toThrow(expected);
+      // NOTHING was created with the unauthorized identity.
+      expect(github.rulesets.size, label).toBe(0);
+      expect([...github.refs.keys()].filter((ref) => ref.includes("aios-policy-commissioning")), label).toEqual([]);
+    }
+  });
+
+  it("F6 · refuses an actor packet whose App identities are the same, or not the intent's", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers).toEqual([]);
+    const intent = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "intent"));
+    // The intent naming ONE App as both identities is a failure in its own right.
+    write("intent", { ...intent, emergency_app_id: intent.normal_app_id });
+    expect((assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[])
+      .some((entry) => /the SAME App as both the normal and the emergency identity/.test(entry.detail))).toBe(true);
+    write("intent", intent);
+    // Two actor files agreeing with themselves about the SAME unrelated App — the packet the review
+    // executed — is now two blockers: neither matches the intent, and they are not distinct.
+    for (const role of ["normal", "emergency"]) {
+      const file = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, role));
+      write(role, { ...file, actor: { ...file.actor, app_id: 9999, grants: { ...file.actor.grants, app_id: 9999, installation_app_id: 9999 } } });
+    }
+    const blockers = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+    expect(blockers.filter((entry) => /measured App 9999, not the/.test(entry.detail))).toHaveLength(2);
+    expect(blockers.some((entry) => /both actor files measured App 9999/.test(entry.detail))).toBe(true);
+  });
+
+  it("F7 · validates the COMPLETE role/job binding for both protected roles, before any credential", () => {
+    // The reviewed defect: `PHASE_JOBS` was keyed by the phase word while the call site looked it up
+    // by the role word, so BOTH lookups returned `undefined` and the guard was written
+    // `if (expectedJob)`. Every role now resolves, and an unknown one refuses rather than skipping.
+    for (const role of Object.keys(ROLE_BINDINGS)) {
+      const binding = assertRoleBinding(role);
+      expect(binding.job, `role ${role} job`).toBeTruthy();
+      expect(binding.mode, `role ${role} mode`).toBeTruthy();
+    }
+    expect(() => assertRoleBinding("promote")).toThrow(/no role binding for "promote"/);
+    expect(() => assertRoleBinding(undefined)).toThrow(/no role binding for "undefined"/);
+    // BOTH protected roles, under the wrong job and under no job at all.
+    for (const role of ["normal", "emergency"]) {
+      const wrongJob = role === "normal" ? "emergency" : "normal";
+      expect(() => assertRunContext(cloudEnv(wrongJob), { runId: RUN_ID, attempt: ATTEMPT, role }), `${role} under ${wrongJob}`)
+        .toThrow(new RegExp(`the ${role} role runs only in the ${role} job`));
+      const noJob = { ...cloudEnv(role) } as Record<string, string>;
+      delete noJob.GITHUB_JOB;
+      expect(() => assertRunContext(noJob as unknown as NodeJS.ProcessEnv, { runId: RUN_ID, attempt: ATTEMPT, role }), `${role} with no job`)
+        .toThrow(/GITHUB_JOB is required/);
+    }
+    // The two non-actor transport jobs are bound to their own job IDs and their own modes, and
+    // neither may be reached in commissioning mode.
+    expect(() => assertRunContext(cloudEnv("policy-witness"), { runId: RUN_ID, attempt: ATTEMPT, role: "witness-publisher" }))
+      .toThrow(/runs only in policy-witness mode/);
+    expect(() => assertRunContext(cloudEnv("normal"), { runId: RUN_ID, attempt: ATTEMPT, role: "rehearsal" }))
+      .toThrow(/the rehearsal role runs only in the transport-rehearsal job/);
+    // An unknown or empty MODE is admitted by no role.
+    for (const mode of ["", "promote", "COMMISSION"]) {
+      expect(() => assertRunContext(cloudEnv("intent", { COMMISSIONING_MODE: mode }), { runId: RUN_ID, attempt: ATTEMPT, role: "intent" }), `mode ${JSON.stringify(mode)}`)
+        .toThrow(/COMMISSIONING_MODE is required|refuses the unknown mode/);
+    }
   });
 });

@@ -142,7 +142,26 @@ const COMMISSIONING = {
   admission:
     "github.event_name == 'workflow_dispatch' && " +
     "github.repository == 'aiosbrain/aios-team-brain' && " +
-    "github.ref == 'refs/heads/staging'",
+    "github.ref == 'refs/heads/staging' && " +
+    // The MODE clause. The commissioning harness gained a closed three-way `mode` input for the F1
+    // witness transport, and the fixture is admitted in exactly one of them. An exemption that did
+    // not require this would keep the `checks: write` grant for a fixture reachable in the modes
+    // whose whole point is that no App-credentialed job runs.
+    "inputs.mode == 'commission'",
+  /**
+   * The CLOSED input surface this exemption tolerates, exactly.
+   *
+   * (1a) used to require NO inputs at all, which was the strongest possible statement of "nothing a
+   * caller types can redirect this run". The F1 transport needs two: `mode`, a closed choice over
+   * three reviewed job sets, and `witness_envelope`, DATA that fixed checked-out code reads from the
+   * event payload. Neither is a repository, ref, endpoint, script path or resource name — so the
+   * property is preserved by pinning the surface rather than by forbidding it. A THIRD input, a
+   * free-text mode, or an added option loses the exemption.
+   */
+  inputs: {
+    mode: { type: "choice", options: ["commission", "policy-witness", "transport-rehearsal"] },
+    witness_envelope: { type: "string" },
+  },
 } as const;
 
 const isMap = (v: unknown): v is Record<string, unknown> =>
@@ -169,7 +188,20 @@ export function commissioningFixtureExemption(file: string, doc: Workflow): bool
   // `workflow_call` trigger would run a copy of this file that the maintainer never dispatched.
   const on = (doc as { on?: unknown }).on;
   if (!isMap(on) || Object.keys(on).length !== 1 || !("workflow_dispatch" in on)) return false;
-  if (on.workflow_dispatch != null) return false; // an empty body parses to null; anything else takes input
+  // The input surface must be EXACTLY the closed pair above — see `COMMISSIONING.inputs` for why the
+  // rule is "pin it" rather than "forbid it".
+  const dispatch = on.workflow_dispatch;
+  if (dispatch !== null) {
+    if (!isMap(dispatch) || Object.keys(dispatch).length !== 1 || !isMap(dispatch.inputs)) return false;
+    const inputs = dispatch.inputs as Record<string, unknown>;
+    const expected = COMMISSIONING.inputs as Record<string, { type: string; options?: readonly string[] }>;
+    if (JSON.stringify(Object.keys(inputs).sort()) !== JSON.stringify(Object.keys(expected).sort())) return false;
+    for (const [name, spec] of Object.entries(expected)) {
+      const declared = inputs[name];
+      if (!isMap(declared) || declared.type !== spec.type) return false;
+      if (spec.options && JSON.stringify(declared.options) !== JSON.stringify([...spec.options])) return false;
+    }
+  }
 
   const fixture = isMap(doc.jobs) ? (doc.jobs as Record<string, unknown>)[COMMISSIONING.job] : undefined;
   if (!isMap(fixture)) return false;
@@ -292,7 +324,13 @@ describe("guard: the commissioning fixture's `checks: write` is exempt ONLY in i
   const ADMISSION =
     "github.event_name == 'workflow_dispatch' && " +
     "github.repository == 'aiosbrain/aios-team-brain' && " +
-    "github.ref == 'refs/heads/staging'";
+    "github.ref == 'refs/heads/staging' && " +
+    "inputs.mode == 'commission'";
+  /** The closed input surface, as the real file declares it. */
+  const INPUTS = {
+    mode: { description: "Which reviewed job set may run", required: false, default: "commission", type: "choice", options: ["commission", "policy-witness", "transport-rehearsal"] },
+    witness_envelope: { description: "policy-witness mode only", required: false, default: "", type: "string" },
+  };
   const SHA = "${{ github.sha }}";
 
   type TestStep = { uses?: string; with?: Record<string, unknown>; run?: string; env?: Record<string, string> };
@@ -321,7 +359,7 @@ describe("guard: the commissioning fixture's `checks: write` is exempt ONLY in i
    *  "the fixture holds no secret" is a real distinction rather than an artefact of a bare fixture. */
   const commissioning = (mutate: (d: TestDoc) => void = () => {}): Workflow => {
     const doc: TestDoc = {
-      on: { workflow_dispatch: null },
+      on: { workflow_dispatch: { inputs: INPUTS } },
       permissions: perms(),
       jobs: {
         intent: { if: ADMISSION, permissions: perms(), steps: [checkout()] },
@@ -408,6 +446,16 @@ describe("guard: the commissioning fixture's `checks: write` is exempt ONLY in i
     ["an added workflow_call trigger lets another workflow inherit the grant", (d) => { (d.on as Record<string, unknown>).workflow_call = null; }],
     ["an added push trigger fires without a maintainer dispatching it", (d) => { (d.on as Record<string, unknown>).push = { branches: ["staging"] }; }],
     ["dispatch inputs give a caller somewhere to type a repo or ref", (d) => { d.on = { workflow_dispatch: { inputs: { ref: { required: true } } } }; }],
+    // THE INPUT SURFACE IS PINNED, NOT MERELY BOUNDED. (1a) once required no inputs at all; the F1
+    // transport needs two, so the exemption now names them exactly — and each way of widening that
+    // pin has to lose it, or "pinned" would be a word rather than a check.
+    ["a THIRD input beyond the closed pair", (d) => { d.on = { workflow_dispatch: { inputs: { ...INPUTS, target_ref: { type: "string" } } } }; }],
+    ["the mode input relaxed from a choice to free text", (d) => { d.on = { workflow_dispatch: { inputs: { ...INPUTS, mode: { type: "string", default: "commission" } } } }; }],
+    ["a FOURTH mode option nobody reviewed", (d) => { d.on = { workflow_dispatch: { inputs: { ...INPUTS, mode: { ...INPUTS.mode, options: [...INPUTS.mode.options, "promote"] } } } }; }],
+    ["the envelope input widened to a choice of refs", (d) => { d.on = { workflow_dispatch: { inputs: { ...INPUTS, witness_envelope: { type: "choice", options: ["refs/heads/main"] } } } }; }],
+    ["one of the closed inputs removed, so the file and the pin disagree", (d) => { d.on = { workflow_dispatch: { inputs: { mode: INPUTS.mode } } }; }],
+    ["the mode clause dropped from the admission, admitting the fixture in every mode", (d) => { d.jobs.fixture.if = ADMISSION.replace(" && inputs.mode == 'commission'", ""); }],
+    ["the fixture admitted in the witness mode, where no App-credentialed job may run", (d) => { d.jobs.fixture.if = ADMISSION.replace("'commission'", "'policy-witness'"); }],
     ["no `on:` at all is un-analysable, not a pass", (d) => { delete d.on; }],
     ["a different repository in the admission", (d) => { d.jobs.fixture.if = ADMISSION.replace("aiosbrain/aios-team-brain", "attacker/fork"); }],
     ["a different ref in the admission", (d) => { d.jobs.fixture.if = ADMISSION.replace("refs/heads/staging", "refs/heads/main"); }],

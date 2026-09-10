@@ -48,12 +48,56 @@ export const JOURNAL_EVENTS = Object.freeze([
   "mutation-result",
   "readback",
   "resource-created",
+  /**
+   * The provider's OWN representation of a resource, measured by a readback AFTER the create was
+   * journaled. It is a separate event because the create and the fingerprint are separate fallible
+   * steps: a POST that returns 201 and a GET that then returns 503 leaves a resource that exists,
+   * is owned, and has no measured fingerprint — and collapsing the two into one record is exactly
+   * how that resource became unaccountable (F5).
+   */
+  "resource-fingerprinted",
   "case-outcome",
   "cleanup-intent",
   "cleanup-result",
+  /**
+   * The bounded outcome of reconciling an intent whose result was lost. Distinct from `recovery`,
+   * which is about a LOCK: this is about a MUTATION whose response never arrived, and it is what
+   * must exist before anything decides to create or delete on that intent's behalf.
+   */
+  "reconciliation",
   "recovery",
   "run-closed",
 ]);
+
+/**
+ * The SEPARATE witness journal's closed event set (F1).
+ *
+ * The local witness process is read-only with respect to provider resources, so it must not share the
+ * resource journal's exclusive lock — a witness running concurrently with `human-tests` would
+ * otherwise deadlock against it. It keeps its own chain, under its own lock, and the two are
+ * cross-checked at final assessment because both bind the same immutable source and manifest.
+ */
+export const WITNESS_JOURNAL_EVENTS = Object.freeze([
+  "witness-opened",
+  "challenge-observed",
+  "dispatch-intent",
+  "dispatch-result",
+  "response-reconciled",
+  "reconciliation",
+  "witness-closed",
+]);
+
+/** The two chains this module can carry, and the event vocabulary each admits. */
+export const JOURNAL_KINDS = Object.freeze({
+  resource: Object.freeze({ suffix: "", events: JOURNAL_EVENTS }),
+  witness: Object.freeze({ suffix: ".witness", events: WITNESS_JOURNAL_EVENTS }),
+});
+
+function assertJournalKind(kind) {
+  const spec = JOURNAL_KINDS[kind];
+  if (!spec) throw new JournalRefusalError(`unknown commissioning journal kind ${JSON.stringify(String(kind))}`);
+  return spec;
+}
 
 export class JournalLockedError extends Error {
   constructor(owner) {
@@ -84,11 +128,11 @@ function assertRunIdentity(runId, attempt) {
   if (!DECIMAL.test(String(attempt))) throw new JournalRefusalError("journal attempt must be a positive decimal");
 }
 
-const baseName = (runId, attempt) => `commissioning-${runId}-${attempt}`;
+const baseName = (runId, attempt, kind = "resource") => `commissioning-${runId}-${attempt}${assertJournalKind(kind).suffix}`;
 
-export const journalPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.jsonl`);
-export const lockPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.lock`);
-export const snapshotPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.snapshot.json`);
+export const journalPath = (dir, runId, attempt, kind = "resource") => path.join(dir, `${baseName(runId, attempt, kind)}.jsonl`);
+export const lockPath = (dir, runId, attempt, kind = "resource") => path.join(dir, `${baseName(runId, attempt, kind)}.lock`);
+export const snapshotPath = (dir, runId, attempt, kind = "resource") => path.join(dir, `${baseName(runId, attempt, kind)}.snapshot.json`);
 /**
  * A SECOND lock, held only for the duration of a recovery.
  *
@@ -97,7 +141,7 @@ export const snapshotPath = (dir, runId, attempt) => path.join(dir, `${baseName(
  * acquired, and two writers proceed believing they own the run. This one is created `wx` before
  * anything is read and released only at the end, so exactly one recovery can be in flight.
  */
-export const recoveryLockPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.recovery.lock`);
+export const recoveryLockPath = (dir, runId, attempt, kind = "resource") => path.join(dir, `${baseName(runId, attempt, kind)}.recovery.lock`);
 
 /**
  * The evidence directory must be a real, private directory this process owns.
@@ -164,19 +208,20 @@ const digestOf = (line) => createHash("sha256").update(line, "utf8").digest("hex
  * same path cannot both succeed, on any platform this runs on.
  */
 export function acquireJournalLock({
-  dir, runId, attempt, now = () => new Date(), pid = process.pid, host = hostname(),
+  dir, runId, attempt, kind = "resource", now = () => new Date(), pid = process.pid, host = hostname(),
   nonce = createHash("sha256").update(`${process.pid}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 32),
 }) {
   assertRunIdentity(runId, attempt);
+  assertJournalKind(kind);
   const root = assertPrivateDirectory(dir);
-  const file = lockPath(root, runId, attempt);
+  const file = lockPath(root, runId, attempt, kind);
   assertRegularOrAbsent(file);
-  const owner = { v: JOURNAL_SCHEMA_VERSION, run_id: String(runId), attempt: String(attempt), pid, host, nonce, acquired_at: now().toISOString() };
+  const owner = { v: JOURNAL_SCHEMA_VERSION, run_id: String(runId), attempt: String(attempt), kind: String(kind), pid, host, nonce, acquired_at: now().toISOString() };
   let fd;
   try {
     fd = openSync(file, "wx", 0o600);
   } catch (error) {
-    if (error?.code === "EEXIST") throw new JournalLockedError(readLockOwner(root, runId, attempt));
+    if (error?.code === "EEXIST") throw new JournalLockedError(readLockOwner(root, runId, attempt, kind));
     throw error;
   }
   try {
@@ -191,7 +236,7 @@ export function acquireJournalLock({
     release() {
       // Only the holder removes it, and only if the on-disk nonce still says so. A release that
       // deletes someone else's lock is the same bug as stealing it.
-      const current = readLockOwner(root, runId, attempt);
+      const current = readLockOwner(root, runId, attempt, kind);
       if (current?.nonce !== nonce) return false;
       unlinkSync(file);
       return true;
@@ -199,9 +244,9 @@ export function acquireJournalLock({
   };
 }
 
-export function readLockOwner(dir, runId, attempt) {
+export function readLockOwner(dir, runId, attempt, kind = "resource") {
   try {
-    return JSON.parse(readFileSync(lockPath(dir, runId, attempt), "utf8"));
+    return JSON.parse(readFileSync(lockPath(dir, runId, attempt, kind), "utf8"));
   } catch {
     return null;
   }
@@ -226,10 +271,11 @@ export function readLockOwner(dir, runId, attempt) {
  * An unreconciled or unknown last mutation stays inconclusive. Nothing here adopts or deletes a
  * resource to make the chain look complete.
  */
-export async function recoverJournalLock({ dir, runId, attempt, ownerGone, reconcile, now = () => new Date() }) {
+export async function recoverJournalLock({ dir, runId, attempt, kind = "resource", ownerGone, reconcile, now = () => new Date() }) {
   assertRunIdentity(runId, attempt);
+  assertJournalKind(kind);
   const root = assertPrivateDirectory(dir);
-  const recoveryLock = recoveryLockPath(root, runId, attempt);
+  const recoveryLock = recoveryLockPath(root, runId, attempt, kind);
   assertRegularOrAbsent(recoveryLock);
   let recoveryFd;
   try {
@@ -245,18 +291,20 @@ export async function recoverJournalLock({ dir, runId, attempt, ownerGone, recon
     closeSync(recoveryFd);
   }
   try {
-    const owner = readLockOwner(root, runId, attempt);
+    const owner = readLockOwner(root, runId, attempt, kind);
     if (!owner) throw new JournalRefusalError("there is no lock to recover for this run");
     if (ownerGone !== true) throw new JournalRefusalError("lock recovery requires explicit verification that the recorded owner is gone; elapsed time is not that verification");
     if (typeof reconcile !== "function") throw new JournalRefusalError("lock recovery requires a provider readback reconciliation");
     if (typeof owner.nonce !== "string" || !owner.nonce) throw new JournalRefusalError("the lock being recovered carries no owner nonce; it cannot be identified at replacement");
-    const records = readJournal({ dir: root, runId, attempt });
+    const records = readJournal({ dir: root, runId, attempt, kind });
 
     // The unresolved mutation may be a CLEANUP one. Looking only at `mutation-*` omits an interrupted
     // ruleset or ref DELETE — the most consequential thing a crashed cleanup can leave behind, and
     // the one a resumed run most needs reconciled before it decides anything.
-    const INTENTS = ["mutation-intent", "cleanup-intent"];
-    const RESULTS = ["mutation-result", "cleanup-result"];
+    // `dispatch-intent`/`dispatch-result` are the witness chain's counterparts: a lost witness
+    // dispatch is exactly as unresolved as a lost ruleset create, and is reconciled the same way.
+    const INTENTS = ["mutation-intent", "cleanup-intent", "dispatch-intent"];
+    const RESULTS = ["mutation-result", "cleanup-result", "dispatch-result"];
     const lastIntent = [...records].reverse().find((record) => INTENTS.includes(record.type));
     const lastResult = [...records].reverse().find((record) => RESULTS.includes(record.type));
     const unresolved = lastIntent && (!lastResult || lastResult.seq < lastIntent.seq) ? lastIntent : null;
@@ -268,13 +316,13 @@ export async function recoverJournalLock({ dir, runId, attempt, ownerGone, recon
     // Re-read AFTER the await. If the lock is gone or is somebody else's, this recovery lost the race
     // and must not unlink: the file it would remove now belongs to a writer that believes it owns the
     // run, and removing it is how provider cleanup interleaves with that writer.
-    const current = readLockOwner(root, runId, attempt);
+    const current = readLockOwner(root, runId, attempt, kind);
     if (!current) throw new JournalRefusalError("the lock this recovery started from was already released; re-check the run rather than replacing it");
     if (current.nonce !== owner.nonce) throw new JournalRefusalError("the lock was replaced while this recovery was reconciling; refusing to remove the new owner's lock");
-    unlinkSync(lockPath(root, runId, attempt));
-    const lock = acquireJournalLock({ dir: root, runId, attempt, now });
-    const journal = openJournal({ dir: root, runId, attempt, source: records[0]?.source ?? "unknown", lock });
-    journal.append("recovery", {
+    unlinkSync(lockPath(root, runId, attempt, kind));
+    const lock = acquireJournalLock({ dir: root, runId, attempt, kind, now });
+    const journal = openJournal({ dir: root, runId, attempt, kind, source: records[0]?.source ?? "unknown", lock });
+    journal.append(kind === "witness" ? "reconciliation" : "recovery", {
       replaced_owner: { pid: owner.pid, host: owner.host, acquired_at: owner.acquired_at },
       unresolved_intent_seq: unresolved?.seq ?? null,
       unresolved_intent_type: unresolved?.type ?? null,
@@ -291,9 +339,10 @@ export async function recoverJournalLock({ dir, runId, attempt, ownerGone, recon
  * a partial trailing line (a crash mid-write), a broken `prev` link, a non-monotonic sequence, or
  * a record belonging to a different run.
  */
-export function readJournal({ dir, runId, attempt }) {
+export function readJournal({ dir, runId, attempt, kind = "resource" }) {
   assertRunIdentity(runId, attempt);
-  const file = journalPath(dir, runId, attempt);
+  assertJournalKind(kind);
+  const file = journalPath(dir, runId, attempt, kind);
   assertRegularOrAbsent(file);
   let text;
   try { text = readFileSync(file, "utf8"); } catch (error) {
@@ -315,6 +364,12 @@ export function readJournal({ dir, runId, attempt }) {
     if (String(record.run_id) !== String(runId) || String(record.attempt) !== String(attempt)) {
       throw new JournalChainError(`journal record ${expectedSeq} belongs to a different run or attempt`);
     }
+    // A record from the OTHER chain read as this one's would let witness events be counted as
+    // resource ownership, or the reverse. The two vocabularies are disjoint, but the binding is
+    // explicit rather than left to that coincidence.
+    if (record.kind !== undefined && String(record.kind) !== String(kind)) {
+      throw new JournalChainError(`journal record ${expectedSeq} belongs to the ${String(record.kind)} chain, not the ${String(kind)} one`);
+    }
     records.push(record);
     previous = digestOf(line);
     expectedSeq += 1;
@@ -328,12 +383,19 @@ export function readJournal({ dir, runId, attempt }) {
  * `source` binds the chain to the immutable commissioning source (the trusted workflow SHA); a
  * record written under a different source is a different run's evidence wearing this run's name.
  */
-export function openJournal({ dir, runId, attempt, source, lock, now = () => new Date() }) {
+export function openJournal({ dir, runId, attempt, source, lock, kind = "resource", now = () => new Date() }) {
   assertRunIdentity(runId, attempt);
+  const spec = assertJournalKind(kind);
   const root = assertPrivateDirectory(dir);
   if (!lock?.nonce) throw new JournalRefusalError("journal writes require a held run-scoped lock");
-  const file = journalPath(root, runId, attempt);
-  let records = readJournal({ dir: root, runId, attempt });
+  // A lock taken for the OTHER chain is not this chain's lock. Without this the witness process
+  // could append to the resource journal under its own read-only lock — the exact coupling the
+  // separate witness journal exists to prevent.
+  if (lock.kind !== undefined && String(lock.kind) !== String(kind)) {
+    throw new JournalRefusalError(`this writer holds the ${String(lock.kind)} journal lock, not the ${String(kind)} one`);
+  }
+  const file = journalPath(root, runId, attempt, kind);
+  let records = readJournal({ dir: root, runId, attempt, kind });
   // Chain from the file's OWN BYTES, never from a re-serialization of the parsed record: two
   // spellings of the same object hash differently, and a link computed from the wrong one would
   // make every later record fail verification for a reason nobody could find.
@@ -345,14 +407,14 @@ export function openJournal({ dir, runId, attempt, source, lock, now = () => new
   let seq = records.length;
 
   function append(type, data) {
-    if (!JOURNAL_EVENTS.includes(type)) throw new JournalRefusalError(`unknown journal event type ${type}`);
-    const held = readLockOwner(root, runId, attempt);
+    if (!spec.events.includes(type)) throw new JournalRefusalError(`unknown ${kind} journal event type ${type}`);
+    const held = readLockOwner(root, runId, attempt, kind);
     if (held?.nonce !== lock.nonce) throw new JournalRefusalError("this writer no longer holds the run-scoped journal lock");
     assertNoCredentialShapedValues(data, type);
     assertRegularOrAbsent(file);
     seq += 1;
     const record = {
-      v: JOURNAL_SCHEMA_VERSION, seq, run_id: String(runId), attempt: String(attempt),
+      v: JOURNAL_SCHEMA_VERSION, seq, run_id: String(runId), attempt: String(attempt), kind: String(kind),
       source: String(source ?? "unknown"), prev: previous, ts: now().toISOString(), type,
       data: data === undefined ? null : data,
     };
@@ -373,8 +435,9 @@ export function openJournal({ dir, runId, attempt, source, lock, now = () => new
 
   return {
     path: file,
+    kind: String(kind),
     append,
-    read: () => readJournal({ dir: root, runId, attempt }),
+    read: () => readJournal({ dir: root, runId, attempt, kind }),
     get length() { return seq; },
   };
 }
@@ -383,10 +446,11 @@ export function openJournal({ dir, runId, attempt, source, lock, now = () => new
  * An atomic, mode-0600 DERIVED view of a verified chain. Regenerating it is always safe because it
  * is never the evidence — `readJournal` is.
  */
-export function writeJournalSnapshot({ dir, runId, attempt, snapshot }) {
+export function writeJournalSnapshot({ dir, runId, attempt, snapshot, kind = "resource" }) {
   const root = assertPrivateDirectory(dir);
+  assertJournalKind(kind);
   assertNoCredentialShapedValues(snapshot, "snapshot");
-  const target = snapshotPath(root, runId, attempt);
+  const target = snapshotPath(root, runId, attempt, kind);
   assertRegularOrAbsent(target);
   const temporary = `${target}.tmp`;
   assertRegularOrAbsent(temporary);
