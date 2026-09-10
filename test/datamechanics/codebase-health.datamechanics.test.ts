@@ -698,9 +698,8 @@ describe("health v3 route and census persistence", () => {
       post(key, seed.teamSlug, first),
       post(key, seed.teamSlug, second),
     ]);
-    console.info(
-      "AIO-1096 concurrent same-head HTTP outcomes",
-      responses.map((r) => r.status),
+    process.stdout.write(
+      `Concurrent same-head HTTP outcomes: ${JSON.stringify(responses.map((r) => r.status))}\n`,
     );
     expect(responses.some((r) => r.status === 201)).toBe(true);
     for (const response of responses) {
