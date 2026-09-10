@@ -1,0 +1,255 @@
+# AIO-1124 — bounded protected-policy commissioning harness (PC-01 … PC-08).
+#
+# This workflow PROVES NOTHING BY ITSELF and PROMOTES NOTHING. It exercises the normal and emergency
+# release App identities against real GitHub ref/ruleset enforcement on DISPOSABLE refs, without
+# exporting their private keys out of `staging-release` / `staging-emergency`. It never touches main,
+# staging, a tag, a Railway deploy or a release acceptance — see `docs/RELEASING.md` for the release
+# path this is a PREREQUISITE for, not a part of.
+#
+# WHY EVERY JOB REPEATS THE SAME `if:`. A `needs:` edge propagates a SKIP, but it is not admission
+# control: a job whose needs are satisfied runs under whatever ref/repository created the run. Two of
+# these jobs carry release App private keys, so each states its own admission.
+#
+# THE EVIDENCE CONTRACT (closed; `scripts/staging-ops/policy-commissioning.mjs` must match). Each job
+# writes exactly one sanitized JSON file into the shared evidence dir, and the upload steps name
+# those four files EXACTLY:
+#
+#   job        entrypoint                              evidence file
+#   intent     CLI phase `intent`                      intent.json
+#   fixture    `runFixtureChecks(process.env)`          fixture.json
+#   normal     CLI phase `normal-tests`                 normal-tests.json
+#   emergency  CLI phase `emergency-tests`              emergency-tests.json
+#
+# Nothing else in that directory is uploaded — the local mode-0600 journal and any raw provider body
+# are local-only (PC-07), so a directory or glob path here would be the leak. `if-no-files-found:
+# error` makes a runner that wrote nothing a red job rather than a silently empty artifact.
+#
+# THE TOKEN CONTRACT. `checks: write` is the ONLY write grant in the file and belongs to the fixture
+# job alone. Three jobs get a `GITHUB_TOKEN`: the fixture (to mint TEST-ONLY checks) and the two
+# protected actor jobs, whose tokens are READ-ONLY (`contents: read` + `actions: read`) and used only
+# to read run/commit metadata — they are never actors in the matrix. The actor in each protected job
+# is the short-lived App installation token it mints from its own three secrets. The intent job holds
+# no credential at all: no App secret and no `GITHUB_TOKEN`.
+name: Release policy commissioning (AIO-1124)
+
+on:
+  # Manual only, and deliberately WITHOUT inputs. PC-01 requires that no caller can supply a repo,
+  # ref, endpoint, script path, ruleset ID or resource name; the guarantee is that there is nowhere
+  # to type one. Every mutable name is derived inside the runner from the run ID/attempt.
+  workflow_dispatch:
+
+# Read-only default. Only the fixture job widens it, and only to `checks: write`.
+permissions:
+  contents: read
+  actions: read
+
+# Isolated PER RUN AND ATTEMPT, not a shared lane. Each attempt derives a fresh ref/ruleset suffix
+# (PC-03), so two attempts hold disjoint resources and must not cancel or queue behind one another; a
+# shared group would let a rerun steal the journal of the run still being evidenced.
+concurrency:
+  group: aios-policy-commissioning-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  intent:
+    name: Commissioning intent (credential-free)
+    # Fixed repository, fixed dispatch branch, manual event. Stated on every job — see the header.
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # The TRUSTED IMMUTABLE dispatch SHA, never the moving `staging` ref: the `if` above pins WHERE
+      # the dispatch came from, but checking out the branch NAME would still run whatever landed on it
+      # between dispatch and job start.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # PC-03: runs FIRST and holds NO credential — no App secret, and no `GITHUB_TOKEN` either. It
+      # publishes the immutable workflow/run/repository identity and the closed set of derived
+      # resource names that local setup re-derives independently. A credential here would make the
+      # first artifact in the chain the least trustworthy.
+      - name: Publish credential-free commissioning intent
+        env:
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs intent
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/intent.json
+          if-no-files-found: error
+          retention-days: 30
+
+  fixture:
+    name: Synthetic check fixture (no App secrets)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging'
+    needs: intent
+    runs-on: ubuntu-latest
+    # Backstop for the helper's bounded local-setup wait: the helper owns the real deadline and
+    # refuses rather than hangs, and this stops a stalled poll from holding the run open.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      # The ONE write grant in this workflow, and the reason this is a SEPARATE job. It manufactures
+      # TEST-ONLY check names on JOURNALED SYNTHETIC commits, giving the actor matrix a second
+      # independent measured producer (the GitHub Actions app) for its wrong-producer control cases.
+      # It is deliberately NOT enrolled in a protected environment and holds NO App secret: a job
+      # that can mint a check must not also be able to move a ref, and it must be able to run while
+      # `normal` / `emergency` are still parked waiting for a human.
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # A HELPER, not a CLI phase: the phase enum is closed by the spec, so the fixture calls
+      # `runFixtureChecks` directly on a fixed inline module command with no arguments to widen. The
+      # helper guards `GITHUB_JOB=fixture` itself and takes its evidence dir from the environment.
+      - name: Await local setup and mint TEST-ONLY checks on synthetic commits
+        env:
+          COMMISSIONING_EVIDENCE_DIR: ${{ runner.temp }}/policy-commissioning
+          # Carries the `checks: write` above and nothing else.
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node --input-type=module -e 'import { runFixtureChecks } from "./scripts/staging-ops/policy-commissioning.mjs"; await runFixtureChecks(process.env);'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/fixture.json
+          if-no-files-found: error
+          retention-days: 30
+
+  normal:
+    name: Normal App actor tests (protected)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging'
+    # `fixture` is a REAL dependency: the normal App's accepted case requires every exact synthetic
+    # check already green on the target commit, and its missing/red/wrong-producer denials require
+    # those checks in a known state first. It also means this job only enters "waiting for approval"
+    # once local setup has completed — the state PC-03 asks a human to inspect before approving.
+    needs: [intent, fixture]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Protected: parks until a human reviewer approves. That approval — captured from GitHub's own
+    # review history — IS the PC-06 evidence; nothing here may self-approve.
+    environment: staging-release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Run normal App actor matrix on derived disposable refs
+        env:
+          # EXACTLY the three normal-identity secrets. No emergency key, no operator/admin
+          # credential, no provider token. The ACTOR in the matrix is only ever the short-lived
+          # installation token minted from these.
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_INSTALLATION_ID: ${{ secrets.RELEASE_APP_INSTALLATION_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # READ-ONLY workflow token, for `actions: read` / `contents: read` metadata only (the setup
+          # readback and commit-graph verification). Never an actor — see the header token contract.
+          GITHUB_TOKEN: ${{ github.token }}
+          # NOT secrets: the shared nonsecret identity set, as repository variables. PC-04 requires
+          # this job to refuse identical normal/emergency App IDs, which it cannot check against an
+          # identity it was never told; numeric App/repository/producer IDs are public metadata,
+          # while the counterpart PRIVATE KEY stays in `staging-emergency`.
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs normal-tests
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-normal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/normal-tests.json
+          if-no-files-found: error
+          retention-days: 30
+
+  emergency:
+    name: Emergency App actor tests (protected)
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging'
+    # Only `intent`. The emergency case is "fast-forward with checks ABSENT accepted", so it has no
+    # dependency on the fixture's checks, and it targets its own distinct disposable ref (PC-03) so it
+    # cannot race `normal`. Its readiness gate is the human approval below; the runner still
+    # re-verifies the setup readback from trusted run metadata before it acts.
+    needs: intent
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: staging-emergency
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Run emergency App actor matrix on derived disposable refs
+        env:
+          # EXACTLY the three emergency-identity secrets — the mirror image of the normal job.
+          EMERGENCY_APP_ID: ${{ secrets.EMERGENCY_APP_ID }}
+          EMERGENCY_APP_INSTALLATION_ID: ${{ secrets.EMERGENCY_APP_INSTALLATION_ID }}
+          EMERGENCY_APP_PRIVATE_KEY: ${{ secrets.EMERGENCY_APP_PRIVATE_KEY }}
+          # READ-ONLY metadata token, same rationale as the normal job's.
+          GITHUB_TOKEN: ${{ github.token }}
+          # Shared nonsecret identity set, same rationale as the normal job's.
+          COMMISSIONING_NORMAL_APP_ID: ${{ vars.COMMISSIONING_NORMAL_APP_ID }}
+          COMMISSIONING_EMERGENCY_APP_ID: ${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}
+          COMMISSIONING_PRODUCER_IDS_JSON: ${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}
+          COMMISSIONING_REPOSITORY_ID: ${{ vars.COMMISSIONING_REPOSITORY_ID }}
+        run: >-
+          node scripts/staging-ops/policy-commissioning.mjs emergency-tests
+          --run-id "$GITHUB_RUN_ID"
+          --attempt "$GITHUB_RUN_ATTEMPT"
+          --evidence-dir "$RUNNER_TEMP/policy-commissioning"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-commissioning-emergency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/policy-commissioning/emergency-tests.json
+          if-no-files-found: error
+          retention-days: 30
