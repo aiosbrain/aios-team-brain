@@ -1806,3 +1806,20 @@ npm run check:docs   # run locally before pushing
 
 When you add/remove a route, table, or source: update the matching block here in the same
 PR. The guard verifies structure only — keep the diagrams and prose accurate by review.
+
+### Health v3 ledger compatibility (AIO-1171)
+
+The existing `reconcile_codebase_findings` RPC admits persisted health v2/v3 and
+orders newest evidence across both versions. Migration
+`20260910060000_codebase_finding_health_v3.sql` and the bootstrap schema contain
+the same function. Exact team/codebase/head/JSONB identity and the transaction-scoped
+advisory lock remain unchanged; lifecycle history stays in the existing ledger.
+This database prerequisite does not enable the public v3 boundary or TypeScript
+wrapper: AIO-1096 owns that consumer activation, and AIO-1097 owns emission.
+
+Metrics upsert and ledger reconciliation remain separate transactions; a concurrent
+same-head replacement can make the superseded RPC fail its identity check. This
+change neither weakens that check nor claims whole-ingest transaction atomicity.
+Before activation an old-function rollback preserves v2 operation. After activation,
+retain this compatible RPC or disable v3 emission before a reviewed rollback; never
+delete stored evidence or manually load production schema from a worktree.

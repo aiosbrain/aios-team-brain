@@ -1866,7 +1866,7 @@ declare
   v_reopened integer := 0;
   v_stale integer := 0;
 begin
-  if v_schema_version <> '2' then
+  if v_schema_version not in ('2', '3') then
     return jsonb_build_object(
       'detected', 0, 'observed', 0, 'resolved', 0, 'reopened', 0, 'stale', 0
     );
@@ -1889,7 +1889,7 @@ begin
   end if;
 
   -- Serialize lifecycle projection per codebase. Metrics writes happen before this
-  -- function, so whichever reconciliation wins the lock can see every committed v2
+  -- function, so whichever reconciliation wins the lock can see every committed v2/v3
   -- measurement and classify an out-of-order snapshot deterministically.
   perform pg_advisory_xact_lock(
     hashtextextended(p_team_id::text || ':' || p_codebase_id::text, 0)
@@ -1902,7 +1902,7 @@ begin
   from code_metrics
   where team_id = p_team_id
     and codebase_id = p_codebase_id
-    and codebase_health->>'schema_version' = '2';
+    and codebase_health->>'schema_version' in ('2', '3');
   v_snapshot_is_stale := v_observed_at < v_latest_observed_at;
 
   for v_finding in
