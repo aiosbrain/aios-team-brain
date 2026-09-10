@@ -251,7 +251,7 @@ function functionDefinition(source: string) {
 it("upgrades the baseline in place, matches bootstrap, and rolls back/reapplies safely", async () => {
   const baseline = functionDefinition(
     readFileSync(
-      "postgres/migrations/20260804120000_codebase_finding_ledger.sql",
+      "postgres/migrations/20260804160000_explainable_debt_decisions.sql",
       "utf8",
     ),
   );
