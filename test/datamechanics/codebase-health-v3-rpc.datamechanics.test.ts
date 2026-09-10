@@ -23,8 +23,24 @@ const finding = {
   remediation_tier: 0,
 };
 const client = new Client({ connectionString: process.env.DATABASE_TEST_URL });
-beforeAll(() => client.connect());
-afterAll(() => client.end());
+beforeAll(async () => {
+  await client.connect();
+  await client.query(
+    readFileSync(
+      "postgres/migrations/20260910060000_codebase_finding_health_v3.sql",
+      "utf8",
+    ),
+  );
+});
+afterAll(async () => {
+  try {
+    await client.query(
+      functionDefinition(readFileSync("postgres/schema.sql", "utf8")),
+    );
+  } finally {
+    await client.end();
+  }
+});
 
 function health(
   version: "2" | "3",
