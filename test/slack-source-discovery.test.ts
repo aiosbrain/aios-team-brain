@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   classifySlackCall,
+  needsSlackPublicProof,
+  slackWorkspaceUrl,
   validateSlackHistoryPage,
+  SLACK_METADATA_INTERVAL_MS,
   type SlackHistoryPageValidation,
 } from "@/lib/ingest/slack-source-discovery";
 import {
@@ -191,5 +194,120 @@ describe("the effective selection", () => {
     expect(slackConfigRevision({ ...base, updatedAt: "2026-09-09T00:00:01.000Z" })).not.toBe(revision);
     expect(slackConfigRevision({ ...base, status: "disabled" })).not.toBe(revision);
     expect(revision).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("slackWorkspaceUrl", () => {
+  // This is URL INTEGRITY for a stored permalink base — not an SSRF control. Nothing in this slice
+  // fetches the stored value; what it must not do is record a link that points somewhere else.
+  it("canonicalizes a workspace ROOT under .slack.com", () => {
+    // The shape Slack's own auth.test reference documents.
+    expect(slackWorkspaceUrl("https://acme.slack.com/")).toBe("https://acme.slack.com/");
+    // A missing trailing slash is the same root; an explicit default port is the same origin.
+    expect(slackWorkspaceUrl("https://acme.slack.com")).toBe("https://acme.slack.com/");
+    expect(slackWorkspaceUrl("https://acme.slack.com:443/")).toBe("https://acme.slack.com/");
+    // Host case is not identity; the stored value is the normalized one, never the original bytes.
+    expect(slackWorkspaceUrl("https://ACME.slack.com/")).toBe("https://acme.slack.com/");
+    expect(slackWorkspaceUrl("https://work-space-1.slack.com/")).toBe("https://work-space-1.slack.com/");
+  });
+
+  it("refuses every host that is not exactly one label under .slack.com", () => {
+    for (const value of [
+      "https://example.invalid/",
+      // The suffix trick: `.slack.com` appears, and the registrable domain is somebody else's.
+      "https://acme.slack.com.evil.invalid/",
+      // A nested label is a deep host, not a workspace root — one label, no more.
+      "https://nested.foo.slack.com/",
+      "https://slack.com/",
+      "https://-acme.slack.com/",
+      "https://127.0.0.1/",
+      "https://localhost/",
+    ]) {
+      expect(slackWorkspaceUrl(value)).toBeNull();
+    }
+  });
+
+  it("refuses credentials, a non-default port, a non-root path, a query or a fragment", () => {
+    for (const value of [
+      // Credentials in a stored link would be a credential in every log that renders it.
+      "https://user:secret@acme.slack.com/",
+      "https://user@acme.slack.com/",
+      "https://acme.slack.com:8443/",
+      "https://acme.slack.com/archives/C0SOURCE1",
+      "https://acme.slack.com/?redirect=https://evil.invalid",
+      "https://acme.slack.com/#/somewhere",
+      "http://acme.slack.com/",
+      "ftp://acme.slack.com/",
+      "acme.slack.com",
+      "",
+      "   ",
+    ]) {
+      expect(slackWorkspaceUrl(value)).toBeNull();
+    }
+    for (const value of [null, undefined, 42, {}, ["https://acme.slack.com/"]]) {
+      expect(slackWorkspaceUrl(value)).toBeNull();
+    }
+  });
+});
+
+describe("needsSlackPublicProof", () => {
+  const REF = { integrationId: "i-1", configRevision: "r-1" };
+  const NOW = Date.parse("2026-09-09T12:00:00.000Z");
+  const proof = (over: Partial<Parameters<typeof needsSlackPublicProof>[0]> = {}) => ({
+    publicState: "public" as const,
+    publicCheckedAt: "2026-09-09T11:59:00.000Z",
+    bindingIntegrationId: "i-1",
+    bindingConfigRevision: "r-1",
+    ...over,
+  });
+
+  it("reuses a proof made under this binding, inside the cadence", () => {
+    expect(needsSlackPublicProof(proof(), REF, NOW, SLACK_METADATA_INTERVAL_MS)).toBe(false);
+  });
+
+  it("re-observes when there is no proof, or none this binding made", () => {
+    expect(
+      needsSlackPublicProof(
+        proof({ publicState: "unknown", publicCheckedAt: null }),
+        REF,
+        NOW,
+        SLACK_METADATA_INTERVAL_MS
+      )
+    ).toBe(true);
+    expect(needsSlackPublicProof(proof({ publicCheckedAt: null }), REF, NOW, SLACK_METADATA_INTERVAL_MS)).toBe(true);
+    expect(
+      needsSlackPublicProof(proof({ bindingIntegrationId: "i-2" }), REF, NOW, SLACK_METADATA_INTERVAL_MS)
+    ).toBe(true);
+    expect(
+      needsSlackPublicProof(proof({ bindingConfigRevision: "r-2" }), REF, NOW, SLACK_METADATA_INTERVAL_MS)
+    ).toBe(true);
+    // A definitive refusal is re-observed on the same cadence: a channel can become public again.
+    expect(
+      needsSlackPublicProof(
+        proof({ publicState: "private", publicCheckedAt: "2026-09-09T10:00:00.000Z" }),
+        REF,
+        NOW,
+        SLACK_METADATA_INTERVAL_MS
+      )
+    ).toBe(true);
+  });
+
+  it("takes the cadence from its ARGUMENT — no interval is baked into the decision", () => {
+    const aged = proof({ publicCheckedAt: "2026-09-09T11:15:00.000Z" }); // 45 minutes old
+    // The default cadence is the existing scheduled observation interval, not an invented TTL…
+    expect(SLACK_METADATA_INTERVAL_MS).toBe(30 * 60 * 1000);
+    expect(needsSlackPublicProof(aged, REF, NOW, SLACK_METADATA_INTERVAL_MS)).toBe(true);
+    // …and a caller that configures a longer one gets a longer one. A constant read straight from
+    // the module would make this pair impossible to write, which is the point of the parameter.
+    expect(needsSlackPublicProof(aged, REF, NOW, 6 * 60 * 60 * 1000)).toBe(false);
+    // The boundary is inclusive: exactly one cadence old is due.
+    expect(
+      needsSlackPublicProof(
+        proof({ publicCheckedAt: new Date(NOW - SLACK_METADATA_INTERVAL_MS).toISOString() }),
+        REF,
+        NOW,
+        SLACK_METADATA_INTERVAL_MS
+      )
+    ).toBe(true);
   });
 });
