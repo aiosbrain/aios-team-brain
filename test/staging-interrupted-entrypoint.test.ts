@@ -6,7 +6,7 @@ import { loaderCapabilityIdentity } from "../scripts/staging-ops/build-identity.
 const comparisonKey = Buffer.alloc(32, 11);
 const env = {
   STAGING_COMPARISON_KEY_BASE64: comparisonKey.toString("base64"), STAGING_COMPARISON_KEY_ID: "ops-v2",
-  AUTH_SECRET: "staging-auth", SECRETS_KEY: "staging-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "staging-password",
+  AUTH_SECRET: "staging-auth", SECRETS_KEY: "staging-secrets", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "FAKE-staging-password",
 } as NodeJS.ProcessEnv;
 const credentialFingerprints = Object.fromEntries([
   ["auth-secret", "production-auth"], ["secrets-key", "production-secrets"], ["neo4j-credential", "neo4j\0production-password"],

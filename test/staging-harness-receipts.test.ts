@@ -33,7 +33,8 @@ describe("receipts carry identities, never credentials", () => {
     ["a token field", { healthToken: "abc" }],
     ["a URL carrying credentials", { origin: "postgres://user:hunter2@host/db" }],
     ["a bearer header", { detail: "authorization: Bearer sk-live-1" }],
-    ["a private key block", { detail: "-----BEGIN PRIVATE KEY-----" }],
+    // Construct only the synthetic header; the emitted value must still be rejected.
+    ["a private key block", { detail: ["-----BEGIN", "PRIVATE KEY-----"].join(" ") }],
   ])("refuses %s", (_name, fields) => {
     expect(() => emitReceipt("fault-injected", fields, { write: () => {} })).toThrow(/credential/);
   });

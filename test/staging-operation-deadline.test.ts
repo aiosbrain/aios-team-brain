@@ -271,7 +271,7 @@ describe("M8 — the actual exporter retries one whole private capture and publi
     RAILWAY_ENVIRONMENT_ID: "prod", PRODUCTION_EXPORT_ENVIRONMENT_ID: "prod",
     STAGING_MAINTENANCE_ADAPTER: "local", SOURCE_APPLICATION_COMMIT: commit,
     DATABASE_URL: "postgres://u:p@postgres.railway.internal:5432/db", NEO4J_URL: "bolt://neo4j.railway.internal",
-    NEO4J_USER: "neo4j", NEO4J_PASSWORD: "prod-password", NEO4J_DATABASE: "neo4j",
+    NEO4J_USER: "neo4j", NEO4J_PASSWORD: "FAKE-prod-password", NEO4J_DATABASE: "neo4j",
     AUTH_SECRET: "prod-auth", SECRETS_KEY: "prod-secrets",
     STAGING_COMPARISON_KEY_BASE64: Buffer.alloc(32, 7).toString("base64"), STAGING_COMPARISON_KEY_ID: "ops-v2",
     EXPORTER_SIGNING_PRIVATE_KEY: signing.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),

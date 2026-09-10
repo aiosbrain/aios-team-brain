@@ -17,7 +17,7 @@ import { groupAlive, supervisionSupported } from "../scripts/staging-ops/owned-w
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/owned-workload-wrapper.mjs", import.meta.url));
 const CONTROLLER = fileURLToPath(new URL("../scripts/staging-ops/local-maintenance-service.mjs", import.meta.url));
-const TOKEN = "local-maintenance-token";
+const TOKEN = "FAKE-local-maintenance-token";
 const POSIX = supervisionSupported();
 
 async function freePort(): Promise<number> {

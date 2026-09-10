@@ -24,7 +24,7 @@ describe("M3 — Railway's staticUrl is a bare hostname", () => {
   it.each([
     ["nothing", ""],
     ["a scheme that is not https", "http://aios-staging.up.railway.app"],
-    ["credentials", "https://user:pass@aios-staging.up.railway.app"],
+    ["credentials", "https://FAKE-user:FAKE-pass@aios-staging.up.railway.app"],
     ["a path", "https://aios-staging.up.railway.app/app"],
     ["a value that is not a host", "not a host"],
   ])("returns null for %s", (_label, value) => {

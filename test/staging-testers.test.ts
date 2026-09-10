@@ -36,7 +36,7 @@ function db({ row = VALID_ROW as any, teamPosture = true, error = null as { mess
 
 const tester = {
   email: "tester@example.test",
-  password: "a-strong-staging-password",
+  password: "FAKE-strong-staging-password",
   teamId: "team",
   memberId: "member",
   role: "member",
