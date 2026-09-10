@@ -112,13 +112,13 @@
       "sha256": "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e"
     }
   },
-  "contentHash": "22e8b27c0409d56acd7aff72a2da165f3c3b2e9a068c54443a3fa56e93b3f7aa",
+  "contentHash": "640339f218c054dfd39e0e32faf60d50e2f4aac21d63ad1750be870178778a11",
   "debtIntakeEventsContract": {
     "version": "1.26",
     "requestVersion": "debt-intake-events.v1",
     "method": "POST",
     "route": "/api/v1/codebases/:slug/debt-intake-events",
-    "availability": "contract-only; future Team Brain implementation AIO-1101",
+    "availability": "implemented in Team Brain commit 87be1293dd8338dde953020c757bad336f2da9b4; deployment and activation require verification in each target environment; no production availability claim",
     "harnessCommit": "691762a469f5e816d35a6263467c9e2d8cc98e8e",
     "maxRecords": 256,
     "maxRawBodyBytes": 1048576,
