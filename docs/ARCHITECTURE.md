@@ -92,9 +92,12 @@ their own protected environments, and with everything it created deleted afterwa
 mode-0600 append-only journal (`commissioning-journal.mjs`). It promotes nothing: no main promotion,
 no protection mutation, no tag, no deploy, no release acceptance. A denial counts only when the
 provider refused AND the ref is unchanged; an acceptance only when an independent readback shows the
-exact expected descendant; everything else is `inconclusive`. Its two structurally unproducible gates
-— the environment negative controls and the Apps' installation permission sets — stay `unverified` and
-block activation. Sequence: `docs/RELEASING.md` §5; runbook: `docs/OPS.md` §13.
+exact expected descendant; everything else is `inconclusive`. Each protected job measures its own App's
+grants with an App JWT and refuses an unexpected set before exercising the credential, and binds the
+policy on its ref by BODY rather than by name. The one structurally unproducible gate — the protected
+environments' negative controls — stays `unverified` and blocks activation; its operator-supplied proof
+must name a retained artifact whose digest `check-evidence` recomputes. Sequence:
+`docs/RELEASING.md` §5; runbook: `docs/OPS.md` §13.
 
 Draining is a POLL, not a single request. Both maintenance adapters
 (`scripts/staging-ops/local-maintenance.mjs`, `railway-maintenance.mjs`) re-list the active

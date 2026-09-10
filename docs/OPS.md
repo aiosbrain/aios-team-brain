@@ -1220,13 +1220,14 @@ credential that could. The output is one sanitized evidence packet.
 
 | Prerequisite | Why a run without it is not evidence |
 |---|---|
-| Distinct normal + emergency GitHub Apps, installed on **this repository only** | The runner refuses identical App IDs and refuses an installation whose repository selection is not exactly this repo. A shared or org-wide identity is out of scope. |
+| Distinct normal + emergency GitHub Apps, installed on **this repository only** | The runner refuses identical App IDs, and each protected job MEASURES its own App with the App JWT before exercising anything: `GET /app` for the App's declared permissions, `GET /app/installations/<id>` for that installation's granted permissions, `repository_selection` and `suspended_at`. An org-wide, suspended or wrongly-owned installation refuses there. |
+| The exact grants: **normal** = `contents: write`, `checks: write`, `metadata: read`; **emergency** = `contents: write`, `metadata: read` | `ROLE_APP_PERMISSIONS` in the runner is closed BOTH ways — an extra grant, a missing one, and a grant at the wrong level are each a refusal, and all three happen **before the first write**. An over-granted release identity would make an acceptance in the matrix a statement about the grant rather than about the policy. The emergency App must not hold `checks: write`: the identity that can mint a required check must not also be the one whose bypass makes that check irrelevant. |
 | Their keys in `staging-release` / `staging-emergency`, **each in its own environment** | The protected jobs assert they cannot see the counterpart key. Both in one environment is one identity, not two. |
 | John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
 | A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
 | Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
 | Local `gh` admin identity (`johnellison`) | Administers the disposable resources and runs the human/admin cases. It is never uploaded into Actions, and no new long-lived admin token is created. |
-| No release in progress | Cleanup asserts `main`/`staging` SHAs, main's applicable and classic protections, and the `v*` tag ruleset are unchanged. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
+| No release in progress | Cleanup asserts the SHAs, classic protections and resolved applicable-ruleset definitions of **both `main` and `staging`**, plus every `v*` tag ruleset, are unchanged. Every list is read to complete pagination and refuses a full final page rather than assuming it was the last. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
 
 ### The three roles, and the fourth job that is not an actor
 
@@ -1245,44 +1246,100 @@ credential that could. The output is one sanitized evidence packet.
 
 Nine files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
 phase plus the operator-supplied environment controls; `collect` and `check-evidence` write their own
-summaries alongside. Each of the nine is validated for
-schema version, run, attempt and phase before any gate reads a field out of it: a file that belongs to
-another run is discarded and reported `invalid`, because a mis-bound file is worse than an absent one —
-absence blocks loudly, whereas a stale green packet would contribute *passing* gates measured against
-a different subject.
+summaries alongside.
+
+**Nothing in a file is trusted because of its filename.** Each of the nine is checked for its schema
+version, run, attempt, phase, a CLOSED list of required fields, and agreement with the run's immutable
+workflow SHA — before any gate reads a field out of it. A file that fails is discarded and reported
+`invalid`, and the coverage it was carrying is reported LOST rather than quietly assessed as fewer
+cases than the matrix has. Beyond that:
+
+- **Case outcomes are DERIVED, not read.** `passed: true` is a claim a file makes about itself. Every
+  case is re-checked against its own record: the operation and force flag it claims, the ref it names,
+  the before/after/requested SHAs, the HTTP class, whether the diagnostic actually attributes the
+  refusal to a rule, and whether the declared check state was measured before the mutation. A denial
+  on a ref that moved, or an acceptance whose readback is not the requested commit, is not a pass.
+- **A case is only counted from its own actor's file.** A `passed: true` for a normal-App case sitting
+  in the human evidence is not that case's outcome.
+- **Cleanup coverage comes from the verified journal**, not from the cleanup file's own list. An
+  `outcomes: []` satisfies nothing; each journaled ref, ruleset and pull request must have an outcome,
+  and an outcome for a resource the journal does not record this run creating is `invalid`.
+- **The App grants must be the measured object**, matching `ROLE_APP_PERMISSIONS`. A placeholder string
+  in its place is `unverified`, and a file claiming a measurement the harness does not perform is
+  `invalid`.
 
 Three blocker kinds, and they mean different things. **`failed`** is a measured statement about the
 subject. **`unverified`** is "we could not look, or nobody has looked yet". **`invalid`** is "a file
 claiming to be this evidence is not this evidence". Only an empty blocker list is a pass.
 
-### The two things that are honestly unverified
+### The one thing that is honestly unverified
 
-1. **The protected-environment negative controls.** This harness cannot impersonate a second reviewer,
-   cannot read `prevent_self_review` back from the environments API, and a skipped off-branch job
-   proves workflow *admission* rather than environment branch policy. So each control is
-   operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`, named
-   individually (`ENVIRONMENT_CONTROL_KEYS` in the runner) so one observation cannot stand in for
-   seven:
+**The protected-environment negative controls.** This harness cannot impersonate a second reviewer,
+cannot read `prevent_self_review` back from the environments API, and a skipped off-branch job proves
+workflow *admission* rather than environment branch policy — PC-06's own instruction for that last
+case is to report it unverified rather than widen admission to arbitrary refs. So each control is
+operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`.
 
-   ```json
-   {
-     "schema_version": 1, "phase": "environment-controls", "run_id": "…", "attempt": "…",
-     "controls": {
-       "required_reviewer_is_owner":       { "status": "verified",   "evidence": "UI readback <date>" },
-       "unauthorized_reviewer_refused":    { "status": "unverified", "evidence": "no second reviewer identity available" }
-     }
-   }
-   ```
+Because it is operator-supplied, the SHAPE of it is checked hard. A `verified: true` boolean is
+rejected, and so is prose. Every verified record must name a **retained artifact inside the evidence
+directory** and commit to its SHA-256, which `check-evidence` recomputes from the file on disk. That
+is the difference between an attestation and a binding: a reviewer can re-hash the artifact, and an
+operator cannot satisfy the gate by typing a word.
 
-   A `verified` with no `evidence` reference is not a verification, and a control outside the closed
-   list is `invalid`. If the second identity does not exist, leave it `unverified` — that blocks full
-   activation, which is the correct outcome, and is the whole reason the field is per-control.
+Coverage is the **cross product** of the seven controls (`ENVIRONMENT_CONTROL_KEYS`) and the two
+protected environments — fourteen records. The environments are configured separately; one of them
+being right says nothing whatever about the other, and a single record covering "the environments"
+would hide exactly that.
 
-2. **The two release Apps' installation permission sets.** The finite-deadline token helper does not
-   surface an installation token's permissions and no endpoint reports them back for someone else's
-   installation. The actor evidence therefore says `installation_permissions:
-   "unverified-by-this-harness"`, and a file claiming otherwise is `invalid`. Attach the owner-side
-   readback as `normal_app_permissions_confirmed` / `emergency_app_permissions_confirmed`.
+```json
+{
+  "schema_version": 1, "phase": "environment-controls", "run_id": "…", "attempt": "…",
+  "controls": {
+    "prevent_self_review_enabled": {
+      "staging-release": {
+        "status": "verified",
+        "source": "provider-ui",
+        "measured_at": "2026-09-10T09:00:00.000Z",
+        "artifact": "env-prevent-self-review-staging-release.png",
+        "artifact_sha256": "<64 hex, recomputed from that file>",
+        "observed": { "prevent_self_review": true, "reviewers": ["johnellison"] }
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "unauthorized_reviewer_refused": {
+      "staging-release":   { "status": "unverified", "note": "no second reviewer identity is available" },
+      "staging-emergency": { "status": "unverified", "note": "no second reviewer identity is available" }
+    }
+  }
+}
+```
+
+If the second identity does not exist, leave that control `unverified` — it blocks full activation,
+which is the correct outcome, and per-control granularity is the whole reason it does not drag the
+other six down with a single flag.
+
+> **A note on what changed here.** An earlier version of this section claimed the two release Apps'
+> installation permission sets were "an owner provisioning fact this harness does not measure", and
+> asked for them as two more attested controls. That was wrong: each protected job already holds its
+> own App private key and can therefore sign an App JWT, and GitHub documents `GET /app` and
+> `GET /app/installations/{installation_id}` as reporting exactly those grants. They are now MEASURED,
+> in the job, before any credential is exercised — see the prerequisites table above. The two
+> `*_app_permissions_confirmed` controls no longer exist.
+
+### Two live prerequisites this harness cannot establish from a local run
+
+1. **The protected jobs must be able to read ruleset definitions.** Their body binding calls
+   `GET /repos/…/rules/branches/<derived>` and `GET /repos/…/rulesets/<id>` with the read-only
+   `GITHUB_TOKEN`. GitHub does not document a fine-grained permission requirement for either read, so
+   whether that token reaches them is a fact about the live repository, not something a mocked run can
+   settle. If it cannot, the job exits **3** with "could not be measured" — the correct failure, but
+   confirm it on the first live dispatch rather than discovering it after two human approvals.
+2. **Nothing in the harness reads classic branch protection from inside a protected job.** That read
+   needs administrative reach neither the job's `GITHUB_TOKEN` nor its closed App grant set has, and
+   the requirement for the *read* is undocumented. The operator measures that dimension under admin in
+   `setup`, per actor, before the human approves; `check-evidence` requires that verdict. The job's own
+   `policy_in_force` record says so in `classic_protection_scope`, so the verdict cannot be read as
+   covering more than it does.
 
 ### If something goes wrong
 
@@ -1296,6 +1353,13 @@ claiming to be this evidence is not this evidence". Only an empty blocker list i
 - **A stale lock.** Not removed on elapsed time alone: a slow provider call and a dead process look
   identical by clock. Recovery needs positive evidence the owner is gone *and* a provider readback
   that reconciles its last recorded mutation.
-- **`cleanup` reports a refusal.** A resource whose name or exact derived target no longer matches its
-  journaled fingerprint is left in place for a human. It is never deleted by wildcard or by prefix
-  sweep, and an owned leftover is reported as a cleanup refusal rather than as production drift.
+- **`cleanup` reports a refusal.** A ruleset is deleted only if its COMPLETE governed fingerprint —
+  name, target, enforcement, conditions, bypass actors and rules, hashed from the readback journaled
+  at creation — still matches. A body edited at the same ID, name and target is a different policy and
+  is left in place for a human. Nothing is ever deleted by wildcard or by prefix sweep, and an owned
+  leftover is reported as a cleanup refusal rather than as production drift.
+- **A crashed cleanup.** Recovery reconciles a pending `cleanup-intent` as well as a pending
+  mutation — an interrupted DELETE is the most consequential thing a crashed cleanup leaves behind,
+  and it is the one a resumed run most needs read back before deciding anything. Recoveries are
+  serialised by their own lock, and a recovery whose original lock was replaced while it was
+  reconciling refuses rather than removing the new owner's lock.

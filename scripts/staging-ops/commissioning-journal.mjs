@@ -89,6 +89,15 @@ const baseName = (runId, attempt) => `commissioning-${runId}-${attempt}`;
 export const journalPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.jsonl`);
 export const lockPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.lock`);
 export const snapshotPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.snapshot.json`);
+/**
+ * A SECOND lock, held only for the duration of a recovery.
+ *
+ * The run lock cannot serialise its own replacement: two recoveries both find the same stale owner,
+ * both reconcile, and both then unlink the pathname — so the second deletes the lock the first just
+ * acquired, and two writers proceed believing they own the run. This one is created `wx` before
+ * anything is read and released only at the end, so exactly one recovery can be in flight.
+ */
+export const recoveryLockPath = (dir, runId, attempt) => path.join(dir, `${baseName(runId, attempt)}.recovery.lock`);
 
 /**
  * The evidence directory must be a real, private directory this process owns.
@@ -201,11 +210,18 @@ export function readLockOwner(dir, runId, attempt) {
 /**
  * Explicit local recovery of a lock whose owner is gone (PC-03).
  *
- * Two proofs are REQUIRED and neither is inferable from the file itself:
- *  - `ownerGone` — the caller verified the recorded PID/host is not running this run. Elapsed time
- *    is not that proof; a slow provider call looks exactly like a dead process.
+ * THREE proofs are REQUIRED and none is inferable from the lock file:
+ *  - `ownerGone` — the caller verified the recorded PID/host is not running this run. Elapsed time is
+ *    not that proof; a slow provider call looks exactly like a dead process.
  *  - `reconcile` — a provider READBACK of the last recorded mutation, so the run resumes from what
  *    the provider actually holds rather than from what the journal last intended.
+ *  - the lock is STILL the one this recovery started from, re-read immediately before replacement.
+ *
+ * The last of those is what stops a recovery from deleting a live owner's lock: `reconcile` is
+ * awaited, and in that window another recovery can complete and take the lock. Comparing the nonce
+ * at replacement time turns that race into a refusal. A recovery-scoped lock makes the race rare;
+ * the nonce check makes it safe, and both are needed — the first alone leaves the window open across
+ * processes that were already past it.
  *
  * An unreconciled or unknown last mutation stays inconclusive. Nothing here adopts or deletes a
  * resource to make the chain look complete.
@@ -213,27 +229,61 @@ export function readLockOwner(dir, runId, attempt) {
 export async function recoverJournalLock({ dir, runId, attempt, ownerGone, reconcile, now = () => new Date() }) {
   assertRunIdentity(runId, attempt);
   const root = assertPrivateDirectory(dir);
-  const owner = readLockOwner(root, runId, attempt);
-  if (!owner) throw new JournalRefusalError("there is no lock to recover for this run");
-  if (ownerGone !== true) throw new JournalRefusalError("lock recovery requires explicit verification that the recorded owner is gone; elapsed time is not that verification");
-  if (typeof reconcile !== "function") throw new JournalRefusalError("lock recovery requires a provider readback reconciliation");
-  const records = readJournal({ dir: root, runId, attempt });
-  const lastIntent = [...records].reverse().find((record) => record.type === "mutation-intent");
-  const lastResult = [...records].reverse().find((record) => record.type === "mutation-result");
-  const unresolved = lastIntent && (!lastResult || lastResult.seq < lastIntent.seq) ? lastIntent : null;
-  const reconciliation = await reconcile(unresolved ? { ...unresolved.data } : null);
-  if (reconciliation?.reconciled !== true) {
-    throw new JournalRefusalError("the last recorded mutation could not be reconciled by provider readback; the run stays inconclusive");
+  const recoveryLock = recoveryLockPath(root, runId, attempt);
+  assertRegularOrAbsent(recoveryLock);
+  let recoveryFd;
+  try {
+    recoveryFd = openSync(recoveryLock, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new JournalRefusalError("another recovery of this run is already in flight; recoveries are serialised");
+    throw error;
   }
-  unlinkSync(lockPath(root, runId, attempt));
-  const lock = acquireJournalLock({ dir: root, runId, attempt, now });
-  const journal = openJournal({ dir: root, runId, attempt, source: records[0]?.source ?? "unknown", lock });
-  journal.append("recovery", {
-    replaced_owner: { pid: owner.pid, host: owner.host, acquired_at: owner.acquired_at },
-    unresolved_intent_seq: unresolved?.seq ?? null,
-    readback: reconciliation.readback ?? null,
-  });
-  return { lock, journal, unresolvedIntent: unresolved?.data ?? null, readback: reconciliation.readback ?? null };
+  try {
+    writeSync(recoveryFd, `${JSON.stringify({ v: JOURNAL_SCHEMA_VERSION, pid: process.pid, host: hostname(), started_at: now().toISOString() })}\n`);
+    fsyncSync(recoveryFd);
+  } finally {
+    closeSync(recoveryFd);
+  }
+  try {
+    const owner = readLockOwner(root, runId, attempt);
+    if (!owner) throw new JournalRefusalError("there is no lock to recover for this run");
+    if (ownerGone !== true) throw new JournalRefusalError("lock recovery requires explicit verification that the recorded owner is gone; elapsed time is not that verification");
+    if (typeof reconcile !== "function") throw new JournalRefusalError("lock recovery requires a provider readback reconciliation");
+    if (typeof owner.nonce !== "string" || !owner.nonce) throw new JournalRefusalError("the lock being recovered carries no owner nonce; it cannot be identified at replacement");
+    const records = readJournal({ dir: root, runId, attempt });
+
+    // The unresolved mutation may be a CLEANUP one. Looking only at `mutation-*` omits an interrupted
+    // ruleset or ref DELETE — the most consequential thing a crashed cleanup can leave behind, and
+    // the one a resumed run most needs reconciled before it decides anything.
+    const INTENTS = ["mutation-intent", "cleanup-intent"];
+    const RESULTS = ["mutation-result", "cleanup-result"];
+    const lastIntent = [...records].reverse().find((record) => INTENTS.includes(record.type));
+    const lastResult = [...records].reverse().find((record) => RESULTS.includes(record.type));
+    const unresolved = lastIntent && (!lastResult || lastResult.seq < lastIntent.seq) ? lastIntent : null;
+    const reconciliation = await reconcile(unresolved ? { kind_of_intent: unresolved.type, ...unresolved.data } : null);
+    if (reconciliation?.reconciled !== true) {
+      throw new JournalRefusalError("the last recorded mutation could not be reconciled by provider readback; the run stays inconclusive");
+    }
+
+    // Re-read AFTER the await. If the lock is gone or is somebody else's, this recovery lost the race
+    // and must not unlink: the file it would remove now belongs to a writer that believes it owns the
+    // run, and removing it is how provider cleanup interleaves with that writer.
+    const current = readLockOwner(root, runId, attempt);
+    if (!current) throw new JournalRefusalError("the lock this recovery started from was already released; re-check the run rather than replacing it");
+    if (current.nonce !== owner.nonce) throw new JournalRefusalError("the lock was replaced while this recovery was reconciling; refusing to remove the new owner's lock");
+    unlinkSync(lockPath(root, runId, attempt));
+    const lock = acquireJournalLock({ dir: root, runId, attempt, now });
+    const journal = openJournal({ dir: root, runId, attempt, source: records[0]?.source ?? "unknown", lock });
+    journal.append("recovery", {
+      replaced_owner: { pid: owner.pid, host: owner.host, acquired_at: owner.acquired_at },
+      unresolved_intent_seq: unresolved?.seq ?? null,
+      unresolved_intent_type: unresolved?.type ?? null,
+      readback: reconciliation.readback ?? null,
+    });
+    return { lock, journal, unresolvedIntent: unresolved?.data ?? null, unresolvedIntentType: unresolved?.type ?? null, readback: reconciliation.readback ?? null };
+  } finally {
+    try { unlinkSync(recoveryLock); } catch { /* a recovery that never created it has nothing to remove */ }
+  }
 }
 
 /**

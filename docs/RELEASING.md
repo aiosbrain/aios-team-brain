@@ -483,6 +483,25 @@ is DERIVED inside the runner from the GitHub run ID and attempt
 an independent request boundary enforces a verb + endpoint + body allowlist, so routing a call through
 a helper cannot reach a target the guard would refuse. There is no input to type a target into.
 
+**Four things it measures rather than assumes**, because each was a place where a green result would
+otherwise have meant less than it appeared to:
+
+- **The App grants, before any credential is exercised.** Each protected job signs an App JWT from its
+  own private key and reads `GET /app` and `GET /app/installations/<id>`; the installation's granted
+  permissions must equal the closed set for that role exactly, and the installation must be
+  selected-repository and unsuspended. An extra grant refuses there, before the first write.
+- **The policy in force on its own ref, by BODY.** The job re-derives the plan, binds the manifest to
+  that derivation, and re-runs the complete inverse-transformed compatibility check against what the
+  provider actually holds. A same-named ruleset whose rules were rewritten after the human approved is
+  refused, not accepted.
+- **The pull request's current target, immediately before the merge attempt.** Both repositories, both
+  refs, the state and the head SHA — and the merge itself carries that head SHA as a condition. A
+  retargeted pull request would otherwise put a real merge into a production ref under the local admin
+  credential, and the case's own readback of the disposable ref could not have detected it.
+- **Both `main` and `staging`**, resolved to complete ruleset definitions over complete pagination.
+  Staging is the dispatch branch and the contribution base; measuring only main and then reporting
+  "production unchanged" would be a claim about half of production.
+
 **The operator sequence.** Root dispatches the workflow, reads the exact run, and drives the local
 phases with the MEASURED run ID and attempt — never a guessed one:
 
@@ -504,8 +523,11 @@ failure, `2` an invalid invocation, `3` incomplete or ambiguous evidence. Do NOT
 `&&`/`;` and read the last line: `collect` before cleanup is *expected* to exit 3, and the difference
 between 1 and 3 is the difference between "the policy is wrong" and "we could not look".
 
-**`check-evidence` is the authoritative gate, and passing it is still not authorization.** A complete
-actor matrix says the mechanics behave as designed on disposable refs. It does not say the twelve real
-production context producers ran, and it is not a decision to change main's policy — that remains a
-separate, root-owned step with its own gates. The runbook, the prerequisites, and what a
+**`check-evidence` is the authoritative gate, it trusts nothing for its filename, and passing it is
+still not authorization.** It re-derives every case outcome from what the record measured rather than
+reading its `passed` field, counts a case only from its own actor's file, computes cleanup coverage
+from the verified journal, and re-hashes each PC-06 environment proof from the artifact on disk. And
+then: a complete actor matrix says the mechanics behave as designed on disposable refs. It does not say
+the twelve real production context producers ran, and it is not a decision to change main's policy —
+that remains a separate, root-owned step with its own gates. The runbook, the prerequisites, and what a
 DELIBERATELY-unverified PC-06 control looks like are in `docs/OPS.md` §13.

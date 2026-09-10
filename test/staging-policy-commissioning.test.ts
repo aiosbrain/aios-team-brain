@@ -7,14 +7,16 @@ import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ALLOWED_OPERATIONS, ALLOWED_REQUEST_SCOPES, COMMISSIONING_REPOSITORY, COMMISSIONING_WORKFLOW_PATH,
-  ENVIRONMENT_CONTROL_KEYS, PROTECTED_JOBS, RESULT_SCHEMA_VERSION,
+  ENVIRONMENT_CONTROL_KEYS, PROTECTED_JOBS, RESULT_SCHEMA_VERSION, ROLE_APP_PERMISSIONS,
   assertAllowedRequest, assertCasePrecondition, assertDerivedRef, assertManifestBinding,
   assessEvidence, awaitManifestFromRef, buildActorMatrix, buildGraphPlan, classifyCaseOutcome,
-  collectSentinels, createRedactor, derivedContextNames, derivedRef, derivedRefs,
-  derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug, invertDisposable, main,
-  parseArgs, readApplicableBranchRulesets, readEvidenceFile, runCloudTestsPhase, runFixtureChecks,
-  runHumanTestsPhase, runIntentPhase, runPhase, transformToDisposable, validateEvidenceBinding,
-  writeEvidenceFile,
+  collectSentinels, comparePermissions, createRedactor, deriveCaseVerdict, derivedContextNames,
+  derivedRef, derivedRefs, derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug,
+  assertPlannedPolicyInForce, assertSyntheticPullTarget, governedFingerprint, invertDisposable,
+  evidenceFileName, main, mintAppJwt, parseArgs, readAllPages,
+  readApplicableBranchRulesets, readEvidenceFile, runCloudTestsPhase, runFixtureChecks,
+  runHumanTestsPhase, runIntentPhase, runPhase, transformToDisposable, validateEnvironmentControl,
+  validateEvidenceBinding, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
@@ -89,9 +91,33 @@ type CheckRun = { name: string; status: string; conclusion: string; app: { id: n
 type StoredCommit = { sha: string; message: string; tree: { sha: string }; parents: { sha: string }[] };
 type StoredTree = { sha: string; tree: { path: string; mode: string; type: string; sha: string }[]; truncated: boolean };
 type StoredBlob = { sha: string; encoding: string; content: string };
-type StoredPull = { number: number; state: string; base: { ref: string }; head: { ref: string }; title?: string };
+type StoredPull = {
+  number: number;
+  state: string;
+  title?: string;
+  base: { ref: string; repo: { full_name: string } };
+  head: { ref: string; repo: { full_name: string }; sha: string };
+};
 type ApprovalEntry = { state: string; user: { login: string; type: string }; environments: { name: string }[] };
 type ApplicableRule = { type: string; ruleset_id?: number; ruleset_source_type?: string; ruleset_source?: string };
+type Permissions = Record<string, string>;
+
+/**
+ * What the provider reports for each role's App and installation — the subject of PC-04's grant
+ * gate. Held here (not derived from the runner's own closed set) so a test can present grants that
+ * DISAGREE with what the harness requires, which is the only way that gate is falsifiable.
+ */
+const APP_METADATA: Record<string, { id: number; slug: string; permissions: Permissions; installationId: string }> = {
+  normal: { id: NORMAL_APP, slug: "aios-release", permissions: { checks: "write", contents: "write", metadata: "read" }, installationId: "5001" },
+  emergency: { id: EMERGENCY_APP, slug: "aios-emergency", permissions: { contents: "write", metadata: "read" }, installationId: "5002" },
+};
+const INSTALLATION_ROLES: Record<string, string> = { 5001: "normal", 5002: "emergency" };
+/** The `phase` each evidence file must declare — used to build deliberately malformed packets. */
+const EVIDENCE_PHASES: Record<string, string> = {
+  intent: "intent", setup: "setup", fixture: "fixture-checks", human: "human-tests",
+  normal: "normal-tests", emergency: "emergency-tests", approvals: "approvals",
+  environment: "environment-controls", cleanup: "cleanup",
+};
 
 /**
  * The union of every request body this fake is asked to handle. Optional throughout: each endpoint
@@ -185,6 +211,10 @@ interface FakeOptions {
    * an acceptance on an unprotected branch from being recorded as a bypass.
    */
   ignoreRuleTypes?: string[];
+  /** Override the permissions the provider reports for a role's App and installation. */
+  appPermissions?: Record<string, Permissions>;
+  /** Override the installation's repository selection or suspension, per role. */
+  installationOverrides?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -293,7 +323,28 @@ function createFakeGitHub(options: FakeOptions = {}) {
 
     if (pathname === "/user") return json(200, { login: "johnellison", type: "User", id: 4242 });
     if (pathname === "/installation/repositories") {
-      return json(200, { total_count: 1, repository_selection: "selected", repositories: [{ id: REPOSITORY_ID }] });
+      // EXACTLY the documented shape: `total_count` + `repositories`. No `repository_selection` —
+      // that field lives on the installation, and asking this endpoint for it was the bug.
+      return json(200, { total_count: 1, repositories: [{ id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY }] });
+    }
+    // The App JWT's two read endpoints. The credential decides which App answers, exactly as the
+    // provider's JWT-issuer validation does.
+    if (pathname === "/app") {
+      const meta = APP_METADATA[actorName];
+      if (!meta) return json(401, { message: "Bad credentials" });
+      return json(200, { id: meta.id, slug: meta.slug, permissions: options.appPermissions?.[actorName] ?? meta.permissions });
+    }
+    const installationMatch = /^\/app\/installations\/(\d+)$/.exec(pathname);
+    if (installationMatch) {
+      const role = INSTALLATION_ROLES[installationMatch[1]];
+      const meta = APP_METADATA[role ?? ""];
+      if (!meta || role !== actorName) return json(404, { message: "Not Found" });
+      return json(200, {
+        id: Number(installationMatch[1]), app_id: meta.id, account: { login: "aiosbrain", type: "Organization" },
+        permissions: options.appPermissions?.[actorName] ?? meta.permissions,
+        repository_selection: "selected", suspended_at: null,
+        ...(options.installationOverrides?.[actorName] ?? {}),
+      });
     }
     if (rel === "") return json(200, { id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY });
     if (rel === "/collaborators/johnellison/permission") return json(200, { permission: "admin" });
@@ -406,7 +457,11 @@ function createFakeGitHub(options: FakeOptions = {}) {
     if (checkRunsMatch) return json(200, { check_runs: checks.get(checkRunsMatch[1]) ?? [] });
     if (rel === "/pulls" && method === "POST") {
       const number = (nextPull += 1);
-      pulls.set(number, { number, state: "open", base: { ref: body.base }, head: { ref: body.head }, title: body.title });
+      pulls.set(number, {
+        number, state: "open", title: body?.title,
+        base: { ref: String(body?.base), repo: { full_name: COMMISSIONING_REPOSITORY } },
+        head: { ref: String(body?.head), repo: { full_name: COMMISSIONING_REPOSITORY }, sha: refs.get(`refs/heads/${String(body?.head)}`)! },
+      });
       return json(201, pulls.get(number));
     }
     const pullMatch = /^\/pulls\/(\d+)(\/merge)?$/.exec(rel ?? "");
@@ -417,15 +472,20 @@ function createFakeGitHub(options: FakeOptions = {}) {
       if (method === "GET") return json(200, pull);
       if (method === "PATCH") { pull.state = body.state; return json(200, pull); }
       const base = `refs/heads/${pull.base.ref}`;
-      const denial = evaluate(base, "merge", actor, refs.get(`refs/heads/${pull.head.ref}`)!);
+      const headSha = refs.get(`refs/heads/${pull.head.ref}`)!;
+      // The documented head-SHA condition: a mismatch is a 409 and no merge happens.
+      if (body?.sha !== undefined && String(body.sha) !== headSha) {
+        return json(409, { message: "Head branch was modified. Review and try the merge again." });
+      }
+      const denial = evaluate(base, "merge", actor, headSha);
       if (denial) return json(405, { message: denial });
-      refs.set(base, refs.get(`refs/heads/${pull.head.ref}`)!);
+      refs.set(base, headSha);
       return json(200, { merged: true });
     }
     return json(404, { message: "Not Found" });
   }
 
-  const tokenActor = (token: string) => token.replace(/-token$/, "");
+  const tokenActor = (token: string) => token.replace(/-(token|jwt)$/, "");
 
   const fetchImpl = (async (input: unknown, init: RequestInit = {}) => {
     const url = new URL(String(input));
@@ -522,9 +582,17 @@ const NORMAL_JOB_ENV = { RELEASE_APP_ID: String(NORMAL_APP), RELEASE_APP_INSTALL
 const EMERGENCY_JOB_ENV = { EMERGENCY_APP_ID: String(EMERGENCY_APP), EMERGENCY_APP_INSTALLATION_ID: "5002", EMERGENCY_APP_PRIVATE_KEY: SENTINEL_KEY };
 
 const mintToken = async ({ appId }: { appId: string }) => (Number(appId) === NORMAL_APP ? "normal-token" : "emergency-token");
+/**
+ * A stubbed App JWT. The real `mintAppJwt` signs with `jose` and is exercised directly in its own
+ * case below; here the point is the credential's IDENTITY, which the fake resolves the same way
+ * GitHub resolves a JWT issuer.
+ */
+const mintAppJwtStub = async ({ appId }: { appId: string }) => (Number(appId) === NORMAL_APP ? "normal-jwt" : "emergency-jwt");
 
 const localDeps = (github: ReturnType<typeof createFakeGitHub>) => ({ spawnImpl: github.spawnImpl });
-const cloudDeps = (github: ReturnType<typeof createFakeGitHub>) => ({ fetchImpl: github.fetchImpl, createInstallationToken: mintToken });
+const cloudDeps = (github: ReturnType<typeof createFakeGitHub>) => ({
+  fetchImpl: github.fetchImpl, createInstallationToken: mintToken, mintAppJwt: mintAppJwtStub,
+});
 
 /**
  * The intent job as the workflow actually runs it: NO `GITHUB_TOKEN`, and no transport passed in.
@@ -556,6 +624,33 @@ async function commissionEverything(github: ReturnType<typeof createFakeGitHub>)
   const emergency = await runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: cloudDeps(github) });
   return { fixture, normal, human, emergency };
 }
+
+/**
+ * Build a complete, VALID PC-06 environment-controls packet: one bound proof per control per
+ * protected environment, each naming a retained artifact whose SHA-256 is recomputed from disk by
+ * `assessEvidence`. This is what "not a boolean" costs, and it is the whole point — the packet cannot
+ * be satisfied by typing a word.
+ */
+const environmentControls = (dir: string, mutate: (controls: Record<string, Record<string, unknown>>) => void = () => {}) => {
+  const controls: Record<string, Record<string, unknown>> = {};
+  for (const key of ENVIRONMENT_CONTROL_KEYS as string[]) {
+    controls[key] = {};
+    for (const spec of PROTECTED_JOBS as { environment: string }[]) {
+      const name = `env-${key}-${spec.environment}.json`;
+      const bytes = Buffer.from(`${JSON.stringify({ control: key, environment: spec.environment, observed: true }, null, 2)}\n`, "utf8");
+      writeFileSync(path.join(dir, name), bytes);
+      controls[key][spec.environment] = {
+        status: "verified", source: "provider-api", measured_at: "2026-09-10T09:00:00.000Z",
+        artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex"),
+        observed: { environment: spec.environment, field: key, value: true },
+      };
+    }
+  }
+  mutate(controls);
+  return writeEvidenceFile(dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+    schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT, controls,
+  });
+};
 
 /** Deterministic, instant timing for the fixture's bounded wait — no real clock, no real sleep. */
 const WAIT = { intervalMs: 1, deadlineMs: 1_000, now: () => 0, sleep: async () => {} };
@@ -658,6 +753,10 @@ describe("PC-01 fixed targets and request-boundary allowlists refuse before cred
       "/repos/aiosbrain/aios-team-brain.wiki/rulesets",
       "/orgs/other-org/rulesets/7001",
       "/orgs/aiosbrain-evil/rulesets/7001",
+      // The App scope: the endpoints are fixed and installation-bound, and there is no `/apps/…`
+      // route in the allowlist at all.
+      "/apps/other-app",
+      "/app/hook/config",
       "/user/repos",
       "/installation/repositories/other",
       "//api.evil.example/repos/aiosbrain/aios-team-brain",
@@ -954,13 +1053,64 @@ describe("PC-04 the disposable transformation is closed and invertible, and appl
     expect(page).toBe(20);
   });
 
-  it("refuses an installation that is not scoped to exactly this repository", async () => {
+  it("measures the App's ACTUAL grants with the App JWT and refuses an unexpected set BEFORE any write", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
+    expect(normal.status).toBe("passed");
+    const grants = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")).actor.grants;
+    // MEASURED, from the endpoints that document each field — not a placeholder string, and not
+    // `repository_selection` scraped off an endpoint that never returns it.
+    expect(grants).toMatchObject({
+      measured: true, app_id: NORMAL_APP, installation_app_id: NORMAL_APP, installation_id: "5001",
+      repository_selection: "selected", suspended: false,
+      installation_permissions: { checks: "write", contents: "write", metadata: "read" },
+    });
+    // And it happened BEFORE the first write: the grant reads precede the check publication.
+    const order = github.calls.filter((call) => call.actor === "normal").map((call) => `${call.method} ${call.path}`);
+    const firstWrite = order.findIndex((entry) => entry.startsWith("POST") || entry.startsWith("PATCH") || entry.startsWith("PUT") || entry.startsWith("DELETE"));
+    expect(order.indexOf("GET /app")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("GET /app")).toBeLessThan(firstWrite);
+    expect(order.indexOf("GET /app/installations/5001")).toBeLessThan(firstWrite);
+  });
+
+  it("refuses each way an App's installation can be wrong, and refuses it before exercising the credential", async () => {
+    const cases: [string, FakeOptions, RegExp][] = [
+      // An extra grant is the dangerous one: an over-granted release identity turns an acceptance in
+      // the matrix into a statement about the grant rather than about the policy.
+      ["an extra grant", { appPermissions: { normal: { checks: "write", contents: "write", metadata: "read", administration: "write" } } }, /unexpected: administration/],
+      ["a missing grant", { appPermissions: { normal: { contents: "write", metadata: "read" } } }, /missing: checks/],
+      ["a grant at the wrong level", { appPermissions: { normal: { checks: "read", contents: "write", metadata: "read" } } }, /wrong level: checks=read/],
+      ["an org-wide installation", { installationOverrides: { normal: { repository_selection: "all" } } }, /not limited to selected repositories/],
+      ["a suspended installation", { installationOverrides: { normal: { suspended_at: "2026-09-01T00:00:00Z" } } }, /suspended/],
+      ["an installation belonging to another App", { installationOverrides: { normal: { app_id: 999 } } }, /belongs to App 999/],
+    ];
+    for (const [label, options, expected] of cases) {
+      const dir = mkdtempSync(path.join(tmpdir(), "aio1124-"));
+      created.push(dir);
+      const github = createFakeGitHub(options);
+      await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: INTENT_ENV() });
+      await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: LOCAL_ENV, deps: localDeps(github) });
+      await expect(
+        runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir: dir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) }),
+        label,
+      ).rejects.toThrow(expected);
+      // NOTHING was written with the App credential: no check minted, no ref moved.
+      expect(github.calls.filter((call) => call.actor === "normal" && call.method !== "GET"), label).toEqual([]);
+    }
+  });
+
+  it("binds the installation TOKEN to its one repository, using only what that endpoint documents", async () => {
     const github = createFakeGitHub();
     await intentAndSetup(github);
     for (const [label, body] of [
-      ["installed org-wide", { total_count: 1, repository_selection: "all", repositories: [{ id: REPOSITORY_ID }] }],
-      ["covering a second repository", { total_count: 2, repository_selection: "selected", repositories: [{ id: REPOSITORY_ID }, { id: 999 }] }],
-      ["scoped to a different repository", { total_count: 1, repository_selection: "selected", repositories: [{ id: 999 }] }],
+      ["reaching a second repository", { total_count: 2, repositories: [{ id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY }, { id: 999, full_name: "aiosbrain/other" }] }],
+      ["reaching a different repository", { total_count: 1, repositories: [{ id: 999, full_name: "aiosbrain/other" }] }],
+      ["reporting a mismatched full name", { total_count: 1, repositories: [{ id: REPOSITORY_ID, full_name: "aiosbrain/other" }] }],
+      ["returning an undocumented shape", { total_count: 1 }],
     ] as [string, unknown][]) {
       const fetchImpl = (async (input: unknown, init: RequestInit = {}) => {
         const url = new URL(String(input));
@@ -968,10 +1118,57 @@ describe("PC-04 the disposable transformation is closed and invertible, and appl
         return github.fetchImpl(input as string, init);
       }) as unknown as typeof fetch;
       await expect(
-        runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: { fetchImpl, createInstallationToken: mintToken } }),
-        `installation ${label}`,
-      ).rejects.toThrow(/installation/);
+        runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: { fetchImpl, createInstallationToken: mintToken, mintAppJwt: mintAppJwtStub } }),
+        label,
+      ).rejects.toThrow(/installation token|documented shape/);
     }
+  });
+
+  it("compares a permission set closed in BOTH directions", () => {
+    const expected = ROLE_APP_PERMISSIONS.normal;
+    expect(comparePermissions({ checks: "write", contents: "write", metadata: "read" }, expected)).toMatchObject({ ok: true });
+    // The three ways a grant set can be wrong, each reported separately — an "unexpected" grant is a
+    // different provisioning error from a "missing" one, and the operator fixes them differently.
+    expect(comparePermissions({ checks: "write", contents: "write", metadata: "read", administration: "write" }, expected))
+      .toMatchObject({ ok: false, unexpected: ["administration"], missing: [], wrongLevel: [] });
+    expect(comparePermissions({ contents: "write", metadata: "read" }, expected))
+      .toMatchObject({ ok: false, unexpected: [], missing: ["checks"], wrongLevel: [] });
+    expect(comparePermissions({ checks: "read", contents: "write", metadata: "read" }, expected))
+      .toMatchObject({ ok: false, unexpected: [], missing: [], wrongLevel: ["checks=read (expected write)"] });
+    // Absent, or not an object at all, is not an empty grant set.
+    expect(comparePermissions(undefined, expected)).toMatchObject({ ok: false, missing: ["checks", "contents", "metadata"] });
+    expect(comparePermissions([], expected).ok).toBe(false);
+    // The emergency App must NOT hold `checks: write`: the identity that can mint a required check
+    // must not also be the one whose bypass makes that check irrelevant.
+    expect(ROLE_APP_PERMISSIONS.emergency).not.toHaveProperty("checks");
+    expect(comparePermissions({ checks: "write", contents: "write", metadata: "read" }, ROLE_APP_PERMISSIONS.emergency))
+      .toMatchObject({ ok: false, unexpected: ["checks"] });
+  });
+
+  it("refuses to read an installation other than the one the job holds credentials for", () => {
+    const ctx = { role: "normal", runId: RUN_ID, attempt: ATTEMPT, installationId: "5001", graphShas: new Set<string>(), contextNames: new Set<string>(), rulesetIds: new Set<number>(), rulesetNames: new Set<string>() };
+    expect(assertAllowedRequest({ method: "GET", path: "/app/installations/5001", body: undefined }, ctx)).toBe("read-app-installation");
+    // Any other installation of the same App would be on a repository outside this run's scope.
+    expect(() => assertAllowedRequest({ method: "GET", path: "/app/installations/5002", body: undefined }, ctx)).toThrow(/only the installation this job holds/);
+    expect(() => assertAllowedRequest({ method: "GET", path: "/app/installations/5001", body: undefined }, { ...ctx, installationId: undefined })).toThrow(/own measured installation ID/);
+    // The local operator has no App identity at all.
+    expect(() => assertAllowedRequest({ method: "GET", path: "/app", body: undefined }, { ...ctx, role: "local" })).toThrow(/may not issue read-app/);
+  });
+
+  it("signs a real App JWT bound to the App as issuer, and never lets it or the token reach an artifact", async () => {
+    const { generateKeyPair, exportPKCS8, jwtVerify } = await import("jose");
+    const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+    const jwt = await mintAppJwt({ appId: String(NORMAL_APP), privateKey: await exportPKCS8(privateKey) });
+    const { payload } = await jwtVerify(jwt, publicKey);
+    // The issuer IS the identity claim: a token only verifies against the App's public key if the
+    // private key in this job belongs to that App.
+    expect(payload.iss).toBe(String(NORMAL_APP));
+    expect(Number(payload.exp) - Number(payload.iat)).toBeLessThanOrEqual(120);
+    expect(() => mintAppJwt({ appId: "0", privateKey: "x" })).rejects.toThrow(/positive decimal App ID/);
+    // A learned secret: the redactor is told the JWT and the token the moment each is minted.
+    const redact = createRedactor([]);
+    redact.add(jwt);
+    expect(redact(`Authorization: Bearer ${jwt}`)).not.toContain(jwt.slice(0, 24));
   });
 });
 
@@ -1177,12 +1374,6 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
 // ── PC-06 ─────────────────────────────────────────────────────────────────────
 
 describe("PC-06 protected-environment controls: the approval is read where it can exist, and never invented", () => {
-  const controlsFile = (dir: string, overrides: Record<string, unknown> = {}) => writeEvidenceFile(dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
-    schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
-    controls: Object.fromEntries(ENVIRONMENT_CONTROL_KEYS.map((key: string) => [key, { status: "verified", evidence: `provider readback ${key}` }])),
-    ...overrides,
-  });
-
   it("refuses a setup whose protected environment was ALREADY approved before the plan existed", async () => {
     const github = createFakeGitHub();
     github.approve("emergency");
@@ -1238,7 +1429,7 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     github.approve("normal", "aios-commissioning-dispatcher[bot]", "Bot");
     github.approve("emergency");
     await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
-    controlsFile(evidenceDir);
+    environmentControls(evidenceDir);
     const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
     const selfReview = (blockers as Blocker[]).filter((entry) => entry.kind === "failed" && /self-review/.test(entry.detail));
     expect(selfReview).toHaveLength(1);
@@ -1264,36 +1455,90 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     expect((blockers as Blocker[]).filter((entry) => entry.gate === "PC-06" && entry.kind === "failed")).toEqual([]);
   });
 
-  it("blocks on EACH named environment control, and cannot be satisfied by one blanket flag", () => {
-    // Every control absent.
+  it("blocks on EACH control for EACH environment, and refuses a boolean, prose, or an unbound digest", () => {
+    // Nothing supplied at all.
     expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
       .some((entry: Blocker) => entry.gate === "PC-06" && /environment-controls evidence file is absent/.test(entry.detail))).toBe(true);
-    // A file that asserts the controls with a single true flag and no per-control evidence.
-    controlsFile(evidenceDir, { controls: {}, verified: true });
-    const blanket = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
-      .filter((entry: Blocker) => entry.gate === "PC-06" && /control .* is absent/.test(entry.detail));
-    expect(blanket).toHaveLength(ENVIRONMENT_CONTROL_KEYS.length);
-    // The realistic case: the unauthorized-reviewer control cannot be produced without a second
-    // identity, so it stays unverified — and it alone still blocks.
-    controlsFile(evidenceDir, {
-      controls: {
-        ...Object.fromEntries(ENVIRONMENT_CONTROL_KEYS.map((key: string) => [key, { status: "verified", evidence: "provider readback" }])),
-        unauthorized_reviewer_refused: { status: "unverified", evidence: "no second reviewer identity is available" },
-      },
+
+    const controlBlockers = () => assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
+      .filter((entry: Blocker) => entry.gate === "PC-06" && /protected-environment control/.test(entry.detail));
+
+    // A single blanket boolean — the shape the previous checker accepted outright.
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+      schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+      verified: true, controls: {},
     });
-    const remaining = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
-      .filter((entry: Blocker) => entry.gate === "PC-06" && /unauthorized_reviewer_refused/.test(entry.detail));
-    expect(remaining).toHaveLength(1);
-    // A `verified` claim with no evidence reference is not a verification either.
-    controlsFile(evidenceDir, {
-      controls: Object.fromEntries(ENVIRONMENT_CONTROL_KEYS.map((key: string) => [key, { status: "verified", evidence: "" }])),
+    expect(controlBlockers()).toHaveLength(ENVIRONMENT_CONTROL_KEYS.length);
+
+    // Prose in place of proof: a status word and a sentence, per environment.
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+      schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+      controls: Object.fromEntries((ENVIRONMENT_CONTROL_KEYS as string[]).map((key) => [key, Object.fromEntries(
+        (PROTECTED_JOBS as { environment: string }[]).map((spec) => [spec.environment, { status: "verified", evidence: "checked it in the UI" }]),
+      )])),
     });
-    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
-      .filter((entry: Blocker) => /marked verified with no evidence reference/.test(entry.detail))).toHaveLength(ENVIRONMENT_CONTROL_KEYS.length);
+    // Every one of the twelve is refused: no source, no timestamp, no artifact, no digest.
+    expect(controlBlockers()).toHaveLength(ENVIRONMENT_CONTROL_KEYS.length * PROTECTED_JOBS.length);
+
+    // A complete packet passes — and each proof is a file this checker re-hashed off disk.
+    environmentControls(evidenceDir);
+    expect(controlBlockers()).toEqual([]);
+
+    // The realistic honest gap: no second reviewer identity exists, so that ONE control stays
+    // unverified for both environments and still blocks.
+    environmentControls(evidenceDir, (controls) => {
+      for (const spec of PROTECTED_JOBS as { environment: string }[]) {
+        controls.unauthorized_reviewer_refused[spec.environment] = { status: "unverified", note: "no second reviewer identity is available" };
+      }
+    });
+    expect(controlBlockers().map((entry: Blocker) => entry.detail)).toEqual([
+      expect.stringContaining("unauthorized_reviewer_refused for staging-release is unverified"),
+      expect.stringContaining("unauthorized_reviewer_refused for staging-emergency is unverified"),
+    ]);
+
+    // One environment covered and the other not: they are configured separately, and one being
+    // right says nothing about the other.
+    environmentControls(evidenceDir, (controls) => { delete controls.prevent_self_review_enabled["staging-emergency"]; });
+    expect(controlBlockers().map((entry: Blocker) => entry.detail))
+      .toEqual([expect.stringContaining("prevent_self_review_enabled for staging-emergency is absent")]);
+
+    // A digest that does not match the artifact on disk, and an artifact that is not there at all.
+    environmentControls(evidenceDir, (controls) => {
+      (controls.administrators_cannot_bypass["staging-release"] as Record<string, unknown>).artifact_sha256 = "f".repeat(64);
+      (controls.administrators_cannot_bypass["staging-emergency"] as Record<string, unknown>).artifact = "not-retained.json";
+    });
+    expect(controlBlockers().map((entry: Blocker) => entry.detail)).toEqual([
+      expect.stringContaining("digest does not match"),
+      expect.stringContaining("not in the evidence directory"),
+    ]);
+
     // A control outside the closed list is INVALID, not extra credit.
-    controlsFile(evidenceDir, { controls: { made_up_control: { status: "verified", evidence: "x" } } });
+    environmentControls(evidenceDir, (controls) => { controls.made_up_control = { "staging-release": { status: "verified" } }; });
     expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
       .some((entry: Blocker) => entry.kind === "invalid" && /outside the closed PC-06 list/.test(entry.detail))).toBe(true);
+  });
+
+  it("validates one control record in isolation, so every refusal reason is its own", () => {
+    const bytes = Buffer.from("proof\n", "utf8");
+    writeFileSync(path.join(evidenceDir, "proof.json"), bytes);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const good = {
+      status: "verified", source: "provider-api", measured_at: "2026-09-10T09:00:00.000Z",
+      artifact: "proof.json", artifact_sha256: digest, observed: { prevent_self_review: true },
+    };
+    expect(validateEnvironmentControl(good, { dir: evidenceDir })).toBeNull();
+    const cases: [string, Record<string, unknown>, RegExp][] = [
+      ["a boolean instead of a record", { status: true }, /is /],
+      ["an unverified status", { ...good, status: "unverified" }, /is unverified/],
+      ["an unknown source", { ...good, source: "i-checked" }, /not one of provider-api\/provider-ui/],
+      ["no timestamp", { ...good, measured_at: "whenever" }, /no parseable measured_at/],
+      ["no observed fields", { ...good, observed: {} }, /no observed provider fields/],
+      ["a path instead of a basename", { ...good, artifact: "../elsewhere.json" }, /plain retained artifact file/],
+      ["a short digest", { ...good, artifact_sha256: "abc" }, /no SHA-256 digest/],
+    ];
+    for (const [label, record, expected] of cases) {
+      expect(validateEnvironmentControl(record, { dir: evidenceDir }), label).toMatch(expected);
+    }
   });
 
   it("cannot reach a full PASS while PC-06 is unverified, even with the whole actor matrix green", async () => {
@@ -1308,8 +1553,9 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     expect(before.blockers.length).toBeGreaterThan(0);
     const code = await main(["check-evidence", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir], LOCAL_ENV, { write: () => {} });
     expect(code).toBe(3);
-    // With the accepted provider evidence for those controls attached, and ONLY then, it passes.
-    controlsFile(evidenceDir);
+    // With the accepted, artifact-bound provider evidence for those controls attached — and ONLY
+    // then — it passes.
+    environmentControls(evidenceDir);
     const after = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
     expect(after.blockers).toEqual([]);
   });
@@ -1552,7 +1798,9 @@ describe("PC-07 journal durability, cleanup ownership and the leakage boundary",
     writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"), { ...genuine, run_id: "8000" });
     const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
     expect((blockers as Blocker[]).some((entry) => entry.kind === "invalid" && /normal-tests evidence file belongs to run/.test(entry.detail))).toBe(true);
-    expect((blockers as Blocker[]).some((entry) => entry.gate === "PC-05" && /has no recorded outcome/.test(entry.detail))).toBe(true);
+    // And the coverage it was carrying is reported LOST, rather than the packet quietly assessing
+    // fewer cases than the matrix has.
+    expect((blockers as Blocker[]).some((entry) => entry.gate === "PC-05" && /normal case\(s\) have no usable recorded outcome/.test(entry.detail))).toBe(true);
     // The same file with a doctored schema version, or the wrong phase, is refused the same way.
     for (const override of [{ schema_version: 2 }, { phase: "emergency-tests" }]) {
       writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"), { ...genuine, ...override });
@@ -1615,10 +1863,7 @@ describe("PC-08 the closed CLI contract: one status word and one exit code per o
 
     // Still 3: the PC-06 environment controls are the one thing this harness cannot produce.
     expect(await run(["check-evidence", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir])).toBe(3);
-    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
-      schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
-      controls: Object.fromEntries(ENVIRONMENT_CONTROL_KEYS.map((key: string) => [key, { status: "verified", evidence: "provider readback, docs/OPS.md §12" }])),
-    });
+    environmentControls(evidenceDir);
     expect(await run(["check-evidence", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir])).toBe(0);
     const final = JSON.parse(emitted.at(-1)!);
     expect(final).toMatchObject({ phase: "check-evidence", status: "passed" });
@@ -1708,5 +1953,432 @@ describe("the request allowlist has no dead surface", () => {
     // are worth naming out loud rather than leaving in a list nobody re-reads.
     expect(declared.filter((id) => !exercised.has(id)).sort()).toEqual([...errorPathOnly].sort());
     expect(new Set(declared).size, "duplicate operation id").toBe(declared.length);
+  });
+});
+
+// ── Astra correction pass 1: one regression per reviewed finding ───────────────
+
+describe("correction pass 1 — the reviewed findings, each with the defect it would have allowed", () => {
+  it("F1 · re-reads the pull request's target immediately before the merge, and refuses a retarget", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const setup = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup"));
+    const pull = github.pulls.get(setup.synthetic_pull_request.number)!;
+    // The exact defect: setup verified this pull request's base at creation, and something has
+    // retargeted it since. Merging now would put a REAL merge into `staging` under the local admin
+    // credential — and the case's own readback looks at the untouched disposable ref, so it would
+    // have recorded a clean policy denial for a merge that actually landed somewhere else.
+    pull.base = { ref: "staging", repo: { full_name: COMMISSIONING_REPOSITORY } };
+    await expect(runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }))
+      .rejects.toThrow();
+    // NOTHING was merged, and staging is exactly where it started.
+    expect(github.calls.some((call) => call.method === "PUT" && /\/merge$/.test(call.path))).toBe(false);
+    expect(github.refs.get("refs/heads/staging")).toBe(STAGING_SHA);
+    const evidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
+    const merge = evidence.cases.find((record: CaseRecord) => record.case === "human-pull-request-merge");
+    expect(merge.outcome).toBe("inconclusive");
+    expect(merge.reason).toMatch(/retargeted|refuses to merge against a target it did not measure/);
+  });
+
+  it("F1 · refuses a cross-repository, closed, or moved-head pull request, and conditions the merge on the head SHA", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const setup = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup"));
+    const number = setup.synthetic_pull_request.number;
+    const graphShas = setup.synthetic_graph;
+    const request = Object.assign(async (method: string, requestPath: string, body?: unknown) => {
+      const url = new URL(`https://api.github.com${requestPath}`);
+      const result = github.handle("local", method, `${url.pathname}${url.search}`, body as RequestBody);
+      return { ...result, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
+    }, { issued: [] as string[] });
+    const ctx = { runId: RUN_ID, attempt: ATTEMPT };
+    const journaled = { number, base: setup.synthetic_pull_request.base, head: setup.synthetic_pull_request.head };
+    const pull = github.pulls.get(number)!;
+    const original = structuredClone(pull);
+
+    // The clean case reports the exact head SHA the merge will be conditioned on.
+    await expect(assertSyntheticPullTarget({ request, ctx, pull: journaled, graphShas }))
+      .resolves.toMatchObject({ number, head_sha: graphShas.P });
+
+    const perturbations: [string, () => void, RegExp][] = [
+      ["a cross-repository head", () => { pull.head = { ...original.head, repo: { full_name: "someone/fork" } }; }, /has its head in/],
+      ["a cross-repository base", () => { pull.base = { ...original.base, repo: { full_name: "someone/fork" } }; }, /has its base in/],
+      ["a closed pull request", () => { pull.state = "closed"; }, /is closed rather than open/],
+      ["a head that has moved off the synthetic commit", () => { pull.head = { ...original.head, sha: sha("something else") }; }, /not the synthetic commit this run created/],
+    ];
+    for (const [label, perturb, expected] of perturbations) {
+      Object.assign(pull, structuredClone(original));
+      perturb();
+      await expect(assertSyntheticPullTarget({ request, ctx, pull: journaled, graphShas }), label).rejects.toThrow(expected);
+    }
+
+    // The request boundary independently requires the head-SHA condition and nothing else, so the
+    // provider gets its own chance to refuse if the head moves in the gap.
+    const guardCtx = { role: "local", runId: RUN_ID, attempt: ATTEMPT, graphShas: new Set([graphShas.P]), contextNames: new Set<string>(), rulesetIds: new Set<number>(), rulesetNames: new Set<string>(), pullNumber: number };
+    expect(assertAllowedRequest({ method: "PUT", path: `/repos/${COMMISSIONING_REPOSITORY}/pulls/${number}/merge`, body: { sha: graphShas.P } }, guardCtx)).toBe("merge-synthetic-pull");
+    expect(() => assertAllowedRequest({ method: "PUT", path: `/repos/${COMMISSIONING_REPOSITORY}/pulls/${number}/merge`, body: {} }, guardCtx)).toThrow(/exactly the measured head SHA/);
+    expect(() => assertAllowedRequest({ method: "PUT", path: `/repos/${COMMISSIONING_REPOSITORY}/pulls/${number}/merge`, body: { sha: sha("elsewhere") } }, guardCtx)).toThrow(/a commit this run created/);
+    expect(() => assertAllowedRequest({ method: "PUT", path: `/repos/${COMMISSIONING_REPOSITORY}/pulls/${number}/merge`, body: { sha: graphShas.P, merge_method: "squash" } }, guardCtx)).toThrow(/exactly the measured head SHA/);
+  });
+
+  it("F3 · returns blockers for the adversarial packet that previously assessed clean", () => {
+    // This is the exact shape the reviewer executed against the old checker, which returned ZERO
+    // blockers: a wrong-run intent, empty objects for the actor and cleanup files, no compatibility
+    // entries, every case ID pooled into the human file as a bare `passed: true`, and a boolean for
+    // the environment controls.
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "intent"), { schema_version: 1, phase: "intent", run_id: "8000", attempt: ATTEMPT, workflow_sha: WORKFLOW_SHA, provider_measured: false });
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup"), { schema_version: 1, phase: "setup", run_id: RUN_ID, attempt: ATTEMPT, compatibility: {} });
+    for (const key of ["fixture", "normal", "emergency", "cleanup"]) {
+      writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, key), { schema_version: 1, phase: EVIDENCE_PHASES[key], run_id: RUN_ID, attempt: ATTEMPT });
+    }
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"), {
+      schema_version: 1, phase: "human-tests", run_id: RUN_ID, attempt: ATTEMPT, workflow_sha: WORKFLOW_SHA,
+      actor: { kind: "human-admin" },
+      cases: buildActorMatrix().map((kase) => ({ case: kase.id, passed: true })),
+    });
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), { schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT, controls: {}, verified: true });
+
+    const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    const details = (blockers as Blocker[]).map((entry) => entry.detail).join(" | ");
+    expect(blockers.length).toBeGreaterThan(0);
+    // Each hole the reviewer named, now its own blocker.
+    expect(details).toMatch(/intent evidence file belongs to run "8000"/);
+    expect(details).toMatch(/setup evidence file is missing the required field/);
+    expect(details).toMatch(/fixture-checks evidence file is missing the required field/);
+    expect(details).toMatch(/normal-tests evidence file is missing the required field/);
+    expect(details).toMatch(/cleanup evidence file is missing the required field/);
+    // The pooled bare records: a `passed: true` for another actor's case is not that case's outcome.
+    expect(details).toMatch(/normal case\(s\) have no usable recorded outcome/);
+    expect(details).toMatch(/emergency case\(s\) have no usable recorded outcome/);
+    expect(details).toMatch(/human-force-rewind claims actor/);
+    // And the boolean.
+    expect(details).toMatch(/protected-environment control required_reviewer_is_owner has no per-environment records/);
+  });
+
+  it("F3 · derives every case verdict from what the record measured, not from its `passed` field", () => {
+    const kase = buildActorMatrix().find((entry) => entry.id === "normal-update-missing-check")!;
+    const ref = derivedRef(RUN_ID, ATTEMPT, "normal");
+    const sound = {
+      case: kase.id, actor: "normal", operation: "update", force: false, expected: "denied", ref,
+      outcome: "denied", passed: true, before_sha: sha("A"), after_sha: sha("A"), requested_sha: sha("N1"),
+      http_status: 422, diagnostic: { status: 422, category: "repository-rule-violation", ruleIds: ["repository-rule-violation"], policyDenial: true },
+      check_state: { expectation: kase.checks, measured: true },
+    };
+    expect(deriveCaseVerdict(sound, kase, { runId: RUN_ID, attempt: ATTEMPT })).toEqual([]);
+    // The bare claim is checked WHOLE, not merged over a sound record: `{case, passed: true}` is
+    // exactly the shape the adversarial packet used, and merging it over good fields would test
+    // nothing.
+    expect(deriveCaseVerdict({ case: kase.id, passed: true }, kase, { runId: RUN_ID, attempt: ATTEMPT }).join("; "))
+      .toMatch(/records the unknown outcome/);
+    const perturbations: [string, Record<string, unknown>, RegExp][] = [
+      ["another actor's case", { actor: "human" }, /claims actor "human"/],
+      ["a ref this run did not derive", { ref: "refs/heads/main" }, /did not derive/],
+      ["a denial the diagnostic does not attribute to a rule", { diagnostic: { ...sound.diagnostic, policyDenial: false } }, /does not attribute to a policy rule/],
+      ["a denial on a ref that moved", { after_sha: sha("N1") }, /denial on a ref that moved/],
+      ["a denial that is not a client refusal", { http_status: 200 }, /not a client refusal/],
+      ["an unmeasured check state", { check_state: { expectation: kase.checks, measured: false } }, /check state was measured/],
+      ["a `passed` that disagrees with its own outcome", { passed: false }, /says passed=false for outcome denied/],
+      ["an acceptance with no matching readback", { outcome: "accepted", passed: false, expected: "denied" }, /recorded accepted/],
+    ];
+    for (const [label, override, expected] of perturbations) {
+      const problems = deriveCaseVerdict({ ...sound, ...override }, kase, { runId: RUN_ID, attempt: ATTEMPT });
+      expect(problems.join("; "), label).toMatch(expected);
+    }
+    // The acceptance invariant, on the case that is actually an acceptance.
+    const green = buildActorMatrix().find((entry) => entry.id === "normal-update-all-green")!;
+    const accepted = {
+      case: green.id, actor: "normal", operation: "update", force: false, expected: "accepted", ref,
+      outcome: "accepted", passed: true, before_sha: sha("A"), requested_sha: sha("N4"), after_sha: sha("N4"),
+      http_status: 200, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false },
+      check_state: { expectation: green.checks, measured: true },
+    };
+    expect(deriveCaseVerdict(accepted, green, { runId: RUN_ID, attempt: ATTEMPT })).toEqual([]);
+    expect(deriveCaseVerdict({ ...accepted, after_sha: sha("A") }, green, { runId: RUN_ID, attempt: ATTEMPT }).join("; "))
+      .toMatch(/readback is not the requested commit/);
+  });
+
+  it("F3 · requires cleanup to cover every resource the verified journal records this run creating", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    expect(assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers).toEqual([]);
+
+    const genuine = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup"));
+    // An `outcomes: []` used to satisfy every leftover check by having nothing to object to. The
+    // coverage is now computed from the journal, so an empty list is a gap the journal names.
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup"), { ...genuine, outcomes: [] });
+    const emptied = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+    expect(emptied.some((entry) => /journaled resource\(s\) have no cleanup outcome/.test(entry.detail))).toBe(true);
+
+    // A dropped ref, and an invented outcome for a resource the journal never records.
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup"), {
+      ...genuine,
+      outcomes: [...genuine.outcomes.filter((entry: { kind: string }) => entry.kind !== "ref"), { kind: "ruleset", id: 999999, name: "not-ours", result: "removed" }],
+    });
+    const tampered = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+    expect(tampered.some((entry) => /have no cleanup outcome \(ref:/.test(entry.detail))).toBe(true);
+    expect(tampered.some((entry) => entry.kind === "invalid" && /the journal does not record this run creating/.test(entry.detail))).toBe(true);
+  });
+
+  it("F4 · refuses to delete a ruleset whose governed BODY changed, at the same ID, name and target", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const ours = [...github.rulesets.values()].find((ruleset) => ruleset.name.includes("-human-main-integrity"))!;
+    const fingerprintBefore = governedFingerprint(ours);
+    // Same ID, same name, same single derived target — and its rules have been emptied. The old
+    // ownership check compared exactly the three things that did NOT change, and deleted it.
+    ours.rules = [];
+    expect(governedFingerprint(ours)).not.toBe(fingerprintBefore);
+    await expect(runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }))
+      .rejects.toThrow(/did not match their journaled fingerprint/);
+    const cleanup = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup"));
+    expect(cleanup.outcomes).toContainEqual(expect.objectContaining({ kind: "ruleset", id: ours.id, result: "refused-ownership-mismatch" }));
+    expect(github.rulesets.has(ours.id)).toBe(true);
+  });
+
+  it("F4 · fingerprints only the governed fields, so provider bookkeeping is not a false mismatch", () => {
+    const [ruleset] = transformToDisposable(
+      buildMainRulesets({ normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS }),
+      { runId: RUN_ID, attempt: ATTEMPT, actor: "normal", normalAppId: NORMAL_APP },
+    );
+    const base = governedFingerprint(ruleset);
+    // `id`, `created_at` and `source` are the provider's own bookkeeping: counting them would make
+    // every readback a mismatch, and the check would be discarded within a day.
+    expect(governedFingerprint({ ...ruleset, id: 7001, created_at: "2026-09-10T00:00:00Z", source: COMMISSIONING_REPOSITORY })).toBe(base);
+    // Each governed field, on the other hand, must move it.
+    for (const mutation of [
+      { enforcement: "evaluate" },
+      { bypass_actors: [{ actor_type: "Integration", actor_id: 4242, bypass_mode: "always" }] },
+      { rules: [] },
+      { conditions: { ref_name: { include: [derivedRef(RUN_ID, ATTEMPT, "normal")], exclude: ["x"] } } },
+      { name: "renamed" },
+      { target: "tag" },
+    ]) {
+      expect(governedFingerprint({ ...ruleset, ...mutation }), JSON.stringify(mutation)).not.toBe(base);
+    }
+  });
+
+  it("F4 · refuses to adopt a journaled ruleset on resume if its body changed", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const ours = [...github.rulesets.values()].find((ruleset) => ruleset.name.includes("-normal-main-integrity"))!;
+    ours.bypass_actors = [{ actor_type: "Integration", actor_id: 4242, bypass_mode: "always" }];
+    // A resumed setup must not treat "same ID, same name" as "the policy I created".
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }))
+      .rejects.toThrow(/has been modified since this run created it/);
+  });
+
+  it("F6 · serialises concurrent stale-lock recoveries and never removes a new owner's lock", async () => {
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+    journal.append("mutation-intent", { kind: "ref", ref: derivedRef(RUN_ID, ATTEMPT, "normal") });
+    const originalNonce = readLockOwner(evidenceDir, RUN_ID, ATTEMPT)!.nonce;
+
+    // Two recoveries in flight at once, both having read the same stale owner. Previously both
+    // unlinked the pathname after their awaits, so the second deleted the lock the first had just
+    // acquired — and two writers proceeded believing they owned the run.
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const slow = recoverJournalLock({
+      dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, ownerGone: true,
+      reconcile: async () => { await gate; return { reconciled: true }; },
+    });
+    // The second one cannot even start: recoveries are serialised by their own lock.
+    await expect(recoverJournalLock({
+      dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, ownerGone: true, reconcile: async () => ({ reconciled: true }),
+    })).rejects.toThrow(/already in flight/);
+    release!();
+    const recovered = await slow;
+    expect(readLockOwner(evidenceDir, RUN_ID, ATTEMPT)!.nonce).not.toBe(originalNonce);
+
+    // And the identity check at replacement: a recovery that reconciled against a lock which has
+    // since been replaced refuses rather than unlinking the live owner's file.
+    const liveNonce = readLockOwner(evidenceDir, RUN_ID, ATTEMPT)!.nonce;
+    await expect(recoverJournalLock({
+      dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, ownerGone: true,
+      reconcile: async () => {
+        // Simulate the window: the lock is replaced while this recovery is awaiting its readback.
+        recovered.lock.release();
+        acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+        return { reconciled: true };
+      },
+    })).rejects.toThrow(/replaced while this recovery was reconciling/);
+    expect(readLockOwner(evidenceDir, RUN_ID, ATTEMPT)!.nonce).not.toBe(liveNonce);
+  });
+
+  it("F6 · reconciles an interrupted CLEANUP, not only an interrupted mutation", async () => {
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+    journal.append("mutation-intent", { kind: "ref", ref: derivedRef(RUN_ID, ATTEMPT, "normal") });
+    journal.append("mutation-result", { kind: "ref", status: 201 });
+    // The crash that matters most: a DELETE was intended and nobody knows whether it happened.
+    // Looking only at `mutation-*` events reported "nothing unresolved" and moved on.
+    journal.append("cleanup-intent", { kind: "ruleset", id: 7001, name: "commissioning-9001-2-human-main-integrity" });
+
+    let handed: Record<string, unknown> | null = null;
+    const recovered = await recoverJournalLock({
+      dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, ownerGone: true,
+      reconcile: async (intent: Record<string, unknown> | null) => { handed = intent; return { reconciled: true, readback: { present: false } }; },
+    });
+    expect(handed).toMatchObject({ kind_of_intent: "cleanup-intent", kind: "ruleset", id: 7001 });
+    expect(recovered.unresolvedIntentType).toBe("cleanup-intent");
+    expect(readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).at(-1))
+      .toMatchObject({ type: "recovery", data: { unresolved_intent_type: "cleanup-intent" } });
+    recovered.lock.release();
+  });
+
+  it("F7 · measures main AND staging, resolved to complete definitions, over complete pagination", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const baseline = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup")).production_baseline;
+    // Staging is the dispatch branch and the contribution base. Measuring only main and then
+    // reporting "production unchanged" would be a claim about half of production.
+    expect(Object.keys(baseline).sort()).toEqual([
+      "main_applicable_rulesets_hash", "main_classic_protection_hash", "main_classic_protection_present", "main_sha",
+      "repository_ruleset_inventory_hash", "staging_applicable_rulesets_hash", "staging_classic_protection_hash",
+      "staging_classic_protection_present", "staging_sha", "tag_ruleset_hashes",
+    ]);
+    expect(baseline.staging_sha).toBe(STAGING_SHA);
+    // A change to staging's protection is drift, exactly as a change to main's would be.
+    github.refs.set("refs/heads/main", sha("someone released"));
+    await expect(runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }))
+      .rejects.toThrow(/interrupted and needs root reconciliation/);
+    expect(readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "cleanup")).production_drift).toContain("main_sha");
+  });
+
+  it("F7 · treats a page that is exactly full with no following page as INCOMPLETE, not as the whole list", async () => {
+    let page = 0;
+    const full = Object.assign(async () => {
+      page += 1;
+      return { status: 200, body: Array.from({ length: 100 }, (_, index) => ({ id: page * 1000 + index })) };
+    }, { issued: [] as string[] });
+    await expect(readAllPages({ request: full, endpoint: "/repos/x/y/rulesets", label: "the inventory" }))
+      .rejects.toThrow(/exceeded 20 pages/);
+    expect(page).toBe(20);
+    // A short page terminates; a page that is exactly full does not, because those two are
+    // indistinguishable from the outside and only one of them is safe to assume.
+    let calls = 0;
+    const short = Object.assign(async () => { calls += 1; return { status: 200, body: [{ id: 1 }] }; }, { issued: [] as string[] });
+    await expect(readAllPages({ request: short, endpoint: "/repos/x/y/rulesets", label: "the inventory" })).resolves.toHaveLength(1);
+    expect(calls).toBe(1);
+    const broken = Object.assign(async () => ({ status: 403, body: null }), { issued: [] as string[] });
+    await expect(readAllPages({ request: broken, endpoint: "/repos/x/y/rulesets", label: "the inventory" }))
+      .rejects.toThrow(/could not be measured \(403\)/);
+  });
+
+  it("F8 · binds the policy in force by BODY, and refuses a same-named ruleset whose rules were rewritten", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    // Same name, same target, still active — and its required checks have been removed after the
+    // human approved the plan. A names-and-enforcement comparison accepts this, and the acceptance
+    // that follows is then a statement about a policy nobody reviewed.
+    const evidenceRuleset = [...github.rulesets.values()].find((ruleset) => ruleset.name.includes("-normal-main-release-evidence"))!;
+    const rule = evidenceRuleset.rules!.find((entry) => entry.type === "required_status_checks")!;
+    rule.parameters!.strict_required_status_checks_policy = false;
+    await expect(runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) }))
+      .rejects.toThrow(/not the reviewed disposable policy/);
+    // And it refused BEFORE writing: no check was minted and no ref moved with the App credential.
+    expect(github.calls.filter((call) => call.actor === "normal" && call.method !== "GET")).toEqual([]);
+  });
+
+  it("F8 · refuses a manifest whose declared plan is not the one the job derives, and records what it measured", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
+    expect(normal.status).toBe("passed");
+    const policy = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")).policy_in_force;
+    // The evidence records the measured BODY fingerprints and the compatibility verdict, not a
+    // count of matching names.
+    expect(policy.verdict).toBe("compatible");
+    // And it says which dimension it did NOT cover, rather than implying it covered everything.
+    expect(policy.classic_protection_scope).toMatch(/measured-by-local-setup-under-admin/);
+    expect(Object.keys(policy.body_fingerprints).sort()).toEqual(policy.planned);
+    for (const fingerprint of Object.values(policy.body_fingerprints)) expect(String(fingerprint)).toMatch(/^[0-9a-f]{64}$/);
+    // An additional effective rule is preserved and named rather than dropped as "not ours".
+    expect(policy.additional_effective_rules).toEqual([]);
+
+    const manifest = { policy_plan: { normal: [{ name: "commissioning-9001-2-normal-main-integrity", target_ref: derivedRef(RUN_ID, ATTEMPT, "normal"), hash: "0".repeat(64) }] } };
+    const ctx = { runId: RUN_ID, attempt: ATTEMPT, normalAppId: NORMAL_APP, emergencyAppId: EMERGENCY_APP, producerIds: PRODUCER_IDS };
+    const request = Object.assign(async () => ({ status: 200, body: [] }), { issued: [] as string[] });
+    await expect(assertPlannedPolicyInForce({ request, ctx, actor: "normal", manifest }))
+      .rejects.toThrow(/not the one this job derives from its own measured identities/);
+  });
+});
+
+describe("the final evidence check against a hostile packet", () => {
+  const write = (key: string, payload: unknown) => {
+    const target = path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, key));
+    writeFileSync(target, typeof payload === "string" ? payload : `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  };
+
+  it("refuses malformed, non-object and truncated evidence rather than reading fields out of it", () => {
+    for (const [label, payload] of [
+      ["a JSON array", []],
+      ["a bare string", JSON.stringify("passed")],
+      ["a number", "7"],
+      ["truncated JSON", '{"schema_version": 1, "phase": "setup"'],
+      ["an empty file", ""],
+    ] as [string, unknown][]) {
+      write("setup", payload);
+      const { blockers } = assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+      // Either unreadable (absent) or not-an-object (invalid) — never a file whose fields are read.
+      expect((blockers as Blocker[]).some((entry) => /setup evidence file (is absent|is not a JSON object)/.test(entry.detail)), label).toBe(true);
+    }
+  });
+
+  it("refuses a future schema version instead of best-effort reading it", () => {
+    write("cleanup", { schema_version: 2, phase: "cleanup", run_id: RUN_ID, attempt: ATTEMPT, outcomes: [], refusals: 0 });
+    expect((assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[])
+      .some((entry) => entry.kind === "invalid" && /cleanup evidence file declares schema version 2/.test(entry.detail))).toBe(true);
+  });
+
+  it("refuses a packet whose files disagree about the immutable workflow SHA they were produced against", async () => {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    const genuine = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
+    // A human-tests file from a different dispatch of the same run number. Every identity field
+    // matches; only the source it was produced against does not.
+    write("human", { ...genuine, workflow_sha: sha("a different dispatch") });
+    expect((assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[])
+      .some((entry) => entry.kind === "invalid" && /human-tests evidence file was produced against workflow SHA/.test(entry.detail))).toBe(true);
+  });
+
+  it("exits 1 on a hostile packet with a measured contradiction, and 3 when it is merely sparse", async () => {
+    const emitted: string[] = [];
+    const run = () => main(["check-evidence", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir], LOCAL_ENV, { write: (text: string) => emitted.push(text) });
+
+    // Sparse: nothing has run. Every gate is unverified, and there is no measured failure to report.
+    expect(await run()).toBe(3);
+    expect(JSON.parse(emitted.at(-1)!).status).toBe("incomplete");
+
+    // Now a real run, then one contradiction planted in it: a case record whose own outcome says the
+    // human/admin was ALLOWED to move a protected ref.
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    expect(await run()).toBe(0);
+
+    const genuine = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
+    write("human", {
+      ...genuine,
+      cases: (genuine.cases as CaseRecord[]).map((record) => (record.case === "human-force-rewind"
+        ? { ...record, outcome: "unexpected-success", passed: false }
+        : record)),
+    });
+    // A measured statement about the subject: exit 1, not 3.
+    expect(await run()).toBe(1);
+    const failure = JSON.parse(emitted.at(-1)!);
+    expect(failure.status).toBe("failed");
+    expect(JSON.stringify(failure.blockers)).toMatch(/human-force-rewind recorded unexpected-success/);
   });
 });
