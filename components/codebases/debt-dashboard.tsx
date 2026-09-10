@@ -243,7 +243,8 @@ export function ScannerCheckCoverage({
       ) : (
         <p className="mt-3 text-xs text-ink-secondary">
           Configured checks: Unknown · Complete required: Unknown · Findings
-          emitted: Unknown
+          emitted: Unknown · Legacy measured time:{" "}
+          {health?.measured_at ?? "Unknown"}
         </p>
       )}
     </section>

@@ -291,3 +291,26 @@ describe("health v3 semantic census invariants", () => {
     }
   });
 });
+
+it("v3 inherits evidence/head constraints and cannot fall through the legacy schema", () => {
+  const entry = fixtures.valid.find((f) => f.name === "valid-v3-complete")!;
+  const payload = structuredClone(entry.payload) as {
+    metrics: { head_sha: string; codebase_health: Record<string, unknown> };
+  };
+  payload.metrics.head_sha = payload.metrics.codebase_health.head_sha as string;
+  expect(codebaseScanPayloadSchema.safeParse(payload).success).toBe(true);
+  for (const patch of [
+    { quality_gate: "pass", evidence_status: "partial" },
+    { quality_gate: "unknown", evidence_status: "complete" },
+    { automation_eligible: true, status: "fail" },
+    { head_sha: "f".repeat(40) },
+    { source: "/private/source.ts" },
+  ]) {
+    const invalid = structuredClone(payload);
+    Object.assign(invalid.metrics.codebase_health, patch);
+    expect(codebaseScanPayloadSchema.safeParse(invalid).success).toBe(false);
+  }
+  const missing = structuredClone(payload);
+  delete missing.metrics.codebase_health.check_coverage;
+  expect(codebaseScanPayloadSchema.safeParse(missing).success).toBe(false);
+});
