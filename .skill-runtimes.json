@@ -2,6 +2,8 @@
   "version": 1,
   "canonical": ".claude/skills",
   "published": [
+    "astra-spec-opus-build",
+    "astra-spec-sol-build",
     "connect",
     "cut-release",
     "pr-review-attestation",

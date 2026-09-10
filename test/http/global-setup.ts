@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { once } from "node:events";
 import { BASE_URL, HTTP_TEST_PORT as PORT } from "./server-url";
 
 // One production Next.js server for the whole HTTP suite. We boot `next start`
@@ -14,7 +15,7 @@ async function waitForReady(): Promise<void> {
   // the route runtime is live. Poll until then (≤30s).
   for (let i = 0; i < 30; i++) {
     try {
-      const res = await fetch(`${BASE_URL}/api/v1/items`);
+      const res = await fetch(`${BASE_URL}/api/v1/items`, { signal: AbortSignal.timeout(1000) });
       if (res.status === 401) return;
     } catch {
       // connection refused while the server is still binding — keep polling
@@ -33,13 +34,21 @@ export default async function setup(): Promise<() => Promise<void>> {
   }
 
   const nextBin = resolve("node_modules/.bin/next");
+  // The MCP outer runner owns a detached Vitest process group. Keep its server
+  // inside that group so an outer timeout also closes every inherited pipe.
+  const detached = process.env.MCP_HTTP_ATTACHED !== "1";
   const server: ChildProcess = spawn(nextBin, ["start", "-p", PORT], {
     // Inherit the backend/secret env pinned in vitest.http.config.ts; PORT is also
     // honored by `next start`. detached so we can kill the whole process group.
     env: { ...process.env, PORT },
     stdio: ["ignore", "inherit", "inherit"],
-    detached: true,
+    detached,
   });
+  const stop = (signal: NodeJS.Signals) => {
+    if (!server.pid) return;
+    if (detached) process.kill(-server.pid, signal);
+    else server.kill(signal);
+  };
 
   server.on("error", (err) => {
     throw new Error(`HTTP tier: failed to spawn next start — ${err.message}`);
@@ -50,7 +59,7 @@ export default async function setup(): Promise<() => Promise<void>> {
   } catch (e) {
     if (server.pid) {
       try {
-        process.kill(-server.pid, "SIGKILL");
+        stop("SIGKILL");
       } catch {
         /* already gone */
       }
@@ -59,12 +68,17 @@ export default async function setup(): Promise<() => Promise<void>> {
   }
 
   return async () => {
-    if (server.pid) {
+    if (server.pid && server.exitCode === null && server.signalCode === null) {
+      const exited = once(server, "exit");
+      const timeout = setTimeout(() => {
+        try { stop("SIGKILL"); } catch { /* exit raced */ }
+      }, 5000);
       try {
-        process.kill(-server.pid, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
+        stop("SIGTERM");
+        await exited;
+        if (server.signalCode === "SIGKILL") throw new Error("HTTP server required forced termination");
+      } finally { clearTimeout(timeout); }
     }
+    console.log("HTTP_SERVER_CLEANUP_OK");
   };
 }

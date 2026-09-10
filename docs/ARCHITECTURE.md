@@ -14,6 +14,13 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 
 ## First-install deployment flow
 
+Test-only MCP acceptance (`vitest.mcp.config.ts`) reuses the production HTTP harness
+and real Postgres helpers. `test/http/mcp-tier-safety.acceptance.ts` provisions synthetic
+ingestion, keys, and project memberships, then launches the Workspace-owned stdio
+outcome suite over a private parent/child IPC channel. It exposes no HTTP control route
+and changes no production authorization. The caller owns the isolated database and
+disposable build; fixture cleanup is asserted before server/database teardown.
+
 The canonical hosted-install entry point is `https://aiosbrain.dev/deploy/team-brain/`. It resolves
 to the official Railway template described in [`RAILWAY-TEMPLATE.md`](RAILWAY-TEMPLATE.md): Team
 Brain, Postgres, Graphiti, and Neo4j. Railway reference variables keep Graphiti and Neo4j on the
@@ -211,6 +218,10 @@ the app's own mode.
 The `review-recent-prs` skill provides a read-only audit of recent PRs and is
 published through `.skill-runtimes.json`. Its default target follows the contribution
 branch in `scripts/branches.mjs`; an explicit user target takes precedence.
+
+`AGENTS.md` requires subscription-authenticated Claude access for coding, including
+delegated work and builder fallbacks. Anthropic API-key billing is prohibited for
+coding even when subscription access is unavailable or reaches a limit.
 
 Repository-local agent skills are authored once under `.claude/skills/`. The explicit
 publication manifest `.skill-runtimes.json` selects which canonical skills are projected
@@ -1896,3 +1907,32 @@ The mirrored additive migration and isolated PostgreSQL tests cover fresh setup,
 populated upgrade/replay, constraints, concurrency, history, finalization, auth and
 audit rollback. Isolated proofs do not constitute production migration rehearsal
 or authorize production ingestion; controlled release retains those separate gates.
+
+## Repository build skills
+
+The `astra-spec-opus-build` workflow is maintained in
+`.claude/skills/astra-spec-opus-build/SKILL.md`. It creates or reuses the task's
+Linear ticket before specification, attaches the agreed spec before implementation,
+and coordinates Astra, Fable, and Opus reviews through PR publication.
+`scripts/sync-skill-runtimes.sh astra-spec-opus-build` generates the matching
+Codex (`.agents/skills`), OpenCode (`.opencode/skills`), and Cursor (`.cursor/rules`)
+copies; `.skill-runtimes.json` registers both skills for publication. These repository files travel with the commit: new worktrees inherit
+the skill when their starting revision contains it; older revisions require
+the skill change to be brought forward.
+
+The companion `astra-spec-sol-build` skill uses GPT-5.6 Sol through the Codex CLI
+for implementation and accepted fixes, with the same Astra/Fable review stages.
+Both skills start tickets in In Progress and move them to Done only after the
+finished feature's merge into remote `main` is verified. Merge authorization
+remains separate. Both use the same canonical-source and runtime-copy mechanism.
+
+Both build skills describe switching the active implementer between Sol and Opus 5
+on provider credit or usage limits, including during review fixes and conflict
+resolution. That switch is conditional, not automatic: it applies only where the
+repository instructions in `AGENTS.md` and the user's current builder assignment
+permit an alternative builder. `AGENTS.md` currently assigns Opus-only building
+under subscription authentication and forbids automatic fallback, so under that
+assignment a limit is a pause-and-report condition rather than a switch. When a
+switch is permitted, the skills preserve partial work and the handoff in durable
+storage, retain assigned reviewers, and pause if both builders remain exhausted
+until capacity returns.
