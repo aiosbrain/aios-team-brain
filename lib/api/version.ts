@@ -108,7 +108,8 @@
  *        (postgres/migrations/20260831120000_code_metrics_scanner_identity.sql).
  */
 // 1.25 — closed health v3 configured-check census, persisted verbatim (AIO-1096).
-export const BRAIN_API_VERSION = "1.25";
+// 1.26 — strict append-only finding intake with candidate and run-summary finalization (AIO-1101).
+export const BRAIN_API_VERSION = "1.26";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";
