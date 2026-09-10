@@ -276,7 +276,11 @@ describe("health v3 semantic census invariants", () => {
   it.each(fixtures.coverage_invalid.map((f) => [f.name, f.payload] as const))(
     "rejects %s",
     (_name, payload) => {
-      expect(codebaseScanPayloadSchema.safeParse(payload).success).toBe(false);
+      const scenario = structuredClone(payload) as {
+        metrics: { head_sha: string; codebase_health: { head_sha: string } };
+      };
+      scenario.metrics.head_sha = scenario.metrics.codebase_health.head_sha;
+      expect(codebaseScanPayloadSchema.safeParse(scenario).success).toBe(false);
     },
   );
   it("preserves every v3 fixture as a whole object", () => {

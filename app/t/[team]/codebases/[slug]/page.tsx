@@ -158,7 +158,7 @@ export default async function CodebaseDetailPage({
         health={cb.breakdown?.codebase_health ?? null}
         healthStale={isCodebaseStale(
           cb.breakdown?.codebase_health?.measured_at ?? null,
-          Date.now(),
+          Date.parse(cb.debtKpis.movement.asOf),
         )}
       />
 
