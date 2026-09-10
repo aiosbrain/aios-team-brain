@@ -53,18 +53,19 @@
     "test:gateway-api": "vitest run test/gateway test/guards/gateway-writers.test.ts",
     "test:gateway-approval:unit": "vitest run test/gateway/gateway-approval-contracts.test.ts test/gateway/gateway-approval.test.ts test/guards/gateway-writers.test.ts",
     "test:gateway-approval": "npm run test:gateway-approval:unit && vitest run --config vitest.datamechanics.config.ts gateway-approval",
-    "test:http:local": "npm run build && DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.http.config.ts"
-    ,"test:staging-pair": "bash scripts/staging-pair-isolated.sh"
-    ,"test:staging-pair:inside": "vitest run test/staging-paired.integration.test.ts"
+    "test:http:local": "npm run build && DATABASE_TEST_URL=postgres://app:app@localhost:5434/app_test vitest run --config vitest.http.config.ts",
+    "test:staging-pair": "bash scripts/staging-pair-isolated.sh",
+    "test:staging-pair:inside": "vitest run test/staging-paired.integration.test.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.808.0",
     "@aios-alpha/design": "^0.6.0",
     "@aios-alpha/ui": "^0.6.0",
     "@anthropic-ai/sdk": "^0.115.0",
+    "@aws-sdk/client-s3": "3.808.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@sentry/nextjs": "^10.69.0",
+    "ajv": "8.20.0",
     "jose": "^6.2.8",
     "lucide-react": "^1.30.0",
     "neo4j-driver": "^6.2.0",

@@ -400,7 +400,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.25** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.26** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -416,7 +416,7 @@ request-admission supplement** for `POST /api/v1/codebases` — canonical
 `aios-workspace/docs/contract/codebase-request-limits-v1.json`, vendored and sha256-pinned at
 `test/fixtures/contract/codebase-request-limits-v1.json`, carrying its own `revision: 1` and
 `appliesFromMemberApiVersion: "1.23"`. The effective contract is therefore *the published payload
-shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.25** with the scanner-identity implementation below; the admission
+shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.26** with the separate finding intake endpoint; the admission
 supplement remains independently versioned and does not itself bump the member API version. A limit is a **resource-admission** change, and the canonical change
 policy names that as an explicit exception to "breaking semantics go to /v2" — precedent: the 1.20
 `rows` cap and the dated 2026-06-19 same-route full-metrics tightening. (That exception and the
@@ -1504,6 +1504,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:routes -->
 
+- `POST /api/v1/codebases/:slug/debt-intake-events` — dedicated team/uploader-authorized atomic finding ledger ingestion and run finalization
+
 - `GET /api/health` — bounded public Postgres readiness; authenticated copied-staging Postgres/Neo4j/run evidence and boot probe
 - `GET /api/internal/staging-build-metadata` — token-authenticated declared build identity (deployed commit + migration-set hash) for the staging paired-refresh exporter
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
@@ -1597,6 +1599,10 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 ### Database tables
 
 <!-- drift:tables -->
+
+- `codebase_debt_candidates` — immutable team-scoped finding identity
+- `codebase_debt_candidate_codebases` — append-only historical repository membership
+- `codebase_debt_candidate_events` — immutable canonical candidates and producer-run summaries
 
 `auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` ·
 `gateway_service_identities` · `gateway_service_credentials` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·
@@ -1840,8 +1846,50 @@ error and partial cues coexist. V1/v2/absent census is unknown, measured zero is
 explicit, and required completeness never implies all-check completeness. Producer
 emission remains disabled until the separate production acceptance gate.
 
-The scanner conformance snapshot remains member API 1.25 even when newer intake
-contracts are published: `test/fixtures/contract/brain-contract.json` is vendored
-from Workspace's frozen `docs/contract/brain-contract-1.25.json`, with exact
-`codebase-payload-1.25` schema/fixture pins. This consumer does not claim the
-separate intake endpoint introduced by later member API revisions.
+The member conformance snapshot is now the full Workspace member API 1.26 contract,
+vendored from merge `b8559ebf40b876dc36ac00605244af670edb1920`. Scanner payloads
+remain independently pinned to `codebase-payload-1.25`; gateway remains 1.10.
+The earlier frozen 1.25 compatibility snapshot was used only by the coverage-only
+consumer before intake implementation.
+
+### Incremental finding intake (AIO-1101)
+
+`POST /api/v1/codebases/:slug/debt-intake-events` accepts the unchanged canonical
+finding candidate/run-summary union through a closed 256-record, 1 MiB envelope.
+Strict UTF-8/JSON parsing rejects duplicate decoded keys and noninteger numeric
+syntax. Canonical hashes, typed references, lifecycle history and final summary
+reconciliation are validated before any write. The slug anchors authorization and
+audit; a mixed-repository producer run need not mention it in every candidate.
+
+Three additive tables retain immutable evidence: `codebase_debt_candidates`,
+`codebase_debt_candidate_codebases` (historical membership union), and
+`codebase_debt_candidate_events` (canonical bytes plus query indexes). Composite
+team keys, direct team foreign keys and append-only row triggers prevent cross-team
+relations and destructive row updates. Privileged TRUNCATE/DDL is outside those
+row-trigger guarantees. Rollback disables writers and retains all ledger evidence.
+
+Authentication requires active API key membership and actual everyone-group team
+posture, rechecked on the transaction connection after the team advisory lock.
+`DEBT_INTAKE_REGISTRY_JSON` is reviewed server configuration keyed by team UUID:
+`producers` maps namespaces to historical versions, `codebases` and `linear_teams`
+are allowlists, and `uploaders` maps API key UUIDs to permitted namespace/version
+maps. Missing configuration or uploader grants denies ingestion and replay.
+Registry changes are operationally reviewed; request bodies never extend trust.
+The dedicated uploader attests external inventory evidence, which Brain cannot
+recover or prove from a digest. Production activation requires the separate
+uploader preflight and retained-evidence reconciliation proof.
+
+The writer serializes each team, loads bounded incoming-candidate history heads,
+and checks reachable historical duplicate edges plus run-scoped aggregates.
+Final summaries freeze producer runs. Exact replays return 200, new records 201,
+with disjoint distinct acknowledgments in first-occurrence order. All candidate,
+membership, event and mandatory payload-free audit writes commit atomically.
+Audit insertion failure rolls back the whole batch; no success is sent before
+commit. A two-second lock deadline and fifteen-second statement deadline yield
+retryable 503, while the existing per-key limiter yields 429 with Retry-After.
+Malformed or inconsistent events return 422 without partial acceptance.
+
+The mirrored additive migration and isolated PostgreSQL tests cover fresh setup,
+populated upgrade/replay, constraints, concurrency, history, finalization, auth and
+audit rollback. Isolated proofs do not constitute production migration rehearsal
+or authorize production ingestion; controlled release retains those separate gates.

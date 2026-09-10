@@ -1,7 +1,7 @@
 {
   "$schema": "aios-brain-contract/v1",
   "_note": "Canonical conformance fixture for the workspace<->brain seam (AIO-314). Home: aios-workspace/docs/contract. Vendored into aios-team-brain/test/fixtures/contract. contentHash pins the content; /docs-sync compares the two copies. Regenerate: node scripts/gen-contract-fixture.mjs.",
-  "version": "1.25",
+  "version": "1.26",
   "tierAliases": {
     "shared": {
       "team": "team",
@@ -112,5 +112,78 @@
       "sha256": "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e"
     }
   },
-  "contentHash": "e9d81bb9873d09e2f15964f1f99cf6108eba862a411999dea1a2a08310c16e1e"
+  "contentHash": "22e8b27c0409d56acd7aff72a2da165f3c3b2e9a068c54443a3fa56e93b3f7aa",
+  "debtIntakeEventsContract": {
+    "version": "1.26",
+    "requestVersion": "debt-intake-events.v1",
+    "method": "POST",
+    "route": "/api/v1/codebases/:slug/debt-intake-events",
+    "availability": "contract-only; future Team Brain implementation AIO-1101",
+    "harnessCommit": "691762a469f5e816d35a6263467c9e2d8cc98e8e",
+    "maxRecords": 256,
+    "maxRawBodyBytes": 1048576,
+    "canonicalContract": {
+      "path": "finding-observations-v1.md",
+      "sha256": "b23baa16b0055e4841584433390c9412ac11c922a333dec35cae45108761e0ac"
+    },
+    "canonicalSchema": {
+      "path": "finding-observations.v1.schema.json",
+      "sha256": "a51f360769ab26440287891867447baf6e3df93073df6f0d7febc1f3c10322b2"
+    },
+    "knownAnswers": {
+      "path": "debt-intake/known-answers.json",
+      "sha256": "48edbd98f42a88f80462b765949dcee29ab8ac4b1c63ffdfe3c5a88e1553ba6a"
+    },
+    "trustedConfig": {
+      "path": "debt-intake/trusted-config.json",
+      "sha256": "30776d6587b21183b6ce531bd70a4b55444d04f4f61c5014eae3b4eb5107a8a7"
+    },
+    "canonicalFixtures": [
+      {
+        "path": "debt-intake/complete-lifecycle.jsonl",
+        "sha256": "0b5b00a680b39ee7fd3ff0427bd08a7239e7a5560a3c41aef0ded9b407505790"
+      },
+      {
+        "path": "debt-intake/empty-success.jsonl",
+        "sha256": "062ee53e59331423836f7ac860725db492d381537affb59fce1f09e7c517e109"
+      },
+      {
+        "path": "debt-intake/escaped-reopened.jsonl",
+        "sha256": "55f680397e4da3f3d382a6a0c29329cd622ab77d8af2ce674e1e7a74f4fa6b88"
+      },
+      {
+        "path": "debt-intake/five-candidate-worked-example.jsonl",
+        "sha256": "7314ddea8125669b7e29424a39185fdcdc65704bf67d74d65b6cfa7417383417"
+      },
+      {
+        "path": "debt-intake/malformed-accounted.jsonl",
+        "sha256": "fc325ffcb1f5489f1c0858da5b1a4eab698d49f66d8feaa5577b13ff5c5e1a26"
+      },
+      {
+        "path": "debt-intake/partial-capture.jsonl",
+        "sha256": "43b98197cdfe6f0c758b653e4f5b1efc1560bba38e016b01d73a6cb4db05816b"
+      },
+      {
+        "path": "debt-intake/provider-failure.jsonl",
+        "sha256": "72643103bf37b0fa907e92e80fc2e4ee9dda61684fbebd43cdabd1ac5d030af9"
+      },
+      {
+        "path": "debt-intake/structural-key.jsonl",
+        "sha256": "879bb147287f7e879e44be8b02ea9e019817bac8b515386933daa5fccfef02a6"
+      }
+    ],
+    "schema": {
+      "path": "debt-intake-events-v1.schema.json",
+      "sha256": "7f7dae971a8837bb3acd06732d616abd043914203f8dd67f4c64620f99f0703a"
+    },
+    "ackSchema": {
+      "path": "debt-intake-events-v1-ack.schema.json",
+      "sha256": "92e441176d3221aafa2afec767c3caeb2cde717dd06ab44c9de101ae6d9975f3"
+    },
+    "fixtures": {
+      "path": "debt-intake-events-v1-fixtures.json",
+      "sha256": "bafd991a3bd7071e021b7b4bb1be202a82522c07dfefdb1918405cd4249f5d05"
+    },
+    "schemaRegistration": "Before compiling the request schema, register canonicalSchema by its unchanged $id urn:aios:finding-observations:v1. The request $ref resolves to this exact locally vendored schema; do not fetch or substitute a remote schema."
+  }
 }

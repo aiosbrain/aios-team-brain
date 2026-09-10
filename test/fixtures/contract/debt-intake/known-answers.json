@@ -1,0 +1,15 @@
+{
+  "identity": {
+    "version": "discovery.v1",
+    "producer_namespace": "harness",
+    "original_run_id": "0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5",
+    "source_artifact_sha256": "b8f86516827c289f3940c38393e798728d28e093321ede9a60ab7e7ad67ccabb",
+    "source_record_key": {
+      "kind": "position",
+      "value": 0
+    }
+  },
+  "candidate_id": "e91b954b09dbac5ec03e03c9596efd5da5058e13d4b049607d97e39d8c964eec",
+  "discovered_event_id": "65c1d143ea43f9febf1b1a2d64a20da5045d612010348658df5b68557bdab3e1",
+  "canonical_identity_utf8": "{\"original_run_id\":\"0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5\",\"producer_namespace\":\"harness\",\"source_artifact_sha256\":\"b8f86516827c289f3940c38393e798728d28e093321ede9a60ab7e7ad67ccabb\",\"source_record_key\":{\"kind\":\"position\",\"value\":0},\"version\":\"discovery.v1\"}"
+}
