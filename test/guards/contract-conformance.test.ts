@@ -80,6 +80,7 @@ describe("brain-api tier + SSE conformance", () => {
       gatewayContract,
       itemPayloadContract,
       codebasePayloadContract,
+      debtIntakeEventsContract,
     } = fixture;
     const recomputed = createHash("sha256")
       .update(
@@ -95,6 +96,7 @@ describe("brain-api tier + SSE conformance", () => {
             // threshold a scan's `scanner_version` is read against — so it is contract CONTENT,
             // not commentary, and an out-of-band edit to it must break the hash like any other.
             codebasePayloadContract,
+            debtIntakeEventsContract,
           }),
         ),
       )

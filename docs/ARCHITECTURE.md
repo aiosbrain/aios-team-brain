@@ -400,7 +400,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.25** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.26** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -1504,6 +1504,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 
 <!-- drift:routes -->
 
+- `POST /api/v1/codebases/:slug/debt-intake-events` — dedicated team/uploader-authorized atomic finding ledger ingestion and run finalization
+
 - `GET /api/health` — bounded public Postgres readiness; authenticated copied-staging Postgres/Neo4j/run evidence and boot probe
 - `GET /api/internal/staging-build-metadata` — token-authenticated declared build identity (deployed commit + migration-set hash) for the staging paired-refresh exporter
 - `POST /api/internal/executor-gateway/v1/resolve-lease` — service-authenticated, version-pinned, one-use 30-second credential-resolution lease
@@ -1597,6 +1599,10 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 ### Database tables
 
 <!-- drift:tables -->
+
+- `codebase_debt_candidates` — immutable team-scoped finding identity
+- `codebase_debt_candidate_codebases` — append-only historical repository membership
+- `codebase_debt_candidate_events` — immutable canonical candidates and producer-run summaries
 
 `auth_users` · `auth_tokens` · `oauth_states` · `teams` · `members` · `api_keys` · `audit_log` ·
 `gateway_service_identities` · `gateway_service_credentials` · `executor_subject_bindings` · `gateway_connections` · `gateway_resolution_leases` ·

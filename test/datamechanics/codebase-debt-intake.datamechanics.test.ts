@@ -85,6 +85,8 @@ describe("AIO-1101 append-only intake: real route and private Postgres", () => {
     const first = await send(ctx, events);
     expect(first.status, await first.clone().text()).toBe(201);
     expect(await first.json()).toEqual({ status: "ok", accepted_event_ids: events.map(e => e.event_id), duplicate_event_ids: [] });
+    const stored = await getPool().query("select event_id, canonical_record from codebase_debt_candidate_events where team_id=$1", [ctx.teamId]);
+    for (const row of stored.rows) expect(row.canonical_record).toBe(canonical(events.find(e => e.event_id === row.event_id)));
     const before = await counts(ctx);
     const replay = await send(ctx, events);
     expect(replay.status).toBe(200);
@@ -229,10 +231,13 @@ describe("AIO-1101 append-only intake: real route and private Postgres", () => {
       }
       expect(waiting).toBe(true);
       if (change === "revoked") await pool.query("update api_keys set revoked_at=now() where id=$1", [ctx.apiKeyId]);
-      if (change === "inactive") await pool.query("update members set status='inactive' where id=$1", [ctx.memberId]);
+      if (change === "inactive") await pool.query("update members set status='disabled' where id=$1", [ctx.memberId]);
       if (change === "posture") await pool.query("delete from group_members where team_id=$1 and member_id=$2", [ctx.teamId, ctx.memberId]);
     } finally {
       await holder.query("rollback"); holder.release();
+      // Always drain an authenticated request, even if the mutation/assertion above failed.
+      // Otherwise global per-test TRUNCATE can race an unfinished transaction.
+      if (response) await response;
     }
     const result = await response!;
     if (change === "control") expect(result.status).toBe(201);
@@ -272,6 +277,100 @@ describe("AIO-1101 append-only intake: real route and private Postgres", () => {
     expect(await counts(ctx)).toEqual([0, 0, 0]);
   });
 
+  it.each(["unknown-duplicate", "duplicate-cycle", "self-duplicate", "conflicting-summary", "conflicting-replay"])("rejects canonical relational negative %s atomically", async name => {
+    const ctx = await setup();
+    await denied(await send(ctx, ledger(`negative/${name}`)));
+    expect(await counts(ctx)).toEqual([0, 0, 0]);
+  });
+
+  it("retains historical duplicate edges after reopening and rejects a later reverse edge", async () => {
+    const ctx = await setup(); const [a, aDuplicate, b, bDuplicate] = ledger("negative/duplicate-cycle");
+    expect((await send(ctx, [a, b, aDuplicate])).status).toBe(201);
+    const reopened = rehash({ ...aDuplicate, sequence: 2, predecessor_event_id: aDuplicate.event_id,
+      state: "reopened", disposition: "open", duplicate_target: null, episode: 1 });
+    expect((await send(ctx, [reopened])).status).toBe(201);
+    await denied(await send(ctx, [bDuplicate]));
+    expect(await counts(ctx)).toEqual([2, 2, 4]);
+  });
+
+  it("concurrent divergent children cannot both win the same sequence", async () => {
+    const ctx = await setup(); const [a, b] = ledger();
+    expect((await send(ctx, [a])).status).toBe(201);
+    const fork = rehash({ ...b, observed_at: "2026-08-30T10:00:00Z" });
+    const results = await Promise.all([send(ctx, [b]), send(ctx, [fork])]);
+    expect(results.map(r => r.status).sort()).toEqual([201, 422]);
+    expect(await counts(ctx)).toEqual([1, 1, 2]);
+  });
+
+  it("isolates identical candidate/event IDs and replay acknowledgments between teams", async () => {
+    const first = await setup(); const firstRegistry = JSON.parse(process.env.DEBT_INTAKE_REGISTRY_JSON!);
+    const second = await setup();
+    process.env.DEBT_INTAKE_REGISTRY_JSON = JSON.stringify({ ...firstRegistry, ...JSON.parse(process.env.DEBT_INTAKE_REGISTRY_JSON!) });
+    const events = ledger();
+    expect((await send(first, events)).status).toBe(201);
+    expect((await send(second, events)).status).toBe(201);
+    expect((await send(first, events)).status).toBe(200);
+    expect(await counts(first)).toEqual([1, 1, 9]);
+    expect(await counts(second)).toEqual([1, 1, 9]);
+  });
+
+  it("returns deterministic rate limiting with Retry-After and no intake writes", async () => {
+    const ctx = await setup();
+    await getPool().query(`insert into rate_limits(bucket,window_start,count)
+      values($1,date_trunc('minute',now()),60)`, [`${ctx.apiKeyId}:debt-intake:post`]);
+    const response = await send(ctx, ledger("empty-success"));
+    expect(Number(response.headers.get("Retry-After"))).toBeGreaterThan(0);
+    await denied(response, 429, "rate_limited");
+    expect(await counts(ctx)).toEqual([0, 0, 0]);
+  });
+
+  it("rejects unregistered typed links without letting a valid anchor authorize them", async () => {
+    const ctx = await setup(); const discovery = ledger()[0];
+    const links = discovery.links as Record<string, unknown>;
+    for (const invalidLinks of [
+      { ...links, linear: { type: "linear", team: "OTHER", number: 1 } },
+      { ...links, scanner: { type: "scanner", producer: "other", finding_id: "a".repeat(64) } },
+      { ...links, pull_request: { type: "pull_request", codebase: "workspace", number: 1 } },
+      { ...links, merge: { type: "merge", codebase: "workspace", sha: "a".repeat(40) } },
+    ]) await denied(await send(ctx, [rehash({ ...discovery, links: invalidLinks })]));
+    expect(await counts(ctx)).toEqual([0, 0, 0]);
+  });
+
+  it("stops a chunked request at the raw-body ceiling before consuming the rest", async () => {
+    const ctx = await setup(); let reads = 0; let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { reads++; controller.enqueue(new Uint8Array(262144).fill(32)); },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const request = new NextRequest("http://test/api/v1/codebases/harness/debt-intake-events", {
+      method: "POST", headers: { Authorization: `Bearer ${ctx.key}`, "Content-Type": "application/json" },
+      body, duplex: "half",
+    } as RequestInit);
+    await denied(await POST(request, { params: Promise.resolve({ slug: "harness" }) }), 413, "payload_too_large");
+    expect(cancelled).toBe(true); expect(reads).toBe(5);
+    expect(await counts(ctx)).toEqual([0, 0, 0]);
+  });
+
+  it("rejects non-JSON and non-UTF8 content types before storing a valid record", async () => {
+    const ctx = await setup(); const body = JSON.stringify({ schema_version: "debt-intake-events.v1", events: ledger("empty-success") });
+    for (const contentType of ["text/plain", "application/json; charset=iso-8859-1"])
+      await denied(await raw(ctx, body, "harness", { "Content-Type": contentType }));
+    expect(await counts(ctx)).toEqual([0, 0, 0]);
+  });
+
+  it("SQL uniqueness forbids a second event at a candidate sequence and a second run summary", async () => {
+    const ctx = await setup(); const events = ledger();
+    expect((await send(ctx, events)).status).toBe(201);
+    for (const source of [events[0], events.at(-1)!]) {
+      const conflicting = rehash({ ...source, observed_at: "2026-08-30T10:00:00Z" });
+      await expect(getPool().query(
+        "insert into codebase_debt_candidate_events(team_id,event_id,record,canonical_record) values($1,$2,$3::jsonb,$4::text)",
+        [ctx.teamId, conflicting.event_id, canonical(conflicting), canonical(conflicting)],
+      )).rejects.toMatchObject({ code: "23505" });
+    }
+    expect(await counts(ctx)).toEqual([1, 1, 9]);
+  });
+
   it("enforces direct SQL null safety, team foreign keys and summary-only retention", async () => {
     const ctx = await setup(); const summary = ledger("empty-success")[0];
     const insert = (team: string, record: unknown, bytes: string | null = canonical(record)) => getPool().query(
@@ -286,7 +385,12 @@ describe("AIO-1101 append-only intake: real route and private Postgres", () => {
     await expect(insert(ctx.teamId, { ...summary, record_type: "candidate" })).rejects.toThrow();
     await insert(ctx.teamId, summary);
     expect(await counts(ctx)).toEqual([0, 0, 1]);
-    await expect(getPool().query("delete from teams where id=$1", [ctx.teamId])).rejects.toMatchObject({ code: "23503" });
+    // A minimal team without key-issuance audit isolates the direct summary-to-team FK;
+    // deleting a fully seeded team can hit unrelated audit retention triggers first.
+    const retentionTeam = randomUUID();
+    await getPool().query("insert into teams(id,slug,name) values($1,$2,'Summary retention')", [retentionTeam, `retention-${retentionTeam}`]);
+    await insert(retentionTeam, summary);
+    await expect(getPool().query("delete from teams where id=$1", [retentionTeam])).rejects.toMatchObject({ code: "23503" });
     const { rows } = await getPool().query("select attname,attnotnull from pg_attribute where attrelid='codebase_debt_candidate_events'::regclass and attname=any($1)", [["team_id", "record", "canonical_record", "record_type", "producer_name", "producer_run_id"]]);
     expect(rows).toHaveLength(6); expect(rows.every(row => row.attnotnull)).toBe(true);
   });

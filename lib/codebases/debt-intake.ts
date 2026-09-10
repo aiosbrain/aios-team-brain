@@ -194,7 +194,7 @@ export async function ingestDebtIntake(
     );
     for (const record of accepted) await client.query(
       `insert into codebase_debt_candidate_events(team_id,event_id,record,canonical_record)
-       values($1,$2,$3::jsonb,$3)`, [auth.teamId, record.event_id, canonicalRecord(record)],
+       values($1,$2,$3::jsonb,$4::text)`, [auth.teamId, record.event_id, canonicalRecord(record), canonicalRecord(record)],
     );
     await auditRequired(client, {
       team_id: auth.teamId, actor_kind: "api_key", member_id: auth.memberId, api_key_id: auth.apiKeyId,
