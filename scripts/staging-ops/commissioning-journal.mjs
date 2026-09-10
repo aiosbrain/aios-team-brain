@@ -66,6 +66,12 @@ export const JOURNAL_EVENTS = Object.freeze([
    */
   "reconciliation",
   "recovery",
+  /**
+   * The digest of the PRIVATE production input/subject file (PC-04), bound into the chain before any
+   * disposable mutation. It is the anchor that makes the offline reconstruction authoritative: a file
+   * swapped after the fact no longer matches the hash-linked record that named it.
+   */
+  "production-inputs-bound",
   "run-closed",
 ]);
 
@@ -440,6 +446,83 @@ export function openJournal({ dir, runId, attempt, source, lock, kind = "resourc
     read: () => readJournal({ dir: root, runId, attempt, kind }),
     get length() { return seq; },
   };
+}
+
+/**
+ * ── THE ONCE-ONLY WITNESS EVENT TRANSITION ──────────────────────────────────────────────────────
+ *
+ * The closed binding that decides whether two records describe THE SAME EVENT.
+ *
+ * Every field here is a retained challenge/dispatch/publication fact or an exact digest. A field
+ * outside the list is never consulted for equality, and a field inside it may never differ.
+ *
+ * `polls`, `envelope_digest` and `recovered_pending_dispatch_seq` are deliberately OUTSIDE: they
+ * describe THIS PROCESS'S ATTEMPT TO OBSERVE a publication, not the publication. A first pass that
+ * dispatched holds an envelope digest; a later pass that finds the artifact already published holds
+ * `null` — and it is nevertheless the same publication, because the expected artifact name, the
+ * provider artifact ID, the publisher run and the entry digest are all the same. So they are
+ * excluded from the equality test, and the transition returns the ORIGINAL record untouched rather
+ * than merging, overwriting or appending. Exactly one record survives, and a genuinely different
+ * publication under the same key still refuses.
+ */
+export const ONCE_ONLY_EVENT_BINDINGS = Object.freeze({
+  "challenge-observed": Object.freeze(["case_id", "role", "direction", "artifact_id", "challenge_digest", "nonce_digest", "expires_at"]),
+  "response-reconciled": Object.freeze(["case_id", "role", "direction", "expected_artifact", "artifact_id", "publisher_run_id", "entry_digest"]),
+});
+
+/**
+ * Append a witness event AT MOST ONCE, or return the one already recorded, or refuse.
+ *
+ * ── THE DEFECT THIS REPLACES ────────────────────────────────────────────────────────────────────
+ *
+ * Four append sites wrote these events UNCONDITIONALLY: one `challenge-observed` on every serve of
+ * an item, and one `response-reconciled` from each of three reconciliation paths. So any restarted
+ * or re-entered witness process — an ordinary production event, since the whole point of the
+ * pending-dispatch reconciliation is that the process can die and resume — appended a second copy
+ * of an event that is once-only by contract. The final assessment counted them and refused, and the
+ * wrong fix was to make the assessment count presence instead. This is the right one: the producer
+ * makes the transition, and the assessment keeps requiring exactly one.
+ *
+ * Three outcomes and no fourth:
+ *
+ *  - nothing recorded for this key  → append once;
+ *  - exactly one record whose complete closed binding is byte-identical → return THAT record,
+ *    without appending;
+ *  - a conflicting binding, or more than one matching record already in the chain → REFUSE.
+ *
+ * It performs no measurement, mints no nonce, restamps no timestamp and dispatches nothing. The
+ * caller has already re-resolved the publication through the ordinary consumer path, so the original
+ * challenge, its ORIGINAL expiry and the existing source and provenance rules have all been applied
+ * before this is reached.
+ */
+export function recordWitnessEventOnce({ journal, type, data }) {
+  const binding = ONCE_ONLY_EVENT_BINDINGS[String(type)];
+  if (!binding) throw new JournalRefusalError(`${String(type)} is not a once-only witness event`);
+  const caseId = String(data?.case_id ?? "");
+  const direction = String(data?.direction ?? "");
+  if (!caseId || !direction) throw new JournalRefusalError(`a ${type} record needs its case and direction to be recorded once-only`);
+  const project = (value) => JSON.stringify(binding.map((field) => (value?.[field] === undefined ? null : value[field])));
+  const wanted = project(data);
+  const existing = journal.read().filter((record) => String(record.type) === String(type)
+    && String(record.data?.case_id ?? "") === caseId
+    && String(record.data?.direction ?? "") === direction);
+  if (existing.length > 1) {
+    throw new JournalRefusalError(
+      `this witness journal already holds ${existing.length} ${type} records for ${caseId}:${direction}; a once-only event cannot be resolved from an ambiguous history`,
+    );
+  }
+  if (existing.length === 1) {
+    if (project(existing[0].data) !== wanted) {
+      const conflicting = binding.filter((field) => JSON.stringify(existing[0].data?.[field] ?? null) !== JSON.stringify(data?.[field] ?? null));
+      throw new JournalRefusalError(
+        `this witness journal already holds a different ${type} for ${caseId}:${direction} (conflicting: ${conflicting.join(", ")}); commissioning refuses to record a second one`,
+      );
+    }
+    // THE RETAINED RECORD, returned as it stands. Nothing is appended and nothing is rewritten.
+    return { record: existing[0].data, appended: false, replayed: true };
+  }
+  journal.append(type, data);
+  return { record: data, appended: true, replayed: false };
 }
 
 /**

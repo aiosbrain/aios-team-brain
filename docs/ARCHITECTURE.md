@@ -106,7 +106,28 @@ one non-protected publisher job republishes those exact bytes as a single-entry 
 binds it to its own nonce and immutable source before running the production verifier and mutating.
 Eleven cloud cases × pre and post = exactly **22** publications per attempt, and `check-evidence`
 JOINS that exact closed set across the immutable intent, each actor's own consumed evidence and BOTH
-hash-chained journals rather than counting it. ⚠️ This is a bounded
+hash-chained journals rather than counting it.
+
+**What each of those joins actually recomputes** (AIO-1124 defensive correction). `check-evidence` is
+a re-derivation, not a re-reading, so five things it used to accept as declarations are now rebuilt
+from independent artefacts:
+
+| Claim | Reconstructed from |
+|---|---|
+| ownership of a disposable ruleset | the intended governed body recomputed from the immutable intent (`buildDisposablePlan`). **Every** added field refuses — including a provider default such as `update_allows_fetch_and_merge` — and a real expansion is reported as a named `provider-normalization` gap rather than adopted. Applies to **every** first fingerprint adoption, the successful-`201` readback included: a 201 does not prove the later GET body |
+| the production subject and its hash | a **private, local, mode-0600** `production-inputs` record holding the exact twelve-context producer map and the raw `buildMainRulesets` output, digest-anchored in the resource journal. `buildMainRulesets` is regenerated from it and the manifest is rebuilt; the published intent still exposes only the producer-map **digest**, and this file is never uploaded, dispatched or logged |
+| the publisher's publishable vocabulary | the ORIGINAL run's authenticated **intent artifact**, read by the publisher job with the `actions: read` it already holds, through the existing bounded archive transport and single-entry ZIP reader at a fixed entry name. The exact planned App identities come from there — never from an arbitrary-positive inference |
+| a credential's installation identity | typed, positive, **distinct planned installation IDs** in the credential-free intent (`vars.COMMISSIONING_*_INSTALLATION_ID`), compared to the protected job's configuration *before* the exchange and to the provider's **returned** `installation.id` after it |
+| a publication's bytes | the **dispatch → exact retained bytes → entry digest → challenge nonce** join. The bytes are retained and re-hashed under the same serialization contract they were dispatched under, so an unknown or changed byte stream refuses even when the parsed response objects look equivalent |
+
+Two lifecycle rules underpin them. Each of the 22 keys carries **exactly one** `challenge-observed`,
+`dispatch-intent`, `dispatch-result` and `response-reconciled`; the producer reaches that through one
+shared validated once-only transition (`recordWitnessEventOnce`), so a restarted witness replays the
+retained record instead of appending a second, and a conflicting publication or observation under the
+same key refuses. And every timestamp is judged as **history**: a response's creation and its receipt
+are distinct measured events, a missing receipt is incomplete rather than substituted, and controls
+and approvals must fall inside the run's window at both ends — a capture dated after the run is as
+unmoored as one dated before it. ⚠️ This is a bounded
 contemporaneous pre/post measurement under administrative quiescence, **not an atomic
 policy-at-mutation proof**; every policy record in the packet carries that sentence and
 `check-evidence` refuses a packet that drops it. A separate `transport-rehearsal` mode measures that

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,11 +30,13 @@ import {
   responseArtifactName, runCaseStage, runCloudTestsPhase, runFixtureChecks,
   runHumanTestsPhase, runIntentPhase, runNormalCheckPublication, runPhase, runRehearsalStage,
   beginWitnessItem, runWitnessPublisherJob, serveWitnessItem, transformToDisposable, unresolvedCreateIntents,
+  INTENT_JOB_NAME, intentArtifactEntry, intentArtifactName, derivedRulesetNames, pollWitnessPublication,
   validateEnvironmentControl, validateEvidenceBinding, verifyWitnessedPolicy, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
-  acquireJournalLock, journalPath, openJournal, readJournal, readLockOwner, recoverJournalLock,
+  acquireJournalLock, journalPath, openJournal, readJournal, readLockOwner, recordWitnessEventOnce,
+  recoverJournalLock,
 } from "../scripts/staging-ops/commissioning-journal.mjs";
 import { openCaseStateStore } from "../scripts/staging-ops/commissioning-case.mjs";
 import {
@@ -207,7 +209,11 @@ type StoredPull = {
   base: { ref: string; repo: { full_name: string } };
   head: { ref: string; repo: { full_name: string }; sha: string };
 };
-type ApprovalEntry = { state: string; user: { login: string; type: string }; environments: { name: string }[] };
+type ApprovalEntry = {
+  state: string; user: { login: string; type: string };
+  comment?: string; created_at?: string; updated_at?: string;
+  environments: { name: string }[];
+};
 type ApplicableRule = { type: string; ruleset_id?: number; ruleset_source_type?: string; ruleset_source?: string };
 type Permissions = Record<string, string>;
 
@@ -313,6 +319,9 @@ interface FakeOptions {
    */
   approvalsStatus?: number;
   jobsStatus?: number;
+  /** The credential-free intent job's own state in the original run. */
+  intentJobStatus?: string;
+  intentJobConclusion?: string;
   /**
    * Rule types the provider silently fails to enforce, while still REPORTING the ruleset as
    * applicable. This is the only honest way to model an over-privileged actor: deleting the ruleset
@@ -431,8 +440,10 @@ function createFakeGitHub(options: FakeOptions = {}) {
    * jumped straight to `completed` would make every witness service refuse for the right reason at
    * the wrong time. {@link finish} is the separate event of the job ending.
    */
-  const approve = (job: string, login = OWNER_LOGIN, type = "User", id = OWNER_USER_ID) => {
-    approvals.push({ state: "approved", user: { login, type, id }, environments: [{ name: JOB_ENVIRONMENTS[job] }] });
+  const approve = (job: string, login = OWNER_LOGIN, type = "User", id = OWNER_USER_ID, approvedAt = new Date().toISOString()) => {
+    // GitHub's deployment-approval object carries its own timestamp. The harness used to drop it,
+    // so an approval could not be placed in time at all — which is why a future one was invisible.
+    approvals.push({ state: "approved", user: { login, type, id }, comment: "", created_at: approvedAt, updated_at: approvedAt, environments: [{ name: JOB_ENVIRONMENTS[job] }] });
     jobState.set(job, { status: "in_progress", conclusion: null });
   };
   const finish = (job: string, conclusion = "success") => jobState.set(job, { status: "completed", conclusion });
@@ -580,7 +591,13 @@ function createFakeGitHub(options: FakeOptions = {}) {
         const rows = options.jobStatus
           ? Object.keys(JOB_NAMES).map((id) => ({ id: 900 + Object.keys(JOB_NAMES).indexOf(id), name: JOB_NAMES[id], status: options.jobStatus, conclusion: null, run_attempt: Number(ATTEMPT) }))
           : [...jobState.entries()].map(([id, value]) => ({ id: 900 + Object.keys(JOB_NAMES).indexOf(id), name: JOB_NAMES[id], status: value.status, conclusion: value.conclusion, run_attempt: Number(ATTEMPT) }));
-        return json(200, { total_count: rows.length, jobs: rows });
+        // The credential-free intent job, which really is in this run and really does finish first:
+        // the publisher binds its intent artifact to THIS job's success in THIS attempt.
+        const withIntent = [
+          { id: 890, name: INTENT_JOB_NAME, status: options.intentJobStatus ?? "completed", conclusion: options.intentJobConclusion ?? "success", run_attempt: Number(ATTEMPT) },
+          ...rows,
+        ];
+        return json(200, { total_count: withIntent.length, jobs: withIntent });
       }
       if (rel.endsWith("/approvals")) {
         if (faults.approvals) return json(faults.approvals, { message: "Not Found" });
@@ -822,6 +839,10 @@ const cloudEnv = (job: string, extra: Record<string, string> = {}) => ({
   COMMISSIONING_REPOSITORY_ID: String(REPOSITORY_ID),
   COMMISSIONING_NORMAL_APP_ID: String(NORMAL_APP),
   COMMISSIONING_EMERGENCY_APP_ID: String(EMERGENCY_APP),
+  // The PLANNED installations, from nonsecret commissioning configuration. The protected jobs'
+  // own `*_INSTALLATION_ID` values must equal these before any credential is exchanged.
+  COMMISSIONING_NORMAL_INSTALLATION_ID: "5001",
+  COMMISSIONING_EMERGENCY_INSTALLATION_ID: "5002",
   COMMISSIONING_PRODUCER_IDS_JSON: JSON.stringify(PRODUCER_IDS),
   ...extra,
 }) as unknown as NodeJS.ProcessEnv;
@@ -854,9 +875,12 @@ const INTENT_ENV = () => {
   return env as unknown as NodeJS.ProcessEnv;
 };
 
-async function intentAndSetup(github: ReturnType<typeof createFakeGitHub>) {
+async function intentAndSetup(github: ReturnType<typeof createFakeGitHub>, clock?: () => Date) {
   const intent = await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
-  const setup = await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+  const setup = await runPhase({
+    phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+    deps: clock ? { ...localDeps(github), now: clock } : localDeps(github),
+  });
   return { intent, setup };
 }
 
@@ -879,31 +903,49 @@ const publishChallenge = (github: ReturnType<typeof createFakeGitHub>, role: str
 };
 
 /** The local witness, serving exactly one work item — the read-only half of the transport. */
-async function serveOne(github: ReturnType<typeof createFakeGitHub>, item: { role: string; caseId: string; ordinal: number; direction: "pre" | "post" }, overrides: Record<string, unknown> = {}) {
+async function serveOne(github: ReturnType<typeof createFakeGitHub>, item: { role: string; caseId: string; ordinal: number; direction: "pre" | "post" }, overrides: Record<string, unknown> = {}, clock?: () => Date) {
   const session = await openWitnessSession({
     runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
-    deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl },
+    deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, ...(clock ? { now: clock } : {}) },
   });
   try {
     return await serveWitnessItem({
       request: session.request, requestArchive: session.requestArchive, ctx: session.ctx, journal: session.journal,
       item, operator: session.operator, domain: session.domain, setupBindings: session.setupBindings,
-      now: () => new Date(), sleep: async () => {}, intervalMs: 1, ...overrides,
+      now: clock ?? (() => new Date()), sleep: async () => {}, intervalMs: 1, ...overrides,
     });
   } finally { session.lock.release(); }
 }
 
+/**
+ * Register the ORIGINAL run's credential-free intent artifact, exactly as its upload step does.
+ *
+ * The publisher reads this to learn the run's planned App identities before it validates a governed
+ * projection, so a fixture that omits it is a fixture in which the publisher cannot do its job.
+ */
+async function publishIntentArtifact(github: ReturnType<typeof createFakeGitHub>) {
+  let intent = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "intent"));
+  if (!intent) {
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    intent = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "intent"));
+  }
+  return github.addArtifact(
+    intentArtifactName(RUN_ID, ATTEMPT), intentArtifactEntry(RUN_ID, ATTEMPT),
+    Buffer.from(`${JSON.stringify(intent)}\n`, "utf8"), Number(RUN_ID),
+  );
+}
+
 /** Run one case end to end: prepare → upload → serve → execute → upload → serve → finalize. */
-async function runCase(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency", caseId: string) {
+async function runCase(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency", caseId: string, clock?: () => Date) {
   const ordinal = CLOUD_CASE_SEQUENCE[role].indexOf(caseId) + 1;
   const env = cloudEnv(role, { ...(role === "normal" ? NORMAL_JOB_ENV : EMERGENCY_JOB_ENV), COMMISSIONING_EVIDENCE_DIR: evidenceDir });
-  const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+  const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, ...(clock ? { now: clock } : {}) };
   await runCaseStage({ stage: "prepare", caseId, env, deps });
   publishChallenge(github, role, ordinal, "pre");
-  await serveOne(github, { role, caseId, ordinal, direction: "pre" });
+  await serveOne(github, { role, caseId, ordinal, direction: "pre" }, {}, clock);
   await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
   publishChallenge(github, role, ordinal, "post");
-  await serveOne(github, { role, caseId, ordinal, direction: "post" });
+  await serveOne(github, { role, caseId, ordinal, direction: "post" }, {}, clock);
   return runCaseStage({ stage: "await-and-finalize", caseId, env, deps });
 }
 
@@ -920,37 +962,39 @@ async function runRoleCasesUntilRefusal(github: ReturnType<typeof createFakeGitH
 }
 
 /** Every case a role owns, in its closed sequence order. */
-async function runRoleCases(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency") {
+async function runRoleCases(github: ReturnType<typeof createFakeGitHub>, role: "normal" | "emergency", clock?: () => Date) {
   const results = [];
-  for (const caseId of CLOUD_CASE_SEQUENCE[role]) results.push(await runCase(github, role, caseId));
+  for (const caseId of CLOUD_CASE_SEQUENCE[role]) results.push(await runCase(github, role, caseId, clock));
   return results;
 }
 
 /** The whole reviewed order: intent → setup → fixture → normal → human → emergency → cleanup. */
-async function commissionEverything(github: ReturnType<typeof createFakeGitHub>) {
-  await intentAndSetup(github);
+async function commissionEverything(github: ReturnType<typeof createFakeGitHub>, options: { now?: () => Date } = {}) {
+  const clock = options.now;
+  const withClock = <T extends Record<string, unknown>>(deps: T) => (clock ? { ...deps, now: clock } : deps);
+  await intentAndSetup(github, clock);
   const fixture = await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
   // What GitHub and the human do, in the order they do it: the fixture finishing is what lets
   // `normal` be created at all, and only then can anyone approve it.
   github.createNormalJob();
-  github.approve("normal");
+  github.approve("normal", OWNER_LOGIN, "User", OWNER_USER_ID, clock ? clock().toISOString() : undefined);
   await runNormalCheckPublication({
     env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }),
-    deps: cloudDeps(github),
+    deps: withClock(cloudDeps(github)),
   });
-  await runRoleCases(github, "normal");
+  await runRoleCases(github, "normal", clock);
   github.finish("normal");
-  const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: cloudDeps(github) });
-  const human = await runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
-  github.approve("emergency");
-  await runRoleCases(github, "emergency");
+  const normal = await runCloudTestsPhase({ role: "normal", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("normal", NORMAL_JOB_ENV), deps: withClock(cloudDeps(github)) });
+  const human = await runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: withClock(localDeps(github)) });
+  github.approve("emergency", OWNER_LOGIN, "User", OWNER_USER_ID, clock ? clock().toISOString() : undefined);
+  await runRoleCases(github, "emergency", clock);
   github.finish("emergency");
-  const emergency = await runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: cloudDeps(github) });
+  const emergency = await runCloudTestsPhase({ role: "emergency", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: cloudEnv("emergency", EMERGENCY_JOB_ENV), deps: withClock(cloudDeps(github)) });
   // The local witness process's own summary. Every response is already published, so this RECONCILES
   // all 22 rather than dispatching again — which is the property that makes a restarted witness safe.
   const witness = await runPhase({
     phase: "witness", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
-    deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 },
+    deps: withClock({ spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 }),
   });
   return { fixture, normal, human, emergency, witness };
 }
@@ -961,7 +1005,19 @@ async function commissionEverything(github: ReturnType<typeof createFakeGitHub>)
  * `assessEvidence`. This is what "not a boolean" costs, and it is the whole point — the packet cannot
  * be satisfied by typing a word.
  */
-const environmentControls = (dir: string, mutate: (controls: Record<string, Record<string, unknown>>) => void = () => {}) => {
+const environmentControls = (
+  dir: string,
+  mutate: (controls: Record<string, Record<string, unknown>>) => void = () => {},
+  options: { measuredAt?: string } = {},
+) => {
+  /**
+   * A COHERENT capture time, not a year that has not happened.
+   *
+   * This fixture used to stamp every control `2099-01-01`, and the packet passed — which is the
+   * defect the retained reviewer baseline demonstrates, not a property to preserve. A control
+   * captured after the run it describes is exactly as unmoored as one captured before it.
+   */
+  const measuredAt = options.measuredAt ?? new Date().toISOString();
   const controls: Record<string, Record<string, unknown>> = {};
   const schemas = ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { sources: string[]; expected: unknown; run_bound: boolean }>;
   for (const key of ENVIRONMENT_CONTROL_KEYS as string[]) {
@@ -977,9 +1033,7 @@ const environmentControls = (dir: string, mutate: (controls: Record<string, Reco
         status: "verified", source: schema.sources[0],
         environment_name: spec.environment, environment_id: 4400 + index,
         expected: schema.expected, measured: schema.expected,
-        // Inside the run's window — the journal's first record is stamped by the run itself, so a
-        // date far in the future is the safe side of the staleness check for a fixture.
-        measured_at: "2099-01-01T00:00:00.000Z",
+        measured_at: measuredAt,
         ...(schema.run_bound ? { run_id: RUN_ID, attempt: ATTEMPT } : {}),
         artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex"),
       };
@@ -990,6 +1044,32 @@ const environmentControls = (dir: string, mutate: (controls: Record<string, Reco
     schema_version: RESULT_SCHEMA_VERSION, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT, controls,
   });
 };
+
+/** A monotonic clock: fixed origin, small tick, so every bound in the harness stays satisfiable. */
+function createTestClock(origin = "2026-09-10T09:00:00.000Z", tickMs = 10) {
+  let value = Date.parse(origin);
+  return {
+    now: () => new Date((value += tickMs)),
+    /** The clock's CURRENT instant, without advancing it — for stamping evidence coherently. */
+    peek: () => new Date(value).toISOString(),
+    after: (ms: number) => new Date(value + ms).toISOString(),
+  };
+}
+
+/**
+ * The corrected valid packet: every phase, the controls and the approval share ONE clock, and the
+ * controls are captured DURING the run rather than in a year that has not happened.
+ */
+async function coherentPacket() {
+  const clock = createTestClock();
+  const github = createFakeGitHub();
+  await commissionEverything(github, { now: clock.now });
+  await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { ...localDeps(github), now: clock.now } }).catch(() => {});
+  await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { ...localDeps(github), now: clock.now } });
+  // Captured inside the run's own window, which is what "this run's evidence" means.
+  environmentControls(evidenceDir, () => {}, { measuredAt: clock.peek() });
+  return { github, clock };
+}
 
 /** Deterministic, instant timing for the fixture's bounded wait — no real clock, no real sleep. */
 const WAIT = { intervalMs: 1, deadlineMs: 1_000, now: () => 0, sleep: async () => {} };
@@ -1015,6 +1095,30 @@ const WITNESS_BINDING = {
   intended_app_id: NORMAL_APP, intended_installation_id: "5001",
   manifest_sha256: "c".repeat(64), graph_sha256: "d".repeat(64),
 };
+
+/**
+ * Recompute a governed observation's OWN losslessness digest.
+ *
+ * `validObservation` carries a placeholder, which is fine for the shape-only callers it was written
+ * for. Any caller that reaches {@link validateGovernedSnapshot} needs the real thing, or it refuses
+ * on the digest before reaching the invariant under test — and a negative case that trips two rules
+ * proves neither.
+ */
+const withGovernedDigest = (observation: Record<string, unknown>) => {
+  const rulesets = observation.governed_rulesets as { governed: unknown }[];
+  observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
+  return observation;
+};
+
+/** The closed vocabulary the publisher derives from the run's authenticated intent. */
+const plannedVocabulary = (role: "normal" | "emergency" = "normal") => ({
+  rulesetNames: new Set(Object.values(derivedRulesetNames(RUN_ID, ATTEMPT)[role] ?? [])),
+  refPatterns: new Set([derivedRef(RUN_ID, ATTEMPT, role)]),
+  contexts: new Set(derivedContextNames(RUN_ID, ATTEMPT)),
+  producerIds: new Set([NORMAL_APP]),
+  bypassAppIds: new Set([NORMAL_APP, EMERGENCY_APP]),
+  sources: new Set([COMMISSIONING_REPOSITORY, COMMISSIONING_REPOSITORY.split("/")[0]]),
+});
 
 const validObservation = (overrides: Record<string, unknown> = {}, padding = 0) => {
   const started = "2026-09-10T09:00:00.000Z";
@@ -1825,7 +1929,10 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     const approvals = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "approvals"));
     for (const spec of PROTECTED_JOBS as { environment: string }[]) {
       expect(approvals.environments[spec.environment]).toMatchObject({ approved: true, approval_measured: true, job_status: "completed" });
-      expect(approvals.environments[spec.environment].reviewers).toEqual([{ login: OWNER_LOGIN, id: OWNER_USER_ID, type: "User", is_dispatcher: false }]);
+      // `approved_at` is the provider's own approval timestamp, which this summary used to DROP —
+      // so an approval could not be placed in time at all and a future one was invisible.
+      expect(approvals.environments[spec.environment].reviewers)
+        .toEqual([{ login: OWNER_LOGIN, id: OWNER_USER_ID, type: "User", approved_at: expect.any(String), is_dispatcher: false }]);
     }
     // The dispatcher is recorded and is explicitly NOT the approver. GITHUB_ACTOR may be a bot.
     // The dispatcher is MEASURED from the provider's own run metadata (F6), not read out of the
@@ -3221,7 +3328,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       challenge_nonce: "a".repeat(64), challenge_digest: "b".repeat(64),
       challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
       witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
-      observation: validObservation(),
+      observation: withGovernedDigest(validObservation() as Record<string, unknown>),
     };
     /**
      * THE CLOSED PUBLICATION VOCABULARY (F11). An envelope carrying an unknown top-level property,
@@ -3258,6 +3365,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     };
     const result = publishWitnessResponse({
       response: ok, envelope, publisherRunId: "77001", originalRun, expected: publisherExpected,
+      allowed: plannedVocabulary(),
       writeEntry: (name, bytes) => { written.push({ name, bytes }); return `/tmp/${name}`; },
     });
     expect(written).toHaveLength(1);
@@ -3310,7 +3418,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       challenge_nonce: "e".repeat(64), challenge_digest: "f".repeat(64),
       challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
       witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
-      observation: validObservation({ completed_at: "2026-09-10T09:00:01.000Z", span_ms: 1000 }),
+      observation: withGovernedDigest(validObservation({ completed_at: "2026-09-10T09:00:01.000Z", span_ms: 1000 }) as Record<string, unknown>),
     };
     const envelope = JSON.stringify(response);
     const eventPath = path.join(evidenceDir, "event.json");
@@ -3320,6 +3428,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     // The publisher run: the authorized local identity, attempt 1, the reviewed workflow, the source
     // it checked out. `77500` is registered as a publisher run so the fake answers for it.
     github.publishWitness(envelope);
+    await publishIntentArtifact(github);
     const publisherRunId = [...github.publisherRuns.keys()][0];
     const env = {
       GITHUB_REPOSITORY: COMMISSIONING_REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch",
@@ -3330,7 +3439,7 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       GITHUB_REPOSITORY_ID: String(REPOSITORY_ID), COMMISSIONING_REPOSITORY_ID: String(REPOSITORY_ID),
       COMMISSIONING_EVIDENCE_DIR: evidenceDir, GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath,
     } as unknown as NodeJS.ProcessEnv;
-    const published = await runWitnessPublisherJob(env, { fetchImpl: github.fetchImpl });
+    const published = await runWitnessPublisherJob(env, { fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl });
     expect(published.status).toBe("published");
     expect(published.entry).toBe("witness.json");
     // The EXACT received bytes: the digest both the actor and the local witness cross-check is of
@@ -3343,11 +3452,11 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
     }));
     expect(readFileSync(outputPath, "utf8")).toBe(`artifact_name=${published.artifact_name}\n`);
     // It holds no App secret, and it is refused outside its own job and mode.
-    await expect(runWitnessPublisherJob({ ...env, GITHUB_JOB: "normal" }, { fetchImpl: github.fetchImpl }))
+    await expect(runWitnessPublisherJob({ ...env, GITHUB_JOB: "normal" }, { fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl }))
       .rejects.toThrow(/runs only in the policy-witness job/);
-    await expect(runWitnessPublisherJob({ ...env, COMMISSIONING_MODE: "commission" }, { fetchImpl: github.fetchImpl }))
+    await expect(runWitnessPublisherJob({ ...env, COMMISSIONING_MODE: "commission" }, { fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl }))
       .rejects.toThrow(/runs only in policy-witness mode/);
-    await expect(runWitnessPublisherJob({ ...env, GITHUB_RUN_ATTEMPT: "2" }, { fetchImpl: github.fetchImpl }))
+    await expect(runWitnessPublisherJob({ ...env, GITHUB_RUN_ATTEMPT: "2" }, { fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl }))
       .rejects.toThrow(/it is a re-run/);
   });
 
@@ -4761,5 +4870,808 @@ describe("correction pass 3 — F10/F11/F12/F13/F14: pending publishers, closed 
       record: { case: CLOUD_CASE_SEQUENCE.normal[0], outcome: "denied", passed: true },
     });
     expect(store.assertPriorCasesFinalized(CLOUD_CASE_SEQUENCE.normal[1])).toBe(true);
+  });
+});
+
+/**
+ * ── CORRECTION PASS 4 — the independently reproduced adoption / publication / assessment gaps ─────
+ *
+ * Every case here reproduces ONE defect the independent driver observed at `3c7d2819`, ISOLATED to a
+ * single invariant. The driver's own scenarios deliberately combined several mutations at once, so
+ * they proved that *something* in each group was unchecked without establishing which component was
+ * accepted alone. These do establish that, and each one starts from a packet that PASSES.
+ *
+ * The accepted obligations they encode are in `AIO-1124-3c7d2819-ACCEPTED-caller-obligations.md`.
+ * None of this is independent review, and none of it is evidence of live enforcement.
+ */
+describe("correction pass 4 — every first fingerprint proves the measured GET body", () => {
+  /**
+   * A transport that rewrites the provider's answer to a GET of one of THIS RUN'S rulesets.
+   *
+   * The mutation is applied to the readback only — the POST still succeeds and still returns its
+   * identity — because "a successful 201 does not prove the later GET body" is precisely the claim.
+   */
+  const readbackTransport = (
+    github: ReturnType<typeof createFakeGitHub>,
+    mutate: (body: Record<string, unknown>) => Record<string, unknown> | null,
+    options: { failFirstGet?: boolean; loseFirstPost?: boolean } = {},
+  ) => {
+    let failedOnce = false;
+    let lostOnce = false;
+    return async (method: string, url: string, body?: unknown) => {
+      const rel = url.split("?")[0];
+      if (options.loseFirstPost && method === "POST" && rel.endsWith("/rulesets") && !lostOnce) {
+        lostOnce = true;
+        // A transport timeout AFTER the provider committed: the ruleset exists, the response is gone.
+        github.handle("local", method, url, body);
+        return { status: 0, body: null, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } };
+      }
+      const response = github.handle("local", method, url, body);
+      if (method !== "GET" || !/\/rulesets\/\d+$/.test(rel) || response.status !== 200) return response;
+      if (!String((response.body as Record<string, unknown>)?.name ?? "").startsWith("commissioning-")) return response;
+      if (options.failFirstGet && !failedOnce) {
+        failedOnce = true;
+        return { status: 503, body: null, diagnostic: { status: 503, category: "server-error", ruleIds: [], policyDenial: false } };
+      }
+      const mutated = mutate(structuredClone(response.body) as Record<string, unknown>);
+      return mutated === null ? response : { ...response, body: mutated };
+    };
+  };
+
+  /** Empty a ruleset's rules — the driver's "changed body", reduced to one field. */
+  const emptyRules = (only: string) => (rulesetBody: Record<string, unknown>) =>
+    String(rulesetBody.name).includes(only) ? { ...rulesetBody, rules: [] } : null;
+
+  /** Add ONE governed parameter to the `update` rule, at the given value. */
+  const addUpdateParameter = (value: boolean) => (rulesetBody: Record<string, unknown>) => {
+    if (!String(rulesetBody.name).includes("main-release-writer")) return null;
+    const rules = (rulesetBody.rules as Record<string, unknown>[]).map((rule) =>
+      rule.type === "update" ? { ...rule, parameters: { update_allows_fetch_and_merge: value } } : rule);
+    return { ...rulesetBody, rules };
+  };
+
+  /** Reorder a ruleset body's KEYS without changing a single value. */
+  const reorderKeys = (rulesetBody: Record<string, unknown>) =>
+    Object.fromEntries(Object.keys(rulesetBody).sort().reverse().map((key) => [key, rulesetBody[key]]));
+
+  const setupWith = async (transport: unknown) => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const outcome = await runPhase({
+      phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport },
+    }).then((value) => ({ ok: true as const, value }), (error: Error) => ({ ok: false as const, error }));
+    return { github, outcome };
+  };
+
+  const journalOf = () => readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+  const fingerprintedNames = () => journalOf()
+    .filter((record) => record.type === "resource-fingerprinted")
+    .map((record) => String((record.data as Record<string, unknown>).key));
+  const ownershipGaps = () => journalOf()
+    .filter((record) => record.type === "reconciliation" && String((record.data as Record<string, unknown>).outcome) === "ownership-unprovable");
+
+  it("O1 · a successful 201 followed by a CHANGED 200 readback is not adopted", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const transport = readbackTransport(github, emptyRules("main-integrity"));
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport } }))
+      .rejects.toThrow(/intended|ownership/i);
+    // The identity is RETAINED — the resource exists and cleanup must be able to name it — but no
+    // fingerprint was adopted from the body that could not be proved.
+    expect(journalOf().some((record) => record.type === "resource-created"
+      && (record.data as Record<string, unknown>).kind === "ruleset"), "the created ID must be retained").toBe(true);
+    expect(fingerprintedNames().some((name) => name.includes("main-integrity")), "a changed body was fingerprinted").toBe(false);
+    expect(ownershipGaps().length, "no ownership gap was journaled").toBeGreaterThan(0);
+  });
+
+  it("O2 · a successful 201 followed by a SEMANTIC ADDITION (update_allows_fetch_and_merge:true) is not adopted", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const transport = readbackTransport(github, addUpdateParameter(true));
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport } }))
+      .rejects.toThrow(/intended|ownership|verifier/i);
+    expect(fingerprintedNames().some((name) => name.includes("main-release-writer")), "a semantically-added parameter was adopted").toBe(false);
+  });
+
+  it("O3 · an added field AT ITS PROVIDER DEFAULT is refused and named as a gap, never silently adopted", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const transport = readbackTransport(github, addUpdateParameter(false));
+    // PC-04: report the concrete provider-normalization gap; never loosen the verifier to absorb it.
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport } }))
+      .rejects.toThrow(/intended|ownership|normalization|verifier/i);
+    expect(fingerprintedNames().some((name) => name.includes("main-release-writer")), "an added default was adopted").toBe(false);
+  });
+
+  it("O4 · a successful 201, a 503 readback, then a CHANGED recovery GET is not adopted on resume", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    // First setup: the create is durable, the fingerprint readback fails.
+    await expect(runPhase({
+      phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: readbackTransport(github, () => null, { failFirstGet: true }) },
+    })).rejects.toThrow();
+    const created = journalOf().filter((record) => record.type === "resource-created"
+      && (record.data as Record<string, unknown>).kind === "ruleset");
+    expect(created.length, "the durable create must be retained across the failed readback").toBeGreaterThan(0);
+    // The resume then measures a body that is NOT the intended one.
+    await expect(runPhase({
+      phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: readbackTransport(github, emptyRules("commissioning-")) },
+    })).rejects.toThrow(/intended|ownership/i);
+    expect(ownershipGaps().length, "the resume adopted an unproven body").toBeGreaterThan(0);
+  });
+
+  it("O5 · a LOST create response followed by a changed same-name ruleset is neither adopted nor deleted", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const transport = readbackTransport(github, () => null, { loseFirstPost: true });
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport } }))
+      .rejects.toThrow();
+    // Somebody edits the created ruleset between the lost response and the cleanup.
+    const orphan = [...github.rulesets.values()].find((entry) => String(entry.name).startsWith("commissioning-"))!;
+    orphan.rules = [];
+    const before = github.rulesets.size;
+    await expect(runPhase({
+      phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: readbackTransport(github, () => null) },
+    })).rejects.toThrow();
+    expect(github.rulesets.has(orphan.id), "cleanup deleted a ruleset whose body it could not prove").toBe(true);
+    expect(github.rulesets.size).toBe(before);
+  });
+
+  it("O6 · a LOST create response followed by the UNCHANGED intended body is adopted and cleaned", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    const transport = readbackTransport(github, () => null, { loseFirstPost: true });
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { transport } }))
+      .rejects.toThrow();
+    const orphan = [...github.rulesets.values()].find((entry) => String(entry.name).startsWith("commissioning-"))!;
+    const cleanup = await runPhase({
+      phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { transport: readbackTransport(github, () => null) },
+    });
+    // The POSITIVE counterpart: the refusal above is about the CHANGE, not about reconciliation.
+    expect(cleanup.status).toBe("cleaned");
+    expect(github.rulesets.has(orphan.id), "a provably owned resource was left behind").toBe(false);
+  });
+
+  it("O7 · a KEY-REORDERED readback is still the intended body and is adopted", async () => {
+    const { outcome } = await setupWith(readbackTransport(createFakeGitHub(), reorderKeys));
+    expect(outcome.ok ? outcome.value.status : (outcome.error as Error).message).toBe("prepared");
+  });
+});
+
+describe("correction pass 4 — the actual publisher reads the authenticated intent before it writes bytes", () => {
+  const PUBLISHER_RUN = "77001";
+  const INTENT_ARTIFACT = `policy-commissioning-intent-${RUN_ID}-${ATTEMPT}`;
+  const INTENT_ENTRY = `commissioning-${RUN_ID}-${ATTEMPT}-intent.json`;
+  const INTENT_ARTIFACT_ID = 6501;
+
+  /** The real credential-free intent this run would have published, produced by the real phase. */
+  async function genuineIntent() {
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    return readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "intent")) as Record<string, unknown>;
+  }
+
+  /**
+   * The publisher's provider surface: its own run, the ORIGINAL run and its jobs, the intent
+   * artifact listing, and the repository/source reads it already makes. Nothing else exists.
+   */
+  const publisherTransport = (options: {
+    intentArtifacts?: { id: number; name: string; expired?: boolean; workflow_run: { id: number } }[];
+    intentJobConclusion?: string;
+  } = {}) => async (method: string, url: string) => {
+    const rel = url.split("?")[0].replace(`/repos/${COMMISSIONING_REPOSITORY}`, "");
+    const ok = (body: unknown) => ({ status: 200, body, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } });
+    if (rel === "") return ok({ id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY, default_branch: "staging" });
+    if (rel === "/git/ref/heads/staging") return ok({ object: { sha: WORKFLOW_SHA } });
+    if (rel === "/actions/artifacts") {
+      const rows = options.intentArtifacts ?? [{ id: INTENT_ARTIFACT_ID, name: INTENT_ARTIFACT, expired: false, workflow_run: { id: Number(RUN_ID) } }];
+      const wanted = new URLSearchParams(url.split("?")[1] ?? "").get("name");
+      const matching = rows.filter((row) => !wanted || row.name === wanted);
+      return ok({ total_count: matching.length, artifacts: matching });
+    }
+    const attempt = /^\/actions\/runs\/(\d+)\/attempts\/(\d+)$/.exec(rel);
+    if (attempt) {
+      const self = attempt[1] === PUBLISHER_RUN;
+      return ok({
+        id: Number(attempt[1]), head_sha: WORKFLOW_SHA, path: COMMISSIONING_WORKFLOW_PATH,
+        event: "workflow_dispatch", head_branch: "staging", run_attempt: self ? 1 : Number(ATTEMPT),
+        actor: OWNER_IDENTITY, triggering_actor: OWNER_IDENTITY, status: "completed", conclusion: "success",
+      });
+    }
+    if (/^\/actions\/runs\/\d+\/attempts\/\d+\/jobs$/.test(rel)) {
+      const jobs = [
+        { id: 9101, name: "Commissioning intent (credential-free)", status: "completed", conclusion: options.intentJobConclusion ?? "success", run_attempt: Number(ATTEMPT) },
+        { id: 9102, name: "Normal App actor tests (protected)", status: "completed", conclusion: "success", run_attempt: Number(ATTEMPT) },
+      ];
+      return ok({ total_count: jobs.length, jobs });
+    }
+    return { status: 404, body: { message: "Not Found" }, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } };
+  };
+
+  const archiveOf = (bytes: Buffer | null) => async () => (bytes
+    ? { status: 200, bytes, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } }
+    : { status: 404, bytes: null, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } });
+
+  /** Run the ACTUAL publisher job over one observation, with one intent, and see what it writes. */
+  async function publish(observation: Record<string, unknown>, options: {
+    intent?: Record<string, unknown> | null;
+    transport?: ReturnType<typeof publisherTransport>;
+  } = {}) {
+    const intent = options.intent === undefined ? await genuineIntent() : options.intent;
+    const dir = mkdtempSync(path.join(tmpdir(), "aio1124-pub-"));
+    created.push(dir);
+    const challenge = buildChallenge({
+      binding: WITNESS_BINDING, nonce: "d".repeat(64), createdAt: "2026-09-10T09:00:00.000Z",
+      extra: { before_sha: "1".repeat(40), requested_sha: "2".repeat(40) },
+    });
+    const response = buildResponse({
+      challenge, challengeDigest: "f".repeat(64), observation,
+      witnessIdentity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
+      createdAt: "2026-09-10T09:00:00.000Z",
+    });
+    const eventPath = path.join(dir, "event.json");
+    writeFileSync(eventPath, JSON.stringify({ inputs: { mode: "policy-witness", witness_envelope: JSON.stringify(response) } }));
+    const env = cloudEnv("policy-witness", {
+      GITHUB_RUN_ID: PUBLISHER_RUN, GITHUB_RUN_ATTEMPT: "1", COMMISSIONING_MODE: "policy-witness",
+      COMMISSIONING_EVIDENCE_DIR: dir, GITHUB_EVENT_PATH: eventPath,
+    });
+    const zip = intent ? buildZip(INTENT_ENTRY, Buffer.from(`${JSON.stringify(intent)}\n`, "utf8")) : null;
+    const outcome = await runWitnessPublisherJob(env, {
+      metadataTransport: options.transport ?? publisherTransport(),
+      archiveTransport: archiveOf(zip),
+    }).then((value) => ({ ok: true as const, value }), (error: Error) => ({ ok: false as const, error }));
+    const written = path.join(dir, "witness", "witness.json");
+    return { outcome, bytes: existsSync(written) ? readFileSync(written, "utf8") : null };
+  }
+
+  /**
+   * A governed observation the closed projection really accepts, so each case changes ONE thing.
+   *
+   * `validObservation` carries a PLACEHOLDER `projected_governed_digest`, which is fine for the
+   * shape-only callers it was written for and useless here: every case below would refuse on the
+   * digest before reaching the invariant it is about. So the digest is computed for real, and each
+   * mutation recomputes it — a negative case that trips two rules proves neither.
+   */
+  const withDigest = (observation: Record<string, unknown>) => {
+    const rulesets = observation.governed_rulesets as { governed: unknown }[];
+    observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
+    return observation;
+  };
+  const soundObservation = () => withDigest(validObservation() as Record<string, unknown>);
+
+  it("P1 · an UNKNOWN nested governed field is refused, and no bytes are written", async () => {
+    const observation = soundObservation() as Record<string, unknown>;
+    const rulesets = observation.governed_rulesets as { governed: Record<string, unknown> }[];
+    rulesets[0].governed.unknown_secret = "SYNTHETIC-NESTED-DISCLOSURE";
+    const { outcome, bytes } = await publish(withDigest(observation));
+    expect(outcome.ok, "the publisher published an unknown nested governed field").toBe(false);
+    expect(bytes, "bytes reached the artifact").toBeNull();
+  });
+
+  it("P2 · an UNAPPROVED source identity is refused", async () => {
+    const observation = soundObservation() as Record<string, unknown>;
+    observation.source_identities = ["SYNTHETIC-UNAPPROVED-SOURCE"];
+    const { outcome, bytes } = await publish(observation);
+    expect(outcome.ok, "the publisher published an unapproved source identity").toBe(false);
+    expect(bytes).toBeNull();
+  });
+
+  it("P3 · arbitrary CLASSIC protection data is refused", async () => {
+    const observation = soundObservation() as Record<string, unknown>;
+    observation.classic_protection = { present: false, status: 404, arbitrary: "SYNTHETIC-CLASSIC-DATA" };
+    const { outcome, bytes } = await publish(observation);
+    expect(outcome.ok, "the publisher published arbitrary classic protection data").toBe(false);
+    expect(bytes).toBeNull();
+  });
+
+  it("P4 · a bypass App the AUTHENTICATED INTENT does not name is refused, however positive its ID", async () => {
+    const observation = soundObservation() as Record<string, unknown>;
+    const rulesets = observation.governed_rulesets as { governed: Record<string, unknown> }[];
+    // A perfectly well-formed, positive, safe integer — and not one of this run's planned Apps.
+    rulesets[0].governed.bypass_actors = [{ actor_type: "Integration", actor_id: 424242, bypass_mode: "always" }];
+    const { outcome, bytes } = await publish(withDigest(observation));
+    expect(outcome.ok, "an arbitrary positive App ID was accepted as a bypass identity").toBe(false);
+    expect(bytes).toBeNull();
+  });
+
+  it("P5 · a sound observation with the planned identities IS published", async () => {
+    const observation = soundObservation() as Record<string, unknown>;
+    const rulesets = observation.governed_rulesets as { governed: Record<string, unknown> }[];
+    rulesets[0].governed.bypass_actors = [{ actor_type: "Integration", actor_id: NORMAL_APP, bypass_mode: "always" }];
+    const { outcome, bytes } = await publish(withDigest(observation));
+    expect(outcome.ok ? outcome.value.status : (outcome.error as Error).message).toBe("published");
+    expect(bytes, "a valid publication wrote nothing").not.toBeNull();
+  });
+
+  it("P6 · a MISSING intent artifact refuses; it never falls back to unvalidated publication", async () => {
+    const { outcome, bytes } = await publish(soundObservation() as Record<string, unknown>, {
+      transport: publisherTransport({ intentArtifacts: [] }),
+    });
+    expect(outcome.ok, "the publisher published without the authenticated intent").toBe(false);
+    expect(bytes).toBeNull();
+  });
+
+  it("P7 · a DUPLICATE intent artifact under the exact name refuses rather than selecting one", async () => {
+    const { outcome, bytes } = await publish(soundObservation() as Record<string, unknown>, {
+      transport: publisherTransport({
+        intentArtifacts: [
+          { id: INTENT_ARTIFACT_ID, name: INTENT_ARTIFACT, expired: false, workflow_run: { id: Number(RUN_ID) } },
+          { id: INTENT_ARTIFACT_ID + 1, name: INTENT_ARTIFACT, expired: false, workflow_run: { id: Number(RUN_ID) } },
+        ],
+      }),
+    });
+    expect(outcome.ok, "the publisher selected between duplicate intent artifacts").toBe(false);
+    expect(bytes).toBeNull();
+  });
+
+  it("P8 · an intent job that did NOT succeed in the original attempt refuses", async () => {
+    const { outcome, bytes } = await publish(soundObservation() as Record<string, unknown>, {
+      transport: publisherTransport({ intentJobConclusion: "failure" }),
+    });
+    expect(outcome.ok, "the publisher trusted an intent artifact whose job failed").toBe(false);
+    expect(bytes).toBeNull();
+  });
+});
+
+describe("correction pass 4 — the final assessment reconstructs each case, and does not read it", () => {
+  const evidenceFile = (key: string) => path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, key));
+  const write = (key: string, payload: unknown) =>
+    writeFileSync(evidenceFile(key), `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  const blockersOf = () => assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+
+  async function validPacket() {
+    const github = createFakeGitHub();
+    await commissionEverything(github);
+    await runPhase({ phase: "collect", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) }).catch(() => {});
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    environmentControls(evidenceDir);
+    return github;
+  }
+
+  /**
+   * ONE mutation at a time, always from a packet that passes.
+   *
+   * The independent driver bundled nine per-case mutations into a single scenario, so its zero-blocker
+   * result proved only that the bundle was unchecked. Each row below is one field.
+   */
+  it("C · each per-case identity, provenance and timing corruption is a blocker on its own", async () => {
+    await validPacket();
+    expect(blockersOf(), "the packet under test does not pass to begin with").toEqual([]);
+
+    const genuine = { normal: readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")) };
+    const restore = () => write("normal", genuine.normal);
+    const mutateCases = (mutate: (record: Record<string, unknown>) => Record<string, unknown>) =>
+      write("normal", { ...genuine.normal, cases: (genuine.normal.cases as Record<string, unknown>[]).map((record) => mutate(structuredClone(record))) });
+    const inWitness = (mutate: (witness: Record<string, unknown>) => void) => () => mutateCases((record) => {
+      mutate(record.witness as Record<string, unknown>);
+      return record;
+    });
+
+    const cases: [string, () => void, RegExp][] = [
+      ["a mutation start time far in the future", () => mutateCases((record) => ({ ...record, mutation_started_at: "2099-01-01T00:00:00Z" })),
+        /mutation|interval|timing|ordering|proximity/i],
+      ["a readback time before the mutation", () => mutateCases((record) => ({ ...record, readback_at: "2000-01-01T00:00:00Z" })),
+        /readback|interval|timing|ordering/i],
+      ["a pre-challenge lifetime that is not this run's", inWitness((witness) => {
+        witness.pre_challenge_created_at = "2000-01-01T00:00:00Z";
+        witness.pre_challenge_expires_at = "2000-01-01T00:03:00Z";
+      }), /challenge|expiry|lifetime|binding/i],
+      ["a source that moved under the case", () => mutateCases((record) => ({
+        ...record, source_continuity: { pre: { measured: true, moved: true }, post: { measured: true, moved: true } },
+      })), /source|continuity|moved/i],
+      ["the pre publisher run identity removed", inWitness((witness) => { delete witness.pre_publisher_run_id; }),
+        /publisher run|provenance/i],
+      ["the retained pre publisher provenance facts removed", inWitness((witness) => {
+        // The corrected build reconstructs provenance from the retained artifact/run/jobs FACTS, so
+        // this removes the evidence rather than the conclusion drawn from it.
+        delete witness.pre_provenance_facts;
+      }), /provenance|publisher/i],
+      ["a scoped read that was refused", () => mutateCases((record) => ({
+        ...record, token_proof: { ...(record.token_proof as Record<string, unknown>), scoped_read: { status: 403 } },
+      })), /scoped read|scoped_read/i],
+      ["an installation the plan does not name", () => mutateCases((record) => ({
+        ...record, grants: { ...(record.grants as Record<string, unknown>), installation_id: "999999" },
+      })), /installation/i],
+      ["a grant whose installation App is not its App", () => mutateCases((record) => ({
+        ...record, grants: { ...(record.grants as Record<string, unknown>), installation_app_id: 999999 },
+      })), /installation|App/i],
+      ["a case-level installation the plan does not name", () => mutateCases((record) => ({ ...record, installation_id: "888888" })),
+        /installation/i],
+      ["one extra governed update parameter, with its projection digest recomputed", () => mutateCases((record) => {
+        const witness = record.witness as Record<string, unknown>;
+        for (const direction of ["pre_observation", "post_observation"]) {
+          const observation = witness[direction] as Record<string, unknown>;
+          const rulesets = observation.governed_rulesets as { governed: { name: string; rules: Record<string, unknown>[] } }[];
+          const writer = rulesets.find((entry) => entry.governed.name.endsWith("main-release-writer"));
+          if (writer) writer.governed.rules[0].parameters = { update_allows_fetch_and_merge: true };
+          observation.projected_governed_digest = canonicalHash(rulesets.map((entry) => entry.governed));
+        }
+        return record;
+      }), /policy|verifier|governed|intended/i],
+    ];
+
+    const failures: string[] = [];
+    for (const [label, mutate, expected] of cases) {
+      restore();
+      expect(blockersOf(), `${label}: the restored packet should pass`).toEqual([]);
+      mutate();
+      const blockers = blockersOf();
+      if (!blockers.length) { failures.push(`${label}: NO blocker`); continue; }
+      const detail = blockers.map((entry) => entry.detail).join("\n");
+      if (!expected.test(detail)) failures.push(`${label}: blocked for the wrong reason — ${detail.slice(0, 200)}`);
+    }
+    restore();
+    expect(blockersOf()).toEqual([]);
+    expect(failures.join("\n") || "none").toBe("none");
+  });
+
+  it("S · each setup and journal corruption is a blocker on its own", async () => {
+    await validPacket();
+    expect(blockersOf(), "the packet under test does not pass to begin with").toEqual([]);
+
+    const genuine = {
+      setup: readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "setup")),
+      normal: readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal")),
+      emergency: readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "emergency")),
+    };
+    const witnessJournal = journalPath(evidenceDir, RUN_ID, ATTEMPT, "witness");
+    const witnessBytes = readFileSync(witnessJournal);
+    const restore = () => {
+      write("setup", genuine.setup);
+      write("normal", genuine.normal);
+      write("emergency", genuine.emergency);
+      writeFileSync(witnessJournal, witnessBytes, { mode: 0o600 });
+    };
+
+    /** Rebuild the witness chain so it VERIFIES, with exactly one property changed. */
+    const rebuildWitnessJournal = (options: { source?: string; drop?: string[] }) => {
+      const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+      rmSync(witnessJournal, { force: true });
+      const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+      try {
+        const journal = openJournal({
+          dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness",
+          source: options.source ?? WORKFLOW_SHA, lock,
+        });
+        for (const record of records) {
+          if ((options.drop ?? []).includes(String(record.type))) continue;
+          journal.append(String(record.type), record.data);
+        }
+      } finally { lock.release(); }
+    };
+
+    /** A fabricated manifest digest, propagated so cross-copy equality alone stays silent. */
+    const fabricateManifestDigest = () => {
+      const digest = "f".repeat(64);
+      write("setup", { ...genuine.setup, manifest_sha256: digest });
+      for (const role of ["normal", "emergency"] as const) {
+        const file = structuredClone(genuine[role]) as Record<string, unknown>;
+        file.manifest_sha256 = digest;
+        file.cases = (file.cases as Record<string, unknown>[]).map((record) => ({ ...record, manifest_sha256: digest }));
+        write(role, file);
+      }
+    };
+
+    const cases: [string, () => void, RegExp][] = [
+      ["a production policy hash that is not a digest at all", () => write("setup", { ...genuine.setup, production_policy_hash: "invalid" }),
+        /production|policy hash|reconstruct/i],
+      ["a fabricated manifest digest, consistently propagated", fabricateManifestDigest,
+        /manifest|reconstruct/i],
+      ["an intent re-measurement reduced to a boolean", () => write("setup", { ...genuine.setup, intent_remeasured: { confirmed: true } }),
+        /re-measur|remeasur|intent/i],
+      ["an empty protected-job snapshot", () => write("setup", { ...genuine.setup, protected_jobs_at_setup: {} }),
+        /protected job/i],
+      ["a witness chain rebuilt under a source this run never ran", () => rebuildWitnessJournal({ source: "e".repeat(40) }),
+        /source/i],
+      ["a witness chain with every dispatch record removed", () => rebuildWitnessJournal({ drop: ["dispatch-intent", "dispatch-result"] }),
+        /dispatch/i],
+    ];
+
+    const failures: string[] = [];
+    for (const [label, mutate, expected] of cases) {
+      restore();
+      expect(blockersOf(), `${label}: the restored packet should pass`).toEqual([]);
+      mutate();
+      const blockers = blockersOf();
+      if (!blockers.length) { failures.push(`${label}: NO blocker`); continue; }
+      const detail = blockers.map((entry) => entry.detail).join("\n");
+      if (!expected.test(detail)) failures.push(`${label}: blocked for the wrong reason — ${detail.slice(0, 200)}`);
+    }
+    restore();
+    expect(blockersOf()).toEqual([]);
+    expect(failures.join("\n") || "none").toBe("none");
+  });
+});
+
+/**
+ * ── CORRECTION PASS 4 (clock) — the corrected baseline runs on a COHERENT clock ──────────────────
+ *
+ * The retained review driver stamped its "valid" environment controls **2099**, and the packet
+ * passed. That is evidence of the unfixed candidate, not a corrected baseline: the canonical forbids
+ * future and impossible ordering and forbids stale-or-false environment evidence, and a control
+ * captured after the run it claims to describe is exactly as unmoored as one captured before it.
+ *
+ * So the valid packet below runs on an explicit, monotonic test clock with real phase, control and
+ * approval times, and each refusal case moves ONE of those times out of coherence.
+ */
+describe("correction pass 4 — future and contradictory times are refused, on an explicit coherent clock", () => {
+  const write = (key: string, payload: unknown) =>
+    writeFileSync(path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, key)), `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  const blockersOf = () => assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers as Blocker[];
+
+  it("K0 · the coherent packet passes, and it does NOT rely on a future control date", async () => {
+    const { clock } = await coherentPacket();
+    expect(blockersOf(), "the coherent-clock packet does not pass").toEqual([]);
+    const controls = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment")) as Record<string, unknown>;
+    const stamps = Object.values(controls.controls as Record<string, Record<string, { measured_at: string }>>)
+      .flatMap((perEnvironment) => Object.values(perEnvironment).map((record) => record.measured_at));
+    expect(stamps.length).toBeGreaterThan(0);
+    for (const stamp of stamps) {
+      expect(Date.parse(stamp), `control stamped ${stamp} is not inside the run`).toBeLessThanOrEqual(Date.parse(clock.peek()) + 1000);
+      expect(new Date(stamp).getUTCFullYear(), "a corrected baseline must not be dated in the future").toBeLessThan(2030);
+    }
+  });
+
+  it("K1 · a control captured AFTER the run it describes is refused", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    // The reviewer's own 2099 stamp, isolated to exactly one control on one environment.
+    const controls = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "environment")) as Record<string, unknown>;
+    const map = controls.controls as Record<string, Record<string, Record<string, unknown>>>;
+    const key = Object.keys(map)[0];
+    const environment = Object.keys(map[key])[0];
+    map[key][environment].measured_at = "2099-01-01T00:00:00.000Z";
+    write("environment", controls);
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "a control dated 2099 produced no blocker").not.toBe("");
+    expect(detail).toMatch(/after this run|future|window/i);
+  });
+
+  it("K2 · an approval recorded AFTER the run it approves is refused", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    const approvals = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "approvals")) as Record<string, unknown>;
+    const environments = approvals.environments as Record<string, { reviewers: Record<string, unknown>[] }>;
+    for (const environment of Object.values(environments)) {
+      for (const reviewer of environment.reviewers) reviewer.approved_at = "2099-01-01T00:00:00.000Z";
+    }
+    write("approvals", approvals);
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "an approval dated 2099 produced no blocker").not.toBe("");
+    expect(detail).toMatch(/approval|approved_at|after this run|future|window/i);
+  });
+
+  it("K3 · a phase collected BEFORE the cases it reports on is a contradictory phase time", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    const approvals = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "approvals")) as Record<string, unknown>;
+    // `collect` runs AFTER the protected actor phases. A collection time that precedes the first
+    // case's measured mutation describes an ordering that did not happen.
+    approvals.collected_at = "2026-09-10T08:00:00.000Z";
+    write("approvals", approvals);
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "a collection time before the cases produced no blocker").not.toBe("");
+    expect(detail).toMatch(/collect|ordering|before|phase/i);
+  });
+});
+
+/**
+ * ── CORRECTION PASS 5 — the dispatch→bytes→entry→nonce join, and the once-only transition ────────
+ *
+ * Two obligations root attached to accepting the once-only transition:
+ *
+ *  1. The final assessment must independently JOIN the dispatch envelope digest to the ACTUAL
+ *     retained response bytes, their entry digest, and the challenge nonce. Repeated hash
+ *     declarations are not that join, and an unknown or changed byte stream must refuse even when
+ *     the parsed response objects look equivalent.
+ *  2. The retained historical `received_at` is REQUIRED. A response's CREATION and its RECEIPT are
+ *     distinct measured events, so substituting one for the other is not a fallback — it is a
+ *     different claim. A missing receipt is incomplete, and an already-valid historical packet must
+ *     assess without consulting the wall clock.
+ */
+describe("correction pass 5 — the dispatch/bytes/receipt join and the once-only journal transition", () => {
+  const write = (key: string, payload: unknown) =>
+    writeFileSync(path.join(evidenceDir, evidenceFileName(RUN_ID, ATTEMPT, key)), `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  const blockersOf = (now?: () => Date) =>
+    assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, ...(now ? { now } : {}) }).blockers as Blocker[];
+  const witnessJournalPath = () => journalPath(evidenceDir, RUN_ID, ATTEMPT, "witness");
+
+  /** Rebuild the witness chain so its hash links VERIFY, with one record's data rewritten. */
+  const rebuildWitnessJournal = (mutate: (record: { type: string; data: Record<string, unknown> }) => { type: string; data: Record<string, unknown> } | null) => {
+    const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    rmSync(witnessJournalPath(), { force: true });
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness", source: WORKFLOW_SHA, lock });
+      for (const record of records) {
+        const next = mutate({ type: String(record.type), data: record.data as Record<string, unknown> });
+        if (!next) continue;
+        journal.append(next.type, next.data);
+      }
+    } finally { lock.release(); }
+  };
+
+  const firstNormalCase = () => CLOUD_CASE_SEQUENCE.normal[0];
+
+  it("R1 · a case with NO retained receipt is incomplete; its creation time is not its receipt", async () => {
+    await coherentPacket();
+    expect(blockersOf(), "the coherent packet does not pass").toEqual([]);
+    const normal = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"));
+    write("normal", {
+      ...normal,
+      cases: (normal.cases as Record<string, unknown>[]).map((record) => {
+        const witness = { ...(record.witness as Record<string, unknown>) };
+        delete witness.pre_received_at;
+        return { ...record, witness };
+      }),
+    });
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "a missing receipt produced no blocker").not.toBe("");
+    expect(detail).toMatch(/receipt|received_at/i);
+  });
+
+  it("R2 · a dispatch envelope digest that does not describe the published bytes refuses", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    // ONE invariant: the dispatch record's envelope digest, rebuilt into a correctly chained journal.
+    rebuildWitnessJournal((record) => (record.type === "dispatch-intent" && String(record.data.case_id) === firstNormalCase()
+      ? { ...record, data: { ...record.data, envelope_digest: "b".repeat(64) } }
+      : record));
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "a wrong dispatch envelope digest produced no blocker").not.toBe("");
+    expect(detail).toMatch(/dispatch|envelope/i);
+  });
+
+  it("R3 · retained response BYTES that do not hash to the entry digest refuse, however equivalent the object", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    const normal = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "normal"));
+    write("normal", {
+      ...normal,
+      cases: (normal.cases as Record<string, unknown>[]).map((record) => {
+        const witness = { ...(record.witness as Record<string, unknown>) };
+        // Semantically identical, byte-different: the same response, pretty-printed. The object
+        // "looks equivalent" and the bytes are not the ones the publisher published.
+        if (witness.pre_response) witness.pre_response_bytes = JSON.stringify(witness.pre_response, null, 2);
+        return { ...record, witness };
+      }),
+    });
+    const detail = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(detail, "a changed byte stream produced no blocker").not.toBe("");
+    expect(detail).toMatch(/bytes|digest/i);
+  });
+
+  it("R4 · an already-valid historical packet assesses without the wall clock, and late NEW consumption still refuses", async () => {
+    const { github } = await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    // THE WALL CLOCK MOVES ON. A packet that was valid when it was produced stays valid: every
+    // receipt, lifetime and ordering fact it is judged on is retained history, not "now".
+    const muchLater = () => new Date(Date.parse("2027-01-01T00:00:00.000Z"));
+    expect(blockersOf(muchLater), "a historical packet stopped assessing once the clock moved").toEqual([]);
+    // But a NEW consumption after the original expiry is still refused — the expiry is never
+    // extended, and being historical does not make a late measurement admissible.
+    const ordinal = 1;
+    const expired = createTestClock("2027-01-01T00:00:00.000Z");
+    await expect(serveOne(
+      github,
+      { role: "normal", caseId: firstNormalCase(), ordinal, direction: "pre" },
+      {}, expired.now,
+    )).rejects.toThrow(/expired|expiry/i);
+  });
+
+  it("T1 · serving the SAME validated publication again returns the prior record and appends nothing", async () => {
+    const { github } = await coherentPacket();
+    const before = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    const countOf = (records: { type: string; data: Record<string, unknown> }[], type: string) => records.filter((record) =>
+      String(record.type) === type && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre").length;
+    expect(countOf(before as never, "challenge-observed")).toBe(1);
+    expect(countOf(before as never, "response-reconciled")).toBe(1);
+    const priorReconciled = (before as never as { type: string; data: Record<string, unknown> }[])
+      .find((record) => String(record.type) === "response-reconciled" && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data;
+
+    // THE ACTUAL FLOW, called again — a restarted witness serving an item it already served, WITHIN
+    // the original challenge expiry. (Outside it the serve refuses, which R4 proves separately: the
+    // expiry is never extended, and a replay does not earn one.)
+    const name = challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: "normal", ordinal: 1, direction: "pre" });
+    const challenge = JSON.parse(readFileSync(path.join(cloudDir("challenges"), `${name}.json`), "utf8"));
+    const insideExpiry = createTestClock(new Date(Date.parse(String(challenge.created_at)) + 1000).toISOString());
+    const served = await serveOne(github, { role: "normal", caseId: firstNormalCase(), ordinal: 1, direction: "pre" }, {}, insideExpiry.now);
+    // `serveWitnessItem` returns the reconciled RECORD itself — and on a replay it must be the one
+    // already in the chain, unchanged.
+    expect(served).toEqual(priorReconciled);
+
+    const after = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    expect(countOf(after as never, "challenge-observed"), "a replay appended a second observation").toBe(1);
+    expect(countOf(after as never, "response-reconciled"), "a replay appended a second reconciliation").toBe(1);
+    // And the packet still passes: an idempotent replay changes no evidence.
+    expect(blockersOf()).toEqual([]);
+  });
+
+  it("T2 · the poll path is idempotent for the same publication", async () => {
+    const { github } = await coherentPacket();
+    const session = await openWitnessSession({
+      runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl },
+    });
+    try {
+      const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+      const observed = records.find((record) => String(record.type) === "challenge-observed"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data as Record<string, unknown>;
+      const reconciled = records.find((record) => String(record.type) === "response-reconciled"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data as Record<string, unknown>;
+      // Rebuild the pending shape the poller is handed, from RETAINED facts only.
+      const name = challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: "normal", ordinal: 1, direction: "pre" });
+      const challengeBytes = readFileSync(path.join(cloudDir("challenges"), `${name}.json`));
+      const challenge = JSON.parse(challengeBytes.toString("utf8"));
+      const pending = {
+        challenge, challengeDigest: String(observed.challenge_digest),
+        challengeBinding: Object.fromEntries(Object.keys(challenge).filter((key) => key !== "nonce" && key !== "created_at" && key !== "expires_at" && key !== "schema_version" && key !== "kind" && key !== "before_sha" && key !== "requested_sha").map((key) => [key, challenge[key]])),
+        expectedName: String(reconciled.expected_artifact), envelopeDigest: reconciled.envelope_digest ?? null,
+      };
+      const polled = await pollWitnessPublication({
+        request: session.request, requestArchive: session.requestArchive, ctx: session.ctx,
+        journal: session.journal, item: { role: "normal", caseId: firstNormalCase(), ordinal: 1, direction: "pre" },
+        pending, now: () => new Date(Date.parse(String(challenge.created_at)) + 1000),
+      });
+      expect(polled, "the poll returned nothing for a published response").not.toBeNull();
+      expect(polled).toEqual(reconciled);
+      const after = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+      expect(after.filter((record) => String(record.type) === "response-reconciled"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre").length,
+      "the poll appended a second reconciliation").toBe(1);
+    } finally { session.lock.release(); }
+  });
+
+  it("T3 · a CONFLICTING publication or observation under the same key refuses", async () => {
+    await coherentPacket();
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness", source: WORKFLOW_SHA, lock });
+      const existing = journal.read();
+      const reconciled = existing.find((record) => String(record.type) === "response-reconciled"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data as Record<string, unknown>;
+      const observed = existing.find((record) => String(record.type) === "challenge-observed"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data as Record<string, unknown>;
+      // A DIFFERENT publication for the same case/direction: same key, other artifact and bytes.
+      expect(() => recordWitnessEventOnce({
+        journal, type: "response-reconciled",
+        data: { ...reconciled, artifact_id: 999999, entry_digest: "c".repeat(64) },
+      })).toThrow(/already holds a different response-reconciled.*conflicting/s);
+      // A DIFFERENT challenge for the same case/direction.
+      expect(() => recordWitnessEventOnce({
+        journal, type: "challenge-observed",
+        data: { ...observed, challenge_digest: "d".repeat(64) },
+      })).toThrow(/already holds a different challenge-observed.*conflicting/s);
+      // The identical validated record still replays without appending.
+      const replay = recordWitnessEventOnce({ journal, type: "response-reconciled", data: reconciled });
+      expect(replay.appended).toBe(false);
+      expect(replay.record).toEqual(reconciled);
+    } finally { lock.release(); }
+  });
+
+  it("T4 · a correctly chained DUPLICATE history refuses, and a missing event refuses", async () => {
+    await coherentPacket();
+    expect(blockersOf()).toEqual([]);
+    // A genuinely duplicated event, in a chain whose hash links verify.
+    rebuildWitnessJournal((record) => record);
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness" });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, kind: "witness", source: WORKFLOW_SHA, lock });
+      const reconciled = journal.read().find((record) => String(record.type) === "response-reconciled"
+        && String(record.data?.case_id) === firstNormalCase() && String(record.data?.direction) === "pre")!.data;
+      // Appended DIRECTLY, bypassing the transition, exactly as a pre-correction producer would.
+      journal.append("response-reconciled", reconciled);
+    } finally { lock.release(); }
+    const duplicated = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(duplicated).toMatch(/records 2 response-reconciled events/);
+
+    // And a MISSING event, from the same coherent baseline.
+    rebuildWitnessJournal((record) => (record.type === "dispatch-result" && String(record.data.case_id) === firstNormalCase()
+      && String(record.data.direction) === "pre" ? null : record));
+    const missing = blockersOf().map((entry) => entry.detail).join("\n");
+    expect(missing).toMatch(/records no dispatch-result/);
   });
 });

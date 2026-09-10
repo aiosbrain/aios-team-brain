@@ -107,6 +107,17 @@ const challengeName = (role: string, ordinal: number, direction: "pre" | "post")
 const SHARED_VARS: Record<string, string> = {
   COMMISSIONING_NORMAL_APP_ID: "${{ vars.COMMISSIONING_NORMAL_APP_ID }}",
   COMMISSIONING_EMERGENCY_APP_ID: "${{ vars.COMMISSIONING_EMERGENCY_APP_ID }}",
+  /**
+   * The PLANNED installation identities (PC-02/PC-04).
+   *
+   * They are `vars.`, not `secrets.` — numeric identifiers, not keys — and they belong in the
+   * credential-free intent so that every later boundary has an expectation that does not come from
+   * the protected job's own configuration. `measureAppGrants` used to record the installation ID it
+   * was ASKED for as though it had measured it; the plan is what makes the returned identity
+   * checkable.
+   */
+  COMMISSIONING_NORMAL_INSTALLATION_ID: "${{ vars.COMMISSIONING_NORMAL_INSTALLATION_ID }}",
+  COMMISSIONING_EMERGENCY_INSTALLATION_ID: "${{ vars.COMMISSIONING_EMERGENCY_INSTALLATION_ID }}",
   COMMISSIONING_PRODUCER_IDS_JSON: "${{ vars.COMMISSIONING_PRODUCER_IDS_JSON }}",
   COMMISSIONING_REPOSITORY_ID: "${{ vars.COMMISSIONING_REPOSITORY_ID }}",
 };

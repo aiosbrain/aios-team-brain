@@ -71,7 +71,10 @@ import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } 
  * command does not establish this property.
  */
 const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
-import { acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, writeJournalSnapshot } from "./commissioning-journal.mjs";
+import {
+  acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, recordWitnessEventOnce,
+  writeJournalSnapshot,
+} from "./commissioning-journal.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
   REHEARSAL_CASE_ID, REHEARSAL_DOMAIN, REHEARSAL_ROLE, REHEARSAL_TARGET,
@@ -86,7 +89,7 @@ import {
   WITNESS_ENTRY_NAME, WITNESS_JOB_ID, WITNESS_MAX_PAGES, WITNESS_MODES, WITNESS_PAGE_SIZE,
   assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
   assertPublisherContext, assertResponseBinding, buildChallenge, buildGovernedSnapshot,
-  buildResponse, canonicalHash as witnessCanonicalHash, canonicalJson as witnessCanonicalJson,
+  buildResponse, bytesSha256, canonicalHash as witnessCanonicalHash, canonicalJson as witnessCanonicalJson,
   challengeArtifactName, publishWitnessResponse, readSingleEntryZip, readWitnessEnvelopeFromEvent,
   responseArtifactName, serializeDispatchEnvelope, validateGovernedSnapshot,
 } from "./commissioning-witness.mjs";
@@ -212,6 +215,16 @@ export const PROTECTED_JOBS = Object.freeze([
  * because the rehearsal previously admitted itself by COUNTING one non-skipped job, which says
  * nothing about which job that was. The workflow guard asserts both strings against the YAML.
  */
+/**
+ * The credential-free intent job's DISPLAY name, and the artifact it publishes.
+ *
+ * Both are fixed by the reviewed workflow. The publisher derives the artifact name from the run and
+ * attempt it MEASURED, never from a string in the envelope it was handed.
+ */
+export const INTENT_JOB_NAME = "Commissioning intent (credential-free)";
+export const intentArtifactName = (runId, attempt) => `policy-commissioning-intent-${String(runId)}-${String(attempt)}`;
+export const intentArtifactEntry = (runId, attempt) => `commissioning-${String(runId)}-${String(attempt)}-intent.json`;
+
 export const WITNESS_JOB_NAME = "Local policy witness publisher (no secrets)";
 export const REHEARSAL_JOB_NAME = "Transport rehearsal (inert, no secrets)";
 
@@ -461,7 +474,7 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   // run's identity: the publisher checks its own, the local witness checks the publisher's, and the
   // actor checks the publisher run that owns the artifact it is about to consume.
   { id: "read-workflow-run-attempt", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}$`), body: noBody },
-  { id: "read-workflow-run-jobs", method: "GET", roles: ["local", "normal", "emergency", "rehearsal"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
+  { id: "read-workflow-run-jobs", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
   { id: "read-workflow-run-approvals", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/approvals$`), body: noBody },
 
   // ── the F1 witness transport: artifacts in, one bounded dispatch out ───────────────────────────
@@ -469,13 +482,13 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   // "List and take the newest match" is the selection rule the canonical revision forbids, and a
   // deterministic name plus a refusal on duplicates is what replaces it.
   {
-    id: "list-artifacts-by-name", method: "GET", roles: ["local", "normal", "emergency", "rehearsal"],
+    id: "list-artifacts-by-name", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"],
     path: `/repos/${REPO}/actions/artifacts`, query: Object.freeze(["per_page", "page", "name"]), body: noBody,
   },
   {
     // A BINARY read, bounded by {@link MAX_ARCHIVE_BYTES} at the transport and re-checked by the
     // single-entry archive reader. It is the one operation whose response is not JSON.
-    id: "download-artifact-archive", method: "GET", roles: ["local", "normal", "emergency", "rehearsal"],
+    id: "download-artifact-archive", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"],
     pattern: new RegExp(`^/repos/${R}/actions/artifacts/[1-9][0-9]{0,17}/zip$`), body: noBody,
   },
   {
@@ -1123,15 +1136,34 @@ export function assertRunContext(env, { runId, attempt, role }) {
   let normalAppId = null;
   let emergencyAppId = null;
   let producerIds = null;
+  let plannedInstallations = null;
   if (binding.mode === "commission") {
     normalAppId = positiveInt(env?.COMMISSIONING_NORMAL_APP_ID, "COMMISSIONING_NORMAL_APP_ID");
     emergencyAppId = positiveInt(env?.COMMISSIONING_EMERGENCY_APP_ID, "COMMISSIONING_EMERGENCY_APP_ID");
     if (normalAppId === emergencyAppId) throw new UsageError("the normal and emergency Apps must be distinct numeric identities");
     producerIds = parseProducerIds(env?.COMMISSIONING_PRODUCER_IDS_JSON);
+    /**
+     * THE PLANNED INSTALLATION IDENTITIES (PC-02/PC-04, corrected).
+     *
+     * They were absent from every immutable input, so the only "expectation" available anywhere was
+     * the value the protected job itself was configured with — and `measureAppGrants` then recorded
+     * that same requested value back as though it had been measured. A record cannot be its own
+     * expectation, so the identity is planned HERE, in the credential-free configuration that the
+     * intent artifact publishes, and every later boundary compares against the plan.
+     *
+     * They are nonsecret numeric identifiers, not keys or tokens. Real values are an owner
+     * provisioning prerequisite; absence refuses at run time rather than defaulting.
+     */
+    const normalInstallationId = positiveInt(env?.COMMISSIONING_NORMAL_INSTALLATION_ID, "COMMISSIONING_NORMAL_INSTALLATION_ID");
+    const emergencyInstallationId = positiveInt(env?.COMMISSIONING_EMERGENCY_INSTALLATION_ID, "COMMISSIONING_EMERGENCY_INSTALLATION_ID");
+    if (normalInstallationId === emergencyInstallationId) {
+      throw new UsageError("the normal and emergency installations must be distinct numeric identities");
+    }
+    plannedInstallations = Object.freeze({ normal: String(normalInstallationId), emergency: String(emergencyInstallationId) });
   }
   return Object.freeze({
     runId: String(runId), attempt: String(attempt), role, mode, binding, workflowSha, repositoryId,
-    normalAppId, emergencyAppId,
+    normalAppId, emergencyAppId, plannedInstallations,
     actor: String(env?.GITHUB_ACTOR ?? "").trim() || null,
     producerIds,
   });
@@ -1627,6 +1659,44 @@ export function describeDifferences(actual, wanted, base = "", out = [], limit =
   }
   if (actual !== wanted) out.push({ path: base || ".", kind: "changed" });
   return out;
+}
+
+/**
+ * THE STRICT COMPARISON AN ADOPTION MAY REST ON, and the reason it is not {@link compareToDesired}.
+ *
+ * `compareToDesired` reports a difference set where EVERY entry is `added` as `normalizationOnly`.
+ * That is a reasonable thing for a difference REPORTER to say, and a disastrous thing for an
+ * OWNERSHIP PROOF to say: a ruleset whose `update` rule acquired `update_allows_fetch_and_merge:
+ * true` differs from the intended policy only by an added key, so the permissive reading called a
+ * semantic change benign and authorised adoption — and therefore deletion — of a policy nobody
+ * intended.
+ *
+ * So this accepts exactly two things: byte equality, and key REORDERING. Nothing else. Every added
+ * field refuses, whatever its value, including one that happens to equal the provider's documented
+ * default.
+ *
+ * ── WHY EVEN A BENIGN DEFAULT EXPANSION REFUSES ─────────────────────────────────────────────────
+ *
+ * Because the gate standing beside this one already does. The setup compatibility check runs the
+ * UNCHANGED production verifier, whose `sameJson` rejects any added parameter, so an adoption rule
+ * that tolerated `update_allows_fetch_and_merge: false` would contradict the verifier three lines
+ * away. PC-04 prescribes the outcome directly: "if provider-default expansion/order makes existing
+ * raw JSON verifier reject equivalent rules, REPORT THE CONCRETE GAP; this harness must not silently
+ * loosen the production verifier or claim PASS." A real expansion is therefore a named
+ * `provider-normalization` gap for root, never a silent adoption.
+ */
+export function compareToIntendedGoverned(actual, wanted) {
+  const differences = describeDifferences(actual, wanted);
+  const byteEqual = JSON.stringify(actual) === JSON.stringify(wanted);
+  const semanticallyEqual = differences.length === 0;
+  return {
+    differences,
+    byteEqual,
+    equal: byteEqual || semanticallyEqual,
+    basis: byteEqual ? "byte-equal" : (semanticallyEqual ? "key-ordering-only" : null),
+    // Distinguishes the gap KIND for the refusal message; it never authorises anything.
+    addedOnly: differences.length > 0 && differences.every((entry) => entry.kind === "added"),
+  };
 }
 
 /** Byte-identical, semantically identical, or identical-but-for-provider-normalisation. */
@@ -2235,6 +2305,16 @@ export const EVIDENCE_KEYS = Object.freeze({
   witness: "witness-publication",
   "witness-process": "witness",
   rehearsal: "transport-rehearsal",
+  /**
+   * The PRIVATE production input/subject record (PC-04). LOCAL ONLY, mode 0600.
+   *
+   * It carries the exact validated twelve-context producer map and the raw `buildMainRulesets`
+   * output it produced, so an offline reader can REGENERATE the production subject and its hash
+   * instead of accepting a digest the packet asserts about itself. The published intent continues to
+   * expose only the producer-map digest; this file is never uploaded, dispatched, put in the
+   * manifest, or logged.
+   */
+  "production-inputs": "production-inputs",
 });
 
 export function evidenceSlug(runId, attempt, key) {
@@ -2484,6 +2564,10 @@ export async function runIntentPhase({ runId, attempt, evidenceDir, env }) {
     // that comes from the protected environments' own review history, read in `collect`.
     dispatcher: ctx.actor, dispatcher_is_human: null,
     normal_app_id: ctx.normalAppId, emergency_app_id: ctx.emergencyAppId,
+    // The PLANNED installations, in the immutable credential-free artifact, so every later boundary
+    // has an expectation that does not come from the record it is checking. Nonsecret identifiers.
+    normal_installation_id: ctx.plannedInstallations.normal,
+    emergency_installation_id: ctx.plannedInstallations.emergency,
     // Not the IDs: their canonical digest, so the local operator's map can be proved identical to
     // the one this job was configured with without republishing the production producer inventory.
     producer_ids_hash: canonicalHash(ctx.producerIds),
@@ -2543,6 +2627,7 @@ export async function localContext({ request, runId, attempt, evidenceDir, env, 
     runId: String(runId), attempt: String(attempt), role: "local",
     workflowSha: String(intent.workflow_sha), repositoryId: Number(intent.repository_id),
     normalAppId: Number(intent.normal_app_id), emergencyAppId: Number(intent.emergency_app_id),
+    plannedInstallations: assertPlannedInstallations(intent),
     producerIds, intent, actor: null,
     /**
      * The provider re-measurement the credential-free intent phase deliberately did not make.
@@ -2574,6 +2659,23 @@ export async function localContext({ request, runId, attempt, evidenceDir, env, 
  * producing evidence about a different identity. So all three of the numeric ID, the login and the
  * account type are required, and the numeric ID is the one GitHub will not reissue under a rename.
  */
+/**
+ * The two planned installation identities an intent artifact must carry, typed and distinct.
+ *
+ * Parsed in ONE place so the local operator, the publisher and the offline assessor all read the
+ * plan the same way, and so a missing plan is a refusal rather than an `undefined` that compares
+ * equal to nothing later on.
+ */
+export function assertPlannedInstallations(intent) {
+  const normal = positiveProviderId(intent?.normal_installation_id);
+  const emergency = positiveProviderId(intent?.emergency_installation_id);
+  if (normal === null || emergency === null) {
+    throw new AssertionFailure("the intent artifact carries no positive planned normal and emergency installation identities");
+  }
+  if (normal === emergency) throw new AssertionFailure("the intent artifact plans the same installation for both release identities");
+  return Object.freeze({ normal: String(normal), emergency: String(emergency) });
+}
+
 export async function assertLocalOperator({ request }) {
   const viewer = await request("GET", "/user");
   if (viewer.status !== 200 || !viewer.body?.login) throw new IncompleteEvidence("the local gh identity could not be measured");
@@ -2822,6 +2924,9 @@ export function intentKey(data) {
  *  - `response-ambiguous` — a result with no usable identity whose status is 2xx or a transport
  *                           failure (0). Something may exist. Reconcile by readback; never re-POST.
  *  - `response-lost`      — no result at all. Same treatment as ambiguous, different cause.
+ *  - `ownership-unprovable` — a bounded readback FOUND the resource and could not prove its body is
+ *                           the intended one. It exists, this run may own it, and nothing may adopt
+ *                           or delete it. Deliberately NOT resolved: root reconciles it.
  *
  * `unresolved` below is the set that BLOCKS: everything except `created`, `reconciled` and
  * `refused`. A packet cannot be complete while one of them stands.
@@ -2842,7 +2947,17 @@ export function unresolvedCreateIntents(records) {
     const identity = result ? (positiveProviderId(result.id) ?? positiveProviderId(result.number)) : null;
     const status = result ? Number(result.status) : null;
     let state;
-    if (reconciled.has(key)) state = "reconciled";
+    /**
+     * AN OWNERSHIP GAP IS NOT A SETTLED RECONCILIATION (F8, corrected).
+     *
+     * Every reconciliation record used to map to `reconciled`, which is in
+     * {@link RESOLVED_INTENT_STATES} — so the moment an adoption site journaled
+     * `ownership-unprovable`, the intent it refused to adopt counted as resolved and cleanup could
+     * still report `cleaned`. The refusal would have laundered itself.
+     */
+    const settlement = reconciled.get(key) ?? null;
+    if (settlement && String(settlement.outcome) === "ownership-unprovable") state = "ownership-unprovable";
+    else if (reconciled.has(key)) state = "reconciled";
     else if (!result) state = "response-lost";
     else if (identity !== null) state = "identified";
     // A ref create carries no identity of its own — its identity IS its name — so a measured 2xx
@@ -2975,18 +3090,32 @@ export function proveIntendedOwnership({ measured, intended }) {
     return { provable: false, reason: "this run retains no independently derived intended body to compare against", differences: [] };
   }
   const differences = [];
-  let normalizationOnly = true;
+  let byteEqual = true;
+  let addedOnly = true;
   for (const field of GOVERNED_RULESET_FIELDS) {
-    const comparison = compareToDesired(measured[field] ?? null, intended[field] ?? null);
-    if (comparison.byteEqual) continue;
-    if (!comparison.normalizationOnly) normalizationOnly = false;
+    // STRICT (see {@link compareToIntendedGoverned}): byte equality or key reordering, and nothing
+    // else. An added field is a difference here even when its value is the provider's own default.
+    const comparison = compareToIntendedGoverned(measured[field] ?? null, intended[field] ?? null);
+    if (!comparison.byteEqual) byteEqual = false;
+    if (comparison.equal) continue;
+    if (!comparison.addedOnly) addedOnly = false;
     for (const entry of comparison.differences.slice(0, 8)) differences.push({ path: `${field}${entry.path}`, kind: entry.kind });
   }
-  if (!differences.length) return { provable: true, reason: null, differences: [], basis: "byte-equal-to-the-intended-governed-body" };
-  if (normalizationOnly) return { provable: true, reason: null, differences: differences.slice(0, 8), basis: "equal-to-the-intended-governed-body-modulo-provider-default-expansion" };
+  if (!differences.length) {
+    return {
+      provable: true, reason: null, differences: [], gap: null,
+      basis: byteEqual ? "byte-equal-to-the-intended-governed-body" : "equal-to-the-intended-governed-body-modulo-key-ordering",
+    };
+  }
+  // The gap is NAMED rather than absorbed. `provider-normalization` is PC-04's "report the concrete
+  // gap" case: it is still a refusal, and root commissions a reviewed correction for it.
+  const gap = addedOnly ? "provider-normalization" : "semantic";
   return {
     provable: false,
-    reason: `the provider's governed body differs from the intended one in ${differences.length} way(s) that provider normalization does not explain`,
+    gap,
+    reason: addedOnly
+      ? `the provider's governed body carries ${differences.length} field(s) the intended policy does not; this harness reports the concrete provider-normalization gap rather than adopting a body the unchanged production verifier would reject`
+      : `the provider's governed body differs from the intended one in ${differences.length} semantic way(s)`,
     differences: differences.slice(0, 8),
   };
 }
@@ -3076,8 +3205,35 @@ export async function createDisposableRulesets({ request, journal, plan, guardCt
       if (String(readback.body.name) !== entry.name) {
         throw new AssertionFailure(`the disposable ruleset created for ${entry.name} reads back under a different name`);
       }
+      /**
+       * A SUCCESSFUL 201 DOES NOT PROVE THIS GET BODY (F8, corrected).
+       *
+       * This site used to fingerprint the readback after a name check alone — so the very FIRST
+       * adoption, on the ordinary success path, took whatever the provider returned as the
+       * definition of "what we own". A body edited between the POST and this GET therefore became
+       * its own evidence of ownership, and cleanup would later delete it for matching a fingerprint
+       * derived from the edit. The independent driver's own scenario is the lost-response variant of
+       * exactly this; the successful-201 variant was simply never asked about.
+       *
+       * The request body is right here (`entry.body`), independently derived from the immutable
+       * intent, so there is nothing to reconstruct: the readback must BE that body.
+       */
+      const proof = proveIntendedOwnership({ measured: readback.body, intended: entry.body });
+      if (!proof.provable) {
+        journal.append("reconciliation", {
+          kind: "ruleset", key: `ruleset:${entry.name}`, outcome: "ownership-unprovable",
+          id, reason: proof.reason, differences: proof.differences, gap: proof.gap,
+          measured_at_stage: "creation-readback",
+        });
+        throw new AssertionFailure(
+          `the disposable ruleset ${entry.name} was created (id ${id}) but its readback is not the intended governed body (${proof.reason}); the created identity is retained and an ownership gap is recorded for root rather than adopting the body this run would later delete`,
+        );
+      }
       const governed = governedFingerprint(readback.body);
-      journal.append("resource-fingerprinted", { kind: "ruleset", key: entry.name, id, governed_fingerprint: governed, measured_at_stage: "creation" });
+      journal.append("resource-fingerprinted", {
+        kind: "ruleset", key: entry.name, id, governed_fingerprint: governed,
+        measured_at_stage: "creation", ownership_basis: proof.basis,
+      });
       result[actor].push({ ...record, governed_fingerprint: governed });
     }
   }
@@ -3094,8 +3250,25 @@ export async function createDisposableRulesets({ request, journal, plan, guardCt
  */
 export async function reconcileCreateIntents({ request, ctx, journal }) {
   const outcomes = [];
+  /**
+   * The INDEPENDENTLY DERIVED intended bodies, recomputed from the immutable context rather than
+   * measured from the provider. Built lazily: a run with no unresolved ruleset intent should not pay
+   * for it, and a context that cannot produce a plan should fail where that matters.
+   */
+  let intendedRulesets = null;
+  const intendedBody = (name) => {
+    if (intendedRulesets === null) {
+      intendedRulesets = new Map(Object.values(buildDisposablePlan(ctx).plan).flat().map((entry) => [entry.name, entry.body]));
+    }
+    return intendedRulesets.get(String(name)) ?? null;
+  };
   for (const pending of unresolvedCreateIntents(journal.read())) {
-    if (pending.state === "reconciled") { outcomes.push({ ...pending.reconciliation, replayed: true }); continue; }
+    // A recorded ownership gap is REPLAYED, not redone: it stays unresolved and blocking, and the
+    // chain does not grow a duplicate record every time cleanup runs.
+    if (pending.state === "reconciled" || pending.state === "ownership-unprovable") {
+      outcomes.push({ ...pending.reconciliation, replayed: true });
+      continue;
+    }
     const base = { kind: pending.intent.kind, key: pending.key, intent_seq: pending.seq };
 
     if (pending.intent.kind === "commit") {
@@ -3134,10 +3307,40 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
       if (String(detail.body.name) !== String(pending.intent.name)) {
         throw new AssertionFailure(`reconciliation found ruleset ${id} under a different name than the intent recorded; commissioning refuses to adopt it`);
       }
-      const outcome = { ...base, outcome: "adopted-from-intent", id };
+      /**
+       * ── THE ADOPTION THE PREVIOUS PLAN MISSED ENTIRELY (F8, corrected) ──────────────────────────
+       *
+       * This is a FIRST FINGERPRINT ADOPTION, and until now the only thing between a lost create
+       * response and `resource-fingerprinted` was a name match. That mattered more than the two
+       * guarded sites, because reconciliation runs BEFORE them: `runCleanupPhase` calls it first, so
+       * by the time cleanup's own `proveIntendedOwnership` branch is reached a fingerprint already
+       * exists and the branch is skipped. The guarded sites were guarded; the unguarded one supplied
+       * the evidence they trusted, and a ruleset whose rules had been emptied was deleted.
+       *
+       * The intended body is rebuilt from the immutable context, never from the resource.
+       */
+      const intended = intendedBody(pending.intent.name);
+      const proof = proveIntendedOwnership({ measured: detail.body, intended });
+      if (!proof.provable) {
+        // The ID IS retained — the resource exists and root must be able to name it — but nothing is
+        // adopted, nothing is fingerprinted, and the intent stays unresolved so no phase can claim
+        // this run left nothing behind.
+        const gap = {
+          ...base, outcome: "ownership-unprovable", id,
+          reason: proof.reason, differences: proof.differences, gap: proof.gap,
+          measured_at_stage: "lost-response-reconciliation",
+        };
+        journal.append("reconciliation", gap);
+        outcomes.push(gap);
+        continue;
+      }
+      const outcome = { ...base, outcome: "adopted-from-intent", id, ownership_basis: proof.basis };
       journal.append("reconciliation", outcome);
       journal.append("resource-created", { kind: "ruleset", actor: pending.intent.actor, id, name: pending.intent.name, target_ref: pending.intent.target_ref, hash: pending.intent.hash, provenance: "reconciled-from-intent" });
-      journal.append("resource-fingerprinted", { kind: "ruleset", key: pending.intent.name, id, governed_fingerprint: governedFingerprint(detail.body), measured_at_stage: "reconciliation" });
+      journal.append("resource-fingerprinted", {
+        kind: "ruleset", key: pending.intent.name, id, governed_fingerprint: governedFingerprint(detail.body),
+        measured_at_stage: "reconciliation", ownership_basis: proof.basis,
+      });
       outcomes.push(outcome);
       continue;
     }
@@ -3303,7 +3506,56 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
       if (positiveProviderId(entry.id) !== null) guardCtx.rulesetIds.add(positiveProviderId(entry.id));
     }
     for (const entry of journaledResources(journal.read(), "commit")) guardCtx.graphShas.add(String(entry.sha));
-    const { productionHash, plan } = buildDisposablePlan(ctx);
+    const { production, productionHash, plan } = buildDisposablePlan(ctx);
+    /**
+     * ── THE PRIVATE PRODUCTION SUBJECT, RETAINED BEFORE ANY DISPOSABLE MUTATION (PC-04) ───────────
+     *
+     * PC-04 requires the raw production-shape subject and its hash to be preserved, and the final
+     * assessment requires the producer map and policy hash to be RECONSTRUCTED. Neither was possible
+     * offline: the published intent deliberately carries only `producer_ids_hash`, so an assessor
+     * had nothing to regenerate `buildMainRulesets` from and could do no better than check that the
+     * packet's copies of a digest agreed with each other — which the independent driver defeated
+     * with a single invented string.
+     *
+     * `localContext` has already parsed the exact twelve-context map and proved its canonical digest
+     * against the immutable intent, so the inputs are validated before they are retained here.
+     *
+     * PRIVACY IS THE POINT AND THE BOUND. This file is mode 0600, local, and is never added to a
+     * workflow upload path, a dispatch envelope, the public manifest or any log. The published
+     * intent still exposes only the digest.
+     */
+    const productionInputs = {
+      schema_version: RESULT_SCHEMA_VERSION, phase: "production-inputs",
+      run_id: String(runId), attempt: String(attempt), workflow_sha: ctx.workflowSha,
+      repository: COMMISSIONING_REPOSITORY, repository_id: ctx.repositoryId,
+      normal_app_id: ctx.normalAppId, emergency_app_id: ctx.emergencyAppId,
+      normal_installation_id: ctx.plannedInstallations.normal,
+      emergency_installation_id: ctx.plannedInstallations.emergency,
+      producer_ids: ctx.producerIds,
+      producer_ids_hash: canonicalHash(ctx.producerIds),
+      production_rulesets: production,
+      production_policy_hash: productionHash,
+      visibility: "PRIVATE local evidence, mode 0600. Never uploaded, dispatched, published in the manifest, or logged.",
+    };
+    const productionInputsPath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, "production-inputs"), productionInputs);
+    const productionInputsDigest = canonicalHash(productionInputs);
+    const boundRecord = session.records.find((record) => record.type === "production-inputs-bound")?.data ?? null;
+    if (boundRecord) {
+      // A RESUME may not swap the subject its predecessor was measured against.
+      if (String(boundRecord.production_inputs_sha256) !== productionInputsDigest) {
+        throw new AssertionFailure(
+          "this run's private production inputs no longer match the digest its journal bound at setup; the production subject changed under a resumed attempt",
+        );
+      }
+    } else {
+      journal.append("production-inputs-bound", {
+        production_inputs_sha256: productionInputsDigest,
+        production_policy_hash: productionHash,
+        producer_ids_hash: canonicalHash(ctx.producerIds),
+        // The PATH is journaled, the CONTENT is not: the chain must stay publishable-safe.
+        evidence_file: path.basename(productionInputsPath),
+      });
+    }
     const { shas, manifest } = await createSyntheticGraph({
       request, ctx, journal, guardCtx,
       manifestInputs: {
@@ -3350,6 +3602,12 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
       // the graph it records rather than believed (F4). The cloud challenges carry the same two.
       manifest_sha256: canonicalHash(manifest),
       graph_sha256: graphBindingDigest(shas, runId, attempt),
+      // The digest of the PRIVATE production input/subject file, so the offline reconstruction can
+      // bind file → journal → setup. The file's contents stay local; only its hash travels here.
+      production_inputs_sha256: productionInputsDigest,
+      // The manifest ITSELF, so its digest can be recomputed rather than believed. It carries
+      // identities and hashes only — no producer map, no raw production subject.
+      manifest,
       unresolved_intents: blockingCreateIntents(journal.read()).length,
       reconciliations,
       synthetic_graph: shas, derived_refs: refs,
@@ -3395,6 +3653,12 @@ export function summarizeApprovals(response) {
       reviewer_login: String(entry?.user?.login ?? "unknown"),
       reviewer_id: Number.isInteger(Number(entry?.user?.id)) ? Number(entry.user.id) : null,
       reviewer_type: String(entry?.user?.type ?? "unknown"),
+      /**
+       * WHEN. The provider's own timestamp for the approval, which this summary used to DROP —
+       * so an approval could not be placed in time at all, and one dated after the run it approved
+       * was invisible by construction rather than by oversight.
+       */
+      approved_at: String(entry?.updated_at ?? entry?.created_at ?? ""),
       environments: (entry?.environments ?? []).map((environment) => String(environment?.name ?? "unknown")),
     })),
   };
@@ -3509,6 +3773,19 @@ export async function measureAppGrants({ request, role, ctx, installationId }) {
 
   const installation = await request("GET", `/app/installations/${installationId}`);
   if (installation.status !== 200 || !installation.body) throw new IncompleteEvidence(`the ${role} App's installation could not be measured (${installation.status})`);
+  /**
+   * THE RETURNED IDENTITY IS THE REQUESTED ONE (PC-04, corrected).
+   *
+   * This function recorded `installation_id: String(installationId)` — the value it was ASKED for,
+   * echoed back into the evidence as though it had been measured. Nothing ever compared the
+   * provider's own `id` with it, so a redirect, a proxy or a fixture could answer for a different
+   * installation and the packet would read as a measurement of the intended one.
+   */
+  if (Number(installation.body.id) !== Number(installationId)) {
+    throw new AssertionFailure(
+      `the provider answered for installation ${JSON.stringify(installation.body.id ?? null)}, not the ${String(installationId)} this job asked about`,
+    );
+  }
   if (Number(installation.body.app_id) !== Number(expectedAppId)) {
     throw new AssertionFailure(`installation ${String(installationId)} belongs to App ${Number(installation.body.app_id)}, not the ${role} identity`);
   }
@@ -3543,6 +3820,8 @@ export async function measureAppGrants({ request, role, ctx, installationId }) {
     app_id: Number(app.body.id),
     app_slug: typeof app.body.slug === "string" ? app.body.slug : null,
     installation_id: String(installationId),
+    // The provider's OWN identity for the installation, distinct from the one we requested.
+    installation_body_id: Number(installation.body.id),
     installation_app_id: Number(installation.body.app_id),
     account_login: typeof installation.body.account?.login === "string" ? installation.body.account.login : null,
     repository_selection: "selected",
@@ -3805,7 +4084,10 @@ export function caseBinding({ ctx, role, caseId, direction, targetRef, installat
     direction: String(direction),
     target_ref: String(targetRef),
     intended_app_id: domain === REHEARSAL_DOMAIN ? null : Number(role === "normal" ? ctx.normalAppId : ctx.emergencyAppId),
-    intended_installation_id: domain === REHEARSAL_DOMAIN ? null : String(installationId),
+    // FROM THE PLAN. `installationId` is the value the protected job was configured with, and
+    // `mintActorCredential` refuses unless the two agree — so binding the plan makes the challenge
+    // carry an identity the immutable intent chose rather than one the job supplied.
+    intended_installation_id: domain === REHEARSAL_DOMAIN ? null : String(ctx.plannedInstallations?.[role] ?? installationId),
     manifest_sha256: domain === REHEARSAL_DOMAIN ? null : canonicalHash(manifest),
     graph_sha256: domain === REHEARSAL_DOMAIN ? null : graphBindingDigest(graphShas, ctx.runId, ctx.attempt),
   };
@@ -3845,7 +4127,35 @@ export async function findWitnessResponseArtifact({ request, ctx, binding, nonce
     artifact, run: { ...run.body, id: owningRun }, jobs: jobs.body.jobs,
     expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: ctx.workflowSha },
   });
-  return { name, artifact_id: provenance.artifact_id, provenance };
+  /**
+   * THE BOUNDED FACTS THE PROVENANCE VERDICT WAS DERIVED FROM (F2, corrected).
+   *
+   * Retaining only `provenance` retained the CONCLUSION. The offline assessor could then do nothing
+   * but read it — which is why deleting the whole field produced no blocker. These are the exact
+   * inputs `assertPublisherArtifactProvenance` consumes, and nothing else: no raw provider body, no
+   * token, no measurement. The assessor re-runs the same function on them.
+   */
+  const identity = (value) => (value && typeof value === "object"
+    ? { login: String(value.login ?? ""), id: Number.isInteger(Number(value.id)) ? Number(value.id) : null, type: String(value.type ?? "") }
+    : null);
+  const facts = {
+    artifact: {
+      id: Number(artifact.id), name: String(artifact.name ?? ""),
+      expired: artifact.expired === true, workflow_run: { id: owningRun },
+    },
+    run: {
+      id: owningRun, run_attempt: Number(run.body.run_attempt), event: String(run.body.event ?? ""),
+      path: String(run.body.path ?? ""), head_sha: String(run.body.head_sha ?? ""),
+      status: String(run.body.status ?? ""),
+      conclusion: run.body.conclusion === null || run.body.conclusion === undefined ? null : String(run.body.conclusion),
+      actor: identity(run.body.actor), triggering_actor: identity(run.body.triggering_actor),
+    },
+    jobs: jobs.body.jobs.map((job) => ({
+      id: Number.isInteger(Number(job?.id)) ? Number(job.id) : null,
+      conclusion: job?.conclusion === null || job?.conclusion === undefined ? null : String(job.conclusion),
+    })),
+  };
+  return { name, artifact_id: provenance.artifact_id, provenance, provenance_facts: facts };
 }
 
 /** Download and open the pinned artifact, bounded at the transport and again in the reader. */
@@ -3856,7 +4166,19 @@ export async function readWitnessResponseArtifact({ requestArchive, artifactId }
   let response;
   try { response = JSON.parse(entry.bytes.toString("utf8")); }
   catch { throw new AssertionFailure("the witness artifact's single entry is not valid JSON"); }
-  return { response, entry_digest: entry.digest, archive_bytes: download.bytes.length };
+  /**
+   * THE EXACT BYTES, retained alongside the parsed object.
+   *
+   * The entry digest is a hash of THESE bytes, and a parsed-and-re-serialized object is not
+   * guaranteed to reproduce them. Without the bytes the offline assessor can only compare the
+   * packet's copies of a digest with each other, which is what let a semantically-equivalent but
+   * byte-different stream pass. They are the same bounded nonsecret published content the artifact
+   * already exposes, so retaining them discloses nothing new.
+   */
+  return {
+    response, entry_digest: entry.digest, archive_bytes: download.bytes.length,
+    response_bytes: entry.bytes.toString("utf8"),
+  };
 }
 
 /**
@@ -3880,9 +4202,14 @@ export async function resolvePublishedResponse({
   request, requestArchive, ctx, binding, challenge, challengeDigest, receivedAt,
 }) {
   const found = await findWitnessResponseArtifact({ request, ctx, binding, nonce: challenge.nonce });
-  const { response, entry_digest: entryDigest, archive_bytes: archiveBytes } = await readWitnessResponseArtifact({ requestArchive, artifactId: found.artifact_id });
+  const { response, entry_digest: entryDigest, archive_bytes: archiveBytes, response_bytes: responseBytes } = await readWitnessResponseArtifact({ requestArchive, artifactId: found.artifact_id });
   assertResponseBinding(response, { challenge, challengeDigest, expectedBinding: binding, receivedAt });
-  return { response, artifact: found, entry_digest: entryDigest, archive_bytes: archiveBytes };
+  // The RECEIPT INSTANT is part of the binding (the expiry is checked against it), so it travels
+  // with the result and is retained — the assessor re-runs the same comparison.
+  return {
+    response, artifact: found, entry_digest: entryDigest, archive_bytes: archiveBytes,
+    response_bytes: responseBytes, received_at: String(receivedAt),
+  };
 }
 
 /**
@@ -3949,6 +4276,18 @@ export async function mintActorCredential({ role, ctx, env, redact, deps = {} })
   if (Number(names.appId) !== expected) throw new AssertionFailure(`the ${role} job's App ID is not the identity this commissioning run was configured for`);
   if (!names.privateKey || !names.installationId) throw new UsageError(`the ${role} job is missing its App installation credentials`);
   if (!POSITIVE_DECIMAL.test(String(names.installationId))) throw new UsageError(`the ${role} job's installation ID is not a positive decimal identifier`);
+  // BEFORE THE CREDENTIAL EXCHANGE: the installation this protected job is configured with must be
+  // the one the immutable intent planned for this role. The expectation comes from the plan, never
+  // from the job's own configuration compared with itself.
+  const plannedInstallation = String(ctx.plannedInstallations?.[role] ?? "");
+  if (!POSITIVE_DECIMAL.test(plannedInstallation)) {
+    throw new IncompleteEvidence(`this run plans no installation identity for the ${role} role; its credential cannot be admitted against an expectation that does not exist`);
+  }
+  if (String(names.installationId) !== plannedInstallation) {
+    throw new AssertionFailure(
+      `the ${role} job is configured with installation ${String(names.installationId)}, not the ${plannedInstallation} this run's immutable intent planned`,
+    );
+  }
   const fetchImpl = deps.fetchImpl ?? fetch;
   const makeRequest = (transport, extra) => createGuardedRequest(transport, {
     role, runId: String(ctx.runId), attempt: String(ctx.attempt),
@@ -4212,6 +4551,21 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
        * what makes the final assessment a re-derivation instead of a re-reading.
        */
       pre_observation: received.response.observation,
+      /**
+       * THE FULL CHALLENGE AND RESPONSE (F2, corrected).
+       *
+       * The assessor is required to re-run `assertResponseBinding` on retained bytes, and it cannot
+       * do that from digests: the function needs the challenge, its digest, and the response object.
+       * All three are the bounded nonsecret values already published to a readable artifact, so
+       * retaining them locally discloses nothing new — it is what turns the final assessment from a
+       * re-reading into a re-derivation.
+       */
+      pre_challenge: challenge,
+      pre_challenge_digest_retained: digest,
+      pre_response: received.response,
+      pre_response_bytes: received.response_bytes ?? null,
+      pre_received_at: received.received_at ?? null,
+      pre_provenance_facts: received.artifact?.provenance_facts ?? null,
       pre_response_created_at: String(received.response.created_at),
       pre_challenge_created_at: String(challenge.created_at),
       pre_challenge_expires_at: String(challenge.expires_at),
@@ -4307,6 +4661,20 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       pre_challenge_expires_at: prior.pre_challenge_expires_at ?? null,
       post_challenge_created_at: String(postRead.challenge.created_at),
       post_challenge_expires_at: String(postRead.challenge.expires_at),
+      // The retained bytes and facts for BOTH directions, so the assessor re-runs the same two
+      // authoritative validators rather than reading the verdicts they produced.
+      pre_challenge: prior.pre_challenge ?? null,
+      pre_challenge_digest: prior.pre_challenge_digest_retained ?? null,
+      pre_response: prior.pre_response ?? null,
+      pre_response_bytes: prior.pre_response_bytes ?? null,
+      pre_received_at: prior.pre_received_at ?? null,
+      pre_provenance_facts: prior.pre_provenance_facts ?? null,
+      post_challenge: postRead.challenge,
+      post_challenge_digest: postRead.digest,
+      post_response: received.response,
+      post_response_bytes: received.response_bytes ?? null,
+      post_received_at: received.received_at ?? null,
+      post_provenance_facts: received.artifact?.provenance_facts ?? null,
     },
     // The exact request the case issued and what came back, so the outcome is re-derivable.
     request_class: Number(prior.http_status) === 0 ? "ambiguous" : (Number(prior.http_status) >= 200 && Number(prior.http_status) < 300 ? "accepted" : "refused"),
@@ -4454,6 +4822,120 @@ export async function runCloudTestsPhase({ role, runId, attempt, evidenceDir, en
  * bytes it writes are the bytes it received, because the digest of those bytes is the binding the
  * actor and the local witness cross-check.
  */
+/**
+ * READ THE ORIGINAL RUN'S AUTHENTICATED INTENT, with the authority the publisher already holds.
+ *
+ * ── WHY THE PUBLISHER NEEDS THIS AT ALL ─────────────────────────────────────────────────────────
+ *
+ * The publisher is the hop that turns a private local measurement into an artifact anyone with
+ * Actions access can read, so it is the last place an unpublishable value can be stopped. To apply
+ * the closed governed projection it needs the run's VOCABULARY — the generated names, the derived
+ * ref, the TEST-ONLY contexts and, above all, the two planned release App identities. Inferring
+ * "any positive integer looks like an App ID" would make the identity half of that projection
+ * vacuous at the one boundary that publishes.
+ *
+ * The intent job publishes exactly those facts, credential-free, as a single-file artifact of the
+ * ORIGINAL run. The publisher job already holds `actions: read` and a `GITHUB_TOKEN`; the only thing
+ * missing was three roles in this module's own operation table. No new provider grant, no new
+ * dependency, no mutation: the existing bounded archive transport and the existing single-entry ZIP
+ * reader do the work, at a FIXED entry name.
+ *
+ * ── THE TRUST BOUNDARY, STATED HONESTLY ─────────────────────────────────────────────────────────
+ *
+ * REST artifact metadata does NOT attest which job produced an artifact. What is established here is
+ * the original run/attempt/source, the fixed intent job's own success in that attempt, exactly one
+ * artifact under the derived name, its numeric ID and its bytes. The link from "that job" to "these
+ * bytes" rests on the reviewed workflow's exclusive upload wiring, exactly as it does for the
+ * witness response itself. Nothing below upgrades that into a job-level attestation.
+ */
+export async function readOriginalIntentArtifact({ request, requestArchive, runId, attempt, expected }) {
+  const name = intentArtifactName(runId, attempt);
+  const listed = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/artifacts?per_page=${PAGE_SIZE}&page=1&name=${encodeURIComponent(name)}`);
+  if (listed.status !== 200 || !listed.body) throw new IncompleteEvidence(`the original run's intent artifact ${name} could not be looked up (${listed.status})`);
+  const rows = Array.isArray(listed.body.artifacts) ? listed.body.artifacts : null;
+  if (!rows) throw new IncompleteEvidence("the artifact listing is not the documented shape");
+  const total = Number(listed.body.total_count ?? rows.length);
+  if (total > rows.length) throw new IncompleteEvidence(`the intent artifact lookup for ${name} is paginated beyond this bounded read`);
+  const matching = rows.filter((artifact) => String(artifact?.name) === name);
+  if (!matching.length) throw new IncompleteEvidence(`the original run published no intent artifact named ${name}; this publisher refuses rather than publishing an unvalidated projection`);
+  // NEVER "take the newest". Two artifacts under the derived name is an ambiguity, not a choice.
+  if (matching.length > 1) throw new AssertionFailure(`${matching.length} artifacts are named ${name}; commissioning never selects between duplicate intent publications`);
+  const artifact = matching[0];
+  if (artifact.expired === true) throw new IncompleteEvidence(`the original run's intent artifact ${name} has expired`);
+  const artifactId = positiveProviderId(artifact.id);
+  if (artifactId === null) throw new AssertionFailure(`the intent artifact ${name} carries no positive provider identity`);
+  if (Number(artifact.workflow_run?.id) !== Number(runId)) {
+    throw new AssertionFailure(`the intent artifact ${name} is owned by run ${JSON.stringify(artifact.workflow_run?.id ?? null)}, not the original run it must belong to`);
+  }
+
+  // THE FIXED INTENT JOB SUCCEEDED, IN THAT EXACT ATTEMPT. An artifact whose producing job failed is
+  // not evidence, and the run's job set is read to completion rather than sampled.
+  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
+  if (jobs.status !== 200 || !Array.isArray(jobs.body?.jobs)) throw new IncompleteEvidence("the original run's jobs could not be measured");
+  const jobRows = jobs.body.jobs;
+  if (Number(jobs.body.total_count ?? jobRows.length) > jobRows.length) {
+    throw new IncompleteEvidence("the original run's job list is paginated beyond this bounded read; the intent job's state is unmeasured");
+  }
+  const intentJob = jobRows.find((job) => String(job?.name ?? "") === INTENT_JOB_NAME);
+  if (!intentJob) throw new IncompleteEvidence(`the original run records no ${JSON.stringify(INTENT_JOB_NAME)} job; its intent artifact has no producing job to bind to`);
+  if (String(intentJob.status ?? "") !== "completed" || String(intentJob.conclusion ?? "") !== "success") {
+    throw new AssertionFailure(`the original run's intent job concluded ${JSON.stringify(String(intentJob.conclusion ?? intentJob.status ?? "none"))}, not success`);
+  }
+  // EXCLUSIVE WIRING: the original run is a COMMISSION run, so its publisher and rehearsal jobs must
+  // not have executed in it. A run in which both a commissioning and a witness job ran is not the
+  // reviewed mode separation this artifact's authority depends on.
+  for (const forbidden of [WITNESS_JOB_NAME, REHEARSAL_JOB_NAME]) {
+    const job = jobRows.find((row) => String(row?.name ?? "") === forbidden);
+    if (job && String(job.conclusion ?? "") !== "skipped") {
+      throw new AssertionFailure(`the original run executed the ${JSON.stringify(forbidden)} job; commission and witness modes are mutually exclusive by construction`);
+    }
+  }
+
+  const download = await requestArchive("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/artifacts/${artifactId}/zip`);
+  if (download.status !== 200 || !download.bytes) throw new IncompleteEvidence(`the intent artifact ${artifactId} could not be downloaded (${download.status})`);
+  const entry = readSingleEntryZip(download.bytes, {
+    entryName: intentArtifactEntry(runId, attempt), maxArchiveBytes: MAX_ARCHIVE_BYTES, maxEntryBytes: MAX_ENTRY_BYTES,
+  });
+  let intent;
+  try { intent = JSON.parse(entry.bytes.toString("utf8")); }
+  catch { throw new AssertionFailure("the intent artifact's single entry is not valid JSON"); }
+
+  // THE CLOSED SCHEMA, plus INDEPENDENT re-derivation of everything this module can derive itself.
+  // The artifact supplies the two App identities and the installation plan; it does not get to
+  // supply the derived names, because those are a function of the run and attempt already measured.
+  const refuse = (why) => { throw new AssertionFailure(`the original run's intent artifact ${why}`); };
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) refuse("is not a JSON object");
+  if (intent.schema_version !== RESULT_SCHEMA_VERSION) refuse("declares an unsupported schema version");
+  if (String(intent.phase) !== "intent") refuse(`records phase ${JSON.stringify(String(intent.phase ?? ""))}`);
+  if (intent.provider_measured !== false) refuse("claims a provider measurement the credential-free intent phase does not make");
+  if (String(intent.repository) !== COMMISSIONING_REPOSITORY) refuse("names another repository");
+  if (String(intent.workflow_path) !== COMMISSIONING_WORKFLOW_PATH) refuse("names another workflow");
+  if (String(intent.run_id) !== String(runId) || String(intent.attempt) !== String(attempt)) refuse("belongs to a different run or attempt");
+  if (String(intent.workflow_sha) !== String(expected.sourceSha)) refuse("was produced against a different immutable source");
+  if (Number(intent.repository_id) !== Number(expected.repositoryId)) refuse("names a different repository identity");
+  if (canonicalJson(intent.derived_refs) !== canonicalJson(derivedRefs(runId, attempt))) refuse("carries derived refs this run does not derive");
+  if (canonicalJson(intent.derived_contexts) !== canonicalJson(derivedContextNames(runId, attempt))) refuse("carries TEST-ONLY contexts this run does not derive");
+  if (canonicalJson(intent.derived_ruleset_names) !== canonicalJson(derivedRulesetNames(runId, attempt))) refuse("carries generated ruleset names this run does not derive");
+  const normalAppId = positiveProviderId(intent.normal_app_id);
+  const emergencyAppId = positiveProviderId(intent.emergency_app_id);
+  if (normalAppId === null || emergencyAppId === null) refuse("carries no positive normal and emergency App identities");
+  if (normalAppId === emergencyAppId) refuse("names the same App as both release identities");
+  return {
+    intent,
+    provenance: {
+      artifact_id: artifactId,
+      artifact_name: name,
+      entry: intentArtifactEntry(runId, attempt),
+      entry_digest: entry.digest,
+      owning_run_id: Number(runId),
+      intent_job_conclusion: "success",
+      // Correlation only, and said so: see this function's header.
+      intent_job_id: Number.isInteger(Number(intentJob.id)) ? Number(intentJob.id) : null,
+      basis: "reviewed-immutable-workflow-exclusive-upload-wiring + api-run-attempt-and-job-state; REST artifact metadata does not attest a producing job",
+    },
+  };
+}
+
 export async function runWitnessPublisherJob(env = process.env, deps = {}) {
   const role = "witness-publisher";
   const runId = String(env.GITHUB_RUN_ID ?? "");
@@ -4470,9 +4952,15 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
 
   const token = String(env.GITHUB_TOKEN ?? "");
   if (!token) throw new UsageError("the witness publisher needs its read-only GITHUB_TOKEN to measure its own run");
-  const request = createGuardedRequest(deps.metadataTransport ?? createTokenTransport({ token, fetchImpl: deps.fetchImpl ?? fetch, redact }), {
+  const publisherGuardCtx = {
     role, runId, attempt, graphShas: new Set(), contextNames: new Set(), rulesetIds: new Set(), rulesetNames: new Set(),
-  });
+  };
+  const request = createGuardedRequest(deps.metadataTransport ?? createTokenTransport({ token, fetchImpl: deps.fetchImpl ?? fetch, redact }), publisherGuardCtx);
+  // The SAME bounded binary transport the consumers use, for the one artifact this job reads.
+  const requestArchive = createGuardedRequest(
+    deps.archiveTransport ?? createArchiveTransport({ token, fetchImpl: deps.fetchImpl ?? fetch }),
+    publisherGuardCtx,
+  );
   const run = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/1`);
   if (run.status !== 200 || !run.body) throw new IncompleteEvidence("the witness publisher could not measure its own run");
   const { sourceSha } = assertPublisherContext({
@@ -4497,10 +4985,38 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
   if (originalRunResponse.status !== 200 || !originalRunResponse.body) {
     throw new IncompleteEvidence(`the witness publisher could not measure the original run ${String(response.original_run_id)} its envelope names (${originalRunResponse.status})`);
   }
+  /**
+   * THE AUTHENTICATED VOCABULARY, for a COMMISSIONING publication only (F11, corrected).
+   *
+   * The inert rehearsal has no commissioning intent artifact by design and carries no policy
+   * measurement, so it is not read for one. A commissioning response whose intent cannot be read is
+   * a REFUSAL — never a fall-back to rehearsal semantics, which would let a missing artifact buy a
+   * weaker check.
+   */
+  const rehearsalDomain = String(response.domain ?? "") === REHEARSAL_DOMAIN;
+  let allowed = null;
+  let intentProvenance = null;
+  if (!rehearsalDomain) {
+    const role = String(response.role ?? "");
+    if (!ACTOR_ROLES.includes(role)) {
+      throw new AssertionFailure(`the witness envelope names the role ${JSON.stringify(role)}, which is not one this commissioning run publishes for`);
+    }
+    const original = await readOriginalIntentArtifact({
+      request, requestArchive,
+      runId: String(response.original_run_id), attempt: String(response.original_attempt),
+      expected: { sourceSha, repositoryId: ctx.repositoryId },
+    });
+    intentProvenance = original.provenance;
+    // The SAME closed vocabulary the offline assessor derives, from the SAME authenticated facts.
+    allowed = offlinePublishableVocabulary({
+      runId: String(response.original_run_id), attempt: String(response.original_attempt), actor: role,
+      normalAppId: Number(original.intent.normal_app_id), emergencyAppId: Number(original.intent.emergency_app_id),
+    });
+  }
   const witnessDir = path.join(evidenceDir, "witness");
   mkdirSync(witnessDir, { recursive: true, mode: 0o700 });
   const result = publishWitnessResponse({
-    response, envelope, publisherRunId: runId, originalRun: originalRunResponse.body,
+    response, envelope, publisherRunId: runId, originalRun: originalRunResponse.body, allowed,
     expected: {
       repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha,
       dispatchBranch: branchOf(COMMISSIONING_DISPATCH_REF),
@@ -4521,9 +5037,9 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
   }
   writeEvidenceFile(evidenceDir, evidenceSlug(String(response.original_run_id), String(response.original_attempt), "witness"), {
     ...result, run_id: String(response.original_run_id), attempt: String(response.original_attempt),
-    workflow_sha: ctx.workflowSha, source_continuity: continuity,
+    workflow_sha: ctx.workflowSha, source_continuity: continuity, intent_provenance: intentProvenance,
   });
-  return { ...result, source_continuity: continuity };
+  return { ...result, source_continuity: continuity, intent_provenance: intentProvenance };
 }
 
 /**
@@ -4834,11 +5350,6 @@ export async function beginWitnessItem({
   if (receivedAt.getTime() > Date.parse(String(challenge.expires_at))) {
     throw new IncompleteEvidence(`the challenge ${challengeName} expired before this witness could serve it; the expiry is never extended`);
   }
-  journal.append("challenge-observed", {
-    case_id: item.caseId, role: item.role, direction: item.direction, artifact_id: Number(artifact.id),
-    challenge_digest: entry.digest, nonce_digest: nonceDigest(String(challenge.nonce)), expires_at: String(challenge.expires_at),
-  });
-
   const expectedName = responseArtifactName({
     runId: ctx.runId, attempt: ctx.attempt, role: item.role, ordinal: item.ordinal,
     direction: item.direction, nonce: String(challenge.nonce),
@@ -4891,6 +5402,28 @@ export async function beginWitnessItem({
    * the artifact is not there yet, the item stays PENDING within its original expiry. It is never
    * restamped with a fresh nonce and never reposted.
    */
+  /**
+   * ── THE OBSERVATION IS RECORDED ONLY AFTER EVERY SUBJECT CHECK HAS PASSED ─────────────────────
+   *
+   * It used to be appended immediately after the challenge's own shape and identity checks, which
+   * is BEFORE the manifest/graph subject checks and before the actor job's active-and-approved
+   * state is measured. So a challenge this witness went on to REFUSE was already recorded as one it
+   * had observed — a claim about itself that its own refusal contradicted, and (once the event
+   * became once-only) an entry that then collided with the legitimate challenge for that key.
+   *
+   * ONCE-ONLY (see {@link recordWitnessEventOnce}): the append was also unconditional, so every
+   * restart or re-entry recorded a second observation of a challenge that is observed once by
+   * contract. A replay returns the retained record; a DIFFERENT challenge under the same key
+   * refuses.
+   */
+  recordWitnessEventOnce({
+    journal, type: "challenge-observed",
+    data: {
+      case_id: item.caseId, role: item.role, direction: item.direction, artifact_id: Number(artifact.id),
+      challenge_digest: entry.digest, nonce_digest: nonceDigest(String(challenge.nonce)), expires_at: String(challenge.expires_at),
+    },
+  });
+
   const pending = pendingWitnessDispatch(journal.read(), expectedName);
   if (pending) {
     try {
@@ -4903,8 +5436,10 @@ export async function beginWitnessItem({
         entry_digest: resolved.entry_digest, polls: 0,
         reconciled_without_redispatch: true, recovered_pending_dispatch_seq: pending.seq,
       };
-      journal.append("response-reconciled", reconciled);
-      return { state: "reconciled", reconciled };
+      // ONCE-ONLY: a resumed witness that finds its own pending dispatch already published must
+      // return the record it wrote before, not add a second one for the same publication.
+      const settled = recordWitnessEventOnce({ journal, type: "response-reconciled", data: reconciled });
+      return { state: "reconciled", reconciled: settled.record };
     } catch (error) {
       if (error?.detail?.retryable !== true) throw error;
       // Known-pending, measured-absent: distinct from "never dispatched", and resolved only by
@@ -4933,8 +5468,8 @@ export async function beginWitnessItem({
       expected_artifact: expectedName, envelope_digest: null, entry_digest: resolved.entry_digest,
       polls: 0, reconciled_without_redispatch: true,
     };
-    journal.append("response-reconciled", reconciled);
-    return { state: "reconciled", reconciled };
+    const settled = recordWitnessEventOnce({ journal, type: "response-reconciled", data: reconciled });
+    return { state: "reconciled", reconciled: settled.record };
   } catch (error) {
     // "Not published yet" is the ordinary case and the reason to dispatch. Anything else — a
     // duplicate, a wrong-source publisher, a failed one, bytes that do not bind — is a refusal.
@@ -5011,8 +5546,8 @@ export async function pollWitnessPublication({ request, requestArchive, ctx, jou
       entry_digest: resolved.entry_digest, polls,
       ...(pending.recoveredPendingDispatchSeq ? { recovered_pending_dispatch_seq: pending.recoveredPendingDispatchSeq } : {}),
     };
-    journal.append("response-reconciled", reconciled);
-    return reconciled;
+    const settled = recordWitnessEventOnce({ journal, type: "response-reconciled", data: reconciled });
+    return settled.record;
   } catch (error) {
     if (error?.detail?.retryable !== true) throw error;
     return null;
@@ -5357,10 +5892,24 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
           });
         }
       }
+      /**
+       * EXACT GOVERNED EQUALITY, EVEN WHEN A FINGERPRINT WAS RECORDED (F8, corrected).
+       *
+       * The fingerprint path proves "the body has not changed since we measured it". That is only
+       * an ownership proof if what we measured was the INTENDED body — which is exactly what the
+       * corrected adoption sites now establish. Re-proving it here costs one comparison and closes
+       * the case where a fingerprint reached the journal by some path this build has not thought of:
+       * the deletion decision never rests on a digest alone.
+       */
+      if (recorded !== undefined && ownershipGap === null) {
+        const proof = proveIntendedOwnership({ measured: detail.body, intended: intendedRulesets.get(owned.name) ?? null });
+        if (!proof.provable) ownershipGap = proof.reason;
+      }
       // The COMPLETE governed fingerprint, not a name and one include ref. A ruleset whose rules,
       // bypass actors, enforcement mode or exclusions changed after setup is a different policy at
       // the same ID, and PC-07 requires a changed resource to be refused rather than deleted.
-      const identical = String(detail.body.name) === owned.name
+      const identical = ownershipGap === null
+        && String(detail.body.name) === owned.name
         && include.length === 1 && include[0] === owned.target_ref
         && typeof recorded === "string" && measured === recorded;
       if (!identical) {
@@ -5658,8 +6207,8 @@ export function validateEvidenceBinding(payload, { runId, attempt, phase, requir
 
 /** Which evidence file each gate needs, the phase it must declare, and the fields it must carry. */
 const EVIDENCE_MANIFEST = Object.freeze([
-  { key: "intent", gate: "PC-03", phase: "intent", required: ["workflow_sha", "repository_id", "derived_refs", "derived_contexts", "graph_plan", "provider_measured", "normal_app_id", "emergency_app_id", "producer_ids_hash"] },
-  { key: "setup", gate: "PC-03", phase: "setup", required: ["workflow_sha", "operator", "intent_remeasured", "protected_jobs_at_setup", "production_baseline", "production_policy_hash", "synthetic_graph", "derived_refs", "disposable_rulesets", "synthetic_pull_request", "compatibility", "approval_history_before_approval", "manifest_sha256", "graph_sha256", "unresolved_intents"] },
+  { key: "intent", gate: "PC-03", phase: "intent", required: ["workflow_sha", "repository_id", "derived_refs", "derived_contexts", "graph_plan", "provider_measured", "normal_app_id", "emergency_app_id", "producer_ids_hash", "normal_installation_id", "emergency_installation_id"] },
+  { key: "setup", gate: "PC-03", phase: "setup", required: ["workflow_sha", "operator", "intent_remeasured", "protected_jobs_at_setup", "production_baseline", "production_policy_hash", "synthetic_graph", "derived_refs", "disposable_rulesets", "synthetic_pull_request", "compatibility", "approval_history_before_approval", "manifest_sha256", "manifest", "graph_sha256", "production_inputs_sha256", "unresolved_intents"] },
   { key: "fixture", gate: "PC-02", phase: "fixture-checks", required: ["workflow_sha", "published", "measured_producer_app_ids", "manifest_wait"] },
   { key: "human", gate: "PC-05", phase: "human-tests", required: ["workflow_sha", "actor", "cases"] },
   { key: "normal", gate: "PC-05", phase: "normal-tests", required: ["workflow_sha", "actor", "policy_in_force", "check_publication", "cases", "manifest_commit_sha", "manifest_sha256", "graph_sha256"] },
@@ -5669,6 +6218,9 @@ const EVIDENCE_MANIFEST = Object.freeze([
   { key: "cleanup", gate: "PC-07", phase: "cleanup", required: ["workflow_sha", "operator", "outcomes", "refusals", "production_baseline_before", "production_baseline_after", "production_drift", "unresolved_intents"] },
   // The F1 transport's own record: the local witness process's summary of what it published.
   { key: "witness-process", gate: "PC-04", phase: "witness", required: ["workflow_sha", "domain", "expected_publications", "publications", "witness_identity"] },
+  // The private local subject the offline reconstruction needs. Absent means INCOMPLETE, never
+  // "fall back to comparing the packet's copies of a digest with each other".
+  { key: "production-inputs", gate: "PC-04", phase: "production-inputs", required: ["workflow_sha", "repository_id", "normal_app_id", "emergency_app_id", "producer_ids", "producer_ids_hash", "production_rulesets", "production_policy_hash"] },
 ]);
 
 /** The evidence file a case's outcome must come from — its OWN actor's, and no other. */
@@ -5848,11 +6400,51 @@ export function reassessGovernedObservation(observation, { runId, attempt, actor
     const actual = byName.get(String(want.name));
     if (!actual) { problems.push(`measured no ${want.name} ruleset as applicable`); continue; }
     for (const field of GOVERNED_RULESET_FIELDS.filter((entry) => entry !== "name")) {
-      const comparison = compareToDesired(actual[field] ?? null, want[field] ?? null);
-      // Provider default expansion and key ordering are the known-benign differences; anything else
-      // means the policy in force was not the reviewed disposable one.
-      if (!comparison.byteEqual && !comparison.normalizationOnly) {
+      // STRICT: byte equality or key reordering. `compareToDesired` reported an all-`added`
+      // difference set as normalization-only, which is how an extra governed parameter passed.
+      const comparison = compareToIntendedGoverned(actual[field] ?? null, want[field] ?? null);
+      if (!comparison.equal) {
         problems.push(`measured a ${want.name} ${field} that is not the intended disposable policy`);
+      }
+    }
+  }
+  /**
+   * ── AND THE UNCHANGED PRODUCTION VERIFIER, ON THE OFFLINE INVERSE (root's qualification) ──────
+   *
+   * The field comparison above is a difference REPORTER. The VERDICT belongs to the same function
+   * runtime uses, because that is the only way the offline answer to "is
+   * `update_allows_fetch_and_merge: true` acceptable?" is the runtime answer. The driver added
+   * exactly that parameter, recomputed the projection digest, and the packet returned no blockers.
+   *
+   * The inverse uses the same placeholder producer map {@link expectedDisposableRulesets} relies on,
+   * so the comparison is the runtime one modulo the producer identity — which is checked separately
+   * against the immutable intent. `main-policy.mjs` is not touched.
+   */
+  const owned = governed.filter((ruleset) => wanted.some((want) => String(want.name) === String(ruleset.name)));
+  const foreignRulesets = governed.filter((ruleset) => !wanted.some((want) => String(want.name) === String(ruleset.name)));
+  let inverted = null;
+  try {
+    inverted = owned.map((ruleset) => invertDisposable(ruleset, {
+      runId, attempt, actor,
+      producerIds: Object.fromEntries(REQUIRED_MAIN_CONTEXTS.map((context) => [context, 1])),
+      normalAppId,
+    }));
+  } catch (error) {
+    problems.push(`carries a governed body the closed inverse transformation refuses (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (inverted) {
+    const verdict = verifyEffectiveMainPolicy({
+      applicableRulesets: [...inverted, ...foreignRulesets],
+      classicProtection: null,
+      expected: {
+        normalAppId, emergencyAppId,
+        producerIds: Object.fromEntries(REQUIRED_MAIN_CONTEXTS.map((context) => [context, 1])),
+      },
+      applicabilityMeasured: true,
+    });
+    if (!verdict.ok) {
+      for (const error of (verdict.errors ?? []).slice(0, 6)) {
+        problems.push(`is rejected by the unchanged production verifier: ${error}`);
       }
     }
   }
@@ -5894,7 +6486,263 @@ function assessInterval(value, label, bound) {
  * outcomes are derived rather than read, cases are bound to their own actor's file, cleanup coverage
  * is computed from the verified journal, and environment proof is re-hashed from disk.
  */
-export function assessEvidence({ dir, runId, attempt }) {
+/**
+ * RE-RUN THE TWO AUTHORITATIVE TRANSPORT VALIDATORS on one case's retained facts (F2, corrected).
+ *
+ * ── WHY THIS EXISTS RATHER THAN MORE FIELD CHECKS ───────────────────────────────────────────────
+ *
+ * The previous assessment read this case's digests, artifact IDs and DECLARED intervals. Every one
+ * of those is a value the packet controls, which is why eleven independent per-case corruptions —
+ * a mutation timestamped 2099, a readback before the mutation, a foreign challenge lifetime, a
+ * moved source, a removed publisher run, a removed provenance record, a refused scoped read, an
+ * unplanned installation — each produced ZERO blockers on their own.
+ *
+ * So the actual functions run again, here, on the retained bytes: {@link assertResponseBinding}
+ * against an expected binding this assessor DERIVES, and {@link assertPublisherArtifactProvenance}
+ * against the retained artifact/run/jobs facts. The timings are recomputed from the observation and
+ * readback instants rather than read from the record that asserts them.
+ *
+ * `expectedBinding` is built from the immutable intent (repository, source, App and PLANNED
+ * INSTALLATION identities), this build's own derivations (ref, ordinal, job) and the digests
+ * reconstructed elsewhere in this function — never from the case record.
+ */
+function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, manifestDigest, graphDigest, witnessJournal = null }) {
+  const problems = [];
+  const witness = record?.witness;
+  if (!witness || typeof witness !== "object") return ["records no witness evidence to reconstruct"];
+  const plannedInstallation = String(role === "normal" ? intent?.normal_installation_id ?? "" : intent?.emergency_installation_id ?? "");
+  const intendedAppId = Number(role === "normal" ? intent?.normal_app_id : intent?.emergency_app_id);
+
+  // ── THE PLANNED INSTALLATION IDENTITY, from the intent and nowhere else ────────────────────────
+  if (!POSITIVE_DECIMAL.test(plannedInstallation)) {
+    problems.push("cannot be bound to a planned installation identity, because the immutable intent carries none");
+  } else if (String(record?.installation_id ?? "") !== plannedInstallation) {
+    problems.push(`names installation ${JSON.stringify(String(record?.installation_id ?? ""))}, not the ${plannedInstallation} this run's immutable intent planned`);
+  }
+  const grants = record?.grants;
+  if (grants && typeof grants === "object") {
+    if (String(grants.installation_id ?? "") !== plannedInstallation) {
+      problems.push(`measured installation ${JSON.stringify(String(grants.installation_id ?? ""))}, not the planned ${plannedInstallation}`);
+    }
+    // The provider's OWN identity for the installation must be the one that was asked about.
+    if (grants.installation_body_id !== undefined && Number(grants.installation_body_id) !== Number(plannedInstallation)) {
+      problems.push(`records a provider installation identity of ${JSON.stringify(grants.installation_body_id ?? null)}, not the planned ${plannedInstallation}`);
+    }
+    if (Number.isInteger(intendedAppId) && Number(grants.installation_app_id) !== intendedAppId) {
+      problems.push(`records an installation belonging to App ${JSON.stringify(grants.installation_app_id ?? null)}, not the ${intendedAppId} the intent configured`);
+    }
+  }
+  // ── THE SCOPED READ, which is a MEASUREMENT and not a field ─────────────────────────────────────
+  const scoped = record?.token_proof?.scoped_read;
+  if (!scoped || typeof scoped !== "object") problems.push("records no scoped read for its freshly minted credential");
+  else {
+    if (String(scoped.operation ?? "") !== "read-repository") problems.push(`records a scoped read of ${JSON.stringify(String(scoped.operation ?? ""))}`);
+    if (Number(scoped.status) !== 200) problems.push(`records a scoped read that returned ${JSON.stringify(scoped.status ?? null)}, which is not a successful read`);
+    if (intent && Number(scoped.repository_id) !== Number(intent.repository_id)) {
+      problems.push("records a scoped read of a repository the immutable intent did not configure");
+    }
+  }
+  // ── SOURCE CONTINUITY AT BOTH CONSUMPTION BOUNDARIES ────────────────────────────────────────────
+  for (const direction of ["pre", "post"]) {
+    const continuity = record?.source_continuity?.[direction];
+    if (!continuity || typeof continuity !== "object" || continuity.measured !== true) {
+      problems.push(`records no measured ${direction}-consumption source continuity`);
+      continue;
+    }
+    if (continuity.moved === true) problems.push(`ran with the source MOVED at its ${direction} consumption boundary; the attempt is interrupted, not passing`);
+    if (intent && String(continuity.trusted_source_sha ?? "") !== String(intent.workflow_sha)) {
+      problems.push(`measured ${direction} continuity against a source that is not this run's immutable one`);
+    }
+  }
+
+  for (const direction of ["pre", "post"]) {
+    const challenge = witness[`${direction}_challenge`];
+    const digest = witness[`${direction}_challenge_digest`];
+    const response = witness[`${direction}_response`];
+    const receivedAt = witness[`${direction}_received_at`];
+    const responseBytes = witness[`${direction}_response_bytes`];
+    const entryDigest = witness[`${direction}_entry_digest`];
+    const facts = witness[`${direction}_provenance_facts`];
+    if (!challenge || !response || !SHA256_HEX.test(String(digest ?? ""))) {
+      problems.push(`retains no ${direction} challenge/response pair to re-bind`);
+      continue;
+    }
+    /**
+     * ── THE RECEIPT IS A DISTINCT MEASURED EVENT (root's condition 3) ────────────────────────────
+     *
+     * This used to read `receivedAt ?? response.created_at`. Those are two different facts: WHEN THE
+     * WITNESS CREATED the response, and WHEN THIS JOB RECEIVED it. The challenge lifetime is checked
+     * against the receipt, so substituting the creation time silently answered a question nobody had
+     * measured — and made a packet with no receipt at all indistinguishable from one that arrived in
+     * time. There is no fallback: a missing receipt is INCOMPLETE.
+     *
+     * It is also why an already-valid historical packet needs no wall clock here. Everything the
+     * lifetime and ordering are judged against is retained history.
+     */
+    if (!Number.isFinite(Date.parse(String(receivedAt ?? "")))) {
+      problems.push(`retains no measured ${direction} receipt time; a response's creation time is not its receipt, and an absent receipt is not substituted`);
+      continue;
+    }
+    /**
+     * ── THE DISPATCH → EXACT BYTES → ENTRY DIGEST → CHALLENGE/NONCE JOIN (root's condition 2) ────
+     *
+     * Every step is recomputed from a different retained artefact, so no single declared hash can
+     * carry the claim:
+     *
+     *   the retained BYTES hash to the entry digest           (bytes ⇄ entry_digest)
+     *   the bytes PARSE to the retained response object       (bytes ⇄ response)
+     *   re-serializing that response reproduces the digest    (response ⇄ envelope contract)
+     *   the witness journal's DISPATCH names that digest      (dispatch ⇄ bytes)
+     *   the response's nonce digests to the observed challenge (bytes ⇄ nonce)
+     *
+     * An unknown or changed byte stream refuses even when the parsed objects look equivalent, which
+     * is the case a pretty-printed re-serialization of the same response produces.
+     */
+    if (typeof responseBytes !== "string" || !responseBytes) {
+      problems.push(`retains no exact ${direction} response bytes, so its entry digest describes nothing this assessor can measure`);
+    } else if (!SHA256_HEX.test(String(entryDigest ?? ""))) {
+      problems.push(`retains no ${direction} entry digest for the bytes it carries`);
+    } else {
+      const measuredDigest = bytesSha256(Buffer.from(responseBytes, "utf8"));
+      if (measuredDigest !== String(entryDigest)) {
+        problems.push(`retains ${direction} response bytes that hash to ${measuredDigest.slice(0, 12)}, not the ${String(entryDigest).slice(0, 12)} entry digest they are published under`);
+      }
+      let parsed = null;
+      try { parsed = JSON.parse(responseBytes); } catch { problems.push(`retains ${direction} response bytes that are not valid JSON`); }
+      if (parsed && canonicalJson(parsed) !== canonicalJson(response)) {
+        problems.push(`retains ${direction} response bytes that do not describe the response object beside them`);
+      }
+      // The SAME serialization contract the local witness dispatched under.
+      try {
+        if (serializeDispatchEnvelope({ response }).digest !== String(entryDigest)) {
+          problems.push(`retains a ${direction} response whose dispatch serialization does not reproduce its published entry digest`);
+        }
+      } catch (error) {
+        problems.push(`retains a ${direction} response that does not serialize under the dispatch contract (${error instanceof Error ? error.message : String(error)})`);
+      }
+      // THE DISPATCH ITSELF, from the separate witness chain.
+      const history = witnessJournal?.get(`${String(kase.id)}:${direction}`) ?? null;
+      if (!history?.dispatchIntent) {
+        problems.push(`has no ${direction} dispatch record in the verified witness journal to join its published bytes to`);
+      } else if (String(history.dispatchIntent.envelope_digest ?? "") !== String(entryDigest)) {
+        problems.push(`was dispatched under envelope digest ${String(history.dispatchIntent.envelope_digest ?? "none").slice(0, 12)}, which is not the ${String(entryDigest).slice(0, 12)} its published bytes carry`);
+      }
+      if (history?.observed) {
+        if (String(history.observed.nonce_digest ?? "") !== nonceDigest(String(response.challenge_nonce ?? ""))) {
+          problems.push(`carries a ${direction} response whose nonce is not the one the witness journal observed for it`);
+        }
+        if (String(history.observed.challenge_digest ?? "") !== String(response.challenge_digest ?? "")) {
+          problems.push(`carries a ${direction} response answering challenge bytes the witness journal did not observe`);
+        }
+      }
+    }
+    // THE EXPECTED BINDING, DERIVED. Not one field of it comes from the record.
+    const expectedBinding = {
+      domain: COMMISSION_DOMAIN,
+      repository: COMMISSIONING_REPOSITORY,
+      repository_id: intent ? Number(intent.repository_id) : null,
+      source_mode: "commission",
+      original_run_id: String(runId),
+      original_attempt: String(attempt),
+      workflow_path: COMMISSIONING_WORKFLOW_PATH,
+      source_sha: intent ? String(intent.workflow_sha) : null,
+      role: String(role),
+      job_id: assertRoleBinding(role).job,
+      case_id: String(kase.id),
+      case_ordinal: caseOrdinal(role, kase.id),
+      direction,
+      target_ref: derivedRef(runId, attempt, kase.ref),
+      intended_app_id: Number.isInteger(intendedAppId) ? intendedAppId : null,
+      intended_installation_id: POSITIVE_DECIMAL.test(plannedInstallation) ? plannedInstallation : null,
+      manifest_sha256: manifestDigest,
+      graph_sha256: graphDigest,
+    };
+    try {
+      // AT THE HISTORICAL RECEIPT. No wall clock, and no substituted creation time.
+      assertResponseBinding(response, {
+        challenge, challengeDigest: String(digest), expectedBinding,
+        receivedAt: String(receivedAt),
+      });
+    } catch (error) {
+      problems.push(`${direction} response does not re-bind to the challenge this assessor derives (${error instanceof Error ? error.message : String(error)})`);
+    }
+    // THE PUBLISHER'S PROVENANCE, re-derived from the retained facts.
+    if (!facts || typeof facts !== "object") {
+      problems.push(`retains no ${direction} publisher artifact/run/job facts, so its provenance cannot be re-derived`);
+    } else {
+      try {
+        const provenance = assertPublisherArtifactProvenance({
+          artifact: facts.artifact, run: facts.run, jobs: facts.jobs,
+          expected: { workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: intent ? String(intent.workflow_sha) : null },
+        });
+        if (positiveProviderId(witness[`${direction}_publisher_run_id`]) !== provenance.publisher_run_id) {
+          problems.push(`records a ${direction} publisher run that is not the one its retained provenance facts establish`);
+        }
+        if (positiveProviderId(witness[`${direction}_artifact`]?.artifact_id) !== provenance.artifact_id) {
+          problems.push(`records a ${direction} artifact identity that is not the one its retained provenance facts establish`);
+        }
+      } catch (error) {
+        problems.push(`${direction} publisher provenance does not re-derive (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
+    // THE CHALLENGE LIFETIME, exactly the fixed TTL, and the response inside it.
+    const created = Date.parse(String(challenge.created_at));
+    const expires = Date.parse(String(challenge.expires_at));
+    if (!Number.isFinite(created) || !Number.isFinite(expires)) problems.push(`carries no parseable ${direction} challenge lifetime`);
+    else if (expires - created !== CHALLENGE_TTL_MS) problems.push(`records a ${direction} challenge lifetime of ${expires - created}ms rather than the fixed ${CHALLENGE_TTL_MS}ms`);
+    if (String(witness[`${direction}_challenge_created_at`] ?? "") !== String(challenge.created_at)) {
+      problems.push(`records a ${direction} challenge creation time that is not the retained challenge's own`);
+    }
+  }
+
+  // ── THE TIMINGS, RECOMPUTED FROM THE FACTS ──────────────────────────────────────────────────────
+  const preObservation = witness.pre_observation ?? witness.pre_response?.observation ?? null;
+  const postObservation = witness.post_observation ?? witness.post_response?.observation ?? null;
+  const mutationStartedAt = Date.parse(String(record?.mutation_started_at ?? ""));
+  const readbackAt = Date.parse(String(record?.readback_at ?? ""));
+  if (!Number.isFinite(mutationStartedAt)) problems.push("carries no parseable mutation start time");
+  if (!Number.isFinite(readbackAt)) problems.push("carries no parseable readback time");
+  if (Number.isFinite(mutationStartedAt) && Number.isFinite(readbackAt) && readbackAt < mutationStartedAt) {
+    problems.push("records a readback that happened before the mutation it reads back; the ordering is impossible");
+  }
+  if (preObservation && Number.isFinite(mutationStartedAt)) {
+    const observed = Date.parse(String(preObservation.completed_at));
+    if (!Number.isFinite(observed)) problems.push("carries no parseable pre-observation completion time");
+    else {
+      const recomputed = mutationStartedAt - observed;
+      if (recomputed < 0) problems.push("mutated before the pre-witness observation it depends on completed; the ordering is impossible");
+      else if (recomputed > MAX_OBSERVATION_TO_MUTATION_MS) problems.push(`mutated ${recomputed}ms after its pre-observation, beyond the ${MAX_OBSERVATION_TO_MUTATION_MS}ms bound`);
+      if (Number(witness.pre_to_mutation_ms) !== recomputed) {
+        problems.push(`declares a pre-to-mutation interval of ${JSON.stringify(witness.pre_to_mutation_ms ?? null)}ms; its own retained facts give ${recomputed}ms`);
+      }
+    }
+    // The challenge that authorised the mutation must still have been alive when it was issued.
+    const preExpiry = Date.parse(String(witness.pre_challenge?.expires_at ?? ""));
+    if (Number.isFinite(preExpiry) && mutationStartedAt > preExpiry) {
+      problems.push("mutated after its pre-witness challenge had expired; the expiry is never extended");
+    }
+  }
+  if (postObservation && Number.isFinite(readbackAt)) {
+    const started = Date.parse(String(postObservation.started_at));
+    if (!Number.isFinite(started)) problems.push("carries no parseable post-observation start time");
+    else {
+      const recomputed = started - readbackAt;
+      if (recomputed < 0) problems.push("observed its post-witness policy before the readback it is bound to; the ordering is impossible");
+      else if (recomputed > MAX_OBSERVATION_TO_MUTATION_MS) problems.push(`observed its post-witness policy ${recomputed}ms after its readback, beyond the ${MAX_OBSERVATION_TO_MUTATION_MS}ms bound`);
+      if (Number(witness.readback_to_post_ms) !== recomputed) {
+        problems.push(`declares a readback-to-post interval of ${JSON.stringify(witness.readback_to_post_ms ?? null)}ms; its own retained facts give ${recomputed}ms`);
+      }
+    }
+  }
+  // The post challenge is created AT the readback, by construction.
+  if (witness.post_challenge_created_at !== undefined && record?.readback_at !== undefined
+    && String(witness.post_challenge_created_at) !== String(record.readback_at)) {
+    problems.push("records a post-challenge creation time that is not its own measured readback instant");
+  }
+  return problems;
+}
+
+export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) {
   const blockers = [];
   const block = (gate, kind, detail) => { blockers.push({ gate, kind, detail }); };
   let journalRecords = null;
@@ -5929,12 +6777,38 @@ export function assessEvidence({ dir, runId, attempt }) {
    * predates the run is a historical observation, and a historical observation is not this run's
    * evidence no matter how correctly it is hashed.
    */
-  const runWindow = journalRecords?.length ? { start: String(journalRecords[0].ts) } : null;
+  /**
+   * ── THIS RUN'S WINDOW, WITH BOTH ENDS (root's clock qualification) ────────────────────────────
+   *
+   * It had only a START, so a control captured in 2099 was "not before the run opened" and passed.
+   * The retained reviewer packet dated every control 2099 and was accepted, and that is evidence of
+   * the defect rather than a baseline to keep. A capture AFTER the run it claims to describe is
+   * exactly as unmoored as one before it, and the canonical forbids future and impossible ordering
+   * outright, so the window closes at the moment of assessment.
+   */
+  const assessedAt = now().toISOString();
+  const runWindow = journalRecords?.length ? { start: String(journalRecords[0].ts), end: assessedAt } : null;
 
   // The immutable source every file must agree about. Taken from the INTENT, which is the first
   // artifact in the chain, and re-measured against the provider by setup.
   const intentRaw = readEvidenceFile(dir, evidenceSlug(runId, attempt, "intent"));
   const workflowSha = FULL_SHA.test(String(intentRaw?.workflow_sha ?? "")) ? String(intentRaw.workflow_sha) : null;
+  const workflowShaFromIntent = workflowSha;
+
+  /**
+   * BOTH CHAINS ARE BOUND TO THE IMMUTABLE SOURCE (F2, corrected).
+   *
+   * `openJournal` writes a `source` into every record, and nothing read it. So a witness chain
+   * rebuilt under a source this run never ran verified perfectly — the hash links were genuine — and
+   * produced no blocker. The chain's integrity was never the question; whose evidence it is was.
+   */
+  for (const [label, records, gate] of [["resource", journalRecords, "PC-07"], ["witness", witnessRecords, "PC-04"]]) {
+    if (!records?.length || !workflowShaFromIntent) continue;
+    const foreign = records.filter((record) => String(record.source) !== String(workflowShaFromIntent));
+    if (foreign.length) {
+      block(gate, "invalid", `${foreign.length} record(s) in the ${label} journal were written against a different immutable source than this run's`);
+    }
+  }
 
   const files = {};
   for (const entry of EVIDENCE_MANIFEST) {
@@ -5991,14 +6865,107 @@ export function assessEvidence({ dir, runId, attempt }) {
     if (!SHA256_HEX.test(String(files.setup.manifest_sha256 ?? ""))) {
       block("PC-03", "invalid", "the setup evidence carries no manifest digest for the cloud challenges to bind against");
     }
+    /**
+     * THE MANIFEST, RECOMPUTED AND THEN RECONSTRUCTED.
+     *
+     * First its digest must describe the manifest it carries — which alone defeats a fabricated
+     * digest, however consistently propagated. Then the manifest itself is rebuilt from the verified
+     * journal's graph, this build's derivations and the private inputs' identities, so the object
+     * cannot be fabricated to match a digest either.
+     */
+    if (canonicalJson(files.setup.manifest ?? null) === canonicalJson(null)) {
+      block("PC-03", "invalid", "the setup evidence retains no manifest, so its digest cannot be recomputed");
+    } else if (canonicalHash(files.setup.manifest) !== String(files.setup.manifest_sha256 ?? "")) {
+      block("PC-03", "invalid", "the setup evidence's manifest digest does not describe the manifest it carries");
+    } else if (graph && files["production-inputs"] && files.intent) {
+      const rebuilt = buildManifest({
+        runId, attempt, workflowSha: String(files.intent.workflow_sha), repositoryId: Number(files.intent.repository_id),
+        normalAppId: Number(files["production-inputs"].normal_app_id),
+        emergencyAppId: Number(files["production-inputs"].emergency_app_id),
+        graphShas: graph, contextNames: derivedContextNames(runId, attempt),
+        rulesetPlan: Object.fromEntries(["normal", "emergency", "human"].map((actor) => [actor,
+          expectedDisposableRulesets({
+            runId, attempt, actor,
+            normalAppId: Number(files["production-inputs"].normal_app_id),
+            emergencyAppId: Number(files["production-inputs"].emergency_app_id),
+          }).map((ruleset) => ({ name: ruleset.name, target_ref: ruleset.conditions.ref_name.include[0], hash: canonicalHash(ruleset) })),
+        ])),
+        productionPolicyHash: String(files["production-inputs"].production_policy_hash),
+      });
+      if (canonicalHash(rebuilt) !== String(files.setup.manifest_sha256)) {
+        block("PC-03", "invalid", "the setup evidence's manifest is not the one this run's authoritative inputs reconstruct");
+      }
+    }
     // The OPERATOR, by numeric identity (F6).
     const operator = files.setup.operator;
     if (Number(operator?.id) !== OWNER_USER_ID || String(operator?.login) !== OWNER_LOGIN || String(operator?.permission) !== "admin") {
       block("PC-02", "failed", `the setup evidence records the operator ${JSON.stringify(String(operator?.login ?? ""))} (#${operator?.id ?? "unmeasured"}), not the one authorized administrator`);
     }
-    // The PRODUCER MAP, bound to the credential-free intent's digest of it.
-    if (files.intent && String(files.setup.production_policy_hash ?? "") === "") {
-      block("PC-04", "invalid", "the setup evidence carries no production-policy hash");
+    /**
+     * ── THE PRODUCTION SUBJECT, REGENERATED FROM PRIVATE RETAINED INPUTS (PC-04, corrected) ──────
+     *
+     * This gate was `!== ""`, so `production_policy_hash: "invalid"` passed; and the manifest digest
+     * was only SHA-shaped, so a fabricated one propagated consistently through the actor and case
+     * files passed too. Neither could be better, because the producer map is deliberately not
+     * published and the assessor had nothing to regenerate the subject FROM.
+     *
+     * Now it does. The private mode-0600 production-inputs file carries the exact validated map and
+     * the raw `buildMainRulesets` output; its digest is anchored in the hash-linked journal; and
+     * everything downstream — the raw subject, the policy hash, the disposable plan and the whole
+     * manifest — is recomputed here. The setup file's declarations are OUTPUTS TO VERIFY.
+     */
+    const privateInputs = files["production-inputs"];
+    if (!privateInputs) {
+      block("PC-04", "unverified", "this run retains no private production-input record, so its production subject, policy hash and manifest cannot be independently reconstructed");
+    } else {
+      const bound = journalRecords?.find((record) => record.type === "production-inputs-bound")?.data ?? null;
+      if (!bound) block("PC-04", "unverified", "the verified journal records no binding for the private production inputs");
+      else if (String(bound.production_inputs_sha256) !== canonicalHash(privateInputs)) {
+        block("PC-04", "invalid", "the private production-input record is not the one this run's verified journal bound at setup");
+      }
+      if (files.intent && String(privateInputs.producer_ids_hash ?? "") !== String(files.intent.producer_ids_hash ?? "")) {
+        block("PC-04", "invalid", "the private production inputs carry a producer map whose digest is not the one the immutable intent measured");
+      }
+      const producerIds = privateInputs.producer_ids;
+      const contextKeys = producerIds && typeof producerIds === "object" && !Array.isArray(producerIds) ? Object.keys(producerIds).sort() : null;
+      if (!contextKeys || canonicalJson(contextKeys) !== canonicalJson([...REQUIRED_MAIN_CONTEXTS].sort())) {
+        block("PC-04", "invalid", "the private production inputs do not carry exactly this build's required production contexts");
+      } else if (Object.values(producerIds).some((value) => positiveProviderId(value) === null)) {
+        block("PC-04", "invalid", "the private production inputs carry a producer identity that is not a positive integer");
+      } else if (canonicalHash(producerIds) !== String(privateInputs.producer_ids_hash ?? "")) {
+        block("PC-04", "invalid", "the private production inputs' own producer-map digest does not describe the map they carry");
+      } else {
+        // REGENERATED, not compared. This is the whole point of retaining the inputs.
+        let regenerated = null;
+        try {
+          regenerated = buildMainRulesets({
+            normalAppId: Number(privateInputs.normal_app_id),
+            emergencyAppId: Number(privateInputs.emergency_app_id),
+            producerIds,
+          });
+        } catch (error) {
+          block("PC-04", "invalid", `the private production inputs do not regenerate a production policy (${error instanceof Error ? error.message : String(error)})`);
+        }
+        if (regenerated) {
+          if (canonicalJson(regenerated) !== canonicalJson(privateInputs.production_rulesets)) {
+            block("PC-04", "invalid", "the retained raw production subject is not the one its own inputs regenerate");
+          }
+          const regeneratedHash = canonicalHash(regenerated);
+          if (String(privateInputs.production_policy_hash ?? "") !== regeneratedHash) {
+            block("PC-04", "invalid", "the private production inputs' policy hash does not describe the subject they regenerate");
+          }
+          if (String(files.setup.production_policy_hash ?? "") !== regeneratedHash) {
+            block("PC-04", "invalid", `the setup evidence declares a production-policy hash the retained private inputs do not produce`);
+          }
+        }
+      }
+      if (files.intent) {
+        for (const [field, label] of [["normal_app_id", "normal App"], ["emergency_app_id", "emergency App"], ["normal_installation_id", "planned normal installation"], ["emergency_installation_id", "planned emergency installation"]]) {
+          if (String(privateInputs[field] ?? "") !== String(files.intent[field] ?? "")) {
+            block("PC-04", "invalid", `the private production inputs name a ${label} identity the immutable intent did not configure`);
+          }
+        }
+      }
     }
     // COMPLETE RESOURCE ACCOUNTING: every resource the journal records, present in the setup file.
     if (journalRecords?.length) {
@@ -6030,8 +6997,53 @@ export function assessEvidence({ dir, runId, attempt }) {
     }
     // Because intent measures nothing, THIS is where the run's identity was checked against the
     // provider. A setup file without it is not a pass with a caveat; it is an unproved identity.
-    if (files.setup.intent_remeasured?.confirmed !== true) {
+    /**
+     * THE PROVIDER RE-MEASUREMENT, AS A COMPLETE RECORD (F2, corrected).
+     *
+     * This read one boolean, so `intent_remeasured: {confirmed: true}` satisfied the one gate where
+     * the run's identity is actually checked against the provider. The re-measurement is the
+     * substance; `confirmed` is its label.
+     */
+    const remeasured = files.setup.intent_remeasured;
+    if (!remeasured || typeof remeasured !== "object" || remeasured.confirmed !== true) {
       block("PC-03", "unverified", "the setup evidence does not record a provider re-measurement of the credential-free intent's identity claims");
+    } else {
+      const expectedRemeasurement = files.intent ? {
+        measured_repository_id: Number(files.intent.repository_id),
+        measured_head_sha: String(files.intent.workflow_sha),
+        measured_workflow_path: COMMISSIONING_WORKFLOW_PATH,
+        measured_event: COMMISSIONING_EVENT_NAME,
+        measured_head_branch: branchOf(COMMISSIONING_DISPATCH_REF),
+      } : null;
+      if (expectedRemeasurement) {
+        for (const [field, wanted] of Object.entries(expectedRemeasurement)) {
+          if (String(remeasured[field] ?? "") !== String(wanted)) {
+            block("PC-03", "invalid", `the setup evidence's provider re-measurement records ${field} as ${JSON.stringify(remeasured[field] ?? null)}, not the ${JSON.stringify(wanted)} this run is bound to`);
+          }
+        }
+      }
+      if (remeasured.matches_intent !== true) block("PC-03", "invalid", "the setup evidence's provider re-measurement does not state that it matches the immutable intent");
+    }
+    /**
+     * THE PROTECTED JOBS AT SETUP, AS A MEASUREMENT.
+     *
+     * `protected_jobs_at_setup: {}` satisfied every gate by having nothing to object to. The closed
+     * expectation is one entry per protected job, each in a state the run could legally be in.
+     */
+    const parked = files.setup.protected_jobs_at_setup;
+    const parkedStates = [...PARKED_JOB_STATUSES, "uncreated"];
+    if (!parked || typeof parked !== "object" || Array.isArray(parked)) {
+      block("PC-03", "invalid", "the setup evidence carries no protected-job snapshot");
+    } else {
+      for (const spec of PROTECTED_JOBS) {
+        const state = String(parked[spec.id] ?? "");
+        if (!state) block("PC-03", "unverified", `the setup evidence records no state for the ${spec.id} protected job`);
+        else if (!parkedStates.includes(state)) {
+          block("PC-03", "failed", `the setup evidence records the ${spec.id} protected job as ${JSON.stringify(state)}, which is not a state it could legally be in when setup ran`);
+        }
+      }
+      const unknownJobs = Object.keys(parked).filter((id) => !PROTECTED_JOBS.some((spec) => spec.id === id));
+      if (unknownJobs.length) block("PC-03", "invalid", `the setup evidence's protected-job snapshot names ${unknownJobs.length} job(s) outside this workflow's two`);
     }
     // EXACTLY the three actors, each compatible. A compatibility map with no entries used to pass
     // this gate by iterating nothing.
@@ -6163,13 +7175,69 @@ export function assessEvidence({ dir, runId, attempt }) {
    * with no counterparty.
    */
   const expectedPublicationKeys = witnessWorkPlan(COMMISSION_DOMAIN).map((entry) => `${entry.caseId}:${entry.direction}`);
+  /** The three witness-chain facts each case/direction is joined against, in one place. */
+  const witnessTransportHistory = new Map();
   /** The witness journal's own record of what it observed and what it reconciled. */
   const witnessObserved = new Map();
   const witnessReconciled = new Map();
+  /** The DISPATCH the published bytes must join back to — the other half of the transport. */
+  const witnessDispatched = new Map();
+  /** Every witness-journal event, counted per case/direction, so a MISSING one is visible. */
+  const witnessHistory = new Map();
   for (const record of witnessRecords ?? []) {
     const key = `${String(record.data?.case_id)}:${String(record.data?.direction)}`;
     if (record.type === "challenge-observed") witnessObserved.set(key, record.data);
     if (record.type === "response-reconciled") witnessReconciled.set(key, record.data);
+    if (record.type === "dispatch-intent") witnessDispatched.set(key, record.data);
+    if (!witnessHistory.has(key)) witnessHistory.set(key, {});
+    const counts = witnessHistory.get(key);
+    counts[record.type] = Number(counts[record.type] ?? 0) + 1;
+  }
+  /**
+   * ── THE COMPLETE ONE-USE HISTORY (F2, corrected) ──────────────────────────────────────────────
+   *
+   * A reconciled publication was never required to have a DISPATCH behind it, so a chain with every
+   * `dispatch-intent` and `dispatch-result` removed — rebuilt so the hash links still verified —
+   * produced no blocker. A publication with no recorded dispatch has no counterparty: the nonce it
+   * answers was never sent by this process, which is the one thing the witness journal exists to
+   * record. Each of the closed 22 needs exactly one of each event, and every nonce is used once.
+   */
+  if (witnessRecords?.length) {
+    const nonceDigests = [];
+    for (const key of witnessWorkPlan(COMMISSION_DOMAIN).map((entry) => `${entry.caseId}:${entry.direction}`)) {
+      const counts = witnessHistory.get(key) ?? {};
+      /**
+       * EXACTLY ONE OF EACH. Not presence, and not "once-only for the dispatch".
+       *
+       * ⚠️ I relaxed this to presence-only because the producer appended twice, and that was the
+       * wrong repair: the duplicate came from four UNCONDITIONAL append sites in the production
+       * witness path, so weakening the count made a real lifecycle defect invisible instead of
+       * fixing it. The producer now makes a validated once-only transition
+       * ({@link recordWitnessEventOnce}), and this stays exact — zero has no counterparty, and two
+       * is an ambiguous history that cannot be resolved into one publication.
+       */
+      for (const type of ["challenge-observed", "dispatch-intent", "dispatch-result", "response-reconciled"]) {
+        const seen = Number(counts[type] ?? 0);
+        if (seen === 0) {
+          block("PC-04", "unverified", `the verified witness journal records no ${type} for ${key}; its publication has no counterparty in the process that served it`);
+        } else if (seen > 1) {
+          block("PC-04", "invalid", `the verified witness journal records ${seen} ${type} events for ${key}; each is once-only and a duplicated history cannot be resolved into one publication`);
+        }
+      }
+      const observed = witnessObserved.get(key);
+      if (observed && SHA256_HEX.test(String(observed.nonce_digest ?? ""))) nonceDigests.push(String(observed.nonce_digest));
+    }
+    if (new Set(nonceDigests).size !== nonceDigests.length) {
+      block("PC-04", "invalid", "the verified witness journal observes the same nonce for more than one case or direction; every witness nonce is used once");
+    }
+  }
+
+  for (const key of new Set([...witnessObserved.keys(), ...witnessReconciled.keys(), ...witnessDispatched.keys()])) {
+    witnessTransportHistory.set(key, {
+      observed: witnessObserved.get(key) ?? null,
+      reconciled: witnessReconciled.get(key) ?? null,
+      dispatchIntent: witnessDispatched.get(key) ?? null,
+    });
   }
 
   if (files["witness-process"]) {
@@ -6294,6 +7362,24 @@ export function assessEvidence({ dir, runId, attempt }) {
         if (problem) block("PC-04", "invalid", problem);
       }
 
+      /**
+       * ── THE TWO AUTHORITATIVE TRANSPORT VALIDATORS, RE-RUN (F2, corrected) ────────────────────
+       *
+       * Response binding and artifact provenance, on this case's RETAINED BYTES AND FACTS, against
+       * an expected binding derived from the immutable intent and this build's own derivations.
+       * Plus the timings recomputed from the observation and readback instants, the per-case source
+       * continuity, the scoped read, and the PLANNED installation identity.
+       */
+      const matchingCase = buildActorMatrix().find((entry) => entry.id === caseId);
+      if (matchingCase) {
+        for (const why of reconstructCaseTransport(record, {
+          runId, attempt, role, kase: matchingCase, intent: files.intent,
+          manifestDigest: files.setup ? String(files.setup.manifest_sha256 ?? "") : null,
+          graphDigest: graph ? graphBindingDigest(graph, runId, attempt) : null,
+          witnessJournal: witnessTransportHistory,
+        })) block("PC-04", "failed", `case ${caseId} ${why}`);
+      }
+
       // ── the retained pre/post observations, INDEPENDENTLY REPEATED ───────────────────────────
       if (Number.isInteger(intendedApp) && intendedApps) {
         for (const direction of ["pre", "post"]) {
@@ -6372,6 +7458,30 @@ export function assessEvidence({ dir, runId, attempt }) {
     if (!dispatcher || !Number.isInteger(Number(dispatcher.id))) {
       block("PC-06", "unverified", "the approval evidence records no numeric measured dispatcher identity");
     }
+    /**
+     * ── THE PHASE'S OWN TIME, ORDERED AGAINST WHAT IT REPORTS (root's clock qualification) ───────
+     *
+     * `collect` runs AFTER the protected actor phases, so a collection time that precedes the first
+     * case's measured mutation describes an ordering that did not happen. The phase time was never
+     * read at all, so a contradictory one was free.
+     */
+    const collectedAt = Date.parse(String(files.approvals.collected_at ?? ""));
+    if (!Number.isFinite(collectedAt)) block("PC-06", "invalid", "the approval evidence carries no parseable collection time");
+    else {
+      if (runWindow?.start && collectedAt < Date.parse(String(runWindow.start))) {
+        block("PC-06", "invalid", "the approval evidence was collected before this run's window opened");
+      }
+      if (runWindow?.end && collectedAt > Date.parse(String(runWindow.end))) {
+        block("PC-06", "invalid", "the approval evidence was collected after this run's window closed");
+      }
+      const caseMutations = ["normal", "emergency"]
+        .flatMap((role) => (Array.isArray(files[role]?.cases) ? files[role].cases : []))
+        .map((record) => Date.parse(String(record?.mutation_started_at ?? "")))
+        .filter((value) => Number.isFinite(value));
+      if (caseMutations.length && collectedAt < Math.max(...caseMutations)) {
+        block("PC-06", "invalid", `the approval evidence was collected at ${new Date(collectedAt).toISOString()}, before the last actor case it reports on mutated; the phase ordering is contradictory`);
+      }
+    }
     for (const spec of PROTECTED_JOBS) {
       const environment = files.approvals.environments?.[spec.environment];
       if (!environment) { block("PC-06", "unverified", `the approval evidence records nothing for ${spec.environment}`); continue; }
@@ -6402,6 +7512,26 @@ export function assessEvidence({ dir, runId, attempt }) {
       }
       if (reviewers.some((reviewer) => reviewer.is_dispatcher === true)) {
         block("PC-06", "failed", `${spec.environment}'s own record marks its approver as the dispatcher; that is a self-review`);
+      }
+      /**
+       * WHEN THE APPROVAL HAPPENED (root's clock qualification).
+       *
+       * The summary dropped the provider's timestamp entirely, so an approval could not be placed in
+       * time and a future one was invisible by construction. An approval outside this run's window
+       * is not this run's approval.
+       */
+      for (const reviewer of reviewers) {
+        const approvedAt = Date.parse(String(reviewer?.approved_at ?? ""));
+        if (!Number.isFinite(approvedAt)) {
+          block("PC-06", "unverified", `${spec.environment}'s approval by ${JSON.stringify(String(reviewer?.login ?? ""))} carries no parseable approval time`);
+          continue;
+        }
+        if (runWindow?.start && approvedAt < Date.parse(String(runWindow.start))) {
+          block("PC-06", "failed", `${spec.environment} records an approval at ${new Date(approvedAt).toISOString()}, before this run's window opened; it cannot have been given against a plan that did not exist`);
+        }
+        if (runWindow?.end && approvedAt > Date.parse(String(runWindow.end))) {
+          block("PC-06", "failed", `${spec.environment} records an approval at ${new Date(approvedAt).toISOString()}, after this run's window closed`);
+        }
       }
       if (environment.job_state_measured !== true) block("PC-06", "unverified", `the ${spec.id} job's final state could not be measured`);
       else if (environment.job_status !== "completed") block("PC-06", "unverified", `the ${spec.id} job is ${environment.job_status}; its approval did not lead to a completed actor phase`);
@@ -6546,7 +7676,7 @@ export function assessEvidence({ dir, runId, attempt }) {
 }
 
 function evidenceResult({ runId, attempt, phase, dir, deps }) {
-  const assessment = assessEvidence({ dir, runId, attempt });
+  const assessment = assessEvidence({ dir, runId, attempt, now: deps.now ?? (() => new Date()) });
   const summary = {
     schema_version: RESULT_SCHEMA_VERSION, phase, run_id: String(runId), attempt: String(attempt),
     assessed_at: (deps.now ?? (() => new Date()))().toISOString(),
@@ -6612,6 +7742,7 @@ export async function collectApprovalEvidence({ request, runId, attempt, ctx, no
       // rather than reading it — a supplied boolean is not an identity comparison.
       reviewers: approvals.map((entry) => ({
         login: entry.reviewer_login, id: entry.reviewer_id, type: entry.reviewer_type,
+        approved_at: entry.approved_at,
         is_dispatcher: Boolean(
           (measuredDispatcher && entry.reviewer_id !== null && entry.reviewer_id === measuredDispatcher.id)
           || (measuredDispatcher && entry.reviewer_login === measuredDispatcher.login)

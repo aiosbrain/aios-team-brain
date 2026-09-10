@@ -418,6 +418,23 @@ export function validateGovernedSnapshot(snapshot, allowed) {
   if (!classic || typeof classic !== "object" || classic.present !== false || Number(classic.status) !== 404) {
     refuse("it does not carry the measured no-classic-protection representation");
   }
+  /**
+   * The classic representation is CLOSED, and the source list is VOCABULARY-BOUND.
+   *
+   * Both were unchecked. `projectGovernedRuleset` closes a ruleset's own `source`, but nothing
+   * looked at the snapshot-level `source_identities` list or at any key of `classic_protection`
+   * beyond the two it reads — so an envelope could carry `classic_protection.arbitrary` and a
+   * `source_identities` entry this run never approved, and both travelled into the published
+   * artifact intact. That is the publication boundary the independent driver walked through.
+   */
+  assertClosedKeys(classic, ["present", "status"], "the witness snapshot's classic protection", refuse);
+  const sources = snapshot.source_identities;
+  if (!Array.isArray(sources)) refuse("it carries no measured source-identity list");
+  for (const entry of sources) {
+    if (!allowed.sources.has(String(entry))) {
+      refuse(`it names the source ${JSON.stringify(String(entry))}, which is not one this run approved in intent`);
+    }
+  }
   const span = Number(snapshot.span_ms);
   if (!Number.isFinite(span) || span < 0 || span > MAX_POLICY_READ_SPAN_MS) refuse(`its observation span (${snapshot.span_ms}) is outside the contemporaneity bound`);
   const governed = list.map((entry) => {
@@ -982,11 +999,12 @@ export function assertOriginalSubject({ response, originalRun, expected }) {
   };
 }
 
-export function publishWitnessResponse({ response, envelope, expected, publisherRunId, originalRun = null, writeEntry }) {
+export function publishWitnessResponse({ response, envelope, expected, publisherRunId, originalRun = null, writeEntry, allowed = null }) {
   const original = { runId: String(response.original_run_id), attempt: String(response.original_attempt) };
   // THE CLOSED SCHEMA, before anything is written. The bytes are published verbatim, so this is the
   // one place a field outside the closed vocabulary can be stopped from reaching an artifact.
-  assertResponseShape(response, { domain: String(response.domain ?? "") === REHEARSAL_RESPONSE_DOMAIN ? "rehearsal" : "commission" });
+  const rehearsal = String(response.domain ?? "") === REHEARSAL_RESPONSE_DOMAIN;
+  assertResponseShape(response, { domain: rehearsal ? "rehearsal" : "commission" });
   if (String(response.repository) !== expected.repository) throw new WitnessRefusal("the witness envelope names another repository");
   if (String(response.workflow_path) !== expected.workflowPath) throw new WitnessRefusal("the witness envelope names another workflow");
   if (!expected.sourceSha || String(response.source_sha) !== String(expected.sourceSha)) {
@@ -994,6 +1012,33 @@ export function publishWitnessResponse({ response, envelope, expected, publisher
   }
   // THE ORIGINAL SUBJECT, from provider metadata rather than from the envelope's own claims.
   const subject = assertOriginalSubject({ response, originalRun, expected });
+  /**
+   * ── THE NESTED GOVERNED CONTRACT, ALSO BEFORE THE BYTES (F11, corrected) ────────────────────────
+   *
+   * `assertResponseShape` closes the response's TOP-LEVEL keys and the observation's OWN keys. It
+   * does not descend into `governed_rulesets[].governed`, and it never looked at
+   * `source_identities` or at the key set of `classic_protection`. So the publisher — the one hop
+   * that turns a private measurement into an artifact anyone with Actions access can read — wrote
+   * an envelope carrying an arbitrary nested field verbatim. The independent driver published a
+   * sentinel through exactly this path.
+   *
+   * `allowed` is the closed vocabulary the CALLER derived from the AUTHENTICATED intent artifact of
+   * the original run. It is required for a commissioning publication and must not be inferred from
+   * the envelope: the planned App identities are the whole point, and an envelope cannot be its own
+   * authority for which Apps may appear in it.
+   *
+   * The inert rehearsal carries no policy measurement and has no commissioning intent by design, so
+   * it is excluded here — and a MISSING intent in the commissioning domain is a refusal, never a
+   * fall-back to rehearsal semantics.
+   */
+  if (!rehearsal) {
+    if (!allowed) {
+      throw new WitnessIncomplete(
+        "the witness publisher has no authenticated intent vocabulary to validate this commissioning observation against; it refuses rather than publishing an unvalidated governed projection",
+      );
+    }
+    validateGovernedSnapshot(response.observation, allowed);
+  }
   const bytes = Buffer.from(envelope, "utf8");
   const name = responseArtifactName({
     runId: original.runId, attempt: original.attempt, role: String(response.role),

@@ -1216,6 +1216,15 @@ places where an honest result is `unverified` rather than a pass.
 protection, cuts a tag, deploys, restarts a service or accepts a release — and no job in it holds a
 credential that could. The output is one sanitized evidence packet.
 
+**One local file in that packet is PRIVATE and must stay local.**
+`commissioning-<run>-<attempt>-production-inputs.json` is written mode-0600 by `setup` and holds the
+exact twelve-context producer map plus the raw `buildMainRulesets` subject it generates. It exists so
+`check-evidence` can **regenerate** the production subject and its hash instead of comparing the
+packet's own copies of a digest with each other, and its digest is anchored in the resource journal so
+a swapped file refuses on resume. It is not in any upload path, dispatch envelope, published manifest
+or log, and the published intent continues to expose only the producer-map **digest**. Do not attach
+it to a ticket; attach the sanitized packet.
+
 ### Prerequisites — all of them, or the run measures nothing
 
 | Prerequisite | Why a run without it is not evidence |
@@ -1226,6 +1235,7 @@ credential that could. The output is one sanitized evidence packet.
 | John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
 | A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
 | Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
+| Repository variables `COMMISSIONING_NORMAL_INSTALLATION_ID`, `COMMISSIONING_EMERGENCY_INSTALLATION_ID` | The **planned** installation identities, and they must be positive and **distinct**. They are nonsecret numeric identifiers, not keys, and they go in the credential-free intent deliberately: without a plan the only available "expectation" was the value the protected job was configured with, and `measureAppGrants` recorded that requested value back as though it had been measured. With the plan, the runner compares the job's configuration to it **before** the credential exchange and the provider's **returned** `installation.id` to it after. Absent values refuse at run time rather than defaulting — provisioning them is an owner prerequisite. |
 | Local `gh` admin identity — **exactly `johnellison`, numeric ID `5806135`, type `User`** | Administers the disposable resources, runs the human/admin cases, and is the **complete-policy measurement authority** for the witness protocol. All three of the ID, the login and the account type are required: a second administrator, or a machine account holding admin, would satisfy an any-admin check while producing evidence about a different identity. It is never uploaded into Actions, and no new long-lived admin token is created. |
 | That same local identity can **dispatch this workflow** | The witness protocol needs it to dispatch `policy-witness` mode. Measure that prerequisite with the separately approved, non-privileged **transport rehearsal** (mode `transport-rehearsal`) — absence is `incomplete`, never grounds for a new grant. |
 | A **quiet commissioning window**: no concurrent policy writer | The pre/post witness pair is a bounded contemporaneous measurement under administrative quiescence, **not** an atomic policy-at-mutation proof. A known concurrent policy writer interrupts the run. |
