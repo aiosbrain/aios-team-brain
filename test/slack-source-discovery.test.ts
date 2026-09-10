@@ -162,7 +162,7 @@ describe("classifySlackCall", () => {
 });
 
 describe("the effective selection", () => {
-  it("resolves both env aliases, saved-secret precedence first", () => {
+  it("resolves both env aliases, the canonical spelling first", () => {
     expect(resolveEnvSlackToken({ SLACK_BOT_TOKEN: "a", slack_bot_token: "b" })).toBe("a");
     expect(resolveEnvSlackToken({ slack_bot_token: "b" })).toBe("b");
     expect(resolveEnvSlackToken({})).toBeNull();

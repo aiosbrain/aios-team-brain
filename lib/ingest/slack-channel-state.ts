@@ -327,10 +327,12 @@ export async function recordSlackChannelPublicState(
 
 /**
  * Record a transient failure that happened OUTSIDE a claim (a delayed metadata read). It touches the
- * category and the not-before only — never the public proof, never a frontier.
+ * category — never the public proof, never a frontier.
  *
- * `dueAt` is null when nothing stated a real deadline; the DB clock is used then, because the durable
- * method budget is the actual gate and this column must not become a second, invented schedule.
+ * `dueAt` is null when the caller must NOT move the not-before, and that is the normal case for a
+ * metadata failure: `due_at` gates the HISTORY lane, while a `conversations.info` cooldown is about
+ * a different method with its own budget. Pushing it here would let one flaky metadata recheck stop
+ * a channel from being read at all — a proof we could not refresh is still a proof.
  */
 export async function delaySlackChannel(
   session: TransactionSession,
@@ -342,7 +344,7 @@ export async function delaySlackChannel(
   if (input.dueAt !== null) assertInstant("dueAt", input.dueAt);
   const result = await session.executeSql<StateRow>(
     `update slack_sync_channels
-        set due_at = coalesce($5::timestamptz, clock_timestamp()),
+        set due_at = coalesce($5::timestamptz, due_at),
             last_error_code = $4,
             updated_at = clock_timestamp()
       where ${SCOPE_PREDICATE}
@@ -453,7 +455,9 @@ export async function claimSlackChannelPage(
     lowerTs: laneState.lowerTs,
     cursor: laneState.cursor,
     scanGeneration: laneState.scanGeneration,
-    oldestSeenTs: state.historicalOldestSeenTs,
+    // The oldest instant belongs to the HISTORICAL scan; a newest-lane claim carries none, so it
+    // cannot accidentally be folded into that lane's certification.
+    oldestSeenTs: lane === "historical" ? state.historicalOldestSeenTs : null,
     completedLowerTs: state.completedLowerTs,
     completedUpperTs: state.completedUpperTs,
   };
@@ -647,6 +651,11 @@ export async function restartSlackChannelScan(
  * anchor, cursor, generation, certified interval — is left exactly as it is, so the retry RESUMES
  * the same anchored scan rather than restarting it at a new "now". The lane's turn still passes, so
  * a channel failing on one lane cannot starve the other.
+ *
+ * `nextDueAt` null means DUE NOW, and that is not the same decision as `delaySlackChannel`'s null
+ * (which leaves the not-before alone): here the channel is being handed back for its own lane, and
+ * the durable method budget — the cross-process gate — is what decides when the retry may actually
+ * send anything. A per-channel backoff curve belongs to the scheduler slice, not to this writer.
  */
 export async function releaseSlackChannelForRetry(
   session: TransactionSession,

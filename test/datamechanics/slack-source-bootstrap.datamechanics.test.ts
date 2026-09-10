@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { discoverSlackSource, type SlackSourceDiscoveryResult } from "@/lib/ingest/slack-source-discovery";
 import { db, seedTeam, type Seed } from "./helpers";
@@ -15,7 +15,9 @@ import {
   elapse,
   fakeSlack,
   historyBody,
+  integrationRow,
   rawSql,
+  requireSlackSourceTables,
   rootMessage,
   rotateSlackSecret,
   seedSlackIntegration,
@@ -51,6 +53,7 @@ const CHANNEL = "C0SOURCE1";
 const TOKEN = "xoxb-synthetic-not-a-real-token";
 const ROTATED = "xoxb-synthetic-rotated-token";
 
+beforeAll(requireSlackSourceTables);
 afterAll(closeRawSql);
 
 function discover(
@@ -186,7 +189,10 @@ describe("app-identity bootstrap", () => {
 
     // The seed page certifies exactly the interval it covered: [oldest returned, frozen anchor].
     expect(channel?.completed_lower_ts).toBe("1718900000.000100");
-    expect(channel?.completed_upper_ts).toBe(channel?.newest_anchor_ts ?? null);
+    // The anchor was the DB clock at claim time, and the scan that froze it is over — so it lives on
+    // as the certified top rather than as live lane state.
+    expect(channel?.completed_upper_ts).toMatch(/^[0-9]+\.[0-9]{6}$/);
+    expect(channel?.newest_anchor_ts).toBeNull();
     // …and the lease is not held between wakes.
     expect(channel?.lease_owner).toBeNull();
     expect(channel?.claimed_lane).toBeNull();
@@ -405,16 +411,19 @@ describe("token and config changes invalidate the binding", () => {
     await discover(seed, integrationId, fullPass(), { envToken: () => TOKEN });
     const bound = await bindingRow(seed.teamId, integrationId);
     expect(bound).toMatchObject({ state: "verified" });
+    const beforeRow = await integrationRow(integrationId);
 
     await elapse(seed.teamId);
     const rotated = fullPass();
     await discover(seed, integrationId, rotated, { envToken: () => ROTATED });
 
-    // updated_at cannot see this change; the fingerprint is the only thing that can.
+    // ⚠️ THE INTEGRATION ROW DID NOT MOVE — which is exactly why the fingerprint exists. A
+    // revision built from `updated_at` alone cannot see an env rotation at all.
+    expect((await integrationRow(integrationId))?.updated_at).toEqual(beforeRow?.updated_at);
     expect(rotated.countOf("auth.test")).toBe(1);
     const after = await bindingRow(seed.teamId, integrationId);
     expect(after?.token_fingerprint).not.toBe(bound?.token_fingerprint);
-    expect(after?.updated_at).not.toEqual(bound?.updated_at);
+    expect(after?.config_revision).toBe(bound?.config_revision);
   });
 
   it("reports a disabled selection as inactive, with zero provider requests", async () => {

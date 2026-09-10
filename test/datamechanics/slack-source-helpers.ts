@@ -53,6 +53,27 @@ export async function closeRawSql(): Promise<void> {
   raw = null;
 }
 
+/**
+ * A reused per-worktree container is schema-loaded only when it is CREATED (`scripts/dm-isolated.sh`),
+ * so one that predates this change silently lacks both new tables — and every test below would fail
+ * with a relation error that reads like a product bug. Say what it actually is, once, up front.
+ */
+export async function requireSlackSourceTables(): Promise<void> {
+  const c = await rawSql();
+  const { rows } = await c.query<{ tablename: string }>(
+    `select tablename from pg_tables
+      where schemaname = 'public' and tablename = any($1::text[])`,
+    [["slack_integration_bindings", "slack_sync_channels"]]
+  );
+  if (rows.length !== 2) {
+    throw new Error(
+      "slack_integration_bindings / slack_sync_channels are missing from the test database. The dm " +
+        "container loads the schema only when it is created — re-run with AIOS_DM_RESET=1 " +
+        "npm run test:datamechanics:iso <file>"
+    );
+  }
+}
+
 // ── real integration rows ────────────────────────────────────────────────────
 
 export async function seedSlackIntegration(
@@ -217,6 +238,12 @@ export async function bindingRow(teamId: string, integrationId: string): Promise
     `select * from slack_integration_bindings where team_id = $1 and integration_id = $2`,
     [teamId, integrationId]
   );
+  return rows[0] ?? null;
+}
+
+export async function integrationRow(integrationId: string): Promise<Row | null> {
+  const c = await rawSql();
+  const { rows } = await c.query<Row>(`select * from integrations where id = $1`, [integrationId]);
   return rows[0] ?? null;
 }
 

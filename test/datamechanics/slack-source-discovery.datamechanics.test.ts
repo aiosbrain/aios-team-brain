@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import type { TransactionSession } from "@/lib/db/types";
 import { claimSlackThread, checkpointSlackThread } from "@/lib/ingest/slack-thread-state";
@@ -14,6 +14,7 @@ import {
   fakeSlack,
   historyBody,
   rawSql,
+  requireSlackSourceTables,
   rootMessage,
   seedSlackIntegration,
   setSlackChannelIds,
@@ -46,6 +47,7 @@ const CHANNEL = "C0SOURCE1";
 const TOKEN = "xoxb-synthetic-not-a-real-token";
 const APP = "A0SOURCE1";
 
+beforeAll(requireSlackSourceTables);
 afterAll(closeRawSql);
 
 function discover(

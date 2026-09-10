@@ -3052,8 +3052,11 @@ create table if not exists slack_integration_bindings (
   -- which verified integrations select a shared channel state: two integrations selecting one
   -- channel coalesce onto one `slack_sync_channels` row, and this is where "who selects it" lives.
   selected_channel_ids text[] not null default '{}',
-  -- Not-before for the next bootstrap attempt. Only ever set from a REAL persisted deadline (the
-  -- method budget's own `next_permitted_at`) or the DB clock — never a fabricated retry time.
+  -- A RECORD of when the next bootstrap attempt was said to be allowed, only ever set from a real
+  -- persisted deadline (the method budget's own `next_permitted_at`) or the DB clock — never a
+  -- fabricated retry time. ⚠️ It is deliberately NOT the gate: the durable per-method budget is,
+  -- because that one is shared across processes and integrations. A second schedule here would be a
+  -- weaker copy of it that could disagree.
   due_at timestamptz not null default now(),
   -- A sanitized CATEGORY, same syntax rule and same reason as `slack_sync_threads.last_error_code`.
   error_code text check (error_code is null or error_code ~ '^[a-z][a-z0-9_]{0,39}$'),

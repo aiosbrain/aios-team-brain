@@ -547,10 +547,12 @@ async function proveChannel(
 
   if (call.kind === "transient" || call.kind === "deferred") {
     // ⚠️ A BLIP IS NOT EVIDENCE. The last valid proof is the best information there is, so nothing
-    // about the public state is written — only the category and the deadline something stated.
+    // about the public state is written — only the category. `dueAt: null` leaves the not-before
+    // alone on purpose: it gates the HISTORY lane, and a `conversations.info` cooldown says nothing
+    // about whether this channel may be read under the proof it already has.
     await runContextTransaction(pass.input.db, (session) =>
       delaySlackChannel(session, target.scope, {
-        dueAt: deadline(call),
+        dueAt: null,
         errorCode: sanitize(call.category),
       })
     );
