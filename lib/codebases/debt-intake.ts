@@ -92,7 +92,7 @@ export async function ingestDebtIntake(
     const ids = [...new Set(candidates.map((record) => record.candidate_id))];
     const latest = await client.query<{ record: CandidateRecord }>(
       `select distinct on (candidate_id) record from codebase_debt_candidate_events
-       where team_id = $1 and candidate_id = any($2::text[])
+       where team_id = $1 and record_type = 'candidate' and candidate_id = any($2::text[])
        order by candidate_id, sequence desc`, [auth.teamId, ids],
     );
     const globalLatestByCandidate = new Map(latest.rows.map(({ record }) => [record.candidate_id, record]));
@@ -118,13 +118,14 @@ export async function ingestDebtIntake(
       const cycles = await client.query<{ cycle: boolean }>(
         `with recursive incoming(source, target) as (
            select * from unnest($2::text[], $3::text[])
-         ), edges(source, target) as (
-           select candidate_id, duplicate_target from codebase_debt_candidate_events
-           where team_id = $1 and duplicate_target is not null
-           union select source, target from incoming
          ), reachable(source, target) as (
            select source, target from incoming
-           union select r.source, e.target from reachable r join edges e on e.source = r.target
+           union
+           select r.source, edge.target from reachable r cross join lateral (
+             select duplicate_target as target from codebase_debt_candidate_events
+             where team_id = $1 and candidate_id = r.target and duplicate_target is not null
+             union select target from incoming where source = r.target
+           ) edge
          ) select exists(select 1 from reachable where source = target) as cycle`,
         [auth.teamId, edges.map((edge) => edge[0]), edges.map((edge) => edge[1])],
       );
