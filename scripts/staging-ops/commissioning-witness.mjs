@@ -444,6 +444,49 @@ export const BINDING_FIELDS = Object.freeze([
   "target_ref", "intended_app_id", "intended_installation_id", "manifest_sha256", "graph_sha256",
 ]);
 
+/**
+ * ── THE CLOSED PUBLICATION VOCABULARY (F11) ─────────────────────────────────────────────────────
+ *
+ * Every field a challenge or a response may carry, and nothing else. `assertResponseShape` accepted
+ * ARBITRARY top-level properties and an arbitrary observation object, and `publishWitnessResponse`
+ * then wrote the whole envelope verbatim — so a response carrying `unknown_top_level` and an
+ * arbitrary provider property survived both validation and dispatch serialization and was published
+ * as an artifact. That is a missing publication BOUNDARY, not a claim that the normal measured
+ * projection leaks a real secret: the projection already refuses unknown governed fields, and this
+ * closes the envelope around it so nothing can travel BESIDE the projection either.
+ *
+ * The rule the canonical states, and the one this encodes: never strip an unknown field to
+ * manufacture compatibility. An unknown key REFUSES, before publication.
+ */
+const CHALLENGE_BASE_FIELDS = Object.freeze([
+  "schema_version", "kind", ...BINDING_FIELDS, "nonce", "created_at", "expires_at",
+]);
+/** Both directions carry the ref state the case is about. */
+const CHALLENGE_PRE_FIELDS = Object.freeze([...CHALLENGE_BASE_FIELDS, "before_sha", "requested_sha"]);
+/** A post challenge additionally binds the request it followed and the pre-response it answers. */
+const CHALLENGE_POST_FIELDS = Object.freeze([
+  ...CHALLENGE_PRE_FIELDS,
+  "request_class", "request_status", "readback_sha", "readback_at", "pre_artifact_id", "pre_artifact_digest",
+]);
+export const RESPONSE_FIELDS = Object.freeze([
+  "schema_version", "kind", ...BINDING_FIELDS,
+  "challenge_nonce", "challenge_digest", "challenge_expires_at", "observation", "witness_identity", "created_at",
+]);
+/** The measured governed observation. Exactly what {@link buildGovernedSnapshot} produces. */
+export const OBSERVATION_FIELDS = Object.freeze([
+  "started_at", "completed_at", "span_ms", "applicability_pages", "source_identities",
+  "classic_protection", "governed_rulesets", "raw_governed_digest", "projected_governed_digest",
+]);
+/** The inert rehearsal observation. It carries NO policy measurement, and may not acquire one. */
+export const INERT_OBSERVATION_FIELDS = Object.freeze(["started_at", "completed_at", "span_ms", "inert"]);
+export const REQUEST_CLASSES = Object.freeze(["accepted", "refused", "ambiguous"]);
+
+/** Refuse any key outside the closed set. The unknown key is NAMED, so the refusal is actionable. */
+function assertClosedKeys(value, allowed, label, refuse) {
+  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unknown.length) refuse(`${label} carries the field(s) ${unknown.sort().join(", ")}, which are outside its closed schema`);
+}
+
 const requireString = (value, label, pattern = null) => {
   const text = String(value ?? "");
   if (!text) throw new WitnessRefusal(`a commissioning challenge needs ${label}`);
@@ -498,15 +541,31 @@ export function assertChallengeShape(challenge) {
   // Exactly the fixed TTL. A longer one is an extension, and extensions are how queue latency gets
   // concealed rather than reported.
   if (expires - created !== CHALLENGE_TTL_MS) throw new WitnessRefusal(`the challenge lifetime is not the fixed ${CHALLENGE_TTL_MS}ms`);
+  const refuse = (why) => { throw new WitnessRefusal(why); };
+  // CLOSED, per direction. An extra top-level field on a challenge is refused here, before the
+  // local witness ever measures anything on its behalf.
+  assertClosedKeys(challenge, challenge.direction === "post" ? CHALLENGE_POST_FIELDS : CHALLENGE_PRE_FIELDS, "the challenge", refuse);
   if (challenge.domain === "commission") {
     requireString(challenge.manifest_sha256, "the challenge manifest digest", SHA256);
     requireString(challenge.graph_sha256, "the challenge graph digest", SHA256);
     requireString(challenge.target_ref, "the challenge derived ref", /^refs\/heads\/aios-policy-commissioning\//);
     if (challenge.direction === "post") {
       if (!Number.isInteger(challenge.request_status)) throw new WitnessRefusal("a post challenge must carry the measured request status");
-      requireString(challenge.request_class, "the post challenge request class");
+      if (!REQUEST_CLASSES.includes(String(challenge.request_class))) {
+        throw new WitnessRefusal(`a post challenge's request class is one of ${REQUEST_CLASSES.join("/")}, not ${JSON.stringify(String(challenge.request_class ?? ""))}`);
+      }
       requireString(challenge.pre_artifact_digest, "the post challenge pre-response digest", SHA256);
-      requireString(challenge.readback_at, "the post challenge readback timestamp");
+      // The pre-response artifact's own POSITIVE identity, so the post challenge names the exact
+      // publication it followed rather than merely a digest that could belong to anything.
+      if (!Number.isInteger(challenge.pre_artifact_id) || challenge.pre_artifact_id <= 0) {
+        throw new WitnessRefusal("a post challenge must name the positive provider ID of the pre-response artifact it followed");
+      }
+      const readbackAt = Date.parse(String(challenge.readback_at ?? ""));
+      if (!Number.isFinite(readbackAt)) throw new WitnessRefusal("a post challenge must carry a parseable readback timestamp");
+      // Temporal ordering, complete: the readback happened before this challenge was created.
+      if (readbackAt > Date.parse(String(challenge.created_at))) {
+        throw new WitnessRefusal("a post challenge claims a readback that happened after the challenge was created; the ordering is impossible");
+      }
     }
   } else if (challenge.domain === "rehearsal") {
     // The inert variant. It deliberately has NO synthetic graph, ref or resource journal to bind —
@@ -547,21 +606,77 @@ export function buildResponse({ challenge, challengeDigest, observation, witness
   return response;
 }
 
-export function assertResponseShape(response) {
-  if (!response || typeof response !== "object" || Array.isArray(response)) throw new WitnessRefusal("a witness response must be a JSON object");
-  if (response.schema_version !== WITNESS_SCHEMA_VERSION) throw new WitnessRefusal("the witness response declares an unsupported schema version");
-  if (response.kind !== RESPONSE_KIND) throw new WitnessRefusal("the payload does not declare itself a commissioning witness response");
-  if (!NONCE.test(String(response.challenge_nonce ?? ""))) throw new WitnessRefusal("the witness response binds no challenge nonce");
-  if (!SHA256.test(String(response.challenge_digest ?? ""))) throw new WitnessRefusal("the witness response binds no exact challenge bytes");
-  if (!Number.isFinite(Date.parse(String(response.created_at)))) throw new WitnessRefusal("the witness response carries no parseable creation time");
-  if (!Number.isFinite(Date.parse(String(response.challenge_expires_at)))) throw new WitnessRefusal("the witness response carries no challenge expiry");
+/**
+ * THE CLOSED RESPONSE SCHEMA (F11). One validator, applied by the publisher BEFORE publication, by
+ * every consumer, and by the final assessor on the retained bytes.
+ *
+ * `domain` is optional and, when supplied, pins which observation variant is acceptable — the
+ * rehearsal's inert one or the commissioning measurement. A caller that does not know the domain
+ * still gets the closed key set, the derived identifiers and the temporal ordering.
+ */
+export function assertResponseShape(response, { domain = null } = {}) {
+  const refuse = (why) => { throw new WitnessRefusal(why); };
+  if (!response || typeof response !== "object" || Array.isArray(response)) refuse("a witness response must be a JSON object");
+  if (response.schema_version !== WITNESS_SCHEMA_VERSION) refuse("the witness response declares an unsupported schema version");
+  if (response.kind !== RESPONSE_KIND) refuse("the payload does not declare itself a commissioning witness response");
+  // CLOSED. Nothing may travel beside the governed projection.
+  assertClosedKeys(response, RESPONSE_FIELDS, "the witness response", refuse);
+  if (!NONCE.test(String(response.challenge_nonce ?? ""))) refuse("the witness response binds no challenge nonce");
+  if (!SHA256.test(String(response.challenge_digest ?? ""))) refuse("the witness response binds no exact challenge bytes");
+  const createdAt = Date.parse(String(response.created_at));
+  const expiresAt = Date.parse(String(response.challenge_expires_at));
+  if (!Number.isFinite(createdAt)) refuse("the witness response carries no parseable creation time");
+  if (!Number.isFinite(expiresAt)) refuse("the witness response carries no challenge expiry");
+
+  // THE BINDING FIELDS, with EXACT derived shapes rather than mere presence. A response whose role
+  // or ordinal is a string where the consumer derives a number binds nothing on that field.
+  if (!DECIMAL.test(String(response.repository_id ?? ""))) refuse("the witness response carries no numeric repository ID");
+  if (!DECIMAL.test(String(response.original_run_id ?? "")) || !DECIMAL.test(String(response.original_attempt ?? ""))) {
+    refuse("the witness response carries no original run identity");
+  }
+  if (!WITNESS_MODES.includes(String(response.source_mode))) refuse("the witness response declares an unknown source mode");
+  if (!FULL_SHA.test(String(response.source_sha ?? ""))) refuse("the witness response carries no immutable source SHA");
+  if (!["pre", "post"].includes(String(response.direction))) refuse("the witness response's direction is pre or post");
+  if (!Number.isInteger(response.case_ordinal) || response.case_ordinal < 0) refuse("the witness response carries no case ordinal");
+  for (const field of ["repository", "workflow_path", "role", "job_id", "case_id", "target_ref", "domain"]) {
+    if (typeof response[field] !== "string" || !response[field]) refuse(`the witness response carries no ${field}`);
+  }
+
   const identity = response.witness_identity;
   // The measuring authority is named, by numeric ID: the whole trust story is "authenticated local
   // John measured this", so a response that does not say which identity measured it is unusable.
-  if (!identity || Number(identity.user_id) !== OWNER_USER_ID || String(identity.login) !== OWNER_LOGIN || String(identity.type) !== OWNER_USER_TYPE) {
-    throw new WitnessRefusal("the witness response does not name the one authorized local measuring identity");
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) refuse("the witness response carries no measuring identity");
+  assertClosedKeys(identity, ["login", "user_id", "type"], "the witness response's identity", refuse);
+  if (Number(identity.user_id) !== OWNER_USER_ID || String(identity.login) !== OWNER_LOGIN || String(identity.type) !== OWNER_USER_TYPE) {
+    refuse("the witness response does not name the one authorized local measuring identity");
   }
-  if (!response.observation || typeof response.observation !== "object") throw new WitnessRefusal("the witness response carries no observation");
+
+  const observation = response.observation;
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) refuse("the witness response carries no observation");
+  const inert = observation.inert === true;
+  if (domain === "rehearsal" && !inert) refuse("a rehearsal response must carry the inert observation variant; a rehearsal produces no policy measurement");
+  if (domain === "commission" && inert) refuse("a commissioning response must carry a measured governed observation, not the inert rehearsal variant");
+  assertClosedKeys(observation, inert ? INERT_OBSERVATION_FIELDS : OBSERVATION_FIELDS, "the witness observation", refuse);
+  // ACTUAL FINITE TIMESTAMPS, not values that coerce. `Number(null)` is 0 and `Date.parse` of a
+  // missing field is NaN; both have to be refusals here rather than measurements downstream.
+  const startedAt = Date.parse(String(observation.started_at));
+  const completedAt = Date.parse(String(observation.completed_at));
+  if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt)) refuse("the witness observation carries no parseable measurement window");
+  if (completedAt < startedAt) refuse("the witness observation completed before it started; the ordering is impossible");
+  if (typeof observation.span_ms !== "number" || !Number.isFinite(observation.span_ms) || observation.span_ms < 0) {
+    refuse("the witness observation carries no finite measured span");
+  }
+  if (completedAt - startedAt !== observation.span_ms) refuse("the witness observation's span does not describe its own measurement window");
+  // The observation was made before the response that reports it, and inside the challenge's life.
+  if (startedAt > createdAt) refuse("the witness observation claims to have started after the response reporting it was created");
+  if (!inert) {
+    if (!Array.isArray(observation.governed_rulesets) || !observation.governed_rulesets.length) {
+      refuse("the witness observation carries no complete governed ruleset set");
+    }
+    if (!SHA256.test(String(observation.raw_governed_digest ?? "")) || !SHA256.test(String(observation.projected_governed_digest ?? ""))) {
+      refuse("the witness observation carries no digests of the measurement it was projected from");
+    }
+  }
   return response;
 }
 
@@ -737,6 +852,8 @@ export function readSingleEntryZip(buffer, { entryName = WITNESS_ENTRY_NAME, max
 
 export const WITNESS_JOB_ID = "policy-witness";
 export const REHEARSAL_JOB_ID = "transport-rehearsal";
+/** The rehearsal's response DOMAIN, named here so the publisher can pin the observation variant. */
+const REHEARSAL_RESPONSE_DOMAIN = "rehearsal";
 
 /**
  * Every provider fact the publisher must hold before it republishes a single byte.
@@ -813,13 +930,70 @@ export function readWitnessEnvelopeFromEvent(eventJson) {
  * it exists to carry — and it holds no App secret, no protected environment and no write scope with
  * which it could do anything else.
  */
-export function publishWitnessResponse({ response, envelope, expected, publisherRunId, writeEntry }) {
+/**
+ * Everything the publisher must know about the ORIGINAL run before it republishes a byte (F11).
+ *
+ * The publisher read only its OWN run. The spec requires it to validate the original commissioning
+ * run/attempt/source and the closed challenge subject from provider metadata — which is a
+ * different question: "was I dispatched correctly" says nothing about whether the subject inside
+ * the envelope is a run that exists, ran the reviewed workflow at this same immutable source, and
+ * was created by the authorized identity. `originalRun` is the provider's record of the run named
+ * INSIDE the envelope, fetched by the caller through the guarded transport.
+ */
+export function assertOriginalSubject({ response, originalRun, expected }) {
+  const refuse = (why) => { throw new WitnessRefusal(`the witness publisher refuses to publish: ${why}`); };
+  if (!originalRun || typeof originalRun !== "object") {
+    throw new WitnessIncomplete("the witness publisher could not measure the original run its envelope names");
+  }
+  if (String(originalRun.path) !== expected.workflowPath) refuse("the envelope's original run is not the reviewed commissioning workflow");
+  if (String(originalRun.event) !== "workflow_dispatch") refuse("the envelope's original run was not dispatched manually");
+  if (String(originalRun.head_sha) !== String(expected.sourceSha)) {
+    refuse("the envelope's original run did not run the immutable source this publisher ran");
+  }
+  if (String(originalRun.head_branch ?? "") !== expected.dispatchBranch) refuse("the envelope's original run was not dispatched from the fixed staging branch");
+  if (Number(originalRun.run_attempt) !== Number(response.original_attempt)) {
+    refuse("the envelope's original attempt is not the attempt the provider records for that run");
+  }
+  /**
+   * ⚠️ THE ORIGINAL RUN'S ACTOR IS DELIBERATELY *NOT* REQUIRED TO BE JOHN.
+   *
+   * The PUBLISHER's own run must be John's — the local witness dispatches it with John's `gh`
+   * credential, and that is what the transport's authority rests on. The ORIGINAL commissioning
+   * run is a different thing: PC-02 has the optional dispatcher App trigger it precisely SO THAT
+   * John can approve the protected environments without self-reviewing, and PC-06 then requires
+   * the reviewer to be an identity distinct from the measured dispatcher. Requiring John here
+   * would make the reviewed no-self-review design impossible to satisfy.
+   *
+   * So the identity is MEASURED AND RECORDED rather than constrained, and the checks above bind
+   * what the canonical actually asks the publisher to validate: the original run's workflow,
+   * event, immutable source, dispatch branch and attempt.
+   */
+  const identity = (value) => (value && typeof value === "object"
+    ? { login: String(value.login ?? "unknown"), id: Number.isInteger(Number(value.id)) ? Number(value.id) : null, type: String(value.type ?? "unknown") }
+    : null);
+  return {
+    original_run_id: String(response.original_run_id),
+    original_attempt: String(response.original_attempt),
+    original_head_sha: String(originalRun.head_sha),
+    // Recorded for the approval evidence's self-review comparison, never used as an admission here.
+    original_dispatcher: identity(originalRun.actor),
+    original_triggering_actor: identity(originalRun.triggering_actor),
+    original_subject_measured: true,
+  };
+}
+
+export function publishWitnessResponse({ response, envelope, expected, publisherRunId, originalRun = null, writeEntry }) {
   const original = { runId: String(response.original_run_id), attempt: String(response.original_attempt) };
+  // THE CLOSED SCHEMA, before anything is written. The bytes are published verbatim, so this is the
+  // one place a field outside the closed vocabulary can be stopped from reaching an artifact.
+  assertResponseShape(response, { domain: String(response.domain ?? "") === REHEARSAL_RESPONSE_DOMAIN ? "rehearsal" : "commission" });
   if (String(response.repository) !== expected.repository) throw new WitnessRefusal("the witness envelope names another repository");
   if (String(response.workflow_path) !== expected.workflowPath) throw new WitnessRefusal("the witness envelope names another workflow");
   if (!expected.sourceSha || String(response.source_sha) !== String(expected.sourceSha)) {
     throw new WitnessRefusal("the witness envelope's immutable source is not the source this publisher ran");
   }
+  // THE ORIGINAL SUBJECT, from provider metadata rather than from the envelope's own claims.
+  const subject = assertOriginalSubject({ response, originalRun, expected });
   const bytes = Buffer.from(envelope, "utf8");
   const name = responseArtifactName({
     runId: original.runId, attempt: original.attempt, role: String(response.role),
@@ -843,6 +1017,7 @@ export function publishWitnessResponse({ response, envelope, expected, publisher
     case_ordinal: Number(response.case_ordinal),
     direction: String(response.direction),
     domain: String(response.domain),
+    original_subject: subject,
     note: "The provider authenticates this publisher's actor, immutable source and artifact bytes. It does not attest that the measurement inside is true.",
   };
 }
@@ -863,9 +1038,12 @@ export function assertPublisherArtifactProvenance({ artifact, run, jobs, expecte
   const owningRun = Number(artifact.workflow_run?.id);
   if (!Number.isInteger(owningRun)) refuse("it names no owning run");
   if (!run || Number(run.id) !== owningRun) throw new WitnessIncomplete("the witness artifact's owning run could not be measured");
-  if (String(run.status) !== "completed" || String(run.conclusion) !== "success") {
-    throw new WitnessIncomplete(`the witness artifact's publisher run is ${String(run.status)}/${String(run.conclusion)}; a publication is pinned to a SUCCESSFUL publisher run`);
-  }
+
+  // ── THE BINDING CHECKS COME FIRST, and every one of them is TERMINAL ────────────────────────────
+  //
+  // Ordering matters here (F10). A wrong-source, wrong-actor, re-run or wrong-workflow publisher is
+  // refused OUTRIGHT whatever state it is in — waiting for a run that will never be acceptable is
+  // just a slower refusal, and re-reading it would be waiting for somebody to publish a better one.
   if (Number(run.run_attempt) !== 1) refuse("its publisher run is a re-run");
   if (String(run.event) !== "workflow_dispatch") refuse("its publisher run was not dispatched manually");
   if (String(run.path) !== expected.workflowPath) refuse("its publisher run is not the reviewed commissioning workflow");
@@ -875,6 +1053,32 @@ export function assertPublisherArtifactProvenance({ artifact, run, jobs, expecte
     if (!identity || Number(identity.id) !== OWNER_USER_ID || String(identity.login) !== OWNER_LOGIN || String(identity.type) !== OWNER_USER_TYPE) {
       refuse(`its publisher run's ${field} is not the one authorized local identity`);
     }
+  }
+
+  /**
+   * ── ONLY NOW THE LIFECYCLE, AND A CORRECTLY BOUND NONTERMINAL PUBLISHER IS *PENDING* ───────────
+   *
+   * An upload necessarily happens BEFORE the job and the run that produced it can finish, so the
+   * artifact being visible while its own valid publisher is still `in_progress` is the ordinary
+   * case, not an anomaly. This threw `WitnessIncomplete` WITHOUT the retryable marker, so the
+   * bounded waiter aborted immediately instead of waiting for the publisher's terminal result —
+   * with zero sleeps, on a run that was about to succeed.
+   *
+   * So a run that has passed every binding check above and has simply not finished yet is RETRYABLE
+   * (the waiter polls it within the original challenge expiry, which is never extended). A run that
+   * reached a terminal state other than success is a refusal, immediately: there is nothing to wait
+   * for and a failed publisher is not a publication.
+   */
+  const status = String(run.status ?? "");
+  const conclusion = run.conclusion === null || run.conclusion === undefined ? null : String(run.conclusion);
+  if (status !== "completed") {
+    throw new WitnessIncomplete(
+      `the witness artifact's publisher run is ${status || "unreported"}; it is correctly bound but has not finished, so this publication is PENDING within the original challenge expiry`,
+      { retryable: true, publisher_run_id: owningRun, publisher_run_status: status },
+    );
+  }
+  if (conclusion !== "success") {
+    refuse(`its publisher run completed as ${JSON.stringify(conclusion ?? "none")}; a publication is pinned to a SUCCESSFUL publisher run`);
   }
   // EXCLUSIVITY: one publisher-capable job ran, and every other job in that run was skipped. This is
   // the reviewed wiring being checked against the provider's own job state rather than assumed.

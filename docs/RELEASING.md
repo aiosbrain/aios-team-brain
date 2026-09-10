@@ -553,8 +553,12 @@ node scripts/staging-ops/policy-commissioning.mjs setup         --run-id "$RUN_I
 
 # 2. START THE LOCAL WITNESS, in its own shell, BEFORE the approvals. It holds its own read-only
 #    journal lock, so it runs concurrently with `human-tests` rather than blocking on it, and it
-#    polls for work that does not exist yet — that is the normal beginning of a run. Its exit 0
-#    means all 22 assigned cloud-case responses were published and reconciled; it is never a pass.
+#    polls for work that does not exist yet — that is the normal beginning of a run. It serves
+#    READY WORK ACROSS BOTH ROLES: approving emergency before normal is a supported ordering, and
+#    a role with nothing published yet is skipped rather than waited on, so neither role's
+#    challenges can expire queued behind the other's. Its exit 0 means all 22 assigned cloud-case
+#    responses were published and reconciled; it is never a pass. If it is restarted, it reconciles
+#    any dispatch already in flight from its own journal and never re-sends a consumed nonce.
 node scripts/staging-ops/policy-commissioning.mjs witness       --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR" &
 
 # 3. Inspect the setup readback and the exact immutable runner code, THEN approve the two
@@ -562,7 +566,9 @@ node scripts/staging-ops/policy-commissioning.mjs witness       --run-id "$RUN_I
 #    in the workflow can produce it.
 node scripts/staging-ops/policy-commissioning.mjs human-tests    --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
 
-# 4. Stop the witness once both actor jobs have finished, then collect and clean up.
+# 4. Stop the witness once both actor jobs have finished, then collect and clean up. Every local
+#    phase — including cleanup and collect — re-measures the named operator (`johnellison`,
+#    #5806135, type User, repository admin) before it can reach the journal or the transport.
 node scripts/staging-ops/policy-commissioning.mjs collect        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
 node scripts/staging-ops/policy-commissioning.mjs cleanup        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
 node scripts/staging-ops/policy-commissioning.mjs check-evidence --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"

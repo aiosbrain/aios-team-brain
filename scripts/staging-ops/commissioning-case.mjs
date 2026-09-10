@@ -275,6 +275,22 @@ export function openCaseStateStore({ dir, runId, attempt, role, now = () => new 
         if (state.halt === true) {
           throw new CaseStateError(`case ${caseId} cannot start: the earlier case ${earlier} halted this actor, and no further mutation runs in this attempt`);
         }
+        /**
+         * A GENUINELY SUCCESSFUL predecessor, not merely a finalized one.
+         *
+         * `finalized` and `halt` were the whole test, and neither covers the state in between:
+         * finalization WRITES the finalized state and then throws for an inconclusive, non-halting
+         * verdict. So a case that recorded `inconclusive` — the provider refused for a reason no
+         * rule explains, or the readback did not show the requested commit — left a finalized,
+         * non-halting record, and the next case started against a ref state nobody had established.
+         * Each case's precondition is the previous case's OUTCOME, so the outcome is what has to
+         * hold.
+         */
+        if (state.record?.passed !== true) {
+          throw new CaseStateError(
+            `case ${caseId} cannot start: the earlier case ${earlier} recorded ${JSON.stringify(String(state.record?.outcome ?? "no outcome"))} rather than its expected result, so this case's preconditions were never established`,
+          );
+        }
       }
       return true;
     },

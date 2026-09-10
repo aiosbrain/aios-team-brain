@@ -1305,7 +1305,25 @@ window or retrying a case.
 
 **An ambiguous mutation is never retried.** A crash after the fsynced marker, a missing or changed
 post-witness, or an unexpected force/delete success stops further actor mutations in that attempt; the
-state machine refuses a second mutation for a case, and a halt is terminal for the whole role.
+state machine refuses a second mutation for a case, and a halt is terminal for the whole role. A case
+may also only begin after its predecessor recorded its EXPECTED OUTCOME — `finalized` is not enough,
+because finalization writes that state and then throws for an inconclusive verdict, which would leave
+the next case measuring against a ref state nobody established.
+
+**The witness serves READY WORK ACROSS ROLES, in each role's own order.** The two protected jobs are
+independent — `emergency` needs only `intent` — so whichever human approves first is the role whose
+challenge appears first, and that is a supported ordering rather than a misuse. A role whose next
+item has no challenge published yet is SKIPPED for this pass, never waited on, so an independently
+approved emergency job cannot starve behind normal's fourteen responses and expire unserved. Per-role
+sequence, once-only nonce consumption, the 180-second lifetime and the approval requirement are
+unchanged; nothing is served out of its own role's order.
+
+**A restart never re-dispatches a nonce.** Before any new measurement or POST, the witness reads its
+own journal for a `dispatch-intent` with no reconciled publication. A dispatch already in flight is
+reconciled against the exact expected artifact through the SAME provenance, byte and binding rules a
+consumer applies — never from a listing row under a matching name — and if the artifact has not
+landed yet the item stays PENDING within its ORIGINAL expiry. Known-pending, measured-absent, refused
+and ambiguous stay four different states; none of them is resolved by dispatching again.
 
 ### Reading the packet
 
@@ -1334,10 +1352,23 @@ cases than the matrix has. Beyond that:
   beside a measurement that contradicts the expectation next to it is not sufficient for anything.
 - **A case is only counted from its own actor's file.** A `passed: true` for a normal-App case sitting
   in the human evidence is not that case's outcome.
-- **The witness transport is counted, not summarised.** Exactly 22 publications, with distinct nonce
-  digests and distinct artifact IDs, each case's pre/post governed fingerprints equal, and both
-  sequencing intervals inside the 90-second bound. Every policy record must carry the bounded pre/post
-  guarantee verbatim; a packet that drops it or restates it as an atomicity claim is `invalid`.
+- **The witness transport is JOINED across four sources, not counted.** Both hash-chained journals
+  are verified — the resource journal AND the separate witness journal — and the exact eleven cloud
+  cases × two directions are then joined across the immutable intent's derived plan, each actor
+  job's own consumed evidence, the resource journal's synthetic graph and the witness journal's
+  observed challenges and reconciled publications. A publication whose case/direction pair is not
+  one of the closed 22 is an invented case; one whose artifact the witness journal does not record
+  reconciling is a claim with no counterparty; one naming no publisher run has no provenance to
+  re-derive. Counting distinct IDs and checking digest SYNTAX is not this, and was what let a
+  packet with invented case names, absent publisher runs and no witness journal at all pass.
+- **Each case's own proof is re-derived, not the first case's.** Per case and per direction the
+  assessment re-runs the same governed projection validator and compares the retained bounded
+  projection against the disposable policy it derives for itself; it re-checks that case's OWN
+  token/installation proof (repository by NUMERIC ID, exactly one reachable repository), that
+  case's OWN measured grants, its manifest and graph bindings, and its pre==post governed digest.
+  A measured interval must be an actual finite number: an absent timing is not a zero one.
+  Every policy record must carry the bounded pre/post guarantee verbatim; a packet that drops it or
+  restates it as an atomicity claim is `invalid`.
 - **Cleanup drift is RECOMPUTED from the two baselines the file carries**, not read from its
   `production_drift`. Different before/after SHAs beside an empty drift list is a measured failure, and
   the "before" baseline must be the one the verified journal recorded at the start of the run.
@@ -1524,6 +1555,20 @@ bounds — and its response can satisfy no actor case.
   at creation — still matches. A body edited at the same ID, name and target is a different policy and
   is left in place for a human. Nothing is ever deleted by wildcard or by prefix sweep, and an owned
   leftover is reported as a cleanup refusal rather than as production drift.
+- **An UNPROVABLE first fingerprint is an ownership gap, never a fresh one.** When a create was
+  durable but its first fingerprint readback failed — a 201 followed by a 503 — the resource is
+  owned and has no measured fingerprint. Measuring it NOW and trusting that value would make a
+  ruleset edited after creation its own evidence of identity, and then delete it. So the current
+  body is proved against the intended policy recomputed from the immutable intent, allowing only
+  provider default expansion and key ordering; if that cannot be proved, an `ownership-unprovable`
+  reconciliation is journalled, the resource is REFUSED and left in place for root, and the run
+  does not claim it left nothing behind. Never make a deletion safe by first trusting the value
+  being deleted.
+- **Cleanup runs under the SAME named-operator admission as every other local phase.** Opening a
+  local session — setup, human tests, cleanup, collect — measures `/user` for the numeric ID, the
+  login, the account type and current repository admin. The identity that created the journal is
+  not evidence about the identity now deleting things, and the operator who ran cleanup is recorded
+  in its evidence so the final assessment can require it.
 - **A crashed cleanup.** Recovery reconciles a pending `cleanup-intent` as well as a pending
   mutation — an interrupted DELETE is the most consequential thing a crashed cleanup leaves behind,
   and it is the one a resumed run most needs read back before deciding anything. Recoveries are

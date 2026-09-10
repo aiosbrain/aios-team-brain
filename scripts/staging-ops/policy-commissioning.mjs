@@ -51,7 +51,26 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, sta
 import path from "node:path";
 import { isDirectEntry as directEntry } from "./direct-entry.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS, verifyEffectiveMainPolicy } from "./main-policy.mjs";
-import { createInstallationToken } from "./release-controller.mjs";
+/**
+ * ⚠️ `release-controller.mjs` is DELIBERATELY NOT IMPORTED AT MODULE SCOPE (F1).
+ *
+ * It eagerly imports `jose`, and this module is the entrypoint for jobs that install NOTHING: the
+ * witness publisher runs with no `npm ci` by design, because the one job whose whole purpose is to
+ * move bytes it did not compute should not carry a dependency tree. A static import here therefore
+ * made the publisher exit 1 with `ERR_MODULE_NOT_FOUND: Cannot find package 'jose'` at module load —
+ * before admission, before envelope validation, before anything could refuse honestly — which
+ * blocked every witness publication including the prerequisite transport rehearsal's response.
+ *
+ * The fix is a LAZY resolution at the one call site that actually exchanges a credential
+ * ({@link mintActorCredential}), not a second token implementation: `createInstallationToken` stays
+ * the only installation-token path and its behaviour is unchanged. The rule this encodes is that
+ * this module's STATIC import closure must remain node built-ins plus dependency-free repository
+ * modules; anything needing a package is resolved inside admitted credential-bearing execution.
+ * `test/staging-policy-commissioning.test.ts` runs the actual fixed publisher command from a clean
+ * archive with no `node_modules`, because a string assertion that the workflow contains no npm
+ * command does not establish this property.
+ */
+const resolveInstallationTokenHelper = async () => (await import("./release-controller.mjs")).createInstallationToken;
 import { acquireJournalLock, assertPrivateDirectory, openJournal, readJournal, writeJournalSnapshot } from "./commissioning-journal.mjs";
 import {
   CHALLENGE_DIRECTIONS, CLOUD_CASE_SEQUENCE, COMMISSION_DOMAIN,
@@ -60,10 +79,11 @@ import {
   nonceDigest, openCaseStateStore, roleForCase,
 } from "./commissioning-case.mjs";
 import {
+  BINDING_FIELDS,
   CHALLENGE_TTL_MS, MAX_ARCHIVE_BYTES, MAX_DISPATCH_ENVELOPE_BYTES, MAX_ENTRY_BYTES,
-  MAX_OBSERVATION_TO_MUTATION_MS, MAX_WITNESS_PROCESS_MS, OWNER_LOGIN,
+  MAX_OBSERVATION_TO_MUTATION_MS, MAX_POLICY_READ_SPAN_MS, MAX_WITNESS_PROCESS_MS, OWNER_LOGIN,
   OWNER_USER_ID, OWNER_USER_TYPE, POLL_INTERVAL_MS, PUBLISHER_DISCOVERY_CEILING, REHEARSAL_JOB_ID,
-  WITNESS_ENTRY_NAME, WITNESS_JOB_ID, WITNESS_MODES,
+  WITNESS_ENTRY_NAME, WITNESS_JOB_ID, WITNESS_MAX_PAGES, WITNESS_MODES, WITNESS_PAGE_SIZE,
   assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
   assertPublisherContext, assertResponseBinding, buildChallenge, buildGovernedSnapshot,
   buildResponse, canonicalHash as witnessCanonicalHash, canonicalJson as witnessCanonicalJson,
@@ -185,6 +205,17 @@ export const PROTECTED_JOBS = Object.freeze([
 ]);
 
 /**
+ * The two NON-PROTECTED transport jobs' DISPLAY names (F11).
+ *
+ * Same reason as {@link PROTECTED_JOBS}: `/jobs` reports the display name, so matching on the job
+ * ID finds nothing and "no job found" would read as a refusal rather than a bug. These exist
+ * because the rehearsal previously admitted itself by COUNTING one non-skipped job, which says
+ * nothing about which job that was. The workflow guard asserts both strings against the YAML.
+ */
+export const WITNESS_JOB_NAME = "Local policy witness publisher (no secrets)";
+export const REHEARSAL_JOB_NAME = "Transport rehearsal (inert, no secrets)";
+
+/**
  * Job statuses that mean "created, and still waiting for a human". `queued`, `in_progress` and
  * `completed` all mean the environment gate has already been passed, which is the thing setup
  * exists to rule out — so they are deliberately NOT in this list.
@@ -201,8 +232,19 @@ export const ALLOWED_MANIFEST_FILES = Object.freeze([MARKER_PATH, MANIFEST_PATH]
 
 const POSITIVE_DECIMAL = /^[1-9][0-9]{0,17}$/;
 const FULL_SHA = /^[0-9a-f]{40}$/;
-const MAX_PAGES = 20;
-const PAGE_SIZE = 100;
+/**
+ * The CANONICAL bounded pagination: at most 10 pages of 100 per endpoint, from ONE definition (F15).
+ *
+ * This build permitted 20 and a test blessed 20, which is not the accepted contract — and a limit
+ * that differs from the one the contract states is not a safety bound, it is a second contract. The
+ * witness module states the same two numbers for its own reads; both are re-exported so the guard
+ * suites assert one pair of values rather than three copies.
+ */
+const MAX_PAGES = WITNESS_MAX_PAGES;
+const PAGE_SIZE = WITNESS_PAGE_SIZE;
+export { WITNESS_MAX_PAGES as MAX_PAGES, WITNESS_PAGE_SIZE as PAGE_SIZE } from "./commissioning-witness.mjs";
+/** The canonical job/process bound the workflow's `timeout-minutes` must equal (F15). */
+export const MAX_JOB_MINUTES = 30;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 2. Typed refusals. The CLI's exit code is a property of the error, not of a call site.
@@ -224,6 +266,34 @@ export class IncompleteEvidence extends Error {
 // ──────────────────────────────────────────────────────────────────────────────
 // 3. Derived names. Every mutable target in the whole harness comes from here.
 // ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE ONE PROVIDER-IDENTIFIER PARSER (F7). Positive integer, or `null`. Never `0`.
+ *
+ * ── WHY A ONE-LINE NULL GUARD WOULD NOT HAVE BEEN ENOUGH ────────────────────────────────────────
+ *
+ * The create paths deliberately persist `id: null` / `number: null` when a response carries no
+ * identity — that is correct, and it is what makes a lost response distinguishable from a refused
+ * one. Recovery then applied `Number(...)`, and `Number(null)` is `0`, which is an INTEGER. So
+ * `Number.isInteger(id)` was true, the discovery branch was skipped, and the two recovery paths did
+ * the two worst things available to them: the ruleset path issued a forbidden `/rulesets/0` with no
+ * provider read behind it, and the pull-request path journalled an OWNED pull request number zero
+ * without making a single provider call. Both are reproduced from the production-shaped intent and
+ * result stream.
+ *
+ * The original create code had the same shape from the other side: it treated ANY integer as an
+ * identity, zero included. So the fix is one parser, used by creation, recovery, unresolved
+ * accounting and cleanup alike — every place an identity is read out of a provider body or a
+ * journal record — and the ABSENCE of an identity is a distinct, preserved state rather than a
+ * number that happens to be falsy.
+ */
+export function positiveProviderId(value) {
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : null;
+  // A decimal STRING is the other shape a provider and a journal both produce. Anything else —
+  // `null`, `undefined`, a float, a negative, `"0"`, `"1e3"`, an object — is an absent identity.
+  if (typeof value === "string" && POSITIVE_DECIMAL.test(value)) return Number(value);
+  return null;
+}
 
 export function assertRunIdentity(runId, attempt) {
   if (!POSITIVE_DECIMAL.test(String(runId ?? ""))) throw new UsageError("--run-id must be a positive decimal GitHub run ID");
@@ -433,7 +503,16 @@ export const ALLOWED_OPERATIONS = Object.freeze([
 
   // ── baseline reads. Production refs and protections are READ here and never written. ─────────
   { id: "read-main-ref", method: "GET", roles: ["local"], path: `/repos/${REPO}/git/ref/heads/main`, body: noBody },
-  { id: "read-staging-ref", method: "GET", roles: ["local"], path: `/repos/${REPO}/git/ref/heads/staging`, body: noBody },
+  {
+    // WIDENED, deliberately and minimally (F3). Every participant in the witness transport has to be
+    // able to resolve the live dispatch branch and compare it to the immutable trusted source: the
+    // canonical requires that check at original dispatch, at local witness dispatch, at publisher
+    // execution and at response consumption, and a role that cannot READ `staging` cannot make it.
+    // This is a fixed read-only GET of one hardcoded ref — it grants no target and no write, and it
+    // is the only admission this correction adds. See {@link assertSourceContinuity}.
+    id: "read-staging-ref", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"],
+    path: `/repos/${REPO}/git/ref/heads/staging`, body: noBody,
+  },
   { id: "read-main-protection", method: "GET", roles: ["local"], path: `/repos/${REPO}/branches/main/protection`, body: noBody },
   { id: "read-main-applicable-rules", method: "GET", roles: ["local"], path: `/repos/${REPO}/rules/branches/main`, body: noBody },
   // PC-07's protection scope is main AND staging: staging is the dispatch branch and the
@@ -896,14 +975,50 @@ export function createTokenTransport({ token, fetchImpl = fetch, timeoutMs = 15_
  */
 export function createArchiveTransport({ token, fetchImpl = fetch, timeoutMs = 20_000, baseUrl = "https://api.github.com", maxBytes = MAX_ARCHIVE_BYTES }) {
   if (!token) throw new UsageError("an archive transport requires a token");
+  /**
+   * Consume the body INCREMENTALLY and abort at the cap (F15).
+   *
+   * `arrayBuffer()` buffers the whole response before anything can be checked, so a missing or
+   * understated `Content-Length` meant the memory/download bound was enforced only AFTER the bytes
+   * had already been received — which is not a bound during receipt, and the declared-length check
+   * in front of it is exactly the value an adversarial or broken sender controls. The declared
+   * length is still refused up front when it is present and too large; the running total is what
+   * actually stops the transfer, and the reader is cancelled rather than drained.
+   */
   const bounded = async (response) => {
     const declared = Number(response.headers?.get?.("content-length") ?? NaN);
     if (Number.isFinite(declared) && declared > maxBytes) {
       throw new IncompleteEvidence(`the witness artifact archive declares ${declared} bytes, beyond the ${maxBytes}-byte bound`);
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length > maxBytes) throw new IncompleteEvidence(`the witness artifact archive is ${buffer.length} bytes, beyond the ${maxBytes}-byte bound`);
-    return buffer;
+    const stream = response.body;
+    if (!stream || typeof stream.getReader !== "function") {
+      // A body with no readable stream (a test double, or a runtime without one). The whole-body
+      // read is still bounded, and it is the fallback rather than the path.
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > maxBytes) throw new IncompleteEvidence(`the witness artifact archive is ${buffer.length} bytes, beyond the ${maxBytes}-byte bound`);
+      return buffer;
+    }
+    const reader = stream.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        received += chunk.length;
+        if (received > maxBytes) {
+          throw new IncompleteEvidence(
+            `the witness artifact archive exceeded the ${maxBytes}-byte bound while being received (${received} bytes read); the download was aborted`,
+          );
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      // Cancel rather than let the remainder arrive: aborting is the point of the bound.
+      try { await reader.cancel(); } catch { /* an already-finished reader has nothing to cancel */ }
+    }
+    return Buffer.concat(chunks, received);
   };
   return async (method, requestPath) => {
     if (method !== "GET") throw new UsageError("the archive transport reads only");
@@ -1020,6 +1135,129 @@ export function assertRunContext(env, { runId, attempt, role }) {
     actor: String(env?.GITHUB_ACTOR ?? "").trim() || null,
     producerIds,
   });
+}
+
+/**
+ * THE ONE PROVIDER-MEASURED SOURCE AND LIFECYCLE CHECK (F3).
+ *
+ * ── THE HOLE THIS CLOSES ────────────────────────────────────────────────────────────────────────
+ *
+ * The canonical contract requires that, at ORIGINAL DISPATCH, at LOCAL WITNESS DISPATCH, at
+ * PUBLISHER EXECUTION and at RESPONSE CONSUMPTION, the harness resolve `staging` and require the
+ * original trusted workflow SHA — and that a measured default branch of `staging` be part of the
+ * repository identity. Nothing in this build did either. The only staging read was inside the
+ * production baseline, which recorded the SHA and never compared it to the trusted source, and
+ * `default_branch` was read by no code at all. A complete run therefore returned NO BLOCKERS on a
+ * fixture whose live staging head (`cccc…`) was a different commit from the workflow SHA it claimed
+ * to have run (`aaaa…`): the source could move after setup, dispatch a DIFFERENT workflow tree, and
+ * nothing would interrupt the attempt.
+ *
+ * The test that used to be called "MOVED source" changed a challenge's declared SHA string. That is
+ * a caller-supplied field. This resolves the LIVE REF through the provider, which is the only thing
+ * a moved branch actually changes.
+ *
+ * ── WHAT IT IS NOT ──────────────────────────────────────────────────────────────────────────────
+ *
+ * It is a bounded read-only comparison at fixed boundaries, not a lock on the branch and not a
+ * continuous watch: a move BETWEEN two boundaries is caught at the next one, which is the same
+ * bounded-window guarantee the pre/post witness pair has, and the evidence says so rather than
+ * implying continuity nobody measured.
+ */
+export async function assertSourceContinuity({ request, expected, label = "this commissioning attempt", mode = "enforce" }) {
+  const repository = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}`);
+  if (repository.status !== 200 || !repository.body) {
+    throw new IncompleteEvidence(`${label}'s repository identity could not be measured (${repository.status})`, { retryable: true });
+  }
+  if (String(repository.body.full_name ?? "") !== COMMISSIONING_REPOSITORY) {
+    throw new AssertionFailure(`${label} is measuring ${JSON.stringify(String(repository.body.full_name ?? ""))}, not the fixed commissioning repository`);
+  }
+  if (expected?.repositoryId !== undefined && expected.repositoryId !== null
+    && Number(repository.body.id) !== Number(expected.repositoryId)) {
+    throw new AssertionFailure(`${label}'s measured repository ID is not the one this attempt is bound to`);
+  }
+  // The DEFAULT BRANCH, measured. The canonical states that GitHub reports staging as the default
+  // branch and that normal reviewed staging merge is what supplies workflow availability; a
+  // repository whose default branch moved is not the configuration this attempt was reviewed for.
+  const defaultBranch = String(repository.body.default_branch ?? "");
+  if (defaultBranch !== branchOf(COMMISSIONING_DISPATCH_REF)) {
+    throw new AssertionFailure(
+      `${label} measured the default branch ${JSON.stringify(defaultBranch || "unreported")}, not ${branchOf(COMMISSIONING_DISPATCH_REF)}`,
+    );
+  }
+  const stagingRef = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/git/ref/heads/staging`);
+  if (stagingRef.status !== 200 || !stagingRef.body?.object?.sha) {
+    throw new IncompleteEvidence(`${label}'s live staging head could not be measured (${stagingRef.status})`, { retryable: true });
+  }
+  const stagingSha = String(stagingRef.body.object.sha);
+  if (!FULL_SHA.test(stagingSha)) throw new IncompleteEvidence(`${label}'s live staging head is not a full commit SHA`);
+  const moved = String(expected?.workflowSha ?? "") !== stagingSha;
+  /**
+   * ── `enforce` STOPS THE ATTEMPT; `observe` RECORDS THE MOVE AND LETS REMEDIATION RUN ──────────
+   *
+   * The canonical's sentence is "movement interrupts the attempt, WITH CLEANUP and root
+   * reconciliation" — so a source move must stop the forward work (setup, witness dispatch,
+   * publisher execution, response consumption) and must NOT stop the phase whose whole job is to
+   * remove what the run created. An enforcing check in every local phase would have made a
+   * legitimate merge to staging mid-window leave the disposable rulesets and refs in place
+   * permanently, with no supported way to remove them: the remedy would have become the casualty.
+   *
+   * `observe` therefore measures and REPORTS the move rather than throwing. Cleanup and collect use
+   * it; their own production-baseline comparison still ends the run as interrupted — after the
+   * owned resources are gone — which is the outcome the canonical asks for.
+   */
+  if (moved && mode === "enforce") {
+    // INTERRUPTED, not failed. Reverting somebody else's legitimate merge is not this harness's
+    // business; stopping and handing the reconciliation to root is.
+    throw new IncompleteEvidence(
+      `${label}'s live staging head (${stagingSha.slice(0, 12)}) is no longer the immutable trusted source this attempt is bound to (${String(expected?.workflowSha ?? "").slice(0, 12)}); the attempt is interrupted and needs cleanup and root reconciliation`,
+      { moved: true, measured_staging_sha: stagingSha, trusted_source_sha: String(expected?.workflowSha ?? "") },
+    );
+  }
+  return Object.freeze({
+    measured: true,
+    mode,
+    moved,
+    repository_id: Number(repository.body.id),
+    repository_full_name: COMMISSIONING_REPOSITORY,
+    default_branch: defaultBranch,
+    staging_sha: stagingSha,
+    trusted_source_sha: String(expected?.workflowSha ?? ""),
+    // The bound this check does and does not carry, stated where it is recorded.
+    guarantee: "the live dispatch branch equalled the immutable trusted source AT THIS BOUNDARY; movement between boundaries is caught at the next one",
+  });
+}
+
+/**
+ * The provider's own state for ONE named job in THIS attempt (F11).
+ *
+ * Extracted from {@link assertActorJobActive} so the rehearsal stops admitting itself by COUNTING
+ * one non-skipped job — a count says nothing about WHICH job ran, and the rehearsal's whole claim is
+ * that the exact reviewed `transport-rehearsal` job is the one active in a rehearsal source run.
+ */
+export async function assertNamedJobActive({ request, runId, attempt, jobName, label, allowCompleted = false }) {
+  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
+  if (jobs.status !== 200 || !Array.isArray(jobs.body?.jobs)) throw new IncompleteEvidence(`the ${label} job's state could not be measured`, { retryable: true });
+  const rows = jobs.body.jobs;
+  if (Number(jobs.body.total_count ?? rows.length) > rows.length) {
+    throw new IncompleteEvidence(`the ${label} run's job list is paginated beyond the first page; its job states are unmeasured`);
+  }
+  const job = rows.find((entry) => String(entry?.name ?? "") === jobName);
+  if (!job) throw new IncompleteEvidence(`the ${label} job has not been created in this attempt`, { retryable: true });
+  const active = ["in_progress", "queued"].includes(String(job.status));
+  const completed = allowCompleted && String(job.status) === "completed";
+  if (!active && !completed) {
+    throw new AssertionFailure(`the ${label} job is ${String(job.status)}; a witness response is served only to a job that is actually running this attempt`);
+  }
+  // EXCLUSIVITY where the mode demands it: every OTHER job in the run must have been skipped.
+  const executed = rows.filter((entry) => String(entry?.conclusion ?? "") !== "skipped");
+  return {
+    job_id: positiveProviderId(job.id),
+    job_name: jobName,
+    job_status: String(job.status),
+    job_conclusion: job.conclusion === undefined ? null : String(job.conclusion ?? "none"),
+    job_run_attempt: positiveProviderId(job.run_attempt),
+    executed_job_names: executed.map((entry) => String(entry?.name ?? "")).sort(),
+  };
 }
 
 /**
@@ -1723,10 +1961,48 @@ export async function assertSyntheticPullTarget({ request, ctx, pull, graphShas 
 }
 
 /**
+ * The LOCAL-HUMAN actor roles this direct path may execute (F14).
+ *
+ * Cloud actors are absent by NAME, not by a conditional at a call site, because the alternate path
+ * is the whole finding: the fixed CLI phases correctly route a cloud case through the staged
+ * `prepare → await-and-execute → await-and-finalize` machinery — role/job admission, a fresh
+ * witness, a just-in-time token with its own proof, a durable mutation-used marker — while these
+ * older exported functions still accepted a normal or emergency case and issued the mutation with
+ * none of it. A direct exported emergency case returned `accepted` with ZERO witness artifacts.
+ *
+ * That is not a claim that importing a function grants credentials. It is a second, supported cloud
+ * mutation implementation in a harness whose accepted internal-helper contract says cloud actors
+ * use the admitted staged execution — and two implementations of the same mutation is exactly the
+ * maintenance hazard that lets one of them quietly stop matching the reviewed one.
+ */
+export const DIRECT_EXECUTION_ACTORS = Object.freeze(["human"]);
+
+/**
+ * Refuse a cloud actor BEFORE a request, a credential or a journal write (F14).
+ *
+ * The legitimate caller of the direct path is the local human phase, which measures the policy
+ * directly under admin and needs no witness at all.
+ */
+export function assertDirectExecutionAdmitted(kase, ctx) {
+  if (!DIRECT_EXECUTION_ACTORS.includes(String(kase?.actor))) {
+    throw new UsageError(
+      `the ${String(kase?.actor)} actor may not execute directly: a cloud actor case runs only through the admitted staged path (prepare → await-and-execute → await-and-finalize), which binds a fresh witness, a role/job admission and a durable once-only mutation marker`,
+    );
+  }
+  if (String(ctx?.role ?? "") !== "local") {
+    throw new UsageError(`direct case execution runs only in the verified local operator's process, not as ${JSON.stringify(String(ctx?.role ?? ""))}`);
+  }
+  return true;
+}
+
+/**
  * Execute one case: measure before, refuse a no-op, journal INTENT, issue exactly one request,
  * journal the RESULT, measure after independently, then classify. Never retries a mutation.
+ *
+ * LOCAL-HUMAN CASES ONLY — see {@link assertDirectExecutionAdmitted}.
  */
 export async function runActorCase({ request, kase, ctx, graphShas, journal, pull = null }) {
+  assertDirectExecutionAdmitted(kase, ctx);
   const ref = derivedRef(ctx.runId, ctx.attempt, kase.ref);
   const beforeSha = await readDerivedRefSha({ request, ref });
   assertCasePrecondition(kase, { beforeSha, graphShas });
@@ -1779,6 +2055,9 @@ export async function runActorCase({ request, kase, ctx, graphShas, journal, pul
  * actions with a credential that has just been shown to be over-privileged.
  */
 export async function runActorCases({ request, actor, ctx, graphShas, journal, pull = null }) {
+  if (!DIRECT_EXECUTION_ACTORS.includes(String(actor))) {
+    throw new UsageError(`the ${String(actor)} actor's cases run only through the admitted staged cloud path, never through direct execution`);
+  }
   const records = [];
   let halted = null;
   for (const kase of casesForActor(actor)) {
@@ -2002,53 +2281,141 @@ const closedResult = ({ runId, attempt, phase, status, evidencePath, extra = {} 
   phase, status, evidence_path: evidencePath, ...extra,
 });
 
+export const CHECK_EXPECTATIONS = Object.freeze([
+  "irrelevant", "none", "all-green-expected-producer",
+  "one-required-check-absent", "one-required-check-failed", "all-green-wrong-producer",
+]);
+
+/**
+ * THE ONE CHECK-STATE EVALUATOR (F12). Runtime and offline both call it, and neither has its own.
+ *
+ * ── WHY THIS IS AN EXTRACTION RATHER THAN A NEW LAYER ───────────────────────────────────────────
+ *
+ * This ladder existed TWICE: once in {@link assertCheckState}, which measures the rows, and once in
+ * {@link recomputeCheckState}, which judges a recorded measurement offline. Two copies of a rule are
+ * two rules, and they had already drifted in the way that mattered least visibly and most: NEITHER
+ * required the failing check to come from the expected producer. So a `failure` published by the
+ * Actions App, with every other context green from the normal App, satisfied
+ * `one-required-check-failed` — and the denial that followed could equally be explained by the
+ * expected producer being ABSENT, which is a different case that this run tests separately. The
+ * red, missing and wrong-producer cases have to stay independently falsifiable or none of the three
+ * proves anything.
+ *
+ * `rows` is the normalised per-context measurement: `{ ordinal, name, present, status, conclusion,
+ * app_id, duplicates }`. Returns the reasons the measurement does not satisfy `expectation`; empty
+ * means it does.
+ */
+export function evaluateCheckState(rows, { runId, attempt, expectation, normalAppId }) {
+  if (!CHECK_EXPECTATIONS.includes(String(expectation))) {
+    return [`declares the unknown check expectation ${JSON.stringify(String(expectation))}`];
+  }
+  if (expectation === "irrelevant") return [];
+  const problems = [];
+  const contexts = derivedContextNames(runId, attempt);
+  const byOrdinal = new Map((Array.isArray(rows) ? rows : []).map((row) => [Number(row?.ordinal), row]));
+  for (const [ordinal, name] of contexts.entries()) {
+    const row = byOrdinal.get(ordinal);
+    if (!row) { problems.push(`has no measurement for context ordinal ${ordinal}`); continue; }
+    if (String(row.name) !== name) problems.push(`names ${JSON.stringify(String(row.name ?? ""))} at context ordinal ${ordinal}`);
+    // A duplicate listing is not a detail: a name map lets the LAST row decide, so two rows for one
+    // context mean the verdict depends on listing order. That is unmeasurable, not merely untidy.
+    if (Number(row.duplicates ?? 1) !== 1) problems.push(`measured ${Number(row.duplicates ?? 1)} check runs for context ordinal ${ordinal}; a duplicate listing makes the state ambiguous`);
+  }
+  const last = contexts.length - 1;
+  /** A context is green only when it is COMPLETED, SUCCESS and — when named — from that producer. */
+  const green = (ordinal, producer) => {
+    const row = byOrdinal.get(ordinal);
+    return Boolean(row?.present) && String(row?.status) === "completed" && String(row?.conclusion) === "success"
+      && (producer === undefined || Number(row?.app_id) === Number(producer));
+  };
+  /** A context is a genuine red only when it is COMPLETED, FAILURE and from the EXPECTED producer. */
+  const redFromExpectedProducer = (ordinal, producer) => {
+    const row = byOrdinal.get(ordinal);
+    return Boolean(row?.present) && String(row?.status) === "completed" && String(row?.conclusion) === "failure"
+      && Number(row?.app_id) === Number(producer);
+  };
+  const allButLast = [...contexts.keys()].filter((ordinal) => ordinal !== last);
+  if (expectation === "none") {
+    const present = [...byOrdinal.values()].filter((row) => row?.present);
+    if (present.length) problems.push(`measured ${present.length} TEST-ONLY check(s) where the case requires none`);
+  } else if (expectation === "all-green-expected-producer") {
+    if (![...contexts.keys()].every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure every required context green from the expected producer");
+  } else if (expectation === "one-required-check-absent") {
+    if (byOrdinal.get(last)?.present) problems.push("measured the context the case requires to be absent as present");
+    if (!allButLast.every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure the remaining contexts green from the expected producer");
+  } else if (expectation === "one-required-check-failed") {
+    // BOTH halves. A failure from the wrong producer is the missing-check case wearing a red badge.
+    if (!redFromExpectedProducer(last, normalAppId)) {
+      problems.push("did not measure the context the case requires to have failed as a completed failure FROM THE EXPECTED PRODUCER");
+    }
+    if (!allButLast.every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure the remaining contexts green from the expected producer");
+  } else if (expectation === "all-green-wrong-producer") {
+    if (![...contexts.keys()].every((ordinal) => green(ordinal))) problems.push("did not measure every required context green");
+    if ([...byOrdinal.values()].some((row) => Number(row?.app_id) === Number(normalAppId))) {
+      problems.push("measured the expected producer publishing here, so a denial would not isolate the producer mismatch");
+    }
+  }
+  return problems;
+}
+
+/**
+ * Read a synthetic commit's TEST-ONLY check runs to COMPLETION, bounded (F12/F15).
+ *
+ * The endpoint answers `{ total_count, check_runs }` rather than a bare array, so it cannot go
+ * through {@link readAllPages} — and a single `per_page=100` read was silently treating "the first
+ * hundred" as "all of them". A listing this build cannot see the end of is incomplete evidence, not
+ * a measurement with a caveat.
+ */
+export async function readCheckRuns({ request, headSha }) {
+  const rows = [];
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const response = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/commits/${headSha}/check-runs?per_page=${PAGE_SIZE}&page=${page}`);
+    if (response.status !== 200 || !response.body) throw new IncompleteEvidence(`the check state of ${String(headSha).slice(0, 12)} could not be measured (${response.status})`);
+    const batch = Array.isArray(response.body.check_runs) ? response.body.check_runs : null;
+    if (!batch) throw new IncompleteEvidence(`the check listing for ${String(headSha).slice(0, 12)} is not the documented shape`);
+    rows.push(...batch);
+    const total = Number(response.body.total_count);
+    if (Number.isFinite(total) && rows.length >= total) return rows;
+    if (batch.length < PAGE_SIZE) return rows;
+    if (page === MAX_PAGES) throw new IncompleteEvidence(`the check listing for ${String(headSha).slice(0, 12)} exceeded ${MAX_PAGES} pages; the measurement is incomplete`);
+  }
+  throw new IncompleteEvidence(`the check listing for ${String(headSha).slice(0, 12)} did not terminate within ${MAX_PAGES} pages`);
+}
+
 /** Assert the observed TEST-ONLY check state on a synthetic commit MATCHES what the case claims. */
 export async function assertCheckState({ request, headSha, expectation, ctx }) {
   if (expectation === "irrelevant") return { expectation, measured: false };
-  const response = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/commits/${headSha}/check-runs?per_page=${PAGE_SIZE}`);
-  if (response.status !== 200 || !response.body) throw new IncompleteEvidence(`the check state of ${headSha.slice(0, 12)} could not be measured (${response.status})`);
+  if (!CHECK_EXPECTATIONS.includes(String(expectation))) throw new UsageError(`unknown declared check state ${JSON.stringify(String(expectation))}`);
+  const listing = await readCheckRuns({ request, headSha });
   const contexts = derivedContextNames(ctx.runId, ctx.attempt);
-  const runs = (response.body.check_runs ?? []).filter((run) => contexts.includes(run?.name));
-  const byName = new Map(runs.map((run) => [run.name, run]));
-  const last = contexts.length - 1;
-  const green = (name, producer) => {
-    const run = byName.get(name);
-    return run?.status === "completed" && run?.conclusion === "success" && (producer === undefined || Number(run?.app?.id) === producer);
-  };
-  const producers = [...new Set(runs.map((run) => Number(run?.app?.id)).filter(Number.isInteger))];
-  const fail = (why) => { throw new IncompleteEvidence(`the case's declared check state is not yet in place (${why}); this case cannot be measured`); };
-  if (expectation === "none") {
-    if (runs.length) fail("TEST-ONLY checks are present where the case requires none");
-  } else if (expectation === "all-green-expected-producer") {
-    if (!contexts.every((name) => green(name, ctx.normalAppId))) fail("not every required TEST-ONLY context is green from the expected producer");
-  } else if (expectation === "one-required-check-absent") {
-    if (byName.has(contexts[last])) fail("the context the case requires to be absent is present");
-    if (!contexts.slice(0, last).every((name) => green(name, ctx.normalAppId))) fail("the remaining contexts are not green from the expected producer");
-  } else if (expectation === "one-required-check-failed") {
-    if (byName.get(contexts[last])?.conclusion !== "failure") fail("the context the case requires to have failed is not a completed failure");
-    if (!contexts.slice(0, last).every((name) => green(name, ctx.normalAppId))) fail("the remaining contexts are not green from the expected producer");
-  } else if (expectation === "all-green-wrong-producer") {
-    if (!contexts.every((name) => green(name))) fail("not every required TEST-ONLY context is green");
-    if (producers.includes(ctx.normalAppId)) fail("the expected producer also published here, so a denial would not isolate the producer mismatch");
-  } else {
-    throw new UsageError(`unknown declared check state ${JSON.stringify(String(expectation))}`);
+  const runs = listing.filter((run) => contexts.includes(run?.name));
+  // The per-context rows, INCLUDING how many runs carried each name — the input the one evaluator
+  // takes, and the same shape the offline gate reconstructs from the record.
+  const rows = contexts.map((name, ordinal) => {
+    const matching = runs.filter((run) => String(run?.name) === name);
+    const run = matching[0];
+    return {
+      ordinal, name,
+      present: matching.length > 0,
+      status: run ? String(run.status ?? "") : null,
+      conclusion: run ? String(run.conclusion ?? "") : null,
+      app_id: run && Number.isInteger(Number(run?.app?.id)) ? Number(run.app.id) : null,
+      duplicates: matching.length === 0 ? 1 : matching.length,
+    };
+  });
+  const problems = evaluateCheckState(rows, { runId: ctx.runId, attempt: ctx.attempt, expectation, normalAppId: ctx.normalAppId });
+  if (problems.length) {
+    throw new IncompleteEvidence(`the case's declared check state is not yet in place (${problems.join("; ")}); this case cannot be measured`);
   }
   return {
-    expectation, measured: true, producers, present: runs.length,
+    expectation, measured: true,
+    producers: [...new Set(runs.map((run) => Number(run?.app?.id)).filter(Number.isInteger))],
+    present: runs.length,
     head_sha: String(headSha),
     // The PER-CONTEXT measurement, not just a count and a boolean (F3). The offline completeness
-    // gate recomputes the declared expectation from exactly these rows, so `measured: true` next to
-    // a contradictory expectation is no longer sufficient for anything.
-    contexts: contexts.map((name, ordinal) => {
-      const run = byName.get(name);
-      return {
-        ordinal, name,
-        present: Boolean(run),
-        status: run ? String(run.status ?? "") : null,
-        conclusion: run ? String(run.conclusion ?? "") : null,
-        app_id: run && Number.isInteger(Number(run?.app?.id)) ? Number(run.app.id) : null,
-      };
-    }),
+    // gate recomputes the declared expectation from exactly these rows through the SAME evaluator,
+    // so `measured: true` next to a contradictory expectation is not sufficient for anything.
+    contexts: rows,
   };
 }
 
@@ -2060,7 +2427,7 @@ export async function assertCheckState({ request, headSha, expectation, ctx }) {
  * expectation next to it — so a record could claim `all-green-expected-producer` while its
  * measurement showed nothing green, and the case still counted.
  */
-export function recomputeCheckState(state, { runId, attempt, expectation, normalAppId }) {
+export function recomputeCheckState(state, { runId, attempt, expectation, normalAppId, headSha = null }) {
   const problems = [];
   if (expectation === "irrelevant") {
     if (state && state.measured === true) problems.push("records a measured check state for a case whose checks are irrelevant");
@@ -2069,41 +2436,24 @@ export function recomputeCheckState(state, { runId, attempt, expectation, normal
   if (!state || typeof state !== "object") return ["carries no check-state measurement"];
   if (String(state.expectation) !== String(expectation)) problems.push(`claims the check expectation ${JSON.stringify(String(state.expectation ?? ""))}`);
   if (state.measured !== true) return [...problems, "does not record that its declared check state was measured before the mutation"];
+  /**
+   * THE EXACT COMMIT THE CHECK STATE WAS MEASURED ON.
+   *
+   * A per-context measurement is only about a case if it was taken on the commit that case
+   * requested. Without this, a record could carry a perfectly consistent green measurement of some
+   * OTHER synthetic commit — the four `N*` nodes deliberately have different check states, which is
+   * precisely what makes the missing/red/wrong-producer cases separable — and satisfy this gate.
+   */
+  if (headSha !== null && String(state.head_sha ?? "") !== String(headSha)) {
+    problems.push(`records a check state measured on ${JSON.stringify(String(state.head_sha ?? "no commit"))} rather than on the commit this case requested`);
+  }
   const contexts = derivedContextNames(runId, attempt);
   const rows = Array.isArray(state.contexts) ? state.contexts : null;
   if (!rows) return [...problems, "carries no per-context check measurement to recompute from"];
   if (rows.length !== contexts.length) problems.push(`measured ${rows.length} of ${contexts.length} required contexts`);
-  const byOrdinal = new Map(rows.map((row) => [Number(row?.ordinal), row]));
-  for (const [ordinal, name] of contexts.entries()) {
-    const row = byOrdinal.get(ordinal);
-    if (!row) { problems.push(`has no measurement for context ordinal ${ordinal}`); continue; }
-    if (String(row.name) !== name) problems.push(`names ${JSON.stringify(String(row.name ?? ""))} at context ordinal ${ordinal}`);
-  }
-  const last = contexts.length - 1;
-  const green = (ordinal, producer) => {
-    const row = byOrdinal.get(ordinal);
-    return Boolean(row?.present) && String(row?.status) === "completed" && String(row?.conclusion) === "success"
-      && (producer === undefined || Number(row?.app_id) === Number(producer));
-  };
-  const allButLast = [...contexts.keys()].filter((ordinal) => ordinal !== last);
-  if (expectation === "none") {
-    const present = rows.filter((row) => row?.present);
-    if (present.length) problems.push(`measured ${present.length} TEST-ONLY check(s) where the case requires none`);
-  } else if (expectation === "all-green-expected-producer") {
-    if (![...contexts.keys()].every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure every required context green from the expected producer");
-  } else if (expectation === "one-required-check-absent") {
-    if (byOrdinal.get(last)?.present) problems.push("measured the context the case requires to be absent as present");
-    if (!allButLast.every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure the remaining contexts green from the expected producer");
-  } else if (expectation === "one-required-check-failed") {
-    if (String(byOrdinal.get(last)?.conclusion ?? "") !== "failure") problems.push("did not measure the context the case requires to have failed as a completed failure");
-    if (!allButLast.every((ordinal) => green(ordinal, normalAppId))) problems.push("did not measure the remaining contexts green from the expected producer");
-  } else if (expectation === "all-green-wrong-producer") {
-    if (![...contexts.keys()].every((ordinal) => green(ordinal))) problems.push("did not measure every required context green");
-    if (rows.some((row) => Number(row?.app_id) === Number(normalAppId))) problems.push("measured the expected producer publishing here, so a denial would not isolate the producer mismatch");
-  } else {
-    problems.push(`declares the unknown check expectation ${JSON.stringify(String(expectation))}`);
-  }
-  return problems;
+  // THE SAME EVALUATOR the runtime measurement used. The record supplies the rows; the rule lives in
+  // exactly one place, so the producer/status semantics cannot drift between the two paths again.
+  return [...problems, ...evaluateCheckState(rows, { runId, attempt, expectation, normalAppId })];
 }
 
 /**
@@ -2164,7 +2514,7 @@ export function derivedRulesetNames(runId, attempt) {
  * the provider's own record of the run. The intent file is evidence, not authority: every field it
  * carries is either derived independently here or checked against the provider.
  */
-export async function localContext({ request, runId, attempt, evidenceDir, env }) {
+export async function localContext({ request, runId, attempt, evidenceDir, env, sourceContinuity = "enforce" }) {
   const intent = readEvidenceFile(evidenceDir, evidenceSlug(runId, attempt, "intent"));
   if (!intent) throw new IncompleteEvidence("the run's intent artifact is not in the evidence directory; download it before local setup");
   if (intent.schema_version !== RESULT_SCHEMA_VERSION || intent.repository !== COMMISSIONING_REPOSITORY) throw new AssertionFailure("the intent artifact is not this harness's");
@@ -2176,9 +2526,13 @@ export async function localContext({ request, runId, attempt, evidenceDir, env }
   if (canonicalHash(producerIds) !== intent.producer_ids_hash) {
     throw new AssertionFailure("the local production producer map is not the one the intent job measured");
   }
-  const repository = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}`);
-  if (repository.status !== 200 || !repository.body) throw new IncompleteEvidence("the repository identity could not be measured locally");
-  if (Number(repository.body.id) !== Number(intent.repository_id)) throw new AssertionFailure("the measured repository ID is not the one the intent job recorded");
+  // THE SHARED SOURCE CONTINUITY CHECK (F3), at the local boundary: repository identity, measured
+  // default branch, and the live staging head still equal to the immutable trusted source. Every
+  // other boundary calls the same function.
+  const continuity = await assertSourceContinuity({
+    request, label: "local commissioning administration", mode: sourceContinuity,
+    expected: { repositoryId: Number(intent.repository_id), workflowSha: String(intent.workflow_sha) },
+  });
   const attemptRun = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}`);
   if (attemptRun.status !== 200 || !attemptRun.body) throw new IncompleteEvidence("the workflow run attempt could not be measured locally");
   if (String(attemptRun.body.head_sha) !== String(intent.workflow_sha)) throw new AssertionFailure("the run's head SHA is not the immutable SHA the intent job recorded");
@@ -2199,13 +2553,14 @@ export async function localContext({ request, runId, attempt, evidenceDir, env }
      */
     remeasuredIntent: Object.freeze({
       confirmed: true,
-      measured_repository_id: Number(repository.body.id),
+      measured_repository_id: continuity.repository_id,
       measured_head_sha: String(attemptRun.body.head_sha),
       measured_workflow_path: String(attemptRun.body.path),
       measured_event: String(attemptRun.body.event),
       measured_head_branch: String(attemptRun.body.head_branch ?? ""),
       matches_intent: true,
     }),
+    sourceContinuity: continuity,
   });
 }
 
@@ -2365,20 +2720,36 @@ export async function measureProductionBaseline({ request, excludeRulesetIds = n
   };
 }
 
-/** A collision refuses. It never adopts a resource it did not create, and never deletes one. */
+/**
+ * A collision refuses. It never adopts a resource it did not create, and never deletes one.
+ *
+ * ── COMPLETE INVENTORY, NOT PAGE ONE (F13) ──────────────────────────────────────────────────────
+ *
+ * This read page 1 directly instead of using the bounded complete-pagination helper beside it. With
+ * a hundred unrelated rulesets on page 1 and a conflicting exact derived name on page 2, it
+ * returned true and setup POSTed a SECOND ruleset under the same name — which undermines precisely
+ * the unique run-owned namespace that lost-response adoption relies on to know a resource is ours.
+ *
+ * {@link readAllPages} is the same pagination semantics recovery uses, and it treats a full
+ * terminal page as INCOMPLETE rather than as proof of the end: absence has to be proved over a
+ * complete bounded inventory before anything is created, and "I saw no collision in the part I
+ * read" is not that proof.
+ */
 export async function assertNoCollision({ request, ctx }) {
   for (const suffix of REF_SUFFIXES) {
     const ref = derivedRef(ctx.runId, ctx.attempt, suffix);
     const existing = await readDerivedRefSha({ request, ref });
     if (existing) throw new AssertionFailure(`${ref} already exists; commissioning refuses to adopt or delete a resource it did not create`);
   }
-  const rulesets = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets?per_page=${PAGE_SIZE}&page=1`);
-  if (rulesets.status !== 200 || !Array.isArray(rulesets.body)) throw new IncompleteEvidence("the repository ruleset inventory could not be measured for collision");
+  const inventory = await readAllPages({
+    request, endpoint: `/repos/${COMMISSIONING_REPOSITORY}/rulesets`,
+    label: "the repository ruleset inventory (collision check)",
+  });
   const derived = new Set(Object.values(derivedRulesetNames(ctx.runId, ctx.attempt)).flat());
-  for (const ruleset of rulesets.body) {
+  for (const ruleset of inventory) {
     if (derived.has(String(ruleset?.name))) throw new AssertionFailure(`a ruleset named ${String(ruleset.name)} already exists; commissioning refuses to adopt it`);
   }
-  return true;
+  return { measured: true, inventory_size: inventory.length };
 }
 
 /** The disposable rulesets this run intends to create, per actor, with their canonical digests. */
@@ -2400,10 +2771,18 @@ const journaledFingerprints = (records) => new Map(
     .map((record) => [`${record.data?.kind}:${record.data?.key}`, String(record.data?.governed_fingerprint ?? "")]),
 );
 
-/** Every reconciliation this run has already recorded, keyed the same way as the intents. */
+/**
+ * Every reconciliation this run has already recorded, keyed the same way as the intents.
+ *
+ * ⚠️ The key is `record.data.key` AS WRITTEN (F7). `reconcileCreateIntents` writes `key: pending.key`
+ * and `pending.key` is ALREADY an {@link intentKey} — `ruleset:<name>` — so composing
+ * `${kind}:${key}` here recorded every reconciliation under `ruleset:ruleset:<name>` and no lookup
+ * ever found one. A reconciliation nobody can find is a reconciliation that gets performed again,
+ * which is the opposite of what the record exists to prevent.
+ */
 const journaledReconciliations = (records) => new Map(
-  records.filter((record) => record.type === "reconciliation")
-    .map((record) => [`${record.data?.kind}:${record.data?.key}`, record.data]),
+  records.filter((record) => record.type === "reconciliation" && typeof record.data?.key === "string")
+    .map((record) => [String(record.data.key), record.data]),
 );
 
 /** The stable key a create intent, its result and its resource record all agree about. */
@@ -2423,12 +2802,32 @@ export function intentKey(data) {
  * that existed, was owned, and appeared in the journal only as a name — so the next setup saw no
  * `resource-created` for it and POSTed a SECOND one, and cleanup could account for neither.
  *
- * Three states are distinguished, because they need three different actions:
- *  - `resource-created` present → resolved, nothing to do.
- *  - `mutation-result` present with an identity → the response WAS seen; adopt that exact identity.
- *  - neither → the response was lost; reconcile by a bounded provider readback of this exact intent,
- *    and never by re-issuing the POST or by matching a name prefix.
+ * ── THE STATES, AND WHY "A RESULT EXISTS" IS NOT ONE OF THEM (F7) ───────────────────────────────
+ *
+ * This used to mark ANY result object `result-seen`, and downstream accounting counted only
+ * `response-lost`. So a create whose response arrived carrying NO USABLE IDENTITY — a 201 whose
+ * body had no `id`, or an ambiguous transport result at status 0 — was silently treated as
+ * resolved: not counted as unresolved, not reconciled, and not created. The most consequential
+ * possible state, "something may exist and we cannot name it", was the one state that produced no
+ * action at all.
+ *
+ * Five states now, each with a different required action, and every identity read through the ONE
+ * {@link positiveProviderId} parser so an absent identity can never arrive as `0`:
+ *
+ *  - `created`            — a `resource-created` record exists. Resolved; excluded from the list.
+ *  - `reconciled`         — a bounded readback already established the outcome. Replayed, not redone.
+ *  - `identified`         — a result carrying a POSITIVE provider identity. Adopt that exact identity.
+ *  - `refused`            — a result with a measured non-2xx status and no identity. Nothing was
+ *                           created; safe to recreate, and NOT an unaccounted resource.
+ *  - `response-ambiguous` — a result with no usable identity whose status is 2xx or a transport
+ *                           failure (0). Something may exist. Reconcile by readback; never re-POST.
+ *  - `response-lost`      — no result at all. Same treatment as ambiguous, different cause.
+ *
+ * `unresolved` below is the set that BLOCKS: everything except `created`, `reconciled` and
+ * `refused`. A packet cannot be complete while one of them stands.
  */
+export const RESOLVED_INTENT_STATES = Object.freeze(["created", "reconciled", "refused"]);
+
 export function unresolvedCreateIntents(records) {
   const created = new Set(records.filter((r) => r.type === "resource-created").map((r) => intentKey(r.data)));
   const results = new Map(records.filter((r) => r.type === "mutation-result" && r.data?.kind).map((r) => [intentKey(r.data), r.data]));
@@ -2440,15 +2839,30 @@ export function unresolvedCreateIntents(records) {
     const key = intentKey(record.data);
     if (created.has(key)) continue;
     const result = results.get(key) ?? null;
+    const identity = result ? (positiveProviderId(result.id) ?? positiveProviderId(result.number)) : null;
+    const status = result ? Number(result.status) : null;
+    let state;
+    if (reconciled.has(key)) state = "reconciled";
+    else if (!result) state = "response-lost";
+    else if (identity !== null) state = "identified";
+    // A ref create carries no identity of its own — its identity IS its name — so a measured 2xx
+    // for a ref is `identified` by the ref it named rather than by a number it never returns.
+    else if (record.data?.kind === "ref" && Number.isFinite(status) && status >= 200 && status < 300) state = "identified";
+    else if (Number.isFinite(status) && status !== 0 && (status < 200 || status >= 300)) state = "refused";
+    else state = "response-ambiguous";
     out.push({
-      key, seq: record.seq, intent: record.data,
-      result,
+      key, seq: record.seq, intent: record.data, result,
+      identity,
       reconciliation: reconciled.get(key) ?? null,
-      state: result ? "result-seen" : (reconciled.has(key) ? "reconciled" : "response-lost"),
+      state,
+      unresolved: !RESOLVED_INTENT_STATES.includes(state),
     });
   }
   return out;
 }
+
+/** The intents that BLOCK a complete packet: everything created, reconciled or refused is settled. */
+export const blockingCreateIntents = (records) => unresolvedCreateIntents(records).filter((entry) => entry.unresolved);
 
 /** Create the synthetic graph, resuming from whatever the verified journal already recorded. */
 export async function createSyntheticGraph({ request, ctx, journal, guardCtx, manifestInputs }) {
@@ -2535,6 +2949,49 @@ export function governedFingerprint(ruleset) {
 }
 
 /**
+ * Can the CURRENT body be proved to be the INTENDED one? (F8)
+ *
+ * ── THE UNSAFE MOVE THIS REPLACES ───────────────────────────────────────────────────────────────
+ *
+ * When a create was durable but the first fingerprint GET failed — a 201 followed by a 503 — resume
+ * and cleanup both simply MEASURED the current body and installed that value as the ownership
+ * fingerprint, having checked only the name and one include ref. A ruleset edited after creation
+ * therefore became its own evidence of identity and was deleted: the reproduction empties a
+ * ruleset's rules from exactly that journal prefix and cleanup removes it. (The simulated run later
+ * notices unrelated inventory drift, but the changed ruleset is already gone; a later refusal does
+ * not undo an unsafe ownership decision.)
+ *
+ * A new current fingerprint cannot establish that a previously UNMEASURED body was unchanged. What
+ * can is the INDEPENDENTLY RETAINED intended policy: the disposable body is recomputed from the
+ * immutable intent (`buildDisposablePlan`), and the provider's governed body must equal it under
+ * the SAME strict contract used everywhere else — byte-equal, or different only by provider default
+ * expansion and key ordering. Anything else is an explicit OWNERSHIP GAP for root reconciliation.
+ *
+ * Never make a deletion safe by first trusting the value being deleted.
+ */
+export function proveIntendedOwnership({ measured, intended }) {
+  if (!measured || typeof measured !== "object") return { provable: false, reason: "the provider returned no measurable body", differences: [] };
+  if (!intended || typeof intended !== "object") {
+    return { provable: false, reason: "this run retains no independently derived intended body to compare against", differences: [] };
+  }
+  const differences = [];
+  let normalizationOnly = true;
+  for (const field of GOVERNED_RULESET_FIELDS) {
+    const comparison = compareToDesired(measured[field] ?? null, intended[field] ?? null);
+    if (comparison.byteEqual) continue;
+    if (!comparison.normalizationOnly) normalizationOnly = false;
+    for (const entry of comparison.differences.slice(0, 8)) differences.push({ path: `${field}${entry.path}`, kind: entry.kind });
+  }
+  if (!differences.length) return { provable: true, reason: null, differences: [], basis: "byte-equal-to-the-intended-governed-body" };
+  if (normalizationOnly) return { provable: true, reason: null, differences: differences.slice(0, 8), basis: "equal-to-the-intended-governed-body-modulo-provider-default-expansion" };
+  return {
+    provable: false,
+    reason: `the provider's governed body differs from the intended one in ${differences.length} way(s) that provider normalization does not explain`,
+    differences: differences.slice(0, 8),
+  };
+}
+
+/**
  * Create the disposable rulesets — with the CREATE RESULT journaled before any further fallible read.
  *
  * ORDER IS THE WHOLE CORRECTION (F5). Previously: intent → POST → **GET** → journal the identity. A
@@ -2567,31 +3024,43 @@ export async function createDisposableRulesets({ request, journal, plan, guardCt
         const recorded = fingerprints.get(`ruleset:${entry.name}`);
         if (recorded === undefined) {
           // The create was journaled but its fingerprint never was — a crash between the two steps.
-          // Measuring it NOW is the bounded reconciliation, and it is recorded as such rather than
-          // backdated: the fingerprint's own event says when it was measured.
+          // The bounded reconciliation is NOT "measure it now and trust that" (F8): the body is
+          // proved against the independently retained intended policy first, and an unprovable body
+          // becomes an explicit ownership gap rather than a fingerprint.
+          const proof = proveIntendedOwnership({ measured: detail.body, intended: entry.body });
+          if (!proof.provable) {
+            journal.append("reconciliation", {
+              kind: "ruleset", key: `ruleset:${entry.name}`, outcome: "ownership-unprovable",
+              id: positiveProviderId(known.id), reason: proof.reason, differences: proof.differences,
+            });
+            throw new AssertionFailure(
+              `journaled ruleset ${entry.name} was created but never fingerprinted, and its current body cannot be proved to be the intended one (${proof.reason}); commissioning records an ownership gap for root reconciliation rather than adopting the value it would later delete`,
+            );
+          }
           journal.append("resource-fingerprinted", {
-            kind: "ruleset", key: entry.name, id: Number(known.id), governed_fingerprint: measured,
-            measured_at_stage: "resume-reconciliation",
+            kind: "ruleset", key: entry.name, id: positiveProviderId(known.id), governed_fingerprint: measured,
+            measured_at_stage: "resume-reconciliation", ownership_basis: proof.basis,
           });
         } else if (measured !== recorded) {
           // A resumed setup adopts a journaled ruleset only if its COMPLETE governed body is still the
           // one it recorded. Same ID and same name is not the same policy.
           throw new AssertionFailure(`journaled ruleset ${entry.name} has been modified since this run created it; commissioning refuses to adopt it`);
         }
-        guardCtx.rulesetIds.add(Number(known.id));
+        if (positiveProviderId(known.id) !== null) guardCtx.rulesetIds.add(positiveProviderId(known.id));
         result[actor].push({ ...known, governed_fingerprint: recorded ?? measured });
         continue;
       }
       journal.append("mutation-intent", { kind: "ruleset", actor, name: entry.name, target_ref: entry.target_ref, hash: entry.hash });
       const response = await request("POST", `/repos/${COMMISSIONING_REPOSITORY}/rulesets`, entry.body);
-      const id = Number(response.body?.id);
+      // POSITIVE or absent — never a zero that later reads as an identity (F7).
+      const id = positiveProviderId(response.body?.id);
       // FSYNCED BEFORE THE NEXT FALLIBLE CALL. This event is written whether the create succeeded or
       // not, and it carries the identity when there is one, so "the response was seen" is durable.
       journal.append("mutation-result", {
         kind: "ruleset", key: entry.name, name: entry.name, status: response.status,
-        id: Number.isInteger(id) ? id : null, operation_id: response.operation,
+        id, operation_id: response.operation,
       });
-      if (response.status < 200 || response.status >= 300 || !Number.isInteger(id)) {
+      if (response.status < 200 || response.status >= 300 || id === null) {
         throw new IncompleteEvidence(`the disposable ruleset ${entry.name} could not be created (${response.status})`);
       }
       const record = { kind: "ruleset", actor, id, name: entry.name, target_ref: entry.target_ref, hash: entry.hash, provenance: "created" };
@@ -2640,16 +3109,21 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
     }
 
     if (pending.intent.kind === "ruleset") {
-      let id = Number(pending.result?.id);
-      if (!Number.isInteger(id)) {
-        // The response was lost. Ask the provider for the EXACT name this intent recorded, over
-        // complete pagination — not a prefix sweep.
+      // POSITIVE identity or NOTHING (F7). `Number(null)` is 0, and a zero here meant a forbidden
+      // `/rulesets/0` request issued with no provider read behind it at all.
+      let id = positiveProviderId(pending.result?.id);
+      if (id === null) {
+        // The response was lost or carried no identity. Ask the provider for the EXACT name this
+        // intent recorded, over complete pagination — not a prefix sweep.
         const inventory = await readAllPages({ request, endpoint: `/repos/${COMMISSIONING_REPOSITORY}/rulesets`, label: "the repository ruleset inventory" });
         const found = inventory.filter((ruleset) => String(ruleset?.name) === String(pending.intent.name));
         if (found.length > 1) throw new AssertionFailure(`reconciliation found ${found.length} rulesets named ${pending.intent.name}; commissioning refuses an ambiguous ownership claim`);
-        id = found.length ? Number(found[0].id) : NaN;
+        id = found.length ? positiveProviderId(found[0].id) : null;
+        if (found.length && id === null) {
+          throw new IncompleteEvidence(`reconciliation found a ruleset named ${pending.intent.name} carrying no usable provider identity; its ownership cannot be established`);
+        }
       }
-      if (!Number.isInteger(id)) {
+      if (id === null) {
         const outcome = { ...base, outcome: "absent", safe_to_recreate: true };
         journal.append("reconciliation", outcome);
         outcomes.push(outcome);
@@ -2686,17 +3160,22 @@ export async function reconcileCreateIntents({ request, ctx, journal }) {
       continue;
     }
 
-    // pull-request
-    let number = Number(pending.result?.number);
-    if (!Number.isInteger(number)) {
+    // pull-request. POSITIVE identity or a PROVIDER READ (F7): `Number(null)` was 0, an integer, so
+    // this branch was skipped entirely and an owned pull request number ZERO was journalled without
+    // a single provider call ever being made.
+    let number = positiveProviderId(pending.result?.number);
+    if (number === null) {
       const head = branchOf(derivedRef(ctx.runId, ctx.attempt, "pr-head"));
       const listed = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/pulls?per_page=100&page=1&state=all&head=${ORG}:${head}`);
       if (listed.status !== 200 || !Array.isArray(listed.body)) throw new IncompleteEvidence("reconciliation could not read this run's own synthetic pull requests");
       const matching = listed.body.filter((pull) => String(pull?.head?.ref) === head && String(pull?.base?.ref) === String(pending.intent.base));
       if (matching.length > 1) throw new AssertionFailure(`reconciliation found ${matching.length} synthetic pull requests for this run's head; commissioning refuses an ambiguous ownership claim`);
-      number = matching.length ? Number(matching[0].number) : NaN;
+      number = matching.length ? positiveProviderId(matching[0].number) : null;
+      if (matching.length && number === null) {
+        throw new IncompleteEvidence("reconciliation found this run's synthetic pull request carrying no usable number; its ownership cannot be established");
+      }
     }
-    if (!Number.isInteger(number)) {
+    if (number === null) {
       const outcome = { ...base, outcome: "absent", safe_to_recreate: true };
       journal.append("reconciliation", outcome);
       outcomes.push(outcome);
@@ -2721,11 +3200,11 @@ export async function createSyntheticPull({ request, ctx, journal }) {
     head, base,
     body: "AIO-1124 synthetic commissioning. Disposable: this pull request exists only to measure whether the writer policy refuses an ordinary merge into a protected disposable ref. It is closed by the run's cleanup phase and references no real task.",
   });
-  const number = Number(response.body?.number);
+  const number = positiveProviderId(response.body?.number);
   // The RESULT before anything else can fail (F5). A created pull request whose number was never
-  // journaled is a pull request cleanup will not close.
-  journal.append("mutation-result", { kind: "pull-request", key: head, base, head, status: response.status, number: Number.isInteger(number) ? number : null, operation_id: response.operation });
-  if (response.status < 200 || response.status >= 300 || !Number.isInteger(number)) {
+  // journaled is a pull request cleanup will not close. POSITIVE identity only (F7).
+  journal.append("mutation-result", { kind: "pull-request", key: head, base, head, status: response.status, number, operation_id: response.operation });
+  if (response.status < 200 || response.status >= 300 || number === null) {
     throw new IncompleteEvidence(`the synthetic pull request could not be created (${response.status})`);
   }
   const record = { kind: "pull-request", number, base, head, provenance: "created" };
@@ -2738,8 +3217,24 @@ export async function createSyntheticPull({ request, ctx, journal }) {
   return record;
 }
 
-/** The one place a local phase opens its lock, its journal and its guarded `gh` transport. */
-async function openLocalSession({ runId, attempt, evidenceDir, env, deps }) {
+/**
+ * The one place a local phase opens its lock, its journal and its guarded `gh` transport — and, now,
+ * THE ONE PLACE LOCAL MUTATION ADMISSION HAPPENS (F9).
+ *
+ * ── WHY THE IDENTITY CHECK MOVED HERE ───────────────────────────────────────────────────────────
+ *
+ * `assertLocalOperator` was called by setup and by human-tests, each at its own call site — and
+ * therefore NOT by cleanup or by collect, which is precisely the shape a per-call-site rule always
+ * ends up in. Cleanup is the phase that DELETES: swapping the local `gh` credential to a different
+ * repository administrator between setup and cleanup still returned `cleaned`, issued thirteen
+ * DELETEs, and never read `/user` at all. The identity of the operator who created the journal is
+ * not evidence about the identity of the operator now deleting things.
+ *
+ * So admission is a property of opening a local session, and every local phase — setup, human
+ * tests, cleanup, collect, and any recovery that can cause a mutation — gets the same fresh numeric
+ * ID, login, type and repository-admin proof before it can reach the journal or the transport.
+ */
+async function openLocalSession({ runId, attempt, evidenceDir, env, deps, sourceContinuity = "enforce" }) {
   const dir = assertPrivateDirectory(evidenceDir);
   const redact = createRedactor(collectSentinels(env));
   const guardCtx = {
@@ -2750,7 +3245,10 @@ async function openLocalSession({ runId, attempt, evidenceDir, env, deps }) {
   };
   const transport = deps.transport ?? createLocalGhTransport({ spawnImpl: deps.spawnImpl ?? spawn, redact, env });
   const request = createGuardedRequest(transport, guardCtx);
-  const ctx = await localContext({ request, runId, attempt, evidenceDir: dir, env });
+  // FRESH, before the lock and before anything is read or written: the named local operator, by
+  // numeric ID, login and type, holding repository admin right now (F9).
+  const operator = await assertLocalOperator({ request });
+  const ctx = await localContext({ request, runId, attempt, evidenceDir: dir, env, sourceContinuity });
   const lock = acquireJournalLock({ dir, runId, attempt, now: deps.now });
   try {
     const journal = openJournal({ dir, runId, attempt, source: ctx.workflowSha, lock, now: deps.now });
@@ -2759,9 +3257,11 @@ async function openLocalSession({ runId, attempt, evidenceDir, env, deps }) {
       throw new AssertionFailure("this run's journal was opened against a different immutable source; it is not this commissioning run's evidence");
     }
     for (const entry of journaledResources(existing, "commit")) guardCtx.graphShas.add(entry.sha);
-    for (const entry of journaledResources(existing, "ruleset")) guardCtx.rulesetIds.add(Number(entry.id));
-    guardCtx.pullNumber = journaledResources(existing, "pull-request")[0]?.number ?? null;
-    return { dir, ctx, request, guardCtx, journal, lock, records: existing };
+    for (const entry of journaledResources(existing, "ruleset")) {
+      if (positiveProviderId(entry.id) !== null) guardCtx.rulesetIds.add(positiveProviderId(entry.id));
+    }
+    guardCtx.pullNumber = positiveProviderId(journaledResources(existing, "pull-request")[0]?.number);
+    return { dir, ctx, operator, request, guardCtx, journal, lock, records: existing };
   } catch (error) {
     lock.release();
     throw error;
@@ -2771,9 +3271,8 @@ async function openLocalSession({ runId, attempt, evidenceDir, env, deps }) {
 /** PC-03/PC-04 setup. Creates nothing until every precondition has been measured. */
 export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {} }) {
   const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
-  const { dir, ctx, request, guardCtx, journal, lock } = session;
+  const { dir, ctx, operator, request, guardCtx, journal, lock } = session;
   try {
-    const operator = await assertLocalOperator({ request });
     const jobs = await assertProtectedJobsWaiting({ request, runId, attempt });
     // The PRE-APPROVAL snapshot, measured HERE — before anything is created — because it is a
     // precondition, not a report. Its value is that it should be EMPTY: it is what proves the human
@@ -2800,7 +3299,9 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
     // must resolve that intent by bounded readback of the exact name/ref it recorded, BEFORE any new
     // POST — otherwise the resume is the duplicate-creation path this reconciliation exists to close.
     const reconciliations = await reconcileCreateIntents({ request, ctx, journal });
-    for (const entry of journaledResources(journal.read(), "ruleset")) guardCtx.rulesetIds.add(Number(entry.id));
+    for (const entry of journaledResources(journal.read(), "ruleset")) {
+      if (positiveProviderId(entry.id) !== null) guardCtx.rulesetIds.add(positiveProviderId(entry.id));
+    }
     for (const entry of journaledResources(journal.read(), "commit")) guardCtx.graphShas.add(String(entry.sha));
     const { productionHash, plan } = buildDisposablePlan(ctx);
     const { shas, manifest } = await createSyntheticGraph({
@@ -2849,7 +3350,7 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
       // the graph it records rather than believed (F4). The cloud challenges carry the same two.
       manifest_sha256: canonicalHash(manifest),
       graph_sha256: graphBindingDigest(shas, runId, attempt),
-      unresolved_intents: unresolvedCreateIntents(journal.read()).filter((entry) => entry.state === "response-lost").length,
+      unresolved_intents: blockingCreateIntents(journal.read()).length,
       reconciliations,
       synthetic_graph: shas, derived_refs: refs,
       disposable_rulesets: Object.fromEntries(Object.entries(rulesets).map(([actor, list]) => [actor, list.map(({ id, name, target_ref, hash }) => ({ id, name, target_ref, hash }))])),
@@ -2902,13 +3403,12 @@ export function summarizeApprovals(response) {
 /** PC-05, the local human/admin half. */
 export async function runHumanTestsPhase({ runId, attempt, evidenceDir, env, deps = {} }) {
   const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
-  const { dir, ctx, request, journal, lock, records } = session;
+  const { dir, ctx, operator, request, journal, lock, records } = session;
   try {
     const setup = readEvidenceFile(dir, evidenceSlug(runId, attempt, "setup"));
     if (!setup) throw new IncompleteEvidence("local setup has not completed for this run");
     const shas = Object.fromEntries(journaledResources(records, "commit").map((entry) => [entry.node, entry.sha]));
     if (!Object.keys(shas).length) throw new IncompleteEvidence("the journal records no synthetic commits for this run");
-    const operator = await assertLocalOperator({ request });
     const { records: caseRecords, halted } = await runActorCases({
       request, actor: "human", ctx, graphShas: shas, journal, pull: journaledResources(records, "pull-request")[0] ?? null,
     });
@@ -3360,11 +3860,39 @@ export async function readWitnessResponseArtifact({ requestArchive, artifactId }
 }
 
 /**
+ * THE ONE PATH BY WHICH AN ARTIFACT BECOMES A PUBLICATION (F6).
+ *
+ * ── WHY THIS IS ONE FUNCTION AND NOT THREE PLACES ───────────────────────────────────────────────
+ *
+ * Consumption did this properly — discover by exact derived name, pin the owning run's provenance,
+ * download, open the single-entry archive, and bind the payload to this job's own nonce and exact
+ * challenge bytes. The local witness's TWO reconciliation branches did not: both accepted a
+ * LISTING ROW under the expected name and returned a publication from it, without reading the
+ * bytes, the expiry, the owning run, the job set or the envelope digest. So the process that is
+ * responsible for not publishing twice was deciding "already published" on strictly weaker
+ * evidence than the consumer would accept — and doing it BEFORE the manifest/graph and active-job
+ * checks, at that.
+ *
+ * Every caller now gets the consumer's rules. `receivedAt` is the caller's own clock, and the
+ * challenge's expiry is enforced against it as before.
+ */
+export async function resolvePublishedResponse({
+  request, requestArchive, ctx, binding, challenge, challengeDigest, receivedAt,
+}) {
+  const found = await findWitnessResponseArtifact({ request, ctx, binding, nonce: challenge.nonce });
+  const { response, entry_digest: entryDigest, archive_bytes: archiveBytes } = await readWitnessResponseArtifact({ requestArchive, artifactId: found.artifact_id });
+  assertResponseBinding(response, { challenge, challengeDigest, expectedBinding: binding, receivedAt });
+  return { response, artifact: found, entry_digest: entryDigest, archive_bytes: archiveBytes };
+}
+
+/**
  * The bounded wait for one witness response: poll at the fixed interval until the challenge expires.
  *
  * Only the RETRYABLE shape is polled. A response that exists and does not bind — a wrong nonce, a
- * wrong source, a duplicate publication — is refused on its first read and must never be waited on:
- * re-reading it would be waiting for somebody to publish a better one.
+ * wrong source, a duplicate publication, a terminally failed publisher — is refused on its first
+ * read and must never be waited on: re-reading it would be waiting for somebody to publish a better
+ * one. A CORRECTLY BOUND publisher that has simply not finished yet IS retryable (F10), which is
+ * the ordinary case, since an upload necessarily precedes the run that carried it finishing.
  */
 export async function awaitWitnessResponse({
   request, requestArchive, ctx, binding, challenge, challengeDigest, store, caseId,
@@ -3374,15 +3902,16 @@ export async function awaitWitnessResponse({
   const expiry = Date.parse(String(challenge.expires_at));
   for (let polls = 1; ; polls += 1) {
     try {
-      const found = await findWitnessResponseArtifact({ request, ctx, binding, nonce: challenge.nonce });
-      const { response, entry_digest: entryDigest, archive_bytes: archiveBytes } = await readWitnessResponseArtifact({ requestArchive, artifactId: found.artifact_id });
-      assertResponseBinding(response, { challenge, challengeDigest, expectedBinding: binding, receivedAt: new Date(now()).toISOString() });
+      const resolved = await resolvePublishedResponse({
+        request, requestArchive, ctx, binding, challenge, challengeDigest,
+        receivedAt: new Date(now()).toISOString(),
+      });
       // ONCE-ONLY, durably. A replayed response is refused by the store, not by memory.
       const consumed = store.consumeNonce(caseId, {
         direction: binding.direction, nonce: challenge.nonce,
-        artifact_id: found.artifact_id, artifact_digest: entryDigest, response_digest: entryDigest,
+        artifact_id: resolved.artifact.artifact_id, artifact_digest: resolved.entry_digest, response_digest: resolved.entry_digest,
       });
-      return { response, artifact: found, entry_digest: entryDigest, archive_bytes: archiveBytes, polls, consumed };
+      return { ...resolved, polls, consumed };
     } catch (error) {
       if (error?.detail?.retryable !== true) throw error;
       if (now() + intervalMs > expiry) {
@@ -3435,7 +3964,10 @@ export async function mintActorCredential({ role, ctx, env, redact, deps = {} })
 
   // The exchange is a second, independent identity proof: GitHub validates the JWT signature against
   // the public key of the App named as its ISSUER, so a token exists only if this key is that App's.
-  const token = await (deps.createInstallationToken ?? createInstallationToken)({
+  // Resolved HERE, inside admitted credential-bearing execution — see the module header's note on
+  // why `release-controller.mjs` is not a static import. The helper itself is unchanged.
+  const createInstallationToken = deps.createInstallationToken ?? await resolveInstallationTokenHelper();
+  const token = await createInstallationToken({
     appId: names.appId, installationId: names.installationId, privateKey: names.privateKey, fetchImpl,
   });
   redact.add(token);
@@ -3567,6 +4099,14 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       return { challenge: read.challenge, digest: read.digest };
     })();
     const installationId = String(prior.installation_id);
+    // SOURCE CONTINUITY AT RESPONSE CONSUMPTION (F3). A witness response measured against the
+    // reviewed source is not usable evidence once staging has moved: the tree the case is about to
+    // mutate under would no longer be the one this attempt was reviewed for. A same-old-SHA
+    // artifact consumed after a source move is exactly the case this closes.
+    const continuity = await assertSourceContinuity({
+      request: metadata, label: `case ${caseId}`,
+      expected: { repositoryId: ctx.repositoryId, workflowSha: ctx.workflowSha },
+    });
     const binding = caseBinding({ ctx, role, caseId, direction: "pre", targetRef: ref, installationId, manifest, graphShas });
     const received = await awaitWitnessResponse({
       request: metadata, requestArchive, ctx, binding, challenge, challengeDigest: digest,
@@ -3579,8 +4119,32 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       throw new AssertionFailure(`the witnessed policy in force on this job's ref is not the reviewed disposable policy (${policy.gap ?? "mismatch"}: ${policy.reason ?? "differs"})`);
     }
 
-    // Re-measure the world immediately before acting: the ref, the declared check state, and the
-    // 90-second proximity between the witness's observation and this mutation.
+    /**
+     * ── THE CREDENTIAL COMES FIRST, THE FRESHNESS CHECK COMES LAST (F4) ──────────────────────────
+     *
+     * This used to capture `mutationStartedAt` and check the 90-second observation-to-mutation
+     * bound BEFORE the App JWT identity reads, the token exchange and two scoped token reads. Those
+     * are three network round trips with finite but nonzero deadlines, and the request that
+     * followed used the EARLIER timestamp and never rechecked anything. A synthetic clock advancing
+     * 100 seconds solely inside the mocked token exchange still returned `executed` and issued the
+     * emergency PATCH, with the recorded mutation time a hundred seconds before the actual request:
+     * the bound was exceeded, with no real wait, and the evidence said it was not.
+     *
+     * So all the fallible preparation happens first, the live preconditions are then re-measured,
+     * and the freshness and expiry checks are made against a timestamp captured immediately before
+     * the durable used marker and the send — which is the time the evidence records.
+     */
+    const credential = await mintActorCredential({ role, ctx, env, redact, deps });
+    const request = credential.makeRequest(deps.appTransport ?? createTokenTransport({ token: credential.token, fetchImpl: credential.fetchImpl, redact }), {
+      graphShas: new Set(Object.values(graphShas)),
+      contextNames: new Set(derivedContextNames(runId, attempt)),
+      installationId,
+      pullNumber: kase.operation === "merge" ? positiveProviderId(prior.pull_number) : null,
+    });
+    const tokenProof = await proveTokenScopedRead({ request, ctx });
+
+    // THE REQUIRED LIVE PRECONDITIONS, re-measured AFTER all of that: the ref, and the declared
+    // check state. Both are read with the metadata credential, and neither mutates anything.
     const beforeSha = await readDerivedRefSha({ request: metadata, ref });
     if (String(beforeSha) !== String(prior.before_sha)) {
       throw new IncompleteEvidence(`case ${caseId}'s ref moved between prepare and execute; this run is interrupted rather than failed`);
@@ -3589,21 +4153,21 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
     const recheckedChecks = kase.to && kase.checks !== "irrelevant"
       ? await assertCheckState({ request: metadata, headSha: graphShas[kase.to], expectation: kase.checks, ctx })
       : { expectation: kase.checks, measured: false };
+
+    // THE ACTUAL REQUEST-START TIME, and both bounds enforced against it.
     const mutationStartedAt = now().toISOString();
     const proximityMs = assertObservationProximity({
       observedAt: received.response.observation.completed_at, actedAt: mutationStartedAt,
       label: `case ${caseId}'s mutation`,
     });
-
-    // The credential, minted here and nowhere else, and never serialized into state or a challenge.
-    const credential = await mintActorCredential({ role, ctx, env, redact, deps });
-    const request = credential.makeRequest(deps.appTransport ?? createTokenTransport({ token: credential.token, fetchImpl: credential.fetchImpl, redact }), {
-      graphShas: new Set(Object.values(graphShas)),
-      contextNames: new Set(derivedContextNames(runId, attempt)),
-      installationId,
-      pullNumber: kase.operation === "merge" ? Number(prior.pull_number) : null,
-    });
-    const tokenProof = await proveTokenScopedRead({ request, ctx });
+    // The challenge whose measurement authorises this mutation must still be alive AT THE MOMENT OF
+    // THE MUTATION, not merely at the moment its response was consumed. The expiry is never
+    // extended, and an expired one issues zero mutations.
+    if (Date.parse(mutationStartedAt) > Date.parse(String(challenge.expires_at))) {
+      throw new IncompleteEvidence(
+        `case ${caseId}'s pre-witness challenge expired before the mutation could start; the ${CHALLENGE_TTL_MS}ms lifetime is never extended and no mutation is issued`,
+      );
+    }
 
     // FSYNC THE MARKER, THEN ISSUE EXACTLY ONE REQUEST. A crash after this point is an ambiguous
     // mutation, and the store refuses to mark a second one.
@@ -3637,6 +4201,22 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       post_nonce: postNonce, post_challenge_name: postName, post_challenge_digest: postWritten.digest,
       pre_policy: policy, pre_artifact: received.artifact, pre_entry_digest: received.entry_digest,
       pre_observation_proximity_ms: proximityMs,
+      /**
+       * THE RETAINED PRE OBSERVATION (F2), not just its fingerprint.
+       *
+       * The finalizer used to discard the complete pre/post observations, so the authoritative
+       * assessor had nothing to independently repeat the runtime verifier ON — it could only read
+       * the verdict the runtime wrote about itself. The bounded nonsecret governed projection is
+       * exactly what the local witness already published to an artifact anybody with Actions
+       * access can read, so retaining it in this run's own evidence discloses nothing new and is
+       * what makes the final assessment a re-derivation instead of a re-reading.
+       */
+      pre_observation: received.response.observation,
+      pre_response_created_at: String(received.response.created_at),
+      pre_challenge_created_at: String(challenge.created_at),
+      pre_challenge_expires_at: String(challenge.expires_at),
+      pre_publisher_run_id: positiveProviderId(received.artifact?.provenance?.publisher_run_id),
+      source_continuity: continuity,
       rechecked_check_state: recheckedChecks,
       http_status: Number(response.status), diagnostic: response.diagnostic, operation_id: response.operation,
       after_sha: afterSha, readback_at: readbackAt, mutation_started_at: mutationStartedAt,
@@ -3653,6 +4233,11 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
   const prior = store.requireStage(caseId, "await-and-finalize");
   const postRead = readChallengeFile(challengeDir, String(prior.post_challenge_name));
   if (postRead.digest !== String(prior.post_challenge_digest)) throw new AssertionFailure("the retained post challenge is not the bytes this case published");
+  // SOURCE CONTINUITY AT THE SECOND CONSUMPTION BOUNDARY (F3), for the same reason as the first.
+  const finalizeContinuity = await assertSourceContinuity({
+    request: metadata, label: `case ${caseId}'s post-mutation consumption`,
+    expected: { repositoryId: ctx.repositoryId, workflowSha: ctx.workflowSha },
+  });
   const installationId = String(prior.installation_id);
   const postBinding = caseBinding({ ctx, role, caseId, direction: "post", targetRef: ref, installationId, manifest, graphShas });
   const received = await awaitWitnessResponse({
@@ -3691,16 +4276,53 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
     http_status: Number(prior.http_status), diagnostic: prior.diagnostic, outcome: verdict.outcome,
     check_state: prior.rechecked_check_state ?? prior.check_state,
     passed: verdict.outcome === kase.expected, reason: verdict.reason,
+    /**
+     * ── THE COMPLETE RETAINED PER-CASE EVIDENCE (F2) ─────────────────────────────────────────────
+     *
+     * Every value the final assessor needs to RECONSTRUCT this case rather than read its verdict:
+     * both bounded governed projections, both artifact identities and entry digests, both nonce
+     * digests, the publisher runs that carried them, the exact request class/status/readback, the
+     * actual measured times, this case's OWN token/installation proof and grants, and the
+     * manifest/graph bindings the challenges carried.
+     *
+     * Nothing here is new disclosure: the projections are the same bounded nonsecret governed
+     * representation the witness already published to a readable artifact, and no token, private
+     * key or raw provider body is present. What changes is that the assessor can now recompute the
+     * verdict, which it previously could not — the first case's record supplied the role-level
+     * grants and policy and every later case's proof sat outside substantive assessment.
+     */
     witness: {
       pre_artifact: prior.pre_artifact, post_artifact: received.artifact,
       pre_entry_digest: prior.pre_entry_digest, post_entry_digest: received.entry_digest,
       pre_nonce_digest: nonceDigest(String(prior.pre_nonce)), post_nonce_digest: nonceDigest(String(prior.post_nonce)),
+      pre_publisher_run_id: positiveProviderId(prior.pre_publisher_run_id),
+      post_publisher_run_id: positiveProviderId(received.artifact?.provenance?.publisher_run_id),
       governed_fingerprint: postPolicy.governed_fingerprint, classic_fingerprint: postPolicy.classic_fingerprint,
       pre_to_mutation_ms: prior.pre_observation_proximity_ms, readback_to_post_ms: postProximity,
       guarantee: postPolicy.guarantee,
+      // The bounded projections themselves, one per direction.
+      pre_observation: prior.pre_observation ?? null,
+      post_observation: received.response.observation,
+      pre_challenge_created_at: prior.pre_challenge_created_at ?? null,
+      pre_challenge_expires_at: prior.pre_challenge_expires_at ?? null,
+      post_challenge_created_at: String(postRead.challenge.created_at),
+      post_challenge_expires_at: String(postRead.challenge.expires_at),
     },
+    // The exact request the case issued and what came back, so the outcome is re-derivable.
+    request_class: Number(prior.http_status) === 0 ? "ambiguous" : (Number(prior.http_status) >= 200 && Number(prior.http_status) < 300 ? "accepted" : "refused"),
+    mutation_started_at: prior.mutation_started_at ?? null,
+    readback_at: prior.readback_at ?? null,
+    // The bindings this case's challenges carried, so a case cannot be joined to another run's plan.
+    manifest_sha256: prior.manifest_sha256 ?? null,
+    graph_sha256: prior.graph_sha256 ?? null,
+    manifest_commit_sha: prior.manifest_commit_sha ?? null,
+    installation_id: String(prior.installation_id ?? ""),
+    source_continuity: { pre: prior.source_continuity ?? null, post: finalizeContinuity },
+    // PER CASE, never collapsed into the first record.
+    policy_pre: prior.pre_policy ?? null,
     policy_in_force: postPolicy,
     token_proof: prior.token_proof,
+    grants: prior.grants ?? null,
   };
   store.write(caseId, { ...store.read(caseId), stage: "await-and-finalize", status: "finalized", record, halt: verdict.halt === true });
   if (verdict.halt) {
@@ -3857,11 +4479,32 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
     env, run: { ...run.body, run_attempt: Number(run.body.run_attempt ?? attempt) },
     expected: { repository: COMMISSIONING_REPOSITORY, dispatchRef: COMMISSIONING_DISPATCH_REF, workflowPath: COMMISSIONING_WORKFLOW_PATH },
   });
+  // SOURCE CONTINUITY AT PUBLISHER EXECUTION (F3): the live dispatch branch must still be the
+  // immutable source this publisher checked out, or the response it is about to carry describes a
+  // tree that is no longer the one the attempt is bound to.
+  const continuity = await assertSourceContinuity({
+    request, label: "the witness publisher",
+    expected: { repositoryId: ctx.repositoryId, workflowSha: sourceSha },
+  });
+  /**
+   * THE ORIGINAL SUBJECT (F11), measured rather than believed. The publisher previously read only
+   * its own run; the envelope's `original_run_id`/`original_attempt` were taken on trust.
+   */
+  const originalRunResponse = await request(
+    "GET",
+    `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${String(response.original_run_id)}/attempts/${String(response.original_attempt)}`,
+  );
+  if (originalRunResponse.status !== 200 || !originalRunResponse.body) {
+    throw new IncompleteEvidence(`the witness publisher could not measure the original run ${String(response.original_run_id)} its envelope names (${originalRunResponse.status})`);
+  }
   const witnessDir = path.join(evidenceDir, "witness");
   mkdirSync(witnessDir, { recursive: true, mode: 0o700 });
   const result = publishWitnessResponse({
-    response, envelope, publisherRunId: runId,
-    expected: { repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha },
+    response, envelope, publisherRunId: runId, originalRun: originalRunResponse.body,
+    expected: {
+      repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha,
+      dispatchBranch: branchOf(COMMISSIONING_DISPATCH_REF),
+    },
     writeEntry: (name, bytes) => {
       const target = path.join(witnessDir, name);
       const fd = openSync(target, "wx", 0o600);
@@ -3878,9 +4521,9 @@ export async function runWitnessPublisherJob(env = process.env, deps = {}) {
   }
   writeEvidenceFile(evidenceDir, evidenceSlug(String(response.original_run_id), String(response.original_attempt), "witness"), {
     ...result, run_id: String(response.original_run_id), attempt: String(response.original_attempt),
-    workflow_sha: ctx.workflowSha,
+    workflow_sha: ctx.workflowSha, source_continuity: continuity,
   });
-  return result;
+  return { ...result, source_continuity: continuity };
 }
 
 /**
@@ -3919,12 +4562,24 @@ export async function runRehearsalStage({ stage, env = process.env, deps = {} })
 
   if (stage === "challenge") {
     store.requireStage(REHEARSAL_CASE_ID, "challenge");
-    // Its own actual job identity, from the provider — the same check the actor makes, on the one
-    // job that is allowed to be active in a transport-rehearsal source run.
-    const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
-    if (jobs.status !== 200 || !Array.isArray(jobs.body?.jobs)) throw new IncompleteEvidence("the rehearsal could not measure its own run's jobs");
-    const executing = jobs.body.jobs.filter((job) => String(job?.conclusion ?? "") !== "skipped");
-    if (executing.length !== 1) throw new AssertionFailure(`a transport-rehearsal source run executes exactly one job; this run executes ${executing.length}`);
+    /**
+     * ITS OWN ACTUAL JOB IDENTITY, BY NAME (F11).
+     *
+     * This counted one non-skipped job. A count says nothing about WHICH job ran, and the
+     * rehearsal's whole claim is that the exact reviewed `transport-rehearsal` job is the active
+     * one in a rehearsal source run — the same check the actor makes, through the same function.
+     */
+    const jobState = await assertNamedJobActive({
+      request, runId, attempt, jobName: REHEARSAL_JOB_NAME, label: "transport rehearsal",
+    });
+    if (jobState.executed_job_names.length !== 1 || jobState.executed_job_names[0] !== REHEARSAL_JOB_NAME) {
+      throw new AssertionFailure(
+        `a transport-rehearsal source run executes exactly the ${JSON.stringify(REHEARSAL_JOB_NAME)} job; this run executed ${jobState.executed_job_names.length ? jobState.executed_job_names.join(", ") : "no job"}`,
+      );
+    }
+    // SOURCE CONTINUITY and the ACTOR the rehearsal claims to be running as — attempt 1, John,
+    // measured from the provider rather than from `GITHUB_ACTOR` (F3/F11).
+    await measureRehearsalContext({ request, runId, attempt });
     const nonce = (deps.freshNonce ?? freshNonce)();
     const challenge = buildChallenge({ binding, nonce, createdAt: now().toISOString(), extra: { before_sha: null, requested_sha: null } });
     const name = challengeArtifactName({ runId, attempt, role, ordinal: 0, direction: "pre" });
@@ -4018,17 +4673,17 @@ export async function probeWitnessDomain({ request, runId, attempt }) {
 }
 
 /** The original protected job must be ACTIVE, in THIS attempt, with an actual approval behind it. */
-export async function assertActorJobActive({ request, runId, attempt, role }) {
+export async function assertActorJobActive({ request, runId, attempt, role, allowCompleted = false }) {
   const binding = assertRoleBinding(role);
   const spec = PROTECTED_JOBS.find((entry) => entry.id === binding.job);
   if (!spec) throw new UsageError(`the ${role} role has no protected job specification`);
-  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
-  if (jobs.status !== 200 || !Array.isArray(jobs.body?.jobs)) throw new IncompleteEvidence(`the ${role} job's state could not be measured`, { retryable: true });
-  const job = jobs.body.jobs.find((entry) => String(entry?.name ?? "") === spec.name);
-  if (!job) throw new IncompleteEvidence(`the ${role} protected job has not been created in this attempt`, { retryable: true });
-  if (!["in_progress", "queued"].includes(String(job.status))) {
-    throw new AssertionFailure(`the ${role} protected job is ${String(job.status)}; a witness response is served only to a job that is actually running this attempt`);
-  }
+  // THE SHARED NAMED-JOB CHECK. `allowCompleted` exists for RECONCILIATION only: a witness that
+  // restarts after the actor consumed its last post response finds that job legitimately finished,
+  // and refusing there would strand a publication that already happened. It never admits a NEW
+  // dispatch to a finished job, and the approval requirement below is unchanged either way.
+  const job = await assertNamedJobActive({
+    request, runId, attempt, jobName: spec.name, label: `${role} protected`, allowCompleted,
+  });
   const approvals = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/approvals`);
   const history = summarizeApprovals(approvals);
   if (!history.measured) throw new IncompleteEvidence(`the ${role} job's environment approval history could not be measured (${history.reason})`, { retryable: true });
@@ -4036,7 +4691,7 @@ export async function assertActorJobActive({ request, runId, attempt, role }) {
   if (!approved.length) {
     throw new AssertionFailure(`no human approval is recorded for ${spec.environment}; the local witness does not serve a job whose protected environment was never approved`);
   }
-  return { job_id: Number(job.id) || null, job_status: String(job.status), environment: spec.environment, approvals: approved };
+  return { job_id: job.job_id, job_status: job.job_status, environment: spec.environment, approvals: approved };
 }
 
 /**
@@ -4075,9 +4730,76 @@ export async function measureCompletePolicy({ request, ctx, actor, now = () => n
  * response is reconciled by looking for the exact expected response artifact — never by dispatching
  * again, which would publish a second response for a nonce that is consumed once.
  */
+/**
+ * Every pending dispatch this witness journal records for a given expected publication (F6).
+ *
+ * A `dispatch-intent` with no `response-reconciled` for the same expected artifact is a dispatch
+ * whose OUTCOME IS UNKNOWN — the request may have been accepted and the process may have died
+ * before the upload landed, in which case the artifact is not yet present and the naive answer
+ * ("no artifact, so dispatch") produces a SECOND publisher run for a nonce that is consumed once.
+ */
+export function pendingWitnessDispatch(records, expectedName) {
+  const intents = records.filter((record) => record.type === "dispatch-intent" && String(record.data?.expected_artifact) === String(expectedName));
+  if (!intents.length) return null;
+  const reconciled = records.some((record) => record.type === "response-reconciled" && String(record.data?.expected_artifact) === String(expectedName));
+  if (reconciled) return null;
+  const intent = intents[intents.length - 1];
+  const result = [...records].reverse().find((record) => record.type === "dispatch-result"
+    && String(record.data?.case_id) === String(intent.data?.case_id)
+    && String(record.data?.direction) === String(intent.data?.direction));
+  return {
+    seq: intent.seq,
+    expected_artifact: String(intent.data.expected_artifact),
+    envelope_digest: String(intent.data.envelope_digest ?? ""),
+    nonce_digest: String(intent.data.nonce_digest ?? ""),
+    case_id: String(intent.data.case_id ?? ""),
+    direction: String(intent.data.direction ?? ""),
+    // `null` when the process died between the intent and the result — the most ambiguous state,
+    // and the one that must never be resolved by dispatching again.
+    result: result ? result.data : null,
+  };
+}
+
 export async function serveWitnessItem({
   request, requestArchive, ctx, journal, item, operator, domain, setupBindings,
   now = () => new Date(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), intervalMs = POLL_INTERVAL_MS,
+}) {
+  const started = await beginWitnessItem({ request, requestArchive, ctx, journal, item, operator, domain, setupBindings, now });
+  if (started.state === "reconciled") return started.reconciled;
+  const expiry = Date.parse(String(started.challenge.expires_at));
+  for (let polls = 1; ; polls += 1) {
+    const reconciled = await pollWitnessPublication({ request, requestArchive, ctx, journal, item, pending: started, now, polls });
+    if (reconciled) return reconciled;
+    if (now().getTime() + intervalMs > expiry) {
+      journal.append("reconciliation", {
+        kind: "witness-dispatch", key: started.expectedName, outcome: "unpublished-within-challenge-lifetime",
+        case_id: item.caseId, direction: item.direction, polls,
+      });
+      throw new IncompleteEvidence(`the witness response ${started.expectedName} was not published within the challenge lifetime; the dispatch is not repeated`);
+    }
+    await sleep(intervalMs);
+  }
+}
+
+/**
+ * ── HALF ONE: observe, validate, reconcile-or-dispatch, and RETURN (F5/F6) ──────────────────────
+ *
+ * Split out of `serveWitnessItem` so the process can serve READY WORK ACROSS ROLES instead of
+ * blocking on one item until its ceiling. The blocking version is why an independently approved
+ * emergency job STARVED: the work plan listed all fourteen normal responses before any of the eight
+ * emergency ones, so approving emergency first published a valid expiring challenge that the
+ * witness never looked at — it was waiting for normal's first challenge, which nobody had approved
+ * yet — and the emergency challenge died of its own 180-second lifetime with zero dispatches. The
+ * workflow explicitly allows emergency to run independently of normal, so that ordering is not a
+ * misuse; it is the design.
+ *
+ * The fix is not a longer TTL and not a forced approval order, both of which the canonical rules
+ * out. It is that "this role's next item has no challenge yet" must be a REASON TO LOOK AT THE
+ * OTHER ROLE, not a reason to sleep. Per-role sequence and once-only state are untouched: each role
+ * advances only its own cursor, in its own closed case order.
+ */
+export async function beginWitnessItem({
+  request, requestArchive, ctx, journal, item, operator, domain, setupBindings, now = () => new Date(),
 }) {
   const challengeName = challengeArtifactName({ runId: ctx.runId, attempt: ctx.attempt, role: item.role, ordinal: item.ordinal, direction: item.direction });
   const listed = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/artifacts?per_page=${PAGE_SIZE}&page=1&name=${encodeURIComponent(challengeName)}`);
@@ -4121,42 +4843,117 @@ export async function serveWitnessItem({
     runId: ctx.runId, attempt: ctx.attempt, role: item.role, ordinal: item.ordinal,
     direction: item.direction, nonce: String(challenge.nonce),
   });
+  const challengeBinding = Object.fromEntries(BINDING_FIELDS.map((field) => [field, challenge[field] ?? null]));
+  const resolveExisting = () => resolvePublishedResponse({
+    request, requestArchive, ctx, binding: challengeBinding, challenge,
+    challengeDigest: entry.digest, receivedAt: now().toISOString(),
+  });
 
   /**
-   * ALREADY PUBLISHED? Then reconcile it, and do NOT dispatch again (F5).
+   * ── THE SUBJECT CHECKS COME BEFORE ANY RECONCILIATION DECISION (F6) ───────────────────────────
    *
-   * This is what makes a restarted witness safe. A dispatch returns 204 with no body, so even a
-   * clean success tells this process nothing about which run it created — the only answer is ever
-   * "look for the exact expected artifact". A second dispatch would publish a second response for a
-   * nonce that is consumed exactly once, and the actor would then refuse the duplicate rather than
-   * read either.
+   * The "already published" shortcut used to run FIRST, so a publication was accepted or rejected
+   * before this process had checked that the challenge names the manifest and graph this run
+   * created, or that the actor job it serves is genuinely active and approved. Both now happen up
+   * front, for both the reconcile path and the dispatch path.
    */
-  const alreadyPublished = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/artifacts?per_page=${PAGE_SIZE}&page=1&name=${encodeURIComponent(expectedName)}`);
-  const existing = alreadyPublished.status === 200 && Array.isArray(alreadyPublished.body?.artifacts)
-    ? alreadyPublished.body.artifacts.filter((row) => String(row?.name) === expectedName)
-    : [];
-  if (existing.length > 1) throw new AssertionFailure(`${existing.length} artifacts are named ${expectedName}; a witness response is published exactly once`);
-  if (existing.length === 1) {
+  let jobState = null;
+  if (expectDomain === REHEARSAL_DOMAIN) {
+    // The rehearsal's own job, BY NAME — the local serving branch previously skipped the active-job
+    // check entirely, so it served a response to a rehearsal run whose job it never identified.
+    jobState = await assertNamedJobActive({
+      request, runId: ctx.runId, attempt: ctx.attempt, jobName: REHEARSAL_JOB_NAME,
+      label: "transport rehearsal", allowCompleted: true,
+    });
+  } else {
+    // The manifest/graph digests the local run recorded must be the ones the challenge carries.
+    if (String(challenge.manifest_sha256) !== String(setupBindings.manifest_sha256)) throw new AssertionFailure(`the challenge ${challengeName} names a manifest this run did not publish`);
+    if (String(challenge.graph_sha256) !== String(setupBindings.graph_sha256)) throw new AssertionFailure(`the challenge ${challengeName} names a synthetic graph this run did not create`);
+    // A RECONCILING witness may find the actor job already completed — the actor consumes the last
+    // post response and the job ends — so a completed job is admissible for reconciliation while a
+    // NEW dispatch still requires an actively running, approved job. The approval requirement is
+    // unchanged in both cases.
+    jobState = await assertActorJobActive({ request, runId: ctx.runId, attempt: ctx.attempt, role: item.role, allowCompleted: true });
+  }
+
+  /**
+   * ── PENDING DISPATCH FIRST, FROM THE DURABLE JOURNAL (F6) ─────────────────────────────────────
+   *
+   * The restart path only ever asked whether the expected artifact already existed. It never
+   * consulted the `dispatch-intent`/`dispatch-result` records — so a first dispatch that WAS
+   * accepted but whose process died before the upload left no artifact to find, and the restart
+   * created a new observation and POSTed the same challenge again: one dispatch before the
+   * simulated crash, two after reopening the same journal. Lost-response ambiguity had the same
+   * shape.
+   *
+   * So the journal is consulted BEFORE any new measurement or POST. A dispatch already in flight is
+   * reconciled against the exact expected artifact through the SAME validator a consumer uses; if
+   * the artifact is not there yet, the item stays PENDING within its original expiry. It is never
+   * restamped with a fresh nonce and never reposted.
+   */
+  const pending = pendingWitnessDispatch(journal.read(), expectedName);
+  if (pending) {
+    try {
+      const resolved = await resolveExisting();
+      const reconciled = {
+        case_id: item.caseId, role: item.role, direction: item.direction,
+        artifact_id: resolved.artifact.artifact_id,
+        publisher_run_id: positiveProviderId(resolved.artifact.provenance?.publisher_run_id),
+        expected_artifact: expectedName, envelope_digest: pending.envelope_digest || null,
+        entry_digest: resolved.entry_digest, polls: 0,
+        reconciled_without_redispatch: true, recovered_pending_dispatch_seq: pending.seq,
+      };
+      journal.append("response-reconciled", reconciled);
+      return { state: "reconciled", reconciled };
+    } catch (error) {
+      if (error?.detail?.retryable !== true) throw error;
+      // Known-pending, measured-absent: distinct from "never dispatched", and resolved only by
+      // waiting for the ORIGINAL dispatch's publication within the ORIGINAL expiry.
+      return {
+        state: "pending", challenge, challengeDigest: entry.digest, challengeBinding,
+        expectedName, envelopeDigest: pending.envelope_digest || null, jobState, recoveredPendingDispatchSeq: pending.seq,
+      };
+    }
+  }
+
+  /**
+   * ALREADY PUBLISHED, WITH NO PENDING INTENT? Then reconcile it, and do NOT dispatch (F6).
+   *
+   * A dispatch returns 204 with no body, so even a clean success tells this process nothing about
+   * which run it created — the only answer is ever "look for the exact expected artifact". This now
+   * goes through {@link resolvePublishedResponse}, so it applies the consumer's provenance, byte,
+   * expiry and binding rules rather than accepting a listing row under a matching name.
+   */
+  try {
+    const resolved = await resolveExisting();
     const reconciled = {
       case_id: item.caseId, role: item.role, direction: item.direction,
-      artifact_id: Number(existing[0].id), publisher_run_id: Number(existing[0]?.workflow_run?.id) || null,
-      expected_artifact: expectedName, envelope_digest: null, polls: 0, reconciled_without_redispatch: true,
+      artifact_id: resolved.artifact.artifact_id,
+      publisher_run_id: positiveProviderId(resolved.artifact.provenance?.publisher_run_id),
+      expected_artifact: expectedName, envelope_digest: null, entry_digest: resolved.entry_digest,
+      polls: 0, reconciled_without_redispatch: true,
     };
     journal.append("response-reconciled", reconciled);
-    return reconciled;
+    return { state: "reconciled", reconciled };
+  } catch (error) {
+    // "Not published yet" is the ordinary case and the reason to dispatch. Anything else — a
+    // duplicate, a wrong-source publisher, a failed one, bytes that do not bind — is a refusal.
+    if (error?.detail?.retryable !== true) throw error;
   }
 
   let observation;
-  let jobState = null;
   if (expectDomain === REHEARSAL_DOMAIN) {
     // Inert: no policy read, no graph, no resource journal. See {@link runRehearsalStage}.
     const startedAt = now().toISOString();
     observation = { started_at: startedAt, completed_at: now().toISOString(), span_ms: 0, inert: true };
   } else {
-    // The manifest/graph digests the local run recorded must be the ones the challenge carries.
-    if (String(challenge.manifest_sha256) !== String(setupBindings.manifest_sha256)) throw new AssertionFailure(`the challenge ${challengeName} names a manifest this run did not publish`);
-    if (String(challenge.graph_sha256) !== String(setupBindings.graph_sha256)) throw new AssertionFailure(`the challenge ${challengeName} names a synthetic graph this run did not create`);
-    jobState = await assertActorJobActive({ request, runId: ctx.runId, attempt: ctx.attempt, role: item.role });
+    // SOURCE CONTINUITY AT LOCAL WITNESS DISPATCH (F3), immediately before the measurement it
+    // carries: a policy measured against a tree that is no longer the trusted source is not
+    // evidence about the reviewed attempt.
+    await assertSourceContinuity({
+      request, label: "the local policy witness",
+      expected: { repositoryId: ctx.repositoryId, workflowSha: ctx.workflowSha },
+    });
     observation = await measureCompletePolicy({ request, ctx, actor: item.role, now });
   }
 
@@ -4182,32 +4979,43 @@ export async function serveWitnessItem({
   if (Number(dispatch.status) !== 0 && (dispatch.status < 200 || dispatch.status >= 300)) {
     throw new IncompleteEvidence(`the witness dispatch for ${expectedName} was refused (${dispatch.status})`);
   }
+  // The dispatch is away. Its OUTCOME is now the scheduler's business: a dispatch returns 204 with
+  // no body, so even a clean success says nothing about which run it made, and the answer is always
+  // "look for the exact expected artifact" — never "dispatch again".
+  return {
+    state: "pending", challenge, challengeDigest: entry.digest, challengeBinding,
+    expectedName, envelopeDigest: envelope.digest, jobState,
+  };
+}
 
-  // RECONCILIATION, and the reason it is the same code path for the ambiguous case: a dispatch
-  // returns 204 with no body, so even a clean success tells us nothing about which run it made. The
-  // answer is always "look for the exact expected artifact" — never "dispatch again".
-  const expiry = Date.parse(String(challenge.expires_at));
-  for (let polls = 1; ; polls += 1) {
-    const found = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/artifacts?per_page=${PAGE_SIZE}&page=1&name=${encodeURIComponent(expectedName)}`);
-    const rows = found.status === 200 && Array.isArray(found.body?.artifacts) ? found.body.artifacts.filter((row) => String(row?.name) === expectedName) : [];
-    if (rows.length > 1) throw new AssertionFailure(`${rows.length} artifacts are named ${expectedName}; a witness response is published exactly once`);
-    if (rows.length === 1) {
-      const reconciled = {
-        case_id: item.caseId, role: item.role, direction: item.direction,
-        artifact_id: Number(rows[0].id), publisher_run_id: Number(rows[0]?.workflow_run?.id) || null,
-        expected_artifact: expectedName, envelope_digest: envelope.digest, polls,
-      };
-      journal.append("response-reconciled", reconciled);
-      return reconciled;
-    }
-    if (now().getTime() + intervalMs > expiry) {
-      journal.append("reconciliation", {
-        kind: "witness-dispatch", key: expectedName, outcome: "unpublished-within-challenge-lifetime",
-        case_id: item.caseId, direction: item.direction, polls,
-      });
-      throw new IncompleteEvidence(`the witness response ${expectedName} was not published within the challenge lifetime; the dispatch is not repeated`);
-    }
-    await sleep(intervalMs);
+/**
+ * ── HALF TWO: ONE non-blocking look for the publication a pending dispatch is waiting for ───────
+ *
+ * Returns the reconciled record, or `null` for "not yet". It never sleeps and never dispatches, so
+ * the scheduler above can interleave it with another role's work — which is the whole point of the
+ * split. A publication that exists and does not bind is a refusal here exactly as it is anywhere
+ * else, through the same validator.
+ */
+export async function pollWitnessPublication({ request, requestArchive, ctx, journal, item, pending, now = () => new Date(), polls = 1 }) {
+  try {
+    const resolved = await resolvePublishedResponse({
+      request, requestArchive, ctx, binding: pending.challengeBinding,
+      challenge: pending.challenge, challengeDigest: pending.challengeDigest,
+      receivedAt: now().toISOString(),
+    });
+    const reconciled = {
+      case_id: item.caseId, role: item.role, direction: item.direction,
+      artifact_id: resolved.artifact.artifact_id,
+      publisher_run_id: positiveProviderId(resolved.artifact.provenance?.publisher_run_id),
+      expected_artifact: pending.expectedName, envelope_digest: pending.envelopeDigest ?? null,
+      entry_digest: resolved.entry_digest, polls,
+      ...(pending.recoveredPendingDispatchSeq ? { recovered_pending_dispatch_seq: pending.recoveredPendingDispatchSeq } : {}),
+    };
+    journal.append("response-reconciled", reconciled);
+    return reconciled;
+  } catch (error) {
+    if (error?.detail?.retryable !== true) throw error;
+    return null;
   }
 }
 
@@ -4239,12 +5047,40 @@ export async function measureRehearsalContext({ request, runId, attempt }) {
   if (String(run.body.path) !== COMMISSIONING_WORKFLOW_PATH) throw new AssertionFailure("the rehearsal source run is not the reviewed commissioning workflow");
   if (String(run.body.event) !== COMMISSIONING_EVENT_NAME) throw new AssertionFailure("the rehearsal source run was not dispatched manually");
   if (!FULL_SHA.test(String(run.body.head_sha ?? ""))) throw new IncompleteEvidence("the rehearsal source run reports no immutable head SHA");
+  if (String(run.body.head_branch ?? "") !== branchOf(COMMISSIONING_DISPATCH_REF)) {
+    throw new AssertionFailure("the rehearsal source run was not dispatched from the fixed staging branch");
+  }
+  /**
+   * THE REHEARSAL'S OWN ACTOR AND ATTEMPT (F11).
+   *
+   * Neither the cloud rehearsal path nor this local context required a provider-measured John or
+   * attempt 1, so a rehearsal source run created by `wrong-user` (#42) on attempt 2 was PREPARED
+   * and ACCEPTED. The rehearsal is inert and produces no enforcement verdict — but it is still the
+   * measurement root asks for before staging protected approvals, and evidence about a transport
+   * exercised by someone else, on a re-run, is not that measurement. It inherits no actor approval
+   * and makes no policy claim; what it must do is say honestly whose transport it measured.
+   */
+  if (Number(run.body.run_attempt) !== 1) {
+    throw new AssertionFailure(`the rehearsal source run is attempt ${Number(run.body.run_attempt)}; a rehearsal is measured on the first attempt, never on a re-run`);
+  }
+  for (const field of ["actor", "triggering_actor"]) {
+    const identity = run.body[field];
+    if (!identity || Number(identity.id) !== OWNER_USER_ID || String(identity.login) !== OWNER_LOGIN || String(identity.type) !== OWNER_USER_TYPE) {
+      throw new AssertionFailure(`the rehearsal source run's measured ${field} is not the one authorized local identity`);
+    }
+  }
+  // The same shared source continuity check every other boundary makes (F3).
+  const continuity = await assertSourceContinuity({
+    request, label: "the transport rehearsal",
+    expected: { repositoryId: Number(repository.body.id), workflowSha: String(run.body.head_sha) },
+  });
   return Object.freeze({
     runId: String(runId), attempt: String(attempt), role: "local",
     workflowSha: String(run.body.head_sha), repositoryId: Number(repository.body.id),
     // A rehearsal has no release identity and no producer map, and says so rather than carrying nulls
     // that could be mistaken for measurements.
     normalAppId: null, emergencyAppId: null, producerIds: null, intent: null, actor: null,
+    sourceContinuity: continuity,
   });
 }
 
@@ -4332,25 +5168,88 @@ export async function runWitnessPhase({ runId, attempt, evidenceDir, env, deps =
       expected_publications: domain === REHEARSAL_DOMAIN ? 1 : REQUIRED_WITNESS_PUBLICATIONS,
     });
     const plan = witnessWorkPlan(domain);
-    for (const item of plan) {
-      for (;;) {
-        // The process ceiling, checked before every attempt at an item: a witness that outlived its
-        // 30 minutes stops and reports incomplete rather than serving a stale attempt.
-        if (now().getTime() - started > deadlineMs) {
-          journal.append("witness-closed", { domain, served: served.length, expected: plan.length, outcome: "process-deadline" });
-          throw new IncompleteEvidence(`the local witness reached its ${deadlineMs}ms ceiling after serving ${served.length} of ${plan.length} responses`);
-        }
+    const intervalMs = deps.intervalMs ?? POLL_INTERVAL_MS;
+    /**
+     * ── THE READY-WORK SCHEDULER (F5) ────────────────────────────────────────────────────────────
+     *
+     * One queue per ROLE, each in its own strict case/pre-post order, and a cursor that only that
+     * role's own progress advances. Every pass looks at every role that still has work:
+     *
+     *   - a role whose current item has a pending dispatch gets ONE non-blocking poll;
+     *   - a role whose current item has no challenge published yet is SKIPPED, not waited on;
+     *   - a role whose current item is ready is begun, and may reconcile immediately.
+     *
+     * A pass that made no progress anywhere sleeps once and tries again. That is the whole
+     * correction: the previous loop walked one flat list in plan order and BLOCKED on each entry
+     * until the process ceiling, so all fourteen normal responses stood in front of the first
+     * emergency one and an independently approved emergency job could never be served at all.
+     *
+     * What is deliberately unchanged: per-role sequence, once-only nonce consumption, the 180-second
+     * challenge lifetime (never extended), and the approval requirement. Serving across roles is
+     * what the workflow's own independence between `normal` and `emergency` already permits.
+     */
+    const roles = [...new Set(plan.map((entry) => entry.role))];
+    const queues = new Map(roles.map((role) => [role, plan.filter((entry) => entry.role === role)]));
+    const cursors = new Map(roles.map((role) => [role, 0]));
+    const pending = new Map();
+    const polls = new Map();
+    const remaining = () => roles.reduce((total, role) => total + (queues.get(role).length - cursors.get(role)), 0);
+    while (remaining() > 0) {
+      // The process ceiling, checked before every pass: a witness that outlived its 30 minutes
+      // stops and reports incomplete rather than serving a stale attempt.
+      if (now().getTime() - started > deadlineMs) {
+        journal.append("witness-closed", { domain, served: served.length, expected: plan.length, outcome: "process-deadline" });
+        throw new IncompleteEvidence(`the local witness reached its ${deadlineMs}ms ceiling after serving ${served.length} of ${plan.length} responses`);
+      }
+      let progressed = false;
+      for (const role of roles) {
+        const queue = queues.get(role);
+        const index = cursors.get(role);
+        if (index >= queue.length) continue;
+        const item = queue[index];
+        const key = `${item.role}:${item.caseId}:${item.direction}`;
         try {
-          served.push(await serveWitnessItem({
-            request, requestArchive, ctx, journal, item, operator, domain, setupBindings,
-            now, sleep: deps.sleep, intervalMs: deps.intervalMs ?? POLL_INTERVAL_MS,
-          }));
-          break;
+          if (!pending.has(key)) {
+            const begun = await beginWitnessItem({ request, requestArchive, ctx, journal, item, operator, domain, setupBindings, now });
+            if (begun.state === "reconciled") {
+              served.push(begun.reconciled);
+              cursors.set(role, index + 1);
+              progressed = true;
+              continue;
+            }
+            pending.set(key, begun);
+            polls.set(key, 0);
+            progressed = true;
+          }
+          const count = (polls.get(key) ?? 0) + 1;
+          polls.set(key, count);
+          const reconciled = await pollWitnessPublication({
+            request, requestArchive, ctx, journal, item, pending: pending.get(key), now, polls: count,
+          });
+          if (reconciled) {
+            served.push(reconciled);
+            pending.delete(key);
+            polls.delete(key);
+            cursors.set(role, index + 1);
+            progressed = true;
+            continue;
+          }
+          // Still unpublished. Its ORIGINAL expiry bounds it, and the expiry is never extended.
+          const expiry = Date.parse(String(pending.get(key).challenge.expires_at));
+          if (now().getTime() + intervalMs > expiry) {
+            journal.append("reconciliation", {
+              kind: "witness-dispatch", key: pending.get(key).expectedName,
+              outcome: "unpublished-within-challenge-lifetime", case_id: item.caseId, direction: item.direction, polls: count,
+            });
+            throw new IncompleteEvidence(`the witness response ${pending.get(key).expectedName} was not published within the challenge lifetime; the dispatch is not repeated`);
+          }
         } catch (error) {
+          // "This role's challenge is not published yet" is a reason to look at the OTHER role, not
+          // a reason to stop or to sleep. Every other refusal is immediate, as before.
           if (error?.detail?.retryable !== true) throw error;
-          await sleep(deps.intervalMs ?? POLL_INTERVAL_MS);
         }
       }
+      if (!progressed) await sleep(intervalMs);
     }
     journal.append("witness-closed", { domain, served: served.length, expected: plan.length, outcome: "complete" });
     const evidence = {
@@ -4377,8 +5276,11 @@ export async function runWitnessPhase({ runId, attempt, evidenceDir, env, deps =
 
 /** PC-07 cleanup: rulesets, then refs, then the synthetic pull request. Never by wildcard. */
 export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps = {} }) {
-  const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
-  const { dir, ctx, request, guardCtx, journal, lock, records } = session;
+  // OBSERVE, not enforce: cleanup is the remediation a source move calls for, so a moved staging
+  // head is recorded and reported here rather than refusing the one phase that can remove what
+  // this run created. The production-baseline comparison below still ends the run as interrupted.
+  const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps, sourceContinuity: "observe" });
+  const { dir, ctx, operator, request, guardCtx, journal, lock, records } = session;
   try {
     const baseline = records.find((record) => record.type === "baseline-measured")?.data;
     if (!baseline) throw new IncompleteEvidence("this run has no journaled production baseline; cleanup cannot prove it changed nothing");
@@ -4387,6 +5289,30 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
     // cannot say whether the resource it is not deleting exists.
     const reconciliations = await reconcileCreateIntents({ request, ctx, journal });
     const current = journal.read();
+    /**
+     * REFRESH THE OWNED-ID GUARD CONTEXT AFTER RECONCILIATION (F7).
+     *
+     * `openLocalSession` builds these sets from the journal as it stood when the session opened —
+     * i.e. BEFORE the reconciliation above may have appended newly discovered resources. The
+     * request boundary refuses a DELETE whose ruleset ID is not in `rulesetIds`, so a resource that
+     * reconciliation had just proved this run owns could not be deleted through the very guard that
+     * exists to permit exactly that. The sets are re-derived from the journal the reconciliation
+     * wrote, and only from it.
+     */
+    for (const entry of journaledResources(current, "ruleset")) {
+      const id = positiveProviderId(entry.id);
+      if (id !== null) guardCtx.rulesetIds.add(id);
+    }
+    for (const entry of journaledResources(current, "commit")) guardCtx.graphShas.add(String(entry.sha));
+    guardCtx.pullNumber = positiveProviderId(journaledResources(current, "pull-request")[0]?.number);
+    /**
+     * The INDEPENDENTLY DERIVED intended bodies (F8), recomputed from the immutable intent rather
+     * than read back from the provider. This is what an unfingerprinted resource has to match
+     * before cleanup will treat it as owned.
+     */
+    const intendedRulesets = new Map(
+      Object.values(buildDisposablePlan(ctx).plan).flat().map((entry) => [entry.name, entry.body]),
+    );
     const fingerprints = journaledFingerprints(current);
     const outcomes = [];
     let refused = 0;
@@ -4399,15 +5325,36 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       const measured = governedFingerprint(detail.body);
       let recorded = fingerprints.get(`ruleset:${owned.name}`);
       let fingerprintStage = "creation";
+      let ownershipGap = null;
       if (recorded === undefined) {
-        // A create whose fingerprint readback failed (F5). The resource IS owned — the journal names
-        // its exact ID and name — so refusing outright would leave it behind for ever. The bounded
-        // reconciliation is to measure it NOW, having first proved the identity the intent recorded,
-        // and to record that the fingerprint is a cleanup-time measurement rather than a creation one.
-        if (String(detail.body.name) === owned.name && include.length === 1 && include[0] === owned.target_ref) {
-          journal.append("resource-fingerprinted", { kind: "ruleset", key: owned.name, id: Number(owned.id), governed_fingerprint: measured, measured_at_stage: "cleanup-reconciliation" });
+        /**
+         * A create whose fingerprint readback failed (F5/F8). The resource IS owned — the journal
+         * names its exact ID and name — so refusing outright would leave it behind for ever. But
+         * the bounded reconciliation is NOT "measure it now": the name and one include ref were the
+         * whole check, and a ruleset whose RULES had been emptied after creation satisfied both and
+         * was deleted.
+         *
+         * The intended body is recomputed from the immutable intent, independently of anything the
+         * provider now holds, and the current body must be provably that body. If it is not, the
+         * ownership gap is recorded and the resource is REFUSED — left in place, named, for root.
+         */
+        const intended = intendedRulesets.get(owned.name) ?? null;
+        const proof = proveIntendedOwnership({ measured: detail.body, intended });
+        if (String(detail.body.name) === owned.name && include.length === 1 && include[0] === owned.target_ref && proof.provable) {
+          journal.append("resource-fingerprinted", {
+            kind: "ruleset", key: owned.name, id: positiveProviderId(owned.id), governed_fingerprint: measured,
+            measured_at_stage: "cleanup-reconciliation", ownership_basis: proof.basis,
+          });
           recorded = measured;
           fingerprintStage = "cleanup-reconciliation";
+        } else {
+          ownershipGap = proof.provable
+            ? "the resource does not read back under the exact name and target the journal recorded"
+            : proof.reason;
+          journal.append("reconciliation", {
+            kind: "ruleset", key: `ruleset:${owned.name}`, outcome: "ownership-unprovable",
+            id: positiveProviderId(owned.id), reason: ownershipGap, differences: proof.differences,
+          });
         }
       }
       // The COMPLETE governed fingerprint, not a name and one include ref. A ruleset whose rules,
@@ -4420,8 +5367,13 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         outcomes.push({
           kind: "ruleset", id: owned.id, name: owned.name, result: "refused-ownership-mismatch",
           // Which half of the check refused, so a reviewer does not have to guess whether the
-          // resource was retargeted or its body was edited.
-          detail: typeof recorded !== "string" ? "no journaled fingerprint and the identity does not match the recorded intent" : "fingerprint or target differs from the journaled creation readback",
+          // resource was retargeted, its body was edited, or its ownership was never provable.
+          detail: ownershipGap
+            ? `ownership gap: ${ownershipGap}`
+            : (typeof recorded !== "string"
+              ? "no journaled fingerprint and the identity does not match the recorded intent"
+              : "fingerprint or target differs from the journaled creation readback"),
+          ...(ownershipGap ? { ownership_gap: true } : {}),
         });
         refused += 1;
         continue;
@@ -4477,11 +5429,17 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       excludeRulesetIds: new Set(journaledResources(current, "ruleset").map((owned) => Number(owned.id))),
     });
     const drift = Object.keys(baseline).filter((key) => canonicalJson(baseline[key]) !== canonicalJson(after[key]));
-    const stillUnresolved = unresolvedCreateIntents(journal.read()).filter((entry) => entry.state === "response-lost");
+    const stillUnresolved = blockingCreateIntents(journal.read());
     journal.append("run-closed", { cleanup_refusals: refused, production_drift: drift, unresolved_intents: stillUnresolved.length });
     const evidence = {
       schema_version: RESULT_SCHEMA_VERSION, phase: "cleanup", run_id: String(runId), attempt: String(attempt),
       workflow_sha: ctx.workflowSha, outcomes, refusals: refused,
+      // WHO DELETED (F9). Cleanup made thirteen DELETE calls without ever reading `/user`; the
+      // identity that ran it is now admitted by the shared local session AND recorded here, so the
+      // final assessment can require that the operator who removed the resources is the one this
+      // harness names rather than whoever happened to hold the credential at the end.
+      operator: { login: operator.login, permission: operator.permission, id: operator.id, type: operator.type },
+      source_continuity: ctx.sourceContinuity ?? null,
       production_baseline_before: baseline, production_baseline_after: after, production_drift: drift,
       // Both are recomputed by `check-evidence` from the journal and from the two baselines it
       // carries; they are published so a reviewer can re-derive them, not so a gate can read them.
@@ -4708,7 +5666,7 @@ const EVIDENCE_MANIFEST = Object.freeze([
   { key: "emergency", gate: "PC-05", phase: "emergency-tests", required: ["workflow_sha", "actor", "policy_in_force", "cases", "manifest_commit_sha", "manifest_sha256", "graph_sha256"] },
   { key: "approvals", gate: "PC-06", phase: "approvals", required: ["workflow_sha", "approval_history", "environments", "dispatcher_is_the_approver", "measured_dispatcher", "run_measured"] },
   { key: "environment", gate: "PC-06", phase: "environment-controls", required: ["controls"] },
-  { key: "cleanup", gate: "PC-07", phase: "cleanup", required: ["workflow_sha", "outcomes", "refusals", "production_baseline_before", "production_baseline_after", "production_drift", "unresolved_intents"] },
+  { key: "cleanup", gate: "PC-07", phase: "cleanup", required: ["workflow_sha", "operator", "outcomes", "refusals", "production_baseline_before", "production_baseline_after", "production_drift", "unresolved_intents"] },
   // The F1 transport's own record: the local witness process's summary of what it published.
   { key: "witness-process", gate: "PC-04", phase: "witness", required: ["workflow_sha", "domain", "expected_publications", "publications", "witness_identity"] },
 ]);
@@ -4794,8 +5752,10 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
     }
   }
 
-  // The declared check state, RECOMPUTED from its own per-context measurement.
-  for (const why of recomputeCheckState(record.check_state, { runId, attempt, expectation: kase.checks, normalAppId })) complain(why);
+  // The declared check state, RECOMPUTED from its own per-context measurement AND bound to the
+  // exact synthetic commit this case requested.
+  const checkHeadSha = kase.to && graph && typeof graph === "object" && FULL_SHA.test(String(graph[kase.to] ?? "")) ? String(graph[kase.to]) : null;
+  for (const why of recomputeCheckState(record.check_state, { runId, attempt, expectation: kase.checks, normalAppId, headSha: checkHeadSha })) complain(why);
 
   if (outcome === "denied") {
     if (!(status >= 400 && status < 500)) complain(`records a denial at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a client refusal`);
@@ -4818,6 +5778,103 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
     if (!(status >= 200 && status < 300) && status !== 0) complain(`records an acceptance at HTTP ${Number.isFinite(status) ? status : "?"}`);
   }
   return problems;
+}
+
+/**
+ * The disposable policy this run INTENDED, recomputed offline from the immutable intent (F2).
+ *
+ * ── WHY THIS IS COMPUTABLE WITHOUT THE PRODUCER MAP ─────────────────────────────────────────────
+ *
+ * The intent artifact deliberately publishes only a DIGEST of the twelve production producer IDs,
+ * not the map, so an offline assessor does not have them. It does not need them: the closed
+ * disposable transformation REPLACES every required check with `{ context: <derived TEST-ONLY
+ * name>, integration_id: <normal App> }`, and the derived context names come from the ordinals of
+ * `REQUIRED_MAIN_CONTEXTS`. So the disposable body depends on the producer map only through the
+ * NUMBER and ORDER of required contexts, which are fixed. The placeholder map below therefore
+ * yields exactly the bodies this run created — the same trick {@link derivedRulesetNames} already
+ * relies on — and the assessment compares the retained projections against a policy it derived
+ * itself rather than against anything the packet supplied.
+ */
+export function expectedDisposableRulesets({ runId, attempt, actor, normalAppId, emergencyAppId }) {
+  const placeholderProducers = Object.fromEntries(REQUIRED_MAIN_CONTEXTS.map((context) => [context, 1]));
+  const production = buildMainRulesets({ normalAppId, emergencyAppId, producerIds: placeholderProducers });
+  return transformToDisposable(production, { runId, attempt, actor, normalAppId });
+}
+
+/**
+ * The closed publishable vocabulary an OFFLINE reader can derive (F2).
+ *
+ * Narrower than {@link publishableVocabulary} in exactly one dimension — the producer set contains
+ * only the normal App, because that is the only producer a DISPOSABLE required check may name.
+ * Narrower is the safe direction: a projection that would fail this re-validation is one this
+ * build would never have published.
+ */
+export function offlinePublishableVocabulary({ runId, attempt, actor, normalAppId, emergencyAppId }) {
+  return {
+    rulesetNames: new Set(derivedRulesetNames(runId, attempt)[actor] ?? []),
+    refPatterns: new Set([derivedRef(runId, attempt, actor === "human" ? "human" : actor)]),
+    contexts: new Set(derivedContextNames(runId, attempt)),
+    producerIds: new Set([Number(normalAppId)]),
+    bypassAppIds: new Set([Number(normalAppId), Number(emergencyAppId)]),
+    sources: new Set([COMMISSIONING_REPOSITORY, ORG]),
+  };
+}
+
+/**
+ * INDEPENDENTLY REPEAT one retained governed observation (F2).
+ *
+ * Runs the SAME closed projection validator the consumer ran ({@link validateGovernedSnapshot}),
+ * then compares the governed set to the policy this assessor derived for itself. Returns the
+ * reasons the retained measurement does not support the verdict recorded beside it.
+ *
+ * This is the difference the review names: the previous gate counted unique IDs and checked digest
+ * SYNTAX, so a packet whose per-case policy verdicts all read `mismatch`, or whose observations
+ * were absent entirely, produced no blockers at all. A digest proves which bytes were retained. It
+ * does not prove what they say.
+ */
+export function reassessGovernedObservation(observation, { runId, attempt, actor, normalAppId, emergencyAppId }) {
+  const problems = [];
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return ["carries no retained governed observation"];
+  if (observation.inert === true) return ["carries an INERT rehearsal observation; a rehearsal measurement can never stand for a commissioning case"];
+  let governed;
+  try {
+    ({ governed } = validateGovernedSnapshot(observation, offlinePublishableVocabulary({ runId, attempt, actor, normalAppId, emergencyAppId })));
+  } catch (error) {
+    return [`carries a governed observation that does not re-validate against the closed publishable vocabulary (${error instanceof Error ? error.message : String(error)})`];
+  }
+  const wanted = expectedDisposableRulesets({ runId, attempt, actor, normalAppId, emergencyAppId });
+  const byName = new Map(governed.map((ruleset) => [String(ruleset.name), ruleset]));
+  for (const want of wanted) {
+    const actual = byName.get(String(want.name));
+    if (!actual) { problems.push(`measured no ${want.name} ruleset as applicable`); continue; }
+    for (const field of GOVERNED_RULESET_FIELDS.filter((entry) => entry !== "name")) {
+      const comparison = compareToDesired(actual[field] ?? null, want[field] ?? null);
+      // Provider default expansion and key ordering are the known-benign differences; anything else
+      // means the policy in force was not the reviewed disposable one.
+      if (!comparison.byteEqual && !comparison.normalizationOnly) {
+        problems.push(`measured a ${want.name} ${field} that is not the intended disposable policy`);
+      }
+    }
+  }
+  const foreign = governed.filter((ruleset) => !wanted.some((want) => String(want.name) === String(ruleset.name)));
+  if (foreign.length) problems.push(`measured ${foreign.length} additional applicable ruleset(s) (${foreign.map((r) => String(r.name)).join(", ")})`);
+  // The timings, as ACTUAL FINITE NUMBERS. `Number(null)` is zero and zero is inside every bound.
+  for (const field of ["started_at", "completed_at"]) {
+    if (!Number.isFinite(Date.parse(String(observation[field])))) problems.push(`carries no parseable ${field}`);
+  }
+  if (typeof observation.span_ms !== "number" || !Number.isFinite(observation.span_ms) || observation.span_ms < 0 || observation.span_ms > MAX_POLICY_READ_SPAN_MS) {
+    problems.push(`carries an observation span (${JSON.stringify(observation.span_ms ?? null)}) outside the ${MAX_POLICY_READ_SPAN_MS}ms contemporaneity bound`);
+  }
+  return problems;
+}
+
+/** A measured interval must be an ACTUAL FINITE NUMBER inside its bound — never `null` coerced. */
+function assessInterval(value, label, bound) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return `${label} is ${JSON.stringify(value ?? null)} rather than an actual measured interval; an absent timing is not a zero one`;
+  }
+  if (value < 0 || value > bound) return `${label} (${value}ms) is outside the ${bound}ms sequencing bound`;
+  return null;
 }
 
 /**
@@ -4846,6 +5903,23 @@ export function assessEvidence({ dir, runId, attempt }) {
   catch (error) { journalError = error instanceof Error ? error.message : String(error); }
   if (journalError) block("PC-07", "failed", `the local journal chain does not verify: ${journalError}`);
   else if (!journalRecords.length) block("PC-07", "unverified", "the local journal is empty; no local phase has run");
+
+  /**
+   * ── THE SECOND HASH-CHAINED JOURNAL, VERIFIED (F2) ────────────────────────────────────────────
+   *
+   * The assessor read only the RESOURCE journal. The witness process keeps its own separate
+   * append-only chain — the challenges it observed, the dispatches it made, the publications it
+   * reconciled — and removing that file entirely produced no blocker whatsoever: the whole
+   * transport half of the evidence could simply be absent and the packet still passed. Both chains
+   * bind the same immutable source and the same manifest, which is exactly what makes the join
+   * below possible, so both are verified here and a missing one blocks.
+   */
+  let witnessRecords = null;
+  let witnessJournalError = null;
+  try { witnessRecords = readJournal({ dir, runId, attempt, kind: "witness" }); }
+  catch (error) { witnessJournalError = error instanceof Error ? error.message : String(error); }
+  if (witnessJournalError) block("PC-04", "failed", `the local witness journal chain does not verify: ${witnessJournalError}`);
+  else if (!witnessRecords.length) block("PC-04", "unverified", "the separate witness journal is absent or empty; the witness transport's own record of what it observed, dispatched and reconciled is missing");
 
   /**
    * THIS RUN'S WINDOW, from the verified journal's own first record.
@@ -4948,7 +6022,7 @@ export function assessEvidence({ dir, runId, attempt }) {
       }
       // UNRESOLVED CREATE INTENTS (F5). A packet cannot be complete while the journal holds a create
       // whose outcome nobody established.
-      const unresolved = unresolvedCreateIntents(journalRecords).filter((entry) => entry.state === "response-lost");
+      const unresolved = blockingCreateIntents(journalRecords);
       if (unresolved.length) block("PC-07", "unverified", `${unresolved.length} create intent(s) in the verified journal have no result and no reconciliation`);
       if (Number(files.setup.unresolved_intents ?? -1) !== unresolved.length) {
         block("PC-07", "invalid", "the setup evidence's unresolved-intent count is not the one the verified journal supports");
@@ -5072,8 +6146,32 @@ export function assessEvidence({ dir, runId, attempt }) {
     }
   }
 
-  // THE WITNESS TRANSPORT (F1). Exactly 22 publications for a commissioning attempt, and a rehearsal
-  // response can never be one of them.
+  /**
+   * ── THE WITNESS TRANSPORT, JOINED ACROSS ALL FOUR SOURCES (F1/F2) ─────────────────────────────
+   *
+   * The previous checks here counted unique IDs, validated digest SYNTAX, and compared totals. All
+   * of that is satisfied by a packet whose publication case IDs are invented unique names, whose
+   * publisher-run identities are absent, whose per-case artifacts are unrelated numbers with the
+   * entry digests removed, and whose separate witness journal does not exist — and every one of
+   * those independent mutations returned `blockers: []`.
+   *
+   * So the exact ELEVEN cloud cases × TWO directions are joined, by name, across the four things
+   * that must agree about them: the immutable intent's derived plan, the actor job's own consumed
+   * evidence, the verified resource journal's synthetic graph, and the verified witness journal's
+   * observed challenges and reconciled publications. A publication that is not one of the closed
+   * 22 is an invented case; a case whose artifact the witness journal does not record is a claim
+   * with no counterparty.
+   */
+  const expectedPublicationKeys = witnessWorkPlan(COMMISSION_DOMAIN).map((entry) => `${entry.caseId}:${entry.direction}`);
+  /** The witness journal's own record of what it observed and what it reconciled. */
+  const witnessObserved = new Map();
+  const witnessReconciled = new Map();
+  for (const record of witnessRecords ?? []) {
+    const key = `${String(record.data?.case_id)}:${String(record.data?.direction)}`;
+    if (record.type === "challenge-observed") witnessObserved.set(key, record.data);
+    if (record.type === "response-reconciled") witnessReconciled.set(key, record.data);
+  }
+
   if (files["witness-process"]) {
     const witness = files["witness-process"];
     if (String(witness.domain) !== COMMISSION_DOMAIN) {
@@ -5083,46 +6181,181 @@ export function assessEvidence({ dir, runId, attempt }) {
     if (Number(witness.expected_publications) !== REQUIRED_WITNESS_PUBLICATIONS) {
       block("PC-04", "invalid", `the witness evidence expected ${witness.expected_publications} publications; this build requires exactly ${REQUIRED_WITNESS_PUBLICATIONS}`);
     }
-    if (publications.length !== REQUIRED_WITNESS_PUBLICATIONS) {
-      block("PC-04", "unverified", `${publications.length} of the required ${REQUIRED_WITNESS_PUBLICATIONS} witness publications were reconciled`);
-    }
+    // THE EXACT CLOSED SET, not a count of distinct strings.
     const keys = publications.map((entry) => `${String(entry?.case_id)}:${String(entry?.direction)}`);
+    const missingKeys = expectedPublicationKeys.filter((key) => !keys.includes(key));
+    const inventedKeys = keys.filter((key) => !expectedPublicationKeys.includes(key));
     if (new Set(keys).size !== keys.length) block("PC-04", "invalid", "the witness evidence records duplicate case/direction publications");
-    const artifactIds = publications.map((entry) => Number(entry?.artifact_id));
+    if (missingKeys.length) {
+      block("PC-04", "unverified", `${missingKeys.length} of the required ${REQUIRED_WITNESS_PUBLICATIONS} case/direction publications are missing (${missingKeys.slice(0, 4).join(", ")}${missingKeys.length > 4 ? ", …" : ""})`);
+    }
+    if (inventedKeys.length) {
+      block("PC-04", "invalid", `the witness evidence records ${inventedKeys.length} publication(s) for case/direction pairs outside this run's closed set (${inventedKeys.slice(0, 4).join(", ")}${inventedKeys.length > 4 ? ", …" : ""})`);
+    }
+    const artifactIds = publications.map((entry) => positiveProviderId(entry?.artifact_id));
+    if (artifactIds.some((id) => id === null)) block("PC-04", "invalid", "a witness publication carries no positive artifact identity");
     if (new Set(artifactIds).size !== artifactIds.length) block("PC-04", "invalid", "the witness evidence records the same artifact for more than one publication");
+    // THE PUBLISHER RUN, per publication. Removing these was one of the independent mutations that
+    // used to pass: a publication with no publisher run has no provenance to re-derive.
+    const withoutPublisher = publications.filter((entry) => positiveProviderId(entry?.publisher_run_id) === null);
+    if (withoutPublisher.length) {
+      block("PC-04", "invalid", `${withoutPublisher.length} witness publication(s) name no publisher run identity`);
+    }
+    // CROSS-CHECKED AGAINST THE WITNESS JOURNAL, which is the chain that actually recorded them.
+    for (const entry of publications) {
+      const key = `${String(entry?.case_id)}:${String(entry?.direction)}`;
+      if (!expectedPublicationKeys.includes(key)) continue;
+      const journaled = witnessReconciled.get(key);
+      if (!journaled) { block("PC-04", "invalid", `the witness evidence reports a publication for ${key} that its own verified journal does not record reconciling`); continue; }
+      if (positiveProviderId(journaled.artifact_id) !== positiveProviderId(entry?.artifact_id)) {
+        block("PC-04", "invalid", `the witness evidence's artifact for ${key} is not the one its verified journal reconciled`);
+      }
+    }
     const identity = witness.witness_identity;
     if (Number(identity?.user_id) !== OWNER_USER_ID || String(identity?.login) !== OWNER_LOGIN) {
       block("PC-04", "failed", "the witness evidence does not name the one authorized local measuring identity");
     }
   }
 
-  // Per-case witness bindings, from each actor's own file: distinct nonces, distinct artifacts, and
-  // the pre/post policy fingerprints EQUAL — which is the whole contemporaneity claim.
+  /**
+   * ── PER-CASE RECONSTRUCTION, FROM EACH ACTOR'S OWN FILE (F2) ──────────────────────────────────
+   *
+   * Every case, not the first one. The previous shape let the first case supply the role-level
+   * grants and policy record and left every subsequent case's proof outside substantive
+   * assessment — so deleting every per-case token proof, or setting every per-case policy verdict
+   * to `mismatch`, changed nothing.
+   */
   for (const role of ["normal", "emergency"]) {
     if (!files[role]) continue;
     const cases = Array.isArray(files[role].cases) ? files[role].cases : [];
     const nonces = [];
     const artifacts = [];
+    const intendedApp = intendedApps ? intendedApps[role] : null;
+    /**
+     * THE ACTOR FILE'S OWN MANIFEST AND GRAPH BINDINGS, RECOMPUTED (F2).
+     *
+     * Replacing either with an unrelated valid-length digest was one of the independent mutations
+     * that produced no blockers: the fields were REQUIRED to be present and then never compared to
+     * anything. The graph digest is recomputed from the verified journal's own commits, and the
+     * manifest digest must be the one this run's setup published.
+     */
+    if (files.setup && String(files[role].manifest_sha256 ?? "") !== String(files.setup.manifest_sha256 ?? "")) {
+      block("PC-04", "invalid", `the ${role} actor evidence names a manifest digest that is not the one this run's setup published`);
+    }
+    if (graph && String(files[role].graph_sha256 ?? "") !== graphBindingDigest(graph, runId, attempt)) {
+      block("PC-04", "invalid", `the ${role} actor evidence's graph digest does not describe the synthetic graph the verified journal records`);
+    }
     for (const record of cases) {
+      const caseId = String(record?.case);
       const witness = record?.witness;
-      if (!witness) { block("PC-04", "unverified", `case ${String(record?.case)} records no witness binding`); continue; }
+      if (!witness) { block("PC-04", "unverified", `case ${caseId} records no witness binding`); continue; }
+
+      // ── identities, positive and distinct ─────────────────────────────────────────────────────
       for (const field of ["pre_nonce_digest", "post_nonce_digest"]) {
-        if (!SHA256_HEX.test(String(witness[field] ?? ""))) block("PC-04", "invalid", `case ${String(record?.case)} carries no ${field}`);
+        if (!SHA256_HEX.test(String(witness[field] ?? ""))) block("PC-04", "invalid", `case ${caseId} carries no ${field}`);
         else nonces.push(String(witness[field]));
       }
       for (const field of ["pre_artifact", "post_artifact"]) {
-        const id = Number(witness[field]?.artifact_id);
-        if (!Number.isInteger(id)) block("PC-04", "invalid", `case ${String(record?.case)} carries no ${field} identity`);
+        const id = positiveProviderId(witness[field]?.artifact_id);
+        if (id === null) block("PC-04", "invalid", `case ${caseId} carries no ${field} identity`);
         else artifacts.push(id);
       }
-      if (!SHA256_HEX.test(String(witness.governed_fingerprint ?? ""))) {
-        block("PC-04", "invalid", `case ${String(record?.case)} carries no complete governed fingerprint for its measurement window`);
+      // THE ENTRY DIGESTS, whose removal used to be invisible: without them the retained bytes are
+      // bound to nothing.
+      for (const field of ["pre_entry_digest", "post_entry_digest"]) {
+        if (!SHA256_HEX.test(String(witness[field] ?? ""))) block("PC-04", "invalid", `case ${caseId} carries no ${field} for the publication it consumed`);
       }
-      for (const field of ["pre_to_mutation_ms", "readback_to_post_ms"]) {
-        const value = Number(witness[field]);
-        if (!Number.isFinite(value) || value < 0 || value > MAX_OBSERVATION_TO_MUTATION_MS) {
-          block("PC-04", "invalid", `case ${String(record?.case)}'s ${field} (${witness[field]}) is outside the ${MAX_OBSERVATION_TO_MUTATION_MS}ms sequencing bound`);
+      if (!SHA256_HEX.test(String(witness.governed_fingerprint ?? ""))) {
+        block("PC-04", "invalid", `case ${caseId} carries no complete governed fingerprint for its measurement window`);
+      }
+
+      // ── the join, per direction, against the verified witness journal ─────────────────────────
+      for (const [direction, artifactField] of [["pre", "pre_artifact"], ["post", "post_artifact"]]) {
+        const key = `${caseId}:${direction}`;
+        if (!expectedPublicationKeys.includes(key)) continue;
+        const reconciled = witnessReconciled.get(key);
+        const observed = witnessObserved.get(key);
+        if (!reconciled) { block("PC-04", "unverified", `the verified witness journal records no reconciled ${direction} publication for case ${caseId}`); continue; }
+        if (positiveProviderId(reconciled.artifact_id) !== positiveProviderId(witness[artifactField]?.artifact_id)) {
+          block("PC-04", "invalid", `case ${caseId}'s ${direction} artifact is not the one the verified witness journal reconciled`);
         }
+        if (!observed) block("PC-04", "unverified", `the verified witness journal records no observed ${direction} challenge for case ${caseId}`);
+        else if (String(observed.nonce_digest) !== String(witness[`${direction}_nonce_digest`])) {
+          block("PC-04", "invalid", `case ${caseId}'s ${direction} nonce digest is not the one the verified witness journal observed`);
+        }
+        if (reconciled.entry_digest !== undefined && String(reconciled.entry_digest) !== String(witness[`${direction}_entry_digest`])) {
+          block("PC-04", "invalid", `case ${caseId}'s ${direction} entry digest is not the one the verified witness journal reconciled`);
+        }
+      }
+
+      // ── the actual measured intervals: FINITE NUMBERS, never a coerced null ───────────────────
+      for (const field of ["pre_to_mutation_ms", "readback_to_post_ms"]) {
+        const problem = assessInterval(witness[field], `case ${caseId}'s ${field}`, MAX_OBSERVATION_TO_MUTATION_MS);
+        if (problem) block("PC-04", "invalid", problem);
+      }
+
+      // ── the retained pre/post observations, INDEPENDENTLY REPEATED ───────────────────────────
+      if (Number.isInteger(intendedApp) && intendedApps) {
+        for (const direction of ["pre", "post"]) {
+          const problems = reassessGovernedObservation(witness[`${direction}_observation`], {
+            runId, attempt, actor: role, normalAppId: intendedApps.normal, emergencyAppId: intendedApps.emergency,
+          });
+          for (const why of problems) block("PC-04", "failed", `case ${caseId}'s ${direction} witness observation ${why}`);
+        }
+      }
+      // PRE == POST on the complete governed policy: the whole contemporaneity claim, recomputed
+      // here rather than read out of the record that asserts it.
+      const preDigest = witness.pre_observation?.projected_governed_digest;
+      const postDigest = witness.post_observation?.projected_governed_digest;
+      if (SHA256_HEX.test(String(preDigest ?? "")) && SHA256_HEX.test(String(postDigest ?? "")) && String(preDigest) !== String(postDigest)) {
+        block("PC-04", "failed", `case ${caseId}'s governed policy changed across its mutation window; the measurement is not contemporaneous`);
+      }
+
+      // ── this case's OWN policy verdict, and its OWN token/installation proof ──────────────────
+      for (const [label, policy] of [["pre-mutation", record?.policy_pre], ["post-mutation", record?.policy_in_force]]) {
+        if (!policy || typeof policy !== "object") { block("PC-04", "unverified", `case ${caseId} records no ${label} policy verdict`); continue; }
+        if (String(policy.verdict) !== "compatible") {
+          block("PC-04", String(policy.verdict) === "measurement-incomplete" ? "unverified" : "failed",
+            `case ${caseId}'s ${label} policy is recorded as ${JSON.stringify(String(policy.verdict ?? "unreported"))}`);
+        }
+      }
+      const proof = record?.token_proof;
+      if (!proof || typeof proof !== "object") {
+        block("PC-04", "unverified", `case ${caseId} records no token proof; its credential's App, installation, repository and scoped read are unestablished`);
+      } else {
+        const installation = proof.installation;
+        if (!installation || typeof installation !== "object") block("PC-04", "unverified", `case ${caseId}'s token proof records no installation scope`);
+        else {
+          // THE REPOSITORY, BY NUMERIC ID. A proof naming repository 1 with `total_count: 999`,
+          // preserving only the expected repository NAME, used to pass.
+          if (files.intent && Number(installation.repository_id) !== Number(files.intent.repository_id)) {
+            block("PC-04", "failed", `case ${caseId}'s token proof names repository ${JSON.stringify(installation.repository_id ?? null)}, not the one this run's immutable intent configured`);
+          }
+          if (String(installation.repository_full_name ?? "") !== COMMISSIONING_REPOSITORY) {
+            block("PC-04", "failed", `case ${caseId}'s token proof names ${JSON.stringify(String(installation.repository_full_name ?? ""))} as its repository`);
+          }
+          if (Number(installation.total_count) !== 1) {
+            block("PC-04", "failed", `case ${caseId}'s token proof reports ${JSON.stringify(installation.total_count ?? null)} reachable repositories; commissioning requires exactly one`);
+          }
+        }
+      }
+      const grants = record?.grants;
+      if (!grants || typeof grants !== "object" || grants.measured !== true) {
+        block("PC-04", "unverified", `case ${caseId} records no measured App grant set of its own`);
+      } else {
+        if (Number.isInteger(intendedApp) && Number(grants.app_id) !== intendedApp) {
+          block("PC-04", "failed", `case ${caseId} measured App ${Number(grants.app_id)}, not the ${intendedApp} this run's immutable intent configured`);
+        }
+        const comparison = comparePermissions(grants.installation_permissions, ROLE_APP_PERMISSIONS[role]);
+        if (!comparison.ok) block("PC-04", "failed", `case ${caseId}'s measured grants are not the closed ${role} set`);
+      }
+
+      // ── the manifest and graph this case's challenges bound ──────────────────────────────────
+      if (files.setup && String(record?.manifest_sha256 ?? "") !== String(files.setup.manifest_sha256 ?? "")) {
+        block("PC-04", "invalid", `case ${caseId} names a manifest digest that is not the one this run's setup published`);
+      }
+      if (graph && String(record?.graph_sha256 ?? "") !== graphBindingDigest(graph, runId, attempt)) {
+        block("PC-04", "invalid", `case ${caseId} names a synthetic graph digest that does not describe the graph the verified journal records`);
       }
     }
     if (new Set(nonces).size !== nonces.length) block("PC-04", "invalid", `the ${role} actor evidence reuses a witness nonce across cases or directions`);
@@ -5210,6 +6443,19 @@ export function assessEvidence({ dir, runId, attempt }) {
   }
 
   if (files.cleanup) {
+    /**
+     * THE OPERATOR WHO DELETED, by numeric identity (F9).
+     *
+     * Cleanup previously performed no `/user` read at all, so a different repository administrator
+     * could run it end to end and the packet recorded nothing about that at all. The admission is
+     * now in the shared local session; this is the durable half, so a reviewer can see WHOSE
+     * credential removed the resources rather than assuming it was the one who created them.
+     */
+    const cleaner = files.cleanup.operator;
+    if (Number(cleaner?.id) !== OWNER_USER_ID || String(cleaner?.login) !== OWNER_LOGIN
+      || String(cleaner?.type) !== OWNER_USER_TYPE || String(cleaner?.permission) !== "admin") {
+      block("PC-02", "failed", `the cleanup evidence records the operator ${JSON.stringify(String(cleaner?.login ?? ""))} (#${cleaner?.id ?? "unmeasured"}), not the one authorized administrator`);
+    }
     if ((files.cleanup.production_drift ?? []).length) block("PC-07", "failed", "production state moved during the run");
     if (Number(files.cleanup.refusals ?? 0) > 0) block("PC-07", "failed", `${files.cleanup.refusals} owned resource(s) remain or did not match their fingerprint`);
     /**
@@ -5406,7 +6652,9 @@ export async function collectApprovalEvidence({ request, runId, attempt, ctx, no
  * never touches a credential.
  */
 export async function runCollectPhase({ runId, attempt, evidenceDir, env = process.env, deps = {} }) {
-  const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
+  // OBSERVE, for the same reason as cleanup: gathering the approval evidence a completed run
+  // already produced must not be blocked by a later, unrelated merge to staging.
+  const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps, sourceContinuity: "observe" });
   const { dir, ctx, request, lock } = session;
   try {
     const approvals = await collectApprovalEvidence({ request, runId, attempt, ctx, now: deps.now });

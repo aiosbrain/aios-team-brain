@@ -170,9 +170,12 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.repository == 'aiosbrain/aios-team-brain' && github.ref == 'refs/heads/staging' && inputs.mode == 'commission'
     needs: intent
     runs-on: ubuntu-latest
-    # Backstop for the helper's bounded local-setup wait: the helper owns the real deadline and
-    # refuses rather than hangs, and this stops a stalled poll from holding the run open.
-    timeout-minutes: 45
+    # Backstop for the helper's bounded local-setup wait: the helper owns the real deadline (25
+    # minutes, inside this one) and refuses rather than hangs, and this stops a stalled poll from
+    # holding the run open. THE CANONICAL JOB BOUND IS 30 MINUTES and every job in this file states
+    # exactly that or less — a job that allowed itself longer than the accepted contract is not a
+    # safety bound, it is a second contract. Asserted against `MAX_JOB_MINUTES`.
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -225,8 +228,12 @@ jobs:
     # once local setup has completed — the state PC-03 asks a human to inspect before approving.
     needs: [intent, fixture]
     runs-on: ubuntu-latest
-    # Seven cases, each waiting on two witness publications with a 180-second challenge lifetime.
-    timeout-minutes: 90
+    # THE CANONICAL 30-MINUTE JOB BOUND (F15). Seven cases, each waiting on two witness publications
+    # with a 180-second challenge lifetime, so a run in which EVERY publication took its full
+    # lifetime would not fit — and that is deliberately not concealed by a wider window. Measuring
+    # whether the real queue meets these bounds is what the inert transport rehearsal is for; a job
+    # that overran would report incomplete, which is the honest outcome the canonical asks for.
+    timeout-minutes: 30
     # Protected: parks until a human reviewer approves. That approval — captured from GitHub's own
     # review history — IS the PC-06 evidence; nothing here may self-approve.
     environment: staging-release
@@ -696,7 +703,8 @@ jobs:
     # re-verifies the setup readback from trusted run metadata before it acts.
     needs: intent
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The canonical 30-minute job bound (F15), for the same reason as the normal job above.
+    timeout-minutes: 30
     environment: staging-emergency
     permissions:
       contents: read

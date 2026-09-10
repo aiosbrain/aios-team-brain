@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
-  CLOUD_CASE_SEQUENCE, PROTECTED_JOBS, REHEARSAL_JOB_ID, REQUIRED_WITNESS_PUBLICATIONS,
-  WITNESS_JOB_ID, WITNESS_MODES, evidenceFileName, formatChallengeArtifactName,
+  CLOUD_CASE_SEQUENCE, MAX_JOB_MINUTES, PROTECTED_JOBS, REHEARSAL_JOB_ID, REHEARSAL_JOB_NAME,
+  REQUIRED_WITNESS_PUBLICATIONS, WITNESS_JOB_ID, WITNESS_JOB_NAME, WITNESS_MODES,
+  evidenceFileName, formatChallengeArtifactName,
 } from "../../scripts/staging-ops/policy-commissioning.mjs";
 
 /**
@@ -564,12 +565,35 @@ describe("PC-03: ordered bootstrap — dependencies and protected environments",
     expect(typeof (jobs.fixture as unknown as { "timeout-minutes"?: number })["timeout-minutes"]).toBe("number");
   });
 
-  it("bounds every job's wall-clock time, including the two that wait on a witness", () => {
+  it("bounds every job at or under the CANONICAL 30-minute limit, by exact value (F15)", () => {
+    /**
+     * `> 0` was the whole assertion, which is why the fixture job carried 45 minutes and both
+     * actor jobs carried 90 while the accepted contract says 30. A bound that may exceed the
+     * contract is not a bound; it is a second contract. The value comes from the runner's one
+     * definition rather than being retyped here.
+     */
+    expect(MAX_JOB_MINUTES).toBe(30);
     for (const id of JOB_IDS) {
       const timeout = (jobs[id] as unknown as { "timeout-minutes"?: number })["timeout-minutes"];
       expect(typeof timeout, `job ${id} timeout`).toBe("number");
       expect(Number(timeout), `job ${id} timeout`).toBeGreaterThan(0);
+      expect(Number(timeout), `job ${id} exceeds the canonical job bound`).toBeLessThanOrEqual(MAX_JOB_MINUTES);
     }
+    // The three jobs the review named, at exactly the canonical bound.
+    for (const id of ["fixture", "normal", "emergency"]) {
+      expect(Number((jobs[id] as unknown as { "timeout-minutes"?: number })["timeout-minutes"]), id).toBe(MAX_JOB_MINUTES);
+    }
+  });
+
+  it("names the two transport jobs exactly as the runner matches them in the jobs API (F11)", () => {
+    /**
+     * `/jobs` reports the DISPLAY name, so a rename here would make the runner's lookup find
+     * nothing — and "no job found" reads as a refusal rather than as a bug. The rehearsal used to
+     * admit itself by COUNTING one non-skipped job, which says nothing about which job that was;
+     * it now matches this exact string.
+     */
+    expect((jobs[WITNESS_JOB_ID] as unknown as { name?: string }).name).toBe(WITNESS_JOB_NAME);
+    expect((jobs[REHEARSAL_JOB_ID] as unknown as { name?: string }).name).toBe(REHEARSAL_JOB_NAME);
   });
 });
 

@@ -104,7 +104,9 @@ private nonce, the local **witness** process (`commissioning-witness.mjs`, CLI p
 measures the full governed policy and dispatches the same reviewed workflow in `policy-witness` mode,
 one non-protected publisher job republishes those exact bytes as a single-entry artifact, and the actor
 binds it to its own nonce and immutable source before running the production verifier and mutating.
-Eleven cloud cases × pre and post = exactly **22** publications per attempt. ⚠️ This is a bounded
+Eleven cloud cases × pre and post = exactly **22** publications per attempt, and `check-evidence`
+JOINS that exact closed set across the immutable intent, each actor's own consumed evidence and BOTH
+hash-chained journals rather than counting it. ⚠️ This is a bounded
 contemporaneous pre/post measurement under administrative quiescence, **not an atomic
 policy-at-mutation proof**; every policy record in the packet carries that sentence and
 `check-evidence` refuses a packet that drops it. A separate `transport-rehearsal` mode measures that
