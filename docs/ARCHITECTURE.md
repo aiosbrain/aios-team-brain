@@ -1847,7 +1847,10 @@ explicit, and required completeness never implies all-check completeness. Produc
 emission remains disabled until the separate production acceptance gate.
 
 The member conformance snapshot is now the full Workspace member API 1.26 contract,
-vendored from merge `b8559ebf40b876dc36ac00605244af670edb1920`. Scanner payloads
+vendored from Workspace merge `ce28fa75e6cbe35d7d7e3c9d9620e82cecd31255` (document
+revision 1.28). Its availability metadata identifies implemented Brain commit
+`87be1293dd8338dde953020c757bad336f2da9b4`; deployment and activation still require
+verification in each target environment, with no production availability claim. Scanner payloads
 remain independently pinned to `codebase-payload-1.25`; gateway remains 1.10.
 The earlier frozen 1.25 compatibility snapshot was used only by the coverage-only
 consumer before intake implementation.
