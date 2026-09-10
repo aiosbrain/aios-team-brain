@@ -314,6 +314,13 @@ it("v3 inherits evidence/head constraints and cannot fall through the legacy sch
     Object.assign(invalid.metrics.codebase_health, patch);
     expect(codebaseScanPayloadSchema.safeParse(invalid).success).toBe(false);
   }
+  const legacy = structuredClone(
+    fixtures.valid.find((f) => f.name.startsWith("valid-with-health:"))!
+      .payload,
+  ) as typeof payload;
+  legacy.metrics.codebase_health.schema_version = "3";
+  legacy.metrics.head_sha = legacy.metrics.codebase_health.head_sha as string;
+  expect(codebaseScanPayloadSchema.safeParse(legacy).success).toBe(false);
   const missing = structuredClone(payload);
   delete missing.metrics.codebase_health.check_coverage;
   expect(codebaseScanPayloadSchema.safeParse(missing).success).toBe(false);
