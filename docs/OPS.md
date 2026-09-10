@@ -1205,3 +1205,97 @@ until someone measures them:
 
 **Do not "fix" any of these by broadening token scopes, adding a PAT, or making the package
 public.** If a prerequisite fails, the workflow refusing is the correct outcome.
+
+## 13. Release-policy commissioning runbook — `release-policy-commissioning.yml` (AIO-1124)
+
+The harness, what it cannot do, and the phase sequence are in `docs/RELEASING.md` §5. This section is
+the operational half: what must exist before a run, what each of the three roles holds, and the two
+places where an honest result is `unverified` rather than a pass.
+
+**⚠️ Commissioning is not activation.** Nothing here promotes `main`, changes `main`/`staging`
+protection, cuts a tag, deploys, restarts a service or accepts a release — and no job in it holds a
+credential that could. The output is one sanitized evidence packet.
+
+### Prerequisites — all of them, or the run measures nothing
+
+| Prerequisite | Why a run without it is not evidence |
+|---|---|
+| Distinct normal + emergency GitHub Apps, installed on **this repository only** | The runner refuses identical App IDs and refuses an installation whose repository selection is not exactly this repo. A shared or org-wide identity is out of scope. |
+| Their keys in `staging-release` / `staging-emergency`, **each in its own environment** | The protected jobs assert they cannot see the counterpart key. Both in one environment is one identity, not two. |
+| John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
+| A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
+| Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
+| Local `gh` admin identity (`johnellison`) | Administers the disposable resources and runs the human/admin cases. It is never uploaded into Actions, and no new long-lived admin token is created. |
+| No release in progress | Cleanup asserts `main`/`staging` SHAs, main's applicable and classic protections, and the `v*` tag ruleset are unchanged. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
+
+### The three roles, and the fourth job that is not an actor
+
+- **local** — the operator's existing `gh` identity. Creates and removes the disposable graph, refs,
+  rulesets and its one synthetic PR; runs the human/admin cases; owns cleanup and the journal.
+- **normal** — the `staging-release` job. Holds only the three normal-App secrets, mints a short-lived
+  installation token, and is the actor for the missing / red / wrong-producer / all-green cases.
+- **emergency** — the `staging-emergency` job. Holds only its own three secrets. Its acceptance with
+  checks absent is both a case and the liveness proof for that identity.
+- **fixture** — `checks: write` and **no App secret**. It is the second, independently measured
+  producer (the GitHub Actions app) that makes a wrong-producer control case possible at all. It waits
+  a bounded time for local setup to publish the manifest, then refuses rather than hanging, so its
+  `always()` artifact upload still runs.
+
+### Reading the packet
+
+Nine files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
+phase plus the operator-supplied environment controls; `collect` and `check-evidence` write their own
+summaries alongside. Each of the nine is validated for
+schema version, run, attempt and phase before any gate reads a field out of it: a file that belongs to
+another run is discarded and reported `invalid`, because a mis-bound file is worse than an absent one —
+absence blocks loudly, whereas a stale green packet would contribute *passing* gates measured against
+a different subject.
+
+Three blocker kinds, and they mean different things. **`failed`** is a measured statement about the
+subject. **`unverified`** is "we could not look, or nobody has looked yet". **`invalid`** is "a file
+claiming to be this evidence is not this evidence". Only an empty blocker list is a pass.
+
+### The two things that are honestly unverified
+
+1. **The protected-environment negative controls.** This harness cannot impersonate a second reviewer,
+   cannot read `prevent_self_review` back from the environments API, and a skipped off-branch job
+   proves workflow *admission* rather than environment branch policy. So each control is
+   operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`, named
+   individually (`ENVIRONMENT_CONTROL_KEYS` in the runner) so one observation cannot stand in for
+   seven:
+
+   ```json
+   {
+     "schema_version": 1, "phase": "environment-controls", "run_id": "…", "attempt": "…",
+     "controls": {
+       "required_reviewer_is_owner":       { "status": "verified",   "evidence": "UI readback <date>" },
+       "unauthorized_reviewer_refused":    { "status": "unverified", "evidence": "no second reviewer identity available" }
+     }
+   }
+   ```
+
+   A `verified` with no `evidence` reference is not a verification, and a control outside the closed
+   list is `invalid`. If the second identity does not exist, leave it `unverified` — that blocks full
+   activation, which is the correct outcome, and is the whole reason the field is per-control.
+
+2. **The two release Apps' installation permission sets.** The finite-deadline token helper does not
+   surface an installation token's permissions and no endpoint reports them back for someone else's
+   installation. The actor evidence therefore says `installation_permissions:
+   "unverified-by-this-harness"`, and a file claiming otherwise is `invalid`. Attach the owner-side
+   readback as `normal_app_permissions_confirmed` / `emergency_app_permissions_confirmed`.
+
+### If something goes wrong
+
+- **An actor unexpectedly SUCCEEDS at a force or delete.** That actor's remaining cases are recorded
+  `not-run` and nothing further is attempted with a credential just shown to be over-privileged. Run
+  `cleanup` — it removes only journaled resources — and stop.
+- **A partial setup.** Re-run `setup` for the same run and attempt. It resumes from the verified
+  journal, reading each journaled resource back before adopting it, and refuses a collision rather
+  than adopting or deleting anything it did not create. A **rerun attempt** derives a fresh suffix and
+  reuses nothing.
+- **A stale lock.** Not removed on elapsed time alone: a slow provider call and a dead process look
+  identical by clock. Recovery needs positive evidence the owner is gone *and* a provider readback
+  that reconciles its last recorded mutation.
+- **`cleanup` reports a refusal.** A resource whose name or exact derived target no longer matches its
+  journaled fingerprint is left in place for a human. It is never deleted by wildcard or by prefix
+  sweep, and an owned leftover is reported as a cleanup refusal rather than as production drift.

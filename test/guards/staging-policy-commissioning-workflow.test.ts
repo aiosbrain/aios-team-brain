@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
+import { PROTECTED_JOBS, evidenceFileName } from "../../scripts/staging-ops/policy-commissioning.mjs";
 
 /**
  * AIO-1124 — structural guard over `.github/workflows/release-policy-commissioning.yml`.
@@ -65,6 +66,17 @@ const job = (id: string): Job => {
 
 const EVIDENCE_DIR = "${{ runner.temp }}/policy-commissioning";
 const RUNNER = "node scripts/staging-ops/policy-commissioning.mjs";
+
+/**
+ * The run ID and attempt as the WORKFLOW spells them. Feeding these expressions through the runner's
+ * own `evidenceFileName` is what makes this a single-source check: the upload path is compared with
+ * the function that writes the file, so the two cannot drift into an `if-no-files-found: error`
+ * upload of a file that was never written. A second hand-copied list here would just be the same
+ * mismatch with a test that agreed with it.
+ */
+const RUN_EXPR = "${{ github.run_id }}";
+const ATTEMPT_EXPR = "${{ github.run_attempt }}";
+const evidencePath = (key: string) => `${EVIDENCE_DIR}/${evidenceFileName(RUN_EXPR, ATTEMPT_EXPR, key)}`;
 const runnerCommand = (phase: string) =>
   `${RUNNER} ${phase} --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --evidence-dir "$RUNNER_TEMP/policy-commissioning"`;
 
@@ -93,7 +105,7 @@ const SHARED_VAR_KEYS = Object.keys(SHARED_VARS);
 const JOBS = {
   intent: {
     command: runnerCommand("intent"),
-    evidence: "intent.json",
+    evidenceKey: "intent",
     secrets: [] as string[],
     // Credential-free: no App secret and no GITHUB_TOKEN, so the first artifact in the chain is the
     // one nothing could have been forged with.
@@ -101,20 +113,20 @@ const JOBS = {
   },
   fixture: {
     command: FIXTURE_COMMAND,
-    evidence: "fixture.json",
+    evidenceKey: "fixture",
     secrets: [] as string[],
     // No CLI flags to carry the evidence dir, so the helper takes it from the environment.
     env: ["COMMISSIONING_EVIDENCE_DIR", "GITHUB_TOKEN", ...SHARED_VAR_KEYS],
   },
   normal: {
     command: runnerCommand("normal-tests"),
-    evidence: "normal-tests.json",
+    evidenceKey: "normal",
     secrets: ["RELEASE_APP_ID", "RELEASE_APP_INSTALLATION_ID", "RELEASE_APP_PRIVATE_KEY"],
     env: ["GITHUB_TOKEN", "RELEASE_APP_ID", "RELEASE_APP_INSTALLATION_ID", "RELEASE_APP_PRIVATE_KEY", ...SHARED_VAR_KEYS],
   },
   emergency: {
     command: runnerCommand("emergency-tests"),
-    evidence: "emergency-tests.json",
+    evidenceKey: "emergency",
     secrets: ["EMERGENCY_APP_ID", "EMERGENCY_APP_INSTALLATION_ID", "EMERGENCY_APP_PRIVATE_KEY"],
     env: ["EMERGENCY_APP_ID", "EMERGENCY_APP_INSTALLATION_ID", "EMERGENCY_APP_PRIVATE_KEY", "GITHUB_TOKEN", ...SHARED_VAR_KEYS],
   },
@@ -364,6 +376,43 @@ describe("PC-03: ordered bootstrap — dependencies and protected environments",
     expect(protectedJobs.sort()).toEqual(["emergency", "normal"]);
   });
 
+  /**
+   * Whether a job transitively depends on the fixture — and therefore on the LOCAL setup phase the
+   * fixture waits for. This is the fact `PROTECTED_JOBS[].atSetup` in the runner encodes, and the
+   * two must agree or the runner's pre-approval assertion is wrong about its own workflow.
+   */
+  const dependsOnFixture = (id: string, seen = new Set<string>()): boolean => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return needs(id).some((dep) => dep === "fixture" || dependsOnFixture(dep, seen));
+  };
+
+  it("the runner's protected-job table names the jobs as the JOBS API will report them", () => {
+    // The jobs API returns the DISPLAY name, so this is the string `assertProtectedJobsWaiting`
+    // matches on. A rename here with no rename there would make every protected job look absent —
+    // and "absent" is a state the runner treats as legal for one of them, so the bug would present
+    // as a quietly weaker assertion rather than as an error.
+    expect(PROTECTED_JOBS.map((spec: { id: string }) => spec.id).sort()).toEqual(["emergency", "normal"]);
+    for (const spec of PROTECTED_JOBS as { id: string; name: string; environment: string }[]) {
+      expect(job(spec.id).name, `job ${spec.id} display name`).toBe(spec.name);
+      expect(job(spec.id).environment, `job ${spec.id} environment`).toBe(spec.environment);
+    }
+  });
+
+  it("the runner's at-setup expectation follows this file's real dependency graph", () => {
+    for (const spec of PROTECTED_JOBS as { id: string; atSetup: string }[]) {
+      // A protected job downstream of the fixture cannot yet exist when setup runs (GitHub does not
+      // create a job until its `needs:` are satisfied), so requiring it to be `waiting` would
+      // deadlock the harness against its own ordering. One that is not may only be parked.
+      expect(spec.atSetup, `job ${spec.id} at-setup expectation`).toBe(
+        dependsOnFixture(spec.id) ? "parked-or-uncreated" : "parked",
+      );
+    }
+    // Non-vacuity: the two protected jobs must actually DIFFER on this, or the assertion above
+    // would pass for a table that made both expectations the same.
+    expect(new Set((PROTECTED_JOBS as { atSetup: string }[]).map((spec) => spec.atSetup)).size).toBe(2);
+  });
+
   it("leaves the fixture UNPROTECTED so it can wait for local setup while the actors are parked", () => {
     // If the fixture were environment-gated it would need its own approval, and the checks the
     // protected jobs are approved to exercise could not exist yet at the moment of approval. Its
@@ -403,7 +452,7 @@ describe("PC-07: evidence — one exact sanitized file per job, nothing raw", ()
     expect(uploads(workflow).map((u) => u.job).sort()).toEqual([...JOB_IDS].sort());
     for (const { job: id, step } of uploads(workflow)) {
       const spec = JOBS[id as keyof typeof JOBS];
-      expect(step.with?.path, `job ${id} artifact path`).toBe(`${EVIDENCE_DIR}/${spec.evidence}`);
+      expect(step.with?.path, `job ${id} artifact path`).toBe(evidencePath(spec.evidenceKey));
     }
     // The fixture takes no `--evidence-dir` flag, so its env value is the only thing tying the file
     // it writes to the file this workflow uploads. They must be the same directory.

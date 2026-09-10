@@ -81,6 +81,21 @@ journal ready. The app/startup fence holds a shared form of the same lock. Durab
 authenticated readback, explicit bootstrap/rollback, bounded catch-up, and complete Railway
 deployment enumeration prevent a partial pair or stale deployment selection from becoming ready.
 
+**Main's release policy is measured before it is armed** (AIO-1124). `main-policy.mjs` builds main's
+three release rulesets and `verifyEffectiveMainPolicy` evaluates them, but every existing test asserts
+a MODEL of GitHub's rules. `scripts/staging-ops/policy-commissioning.mjs`, driven by the manual
+protected workflow `.github/workflows/release-policy-commissioning.yml`, performs one bounded
+disposable experiment that measures what the provider actually does when the normal App, the emergency
+App and a human admin each push, force-push, delete and merge against that policy — on DERIVED
+`refs/heads/aios-policy-commissioning/run-<runId>-<attempt>-*` refs, with the release keys confined to
+their own protected environments, and with everything it created deleted afterwards against a
+mode-0600 append-only journal (`commissioning-journal.mjs`). It promotes nothing: no main promotion,
+no protection mutation, no tag, no deploy, no release acceptance. A denial counts only when the
+provider refused AND the ref is unchanged; an acceptance only when an independent readback shows the
+exact expected descendant; everything else is `inconclusive`. Its two structurally unproducible gates
+— the environment negative controls and the Apps' installation permission sets — stay `unverified` and
+block activation. Sequence: `docs/RELEASING.md` §5; runbook: `docs/OPS.md` §13.
+
 Draining is a POLL, not a single request. Both maintenance adapters
 (`scripts/staging-ops/local-maintenance.mjs`, `railway-maintenance.mjs`) re-list the active
 deployments and re-request a stop until their own deadline, and the listing is the only thing that
@@ -1488,6 +1503,11 @@ guard enforces it, it's named.
   fork, and `scripts/migrate-from-existing.mjs` requires the release tag to be DECLARED in
   `DEFAULT_TAGS` before it is cut (`nextTagPolicy`) — the lane runs on every PR, so getting that
   order wrong reds the whole repo.
+- **Arm or change main's release policy** → the policy itself is `scripts/staging-ops/main-policy.mjs`,
+  but a change to it is not proved by its unit tests: those assert a model of GitHub's rules. Re-run the
+  bounded commissioning experiment (`docs/RELEASING.md` §5, runbook `docs/OPS.md` §13) and read
+  `check-evidence`'s exit code — `3` means a gate could not be measured, which is not a pass. Passing it
+  is still not authorization to change main.
 - **Copy production data anywhere** (e.g. refreshing staging) → `scripts/staging-refresh.sh` is the
   only sanctioned path, and its refusals are pure + unit-tested in
   `scripts/staging-refresh-decision.mjs`. The dump EXCLUDES the data of every table carrying a

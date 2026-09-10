@@ -455,3 +455,57 @@ Two limits worth stating rather than discovering, both found in review:
 That rule is not a nuisance. Its own comment explains it: a hardcoded list *"rots SILENTLY — the lane
 would keep upgrading from an ever-staler state and stay green, which is the exact failure shape this
 file exists to remove."*
+
+---
+
+## 5. Before main's release policy is armed — the commissioning run (AIO-1124)
+
+`scripts/staging-ops/main-policy.mjs` builds main's three release rulesets, and
+`verifyEffectiveMainPolicy` evaluates them. Everything that has ever been said about what those
+rules DO, however, has been said by a test asserting a **model** of GitHub's rules. Nothing has
+measured what the provider actually does when the normal App, the emergency App and a human admin
+each push, force-push, delete and merge against that policy — so arming it on `main` would be the
+first time anyone found out.
+
+The commissioning harness is one bounded, manually dispatched, disposable experiment that measures
+it, and then deletes everything it made:
+
+| Piece | What it is |
+|---|---|
+| `.github/workflows/release-policy-commissioning.yml` | The manual protected workflow. Four jobs: credential-free `intent`, the `fixture` check producer, and the two protected actor jobs. |
+| `scripts/staging-ops/policy-commissioning.mjs` | The closed-CLI runner. Eight phases, three flags, no ref/repo/endpoint/actor override anywhere. |
+| `scripts/staging-ops/commissioning-journal.mjs` | The mode-0600 append-only hash-chained local journal, and its run-scoped lock. |
+
+**What it cannot do, by construction.** It never promotes `main`, never mutates `main`/`staging`
+protection, never cuts a tag, never deploys Railway and never accepts a release. Every mutable target
+is DERIVED inside the runner from the GitHub run ID and attempt
+(`refs/heads/aios-policy-commissioning/run-<runId>-<attempt>-{normal,emergency,human,pr-head}`), and
+an independent request boundary enforces a verb + endpoint + body allowlist, so routing a call through
+a helper cannot reach a target the guard would refuse. There is no input to type a target into.
+
+**The operator sequence.** Root dispatches the workflow, reads the exact run, and drives the local
+phases with the MEASURED run ID and attempt — never a guessed one:
+
+```sh
+# 1. Actions → "Release policy commissioning (AIO-1124)" → Run workflow → branch `staging`.
+#    Then download the intent artifact into $COMMISSIONING_EVIDENCE_DIR (an absolute private dir).
+node scripts/staging-ops/policy-commissioning.mjs setup         --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+# 2. Inspect the setup readback and the exact immutable runner code, THEN approve the two
+#    protected environments in the GitHub UI. That approval is the PC-06 evidence; nothing
+#    in the workflow can produce it.
+node scripts/staging-ops/policy-commissioning.mjs human-tests    --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs collect        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs cleanup        --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+node scripts/staging-ops/policy-commissioning.mjs check-evidence --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT" --evidence-dir "$COMMISSIONING_EVIDENCE_DIR"
+```
+
+**Read each phase's exit code.** `0` is that phase's affirmative success, `1` a measured assertion
+failure, `2` an invalid invocation, `3` incomplete or ambiguous evidence. Do NOT chain these with
+`&&`/`;` and read the last line: `collect` before cleanup is *expected* to exit 3, and the difference
+between 1 and 3 is the difference between "the policy is wrong" and "we could not look".
+
+**`check-evidence` is the authoritative gate, and passing it is still not authorization.** A complete
+actor matrix says the mechanics behave as designed on disposable refs. It does not say the twelve real
+production context producers ran, and it is not a decision to change main's policy — that remains a
+separate, root-owned step with its own gates. The runbook, the prerequisites, and what a
+DELIBERATELY-unverified PC-06 control looks like are in `docs/OPS.md` §13.

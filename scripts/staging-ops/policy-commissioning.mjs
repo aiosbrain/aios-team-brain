@@ -81,6 +81,39 @@ export const PHASE_JOBS = Object.freeze({
   fixture: "fixture",
 });
 
+/**
+ * The two protected jobs, as the JOBS API reports them — and the state each may legally be in when
+ * local setup runs (PC-03: "asserts expected protected jobs are waiting/unstarted").
+ *
+ * TWO THINGS HERE ARE EASY TO GET WRONG, AND BOTH HAVE A GUARD.
+ *
+ *  1. `name` is the job's DISPLAY name, because that is the only name
+ *     `/actions/runs/{id}/attempts/{n}/jobs` returns. Matching on the job *id* (`normal`) finds
+ *     nothing, and "no job found" would read as a refusal rather than a bug.
+ *     `test/guards/staging-policy-commissioning-workflow.test.ts` asserts these strings equal the
+ *     workflow's `name:` values, so a rename is a red build rather than a silent never-match.
+ *
+ *  2. `atSetup` follows the workflow's REAL dependency graph, and the two jobs genuinely differ.
+ *     GitHub does not create a job until its `needs:` are satisfied, so a job that does not exist
+ *     yet is ABSENT from the jobs list — not "waiting". `emergency` needs only `intent`, which has
+ *     finished by the time root has the intent artifact in hand, so it must be present and parked.
+ *     `normal` needs `fixture`, and the fixture is itself waiting for THIS setup phase to publish
+ *     the manifest — so at this instant `normal` has not been created. Requiring it to be `waiting`
+ *     would deadlock the harness against its own ordering; treating a missing `emergency` as
+ *     "unstarted" would throw away the one pre-approval observation we can actually make.
+ */
+export const PROTECTED_JOBS = Object.freeze([
+  Object.freeze({ id: "normal", name: "Normal App actor tests (protected)", environment: "staging-release", atSetup: "parked-or-uncreated" }),
+  Object.freeze({ id: "emergency", name: "Emergency App actor tests (protected)", environment: "staging-emergency", atSetup: "parked" }),
+]);
+
+/**
+ * Job statuses that mean "created, and still waiting for a human". `queued`, `in_progress` and
+ * `completed` all mean the environment gate has already been passed, which is the thing setup
+ * exists to rule out — so they are deliberately NOT in this list.
+ */
+export const PARKED_JOB_STATUSES = Object.freeze(["waiting", "requested", "pending"]);
+
 export const RESULT_SCHEMA_VERSION = 1;
 
 /** Files a synthetic commit tree may contain. Anything else — above all a workflow — refuses. */
@@ -204,6 +237,23 @@ const REPO = COMMISSIONING_REPOSITORY;
 const ORG = COMMISSIONING_REPOSITORY.split("/")[0];
 const ALLOWED_QUERY_KEYS = new Set(["per_page", "page"]);
 
+/**
+ * Escape a fixed identifier for LITERAL use inside a pattern. `aiosbrain/aios-team-brain` happens to
+ * contain no regex metacharacter today, so this changes nothing now — which is the point: it makes
+ * the guard's correctness independent of that accident. A repository or organisation whose name
+ * contained a `.` would otherwise widen every pattern below into a single-character wildcard.
+ */
+const literal = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const R = literal(REPO);
+const O = literal(ORG);
+
+/**
+ * The CLOSED set of API scopes any commissioning operation may live under. Exported so the guard
+ * suite can assert it BEHAVIOURALLY — that no spelling in {@link ALLOWED_OPERATIONS} can match a
+ * path outside these four — rather than by eyeballing the table.
+ */
+export const ALLOWED_REQUEST_SCOPES = Object.freeze([`/repos/${REPO}`, `/orgs/${ORG}`, "/user", "/installation"]);
+
 const isSha = (value) => FULL_SHA.test(String(value ?? ""));
 const knownSha = (value, ctx) => isSha(value) && ctx.graphShas?.has(String(value));
 
@@ -215,17 +265,23 @@ function noBody(body) {
 /**
  * The CLOSED operation list. `id` is what appears in evidence; `roles` is which execution role may
  * issue it; `body` is a validator, not a serializer — it refuses rather than repairs.
+ *
+ * NOTE THE ABSENCE OF `intent`. The intent phase holds no credential and makes NO request (PC-03),
+ * so it appears in no row here: the request boundary refuses everything it could attempt, and the
+ * provider re-measurement of what it asserted happens in the authenticated phases that follow.
  */
 export const ALLOWED_OPERATIONS = Object.freeze([
   // ── metadata and identity reads ─────────────────────────────────────────────
-  { id: "read-repository", method: "GET", roles: ["local", "normal", "emergency", "fixture", "intent"], path: `/repos/${REPO}`, body: noBody },
+  { id: "read-repository", method: "GET", roles: ["local", "normal", "emergency", "fixture"], path: `/repos/${REPO}`, body: noBody },
   { id: "read-viewer", method: "GET", roles: ["local"], path: "/user", body: noBody },
-  { id: "read-collaborator-permission", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${REPO}/collaborators/[A-Za-z0-9-]{1,39}/permission$`), body: noBody },
+  { id: "read-collaborator-permission", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/collaborators/[A-Za-z0-9-]{1,39}/permission$`), body: noBody },
   { id: "read-installation-repositories", method: "GET", roles: ["normal", "emergency"], path: "/installation/repositories", body: noBody },
-  { id: "read-workflow-run", method: "GET", roles: ["local", "intent"], pattern: new RegExp(`^/repos/${REPO}/actions/runs/[1-9][0-9]{0,17}$`), body: noBody },
-  { id: "read-workflow-run-attempt", method: "GET", roles: ["local", "intent"], pattern: new RegExp(`^/repos/${REPO}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}$`), body: noBody },
-  { id: "read-workflow-run-jobs", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${REPO}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
-  { id: "read-workflow-run-approvals", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${REPO}/actions/runs/[1-9][0-9]{0,17}/approvals$`), body: noBody },
+  // ATTEMPT-scoped, and there is deliberately no run-scoped counterpart: `/actions/runs/<id>`
+  // describes the LATEST attempt, so reading it would silently describe a rerun rather than the
+  // attempt whose derived resources this run owns.
+  { id: "read-workflow-run-attempt", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}$`), body: noBody },
+  { id: "read-workflow-run-jobs", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
+  { id: "read-workflow-run-approvals", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/approvals$`), body: noBody },
 
   // ── baseline reads. Production refs and protections are READ here and never written. ─────────
   { id: "read-main-ref", method: "GET", roles: ["local"], path: `/repos/${REPO}/git/ref/heads/main`, body: noBody },
@@ -237,39 +293,39 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   // ── the disposable subject ──────────────────────────────────────────────────
   {
     id: "read-derived-ref", method: "GET", roles: ["local", "normal", "emergency", "fixture"],
-    pattern: new RegExp(`^/repos/${REPO}/git/ref/heads/(.+)$`),
+    pattern: new RegExp(`^/repos/${R}/git/ref/heads/(.+)$`),
     check: (match, ctx) => assertDerivedRef(`refs/heads/${match[1]}`, ctx), body: noBody,
   },
   {
     id: "read-derived-branch-rules", method: "GET", roles: ["local", "normal", "emergency"],
-    pattern: new RegExp(`^/repos/${REPO}/rules/branches/(.+)$`),
+    pattern: new RegExp(`^/repos/${R}/rules/branches/(.+)$`),
     check: (match, ctx) => assertDerivedRef(`refs/heads/${decodeURIComponent(match[1])}`, ctx), body: noBody,
   },
   {
     id: "read-derived-branch-protection", method: "GET", roles: ["local"],
-    pattern: new RegExp(`^/repos/${REPO}/branches/(.+)/protection$`),
+    pattern: new RegExp(`^/repos/${R}/branches/(.+)/protection$`),
     check: (match, ctx) => assertDerivedRef(`refs/heads/${match[1]}`, ctx), body: noBody,
   },
-  { id: "read-repository-ruleset", method: "GET", roles: ["local", "normal", "emergency"], pattern: new RegExp(`^/repos/${REPO}/rulesets/[1-9][0-9]{0,17}$`), body: noBody },
-  { id: "read-organization-ruleset", method: "GET", roles: ["local", "normal", "emergency"], pattern: new RegExp(`^/orgs/${ORG}/rulesets/[1-9][0-9]{0,17}$`), body: noBody },
+  { id: "read-repository-ruleset", method: "GET", roles: ["local", "normal", "emergency"], pattern: new RegExp(`^/repos/${R}/rulesets/[1-9][0-9]{0,17}$`), body: noBody },
+  { id: "read-organization-ruleset", method: "GET", roles: ["local", "normal", "emergency"], pattern: new RegExp(`^/orgs/${O}/rulesets/[1-9][0-9]{0,17}$`), body: noBody },
   {
     id: "read-synthetic-commit", method: "GET", roles: ["local", "normal", "emergency", "fixture"],
-    pattern: new RegExp(`^/repos/${REPO}/git/commits/([0-9a-f]{40})$`), body: noBody,
+    pattern: new RegExp(`^/repos/${R}/git/commits/([0-9a-f]{40})$`), body: noBody,
   },
   {
     id: "read-synthetic-tree", method: "GET", roles: ["local", "normal", "emergency", "fixture"],
-    pattern: new RegExp(`^/repos/${REPO}/git/trees/([0-9a-f]{40})$`), body: noBody,
+    pattern: new RegExp(`^/repos/${R}/git/trees/([0-9a-f]{40})$`), body: noBody,
   },
   {
     id: "read-synthetic-blob-contents", method: "GET", roles: ["local", "normal", "emergency", "fixture"],
-    pattern: new RegExp(`^/repos/${REPO}/git/blobs/([0-9a-f]{40})$`), body: noBody,
+    pattern: new RegExp(`^/repos/${R}/git/blobs/([0-9a-f]{40})$`), body: noBody,
   },
   {
     id: "read-synthetic-check-runs", method: "GET", roles: ["local", "normal", "emergency"],
-    pattern: new RegExp(`^/repos/${REPO}/commits/([0-9a-f]{40})/check-runs$`),
+    pattern: new RegExp(`^/repos/${R}/commits/([0-9a-f]{40})/check-runs$`),
     check: (match, ctx) => { if (!knownSha(match[1], ctx)) throw new UsageError("check runs may only be read for a verified synthetic commit"); }, body: noBody,
   },
-  { id: "read-pull-request", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${REPO}/pulls/[1-9][0-9]{0,9}$`), body: noBody },
+  { id: "read-pull-request", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/pulls/[1-9][0-9]{0,9}$`), body: noBody },
 
   // ── local-operator writes: create the disposable graph, then the disposable rulesets ─────────
   {
@@ -320,7 +376,7 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   },
   {
     id: "delete-disposable-ruleset", method: "DELETE", roles: ["local"],
-    pattern: new RegExp(`^/repos/${REPO}/rulesets/([1-9][0-9]{0,17})$`),
+    pattern: new RegExp(`^/repos/${R}/rulesets/([1-9][0-9]{0,17})$`),
     check: (match, ctx) => {
       if (!ctx.rulesetIds?.has(Number(match[1]))) throw new UsageError("cleanup may only delete a ruleset ID this run journaled");
     }, body: noBody,
@@ -329,7 +385,7 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   // ── the actor matrix itself. Three roles, the same two verbs, always a derived ref. ─────────
   {
     id: "update-derived-ref", method: "PATCH", roles: ["local", "normal", "emergency"],
-    pattern: new RegExp(`^/repos/${REPO}/git/refs/heads/(.+)$`),
+    pattern: new RegExp(`^/repos/${R}/git/refs/heads/(.+)$`),
     check: (match, ctx) => assertDerivedRef(`refs/heads/${match[1]}`, ctx),
     body: (body, ctx) => {
       if (!knownSha(body?.sha, ctx)) throw new UsageError("a derived ref may only be moved to a commit this run created");
@@ -339,7 +395,7 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   },
   {
     id: "delete-derived-ref", method: "DELETE", roles: ["local", "normal", "emergency"],
-    pattern: new RegExp(`^/repos/${REPO}/git/refs/heads/(.+)$`),
+    pattern: new RegExp(`^/repos/${R}/git/refs/heads/(.+)$`),
     check: (match, ctx) => assertDerivedRef(`refs/heads/${match[1]}`, ctx), body: noBody,
   },
   {
@@ -367,13 +423,13 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   },
   {
     id: "merge-synthetic-pull", method: "PUT", roles: ["local"],
-    pattern: new RegExp(`^/repos/${REPO}/pulls/([1-9][0-9]{0,9})/merge$`),
+    pattern: new RegExp(`^/repos/${R}/pulls/([1-9][0-9]{0,9})/merge$`),
     check: (match, ctx) => { if (Number(match[1]) !== ctx.pullNumber) throw new UsageError("only this run's own synthetic pull request may be merged against"); },
     body: (body) => { if (body !== undefined && Object.keys(body ?? {}).length > 1) throw new UsageError("the synthetic merge attempt takes no extra parameters"); return true; },
   },
   {
     id: "close-synthetic-pull", method: "PATCH", roles: ["local"],
-    pattern: new RegExp(`^/repos/${REPO}/pulls/([1-9][0-9]{0,9})$`),
+    pattern: new RegExp(`^/repos/${R}/pulls/([1-9][0-9]{0,9})$`),
     check: (match, ctx) => { if (Number(match[1]) !== ctx.pullNumber) throw new UsageError("only this run's own synthetic pull request may be closed"); },
     body: (body) => { if (body?.state !== "closed" || Object.keys(body).length !== 1) throw new UsageError("the synthetic pull request may only be closed"); return true; },
   },
@@ -654,6 +710,13 @@ export function assertRunContext(env, { runId, attempt, role }) {
   const expectedJob = PHASE_JOBS[role === "fixture" ? "fixture" : role];
   if (expectedJob && need("GITHUB_JOB") !== expectedJob) throw new UsageError(`this phase runs only in the ${expectedJob} job`);
   const repositoryId = positiveInt(env?.COMMISSIONING_REPOSITORY_ID, "COMMISSIONING_REPOSITORY_ID");
+  // `GITHUB_REPOSITORY_ID` is injected by the platform and is not settable by a workflow author, so
+  // it is the one identity fact a CREDENTIAL-FREE job can cross-check without a provider call — the
+  // whole reason the intent phase can assert the fixed repository at all. A repository renamed or
+  // transferred under the same full name would disagree here, before anything is created.
+  if (positiveInt(env?.GITHUB_REPOSITORY_ID, "GITHUB_REPOSITORY_ID") !== repositoryId) {
+    throw new UsageError("GITHUB_REPOSITORY_ID does not match COMMISSIONING_REPOSITORY_ID; this is not the repository this run is configured for");
+  }
   const normalAppId = positiveInt(env?.COMMISSIONING_NORMAL_APP_ID, "COMMISSIONING_NORMAL_APP_ID");
   const emergencyAppId = positiveInt(env?.COMMISSIONING_EMERGENCY_APP_ID, "COMMISSIONING_EMERGENCY_APP_ID");
   if (normalAppId === emergencyAppId) throw new UsageError("the normal and emergency Apps must be distinct numeric identities");
@@ -821,7 +884,12 @@ export async function assertInertTree({ request, treeSha, allowed, label }) {
 export async function readManifestFromRef({ request, runId, attempt, context }) {
   const ref = derivedRef(runId, attempt, "pr-head");
   const head = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/git/ref/heads/${branchOf(ref)}`);
-  if (head.status !== 200 || !head.body?.object?.sha) throw new IncompleteEvidence("the commissioning manifest ref is not present; local setup has not completed");
+  if (head.status === 404) {
+    // The ONE retryable shape: setup has not published the manifest ref yet. Tagged so the bounded
+    // wait below can distinguish "not yet" from "the manifest is wrong", which must never be retried.
+    throw new IncompleteEvidence("the commissioning manifest ref is not present; local setup has not completed", { retryable: true });
+  }
+  if (head.status !== 200 || !head.body?.object?.sha) throw new IncompleteEvidence(`the commissioning manifest ref could not be read (${head.status})`);
   const commitSha = String(head.body.object.sha);
   const commit = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/git/commits/${commitSha}`);
   if (commit.status !== 200 || !commit.body) throw new IncompleteEvidence("the commissioning manifest commit could not be read");
@@ -836,6 +904,54 @@ export async function readManifestFromRef({ request, runId, attempt, context }) 
   catch { throw new AssertionFailure("the commissioning manifest is not valid JSON"); }
   assertManifestBinding(manifest, { runId, attempt, context, manifestCommitSha: commitSha });
   return { manifest, manifestCommitSha: commitSha };
+}
+
+/**
+ * The fixture job's BOUNDED wait for local setup to publish the manifest.
+ *
+ * WHY A WAIT EXISTS AT ALL. The ordering is genuinely concurrent and cannot be expressed with
+ * `needs:`. `normal`'s accepted case requires the fixture's TEST-ONLY checks already green, so
+ * `normal` needs `fixture`; the fixture can only mint checks on commits local setup has created, so
+ * the fixture must follow setup; and setup must run while the protected jobs are still parked for a
+ * human. Making the fixture wait is what breaks that cycle WITHOUT giving it a protected
+ * environment or an App key — it holds `checks: write` and nothing else, and a job that can mint a
+ * check must not be able to move a ref.
+ *
+ * WHY IT IS BOUNDED, AND REFUSES RATHER THAN HANGING. The deadline is the runner's own, and it
+ * exits `IncompleteEvidence` (exit 3) with its artifact intact. Letting the job's
+ * `timeout-minutes` kill it instead would lose the `always()` upload — and PC-07 measures evidence
+ * durability rather than assuming it.
+ *
+ * ONLY the retryable shape is retried. A manifest that exists but disagrees with this job's trusted
+ * run metadata, or a commit that is not inert, is an AssertionFailure on the first read and must
+ * NOT be polled: re-reading it would just wait for someone to fix a ref we already refused.
+ */
+export async function awaitManifestFromRef({
+  request, runId, attempt, context,
+  deadlineMs = 25 * 60_000, intervalMs = 15_000,
+  now = () => Date.now(), sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) throw new UsageError("a manifest wait deadline must be a positive whole number of milliseconds");
+  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1) throw new UsageError("a manifest poll interval must be a positive whole number of milliseconds");
+  const started = now();
+  let attempts = 0;
+  for (;;) {
+    attempts += 1;
+    try {
+      const result = await readManifestFromRef({ request, runId, attempt, context });
+      return { ...result, waited_ms: now() - started, polls: attempts };
+    } catch (error) {
+      if (error?.detail?.retryable !== true) throw error;
+      const elapsed = now() - started;
+      if (elapsed + intervalMs > deadlineMs) {
+        throw new IncompleteEvidence(
+          `local setup did not publish the commissioning manifest within ${deadlineMs}ms (${attempts} polls); this job measured nothing`,
+          { polls: attempts, waited_ms: elapsed },
+        );
+      }
+      await sleep(intervalMs);
+    }
+  }
 }
 
 /** Every binding a job can check for itself. The manifest may agree; it may never override. */
@@ -1328,6 +1444,11 @@ export function checkPublicationPlan(runId, attempt) {
       { node: "N1", checks: green([...contexts.keys()].filter((ordinal) => ordinal !== last)) },
       { node: "N2", checks: [...green([...contexts.keys()].filter((ordinal) => ordinal !== last)), { ordinal: last, name: contexts[last], conclusion: "failure" }] },
       { node: "N4", checks: green([...contexts.keys()]) },
+      // The HUMAN pair, and the reason both nodes are published rather than just the green one: H1
+      // carries eleven of the twelve required contexts and H2 carries all twelve, so the two cases
+      // differ in EXACTLY one check. A human denied on an empty commit could be a denial about
+      // checks; a human denied at 11/12 and again at 12/12 can only be the writer policy.
+      { node: "H1", checks: green([...contexts.keys()].filter((ordinal) => ordinal !== last)) },
       { node: "H2", checks: green([...contexts.keys()]) },
     ]),
     // Published by the credential-free fixture job — the GitHub Actions app, i.e. the WRONG
@@ -1372,7 +1493,7 @@ async function publishChecks({ request, entries, graphShas, journal, producer })
  * appears in the graph it just verified.
  */
 export async function runFixtureChecks(env = process.env, {
-  fetchImpl = fetch, now = () => new Date(), writeResult = writeEvidenceFile,
+  fetchImpl = fetch, now = () => new Date(), writeResult = writeEvidenceFile, wait = {},
 } = {}) {
   const runId = String(env.GITHUB_RUN_ID ?? "");
   const attempt = String(env.GITHUB_RUN_ATTEMPT ?? "");
@@ -1384,7 +1505,7 @@ export async function runFixtureChecks(env = process.env, {
   const bootstrap = createGuardedRequest(createTokenTransport({ token, fetchImpl, redact }), {
     role: "fixture", runId, attempt, graphShas: new Set(), contextNames: new Set(), rulesetIds: new Set(), rulesetNames: new Set(),
   });
-  const { manifest } = await readManifestFromRef({ request: bootstrap, runId, attempt, context: ctx });
+  const { manifest, waited_ms: waitedMs, polls } = await awaitManifestFromRef({ request: bootstrap, runId, attempt, context: ctx, ...wait });
   const verified = await verifySyntheticGraph({ request: bootstrap, manifest, runId, attempt });
   const request = createGuardedRequest(createTokenTransport({ token, fetchImpl, redact }), {
     role: "fixture", runId, attempt,
@@ -1402,9 +1523,10 @@ export async function runFixtureChecks(env = process.env, {
     role: "fixture", workflow_sha: ctx.workflowSha, published_at: now().toISOString(),
     published: published.map(({ node, head_sha, context_ordinal, conclusion }) => ({ node, head_sha, context_ordinal, conclusion })),
     producer: "github-actions", measured_producer_app_ids: observedAppIds,
+    manifest_wait: { waited_ms: waitedMs, polls },
     note: "TEST-ONLY contexts on synthetic commits; no App secret is present in this job",
   };
-  const evidencePath = writeResult(evidenceDir, `${runId}-${attempt}-fixture-checks`, result);
+  const evidencePath = writeResult(evidenceDir, evidenceSlug(runId, attempt, "fixture"), result);
   return { ...result, evidence_path: evidencePath };
 }
 
@@ -1426,6 +1548,49 @@ export function assertCloudOutputDirectory(dir) {
   if (!statSync(dir).isDirectory()) throw new UsageError("the evidence directory path is not a directory");
   return dir;
 }
+
+/**
+ * THE ONE PLACE AN EVIDENCE FILE'S NAME IS SPELLED.
+ *
+ * The workflow uploads four of these by EXACT path, so a name invented at a call site is not a
+ * cosmetic difference — it is an `if-no-files-found: error` upload of a file that was never written,
+ * i.e. a red job whose evidence is simply missing. That is the exact mismatch this table exists to
+ * make impossible, and `test/guards/staging-policy-commissioning-workflow.test.ts` asserts the
+ * workflow's paths against {@link evidenceFileName} rather than against a second hand-copied list.
+ *
+ * Every name carries the run ID and attempt, because a rerun derives FRESH resources (PC-03): a
+ * bare `intent.json` would let a second attempt's packet overwrite the first's and read as one
+ * clean run.
+ */
+export const EVIDENCE_KEYS = Object.freeze({
+  intent: "intent",
+  setup: "setup",
+  fixture: "fixture-checks",
+  human: "human-tests",
+  normal: "normal-tests",
+  emergency: "emergency-tests",
+  approvals: "approvals",
+  environment: "environment-controls",
+  cleanup: "cleanup",
+  collect: "collect",
+  "check-evidence": "check-evidence",
+});
+
+export function evidenceSlug(runId, attempt, key) {
+  const slug = EVIDENCE_KEYS[key];
+  if (!slug) throw new UsageError(`unknown commissioning evidence key ${JSON.stringify(String(key))}`);
+  const { runId: id, attempt: n } = assertRunIdentity(runId, attempt);
+  return `${id}-${n}-${slug}`;
+}
+
+/**
+ * The exact basename the workflow must upload for a given cloud job.
+ *
+ * Deliberately does NOT validate its arguments, because the workflow guard calls it with GitHub's
+ * expression strings (`${{ github.run_id }}`) to compare against the YAML's `path:`. Every code path
+ * that actually WRITES a file goes through {@link evidenceSlug}, which does validate.
+ */
+export const evidenceFileName = (runId, attempt, key) => `commissioning-${runId}-${attempt}-${EVIDENCE_KEYS[key]}.json`;
 
 export function writeEvidenceFile(dir, name, payload) {
   if (!/^[0-9]+-[0-9]+-[a-z-]+$/.test(String(name))) throw new UsageError("an evidence file name is derived, never supplied");
@@ -1489,40 +1654,51 @@ export async function assertCheckState({ request, headSha, expectation, ctx }) {
   return { expectation, measured: true, producers, present: runs.length };
 }
 
-/** PC-03 intent: the credential-free preflight record of immutable identity and derived names. */
-export async function runIntentPhase({ runId, attempt, evidenceDir, env, deps = {} }) {
+/**
+ * PC-03 intent: the credential-free preflight record of immutable identity and derived names.
+ *
+ * THIS PHASE MAKES NO REQUEST, AND THAT IS THE DESIGN, not a shortcut. Everything it asserts is
+ * platform-injected into the job's environment and cross-checked there by {@link assertRunContext}:
+ * the repository AND its numeric ID, the event, the dispatch ref, the workflow FILE and ref
+ * (`GITHUB_WORKFLOW_REF`), the immutable `GITHUB_SHA`, the run ID and the attempt. A provider call
+ * here would need a credential, and the first artifact in the evidence chain is precisely the one
+ * that should not have been produced with one.
+ *
+ * The trade is explicit and is carried in the artifact: these are the job's CLAIMS about its own
+ * identity, not a provider measurement of them. Local `setup` re-measures every one of them against
+ * the provider before it creates anything ({@link localContext}), and each protected job re-derives
+ * the same names from its own trusted run metadata. So nothing downstream ever trusts this file —
+ * it is checked against the provider, and against independent derivation, in three later phases.
+ */
+export async function runIntentPhase({ runId, attempt, evidenceDir, env }) {
   const ctx = assertRunContext(env, { runId, attempt, role: "intent" });
   const dir = assertCloudOutputDirectory(evidenceDir);
-  const redact = createRedactor(collectSentinels(env));
-  const transport = deps.transport ?? createTokenTransport({ token: String(env.GITHUB_TOKEN ?? ""), fetchImpl: deps.fetchImpl ?? fetch, redact });
-  const request = createGuardedRequest(transport, { role: "intent", runId, attempt, graphShas: new Set(), contextNames: new Set(), rulesetIds: new Set(), rulesetNames: new Set() });
-  const repository = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}`);
-  if (repository.status !== 200 || !repository.body) throw new IncompleteEvidence("the repository identity could not be measured");
-  if (Number(repository.body.id) !== ctx.repositoryId) throw new AssertionFailure("the measured repository ID is not the one this commissioning run is configured for");
-  const run = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}`);
-  if (run.status !== 200 || !run.body) throw new IncompleteEvidence("the workflow run attempt could not be measured");
-  if (String(run.body.head_sha) !== ctx.workflowSha) throw new AssertionFailure("the workflow run's head SHA is not the immutable dispatch SHA this job checked out");
-  if (String(run.body.path) !== COMMISSIONING_WORKFLOW_PATH) throw new AssertionFailure("the workflow run is not the reviewed commissioning workflow");
-  if (String(run.body.event) !== COMMISSIONING_EVENT_NAME) throw new AssertionFailure("the workflow run was not dispatched manually");
   const intent = {
     schema_version: RESULT_SCHEMA_VERSION, issue: "AIO-1124", phase: "intent",
     repository: COMMISSIONING_REPOSITORY, repository_id: ctx.repositoryId,
     run_id: String(runId), attempt: String(attempt), workflow_path: COMMISSIONING_WORKFLOW_PATH,
     workflow_sha: ctx.workflowSha, dispatch_ref: COMMISSIONING_DISPATCH_REF, event: COMMISSIONING_EVENT_NAME,
     // GITHUB_ACTOR is the DISPATCHER, which may be an App. It is never the human approval evidence;
-    // that comes from the protected environments' own review history.
+    // that comes from the protected environments' own review history, read in `collect`.
     dispatcher: ctx.actor, dispatcher_is_human: null,
     normal_app_id: ctx.normalAppId, emergency_app_id: ctx.emergencyAppId,
     // Not the IDs: their canonical digest, so the local operator's map can be proved identical to
-    // the one the intent job measured without republishing the production producer inventory.
+    // the one this job was configured with without republishing the production producer inventory.
     producer_ids_hash: canonicalHash(ctx.producerIds),
     derived_refs: derivedRefs(runId, attempt),
     derived_ruleset_names: derivedRulesetNames(runId, attempt),
     derived_contexts: derivedContextNames(runId, attempt),
     graph_plan: buildGraphPlan(runId, attempt),
+    // Stated in the artifact so a reader cannot mistake a credential-free claim for a measurement.
+    credentials_held: "none",
+    provider_measured: false,
+    provider_remeasurement_required_in: Object.freeze(["setup", "normal-tests", "emergency-tests"]),
   };
-  const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-intent`, intent);
-  return closedResult({ runId, attempt, phase: "intent", status: "recorded", evidencePath, extra: { workflow_sha: ctx.workflowSha } });
+  const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, "intent"), intent);
+  return closedResult({
+    runId, attempt, phase: "intent", status: "recorded", evidencePath,
+    extra: { workflow_sha: ctx.workflowSha, provider_measured: false },
+  });
 }
 
 export function derivedRulesetNames(runId, attempt) {
@@ -1537,7 +1713,7 @@ export function derivedRulesetNames(runId, attempt) {
  * carries is either derived independently here or checked against the provider.
  */
 export async function localContext({ request, runId, attempt, evidenceDir, env }) {
-  const intent = readEvidenceFile(evidenceDir, `${runId}-${attempt}-intent`);
+  const intent = readEvidenceFile(evidenceDir, evidenceSlug(runId, attempt, "intent"));
   if (!intent) throw new IncompleteEvidence("the run's intent artifact is not in the evidence directory; download it before local setup");
   if (intent.schema_version !== RESULT_SCHEMA_VERSION || intent.repository !== COMMISSIONING_REPOSITORY) throw new AssertionFailure("the intent artifact is not this harness's");
   if (String(intent.run_id) !== String(runId) || String(intent.attempt) !== String(attempt)) throw new AssertionFailure("the intent artifact belongs to a different run or attempt");
@@ -1562,6 +1738,22 @@ export async function localContext({ request, runId, attempt, evidenceDir, env }
     workflowSha: String(intent.workflow_sha), repositoryId: Number(intent.repository_id),
     normalAppId: Number(intent.normal_app_id), emergencyAppId: Number(intent.emergency_app_id),
     producerIds, intent, actor: null,
+    /**
+     * The provider re-measurement the credential-free intent phase deliberately did not make.
+     * Recorded as its own evidence field because PC-03 asks for the identity to be MEASURED, and
+     * after that phase became credential-free this is the only place it happens before anything is
+     * created. `check-evidence` requires `confirmed: true`, so a setup that somehow skipped it
+     * cannot pass as though the intent artifact had proved it.
+     */
+    remeasuredIntent: Object.freeze({
+      confirmed: true,
+      measured_repository_id: Number(repository.body.id),
+      measured_head_sha: String(attemptRun.body.head_sha),
+      measured_workflow_path: String(attemptRun.body.path),
+      measured_event: String(attemptRun.body.event),
+      measured_head_branch: String(attemptRun.body.head_branch ?? ""),
+      matches_intent: true,
+    }),
   });
 }
 
@@ -1578,24 +1770,51 @@ export async function assertLocalOperator({ request }) {
   return { login, permission: "admin", id: Number(viewer.body.id) || null };
 }
 
-/** Both protected jobs must still be WAITING when setup runs; an already-started job saw no plan. */
+/**
+ * Neither protected job may have passed its environment gate when setup runs: a job that has
+ * already started was approved against a plan that did not exist yet. See {@link PROTECTED_JOBS}
+ * for why the two jobs are held to DIFFERENT expectations, and why "absent" is a legal state for
+ * exactly one of them.
+ */
 export async function assertProtectedJobsWaiting({ request, runId, attempt }) {
-  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs`);
+  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
   if (jobs.status !== 200 || !Array.isArray(jobs.body?.jobs)) throw new IncompleteEvidence("the run's jobs could not be measured");
+  if (Number(jobs.body.total_count ?? jobs.body.jobs.length) > jobs.body.jobs.length) {
+    throw new IncompleteEvidence("the run's job list is paginated beyond the first page; the protected jobs' states are unmeasured");
+  }
   const observed = {};
-  for (const name of ["normal", "emergency"]) {
-    const job = jobs.body.jobs.find((entry) => String(entry?.name ?? "") === name);
-    if (!job) throw new IncompleteEvidence(`the ${name} protected job is not present in this run`);
-    if (!["waiting", "queued", "pending"].includes(String(job.status))) {
-      throw new AssertionFailure(`the ${name} protected job has already left the waiting state; it cannot have been approved against a plan that did not exist`);
+  for (const spec of PROTECTED_JOBS) {
+    const job = jobs.body.jobs.find((entry) => String(entry?.name ?? "") === spec.name);
+    if (!job) {
+      if (spec.atSetup !== "parked-or-uncreated") {
+        throw new IncompleteEvidence(`the ${spec.id} protected job is absent from this run, and its dependencies say it should already be parked for approval`);
+      }
+      // Not yet created because its `needs:` include the fixture, which is waiting for this phase.
+      // Recorded as its own state, never collapsed into "waiting" — `collect` requires the ACTUAL
+      // later approval for this environment, so an uncreated job here cannot become evidence.
+      observed[spec.id] = "uncreated";
+      continue;
     }
-    observed[name] = String(job.status);
+    const status = String(job.status ?? "unknown");
+    if (!PARKED_JOB_STATUSES.includes(status)) {
+      throw new AssertionFailure(`the ${spec.id} protected job is ${status}; it has already left the waiting state and cannot have been approved against a plan that did not exist`);
+    }
+    observed[spec.id] = status;
   }
   return observed;
 }
 
-/** The production state this run must leave EXACTLY as it found it (PC-07). */
-export async function measureProductionBaseline({ request }) {
+/**
+ * The production state this run must leave EXACTLY as it found it (PC-07).
+ *
+ * `excludeRulesetIds` is the run's OWN journaled rulesets, and it exists to keep two different
+ * verdicts apart. At baseline time nothing of ours exists, so the inventory naturally excludes
+ * them; if the "after" measurement counted a ruleset of ours that cleanup REFUSED to delete, every
+ * cleanup refusal would surface as "production state moved during this run" — an interrupted result
+ * blaming somebody else's change for our own leftover. A foreign ruleset appearing during the run
+ * still drifts, which is the case this check is actually for.
+ */
+export async function measureProductionBaseline({ request, excludeRulesetIds = new Set() }) {
   const mainRef = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/git/ref/heads/main`);
   const stagingRef = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/git/ref/heads/staging`);
   if (mainRef.status !== 200 || stagingRef.status !== 200) throw new IncompleteEvidence("the production branch state could not be measured");
@@ -1605,7 +1824,9 @@ export async function measureProductionBaseline({ request }) {
   if (applicable.status !== 200 || !Array.isArray(applicable.body)) throw new IncompleteEvidence("main's applicable rules could not be measured");
   const rulesets = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets?per_page=${PAGE_SIZE}&page=1`);
   if (rulesets.status !== 200 || !Array.isArray(rulesets.body)) throw new IncompleteEvidence("the repository ruleset inventory could not be measured");
-  const inventory = rulesets.body.map((ruleset) => ({ id: Number(ruleset.id), name: String(ruleset.name), target: String(ruleset.target ?? ""), enforcement: String(ruleset.enforcement ?? "") }));
+  const inventory = rulesets.body
+    .filter((ruleset) => !excludeRulesetIds.has(Number(ruleset.id)))
+    .map((ruleset) => ({ id: Number(ruleset.id), name: String(ruleset.name), target: String(ruleset.target ?? ""), enforcement: String(ruleset.enforcement ?? "") }));
   const tagRulesets = {};
   for (const entry of inventory.filter((ruleset) => ruleset.target === "tag")) {
     const detail = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${entry.id}`);
@@ -1804,6 +2025,20 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
   try {
     const operator = await assertLocalOperator({ request });
     const jobs = await assertProtectedJobsWaiting({ request, runId, attempt });
+    // The PRE-APPROVAL snapshot, measured HERE — before anything is created — because it is a
+    // precondition, not a report. Its value is that it should be EMPTY: it is what proves the human
+    // approval `collect` later reads was given AFTER this plan existed and could be inspected. It
+    // is NOT the approval evidence itself; capturing that at this point would be capturing the
+    // absence of one. Measuring it after creating the disposable resources would mean refusing a
+    // run whose refs and rulesets already existed.
+    const approvals = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/approvals`);
+    const preApproval = summarizeApprovals(approvals);
+    if (!preApproval.measured) throw new IncompleteEvidence(`the run's pre-approval history could not be measured (${preApproval.reason})`);
+    const premature = preApproval.entries.filter((entry) => entry.state === "approved"
+      && entry.environments.some((environment) => PROTECTED_JOBS.some((spec) => spec.environment === environment)));
+    if (premature.length) {
+      throw new AssertionFailure(`a protected environment was already approved before setup published the plan (${premature.map((entry) => entry.environments.join("/")).join(", ")}); the approval cannot have been given against a plan that did not exist`);
+    }
     let baseline = session.records.find((record) => record.type === "baseline-measured")?.data ?? null;
     if (!baseline) {
       journal.append("run-opened", { operator_login: operator.login, workflow_sha: ctx.workflowSha, repository_id: ctx.repositoryId });
@@ -1845,12 +2080,12 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
         classic_protection_present: protection.status === 200,
       };
     }
-    const approvals = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/approvals`);
     const evidence = {
       schema_version: RESULT_SCHEMA_VERSION, phase: "setup", issue: "AIO-1124",
       run_id: String(runId), attempt: String(attempt), workflow_sha: ctx.workflowSha,
       repository: COMMISSIONING_REPOSITORY, repository_id: ctx.repositoryId,
       operator: { login: operator.login, permission: operator.permission },
+      intent_remeasured: ctx.remeasuredIntent,
       protected_jobs_at_setup: jobs,
       production_baseline: baseline,
       production_policy_hash: productionHash,
@@ -1858,11 +2093,11 @@ export async function runSetupPhase({ runId, attempt, evidenceDir, env, deps = {
       disposable_rulesets: Object.fromEntries(Object.entries(rulesets).map(([actor, list]) => [actor, list.map(({ id, name, target_ref, hash }) => ({ id, name, target_ref, hash }))])),
       synthetic_pull_request: { number: pull.number, base: pull.base, head: pull.head },
       compatibility,
-      approval_history: summarizeApprovals(approvals),
+      approval_history_before_approval: preApproval,
       transformations: TRANSFORMATIONS,
       note: "Live cases demonstrate policy MECHANICS on disposable refs. They do not demonstrate that the real twelve production producers ran; that is a separate activation gate.",
     };
-    const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-setup`, evidence);
+    const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, "setup"), evidence);
     writeJournalSnapshot({ dir, runId, attempt, snapshot: { generated_from: "verified journal", records: journal.read().length, resources: evidence.disposable_rulesets, refs, graph: shas, pull_request: pull.number } });
     const incompatible = Object.entries(compatibility).filter(([, value]) => value.verdict !== "compatible");
     if (incompatible.some(([, value]) => value.verdict === "measurement-incomplete")) {
@@ -1900,7 +2135,7 @@ export async function runHumanTestsPhase({ runId, attempt, evidenceDir, env, dep
   const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
   const { dir, ctx, request, guardCtx, journal, lock, records } = session;
   try {
-    const setup = readEvidenceFile(dir, `${runId}-${attempt}-setup`);
+    const setup = readEvidenceFile(dir, evidenceSlug(runId, attempt, "setup"));
     if (!setup) throw new IncompleteEvidence("local setup has not completed for this run");
     const shas = Object.fromEntries(journaledResources(records, "commit").map((entry) => [entry.node, entry.sha]));
     if (!Object.keys(shas).length) throw new IncompleteEvidence("the journal records no synthetic commits for this run");
@@ -1913,7 +2148,7 @@ export async function runHumanTestsPhase({ runId, attempt, evidenceDir, env, dep
       workflow_sha: ctx.workflowSha, actor: { kind: "human-admin", login: operator.login, permission: operator.permission },
       cases: caseRecords, halted_after: halted,
     };
-    const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-human-tests`, evidence);
+    const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, "human"), evidence);
     return finishTestPhase({ runId, attempt, phase: "human-tests", caseRecords, halted, evidencePath });
   } finally {
     lock.release();
@@ -1980,6 +2215,10 @@ export async function runCloudTestsPhase({ role, runId, attempt, evidenceDir, en
   const metadataToken = String(env.GITHUB_TOKEN ?? "");
   if (!metadataToken) throw new UsageError("the protected job needs its metadata-scoped GITHUB_TOKEN to read the plan");
   const metadata = makeRequest(deps.metadataTransport ?? createTokenTransport({ token: metadataToken, fetchImpl, redact }), {});
+  // Read ONCE, with no bounded wait — unlike the fixture job. This job only starts after a human
+  // approved it, and root approves only after verifying the setup readback, so an absent manifest
+  // here is not "not yet": it means the plan this approval was given against is not there. Waiting
+  // would convert that into a delay, and then into an artifact that looks like a normal run.
   const { manifest, manifestCommitSha } = await readManifestFromRef({ request: metadata, runId, attempt, context: ctx });
   const verified = await verifySyntheticGraph({ request: metadata, manifest, runId, attempt });
 
@@ -2028,7 +2267,7 @@ export async function runCloudTestsPhase({ role, runId, attempt, evidenceDir, en
     dispatcher: ctx.actor, dispatcher_is_the_approver: false,
     policy_in_force: policy, check_publication: publication, cases: records, halted_after: halted,
   };
-  const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-${role}-tests`, evidence);
+  const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, role), evidence);
   return finishTestPhase({ runId, attempt, phase: `${role}-tests`, caseRecords: records, halted, evidencePath });
 }
 
@@ -2103,7 +2342,10 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       }
     }
 
-    const after = await measureProductionBaseline({ request });
+    const after = await measureProductionBaseline({
+      request,
+      excludeRulesetIds: new Set(journaledResources(records, "ruleset").map((owned) => Number(owned.id))),
+    });
     const drift = Object.keys(baseline).filter((key) => canonicalJson(baseline[key]) !== canonicalJson(after[key]));
     journal.append("run-closed", { cleanup_refusals: refused, production_drift: drift });
     const evidence = {
@@ -2111,7 +2353,7 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       workflow_sha: ctx.workflowSha, outcomes, refusals: refused,
       production_baseline_before: baseline, production_baseline_after: after, production_drift: drift,
     };
-    const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-cleanup`, evidence);
+    const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, "cleanup"), evidence);
     if (drift.length) {
       // Concurrent legitimate source movement is INTERRUPTED, requiring reconciliation — never an
       // automatic rollback of somebody else's change.
@@ -2125,8 +2367,78 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
 }
 
 /**
+ * The CLOSED set of protected-environment controls PC-06 requires, and the file that carries them.
+ *
+ * None of these can be produced by this harness. It cannot impersonate a second reviewer, it cannot
+ * read `prevent_self_review` back from the environments API, and a skipped off-branch job proves
+ * workflow ADMISSION rather than environment branch policy. So each is operator-supplied evidence
+ * from a separately reviewed, root-staged observation, and each is named individually — a single
+ * `verified: true` flag would let one observation stand in for seven.
+ *
+ * Every key must be present and `verified`. Anything else — absent, `unverified`, or a value that is
+ * not one of the two words — is a BLOCKER, so an incomplete file cannot round up to a pass.
+ */
+export const ENVIRONMENT_CONTROL_KEYS = Object.freeze([
+  "required_reviewer_is_owner",
+  "prevent_self_review_enabled",
+  "branch_policy_limits_to_staging",
+  "administrators_cannot_bypass",
+  "self_review_refused",
+  "unauthorized_reviewer_refused",
+  "off_branch_environment_reference_refused",
+  // The off-branch environment probe. PC-06 allows a separately staged no-secrets probe from a
+  // disposable ref, but this workflow's admission is FIXED to `refs/heads/staging` — so within it the
+  // case cannot be produced, and the spec's instruction is to report it unverified rather than widen
+  // admission to arbitrary refs. That is what this key is: the honest gap, named.
+  //
+  // The two release Apps' GRANTS. The finite-deadline token helper this harness reuses does not
+  // surface an installation token's permission set, and there is no endpoint that reports it back
+  // for someone else's installation — so these are owner provisioning facts, read out of band and
+  // attached here. They live in this list rather than as a hardcoded blocker for a specific reason:
+  // a blocker nothing can ever satisfy would make `check-evidence` incapable of returning 0, and an
+  // exit code that is always 3 stops carrying information long before anybody stops reading it.
+  "normal_app_permissions_confirmed",
+  "emergency_app_permissions_confirmed",
+]);
+
+/**
+ * Every evidence file's identity, checked before ANY field in it is believed.
+ *
+ * A file that is present but belongs to another run, another attempt or another phase is worse than
+ * an absent one: absence blocks loudly, whereas a mis-bound file would contribute PASSING gates
+ * measured against a different subject. A copy of last week's green packet dropped into this run's
+ * directory is exactly the shape this refuses.
+ */
+export function validateEvidenceBinding(payload, { runId, attempt, phase }) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "is not a JSON object";
+  if (payload.schema_version !== RESULT_SCHEMA_VERSION) return `declares schema version ${JSON.stringify(payload.schema_version ?? null)}, not ${RESULT_SCHEMA_VERSION}`;
+  if (String(payload.run_id) !== String(runId)) return `belongs to run ${JSON.stringify(String(payload.run_id ?? ""))}`;
+  if (String(payload.attempt) !== String(attempt)) return `belongs to attempt ${JSON.stringify(String(payload.attempt ?? ""))}`;
+  if (String(payload.phase) !== phase) return `records phase ${JSON.stringify(String(payload.phase ?? ""))}, not ${phase}`;
+  return null;
+}
+
+/** Which evidence file each gate needs, the phase name it must declare, and whether it is required. */
+const EVIDENCE_MANIFEST = Object.freeze([
+  { key: "intent", gate: "PC-03", phase: "intent", required: true },
+  { key: "setup", gate: "PC-03", phase: "setup", required: true },
+  { key: "fixture", gate: "PC-02", phase: "fixture-checks", required: true },
+  { key: "human", gate: "PC-05", phase: "human-tests", required: true },
+  { key: "normal", gate: "PC-05", phase: "normal-tests", required: true },
+  { key: "emergency", gate: "PC-05", phase: "emergency-tests", required: true },
+  { key: "approvals", gate: "PC-06", phase: "approvals", required: true },
+  { key: "environment", gate: "PC-06", phase: "environment-controls", required: true },
+  { key: "cleanup", gate: "PC-07", phase: "cleanup", required: true },
+]);
+
+/**
  * The authoritative completeness assessment (PC-07/PC-08). Every gate reports, and a gate that
  * could not be measured is `unverified` — which BLOCKS, and is never rendered as a pass.
+ *
+ * THREE KINDS OF BLOCKER, deliberately distinct in the output: `failed` is a measured statement
+ * about the subject, `unverified` is "we could not look or nobody has looked yet", and `invalid` is
+ * "a file claiming to be this evidence is not this evidence". Only an empty blocker list is a pass,
+ * so the distinction changes the exit code (1 vs 3) and the story, never the verdict.
  */
 export function assessEvidence({ dir, runId, attempt }) {
   const blockers = [];
@@ -2138,30 +2450,68 @@ export function assessEvidence({ dir, runId, attempt }) {
   if (journalError) block("PC-07", "failed", `the local journal chain does not verify: ${journalError}`);
   else if (!journalRecords.length) block("PC-07", "unverified", "the local journal is empty; no local phase has run");
 
-  const files = {
-    intent: readEvidenceFile(dir, `${runId}-${attempt}-intent`),
-    setup: readEvidenceFile(dir, `${runId}-${attempt}-setup`),
-    fixture: readEvidenceFile(dir, `${runId}-${attempt}-fixture-checks`),
-    human: readEvidenceFile(dir, `${runId}-${attempt}-human-tests`),
-    normal: readEvidenceFile(dir, `${runId}-${attempt}-normal-tests`),
-    emergency: readEvidenceFile(dir, `${runId}-${attempt}-emergency-tests`),
-    cleanup: readEvidenceFile(dir, `${runId}-${attempt}-cleanup`),
-    environment: readEvidenceFile(dir, `${runId}-${attempt}-environment-controls`),
-  };
-  for (const [name, gate] of [["intent", "PC-03"], ["setup", "PC-03"], ["fixture", "PC-02"], ["human", "PC-05"], ["normal", "PC-05"], ["emergency", "PC-05"], ["cleanup", "PC-07"]]) {
-    if (!files[name]) block(gate, "unverified", `the ${name} evidence file is absent`);
+  // Read, then VALIDATE. A file that fails its binding is discarded before any gate reads a field
+  // out of it, so a mis-bound packet can only ever subtract confidence, never add it.
+  const files = {};
+  for (const entry of EVIDENCE_MANIFEST) {
+    const payload = readEvidenceFile(dir, evidenceSlug(runId, attempt, entry.key));
+    if (!payload) {
+      if (entry.required) block(entry.gate, "unverified", `the ${EVIDENCE_KEYS[entry.key]} evidence file is absent`);
+      files[entry.key] = null;
+      continue;
+    }
+    const problem = validateEvidenceBinding(payload, { runId, attempt, phase: entry.phase });
+    if (problem) {
+      block(entry.gate, "invalid", `the ${EVIDENCE_KEYS[entry.key]} evidence file ${problem}`);
+      files[entry.key] = null;
+      continue;
+    }
+    files[entry.key] = payload;
+  }
+
+  if (files.intent) {
+    // The intent phase is credential-free by design, so it must SAY so rather than look measured.
+    if (files.intent.provider_measured !== false) block("PC-03", "invalid", "the intent evidence claims a provider measurement the credential-free intent phase does not make");
+    if (files.intent.workflow_sha && files.setup && files.setup.workflow_sha !== files.intent.workflow_sha) {
+      block("PC-03", "failed", "the setup evidence and the intent evidence disagree about the immutable workflow SHA");
+    }
   }
   if (files.setup) {
+    // Because intent measures nothing, THIS is where the run's identity was checked against the
+    // provider. A setup file without it is not a pass with a caveat; it is an unproved identity.
+    if (files.setup.intent_remeasured?.confirmed !== true) {
+      block("PC-03", "unverified", "the setup evidence does not record a provider re-measurement of the credential-free intent's identity claims");
+    }
     for (const [actor, value] of Object.entries(files.setup.compatibility ?? {})) {
       if (value?.verdict === "compatible") continue;
       block("PC-04", value?.verdict === "measurement-incomplete" ? "unverified" : "failed", `the ${actor} disposable policy is ${value?.verdict ?? "unreported"}${value?.gap ? ` (${value.gap} gap)` : ""}`);
     }
-    if (files.setup.approval_history?.measured !== true) block("PC-06", "unverified", "the run's protected-environment approval history could not be measured");
-    else {
-      for (const environment of ["staging-release", "staging-emergency"]) {
-        const approved = (files.setup.approval_history.entries ?? []).some((entry) => entry.state === "approved" && entry.environments.includes(environment));
-        if (!approved) block("PC-06", "unverified", `no recorded human approval for ${environment}`);
+    const preApproval = files.setup.approval_history_before_approval;
+    if (preApproval?.measured !== true) block("PC-06", "unverified", "the pre-approval snapshot was not measured, so a later approval cannot be shown to postdate the plan");
+    else if ((preApproval.entries ?? []).some((entry) => entry.state === "approved")) {
+      block("PC-06", "failed", "a protected environment was already approved before setup published the plan");
+    }
+  }
+
+  // PC-06, the ACTUAL human approval — from the approvals file `collect` wrote after the protected
+  // jobs ran, never from setup's pre-approval snapshot.
+  if (files.approvals) {
+    for (const spec of PROTECTED_JOBS) {
+      const environment = files.approvals.environments?.[spec.environment];
+      if (!environment) { block("PC-06", "unverified", `the approval evidence records nothing for ${spec.environment}`); continue; }
+      if (environment.approval_measured !== true) {
+        block("PC-06", "unverified", `${spec.environment}'s approval history could not be measured${environment.approval_measurement_reason ? ` (${environment.approval_measurement_reason})` : ""}`);
+        continue;
       }
+      if (environment.approved !== true) { block("PC-06", "unverified", `no human approval is recorded for ${spec.environment}`); continue; }
+      if (!(environment.reviewers ?? []).length) { block("PC-06", "unverified", `${spec.environment} is recorded as approved with no reviewer identity`); continue; }
+      // A dispatcher that approves its own run is a self-review: the run happened, but it is not
+      // the two-identity evidence PC-06 asks for.
+      if (environment.reviewers.some((reviewer) => reviewer.is_dispatcher === true)) {
+        block("PC-06", "failed", `${spec.environment} was approved by the dispatcher itself; that is a self-review, not independent approval`);
+      }
+      if (environment.job_state_measured !== true) block("PC-06", "unverified", `the ${spec.id} job's final state could not be measured`);
+      else if (environment.job_status !== "completed") block("PC-06", "unverified", `the ${spec.id} job is ${environment.job_status}; its approval did not lead to a completed actor phase`);
     }
   }
 
@@ -2184,17 +2534,28 @@ export function assessEvidence({ dir, runId, attempt }) {
     if (leftovers.length) block("PC-07", "failed", `${leftovers.length} owned resource(s) were not removed`);
   }
 
-  // PC-06 negative controls. These cannot be produced by this harness: it cannot impersonate a
-  // second reviewer, and a skipped off-branch job proves workflow admission, not environment
-  // policy. Absent evidence stays UNVERIFIED and blocks activation, by design.
-  if (!files.environment) {
-    block("PC-06", "unverified", "the protected-environment negative controls (self-review refusal, unauthorized reviewer, branch policy) have no accepted provider evidence");
-  } else if (files.environment.verified !== true) {
-    block("PC-06", "unverified", `the protected-environment negative controls report ${String(files.environment.status ?? "no status")}`);
+  // PC-06 negative controls, per named control. Absent evidence stays UNVERIFIED and blocks
+  // activation, by design — see ENVIRONMENT_CONTROL_KEYS.
+  if (files.environment) {
+    for (const key of ENVIRONMENT_CONTROL_KEYS) {
+      const control = files.environment.controls?.[key];
+      const status = String(control?.status ?? "absent");
+      if (status === "verified") {
+        if (!String(control?.evidence ?? "").trim()) block("PC-06", "unverified", `the ${key} control is marked verified with no evidence reference`);
+        continue;
+      }
+      block("PC-06", "unverified", `the protected-environment control ${key} is ${status}`);
+    }
+    const unknown = Object.keys(files.environment.controls ?? {}).filter((key) => !ENVIRONMENT_CONTROL_KEYS.includes(key));
+    if (unknown.length) block("PC-06", "invalid", `the environment-controls evidence declares ${unknown.length} control(s) outside the closed PC-06 list`);
   }
+  // The mirror of the two `*_app_permissions_confirmed` controls: the actor evidence must keep
+  // SAYING that it did not measure the App's grants. A file that claimed otherwise would be
+  // claiming a measurement no code here performs, which is worse than the gap it papers over.
   for (const role of ["normal", "emergency"]) {
-    if (files[role]?.actor?.installation_permissions === "unverified-by-this-harness") {
-      block("PC-06", "unverified", `the ${role} App's installation permission set is an owner provisioning fact this harness does not measure`);
+    if (!files[role]) continue;
+    if (files[role].actor?.installation_permissions !== "unverified-by-this-harness") {
+      block("PC-06", "invalid", `the ${role} actor evidence claims a measurement of the App's installation permissions that this harness does not perform`);
     }
   }
   return { blockers, files, journal_records: journalRecords?.length ?? 0 };
@@ -2211,15 +2572,83 @@ function evidenceResult({ runId, attempt, phase, dir, deps }) {
     verdict: assessment.blockers.length ? "not-activation-evidence" : "complete",
     note: "A complete actor matrix is not authorization to change main policy. Activation is a separate, root-owned decision with its own gates.",
   };
-  const evidencePath = writeEvidenceFile(dir, `${runId}-${attempt}-${phase}`, summary);
+  const evidencePath = writeEvidenceFile(dir, evidenceSlug(runId, attempt, phase), summary);
   if (!assessment.blockers.length) return closedResult({ runId, attempt, phase, status: "passed", evidencePath });
   const failed = assessment.blockers.filter((entry) => entry.kind === "failed");
   if (failed.length) throw new AssertionFailure(`${failed.length} measured gate failure(s) and ${assessment.blockers.length - failed.length} unverified gate(s)`, { evidencePath, blockers: assessment.blockers });
   throw new IncompleteEvidence(`${assessment.blockers.length} gate(s) remain unverified`, { evidencePath, blockers: assessment.blockers });
 }
 
-export function runCollectPhase({ runId, attempt, evidenceDir, deps = {} }) {
-  return evidenceResult({ runId, attempt, phase: "collect", dir: assertPrivateDirectory(evidenceDir), deps });
+/**
+ * The PC-06 human-approval evidence, measured when it can exist — which is only here.
+ *
+ * WHY NOT IN SETUP. Setup runs BEFORE the approvals it would need to record. Its snapshot of the
+ * approval history is a snapshot of an absence, and reusing it as approval evidence would be
+ * recording the impossible: a human decision captured before the human was asked. So setup asserts
+ * the snapshot is EMPTY (which is what proves this approval came later, against a plan that could be
+ * inspected), and the approval itself is read here, after the protected jobs have run.
+ *
+ * A measurement failure is recorded as `measured: false` with its reason. It is never written down
+ * as "no approval": {@link assessEvidence} turns an unmeasured approval into an UNVERIFIED blocker,
+ * which is a different verdict from a refused one and must stay that way.
+ */
+export async function collectApprovalEvidence({ request, runId, attempt, ctx, now = () => new Date() }) {
+  const dispatcher = String(ctx?.intent?.dispatcher ?? "") || null;
+  const response = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/approvals`);
+  const history = summarizeApprovals(response);
+  const jobs = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/actions/runs/${runId}/attempts/${attempt}/jobs?per_page=${PAGE_SIZE}&page=1`);
+  const jobsMeasured = jobs.status === 200 && Array.isArray(jobs.body?.jobs);
+  const environments = {};
+  for (const spec of PROTECTED_JOBS) {
+    const approvals = history.measured
+      ? history.entries.filter((entry) => entry.state === "approved" && entry.environments.includes(spec.environment))
+      : [];
+    const job = jobsMeasured ? jobs.body.jobs.find((entry) => String(entry?.name ?? "") === spec.name) : null;
+    environments[spec.environment] = {
+      job: spec.id,
+      approval_measured: history.measured,
+      approval_measurement_reason: history.measured ? null : history.reason,
+      approved: history.measured ? approvals.length > 0 : null,
+      // The APPROVER, which is the human evidence. The dispatcher is a separate identity and may be
+      // an App; an approval by the dispatcher is a self-review and is reported as one.
+      reviewers: approvals.map((entry) => ({
+        login: entry.reviewer_login, type: entry.reviewer_type,
+        is_dispatcher: dispatcher !== null && entry.reviewer_login === dispatcher,
+      })),
+      job_state_measured: jobsMeasured,
+      // `null` when the jobs list could not be read, and "uncreated" when the job is genuinely
+      // absent. Neither is collapsed into a state, because "never ran" and "we could not look" are
+      // different facts and only one of them is about the subject.
+      job_status: jobsMeasured ? String(job?.status ?? "uncreated") : null,
+      job_conclusion: jobsMeasured ? (job?.conclusion === undefined ? null : String(job?.conclusion ?? "none")) : null,
+    };
+  }
+  return {
+    schema_version: RESULT_SCHEMA_VERSION, phase: "approvals", run_id: String(runId), attempt: String(attempt),
+    workflow_sha: ctx.workflowSha, collected_at: now().toISOString(),
+    dispatcher, dispatcher_is_the_approver: Object.values(environments).some((entry) => entry.reviewers.some((reviewer) => reviewer.is_dispatcher)),
+    approval_history: history, environments,
+    note: "This records the approvals GitHub itself holds for this run. It is not evidence that the environments' reviewer/self-review/branch-policy CONTROLS were tested; those are the PC-06 negative controls.",
+  };
+}
+
+/**
+ * `collect` is the one evidence phase that TALKS TO THE PROVIDER, because the human approval it must
+ * record does not exist in any file this harness wrote. It gathers, writes the approval evidence,
+ * and then runs the same assessment as `check-evidence` — which stays purely offline, so the
+ * authoritative completeness check reads only durable evidence and can be re-run by a reviewer who
+ * never touches a credential.
+ */
+export async function runCollectPhase({ runId, attempt, evidenceDir, env = process.env, deps = {} }) {
+  const session = await openLocalSession({ runId, attempt, evidenceDir, env, deps });
+  const { dir, ctx, request, lock } = session;
+  try {
+    const approvals = await collectApprovalEvidence({ request, runId, attempt, ctx, now: deps.now });
+    writeEvidenceFile(dir, evidenceSlug(runId, attempt, "approvals"), approvals);
+    return evidenceResult({ runId, attempt, phase: "collect", dir, deps });
+  } finally {
+    lock.release();
+  }
 }
 
 export function runCheckEvidencePhase({ runId, attempt, evidenceDir, deps = {} }) {
@@ -2264,7 +2693,7 @@ export async function runPhase({ phase, runId, attempt, evidenceDir, env = proce
   if (phase === "human-tests") return runHumanTestsPhase({ runId, attempt, evidenceDir, env, deps });
   if (phase === "normal-tests") return runCloudTestsPhase({ role: "normal", runId, attempt, evidenceDir, env, deps });
   if (phase === "emergency-tests") return runCloudTestsPhase({ role: "emergency", runId, attempt, evidenceDir, env, deps });
-  if (phase === "collect") return runCollectPhase({ runId, attempt, evidenceDir, deps });
+  if (phase === "collect") return runCollectPhase({ runId, attempt, evidenceDir, env, deps });
   if (phase === "cleanup") return runCleanupPhase({ runId, attempt, evidenceDir, env, deps });
   if (phase === "check-evidence") return runCheckEvidencePhase({ runId, attempt, evidenceDir, deps });
   throw new UsageError(`unsupported commissioning phase ${JSON.stringify(String(phase))}`);
