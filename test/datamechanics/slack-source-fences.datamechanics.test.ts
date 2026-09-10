@@ -312,7 +312,11 @@ describe("deleting an integration unbinds the channel without losing it", () => 
     expect(rebound?.binding_integration_id).toBe(shared);
     expect(rebound?.binding_config_revision).not.toBeNull();
     expect(resumed.paramsOf("conversations.history")[0].get("cursor")).toBe("cursor-1");
-    expect(await threadRootTs(seed.teamId)).toEqual(["1718900000.000800", "1718900000.000900"]);
+    expect(await threadRootTs(seed.teamId)).toEqual([
+      "1718900000.000800",
+      "1718900000.000850",
+      "1718900000.000900",
+    ]);
   });
 });
 

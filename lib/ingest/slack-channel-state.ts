@@ -36,11 +36,21 @@ import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";
  *     `{ ok: false }`, which `lib/db/pg/tx.ts` reads as a rollback signal — a caller returning one
  *     of those straight out of its transaction would silently undo its own committed work.
  *
- * THE TWO LANES are documented on the table in `postgres/schema.sql`; the rule that lives HERE is
- * what ends a scan. A newest scan with a lower bound ends when the provider says `has_more: false`.
- * A SEED scan — the first one, with no certified top to catch up from — is ONE page by definition,
- * and what it certifies is exactly the span that page returned; everything older is the historical
- * lane's work, which starts at that boundary rather than inheriting the seed's cursor.
+ * THE TWO LANES are documented on the table in `postgres/schema.sql`; the two rules that live HERE
+ * are what STARTS and what ENDS a scan.
+ *
+ *  • A scan ends when, and only when, the provider says `has_more: false`. There is no second,
+ *    locally-decided ending: a request we sent as "everything below this anchor" cannot be relabelled
+ *    as a completed interval after the fact just because the answer was inconveniently partial.
+ *  • The FIRST scan a channel ever runs is the HISTORICAL one, anchored at the DB clock and with no
+ *    lower bound — the accepted "initial anchored scan covers all provider-retained history". The
+ *    newest catch-up lane starts above that fixed anchor, and the two then alternate, so a partial
+ *    first page starves nothing: its continuation stays exactly where it was, as historical progress.
+ *
+ * A catch-up that completes while that initial scan is still draining has read a real interval that
+ * is NOT yet contiguous with anything certified, so it is recorded as `newest_catchup_upper_ts` —
+ * PROVISIONAL progress, deliberately a different column from `completed_*`. The two are joined into
+ * one certified interval when the historical scan finally reaches the retention floor.
  */
 
 export type SlackScanLane = "newest" | "historical";
@@ -72,6 +82,10 @@ export interface SlackChannelState {
   readonly historicalFloorReached: boolean;
   readonly completedLowerTs: string | null;
   readonly completedUpperTs: string | null;
+  /** PROVISIONAL: fully read down to the initial anchor, but not yet contiguous with a certified interval. */
+  readonly newestCatchupUpperTs: string | null;
+  readonly metadataAttemptOwner: string | null;
+  readonly metadataAttemptGeneration: number;
   readonly claimedLane: SlackScanLane | null;
   readonly nextLane: SlackScanLane;
   readonly leaseOwner: string | null;
@@ -103,6 +117,23 @@ export interface SlackChannelClaim {
   readonly oldestSeenTs: string | null;
   readonly completedLowerTs: string | null;
   readonly completedUpperTs: string | null;
+  readonly newestCatchupUpperTs: string | null;
+}
+
+/**
+ * Ownership of ONE metadata observation of one channel.
+ *
+ * ⚠️ IT IS AN ORDERING FENCE, NOT A LEASE. It does not stop a second observation from starting —
+ * `conversations.info` is metered per (team, workspace, APP), so two integrations running two apps in
+ * one workspace legitimately have two allowances and two reads in flight. What it stops is the older
+ * of those two answers being applied AFTER the newer one: starting an attempt bumps the generation,
+ * and only an acceptance carrying the current owner and generation may write a verdict. A dead
+ * attempt (a crashed pass) therefore blocks nothing — the next attempt simply supersedes it.
+ */
+export interface SlackChannelMetadataAttempt {
+  readonly scope: SlackChannelScope;
+  readonly owner: string;
+  readonly generation: number;
 }
 
 export type SlackChannelWrite =
@@ -111,13 +142,6 @@ export type SlackChannelWrite =
 
 /** How long a claim owns a channel. One wake is bounded well below this; a crash frees it. */
 export const SLACK_CHANNEL_LEASE_MS = 120_000;
-
-/**
- * How long a channel's public proof is reused before it is re-checked. Metadata is re-read to notice
- * a channel going private, NOT on every wake: a 15-second re-verification would spend the whole
- * `conversations.info` budget proving what we already know.
- */
-export const SLACK_CHANNEL_METADATA_TTL_MS = 6 * 60 * 60 * 1000;
 
 const MIN_LEASE_MS = 1_000;
 const MAX_LEASE_MS = 900_000;
@@ -142,7 +166,9 @@ const STATE_COLUMNS = `team_id, workspace_id, channel_id, binding_integration_id
        public_state, public_checked_at, newest_anchor_ts, newest_lower_ts, newest_cursor,
        newest_scan_generation::text as newest_scan_generation, historical_anchor_ts, historical_cursor,
        historical_scan_generation::text as historical_scan_generation, historical_oldest_seen_ts,
-       historical_floor_reached, completed_lower_ts, completed_upper_ts, claimed_lane, next_lane,
+       historical_floor_reached, completed_lower_ts, completed_upper_ts, newest_catchup_upper_ts,
+       metadata_attempt_owner, metadata_attempt_generation::text as metadata_attempt_generation,
+       claimed_lane, next_lane,
        lease_owner, lease_generation::text as lease_generation, lease_expires_at, due_at, attempts,
        last_error_code, last_read_at`;
 
@@ -165,6 +191,9 @@ interface StateRow {
   historical_floor_reached: boolean;
   completed_lower_ts: string | null;
   completed_upper_ts: string | null;
+  newest_catchup_upper_ts: string | null;
+  metadata_attempt_owner: string | null;
+  metadata_attempt_generation: string;
   claimed_lane: string | null;
   next_lane: string;
   lease_owner: string | null;
@@ -278,20 +307,73 @@ export async function dueSlackChannels(
 // ── metadata ─────────────────────────────────────────────────────────────────
 
 /**
+ * OPEN a metadata observation of this channel, BEFORE the `conversations.info` request goes out.
+ *
+ * Opening one bumps the channel's metadata generation and takes ownership of it, which is what makes
+ * the answers orderable. Without it, "which verdict is newer?" has no answer at all: the responses
+ * are two independent HTTP calls that can complete in either order, and the config re-check the
+ * acceptance already does cannot see the difference — neither integration's configuration changed.
+ *
+ * It is deliberately unconditional on the public state and the binding: a channel is re-observed
+ * precisely because its stored verdict may be out of date, and WHO may write the verdict is checked
+ * at acceptance, where the current selection is re-read under its row lock.
+ */
+export async function beginSlackChannelMetadata(
+  session: TransactionSession,
+  scope: SlackChannelScope
+): Promise<SlackChannelMetadataAttempt | null> {
+  assertScope(scope);
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_channels
+        set metadata_attempt_owner = gen_random_uuid()::text,
+            metadata_attempt_generation = metadata_attempt_generation + 1,
+            updated_at = clock_timestamp()
+      where ${SCOPE_PREDICATE}
+  returning ${STATE_COLUMNS}`,
+    scopeParams(scope)
+  );
+  const row = single(result);
+  if (!row) return null;
+  const state = toState(row);
+  if (state.metadataAttemptOwner === null) {
+    throw new SlackChannelStateError("a metadata attempt came back without an owner — refusing it");
+  }
+  return { scope: state.scope, owner: state.metadataAttemptOwner, generation: state.metadataAttemptGeneration };
+}
+
+/**
  * Persist a DEFINITIVE public-status verdict, and bind the channel to the integration that proved it.
  *
  * Only a validated `conversations.info` response reaches here. A transient 429/timeout/5xx must NOT
  * call this at all: the last valid proof is the best information there is, and overwriting it with
  * "unknown" on a blip would close a channel that is perfectly fine — while writing "public" on no
  * evidence would open one that is not.
+ *
+ * TWO fences, and they answer different questions. The caller re-reads its integration row under a
+ * lock (is this still the configuration that asked?), and `attempt` is matched here (is this still
+ * the newest observation of this channel?). A rate limit answers neither: the `conversations.info`
+ * allowance is per (team, workspace, app), so two apps in one workspace are never serialized by it.
+ * Ownership is RELEASED on acceptance, so a duplicate delivery of the same response writes once.
  */
 export async function recordSlackChannelPublicState(
   session: TransactionSession,
   scope: SlackChannelScope,
   binding: { integrationId: string; configRevision: string },
+  attempt: SlackChannelMetadataAttempt,
   input: { publicState: Exclude<SlackChannelPublicState, "unknown">; errorCode?: string | null }
 ): Promise<SlackChannelWrite> {
   assertScope(scope);
+  assertScope(attempt.scope);
+  if (
+    attempt.scope.teamId !== scope.teamId ||
+    attempt.scope.workspaceId !== scope.workspaceId ||
+    attempt.scope.channelId !== scope.channelId
+  ) {
+    throw new SlackChannelStateError("the metadata attempt belongs to a different channel");
+  }
+  if (!Number.isSafeInteger(attempt.generation) || attempt.generation <= 0) {
+    throw new SlackChannelStateError("a metadata attempt generation must be a positive whole number");
+  }
   if (!UUID.test(binding.integrationId)) {
     throw new SlackChannelStateError("binding.integrationId must be a UUID");
   }
@@ -310,9 +392,12 @@ export async function recordSlackChannelPublicState(
             binding_integration_id = $5::uuid,
             binding_config_revision = $6,
             last_error_code = $7,
+            metadata_attempt_owner = null,
             due_at = clock_timestamp(),
             updated_at = clock_timestamp()
       where ${SCOPE_PREDICATE}
+        and metadata_attempt_owner = $8
+        and metadata_attempt_generation = $9::bigint
   returning ${STATE_COLUMNS}`,
     [
       ...scopeParams(scope),
@@ -320,6 +405,8 @@ export async function recordSlackChannelPublicState(
       binding.integrationId,
       binding.configRevision,
       input.errorCode ?? null,
+      attempt.owner,
+      String(attempt.generation),
     ]
   );
   return written(result);
@@ -365,6 +452,12 @@ export async function delaySlackChannel(
  * AND has a boundary to start from, and `next_lane` is PERSISTED so an empty lane lends its slot
  * without losing its turn. A caller that recomputed the lane per invocation would hand every slot to
  * the same lane and starve the other forever, which is exactly the failure this column prevents.
+ *
+ * The one lane the rule OVERRIDES `next_lane` for is the first scan a channel ever runs. It is the
+ * historical one, anchored at the DB clock, because there is nothing yet for a catch-up to be "above"
+ * — and that is also this statement's guarantee that a newest scan always has a lower bound: it can
+ * only start once a certified top, a provisional catch-up top or an initial anchor exists, and none
+ * of those three ever goes back to being absent.
  *
  * `null` means NOT CLAIMED: not due, not public, not bound to the CURRENT revision, or somebody's
  * lease is still live. It can never mean a failed statement — a SQL error rejects.
@@ -731,6 +824,9 @@ function toState(row: StateRow): SlackChannelState {
     historicalFloorReached: row.historical_floor_reached === true,
     completedLowerTs: row.completed_lower_ts,
     completedUpperTs: row.completed_upper_ts,
+    newestCatchupUpperTs: row.newest_catchup_upper_ts,
+    metadataAttemptOwner: row.metadata_attempt_owner,
+    metadataAttemptGeneration: counter("metadata_attempt_generation", row.metadata_attempt_generation),
     claimedLane: row.claimed_lane === null ? null : assertLane(row.claimed_lane),
     nextLane: assertLane(row.next_lane),
     leaseOwner: row.lease_owner,
