@@ -485,6 +485,13 @@ export async function claimSlackChannelPage(
     `with candidate as (
         select id,
                case
+                 -- THE INITIAL SCAN, whatever next_lane says: nothing is certified, nothing is
+                 -- provisionally read and no anchor exists, so there is no boundary a catch-up could
+                 -- run above. This is the anchored scan that covers all retained history.
+                 when completed_upper_ts is null
+                      and newest_catchup_upper_ts is null
+                      and historical_anchor_ts is null
+                   then 'historical'
                  when next_lane = 'newest' then 'newest'
                  when not historical_floor_reached
                       and (historical_anchor_ts is not null or completed_lower_ts is not null)
@@ -505,12 +512,18 @@ export async function claimSlackChannelPage(
              newest_anchor_ts = case
                when candidate.lane = 'newest' then coalesce(c.newest_anchor_ts, ${CLOCK_ANCHOR_TS})
                else c.newest_anchor_ts end,
+             -- A starting catch-up begins at the top of whatever is ALREADY fully read: the
+             -- certified interval, else the provisional catch-up top, else the initial anchor. The
+             -- three are tried in that order because that is the order they supersede each other in.
              newest_lower_ts = case
-               when candidate.lane = 'newest' and c.newest_anchor_ts is null then c.completed_upper_ts
+               when candidate.lane = 'newest' and c.newest_anchor_ts is null
+                 then coalesce(c.completed_upper_ts, c.newest_catchup_upper_ts, c.historical_anchor_ts)
                else c.newest_lower_ts end,
+             -- A starting historical scan resumes at the certified bottom, or — the first time —
+             -- freezes the clock as the anchor everything else is measured against.
              historical_anchor_ts = case
                when candidate.lane = 'historical'
-                 then coalesce(c.historical_anchor_ts, c.completed_lower_ts)
+                 then coalesce(c.historical_anchor_ts, c.completed_lower_ts, ${CLOCK_ANCHOR_TS})
                else c.historical_anchor_ts end,
              historical_oldest_seen_ts = case
                when candidate.lane = 'historical' and c.historical_anchor_ts is null then null
@@ -537,6 +550,12 @@ export async function claimSlackChannelPage(
     // alternative is handing back a claim nobody can fence.
     throw new SlackChannelStateError("claimed row came back without a lease or an anchor — refusing it");
   }
+  if (lane === "newest" && laneState.lowerTs === null) {
+    // A catch-up with no lower bound is not a catch-up — it is an unbounded scan of the whole
+    // channel wearing that lane's name, and it would certify as one. The lane rule above is what
+    // prevents it; this refuses to proceed if that rule is ever weakened.
+    throw new SlackChannelStateError("a catch-up claim came back without a lower bound — refusing it");
+  }
   return {
     scope: state.scope,
     lane,
@@ -553,6 +572,7 @@ export async function claimSlackChannelPage(
     oldestSeenTs: lane === "historical" ? state.historicalOldestSeenTs : null,
     completedLowerTs: state.completedLowerTs,
     completedUpperTs: state.completedUpperTs,
+    newestCatchupUpperTs: state.newestCatchupUpperTs,
   };
 }
 
@@ -564,6 +584,12 @@ export async function claimSlackChannelPage(
  * them — and a refusal reported as a return value cannot, since the transaction would commit.
  * `for update` holds the row until this transaction ends, so no concurrent claim can slip in between
  * the check and the advance.
+ *
+ * ⚠️ IT ALSO RE-CHECKS THE PUBLIC PROOF, and this is the ONLY place that check exists on the
+ * acceptance path — deliberately not repeated in the advance below, where a second copy would
+ * silently cover for this one going missing. The claim proved the channel public when it was taken;
+ * a definitive `private`/`unverifiable` observation made WHILE the page was in flight has to refuse
+ * it, or a revoked channel's messages are enqueued minutes after we were told to stop reading it.
  */
 export async function lockSlackChannelForAcceptance(
   session: TransactionSession,
@@ -574,6 +600,7 @@ export async function lockSlackChannelForAcceptance(
   const result = await session.executeSql(
     `select id from slack_sync_channels
       where ${SCOPE_PREDICATE}
+        and public_state = 'public'
         and lease_owner = $4
         and lease_generation = $5::bigint
         and lease_expires_at > clock_timestamp()
@@ -601,14 +628,25 @@ export async function lockSlackChannelForAcceptance(
  * Apply one accepted page: the lane's progress, and — only for a terminal page — the certified
  * interval.
  *
+ * ⚠️ TERMINAL MEANS THE PROVIDER ENDED THE SCAN. A page that says `has_more` is progress, full stop.
+ * There is no case in which a request we sent as "everything below this anchor" is re-read, after
+ * its answer arrives, as a smaller request that happens to be complete: that is not a completed
+ * interval, it is an unfinished one relabelled, and the interval's whole purpose downstream is to be
+ * the range where an ABSENT message counts as evidence of deletion.
+ *
  * The certification rules, which live here because the table's invariant does:
  *  • PARTIAL: store the continuation cursor, remember the oldest instant the historical scan has
- *    seen, and leave `completed_*` exactly as it was.
- *  • TERMINAL, newest lane: the certified top becomes this scan's frozen anchor. On a SEED scan
- *    (no lower bound) the certified bottom becomes the oldest instant the page returned — the span
- *    that page actually covered — or the anchor itself when the page was empty.
- *  • TERMINAL, historical lane: the retention floor is reached, and the certified bottom moves down
- *    to the oldest instant the scan saw. It never moves UP: `olderSlackTs` of the two.
+ *    seen, and leave `completed_*` and the provisional catch-up top exactly as they were.
+ *  • TERMINAL, newest lane, WITH a certified interval: its lower bound was that interval's top, so
+ *    the certified top extends to this scan's frozen anchor.
+ *  • TERMINAL, newest lane, with NOTHING certified yet: the initial scan is still draining below
+ *    this catch-up, so `[initial anchor, this anchor]` is genuinely read but not contiguous with a
+ *    certified interval. It is recorded as PROVISIONAL progress (`newest_catchup_upper_ts`) and
+ *    `completed_*` does not move. Writing it there would certify a range whose bottom half is a hole.
+ *  • TERMINAL, historical lane: the retention floor is reached, so everything from the oldest
+ *    instant the scan saw up to the provisional catch-up top (or the anchor, if no catch-up has
+ *    finished) is now one contiguous certified interval. The certified bottom never moves UP:
+ *    `olderSlackTs` of the two. The provisional column is cleared, because it has been absorbed.
  */
 export async function acceptSlackChannelPage(
   session: TransactionSession,
@@ -625,13 +663,19 @@ export async function acceptSlackChannelPage(
   const seenTs = olderSlackTs(claim.oldestSeenTs, page.oldestTs);
   let completedLowerTs = claim.completedLowerTs;
   let completedUpperTs = claim.completedUpperTs;
+  let catchupUpperTs = claim.newestCatchupUpperTs;
   if (page.terminal) {
     if (lane === "newest") {
-      completedUpperTs = claim.anchorTs;
-      completedLowerTs = claim.completedLowerTs ?? page.oldestTs ?? claim.anchorTs;
+      if (claim.completedUpperTs === null) {
+        catchupUpperTs = claim.anchorTs;
+      } else {
+        completedUpperTs = claim.anchorTs;
+        catchupUpperTs = null;
+      }
     } else {
       completedLowerTs = olderSlackTs(claim.completedLowerTs, seenTs) ?? claim.anchorTs;
-      completedUpperTs = claim.completedUpperTs ?? claim.anchorTs;
+      completedUpperTs = claim.completedUpperTs ?? claim.newestCatchupUpperTs ?? claim.anchorTs;
+      catchupUpperTs = null;
     }
   }
 
@@ -644,6 +688,7 @@ export async function acceptSlackChannelPage(
             historical_floor_reached = historical_floor_reached or $15,
             completed_lower_ts = $16,
             completed_upper_ts = $17,
+            newest_catchup_upper_ts = $18,
             -- The lane's turn is over whether or not its scan is: an empty lane lends its slot, it
             -- does not keep it.
             next_lane = case when claimed_lane = 'newest' then 'historical' else 'newest' end,
@@ -680,6 +725,7 @@ export async function acceptSlackChannelPage(
       lane === "historical" && page.terminal,
       completedLowerTs,
       completedUpperTs,
+      catchupUpperTs,
     ]
   );
   return written(result);
