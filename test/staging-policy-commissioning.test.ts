@@ -16,7 +16,7 @@ import {
   assertPublisherContext, assertResponseBinding, assertRoleBinding, assertRunContext, assessEvidence,
   awaitManifestFromRef, buildChallenge, buildGovernedSnapshot, buildResponse, buildActorMatrix,
   buildGraphPlan, openWitnessSession, publishWitnessResponse, readWitnessEnvelopeFromEvent,
-  runWitnessPhase, serializeDispatchEnvelope, validateGovernedSnapshot,
+  serializeDispatchEnvelope, validateGovernedSnapshot,
   challengeArtifactName, classifyCaseOutcome,
   collectSentinels, comparePermissions, createRedactor, deriveCaseVerdict, derivedContextNames,
   derivedRef, derivedRefs, derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug,
@@ -3164,6 +3164,61 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       expected: { repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH, sourceSha: WORKFLOW_SHA },
       writeEntry: () => "/tmp/x",
     })).toThrow(/immutable source is not the source this publisher ran/);
+  });
+
+  it("the publisher JOB validates its own run, writes the exact bytes, and names its own artifact", async () => {
+    const github = createFakeGitHub();
+    const response = {
+      schema_version: 1, kind: "commissioning-witness-response",
+      domain: "commission", repository: COMMISSIONING_REPOSITORY, repository_id: REPOSITORY_ID,
+      source_mode: "commission", original_run_id: RUN_ID, original_attempt: ATTEMPT,
+      workflow_path: COMMISSIONING_WORKFLOW_PATH, source_sha: WORKFLOW_SHA,
+      role: "normal", job_id: "normal", case_id: CLOUD_CASE_SEQUENCE.normal[0], case_ordinal: 1,
+      direction: "pre", target_ref: derivedRef(RUN_ID, ATTEMPT, "normal"),
+      intended_app_id: NORMAL_APP, intended_installation_id: "5001",
+      manifest_sha256: "c".repeat(64), graph_sha256: "d".repeat(64),
+      challenge_nonce: "e".repeat(64), challenge_digest: "f".repeat(64),
+      challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
+      witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
+      observation: { started_at: "2026-09-10T09:00:00.000Z", completed_at: "2026-09-10T09:00:01.000Z", span_ms: 1000, governed_rulesets: [], classic_protection: { present: false, status: 404 } },
+    };
+    const envelope = JSON.stringify(response);
+    const eventPath = path.join(evidenceDir, "event.json");
+    writeFileSync(eventPath, JSON.stringify({ inputs: { mode: "policy-witness", witness_envelope: envelope } }));
+    const outputPath = path.join(evidenceDir, "step-output.txt");
+    writeFileSync(outputPath, "");
+    // The publisher run: the authorized local identity, attempt 1, the reviewed workflow, the source
+    // it checked out. `77500` is registered as a publisher run so the fake answers for it.
+    github.publishWitness(envelope);
+    const publisherRunId = [...github.publisherRuns.keys()][0];
+    const env = {
+      GITHUB_REPOSITORY: COMMISSIONING_REPOSITORY, GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: "refs/heads/staging", GITHUB_SHA: WORKFLOW_SHA, GITHUB_JOB: "policy-witness",
+      GITHUB_WORKFLOW_REF: `${COMMISSIONING_REPOSITORY}/${COMMISSIONING_WORKFLOW_PATH}@refs/heads/staging`,
+      GITHUB_RUN_ID: String(publisherRunId), GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_TOKEN: "publisher-token", COMMISSIONING_MODE: "policy-witness",
+      GITHUB_REPOSITORY_ID: String(REPOSITORY_ID), COMMISSIONING_REPOSITORY_ID: String(REPOSITORY_ID),
+      COMMISSIONING_EVIDENCE_DIR: evidenceDir, GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath,
+    } as unknown as NodeJS.ProcessEnv;
+    const published = await runWitnessPublisherJob(env, { fetchImpl: github.fetchImpl });
+    expect(published.status).toBe("published");
+    expect(published.entry).toBe("witness.json");
+    // The EXACT received bytes: the digest both the actor and the local witness cross-check is of
+    // these, so a publisher that pretty-printed or reordered would break the binding it carries.
+    expect(readFileSync(path.join(evidenceDir, "witness", "witness.json"), "utf8")).toBe(envelope);
+    expect(published.entry_digest).toBe(createHash("sha256").update(Buffer.from(envelope, "utf8")).digest("hex"));
+    // The artifact NAME is derived here and handed to the fixed upload step as a step output.
+    expect(published.artifact_name).toBe(responseArtifactName({
+      runId: RUN_ID, attempt: ATTEMPT, role: "normal", ordinal: 1, direction: "pre", nonce: response.challenge_nonce,
+    }));
+    expect(readFileSync(outputPath, "utf8")).toBe(`artifact_name=${published.artifact_name}\n`);
+    // It holds no App secret, and it is refused outside its own job and mode.
+    await expect(runWitnessPublisherJob({ ...env, GITHUB_JOB: "normal" }, { fetchImpl: github.fetchImpl }))
+      .rejects.toThrow(/runs only in the policy-witness job/);
+    await expect(runWitnessPublisherJob({ ...env, COMMISSIONING_MODE: "commission" }, { fetchImpl: github.fetchImpl }))
+      .rejects.toThrow(/runs only in policy-witness mode/);
+    await expect(runWitnessPublisherJob({ ...env, GITHUB_RUN_ATTEMPT: "2" }, { fetchImpl: github.fetchImpl }))
+      .rejects.toThrow(/it is a re-run/);
   });
 
   it("refuses a DUPLICATE witness publication rather than selecting between two", async () => {

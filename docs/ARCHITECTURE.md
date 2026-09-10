@@ -93,11 +93,28 @@ mode-0600 append-only journal (`commissioning-journal.mjs`). It promotes nothing
 no protection mutation, no tag, no deploy, no release acceptance. A denial counts only when the
 provider refused AND the ref is unchanged; an acceptance only when an independent readback shows the
 exact expected descendant; everything else is `inconclusive`. Each protected job measures its own App's
-grants with an App JWT and refuses an unexpected set before exercising the credential, and binds the
-policy on its ref by BODY rather than by name. The one structurally unproducible gate — the protected
-environments' negative controls — stays `unverified` and blocks activation; its operator-supplied proof
-must name a retained artifact whose digest `check-evidence` recomputes. Sequence:
-`docs/RELEASING.md` §5; runbook: `docs/OPS.md` §13.
+grants with an App JWT and refuses an unexpected set before exercising the credential.
+
+**Where the complete policy comes from, and why it is not the protected job.** GitHub documents that
+`GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to a caller with write access to the
+ruleset, and the actor jobs hold `metadata: read` — so a protected job cannot measure the bypass matrix
+its own case depends on. The existing local `johnellison` admin identity is therefore the
+complete-policy measurement authority: per case, the actor publishes a challenge carrying a fresh
+private nonce, the local **witness** process (`commissioning-witness.mjs`, CLI phase `witness`)
+measures the full governed policy and dispatches the same reviewed workflow in `policy-witness` mode,
+one non-protected publisher job republishes those exact bytes as a single-entry artifact, and the actor
+binds it to its own nonce and immutable source before running the production verifier and mutating.
+Eleven cloud cases × pre and post = exactly **22** publications per attempt. ⚠️ This is a bounded
+contemporaneous pre/post measurement under administrative quiescence, **not an atomic
+policy-at-mutation proof**; every policy record in the packet carries that sentence and
+`check-evidence` refuses a packet that drops it. A separate `transport-rehearsal` mode measures that
+transport inertly — no key, no ref, no policy, no verdict — before any protected approval exists.
+
+The one structurally unproducible gate — the protected environments' negative controls — stays
+`unverified` and blocks activation; its operator-supplied proof must state the expected AND measured
+control values, name the exact environment, sit inside the run's window, and name a retained artifact
+whose digest `check-evidence` recomputes and whose content it binds to that control and environment.
+Sequence: `docs/RELEASING.md` §5; runbook: `docs/OPS.md` §13.
 
 Draining is a POLL, not a single request. Both maintenance adapters
 (`scripts/staging-ops/local-maintenance.mjs`, `railway-maintenance.mjs`) re-list the active

@@ -1226,27 +1226,94 @@ credential that could. The output is one sanitized evidence packet.
 | John as required reviewer, `prevent_self_review = true`, staging-only branch policy, administrators cannot bypass | These are the PC-06 controls. Read them back in the UI where the API omits the field. |
 | A **distinct dispatcher identity** (the dispatch-only App) | `GITHUB_ACTOR` is the dispatcher and may be a bot. If the dispatcher is also the approver, `check-evidence` reports a **self-review failure** — the run happened, but it is not two-identity evidence. |
 | Repository variables `COMMISSIONING_REPOSITORY_ID`, `COMMISSIONING_NORMAL_APP_ID`, `COMMISSIONING_EMERGENCY_APP_ID`, `COMMISSIONING_PRODUCER_IDS_JSON` | Nonsecret numeric identities. The producer map must be **complete** — all twelve real contexts. A partial map is exit 3; the runner refuses to invent a producer ID. |
-| Local `gh` admin identity (`johnellison`) | Administers the disposable resources and runs the human/admin cases. It is never uploaded into Actions, and no new long-lived admin token is created. |
+| Local `gh` admin identity — **exactly `johnellison`, numeric ID `5806135`, type `User`** | Administers the disposable resources, runs the human/admin cases, and is the **complete-policy measurement authority** for the witness protocol. All three of the ID, the login and the account type are required: a second administrator, or a machine account holding admin, would satisfy an any-admin check while producing evidence about a different identity. It is never uploaded into Actions, and no new long-lived admin token is created. |
+| That same local identity can **dispatch this workflow** | The witness protocol needs it to dispatch `policy-witness` mode. Measure that prerequisite with the separately approved, non-privileged **transport rehearsal** (mode `transport-rehearsal`) — absence is `incomplete`, never grounds for a new grant. |
+| A **quiet commissioning window**: no concurrent policy writer | The pre/post witness pair is a bounded contemporaneous measurement under administrative quiescence, **not** an atomic policy-at-mutation proof. A known concurrent policy writer interrupts the run. |
+| `staging` is the repository's default branch, and the reviewed workflow is merged to it | Dispatch uses the fixed workflow path at ref `staging`. Original dispatch, witness dispatch, publisher execution and response consumption all resolve `staging` and require the **original** trusted workflow SHA; movement interrupts the attempt with cleanup and root reconciliation, rather than continuing against a tree nobody reviewed. |
 | No release in progress | Cleanup asserts the SHAs, classic protections and resolved applicable-ruleset definitions of **both `main` and `staging`**, plus every `v*` tag ruleset, are unchanged. Every list is read to complete pagination and refuses a full final page rather than assuming it was the last. Concurrent legitimate movement is an **interrupted** result needing reconciliation, never an automatic rollback of somebody else's change. |
 
-### The three roles, and the fourth job that is not an actor
+### The three modes, the three roles, and the three jobs that are not actors
+
+`mode` is a closed dispatch input, and each job is admitted in **exactly one** of its three values by
+an equality condition — so an unknown or empty mode is admitted by no job at all. There is
+deliberately no `!= 'policy-witness'` anywhere: a negative condition is how an unrecognised mode would
+fall through into commissioning.
+
+| Mode | What may run |
+|---|---|
+| `commission` (default) | `intent`, `fixture`, and the two protected actor jobs. |
+| `policy-witness` | The one non-protected `policy-witness` publisher job, alone. |
+| `transport-rehearsal` | The one non-protected, no-secrets `transport-rehearsal` job, alone. |
 
 - **local** — the operator's existing `gh` identity. Creates and removes the disposable graph, refs,
-  rulesets and its one synthetic PR; runs the human/admin cases; owns cleanup and the journal.
-- **normal** — the `staging-release` job. Holds only the three normal-App secrets, mints a short-lived
-  installation token, and is the actor for the missing / red / wrong-producer / all-green cases.
+  rulesets and its one synthetic PR; runs the human/admin cases; owns cleanup and the resource journal;
+  and runs the **witness** process that measures the complete policy for the cloud cases.
+- **normal** — the `staging-release` job. Holds only the three normal-App secrets. Its
+  **installation-level positive control** is its TEST-ONLY check publication, once, before its first
+  case; it is the actor for the missing / red / wrong-producer / all-green cases.
 - **emergency** — the `staging-emergency` job. Holds only its own three secrets. Its acceptance with
-  checks absent is both a case and the liveness proof for that identity.
+  checks absent is both a case and the installation-level liveness proof for that identity.
 - **fixture** — `checks: write` and **no App secret**. It is the second, independently measured
   producer (the GitHub Actions app) that makes a wrong-producer control case possible at all. It waits
   a bounded time for local setup to publish the manifest, then refuses rather than hanging, so its
   `always()` artifact upload still runs.
+- **policy-witness** — no App secret, no protected environment, no write scope, and no `npm ci`. It
+  republishes the exact bytes of a witness envelope as a single-entry artifact named from a step output
+  that reviewed code derived. It is the only job admitted in its mode, and a re-run of it is refused —
+  a publisher re-run would republish a nonce that is consumed once.
+- **transport-rehearsal** — no App secret, no ref, no synthetic graph, no resource journal and no
+  policy. Its target is the literal `rehearsal` and its domain is `rehearsal`; every actor consumer
+  rejects that source mode, domain, case and target before credentials. It exists to measure the
+  transport's queue, clock and serialization viability **before** any protected approval exists.
+
+> ⚠️ **Installation-level, not per-token.** Positive-write liveness is established once per attempt at
+> the installation level. It is **not** a claim that every later token performed a successful write:
+> each freshly minted token proves its exact intended App, installation, repository, grant set and one
+> successful scoped READ, and every denied case still requires its own policy-enforcement diagnostics
+> and an unchanged ref.
+
+### The witness protocol, and its bounds
+
+Per cloud case, five FIXED workflow steps — the runner owns three, and two are official upload steps
+because only an Actions step can publish an artifact:
+
+1. `prepare` — verify the prior case finalized, the journaled graph/ref/check preconditions and this
+   job's own role/mode/job binding; persist bounded private state; create a 256-bit **pre**-nonce.
+2. upload the pre challenge.
+3. `await-and-execute` — consume exactly one fresh pre-witness, run the production verifier on its
+   complete governed policy, re-check ref/check state, mint the actor token **just in time**, fsync a
+   mutation-used marker, issue **exactly one** mutation, read back independently, create the post-nonce.
+4. upload the post challenge.
+5. `await-and-finalize` — consume the post-witness, require the complete governed policy and the
+   classic representation to be **equal** across the window, and record the case result.
+
+There are exactly **seven normal and four emergency** cloud cases, so a complete attempt requires
+exactly **22** distinct successful witness publications — one pre and one post per case. Missing,
+extra or duplicate responses refuse; `64` is a bounded *discovery* ceiling, not permission to publish
+that many. The separate rehearsal source run requires exactly one response and **cannot** contribute
+to the 22.
+
+Every bound fails closed and none of them promises hosted-runner capacity: a 180-second challenge
+lifetime inclusive of queue and upload latency (never extended, never restamped); a 15-second ceiling
+on the complete local policy read; 90 seconds from the pre-observation to the mutation and from the
+readback to the post-observation; five-second polling with a finite deadline; a 60,000-byte cap on the
+whole serialized dispatch envelope including JSON overhead; one artifact, one ZIP entry, 60,000
+uncompressed bytes, a 128 KiB archive; 10 pages of 100 objects per endpoint with a terminal page
+required; and a 30-minute ceiling on both the witness process and each job. Queue latency can make a
+legitimate run **incomplete** — and that is the reported result, never one concealed by extending a
+window or retrying a case.
+
+**An ambiguous mutation is never retried.** A crash after the fsynced marker, a missing or changed
+post-witness, or an unexpected force/delete success stops further actor mutations in that attempt; the
+state machine refuses a second mutation for a case, and a halt is terminal for the whole role.
 
 ### Reading the packet
 
-Nine files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
-phase plus the operator-supplied environment controls; `collect` and `check-evidence` write their own
-summaries alongside.
+Ten files feed the assessment — `commissioning-<runId>-<attempt>-<slug>.json`, mode 0600, one per
+phase plus the local witness process's own summary and the operator-supplied environment controls;
+`collect` and `check-evidence` write their own summaries alongside. The publisher and the rehearsal
+write their own records too, and neither feeds a commissioning gate: a rehearsal response can satisfy
+no actor case.
 
 **Nothing in a file is trusted because of its filename.** Each of the nine is checked for its schema
 version, run, attempt, phase, a CLOSED list of required fields, and agreement with the run's immutable
@@ -1254,19 +1321,39 @@ workflow SHA — before any gate reads a field out of it. A file that fails is d
 `invalid`, and the coverage it was carrying is reported LOST rather than quietly assessed as fewer
 cases than the matrix has. Beyond that:
 
-- **Case outcomes are DERIVED, not read.** `passed: true` is a claim a file makes about itself. Every
-  case is re-checked against its own record: the operation and force flag it claims, the ref it names,
-  the before/after/requested SHAs, the HTTP class, whether the diagnostic actually attributes the
-  refusal to a rule, and whether the declared check state was measured before the mutation. A denial
-  on a ref that moved, or an acceptance whose readback is not the requested commit, is not a pass.
+- **Case outcomes are DERIVED from the run's FROZEN GRAPH, not read.** `passed: true` is a claim a file
+  makes about itself, and so is every SHA in it. Each case's before/requested identities must be the
+  journaled synthetic nodes its own case declares, and the RELATION between them must be the one the
+  operation needs: an `update` to a strict descendant, a `force` to a real ancestor or a divergent
+  commit, never a target the ref is already at. A no-op recorded as a permitted write, and a force flag
+  on a ref that never moved recorded as a denied non-fast-forward, are both blockers.
+- **The diagnostic is RE-CLASSIFIED, not believed.** `policyDenial` in a file is a caller-supplied
+  boolean, so the recorded diagnostic CATEGORY is looked up in this build's closed table instead. An
+  invented category, or a `credential-failure` dressed as a policy denial, is a blocker.
+- **The declared check state is RECOMPUTED** from its own per-context measurement. `measured: true`
+  beside a measurement that contradicts the expectation next to it is not sufficient for anything.
 - **A case is only counted from its own actor's file.** A `passed: true` for a normal-App case sitting
   in the human evidence is not that case's outcome.
+- **The witness transport is counted, not summarised.** Exactly 22 publications, with distinct nonce
+  digests and distinct artifact IDs, each case's pre/post governed fingerprints equal, and both
+  sequencing intervals inside the 90-second bound. Every policy record must carry the bounded pre/post
+  guarantee verbatim; a packet that drops it or restates it as an atomicity claim is `invalid`.
+- **Cleanup drift is RECOMPUTED from the two baselines the file carries**, not read from its
+  `production_drift`. Different before/after SHAs beside an empty drift list is a measured failure, and
+  the "before" baseline must be the one the verified journal recorded at the start of the run.
 - **Cleanup coverage comes from the verified journal**, not from the cleanup file's own list. An
   `outcomes: []` satisfies nothing; each journaled ref, ruleset and pull request must have an outcome,
-  and an outcome for a resource the journal does not record this run creating is `invalid`.
-- **The App grants must be the measured object**, matching `ROLE_APP_PERMISSIONS`. A placeholder string
-  in its place is `unverified`, and a file claiming a measurement the harness does not perform is
-  `invalid`.
+  and an outcome for a resource the journal does not record this run creating is `invalid`. Every
+  journaled ruleset must also have a measured provider-shape fingerprint, and any create intent whose
+  outcome the journal cannot account for blocks.
+- **The App grants must be the measured object**, matching `ROLE_APP_PERMISSIONS` — *and* the two App
+  identities must be **distinct** and be the ones the immutable intent configured. A packet naming the
+  same unrelated App for both actors agrees with itself perfectly, which is why self-agreement is not
+  the check.
+- **The approval must be the configured HUMAN reviewer, by numeric identity**, distinct from the
+  dispatcher measured from the provider's own run metadata, with the protected job concluding
+  **success in this exact attempt**. A bot login, a `completed` job that failed, or a success borrowed
+  from another attempt is a blocker.
 
 Three blocker kinds, and they mean different things. **`failed`** is a measured statement about the
 subject. **`unverified`** is "we could not look, or nobody has looked yet". **`invalid`** is "a file
@@ -1280,16 +1367,30 @@ workflow *admission* rather than environment branch policy — PC-06's own instr
 case is to report it unverified rather than widen admission to arbitrary refs. So each control is
 operator-supplied evidence in `commissioning-<runId>-<attempt>-environment-controls.json`.
 
-Because it is operator-supplied, the SHAPE of it is checked hard. A `verified: true` boolean is
-rejected, and so is prose. Every verified record must name a **retained artifact inside the evidence
-directory** and commit to its SHA-256, which `check-evidence` recomputes from the file on disk. That
-is the difference between an attestation and a binding: a reviewer can re-hash the artifact, and an
-operator cannot satisfy the gate by typing a word.
+Because it is operator-supplied, the SHAPE of it is checked hard — and **a digest alone is not
+evidence**. It proves which bytes were retained; it says nothing about whether the control passed,
+which control it was, or when. So every verified record must carry, against its OWN closed schema
+(`ENVIRONMENT_CONTROL_SCHEMAS`):
 
-Coverage is the **cross product** of the seven controls (`ENVIRONMENT_CONTROL_KEYS`) and the two
-protected environments — fourteen records. The environments are configured separately; one of them
-being right says nothing whatever about the other, and a single record covering "the environments"
-would hide exactly that.
+- the control's `expected` outcome, **equal** to this build's declared one — a record cannot bring its
+  own weaker expectation;
+- a `measured` value that **equals** that expectation, so a measurement showing the control OFF is a
+  blocker rather than an accepted observation;
+- the exact `environment_name` **and** numeric `environment_id` it was measured on;
+- a `measured_at` inside this run's window — a historical capture is not this run's evidence, however
+  correctly it is hashed;
+- `run_id`/`attempt` for the three run-bound negative controls, because an attempt outcome belongs to
+  an attempt;
+- a retained artifact inside the evidence directory whose SHA-256 `check-evidence` recomputes from
+  disk **and** whose parsed content names the same control, the same environment and the same measured
+  value — which is what makes reusing one file across controls a refusal rather than a pass.
+
+`administrators_cannot_bypass` is deliberately **UI-only**: the environments API does not return that
+field, so a `provider-api` claim about it would be a claim about something nobody read.
+
+Coverage is the **cross product** of the seven controls and the two protected environments — fourteen
+records. The environments are configured separately; one of them being right says nothing whatever
+about the other, and a single record covering "the environments" would hide exactly that.
 
 ```json
 {
@@ -1299,10 +1400,25 @@ would hide exactly that.
       "staging-release": {
         "status": "verified",
         "source": "provider-ui",
+        "environment_name": "staging-release",
+        "environment_id": 4401,
+        "expected": { "prevent_self_review": true },
+        "measured": { "prevent_self_review": true },
         "measured_at": "2026-09-10T09:00:00.000Z",
-        "artifact": "env-prevent-self-review-staging-release.png",
-        "artifact_sha256": "<64 hex, recomputed from that file>",
-        "observed": { "prevent_self_review": true, "reviewers": ["johnellison"] }
+        "artifact": "env-prevent-self-review-staging-release.json",
+        "artifact_sha256": "<64 hex, recomputed from that file>"
+      },
+      "staging-emergency": { "…": "…" }
+    },
+    "self_review_refused": {
+      "staging-release": {
+        "status": "verified", "source": "provider-ui",
+        "environment_name": "staging-release", "environment_id": 4401,
+        "expected": { "attempt_outcome": "refused" }, "measured": { "attempt_outcome": "refused" },
+        "measured_at": "2026-09-10T09:05:00.000Z",
+        "run_id": "…", "attempt": "…",
+        "artifact": "env-self-review-refused-staging-release.json",
+        "artifact_sha256": "<64 hex>"
       },
       "staging-emergency": { "…": "…" }
     },
@@ -1313,6 +1429,11 @@ would hide exactly that.
   }
 }
 ```
+
+Each named artifact is a small JSON observation, so its content can be bound rather than merely
+hashed: `{"control": "prevent_self_review_enabled", "environment": "staging-release", "measured":
+{"prevent_self_review": true}}`, alongside whatever screenshot or export the operator retains next to
+it.
 
 If the second identity does not exist, leave that control `unverified` — it blocks full activation,
 which is the correct outcome, and per-control granularity is the whole reason it does not drag the
@@ -1326,20 +1447,47 @@ other six down with a single flag.
 > in the job, before any credential is exercised — see the prerequisites table above. The two
 > `*_app_permissions_confirmed` controls no longer exist.
 
-### Two live prerequisites this harness cannot establish from a local run
+### What the protected jobs can and cannot read — and what replaced the guess
 
-1. **The protected jobs must be able to read ruleset definitions.** Their body binding calls
-   `GET /repos/…/rules/branches/<derived>` and `GET /repos/…/rulesets/<id>` with the read-only
-   `GITHUB_TOKEN`. GitHub does not document a fine-grained permission requirement for either read, so
-   whether that token reaches them is a fact about the live repository, not something a mocked run can
-   settle. If it cannot, the job exits **3** with "could not be measured" — the correct failure, but
-   confirm it on the first live dispatch rather than discovering it after two human approvals.
-2. **Nothing in the harness reads classic branch protection from inside a protected job.** That read
-   needs administrative reach neither the job's `GITHUB_TOKEN` nor its closed App grant set has, and
-   the requirement for the *read* is undocumented. The operator measures that dimension under admin in
-   `setup`, per actor, before the human approves; `check-evidence` requires that verdict. The job's own
-   `policy_in_force` record says so in `classic_protection_scope`, so the verdict cannot be read as
-   covering more than it does.
+> **A note on what changed here, because the previous version of this section was wrong in a way that
+> mattered.** It listed "the protected jobs must be able to read ruleset definitions" as a live
+> prerequisite nobody could settle from a mocked run, and had the actor jobs feed those read-only
+> bodies into the production verifier while passing `classicProtection: null` for a dimension they had
+> not measured. That produced a `compatible` verdict about a policy the job had not seen. It is not an
+> unknown: GitHub **documents** that `GET /repos/{repo}/rulesets/{id}` returns `bypass_actors` only to
+> a caller with write access to the ruleset, so a 200 with the bypass matrix absent is the CORRECT
+> response to `metadata: read` — and the emergency App's entire acceptance depends on that matrix.
+
+- **The complete governed policy comes from the local witness**, measured under the operator's admin
+  identity, per case, and bound to that case's private nonce, the immutable source and a 180-second
+  window. The actor runs the unchanged production verifier on the inverse-transformed **full** governed
+  set plus the measured classic representation. Its record states the guarantee it is limited to:
+  a bounded contemporaneous pre/post measurement under administrative quiescence, **not** an atomic
+  policy-at-mutation proof.
+- **What the actor job's own read-only token still does** is measure the applicability SUMMARY — which
+  planned rulesets apply to its ref, their targets and their enforcement mode, all of which
+  `metadata: read` genuinely exposes. That is recorded as `verdict: "applicability-only"` with
+  `bypass_visibility: "redacted-to-this-credential-by-documented-provider-contract"`, so nobody can
+  read it as the compatibility verdict.
+- **Only a measured no-classic-protection 404 is publishable.** If the tested branch reports classic
+  protection, the local process records a mismatch or measurement-incomplete and stops **before** the
+  witness dispatch. That deliberately narrows what this bounded commissioning can measure — it is not
+  a compatibility waiver, and it must not be reported as one.
+- **The narrow disclosure refuses rather than redacts.** An unexpected bypass identity, an arbitrary
+  team name, a condition the harness does not govern or a rule parameter outside the closed schema
+  stops the run before publication. The initial bounded commissioning may therefore refuse an
+  additional inherited policy that might have been compatible; it must not claim a compatibility it
+  cannot safely publish.
+
+### The live prerequisite that remains
+
+**Whether the local identity can dispatch this workflow, and whether the queue meets the bounds.**
+Both are facts about the live repository and the hosted runners, not something a mocked run settles —
+which is exactly what the `transport-rehearsal` mode is for. Run it FIRST, before spending two human
+approvals: it exposes no App key, modifies no policy or ref, produces no enforcement verdict, and
+measures the dispatch → publish → download → bind path against the same clock and serialization
+checks the real cases use. A failed rehearsal does not authorize broader infrastructure or relaxed
+bounds — and its response can satisfy no actor case.
 
 ### If something goes wrong
 
@@ -1350,6 +1498,24 @@ other six down with a single flag.
   journal, reading each journaled resource back before adopting it, and refuses a collision rather
   than adopting or deleting anything it did not create. A **rerun attempt** derives a fresh suffix and
   reuses nothing.
+- **A create whose RESPONSE was lost.** The create RESULT and its returned identity are fsynced before
+  any further fallible read, so a `201` followed by a failed readback still leaves the resource's exact
+  ID in the journal. A resume RECONCILES that intent — by the exact name or ref the intent recorded, in
+  a run/attempt-scoped namespace whose absence the collision check already proved — and never by
+  re-issuing the POST or by matching a name prefix. If reconciliation cannot settle it, the state stays
+  explicitly unresolved and `cleanup` reports it rather than claiming the run left nothing behind.
+- **A witness response that never arrives.** The case exits `incomplete` when its 180-second challenge
+  expires. The expiry is never extended, the observation is never restamped, and the case is not
+  retried; check the witness process is running (step 2 of the sequence) and whether the rehearsal
+  still passes before re-dispatching a fresh attempt.
+- **A witness dispatch whose response is ambiguous.** A dispatch returns `204` with no body, so even a
+  clean success says nothing about which run it created. The witness always answers the same way —
+  look for the exact expected artifact — and it journals intent-then-result, so a restarted witness
+  reconciles an existing publication instead of publishing a second response for a consumed nonce.
+- **The complete governed policy changed across a case's window.** The case stops. That is the pre/post
+  pair doing its job — and it is worth being precise about what it does not do: a change made and
+  reverted inside the window is outside the guarantee, which is why the quiet-window prerequisite is a
+  prerequisite and not a nicety.
 - **A stale lock.** Not removed on elapsed time alone: a slow provider call and a dead process look
   identical by clock. Recovery needs positive evidence the owner is gone *and* a provider readback
   that reconciles its last recorded mutation.
