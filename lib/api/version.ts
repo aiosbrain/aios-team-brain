@@ -107,7 +107,8 @@
  *        NEEDS A MIGRATION: two new columns on `code_metrics`
  *        (postgres/migrations/20260831120000_code_metrics_scanner_identity.sql).
  */
-export const BRAIN_API_VERSION = "1.24";
+// 1.25 — closed health v3 configured-check census, persisted verbatim (AIO-1096).
+export const BRAIN_API_VERSION = "1.25";
 
 /** Server-only Executor gateway negotiation; independent of the member API surface. */
 export const GATEWAY_CONTRACT_VERSION = "1.10";

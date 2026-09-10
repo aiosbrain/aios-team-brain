@@ -400,7 +400,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.24** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.25** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -416,7 +416,7 @@ request-admission supplement** for `POST /api/v1/codebases` — canonical
 `aios-workspace/docs/contract/codebase-request-limits-v1.json`, vendored and sha256-pinned at
 `test/fixtures/contract/codebase-request-limits-v1.json`, carrying its own `revision: 1` and
 `appliesFromMemberApiVersion: "1.23"`. The effective contract is therefore *the published payload
-shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.24** with the scanner-identity implementation below; the admission
+shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.25** with the scanner-identity implementation below; the admission
 supplement remains independently versioned and does not itself bump the member API version. A limit is a **resource-admission** change, and the canonical change
 policy names that as an explicit exception to "breaking semantics go to /v2" — precedent: the 1.20
 `rows` cap and the dated 2026-06-19 same-route full-metrics tightening. (That exception and the
@@ -1823,3 +1823,19 @@ change neither weakens that check nor claims whole-ingest transaction atomicity.
 Before activation an old-function rollback preserves v2 operation. After activation,
 retain this compatible RPC or disable v3 emission before a reviewed rollback; never
 delete stored evidence or manually load production schema from a worktree.
+
+### Scanner check coverage (AIO-1096)
+
+The member API accepts the exact 1.25 health v3 census alongside unchanged v1/v2.
+The Zod boundary rejects unknown census keys, sibling sum failures, required-subset
+failures and inherited health/head contradictions before scan writes. Existing
+JSONB storage preserves the whole validated object; the same finding-ledger wrapper
+now admits v3 through the compatible RPC. No database migration is introduced.
+
+The codebase detail read model carries the typed last-scan health object into
+Scanner check coverage, below the UltraHarden gap and above scanner-admitted debt.
+It shows all/required configured and evidence counts, emitted findings and provenance.
+Freshness uses health measured_at with the existing fourteen-day threshold; stale,
+error and partial cues coexist. V1/v2/absent census is unknown, measured zero is
+explicit, and required completeness never implies all-check completeness. Producer
+emission remains disabled until the separate production acceptance gate.

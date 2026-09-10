@@ -1,3 +1,4 @@
+import type { CodebaseHealth } from "@/lib/api/schemas";
 import type {
   CodebaseDebtKpis,
   FixAgeBucket,
@@ -107,7 +108,157 @@ function EvidenceGap({ label, reason }: { label: string; reason: string }) {
   );
 }
 
-export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
+export function ScannerCheckCoverage({
+  health,
+  stale,
+}: {
+  health: CodebaseHealth | null;
+  stale: boolean;
+}) {
+  const v3 =
+    health?.schema_version === "3" && "check_coverage" in health
+      ? health
+      : null;
+  const flags: string[] = [];
+  if (v3) {
+    const all = v3.check_coverage.all;
+    if (stale || all.stale > 0 || v3.evidence_status === "stale")
+      flags.push("Stale scan");
+    if (all.error > 0 || v3.evidence_status === "error")
+      flags.push("Error evidence");
+    if (all.complete < all.configured || v3.evidence_status !== "complete")
+      flags.push("Partial scan");
+    if (all.configured === 0) flags.push("No configured checks");
+    else if (flags.length === 0) flags.push("Complete scan");
+  }
+  return (
+    <section
+      aria-labelledby="scanner-check-coverage-heading"
+      className="border-t border-border-subtle py-5"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h2
+          id="scanner-check-coverage-heading"
+          className="text-base font-semibold text-ink"
+        >
+          Scanner check coverage
+        </h2>
+        <p className="text-sm font-medium text-ink-secondary">
+          {v3 ? flags.join(" · ") : "Coverage unknown"}
+        </p>
+      </div>
+      <p className="mt-2 text-xs leading-5 text-ink-secondary">
+        {v3
+          ? "Health v3 census available. Each configured check is counted once; findings emitted may be zero or many per check."
+          : "No health v3 census is available. Legacy or absent health data does not establish configured check coverage."}
+      </p>
+      {v3 ? (
+        <>
+          <dl className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-3">
+            {[
+              ["Configured checks", v3.check_coverage.all.configured],
+              [
+                "Complete required",
+                `${v3.check_coverage.required.complete} / ${v3.check_coverage.required.configured}`,
+              ],
+              ["Findings emitted", v3.findings.length],
+            ].map(([label, value]) => (
+              <div key={label} className="min-w-0">
+                <dt className="text-xs text-ink-secondary">{label}</dt>
+                <dd className="mt-1 font-mono text-xl tabular-nums text-ink">
+                  {value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <table className="mt-4 w-full text-left text-xs text-ink-secondary">
+            <caption className="sr-only">
+              Configured check census by evidence state
+            </caption>
+            <thead>
+              <tr>
+                <th scope="col" className="py-2 font-medium">
+                  Evidence state
+                </th>
+                <th scope="col" className="py-2 text-right font-medium">
+                  All checks
+                </th>
+                <th scope="col" className="py-2 text-right font-medium">
+                  Required checks
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {(
+                [
+                  "configured",
+                  "complete",
+                  "partial",
+                  "missing",
+                  "stale",
+                  "error",
+                ] as const
+              ).map((status) => (
+                <tr key={status} className="border-t border-border-subtle">
+                  <th scope="row" className="py-2 font-normal">
+                    {status[0].toUpperCase() + status.slice(1)}
+                  </th>
+                  <td className="py-2 text-right font-mono tabular-nums">
+                    {v3.check_coverage.all[status]}
+                  </td>
+                  <td className="py-2 text-right font-mono tabular-nums">
+                    {v3.check_coverage.required[status]}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <dl className="mt-4 grid gap-x-6 gap-y-3 border-t border-border-subtle pt-4 text-xs sm:grid-cols-2">
+            <div className="min-w-0">
+              <dt className="font-medium text-ink-secondary">Profile</dt>
+              <dd className="mt-1 break-all text-ink-secondary">
+                {v3.profile_id} · {v3.profile_version}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="font-medium text-ink-secondary">Rubric</dt>
+              <dd className="mt-1 break-all text-ink-secondary">
+                {v3.rubric_version}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="font-medium text-ink-secondary">Head</dt>
+              <dd className="mt-1 break-all font-mono text-ink-secondary">
+                {v3.head_sha}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="font-medium text-ink-secondary">Measured time</dt>
+              <dd className="mt-1 break-all text-ink-secondary">
+                <time dateTime={v3.measured_at}>{v3.measured_at}</time>
+              </dd>
+            </div>
+          </dl>
+        </>
+      ) : (
+        <p className="mt-3 text-xs text-ink-secondary">
+          Configured checks: Unknown · Complete required: Unknown · Findings
+          emitted: Unknown
+        </p>
+      )}
+    </section>
+  );
+}
+
+export function DebtMovement({
+  debt,
+  health = null,
+  healthStale = true,
+}: {
+  debt: CodebaseDebtKpis;
+  health?: CodebaseHealth | null;
+  healthStale?: boolean;
+}) {
   const { movement } = debt;
   const openAgeRows: Array<{ key: string; label: string; value: number }> =
     OPEN_AGE_LABELS.map(([key, label]) => ({
@@ -131,129 +282,133 @@ export function DebtMovement({ debt }: { debt: CodebaseDebtKpis }) {
   );
 
   return (
-    <section
-      aria-labelledby="debt-movement-heading"
-      className="border-y border-border-subtle py-5"
-    >
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-tertiary">
-            Scanner-admitted debt
-          </p>
-          <h2
-            id="debt-movement-heading"
-            className="mt-1 font-display text-xl text-ink text-balance"
-          >
-            What has the deterministic health scanner admitted?
-          </h2>
-          <p className="mt-2 max-w-3xl text-xs leading-5 text-ink-tertiary">
-            This section is derived only from scanner-admitted findings and
-            their lifecycle events — what the configured deterministic health
-            scanner admitted into the ledger — and is not a count of all
-            defects in this codebase.
-          </p>
-        </div>
-        <p className="text-xs text-ink-tertiary">
-          Stock as of {new Date(movement.asOf).toLocaleDateString()} · flow in
-          selected range
-        </p>
-      </div>
-
-      <div className="mt-5 grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
-        <div className="border-b border-border-subtle pb-5 lg:border-r lg:border-b-0 lg:pr-5 lg:pb-0">
-          <dl className="grid grid-cols-2 gap-x-5">
-            <Metric
-              label="Active scanner findings"
-              value={movement.actionable}
-              detail={`${movement.actionableOpen} open · ${movement.actionableReopened} reopened`}
-              tone="arrival"
-            />
-            <Metric
-              label="Suppressed"
-              value={movement.suppressed}
-              detail={`${movement.suppressions.accepted} accepted · ${movement.suppressions.riskAccepted} risk · ${movement.suppressions.falsePositive} false positive`}
-            />
-          </dl>
-          {movement.expiryReturnsToActionable > 0 ? (
-            <p className="border-t border-border-subtle pt-3 text-xs leading-5 text-ink-tertiary">
-              {movement.expiryReturnsToActionable} expired decision
-              {movement.expiryReturnsToActionable === 1 ? " is" : "s are"}{" "}
-              actionable again. Expiry flow is not emitted as a ledger event, so
-              it is excluded from arrivals.
-            </p>
-          ) : null}
-        </div>
-
-        <dl className="grid grid-cols-3 gap-x-5">
-          <Metric
-            label="Arrivals"
-            value={movement.arrivals}
-            detail={`${movement.detected} detected · ${movement.reopened} reopened`}
-            tone="arrival"
-          />
-          <Metric
-            label="Closures"
-            value={movement.closures}
-            detail="Resolved transitions only"
-            tone="closure"
-          />
-          <Metric
-            label="Net flow"
-            value={`${movement.netFlow > 0 ? "+" : ""}${movement.netFlow}`}
-            detail={
-              movement.netFlow > 0
-                ? "Stock grew"
-                : movement.netFlow < 0
-                  ? "Stock shrank"
-                  : "Flat"
-            }
-            tone={
-              movement.netFlow > 0
-                ? "regression"
-                : movement.netFlow < 0
-                  ? "closure"
-                  : "neutral"
-            }
-          />
-        </dl>
-      </div>
-
-      <div className="mt-5 grid gap-5 border-t border-border-subtle pt-5 md:grid-cols-2">
-        <div>
-          <h3 className="mb-3 text-xs font-semibold text-ink-secondary">
-            Open age
-          </h3>
-          <Distribution
-            label="Active scanner findings by open-age bucket"
-            rows={openAgeRows}
-            total={movement.actionable}
-            colorClass="bg-amber-500"
-          />
-        </div>
-        <div>
-          <h3 className="mb-3 text-xs font-semibold text-ink-secondary">
-            Current severity
-          </h3>
-          <Distribution
-            label="Active scanner findings by current severity"
-            rows={severityRows}
-            total={movement.actionable}
-            colorClass="bg-red-500"
-          />
-          <p className="mt-3 text-[11px] leading-4 text-ink-tertiary">
-            Historical severity is unavailable until finding events carry
-            event-time snapshots.
-          </p>
-        </div>
-      </div>
-
+    <>
       <div className="mt-5">
         <EvidenceGap
           label="UltraHarden intake"
           reason="candidate intake is not connected yet, so candidates that were rejected, deduplicated, or never filed do not appear here"
         />
       </div>
-    </section>
+      <ScannerCheckCoverage health={health} stale={healthStale} />
+      <section
+        aria-labelledby="debt-movement-heading"
+        className="border-y border-border-subtle py-5"
+      >
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-tertiary">
+              Scanner-admitted debt
+            </p>
+            <h2
+              id="debt-movement-heading"
+              className="mt-1 font-display text-xl text-ink text-balance"
+            >
+              What has the deterministic health scanner admitted?
+            </h2>
+            <p className="mt-2 max-w-3xl text-xs leading-5 text-ink-tertiary">
+              This section is derived only from scanner-admitted findings and
+              their lifecycle events — what the configured deterministic health
+              scanner admitted into the ledger — and is not a count of all
+              defects in this codebase.
+            </p>
+          </div>
+          <p className="text-xs text-ink-tertiary">
+            Stock as of {new Date(movement.asOf).toLocaleDateString()} · flow in
+            selected range
+          </p>
+        </div>
+
+        <div className="mt-5 grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">
+          <div className="border-b border-border-subtle pb-5 lg:border-r lg:border-b-0 lg:pr-5 lg:pb-0">
+            <dl className="grid grid-cols-2 gap-x-5">
+              <Metric
+                label="Active scanner findings"
+                value={movement.actionable}
+                detail={`${movement.actionableOpen} open · ${movement.actionableReopened} reopened`}
+                tone="arrival"
+              />
+              <Metric
+                label="Suppressed"
+                value={movement.suppressed}
+                detail={`${movement.suppressions.accepted} accepted · ${movement.suppressions.riskAccepted} risk · ${movement.suppressions.falsePositive} false positive`}
+              />
+            </dl>
+            {movement.expiryReturnsToActionable > 0 ? (
+              <p className="border-t border-border-subtle pt-3 text-xs leading-5 text-ink-tertiary">
+                {movement.expiryReturnsToActionable} expired decision
+                {movement.expiryReturnsToActionable === 1
+                  ? " is"
+                  : "s are"}{" "}
+                actionable again. Expiry flow is not emitted as a ledger event,
+                so it is excluded from arrivals.
+              </p>
+            ) : null}
+          </div>
+
+          <dl className="grid grid-cols-3 gap-x-5">
+            <Metric
+              label="Arrivals"
+              value={movement.arrivals}
+              detail={`${movement.detected} detected · ${movement.reopened} reopened`}
+              tone="arrival"
+            />
+            <Metric
+              label="Closures"
+              value={movement.closures}
+              detail="Resolved transitions only"
+              tone="closure"
+            />
+            <Metric
+              label="Net flow"
+              value={`${movement.netFlow > 0 ? "+" : ""}${movement.netFlow}`}
+              detail={
+                movement.netFlow > 0
+                  ? "Stock grew"
+                  : movement.netFlow < 0
+                    ? "Stock shrank"
+                    : "Flat"
+              }
+              tone={
+                movement.netFlow > 0
+                  ? "regression"
+                  : movement.netFlow < 0
+                    ? "closure"
+                    : "neutral"
+              }
+            />
+          </dl>
+        </div>
+
+        <div className="mt-5 grid gap-5 border-t border-border-subtle pt-5 md:grid-cols-2">
+          <div>
+            <h3 className="mb-3 text-xs font-semibold text-ink-secondary">
+              Open age
+            </h3>
+            <Distribution
+              label="Active scanner findings by open-age bucket"
+              rows={openAgeRows}
+              total={movement.actionable}
+              colorClass="bg-amber-500"
+            />
+          </div>
+          <div>
+            <h3 className="mb-3 text-xs font-semibold text-ink-secondary">
+              Current severity
+            </h3>
+            <Distribution
+              label="Active scanner findings by current severity"
+              rows={severityRows}
+              total={movement.actionable}
+              colorClass="bg-red-500"
+            />
+            <p className="mt-3 text-[11px] leading-4 text-ink-tertiary">
+              Historical severity is unavailable until finding events carry
+              event-time snapshots.
+            </p>
+          </div>
+        </div>
+      </section>
+    </>
   );
 }
 
