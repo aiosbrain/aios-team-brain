@@ -354,7 +354,7 @@ chooses to adopt.
 ## 7. Upgrading across a brain-api contract bump
 
 The brain-api wire contract is versioned in **`aios-workspace/docs/brain-api.md`** (this server
-declares **v1.23** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
+declares **v1.24** — `lib/api/version.ts`; this paragraph said v1.21 until 2026-08-25, which is the
 drift the table below exists to prevent and did not) — the single pinned contract both `aios-workspace` (the CLI/MCP client) and
 `aios-team-brain` (this server) build against. Per that doc's own change policy: a **breaking**
 change requires a **major version bump** (`/api/v2`); **additive** changes (new endpoints, new
