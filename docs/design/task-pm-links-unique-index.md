@@ -366,7 +366,7 @@ decision 8 · the replay/shape guards · the ARCHITECTURE.md drift blocks.
   need. Explicitly NOT in scope.
 - **Plane's missing ownership pre-check.** Recorded in decision 8; its own ticket.
 - **The adapter-throw parent's inline re-projection.** Shipped behaviour, deliberately untouched.
-- **ADOPTINV-1.** Separate ticket.
+- **Adoption follow-up work.** Separate ticket.
 
 **Correction carried from round 1:** this spec claimed "only two writers of `provider_resource_id`
 exist, verified by grep". **That was FALSE** — `scripts/brain-tasks.ts:357` (the operator `adopt`
