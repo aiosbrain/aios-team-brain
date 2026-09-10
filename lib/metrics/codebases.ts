@@ -461,7 +461,7 @@ export interface AgenticBreakdown {
   readiness_level: string | null;
   readiness_pct: number | null;
   readiness_pillars: Record<string, { passed: number; total: number }>;
-  // Workspace-governance health (brain-api 1.15) — the LAST scan's snapshot, verbatim as
+  // Workspace-governance health (brain-api 1.25, v1/v2/v3 union) — the LAST scan's snapshot, verbatim as
   // pushed (incl. measured_at); null = that scan carried no health object. Provenance-only.
   codebase_health: CodebaseHealth | null;
 }

@@ -716,7 +716,7 @@
           "codebase_health": {
             "schema_version": "2",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -804,7 +804,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -910,7 +910,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -1016,7 +1016,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -1122,7 +1122,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -13534,7 +13534,7 @@
         "state": "unknown"
       },
       {
-        "name": "empty string: unreadable, so unknown — and still not a 422",
+        "name": "empty string: unreadable, so unknown \u2014 and still not a 422",
         "scanner_version": "",
         "state": "unknown"
       },
@@ -13676,7 +13676,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -13782,7 +13782,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -13888,7 +13888,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -13994,7 +13994,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14100,7 +14100,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14206,7 +14206,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14312,7 +14312,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14418,7 +14418,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14524,7 +14524,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14630,7 +14630,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14736,7 +14736,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14842,7 +14842,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -14948,7 +14948,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
@@ -15054,7 +15054,7 @@
           "codebase_health": {
             "schema_version": "3",
             "rubric_version": "1.0.0",
-            "head_sha": "ffff0000ffff0000ffff0000ffff0000ffff0000",
+            "head_sha": "abc123def456abc123def456abc123def456abc1",
             "score_pct": 100,
             "status": "pass",
             "dimensions": {
