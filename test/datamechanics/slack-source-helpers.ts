@@ -265,12 +265,19 @@ export async function threadRootTs(teamId: string): Promise<string[]> {
  */
 export async function elapse(teamId: string, ms = 120_000): Promise<void> {
   const c = await rawSql();
+  const shift = `- ($2::double precision * interval '1 millisecond')`;
+  // Every persisted NOT-BEFORE for this team, so "two minutes passed" means the same thing to the
+  // request budget, the channel lane and the bootstrap. Lease expiries are deliberately NOT moved:
+  // faking an expiry is a different fixture (`expireChannelLease`) with a different meaning.
   await c.query(
-    `update slack_method_budgets
-        set next_permitted_at = next_permitted_at - ($2::double precision * interval '1 millisecond')
-      where team_id = $1`,
+    `update slack_method_budgets set next_permitted_at = next_permitted_at ${shift} where team_id = $1`,
     [teamId, ms]
   );
+  await c.query(`update slack_sync_channels set due_at = due_at ${shift} where team_id = $1`, [teamId, ms]);
+  await c.query(`update slack_integration_bindings set due_at = due_at ${shift} where team_id = $1`, [
+    teamId,
+    ms,
+  ]);
 }
 
 /**
