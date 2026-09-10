@@ -6,7 +6,7 @@ import { scannerStaleness } from "@/lib/codebases/scanner-version";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 
 /**
- * Server-side conformance guard for the Brain API 1.24 codebase-scan payload
+ * Server-side conformance guard for the Brain API 1.25 codebase-scan payload
  * (POST /api/v1/codebases, incl. the optional provenance-only `metrics.codebase_health`
  * object — AIO-609). Mirror of aios-workspace/test/codebase-payload-contract.test.mjs,
  * run against vendored copies of the shared contract artifacts
@@ -32,7 +32,7 @@ const PINNED = {
   "codebase-payload-1.25.schema.json":
     "79cd93c4b46b7ded3af73ac0e320498036bc1e39d7677cad18a6554b1d620d66",
   "codebase-payload-1.25-fixtures.json":
-    "22bc99241032d38578be67a3130af08404efe4588cf678046fb687a00ab91d5a",
+    "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e",
   "codebase-health-v2.schema.json":
     "38de45de129c9ff3a346fb96346f905d79532b053e824a4ac85bb26a88b4371d",
 } as const;

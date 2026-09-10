@@ -105,7 +105,7 @@ async function snapshot() {
 describe("health v3 SQL compatibility", () => {
   it("uses exact canonical 1.25 fixture bytes", () => {
     expect(createHash("sha256").update(fixtureBytes).digest("hex")).toBe(
-      "22bc99241032d38578be67a3130af08404efe4588cf678046fb687a00ab91d5a",
+      "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e",
     );
     expect(canonical.schema_version).toBe("3");
   });

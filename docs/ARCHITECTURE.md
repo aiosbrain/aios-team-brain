@@ -1839,3 +1839,9 @@ Freshness uses health measured_at with the existing fourteen-day threshold; stal
 error and partial cues coexist. V1/v2/absent census is unknown, measured zero is
 explicit, and required completeness never implies all-check completeness. Producer
 emission remains disabled until the separate production acceptance gate.
+
+The scanner conformance snapshot remains member API 1.25 even when newer intake
+contracts are published: `test/fixtures/contract/brain-contract.json` is vendored
+from Workspace's frozen `docs/contract/brain-contract-1.25.json`, with exact
+`codebase-payload-1.25` schema/fixture pins. This consumer does not claim the
+separate intake endpoint introduced by later member API revisions.

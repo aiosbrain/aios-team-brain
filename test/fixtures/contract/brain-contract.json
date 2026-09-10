@@ -109,8 +109,8 @@
     },
     "fixtures": {
       "path": "codebase-payload-1.25-fixtures.json",
-      "sha256": "22bc99241032d38578be67a3130af08404efe4588cf678046fb687a00ab91d5a"
+      "sha256": "d053f4aa12e9afb5d4b8c7a636f399b177ba51f1871f9c2472cab713b4f76b7e"
     }
   },
-  "contentHash": "f46873c773f759512966a1e0f7b8d2efbdb0797a99d184d83bc9b2f23005040b"
+  "contentHash": "e9d81bb9873d09e2f15964f1f99cf6108eba862a411999dea1a2a08310c16e1e"
 }
