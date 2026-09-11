@@ -22,7 +22,7 @@ Astra owns specification and review adjudication; the selected builder applies i
 
 ## Usage discipline
 
-Treat model calls as work units, not as a monitoring loop. The normal path is one Astra specification, one Fable spec review, one builder session, one Fable code review and one fresh Astra final review. Start an additional model run only when a concrete finding, failed acceptance criterion, material base change or interrupted session invalidates an earlier result; record that trigger in the handoff. Do not create parallel agents for the same role, keep completed agents alive for status, or ask a model to restate evidence already preserved in an artifact.
+Treat model calls as work units, not as a monitoring loop. The normal path is one Astra specification, one Fable spec review, one builder session, one Fable code review and one fresh Astra final review. Start an additional model run only when a concrete finding, failed acceptance criterion, material base change or interrupted session invalidates an earlier result; record that trigger in the handoff. Repeated related failures trigger the architectural root-cause check; do not spend repeated model calls patching symptoms before that check is complete. Do not create parallel agents for the same role, keep completed agents alive for status, or ask a model to restate evidence already preserved in an artifact.
 
 Use GPT-5.6 Terra at low reasoning for routine coordination with accepted requirements and clear checks. Increase Terra to medium when coordination must reconcile several dependent slices. Use GPT-5.6 Sol at medium for uncertain cross-system integration, consequential conflict resolution or recovery where the coordinator itself must reason about coupled invariants. Return to Terra after the decision is settled. Do not use Astra as the persistent root coordinator merely because Astra authors the specification or adjudicates findings.
 
@@ -108,6 +108,14 @@ claude -p --model "$fable_51_model_id" --output-format json --no-session-persist
 
 Run it from the reviewed worktree. Restrict reviewers to reading and reporting. The coordinator can run requested diagnostic tests separately. Capture stdout and stderr, inspect exit status and reported model metadata where available, and verify a substantive review was returned. A permission denial, empty output, unavailable model, or failed process is not a clean review. Do not bypass sandbox or permission controls. Avoid inserting untrusted prompts into shell command strings; use prompt files or subprocess argument arrays.
 
+## Architectural root-cause check
+
+Trigger this check when three or more defects, review findings, failing acceptance cases, or recovery anomalies involve the same workflow or state transition. Trigger it immediately for duplicate external effects or member communications; consent, cancellation, STOP, privacy, or data-loss behavior; uncertain queue, provider, or external-side-effect outcomes; retry or recovery that can advance, clear, replace, or replay state; or competing writers or consumers of one durable record.
+
+The decision owner records the source of truth for each material state; every writer, reader, queue producer, worker, retry and recovery path; ownership-transfer boundaries; idempotency keys, request or turn identity, and durable evidence; and how accepted, blocked, failed, cancelled, replaced, and uncertain outcomes are represented across layers. Include a compact ownership map: transition, canonical owner, other writers or consumers, durable evidence, retry or recovery behavior, and unresolved ambiguity.
+
+Require an architectural correction, rather than separate local patches, when multiple components can independently advance, clear, replace, or replay one state; success is inferred from a missing error or normal return rather than durable acceptance; retries lack identity distinguishing original intent from newer intent; delayed work can undo a terminal action; or repeated fixes add layer-specific exceptions instead of clarifying one owner. The correction establishes an explicit ownership boundary, preserves compatible behavior unless the spec deliberately changes it, and tests normal execution, delayed work, retry, cancellation or replacement, and uncertain external effects. If no shared cause exists, record why the existing ownership remains coherent; do not redesign speculatively.
+
 ## Stage 1: Astra specification
 
 Astra at medium reasoning reads the relevant implementation, schemas, tests, and product documentation before writing the spec. Include:
@@ -118,6 +126,7 @@ Astra at medium reasoning reads the relevant implementation, schemas, tests, and
 - Error recovery, retries, concurrency, privacy, and integration effects where relevant.
 - Migration and rollout requirements, compatibility, and rollback where relevant.
 - An implementation sequence and tests tied to observable requirements.
+- When the architectural root-cause check is triggered, ownership and state-transition analysis, with its map and decision linked from the acceptance matrix or decision record.
 
 Assign stable acceptance IDs such as AC-01. Maintain a small acceptance matrix mapping each requirement to its observable expected behavior. Preserve IDs through revisions; explicitly mark replaced requirements rather than silently changing their meaning.
 
@@ -125,9 +134,9 @@ Scale detail to the change. Make routine engineering choices directly. Surface u
 
 ## Stage 2: Fable spec review and Astra revision
 
-Give Fable 5.1 the user request, spec, and repository access. Ask it to audit feasibility, intended behavior, missing journeys, incorrect assumptions, unnecessary complexity, data consistency, and the proposed tests. Require concrete counterexamples and file references where applicable.
+Give Fable 5.1 the user request, spec, and repository access. Ask it to audit feasibility, intended behavior, missing journeys, incorrect assumptions, unnecessary complexity, data consistency, proposed tests, unclear ownership, duplicate producers or consumers, missing durable outcome states, retry-identity gaps, and delayed-work reversals of terminal actions. Require concrete counterexamples and file references where applicable.
 
-Astra evaluates each finding as accepted, rejected with evidence, or unresolved. Revise the spec for accepted findings. Re-review with Fable when revisions change architecture, user behavior, migrations, or important acceptance criteria, or when the first review left substantive uncertainty. A wording-only change does not require another pass.
+Astra evaluates each finding as accepted, rejected with evidence, or unresolved. Route applicable ownership findings through the architectural root-cause check, then revise the spec for accepted findings. Re-review with Fable when revisions change architecture, user behavior, migrations, or important acceptance criteria, or when the first review left substantive uncertainty. A wording-only change does not require another pass.
 
 Default to at most three substantive review/revision rounds per stage. If material disagreement persists, summarize the exact decision needed and pause the dependent work rather than looping indefinitely or treating the review as passed.
 
@@ -141,7 +150,7 @@ With the bundled CLI, read/export the existing description, compose the merged d
 
 ## Stage 3: Implementation
 
-Give the selected implementer the accepted spec, repository instructions, relevant code, and acceptance criteria. The selected implementer implements the scoped change and meaningful tests, runs the relevant checks, and reports deviations or unresolved issues. If implementation reveals a material flaw in the spec, return it to Astra for resolution and repeat the affected spec review before proceeding.
+Give the selected implementer the accepted spec, repository instructions, relevant code, and acceptance criteria. The selected implementer implements the scoped change and meaningful tests, runs the relevant checks, and reports deviations or unresolved issues. If implementation reveals a material flaw in the spec, return it to Astra for resolution and repeat the affected spec review before proceeding. A second related failure in one workflow is not another local patch: return it to Astra for the architectural root-cause check before expanding the fix.
 
 The coordinator verifies the actual diff and test results. Passing tests alone does not demonstrate spec compliance.
 
@@ -149,19 +158,19 @@ The selected implementer fills the acceptance matrix with implementation file re
 
 ## Stage 4: Fable code review and Astra adjudication
 
-Give a new Fable 5.1 session the accepted spec, base SHA, complete implementation diff, and surrounding code access. Request bugs, logical errors, architectural regressions, missing acceptance behavior, and inadequate tests. Review callers and consumers beyond changed lines. Require severity, trigger, expected versus actual behavior, evidence, and a regression-test recommendation.
+Give a new Fable 5.1 session the accepted spec, base SHA, complete implementation diff, and surrounding code access. Request bugs, logical errors, architectural regressions, missing acceptance behavior, inadequate tests, and whether each affected transition has one canonical owner. Review callers and consumers beyond changed lines. Require severity, trigger, expected versus actual behavior, evidence, and a regression-test recommendation.
 
-Astra validates findings against code and product intent. Send accepted corrections to the selected implementer. Preserve a decision record for rejected findings with concrete reasons. Verify fixes and run affected tests. Obtain another Fable pass when corrections are substantial or its blocking concerns remain unresolved.
+Astra validates findings against code and product intent. Reopen the architectural root-cause check when three related findings accumulate, or immediately for its high-risk triggers. Send accepted corrections to the selected implementer. Preserve a decision record for rejected findings with concrete reasons. Verify fixes and run affected tests. Obtain another Fable pass when corrections are substantial or its blocking concerns remain unresolved.
 
 ## Stage 5: Fresh Astra review
 
-Start a completely new Astra context with high reasoning. Supply only the user request, accepted spec, repository instructions, base SHA, and current implementation snapshot. Do not seed it with earlier reviews, author explanations, adjudication records, or conversation history. Ask it to independently examine correctness, architecture, integration behavior, and spec compliance.
+Start a completely new Astra context with high reasoning. Supply only the user request, accepted spec, repository instructions, base SHA, and current implementation snapshot. Do not seed it with earlier reviews, author explanations, adjudication records, or conversation history. Ask it to independently examine correctness, architecture, integration behavior, spec compliance, hidden duplicate ownership, implicit success inference, stale retry identity, and delayed-work reversals of terminal decisions in changed workflows.
 
 After independent findings are returned, the coordinating Astra reconciles them with evidence and earlier decisions. The selected implementer implements accepted fixes and verifies them. Any substantive fix after this review requires a fresh focused Astra review of the affected behavior and its interactions. Record which final snapshot was reviewed; do not claim an earlier review covers later changes.
 
 ## Stage 6: Verify and publish
 
-Confirm all required acceptance criteria are satisfied and substantive findings resolved. Run repository-required checks and tests appropriate to the final diff. Report any checks that cannot run; do not describe them as passing. If a required review or correctness blocker remains, stop before publication unless the user explicitly requests a draft PR with those limitations.
+Confirm all required acceptance criteria are satisfied and substantive findings resolved. State whether the architectural root-cause check was triggered, its canonical-owner decision, and the tests covering delayed work, retry or recovery, cancellation or replacement, and uncertainty where relevant. Run repository-required checks and tests appropriate to the final diff. Report any checks that cannot run; do not describe them as passing. If a required review or correctness blocker remains, stop before publication unless the user explicitly requests a draft PR with those limitations.
 
 Fetch the target branch again before publication and compare its current SHA with the recorded review base. Inspect intervening changes for overlapping code, callers, schemas, dependencies, and assumptions. Integrate relevant base changes using the repository's normal merge/rebase practice, preserving user work and avoiding force-pushes to shared branches. Have the selected implementer resolve implementation conflicts, with Astra deciding changes to behavior. Re-run affected checks and reviews for material changes. If the base advanced without affecting the feature, record the assessed SHA and reason integration was unnecessary. Record the final implementation commit and reviewed base in the handoff and PR; disclose if the remote moves again during publication.
 
