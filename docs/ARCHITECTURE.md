@@ -1919,9 +1919,8 @@ performs the final review. Provider-family switching cannot evade quota stops.
 
 Both retain the AIOS toolkit `scripts/linear.mjs` lifecycle: create or reuse an
 In Progress ticket before specification, attach the accepted specification before
-implementation, and verify Done only when the completed feature has reached remote
-`main` through a separately authorized release. New-work PRs target `staging`;
-staging integration alone does not retire the ticket under this retained policy.
+implementation, and verify Done only after an authorized PR merge to `staging` and
+a verified staging deployment containing that merge. New-work PRs target `staging`.
 
 `.skill-runtimes.json` publishes the canonical skills to Codex (`.agents/skills`),
 OpenCode (`.opencode/skills`), and Cursor (`.cursor/rules`) through
