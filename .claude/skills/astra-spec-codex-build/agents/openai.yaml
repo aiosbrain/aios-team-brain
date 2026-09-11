@@ -1,0 +1,4 @@
+interface:
+  display_name: "Astra Spec Codex Build"
+  short_description: "Astra-led builds with dynamic Codex selection"
+  default_prompt: "Use $astra-spec-codex-build to specify, build, review and publish this change."

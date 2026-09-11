@@ -1910,29 +1910,22 @@ or authorize production ingestion; controlled release retains those separate gat
 
 ## Repository build skills
 
-The `astra-spec-opus-build` workflow is maintained in
-`.claude/skills/astra-spec-opus-build/SKILL.md`. It creates or reuses the task's
-Linear ticket before specification, attaches the agreed spec before implementation,
-and coordinates Astra, Fable, and Opus reviews through PR publication.
-`scripts/sync-skill-runtimes.sh astra-spec-opus-build` generates the matching
-Codex (`.agents/skills`), OpenCode (`.opencode/skills`), and Cursor (`.cursor/rules`)
-copies; `.skill-runtimes.json` registers both skills for publication. These repository files travel with the commit: new worktrees inherit
-the skill when their starting revision contains it; older revisions require
-the skill change to be brought forward.
+The canonical `astra-spec-claude-build` and `astra-spec-codex-build` workflows live
+under `.claude/skills/`. They replace the former Opus-build and Sol-build skills.
+The Claude workflow selects Sonnet 5 or Opus 5 per slice; the Codex workflow selects
+GPT-5.6 Terra or Sol. Terra/Sol coordinate execution, Astra owns specification and
+adjudication, Fable reviews specification and code, and a fresh Astra context
+performs the final review. Provider-family switching cannot evade quota stops.
 
-The companion `astra-spec-sol-build` skill uses GPT-5.6 Sol through the Codex CLI
-for implementation and accepted fixes, with the same Astra/Fable review stages.
-Both skills start tickets in In Progress and move them to Done only after the
-finished feature's merge into remote `main` is verified. Merge authorization
-remains separate. Both use the same canonical-source and runtime-copy mechanism.
+Both retain the AIOS toolkit `scripts/linear.mjs` lifecycle: create or reuse an
+In Progress ticket before specification, attach the accepted specification before
+implementation, and verify Done only when the completed feature has reached remote
+`main` through a separately authorized release. New-work PRs target `staging`;
+staging integration alone does not retire the ticket under this retained policy.
 
-Both build skills describe switching the active implementer between Sol and Opus 5
-on provider credit or usage limits, including during review fixes and conflict
-resolution. That switch is conditional, not automatic: it applies only where the
-repository instructions in `AGENTS.md` and the user's current builder assignment
-permit an alternative builder. `AGENTS.md` currently assigns Opus-only building
-under subscription authentication and forbids automatic fallback, so under that
-assignment a limit is a pause-and-report condition rather than a switch. When a
-switch is permitted, the skills preserve partial work and the handoff in durable
-storage, retain assigned reviewers, and pause if both builders remain exhausted
-until capacity returns.
+`.skill-runtimes.json` publishes the canonical skills to Codex (`.agents/skills`),
+OpenCode (`.opencode/skills`), and Cursor (`.cursor/rules`) through
+`scripts/sync-skill-runtimes.sh`. `AGENTS.md` defines single-writer ownership across
+worktrees, coordinator selection, checkpoint/remote-backup requirements, and safe
+local activity streaming with event-driven supervision. Existing runtimes must use
+the new names; no second copy of the old workflow is maintained.
