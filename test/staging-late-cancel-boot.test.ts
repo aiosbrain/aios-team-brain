@@ -369,7 +369,7 @@ describe("installObject — a late cancellation recovers instead of committing a
   });
 
   const env = Object.freeze({
-    NEO4J_URL: "bolt://127.0.0.1:7687", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "unused-in-this-tier",
+    NEO4J_URL: "bolt://127.0.0.1:7687", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "FAKE-unused-in-this-tier",
     NEO4J_DATABASE: "neo4j", STAGING_DATA_LOCK_TIMEOUT_MS: "5000",
     STAGING_ORIGIN: "https://staging.example.com", STAGING_HEALTH_TOKEN: "t".repeat(32),
   }) as unknown as NodeJS.ProcessEnv;

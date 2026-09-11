@@ -176,6 +176,11 @@ procedure in `docs/OPS.md`, verified read-only by
 `READY TO ACTIVATE` — never "activated", since its schedule check passes only while the automation
 is off.
 
+Staging unit fixtures mark synthetic credentials explicitly. The local compose object-store
+identities use exact value-bound fixture declarations, preserving the client/server pairs;
+credential-shaped receipt rejection tests retain their runtime shapes. These classifications
+do not exclude test files or weaken the release secret scanners.
+
 H5 acquisition is role-isolated. `exporter.mjs activation-evidence` authenticates a production-only
 environment token, performs fixed read-only deployment/configuration/snapshot/private-network reads,
 reduces the transient whole-variable-map response immediately to allowlisted identities, reference

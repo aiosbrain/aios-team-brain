@@ -84,7 +84,7 @@ describe("no privileged health request without an established identity", () => {
     ["no deployment at all", { node: null as unknown as typeof DEPLOYMENT }, "unverified"],
     ["a configured origin naming another host", { env: { STAGING_ORIGIN: "https://unrelated.example.com" } }, "fail"],
     ["a configured origin that is not https", { env: { STAGING_ORIGIN: "http://staging.example.com" } }, "fail"],
-    ["a configured origin carrying credentials", { env: { STAGING_ORIGIN: "https://user:pw@staging.example.com" } }, "fail"],
+    ["a configured origin carrying credentials", { env: { STAGING_ORIGIN: "https://FAKE-user:FAKE-password@staging.example.com" } }, "fail"],
     ["a configured origin that will not parse at all", { env: { STAGING_ORIGIN: "not an origin" } }, "fail"],
     ["no health token supplied", { env: { STAGING_HEALTH_TOKEN: "" } }, "unverified"],
   ];
@@ -315,7 +315,7 @@ describe("live credential separation is not established by a local document", ()
         STAGING_COMPARISON_KEY_ID: SYNTHETIC_COMPARISON_KEY_ID,
         OPPOSITE_ENVIRONMENT_FINGERPRINTS_FILE: remote.file,
         AUTH_SECRET: "local-auth-secret", SECRETS_KEY: "local-secrets-key",
-        NEO4J_USER: "neo4j", NEO4J_PASSWORD: "local-neo4j-password",
+        NEO4J_USER: "neo4j", NEO4J_PASSWORD: "FAKE-local-neo4j-password",
       } as NodeJS.ProcessEnv, { fetchImpl: vi.fn() as unknown as typeof fetch });
       expect(measured.credentialFingerprints).not.toBeNull();
       // POSITIVE CONTROL for the generated document: every required class is comparable, so the
