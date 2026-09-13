@@ -729,6 +729,116 @@ Three properties are the point, and each replaces something weaker:
 
 The narrow policy amendment is explicit: only the reviewed, activated staging-maintenance controller may call `deploymentStop`, `deploymentCancel`, `deploymentRestart`, or exact-commit `serviceInstanceDeployV2` for the two pinned staging app/Graphiti services, and the importer alone may replace the pinned staging Neo4j graph while both locks are held and those deployments are stopped. This does not permit agent Railway lifecycle CLI commands, `railway ssh`, production lifecycle calls, database-service lifecycle calls, arbitrary GraphQL, moving-source deploys, or another `/clear` caller.
 
+#### Keyless staging Graphiti — commissioning a sidecar with NO provider key (AIO-997)
+
+> ⛔ **EXCEPTION, read this before anything else in §11.** A staging Graphiti running in keyless
+> no-model mode is **excluded from the legacy graph-clear and re-projection journey below.** Do not
+> run `scripts/staging-graph-clear.mjs` against it, do not set `GRAPH_PROJECT_WINDOW_DAYS` and let the
+> projector run against it, and do not add a second `/clear` caller to work around the refusal. The
+> keyless sidecar refuses `POST /clear` — and every other graph operation — with `403
+> staging_graphiti_no_model`, so the clear step fails loudly rather than silently half-working; that
+> refusal is the design, not a fault to route around. Re-projection is exactly the extraction spend
+> this mode exists to avoid, and the zero-AI requirement outranks the historical availability of
+> legacy re-projection. Graph readiness in copied staging comes from the **paired import**, never from
+> re-extracting. The sole clear owner and its guard
+> (`test/guards/graph-clear-unreachable.test.ts`) stay exactly as they are. **Unpinned legacy staging
+> is unaffected** — if your staging Graphiti still runs the ordinary application with a provider key,
+> the legacy procedure below is unchanged and still applies to you.
+
+**Why the mode exists.** Upstream's `graph_service/config.py` declares `openai_api_key: str` with no
+default and the lifespan constructs `ZepGraphiti`/`OpenAIGenericClient`, so a sidecar with the
+provider key removed cannot start at all — while the copied-staging contract requires both the key's
+absence and a deployed pinned sidecar. The image now ships a mode-selecting entry
+(`graph_service/staging_entry.py`, source `graphiti/staging-entry.py`) as its `CMD`. Design:
+`docs/design/staging-workflow-hardening.md` AC-07.
+
+**What it does and does not give you.** It serves `GET`/`HEAD /healthcheck` → `200 {"status":
+"healthy", "mode": "staging-no-model"}` and refuses everything else with `403
+staging_graphiti_no_model`. That health is **liveness of the process**, not graph or database
+readiness — the mode opens no database connection and constructs no provider client, so it has
+nothing to say about either. Graphiti search, embedding, extraction and mutation are unavailable;
+the app's graph reads continue through their existing direct Neo4j/FTS paths. Retrieval's
+best-effort Graphiti leg therefore returns no graph facts, and `/api/v1/graph-query` can answer 502
+when `GRAPHITI_URL` is configured and scoped (503 when it is absent). None of that is a fault.
+
+**It is a PRE-DRAIN commissioning capability, not a promise of permanent health.** The importer's
+drain stops the app and Graphiti, and its boot path deploys the app, not the sidecar. After a
+refresh, direct Neo4j reads serve while Graphiti stays stopped — that is AC-06 working as designed.
+This correction adds no sidecar restart, no maintenance-adapter change and no per-install or per-tick
+preflight requirement, and a post-drain preflight will **not** pass automatically. A later deliberate
+re-commissioning is a separate authorized operation with its own keyless deployment and refreshed
+pins, while maintenance is inactive.
+
+**Commissioning, in one transition.** The order matters: the currently deployed staging custom start
+command invokes `/app/.venv/bin/uvicorn` against the OLD `graph_service.main:app` target, so it
+bypasses the new selector and still requires a key. Removing the key first would leave a crashing
+sidecar; deploying first without the pin would leave the ordinary app. Stage all three together
+through the authorized provider workflow:
+
+1. **Prepare and check the image locally, before touching staging.** From the repo root:
+   ```
+   bash graphiti/keyless-image-check.sh
+   ```
+   It builds `graphiti/` fresh, prints the image ID/digests, asserts the shipped `CMD` is
+   `/app/.venv/bin/uvicorn graph_service.staging_entry:app --host 0.0.0.0 --port 8000`, and runs
+   `graphiti/staging-keyless-diagnostic.py` inside a network-disabled container. Record the image
+   identity and the diagnostic's JSON report in the commissioning packet.
+2. **Set the staging Graphiti service's `STAGING_OPS_ENVIRONMENT_ID` to the staging environment's own
+   `RAILWAY_ENVIRONMENT_ID`.** Equality is the entire selector: a mismatched pin, a pin with no actual
+   environment ID, a copy claim with no pin, or an unrecognised `STAGING_DATA_MODE` inside pinned
+   scope all **refuse startup** rather than fall through to the production application. Railway
+   injects an environment ID into every deployment, so its presence alone never selects staging.
+   `legacy-pg-only` is a valid declaration here, which is what lets the sidecar be commissioned
+   before bootstrap.
+3. **Remove every provider-key variable from that service.** The authoritative list is `PROVIDER_KEYS`
+   in `scripts/staging-ops/activation-evidence.mjs` — that is the exact set the activation preflight
+   looks for on the Graphiti service, so it is the set to remove. A shorter enumeration written here
+   would drift from it silently, and the direction it drifts is "the runbook told you to remove four
+   of the fourteen". Model and base-URL settings (`MODEL_NAME`, `EMBEDDING_MODEL_NAME`,
+   `OPENAI_BASE_URL`) are separate cleanup: they are not credentials and preflight does not treat them
+   as any. Do not substitute a placeholder, a loopback endpoint or a proxy URL — preflight checks for
+   the ABSENCE of a provider key and a fabricated one defeats the check it is meant to satisfy.
+   `GRAPH_LLM_PROXY_SECRET` removal is optional hygiene; the keyless branch never reads it and it is
+   not a provider credential.
+4. **Clear the service's custom start command** so the image `CMD` — the reviewed selector — is what
+   actually runs. Nothing in the image can detect an override; this is the step that decides whether
+   any of the above took effect.
+5. **Read the result back from the provider, not from your own expectation:** the deployment
+   identity, the effective start command, and the image/build metadata. A missing live digest stays
+   **unverified**; never manufacture one, and never substitute a source-file hash for a deployed image
+   identity.
+6. **Refresh the Graphiti deployment pin to the deployment you just read back, BEFORE anything
+   preflights.** Set `STAGING_GRAPHITI_DEPLOYMENT_ID` (`config/staging-ops/importer.example.env`) in
+   the importer configuration that will run the pre-drain checks. A new deployment gets a new ID, and
+   activation preflight binds the Graphiti service to a single unambiguous successful active
+   deployment matching that exact pin before it reads anything from it — so a stale pin does not
+   match, and the binding refuses fail-closed rather than producing a weaker reading. Refreshing the
+   pin before the pre-drain preflight is therefore mandatory, not tidy-up. This is configuration
+   bookkeeping for the commissioning run; nothing in this repository mutates a live role's variables,
+   and no journal entry is written for it.
+7. **Observe the named mode over the PRIVATE network, or record it unverified.** The path is exactly
+   `/healthcheck` — no trailing slash. `/healthcheck/` is a different path, it is not the health
+   route, and the default deny answers it with `403 staging_graphiti_no_model` by design; reading
+   that as a broken sidecar is the mistake this line exists to prevent. The sidecar has no public
+   domain and must not be given one for a readback. **No command in this repository performs this
+   named-mode read today** — nothing here fetches the sidecar's private `/healthcheck`, and this
+   correction adds no subcommand, service or endpoint that would. What the readback requires at
+   commissioning is an explicitly authorized, already available read-only channel on the staging
+   private network, producing a response bound to an identity: the status, the `mode` field, and the
+   deployment identity from step 5 the observation is bound to. **Do not use `railway ssh`** — that
+   verb is denied to agents and opens a write-capable shell beside an unauthenticated sidecar (the
+   clear runbook below is human-only for exactly that reason), it is not needed for a read, and
+   nothing here authorizes it. If no such channel is available, or it cannot reach the origin, the
+   named-mode readback stays **UNVERIFIED** and is written down as such: an Admin `res.ok`
+   reachability signal is not the named mode, and neither is an operator's assurance.
+8. **Then run the existing activation-evidence/preflight credential-absence checks**, in this same
+   pre-drain window and with the refreshed pin from step 6.
+
+⚠️ **A healthy keyless sidecar is not an activated copy.** It proves the process is up in no-model
+mode and nothing more. Bootstrap and paired verification are still required, unchanged. And a crash
+or refusal observed during the earlier no-spend transition must never be written up as successful
+sidecar health.
+
 The legacy procedure below remains transitional `legacy-pg-only`: it empties/clears graph state and can never attest paired-refresh acceptance or silently become `copy-ready`.
 
 Copies **production's** Postgres into **staging's own** Postgres so a branch can be looked at against
@@ -904,6 +1014,12 @@ build. Please leave it as prose.
 > above. Do not set them from this section.
 
 #### Clearing staging's GRAPH after a refresh — required before re-projecting
+
+> ⛔ **Not if staging Graphiti is running the keyless no-model mode.** See the AIO-997 exception
+> above: a pinned keyless sidecar refuses `/clear` and every graph operation by design, and
+> re-projecting against it is the extraction spend that mode exists to avoid. This whole procedure
+> applies to an ORDINARY staging Graphiti — one running the unchanged application with a provider
+> key. Check which you have before step 2.
 
 The refresh touches **one database**. It empties `graph_episodes`, and **nothing resets Neo4j**. Once
 staging's graph is wired, skipping this step means: every fact a previous run extracted stays in the
