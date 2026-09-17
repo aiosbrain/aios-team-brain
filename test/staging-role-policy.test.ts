@@ -60,9 +60,9 @@ describe("isolated ops runner roles", () => {
   });
 
   it("refuses an IMPORTER holding the production observation token", () => {
-    const attempt = () => assertRunnerRole(importerEnv({ RAILWAY_PRODUCTION_READ_TOKEN: "synthetic-production-token" }), "importer");
+    const attempt = () => assertRunnerRole(importerEnv({ RAILWAY_PRODUCTION_READ_TOKEN: "FAKE-production-token" }), "importer");
     expect(attempt).toThrow(/RAILWAY_PRODUCTION_READ_TOKEN/);
-    expect(attempt, "the refusal echoed the credential it refused").not.toThrow(/synthetic-production-token/);
+    expect(attempt, "the refusal echoed the credential it refused").not.toThrow(/FAKE-production-token/);
   });
 
   it("admits an importer whose production token is absent, empty or whitespace", () => {
@@ -83,7 +83,7 @@ describe("isolated ops runner roles", () => {
       ...base, STAGING_OPS_ROLE: "exporter", RAILWAY_ENVIRONMENT_ID: "prod", PRODUCTION_EXPORT_ENVIRONMENT_ID: "prod",
       DATABASE_URL: "postgres://x:p@prod-postgres.railway.internal:5432/db",
       NEO4J_URL: "neo4j://prod-neo4j.railway.internal",
-      RAILWAY_PRODUCTION_READ_TOKEN: "synthetic-production-token",
+      RAILWAY_PRODUCTION_READ_TOKEN: "FAKE-production-token",
     }, "exporter")).toBe(true);
   });
 

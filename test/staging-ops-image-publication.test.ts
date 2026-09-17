@@ -352,7 +352,8 @@ describe("OP-05 — the receipt, and what it must never carry", () => {
   it.each([
     ["a classic PAT", "ghp_0123456789abcdefghijklmnopqrstuvwx"],
     ["an Actions token", "ghs_0123456789abcdefghijklmnopqrstuvwx"],
-    ["a fine-grained PAT", "github_pat_11ABCDEFG0abcdefghijklmnop"],
+    // Exact synthetic token declaration preserves the production-shaped rejection case.
+    ["a fine-grained PAT", "github_pat_11ABCDEFG0abcdefghijklmnop"], // aios-secret-fixture:github_pat_11ABCDEFG0abcdefghijklmnop
   ])("refuses %s hiding under an innocent field name", (_label, value) => {
     expect(redactionFailures({ ...receipt(), note: value })).not.toEqual([]);
   });

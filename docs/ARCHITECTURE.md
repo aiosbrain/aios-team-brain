@@ -119,6 +119,22 @@ drain and feeds the graph replacement guard. Staging-owned rollback envelopes ar
 the importer-owned rollback signer and carry an opaque verified provenance into the replacement gate;
 they restore staging's own prior credentials and are never treated as fresh production sources.
 
+Manifest structure and time validity are owned by `validatePairManifest` (`bundle-format.mjs`) and
+checked before any import work. Capture start/end and `expiresAt` must each be a string that parses
+to a finite instant, the capture may not end before it starts, and a manifest expiring at or before
+now is refused; an absent or unparseable instant is refused rather than compared as `NaN`. The
+importer's rollback openings pass `ignoreExpiry`, which waives only the AGE of an admitted
+`staging-rollback` envelope — never a missing or malformed timestamp, and never a source manifest.
+
+Release promotion (`release-controller.mjs`) separates two owners. The promoter
+(`updateMainNonForce`, and `git-promotion.mjs` for the local model) owns the idempotent non-force
+main update and answers `promoted` or, on a retry where main already sits at the candidate,
+`already-promoted` without writing. The controller owns the audit: for BOTH outcomes, in both the
+normal and emergency paths, it observes the production deployment and records `completed` only for
+a `verified` observation. A failed rollout stays `promoted-but-deployment-failed`; anything else
+(including an unclassifiable observation or an observer exception) is
+`promoted-but-deployment-unverified`, and an update outcome the promoter never defined is refused.
+
 The sanitized Postgres graph ledger and graph bundle correspond by durable identity, not counts or
 names alone. Every completed ledger row must carry an `episode_uuid` that resolves within the same
 `group_id` to one of that source item's retained chunk names, and every retained chunk must be
@@ -175,6 +191,11 @@ procedure in `docs/OPS.md`, verified read-only by
 `node scripts/staging-ops/importer.mjs activation-preflight`, whose best verdict is
 `READY TO ACTIVATE` — never "activated", since its schedule check passes only while the automation
 is off.
+
+Staging unit fixtures mark synthetic credentials explicitly. The local compose object-store
+identities use exact value-bound fixture declarations, preserving the client/server pairs;
+credential-shaped receipt rejection tests retain their runtime shapes. These classifications
+do not exclude test files or weaken the release secret scanners.
 
 H5 acquisition is role-isolated. `exporter.mjs activation-evidence` authenticates a production-only
 environment token, performs fixed read-only deployment/configuration/snapshot/private-network reads,
