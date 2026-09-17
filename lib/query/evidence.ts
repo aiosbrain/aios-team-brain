@@ -69,5 +69,6 @@ export async function searchEvidence(db: DbClient, teamId: string, tier: 'team'|
       attribution: resolved && resolved === people.length ? 'resolved' : resolved ? 'partial' : 'unresolved',
       ...(sourceUrl ? { source_url: sourceUrl } : {}), };
   });
-  return boundEvidence(sources, hits.length > limit || attribution.some(a => a.omitted));
+  const labelsShortened = sources.some(s => s.title.endsWith('…') || s.contributors.some(p => [p.name, p.handle, p.role].some(label => label?.endsWith('…'))));
+  return boundEvidence(sources, hits.length > limit || attribution.some(a => a.omitted) || labelsShortened);
 }
