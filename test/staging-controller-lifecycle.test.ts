@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createServer, type Server } from "node:net";
+import { connect, createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { groupAlive, supervisionSupported } from "../scripts/staging-ops/owned-workload.mjs";
@@ -39,19 +39,58 @@ const canBind = async (port: number, host = "127.0.0.1") => await new Promise<bo
   probe.once("error", () => resolve(false));
   probe.listen(port, host, () => probe.close(() => resolve(true)));
 });
+/**
+ * READINESS is asked by CONNECTING, never by binding. `canBind` briefly OWNS the address it probes,
+ * so polling it while a workload starts can hand that workload its own `EADDRINUSE`: the fixture
+ * grandchild dies, its wrapper lives on, and "the replacement never started" is a failure the test
+ * caused. Binding stays the question only once a workload is verifiably stopped.
+ */
+const canConnect = async (port: number, host = "127.0.0.1", attemptMs = 1_000) => await new Promise<boolean>((resolve) => {
+  const socket = connect({ port, host });
+  // One attempt is bounded on its own: a stalled connect must not outlive the caller's deadline.
+  socket.setTimeout(attemptMs, () => { socket.destroy(); resolve(false); });
+  socket.once("connect", () => { socket.destroy(); resolve(true); });
+  socket.once("error", () => { socket.destroy(); resolve(false); });
+});
 const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 15_000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) { if (await predicate()) return true; await new Promise((r) => setTimeout(r, 40)); }
   return false;
 };
 
-const running: { controller: ChildProcess | null; sentinel: Server | null }[] = [];
+/**
+ * Every workload the controller spawns leads its OWN group, so killing the controller's group alone
+ * leaves them running. Teardown therefore asks the controller to stop what it owns, awaits it, and
+ * falls back only to the PGIDs the controller itself reported — never a name, never a port.
+ */
+interface Running { controller: ChildProcess | null; exited: Promise<unknown> | null; ownedGroups: Set<number>; record: (() => Promise<void>) | null; sentinel: Server | null }
+const running: Running[] = [];
+const groupsGone = async (pgids: number[]) => await waitFor(() => pgids.every((pgid) => !groupAlive(pgid)), 5_000);
 afterEach(async () => {
-  for (const { controller, sentinel } of running.splice(0)) {
-    if (controller?.pid) { try { process.kill(-controller.pid, "SIGKILL"); } catch { /* gone */ } }
-    if (sentinel) await new Promise((resolve) => sentinel.close(() => resolve(null)));
+  // EVERY entry is cleaned up, and every sentinel closed, before anything is asserted — one survivor
+  // must not strand the rest of the fixtures.
+  const survivors: number[] = [];
+  for (const entry of running.splice(0)) {
+    const { controller, exited, sentinel } = entry;
+    try {
+      if (controller?.pid && exited) {
+        if (controller.exitCode === null && controller.signalCode === null) {
+          try { await entry.record?.(); } catch { /* unreachable — the last recorded groups still apply */ }
+          try { process.kill(controller.pid, "SIGTERM"); } catch { /* gone */ }
+          let graceTimer: ReturnType<typeof setTimeout> | undefined;
+          try { await Promise.race([exited, new Promise((resolve) => { graceTimer = setTimeout(resolve, 15_000); })]); }
+          finally { clearTimeout(graceTimer); }
+        }
+        const ownedGroups = [...entry.ownedGroups, controller.pid];
+        for (const pgid of ownedGroups) if (groupAlive(pgid)) { try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } }
+        if (!(await groupsGone(ownedGroups))) survivors.push(...ownedGroups.filter((pgid) => groupAlive(pgid)));
+      }
+    } finally {
+      if (sentinel) await new Promise((resolve) => sentinel.close(() => resolve(null)));
+    }
   }
-});
+  expect(survivors, "an owned workload group outlived teardown").toEqual([]);
+}, 30_000);
 
 interface Controller { port: number; appPort: number; child: ChildProcess; call: (path: string, init?: RequestInit) => Promise<{ status: number; body: Record<string, unknown> }> }
 
@@ -69,17 +108,32 @@ async function startController(): Promise<Controller> {
       LOCAL_APP_COMMAND_JSON: JSON.stringify([process.execPath, FIXTURE, String(appPort), "0", "0"]),
     },
   });
-  running.push({ controller: child, sentinel: null });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  const entry: Running = { controller: child, exited, ownedGroups: new Set(), record: null, sentinel: null };
+  running.push(entry);
   const call = async (path: string, init: RequestInit = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, {
       ...init, headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", ...(init.headers ?? {}) },
     });
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   };
+  // REPLACES the set with what the controller lists as active now: a group it already stopped and
+  // verified gone is dropped, so a recycled PGID is never signalled on the strength of a stale record.
+  entry.record = async () => {
+    const active = new Set<number>();
+    for (const serviceId of ["app-local", "graphiti-local"]) {
+      // Bounded: teardown calls this before SIGTERM, and a stalled controller must not hold that up.
+      for (const deployment of (await call(`/deployments?serviceId=${serviceId}`, { signal: AbortSignal.timeout(2_000) })).body.deployments as { lifecycle: { pgid: number | null } }[]) {
+        if (deployment.lifecycle.pgid) active.add(deployment.lifecycle.pgid);
+      }
+    }
+    entry.ownedGroups = active;
+  };
   const up = await waitFor(async () => {
     try { return (await call("/identity")).status === 200; } catch { return false; }
   });
   if (!up) throw new Error("the local maintenance controller never became reachable");
+  await entry.record();
   return { port, appPort, child, call };
 }
 
@@ -108,7 +162,7 @@ describe.runIf(POSIX)("the controller stops what it owns, and only that", () => 
     // The second measured failure: the replacement 10 s after a "completed" stop died with
     // EADDRINUSE because a descendant still held the port.
     const controller = await startController();
-    expect(await waitFor(async () => !(await canBind(controller.appPort))), "the supervised app never bound its port").toBe(true);
+    expect(await waitFor(() => canConnect(controller.appPort)), "the supervised app never bound its port").toBe(true);
     const [app] = await activeApps(controller);
 
     expect((await controller.call(`/deployments/${app.id}/stop`, { method: "POST" })).status).toBe(200);
@@ -117,7 +171,7 @@ describe.runIf(POSIX)("the controller stops what it owns, and only that", () => 
     const deployed = await controller.call("/deploy", { method: "POST", body: JSON.stringify({ serviceId: "app-local", commitSha: "b".repeat(40) }) });
     expect(deployed.status).toBe(200);
     expect(deployed.body.id).toBeTruthy();
-    expect(await waitFor(async () => !(await canBind(controller.appPort))), "the replacement never started").toBe(true);
+    expect(await waitFor(() => canConnect(controller.appPort)), "the replacement never started").toBe(true);
   }, 60_000);
 
   it("REFUSES a replacement when an unrelated listener holds the address, and leaves it alive", async () => {
@@ -129,7 +183,7 @@ describe.runIf(POSIX)("the controller stops what it owns, and only that", () => 
 
     const sentinel = createServer(() => {});
     await new Promise((resolve) => sentinel.listen(controller.appPort, "0.0.0.0", () => resolve(null)));
-    running.push({ controller: null, sentinel });
+    running.push({ controller: null, exited: null, ownedGroups: new Set(), record: null, sentinel });
 
     const refused = await controller.call("/deploy", { method: "POST", body: JSON.stringify({ serviceId: "app-local", commitSha: "b".repeat(40) }) });
     expect(refused.status).toBe(409);
@@ -144,7 +198,7 @@ describe.runIf(POSIX)("the controller stops what it owns, and only that", () => 
 
   it("stops every owned workload when the CONTROLLER itself shuts down", async () => {
     const controller = await startController();
-    expect(await waitFor(async () => !(await canBind(controller.appPort)))).toBe(true);
+    expect(await waitFor(() => canConnect(controller.appPort))).toBe(true);
 
     process.kill(controller.child.pid!, "SIGTERM");
     expect(await waitFor(() => canBind(controller.appPort)), "controller shutdown left a workload holding the address").toBe(true);
