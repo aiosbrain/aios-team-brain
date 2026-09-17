@@ -96,7 +96,7 @@ describe("getThroughputVsCost() on real Postgres (W1.2.3)", () => {
       db(),
       { teamId: seed.teamId, memberId: admin.id, apiKeyId: randomUUID() },
       scan(slug, [
-        { author_key: "dev@x.test", author_email: "dev@x.test", day: "2026-06-10", commits: 10, ai_commits: 8 },
+        { author_key: "dev@x.test", author_email: "dev@x.test", day: new Date().toISOString().slice(0, 10), commits: 10, ai_commits: 8 },
       ])
     );
     // the dev member spends $4 on brain queries
