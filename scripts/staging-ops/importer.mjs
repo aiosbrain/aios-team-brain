@@ -126,7 +126,7 @@ function rollbackKeys(env) {
 
 function openBundleBytes(bytes, env, kind = "source", { ignoreExpiry = false } = {}) {
   const opened = openSignedEncryptedBundle({ bundle: JSON.parse(bytes.toString("utf8")), ...(kind === "rollback" ? rollbackKeys(env) : sourceKeys(env)), signerPurpose: kind });
-  const validity = validatePairManifest(opened.manifest, ignoreExpiry ? 0 : Date.now(), { allowRollback: kind === "rollback" });
+  const validity = validatePairManifest(opened.manifest, Date.now(), { allowRollback: kind === "rollback", ignoreExpiry });
   if (!validity.ok) throw new Error(`${kind} bundle refused: ${validity.errors.join("; ")}`);
   return { ...opened, sourceProvenance: rollbackOpeningProvenance(opened) };
 }

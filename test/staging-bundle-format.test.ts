@@ -98,6 +98,81 @@ describe("immutable pair format", () => {
   });
 
   /**
+   * AIO-1162 — every manifest instant fails CLOSED. `Date.parse` answers `NaN` for an absent or
+   * unparseable value and every comparison with `NaN` is false, so a manifest with no `expiresAt`
+   * was admitted as one that never expires, and a garbage capture interval was admitted as valid.
+   */
+  describe("manifest timestamps", () => {
+    it.each([
+      ["expiresAt is absent", { expiresAt: undefined }, "missing or malformed bundle expiry"],
+      ["expiresAt is null", { expiresAt: null }, "missing or malformed bundle expiry"],
+      ["expiresAt is a number, not a string", { expiresAt: Date.parse("2026-01-02T00:00:00Z") }, "missing or malformed bundle expiry"],
+      ["expiresAt is unparseable", { expiresAt: "not-a-date" }, "missing or malformed bundle expiry"],
+      ["captureStartedAt is absent", { captureStartedAt: undefined }, "invalid online capture interval"],
+      ["captureEndedAt is unparseable", { captureEndedAt: "later" }, "invalid online capture interval"],
+      ["captureStartedAt is not a string", { captureStartedAt: {} }, "invalid online capture interval"],
+      ["the capture ends before it starts", { captureEndedAt: "2025-12-31T23:59:59Z" }, "invalid online capture interval"],
+    ])("refuses a source manifest when %s", (_name, changed, reason) => {
+      const result = validatePairManifest({ ...validManifest(), ...changed }, NOW);
+      expect(result.errors).toEqual([reason]);
+      expect(result.ok).toBe(false);
+    });
+
+    it("treats expiry exactly at now as expired, and one millisecond later as valid", () => {
+      expect(validatePairManifest({ ...validManifest(), expiresAt: new Date(NOW).toISOString() }, NOW).errors)
+        .toEqual(["source bundle expired before it was pinned locally"]);
+      expect(validatePairManifest({ ...validManifest(), expiresAt: new Date(NOW + 1).toISOString() }, NOW))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it("accepts a zero-length capture interval (the exporter's single-instant capture)", () => {
+      const instant = "2026-01-01T00:00:00Z";
+      expect(validatePairManifest({ ...validManifest(), captureStartedAt: instant, captureEndedAt: instant }, NOW))
+        .toEqual({ ok: true, errors: [] });
+    });
+
+    it("rejects a non-finite clock instead of treating every expiry as future", () => {
+      expect(validatePairManifest(validManifest(), Number.NaN).errors).toEqual(["source bundle expired before it was pinned locally"]);
+    });
+
+    describe("rollback ignoreExpiry waives age, never shape", () => {
+      const rollbackManifest = (over: Record<string, unknown> = {}) => ({
+        ...validManifest(),
+        kind: "staging-rollback",
+        checksums: Object.fromEntries(["postgres", "graph"].map((n) => [n, { sha256: "a".repeat(64), bytes: 1 }])),
+        credentialFingerprints: undefined,
+        ...over,
+      });
+      const HISTORICAL = { expiresAt: "2025-06-01T00:00:00Z" };
+
+      it("admits a rollback envelope with a valid but historical expiry", () => {
+        expect(validatePairManifest(rollbackManifest(HISTORICAL), NOW, { allowRollback: true, ignoreExpiry: true }))
+          .toEqual({ ok: true, errors: [] });
+      });
+
+      it("still enforces age on a rollback envelope when the waiver is not requested", () => {
+        expect(validatePairManifest(rollbackManifest(HISTORICAL), NOW, { allowRollback: true }).errors)
+          .toEqual(["source bundle expired before it was pinned locally"]);
+      });
+
+      it.each([
+        ["absent", { expiresAt: undefined }, "missing or malformed bundle expiry"],
+        ["unparseable", { expiresAt: "never" }, "missing or malformed bundle expiry"],
+        ["a reversed capture interval", { captureEndedAt: "2025-12-31T00:00:00Z" }, "invalid online capture interval"],
+      ])("refuses a rollback envelope whose timestamp is %s even with the waiver", (_name, changed, reason) => {
+        const result = validatePairManifest(rollbackManifest(changed), NOW, { allowRollback: true, ignoreExpiry: true });
+        expect(result.errors).toEqual([reason]);
+        expect(result.ok).toBe(false);
+      });
+
+      it("does not let a SOURCE manifest use the waiver", () => {
+        expect(validatePairManifest({ ...validManifest(), ...HISTORICAL }, NOW, { allowRollback: true, ignoreExpiry: true }).errors)
+          .toEqual(["source bundle expired before it was pinned locally"]);
+      });
+    });
+  });
+
+  /**
    * M3 — `databaseMode` decides whether a restored pair keeps its own captured credentials, so an
    * unvalidated value is a rollback-integrity hole. The baseline above is a source manifest with the
    * field ABSENT, which is what the current exporter emits and which means sanitized; the rows here
