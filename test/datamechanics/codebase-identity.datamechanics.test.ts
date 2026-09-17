@@ -33,8 +33,8 @@ describe("codebase contributor identity (real Postgres)", () => {
 
     const slug = `repo-${randomUUID().slice(0, 6)}`;
     await ingest(seed, scan(slug, [
-      { author_key: "john@john.test", author_email: "john@john.test", day: "2026-06-10", commits: 5 },
-      { author_key: NOREPLY, author_email: NOREPLY, day: "2026-06-10", commits: 3 },
+      { author_key: "john@john.test", author_email: "john@john.test", day: new Date().toISOString().slice(0, 10), commits: 5 },
+      { author_key: NOREPLY, author_email: NOREPLY, day: new Date().toISOString().slice(0, 10), commits: 3 },
     ]));
 
     // Before aliasing: the noreply identity is a separate unmapped row.
@@ -82,7 +82,7 @@ describe("codebase contributor identity (real Postgres)", () => {
     await createMember(db(), seed.teamId, { email: "a@x.test", displayName: "A", actorHandle: "aa", role: "member" });
     const b = await createMember(db(), seed.teamId, { email: "b@x.test", displayName: "B", actorHandle: "bb", role: "member" });
     const slug = `repo-${randomUUID().slice(0, 6)}`;
-    await ingest(seed, scan(slug, [{ author_key: "a@x.test", author_email: "a@x.test", day: "2026-06-10", commits: 4 }]));
+    await ingest(seed, scan(slug, [{ author_key: "a@x.test", author_email: "a@x.test", day: new Date().toISOString().slice(0, 10), commits: 4 }]));
     // contribution is mapped to A (matches A's email). Try to claim it for B.
     const noForce = await addAuthorAlias(db(), seed.teamId, b.id, "a@x.test");
     expect(noForce.collisions).toBeGreaterThan(0);

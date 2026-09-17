@@ -214,7 +214,7 @@ describe("codebase scan idempotency (real Postgres)", () => {
       seed,
       buildScan({
         slug,
-        contributions: [{ author_key: email, author_email: email, day: "2026-06-15", commits: 7, ai_commits: 4 }],
+        contributions: [{ author_key: email, author_email: email, day: new Date().toISOString().slice(0, 10), commits: 7, ai_commits: 4 }],
       })
     );
 
