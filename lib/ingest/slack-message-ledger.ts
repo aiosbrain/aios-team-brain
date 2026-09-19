@@ -19,6 +19,12 @@ export interface CompleteSlackThreadEvidence {
 export interface SlackTeamGenerations {
   dataGeneration: string;
   identityGeneration: string;
+  presentationGeneration: string;
+}
+
+export interface PriorSlackPresentation {
+  actor: string;
+  frontmatter: Record<string, unknown> | null;
 }
 
 type StoredMessage = {
@@ -92,20 +98,23 @@ export async function readSlackTeamGenerations(
   teamId: string
 ): Promise<SlackTeamGenerations> {
   requireUuid(teamId, "teamId");
-  const { rows } = await session.executeSql<{ data_generation: string; identity_generation: string }>(
-    `select data_generation::text, identity_generation::text
+  const { rows } = await session.executeSql<{
+    data_generation: string; identity_generation: string; presentation_generation: string;
+  }>(
+    `select data_generation::text, identity_generation::text, presentation_generation::text
        from slack_team_state where team_id = $1`,
     [teamId]
   );
   return rows[0]
-    ? { dataGeneration: rows[0].data_generation, identityGeneration: rows[0].identity_generation }
-    : { dataGeneration: "0", identityGeneration: "0" };
+    ? { dataGeneration: rows[0].data_generation, identityGeneration: rows[0].identity_generation,
+        presentationGeneration: rows[0].presentation_generation }
+    : { dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0" };
 }
 
 async function bumpGeneration(
   session: TransactionSession,
   teamId: string,
-  column: "data_generation" | "identity_generation"
+  column: "data_generation" | "identity_generation" | "presentation_generation"
 ): Promise<string> {
   requireUuid(teamId, "teamId");
   // `column` is a closed internal union, never caller SQL. The upsert serializes competing bumps.
@@ -127,6 +136,36 @@ export async function bumpSlackIdentityGeneration(
   teamId: string
 ): Promise<string> {
   return bumpGeneration(session, teamId, "identity_generation");
+}
+
+function label(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Compare the item locked by ingestItem with the row it actually wrote, inside that same transaction.
+ * Raw evidence changes alone do not advance this revision. A new scoped item always does.
+ */
+export async function bumpSlackPresentationIfChanged(
+  session: TransactionSession,
+  teamId: string,
+  itemId: string,
+  prior: PriorSlackPresentation | null
+): Promise<void> {
+  requireUuid(teamId, "teamId");
+  requireUuid(itemId, "itemId");
+  const { rows } = await session.executeSql<{
+    actor: string; author: string | null; title: string | null; channel: string | null;
+  }>(`select actor, frontmatter->>'author' as author, frontmatter->>'title' as title,
+            frontmatter->>'channel' as channel
+       from items where team_id=$1 and id=$2`, [teamId, itemId]);
+  if (rows.length !== 1) throw new Error("slack ledger: published item missing during presentation comparison");
+  const current = rows[0];
+  const previous = prior?.frontmatter;
+  if (!prior || prior.actor !== current.actor || label(previous?.author) !== current.author ||
+      label(previous?.title) !== current.title || label(previous?.channel) !== current.channel) {
+    await bumpGeneration(session, teamId, "presentation_generation");
+  }
 }
 
 function changed(stored: StoredMessage | undefined, row: SlackMessageEvidence, itemId: string): boolean {

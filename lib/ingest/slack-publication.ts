@@ -5,7 +5,7 @@ import type { ItemPayload } from "@/lib/api/schemas";
 import type { TransactionSession } from "@/lib/db/types";
 import { lockReadySlackNamespaceGate } from "./slack-namespace-gate";
 import { lockSlackSelection, type SlackBindingRef } from "./slack-source-binding";
-import { reconcileCompleteSlackThreadEvidence } from "./slack-message-ledger";
+import { bumpSlackPresentationIfChanged, reconcileCompleteSlackThreadEvidence, type PriorSlackPresentation } from "./slack-message-ledger";
 import type { SlackThreadClaim } from "./slack-thread-state";
 import { normalizeThread } from "./sources/slack-normalize";
 import { projectSlackMessageEvidence, parseSlackTimestamp, type SlackEvidenceUser, type SlackEvidenceProjection } from "./sources/slack-message-evidence";
@@ -168,6 +168,7 @@ export async function prepareSlackPublication(
 /** Called after item and ledger succeed, still inside their transaction. FK cascade removes staging. */
 export async function finishSlackPublication(
   session: TransactionSession, prepared: PreparedSlackPublication, itemId: string,
+  priorPresentation: PriorSlackPresentation | null,
 ): Promise<void> {
   const { option, projection } = prepared;
   const { claim } = option;
@@ -176,6 +177,7 @@ export async function finishSlackPublication(
     teamId: scope.teamId, workspaceId: scope.workspaceId, channelId: scope.channelId,
     rootTs: scope.rootTs, itemId, complete: true, projection,
   });
+  await bumpSlackPresentationIfChanged(session, scope.teamId, itemId, priorPresentation);
   const ack = await session.executeSql(
     `delete from slack_sync_threads t where t.team_id=$1 and t.workspace_id=$2
        and t.channel_id=$3 and t.root_ts=$4 and t.status='running'

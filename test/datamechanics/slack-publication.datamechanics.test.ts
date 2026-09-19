@@ -111,6 +111,14 @@ function payloadFor(messages: SlackMessage[]) {
     frontmatter: { ...normalized.frontmatter, workspace_id: WORKSPACE, source_ts: parseSlackTimestamp(ROOT)!.iso } };
 }
 
+function payloadWithLabels(displayName: string, channelName = "general") {
+  const normalized = normalizeThread({ root: ROOT_MESSAGE, replies: [REPLY_MESSAGE] }, {
+    channelId: CHANNEL, channelName, users: { U1: displayName }, project: "slack",
+  });
+  return { ...normalized, path: scopedSlackItemPath(WORKSPACE, CHANNEL, ROOT),
+    frontmatter: { ...normalized.frontmatter, workspace_id: WORKSPACE, source_ts: parseSlackTimestamp(ROOT)!.iso } };
+}
+
 describe("inactive Slack publication in the existing ingest transaction", () => {
   it("reserves canonical scoped paths across projects before project or pointer writes", async () => {
     const f = await fixture();
@@ -150,7 +158,8 @@ describe("inactive Slack publication in the existing ingest transaction", () => 
       { message_ts: ROOT, eligible: true, exclusion_reason: null, last_seen_generation: "1" },
       { message_ts: REPLY, eligible: true, exclusion_reason: null, last_seen_generation: "1" },
     ]);
-    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("1");
+    expect(await tx((s) => readSlackTeamGenerations(s, f.seed.teamId)))
+      .toEqual({ dataGeneration: "1", identityGeneration: "0", presentationGeneration: "1" });
   });
 
   it("publishes an unchanged body and a changed eligibility verdict without adding a version", async () => {
@@ -166,11 +175,77 @@ describe("inactive Slack publication in the existing ingest transaction", () => 
       { message_ts: REPLY, eligible: false, exclusion_reason: "bot_identity", last_seen_generation: "2" },
     ]);
     expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("2");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("1");
     const identical = slackPublicationOption({ ...reclassified, claim: await restage(f) });
     expect(await ingestItem(db(), f.auth, f.payload, "team", { authorMemberId: null }, "team", identical))
       .toMatchObject({ status: "unchanged" });
     expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("2");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("1");
     expect(await counts(f.seed.teamId)).toMatchObject({ versions: 1, jobs: 0, snapshots: 0 });
+  });
+
+  it.each([
+    { label: "author", displayName: "Person Renamed", channelName: "general", title: "#general: root" },
+    { label: "title", displayName: "Person One", channelName: "renamed-channel", title: "#renamed-channel: root" },
+  ])("keeps semantic generation stable across a $label edit and its identical revisit", async ({ displayName, channelName, title }) => {
+    const f = await fixture();
+    await ingestItem(db(), f.auth, f.payload, "team", { authorMemberId: null }, "team", f.option);
+    const before = await rows(f.seed.teamId);
+    const renamed = slackPublicationOption({ ...f.option, claim: await restage(f),
+      channelName, users: { U1: { ...USERS.U1, displayName } } });
+    const labelled = payloadWithLabels(displayName, channelName);
+    expect(await ingestItem(db(), f.auth, labelled, "team", { authorMemberId: null }, "team", renamed))
+      .toMatchObject({ status: "updated" });
+    expect(await counts(f.seed.teamId)).toMatchObject({ versions: 2, jobs: 0, snapshots: 0 });
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("1");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("2");
+    expect(await rows(f.seed.teamId)).toEqual(before);
+    const item = await raw.query(`select actor,frontmatter->>'author' as author,
+      frontmatter->>'title' as title from items where team_id=$1 and path=$2`,
+      [f.seed.teamId, labelled.path]);
+    expect(item.rows[0]).toMatchObject({ actor: displayName, author: displayName, title });
+
+    const revisit = slackPublicationOption({ ...renamed, claim: await restage(f) });
+    expect(await ingestItem(db(), f.auth, labelled, "team", { authorMemberId: null }, "team", revisit))
+      .toMatchObject({ status: "unchanged" });
+    expect(await counts(f.seed.teamId)).toMatchObject({ versions: 2, jobs: 0, snapshots: 0 });
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("1");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("2");
+    expect(await rows(f.seed.teamId)).toEqual(before);
+  });
+
+  it("keeps presentation stable when only a reply body changes", async () => {
+    const f = await fixture();
+    await ingestItem(db(), f.auth, f.payload, "team", { authorMemberId: null }, "team", f.option);
+    const edited = [ROOT_MESSAGE, { ...REPLY_MESSAGE, text: "edited reply" }];
+    const option = slackPublicationOption({ ...f.option, claim: await restage(f, edited) });
+    expect(await ingestItem(db(), f.auth, payloadFor(edited), "team", { authorMemberId: null }, "team", option))
+      .toMatchObject({ status: "updated" });
+    expect(await tx((s) => readSlackTeamGenerations(s, f.seed.teamId)))
+      .toEqual({ dataGeneration: "2", identityGeneration: "0", presentationGeneration: "1" });
+  });
+
+  it("rolls back a display-label edit with a failed final acknowledgement", async () => {
+    const f = await fixture();
+    await ingestItem(db(), f.auth, f.payload, "team", { authorMemberId: null }, "team", f.option);
+    const before = await rows(f.seed.teamId);
+    const renamed = slackPublicationOption({ ...f.option, claim: await restage(f),
+      users: { U1: { ...USERS.U1, displayName: "Person Renamed" } } });
+    const faulty = transactionSessionDecoratedDb(db(), (s) => ({ ...s,
+      executeSql: async (sql, params) => {
+        if (/delete from slack_sync_threads t/i.test(sql)) throw new Error("injected acknowledgement failure");
+        return s.executeSql(sql, params);
+      },
+    }));
+    await expect(ingestItem(faulty, f.auth, payloadWithLabels("Person Renamed"), "team",
+      { authorMemberId: null }, "team", renamed)).rejects.toThrow("injected acknowledgement failure");
+    expect(await counts(f.seed.teamId)).toMatchObject({ versions: 1, jobs: 1, snapshots: 1 });
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("1");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("1");
+    expect(await rows(f.seed.teamId)).toEqual(before);
+    const item = await raw.query(`select actor,frontmatter->>'author' as author from items where team_id=$1 and path=$2`,
+      [f.seed.teamId, f.payload.path]);
+    expect(item.rows[0]).toMatchObject({ actor: "Person One", author: "Person One" });
   });
 
   it("updates an existing item from a new complete snapshot and acknowledges only after ledger reconciliation", async () => {
@@ -260,6 +335,7 @@ describe("inactive Slack publication in the existing ingest transaction", () => 
       .rejects.toThrow("injected ledger failure");
     expect(await counts(f.seed.teamId)).toMatchObject({ items: 0, versions: 0, jobs: 1, snapshots: 1 });
     expect(await rows(f.seed.teamId)).toEqual([]);
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("0");
   });
 
   it("rolls back item and ledger when final queue acknowledgement fails", async () => {
@@ -275,6 +351,7 @@ describe("inactive Slack publication in the existing ingest transaction", () => 
     expect(await counts(f.seed.teamId)).toMatchObject({ items: 0, versions: 0, jobs: 1, snapshots: 1 });
     expect(await rows(f.seed.teamId)).toEqual([]);
     expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).dataGeneration).toBe("0");
+    expect((await tx((s) => readSlackTeamGenerations(s, f.seed.teamId))).presentationGeneration).toBe("0");
   });
 
   it("rolls back item and ledger if the lease expires after the initial lock but before acknowledgement", async () => {

@@ -1329,11 +1329,10 @@ create index if not exists slack_messages_author_idx
 create index if not exists slack_messages_item_idx
   on slack_messages (team_id, item_id, occurred_at desc);
 
--- Durable Slack cache generations, one row per team. Bumped inside the caller's transaction by the
--- source-owned generation helper: `data_generation` when semantic evidence actually changed,
--- `identity_generation` when a link/unlink/remap/correction changed an account mapping. Cache
--- payloads carry both stamps, so a worker that publishes new evidence invalidates every other
--- worker's memory entry without a broadcast.
+-- Durable Slack revisions, one row per team. Source-owned helpers bump `data_generation` for
+-- semantic evidence, `identity_generation` for an effective mapping change, and
+-- `presentation_generation` for a committed Slack title/author label change or first item.
+-- Timeline cache readers do not yet validate these stamps across workers.
 --
 -- ABSENT ROW = generation 0 (a team that has never published Slack evidence). A FAILED read is an
 -- error and must never be read as 0 — the inactive indexed helper now enforces that distinction;
@@ -1342,9 +1341,14 @@ create table if not exists slack_team_state (
   team_id uuid primary key references teams(id) on delete cascade,
   data_generation bigint not null default 0 check (data_generation >= 0),
   identity_generation bigint not null default 0 check (identity_generation >= 0),
+  presentation_generation bigint not null default 0 check (presentation_generation >= 0),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+-- Existing installations already have the table. The matching timestamped migration makes the
+-- column available to migration-only deploys; this clause also keeps schema replay additive.
+alter table slack_team_state add column if not exists presentation_generation
+  bigint not null default 0 check (presentation_generation >= 0);
 
 -- ── Slack pending-thread work + leases (AIO-1170) ────────────────────────────
 -- Durable state for ONE unit of pending Slack work: "this thread, in this channel, in this

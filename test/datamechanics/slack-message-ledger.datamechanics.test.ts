@@ -72,7 +72,7 @@ describe("inactive Slack message ledger reconciliation", () => {
   it("preserves exact Slack identities and microsecond instants; identical revisits do not churn generation", async () => {
     const seed = await seedTeam(); const itemId = await item(seed, "exact");
     expect(await tx((s) => readSlackTeamGenerations(s, seed.teamId)))
-      .toEqual({ dataGeneration: "0", identityGeneration: "0" });
+      .toEqual({ dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0" });
     expect(await tx((s) => reconcileCompleteSlackThreadEvidence(s, snapshot(seed.teamId, itemId))))
       .toEqual({ changed: true, dataGeneration: "1" });
     expect(await rows(seed.teamId)).toMatchObject([
@@ -147,7 +147,7 @@ describe("inactive Slack message ledger reconciliation", () => {
     }
     expect((await rows(seed.teamId)).map((r) => r.deleted)).toEqual([false, false]);
     expect(await tx((s) => readSlackTeamGenerations(s, seed.teamId)))
-      .toEqual({ dataGeneration: "1", identityGeneration: "0" });
+      .toEqual({ dataGeneration: "1", identityGeneration: "0", presentationGeneration: "0" });
   });
 
   it("rolls back messages and generation with the caller's transaction", async () => {
@@ -158,7 +158,7 @@ describe("inactive Slack message ledger reconciliation", () => {
     })).rejects.toThrow("abort caller");
     expect(await rows(seed.teamId)).toEqual([]);
     expect(await tx((s) => readSlackTeamGenerations(s, seed.teamId)))
-      .toEqual({ dataGeneration: "0", identityGeneration: "0" });
+      .toEqual({ dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0" });
   });
 
   it("isolates tenants and refuses an item from another team or a competing thread binding", async () => {
@@ -174,7 +174,7 @@ describe("inactive Slack message ledger reconciliation", () => {
       snapshot(a.teamId, aItem, [{ ts: ROOT, user: "U1", text: "root" }], { workspaceId: "T0OTHER" })
     ))).rejects.toThrow("already bound");
     expect(await tx((s) => readSlackTeamGenerations(s, a.teamId)))
-      .toEqual({ dataGeneration: "1", identityGeneration: "0" });
+      .toEqual({ dataGeneration: "1", identityGeneration: "0", presentationGeneration: "0" });
   });
 
   it("advances last-seen to the current team generation on a later identical revisit", async () => {
@@ -272,7 +272,7 @@ describe("inactive Slack message ledger reconciliation", () => {
       expect(loser.value).toBeNull();
       expect(loser.error?.message).toContain("thread is already bound");
       expect(await tx((s) => readSlackTeamGenerations(s, seed.teamId)))
-        .toEqual({ dataGeneration: "1", identityGeneration: "0" });
+        .toEqual({ dataGeneration: "1", identityGeneration: "0", presentationGeneration: "0" });
     } finally { release(); }
   });
 
@@ -280,7 +280,7 @@ describe("inactive Slack message ledger reconciliation", () => {
     const seed = await seedTeam();
     expect(await tx((s) => bumpSlackIdentityGeneration(s, seed.teamId))).toBe("1");
     expect(await tx((s) => readSlackTeamGenerations(s, seed.teamId)))
-      .toEqual({ dataGeneration: "0", identityGeneration: "1" });
+      .toEqual({ dataGeneration: "0", identityGeneration: "1", presentationGeneration: "0" });
     await expect(tx(async (s) => {
       await s.executeSql("set local search_path to pg_catalog");
       await readSlackTeamGenerations(s, seed.teamId);

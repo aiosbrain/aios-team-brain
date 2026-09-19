@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Client } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -521,7 +523,7 @@ describe("slack_messages — team-consistent item binding", () => {
 // ── generations ──────────────────────────────────────────────────────────────
 
 describe("slack_team_state — generations", () => {
-  it("defaults both generations to 0 and moves them independently, per team", async () => {
+  it("defaults all generations to 0 and moves them independently, per team", async () => {
     const a = await seedTeam();
     const b = await seedTeam();
     const c = await sql();
@@ -530,15 +532,16 @@ describe("slack_team_state — generations", () => {
     // must get 0, because "absent row" and "generation 0" have to mean the same thing.
     await c.query(`insert into slack_team_state (team_id) values ($1), ($2)`, [a.teamId, b.teamId]);
     const read = async (teamId: string) => {
-      const { rows } = await c.query<{ d: string; i: string }>(
-        `select data_generation::text as d, identity_generation::text as i
+      const { rows } = await c.query<{ d: string; i: string; p: string }>(
+        `select data_generation::text as d, identity_generation::text as i,
+                presentation_generation::text as p
            from slack_team_state where team_id = $1`,
         [teamId]
       );
       return rows[0];
     };
-    expect(await read(a.teamId)).toEqual({ d: "0", i: "0" });
-    expect(await read(b.teamId)).toEqual({ d: "0", i: "0" });
+    expect(await read(a.teamId)).toEqual({ d: "0", i: "0", p: "0" });
+    expect(await read(b.teamId)).toEqual({ d: "0", i: "0", p: "0" });
 
     // A data bump is not an identity bump: an identity mismatch forces an inline cold rebuild while
     // a data mismatch is a background refresh, so a schema that moved them together would turn
@@ -547,14 +550,19 @@ describe("slack_team_state — generations", () => {
       `update slack_team_state set data_generation = data_generation + 1 where team_id = $1`,
       [a.teamId]
     );
-    expect(await read(a.teamId)).toEqual({ d: "1", i: "0" });
+    expect(await read(a.teamId)).toEqual({ d: "1", i: "0", p: "0" });
     await c.query(
       `update slack_team_state set identity_generation = identity_generation + 1 where team_id = $1`,
       [a.teamId]
     );
-    expect(await read(a.teamId)).toEqual({ d: "1", i: "1" });
+    expect(await read(a.teamId)).toEqual({ d: "1", i: "1", p: "0" });
+    await c.query(
+      `update slack_team_state set presentation_generation = presentation_generation + 1 where team_id = $1`,
+      [a.teamId]
+    );
+    expect(await read(a.teamId)).toEqual({ d: "1", i: "1", p: "1" });
     // …and neither one leaked into the other team.
-    expect(await read(b.teamId)).toEqual({ d: "0", i: "0" });
+    expect(await read(b.teamId)).toEqual({ d: "0", i: "0", p: "0" });
   });
 
   it("refuses a negative generation and a second row for one team", async () => {
@@ -565,6 +573,11 @@ describe("slack_team_state — generations", () => {
     expect(
       await errCode(
         c.query(`update slack_team_state set data_generation = -1 where team_id = $1`, [seed.teamId])
+      )
+    ).toBe("23514");
+    expect(
+      await errCode(
+        c.query(`update slack_team_state set presentation_generation = -1 where team_id = $1`, [seed.teamId])
       )
     ).toBe("23514");
     expect(
@@ -668,6 +681,19 @@ describe("rollout — repeatable from zero, on upgrade, and on replay", () => {
           [teamId]
         );
 
+        // Model an installed two-generation table and replay only the additive migration.
+        // Both existing counters survive, the new counter starts at zero, and repeating it is inert.
+        await c.query(`alter table slack_team_state drop column presentation_generation`);
+        const migration = readFileSync(join(import.meta.dirname, "..", "..", "postgres", "migrations",
+          "20260919190000_slack_presentation_generation.sql"), "utf8");
+        await c.query(migration);
+        await c.query(migration);
+        const upgraded = await c.query(`select data_generation::text as d,
+          identity_generation::text as i, presentation_generation::text as p
+          from slack_team_state where team_id=$1`, [teamId]);
+        expect(upgraded.rows).toEqual([{ d: "7", i: "3", p: "0" }]);
+        await c.query(`update slack_team_state set presentation_generation=5 where team_id=$1`, [teamId]);
+
         const snapshot = async () => {
           const { rows: m } = await c.query(
             `select workspace_id, channel_id, message_ts, root_ts, item_id, author_external_id,
@@ -677,7 +703,8 @@ describe("rollout — repeatable from zero, on upgrade, and on replay", () => {
                from slack_messages order by message_ts`
           );
           const { rows: s } = await c.query(
-            `select team_id, data_generation::text as d, identity_generation::text as i
+            `select team_id, data_generation::text as d, identity_generation::text as i,
+                    presentation_generation::text as p
                from slack_team_state order by team_id`
           );
           return { m, s };
@@ -685,7 +712,7 @@ describe("rollout — repeatable from zero, on upgrade, and on replay", () => {
         const before = await snapshot();
         expect(before.m).toHaveLength(1);
         expect(before.m[0].exact).toBe("2024-06-20T16:13:20.000100");
-        expect(before.s).toEqual([{ team_id: teamId, d: "7", i: "3" }]);
+        expect(before.s).toEqual([{ team_id: teamId, d: "7", i: "3", p: "5" }]);
 
         // 4. REPLAY on the now-populated ledger — every deploy re-runs this path.
         await load();

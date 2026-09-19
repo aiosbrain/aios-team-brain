@@ -486,7 +486,7 @@ export async function ingestItem(
     }
     // Ledger and queue acknowledgement belong to this transaction even when the item body is
     // unchanged. An identical revisit can still carry a changed eligibility verdict.
-    if (slackPrepared) await finishSlackPublication(session, slackPrepared, existing.id);
+    if (slackPrepared) await finishSlackPublication(session, slackPrepared, existing.id, existing);
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return {
       result: {
@@ -722,7 +722,7 @@ export async function ingestItem(
     }
   }
 
-  if (slackPrepared) await finishSlackPublication(session, slackPrepared, itemId);
+  if (slackPrepared) await finishSlackPublication(session, slackPrepared, itemId, existing);
   return {
     result: {
       status: existing ? "updated" : "created",
