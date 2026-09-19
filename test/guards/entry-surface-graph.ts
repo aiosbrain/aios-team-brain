@@ -1478,6 +1478,14 @@ export const ENTRY_INVENTORY: Record<string, EntryRecord> = {
       "closure via parseAuthorIdentity in lib/codebases/commits-to-items — a parser shared with the " +
       "commit writer, read-only here",
   },
+  "app/api/v1/evidence/search/route.ts": {
+    class: "IMPORT_ONLY",
+    reason:
+      "imports searchEvidence from lib/query/evidence, which reaches the closure via parseAuthorRefs in " +
+      "lib/attribution/resolve-authors → parseAuthorIdentity in lib/codebases/commits-to-items — the " +
+      "same shared author parser as the attribution route. Evidence search is a ranked FTS READ plus " +
+      "identity lookups; its only write is the rate-limit bucket, never an item",
+  },
 
   /* ── admin server actions that mutate ATTRIBUTION, not the item set ──────────────────────── */
   "app/t/[team]/admin/members/actions.ts": {
