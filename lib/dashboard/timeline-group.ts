@@ -11,7 +11,7 @@
  *                each with that day's evidence nested + grouped by source.
  *   • other[]  — that day's evidence that referenced NO task, grouped by source (rendered below).
  * Ordering: days DESC (undated last); within a day, people by activity DESC; a person's tasks by
- * evidence count DESC; items newest-first, capped per source.
+ * evidence count DESC; items newest-first, capped per source except Slack.
  */
 
 import { SOURCE_RULES } from "@/lib/ingest/source-rules";
@@ -93,8 +93,8 @@ export interface TaskInfo {
 
 export interface SourceGroup {
   source: string;
-  count: number; // total for this bucket (may exceed items.length when capped)
-  items: EvidenceItem[]; // newest-first, capped
+  count: number; // total for this bucket (may exceed items.length for capped non-Slack sources)
+  items: EvidenceItem[]; // newest-first; all loaded Slack evidence, capped for other sources
 }
 
 /** A task with its day's evidence nested under it (only ever present when it HAS evidence). */
@@ -276,7 +276,7 @@ function sortDaysDesc(a: string, b: string): number {
 
 const dayOf = (at: string): string => (at ?? "").slice(0, 10) || "unknown";
 
-/** Group evidence items into SourceGroups (by source, count DESC, newest-first, per-source capped). */
+/** Group evidence by source and count, retaining every loaded Slack row for the timeline UI. */
 function toSourceGroups(items: EvidenceItem[], cap: number): SourceGroup[] {
   const bySource = new Map<string, EvidenceItem[]>();
   for (const it of items) {
@@ -286,8 +286,11 @@ function toSourceGroups(items: EvidenceItem[], cap: number): SourceGroup[] {
   }
   return [...bySource.entries()]
     .map(([source, arr]) => {
-      const sorted = arr.slice().sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0));
-      return { source, count: sorted.length, items: sorted.slice(0, cap) };
+      const sorted = arr.slice().sort((x, y) =>
+        (x.at < y.at ? 1 : x.at > y.at ? -1 : 0) ||
+        (source === "slack" ? (x.id < y.id ? -1 : x.id > y.id ? 1 : 0) : 0),
+      );
+      return { source, count: sorted.length, items: source === "slack" ? sorted : sorted.slice(0, cap) };
     })
     .sort((a, b) => b.count - a.count || (a.source < b.source ? -1 : 1));
 }
