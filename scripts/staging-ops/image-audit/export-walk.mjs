@@ -219,10 +219,14 @@ const exhaustionKind = (budget) => (budget.lastRefusal === "overhead"
 
 const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
 /**
- * Formats this audit cannot expand. Their presence is a RECORDED coverage gap, never a silent skip —
- * at EVERY depth, which is the whole of F3: the top-level member loop tested this and the nested loop
- * did not, so a `.zip` one level inside a `.tar.gz` was staged as opaque bytes and contributed no
- * limitation at all.
+ * Formats this audit cannot expand, BY NAME. Their presence is a RECORDED coverage gap, never a
+ * silent skip — at EVERY depth, which is the whole of F3: the top-level member loop tested this and
+ * the nested loop did not, so a `.zip` one level inside a `.tar.gz` was staged as opaque bytes and
+ * contributed no limitation at all.
+ *
+ * KEPT ALONGSIDE the magic table below rather than replaced by it. A name is the weaker signal and
+ * is the one an attacker chooses, but it is not redundant: brotli has no magic number at all, and
+ * `.jar`/`.whl`/`.egg`/`.apk` are ZIPs whose NAME is the more useful thing to report to a reader.
  */
 const UNEXPANDABLE = /\.(zip|xz|bz2|br|zst|7z|rar|jar|whl|egg|deb|rpm|apk)$/i;
 
@@ -289,13 +293,13 @@ export function unsupportedMagicFormat(head) {
 const looksGzip = (head) => head.length >= 2 && head.subarray(0, 2).equals(GZIP_MAGIC);
 const looksTar = (head) => head.length >= 262 && head.subarray(257, 262).toString("ascii") === "ustar";
 /**
- * Would this member need expanding to be inspected at all? Magic first, then the closed name list.
- *
- * The name list is kept as an ADDITIONAL signal rather than replaced: brotli has no magic number at
- * all, and `.jar`/`.whl`/`.egg`/`.apk` are ZIPs whose name is the more useful thing to report.
+ * `looksArchive(head, name)` USED TO LIVE HERE and had no caller — the one decision it described
+ * ("would this member need expanding at all") is made by `classifyExpanded` below, in the order the
+ * limitation vocabulary requires: name first, then magic, then the two formats this audit CAN open.
+ * A second predicate answering the same question from a different combination of the same tests is
+ * how the two drift apart, and a reader of a security-relevant module is entitled to assume the
+ * function they are reading is the one that runs.
  */
-const looksArchive = (head, name) => looksGzip(head) || looksTar(head)
-  || unsupportedMagicFormat(head) !== undefined || UNEXPANDABLE.test(name);
 
 /**
  * The format of an unexpandable member, taken from THE CLOSED LIST ABOVE rather than from the name.

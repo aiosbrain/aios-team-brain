@@ -1267,6 +1267,11 @@ public evidence.**
   an **explicit coordinator adjudication of the recorded gap**. An opaque-byte scan is not decoded
   archive inspection. Blockers describe a gap by **kind, layer and count** only — never by an
   archive-derived extension, reason or byte count.
+  - An unexpandable container is recognised by its **magic at the start of content**, at every
+    depth, not only by its name: a ZIP that is extensionless, renamed, or wrapped in a gzip (whose
+    inflated payload has no name at all) is a recorded `unexpanded-archive-format` gap. The label is
+    `extension` when the NAME was recognised and `format` when the BYTES were, each from a closed
+    vocabulary in reviewed source — neither is derived from the member.
 - **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
   blocks `transitionReady` and lands the verdict on **`unresolved`** — a question for coordinator
   adjudication, deliberately *not* re-labelled as secret presence. A missing recipe blocks too, so a
@@ -1294,6 +1299,17 @@ public evidence.**
   inventory covering **all pages, tagged AND untagged version ids, and full immutable digests**; a
   count, a screenshot of only the tagged tab, or a truncated digest is insufficient. That evidence can
   satisfy the gate, and `apiStatus` still records that the workflow's own read failed.
+  - That route is the `reconcile` command (`node scripts/staging-ops/image-audit.mjs reconcile
+    --evidence <audit.json> --operator <inventory.json>`), and it **validates the audit record
+    first**: schema, exact subject binding, every required measurement (including the persisted
+    `provenance.identityVerified`), and internal consistency. An absent, foreign, incomplete,
+    self-contradictory or itself-`refused` record is **refused** — verdict `refused`,
+    `transitionReady: false`, fixed codes in `provenance.refusal.codes`, and no reconciled
+    measurements at all. Readiness is then RECOMPUTED from the validated measurements by the same
+    function the audit used, with only the package-inventory dimension substituted: an operator
+    inventory can never clear a coverage, identity, recipe or scanner blocker, and a missing blocker
+    list is not an absent blocker. It is a local evidence helper — it verifies no signature, so the
+    coordinator still confirms the original run and artifact independently.
 - **Any additional version stops the transition.** A clean audit of one digest does not authorize
   exposing unaudited digests in the same package; `additionalSubjects` lists them for a bounded audit.
   Nothing is deleted, and no alternate public package or public-push workaround is implied.
