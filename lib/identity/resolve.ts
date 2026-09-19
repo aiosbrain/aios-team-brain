@@ -1,5 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
+import type { SlackCutoverDiscovery } from "@/lib/identity/slack-cutover-provenance";
 
 /**
  * Shared identity resolution: git/provider author identity → roster `member_id` for a team.
@@ -91,6 +92,171 @@ export async function buildIdentityMap(
 export function resolveByProviderId(map: IdentityMap, provider: string, externalId: string): string | null {
   if (!externalId) return null;
   return map.byProviderId.get(providerKey(provider, externalId)) ?? null;
+}
+
+/**
+ * Inactive Slack lookup for the coordinated identity/credit cutover. The caller must supply a
+ * team-scoped snapshot of current member_identities rows, marking only live rows as live. Audit,
+ * archived and quarantine records must not be supplied as live mappings. This pure helper cannot
+ * certify the discovery adapter's historical completeness or the freshness of its DB snapshot.
+ */
+export interface SlackAccountMapping {
+  teamId: string;
+  provider: string;
+  externalId: string;
+  memberId: string;
+  state: "live" | "archived" | "quarantined";
+}
+
+export interface SlackLegacyEvidenceReview {
+  teamId: string;
+  /** Reviewable evidence for the complete legacy disposition scan, including a zero-finding scan. */
+  evidenceId: string;
+  unresolvedOrQuarantined: readonly { userId: string; evidenceId: string }[];
+}
+
+export interface SlackAccountLookupInput {
+  teamId: string;
+  /** Qualified WORKSPACE:USER or legacy plain USER. */
+  externalId: string;
+  /** Supply only when this item's workspace was verified from source provenance. */
+  verifiedItemWorkspaceId?: string;
+  mappings: readonly SlackAccountMapping[];
+  /** Required only for a plain ID without verified item workspace. */
+  discovery?: SlackCutoverDiscovery;
+  legacyEvidenceReview?: SlackLegacyEvidenceReview;
+}
+
+export type SlackAccountLookupStatus =
+  | "resolved" | "invalid_input" | "no_mapping" | "conflicting_mapping"
+  | "incomplete_provenance" | "conflicting_provenance" | "ambiguous_workspaces"
+  | "unknown_account" | "unmapped_account" | "mismatched_member"
+  | "unresolved_legacy_evidence";
+
+export interface SlackAccountLookupResult {
+  status: SlackAccountLookupStatus;
+  memberId: string | null;
+  accountId: string | null;
+}
+
+const slackIdPart = /^[A-Z0-9]+$/;
+const evidenceId = /^[A-Za-z0-9_-]+$/;
+const isEvidenceId = (value: unknown): value is string => typeof value === "string" && evidenceId.test(value);
+const isPart = (value: unknown): value is string => typeof value === "string" && slackIdPart.test(value);
+const blockedSlackLookup = (status: Exclude<SlackAccountLookupStatus, "resolved">): SlackAccountLookupResult =>
+  ({ status, memberId: null, accountId: null });
+
+/** Exact qualified lookup; legacy compatibility is admitted only by a complete, evidenced closed world. */
+export function lookupSlackAccount(input: SlackAccountLookupInput): SlackAccountLookupResult {
+  if (!isEvidenceId(input.teamId) || typeof input.externalId !== "string") return blockedSlackLookup("invalid_input");
+  const parts = input.externalId.split(":");
+  if (parts.length > 2 || parts.some((part) => !isPart(part)) ||
+      (input.verifiedItemWorkspaceId !== undefined && !isPart(input.verifiedItemWorkspaceId))) {
+    return blockedSlackLookup("invalid_input");
+  }
+  const userId = parts[parts.length - 1];
+  const qualifiedWorkspace = parts.length === 2 ? parts[0] : null;
+  if (qualifiedWorkspace && input.verifiedItemWorkspaceId && qualifiedWorkspace !== input.verifiedItemWorkspaceId) {
+    return blockedSlackLookup("invalid_input");
+  }
+
+  // Case/provider variants are collision evidence, never aliases. Raw rows are never mapping
+  // candidates, even when the old generic provider map could have resolved them.
+  const live = input.mappings.filter((row) => row.state === "live" && row.teamId === input.teamId);
+  const mappingFor = (accountId: string): { memberId: string | null; status: "no_mapping" | "conflicting_mapping" | "resolved" } => {
+    const variants = live.filter((row) => row.provider.trim().toLowerCase() === "slack" &&
+      row.externalId.trim().toUpperCase() === accountId);
+    if (variants.length > 1 || variants.some((row) => row.provider !== "slack" || row.externalId !== accountId || !isEvidenceId(row.memberId))) {
+      return { memberId: null, status: "conflicting_mapping" };
+    }
+    return variants.length === 1
+      ? { memberId: variants[0].memberId, status: "resolved" }
+      : { memberId: null, status: "no_mapping" };
+  };
+  const resolveExact = (accountId: string): SlackAccountLookupResult => {
+    const mapping = mappingFor(accountId);
+    return mapping.status === "resolved"
+      ? { status: "resolved", memberId: mapping.memberId, accountId }
+      : blockedSlackLookup(mapping.status);
+  };
+
+  if (qualifiedWorkspace || input.verifiedItemWorkspaceId) {
+    return resolveExact(`${qualifiedWorkspace ?? input.verifiedItemWorkspaceId}:${userId}`);
+  }
+
+  const discovery = input.discovery;
+  const census = discovery?.historicalSourceCensus;
+  const review = input.legacyEvidenceReview;
+  if (!census || !review || !isEvidenceId(census.evidenceId) || !isEvidenceId(review.evidenceId) ||
+      census.teamId !== input.teamId || review.teamId !== input.teamId || census.sources.length === 0) {
+    return blockedSlackLookup("incomplete_provenance");
+  }
+  const workspaces = new Set<string>();
+  const sourceIds = new Map<string, string>();
+  for (const source of census.sources) {
+    if (!isEvidenceId(source.sourceId) || !isEvidenceId(source.evidenceId) || !isPart(source.workspaceId)) {
+      return blockedSlackLookup("incomplete_provenance");
+    }
+    if (sourceIds.has(source.sourceId) && sourceIds.get(source.sourceId) !== source.workspaceId) {
+      return blockedSlackLookup("conflicting_provenance");
+    }
+    sourceIds.set(source.sourceId, source.workspaceId);
+    workspaces.add(source.workspaceId);
+  }
+  const inventories = new Map<string, Map<string, string | null>>();
+  for (const inventory of discovery.workspaceAccountInventories) {
+    if (inventory.teamId !== input.teamId || !isPart(inventory.workspaceId) || !isEvidenceId(inventory.evidenceId) ||
+        !workspaces.has(inventory.workspaceId) || inventories.has(inventory.workspaceId)) {
+      return blockedSlackLookup("conflicting_provenance");
+    }
+    const accounts = new Map<string, string | null>();
+    for (const account of inventory.accounts) {
+      if (!isPart(account.userId) || !isEvidenceId(account.evidenceId) ||
+          (account.memberId !== null && !isEvidenceId(account.memberId)) || accounts.has(account.userId)) {
+        return blockedSlackLookup("conflicting_provenance");
+      }
+      accounts.set(account.userId, account.memberId);
+    }
+    inventories.set(inventory.workspaceId, accounts);
+  }
+  if ([...workspaces].some((workspace) => !inventories.has(workspace))) {
+    return blockedSlackLookup("incomplete_provenance");
+  }
+  if (review.unresolvedOrQuarantined.some((record) => !isPart(record.userId) || !isEvidenceId(record.evidenceId))) {
+    return blockedSlackLookup("conflicting_provenance");
+  }
+  if (review.unresolvedOrQuarantined.some((record) => record.userId === userId) ||
+      live.some((row) => row.provider.trim().toLowerCase() === "slack" && row.externalId.trim().toUpperCase() === userId)) {
+    return blockedSlackLookup("unresolved_legacy_evidence");
+  }
+
+  const observed = [...inventories].filter(([, accounts]) => accounts.has(userId));
+  if (observed.length > 1) return blockedSlackLookup("ambiguous_workspaces");
+  if (observed.length === 0) return blockedSlackLookup("unknown_account");
+  const [workspace, accounts] = observed[0];
+  const observedMemberId = accounts.get(userId);
+  if (observedMemberId === null) return blockedSlackLookup("unmapped_account");
+  const accountId = `${workspace}:${userId}`;
+  const mapping = mappingFor(accountId);
+  if (mapping.status !== "resolved") return blockedSlackLookup(mapping.status);
+  if (mapping.memberId !== observedMemberId) return blockedSlackLookup("mismatched_member");
+  // An existing qualified row in an unenumerated workspace, or absent from an allegedly
+  // complete inventory, disproves the closed world for every legacy ID. Check all live rows;
+  // a row for another user cannot silently authorize this user's compatibility lookup.
+  const seenAccounts = new Set<string>();
+  for (const row of live) {
+    if (row.provider.trim().toLowerCase() !== "slack" || !row.externalId.includes(":")) continue;
+    const rowParts = row.externalId.split(":");
+    const canonical = rowParts.length === 2 && row.provider === "slack" &&
+      rowParts.every(isPart) && row.externalId === `${rowParts[0]}:${rowParts[1]}`;
+    if (!canonical || seenAccounts.has(row.externalId) || !workspaces.has(rowParts[0]) ||
+        !inventories.get(rowParts[0])?.has(rowParts[1]) ||
+        inventories.get(rowParts[0])?.get(rowParts[1]) !== row.memberId) {
+      return blockedSlackLookup("conflicting_provenance");
+    }
+    seenAccounts.add(row.externalId);
+  }
+  return { status: "resolved", memberId: mapping.memberId, accountId };
 }
 
 /** How an identity resolved — the attribution CONFIDENCE. `email`/`handle` are exact matches;
