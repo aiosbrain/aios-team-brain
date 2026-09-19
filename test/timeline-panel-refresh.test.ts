@@ -156,6 +156,9 @@ describe("timeline same-viewer refresh", () => {
     previousDocument = globalThis.document;
     previousWindow = globalThis.window;
     Object.assign(globalThis, { document, window: document.defaultView, IS_REACT_ACT_ENVIRONMENT: true });
+    // Node 25 exposes navigator globally, but CI's Node runtime does not. React DOM reads it
+    // during its first import, before this custom host has rendered anything.
+    vi.stubGlobal("navigator", { userAgent: "timeline-test" });
     const { createRoot } = await import("react-dom/client");
     root = createRoot(container as unknown as Element);
   });
