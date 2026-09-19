@@ -68,6 +68,79 @@ export interface ItemCreditIds {
   primaryId: string | null;
 }
 
+/** A completed, team-scoped ledger read. A failed read is never equivalent to `absent`.
+ * Entries are resolved HUMAN member IDs in message order (oldest to newest); null means that the
+ * source account did not resolve. The future reader must use the shared Slack account lookup and
+ * exclude connectors before calling this pure selector. */
+export type SlackMessageCreditRead =
+  | { status: "present"; resolvedHumanMemberIds: readonly (string | null)[] }
+  | { status: "absent" }
+  | { status: "failed"; error: Error };
+
+/** `present` means a structured participants field exists, even if parsing/resolution yields [].
+ * Entries are in oldest-last-message to newest-last-message order. */
+export type SlackParticipantCreditEvidence =
+  | { status: "present"; resolvedHumanMemberIds: readonly (string | null)[] }
+  | { status: "absent" };
+
+/** The selected source of Slack credit; legacy credit is explicitly partial. */
+export type SlackCreditSelection =
+  | { kind: "verified_message_ledger_present"; creditIds: ItemCreditIds | null }
+  | { kind: "structured_participants_present"; creditIds: ItemCreditIds | null }
+  | { kind: "legacy_partial"; creditIds: ItemCreditIds | null };
+
+/** Prepare Slack evidence for the existing lock, contributor and primary rules. This has no DB read
+ * or active caller. A future caller must distinguish a successful empty ledger from no ledger, pass
+ * structured-field presence independently of parsed length, and omit a `byItem` entry when
+ * `creditIds` is null. In particular, a failed ledger read must propagate rather than enable legacy
+ * fallback. This selector returns IDs only; it makes no authored-day claim. */
+export function selectSlackCreditIds(input: {
+  locked: boolean;
+  currentMemberId: string | null; // corrected owner when locked; resolved human or null
+  messageLedger: SlackMessageCreditRead;
+  participants: SlackParticipantCreditEvidence;
+  legacyVersionMemberIds: readonly string[]; // distinct human workers in version order
+  legacyLatestWorkerId: string | null;
+}): SlackCreditSelection {
+  if (input.messageLedger.status === "failed") throw input.messageLedger.error;
+
+  let kind: SlackCreditSelection["kind"];
+  let workers: readonly (string | null)[];
+  if (input.messageLedger.status === "present") {
+    kind = "verified_message_ledger_present";
+    workers = input.messageLedger.resolvedHumanMemberIds;
+  } else if (input.participants.status === "present") {
+    kind = "structured_participants_present";
+    workers = input.participants.resolvedHumanMemberIds;
+  } else {
+    kind = "legacy_partial";
+    workers = input.legacyVersionMemberIds;
+  }
+  const resolvedWorkers = workers.filter((id): id is string => typeof id === "string" && id.length > 0);
+  const versionMemberIds = [...new Set(resolvedWorkers)];
+  const latestWorkerId = kind === "legacy_partial"
+    ? input.legacyLatestWorkerId
+    : resolvedWorkers[resolvedWorkers.length - 1] ?? null;
+  // The unchanged helpers normally fall back to current owner for empty versions. Suppress that
+  // fallback only when authoritative Slack evidence is present but resolves to no human.
+  const currentMemberId = !input.locked && kind !== "legacy_partial" && versionMemberIds.length === 0
+    ? null
+    : input.currentMemberId;
+  const contributorIds = [...new Set(creditedContributorIds({
+    locked: input.locked,
+    currentMemberId,
+    versionMemberIds,
+  }))];
+  const primaryId = creditedPrimaryId({
+    locked: input.locked,
+    currentMemberId,
+    versionMemberIds,
+    latestWorkerId,
+  });
+  const creditIds = contributorIds.length || primaryId ? { contributorIds, primaryId } : null;
+  return { kind, creditIds };
+}
+
 /** Display-name projection of `ItemCreditIds` (arcs render names; the admin drill-down shows them). */
 export interface ItemCredit {
   contributors: string[];

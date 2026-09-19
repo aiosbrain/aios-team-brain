@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { creditedContributorIds, creditedPrimaryId, resolveItemCreditIds } from "@/lib/attribution/contributor-credit";
+import { creditedContributorIds, creditedPrimaryId, resolveItemCreditIds, selectSlackCreditIds } from "@/lib/attribution/contributor-credit";
 import type { DbClient } from "@/lib/db/types";
 
 /** Minimal chainable fake db: each `from(table)` resolves to a preset `{data, error}` for that table. */
@@ -23,6 +23,7 @@ function fakeDb(byTable: Record<string, { data: unknown; error: unknown }>): DbC
 
 const A = "m-a";
 const B = "m-b";
+const C = "m-c";
 
 describe("creditedContributorIds", () => {
   it("credits every version author on an unlocked item — a handoff keeps BOTH contributors", () => {
@@ -66,6 +67,126 @@ describe("creditedPrimaryId — the single BALANCING representative", () => {
 
   it("falls back to the current owner when there is no work ledger", () => {
     expect(creditedPrimaryId({ locked: false, currentMemberId: A, versionMemberIds: [], latestWorkerId: null })).toBe(A);
+  });
+});
+
+describe("selectSlackCreditIds — inactive three-state Slack evidence", () => {
+  const base = {
+    locked: false,
+    currentMemberId: B,
+    participants: { status: "absent" as const },
+    legacyVersionMemberIds: [A],
+    legacyLatestWorkerId: A,
+  };
+
+  it("treats an empty verified ledger as authoritative, with no owner/version fallback or byItem entry", () => {
+    const selection = selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "present", resolvedHumanMemberIds: [] },
+    });
+    expect(selection).toEqual({ kind: "verified_message_ledger_present", creditIds: null });
+    const byItem = new Map<string, NonNullable<typeof selection.creditIds>>();
+    if (selection.creditIds) byItem.set("slack-item", selection.creditIds);
+    expect(byItem.has("slack-item")).toBe(false);
+  });
+
+  it("ledger overrides populated participants and root-stamped versions; the latest actual worker is primary", () => {
+    expect(selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "present", resolvedHumanMemberIds: [A] },
+      participants: { status: "present", resolvedHumanMemberIds: [B] },
+    })).toEqual({
+      kind: "verified_message_ledger_present",
+      creditIds: { contributorIds: [A], primaryId: A },
+    });
+  });
+
+  it("does not fall back when ledger accounts are all unresolved", () => {
+    expect(selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "present", resolvedHumanMemberIds: [null, null] },
+    })).toEqual({ kind: "verified_message_ledger_present", creditIds: null });
+  });
+
+  it("uses structured participants when the ledger is absent, including an empty field", () => {
+    expect(selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "absent" },
+      participants: { status: "present", resolvedHumanMemberIds: [] },
+    })).toEqual({ kind: "structured_participants_present", creditIds: null });
+  });
+
+  it("does not restore owner or versions for all-unresolved participants", () => {
+    expect(selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "absent" },
+      participants: { status: "present", resolvedHumanMemberIds: [null, null] },
+    })).toEqual({ kind: "structured_participants_present", creditIds: null });
+  });
+
+  it("keeps contributor first-seen order while latest worker follows the last resolved message", () => {
+    expect(selectSlackCreditIds({
+      ...base,
+      currentMemberId: C,
+      messageLedger: { status: "present", resolvedHumanMemberIds: [A, null, B, A] },
+    })).toEqual({
+      kind: "verified_message_ledger_present",
+      creditIds: { contributorIds: [A, B], primaryId: A },
+    });
+    expect(selectSlackCreditIds({
+      ...base,
+      currentMemberId: C,
+      messageLedger: { status: "absent" },
+      participants: { status: "present", resolvedHumanMemberIds: [A, B, B] },
+    })).toEqual({
+      kind: "structured_participants_present",
+      creditIds: { contributorIds: [A, B], primaryId: B },
+    });
+  });
+
+  it("keeps a working current owner primary and an ownerless item without a primary", () => {
+    const messageLedger = { status: "present" as const, resolvedHumanMemberIds: [A, B, A] };
+    expect(selectSlackCreditIds({ ...base, messageLedger })).toEqual({
+      kind: "verified_message_ledger_present",
+      creditIds: { contributorIds: [A, B], primaryId: B },
+    });
+    expect(selectSlackCreditIds({ ...base, currentMemberId: null, messageLedger })).toEqual({
+      kind: "verified_message_ledger_present",
+      creditIds: { contributorIds: [A, B], primaryId: null },
+    });
+  });
+
+  it("lets a lock retain only the corrected human owner, or nobody when cleared", () => {
+    const messageLedger = { status: "present" as const, resolvedHumanMemberIds: [] };
+    expect(selectSlackCreditIds({ ...base, locked: true, messageLedger })).toEqual({
+      kind: "verified_message_ledger_present",
+      creditIds: { contributorIds: [B], primaryId: B },
+    });
+    expect(selectSlackCreditIds({ ...base, locked: true, currentMemberId: null, messageLedger })).toEqual({
+      kind: "verified_message_ledger_present", creditIds: null,
+    });
+  });
+
+  it("uses the existing version-then-owner rule only for explicitly partial legacy evidence", () => {
+    expect(selectSlackCreditIds({ ...base, messageLedger: { status: "absent" } })).toEqual({
+      kind: "legacy_partial", creditIds: { contributorIds: [A], primaryId: A },
+    });
+    expect(selectSlackCreditIds({
+      ...base,
+      messageLedger: { status: "absent" },
+      legacyVersionMemberIds: [],
+      legacyLatestWorkerId: null,
+    })).toEqual({ kind: "legacy_partial", creditIds: { contributorIds: [B], primaryId: B } });
+  });
+
+  it("propagates a failed ledger read even when participants or a correction lock exist", () => {
+    const error = new Error("ledger unavailable");
+    expect(() => selectSlackCreditIds({
+      ...base,
+      locked: true,
+      messageLedger: { status: "failed", error },
+      participants: { status: "present", resolvedHumanMemberIds: [A] },
+    })).toThrow(error);
   });
 });
 
