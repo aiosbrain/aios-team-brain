@@ -11,6 +11,8 @@ import {
 } from "./slack-item-credit-ledger-read";
 
 export interface SlackCreditInputSnapshot {
+  /** Bound by the reader even when every result collection is empty. */
+  teamId: string;
   ledgers: SlackItemCreditLedger[];
   mappings: SlackAccountMapping[];
   humanMemberIds: ReadonlySet<string>;
@@ -103,6 +105,8 @@ export async function readSlackCreditInputSnapshot(
     const generations = stateRows[0] ?? {
       dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0",
     };
-    return { ledgers, mappings, humanMemberIds, generations };
+    // PostgreSQL UUID projections use lowercase; keep the snapshot binding in the same form
+    // even if the validated caller supplied uppercase UUID hex.
+    return { teamId: teamId.toLowerCase(), ledgers, mappings, humanMemberIds, generations };
   });
 }

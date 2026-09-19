@@ -73,6 +73,7 @@ describe("inactive atomic Slack credit input snapshot on real Postgres", () => {
     );
 
     const result = await readSlackCreditInputSnapshot(team.teamId, [target, absent, otherItem], { pageSize: 2 });
+    expect(result.teamId).toBe(team.teamId);
     expect(result.ledgers).toEqual(await readSlackItemCreditLedger(team.teamId, [target, absent, otherItem],
       { pageSize: 2 }));
     expect(result.ledgers[0].status).toBe("present");
@@ -91,6 +92,10 @@ describe("inactive atomic Slack credit input snapshot on real Postgres", () => {
     expect(result.humanMemberIds).toEqual(new Set([team.memberId, human2, human3]));
     expect(result.generations).toEqual({ dataGeneration: "7", identityGeneration: "11",
       presentationGeneration: "13" });
+    const upper = await readSlackCreditInputSnapshot(team.teamId.toUpperCase(), [target]);
+    expect(upper.teamId).toBe(team.teamId);
+    expect(upper.mappings.every((row) => row.teamId === upper.teamId)).toBe(true);
+    expect(upper.ledgers[0].status).toBe("present");
     expect(JSON.stringify(result)).not.toMatch(/private-handle|private@example|UOTHER|token|email/i);
   });
 
@@ -108,6 +113,7 @@ describe("inactive atomic Slack credit input snapshot on real Postgres", () => {
         where team_id=$1::uuid`, [team.teamId]
     );
     const result = await readSlackCreditInputSnapshot(team.teamId, [], { pageSize: 37 });
+    expect(result.teamId).toBe(team.teamId);
     expect(result.ledgers).toEqual([]);
     expect(result.mappings).toHaveLength(516);
     expect(result.humanMemberIds.size).toBe(516);
