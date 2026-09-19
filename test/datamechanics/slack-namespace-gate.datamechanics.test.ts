@@ -23,8 +23,8 @@ import { db, seedTeam, type Seed } from "./helpers";
  * WHAT THIS FILE PROVES, STATED AS ITS LIMIT. A gate can be created BLOCKED, invalidated
  * atomically, and locked/read without absence or stale readiness being mistaken for permission to
  * migrate or publish. It proves NOTHING about provenance: the migration/provenance producer that
- * would be entitled to set `ready` is not built, and this packet deliberately ships no application
- * path that can create a ready row. A locked capability here is namespace readiness ONLY — never
+ * would repair historical paths is not built; the separate inactive new-channel producer now has
+ * its own real-Postgres suite. A locked capability here is namespace readiness ONLY — never
  * source authorization, channel permission, body completeness or permission to publish.
  *
  * The failure modes only a real database can show, and which this file exists to pin:
@@ -450,12 +450,11 @@ describe("slack_channel_migration_gates — the columns this slice may own", () 
   });
 
   /**
-   * The absence of an activation path is the packet's central claim, so it is asserted rather than
-   * asserted-in-prose: no `markReady`, no verified-boolean entry point, nothing that accepts a
-   * caller's legacy-item list as proof. The capability constructor is module-private (its brand is
-   * an unexported symbol), so a caller cannot mint one either.
+   * The only readiness writer is the source-owned new-channel producer. No generic markReady,
+   * verified-boolean entry point or caller-supplied legacy-item list exists. The capability brand
+   * remains module-private.
    */
-  it("exports no way to make a gate ready", async () => {
+  it("exports only the source-owned readiness producer", async () => {
     const exported = Object.entries(gateModule)
       .filter(([, value]) => typeof value === "function")
       .map(([name]) => name)
@@ -464,6 +463,7 @@ describe("slack_channel_migration_gates — the columns this slice may own", () 
       "ensureBlockedSlackNamespaceGate",
       "invalidateSlackNamespaceGate",
       "lockReadySlackNamespaceGate",
+      "prepareNewSlackChannelNamespace",
     ]);
   });
 
@@ -934,7 +934,7 @@ describe("invalidate — one atomic step from readiness to blocked", () => {
     await seedReady(seed, { revision: 0 });
     await tx((s) => invalidateSlackNamespaceGate(s, scope, "workspace_changed"));
 
-    // A later fixture models what the (unbuilt) producer would eventually write: readiness AT the
+    // A structural fixture models what a producer could write: readiness AT the
     // current revision. Fixture only — it verifies no provenance and activates nothing.
     const c = await sql();
     await c.query(

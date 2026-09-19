@@ -1485,8 +1485,8 @@ alter table slack_thread_snapshots add constraint slack_thread_snapshots_cursor_
 -- ── Slack per-channel NAMESPACE migration gate (AIO-1170) ────────────────────
 -- One durable row per (AIOS team, RAW Slack channel id): may items for this channel be published
 -- under the workspace-qualified namespace `slack/<workspace>/<channel>/<root-ts>.md` yet? The single
--- writer is `lib/ingest/slack-namespace-gate.ts`; the only callers today are its data-mechanics
--- tests. It is keyed on the RAW channel id — not on a workspace — precisely because the question it
+-- writer is `lib/ingest/slack-namespace-gate.ts`; only its data-mechanics tests call it today. It is
+-- keyed on the RAW channel id — not on a workspace — precisely because the question it
 -- answers is which workspace(s) that raw id was proven to belong to.
 --
 -- ⚠️ THIS IS A NAMESPACE GATE, NOT SOURCE AUTHORIZATION. A `ready` row says the channel's legacy
@@ -1495,12 +1495,10 @@ alter table slack_thread_snapshots add constraint slack_thread_snapshots_cursor_
 -- row: provider metadata, a history cursor and method reservations belong to the later source-state
 -- packets, and an empty/default row here must never be read as standing in for them.
 --
--- ⚠️ IT CANNOT BECOME `ready` IN THIS BUILD. The producer entitled to set readiness — the attended
--- migration/provenance writer — does not exist, so no application path writes `state='ready'`; the
--- columns exist because the codec that refuses a half-proved readiness has to be enforced from the
--- first row. When that producer lands, it must lock this row BEFORE the old/new path locks, scan
--- every relevant legacy row under that synchronization, bind each to verified integration/workspace
--- provenance, and leave the gate blocked if any row is unknown/conflicting or any scan is partial.
+-- The inactive new-channel producer may write `ready` only after an empty path scan, current
+-- verified binding/selection and public proof. Historical rows still require an attended repair;
+-- that producer does not exist. No active publication path consumes this gate yet. A ready row does
+-- not stop legacy workers: attended rollout must disable/drain them before readiness or activation.
 --
 -- ABSENT ROW = BLOCKED. There is no arm in which a missing row, a stale readiness or a failed read
 -- means "may publish"; that distinction lives in the reader (a failed read is an error), and there
@@ -1523,8 +1521,8 @@ create table if not exists slack_channel_migration_gates (
   -- this raw channel to. Empty while blocked.
   resolved_workspace_ids text[] not null default '{}',
   -- Durable identity of the completed attended repair that proved the above. Null while blocked.
-  -- The UUID alone proves nothing here — the later producer must tie it to completed provenance
-  -- records; this column exists so that a readiness with no repair behind it cannot be stored.
+  -- The UUID alone proves nothing here; the inactive new-channel producer creates an inspectable
+  -- completed proof row first. Historical repair must likewise record verified provenance.
   completed_repair_id uuid,
   -- A sanitized CATEGORY of why the channel is blocked (lower-case, underscore-separated, ≤40
   -- chars) — never raw provider content, a message or a token. Same syntax rule, and the same
@@ -1554,6 +1552,29 @@ create table if not exists slack_channel_migration_gates (
 create index if not exists slack_channel_migration_gates_state_idx
   on slack_channel_migration_gates (team_id, state);
 
+-- Completed, inspectable evidence for the narrow EMPTY-CHANNEL readiness producer. A gate's
+-- producer writes one of these rows before setting the gate ready. Historical repairs need their
+-- own provenance records and are not represented here. The gate reader's structural fixture can
+-- still exercise a synthetic ready row; application readiness must use the producer below.
+create table if not exists slack_namespace_readiness_proofs (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  raw_channel_id text not null check (raw_channel_id ~ '^[A-Za-z0-9]+$'),
+  gate_revision bigint not null check (gate_revision >= 0),
+  workspace_id text not null check (workspace_id ~ '^[A-Za-z0-9]+$'),
+  integration_id uuid not null,
+  binding_id uuid not null,
+  config_revision text not null check (config_revision ~ '^[0-9a-f]{64}$'),
+  public_checked_at timestamptz not null,
+  proof_kind text not null default 'new_channel_empty_scan'
+    check (proof_kind = 'new_channel_empty_scan'),
+  legacy_rows_found integer not null check (legacy_rows_found = 0),
+  completed_at timestamptz not null default clock_timestamp(),
+  unique (team_id, raw_channel_id, gate_revision)
+);
+create index if not exists slack_namespace_readiness_proofs_gate_idx
+  on slack_namespace_readiness_proofs (team_id, raw_channel_id, id);
+
 -- The WORKSPACE-ID SET syntax. The set is a set of PROVIDER IDS, so `cardinality > 0` in the codec
 -- above cannot be satisfied by a NULL, a blank, free text — or by ONE element that merely spells a
 -- set. CASE, not AND: `array_position` raises on a multidimensional array, and only an ordered
@@ -1572,10 +1593,10 @@ create index if not exists slack_channel_migration_gates_state_idx
 -- Named, dropped and re-added on every replay, per the convention used for `slack_sync_threads`
 -- above: building the table here is a no-op on a database that already has it, so a
 -- checkpoint-created database would otherwise keep the looser rule forever. This table has no
--- production deployment and no application path can write a workspace set (nothing can make a gate
--- ready), so no data migration exists or is needed. If a replay DOES meet a stored row the tightened
--- rule refuses, this ADD fails with 23514 — that failure is the report, and the row is to be
--- investigated, never quietly repaired or deleted here.
+-- production deployment and no active publisher reads this gate. The inactive producer writes only
+-- a verified single-workspace set, so no data migration exists or is needed. If a replay DOES meet a
+-- stored row the tightened rule refuses, this ADD fails with 23514 — that failure is the report,
+-- and the row is to be investigated, never quietly repaired or deleted here.
 alter table slack_channel_migration_gates
   drop constraint if exists slack_channel_migration_gates_workspace_syntax;
 alter table slack_channel_migration_gates

@@ -1,5 +1,6 @@
 import "server-only";
 import type { SqlQueryResult, TransactionSession } from "@/lib/db/types";
+import { lockSlackSelection } from "./slack-source-binding";
 import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";
 
 /**
@@ -14,14 +15,12 @@ import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";
  * slice (`slack-thread-state.ts`) proves ownership of a QUEUE ROW and cannot satisfy this gate
  * either; the two are independent, and the later publisher needs both plus its own checks.
  *
- * ⚠️ NOTHING HERE CAN MAKE A GATE `ready`. The only writer entitled to that is the attended
- * migration/provenance producer, which is not built: it must lock this row BEFORE the old/new path
- * identity locks, scan every relevant legacy row under that synchronization, bind each to verified
- * integration/workspace/channel provenance, preserve item ids, and leave the gate blocked if any
- * row is unknown/conflicting or any scan was partial. So there is deliberately no `markReady`, no
- * entry point taking a caller's `verified: true`, no path that accepts a caller's legacy-item list
- * as proof, and no test-only bypass. A `blocked` gate is not a stub to be switched on — it is the
- * correct state until that producer exists.
+ * The only readiness producer here handles a genuinely NEW channel: it proves current binding,
+ * selection, public status and an empty legacy scan in one caller transaction. Historical paths
+ * still require an attended provenance repair, which is not built. No caller supplies a verified
+ * flag, workspace, repair id or list of supposedly migrated rows.
+ * A ready row does not stop the old Slack writer after commit. Attended activation must disable
+ * and drain those workers before invoking this helper or enabling scoped publication.
  *
  * Four properties hold this module together:
  *
@@ -46,10 +45,8 @@ import { scopedSlackChannelPathPrefix } from "./sources/slack-namespace";
  * (`returnedFailure` in `lib/db/pg/tx.ts`), so a caller returning one of these results straight out
  * of its transaction would silently undo its own committed work.
  *
- * Out of scope on purpose: `slack_sync_channels` provider metadata, history cursors and method
- * reservations. This row is the per-raw-channel MIGRATION state the spec requires; it is not a
- * stand-in for channel sync state, and an empty/default row here proves neither provider scope nor
- * provenance.
+ * This row is the per-raw-channel MIGRATION state, not a stand-in for channel sync state. The
+ * producer reads the current public proof but does not write provider metadata or history cursors.
  */
 
 /** A gate's identity. `team_id` is a namespace above the raw Slack channel id. */
@@ -121,6 +118,24 @@ interface GateRow {
   resolved_workspace_ids: unknown;
   completed_repair_id: string | null;
   blocked_reason: string | null;
+}
+
+interface ChannelProofRow {
+  workspace_id: string;
+  binding_integration_id: string | null;
+  binding_config_revision: string | null;
+  public_state: string;
+  public_checked_at: Date | null;
+}
+
+interface BindingProofRow {
+  id: string;
+  state: string;
+  config_revision: string;
+  token_fingerprint: string;
+  workspace_id: string | null;
+  app_id: string | null;
+  selected_channel_ids: string[];
 }
 
 class SlackNamespaceGateError extends TypeError {
@@ -289,6 +304,135 @@ export async function ensureBlockedSlackNamespaceGate(
 }
 
 /**
+ * Inactive producer for an empty, new channel. Lock order: gate -> integration -> channel TABLE
+ * SHARE -> binding -> channel row -> items TABLE SHARE. Discovery takes integration before channel
+ * writes when both occur in one transaction, so the table lock must follow the integration lock.
+ */
+export async function prepareNewSlackChannelNamespace(
+  session: TransactionSession,
+  scope: SlackNamespaceGateScope
+): Promise<{ readonly outcome: "ready"; readonly gate: SlackNamespaceGateState } | { readonly outcome: "blocked" }> {
+  assertScope(scope);
+  await ensureBlockedSlackNamespaceGate(session, scope);
+  const gateResult = await session.executeSql<GateRow>(
+    `select ${GATE_COLUMNS} from slack_channel_migration_gates
+      where team_id = $1 and raw_channel_id = $2 for update`,
+    [scope.teamId, scope.rawChannelId]
+  );
+  const gateRow = single(gateResult);
+  if (!gateRow) throw new SlackNamespaceGateError("gate disappeared after ensure");
+  const gate = toGate(gateRow);
+  if (gate.state !== "blocked") return { outcome: "blocked" };
+
+  // This is only a locator for the integration lock, never the decisive candidate-set check.
+  // Discovery can insert a second workspace row until the table SHARE lock below is held.
+  const located = await session.executeSql<ChannelProofRow>(
+    `select workspace_id, binding_integration_id, binding_config_revision,
+            public_state, public_checked_at
+       from slack_sync_channels where team_id = $1 and channel_id = $2`,
+    [scope.teamId, scope.rawChannelId]
+  );
+  if (located.rows.length !== 1) return { outcome: "blocked" };
+  const locator = located.rows[0];
+  if (!locator.binding_integration_id) return { outcome: "blocked" };
+
+  const current = await lockSlackSelection(session, {
+    teamId: scope.teamId,
+    integrationId: locator.binding_integration_id,
+  });
+  if (current.outcome !== "current") return { outcome: "blocked" };
+  const selection = current.selection;
+  if (!selection.channelIds.includes(scope.rawChannelId)) return { outcome: "blocked" };
+
+  // A row lock on the located channel cannot exclude a different workspace key. SHARE excludes
+  // discovery's INSERT/UPDATE RowExclusive lock until this transaction commits. Rescan AFTER it
+  // is held, so an insertion that won the race is visible and a later one must wait.
+  await session.executeSql("lock table slack_sync_channels in share mode");
+  const candidates = await session.executeSql<ChannelProofRow>(
+    `select workspace_id, binding_integration_id, binding_config_revision,
+            public_state, public_checked_at
+       from slack_sync_channels where team_id = $1 and channel_id = $2`,
+    [scope.teamId, scope.rawChannelId]
+  );
+  if (candidates.rows.length !== 1) return { outcome: "blocked" };
+  const candidate = candidates.rows[0];
+  if (
+    candidate.workspace_id !== locator.workspace_id ||
+    candidate.binding_integration_id !== selection.integrationId
+  ) return { outcome: "blocked" };
+
+  const bindingResult = await session.executeSql<BindingProofRow>(
+    `select id, state, config_revision, token_fingerprint, workspace_id, app_id,
+            selected_channel_ids
+       from slack_integration_bindings
+      where team_id = $1 and integration_id = $2 for update`,
+    [scope.teamId, selection.integrationId]
+  );
+  const binding = single(bindingResult);
+  if (
+    !binding || binding.state !== "verified" || !binding.app_id ||
+    binding.workspace_id !== candidate.workspace_id ||
+    binding.config_revision !== selection.configRevision ||
+    binding.token_fingerprint !== selection.tokenFingerprint ||
+    !binding.selected_channel_ids.includes(scope.rawChannelId)
+  ) return { outcome: "blocked" };
+
+  const channelResult = await session.executeSql<ChannelProofRow>(
+    `select workspace_id, binding_integration_id, binding_config_revision,
+            public_state, public_checked_at
+       from slack_sync_channels
+      where team_id = $1 and workspace_id = $2 and channel_id = $3 for update`,
+    [scope.teamId, binding.workspace_id, scope.rawChannelId]
+  );
+  const channel = single(channelResult);
+  if (
+    !channel || channel.public_state !== "public" || !channel.public_checked_at ||
+    channel.binding_integration_id !== selection.integrationId ||
+    channel.binding_config_revision !== selection.configRevision
+  ) return { outcome: "blocked" };
+
+  // Legacy writers do not take this gate. SHARE protects ONLY this transaction's scan; the
+  // attended rollout must drain old workers before invoking this helper or enabling publication.
+  // Any legacy path in the team can hide this channel behind a display-name slug, so block.
+  await session.executeSql("lock table items in share mode");
+  const legacy = await session.executeSql<{ id: string }>(
+    `select id from items
+      where team_id = $1
+        and (
+          ((path like 'slack/%' or frontmatter->>'source' = 'slack')
+            and path !~ '^slack/[A-Za-z0-9]+/[A-Za-z0-9]+/[0-9]+[.][0-9]{6}[.]md$')
+          or (path ~ '^slack/[A-Za-z0-9]+/[A-Za-z0-9]+/[0-9]+[.][0-9]{6}[.]md$'
+              and lower(split_part(path, '/', 3)) = lower($2))
+        )
+      limit 1`,
+    [scope.teamId, scope.rawChannelId]
+  );
+  if (legacy.rows.length !== 0) return { outcome: "blocked" };
+
+  const proof = await session.executeSql<{ id: string }>(
+    `insert into slack_namespace_readiness_proofs
+       (team_id, raw_channel_id, gate_revision, workspace_id, integration_id,
+        binding_id, config_revision, public_checked_at, legacy_rows_found)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, 0) returning id`,
+    [scope.teamId, scope.rawChannelId, gate.revision, binding.workspace_id,
+      selection.integrationId, binding.id, selection.configRevision, channel.public_checked_at]
+  );
+  const proofId = single(proof)?.id;
+  if (!proofId) throw new SlackNamespaceGateError("completed proof insert returned no identity");
+  const written = await session.executeSql<GateRow>(
+    `update slack_channel_migration_gates
+        set state = 'ready', ready_revision = revision, resolved_workspace_ids = array[$3]::text[],
+            completed_repair_id = $4::uuid, blocked_reason = null, updated_at = clock_timestamp()
+      where team_id = $1 and raw_channel_id = $2 and state = 'blocked' and revision = $5
+      returning ${GATE_COLUMNS}`,
+    [scope.teamId, scope.rawChannelId, binding.workspace_id, proofId, gate.revision]
+  );
+  const ready = single(written);
+  if (!ready) throw new SlackNamespaceGateError("locked gate changed before readiness write");
+  return { outcome: "ready", gate: toGate(ready) };
+}
+
+/**
  * Invalidate this channel's namespace readiness: bump the revision, clear every proof field, record
  * a sanitized reason — creating the gate blocked if it does not exist yet.
  *
@@ -395,7 +539,7 @@ export async function lockReadySlackNamespaceGate(
 }
 
 /** One row or none. More than one would mean the primary key is not doing its job. */
-function single(result: SqlQueryResult<GateRow>): GateRow | undefined {
+function single<T>(result: SqlQueryResult<T>): T | undefined {
   if (result.rows.length > 1) {
     throw new SlackNamespaceGateError(`expected at most one row, got ${result.rows.length}`);
   }
