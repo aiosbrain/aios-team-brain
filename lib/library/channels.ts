@@ -1,12 +1,17 @@
 /**
  * Pure helpers for the "Data" page (channel inspector). A *channel* is the source stream an item
- * arrived on, derived from the first two segments of its `path` (`slack/eng`, `linear/aio`,
- * `github/acme-app`, `plane/eng`). Grouping by path prefix gives per-Slack-channel granularity
- * (all Slack shares one brain project, so project-grouping would lump channels together).
+ * arrived on, derived from its `path` (`slack/<workspace>/<channel>` for scoped Slack,
+ * `slack/<channel>` for legacy Slack, and the first two segments for other sources).
  *
  * No DB access here — the page fetches `items` (through the `visibleItems` tier choke-point) and
  * feeds rows in. Kept pure so the grouping/freshness/preview rules are unit-tested.
  */
+
+import { parseSlackItemPath, scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
+
+// Two adjacent slashes cannot be produced by the non-Slack first-two-segment key parser,
+// which drops empty segments. This keeps malformed Slack rows distinct from arbitrary paths.
+const UNRECOGNIZED_SLACK_PREFIX = "unrecognized-slack://";
 
 export interface ChannelRow {
   path: string;
@@ -24,20 +29,57 @@ export interface ChannelRow {
 }
 
 export interface Channel {
-  key: string; // "slack/eng" — also the path prefix used to query the feed (`<key>/%`)
+  key: string; // path prefix (or a distinct key for an unrecognized Slack item)
   source: string; // "slack"
   name: string; // "eng"
   count: number;
   lastSyncedAt: string;
 }
 
-/** `slack/eng/123.md` → { key: "slack/eng", source: "slack", name: "eng" }. `key` stays the PATH
- *  prefix (it's also the feed query `<key>/%`); only the display `name` may be overridden by a label. */
+/** Only the shared exact parser may assign a Slack channel identity. Invalid Slack paths remain
+ * individually inspectable, without guessing a workspace or merging them into a valid channel. */
 export function parseChannel(path: string): { key: string; source: string; name: string } {
+  const slack = parseSlackItemPath(path);
+  if (slack?.kind === "scoped" &&
+      scopedSlackItemPath(slack.workspaceSegment, slack.channelSegment, slack.rootTs) === path) {
+    return {
+      key: `slack/${slack.workspaceSegment}/${slack.channelSegment}`,
+      source: "slack",
+      name: slack.channelSegment,
+    };
+  }
+  if (slack?.kind === "legacy") {
+    return { key: `slack/${slack.channelSegment}`, source: "slack", name: slack.channelSegment };
+  }
   const segs = path.split("/").filter(Boolean);
+  if (segs[0] === "slack" || path.startsWith("slack/")) {
+    return { key: `${UNRECOGNIZED_SLACK_PREFIX}${path}`, source: "unknown", name: path };
+  }
   if (segs.length >= 2) return { key: `${segs[0]}/${segs[1]}`, source: segs[0], name: segs[1] };
   const only = segs[0] ?? path;
   return { key: only, source: only, name: only };
+}
+
+/** The unknown-path key is deliberately outside the valid Slack key space. */
+export function channelExactPath(key: string): string {
+  return key.startsWith(UNRECOGNIZED_SLACK_PREFIX) ? key.slice(UNRECOGNIZED_SLACK_PREFIX.length) : key;
+}
+
+/** PostgreSQL LIKE treats `%`, `_` and `\\` specially. Escape the literal channel prefix before
+ * adding its one trailing wildcard; the feed also checks parsed keys after each bounded batch. */
+export function channelFeedPattern(key: string): string {
+  return `${key.replace(/[\\%_]/g, (char) => `\\${char}`)}/%`;
+}
+
+/** The final feed boundary: legacy and scoped Slack prefixes can overlap in SQL, but never here. */
+export function belongsToChannel(path: string, key: string): boolean {
+  return parseChannel(path).key === key;
+}
+
+/** Keep only the filename relative to the selected channel, including the scoped Slack segment. */
+export function channelFeedFilename(path: string, key: string): string {
+  const prefix = `${key}/`;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
 
 /** Normalize a timestamptz value (Date from the pg adapter, or an ISO string) to an ISO string. */
@@ -54,7 +96,7 @@ export function groupChannels(rows: ChannelRow[]): Channel[] {
   const labelAt = new Map<string, number>();
   for (const row of rows) {
     const { key, source, name } = parseChannel(row.path);
-    const label = row.label?.trim() || "";
+    const label = source === "unknown" ? "" : row.label?.trim() || "";
     const syncedAt = isoOf(row.synced_at);
     const ms = Date.parse(syncedAt);
     const existing = byKey.get(key);
