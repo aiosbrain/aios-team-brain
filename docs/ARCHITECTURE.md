@@ -432,7 +432,7 @@ unversioned `/api/brain/*` + `/api/dashboard/*` surfaces; `GET /api/v1/timeline`
 and `GET /api/v1/tasks` still discards its computed `truncated` (both need a brain-api bump, so they are
 deliberately not in this change).
 
-This server **implements brain-api v1.26** (the shipped member-facing wire contract; source of truth:
+This server **implements brain-api v1.27** (the shipped member-facing wire contract; source of truth:
 `aios-workspace/docs/brain-api.md`; see the v1.14 by-key lookup on
 `GET /api/v1/tasks` below; v1.8 added the subscriptions endpoint,
 `POST /api/v1/subscriptions`; the optional `context_health` object on `POST /api/v1/metrics`,
@@ -448,7 +448,7 @@ request-admission supplement** for `POST /api/v1/codebases` — canonical
 `aios-workspace/docs/contract/codebase-request-limits-v1.json`, vendored and sha256-pinned at
 `test/fixtures/contract/codebase-request-limits-v1.json`, carrying its own `revision: 1` and
 `appliesFromMemberApiVersion: "1.23"`. The effective contract is therefore *the published payload
-shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.26** with the separate finding intake endpoint; the admission
+shape plus this admission supplement*, and the two move independently. `BRAIN_API_VERSION` is **1.27** (1.26 added the separate finding intake endpoint; 1.27 adds `POST /api/v1/evidence/search`); the admission
 supplement remains independently versioned and does not itself bump the member API version. A limit is a **resource-admission** change, and the canonical change
 policy names that as an explicit exception to "breaking semantics go to /v2" — precedent: the 1.20
 `rows` cap and the dated 2026-06-19 same-route full-metrics tightening. (That exception and the
@@ -1890,9 +1890,12 @@ error and partial cues coexist. V1/v2/absent census is unknown, measured zero is
 explicit, and required completeness never implies all-check completeness. Producer
 emission remains disabled until the separate production acceptance gate.
 
-The member conformance snapshot is now the full Workspace member API 1.26 contract,
-vendored from Workspace merge `ce28fa75e6cbe35d7d7e3c9d9620e82cecd31255` (document
-revision 1.28). Its availability metadata identifies implemented Brain commit
+The member conformance snapshot is now the full Workspace member API 1.27 contract,
+vendored from Workspace merge `73ed9c33c2e8e39d575c361572ca875754aa91ec` (document
+revision 1.29, which adds `POST /api/v1/evidence/search`; the fixture's semantic keys are
+unchanged from 1.26 — only `version` and `contentHash` move). The debt intake section keeps
+its own `version: "1.26"`, the member version that introduced it. Its availability metadata
+identifies implemented Brain commit
 `87be1293dd8338dde953020c757bad336f2da9b4`; deployment and activation still require
 verification in each target environment, with no production availability claim. Scanner payloads
 remain independently pinned to `codebase-payload-1.25`; gateway remains 1.10.
