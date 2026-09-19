@@ -350,6 +350,9 @@ export async function bindSlackSelection(
  * bots.info fallback is still owed" — so a bots.info the budget delayed is resumed on the next wake
  * WITHOUT re-running auth.test, which is the difference between finishing bootstrap under a
  * one-request-per-minute budget and never finishing it at all.
+ * A matched write also inserts the workspace as auth.test evidence in this same caller
+ * transaction. An unmatched (stale) ref records nothing. These observations are not a complete
+ * historical census: workspaces rotated or deleted before this writer existed remain unknown.
  */
 export async function recordSlackWorkspaceIdentity(
   session: TransactionSession,
@@ -396,6 +399,15 @@ export async function recordSlackWorkspaceIdentity(
       identity.workspaceUrl,
     ]
   );
+  if (result.rows.length > 0) {
+    await session.executeSql(
+      `insert into slack_workspace_observations
+              (team_id, integration_id, workspace_id, provenance_kind)
+            values ($1, $2::uuid, $3, 'auth_test')
+       on conflict (team_id, integration_id, workspace_id) do nothing`,
+      [ref.teamId, ref.integrationId, identity.workspaceId]
+    );
+  }
   return written(result);
 }
 

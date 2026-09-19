@@ -51,6 +51,7 @@ const DATA_TABLES = [
   "slack_thread_snapshots",
   "slack_channel_migration_gates",
   "slack_namespace_readiness_proofs",
+  "slack_workspace_observations",
   "slack_method_budgets",
   "slack_sync_channels",
   "slack_integration_bindings",

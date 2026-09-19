@@ -1653,7 +1653,7 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 `groups` · `group_members` · `project_groups` · `agent_tokens` ·
 `project_context_units` · `project_context_memberships` · `connector_cursors` ·
 `slack_messages` · `slack_team_state` · `slack_sync_threads` · `slack_thread_snapshots` ·
-`slack_channel_migration_gates` · `slack_namespace_readiness_proofs` · `slack_method_budgets` · `slack_integration_bindings` · `slack_sync_channels`
+`slack_channel_migration_gates` · `slack_namespace_readiness_proofs` · `slack_method_budgets` · `slack_integration_bindings` · `slack_workspace_observations` · `slack_sync_channels`
 
 <!-- /drift:tables -->
 

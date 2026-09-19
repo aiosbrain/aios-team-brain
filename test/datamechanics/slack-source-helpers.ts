@@ -55,7 +55,7 @@ export async function closeRawSql(): Promise<void> {
 
 /**
  * A reused per-worktree container is schema-loaded only when it is CREATED (`scripts/dm-isolated.sh`),
- * so one that predates this change silently lacks both new tables — and every test below would fail
+ * so one that predates this change silently lacks a source table — and tests would fail
  * with a relation error that reads like a product bug. Say what it actually is, once, up front.
  */
 export async function requireSlackSourceTables(): Promise<void> {
@@ -63,11 +63,11 @@ export async function requireSlackSourceTables(): Promise<void> {
   const { rows } = await c.query<{ tablename: string }>(
     `select tablename from pg_tables
       where schemaname = 'public' and tablename = any($1::text[])`,
-    [["slack_integration_bindings", "slack_sync_channels"]]
+    [["slack_integration_bindings", "slack_sync_channels", "slack_workspace_observations"]]
   );
-  if (rows.length !== 2) {
+  if (rows.length !== 3) {
     throw new Error(
-      "slack_integration_bindings / slack_sync_channels are missing from the test database. The dm " +
+      "Slack source tables (including slack_workspace_observations) are missing from the test database. The dm " +
         "container loads the schema only when it is created — re-run with AIOS_DM_RESET=1 " +
         "npm run test:datamechanics:iso <file>"
     );
@@ -239,6 +239,17 @@ export async function bindingRow(teamId: string, integrationId: string): Promise
     [teamId, integrationId]
   );
   return rows[0] ?? null;
+}
+
+export async function workspaceObservationRows(teamId: string, integrationId?: string): Promise<Row[]> {
+  const c = await rawSql();
+  const { rows } = await c.query<Row>(
+    `select * from slack_workspace_observations
+      where team_id = $1 and ($2::uuid is null or integration_id = $2::uuid)
+      order by integration_id, workspace_id`,
+    [teamId, integrationId ?? null]
+  );
+  return rows;
 }
 
 export async function integrationRow(integrationId: string): Promise<Row | null> {
