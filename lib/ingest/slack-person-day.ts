@@ -1,4 +1,7 @@
+import type { SlackCreditSelection } from "@/lib/attribution/contributor-credit";
+import { lookupSlackAccount, type SlackAccountMapping } from "@/lib/identity/resolve";
 import type { VisibleSlackMessage } from "./slack-message-read";
+import { parseSlackTimestamp } from "./sources/slack-message-evidence";
 
 /** One eligible source message, retained so a later authorized view can build a source link. */
 export interface SlackPersonDayMessage {
@@ -25,7 +28,7 @@ export interface SlackPersonDay {
 }
 
 /** Return null for unmapped or ambiguous accounts. Errors propagate; no other identity is tried. */
-export type ResolveSlackAuthor = (qualifiedAuthorId: string) => string | null;
+export type ResolveSlackAuthor = (qualifiedAuthorId: string, verifiedWorkspaceId: string) => string | null;
 
 function compare(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
@@ -48,7 +51,7 @@ export function projectSlackPersonDays(
 
   for (const message of messages) {
     if (!UTC_MICROSECOND.test(message.occurredAt) ||
-        !Number.isFinite(Date.parse(message.occurredAt)) ||
+        parseSlackTimestamp(message.messageTs)?.iso !== message.occurredAt ||
         !message.itemId || !message.workspaceId || !message.channelId ||
         !message.rootTs || !message.messageTs || !message.authorExternalId) {
       throw new Error("slack person-day: invalid source message");
@@ -72,7 +75,7 @@ export function projectSlackPersonDays(
     }
     seen.set(sourceKey, fingerprint);
 
-    const memberId = resolveAuthor(`${message.workspaceId}:${message.authorExternalId}`);
+    const memberId = resolveAuthor(`${message.workspaceId}:${message.authorExternalId}`, message.workspaceId);
     if (!memberId) continue;
     const day = message.occurredAt.slice(0, 10);
     const id = JSON.stringify([message.itemId, memberId, day]);
@@ -96,4 +99,58 @@ export function projectSlackPersonDays(
   })).sort((a, b) =>
     compare(b.day, a.day) || compare(b.at, a.at) ||
     compare(a.sourceItemId, b.sourceItemId) || compare(a.memberId, b.memberId));
+}
+
+export interface SlackScopedPersonDayInput {
+  teamId: string;
+  /** A completed readVisibleSlackMessages result for item IDs authorized by the current
+   * visibility oracle. This pure adapter does not authorize items or recover failed pages. */
+  visibleMessages: readonly VisibleSlackMessage[];
+  /** Current team-scoped live identity snapshot, read with the current human roster. */
+  mappings: readonly SlackAccountMapping[];
+  humanMemberIds: ReadonlySet<string>;
+  /** Completed shared selector/composition result per item. An absent entry excludes that item. */
+  creditByItem: ReadonlyMap<string, SlackCreditSelection>;
+}
+
+function validSelection(value: unknown): value is SlackCreditSelection {
+  if (typeof value !== "object" || value === null) return false;
+  const selection = value as Partial<SlackCreditSelection>;
+  if (selection.kind !== "verified_message_ledger_present" &&
+      selection.kind !== "structured_participants_present" &&
+      selection.kind !== "legacy_partial") return false;
+  if (!Object.prototype.hasOwnProperty.call(selection, "creditIds")) return false;
+  if (selection.creditIds === null) return true;
+  const credit = selection.creditIds;
+  return typeof credit === "object" && credit !== null &&
+    Array.isArray(credit.contributorIds) &&
+    credit.contributorIds.every((id: unknown) => typeof id === "string" && id.length > 0) &&
+    (credit.primaryId === null || typeof credit.primaryId === "string" && credit.primaryId.length > 0);
+}
+
+/** Factual source-message days limited by the shared item credit decision. A correction lock
+ * therefore suppresses other authors; it never assigns their source messages to the owner.
+ * The future caller must authorize source items and revalidate visibility/generations at publish. */
+export function projectScopedSlackPersonDays(input: SlackScopedPersonDayInput): SlackPersonDay[] {
+  if (!input || typeof input.teamId !== "string" || !input.teamId ||
+      !Array.isArray(input.visibleMessages) || !Array.isArray(input.mappings) ||
+      !(input.humanMemberIds instanceof Set) || !(input.creditByItem instanceof Map)) {
+    throw new TypeError("slack person-day: incomplete projection input");
+  }
+  for (const [itemId, selection] of input.creditByItem) {
+    if (typeof itemId !== "string" || !itemId || !validSelection(selection)) {
+      throw new TypeError("slack person-day: invalid credit selection");
+    }
+  }
+
+  const days = projectSlackPersonDays(input.visibleMessages, (qualifiedAuthorId, verifiedWorkspaceId) => {
+    const result = lookupSlackAccount({ teamId: input.teamId, externalId: qualifiedAuthorId,
+      verifiedItemWorkspaceId: verifiedWorkspaceId, mappings: input.mappings });
+    return result.memberId && input.humanMemberIds.has(result.memberId) ? result.memberId : null;
+  });
+  return days.filter((day) => {
+    const selection = input.creditByItem.get(day.sourceItemId);
+    return selection?.kind === "verified_message_ledger_present" &&
+      (selection.creditIds?.contributorIds.includes(day.memberId) ?? false);
+  });
 }

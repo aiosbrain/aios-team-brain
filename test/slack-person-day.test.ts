@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { projectSlackPersonDays } from "@/lib/ingest/slack-person-day";
+import { selectSlackCreditIds, type SlackCreditSelection } from "@/lib/attribution/contributor-credit";
+import type { SlackAccountMapping } from "@/lib/identity/resolve";
+import { projectScopedSlackPersonDays, projectSlackPersonDays,
+  type SlackScopedPersonDayInput } from "@/lib/ingest/slack-person-day";
 import type { VisibleSlackMessage } from "@/lib/ingest/slack-message-read";
 
 const rootTs = "1718841599.999999";
@@ -102,5 +105,162 @@ describe("inactive Slack message to person-day projection", () => {
       .toThrow("conflicting source message");
     expect(() => projectSlackPersonDays([a, { ...b, rootTs: "other-root" }], resolve))
       .toThrow("conflicting thread identity");
+  });
+
+  it("rejects a persisted instant that disagrees with the source timestamp", () => {
+    expect(() => projectSlackPersonDays([
+      message(rootTs, "2024-06-20T00:00:00.000000Z", "U1"),
+    ], resolve)).toThrow("invalid source message");
+  });
+});
+
+const TEAM = "team-1";
+const A = "member-1";
+const B = "member-2";
+const C = "member-3";
+
+function mapping(externalId: string, memberId: string,
+  changes: Partial<SlackAccountMapping> = {}): SlackAccountMapping {
+  return { teamId: TEAM, provider: "slack", externalId, memberId, state: "live", ...changes };
+}
+
+function selection(authors: readonly (string | null)[],
+  locked = false, owner: string | null = null): SlackCreditSelection {
+  return selectSlackCreditIds({ locked, currentMemberId: owner,
+    messageLedger: { status: "present", resolvedHumanMemberIds: authors },
+    participants: { status: "absent" }, legacyVersionMemberIds: [], legacyLatestWorkerId: null });
+}
+
+function scoped(overrides: Partial<SlackScopedPersonDayInput> = {}): SlackScopedPersonDayInput {
+  return {
+    teamId: TEAM,
+    visibleMessages: [
+      message(rootTs, rootAt, "U1"),
+      message("1718841600.000001", "2024-06-20T00:00:00.000001Z", "U2"),
+      message("1718841600.000002", "2024-06-20T00:00:00.000002Z", "U3"),
+      message("1719014400.000001", "2024-06-22T00:00:00.000001Z", "U3"),
+    ],
+    mappings: [mapping("T1:U1", A), mapping("T1:U2", A), mapping("T1:U3", B)],
+    humanMemberIds: new Set([A, B, C]),
+    creditByItem: new Map([["item-1", selection([A, A, B, B])]]),
+    ...overrides,
+  };
+}
+
+describe("inactive team-scoped factual Slack person-days", () => {
+  it("keeps each actual author's UTC days, merges qualified accounts, and sorts independent of input order", () => {
+    const input = scoped();
+    const days = projectScopedSlackPersonDays(input);
+    expect(days.map((day) => [day.day, day.memberId, day.messageCount, day.rootAuthored])).toEqual([
+      ["2024-06-22", B, 1, false],
+      ["2024-06-20", B, 1, false],
+      ["2024-06-20", A, 1, false],
+      ["2024-06-19", A, 1, true],
+    ]);
+    expect(days[0].at).toBe("2024-06-22T00:00:00.000001Z");
+    expect(projectScopedSlackPersonDays({ ...input,
+      visibleMessages: [...input.visibleMessages].reverse(), mappings: [...input.mappings].reverse(),
+    })).toEqual(days);
+
+    const sameMember = projectScopedSlackPersonDays(scoped({ visibleMessages: [
+      message("1718841600.000001", "2024-06-20T00:00:00.000001Z", "U1"),
+      message("1718841600.000002", "2024-06-20T00:00:00.000002Z", "U2"),
+    ] }));
+    expect(sameMember).toMatchObject([{ memberId: A, day: "2024-06-20", messageCount: 2 }]);
+    expect(sameMember[0].messages.map((entry) => entry.messageTs))
+      .toEqual(["1718841600.000001", "1718841600.000002"]);
+  });
+
+  it("uses only exact live account mappings in the source workspace and current human roster", () => {
+    const input = scoped({
+      visibleMessages: [
+        message(rootTs, rootAt, "U1"),
+        message("1718841600.000001", "2024-06-20T00:00:00.000001Z", "U2"),
+        message("1718841600.000002", "2024-06-20T00:00:00.000002Z", "U3"),
+        message("1718841600.000003", "2024-06-20T00:00:00.000003Z", "U4"),
+        message("1718841600.000004", "2024-06-20T00:00:00.000004Z", "U5"),
+        message("1718841600.000005", "2024-06-20T00:00:00.000005Z", "U6"),
+        message("1718841600.000006", "2024-06-20T00:00:00.000006Z", "U7"),
+        message("1718841600.000007", "2024-06-20T00:00:00.000007Z", "U8"),
+      ],
+      mappings: [mapping("T2:U1", A), mapping("T1:U1", A, { state: "archived" }),
+        mapping("U2", A), mapping("T1:U3", A), mapping("T1:U3", A),
+        mapping("t1:U4", A), mapping("T1:U5", A, { provider: "Slack" }),
+        mapping("T1:U6", A, { teamId: "other-team" }),
+        mapping("T1:U7", "connector"), mapping("T1:U8", A)],
+      creditByItem: new Map([["item-1", selection([A])]]),
+    });
+    const days = projectScopedSlackPersonDays(input);
+    expect(days).toMatchObject([{ memberId: A, messageCount: 1,
+      messages: [{ messageTs: "1718841600.000007" }] }]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      mappings: [...input.mappings, mapping("T1:U8", A, { externalId: "t1:u8" })],
+    })).toEqual([]);
+  });
+
+  it("requires selected credit for the same source item and never borrows another item's credit", () => {
+    const input = scoped({ visibleMessages: [message(rootTs, rootAt, "U1"),
+      message(rootTs, rootAt, "U1", { itemId: "item-2", channelId: "C2" })] });
+    expect(projectScopedSlackPersonDays(input).map((day) => day.sourceItemId)).toEqual(["item-1"]);
+    expect(projectScopedSlackPersonDays({ ...input, creditByItem: new Map() })).toEqual([]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      creditByItem: new Map([["item-1", selection([])]]),
+    })).toEqual([]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      creditByItem: new Map([["item-1", selection([B])]]),
+    })).toEqual([]);
+  });
+
+  it("never presents legacy or participant credit as verified message-day evidence", () => {
+    const input = scoped();
+    for (const kind of ["structured_participants_present", "legacy_partial"] as const) {
+      expect(projectScopedSlackPersonDays({ ...input,
+        creditByItem: new Map([["item-1", { kind, creditIds: { contributorIds: [A, B], primaryId: A } }]]),
+      })).toEqual([]);
+    }
+  });
+
+  it("uses each visible item's source workspace and never emits an item absent from visible evidence", () => {
+    const t1 = message(rootTs, rootAt, "U1");
+    const t2 = message(rootTs, rootAt, "U1", { itemId: "item-2", workspaceId: "T2", channelId: "C2" });
+    const input = scoped({ visibleMessages: [t1, t2],
+      mappings: [mapping("T1:U1", A), mapping("T2:U1", B)],
+      creditByItem: new Map([["item-1", selection([A])], ["item-2", selection([B])]]),
+    });
+    expect(projectScopedSlackPersonDays(input).map((day) =>
+      [day.sourceItemId, day.workspaceId, day.memberId])).toEqual([
+      ["item-1", "T1", A], ["item-2", "T2", B],
+    ]);
+    expect(projectScopedSlackPersonDays({ ...input, visibleMessages: [t1] })
+      .map((day) => day.sourceItemId)).toEqual(["item-1"]);
+  });
+
+  it("honors a correction lock only on the corrected owner's actual message days", () => {
+    const input = scoped({ creditByItem: new Map([["item-1", selection([A, A, B], true, B)]]) });
+    expect(projectScopedSlackPersonDays(input).map((day) => [day.day, day.memberId]))
+      .toEqual([["2024-06-22", B], ["2024-06-20", B]]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      creditByItem: new Map([["item-1", selection([A, A, B], true, C)]]),
+    })).toEqual([]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      creditByItem: new Map([["item-1", selection([A, A, B], true, null)]]),
+    })).toEqual([]);
+    expect(projectScopedSlackPersonDays({ ...input,
+      creditByItem: new Map([["item-1", selection([A, A, B])]]),
+    }).map((day) => day.memberId)).toEqual([B, B, A, A]);
+  });
+
+  it("rejects incomplete upstream arrays and malformed selections instead of treating them as empty", () => {
+    const input = scoped();
+    expect(() => projectScopedSlackPersonDays({ ...input,
+      visibleMessages: undefined as unknown as VisibleSlackMessage[],
+    })).toThrow("incomplete projection input");
+    for (const invalid of [undefined, { status: "failed" }, { kind: "legacy_partial" },
+      { kind: "verified_message_ledger_present", creditIds: undefined },
+      { kind: "verified_message_ledger_present", creditIds: { contributorIds: null, primaryId: A } }]) {
+      expect(() => projectScopedSlackPersonDays({ ...input,
+        creditByItem: new Map([["item-1", invalid as SlackCreditSelection]]),
+      })).toThrow("invalid credit selection");
+    }
   });
 });
