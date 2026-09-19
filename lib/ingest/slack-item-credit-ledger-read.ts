@@ -4,7 +4,8 @@ import { withTransaction } from "@/lib/db/pg/tx";
 import type { SqlExecutor } from "@/lib/db/types";
 import { parseSlackTimestamp } from "./sources/slack-message-evidence";
 
-const PAGE_SIZE = 512;
+export const SLACK_CREDIT_READ_PAGE_SIZE = 512;
+const PAGE_SIZE = SLACK_CREDIT_READ_PAGE_SIZE;
 const MAX_ITEM_IDS = 512;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Match the shared Slack account lookup's exact USER component syntax.
@@ -29,6 +30,11 @@ export type SlackItemCreditLedger =
   | { itemId: string; status: "absent" }
   | { itemId: string; status: "present"; authors: SlackItemCreditAuthor[] };
 
+export interface SlackItemCreditReadOptions {
+  pageSize?: number;
+  afterPage?: (pageNumber: number, query: SqlExecutor) => Promise<void>;
+}
+
 type StoredRow = {
   id: string;
   itemId: string;
@@ -48,12 +54,12 @@ type StoredRow = {
  * from every scoped message row, including deleted and excluded rows. No access or credit decision
  * is made here; a future caller must authorize the items and resolve current account mappings.
  */
-export async function readSlackItemCreditLedger(
+/** Shared pre-transaction validation for the standalone and atomic snapshot readers. */
+export function validateSlackItemCreditRequest(
   teamId: string,
   itemIds: readonly string[] | ReadonlySet<string>,
-  // Test seam for committed writes and failures between pages of one snapshot.
-  options: { pageSize?: number; afterPage?: (pageNumber: number, query: SqlExecutor) => Promise<void> } = {}
-): Promise<SlackItemCreditLedger[]> {
+  pageSizeInput?: number
+): { requested: string[]; pageSize: number } {
   if (typeof teamId !== "string" || !UUID.test(teamId)) {
     throw new TypeError("slack item credit ledger: invalid team ID");
   }
@@ -67,19 +73,23 @@ export async function readSlackItemCreditLedger(
   if (supplied.some((id) => typeof id !== "string" || !UUID.test(id))) {
     throw new TypeError("slack item credit ledger: invalid item ID");
   }
-  const pageSize = options.pageSize === undefined ? PAGE_SIZE : options.pageSize;
+  const pageSize = pageSizeInput === undefined ? PAGE_SIZE : pageSizeInput;
   if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > PAGE_SIZE) {
     throw new RangeError("slack item credit ledger: invalid page size");
   }
   const requested = [...new Set(supplied.map((id) => id.toLowerCase()))];
+  return { requested, pageSize };
+}
 
-  return withTransaction(async (client) => {
-    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+/** The caller owns a read-only repeatable-read transaction. No partial ledger escapes on failure. */
+export async function readSlackItemCreditLedgerInSession(
+  query: SqlExecutor,
+  teamId: string,
+  requested: readonly string[],
+  pageSize: number,
+  afterPage?: SlackItemCreditReadOptions["afterPage"]
+): Promise<SlackItemCreditLedger[]> {
     if (requested.length === 0) return [];
-    const query: SqlExecutor = async <T>(sql: string, params: unknown[] = []) => {
-      const page = await client.query(sql, params);
-      return { rows: page.rows as T[], rowCount: page.rowCount ?? 0 };
-    };
     const byItem = new Map<string, SlackItemCreditAuthor[] | null>(requested.map((id) => [id, null]));
     const bindings = new Map<string, Pick<StoredRow, "workspaceId" | "channelId" | "rootTs">>();
     let cursor: string | null = null;
@@ -126,7 +136,7 @@ export async function readSlackItemCreditLedger(
       }
       if (page.rows.length < pageSize) break;
       cursor = page.rows[page.rows.length - 1].id;
-      await options.afterPage?.(++pageNumber, query);
+      await afterPage?.(++pageNumber, query);
     }
     return requested.map((itemId): SlackItemCreditLedger => {
       const authors = byItem.get(itemId);
@@ -136,5 +146,21 @@ export async function readSlackItemCreditLedger(
         compareText(a.messageTs, b.messageTs));
       return { itemId, status: "present", authors };
     });
+}
+
+export async function readSlackItemCreditLedger(
+  teamId: string,
+  itemIds: readonly string[] | ReadonlySet<string>,
+  // Test seam for committed writes and failures between pages of one snapshot.
+  options: SlackItemCreditReadOptions = {}
+): Promise<SlackItemCreditLedger[]> {
+  const { requested, pageSize } = validateSlackItemCreditRequest(teamId, itemIds, options.pageSize);
+  return withTransaction(async (client) => {
+    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    const query: SqlExecutor = async <T>(sql: string, params: unknown[] = []) => {
+      const page = await client.query(sql, params);
+      return { rows: page.rows as T[], rowCount: page.rowCount ?? 0 };
+    };
+    return readSlackItemCreditLedgerInSession(query, teamId, requested, pageSize, options.afterPage);
   });
 }
