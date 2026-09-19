@@ -731,6 +731,17 @@ existing **120 pushes/min per key** rate limit on an already-authenticated princ
 single-org deployment — a real but small increase in blast radius, taken so legitimate imports stop
 failing.
 
+### Evidence search — `POST /api/v1/evidence/search`
+
+The route authenticates member/delegated credentials, enforces a dedicated 30/minute
+bucket and obtains the live visible-item set. `lib/query/evidence.ts` reuses the
+shared FTS term builder and ranked SQL search with project/visibility predicates
+before ranking and LIMIT. It resolves only the selected source attribution signals
+against same-team identity records; it never treats a connector as an author.
+`lib/query/evidence-format.ts` builds valid JSON under 20,000 characters, disclosing
+excerpt/result omissions. Lookup errors remain errors. No graph, external model,
+conversation or corpus write occurs; duration/count diagnostics omit source text.
+
 ### Grounded query — `POST /api/v1/query` (SSE)
 
 ```mermaid
@@ -1573,6 +1584,7 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url with the full `slack-personal` user-scope set (including matched conversation read/history scopes and `files:write`; signed short-TTL state JWT; CSRF/replay guard)
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
+- `POST /api/v1/evidence/search` — bounded native FTS passages with recorded contributors; live member/delegated visibility, no answer generation
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`); persists the thread (`conversation_id`)
 - `GET /api/v1/conversations` — API-key list of the key member's own chat threads (owner-scoped)
 - `GET /api/v1/conversations/:id` — API-key read of a thread's messages (owner-only)
