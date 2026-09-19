@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { runSql } from "@/lib/db/pg/pool";
 import { ITEM_LIMIT } from "@/lib/dashboard/work-timeline";
 import { readVisibleSlackMessages } from "@/lib/ingest/slack-message-read";
+import { projectSlackPersonDays } from "@/lib/ingest/slack-person-day";
 import { ingest, seedTeam } from "./helpers";
 
 const SINCE = new Date("2024-06-20T00:00:00.000Z");
@@ -48,6 +49,72 @@ async function insertFlood(teamId: string, itemId: string, workspace: string, fi
 }
 
 describe("inactive visible Slack message read on real Postgres", () => {
+  it("projects a long-running thread's recent replies on their actual UTC days through the reader", async () => {
+    const seed = await seedTeam();
+    const visible = await item(seed, "long-thread-projection");
+    const root = "1700000000.000001";
+    await insertMessage({ teamId: seed.teamId, itemId: visible, ts: root,
+      at: "2023-11-14T22:13:20.000001Z", workspace: "TLONG", channel: "CLONG", author: "UROOT" });
+    const replies = [
+      ["1718841599.999999", "2024-06-19T23:59:59.999999Z", "U1"],
+      ["1718841600.000001", "2024-06-20T00:00:00.000001Z", "U1"],
+      ["1718841600.000002", "2024-06-20T00:00:00.000002Z", "U2"],
+      ["1727740800.000001", "2024-10-01T00:00:00.000001Z", "U2"],
+      ["1727740800.000002", "2024-10-01T00:00:00.000002Z", "UUNKNOWN"],
+    ] as const;
+    for (const [ts, at, author] of replies) await insertMessage({ teamId: seed.teamId,
+      itemId: visible, ts, at, rootTs: root, workspace: "TLONG", channel: "CLONG", author });
+    await runSql("update items set synced_at = $2::timestamptz where id = $1::uuid", [
+      visible, "2023-11-15T00:00:00Z",
+    ]);
+    const rows = await readVisibleSlackMessages({ teamId: seed.teamId,
+      since: new Date("2024-06-19T00:00:00Z"), asOf: new Date("2024-10-02T00:00:00Z"),
+      visibleItemIds: new Set([visible]) }, { pageSize: 2 });
+    expect(rows).toHaveLength(5);
+    const seen: string[] = [];
+    const projected = projectSlackPersonDays(rows, (qualified) => {
+      seen.push(qualified);
+      return qualified === "TLONG:U1" || qualified === "TLONG:U2" ? "member-one" : null;
+    });
+    expect(seen).toEqual(["TLONG:U1", "TLONG:U1", "TLONG:U2", "TLONG:U2", "TLONG:UUNKNOWN"]);
+    expect(projected.map((row) => [row.day, row.messageCount, row.at, row.rootAuthored])).toEqual([
+      ["2024-10-01", 1, "2024-10-01T00:00:00.000001Z", false],
+      ["2024-06-20", 2, "2024-06-20T00:00:00.000002Z", false],
+      ["2024-06-19", 1, "2024-06-19T23:59:59.999999Z", false],
+    ]);
+    expect(projected.every((row) => row.sourceItemId === visible && row.rootTs === root &&
+      row.workspaceId === "TLONG" && row.channelId === "CLONG")).toBe(true);
+  });
+
+  it("removes deleted-root authorship without removing live mapped replies", async () => {
+    const seed = await seedTeam();
+    const visible = await item(seed, "deleted-root-projection");
+    const root = "1718841599.999999";
+    await insertMessage({ teamId: seed.teamId, itemId: visible, ts: root,
+      at: "2024-06-19T23:59:59.999999Z", author: "UROOT" });
+    await insertMessage({ teamId: seed.teamId, itemId: visible, ts: "1718841600.000001",
+      rootTs: root, at: "2024-06-20T00:00:00.000001Z", author: "U1" });
+    await insertMessage({ teamId: seed.teamId, itemId: visible, ts: "1718841600.000002",
+      rootTs: root, at: "2024-06-20T00:00:00.000002Z", author: "UAMBIG" });
+    const window = { teamId: seed.teamId,
+      since: new Date("2024-06-19T00:00:00Z"), asOf: new Date("2024-06-21T00:00:00Z"),
+      visibleItemIds: new Set([visible]) };
+    const resolve = (qualified: string) => qualified === "TREAD:U1" ? "member-one" :
+      qualified === "TREAD:UROOT" ? "member-root" : null;
+    const before = projectSlackPersonDays(await readVisibleSlackMessages(window), resolve);
+    expect(before).toHaveLength(2);
+    expect(before[0]).toMatchObject({ day: "2024-06-20", messageCount: 1, rootAuthored: false });
+    expect(before[1]).toMatchObject({ day: "2024-06-19", messageCount: 1, rootAuthored: true,
+      memberId: "member-root" });
+    await runSql("update slack_messages set deleted_at = now() where team_id = $1 and message_ts = $2", [
+      seed.teamId, root,
+    ]);
+    const after = projectSlackPersonDays(await readVisibleSlackMessages(window), resolve);
+    expect(after).toEqual(before.slice(0, 1));
+    expect(after[0].messages).toEqual([{ messageTs: "1718841600.000001",
+      occurredAt: "2024-06-20T00:00:00.000001Z" }]);
+  });
+
   it("does not let more than ITEM_LIMIT old or invisible messages starve an unchanged old thread's recent reply", async () => {
     const seed = await seedTeam();
     const visible = await item(seed, "old-root");
