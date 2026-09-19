@@ -244,7 +244,10 @@ function assertParams(params: SlackRequestParams): void {
 }
 
 /** The paging trio, read off whatever Slack returned. Absent fields are absent, never invented. */
-function readPage(body: Record<string, unknown>): SlackPage {
+function readPage(body: Record<string, unknown>): SlackPage | null {
+  // A present non-boolean must not become false: that would certify a malformed history response as
+  // terminal even when Slack also supplied a continuation cursor.
+  if (body.has_more !== undefined && typeof body.has_more !== "boolean") return null;
   const messages = Array.isArray(body.messages) ? (body.messages as SlackMessage[]) : undefined;
   const metadata = body.response_metadata;
   const rawCursor =
@@ -388,7 +391,11 @@ export async function slackReservedRequest(
       : { outcome: "provider_error", method, category: code };
   }
 
-  return { outcome: "ok", method, body, page: readPage(body) };
+  const page = readPage(body);
+  if (page === null) {
+    return { outcome: "transport_error", method, category: `malformed_response_${response.status}` };
+  }
+  return { outcome: "ok", method, body, page };
 }
 
 /**

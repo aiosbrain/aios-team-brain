@@ -33,6 +33,7 @@ import {
   recordSlackWorkspaceIdentity,
   slackBindingRef,
   type SlackBindingRef,
+  type SlackBindingWrite,
   type SlackSelection,
   type SlackSourceBinding,
 } from "@/lib/ingest/slack-source-binding";
@@ -377,7 +378,8 @@ async function bootstrap(
     const call = await request(pass, "auth", selection, scope, "auth.test", {});
     if (!call) return binding;
     if (call.kind !== "ok") {
-      await reportBindingFailure(pass, "auth", "auth.test", ref, call, selection);
+      const failure = await reportBindingFailure(pass, "auth", "auth.test", ref, call, selection);
+      if (failure.outcome === "written") binding = failure.binding;
       return binding;
     }
     const identity = readAuthTest(call.body);
@@ -420,7 +422,8 @@ async function bootstrap(
     const call = await request(pass, "app", selection, scope, "bots.info", { bot: botId });
     if (!call) return binding;
     if (call.kind !== "ok") {
-      await reportBindingFailure(pass, "app", "bots.info", ref, call, selection);
+      const failure = await reportBindingFailure(pass, "app", "bots.info", ref, call, selection);
+      if (failure.outcome === "written") binding = failure.binding;
       return binding;
     }
     const app = readBotsInfo(call.body, botId);
@@ -905,10 +908,10 @@ async function reportBindingFailure(
   ref: SlackBindingRef,
   call: Exclude<SlackCallDisposition, { readonly kind: "ok" }>,
   selection: SlackSelection
-): Promise<void> {
+): Promise<SlackBindingWrite> {
   const category = sanitize(call.category);
   const blocked = call.kind === "blocked" || call.kind === "refused";
-  await write(pass, selection, ref, (session, r) =>
+  const written = await write(pass, selection, ref, (session, r) =>
     blocked
       ? blockSlackBinding(session, r, { category })
       : delaySlackBinding(session, r, { dueAt: deadline(call), category })
@@ -927,6 +930,7 @@ async function reportBindingFailure(
       : {}),
     ...(deadlineIso(call) ? { nextPermittedAt: deadlineIso(call) as string } : {}),
   });
+  return written;
 }
 
 /** A binding write behind a fresh, locked re-read of the integration row. */

@@ -279,6 +279,31 @@ describe("slackReservedRequest — reserve, commit, then exactly one request", (
     });
   });
 
+  it.each(["true", null, 1])("refuses malformed has_more %s even with a continuation cursor", async (hasMore) => {
+    granted();
+    const { impl } = fetchStub(() =>
+      json({
+        ok: true,
+        messages: [],
+        has_more: hasMore,
+        response_metadata: { next_cursor: "b2Zmc2V0OjE1" },
+      })
+    );
+
+    const result = await slackReservedRequest(
+      { db: fakeDb(), scope: SCOPE, token: TOKEN },
+      "conversations.history",
+      { channel: "C0UNIT001" },
+      { fetchImpl: impl }
+    );
+
+    expect(result).toEqual({
+      outcome: "transport_error",
+      method: "conversations.history",
+      category: "malformed_response_200",
+    });
+  });
+
   it("reads an empty page as provider data, and Slack's empty cursor as no cursor", async () => {
     granted();
     const { impl } = fetchStub(() =>

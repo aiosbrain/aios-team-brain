@@ -163,6 +163,20 @@ describe("the columns this slice may own", () => {
 // ── bootstrap ────────────────────────────────────────────────────────────────
 
 describe("app-identity bootstrap", () => {
+  it("returns the blocked binding written after an auth.test refusal", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const fake = fakeSlack({ "auth.test": () => slackJson({ ok: false, error: "invalid_auth" }) });
+
+    const result = await discover(seed, integrationId, fake);
+
+    expect(result.outcome).toBe("blocked");
+    expect(categories(result, "auth")).toEqual(["blocked:invalid_auth"]);
+    expect(result.binding).toMatchObject({ state: "blocked", errorCode: "invalid_auth" });
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "blocked", error_code: "invalid_auth" });
+    expect(fake.calls.map((call) => call.method)).toEqual(["auth.test"]);
+  });
+
   it("binds from auth.test's own app_id, reads the channel, and enqueues its roots", async () => {
     const seed = await seedTeam();
     const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
@@ -258,13 +272,14 @@ describe("app-identity bootstrap", () => {
       "bots.info": () => slackRateLimited("1"),
     });
 
-    await discover(seed, integrationId, first);
+    const delayed = await discover(seed, integrationId, first);
     expect(first.countOf("auth.test")).toBe(1);
     expect(first.countOf("bots.info")).toBe(1);
     // ⚠️ NOT ONE CHANNEL REQUEST. App identity is unresolved, so conversations.info/history are not
     // reachable — the metadata-only bootstrap exception grants nothing else.
     expect(first.countOf("conversations.info")).toBe(0);
     expect(first.countOf("conversations.history")).toBe(0);
+    expect(delayed.binding).toMatchObject({ state: "pending_app", botId: BOT, errorCode: "rate_limited" });
     expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "pending_app", bot_id: BOT });
 
     await elapse(seed.teamId);
@@ -322,6 +337,7 @@ describe("app-identity bootstrap", () => {
 
     const step = result.steps.find((s) => s.stage === "app");
     expect(step).toMatchObject({ result: "blocked", category: "missing_scope" });
+    expect(result.binding).toMatchObject({ state: "blocked", botId: BOT, errorCode: "missing_scope" });
     // The operator-facing half of a fail-closed diagnostic: which scope actually unblocks it.
     expect(step?.detail).toContain("users:read");
     expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({ state: "blocked" });
