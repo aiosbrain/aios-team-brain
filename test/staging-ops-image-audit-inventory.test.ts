@@ -8,6 +8,7 @@ import {
   readPackageIdentity,
   reconcilePackageInventory,
 } from "../scripts/staging-ops/image-audit/registry.mjs";
+import { classifyPackageMetadata } from "../scripts/staging-ops/image-publication.mjs";
 import { SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { sha256 } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { EXPECTED_REGISTRY_ORIGIN, recipeEvidence } from "../scripts/staging-ops/image-audit/recipe.mjs";
@@ -295,6 +296,59 @@ describe("operator-supplied evidence can satisfy the gate WITHOUT rewriting the 
 
   it("leaves the assessment untouched when no operator evidence exists", () => {
     expect(reconcilePackageInventory(failed, undefined)).toBe(failed);
+  });
+
+  /**
+   * THE HALF OF THE BINDING THAT WAS MISSING. Linkage was compared against reviewed source
+   * (`repositoryLinkage !== REPOSITORY` refuses); visibility was only checked for PRESENCE, so an
+   * operator record stating `public` reconciled to `verified` — an answer the API path it substitutes
+   * for would have REFUSED (`classifyPackageMetadata` confirms only a private package). The operator
+   * route is a substitute for that read, so it must not accept what that read would refuse.
+   */
+  it("refuses an operator inventory that states any visibility but the expected one", () => {
+    // One condition per fixture: the record is the same valid one accepted above, with `visibility`
+    // the only field changed. `Private` is here because the shape check was a lowercase pattern —
+    // a value that merely LOOKS like the expected one is still not it.
+    for (const stated of ["public", "internal", "Private"]) {
+      const reconciled = reconcilePackageInventory(failed, operator({ visibility: stated }), bound);
+      expect(reconciled.status, `visibility ${stated} was accepted`).toBe("unverified");
+      expect(reconciled.operatorEvidence.accepted, stated).toBe(false);
+      const failures = reconciled.operatorEvidence.failures.join(" ");
+      expect(failures, `${stated} failed for another reason`).toContain(
+        "operator evidence does not state the package's visibility as private",
+      );
+      // The reason is written into the PUBLIC reconciliation artifact, so it says what was EXPECTED
+      // and never what was supplied — an operator-controlled string must not reach it.
+      expect(failures, `the refusal echoes the supplied value ${stated}`).not.toContain(stated);
+    }
+  });
+
+  /**
+   * ONE SOURCE, proven by DISCOVERING it rather than by spelling it.
+   *
+   * The expected visibility is not written in this test. It is probed out of `classifyPackageMetadata`
+   * — the API path's own classifier — and the operator path is then required to accept exactly that
+   * value and refuse the others. A second literal pasted into `registry.mjs` passes every other test
+   * in this file and fails this one the moment the single source moves, which is the whole failure
+   * mode "do not paste a second literal" exists to prevent.
+   */
+  it("accepts exactly the visibility the API path would confirm, and refuses the rest", () => {
+    const candidates = ["private", "internal", "public"];
+    const confirmedByApi = candidates.filter((visibility) => (
+      classifyPackageMetadata({ status: 200, body: { visibility, repository: { full_name: SUBJECT.repository } } }).outcome === "confirmed"
+    ));
+    // The probe is only an oracle if it identifies ONE value; two (or none) would make the loop below
+    // assert nothing.
+    expect(confirmedByApi).toHaveLength(1);
+
+    for (const visibility of candidates) {
+      const reconciled = reconcilePackageInventory(failed, operator({ visibility }), bound);
+      const shouldAccept = visibility === confirmedByApi[0];
+      expect(
+        reconciled.operatorEvidence.accepted,
+        `the API path ${shouldAccept ? "confirms" : "refuses"} ${visibility} and the operator path disagrees`,
+      ).toBe(shouldAccept);
+    }
   });
 });
 

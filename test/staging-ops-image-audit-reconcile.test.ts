@@ -318,6 +318,27 @@ describe("the operator supplies ONE dimension, and cannot supply the subject", (
     expect(absent.packageInventory?.status).toBe("unverified");
   });
 
+  /**
+   * The dimension the operator DOES supply still has an expected answer.
+   *
+   * A complete, internally consistent inventory that states the package is PUBLIC used to reconcile
+   * to `clean` / `transitionReady: true` — while the API read it stands in for refuses a public
+   * package outright. Negative and positive control in one case, so "ready" and "not ready" differ
+   * by exactly this field.
+   */
+  it("cannot make the gate ready with a package the API read would have refused as not private", () => {
+    const original = originalAudit();
+    const exposed = reconcile(original, operatorInventory({ visibility: "public" }));
+    expect(exposed.transitionReady).toBe(false);
+    expect(exposed.packageInventory?.status).toBe("unverified");
+    expect(exposed.packageInventory?.operatorEvidence?.accepted).toBe(false);
+
+    // THE POSITIVE CONTROL, on the same original: only `visibility` differs, and it becomes ready.
+    const private_ = reconcile(original, operatorInventory({ visibility: "private" }));
+    expect(private_.transitionReady).toBe(true);
+    expect(private_.packageInventory?.status).toBe("verified");
+  });
+
   it("cannot retarget the audit by naming a different subject", () => {
     const result = reconcile(originalAudit(), operatorInventory({
       subject: { digest: `sha256:${"d".repeat(64)}`, package: SUBJECT.package, sourceRevision: SUBJECT.sourceRevision },

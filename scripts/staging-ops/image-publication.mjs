@@ -36,6 +36,15 @@ export const EXPECTED_WORKFLOW_REF = `${REPOSITORY}/${WORKFLOW_PATH}@${SOURCE_RE
 export const PLATFORM = "linux/amd64";
 export const DOCKERFILE = "docker/staging-ops.Dockerfile";
 export const PACKAGE_METADATA_URL = `https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE}`;
+/**
+ * The ONE visibility a measured package may have for the gate to stand on it — the API path's
+ * `classifyPackageMetadata` and the audit's operator-evidence path both read it from here.
+ *
+ * It is a shared constant rather than a literal in each place because the two paths are SUBSTITUTES
+ * for one another: the operator inventory exists to stand in for the metadata read when that read
+ * fails, so a value one of them accepts and the other refuses is a hole, not a difference.
+ */
+export const EXPECTED_PACKAGE_VISIBILITY = "private";
 
 /**
  * A single-platform, attestation-free build publishes an image MANIFEST. An index/manifest list at
@@ -168,7 +177,9 @@ export function classifyPackageMetadata(response = {}) {
   if (status === 200) {
     const visibility = body?.visibility;
     const linkage = body?.repository?.full_name;
-    if (visibility !== "private") return { outcome: "refused", reason: `package visibility is ${describe(visibility)}, expected private`, visibility, linkage };
+    // The COMPARISON reads the shared constant; the reason's wording is pinned verbatim by
+    // `guard: the publisher is untouched by this change (PUB-06)`, so it stays a literal.
+    if (visibility !== EXPECTED_PACKAGE_VISIBILITY) return { outcome: "refused", reason: `package visibility is ${describe(visibility)}, expected private`, visibility, linkage };
     if (linkage !== REPOSITORY) return { outcome: "refused", reason: `package repository linkage is ${describe(linkage)}, expected ${REPOSITORY}`, visibility, linkage };
     return { outcome: "confirmed", reason: "private and linked to this repository", visibility, linkage };
   }

@@ -14,7 +14,7 @@
  * these functions can issue is a GET — the audit workflow never changes a package's visibility, and
  * the code that would be needed to do so does not exist here.
  */
-import { OWNER, PACKAGE, PACKAGE_METADATA_URL, REPOSITORY, classifyPackageMetadata } from "../image-publication.mjs";
+import { EXPECTED_PACKAGE_VISIBILITY, OWNER, PACKAGE, PACKAGE_METADATA_URL, REPOSITORY, classifyPackageMetadata } from "../image-publication.mjs";
 import { sha256 } from "./layers.mjs";
 
 export const PACKAGE_VERSIONS_URL = `https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE}/versions`;
@@ -146,7 +146,7 @@ export async function readPackageIdentity({ token, fetchImpl = globalThis.fetch 
     status: "verified",
     visibility: classified.visibility,
     linkage: classified.linkage,
-    expectedVisibility: "private",
+    expectedVisibility: EXPECTED_PACKAGE_VISIBILITY,
     expectedLinkage: REPOSITORY,
   });
 }
@@ -272,7 +272,18 @@ export function reconcilePackageInventory(assessment, operatorEvidence, { subjec
   if (idless.length) failures.push(`${idless.length} operator-supplied version(s) carry no numeric version id`);
   const untaggedUnstated = versions.filter((version) => !Array.isArray(version?.tags));
   if (untaggedUnstated.length) failures.push(`${untaggedUnstated.length} operator-supplied version(s) do not state their tags (an untagged version has an empty list, not an absent one)`);
-  if (operatorEvidence.visibility === undefined) failures.push("operator evidence does not state the package's measured visibility");
+  if (operatorEvidence.visibility === undefined) {
+    failures.push("operator evidence does not state the package's measured visibility");
+  } else if (operatorEvidence.visibility !== EXPECTED_PACKAGE_VISIBILITY) {
+    // PRESENT was not the bar. This route SUBSTITUTES for the metadata read, and that read confirms
+    // only `EXPECTED_PACKAGE_VISIBILITY` — so an operator inventory stating `public` used to reconcile
+    // to verified a package whose exposure the API path would have refused outright. The expected
+    // value comes from the classifier's own constant, so the two paths cannot drift.
+    //
+    // The message states the EXPECTATION and never the supplied value: this string is written into
+    // the public reconciliation artifact, and the supplied value is operator-controlled text.
+    failures.push(`operator evidence does not state the package's visibility as ${EXPECTED_PACKAGE_VISIBILITY}`);
+  }
   if (operatorEvidence.repositoryLinkage !== REPOSITORY) failures.push("operator evidence does not state this repository as the package's linkage");
   if (versions.length && !versions.some((version) => version?.digest === subjectDigest)) {
     failures.push("operator evidence does not list the pinned subject digest among the package's versions");
