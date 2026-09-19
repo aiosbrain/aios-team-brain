@@ -1,4 +1,5 @@
 import "server-only";
+import type { PoolClient } from "pg";
 import type { DbClient } from "@/lib/db/types";
 import { transactionSessionFor } from "@/lib/db/pg/tx";
 
@@ -41,4 +42,15 @@ export async function audit(db: DbClient, entry: AuditEntry) {
   } catch {
     // auditing must never take the request down
   }
+}
+
+/** Required evidence: use the caller's transaction; failure must abort its entire write. */
+export async function auditRequired(client: PoolClient, entry: AuditEntry): Promise<void> {
+  await client.query(
+    `insert into audit_log (team_id, actor_kind, member_id, api_key_id, action,
+       target_type, target_id, meta, ip) values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::inet)`,
+    [entry.team_id, entry.actor_kind, entry.member_id ?? null, entry.api_key_id ?? null,
+      entry.action, entry.target_type ?? null, entry.target_id ?? null,
+      JSON.stringify(entry.meta ?? {}), entry.ip ?? null],
+  );
 }

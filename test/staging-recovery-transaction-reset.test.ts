@@ -51,7 +51,7 @@ function fakes() {
     maintenance: { stopAndVerifyAll: vi.fn(async () => true) },
     rollbackStore: { putImmutable: vi.fn(async () => true), verify: vi.fn(async () => true), writePointer: vi.fn(async () => true) },
     env: {
-      NEO4J_URL: "bolt://127.0.0.1:7687", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "unused-in-this-test",
+      NEO4J_URL: "bolt://127.0.0.1:7687", NEO4J_USER: "neo4j", NEO4J_PASSWORD: "FAKE-unused-in-this-test",
       NEO4J_DATABASE: "neo4j", STAGING_DATA_LOCK_TIMEOUT_MS: "1000",
       // The injected harness fault stops the path immediately after the lock is reacquired, so the
       // test observes the ORDERING without needing a real Postgres or a real graph.

@@ -1,0 +1,202 @@
+name: Staging ops image publisher
+
+# AIO-997 — publish the ops RUNNER image (docker/staging-ops.Dockerfile) to a fixed private GHCR
+# package, from ONE trusted source: the immutable `github.sha` of a manual dispatch on
+# refs/heads/staging. Publishing an artifact is NOT activation, deployment or promotion — nothing
+# here touches Railway, schedules, service variables, refs or `main`, and it holds no credential
+# that could.
+#
+# NO SOURCE INPUT, deliberately. An operator picks the branch in the GitHub UI; anything but
+# `staging` is refused by a named FAILING step before login/build/push — not by a job-level `if`,
+# which would show a green skipped job and read like a successful no-op.
+#
+# TRUST BOUNDARY, STATED HONESTLY. These guards bind THIS file on THIS ref. A divergent copy of the
+# workflow on another ref could delete them; that is why the receipt records `workflow_ref` and
+# `workflow_sha`, and why the coordinator validates the real run's provenance against the reviewed
+# staging source before commissioning any digest. This file does not manufacture review status.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-ops-image-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish staging ops runner image
+    runs-on: ubuntu-latest
+    permissions:
+      # The whole grant. `packages: write` is the only addition to the read-only default — no
+      # contents/statuses/checks (those mint required contexts or move refs, see
+      # test/guards/workflow-permissions.test.ts), no id-token, no attestations.
+      contents: read
+      packages: write
+    steps:
+      # BEFORE checkout, and context-only: at this point the repository's own helper code is not yet
+      # on disk, and running it to decide whether to trust the context would be backwards.
+      # Values arrive through `env:`, never interpolated into the script body.
+      - name: Refuse an untrusted dispatch context
+        env:
+          CTX_REPOSITORY: ${{ github.repository }}
+          CTX_EVENT: ${{ github.event_name }}
+          CTX_REF: ${{ github.ref }}
+          CTX_SHA: ${{ github.sha }}
+          CTX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CTX_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          expected_workflow_ref="aiosbrain/aios-team-brain/.github/workflows/staging-ops-image.yml@refs/heads/staging"
+          refused=0
+          note() { echo "::error::staging ops publisher: $1"; refused=1; }
+          [ "$CTX_REPOSITORY" = "aiosbrain/aios-team-brain" ] || note "repository is '$CTX_REPOSITORY', expected aiosbrain/aios-team-brain"
+          [ "$CTX_EVENT" = "workflow_dispatch" ] || note "event is '$CTX_EVENT', expected workflow_dispatch"
+          [ "$CTX_REF" = "refs/heads/staging" ] || note "ref is '$CTX_REF', expected refs/heads/staging"
+          printf '%s' "$CTX_SHA" | grep -Eq '^[0-9a-f]{40}$' || note "source sha '$CTX_SHA' is not a full 40-hex commit"
+          [ "$CTX_WORKFLOW_SHA" = "$CTX_SHA" ] || note "workflow sha '$CTX_WORKFLOW_SHA' differs from source sha '$CTX_SHA'"
+          [ "$CTX_WORKFLOW_REF" = "$expected_workflow_ref" ] || note "workflow ref is '$CTX_WORKFLOW_REF', expected $expected_workflow_ref"
+          [ "$refused" -eq 0 ] || { echo "refusing to publish from an untrusted dispatch context" >&2; exit 1; }
+          echo "dispatch context accepted for $CTX_SHA"
+
+      # The TRUSTED IMMUTABLE dispatch SHA, never the moving `staging` branch name: a later push to
+      # staging must not change the artifact this run publishes. `persist-credentials: false` so the
+      # Dockerfile's `COPY . .` cannot bake a token into a layer through `.git` (`.dockerignore`
+      # excludes `.git` as well — both, because either one alone is a single point of failure).
+      - name: Checkout the immutable dispatch commit
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # Now that the trusted tree IS the tree, re-assert the same context AND measure what actually
+      # got checked out: "we asked for the immutable SHA" and "we are standing on it" are different
+      # claims, and only the second one is evidence.
+      #
+      # The helper is dependency-free (node builtins only) and runs on the runner's preinstalled
+      # Node, so there is no `setup-node`, no `npm ci`, and no third-party code executing outside
+      # the Dockerfile with `packages: write` in scope.
+      - name: Verify the checkout is the dispatch commit
+        run: node scripts/staging-ops/image-publication.mjs verify-context
+
+      # OP-06 precheck. A 200 must say private + linked to this repository; a known-different
+      # visibility or linkage refuses BEFORE any push. A 404 means absent OR invisible to this token
+      # and is recorded as exactly that ambiguity — it is not evidence the package does not exist,
+      # and it does not become a claim in the receipt.
+      - name: Precheck the package (private, linked, honest 404)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/staging-ops/image-publication.mjs precheck-package
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Root context from the clean checked-out commit, the EXISTING Dockerfile and `.dockerignore`,
+      # unchanged. `provenance`/`sbom` are off explicitly so the push is a single image manifest
+      # rather than an index carrying attestation descriptors — this publisher inspects the
+      # top-level descriptor and refuses an index, so producing one would refuse its own build. No
+      # build-args, no secrets, no host mounts: nothing can carry a credential into a layer.
+      - name: Build and push the ops runner image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/staging-ops.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          # Source SHA + run id/attempt: discoverable, and a re-run cannot overwrite an earlier
+          # run's tag. No `latest` — no runner ever follows a tag here; digests are the contract.
+          tags: ghcr.io/aiosbrain/aios-staging-ops:sha-${{ github.sha }}-run-${{ github.run_id }}.${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+        env:
+          # OP-05 keeps ONE receipt artifact and ONE controlled job summary. Left at their defaults
+          # this action ALSO uploads a build record artifact and writes its own build summary into
+          # the same job summary, so the run would carry a second, uncontrolled account of the
+          # publication beside the receipt. Off explicitly, as strings — a YAML bare `false` is a
+          # boolean the runner would stringify, and the action reads these as env text.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+          DOCKER_BUILD_SUMMARY: "false"
+
+      # `steps.build.outputs.digest` — the REGISTRY manifest digest. Never `outputs.imageid`, which
+      # is the local image config digest and names nothing in the registry. The helper then reads
+      # that exact by-digest reference back over the authenticated session and recomputes the digest
+      # from the returned bytes, so a config digest could not survive this step even if it got here.
+      - name: Verify the publication and emit the receipt
+        # A stable id, because the post-upload delivery report has to name this step's own outcome:
+        # "the receipt was emitted" and "the run got past this step" are different claims.
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: sha-${{ github.sha }}-run-${{ github.run_id }}.${{ github.run_attempt }}
+          RECEIPT_PATH: staging-ops-image-receipt.json
+        run: node scripts/staging-ops/image-publication.mjs verify-publication
+
+      # OP-05's honest failure. If a digest exists here, the image IS in the registry and a later
+      # step failed: that is PARTIAL PUBLICATION, recorded as such. A retry publishes a new
+      # run-attempt tag; it does not roll this one back, and nothing here deletes a package.
+      # …but only once the helper it runs is ON DISK. A refusal in the pre-checkout context guard is
+      # the one failure that reaches here with no repository tree, where `node scripts/…` can only
+      # die with MODULE_NOT_FOUND — a second red step whose message describes a missing file rather
+      # than the untrusted dispatch that was correctly refused. Gating on the checkout's own outcome
+      # keeps that refusal the loudest thing in the run.
+      - name: Record a failed or partial publication
+        if: failure() && steps.checkout.outcome == 'success'
+        env:
+          # The BUILD STEP'S OWN OUTCOME decides what may be claimed, not the digest: a push that
+          # succeeded and then emitted an unusable digest is still a push, and reporting "nothing
+          # was published" there would be the one thing that is definitely false.
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: sha-${{ github.sha }}-run-${{ github.run_id }}.${{ github.run_attempt }}
+          RECEIPT_PATH: staging-ops-image-receipt.json
+        run: node scripts/staging-ops/image-publication.mjs record-failure
+
+      - name: Upload the publication receipt
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staging-ops-image-receipt-${{ github.run_id }}.${{ github.run_attempt }}
+          path: staging-ops-image-receipt.json
+          # `warn`, not `error`: a refusal in the context guard happens BEFORE the checkout, so the
+          # helper that writes a record does not exist on disk yet and there is legitimately nothing
+          # to upload. Failing the upload there would only add a second red step to a run that
+          # already refused loudly, for the correct reason.
+          if-no-files-found: warn
+          # The receipt EXPIRES. Download it into the durable commissioning packet — GitHub is not
+          # the archive.
+          retention-days: 30
+
+      # OP-05's delivery accounting, and the ONLY step after the upload. `record-failure` runs BEFORE
+      # it, so an upload that fails after a verified run leaves the job red with a receipt saying
+      # `published` and nothing anywhere saying the evidence never arrived — likewise a receipt file
+      # written and then failed on its way to the step summary.
+      #
+      # It reports, it does not repair: the measured receipt is not rewritten, nothing is deleted,
+      # rolled back or re-pushed, and the run stays red for its ORIGINAL reason. On the all-success
+      # path it does not run at all.
+      - name: Report a partial publication when evidence delivery failed
+        if: failure() && steps.checkout.outcome == 'success'
+        env:
+          # The three ACTUAL step outcomes this decision is made of: the push (was there anything to
+          # call partial), the receipt emission, and the artifact upload.
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          RECEIPT_PATH: staging-ops-image-receipt.json
+        run: node scripts/staging-ops/image-publication.mjs report-delivery

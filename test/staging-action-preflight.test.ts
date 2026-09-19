@@ -9,7 +9,7 @@ import {
 
 const TESTERS = JSON.stringify([{
   email: "tester@example.test",
-  password: "Staging-only-Tester-Password-123!",
+  password: "FAKE-Tester-Password-123!",
   teamId: "11111111-1111-4111-8111-111111111111",
   memberId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
   role: "admin",
@@ -34,7 +34,7 @@ describe("H2 — staging origin", () => {
     ["plain http on the Railway adapter", "http://staging.example.test", /must use https/],
     ["a non-URL", "staging.example.test", /not a valid absolute URL/],
     ["an unsupported scheme", "ftp://staging.example.test", /protocol ftp: is not permitted/],
-    ["embedded credentials", "https://user:pass@staging.example.test", /must not embed credentials/],
+    ["embedded credentials", "https://FAKE-user:FAKE-pass@staging.example.test", /must not embed credentials/],
     ["a path", "https://staging.example.test/app", /must be an origin, not a path/],
   ])("refuses %s", (_label, value, message) => {
     expect(validateStagingOrigin(value as string | undefined).join("; ")).toMatch(message as RegExp);
@@ -73,9 +73,9 @@ describe("H2 — tester credentials are parsed ONCE, before anything is replaced
     ["not an array", '{"email":"x"}', /must be an array/],
     ["empty", "[]", /must not be empty/],
     ["a null entry", "[null]", /tester\[0\] is not an object/],
-    ["a blank field", '[{"email":"","password":"Staging-only-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"team"}]', /tester\[0\]\.email must be a non-blank string/],
+    ["a blank field", '[{"email":"","password":"FAKE-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"team"}]', /tester\[0\]\.email must be a non-blank string/],
     ["a weak password", '[{"email":"a@b.test","password":"short","teamId":"t","memberId":"m","role":"admin","posture":"team"}]', /password must be a string of at least 12/],
-    ["an invalid posture", '[{"email":"a@b.test","password":"Staging-only-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"admin"}]', /posture must be exactly team or external/],
+    ["an invalid posture", '[{"email":"a@b.test","password":"FAKE-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"admin"}]', /posture must be exactly team or external/],
   ])("refuses %s", (_label, raw, message) => {
     expect(() => parseTesterCredentials(raw as string | undefined)).toThrow(message as RegExp);
   });
@@ -87,9 +87,9 @@ describe("H2 — tester credentials are parsed ONCE, before anything is replaced
 
   it("never echoes a password in its diagnostics", () => {
     let message = "";
-    try { parseTesterCredentials('[{"email":"","password":"Staging-only-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"team"}]'); }
+    try { parseTesterCredentials('[{"email":"","password":"FAKE-Tester-Password-123!","teamId":"t","memberId":"m","role":"admin","posture":"team"}]'); }
     catch (error) { message = (error as Error).message; }
-    expect(message).not.toContain("Staging-only-Tester-Password-123!");
+    expect(message).not.toContain("FAKE-Tester-Password-123!");
   });
 });
 

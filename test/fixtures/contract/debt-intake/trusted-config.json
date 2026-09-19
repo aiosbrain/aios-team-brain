@@ -1,0 +1,19 @@
+{
+  "producers": {
+    "harness": [
+      "1.0.0",
+      "1.1.0"
+    ],
+    "scanner": [
+      "1.0.0"
+    ]
+  },
+  "codebases": [
+    "devtools",
+    "harness",
+    "workspace"
+  ],
+  "linear_teams": [
+    "AIO"
+  ]
+}

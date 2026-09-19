@@ -210,11 +210,14 @@ describe("codebase scan idempotency (real Postgres)", () => {
     const seed = await seedTeam();
     const slug = `repo-${randomUUID().slice(0, 6)}`;
     const { email, actor_handle } = await memberIdentity(seed.memberId);
+    // The drill-down and profile read a real trailing 90-day window, so a fixed date ages
+    // out and empties the non-vacuity checks. Yesterday (UTC) stays well inside it.
+    const recentDay = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     await ingestScan(
       seed,
       buildScan({
         slug,
-        contributions: [{ author_key: email, author_email: email, day: "2026-06-15", commits: 7, ai_commits: 4 }],
+        contributions: [{ author_key: email, author_email: email, day: recentDay, commits: 7, ai_commits: 4 }],
       })
     );
 

@@ -102,11 +102,9 @@ describe("codebase request-admission supplement (revision 1)", () => {
     expect(supplement.errors.recentCommits.message).toBe(LITERAL_COUNT_MESSAGE);
   });
 
-  it("adopting the supplement does not bump the member API version", () => {
-    // The supplement carries its own `revision` and applies from 1.23 onward. Bumping
-    // BRAIN_API_VERSION to 1.25 would claim the canonical 1.24 scanner-identity semantics
-    // this server does not implement; leaving it at 1.23 is the honest declaration.
-    expect(BRAIN_API_VERSION).toBe("1.23");
+  it("the independently versioned supplement applies to the member API", () => {
+    // Scanner identity advances the member API to 1.24 independently of this supplement.
+    // The payload contract guard pins that version; admission must accept later minors.
     // "applies from 1.23 ONWARD" — so the running server must be at or above that, not equal
     // to it. Pinning equality here would turn a legitimate future minor bump into a red guard.
     const [supMajor, supMinor] = supplement.appliesFromMemberApiVersion.split(".").map(Number);

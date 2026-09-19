@@ -2068,8 +2068,18 @@ create table if not exists code_metrics (
   -- Workspace-governance health snapshot (brain-api 1.15; AIO-609) — scored scanner-side,
   -- persisted verbatim (closed scalar object incl. measured_at); null = not scored
   codebase_health jsonb,
+  -- Which scanner BUILD produced this point (brain-api 1.24; AIO-1011). `scanner_version` is the
+  -- ingestion package version and is the only input to the staleness reading; `scanner_sha` is
+  -- the brain commit it ran from, provenance only. Both null = UNKNOWN build, which is the state
+  -- of every row written before 1.24 and cannot be backfilled — never read as "current".
+  scanner_version text,
+  scanner_sha text,
   created_at timestamptz not null default now(),
   unique (codebase_id, head_sha),
+  constraint code_metrics_scanner_identity_len check (
+    (scanner_version is null or length(scanner_version) <= 64)
+    and (scanner_sha is null or length(scanner_sha) <= 64)
+  ),
   constraint code_metrics_coverage_denominator_nonneg check (
     (test_coverage_lines_total is null or test_coverage_lines_total >= 0)
     and (test_coverage_lines_covered is null or test_coverage_lines_covered >= 0)
@@ -2204,7 +2214,7 @@ declare
   v_reopened integer := 0;
   v_stale integer := 0;
 begin
-  if v_schema_version <> '2' then
+  if v_schema_version not in ('2', '3') then
     return jsonb_build_object(
       'detected', 0, 'observed', 0, 'resolved', 0, 'reopened', 0, 'stale', 0
     );
@@ -2227,7 +2237,7 @@ begin
   end if;
 
   -- Serialize lifecycle projection per codebase. Metrics writes happen before this
-  -- function, so whichever reconciliation wins the lock can see every committed v2
+  -- function, so whichever reconciliation wins the lock can see every committed v2/v3
   -- measurement and classify an out-of-order snapshot deterministically.
   perform pg_advisory_xact_lock(
     hashtextextended(p_team_id::text || ':' || p_codebase_id::text, 0)
@@ -2240,7 +2250,7 @@ begin
   from code_metrics
   where team_id = p_team_id
     and codebase_id = p_codebase_id
-    and codebase_health->>'schema_version' = '2';
+    and codebase_health->>'schema_version' in ('2', '3');
   v_snapshot_is_stale := v_observed_at < v_latest_observed_at;
 
   for v_finding in
@@ -2553,6 +2563,14 @@ alter table code_metrics add column if not exists test_coverage_branches_pct num
 -- already-deployed code_metrics gains it on `pg:schema` (mirror of
 -- postgres/migrations/20260730130000_code_metrics_codebase_health.sql).
 alter table code_metrics add column if not exists codebase_health jsonb;
+
+-- Scanner identity (brain-api 1.24; AIO-1011) — added via alter so an already-deployed
+-- code_metrics gains them on `pg:schema` (mirror of
+-- postgres/migrations/20260831120000_code_metrics_scanner_identity.sql). Nullable with NO
+-- default: null means UNKNOWN build, which is what every existing row is and must stay. A
+-- default of any kind would assert a build on behalf of a scan that named none.
+alter table code_metrics add column if not exists scanner_version text;
+alter table code_metrics add column if not exists scanner_sha text;
 
 -- Keep `npm run pg:schema` safe for existing deployments that created
 -- code_metrics before AEM readiness fields were added. The table declaration
@@ -3865,3 +3883,68 @@ begin
   insert into migration_markers (name) values ('pret4_builtin_materialize') on conflict (name) do nothing;
   return true;
 end $$;
+
+-- AIO-1101: immutable finding evidence. Rollback disables writers; it never deletes this ledger.
+create table if not exists codebase_debt_candidates (
+  team_id uuid not null references teams(id) on delete restrict,
+  candidate_id text not null check (candidate_id ~ '^[0-9a-f]{64}$'),
+  identity jsonb not null check (jsonb_typeof(identity) = 'object'),
+  program_id text not null check (program_id ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz not null default now(),
+  primary key (team_id, candidate_id)
+);
+
+create table if not exists codebase_debt_candidate_codebases (
+  team_id uuid not null,
+  candidate_id text not null,
+  codebase_slug text not null,
+  primary key (team_id, candidate_id, codebase_slug),
+  foreign key (team_id, candidate_id) references codebase_debt_candidates(team_id, candidate_id) on delete restrict,
+  foreign key (team_id, codebase_slug) references codebases(team_id, slug) on delete restrict
+);
+
+create table if not exists codebase_debt_candidate_events (
+  team_id uuid not null references teams(id) on delete restrict,
+  event_id text not null check (event_id ~ '^[0-9a-f]{64}$'),
+  record jsonb not null check (jsonb_typeof(record) = 'object'),
+  canonical_record text not null,
+  received_at timestamptz not null default now(),
+  record_type text generated always as (record->>'record_type') stored not null,
+  candidate_id text generated always as (record->>'candidate_id') stored,
+  sequence bigint generated always as ((record->>'sequence')::bigint) stored,
+  producer_name text generated always as (record->'producer'->>'name') stored not null,
+  producer_run_id text generated always as (record->'producer'->>'run_id') stored not null,
+  duplicate_target text generated always as (record->>'duplicate_target') stored,
+  primary key (team_id, event_id),
+  foreign key (team_id, candidate_id) references codebase_debt_candidates(team_id, candidate_id) on delete restrict,
+  check (record = canonical_record::jsonb),
+  check (record->>'event_id' is not null and event_id = record->>'event_id'),
+  check (record_type in ('candidate', 'run_summary')),
+  check ((record_type = 'candidate' and candidate_id is not null and candidate_id ~ '^[0-9a-f]{64}$' and sequence is not null and sequence >= 0)
+    or (record_type = 'run_summary' and candidate_id is null and sequence is null and duplicate_target is null))
+);
+
+create unique index if not exists debt_candidate_sequence_unique
+  on codebase_debt_candidate_events(team_id, candidate_id, sequence) where record_type = 'candidate';
+create unique index if not exists debt_run_summary_unique
+  on codebase_debt_candidate_events(team_id, producer_name, producer_run_id) where record_type = 'run_summary';
+create index if not exists debt_run_candidate_latest
+  on codebase_debt_candidate_events(team_id, producer_name, producer_run_id, candidate_id, sequence desc);
+create index if not exists debt_historical_duplicate_edges
+  on codebase_debt_candidate_events(team_id, candidate_id, duplicate_target) where duplicate_target is not null;
+
+create or replace function protect_debt_intake_evidence() returns trigger language plpgsql as $$
+begin
+  raise exception 'debt intake evidence is append-only';
+end;
+$$;
+-- Row protection intentionally does not claim privileged TRUNCATE/DDL resistance.
+drop trigger if exists debt_candidates_protect on codebase_debt_candidates;
+create trigger debt_candidates_protect before update or delete on codebase_debt_candidates
+  for each row execute function protect_debt_intake_evidence();
+drop trigger if exists debt_memberships_protect on codebase_debt_candidate_codebases;
+create trigger debt_memberships_protect before update or delete on codebase_debt_candidate_codebases
+  for each row execute function protect_debt_intake_evidence();
+drop trigger if exists debt_events_protect on codebase_debt_candidate_events;
+create trigger debt_events_protect before update or delete on codebase_debt_candidate_events
+  for each row execute function protect_debt_intake_evidence();
