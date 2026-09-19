@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -45,6 +45,10 @@ function fakeScanner(dir: string, { report, noise = "", exitCode = 0 }: { report
     'import { writeFileSync } from "node:fs";',
     "const args = process.argv.slice(2);",
     'const reportPath = args[args.indexOf("--report-path") + 1];',
+    // What the process was actually GIVEN, written beside the report: the working directory it was
+    // started in and its whole argument list. A flag or a cwd the dispatcher failed to pass is
+    // otherwise invisible from outside — the scan still runs, just not in isolation.
+    'writeFileSync(`${reportPath}.invocation.json`, JSON.stringify({ cwd: process.cwd(), args }));',
     `const noise = ${JSON.stringify(noise)};`,
     "if (noise) { process.stdout.write(noise); process.stderr.write(noise); }",
     `const report = ${report === undefined ? "undefined" : JSON.stringify(report)};`,
@@ -148,6 +152,36 @@ describe("the scanner's report is read at the COMMAND boundary (PUB-03)", () => 
     expect(scanFor(dir, { report: "[]" })()).toEqual([]);
     expect(readFileSync(join(dir, "logs", "scanner-report.json"), "utf8")).toBe("[]");
   });
+
+  /**
+   * F13 AT THE PROCESS, not at the argument builder.
+   *
+   * `scannerArgs` putting `--gitleaks-ignore-path` in a list and `scannerIsolation` writing an empty
+   * file are both already pinned — and both stay green if `scanDirectory` stops passing either one
+   * to `run`. Then the flag defaults to the WORKING DIRECTORY, and a `.gitleaksignore` committed in
+   * this public repository can suppress a finding about the image. Only the spawned process can say
+   * what it was given.
+   */
+  it("gives the scanner PROCESS the audit-owned ignore path and working directory", () => {
+    const dir = createScratch({ RUNNER_TEMP: workspace() });
+    const isolation = scannerIsolation(dir);
+    runScan({
+      binary: fakeScanner(dir, { report: "[]" }),
+      scanDir: join(dir, "scan"),
+      scratch: dir,
+      budget: budget(),
+      configPath: join(dir, "config.toml"),
+      isolation,
+    });
+    const invocation = JSON.parse(readFileSync(join(dir, "logs", "scanner-report.json.invocation.json"), "utf8"));
+    // `realpathSync` on both sides: a macOS temp directory is reached through a symlink, so the
+    // child's own `process.cwd()` is the resolved path and a string comparison would fail for a
+    // reason that has nothing to do with isolation.
+    expect(realpathSync(invocation.cwd)).toBe(realpathSync(isolation.cwd));
+    expect(realpathSync(invocation.cwd).startsWith(realpathSync(process.cwd()))).toBe(false);
+    expect(invocation.args[invocation.args.indexOf("--gitleaks-ignore-path") + 1]).toBe(isolation.ignorePath);
+    expect(readFileSync(isolation.ignorePath, "utf8")).toBe("");
+  });
 });
 
 describe("subprocess failures are classified, and never echoed (PUB-04, M6)", () => {
@@ -246,6 +280,43 @@ describe("the measured build recipe reaches the verdict, not just the record (M3
     const record = assembleAudit(measured);
     expect(record.transitionReady).toBe(false);
     expect(record.blockers.join(" ")).toMatch(/were not measured/);
+  });
+
+  /**
+   * F1's wiring at the SAME assembly step. A canary that did not detect its own sentinel means the
+   * pinned scanner is not reading the representation this audit stages, so every binary-magic
+   * member's byte coverage is unverified. `assembleAudit` is where that measurement becomes a
+   * coverage limitation; without the fold it would sit in the record as a footnote beside a
+   * `complete: true` coverage figure.
+   */
+  it("folds an UNVERIFIED capability canary into coverage, where it blocks the transition", () => {
+    const recipe = { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] };
+    const blocked = assembleAudit({ ...measured, recipe, canary: { status: "unverified", reason: "the sentinel was not detected" } });
+    expect(blocked.coverage.complete).toBe(false);
+    expect(blocked.coverage.limitations).toContainEqual({ kind: "binary-scan-capability-unverified" });
+    expect(blocked.transitionReady).toBe(false);
+    expect(blocked.blockers.join(" ")).toMatch(/binary-scan-capability-unverified/);
+
+    // The positive control, so this is a fold rather than an unconditional limitation: a VERIFIED
+    // canary leaves the measured coverage exactly as the inspection reported it.
+    const verified = assembleAudit({ ...measured, recipe, canary: { status: "verified", binaryMagicSkipReproduced: true } });
+    expect(verified.coverage.complete).toBe(true);
+    expect(verified.coverage.limitations).toEqual([]);
+    expect(verified.transitionReady).toBe(true);
+  });
+
+  /**
+   * The identity chain, persisted as a MEASURED boolean rather than only as the blocker sentence it
+   * produces. The operator reconciliation recomputes readiness from this field; without it there was
+   * no affirmative measurement for a later reader to stand on, and assuming one is how an empty
+   * record became transition-ready.
+   */
+  it("records the identity chain's own result, both ways", () => {
+    const recipe = { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] };
+    expect(assembleAudit({ ...measured, recipe }).provenance.identityVerified).toBe(true);
+    const unverified = assembleAudit({ ...measured, recipe, identityVerified: false });
+    expect(unverified.provenance.identityVerified).toBe(false);
+    expect(unverified.transitionReady).toBe(false);
   });
 });
 

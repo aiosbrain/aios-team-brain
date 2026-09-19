@@ -60,10 +60,20 @@ function openSink(path) {
  * PASS 1 — every member of the export, by content hash.
  *
  * Directories and links are skipped: a layer blob is a regular file, and a link cannot be one.
+ *
+ * THE CLOCK REACHES HERE TOO (F11). This pass HASHES every member of a multi-gigabyte export before
+ * the first layer is decoded, and it used to take no deadline at all: an export pathological enough
+ * to spend the whole budget in pass 1 ran past the job timeout, and a job timeout produces no
+ * sanitized record. The entry assert is what makes an already-exhausted budget abort at the first
+ * thing the inspection does rather than after a full walk; the periodic one bounds the walk itself.
  */
-export function indexExportByDigest(source, { maxMembers = 4096 } = {}) {
+export function indexExportByDigest(source, { maxMembers = 4096, deadline } = {}) {
   const byDigest = new Map();
+  let members = 0;
+  deadline?.assert("export index");
   for (const member of readTarMembers(source, { maxMembers })) {
+    members += 1;
+    if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("export index");
     if (member.type !== "file" || member.size === 0) continue;
     const { sha256 } = member.content();
     byDigest.set(`sha256:${sha256}`, Object.freeze({ name: member.name, dataOffset: member.dataOffset, size: member.size }));
@@ -216,10 +226,76 @@ const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
  */
 const UNEXPANDABLE = /\.(zip|xz|bz2|br|zst|7z|rar|jar|whl|egg|deb|rpm|apk)$/i;
 
+/**
+ * Container formats this audit cannot expand, recognised by the MAGIC AT THE START OF CONTENT.
+ *
+ * THE DEFECT THIS EXISTS FOR. `UNEXPANDABLE` above is a FILENAME test, and a filename is the one
+ * property of a member that survives nothing. An independent probe gzipped a deflated ZIP as
+ * `app/payload.zip.gz`: the bare-gzip branch inflated it, staged the ZIP bytes under the synthetic
+ * name `…#inflated`, and reclassified THAT — a name the end-anchored `.zip` pattern cannot match. The
+ * ZIP bytes are neither gzip nor tar, so classification fell through to "an ordinary file", no
+ * limitation was recorded anywhere, and `inspectExport` returned `coverage.complete === true` over a
+ * container whose decoded content reached no scan surface. An extensionless or renamed ZIP at the top
+ * level had the identical hole, one step shorter.
+ *
+ * Magic is checked at EVERY classification point (top-level members, every member of a nested tar,
+ * and the inflated payload of a bare gzip), because that is the only place all three meet.
+ *
+ * THE LABEL IS FROM THIS LIST, never from the content or the name. A limitation reaches the PUBLIC
+ * artifact; `format` can only ever be one of the eight strings below.
+ *
+ * NOT A DECOMPRESSOR, deliberately. Recognising the container is what makes the gap HONEST — an
+ * expander for each of these would be a new parser per format, and a coverage gap that is recorded
+ * blocks the transition just as effectively as content that was read.
+ */
+const UNSUPPORTED_MAGIC = Object.freeze([
+  // Local file header, end-of-central-directory (an empty archive), and the spanned/split marker.
+  { format: "zip", signatures: [[0x50, 0x4b, 0x03, 0x04], [0x50, 0x4b, 0x05, 0x06], [0x50, 0x4b, 0x07, 0x08]] },
+  { format: "xz", signatures: [[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]] },
+  { format: "bzip2", signatures: [[0x42, 0x5a, 0x68]] },
+  { format: "zstd", signatures: [[0x28, 0xb5, 0x2f, 0xfd]] },
+  { format: "7z", signatures: [[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]] },
+  { format: "rar", signatures: [[0x52, 0x61, 0x72, 0x21, 0x1a, 0x07]] },
+  { format: "ar", signatures: [[0x21, 0x3c, 0x61, 0x72, 0x63, 0x68, 0x3e, 0x0a]] },
+  { format: "rpm", signatures: [[0xed, 0xab, 0xee, 0xdb]] },
+].map(({ format, signatures }) => Object.freeze({
+  format,
+  signatures: Object.freeze(signatures.map((bytes) => Buffer.from(bytes))),
+})));
+
+/**
+ * The closed vocabulary itself, exported so a CONSUMER of a recorded limitation can validate the
+ * label against the same list that produces it rather than against a copy that can drift.
+ */
+export const UNSUPPORTED_FORMATS = Object.freeze(UNSUPPORTED_MAGIC.map(({ format }) => format));
+
+/**
+ * The unexpandable CONTAINER a member's own first bytes declare, or `undefined`.
+ *
+ * START OF CONTENT ONLY. A file that happens to carry `PK\x03\x04` a hundred bytes in is an ordinary
+ * file — a substring test would report a coverage gap for any source file quoting a signature, and a
+ * limitation that fires on ordinary content stops meaning anything.
+ */
+export function unsupportedMagicFormat(head) {
+  if (!Buffer.isBuffer(head) || head.length === 0) return undefined;
+  for (const { format, signatures } of UNSUPPORTED_MAGIC) {
+    for (const signature of signatures) {
+      if (head.length >= signature.length && head.subarray(0, signature.length).equals(signature)) return format;
+    }
+  }
+  return undefined;
+}
+
 const looksGzip = (head) => head.length >= 2 && head.subarray(0, 2).equals(GZIP_MAGIC);
 const looksTar = (head) => head.length >= 262 && head.subarray(257, 262).toString("ascii") === "ustar";
-/** Would this member need expanding to be inspected at all? Magic first, then the closed name list. */
-const looksArchive = (head, name) => looksGzip(head) || looksTar(head) || UNEXPANDABLE.test(name);
+/**
+ * Would this member need expanding to be inspected at all? Magic first, then the closed name list.
+ *
+ * The name list is kept as an ADDITIONAL signal rather than replaced: brotli has no magic number at
+ * all, and `.jar`/`.whl`/`.egg`/`.apk` are ZIPs whose name is the more useful thing to report.
+ */
+const looksArchive = (head, name) => looksGzip(head) || looksTar(head)
+  || unsupportedMagicFormat(head) !== undefined || UNEXPANDABLE.test(name);
 
 /**
  * The format of an unexpandable member, taken from THE CLOSED LIST ABOVE rather than from the name.
@@ -452,10 +528,20 @@ export function stageConfig({ scanDir, configBytes }) {
 function classifyExpanded({ head, name, depth, read, context }) {
   const { layerIndex, limitations, limits } = context;
   const at = depth > 0 ? { depth } : {};
-  const format = unexpandableFormat(name);
-  if (format !== undefined) {
+  const extension = unexpandableFormat(name);
+  if (extension !== undefined) {
     // Scanned as OPAQUE BYTES, which is not decoded inspection and is not reported as one.
-    limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, extension: format, ...at });
+    limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, extension, ...at });
+    return;
+  }
+  /**
+   * …and the same gap when the NAME says nothing. Reported under `format` rather than `extension`
+   * because they are different evidence: `extension` means a name this audit recognises, `format`
+   * means bytes it recognises. Both are closed vocabularies; neither is derived from the member.
+   */
+  const format = unsupportedMagicFormat(head);
+  if (format !== undefined) {
+    limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, format, ...at });
     return;
   }
   if (!looksGzip(head) && !looksTar(head)) return; // an ordinary file: already staged, nothing to expand

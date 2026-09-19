@@ -68,7 +68,9 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   let index;
   let configBytes;
   try {
-    index = indexExportByDigest(source);
+    // The budget reaches PASS 1, not only the layer loop below: hashing every member of a large
+    // export is real work, and it happens before anything is decoded.
+    index = indexExportByDigest(source, { deadline });
     const configEntry = index.get(manifest.config.digest);
     if (!configEntry) {
       // The export does not contain the config the registry manifest names. Refusing here is the

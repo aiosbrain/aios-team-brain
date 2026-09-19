@@ -326,6 +326,45 @@ describe("recorded bounds are ENFORCED, not merely recorded (F5, F11, F12)", () 
       .rejects.toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
   });
 
+  /**
+   * F11's OTHER half: the clock has to reach PASS 1.
+   *
+   * `indexExportByDigest` hashes every member of the export before a single layer is decoded — real
+   * work on a multi-gigabyte archive — and it took no deadline at all. The abort above would have
+   * happened only after that whole walk, which on a pathological export is exactly the budget the
+   * deadline exists to protect. So the FIRST clock check of an inspection must be the indexing one.
+   */
+  it("F11: the FIRST clock check happens at export indexing, before any layer is decoded", async () => {
+    const dir = pool.make();
+    const consulted: string[] = [];
+    const expired = {
+      assert(operation?: string) {
+        consulted.push(String(operation));
+        throw Object.assign(new Error("the budget is exhausted"), { code: "STAGING_OPERATION_TIMEOUT" });
+      },
+    };
+    const image = synthesizeImage([buildTar([{ name: "app/a.js", content: "1" }])]);
+    await expect(inspectSynthetic(image, dir, {}, { deadline: expired }))
+      .rejects.toMatchObject({ code: "STAGING_OPERATION_TIMEOUT" });
+    // Which operation was being asked about is the pin: without the deadline threaded into pass 1,
+    // the first thing consulted is the layer loop, after the whole export has been hashed.
+    expect(consulted).toEqual(["export index"]);
+    expect(readdirSync(join(dir, "layers"))).toEqual([]);
+  });
+
+  it("F11: …and a healthy budget consults the index first, then the layers", async () => {
+    // The negative control on the case above: a deadline that never throws must still be ASKED, in
+    // that order, and the inspection must complete.
+    const consulted: string[] = [];
+    const image = synthesizeImage([buildTar([{ name: "app/a.js", content: "1" }])]);
+    const result = await inspectSynthetic(image, pool.make(), {}, {
+      deadline: { assert(operation?: string) { consulted.push(String(operation)); return undefined; } },
+    });
+    expect(consulted[0]).toBe("export index");
+    expect(consulted).toContain("layer inspection");
+    expect(result.coverage.complete).toBe(true);
+  });
+
   it("F11: a budget with time left does NOT abort a healthy inspection", async () => {
     // The negative control. Without it, a deadline that threw unconditionally would satisfy the test
     // above while breaking every real run.

@@ -67,8 +67,11 @@ export async function listPackageVersions({ token, fetchImpl = globalThis.fetch 
     let res;
     try {
       res = await fetchImpl(`${PACKAGE_VERSIONS_URL}?per_page=${PAGE_SIZE}&page=${page}`, { headers: headers(token) });
-    } catch (error) {
-      return { status: "unverified", reason: `the package versions read failed on page ${page}: ${error?.message ?? "transport error"}` };
+    } catch {
+      // A FIXED reason. `error.message` from `fetch` quotes the URL, the proxy and occasionally a
+      // certificate subject, and this string is written into the PUBLIC evidence artifact as
+      // `packageInventory.reason`. The page number is this loop's own counter, so it is ours to state.
+      return { status: "unverified", reason: `the package versions read failed with a transport error on page ${page}` };
     }
     if (res.status !== 200) {
       // 403 = this token cannot read package metadata. 404 = absent OR invisible to this token.
@@ -116,8 +119,9 @@ export async function readPackageIdentity({ token, fetchImpl = globalThis.fetch 
   let res;
   try {
     res = await fetchImpl(PACKAGE_METADATA_URL, { headers: headers(token) });
-  } catch (error) {
-    return Object.freeze({ status: "unverified", reason: `the package metadata read failed: ${error?.message ?? "transport error"}` });
+  } catch {
+    // Fixed, for the same reason as the versions read above: this reason reaches public evidence.
+    return Object.freeze({ status: "unverified", reason: "the package metadata read failed with a transport error" });
   }
   let body;
   if (res.status === 200) {
@@ -161,7 +165,13 @@ export async function readPackageIdentity({ token, fetchImpl = globalThis.fetch 
  * versions was read cleanly.
  */
 export function assessPackageInventory(inventory, auditedDigest, identity) {
-  if (identity !== undefined && identity?.status !== "verified") {
+  /**
+   * ABSENT METADATA IS UNVERIFIED METADATA. This used to read `identity !== undefined && …`, so a
+   * caller that passed no identity at all skipped the check entirely and could reach the VERIFIED
+   * route — the one state of the world where "we did not measure it" was treated better than "we
+   * measured it and it failed". Undefined is now the same answer as unverified, with a fixed reason.
+   */
+  if (identity?.status !== "verified") {
     return Object.freeze({
       source: "actions-api",
       apiStatus: inventory?.status === "verified" ? "verified" : "unverified",
@@ -173,9 +183,7 @@ export function assessPackageInventory(inventory, auditedDigest, identity) {
       otherVersions: undefined,
     });
   }
-  const identityFields = identity === undefined
-    ? {}
-    : { identityStatus: "verified", visibility: identity.visibility, linkage: identity.linkage };
+  const identityFields = { identityStatus: "verified", visibility: identity.visibility, linkage: identity.linkage };
   if (inventory?.status !== "verified") {
     return Object.freeze({
       source: "actions-api",

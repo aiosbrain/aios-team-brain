@@ -416,6 +416,16 @@ export function assembleAudit({
     },
     provenance: {
       /**
+       * THE IDENTITY BIT, PERSISTED AS A MEASUREMENT (not only as prose inside a blocker).
+       *
+       * `transitionReadiness` consumes `identityVerified`, but the record only ever carried its
+       * CONSEQUENCE — a blocker sentence. So a later reader (the operator reconciliation) had no
+       * affirmative field to recompute from and had to assume; assuming an unmeasured prerequisite
+       * is exactly how an empty record became transition-ready. One boolean, already measured here,
+       * written down where it can be validated.
+       */
+      identityVerified,
+      /**
        * FIXED CODES AND THE EXPECTED IDENTITY ONLY (F10). `revisionLabelFailures` no longer returns
        * interpolated strings, because these objects are exported into a public artifact and a label
        * value is arbitrary builder-chosen text.
@@ -448,6 +458,15 @@ export async function runAudit(env = process.env, {
   scanner = SCANNER,
   run = runPrivate,
   makeScratch = createScratch,
+  /**
+   * PUB-01's internal budget, injectable for the same reason `run` and `makeScratch` are. The
+   * budget is consulted in three different places — around each subprocess, between layers, and
+   * INSIDE the inspection — and only the object itself can say whether the third one still happens:
+   * a real budget with time left is silent, and an expired one refuses at the first subprocess long
+   * before the inspection is reached. The seam is what makes "the deadline reaches the walk" a
+   * measurement rather than a call-site reading.
+   */
+  makeBudget = createOperationBudget,
   /**
    * The ONE remaining external transport this module reaches for directly. Injectable for the same
    * reason `run` is: the assembled-run test (PUB-07, F7) substitutes external command and API
@@ -487,7 +506,7 @@ export async function runAudit(env = process.env, {
      */
     assertSubjectShape();
     assertScannerPinned(scanner);
-    budget = createOperationBudget("staging ops image audit", AUDIT_LIMITS.internalDeadlineMs);
+    budget = makeBudget("staging ops image audit", AUDIT_LIMITS.internalDeadlineMs);
     scratch = makeScratch(env);
 
     // 1. The registry's answer for the pinned digest, recomputed from its own bytes.

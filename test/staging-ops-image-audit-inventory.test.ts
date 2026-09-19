@@ -5,6 +5,7 @@ import {
   hasNextPage,
   listPackageVersions,
   normalizeVersion,
+  readPackageIdentity,
   reconcilePackageInventory,
 } from "../scripts/staging-ops/image-audit/registry.mjs";
 import { SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
@@ -33,6 +34,22 @@ interface PackageVersion {
 
 const digest = (hex: string) => `sha256:${hex.repeat(64).slice(0, 64)}`;
 const AUDITED = SUBJECT.digest;
+
+/**
+ * `readPackageIdentity`'s CONFIRMED answer, as `assessPackageInventory` consumes it.
+ *
+ * Passed explicitly by every case that is about the VERSIONS read, because the identity read is a
+ * separate measurement and an absent one is now unverified (it used to skip the check entirely and
+ * reach the verified route — "we did not measure it" treated better than "we measured it and it
+ * failed"). Stating it here keeps each case below about one condition.
+ */
+const IDENTIFIED = Object.freeze({
+  status: "verified",
+  visibility: "private",
+  linkage: SUBJECT.repository,
+  expectedVisibility: "private",
+  expectedLinkage: SUBJECT.repository,
+});
 
 function page(body: unknown, { next = false, status = 200 } = {}) {
   return {
@@ -63,7 +80,7 @@ describe("package version pagination is walked to its end (PUB-05)", () => {
       page([version(digest("c"), undefined, 2)], { next: false }),
     ];
     const inventory = await listPackageVersions({ token: "t", fetchImpl: async () => pages.shift() });
-    const assessment = assessPackageInventory(inventory, AUDITED);
+    const assessment = assessPackageInventory(inventory, AUDITED, IDENTIFIED);
     expect(assessment.status).toBe("verified");
     expect(assessment.untagged).toBe(1);
     expect(assessment.otherVersions).toBe(1);
@@ -120,62 +137,160 @@ describe("an unreadable inventory is UNVERIFIED, never an empty package (PUB-05)
     const assessment = assessPackageInventory(
       { status: "verified", versions: [normalizeVersion(version(digest("d"), []))], pages: 1 },
       AUDITED,
+      IDENTIFIED,
     );
     expect(assessment.status).toBe("unverified");
     expect(assessment.reason).toMatch(/does not appear in the package/);
   });
 
   it("carries the API status through as unverified when the read failed", () => {
-    const assessment = assessPackageInventory({ status: "unverified", reason: "403" }, AUDITED);
+    const assessment = assessPackageInventory({ status: "unverified", reason: "403" }, AUDITED, IDENTIFIED);
     expect(assessment).toMatchObject({ apiStatus: "unverified", status: "unverified", source: "actions-api" });
     expect(assessment.otherVersions).toBeUndefined();
   });
+
+  /**
+   * F4's wiring, at the ARGUMENT rather than at the function.
+   *
+   * The guard read `identity !== undefined && identity?.status !== "verified"`, so a caller that
+   * passed no metadata at all skipped it and could reach the VERIFIED route on a versions list alone
+   * — which cannot establish that the enumerated package is the private one linked to this
+   * repository. Undefined is the same answer as unverified, and it says which one it was.
+   */
+  it("treats UNDEFINED identity metadata as unverified, never as the verified route", () => {
+    const inventory = { status: "verified", versions: [normalizeVersion(version(AUDITED, []))], pages: 1 };
+    // The positive control FIRST: with the metadata read, this exact inventory IS verified. Without
+    // it the only difference between the two calls is the argument under test.
+    expect(assessPackageInventory(inventory, AUDITED, IDENTIFIED).status).toBe("verified");
+
+    const unmeasured = assessPackageInventory(inventory, AUDITED);
+    expect(unmeasured.status).toBe("unverified");
+    expect(unmeasured.identityStatus).toBe("unverified");
+    expect(unmeasured.reason).toMatch(/identity\/visibility\/linkage was not established: not measured/);
+    // The versions walk really did succeed — reported as measured, so a coordinator can see that the
+    // block is about the metadata read and not about the pages.
+    expect(unmeasured.apiStatus).toBe("verified");
+    // …and no count is offered from an unverified route, which is what would let a reader conclude
+    // "one version, the audited one, safe to expose".
+    expect(unmeasured.otherVersions).toBeUndefined();
+  });
+
+  it("is unverified when the metadata read itself failed", () => {
+    const inventory = { status: "verified", versions: [normalizeVersion(version(AUDITED, []))], pages: 1 };
+    const assessment = assessPackageInventory(inventory, AUDITED, { status: "unverified", reason: "404 — absent OR invisible" });
+    expect(assessment.status).toBe("unverified");
+    expect(assessment.identityStatus).toBe("unverified");
+  });
 });
 
+/**
+ * PUB-04 at the registry boundary: a transport error's own message is the library's, and it quotes
+ * the URL, the proxy and occasionally a certificate subject. These reasons are written into the
+ * PUBLIC evidence artifact as `packageInventory.reason`.
+ */
+describe("a transport failure is reported by FIXED reason, never by the error's message", () => {
+  it("keeps the thrown message out of both the versions read and the metadata read", async () => {
+    const marker = syntheticSecret("proxy_");
+    const throwing = async () => { throw new Error(`connect ECONNREFUSED via ${marker}`); };
+
+    const versions = await listPackageVersions({ token: "t", fetchImpl: throwing });
+    expect(versions.status).toBe("unverified");
+    expect(versions.reason).not.toContain(marker);
+    // Still says WHICH page, because the page number is this walk's own counter rather than the
+    // library's text — a fixed reason has to stay diagnostic to be worth writing.
+    expect(versions.reason).toMatch(/transport error on page 1/);
+
+    const identity = await readPackageIdentity({ token: "t", fetchImpl: throwing });
+    expect(identity.status).toBe("unverified");
+    expect(identity.reason).not.toContain(marker);
+    expect(identity.reason).toMatch(/transport error/);
+  });
+});
+
+/**
+ * PUB-05's alternate path. THE FIXTURES HERE WERE STALE, and the staleness is the lesson: they were
+ * written against an earlier operator shape (`digests: [...]`) and the function was later tightened
+ * to require full version ROWS (`{ id, digest, tags }`), a stated visibility, this repository's
+ * linkage and a caller-bound `subjectDigest`. The old fixtures then failed for reasons that had
+ * nothing to do with what each case was named for — and the two positive ones failed outright.
+ *
+ * So every case below starts from ONE complete, valid record and breaks exactly one field, and each
+ * asserts the failure it is named for. A case that merely comes back rejected proves only that
+ * something was wrong with it.
+ */
 describe("operator-supplied evidence can satisfy the gate WITHOUT rewriting the API result (PUB-05)", () => {
-  const failed = assessPackageInventory({ status: "unverified", reason: "403 on page 1" }, AUDITED);
+  const failed = assessPackageInventory({ status: "unverified", reason: "403 on page 1" }, AUDITED, IDENTIFIED);
+  const bound = { subjectDigest: AUDITED };
+
+  /** A complete administrator inventory for the pinned subject. Each case below breaks one field. */
+  const operator = (overrides: Record<string, unknown> = {}) => ({
+    capturedAt: "2026-09-09T18:00:00Z",
+    coversAllPages: true,
+    coversUntagged: true,
+    auditedDigest: AUDITED,
+    visibility: "private",
+    repositoryLinkage: SUBJECT.repository,
+    versions: [{ id: 41, digest: AUDITED, tags: [] }],
+    ...overrides,
+  });
 
   it("accepts a complete, timestamped, full-digest inventory", () => {
-    const reconciled = reconcilePackageInventory(failed, {
-      capturedAt: "2026-09-09T18:00:00Z",
-      coversAllPages: true,
-      coversUntagged: true,
-      auditedDigest: AUDITED,
-      digests: [AUDITED],
-    });
+    const reconciled = reconcilePackageInventory(failed, operator(), bound);
     expect(reconciled.status).toBe("verified");
     expect(reconciled.otherVersions).toBe(0);
+    expect(reconciled.total).toBe(1);
+    expect(reconciled.untagged).toBe(1);
+    // The row an administrator would have to act on, not just the content it holds.
+    expect(reconciled.operatorEvidence).toMatchObject({ accepted: true, versionIds: ["41"] });
     // THE PROPERTY A SHORTCUT WOULD LOSE: the workflow's own read still reads as failed. Anyone
     // reading this record later can see the gate stood on operator evidence, not on the API.
     expect(reconciled.apiStatus).toBe("unverified");
     expect(reconciled.source).toBe("operator-evidence");
   });
 
-  it("rejects a truncated digest, a missing page attestation and a missing untagged attestation", () => {
-    const cases = [
-      { capturedAt: "x", coversAllPages: true, coversUntagged: true, digests: ["sha256:0005824"] },
-      { capturedAt: "x", coversUntagged: true, digests: [AUDITED] },
-      { capturedAt: "x", coversAllPages: true, digests: [AUDITED] },
-      { coversAllPages: true, coversUntagged: true, digests: [AUDITED] },
-      { capturedAt: "x", coversAllPages: true, coversUntagged: true, digests: [] },
+  it("rejects each missing or malformed field, for its OWN reason", () => {
+    const cases: [string, Record<string, unknown>, RegExp][] = [
+      // A truncated digest is what a screenshot of the packages page actually shows. Listed BESIDE
+      // the valid subject row, so the pinned-digest-present check cannot be what fails.
+      ["truncated digest", { versions: [{ id: 1, digest: AUDITED, tags: [] }, { id: 2, digest: "sha256:0005824", tags: [] }] }, /no full sha256 digest/],
+      ["no version id", { versions: [{ digest: AUDITED, tags: [] }] }, /no numeric version id/],
+      ["tags absent rather than empty", { versions: [{ id: 1, digest: AUDITED }] }, /do not state their tags/],
+      ["no page attestation", { coversAllPages: undefined }, /every page was covered/],
+      ["no untagged attestation", { coversUntagged: undefined }, /untagged versions were included/],
+      ["no capture timestamp", { capturedAt: undefined }, /ISO-8601 capture timestamp/],
+      ["a capture timestamp that is not ISO-8601", { capturedAt: "yesterday" }, /ISO-8601 capture timestamp/],
+      ["no versions at all", { versions: [] }, /lists no package versions/],
+      ["no stated visibility", { visibility: undefined }, /measured visibility/],
+      ["another repository's linkage", { repositoryLinkage: "someone-else/repo" }, /this repository as the package's linkage/],
+      ["a different audited digest", { auditedDigest: digest("f") }, /different audited digest than the pinned subject/],
+      ["the pinned subject absent from the list", { versions: [{ id: 9, digest: digest("e"), tags: [] }] }, /does not list the pinned subject digest/],
     ];
-    for (const evidence of cases) {
-      const reconciled = reconcilePackageInventory(failed, evidence);
-      expect(reconciled.status).toBe("unverified");
+    for (const [label, broken, reason] of cases) {
+      const reconciled = reconcilePackageInventory(failed, operator(broken), bound);
+      expect(reconciled.status, `${label} was accepted`).toBe("unverified");
       expect(reconciled.operatorEvidence.accepted).toBe(false);
+      // The named failure, not merely A failure: a case that passes on someone else's condition is
+      // a case that proves nothing about the condition it is named for.
+      expect(reconciled.operatorEvidence.failures.join(" "), `${label} failed for another reason`).toMatch(reason);
     }
   });
 
+  /** The CALLER's binding, which is the one thing an operator record must not be able to supply. */
+  it("refuses a reconciliation that was not bound to the pinned subject digest", () => {
+    const reconciled = reconcilePackageInventory(failed, operator(), {});
+    expect(reconciled.status).toBe("unverified");
+    expect(reconciled.operatorEvidence.failures.join(" ")).toMatch(/not bound to a pinned subject digest/);
+  });
+
   it("still blocks when the operator's own inventory lists another digest", () => {
-    const reconciled = reconcilePackageInventory(failed, {
-      capturedAt: "2026-09-09T18:00:00Z",
-      coversAllPages: true,
-      coversUntagged: true,
-      auditedDigest: AUDITED,
-      digests: [AUDITED, digest("e")],
-    });
+    const reconciled = reconcilePackageInventory(failed, operator({
+      versions: [{ id: 41, digest: AUDITED, tags: [] }, { id: 42, digest: digest("e"), tags: ["latest"] }],
+    }), bound);
     expect(reconciled.otherVersions).toBe(1);
     expect(reconciled.additionalSubjects).toEqual([digest("e")]);
+    // Tagged, so the untagged count is the audited row alone — a count that moved with the wrong
+    // versions would be the quiet way an extra subject disappears.
+    expect(reconciled.untagged).toBe(1);
   });
 
   it("leaves the assessment untouched when no operator evidence exists", () => {
