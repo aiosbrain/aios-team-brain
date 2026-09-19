@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DbClient, TransactionSession } from "@/lib/db/types";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
-import { bumpSlackIdentityGeneration, readSlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
+import { readSlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { deleteMember } from "@/lib/admin/members";
+import { ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
 import { transactionCapability } from "@/lib/projects/context/transaction";
 import { closeMembershipInto } from "@/lib/projects/context/memberships";
 import { memberVisibility } from "@/lib/access/enforce";
@@ -55,6 +58,16 @@ async function fixture() {
   const backfill = await backfillTeamContext(db(), seed.teamId);
   if (!backfill.ok) throw new Error(`timeline fixture backfill: ${backfill.error}`);
   return { seed, item, frontmatter };
+}
+
+async function activeViewer(teamId: string): Promise<string> {
+  const id = randomUUID();
+  const { error } = await db().from("members").insert({ id, team_id: teamId,
+    email: `${randomUUID()}@test.local`, display_name: "Viewer", actor_handle: `viewer-${randomUUID().slice(0, 8)}`,
+    role: "member", tier: "team", status: "active" });
+  if (error) throw error;
+  await placeMemberByTier(teamId, id, "team");
+  return id;
 }
 
 function observing(real: DbClient, onGenerationRead: (n: number) => Promise<void> | void) {
@@ -112,6 +125,39 @@ async function revokeItem(seed: Awaited<ReturnType<typeof seedTeam>>, itemId: st
 }
 
 describe("timeline cache Slack generation fence (real Postgres)", () => {
+  it("removes a disabled member's Slack credit from a second worker's warm cache", async () => {
+    const { seed } = await fixture();
+    const viewer = await activeViewer(seed.teamId);
+    const warm = await secondWorker();
+    expect(credited((await warm.getCachedWorkTimeline(db(), seed.teamId, "team", viewer)).days))
+      .toContain(seed.memberId);
+    await warm.settleTimelineRefreshes();
+    const email = (await db().from("members").select("email").eq("id", seed.memberId).single()).data.email as string;
+    const before = await tx((s) => readSlackTeamGenerations(s, seed.teamId));
+    await deleteMember(db(), seed.teamId, email);
+    const after = await tx((s) => readSlackTeamGenerations(s, seed.teamId));
+    expect(BigInt(after.identityGeneration)).toBe(BigInt(before.identityGeneration) + 1n);
+    expect(credited((await warm.getCachedWorkTimeline(db(), seed.teamId, "team", viewer)).days))
+      .not.toContain(seed.memberId);
+  });
+
+  it("adds an activated member's Slack credit on another worker's next cache read", async () => {
+    const { seed } = await fixture();
+    const viewer = await activeViewer(seed.teamId);
+    const email = (await db().from("members").select("email").eq("id", seed.memberId).single()).data.email as string;
+    await db().from("members").update({ status: "invited" }).eq("id", seed.memberId);
+    const warm = await secondWorker();
+    expect(credited((await warm.getCachedWorkTimeline(db(), seed.teamId, "team", viewer)).days))
+      .not.toContain(seed.memberId);
+    await warm.settleTimelineRefreshes();
+    const before = await tx((s) => readSlackTeamGenerations(s, seed.teamId));
+    await linkMemberByEmail(await ensureAuthUser(email), email, seed.teamId);
+    const after = await tx((s) => readSlackTeamGenerations(s, seed.teamId));
+    expect(BigInt(after.identityGeneration)).toBe(BigInt(before.identityGeneration) + 1n);
+    expect(credited((await warm.getCachedWorkTimeline(db(), seed.teamId, "team", viewer)).days))
+      .toContain(seed.memberId);
+  });
+
   it("rejects a warm same-project-set hit after the Slack item's reachable membership closes", async () => {
     const { seed, item } = await fixture();
     expect(titles((await cache.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId)).days))
@@ -279,11 +325,20 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
       email: `${randomUUID()}@test.local`, display_name: "New owner", actor_handle: `new-${randomUUID().slice(0, 8)}`,
       role: "member", tier: "team", status: "active" });
     await placeMemberByTier(seed.teamId, memberId, "team");
-    await tx(async (s) => {
-      await s.executeSql(`update member_identities set member_id=$2 where team_id=$1 and provider='slack'
-        and external_id='U_TIMELINE'`, [seed.teamId, memberId]);
-      await bumpSlackIdentityGeneration(s, seed.teamId);
-    });
+    const oldGeneration = await tx((s) => readSlackTeamGenerations(s, seed.teamId));
+    // This worker already has the old person in memory; another loads the old persisted payload.
+    const warm = await secondWorker();
+    expect(credited((await warm.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId)).days))
+      .toContain(seed.memberId);
+    await setMemberIdentity(db(), seed.teamId, memberId,
+      { provider: "slack", externalId: "U_TIMELINE" }, { force: true });
+    expect((await tx((s) => readSlackTeamGenerations(s, seed.teamId))).identityGeneration)
+      .toBe(String(BigInt(oldGeneration.identityGeneration) + 1n));
+    const warmRebuilt = await warm.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
+    expect(credited(warmRebuilt.days)).toContain(memberId);
+    expect(credited(warmRebuilt.days)).not.toContain(seed.memberId);
+    expect(warmRebuilt.days.flatMap((d) => d.people).map((p) => p.summary))
+      .not.toContain("Old owner synopsis");
     const other = await secondWorker();
     const rebuilt = await other.getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(rebuilt.freshness.stale).toBe(false);
@@ -372,5 +427,33 @@ describe("timeline cache Slack generation fence (real Postgres)", () => {
     expect(titles(rebuilt.days)).not.toContain("#eng: first AIO-1170");
     const persisted = await cache.readTimelineCache(db(), seed.teamId, "team", await visOf(seed));
     expect(titles(persisted!.days)).toContain("#eng: overtaking AIO-1170");
+  });
+
+  it("retries an in-flight build overtaken by the production identity writer", async () => {
+    const { seed } = await fixture();
+    const memberId = randomUUID();
+    await db().from("members").insert({ id: memberId, team_id: seed.teamId,
+      email: `${randomUUID()}@test.local`, display_name: "New owner", actor_handle: `new-${randomUUID().slice(0, 8)}`,
+      role: "member", tier: "team", status: "active" });
+    await placeMemberByTier(seed.teamId, memberId, "team");
+    let release!: () => void;
+    let arrived!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const reached = new Promise<void>((resolve) => { arrived = resolve; });
+    const observed = observing(db(), async (n) => {
+      if (n === 2) { arrived(); await gate; }
+    });
+    const pending = cache.getCachedWorkTimeline(observed.client, seed.teamId, "team", seed.memberId);
+    await reached;
+    await setMemberIdentity(db(), seed.teamId, memberId,
+      { provider: "slack", externalId: "U_TIMELINE" }, { force: true });
+    release();
+    const rebuilt = await pending;
+    expect(observed.count()).toBeGreaterThanOrEqual(3);
+    expect(credited(rebuilt.days)).toContain(memberId);
+    expect(credited(rebuilt.days)).not.toContain(seed.memberId);
+    const persisted = await cache.readTimelineCache(db(), seed.teamId, "team", await visOf(seed));
+    expect(credited(persisted!.days)).toContain(memberId);
+    expect(credited(persisted!.days)).not.toContain(seed.memberId);
   });
 });

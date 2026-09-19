@@ -130,12 +130,43 @@ async function bumpGeneration(
   return rows[0].generation;
 }
 
-/** Future canonical identity writers call this in their own transaction after a real mapping change. */
+/** Identity writers call this in the transaction that changes an effective Slack mapping. */
 export async function bumpSlackIdentityGeneration(
   session: TransactionSession,
   teamId: string
 ): Promise<string> {
   return bumpGeneration(session, teamId, "identity_generation");
+}
+
+export class SlackIdentityChangedDuringReattribution extends Error {
+  constructor() { super("slack identity changed during reattribution"); }
+}
+
+/**
+ * A reattribution scan resolves from a snapshot of the identity map. Reject an attribution write
+ * from that snapshot if a mapping changed meanwhile. Called after the item/version update in the
+ * same transaction, so a rejected bump rolls the attribution update back too. The zero-row insert
+ * locks even a pre-activation team that has no generation row yet.
+ */
+export async function bumpSlackIdentityGenerationIfCurrent(
+  session: TransactionSession,
+  teamId: string,
+  expected: string
+): Promise<string> {
+  requireUuid(teamId, "teamId");
+  await session.executeSql(
+    `insert into slack_team_state (team_id) values ($1) on conflict (team_id) do nothing`,
+    [teamId]
+  );
+  const { rows } = await session.executeSql<{ generation: string }>(
+    `update slack_team_state
+        set identity_generation = identity_generation + 1, updated_at = clock_timestamp()
+      where team_id = $1 and identity_generation = $2::bigint
+      returning identity_generation::text as generation`,
+    [teamId, expected]
+  );
+  if (rows.length !== 1) throw new SlackIdentityChangedDuringReattribution();
+  return rows[0].generation;
 }
 
 function label(value: unknown): string | null {

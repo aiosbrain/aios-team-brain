@@ -1,9 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { syncSlackIdentities } from "@/lib/ingest/sources/slack-identity";
 import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
-import { db, seedTeam } from "./helpers";
+import { readSlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
+import { transactionCapability } from "@/lib/projects/context/transaction";
+import { deleteMember, rollbackMemberCreation } from "@/lib/admin/members";
+import { activateInvitedMembership, ensureAuthUser, linkMemberByEmail } from "@/lib/auth/pg-login";
+import { db, seedTeam, transactionSessionDecoratedDb } from "./helpers";
+
+const generation = (teamId: string) => transactionCapability(db()).transaction(async (s) =>
+  (await readSlackTeamGenerations(s, teamId)).identityGeneration);
 
 async function addMember(teamId: string): Promise<string> {
   const { data, error } = await db()
@@ -16,6 +23,145 @@ async function addMember(teamId: string): Promise<string> {
 }
 
 describe("setMemberIdentity (real Postgres)", () => {
+  it("bumps only actual Slack create, remap and remove transitions", async () => {
+    const seed = await seedTeam();
+    const other = await addMember(seed.teamId);
+    expect(await generation(seed.teamId)).toBe("0");
+
+    await setMemberIdentity(db(), seed.teamId, seed.memberId,
+      { provider: "slack", externalId: "U-revision", handle: "first" });
+    expect(await generation(seed.teamId)).toBe("1");
+    await setMemberIdentity(db(), seed.teamId, seed.memberId,
+      { provider: "slack", externalId: "U-revision", handle: "renamed" });
+    expect(await generation(seed.teamId)).toBe("1");
+    const conflict = await setMemberIdentity(db(), seed.teamId, other,
+      { provider: "slack", externalId: "U-revision" });
+    expect(conflict.conflict).toBe(true);
+    expect(await generation(seed.teamId)).toBe("1");
+    await setMemberIdentity(db(), seed.teamId, other,
+      { provider: "slack", externalId: "U-revision" }, { force: true });
+    expect(await generation(seed.teamId)).toBe("2");
+    await setMemberIdentity(db(), seed.teamId, other,
+      { provider: "linear", externalId: "L-revision" });
+    expect(await generation(seed.teamId)).toBe("2");
+    expect((await removeMemberIdentity(db(), seed.teamId,
+      { provider: "slack", externalId: "U-revision" })).removed).toBe(true);
+    expect(await generation(seed.teamId)).toBe("3");
+    expect((await removeMemberIdentity(db(), seed.teamId,
+      { provider: "slack", externalId: "U-revision" })).removed).toBe(false);
+    await removeMemberIdentity(db(), seed.teamId, { provider: "linear", externalId: "L-revision" });
+    expect(await generation(seed.teamId)).toBe("3");
+  });
+
+  it("rolls back a Slack mapping change when its generation bump fails", async () => {
+    const seed = await seedTeam();
+    const other = await addMember(seed.teamId);
+    const failing = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes("insert into slack_team_state") && sql.includes("identity_generation")) {
+          throw new Error("generation unavailable");
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    await expect(setMemberIdentity(failing, seed.teamId, seed.memberId,
+      { provider: "slack", externalId: "U-failure" })).rejects.toThrow("generation unavailable");
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-failure")).toBeNull();
+    expect(await generation(seed.teamId)).toBe("0");
+
+    await setMemberIdentity(db(), seed.teamId, seed.memberId,
+      { provider: "slack", externalId: "U-failure" });
+    await expect(setMemberIdentity(failing, seed.teamId, other,
+      { provider: "slack", externalId: "U-failure" }, { force: true }))
+      .rejects.toThrow("generation unavailable");
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-failure"))
+      .toBe(seed.memberId);
+    await expect(removeMemberIdentity(failing, seed.teamId,
+      { provider: "slack", externalId: "U-failure" })).rejects.toThrow("generation unavailable");
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-failure"))
+      .toBe(seed.memberId);
+    expect(await generation(seed.teamId)).toBe("1");
+  });
+
+  it("bumps for member hard-delete cascades, including invite rollback", async () => {
+    const seed = await seedTeam();
+    const removed = await addMember(seed.teamId);
+    const { data: member } = await db().from("members").select("email").eq("id", removed).single();
+    await setMemberIdentity(db(), seed.teamId, removed,
+      { provider: "slack", externalId: "U-hard-delete" });
+    const result = await deleteMember(db(), seed.teamId, member.email as string, { hard: true });
+    expect(result.deleted).toBe(true);
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-hard-delete"))
+      .toBeNull();
+    expect(await generation(seed.teamId)).toBe("2");
+
+    const rolledBack = await addMember(seed.teamId);
+    await setMemberIdentity(db(), seed.teamId, rolledBack,
+      { provider: "slack", externalId: "U-invite-rollback" });
+    await rollbackMemberCreation(db(), seed.teamId, rolledBack);
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-invite-rollback"))
+      .toBeNull();
+    expect(await generation(seed.teamId)).toBe("4");
+  });
+
+  it("rolls back a hard-delete cascade when its Slack generation bump fails", async () => {
+    const seed = await seedTeam();
+    const removed = await addMember(seed.teamId);
+    const { data: member } = await db().from("members").select("email").eq("id", removed).single();
+    await setMemberIdentity(db(), seed.teamId, removed,
+      { provider: "slack", externalId: "U-hard-rollback" });
+    const failing = transactionSessionDecoratedDb(db(), (session) => ({ ...session,
+      executeSql: async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        if (sql.includes("insert into slack_team_state") && sql.includes("identity_generation")) {
+          throw new Error("generation unavailable");
+        }
+        return session.executeSql<T>(sql, params);
+      },
+    }));
+    await expect(deleteMember(failing, seed.teamId, member.email as string, { hard: true }))
+      .rejects.toThrow("generation unavailable");
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U-hard-rollback"))
+      .toBe(removed);
+    expect(await generation(seed.teamId)).toBe("1");
+  });
+
+  it("bumps on a linked member's active roster transitions, once per transition", async () => {
+    const seed = await seedTeam();
+    const { data: member } = await db().from("members").select("email").eq("id", seed.memberId).single();
+    const email = member.email as string;
+    await setMemberIdentity(db(), seed.teamId, seed.memberId,
+      { provider: "slack", externalId: "U-lifecycle" });
+    expect(await generation(seed.teamId)).toBe("1");
+    await deleteMember(db(), seed.teamId, email);
+    expect(await generation(seed.teamId)).toBe("2");
+    await deleteMember(db(), seed.teamId, email);
+    expect(await generation(seed.teamId)).toBe("2");
+
+    const invited = await addMember(seed.teamId);
+    const { data: invite } = await db().from("members").select("email").eq("id", invited).single();
+    await db().from("members").update({ status: "invited" }).eq("id", invited);
+    await setMemberIdentity(db(), seed.teamId, invited,
+      { provider: "slack", externalId: "U-invited" });
+    expect(await generation(seed.teamId)).toBe("3");
+    const authId = await ensureAuthUser(invite.email as string);
+    await linkMemberByEmail(authId, invite.email as string, seed.teamId);
+    expect(await generation(seed.teamId)).toBe("4");
+    await linkMemberByEmail(authId, invite.email as string, seed.teamId);
+    expect(await generation(seed.teamId)).toBe("4");
+
+    const deferred = await addMember(seed.teamId);
+    await db().from("members").update({ status: "invited" }).eq("id", deferred);
+    await setMemberIdentity(db(), seed.teamId, deferred,
+      { provider: "slack", externalId: "U-deferred" });
+    const deferredEmail = (await db().from("members").select("email").eq("id", deferred).single()).data.email as string;
+    const deferredAuth = await ensureAuthUser(deferredEmail);
+    await linkMemberByEmail(deferredAuth, deferredEmail);
+    expect(await generation(seed.teamId)).toBe("5");
+    await activateInvitedMembership(seed.teamId, deferredAuth);
+    expect(await generation(seed.teamId)).toBe("6");
+    await activateInvitedMembership(seed.teamId, deferredAuth);
+    expect(await generation(seed.teamId)).toBe("6");
+  });
   it("creates, updates-in-place, blocks a cross-member remap, and force-remaps", async () => {
     const seed = await seedTeam();
     const other = await addMember(seed.teamId);
@@ -60,5 +206,11 @@ describe("syncSlackIdentities (real Postgres)", () => {
     expect(resolveByProviderId(map, "slack", "U9")).toBe(seed.memberId); // synced
     expect(resolveByProviderId(map, "slack", "U7")).toBe(other); // manual mapping preserved
     expect(resolveByProviderId(map, "slack", "U8")).toBeNull(); // never mapped
+    expect(await generation(seed.teamId)).toBe("2"); // manual U7 + newly mapped U9
+    await syncSlackIdentities(db(), seed.teamId, [
+      { id: "U9", displayName: "Alice renamed", email: "alice@corp.com" },
+      { id: "U7", displayName: "Alice Alt", email: "alice@corp.com" },
+    ]);
+    expect(await generation(seed.teamId)).toBe("2"); // display edit and collision are not remaps
   });
 });

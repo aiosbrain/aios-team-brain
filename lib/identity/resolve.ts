@@ -33,12 +33,14 @@ export interface AuthorIdentity {
 /** Build lookup tables mapping author identity → member_id for the team. */
 export async function buildIdentityMap(
   db: DbClient,
-  teamId: string
+  teamId: string,
+  opts: { strict?: boolean } = {}
 ): Promise<IdentityMap> {
-  const { data } = await db
+  const { data, error: membersError } = await db
     .from("members")
     .select("id, email, actor_handle")
     .eq("team_id", teamId);
+  if (opts.strict && membersError) throw new Error(`identity members read: ${membersError.message}`);
   const byEmail = new Map<string, string>();
   const byHandle = new Map<string, string>();
   const emailDomains = new Set<string>();
@@ -60,10 +62,11 @@ export async function buildIdentityMap(
   // Deliberately NOT added to emailDomains — alias domains like users.noreply.github.com are
   // shared, so widening the handle heuristic with them would re-introduce cross-author
   // misattribution (the bug PR #11 closed).
-  const { data: aliases } = await db
+  const { data: aliases, error: aliasesError } = await db
     .from("member_emails")
     .select("email, member_id")
     .eq("team_id", teamId);
+  if (opts.strict && aliasesError) throw new Error(`identity aliases read: ${aliasesError.message}`);
   for (const a of (aliases ?? []) as { email: string; member_id: string }[]) {
     if (a.email) byEmail.set(a.email.toLowerCase(), a.member_id);
   }
@@ -71,10 +74,11 @@ export async function buildIdentityMap(
   // Cross-provider identities (Slack/Linear/… user ids). Keyed by (provider, external_id); any
   // email carried on the row is also folded into byEmail as a secondary exact match.
   const byProviderId = new Map<string, string>();
-  const { data: identities } = await db
+  const { data: identities, error: identitiesError } = await db
     .from("member_identities")
     .select("provider, external_id, email, member_id")
     .eq("team_id", teamId);
+  if (opts.strict && identitiesError) throw new Error(`identity provider read: ${identitiesError.message}`);
   for (const i of (identities ?? []) as { provider: string; external_id: string; email: string | null; member_id: string }[]) {
     if (i.provider && i.external_id) byProviderId.set(providerKey(i.provider, i.external_id), i.member_id);
     if (i.email) byEmail.set(i.email.toLowerCase(), i.member_id);
