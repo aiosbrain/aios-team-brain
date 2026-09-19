@@ -36,6 +36,36 @@ export interface SlackEvidenceSnapshotOptions {
   afterPage?: (part: SlackEvidencePagePart, pageNumber: number, query: SqlExecutor) => Promise<void>;
 }
 
+/** Inputs here have been validated and captured by the transaction owner. */
+export interface SlackEvidenceSessionRequest {
+  teamId: string;
+  itemIds: readonly string[];
+  since: Date;
+  asOf: Date;
+  creditPageSize: number;
+  messagePageSize: number;
+}
+
+/** Read all evidence through the caller's read-only repeatable-read executor. */
+export async function readSlackEvidenceSnapshotInSession(
+  query: SqlExecutor,
+  input: SlackEvidenceSessionRequest,
+  afterPage?: SlackEvidenceSnapshotOptions["afterPage"]
+): Promise<SlackEvidenceSnapshot> {
+  const { teamId, itemIds, since, asOf, creditPageSize, messagePageSize } = input;
+  const credit = await readSlackCreditInputSnapshotInSession(
+    query, teamId, itemIds, creditPageSize,
+    (part, page, sql) => afterPage?.(
+      part === "messages" ? "creditMessages" : part, page, sql
+    ) ?? Promise.resolve()
+  );
+  await afterPage?.("creditInputs", 0, query);
+  const messages = await readVisibleSlackMessagesInSession(query, {
+    teamId, itemIds, since, asOf,
+  }, messagePageSize, (page, sql) => afterPage?.("visibleMessages", page, sql) ?? Promise.resolve());
+  return { ...credit, messages };
+}
+
 /**
  * Inactive evidence read. The caller must authorize the supplied IDs before the read, then
  * reauthorize visibility and revalidate generations before publication. No access or credit
@@ -63,16 +93,8 @@ export async function readSlackEvidenceSnapshot(
       const result = await client.query(sql, params);
       return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
     };
-    const credit = await readSlackCreditInputSnapshotInSession(
-      query, teamId, requested, creditPageSize,
-      (part, page, sql) => options.afterPage?.(
-        part === "messages" ? "creditMessages" : part, page, sql
-      ) ?? Promise.resolve()
-    );
-    await options.afterPage?.("creditInputs", 0, query);
-    const messages = await readVisibleSlackMessagesInSession(query, {
-      teamId, itemIds: requested, since, asOf,
-    }, messagePageSize, (page, sql) => options.afterPage?.("visibleMessages", page, sql) ?? Promise.resolve());
-    return { ...credit, messages };
+    return readSlackEvidenceSnapshotInSession(query, {
+      teamId, itemIds: requested, since, asOf, creditPageSize, messagePageSize,
+    }, options.afterPage);
   });
 }

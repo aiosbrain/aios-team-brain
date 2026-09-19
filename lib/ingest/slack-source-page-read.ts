@@ -30,6 +30,15 @@ export interface SlackSourcePage {
   hasMore: boolean;
 }
 
+export interface ValidatedSlackSourcePageRequest {
+  teamId: string;
+  itemIds: string[];
+  since: Date;
+  asOf: Date;
+  pageSize: number;
+  cursor?: SlackSourcePageCursor;
+}
+
 function preciseUtc(value: unknown): value is string {
   if (typeof value !== "string" || !PRECISE_UTC.test(value)) return false;
   const date = new Date(value);
@@ -37,15 +46,10 @@ function preciseUtc(value: unknown): value is string {
     date.toISOString().slice(0, 23) === value.slice(0, 23);
 }
 
-/**
- * One inactive, source-only keyset page. The future caller owns access rechecks, generation
- * binding and restart policy. A failed SQL read rejects; it never means an empty page.
- */
-export async function readSlackSourcePage(
-  input: SlackSourcePageRequest,
-  // Test seam for observing the read-only transaction and deterministic failure injection.
-  options: { beforeRead?: (query: SqlExecutor) => Promise<void> } = {}
-): Promise<SlackSourcePage> {
+/** Validate and capture mutable caller inputs before opening a transaction. */
+export function validateSlackSourcePageRequest(
+  input: SlackSourcePageRequest
+): ValidatedSlackSourcePageRequest {
   if (!input || typeof input.teamId !== "string" || !UUID.test(input.teamId)) {
     throw new TypeError("slack source page: invalid team ID");
   }
@@ -85,14 +89,16 @@ export async function readSlackSourcePage(
     cursor = { occurredAt: candidate.occurredAt, itemId: candidate.itemId.toLowerCase() };
   }
 
-  return withTransaction(async (client) => {
-    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
-    const query: SqlExecutor = async <T>(sql: string, params: unknown[] = []) => {
-      const result = await client.query(sql, params);
-      return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
-    };
-    await options.beforeRead?.(query);
-    const page = await query<SlackSourcePageCursor>(
+  return { teamId, itemIds: ids, since, asOf, pageSize, cursor };
+}
+
+/** The caller owns the read-only repeatable-read transaction and supplies captured bounds. */
+export async function readSlackSourcePageInSession(
+  query: SqlExecutor,
+  input: ValidatedSlackSourcePageRequest
+): Promise<SlackSourcePage> {
+  const { teamId, itemIds, since, asOf, pageSize, cursor } = input;
+  const page = await query<SlackSourcePageCursor>(
       `select m.item_id as "itemId",
               to_char(max(m.occurred_at) at time zone 'UTC',
                 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "occurredAt"
@@ -109,18 +115,38 @@ export async function readSlackSourcePage(
            or (max(m.occurred_at), m.item_id) < ($5::timestamptz, $6::uuid)
         order by max(m.occurred_at) desc, m.item_id desc
         limit $7`,
-      [teamId, ids, since.toISOString(), asOf.toISOString(),
+      [teamId, itemIds, since.toISOString(), asOf.toISOString(),
         cursor?.occurredAt ?? null, cursor?.itemId ?? null, pageSize + 1]
     );
-    const hasMore = page.rows.length > pageSize;
-    const rows = page.rows.slice(0, pageSize);
-    const last = rows.at(-1);
-    return {
-      itemIds: rows.map((row) => row.itemId),
-      hasMore,
-      nextCursor: hasMore && last
-        ? { occurredAt: last.occurredAt, itemId: last.itemId }
-        : null,
+  const hasMore = page.rows.length > pageSize;
+  const rows = page.rows.slice(0, pageSize);
+  const last = rows.at(-1);
+  return {
+    itemIds: rows.map((row) => row.itemId),
+    hasMore,
+    nextCursor: hasMore && last
+      ? { occurredAt: last.occurredAt, itemId: last.itemId }
+      : null,
+  };
+}
+
+/**
+ * One inactive, source-only keyset page. The future caller owns access rechecks, generation
+ * binding and restart policy. A failed SQL read rejects; it never means an empty page.
+ */
+export async function readSlackSourcePage(
+  input: SlackSourcePageRequest,
+  // Test seam for observing the read-only transaction and deterministic failure injection.
+  options: { beforeRead?: (query: SqlExecutor) => Promise<void> } = {}
+): Promise<SlackSourcePage> {
+  const captured = validateSlackSourcePageRequest(input);
+  return withTransaction(async (client) => {
+    await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    const query: SqlExecutor = async <T>(sql: string, params: unknown[] = []) => {
+      const result = await client.query(sql, params);
+      return { rows: result.rows as T[], rowCount: result.rowCount ?? 0 };
     };
+    await options.beforeRead?.(query);
+    return readSlackSourcePageInSession(query, captured);
   });
 }
