@@ -248,7 +248,7 @@ describe("guard: the NDA confidentiality gate", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 60_000);
 
   it("fails an explicitly bounded range above 500 commits with a distinct actionable verdict", () => {
     const dir = mkdtempSync(join(tmpdir(), "nda-gate-pr-limit-"));

@@ -39,6 +39,14 @@ import {
   type SystemProjectIds,
 } from "@/lib/projects/context/reconcile-item";
 import { noWideningGate } from "@/lib/projects/context/memberships";
+import {
+  prepareSlackPublication,
+  finishSlackPublication,
+  isSlackPublicationOption,
+  type SlackPublicationOption,
+} from "@/lib/ingest/slack-publication";
+import { slackChannelPathPrefix } from "@/lib/ingest/sources/slack-normalize";
+import { parseSlackItemPath, scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -131,7 +139,9 @@ export async function ingestItem(
   // visibility by re-pushing it (see the access-heal on the unchanged path). Defaults to `team`
   // because every INTERNAL caller (connectors, scanner, meetings) is trusted; ONLY the public
   // `/api/v1/items` route passes the real key tier, so an untrusted external key is gated out.
-  pusherTier: "team" | "external" = "team"
+  pusherTier: "team" | "external" = "team",
+  // Source-owned, transaction-validated capability. No active caller supplies this yet.
+  slackPublication?: SlackPublicationOption
 ): Promise<IngestResult> {
   const parsedPayload = itemPayloadSchema.safeParse({
     ...rawPayload,
@@ -145,6 +155,22 @@ export async function ingestItem(
   // Fail before project/pointer writes when a legacy wrapper forgot to delegate transactions.
   transactionCapability(db);
   const payload = parsedPayload.data;
+  // The scoped path is reserved at the common ingress, before the project/pointer upserts.
+  // Identity locks include project ID, so an ordinary writer in another project must never
+  // get far enough to race a publication transaction's absent-row collision check.
+  if (slackPublication !== undefined && !isSlackPublicationOption(slackPublication)) {
+    throw new IngestValidationError("slack publication requires an issued internal option");
+  }
+  const slackPath = parseSlackItemPath(payload.path);
+  if (slackPath?.kind === "scoped" &&
+      scopedSlackItemPath(slackPath.workspaceSegment, slackPath.channelSegment, slackPath.rootTs) === payload.path &&
+      !slackPublication) {
+    throw new IngestValidationError("canonical scoped Slack paths require internal Slack publication");
+  }
+  if (slackPublication && (access !== "team" || pusherTier !== "team" ||
+      opts?.authorMemberId !== null || payload.project !== "slack")) {
+    throw new IngestValidationError("slack publication requires the internal team source and an unattributed item");
+  }
   // Authoritative change key (see contentHash). The wire `content_sha256` is advisory from here on:
   // a mismatch means the pushing client hashes something other than the body it sent, which we record
   // on the item's audit row (below) so a buggy connector is diagnosable instead of silently corrupting
@@ -175,7 +201,30 @@ export async function ingestItem(
   const committed = await runContextTransaction(db, async (session) => {
     const db = session.db;
     const projectId = project.id as string;
-    await lockIngestIdentity(session, auth.teamId, projectId, payload.path);
+    const slackPrepared = slackPublication
+      ? await prepareSlackPublication(session, auth.teamId, payload, slackPublication)
+      : null;
+    if (slackPrepared) {
+      const { channelId, rootTs } = slackPublication!.claim.scope;
+      const oldPath = `${slackChannelPathPrefix(channelId)}${rootTs}.md`;
+      // The namespace gate was locked above. Acquire both path identities in canonical order,
+      // including the old identity that an accidentally live legacy writer would use.
+      for (const path of [oldPath, payload.path].sort()) {
+        await lockIngestIdentity(session, auth.teamId, projectId, path);
+      }
+      const old = await session.executeSql<{ id: string }>(
+        `select id from items where team_id=$1 and path=$2 for update`,
+        [auth.teamId, oldPath]
+      );
+      if (old.rows.length) throw new Error("slack publication: live legacy path requires operator repair");
+      const otherProject = await session.executeSql<{ id: string }>(
+        `select id from items where team_id=$1 and path=$2 and project_id<>$3 for update`,
+        [auth.teamId, payload.path, projectId]
+      );
+      if (otherProject.rows.length) throw new Error("slack publication: scoped path is already owned by another project");
+    } else {
+      await lockIngestIdentity(session, auth.teamId, projectId, payload.path);
+    }
     const locked = await lockIngestItemByPath(
       session,
       auth.teamId,
@@ -183,6 +232,13 @@ export async function ingestItem(
       payload.path
     );
     const existing = locked?.item ?? null;
+    if (slackPrepared && existing &&
+        (existing.frontmatter?.source !== "slack" ||
+         existing.frontmatter?.workspace_id !== slackPublication!.claim.scope.workspaceId ||
+         existing.frontmatter?.channel_id !== slackPublication!.claim.scope.channelId ||
+         existing.frontmatter?.ts !== slackPublication!.claim.scope.rootTs)) {
+      throw new Error("slack publication: scoped path has an unrelated item");
+    }
 
   // ── Who may set this item's tier ────────────────────────────────────────────────────────────────
   // Tier is an access-control decision, so it is resolved ONCE here and both write paths below use the
@@ -428,6 +484,9 @@ export async function ingestItem(
         );
       }
     }
+    // Ledger and queue acknowledgement belong to this transaction even when the item body is
+    // unchanged. An identical revisit can still carry a changed eligibility verdict.
+    if (slackPrepared) await finishSlackPublication(session, slackPrepared, existing.id);
     // No projection on an unchanged push (the route also guards status !== "unchanged").
     return {
       result: {
@@ -663,6 +722,7 @@ export async function ingestItem(
     }
   }
 
+  if (slackPrepared) await finishSlackPublication(session, slackPrepared, itemId);
   return {
     result: {
       status: existing ? "updated" : "created",
