@@ -14,10 +14,9 @@ import { ingest, seedTeam, type Seed } from "./helpers";
  * AIO-1170 — the Slack source-message ledger (`slack_messages`) and the per-team Slack cache
  * generations (`slack_team_state`), against real Postgres.
  *
- * NOTHING WRITES THESE TABLES YET. That is exactly why these tests exist now: every invariant the
- * publisher and the read legs will lean on is a property of the SCHEMA, and this is the only tier
- * that can observe it — a check constraint, a composite foreign key and microsecond storage are all
- * invisible to the in-memory fake. What is pinned here:
+ * No active ingestion path writes these tables. The inactive reconciliation helper has a separate
+ * real-Postgres suite; these tests pin the SCHEMA invariants the publisher and read legs rely on:
+ * check constraints, a composite foreign key and microsecond storage. What is pinned here:
  *
  *  1. message identity is the SOURCE's `(team, workspace, channel, ts)`, and the same channel/ts in
  *     another workspace or another AIOS team is a DIFFERENT message, not a duplicate;
@@ -33,7 +32,7 @@ import { ingest, seedTeam, type Seed } from "./helpers";
  * The evidence rows are produced by the accepted pure projection
  * (`lib/ingest/sources/slack-message-evidence`) rather than hand-written, so these assertions are
  * about states the source can actually reach. The small `toLedgerRow` codec below is TEST PLUMBING
- * standing in for the publisher that has not been built yet; when it is, it must map
+ * standing in for the publisher integration that has not been built yet; when it is, it must map
  * `status`/`reason` exactly this way, and the DB constraints here are what will refuse it if it
  * does not.
  */

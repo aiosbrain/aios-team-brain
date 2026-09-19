@@ -1222,11 +1222,11 @@ create index if not exists item_versions_item_idx on item_versions (item_id, cre
 -- UTC day) — cannot be recovered from it: the intervening days a person actually worked are gone.
 -- Design: docs/design/slack-timeline-reliability.md.
 --
--- ⚠️ NOTHING WRITES OR READS THESE TWO TABLES YET. This slice defines the store and its invariants
--- so they can be pinned (test/datamechanics/slack-ledger.datamechanics.test.ts) before the publisher
--- — one source-owned writer inside the EXISTING `ingestItem` transaction — and the query/credit legs
--- depend on them. An empty ledger is therefore NOT evidence of an empty Slack history yet; the
--- oracle's three-state rule only starts reading it once the publisher ships.
+-- ⚠️ No active ingestion or credit path reads or writes these tables. An inactive source-owned
+-- reconciliation helper exists, but the publisher must later call it inside the EXISTING
+-- `ingestItem` transaction after its verification gates. An empty ledger is therefore NOT evidence
+-- of an empty Slack history yet; the oracle's three-state rule starts reading it only after the
+-- publisher ships.
 --
 -- IDENTITY IS THE SOURCE'S. A row is `(team, workspace, channel, message_ts)` with every Slack
 -- string byte-exact; `message_ts` is TEXT and is never parsed to form identity. The instant is
@@ -1336,7 +1336,7 @@ create index if not exists slack_messages_item_idx
 -- worker's memory entry without a broadcast.
 --
 -- ABSENT ROW = generation 0 (a team that has never published Slack evidence). A FAILED read is an
--- error and must never be read as 0 — that distinction lives in the reader, which is a later slice;
+-- error and must never be read as 0 — the inactive indexed helper now enforces that distinction;
 -- there is no schema-level way to state it.
 create table if not exists slack_team_state (
   team_id uuid primary key references teams(id) on delete cascade,
