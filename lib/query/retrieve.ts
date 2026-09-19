@@ -14,6 +14,7 @@ import {
 import { externalProvider } from "./external-provider";
 import { denseSearch, fuseByRrf } from "./dense-search";
 import { rankedFtsSearch } from "./fts-search";
+import { channelScopeSql, resolveVisibleChannelScope, type VisibleChannelScope } from "./channel-scope";
 import { analyzeTermSpecificity } from "./grounding";
 import { taskStatusCounts, matchingDecisions } from "./structured-extras";
 import { copiedStagingSpendAllowed } from "@/lib/staging/runtime-policy";
@@ -33,6 +34,42 @@ const FTS_CANDIDATE_LIMIT = Number(process.env.FTS_CANDIDATE_LIMIT ?? 50);
 // When the question names a source (`parseSourceScope`), how many of its MOST-RECENT items to pull in
 // by recency (bypassing FTS rank) so "what's the conversation in slack" surfaces the latest threads.
 const SOURCE_RECENCY_LIMIT = Number(process.env.SOURCE_RECENCY_LIMIT ?? 8);
+
+/** The same path and membership predicate feeds general and source recency before LIMIT. */
+async function scopedRecency(
+  teamId: string,
+  tier: "team" | "external",
+  limit: number,
+  scope: VisibleChannelScope | null,
+  visibleIds: readonly string[] | null,
+  source?: string
+) {
+  if (visibleIds && visibleIds.length === 0) return { data: [] };
+  const params: unknown[] = [teamId];
+  let where = "i.team_id = $1";
+  if (visibleIds) {
+    params.push(visibleIds);
+    where += ` and i.id = any($${params.length}::uuid[])`;
+  } else if (tier === "external") {
+    where += " and i.access = 'external'";
+  }
+  if (source) {
+    params.push(source);
+    where += ` and i.frontmatter->>'source' = $${params.length}`;
+  }
+  if (scope) where += ` and ${channelScopeSql(scope, "i", params)}`;
+  params.push(limit);
+  const result = await runSql<{
+    id: string; path: string; kind: string; body: string | null;
+    synced_at: string | Date; work_at: string | Date; slug: string;
+  }>(`select i.id, i.path, i.kind, i.body, i.synced_at, i.work_at,
+            coalesce(p.slug, '') as slug
+       from items i left join projects p on p.id = i.project_id
+      where ${where}
+      order by i.work_at desc, i.id desc
+      limit $${params.length}`, params);
+  return { data: result.rows.map(({ slug, ...row }) => ({ ...row, projects: { slug } })) };
+}
 const GIT_WINDOW_DAYS = 90; // recency window for the per-contributor git-activity digest
 const PEOPLE_WINDOW_DAYS = 90; // recency window for the per-person cross-tool activity digest
 
@@ -303,37 +340,6 @@ export function parseChannelScope(question: string): { channel: string | null; c
 }
 
 /**
- * The PATH SEGMENT a channel name lives under, for the soft recency legs.
- *
- * `parseChannelScope` yields a NAME ("#growth" → `growth`), and for sources that key paths by name
- * (`linear/aio/…`) that name IS the 2nd path segment. Slack is different: its paths are keyed on the
- * immutable channel ID so a rename can't re-key every thread into duplicate items, which leaves the
- * segment opaque (`slack/c0b8v119g4d/…`) and the readable name in `frontmatter.channel`. So resolve
- * name → segment once; a name that resolves to nothing (non-Slack sources) falls back to itself,
- * preserving the previous behavior exactly.
- *
- * One small indexed lookup, and ONLY when the question actually names a channel. It exists because
- * the pg adapter has no `.or()` — the precise FTS leg matches both arms in one SQL predicate.
- */
-async function resolveChannelSegment(
-  db: DbClient,
-  teamId: string,
-  tier: "team" | "external",
-  channel: string,
-  visArr?: string[] | null
-): Promise<string> {
-  // Mode-keyed like every content leg since PRET-4 §1b (no RLS backstop): enforcing (visArr
-  // present) → the oracle set alone — the posture conjunct would re-block ruling 2's granted
-  // team rows; permissive → the two-bucket posture wall alone.
-  let q = db.from("items").select("path").eq("team_id", teamId).eq("frontmatter->>channel", channel).limit(1);
-  if (visArr) q = q.in("id", visArr); // enforcement: don't resolve a segment from an invisible item (Codex Medium)
-  const { data } = await q;
-  const path = (data as { path: string }[] | null)?.[0]?.path;
-  const seg = path ? path.split("/")[1] : "";
-  return seg || channel;
-}
-
-/**
  * Detect an explicit SOURCE scope — a query naming an ingestion source it wants the recent content
  * FROM ("what's the conversation in slack right now", "latest notion docs", "what's on linear"). Generic
  * content-similarity ranking BURIES such items: a Slack thread matches the query only on the single word
@@ -568,6 +574,7 @@ async function nativeRetrieve(
   // Channel scope (Gap #4): if the question names a channel ("#eng" / "in the sales channel"), scope
   // item retrieval to it and strip the phrase so the channel word isn't also a content search term.
   const { channel, cleaned } = parseChannelScope(question);
+  const channelScope = channel ? await resolveVisibleChannelScope(teamId, tier, channel, visArr) : null;
   const q = channel ? cleaned : question;
   // Source scope (this fix): if the question names a source it wants recent content FROM ("what's the
   // conversation in slack"), we add a recency leg for that source below — such items are buried by
@@ -620,7 +627,7 @@ async function nativeRetrieve(
   // OR of significant terms by default; AND when the query carries an explicit `AND` operator
   // (conjunctive intent — narrows to docs about ALL topics). Same string flows to every FTS leg.
   const { query: ftsQuery, terms } = buildFtsQuery(q);
-  const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channel, visArr);
+  const ftsP = rankedFtsSearch(teamId, tier, ftsQuery, FTS_CANDIDATE_LIMIT, channelScope, visArr);
   // Grounding specificity (Gap #3) — runs concurrently; combined with hadFtsHit below.
   const specificityP = analyzeTermSpecificity(teamId, tier, terms, visArr ?? []); // ENFB-1: the visible corpus is the statistic's universe
   // Structured-context scaling (Gaps #5/#6): a FULL-corpus task count (aggregates survive the 80-row
@@ -646,37 +653,15 @@ async function nativeRetrieve(
   //    persisted WORK time, not `synced_at` (R1/M3): every re-sync tick bumps `synced_at`, so ordering
   //    by it made "latest" mean "most recently re-scanned" — a backfill of an old corpus would answer
   //    "what's the latest" with months-old documents. `id` breaks ties so the page is deterministic.
-  let recentB = db
-    .from("items")
-    .select("id, path, kind, body, synced_at, work_at, projects(slug)")
-    .eq("team_id", teamId)
-    .order("work_at", { ascending: false })
-    .order("id", { ascending: false })
-    .limit(8);
-  if (visArr) recentB = recentB.in("id", visArr); // enforcement: recency over visible items only
-  // Channel scope (Gap #4) — keep the recency fallback inside the same channel. LIKE on the 2nd path
-  // segment, resolved from the name first (Slack's segment is its channel ID — see
-  // resolveChannelSegment); the FTS leg does the precise matching, this soft filter is padding.
-  const channelSeg = channel ? await resolveChannelSegment(db, teamId, tier, channel, visArr) : null;
-  if (channelSeg) recentB = recentB.like("path", `%/${channelSeg}/%`);
+  const recentB = scopedRecency(teamId, tier, 8, channelScope, visArr);
 
   // 2a. SOURCE-scoped recency: when the question names a source, pull its most-recent items by
   // WORK time (`work_at`, like the leg above) REGARDLESS of keyword rank (the recall fix for "what's the conversation in slack" —
   // Slack threads rank below the FTS cut, so they never reached the model). Tier-filtered like every
   // leg; also channel-scoped when both are named. `null` → no source query (resolves to empty rows).
-  let sourceRecencyB: typeof recentB | null = null;
-  if (scopedSource) {
-    sourceRecencyB = db
-      .from("items")
-      .select("id, path, kind, body, synced_at, work_at, projects(slug)")
-      .eq("team_id", teamId)
-      .eq("frontmatter->>source", scopedSource)
-      .order("work_at", { ascending: false })
-      .order("id", { ascending: false })
-      .limit(SOURCE_RECENCY_LIMIT);
-    if (visArr) sourceRecencyB = sourceRecencyB.in("id", visArr); // enforcement
-    if (channelSeg) sourceRecencyB = sourceRecencyB.like("path", `%/${channelSeg}/%`);
-  }
+  const sourceRecencyB = scopedSource
+    ? scopedRecency(teamId, tier, SOURCE_RECENCY_LIMIT, channelScope, visArr, scopedSource)
+    : null;
 
   // 3. Structured-context queries — ENFB-2 §2.2: the provenance predicate compiles IN-QUERY
   // (before LIMIT), so the recency-50 and task-80 windows fill with rows THIS principal may
@@ -880,7 +865,7 @@ async function nativeRetrieve(
   const graphFacts = await graphFactsP;
   const expansion = graphExpansionQuery(graphFacts);
   if (expansion) {
-    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channel, visArr);
+    const semHits = await rankedFtsSearch(teamId, tier, expansion, 10, channelScope, visArr);
     if (semHits.length > 0) grounded = true;
     for (const hit of semHits) {
       if (seen.has(hit.id)) continue;
