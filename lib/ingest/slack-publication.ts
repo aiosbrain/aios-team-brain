@@ -14,6 +14,7 @@ import type { SlackMessage } from "./sources/slack";
 
 /** Inactive internal seam. A claim is only a locator; every authority is checked again in SQL. */
 const publicationBrand: unique symbol = Symbol("slack-publication");
+const issuedPublicationOptions = new WeakSet<object>();
 export interface SlackPublicationOption {
   readonly [publicationBrand]: true;
   readonly claim: SlackThreadClaim;
@@ -34,7 +35,7 @@ export function slackPublicationOption(input: Omit<SlackPublicationOption, typeo
   }
   // Capture one immutable request. The caller may continue its next provider read while ingestItem
   // awaits SQL; changing a claim or directory object then must not retarget this transaction.
-  return Object.freeze({
+  const option = Object.freeze({
     ...input,
     claim: Object.freeze({ ...input.claim, scope: Object.freeze({ ...input.claim.scope }) }),
     binding: Object.freeze({ ...input.binding }),
@@ -42,6 +43,13 @@ export function slackPublicationOption(input: Omit<SlackPublicationOption, typeo
       [id, Object.freeze({ ...user })]))),
     [publicationBrand]: true as const,
   });
+  issuedPublicationOptions.add(option);
+  return option;
+}
+
+/** Only options issued by this factory can enter the publication transaction. */
+export function isSlackPublicationOption(value: unknown): value is SlackPublicationOption {
+  return typeof value === "object" && value !== null && issuedPublicationOptions.has(value);
 }
 
 export interface PreparedSlackPublication {
@@ -58,7 +66,7 @@ export async function prepareSlackPublication(
   payload: ItemPayload,
   option: SlackPublicationOption,
 ): Promise<PreparedSlackPublication> {
-  if (!option || option[publicationBrand] !== true) refuse();
+  if (!isSlackPublicationOption(option)) refuse();
   const { claim, binding } = option;
   const { scope } = claim;
   if (!scope || scope.teamId !== teamId || binding.teamId !== teamId ||

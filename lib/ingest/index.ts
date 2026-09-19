@@ -42,9 +42,11 @@ import { noWideningGate } from "@/lib/projects/context/memberships";
 import {
   prepareSlackPublication,
   finishSlackPublication,
+  isSlackPublicationOption,
   type SlackPublicationOption,
 } from "@/lib/ingest/slack-publication";
 import { slackChannelPathPrefix } from "@/lib/ingest/sources/slack-normalize";
+import { parseSlackItemPath, scopedSlackItemPath } from "@/lib/ingest/sources/slack-namespace";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -153,6 +155,18 @@ export async function ingestItem(
   // Fail before project/pointer writes when a legacy wrapper forgot to delegate transactions.
   transactionCapability(db);
   const payload = parsedPayload.data;
+  // The scoped path is reserved at the common ingress, before the project/pointer upserts.
+  // Identity locks include project ID, so an ordinary writer in another project must never
+  // get far enough to race a publication transaction's absent-row collision check.
+  if (slackPublication !== undefined && !isSlackPublicationOption(slackPublication)) {
+    throw new IngestValidationError("slack publication requires an issued internal option");
+  }
+  const slackPath = parseSlackItemPath(payload.path);
+  if (slackPath?.kind === "scoped" &&
+      scopedSlackItemPath(slackPath.workspaceSegment, slackPath.channelSegment, slackPath.rootTs) === payload.path &&
+      !slackPublication) {
+    throw new IngestValidationError("canonical scoped Slack paths require internal Slack publication");
+  }
   if (slackPublication && (access !== "team" || pusherTier !== "team" ||
       opts?.authorMemberId !== null || payload.project !== "slack")) {
     throw new IngestValidationError("slack publication requires the internal team source and an unattributed item");

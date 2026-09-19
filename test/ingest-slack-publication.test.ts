@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { TransactionSession } from "@/lib/db/types";
+import type { DbClient } from "@/lib/db/types";
 import type { ItemPayload } from "@/lib/api/schemas";
+import { ingestItem } from "@/lib/ingest";
 import { prepareSlackPublication, slackPublicationOption, type SlackPublicationOption } from "@/lib/ingest/slack-publication";
 
 const TEAM = "00000000-0000-4000-8000-000000000001";
@@ -42,5 +44,24 @@ describe("inactive Slack publication option preflight", () => {
     await expect(prepareSlackPublication(session, TEAM, { ...payload,
       frontmatter: { ...payload.frontmatter, workspace_id: "T2" } }, option))
       .rejects.toThrow(/refused/);
+    // A symbol copied from a legitimate option is not a capability issued by the factory.
+    await expect(prepareSlackPublication(session, TEAM, payload, { ...option }))
+      .rejects.toThrow(/refused/);
+  });
+
+  it("rejects ordinary scoped writes and truthy forged options before any data operation", async () => {
+    const noWrites = {
+      from: () => { throw new Error("project write must not run"); },
+      rpc: () => { throw new Error("RPC must not run"); },
+      transaction: () => { throw new Error("transaction must not run"); },
+    } as unknown as DbClient;
+    const auth = { teamId: TEAM, memberId: TEAM, apiKeyId: TEAM };
+    await expect(ingestItem(noWrites, auth, { ...payload, project: "foreign" }, "team"))
+      .rejects.toThrow(/canonical scoped Slack paths require internal Slack publication/);
+    await expect(ingestItem(noWrites, auth, payload, "team"))
+      .rejects.toThrow(/canonical scoped Slack paths require internal Slack publication/);
+    await expect(ingestItem(noWrites, auth, payload, "team", { authorMemberId: null }, "team",
+      { ...option } as SlackPublicationOption))
+      .rejects.toThrow(/requires an issued internal option/);
   });
 });

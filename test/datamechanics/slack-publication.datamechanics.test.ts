@@ -112,6 +112,35 @@ function payloadFor(messages: SlackMessage[]) {
 }
 
 describe("inactive Slack publication in the existing ingest transaction", () => {
+  it("reserves canonical scoped paths across projects before project or pointer writes", async () => {
+    const f = await fixture();
+    const projects = () => raw.query(`select id,slug,graph_group_id,last_synced_at from projects
+      where team_id=$1 and slug in ('foreign', 'slack') order by slug`, [f.seed.teamId]);
+    const before = (await projects()).rows;
+    for (const candidate of [{ ...f.payload, project: "foreign" }, f.payload]) {
+      await expect(ingestItem(db(), f.auth, candidate, "team"))
+        .rejects.toThrow(/canonical scoped Slack paths require internal Slack publication/);
+      expect((await projects()).rows).toEqual(before);
+      expect(await counts(f.seed.teamId)).toMatchObject({ items: 0, versions: 0, jobs: 1, snapshots: 1 });
+    }
+  });
+
+  it("keeps legacy Slack and unrelated project paths writable through ordinary ingest", async () => {
+    const f = await fixture();
+    const legacy = { ...f.payload, path: `slack/${CHANNEL.toLowerCase()}/${ROOT}.md` };
+    const unrelated = { ...f.payload, project: "foreign", path: `notes/thread-${ROOT}.md` };
+    expect(await ingestItem(db(), f.auth, legacy, "team"))
+      .toMatchObject({ status: "created" });
+    expect(await ingestItem(db(), f.auth, unrelated, "team"))
+      .toMatchObject({ status: "created" });
+    const stored = await raw.query(`select p.slug,i.path,p.graph_group_id from items i
+      join projects p on p.id=i.project_id where i.team_id=$1 order by p.slug`, [f.seed.teamId]);
+    expect(stored.rows).toMatchObject([
+      { slug: "foreign", path: unrelated.path, graph_group_id: expect.any(String) },
+      { slug: "slack", path: legacy.path, graph_group_id: expect.any(String) },
+    ]);
+  });
+
   it("publishes a changed item with exact ledger rows, generation and queue acknowledgement", async () => {
     const f = await fixture();
     expect(await ingestItem(db(), f.auth, f.payload, "team", { authorMemberId: null }, "team", f.option))
