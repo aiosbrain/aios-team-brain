@@ -11,6 +11,7 @@ import { parseSlackTimestamp } from "@/lib/ingest/sources/slack-message-evidence
 import { enqueueSlackThread } from "@/lib/ingest/slack-thread-state";
 import {
   acceptSlackChannelPage,
+  beginSlackChannelMetadata,
   claimSlackChannelPage,
   delaySlackChannel,
   dueSlackChannels,
@@ -20,7 +21,6 @@ import {
   recordSlackChannelPublicState,
   releaseSlackChannelForRetry,
   restartSlackChannelScan,
-  SLACK_CHANNEL_METADATA_TTL_MS,
   type SlackChannelClaim,
   type SlackChannelState,
 } from "@/lib/ingest/slack-channel-state";
@@ -76,6 +76,8 @@ import {
 
 /** The default per-invocation request ceiling: auth.test, bots.info, conversations.info, one page. */
 export const SLACK_DISCOVERY_MAX_REQUESTS = 4;
+/** Initial re-observation cadence; activation must measure provider capacity before changing it. */
+export const SLACK_METADATA_INTERVAL_MS = 30 * 60 * 1000;
 
 export interface SlackSourceDiscoveryInput {
   readonly db: DbClient;
@@ -93,6 +95,8 @@ export interface SlackSourceDiscoveryOptions {
   readonly envToken?: () => string | null;
   readonly maxRequests?: number;
   readonly leaseMs?: number;
+  /** Re-observation interval for channel metadata, in milliseconds. */
+  readonly metadataIntervalMs?: number;
 }
 
 export type SlackDiscoveryStage = "selection" | "auth" | "app" | "metadata" | "history";
@@ -266,6 +270,10 @@ export async function discoverSlackSource(
   input: SlackSourceDiscoveryInput,
   options: SlackSourceDiscoveryOptions = {}
 ): Promise<SlackSourceDiscoveryResult> {
+  const metadataIntervalMs = options.metadataIntervalMs ?? SLACK_METADATA_INTERVAL_MS;
+  if (!Number.isSafeInteger(metadataIntervalMs) || metadataIntervalMs <= 0) {
+    throw new TypeError("slack source discovery: metadataIntervalMs must be a positive whole number");
+  }
   const pass: Pass = {
     input,
     options,
@@ -477,7 +485,7 @@ function readAuthTest(body: Record<string, unknown>): AuthIdentity {
         "user token has no app identity to bind.",
     };
   }
-  return { ok: true, value: { workspaceId, botId, appId, workspaceUrl: httpsUrl(body.url) } };
+  return { ok: true, value: { workspaceId, botId, appId, workspaceUrl: slackWorkspaceUrl(body.url) } };
 }
 
 type AppIdentity = { ok: true; appId: string } | { ok: false; category: string; detail: string };
@@ -535,11 +543,23 @@ async function proveChannel(
   });
 
   const now = Date.now();
-  const target = states.find((state) => needsPublicProof(state, ref, now));
+  const target = states.find((state) =>
+    needsSlackPublicProof(state, ref, now, pass.options.metadataIntervalMs ?? SLACK_METADATA_INTERVAL_MS)
+  );
   if (!target) return;
 
   const scope = verifiedScope(selection, bound);
   const channelId = target.scope.channelId;
+  if (pass.remaining <= 0) {
+    await request(pass, "metadata", selection, scope, "conversations.info", { channel: channelId });
+    return;
+  }
+  // This short transaction commits the channel's ordering generation BEFORE the HTTP request.
+  // A second integration may have a different app bucket and race this one legitimately.
+  const attempt = await runContextTransaction(pass.input.db, (session) =>
+    beginSlackChannelMetadata(session, target.scope)
+  );
+  if (!attempt) return;
   const call = await request(pass, "metadata", selection, scope, "conversations.info", {
     channel: channelId,
   });
@@ -551,7 +571,7 @@ async function proveChannel(
     // alone on purpose: it gates the HISTORY lane, and a `conversations.info` cooldown says nothing
     // about whether this channel may be read under the proof it already has.
     await runContextTransaction(pass.input.db, (session) =>
-      delaySlackChannel(session, target.scope, {
+      delaySlackChannel(session, target.scope, attempt, {
         dueAt: null,
         errorCode: sanitize(call.category),
       })
@@ -579,11 +599,12 @@ async function proveChannel(
       session,
       target.scope,
       { integrationId: selection.integrationId, configRevision: ref.configRevision },
+      attempt,
       { publicState: verdict.state, errorCode: verdict.state === "public" ? null : verdict.category }
     );
   });
   if (written.outcome !== "written") {
-    step(pass, { stage: "metadata", method: "conversations.info", result: "refused", category: "binding_changed", channelId });
+    step(pass, { stage: "metadata", method: "conversations.info", result: "refused", category: "metadata_superseded", channelId });
     return;
   }
   step(pass, {
@@ -597,16 +618,21 @@ async function proveChannel(
 
 /**
  * A proof is re-checked when there is none, when it was made under a configuration or token that no
- * longer applies, or when it is older than the metadata TTL. It is NOT re-checked every wake: a
+ * longer applies, or when it is older than the configured observation interval. It is NOT re-checked every wake: a
  * 15-second re-verification would spend the whole `conversations.info` allowance re-proving what we
  * already know, and that allowance is shared with interactive channel validation.
  */
-function needsPublicProof(state: SlackChannelState, ref: SlackBindingRef, now: number): boolean {
+export function needsSlackPublicProof(
+  state: Pick<SlackChannelState, "publicState" | "publicCheckedAt" | "bindingIntegrationId" | "bindingConfigRevision">,
+  ref: Pick<SlackBindingRef, "integrationId" | "configRevision">,
+  now: number,
+  intervalMs: number
+): boolean {
   if (state.publicState === "unknown") return true;
   if (state.bindingIntegrationId !== ref.integrationId) return true;
   if (state.bindingConfigRevision !== ref.configRevision) return true;
   if (state.publicCheckedAt === null) return true;
-  return Date.parse(state.publicCheckedAt) <= now - SLACK_CHANNEL_METADATA_TTL_MS;
+  return Date.parse(state.publicCheckedAt) <= now - intervalMs;
 }
 
 interface ChannelVerdict {
@@ -771,9 +797,9 @@ async function fetchAndAccept(
     return;
   }
 
-  // A SEED scan is one page by definition: it has no certified top to catch up from, so what it
-  // certifies is the span this page covered and everything older belongs to the historical lane.
-  const terminal = !page.hasMore || (claim.lane === "newest" && claim.lowerTs === null);
+  // A partial initial historical scan retains its actual cursor and anchor. Its newest catch-up
+  // boundary is separate from the certified completed interval until the historical floor is read.
+  const terminal = !page.hasMore;
 
   const accepted = await runContextTransaction(pass.input.db, async (session) => {
     // LOCK ORDER: the integration row first, then the channel row — the same order everywhere, so
@@ -877,7 +903,7 @@ async function reportBindingFailure(
   stage: "auth" | "app",
   method: SlackBudgetedMethod,
   ref: SlackBindingRef,
-  call: SlackCallDisposition,
+  call: Exclude<SlackCallDisposition, { readonly kind: "ok" }>,
   selection: SlackSelection
 ): Promise<void> {
   const category = sanitize(call.category);
@@ -964,10 +990,16 @@ function providerId(value: unknown): string | null {
 }
 
 /** auth.test's `url`, kept only when it is a real HTTPS workspace URL. */
-function httpsUrl(value: unknown): string | null {
+export function slackWorkspaceUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
+  if (value.trim() !== value || /[\\?#\r\n\t]/.test(value)) return null;
   try {
-    return new URL(value).protocol === "https:" ? value : null;
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash || url.pathname !== "/") {
+      return null;
+    }
+    if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?[.]slack[.]com$/.test(url.hostname)) return null;
+    return `https://${url.hostname}/`;
   } catch {
     return null;
   }

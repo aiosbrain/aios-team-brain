@@ -60,11 +60,16 @@ function discover(
   seed: Seed,
   integrationId: string,
   fake: SlackFake,
-  over: { envToken?: () => string | null; maxRequests?: number } = {}
+  over: { envToken?: () => string | null; maxRequests?: number; metadataIntervalMs?: number } = {}
 ): Promise<SlackSourceDiscoveryResult> {
   return discoverSlackSource(
     { db: db(), teamId: seed.teamId, integrationId },
-    { fetchImpl: fake.impl, envToken: over.envToken ?? (() => null), maxRequests: over.maxRequests }
+    {
+      fetchImpl: fake.impl,
+      envToken: over.envToken ?? (() => null),
+      maxRequests: over.maxRequests,
+      metadataIntervalMs: over.metadataIntervalMs,
+    }
   );
 }
 
@@ -133,6 +138,7 @@ describe("the columns this slice may own", () => {
       expect.arrayContaining([
         "completed_lower_ts",
         "completed_upper_ts",
+        "newest_catchup_upper_ts",
         "newest_anchor_ts",
         "newest_cursor",
         "newest_scan_generation",
@@ -146,6 +152,8 @@ describe("the columns this slice may own", () => {
         "lease_generation",
         "lease_expires_at",
         "public_state",
+        "metadata_attempt_owner",
+        "metadata_attempt_generation",
         "binding_config_revision",
       ])
     );
@@ -187,15 +195,38 @@ describe("app-identity bootstrap", () => {
     // Every top-level root on the page became durable pending work, under the SCOPED identity.
     expect(await threadRootTs(seed.teamId)).toEqual(["1718900000.000100", "1718900000.000200"]);
 
-    // The seed page certifies exactly the interval it covered: [oldest returned, frozen anchor].
+    // This terminal initial page certifies [oldest returned, EXACT request.latest].
     expect(channel?.completed_lower_ts).toBe("1718900000.000100");
-    // The anchor was the DB clock at claim time, and the scan that froze it is over — so it lives on
-    // as the certified top rather than as live lane state.
-    expect(channel?.completed_upper_ts).toMatch(/^[0-9]+\.[0-9]{6}$/);
+    const request = fake.paramsOf("conversations.history")[0];
+    expect(request.get("latest")).toMatch(/^[0-9]+\.[0-9]{6}$/);
+    expect(channel?.completed_upper_ts).toBe(request.get("latest"));
+    expect(request.get("oldest")).toBeNull();
     expect(channel?.newest_anchor_ts).toBeNull();
+    expect(channel?.historical_anchor_ts).toBeNull();
+    expect(channel?.historical_cursor).toBeNull();
     // …and the lease is not held between wakes.
     expect(channel?.lease_owner).toBeNull();
     expect(channel?.claimed_lane).toBeNull();
+  });
+
+  it("keeps valid workspace and app identity when the optional workspace URL is invalid", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    const fake = fullPass({
+      "auth.test": () => slackJson(authTestBody({ app_id: APP, url: "https://user:secret@acme.slack.com/" })),
+    });
+
+    const result = await discover(seed, integrationId, fake);
+
+    expect(result.outcome).toBe("progressed");
+    expect(result.binding).toMatchObject({ state: "verified", workspaceId: WORKSPACE, appId: APP, workspaceUrl: null });
+    expect(await bindingRow(seed.teamId, integrationId)).toMatchObject({
+      state: "verified",
+      workspace_id: WORKSPACE,
+      app_id: APP,
+      workspace_url: null,
+    });
+    expect(fake.countOf("conversations.history")).toBe(1);
   });
 
   it("falls back to bots.info for EXACTLY the bot auth.test named", async () => {
@@ -316,6 +347,28 @@ describe("app-identity bootstrap", () => {
 // ── channel metadata ─────────────────────────────────────────────────────────
 
 describe("channel public proof", () => {
+  it("uses the configured metadata observation cadence", async () => {
+    const seed = await seedTeam();
+    const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
+    await discover(seed, integrationId, fullPass());
+    await agePublicProof(seed.teamId, CHANNEL); // seven days old
+    await elapse(seed.teamId);
+
+    const withinCadence = fullPass({
+      "auth.test": () => { throw new Error("the binding is already verified"); },
+      "conversations.info": () => { throw new Error("the 14-day cadence should reuse this proof"); },
+    });
+    await discover(seed, integrationId, withinCadence, { metadataIntervalMs: 14 * 24 * 60 * 60 * 1000 });
+    expect(withinCadence.countOf("conversations.info")).toBe(0);
+
+    await elapse(seed.teamId);
+    const defaultCadence = fullPass({
+      "auth.test": () => { throw new Error("the binding is already verified"); },
+    });
+    await discover(seed, integrationId, defaultCadence);
+    expect(defaultCadence.countOf("conversations.info")).toBe(1);
+  });
+
   it("blocks discovery for a private channel, and dispatches no history", async () => {
     const seed = await seedTeam();
     const integrationId = await seedSlackIntegration(seed, { channelIds: [CHANNEL], token: TOKEN });
@@ -393,11 +446,15 @@ describe("token and config changes invalidate the binding", () => {
     await elapse(seed.teamId);
 
     const after = fullPass();
-    await discover(seed, integrationId, after);
+    // Spend this wake on the new binding and its public proof. A subsequent history request may
+    // legitimately extend completed_upper_ts, so inspect preservation before that next read.
+    await discover(seed, integrationId, after, { maxRequests: 2 });
 
     // The identity is proved again under the NEW token before anything else is read…
     expect(after.countOf("auth.test")).toBe(1);
     expect(after.calls[0]?.authorization).toBe(`Bearer ${ROTATED}`);
+    expect(after.countOf("conversations.info")).toBe(1);
+    expect(after.countOf("conversations.history")).toBe(0);
     // …and the pages we already read are not thrown away.
     const channel = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect(channel?.completed_lower_ts).toBe(before?.completed_lower_ts);

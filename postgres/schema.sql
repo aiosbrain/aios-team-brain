@@ -3119,14 +3119,13 @@ alter table slack_integration_bindings
 -- metadata, not the namespace migration gate.
 --
 -- THE TWO LANES, AND WHY THE CERTIFIED INTERVAL IS SEPARATE FROM THEM:
---  • `newest_*`   — catch-up. Anchored (frozen) at the DB clock when the scan starts, lower-bounded
---                   at `completed_upper_ts` so the previous boundary is re-read; the duplicate root
---                   at the seam is deduplicated by the exact-key thread enqueue, not by trimming.
---                   EMPTY while nothing is certified yet — there is no top to extend from, so the
---                   lane lends its slot to the historical scan.
---  • `historical_*` — backfill. Anchored at `completed_lower_ts` (or the clock, first time) with NO
---                   lower bound, paging back to the provider's retention floor. Empty once
---                   `historical_floor_reached`.
+--  • `historical_*` — the FIRST scan, anchored at the DB clock with no lower bound, pages back to
+--                   the provider's retention floor. A partial first page retains its cursor and
+--                   anchor; later historical scans start at the certified lower bound.
+--  • `newest_*`   — catch-up above the initial historical anchor, then above the most recent fully
+--                   read top. The lower boundary is re-read and its duplicate roots are deduplicated
+--                   by the exact-key thread enqueue. A completed catch-up stays provisional until
+--                   the initial historical scan reaches the floor.
 --  • `completed_lower_ts` / `completed_upper_ts` — the only interval whose pages are all durably
 --                   recorded. A partial page NEVER moves it; only a genuinely terminal provider page
 --                   does. Progress and certification must not be the same column, because absence
@@ -3171,6 +3170,13 @@ create table if not exists slack_sync_channels (
   historical_floor_reached boolean not null default false,
   completed_lower_ts text,
   completed_upper_ts text,
+  -- A completed newest catch-up above an unfinished initial history scan is provisional until the
+  -- historical lane reaches the retained floor; it is never evidence for absence-based deletion.
+  newest_catchup_upper_ts text,
+  -- The latest channel-wide metadata observation owns the verdict, even when different apps have
+  -- independent conversations.info allowances and their responses finish out of order.
+  metadata_attempt_owner text,
+  metadata_attempt_generation bigint not null default 0 check (metadata_attempt_generation >= 0),
   -- Which lane the CURRENT lease owns, and which lane goes next. `claimed_lane` is part of the fence:
   -- an acceptance for the other lane matches no row.
   claimed_lane text check (claimed_lane is null or claimed_lane in ('newest', 'historical')),
@@ -3211,6 +3217,29 @@ create table if not exists slack_sync_channels (
     (binding_integration_id is null) = (binding_config_revision is null)
   )
 );
+-- slack-source-upgrade:begin
+-- Existing discovery tables need explicit column additions on schema replay. Keep this
+-- replayable so a populated frontier survives schema load without a delete/reinsert migration.
+alter table slack_sync_channels add column if not exists newest_catchup_upper_ts text;
+alter table slack_sync_channels add column if not exists metadata_attempt_owner text;
+alter table slack_sync_channels add column if not exists metadata_attempt_generation bigint not null default 0
+  check (metadata_attempt_generation >= 0);
+
+-- The FK's ON DELETE SET NULL updates only binding_integration_id. Clear its paired revision in
+-- the same row update, before the binding codec CHECK runs; keep every cursor and interval intact.
+create or replace function slack_sync_channels_clear_deleted_binding() returns trigger
+language plpgsql as $$
+begin
+  if new.binding_integration_id is null then
+    new.binding_config_revision := null;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists slack_sync_channels_clear_deleted_binding on slack_sync_channels;
+create trigger slack_sync_channels_clear_deleted_binding
+  before update of binding_integration_id on slack_sync_channels
+  for each row execute function slack_sync_channels_clear_deleted_binding();
 -- The two reads a bounded wake performs: due work for a selected channel set, and the reclaim lane.
 create index if not exists slack_sync_channels_due_idx
   on slack_sync_channels (team_id, workspace_id, public_state, due_at);
@@ -3220,7 +3249,7 @@ create index if not exists slack_sync_channels_lease_idx
 -- Every `ts` column, under ONE named rule, aligned byte-for-byte with the shared parser's
 -- `TS_PATTERN` (`lib/ingest/sources/slack-message-evidence.ts`) and with
 -- `slack_sync_threads_root_ts_check` above: any number of seconds digits, then 1–6 fractional
--- digits. Stated once rather than inline eight times, so the eight cannot drift apart; named and
+-- digits. Stated once rather than inline seven times, so the seven cannot drift apart; named and
 -- re-added on every replay because table creation is a no-op on an existing table.
 alter table slack_sync_channels drop constraint if exists slack_sync_channels_ts_syntax;
 alter table slack_sync_channels add constraint slack_sync_channels_ts_syntax check (
@@ -3230,7 +3259,9 @@ alter table slack_sync_channels add constraint slack_sync_channels_ts_syntax che
   and (historical_oldest_seen_ts is null or historical_oldest_seen_ts ~ '^[0-9]+[.][0-9]{1,6}$')
   and (completed_lower_ts is null or completed_lower_ts ~ '^[0-9]+[.][0-9]{1,6}$')
   and (completed_upper_ts is null or completed_upper_ts ~ '^[0-9]+[.][0-9]{1,6}$')
+  and (newest_catchup_upper_ts is null or newest_catchup_upper_ts ~ '^[0-9]+[.][0-9]{1,6}$')
 );
+-- slack-source-upgrade:end
 
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected

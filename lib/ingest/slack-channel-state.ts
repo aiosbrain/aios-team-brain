@@ -108,6 +108,7 @@ export interface SlackChannelClaim {
   readonly leaseGeneration: number;
   readonly leaseExpiresAt: string;
   readonly bindingConfigRevision: string;
+  readonly bindingIntegrationId: string;
   /** The FROZEN upper bound of the scan this claim continues. */
   readonly anchorTs: string;
   /** The newest lane's overlap bound; null on a seed scan and on every historical scan. */
@@ -393,6 +394,12 @@ export async function recordSlackChannelPublicState(
             binding_config_revision = $6,
             last_error_code = $7,
             metadata_attempt_owner = null,
+            -- A definitive non-public observation revokes every in-flight history acceptance,
+            -- even if a later observation makes the channel public again before the page returns.
+            lease_owner = case when $4 = 'public' then lease_owner else null end,
+            lease_expires_at = case when $4 = 'public' then lease_expires_at else null end,
+            claimed_lane = case when $4 = 'public' then claimed_lane else null end,
+            lease_generation = case when $4 = 'public' then lease_generation else lease_generation + 1 end,
             due_at = clock_timestamp(),
             updated_at = clock_timestamp()
       where ${SCOPE_PREDICATE}
@@ -424,19 +431,27 @@ export async function recordSlackChannelPublicState(
 export async function delaySlackChannel(
   session: TransactionSession,
   scope: SlackChannelScope,
+  attempt: SlackChannelMetadataAttempt,
   input: { dueAt: Date | null; errorCode: string }
 ): Promise<SlackChannelWrite> {
   assertScope(scope);
+  assertScope(attempt.scope);
+  if (attempt.scope.teamId !== scope.teamId || attempt.scope.workspaceId !== scope.workspaceId || attempt.scope.channelId !== scope.channelId) {
+    throw new SlackChannelStateError("the metadata attempt belongs to a different channel");
+  }
   assertErrorCode(input.errorCode);
   if (input.dueAt !== null) assertInstant("dueAt", input.dueAt);
   const result = await session.executeSql<StateRow>(
     `update slack_sync_channels
         set due_at = coalesce($5::timestamptz, due_at),
             last_error_code = $4,
+            metadata_attempt_owner = null,
             updated_at = clock_timestamp()
       where ${SCOPE_PREDICATE}
+        and metadata_attempt_owner = $6
+        and metadata_attempt_generation = $7::bigint
   returning ${STATE_COLUMNS}`,
-    [...scopeParams(scope), input.errorCode, input.dueAt]
+    [...scopeParams(scope), input.errorCode, input.dueAt, attempt.owner, String(attempt.generation)]
   );
   return written(result);
 }
@@ -563,6 +578,7 @@ export async function claimSlackChannelPage(
     leaseGeneration: state.leaseGeneration,
     leaseExpiresAt: state.leaseExpiresAt,
     bindingConfigRevision: opts.bindingConfigRevision,
+    bindingIntegrationId: opts.bindingIntegrationId,
     anchorTs: laneState.anchorTs,
     lowerTs: laneState.lowerTs,
     cursor: laneState.cursor,
@@ -606,6 +622,7 @@ export async function lockSlackChannelForAcceptance(
         and lease_expires_at > clock_timestamp()
         and claimed_lane = $6
         and binding_config_revision = $7
+        and binding_integration_id = $11::uuid
         and ${lane}_scan_generation = $8::bigint
         and ${lane}_cursor is not distinct from $9
         and ${lane}_anchor_ts is not distinct from $10
@@ -619,6 +636,7 @@ export async function lockSlackChannelForAcceptance(
       String(claim.scanGeneration),
       claim.cursor,
       claim.anchorTs,
+      claim.bindingIntegrationId,
     ]
   );
   return result.rows.length === 1 ? { outcome: "locked" } : { outcome: "refused" };

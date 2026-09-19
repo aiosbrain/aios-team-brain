@@ -308,7 +308,7 @@ export async function elapse(teamId: string, ms = 120_000): Promise<void> {
 }
 
 /**
- * Age a channel's public proof past its metadata TTL, so the next invocation actually RE-CHECKS it.
+ * Age a channel's public proof past its metadata cadence, so the next invocation actually RE-CHECKS it.
  * Without this the recheck contracts are vacuous: a fresh proof is reused, the fixture's failing
  * `conversations.info` handler is never called, and the assertion passes for the wrong reason.
  */

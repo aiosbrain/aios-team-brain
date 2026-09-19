@@ -97,12 +97,11 @@ async function setup(seed: Seed, channelIds: readonly string[] = [CHANNEL]): Pro
 // ── the first page ───────────────────────────────────────────────────────────
 
 describe("the seed scan", () => {
-  it("certifies exactly the interval its ONE page covered", async () => {
+  it("keeps a partial initial scan and its exact continuation without certifying it", async () => {
     const seed = await seedTeam();
     const integrationId = await setup(seed);
-    // has_more is TRUE and a cursor is offered: the seed scan still ends here, because what it
-    // certifies is the span this page actually returned — everything below it belongs to the
-    // historical lane, which starts at that boundary rather than inheriting this cursor.
+    // The first request is anchored to the retained-history floor. A partial answer leaves the
+    // certified interval empty and keeps the provider's cursor for the SAME anchored request.
     const fake = pass(() =>
       slackJson(
         historyBody({
@@ -116,17 +115,46 @@ describe("the seed scan", () => {
     await discover(seed, integrationId, fake);
 
     const channel = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    const request = fake.paramsOf("conversations.history")[0];
     expect(channel).toMatchObject({
       newest_cursor: null,
-      newest_anchor_ts: null, // the scan is over; its anchor is not left behind as live state
-      completed_lower_ts: "1718900000.000100",
+      newest_anchor_ts: null,
+      historical_cursor: "cursor-1",
+      historical_oldest_seen_ts: "1718900000.000100",
+      completed_lower_ts: null,
+      completed_upper_ts: null,
       historical_floor_reached: false,
-      next_lane: "historical",
+      next_lane: "newest",
     });
-    expect(channel?.completed_upper_ts).not.toBeNull();
+    expect(channel?.historical_anchor_ts).toBe(request.get("latest"));
     expect(await threadRootTs(seed.teamId)).toEqual(["1718900000.000100", "1718900000.000300"]);
-    // The first request has no lower bound; there is no certified top to catch up from yet.
-    expect(fake.paramsOf("conversations.history")[0].get("oldest")).toBeNull();
+    expect(request.get("oldest")).toBeNull();
+  });
+
+  it("certifies a terminal initial interval to the exact request anchor", async () => {
+    const seed = await seedTeam();
+    const integrationId = await setup(seed);
+    const fake = pass(() =>
+      slackJson(historyBody({ messages: [rootMessage("1718900000.000300"), rootMessage("1718900000.000100")] }))
+    );
+    await discover(seed, integrationId, fake);
+    const request = fake.paramsOf("conversations.history")[0];
+    const latest = request.get("latest");
+    expect(latest).toMatch(/^[0-9]+[.][0-9]{6}$/);
+    const channel = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
+    expect(channel).toMatchObject({
+      completed_lower_ts: "1718900000.000100",
+      completed_upper_ts: latest,
+      historical_anchor_ts: null,
+      historical_cursor: null,
+      newest_anchor_ts: null,
+      newest_cursor: null,
+      claimed_lane: null,
+      lease_owner: null,
+      lease_expires_at: null,
+      historical_floor_reached: true,
+    });
+    expect(request.get("oldest")).toBeNull();
   });
 
   it("takes every structurally top-level root, and only those", async () => {
@@ -186,9 +214,9 @@ describe("newest and historical lanes", () => {
       await elapse(seed.teamId);
     }
 
-    // Seed (newest) → historical → newest → historical. A lane position recomputed per invocation
+    // Initial historical → newest → historical → newest. A lane position recomputed per invocation
     // would hand every slot to the same lane; the persisted `next_lane` is what stops that.
-    expect(lanes).toEqual(["newest", "historical", "newest", "historical"]);
+    expect(lanes).toEqual(["historical", "newest", "historical", "newest"]);
   });
 
   it("keeps a partial historical page as PROGRESS, and certifies only at its terminal page", async () => {
@@ -198,9 +226,9 @@ describe("newest and historical lanes", () => {
     const fake = pass((call) => {
       if (isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
       historical += 1;
-      // page 1 = the seed; pages 2+ are the historical scan.
+      // Page 1 is the initial historical scan; it stays open until its terminal page.
       if (historical === 1) {
-        return slackJson(historyBody({ messages: [rootMessage("1718900000.000900")] }));
+        return slackJson(historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "cursor-1" }));
       }
       if (historical === 2) {
         return slackJson(
@@ -214,10 +242,12 @@ describe("newest and historical lanes", () => {
       return slackJson(historyBody({ messages: [rootMessage("1718900000.000100")] }));
     });
 
-    await discover(seed, integrationId, fake); // seed
+    await discover(seed, integrationId, fake); // initial historical page, partial
     const afterSeed = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     await elapse(seed.teamId);
-    await discover(seed, integrationId, fake); // historical, partial
+    await discover(seed, integrationId, fake); // newest catch-up, terminal
+    await elapse(seed.teamId);
+    await discover(seed, integrationId, fake); // historical continuation, partial
 
     const partial = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect(partial?.historical_cursor).toBe("cursor-deep");
@@ -444,7 +474,7 @@ describe("a page that cannot be trusted advances nothing", () => {
         last_error_code: category,
       });
       // The anchor SURVIVES: the same anchored scan is resumed, not restarted at a new "now".
-      expect(channel?.newest_anchor_ts).not.toBeNull();
+      expect(channel?.historical_anchor_ts).not.toBeNull();
     });
   }
 
@@ -460,17 +490,14 @@ describe("a page that cannot be trusted advances nothing", () => {
       );
     });
 
-    await discover(seed, integrationId, fake); // seed page
+    await discover(seed, integrationId, fake); // initial historical page
     await elapse(seed.teamId);
-    await discover(seed, integrationId, fake); // historical page 1 → cursor "loop"
+    await discover(seed, integrationId, fake); // newest catch-up
     const before = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     expect(before?.historical_cursor).toBe("loop");
     const rootsBefore = await threadRootTs(seed.teamId);
     await elapse(seed.teamId);
-    await discover(seed, integrationId, fake); // newest catch-up
-    await elapse(seed.teamId);
-
-    const result = await discover(seed, integrationId, fake); // historical page 2 → "loop" again
+    const result = await discover(seed, integrationId, fake); // historical continuation → repeats "loop"
 
     expect(result.steps.some((s) => s.category === "cursor_repeated")).toBe(true);
     const after = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
@@ -479,26 +506,22 @@ describe("a page that cannot be trusted advances nothing", () => {
     expect(await threadRootTs(seed.teamId)).toEqual(rootsBefore);
   });
 
-  it("restarts the SAME anchored scan on invalid_cursor, keeping what was certified", async () => {
+  it("restarts the SAME anchored initial scan on invalid_cursor without certifying a hole", async () => {
     const seed = await seedTeam();
     const integrationId = await setup(seed);
     let historical = 0;
     const fake = pass((call) => {
       if (isCatchUp(call)) return slackJson(historyBody({ messages: [] }));
       historical += 1;
-      if (historical === 1) return slackJson(historyBody({ messages: [rootMessage("1718900000.000900")] }));
-      if (historical === 2) {
+      if (historical === 1) {
         return slackJson(
-          historyBody({ messages: [rootMessage("1718900000.000800")], hasMore: true, nextCursor: "stale" })
+          historyBody({ messages: [rootMessage("1718900000.000900")], hasMore: true, nextCursor: "stale" })
         );
       }
       return slackJson({ ok: false, error: "invalid_cursor" });
     });
 
-    await discover(seed, integrationId, fake); // seed
-    const certified = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
-    await elapse(seed.teamId);
-    await discover(seed, integrationId, fake); // historical partial
+    await discover(seed, integrationId, fake); // initial historical partial
     const partial = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
     await elapse(seed.teamId);
     await discover(seed, integrationId, fake); // newest catch-up
@@ -509,8 +532,9 @@ describe("a page that cannot be trusted advances nothing", () => {
     expect(after?.historical_cursor).toBeNull();
     expect(after?.historical_anchor_ts).toBe(partial?.historical_anchor_ts);
     expect(Number(after?.historical_scan_generation)).toBe(Number(partial?.historical_scan_generation) + 1);
-    // A restart is not a rollback of what was already proved read.
-    expect(after?.completed_lower_ts).toBe(certified?.completed_lower_ts);
+    // A partial scan never made a certified interval, and an invalid cursor does not mint one.
+    expect(after?.completed_lower_ts).toBeNull();
+    expect(after?.completed_upper_ts).toBeNull();
     expect(after?.historical_floor_reached).toBe(false);
   });
 });
@@ -547,10 +571,8 @@ describe("replay and overlap", () => {
       slackJson(historyBody({ messages: isCatchUp(call) ? [] : [rootMessage("1718900000.000100")] }))
     );
 
-    await discover(seed, integrationId, fake); // seed → completed_upper = anchor
+    await discover(seed, integrationId, fake); // initial terminal → completed_upper = request anchor
     const seeded = await channelRow(seed.teamId, WORKSPACE, CHANNEL);
-    await elapse(seed.teamId);
-    await discover(seed, integrationId, fake); // historical
     await elapse(seed.teamId);
     await discover(seed, integrationId, fake); // newest catch-up
 
