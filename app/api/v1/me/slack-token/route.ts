@@ -18,7 +18,7 @@ const NO_STORE = { "Cache-Control": "no-store" };
  * never logged.
  *
  *   GET    → { connected, token, slack_user_id, workspace }  (the agent fetches its own token)
- *   POST   {token}  → validate (auth.test) + store + capture identity   (manual-paste path)
+ *   POST   {token}  → validate (auth.test) + store + capture identity; reports identity_status
  *   DELETE → disconnect
  */
 async function slackAuthTest(token: string) {
@@ -89,20 +89,22 @@ export async function POST(req: NextRequest) {
     .eq("team_id", auth.teamId)
     .eq("id", auth.memberId)
     .maybeSingle();
+  let identityStatus: "linked" | "conflict" | "pending" = "pending";
   try {
-    await setMemberIdentity(
+    const result = await setMemberIdentity(
       db,
       auth.teamId,
       auth.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },
-      { actor: { kind: "member", memberId: auth.memberId } }
+      { explicit: true, actor: { kind: "member", memberId: auth.memberId } }
     );
+    identityStatus = result.conflict ? "conflict" : "linked";
   } catch {
-    // identity capture is best-effort; the token is stored regardless.
+    // Credential storage succeeded; identity attribution remains pending.
   }
 
   return Response.json(
-    { ok: true, slack_user_id: test.user_id, workspace: test.team ?? null },
+    { ok: true, slack_user_id: test.user_id, workspace: test.team ?? null, identity_status: identityStatus },
     { headers: NO_STORE }
   );
 }

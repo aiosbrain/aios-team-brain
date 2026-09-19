@@ -115,17 +115,25 @@ export async function GET(req: NextRequest) {
     .eq("team_id", bound.teamId)
     .eq("id", bound.memberId)
     .maybeSingle();
+  let identityStatus: "linked" | "conflict" | "pending" = "pending";
   try {
-    await setMemberIdentity(
+    const result = await setMemberIdentity(
       db,
       bound.teamId,
       bound.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },
-      { actor: { kind: "member", memberId: bound.memberId } }
+      { explicit: true, actor: { kind: "member", memberId: bound.memberId } }
     );
+    identityStatus = result.conflict ? "conflict" : "linked";
   } catch {
-    // identity capture is best-effort; the token is stored regardless.
+    // Credential storage succeeded; identity attribution remains pending.
   }
 
+  if (identityStatus !== "linked") {
+    return htmlPage(200, "Slack connected — identity pending",
+      identityStatus === "conflict"
+        ? "Your token is connected, but this Slack account is already linked to another member. Ask an admin to resolve the identity conflict."
+        : "Your token is connected, but identity attribution is pending. Ask an admin to check the link.");
+  }
   return htmlPage(200, "Slack connected", "Your Slack account is connected. You can close this tab and return to your workspace.");
 }

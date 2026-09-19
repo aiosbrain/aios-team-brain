@@ -282,6 +282,17 @@ create table if not exists member_identities (
 );
 create index if not exists member_identities_member_idx on member_identities (member_id);
 
+-- An explicit Slack unlink fences later automatic email reconciliation. The external ID is
+-- stored exactly as the corresponding identity key (raw before the attended namespace cutover,
+-- workspace-qualified afterward). No member FK: deletion must not silently lift a suppression.
+create table if not exists member_identity_suppressions (
+  team_id uuid not null references teams(id) on delete cascade,
+  provider text not null,
+  external_id text not null,
+  created_at timestamptz not null default now(),
+  primary key (team_id, provider, external_id)
+);
+
 -- Per-member encrypted secrets (e.g. a member's own Slack USER token for "act as me").
 -- DISTINCT from team `integrations.secret_ciphertext` (team-scoped, bot/read): this is
 -- per-member + write-capable, written only by lib/member-secrets/manage.ts (audited
