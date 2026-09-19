@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { db, ingest, seedTeam, visOf, externalMember, type Seed } from "./helpers";
 import { getCachedWorkTimeline, PAYLOAD_VERSION, MIN_SALVAGEABLE_VERSION } from "@/lib/dashboard/timeline-cache";
+import { memberVisibility, resolveTimelineEnforcement } from "@/lib/access/enforce";
 
 /**
  * Spec: a PAYLOAD_VERSION bump must not blank the daily synopsis.
@@ -77,7 +78,11 @@ async function seedPriorRow(args: {
   version?: number;
   computedAt?: string;
   groupKey: string;
+  generations?: { dataGeneration: string; identityGeneration: string; presentationGeneration: string };
 }) {
+  const vis = await memberVisibility(db(), { teamId: args.teamId, memberId: args.memberId });
+  const items = (await resolveTimelineEnforcement(db(), args.teamId, vis)).visibleItemIds;
+  const itemFingerprint = createHash("sha256").update(JSON.stringify([...items].sort())).digest("hex");
   const payload = {
     // A FOREIGN version that is still SALVAGEABLE. It used to be `PAYLOAD_VERSION - 1`, which broke the
     // moment `MIN_SALVAGEABLE_VERSION` was introduced at the current version: v10 prose is refused on
@@ -87,6 +92,8 @@ async function seedPriorRow(args: {
     // which would have gone green for the wrong reason. `+1` models the real remaining case: a row
     // written by a NEWER build and read after a rollback.
     v: args.version ?? PAYLOAD_VERSION + 1,
+    generations: args.generations ?? { dataGeneration: "0", identityGeneration: "0", presentationGeneration: "0" },
+    itemFingerprint,
     days: [
       {
         date: args.date,

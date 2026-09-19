@@ -118,10 +118,8 @@ describe("meetings on the person card (spec: meeting-participation-as-work-v1)",
   it("pins the payload version constants", () => {
     // The shape guard alone does NOT catch a revert: v11 is still pinned in SHAPE_BY_VERSION, so
     // dropping the bump back to 11 sails straight through it — which is the v8 incident class the
-    // guard's own comment records. MIN_SALVAGEABLE_VERSION must NOT follow the bump: raising it blanks
-    // every person-day summary, a regression reported twice as "we've lost the summaries".
-    expect(PAYLOAD_VERSION).toBe(14); // v14: PRET-6 tier-row retirement (meaning change, shape identical)
-    expect(MIN_SALVAGEABLE_VERSION).toBe(11);
-    expect(MIN_SALVAGEABLE_VERSION).toBeLessThan(PAYLOAD_VERSION);
+    // guard's own comment records. v15 changes Slack authorship/day meaning, so old prose is unsafe.
+    expect(PAYLOAD_VERSION).toBe(15);
+    expect(MIN_SALVAGEABLE_VERSION).toBe(15);
   });
 });

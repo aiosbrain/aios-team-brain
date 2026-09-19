@@ -156,7 +156,10 @@ export async function getWorkTimeline(
   // IN-QUERY (each leg's limit must rank over VISIBLE rows — a post-filter lets invisible items
   // crowd visible ones out of the page). Structured rows (tasks/decisions/meetings) gate on their
   // SOURCE ITEM when they have one — a restricted item's derived TITLE is the leak.
-  enforce: { visibleItemIds: ReadonlySet<string> } | null = null
+  enforce: { visibleItemIds: ReadonlySet<string> } | null = null,
+  // A generation-aware cache rebuild must never publish a partial Slack leg as a fresh payload.
+  // Direct legacy readers retain their prior best-effort behavior until the coordinated cutover.
+  requireSlackReads = false
 ): Promise<TimelineDay[]> {
   const visArr: string[] | null = enforce ? [...enforce.visibleItemIds] : null;
   // A SOURCED structured row is visible iff its source item is. Meetings + decisions gate on this
@@ -277,7 +280,10 @@ export async function getWorkTimeline(
   // Slack user id → member (lowercased, matching the identity resolver's case-folding). Best-effort —
   // a failure isn't fatal, but WARN so a systemic break (renamed column, adapter change) that silently
   // kills all Slack evidence forever leaves a signal instead of an undiagnosable blank.
-  if (slackIdRes.error) console.warn("[work-timeline] slack identities read failed:", slackIdRes.error.message);
+  if (slackIdRes.error) {
+    if (requireSlackReads) throw new Error(`work-timeline slack identities: ${slackIdRes.error.message}`);
+    console.warn("[work-timeline] slack identities read failed:", slackIdRes.error.message);
+  }
   const slackIdToMember = new Map<string, string>();
   for (const r of (slackIdRes.data ?? []) as { external_id: string | null; member_id: string | null }[]) {
     if (r.external_id && r.member_id) slackIdToMember.set(foldProviderId(r.external_id), r.member_id);
@@ -483,7 +489,10 @@ export async function getWorkTimeline(
   // mapped repliers). Each contributor sees the thread in their day, dated by when THEY last messaged;
   // an unmapped/connector participant is dropped (never guessed). `title` is the topic snippet.
   // Best-effort — WARN (don't throw) so a systemic slack-read failure is visible, not a silent blank.
-  if (slackRes.error) console.warn("[work-timeline] slack items read failed:", slackRes.error.message);
+  if (slackRes.error) {
+    if (requireSlackReads) throw new Error(`work-timeline slack items: ${slackRes.error.message}`);
+    console.warn("[work-timeline] slack items read failed:", slackRes.error.message);
+  }
   for (const r of (slackRes.data ?? []) as ItemRow[]) {
     const fm = r.frontmatter ?? {};
     const title = str(fm.title) || `#${str(fm.channel) ?? "slack"} thread`;
