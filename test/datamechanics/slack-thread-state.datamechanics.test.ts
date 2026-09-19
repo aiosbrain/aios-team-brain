@@ -9,16 +9,21 @@ import {
   claimSlackThread,
   enqueueSlackThread,
   releaseSlackThreadForRetry,
+  readSlackThreadSnapshot,
+  writeSlackThreadSnapshot,
+  purgeExpiredSlackThreadSnapshots,
   type SlackThreadClaim,
   type SlackThreadScope,
 } from "@/lib/ingest/slack-thread-state";
+import { hydrateOneSlackThread } from "@/lib/ingest/slack-thread-hydrator";
 import { db, ingest, seedTeam, type Seed } from "./helpers";
 
 /**
  * AIO-1170 — durable Slack pending-thread state (`slack_sync_threads`) and its lease/fence
  * primitives, against real Postgres.
  *
- * NOTHING SCHEDULES OR PUBLISHES YET. This slice owns pending WORK and nothing else: a lease here
+ * NOTHING SCHEDULES OR PUBLISHES YET. The queue owns pending work and the inactive hydrator adds
+ * expiring raw staging; a lease here
  * proves ownership of a queue row, never source visibility, permission, namespace migration, body
  * completeness or permission to publish. There is deliberately no terminal/acknowledge state — that
  * belongs inside the later `ingestItem` transaction, after the publication gates.
@@ -80,17 +85,263 @@ afterAll(async () => {
   raw = null;
 });
 
+// These cases exercise the inactive page worker with real queue/snapshot rows. Slack itself is
+// deterministic here; every cursor, lease, generation and rollback assertion reads Postgres.
+describe("inactive replies staging — resume, fencing and retention", () => {
+  const rootMessage = { ts: ROOT, text: "root" };
+  const replyOne = { ts: "1718900001.000200", text: "one" };
+  const replyTwo = { ts: "1718900002.000300", text: "two" };
+  const page = (messages: unknown[], hasMore: boolean, nextCursor: string | null = null): typeof fetch =>
+    (async () => new Response(JSON.stringify({ ok: true, messages, has_more: hasMore,
+      response_metadata: { next_cursor: nextCursor ?? "" } }), { status: 200 })) as typeof fetch;
+  const input = (teamId: string) => ({ db: db(), teamId, token: "synthetic-test-token",
+    methodScope: { kind: "verified" as const, teamId, workspaceId: WORKSPACE, appId: "A0THREADS" } });
+  async function staged(scope: SlackThreadScope) {
+    const c = await sql();
+    const { rows } = await c.query<{ snapshot_generation: string; messages: { ts: string }[]; complete: boolean; stored_bytes: number }>(
+      `select snapshot_generation::text as snapshot_generation,messages,complete,stored_bytes
+       from slack_thread_snapshots where team_id=$1 and workspace_id=$2 and channel_id=$3 and root_ts=$4`,
+      [scope.teamId, scope.workspaceId, scope.channelId, scope.rootTs]
+    );
+    return rows[0] ?? null;
+  }
+  async function freeMethod(teamId: string) {
+    const c = await sql();
+    await c.query(`update slack_method_budgets set next_permitted_at=clock_timestamp()-interval '1 second' where team_id=$1`, [teamId]);
+  }
+
+  it("resumes a rootless second page after reclaim and deduplicates a repeated reply", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage, replyOne, replyOne], true, "page-2") }))
+      .toEqual({ outcome: "progressed" });
+    expect((await row(scope)).snapshot_generation).toBe("1");
+    await expireLease(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = null;
+    const second = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([replyOne, replyTwo], false)(url); }) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: second })).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBe("page-2");
+    expect((await staged(scope))?.messages.map((m) => m.ts)).toEqual([ROOT, replyOne.ts, replyTwo.ts]);
+    expect((await staged(scope))?.complete).toBe(true);
+    expect((await staged(scope))?.snapshot_generation).toBe("2");
+    expect((await row(scope)).snapshot_generation).toBe("2");
+    expect((await row(scope)).page_cursor).toBeNull();
+  });
+
+  it("does not reclaim a complete live snapshot or touch another workspace's older due root", async () => {
+    const seed = await seedTeam();
+    const scope = scopeFor(seed);
+    const otherScope = { ...scope, workspaceId: OTHER_WORKSPACE, rootTs: OTHER_ROOT };
+    await enqueue(otherScope, new Date(Date.now() - 60_000));
+    await enqueue(scope);
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage], false) }))
+      .toEqual({ outcome: "progressed" });
+    expect((await row(otherScope)).attempts).toBe(0);
+    expect((await staged(scope))?.complete).toBe(true);
+    await expireLease(scope);
+    await freeMethod(seed.teamId);
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: (async () => {
+      throw new Error("complete staging must not be fetched again");
+    }) as typeof fetch })).toEqual({ outcome: "idle" });
+    expect((await row(scope)).attempts).toBe(1);
+    expect((await staged(scope))?.complete).toBe(true);
+    expect((await row(otherScope)).attempts).toBe(0);
+  });
+
+  it("restarts instead of hiding conflicting observations of one exact message ID", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage, replyOne], true, "page-2") });
+    await expireLease(scope); await freeMethod(seed.teamId);
+    expect(await hydrateOneSlackThread(input(seed.teamId), {
+      fetchImpl: page([{ ...replyOne, text: "changed" }], false),
+    })).toEqual({ outcome: "failed", category: "message_conflict" });
+    expect((await row(scope)).page_cursor).toBeNull();
+    expect((await row(scope)).status).toBe("queued");
+    expect(await staged(scope)).toBeNull();
+  });
+
+  it("refuses to renew a staged page that expires while HTTP is in flight", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage], true, "page-2") });
+    await expireLease(scope); await freeMethod(seed.teamId);
+    const c = await sql();
+    const expiresDuringFetch = (async (url: string) => {
+      await c.query(`update slack_thread_snapshots set expires_at=clock_timestamp()-interval '1 second' where team_id=$1`, [seed.teamId]);
+      return page([replyOne], false)(url);
+    }) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: expiresDuringFetch }))
+      .toEqual({ outcome: "refused", category: "stale_lease" });
+    expect((await row(scope)).page_cursor).toBe("page-2");
+    expect((await row(scope)).snapshot_generation).toBe("1");
+    await expireLease(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = "unset";
+    const refetch = (async (url: string) => {
+      requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([rootMessage, replyOne], false)(url);
+    }) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: refetch }))
+      .toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBeNull();
+    expect((await staged(scope))?.messages.map((m) => m.ts)).toEqual([ROOT, replyOne.ts]);
+  });
+
+  it("restarts at page one under a new generation when staging expired, preserving no missing content", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage, replyOne], true, "page-2") });
+    const c = await sql();
+    await c.query(`update slack_thread_snapshots set expires_at=clock_timestamp()-interval '1 second' where team_id=$1`, [seed.teamId]);
+    await expireLease(scope); await freeMethod(seed.teamId);
+    let requestedCursor: string | null = "unset";
+    const refreshed = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([rootMessage, replyTwo], false)(url); }) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: refreshed })).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBeNull();
+    expect((await staged(scope))?.messages.map((m) => m.ts)).toEqual([ROOT, replyTwo.ts]);
+    expect((await staged(scope))?.snapshot_generation).toBe("3");
+    expect((await row(scope)).snapshot_generation).toBe("3");
+  });
+
+  it("requeues a deferred request at the provider budget deadline without dropping cursor or body", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage], true, "page-2") });
+    await expireLease(scope);
+    const before = await staged(scope);
+    const result = await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: (async () => {
+      throw new Error("deferred budget must not send HTTP"); }) as typeof fetch });
+    expect(result).toEqual({ outcome: "deferred", category: "deferred" });
+    const state = await row(scope);
+    expect(state.status).toBe("queued");
+    expect(state.page_cursor).toBe("page-2");
+    expect(state.snapshot_generation).toBe("1");
+    expect(new Date(state.due_at as string).getTime()).toBeGreaterThan(Date.now());
+    expect(await staged(scope)).toEqual(before);
+  });
+
+  it("rejects a repeated provider cursor without replacing the staged generation", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    await enqueue(scope);
+    await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([rootMessage], true, "page-2") });
+    const before = await staged(scope);
+    await expireLease(scope); await freeMethod(seed.teamId);
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: page([replyOne], true, "page-2") }))
+      .toEqual({ outcome: "failed", category: "cursor_repeated" });
+    expect(await staged(scope)).toEqual(before);
+    expect((await row(scope)).page_cursor).toBe("page-2");
+    expect((await row(scope)).snapshot_generation).toBe("1");
+    expect((await row(scope)).status).toBe("queued");
+  });
+
+  it("backs off 429, transport failure and auth refusal without certifying an empty page", async () => {
+    const cases: { name: string; fetchImpl: typeof fetch; expected: "deferred" | "failed"; category: string; minimumMs: number }[] = [
+      { name: "429", fetchImpl: (async () => new Response("rate limited", { status: 429, headers: { "retry-after": "120" } })) as typeof fetch,
+        expected: "deferred", category: "rate_limited", minimumMs: 110_000 },
+      { name: "transport", fetchImpl: (async () => { throw new Error("socket closed"); }) as typeof fetch,
+        expected: "failed", category: "transport_error", minimumMs: 50_000 },
+      { name: "auth", fetchImpl: (async () => new Response(JSON.stringify({ ok: false, error: "invalid_auth" }), { status: 200 })) as typeof fetch,
+        expected: "failed", category: "auth_error", minimumMs: 23 * 60 * 60_000 },
+    ];
+    for (const testCase of cases) {
+      const seed = await seedTeam(); const scope = scopeFor(seed);
+      await enqueue(scope);
+      const result = await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: testCase.fetchImpl });
+      expect(result, testCase.name).toEqual({ outcome: testCase.expected, category: testCase.category });
+      const state = await row(scope);
+      expect(state.status).toBe("queued");
+      expect(state.page_cursor).toBeNull();
+      expect(new Date(state.due_at as string).getTime() - Date.now()).toBeGreaterThan(testCase.minimumMs);
+      expect(await staged(scope)).toBeNull();
+    }
+  });
+
+  it("fences reads and writes after reclaim and rolls back a snapshot when checkpoint refuses", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    const stale = await claimed(scope);
+    const snapshot = { messages: [rootMessage], complete: false, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    await expect(tx(async (s) => {
+      expect(await writeSlackThreadSnapshot(s, stale, snapshot)).toBe("written");
+      const checkpoint = await checkpointSlackThread(s, { ...stale, leaseOwner: randomUUID() }, { pageCursor: "page-2", snapshotGeneration: 1 });
+      expect(checkpoint.outcome).toBe("refused");
+      throw new Error("rollback on checkpoint refusal");
+    })).rejects.toThrow("rollback on checkpoint refusal");
+    expect(await staged(scope)).toBeNull();
+    await expireLease(scope);
+    const fresh = await claim(scope);
+    expect(fresh).not.toBeNull();
+    expect(await tx((s) => readSlackThreadSnapshot(s, stale))).toBeNull();
+    expect(await tx((s) => writeSlackThreadSnapshot(s, stale, snapshot))).toBe("refused");
+    expect(await tx((s) => writeSlackThreadSnapshot(s, fresh!, snapshot))).toBe("written");
+    expect(await tx((s) => checkpointSlackThread(s, fresh!, { pageCursor: "page-2", snapshotGeneration: 1 }))).toMatchObject({ outcome: "checkpointed" });
+    expect((await staged(scope))?.snapshot_generation).toBe("1");
+  });
+
+  it("serializes two page writes carrying the same live claim so only one generation commits", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    const live = await claimed(scope);
+    const writePage = (suffix: string) => tx(async (s) => {
+      const written = await writeSlackThreadSnapshot(s, live, {
+        messages: [rootMessage, { ts: `171890000${suffix}.000200`, text: suffix }],
+        seenCursors: [`page-${suffix}`], complete: false,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      if (written === "refused") return "refused";
+      return (await checkpointSlackThread(s, live, { pageCursor: `page-${suffix}`, snapshotGeneration: 1 })).outcome;
+    });
+    const outcomes = await Promise.all([writePage("1"), writePage("2")]);
+    expect(outcomes.sort()).toEqual(["checkpointed", "refused"]);
+    expect((await staged(scope))?.snapshot_generation).toBe("1");
+    expect((await row(scope)).snapshot_generation).toBe("1");
+    expect((await row(scope)).page_cursor).toMatch(/^page-[12]$/);
+  });
+
+  it("enforces actual JSON bytes at the database and purges expired staging without deleting the queue", async () => {
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    const live = await claimed(scope);
+    const c = await sql();
+    expect(await refusal(c.query(
+      `insert into slack_thread_snapshots(team_id,workspace_id,channel_id,root_ts,snapshot_generation,messages,stored_bytes,expires_at)
+       values ($1,$2,$3,$4,1,$5::jsonb,1,clock_timestamp()+interval '1 hour')`,
+      [scope.teamId,scope.workspaceId,scope.channelId,scope.rootTs,JSON.stringify([rootMessage])]
+    ))).toMatchObject({ code: "23514", constraint: "slack_thread_snapshots_actual_bytes_check" });
+    expect(await refusal(c.query(
+      `insert into slack_thread_snapshots(team_id,workspace_id,channel_id,root_ts,snapshot_generation,messages,stored_bytes,expires_at)
+       values ($1,$2,$3,$4,1,$5::jsonb,1048576,clock_timestamp()+interval '1 hour')`,
+      [scope.teamId,scope.workspaceId,scope.channelId,scope.rootTs,JSON.stringify([{ ts: ROOT, text: "x".repeat(1_048_576) }])]
+    ))).toMatchObject({ code: "23514", constraint: "slack_thread_snapshots_actual_bytes_check" });
+    expect(await tx((s) => writeSlackThreadSnapshot(s, live, { messages: [rootMessage], storedBytes: 1, complete: false,
+      expiresAt: new Date(Date.now() + 60_000).toISOString() }))).toBe("written");
+    expect((await staged(scope))?.stored_bytes).toBeGreaterThan(1);
+    await tx((s) => checkpointSlackThread(s, live, { pageCursor: "page-2", snapshotGeneration: 1 }));
+    await c.query(`update slack_thread_snapshots set expires_at=clock_timestamp()-interval '1 second' where team_id=$1`, [seed.teamId]);
+    expect(await tx((s) => purgeExpiredSlackThreadSnapshots(s, 1))).toBe(1);
+    expect(await staged(scope)).toBeNull();
+    expect((await row(scope)).page_cursor).toBe("page-2");
+    await expireLease(scope);
+    let requestedCursor: string | null = "unset";
+    const refetch = (async (url: string) => { requestedCursor = new URL(url).searchParams.get("cursor");
+      return page([rootMessage, replyTwo], false)(url); }) as typeof fetch;
+    expect(await hydrateOneSlackThread(input(seed.teamId), { fetchImpl: refetch })).toEqual({ outcome: "progressed" });
+    expect(requestedCursor).toBeNull();
+    expect((await staged(scope))?.messages.map((m) => m.ts)).toEqual([ROOT, replyTwo.ts]);
+    expect((await row(scope)).snapshot_generation).toBe("3");
+  });
+});
+
 beforeAll(async () => {
   const c = await sql();
   const { rows } = await c.query<{ tablename: string }>(
-    `select tablename from pg_tables where schemaname = 'public' and tablename = $1`,
-    ["slack_sync_threads"]
+    `select tablename from pg_tables where schemaname = 'public' and tablename = any($1)`,
+    [["slack_sync_threads", "slack_thread_snapshots"]]
   );
-  if (rows.length !== 1) {
+  if (rows.length !== 2) {
     // A reused per-worktree container is schema-loaded only when it is CREATED
     // (scripts/dm-isolated.sh), so one that predates this change silently lacks the table.
     throw new Error(
-      "slack_sync_threads missing from the test database. The dm container loads the schema only " +
+      "Slack thread queue/snapshot tables missing from the test database. The dm container loads the schema only " +
         "when it is created — re-run with AIOS_DM_RESET=1 npm run test:datamechanics:iso " +
         "test/datamechanics/slack-thread-state.datamechanics.test.ts"
     );
@@ -927,6 +1178,7 @@ describe("rollout — repeatable from zero, on upgrade, and on replay", () => {
         await c.query(`insert into teams (id, slug, name) values ($1, 'legacy-team', 'Legacy')`, [
           teamId,
         ]);
+        await c.query(`drop table slack_thread_snapshots`);
         await c.query(`drop table slack_sync_threads`);
         expect(await present()).toBe("0");
 

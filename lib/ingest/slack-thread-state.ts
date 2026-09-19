@@ -81,6 +81,14 @@ export interface SlackThreadClaim {
   readonly snapshotGeneration: number;
 }
 
+export interface SlackThreadSnapshot {
+  readonly messages: readonly Record<string, unknown>[];
+  readonly storedBytes?: number;
+  readonly seenCursors?: readonly string[];
+  readonly complete: boolean;
+  readonly expiresAt: string;
+}
+
 export interface SlackThreadEnqueueResult {
   /** False when the scope was already pending — the existing state is returned untouched. */
   readonly inserted: boolean;
@@ -369,6 +377,124 @@ export async function claimSlackThread(
   };
 }
 
+/** Claim the oldest due root for one team.  This is the only due-work selector; SKIP LOCKED keeps
+ * competing wakes independent while the UPDATE still supplies the actual lease fence. */
+export async function claimDueSlackThread(
+  session: TransactionSession,
+  teamId: string,
+  opts: { leaseMs: number; workspaceId: string }
+): Promise<SlackThreadClaim | null> {
+  if (!UUID.test(teamId)) throw new SlackThreadStateError("teamId must be a UUID");
+  scopedSlackChannelPathPrefix(opts.workspaceId, "C0VALID");
+  assertLeaseMs(opts.leaseMs);
+  const result = await session.executeSql<StateRow>(
+    `with candidate as (
+       select t.id from slack_sync_threads t where t.team_id = $1 and t.workspace_id = $3
+         and ((t.status = 'queued' and t.due_at <= clock_timestamp())
+           or (t.status = 'running' and t.lease_expires_at <= clock_timestamp()))
+         and not exists (
+           select 1 from slack_thread_snapshots s
+            where s.team_id=t.team_id and s.workspace_id=t.workspace_id
+              and s.channel_id=t.channel_id and s.root_ts=t.root_ts
+              and s.snapshot_generation=t.snapshot_generation and s.complete
+              and s.expires_at>clock_timestamp()
+         )
+       order by t.due_at, t.root_ts limit 1 for update of t skip locked
+     ) update slack_sync_threads t set status='running', attempts=attempts+1,
+       lease_generation=lease_generation+1, lease_owner=gen_random_uuid()::text,
+       lease_expires_at=clock_timestamp()+($2::double precision * interval '1 millisecond'),
+       updated_at=clock_timestamp() from candidate where t.id=candidate.id returning ${STATE_COLUMNS}`,
+    [teamId, opts.leaseMs, opts.workspaceId]
+  );
+  const row = single(result); if (!row) return null;
+  const state = toState(row);
+  if (!state.leaseOwner || !state.leaseExpiresAt) throw new SlackThreadStateError("claimed row came back without a lease");
+  return { scope: state.scope, leaseOwner: state.leaseOwner, leaseGeneration: state.leaseGeneration,
+    leaseExpiresAt: state.leaseExpiresAt, attempts: state.attempts, pageCursor: state.pageCursor,
+    snapshotGeneration: state.snapshotGeneration };
+}
+
+/** Read only a live snapshot belonging to this claim. Expired staging is treated as absent. */
+export async function readSlackThreadSnapshot(session: TransactionSession, claim: SlackThreadClaim): Promise<SlackThreadSnapshot | null> {
+  const r = await session.executeSql<{messages: unknown; seen_cursors: unknown; stored_bytes: number; complete: boolean; expires_at: Date | string}>(
+    `select s.messages,s.seen_cursors,s.stored_bytes,s.complete,s.expires_at from slack_thread_snapshots s join slack_sync_threads t using(team_id,workspace_id,channel_id,root_ts)
+     where ${SCOPE_PREDICATE.replaceAll(/\b(team_id|workspace_id|channel_id|root_ts)\b/g, "t.$1")}
+       and t.status='running' and t.lease_owner=$5 and t.lease_generation=$6::bigint and t.lease_expires_at>clock_timestamp()
+       and t.snapshot_generation=$7::bigint and s.snapshot_generation=t.snapshot_generation and s.expires_at>clock_timestamp()`,
+    [...scopeParams(claim.scope), claim.leaseOwner, String(claim.leaseGeneration), String(claim.snapshotGeneration)]
+  );
+  const row = singleSnapshot(r); if (!row) return null;
+  if (!Array.isArray(row.messages) || !Array.isArray(row.seen_cursors) || !row.seen_cursors.every((c) => typeof c === "string")) throw new SlackThreadStateError("stored snapshot shape is invalid");
+  return { messages: row.messages as Record<string, unknown>[], seenCursors: row.seen_cursors as string[], storedBytes: counter("stored_bytes", row.stored_bytes), complete: row.complete, expiresAt: instant(row.expires_at) };
+}
+
+/** Fenced snapshot replacement. Callers supply already bounded JSON and then checkpoint the cursor
+ * in the same short transaction; no HTTP request ever runs while this transaction is open. */
+export async function writeSlackThreadSnapshot(session: TransactionSession, claim: SlackThreadClaim, snapshot: SlackThreadSnapshot): Promise<"written" | "refused"> {
+  if (!Array.isArray(snapshot.messages)) throw new SlackThreadStateError("invalid bounded snapshot");
+  const serialized = JSON.stringify(snapshot.messages);
+  if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > 1048576) throw new SlackThreadStateError("invalid bounded snapshot");
+  const seenCursors = snapshot.seenCursors ?? [];
+  if (seenCursors.length > 1000 || seenCursors.some((c) => typeof c !== "string" || !c.trim() || c.length > 1024) || new Set(seenCursors).size !== seenCursors.length) throw new SlackThreadStateError("invalid snapshot cursor history");
+  const nextGeneration = claim.snapshotGeneration + 1;
+  assertGeneration(nextGeneration);
+  const r = await session.executeSql(
+    `with owner as (
+       select 1 from slack_sync_threads where ${SCOPE_PREDICATE} and status='running'
+         and lease_owner=$5 and lease_generation=$6::bigint and snapshot_generation=$11::bigint
+         and lease_expires_at>clock_timestamp()
+         and ($13::boolean or exists (
+           select 1 from slack_thread_snapshots live
+            where live.team_id=$1 and live.workspace_id=$2 and live.channel_id=$3
+              and live.root_ts=$4 and live.snapshot_generation=$11::bigint
+              and live.expires_at>clock_timestamp() for update
+         )) for update
+     )
+     insert into slack_thread_snapshots(team_id,workspace_id,channel_id,root_ts,snapshot_generation,messages,stored_bytes,seen_cursors,expires_at,complete,updated_at)
+     select $1,$2,$3,$4,$8::bigint,$7::jsonb,octet_length(($7::jsonb)::text),$12::jsonb,$9::timestamptz,$10,clock_timestamp()
+     from owner
+     on conflict(team_id,workspace_id,channel_id,root_ts) do update set snapshot_generation=excluded.snapshot_generation,messages=excluded.messages,stored_bytes=excluded.stored_bytes,seen_cursors=excluded.seen_cursors,expires_at=excluded.expires_at,complete=excluded.complete,updated_at=clock_timestamp()
+     where slack_thread_snapshots.snapshot_generation <= excluded.snapshot_generation returning team_id`,
+    [...scopeParams(claim.scope), claim.leaseOwner, String(claim.leaseGeneration), serialized, String(nextGeneration), snapshot.expiresAt, snapshot.complete, String(claim.snapshotGeneration), JSON.stringify(seenCursors), claim.pageCursor === null]
+  );
+  return r.rows.length === 1 ? "written" : "refused";
+}
+
+/** Discard an orphaned/expired staging generation before fetching page one again. The returned
+ * claim retains the same lease fence but carries the new queue snapshot generation. */
+export async function restartSlackThreadSnapshot(session: TransactionSession, claim: SlackThreadClaim): Promise<SlackThreadClaim | null> {
+  const result = await session.executeSql<StateRow>(
+    `update slack_sync_threads set page_cursor=null,
+       snapshot_generation=greatest(snapshot_generation,
+         coalesce((select s.snapshot_generation from slack_thread_snapshots s
+           where s.team_id=$1 and s.workspace_id=$2 and s.channel_id=$3 and s.root_ts=$4), 0))+1,
+       checkpointed_at=clock_timestamp(), updated_at=clock_timestamp()
+     where ${SCOPE_PREDICATE} and status='running' and lease_owner=$5 and lease_generation=$6::bigint
+       and snapshot_generation=$7::bigint and lease_expires_at>clock_timestamp()
+     returning ${STATE_COLUMNS}`,
+    [...scopeParams(claim.scope), claim.leaseOwner, String(claim.leaseGeneration), String(claim.snapshotGeneration)]
+  );
+  const row = single(result); if (!row) return null;
+  const state = toState(row);
+  await session.executeSql(
+    `delete from slack_thread_snapshots where ${SCOPE_PREDICATE} and snapshot_generation < $5::bigint`,
+    [...scopeParams(claim.scope), String(state.snapshotGeneration)]
+  );
+  return { ...claim, pageCursor: null, snapshotGeneration: state.snapshotGeneration };
+}
+
+/** Bounded retention cleanup. An expired snapshot cannot certify a queued cursor; the worker
+ * restarts that cursor under a new generation when it next claims the thread. */
+export async function purgeExpiredSlackThreadSnapshots(session: TransactionSession, limit: number): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new SlackThreadStateError("purge limit must be 1..1000");
+  const result = await session.executeSql(
+    `delete from slack_thread_snapshots where ctid in
+       (select ctid from slack_thread_snapshots where expires_at<=clock_timestamp()
+        order by expires_at limit $1 for update skip locked) returning team_id`, [limit]
+  );
+  return result.rows.length;
+}
+
 /**
  * Record how far this claim has read: the provider's page cursor and the generation of the snapshot
  * it belongs to. PROGRESS METADATA ONLY — it publishes nothing, completes nothing, and asserts
@@ -471,5 +597,10 @@ function single(result: SqlQueryResult<StateRow>): StateRow | undefined {
   if (result.rows.length > 1) {
     throw new SlackThreadStateError(`expected at most one row, got ${result.rows.length}`);
   }
+  return result.rows[0];
+}
+
+function singleSnapshot<T>(result: SqlQueryResult<T>): T | undefined {
+  if (result.rows.length > 1) throw new SlackThreadStateError(`expected at most one row, got ${result.rows.length}`);
   return result.rows[0];
 }
