@@ -256,7 +256,13 @@ const UNSUPPORTED_MAGIC = Object.freeze([
   // Local file header, end-of-central-directory (an empty archive), and the spanned/split marker.
   { format: "zip", signatures: [[0x50, 0x4b, 0x03, 0x04], [0x50, 0x4b, 0x05, 0x06], [0x50, 0x4b, 0x07, 0x08]] },
   { format: "xz", signatures: [[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]] },
-  { format: "bzip2", signatures: [[0x42, 0x5a, 0x68]] },
+  // `BZh` AND the block-size digit `1`-`9`, which a real stream always carries. With three bytes
+  // only, any file whose content opened with the letters `BZh` — prose about bzip2, for instance —
+  // was labelled an unexpandable container: fail-closed rather than a coverage hole, but a wrong
+  // label, and a limitation that fires on ordinary content stops meaning anything. Nine fixed
+  // signatures rather than a byte RANGE, because the matcher below compares fixed bytes and one
+  // range would be a second kind of entry for every reader of this table to hold in mind.
+  { format: "bzip2", signatures: Array.from({ length: 9 }, (_, index) => [0x42, 0x5a, 0x68, 0x31 + index]) },
   { format: "zstd", signatures: [[0x28, 0xb5, 0x2f, 0xfd]] },
   { format: "7z", signatures: [[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]] },
   { format: "rar", signatures: [[0x52, 0x61, 0x72, 0x21, 0x1a, 0x07]] },

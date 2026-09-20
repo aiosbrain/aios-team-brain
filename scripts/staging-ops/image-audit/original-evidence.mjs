@@ -30,13 +30,17 @@
  * subject, so that "the operator supplied the version list the API could not read" cannot quietly
  * become "the operator supplied the entire audit".
  */
-import { VERDICTS } from "./evidence.mjs";
+import { EVIDENCE_SCHEMA, VERDICTS } from "./evidence.mjs";
 import { UNSUPPORTED_FORMATS } from "./export-walk.mjs";
 import { SCANNER } from "./scanner.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "./subject.mjs";
 
-/** The schema the audit's own artifact carries (`buildEvidence`'s default). */
-export const ORIGINAL_SCHEMA = "aios.staging-ops.image-audit.v1";
+/**
+ * The schema the audit's own artifact carries — THE constant `buildEvidence` writes, not a copy of
+ * its text. Two literals that must agree is a drift this module cannot detect: a record written by a
+ * newer audit would simply be refused as another schema.
+ */
+export const ORIGINAL_SCHEMA = EVIDENCE_SCHEMA;
 
 /**
  * Every reason this module can refuse, as FIXED codes. A refusal reaches the public reconciled
@@ -81,8 +85,20 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** This repository's own limitation/category vocabulary — the shape `describeLimitations` accepts. */
 const SLUG = /^[a-z][a-z0-9-]{0,60}$/;
 const DOTTED = /^[a-z][a-z0-9.-]{0,63}$/;
-/** A path the audit already established as public source content. Never absolute, never traversing. */
-const PUBLIC_PATH = /^[A-Za-z0-9._@+-]+(?:\/[A-Za-z0-9._@+-]+)*$/;
+/**
+ * A path the audit already established as public source content. Never absolute, never traversing.
+ *
+ * THE CONSTRAINT IS THE SHAPE, NOT THE ALPHABET. This was a filename-character allowlist that had no
+ * place for `[` or `]`, and this repository has 70+ real Next.js dynamic routes carrying them
+ * (`app/t/[team]/projects/[project]/page.tsx`). `publicPathResolver` emits such a path verbatim once
+ * the audit's own expected-tree lookup resolves it, so one finding there refused the ENTIRE record as
+ * `original-findings-malformed` — the wrong failure mode, since findings block the transition on
+ * their own merits and a malformed-record refusal hides the real reason.
+ *
+ * So: printable ASCII (which excludes NUL and every control byte), not absolute, no `..` segment,
+ * and bounded at 300 characters — the same bound the free-text fields in this file carry.
+ */
+const PUBLIC_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[\x20-\x7e]{1,300}$/;
 /** Printable ASCII only: a reason or detail this module passes through must be readable text. */
 const printable = (max) => new RegExp(`^[\\x20-\\x7e]{0,${max}}$`);
 
@@ -92,10 +108,20 @@ const printable = (max) => new RegExp(`^[\\x20-\\x7e]{0,${max}}$`);
  * The refusal half is the point. Dropping an unknown field silently would make this an allowlist for
  * the output while leaving the input free to carry anything — and "the record validated" would then
  * say nothing about the object that was validated.
+ *
+ * LISTED MEANS OWNED, and that is not a detail. `fields[key]` alone is a PROTOTYPE-CHAIN lookup on a
+ * plain object literal, so `fields.constructor` found the built-in `Object` rather than `undefined`:
+ * the refusal branch never fired for a `constructor` key, the rule applied was `Object(value)`, and
+ * `Object` returns an object argument UNCHANGED — so an attacker-shaped payload under `constructor`
+ * validated and was serialized verbatim into the reconciled record, which is as public as the audit's
+ * own artifact. `__proto__`, `hasOwnProperty`, `toString` and `valueOf` reached the same branch with a
+ * non-callable rule or an `Object.prototype` method called with no receiver. `Object.hasOwn` is what
+ * makes the allowlist mean what the paragraph above says it means.
  */
 function pick(value, fields) {
   const out = {};
   for (const key of Object.keys(value)) {
+    if (!Object.hasOwn(fields, key)) return undefined; // inherited is not listed: see above
     const rule = fields[key];
     if (rule === undefined) return undefined; // an unlisted field: the record is not the shape we wrote
     if (value[key] === undefined) continue;
@@ -126,11 +152,20 @@ const listOf = (rule) => (value) => {
   }
   return Object.freeze(out);
 };
+/**
+ * A map whose KEYS are open (a settings name, a source path) but constrained by a pattern.
+ *
+ * `__proto__` is refused outright rather than pattern-matched: `sourceHashes`' key pattern admits
+ * underscores, and `out["__proto__"] = "sha256:…"` is a no-op assignment on a plain object, so the
+ * entry would VANISH from the validated output while the record still validated. Same class as the
+ * `pick` defect above — a key whose meaning comes from the prototype rather than from the record —
+ * and refused the same way, so the two cannot disagree.
+ */
 const objectOf = (keyPattern, rule) => (value) => {
   if (!isObject(value)) return undefined;
   const out = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (!matches(keyPattern, key)) return undefined;
+    if (key === "__proto__" || !matches(keyPattern, key)) return undefined;
     const kept = rule(entry);
     if (kept === undefined) return undefined;
     out[key] = kept;
@@ -239,11 +274,20 @@ const scanner = shape({
     suffix: required(text(/^\.[a-z0-9]{1,8}$/)),
     note: text(printable(500)),
   }),
+  /**
+   * `note` is NOT optional decoration — it is the field the VERIFIED path always writes
+   * (`assessCanary` in `scan-surface.mjs`), and omitting it from this list refused every record whose
+   * scanner had actually proved its capability, because `pick` refuses a key nobody listed. The only
+   * canary that validated was the unverified one, which carries no `note` and blocks anyway: the
+   * healthy case this route exists for was dead on arrival. Listed, not required, because the two
+   * paths genuinely differ.
+   */
   capabilityCanary: shape({
     status: required(oneOf(["verified", "unverified"])),
     representation: text(DOTTED),
     reason: text(printable(300)),
     binaryMagicSkipReproduced: bool,
+    note: text(printable(500)),
   }),
 });
 

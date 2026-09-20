@@ -6,7 +6,9 @@ import { afterAll, describe, expect, it } from "vitest";
 import { assembleAudit } from "../scripts/staging-ops/image-audit.mjs";
 import { reconcileEvidence } from "../scripts/staging-ops/image-audit/reconcile.mjs";
 import { validateOriginalEvidence } from "../scripts/staging-ops/image-audit/original-evidence.mjs";
+import { scannerIdentity } from "../scripts/staging-ops/image-audit/evidence.mjs";
 import { assessPackageInventory } from "../scripts/staging-ops/image-audit/registry.mjs";
+import { assessCanary, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { SCANNER } from "../scripts/staging-ops/image-audit/scanner.mjs";
 import { syntheticSecret } from "./helpers/tar-fixture";
@@ -54,8 +56,11 @@ const apiFailed = assessPackageInventory({ status: "unverified", reason: "the ve
  * outputs. Deliberately not a hand-built `{ blockers: [...] }` object: the positive control has to
  * prove that what the audit actually writes is what reconciliation accepts, and a hand-built stand-in
  * proves only that the fixture matches the validator.
+ *
+ * `assembly` overrides what the AUDIT was given (so a case can exercise a measurement the audit
+ * derives, such as the capability canary); `overrides` rewrites the record it produced.
  */
-function originalAudit(overrides: Record<string, unknown> = {}) {
+function originalAudit(overrides: Record<string, unknown> = {}, assembly: Record<string, unknown> = {}) {
   const record = assembleAudit({
     manifest: { digest: `sha256:${"b".repeat(64)}` },
     inspected: {
@@ -87,6 +92,7 @@ function originalAudit(overrides: Record<string, unknown> = {}) {
     audit: { repository: SUBJECT.repository, runId: "1" },
     startedAt: "2026-09-09T00:00:00.000Z",
     completedAt: "2026-09-09T00:10:00.000Z",
+    ...assembly,
   });
   return { ...record, ...overrides };
 }
@@ -194,6 +200,57 @@ describe("the ORIGINAL record must exist, match the subject, and be complete (PU
     for (const [label, change, code] of cases) {
       const result = reconcile({ ...valid, ...change });
       expect(codes(result), `a record with no ${label} was accepted`).toContain(code);
+      expect(result.transitionReady).toBe(false);
+    }
+  });
+
+  /**
+   * A FINDING PATH the audit itself resolved, including this repository's bracketed dynamic routes.
+   *
+   * `publicPathResolver` emits a member's path verbatim once the audit's own expected-tree lookup has
+   * established it as public source content, and 70+ real paths under `app/` carry `[` and `]`. The
+   * validator's path pattern was a narrow filename-character allowlist that matched none of them, so a
+   * finding in `app/t/[team]/…` refused the WHOLE record as `original-findings-malformed` — the wrong
+   * failure mode twice over: findings block the transition on their own merits, and a malformed-record
+   * refusal hides the real reason while the operator route stops working entirely.
+   *
+   * What the pattern still refuses is what an audit-established path can never be: absolute,
+   * traversing, or carrying a byte outside printable ASCII.
+   */
+  it("accepts a bracketed dynamic-route path in a finding, and still refuses absolute or traversing ones", () => {
+    const valid = originalAudit();
+    const withPath = (path: string) => ({
+      ...valid,
+      verdict: "findings",
+      transitionReady: false,
+      blockers: undefined,
+      findings: {
+        total: 1,
+        rules: 1,
+        groups: [{
+          rule: "generic-api-key",
+          count: 1,
+          occurrences: [{ category: "public-source-path", occurrenceId: "00000000-0000-4000-8000-000000000002", path }],
+        }],
+      },
+    });
+
+    // Both taken from this repository's actual tree, where `publicPathResolver` would find them.
+    for (const path of ["app/t/[team]/projects/[project]/page.tsx", "app/api/dashboard/conversations/[id]/route.ts"]) {
+      const result = reconcile(withPath(path));
+      expect(codes(result), `${path} was refused as malformed`).toEqual([]);
+      expect(result.verdict, path).not.toBe("refused");
+      // It reconciles on its MERITS: a real finding still blocks.
+      expect(result.transitionReady).toBe(false);
+      expect(result.blockers.join(" ")).toMatch(/1 scanner finding/);
+      expect(JSON.stringify(result.findings), `${path} was dropped from the record`).toContain(path);
+    }
+
+    // The NUL case is BUILT, not typed: a literal NUL byte in a source file makes git treat the
+    // whole file as binary, which is a worse problem than the one it would be testing.
+    for (const hostile of ["/etc/shadow", "../../etc/shadow", "app/../../etc/shadow", `app/${String.fromCharCode(0)}hidden.ts`, "app/café.ts"]) {
+      const result = reconcile(withPath(hostile));
+      expect(codes(result), `${JSON.stringify(hostile)} validated`).toContain("original-findings-malformed");
       expect(result.transitionReady).toBe(false);
     }
   });
@@ -412,6 +469,41 @@ describe("the reconciled record is an ALLOWLIST of validated fields (PUB-04)", (
     }
   });
 
+  /**
+   * The same allowlist, attacked with a key the rule table INHERITS rather than owns.
+   *
+   * `pick` resolved its rule with `fields[key]` on a plain object literal, so `fields.constructor`
+   * found `Object` through the PROTOTYPE CHAIN — not `undefined` — and the "an unlisted field: refuse"
+   * branch never fired. The rule then applied was `Object(value)`, which returns an object argument
+   * UNCHANGED, so a nested attacker payload under `constructor` validated and was serialized verbatim
+   * into the reconciled record, which is as public as the audit's own artifact. `__proto__`,
+   * `hasOwnProperty`, `toString` and `valueOf` reached the same branch: a non-callable rule, or an
+   * `Object.prototype` method invoked with no receiver.
+   *
+   * Refusal is the chosen behaviour for ALL of them, not silent exclusion from the output: this
+   * module's stated invariant is that a record carrying a field the audit would never have written is
+   * not the shape we wrote, and a key that is a prototype member is no more written than `scratchPath`.
+   *
+   * One `it` per key rather than a loop, so a key that stops being refused reddens on its own instead
+   * of hiding behind whichever key fails first.
+   */
+  for (const key of ["constructor", "__proto__", "hasOwnProperty", "toString", "valueOf"]) {
+    it(`REFUSES \`${key}\`, a key the rule table inherits rather than owns`, () => {
+      const sentinel = syntheticSecret("proto_");
+      const valid = originalAudit();
+      // `__proto__` has to be an OWN property, which an object literal cannot express — `JSON.parse`
+      // is how it arrives in practice, since the CLI reads the original record from a file. Spread
+      // preserves it, because spread DEFINES properties rather than assigning them.
+      const smuggled = JSON.parse(`{${JSON.stringify(key)}:{"leaked":${JSON.stringify(sentinel)}}}`) as object;
+      const result = reconcile({ ...valid, scanner: { ...(valid.scanner as object), ...smuggled } });
+
+      // The severe property first: whatever the verdict, the payload must not reach the artifact.
+      expect(JSON.stringify(result), `\`${key}\` smuggled a value into the reconciled record`).not.toContain(sentinel);
+      expect(result.verdict, `a \`${key}\` key was accepted`).toBe("refused");
+      expect(codes(result)).toContain("original-scanner-malformed");
+    });
+  }
+
   it("REFUSES to write a record at all when a sensitive SHAPE hides in a field that IS allowlisted", () => {
     // `packageInventory.reason` is legitimate free text — the allowlist cannot exclude it, only
     // bound it to 300 printable characters. The same leak guard the audit's own artifact goes
@@ -464,6 +556,42 @@ describe("a valid original whose ONLY blocker is the API inventory DOES become r
     expect(validated.ok).toBe(true);
     expect(validated.observations.identityVerified).toBe(true);
     expect(validated.observations.auditRunId).toBe("1");
+  });
+
+  /**
+   * THE HEALTHY CANARY — the case this route existed for and could not accept.
+   *
+   * `assessCanary`'s VERIFIED path always writes a `note`; the validator's `capabilityCanary` shape
+   * listed four fields and not that one, and `pick` REFUSES any key nobody listed. So every record
+   * whose scanner had actually PROVED it can read the staged representation was refused as
+   * `original-scanner-malformed`, and the only canary that ever validated was the unverified one —
+   * which carries no `note` and blocks on its own merits. The healthy case was dead on arrival.
+   *
+   * Built from the production `assessCanary` and `scannerIdentity` through the production
+   * `assembleAudit`, because a hand-built canary block is exactly what hid this: it agrees with the
+   * validator rather than with what the audit writes. The other positive controls in this file pass a
+   * canary-less scanner, so this is the one case that exercises the field the defect was in.
+   */
+  it("validates an original whose scanner carries a REAL verified capability canary", () => {
+    const canary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 }) as Record<string, unknown>;
+    // The premise, asserted rather than assumed: `note` is present on the verified path only.
+    expect(canary.status).toBe("verified");
+    expect(typeof canary.note).toBe("string");
+    expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0 })).not.toHaveProperty("note");
+
+    const record = originalAudit({}, {
+      canary,
+      scanner: scannerIdentity(SCANNER, "[allowlist]\n", { representation: SCAN_REPRESENTATION, canary }),
+    });
+    // The audit really does carry the canary into the record — otherwise this case proves nothing.
+    expect(record.scanner.capabilityCanary).toEqual(canary);
+
+    const result = reconcile(record);
+    // The code first: an unlisted `note` refused the whole scanner block as malformed.
+    expect(codes(result)).toEqual([]);
+    expect(validateOriginalEvidence(record, SUBJECT).ok).toBe(true);
+    expect(result.verdict).toBe("clean");
+    expect(result.transitionReady).toBe(true);
   });
 });
 

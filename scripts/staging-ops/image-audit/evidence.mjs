@@ -31,6 +31,13 @@ export const EVIDENCE_FIELDS = Object.freeze([
   "scanner", "audit", "limits", "startedAt", "completedAt",
 ]);
 
+/**
+ * The schema every audit record carries. Exported because the reconciliation validator has to refuse
+ * a record that is not this schema, and a second copy of the string there is a drift waiting to be
+ * introduced by whichever of the two files is edited first.
+ */
+export const EVIDENCE_SCHEMA = "aios.staging-ops.image-audit.v1";
+
 export const VERDICTS = Object.freeze(["clean", "findings", "unresolved", "incomplete", "refused"]);
 
 /**
@@ -248,7 +255,7 @@ export function scannerIdentity(scanner, configText, { settings, representation,
  * not written at all, because the artifact is the thing that becomes public.
  */
 export function buildEvidence(record, { forbidden = [] } = {}) {
-  const allowlisted = allowlistRecord({ schema: "aios.staging-ops.image-audit.v1", ...record });
+  const allowlisted = allowlistRecord({ schema: EVIDENCE_SCHEMA, ...record });
   if (!VERDICTS.includes(allowlisted.verdict)) throw new Error(`evidence verdict ${JSON.stringify(String(allowlisted.verdict))} is not one of ${VERDICTS.join(", ")}`);
   const leaks = evidenceLeakFailures(allowlisted, forbidden);
   if (leaks.length) throw new Error(`refusing to write an audit artifact that leaks:\n- ${leaks.join("\n- ")}`);

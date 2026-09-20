@@ -10,7 +10,7 @@ import {
   parsePaxRecords,
   readTarMembers,
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
-import { UNSUPPORTED_FORMATS } from "../scripts/staging-ops/image-audit/export-walk.mjs";
+import { UNSUPPORTED_FORMATS, unsupportedMagicFormat } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret, ustarSplit } from "./helpers/tar-fixture";
 import { inspectSynthetic, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
@@ -404,7 +404,9 @@ describe("an unsupported container is recognised by its MAGIC, at every depth", 
     const signatures: Record<string, number[]> = {
       zip: [0x50, 0x4b, 0x03, 0x04],
       xz: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00],
-      bzip2: [0x42, 0x5a, 0x68],
+      // `BZh` plus the block-size digit a real stream always carries — the digit is part of the
+      // signature, not payload.
+      bzip2: [0x42, 0x5a, 0x68, 0x39],
       zstd: [0x28, 0xb5, 0x2f, 0xfd],
       "7z": [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c],
       rar: [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07],
@@ -423,9 +425,30 @@ describe("an unsupported container is recognised by its MAGIC, at every depth", 
     }
   });
 
+  /**
+   * bzip2's signature is `BZh` AND the block-size digit, on the recogniser directly.
+   *
+   * With three bytes only, any file whose first three bytes are `BZh` — a text file beginning with
+   * those letters — was labelled an unexpandable bzip2 container. Fail-closed rather than a coverage
+   * hole, but the label was simply wrong, and a limitation that fires on ordinary content stops
+   * meaning anything. All nine digits are asserted, so a signature table that special-cased one of
+   * them cannot pass.
+   */
+  it("recognises bzip2 only when the block-size digit follows `BZh`", () => {
+    for (const digit of "123456789") {
+      expect(unsupportedMagicFormat(Buffer.from(`BZh${digit} payload`)), `BZh${digit} was not bzip2`).toBe("bzip2");
+    }
+    // `0` is not a legal block size, `X` is not a digit, and three bytes are not a signature.
+    for (const near of ["BZh0 payload", "BZhX payload", "BZh", "BZ", "BZhh1"]) {
+      expect(unsupportedMagicFormat(Buffer.from(near)), `${near} was read as bzip2`).toBeUndefined();
+    }
+  });
+
   /** The NEGATIVE CONTROL. A limitation that fires on ordinary content stops meaning anything. */
   it("does NOT flag a file that merely contains a signature later, or starts with a near-miss", async () => {
     const image = synthesizeImage([buildTar([
+      // Prose that opens with the three bzip2 letters but no block-size digit.
+      { name: "app/bzip.md", content: "BZh is the bzip2 magic; the digit after it is the block size" },
       // The signature at offset 200: ordinary source quoting a magic number, which is what this file
       // is. Only the START of content decides.
       { name: "app/doc.md", content: Buffer.concat([Buffer.alloc(200, 0x20), Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from("tail")]) },
