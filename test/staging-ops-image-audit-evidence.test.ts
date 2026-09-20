@@ -249,11 +249,40 @@ describe("findings are grouped, and only allowlisted report fields are read (PUB
     expect(summary.groups.find((g: FindingGroup) => g.rule === "generic-api-key").count).toBe(2);
   });
 
+  /**
+   * IDs THAT CANNOT COLLIDE WITH A MARKER. `summarizeFindings` mints a `randomUUID()` per
+   * occurrence, and a UUID is 32 hex characters — so it contains the substring `"abc"` (the fixture's
+   * fake `Commit`) by chance in ~1.5% of runs. Measured: 302 of 20 000 in-process trials against the
+   * real summariser failed the assertion below with no leak anywhere in sight. That is a fixture
+   * defect, not a redaction defect, and it made a leak test cry wolf 1 run in 66.
+   *
+   * The summariser already accepts an injectable generator, so the test supplies one whose output is
+   * DIGITS ONLY inside the UUID shape: it can collide with no marker, in this list or a future one,
+   * and the only remaining source of variance in the assertion is the code under test.
+   */
+  const sequentialOccurrenceIds = () => {
+    let minted = 0;
+    return () => `00000000-0000-4000-8000-${String(++minted).padStart(12, "0")}`;
+  };
+
   it("carries NO match, secret, fingerprint, commit or author into the summary", () => {
-    const serialized = JSON.stringify(summarizeFindings(report));
+    const serialized = JSON.stringify(summarizeFindings(report, { newOccurrenceId: sequentialOccurrenceIds() }));
     for (const leaked of ["SUPER", "OTHER", "-----BEGIN", "abc", "someone", "app/x.json"]) {
       expect(serialized, `the summary carries ${leaked}`).not.toContain(leaked);
     }
+
+    /**
+     * THE REGRESSION CONTROL for the assertion itself. The markers above are short, human-chosen
+     * strings; pinning the ids removed the noise that used to redden them, and this case shows the
+     * same assertion still has something to catch — a per-run secret planted in EVERY field the
+     * summariser is forbidden to read, none of which can coincide with anything by accident.
+     */
+    const secret = syntheticSecret();
+    const planted = JSON.stringify(summarizeFindings(
+      [{ RuleID: "generic-api-key", File: "L1/000007.json", Match: `TOKEN=${secret}`, Secret: secret, Fingerprint: `app/x.json:generic:${secret}`, Commit: secret, Author: secret, Email: secret }],
+      { newOccurrenceId: sequentialOccurrenceIds() },
+    ));
+    expect(planted, "a planted per-run secret reached the summary").not.toContain(secret);
   });
 
   it("records the layer index from the scratch id, and no filename", () => {

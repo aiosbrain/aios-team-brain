@@ -32,6 +32,7 @@
  */
 import { VERDICTS } from "./evidence.mjs";
 import { UNSUPPORTED_FORMATS } from "./export-walk.mjs";
+import { SCANNER } from "./scanner.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "./subject.mjs";
 
 /** The schema the audit's own artifact carries (`buildEvidence`'s default). */
@@ -52,6 +53,10 @@ export const REFUSAL_CODES = Object.freeze([
   "original-findings-malformed",
   "original-package-inventory-malformed",
   "original-scanner-malformed",
+  "original-scanner-name-mismatch",
+  "original-scanner-version-mismatch",
+  "original-scanner-sha256-mismatch",
+  "original-scanner-config-path-mismatch",
   "original-identity-not-measured",
   "original-recipe-malformed",
   "original-limits-malformed",
@@ -242,6 +247,27 @@ const scanner = shape({
   }),
 });
 
+/**
+ * The scanner the record CLAIMS, against the one reviewed source pins.
+ *
+ * The shape above establishes that `name`/`version`/`sha256`/`configPath` are the right TYPES, and
+ * an independent probe showed what that leaves open: a complete, internally consistent record —
+ * correct subject, clean coverage, verified identity — whose `scanner.sha256` was simply a different
+ * 64-hex string still reconciled to `clean` / `transitionReady: true`. A well-typed identity is not
+ * the pinned identity, so an older scanner build or a different config passed as though it were the
+ * binary the workflow actually runs.
+ *
+ * Each field gets its OWN fixed code, because a coordinator reading a refusal needs to know which
+ * one drifted — and the code names the FIELD, never the record's value, which is as public as the
+ * audit's own artifact.
+ */
+const SCANNER_BINDING = Object.freeze([
+  ["name", "original-scanner-name-mismatch"],
+  ["version", "original-scanner-version-mismatch"],
+  ["sha256", "original-scanner-sha256-mismatch"],
+  ["configPath", "original-scanner-config-path-mismatch"],
+]);
+
 const recipe = shape({
   assertions: required(listOf(shape({
     id: required(text(/^[a-z][a-z0-9.-]{0,63}$/)),
@@ -321,6 +347,15 @@ export function validateOriginalEvidence(record, subject = SUBJECT) {
     limits: "original-limits-malformed",
   };
   for (const [name, value] of Object.entries(measured)) if (value === undefined) refuse(codeFor[name]);
+
+  /**
+   * …and the scanner identity must BE the pinned one, not merely look like one. This is a second
+   * check on top of the shape validation above, never a replacement for it: the shape decides the
+   * record is readable, this decides the record is about the scanner reviewed source pins.
+   */
+  if (measured.scanner !== undefined) {
+    for (const [field, code] of SCANNER_BINDING) if (measured.scanner[field] !== SCANNER[field]) refuse(code);
+  }
 
   /**
    * THE AFFIRMATIVE IDENTITY BIT (item 3). Readiness needs to know whether the manifest/config/layer

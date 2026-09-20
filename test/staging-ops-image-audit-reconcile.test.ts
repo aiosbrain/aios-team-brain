@@ -199,6 +199,40 @@ describe("the ORIGINAL record must exist, match the subject, and be complete (PU
   });
 
   /**
+   * A WELL-TYPED scanner identity is not the PINNED scanner identity.
+   *
+   * The measured defect: a complete, internally consistent original — real `assembleAudit` output,
+   * correct subject, clean coverage, verified identity chain — whose `scanner.sha256` was a
+   * different 64-hex string still reconciled to `clean` / `transitionReady: true`. The shape check
+   * only ever asked whether the four fields were the right TYPES, so a stale scanner build or a
+   * different config passed as the binary the workflow pins. Each field is mutated to a value that
+   * SURVIVES the shape check, so what reddens here is the binding and not the types.
+   */
+  it("REFUSES a record whose scanner is not the PINNED scanner, field by field", () => {
+    const valid = originalAudit();
+    const drifted: [string, string, string][] = [
+      ["sha256", "f".repeat(64), "original-scanner-sha256-mismatch"],
+      ["version", "8.18.4", "original-scanner-version-mismatch"],
+      ["name", "trufflehog", "original-scanner-name-mismatch"],
+      ["configPath", "config/staging-ops/someone-elses-gitleaks.toml", "original-scanner-config-path-mismatch"],
+    ];
+    for (const [field, value, code] of drifted) {
+      const result = reconcile({ ...valid, scanner: { ...(valid.scanner as object), [field]: value } });
+      expect(result.verdict, `a ${field} the pinned scanner never had was accepted`).toBe("refused");
+      expect(result.transitionReady).toBe(false);
+      expect(codes(result), `${field} drift produced the wrong codes`).toEqual([code]);
+      // The refusal names the FIELD. The record's own value is attacker-supplied and the
+      // reconciled record is as public as the audit's, so it is never echoed.
+      expect(result.blockers.join(" ")).toContain(code);
+      expect(JSON.stringify(result), `the ${field} value reached the reconciled record`).not.toContain(value);
+    }
+
+    // THE POSITIVE CONTROL, on the same original: with the pinned scanner it is still ready, so the
+    // four cases above differ from readiness by exactly this binding.
+    expect(reconcile(valid).transitionReady).toBe(true);
+  });
+
+  /**
    * The identity bit is the field this fix had to ADD. Before it, the record stated the outcome of
    * the identity chain only inside a blocker sentence — nothing a later reader could recompute from,
    * so reconciliation had to assume it. Assuming an unmeasured prerequisite is the whole defect.
