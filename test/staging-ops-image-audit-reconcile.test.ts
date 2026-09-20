@@ -248,7 +248,13 @@ describe("the ORIGINAL record must exist, match the subject, and be complete (PU
 
     // The NUL case is BUILT, not typed: a literal NUL byte in a source file makes git treat the
     // whole file as binary, which is a worse problem than the one it would be testing.
-    for (const hostile of ["/etc/shadow", "../../etc/shadow", "app/../../etc/shadow", `app/${String.fromCharCode(0)}hidden.ts`, "app/café.ts"]) {
+    //
+    // The backslash forms and the whitespace-only one each trip ONE clause and nothing else: a
+    // backslash is not a separator to the traversal lookahead, so `..\..\etc\shadow` and
+    // `C:\Windows\x` validated as ordinary relative paths while the comment above the pattern
+    // claimed "never absolute, never traversing"; `"   "` is printable ASCII within the bound and
+    // names nothing at all. No path in this repository's tracked tree carries a backslash.
+    for (const hostile of ["/etc/shadow", "../../etc/shadow", "app/../../etc/shadow", `app/${String.fromCharCode(0)}hidden.ts`, "app/café.ts", "..\\..\\etc\\shadow", "C:\\Windows\\x", "   "]) {
       const result = reconcile(withPath(hostile));
       expect(codes(result), `${JSON.stringify(hostile)} validated`).toContain("original-findings-malformed");
       expect(result.transitionReady).toBe(false);
@@ -503,6 +509,36 @@ describe("the reconciled record is an ALLOWLIST of validated fields (PUB-04)", (
       expect(codes(result)).toContain("original-scanner-malformed");
     });
   }
+
+  /**
+   * The same attack one layer down, where the KEYS are open rather than allowlisted.
+   *
+   * `provenance.recipe.sourceHashes` is an `objectOf` whose key pattern admits underscores, so
+   * `__proto__` passes it — and it is the only pattern-keyed field in this module that does (the
+   * others require a leading letter). Without the explicit refusal in `objectOf`, the validator's
+   * `out["__proto__"] = "unreadable"` is a SILENT NO-OP on a plain object: the `__proto__` setter
+   * ignores a string, so the entry VANISHES from the validated output while the record still
+   * validates. Not the `pick` bypass — a different failure mode from the same root-cause family, a
+   * plain-object dictionary keyed by a string the record controls — and refused the same way so the
+   * two layers cannot disagree about what a prototype key means.
+   *
+   * The key has to be an OWN property, which object-literal syntax cannot express; `JSON.parse` is
+   * both how it arrives in practice (the CLI reads the record from a file) and the only way to build
+   * it here. The ordinary sibling is what proves the map would otherwise have been accepted.
+   */
+  it("REFUSES `__proto__` as a KEY of the open-keyed sourceHashes map", () => {
+    const valid = originalAudit();
+    const provenance = valid.provenance as { recipe: Record<string, unknown> };
+    const sourceHashes = JSON.parse(`{"__proto__":"unreadable","lib/a.ts":"sha256:${"0".repeat(64)}"}`) as object;
+    const result = reconcile({
+      ...valid,
+      provenance: { ...provenance, recipe: { ...provenance.recipe, sourceHashes } },
+    });
+
+    expect(result.verdict, "a `__proto__` source-hash key was accepted").toBe("refused");
+    expect(codes(result)).toContain("original-recipe-malformed");
+    expect(result.transitionReady).toBe(false);
+  });
 
   it("REFUSES to write a record at all when a sensitive SHAPE hides in a field that IS allowlisted", () => {
     // `packageInventory.reason` is legitimate free text — the allowlist cannot exclude it, only

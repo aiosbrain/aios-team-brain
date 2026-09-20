@@ -97,8 +97,17 @@ const DOTTED = /^[a-z][a-z0-9.-]{0,63}$/;
  *
  * So: printable ASCII (which excludes NUL and every control byte), not absolute, no `..` segment,
  * and bounded at 300 characters — the same bound the free-text fields in this file carry.
+ *
+ * TWO FORMS THE SENTENCE ABOVE DID NOT ACTUALLY REFUSE. `/` is the only separator these lookaheads
+ * understand, so `..\..\etc\shadow` and `C:\Windows\x` were read as ordinary relative names and
+ * validated — "never absolute, never traversing" was a claim about POSIX spelling, not about the
+ * strings this pattern accepted. And `"   "` is printable ASCII within the bound while naming
+ * nothing. Neither is exploitable here (no code opens, shells out on, or decodes this value; it only
+ * reaches a JSON artifact), but a pattern whose comment overstates it is the kind of claim a later
+ * reader builds on. So: no backslash anywhere, and at least one character that is neither
+ * whitespace nor a separator.
  */
-const PUBLIC_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[\x20-\x7e]{1,300}$/;
+const PUBLIC_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\\)(?=.*[^\s/])[\x20-\x7e]{1,300}$/;
 /** Printable ASCII only: a reason or detail this module passes through must be readable text. */
 const printable = (max) => new RegExp(`^[\\x20-\\x7e]{0,${max}}$`);
 
