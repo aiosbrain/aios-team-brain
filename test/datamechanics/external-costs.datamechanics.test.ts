@@ -8,6 +8,19 @@ import {
 import { IngestValidationError } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 
+/**
+ * ROLLING DAYS, IN UTC — not fixed dates.
+ *
+ * The readers derive the `90d` window's lower bound from `Date.now()` and filter on `cost_date`, so
+ * a hard-coded seed day silently ages out of the window and every positive cost assertion reads
+ * zero (CI 35447298065: the 2026-06-20 seed went 91 days old). These are ingest/idempotence/role
+ * tests, not date-boundary ones: in-window seeds sit comfortably inside the window, and an
+ * `AGED_OUT` seed well outside it proves the window filter is live, so the positives are not vacuous.
+ */
+const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+const recentDay = () => daysAgo(1);
+const agedOutDay = () => daysAgo(120);
+
 describe("usage_costs ingest + read (W2.1)", () => {
   it("upserts daily provider cost and reads it back team-wide for admin", async () => {
     const seed = await seedTeam();
@@ -18,7 +31,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     };
 
     await ingestUsageCost(db(), auth, {
-      date: "2026-06-22",
+      date: recentDay(),
       provider: "cursor",
       source: "dashboard-api",
       project: "aios",
@@ -31,7 +44,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     });
 
     await ingestUsageCost(db(), auth, {
-      date: "2026-06-22",
+      date: recentDay(),
       provider: "claude",
       source: "session-logs",
       project: "aios",
@@ -79,7 +92,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
       apiKeyId: "test-key",
     };
     const payload = {
-      date: "2026-06-20",
+      date: recentDay(),
       provider: "cursor" as const,
       source: "dashboard-api",
       project: "",
@@ -93,6 +106,8 @@ describe("usage_costs ingest + read (W2.1)", () => {
       cost_usd: 61.5,
       events: 36,
     });
+    // Non-vacuity: the same key on an aged-out day is a distinct row the window must exclude.
+    await ingestUsageCost(db(), auth, { ...payload, date: agedOutDay(), cost_usd: 1000, events: 999 });
 
     const view = await getExternalCosts(db(), seed.teamId, "90d", {
       isAdmin: true,
@@ -100,6 +115,18 @@ describe("usage_costs ingest + read (W2.1)", () => {
     });
     expect(view.totals.cost_usd).toBeCloseTo(61.5, 2);
     expect(view.totals.events).toBe(36);
+
+    // Both day rows are stored (re-push upserted in place, the aged-out day is its own row), so the
+    // single in-window row above is the window filter at work, not a missing seed.
+    const { data: stored } = await db()
+      .from("usage_costs")
+      .select("cost_usd, events")
+      .eq("team_id", seed.teamId)
+      .order("cost_date", { ascending: true });
+    // Compared by cost in date order, not by the date value: the pg adapter returns `date` columns
+    // as local-midnight Date objects, which would make a string compare timezone-dependent.
+    const costs = ((stored ?? []) as { cost_usd: number | string; events: number }[]).map((r) => [Number(r.cost_usd), r.events]);
+    expect(costs).toEqual([[1000, 999], [61.5, 36]]);
   });
 
   it("getExternalCostSeries builds day×provider buckets and role-scopes non-admins", async () => {
@@ -121,11 +148,12 @@ describe("usage_costs ingest + read (W2.1)", () => {
     const otherId = (other as { id: string }).id;
 
     // member1: opencode; member2: codex — same day, exercising the new providers.
+    const day = recentDay();
     await ingestUsageCost(
       db(),
       { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "k1" },
       {
-        date: "2026-07-09",
+        date: day,
         provider: "opencode",
         source: "session-api",
         project: "aios",
@@ -139,7 +167,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
       db(),
       { teamId: seed.teamId, memberId: otherId, apiKeyId: "k2" },
       {
-        date: "2026-07-09",
+        date: day,
         provider: "codex",
         source: "session-logs",
         project: "aios",
@@ -149,6 +177,13 @@ describe("usage_costs ingest + read (W2.1)", () => {
         events: 9,
         meta: { estimated: true },
       },
+    );
+
+    // Non-vacuity: an aged-out row for a THIRD provider must not surface anywhere in the window.
+    await ingestUsageCost(
+      db(),
+      { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "k1" },
+      { date: agedOutDay(), provider: "cursor", source: "dashboard-api", project: "aios", cost_usd: 500, events: 1 },
     );
 
     // Admin sees the whole team: both providers, both costs stacked on the one day.
@@ -161,7 +196,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     // codex (session-logs) is an estimate; opencode (session-api) is billed.
     expect(admin.estimatedProviders).toEqual(["codex"]);
     expect(admin.spendByDay.length).toBe(1);
-    expect(admin.spendByDay[0].date).toBe("2026-07-09");
+    expect(admin.spendByDay[0].date).toBe(day);
     expect(admin.spendByDay[0].opencode).toBeCloseTo(4.0, 2);
     expect(admin.spendByDay[0].codex).toBeCloseTo(2.0, 2);
     expect(admin.tokensByDay[0].input).toBe(800);
@@ -188,7 +223,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     await expect(
       ingestUsageCost(db(), auth, {
         member: "nobody-here",
-        date: "2026-06-22",
+        date: recentDay(),
         provider: "cursor",
         source: "dashboard-api",
         project: "",
