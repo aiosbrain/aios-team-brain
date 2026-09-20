@@ -567,6 +567,8 @@ Two fixture-only failures were corrected without changing product behavior: the 
 
 The coordinator reran both changed files on disposable PostgreSQL: **16/16 passed**. Typecheck, targeted ESLint and `git diff --check` passed. Claude subscription login is now verified (`claude.ai`, Max), and the exact `claude-fable-5-1` model ran twice for a focused review, but both CLI invocations returned empty final review text. Neither is counted as a completed Fable review. The separate staging paired-refresh CI job remains failed on a rollback catalog digest mismatch and requires diagnosis before readiness.
 
+A subsequent focused Fable 5.1 review ran with optional CLI settings and hooks disabled and the exact repair diff supplied directly. It returned the substantive verdict **“No actionable findings in this focused packet.”** This verifies the reviewed CI fixture repair only; the full integrated AIO-1170 Fable code review remains pending. The reviewer noted, without treating either as a regression, that these tests do not provide a negative 90-day-window control and that the scoped-path update's causal branch was not independently read in its text-only pass. The local pre-push reviewer inspected the producer SQL and found that the path branch is exercised.
+
 ### Inactive Slack source and evidence page — September 19, implementation packet
 
 GPT-5.6 Sol was the implementation writer from clean `bedfaeb9` on `codex/aio-1170-resume`, under the accepted AIO-1170 specification. The coordinator reported weekly Codex usage at 35%, below the 40% ceiling. This packet has no active caller, access decision, cache/API/UI wiring, merge or deployment.
