@@ -1479,7 +1479,10 @@ create table if not exists slack_sync_threads (
   -- string. Nulls do not conflict in a unique index, so unleased rows are unconstrained.
   lease_owner text unique check (
     lease_owner is null
-    or (length(lease_owner) between 8 and 128 and lease_owner !~ '[[:space:]]')
+    -- A flat AND chain, NOT `between`: a BETWEEN on the left of an AND deparses nested, and a dump
+    -- restore re-parses it flat, so the restored catalog differs and the staging refresh refuses
+    -- (test/datamechanics/check-constraint-dump-roundtrip).
+    or (length(lease_owner) >= 8 and length(lease_owner) <= 128 and lease_owner !~ '[[:space:]]')
   ),
   lease_expires_at timestamptz,
   -- PROGRESS METADATA ONLY, never evidence: the provider's opaque pagination cursor and the
@@ -3379,7 +3382,10 @@ create table if not exists slack_sync_channels (
   -- three, so a reclaimed worker's late acceptance is refused rather than applied.
   lease_owner text unique check (
     lease_owner is null
-    or (length(lease_owner) between 8 and 128 and lease_owner !~ '[[:space:]]')
+    -- A flat AND chain, NOT `between`: a BETWEEN on the left of an AND deparses nested, and a dump
+    -- restore re-parses it flat, so the restored catalog differs and the staging refresh refuses
+    -- (test/datamechanics/check-constraint-dump-roundtrip).
+    or (length(lease_owner) >= 8 and length(lease_owner) <= 128 and lease_owner !~ '[[:space:]]')
   ),
   lease_generation bigint not null default 0 check (lease_generation >= 0),
   lease_expires_at timestamptz,
