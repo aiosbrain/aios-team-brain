@@ -41,13 +41,33 @@ export async function unpackPair(payload, directory, expected) {
  */
 const SUPPORTED_DATABASE_MODES = new Set(["sanitized", "full"]);
 
-export function validatePairManifest(manifest, now = Date.now(), { allowRollback = false } = {}) {
+/**
+ * A manifest instant is a string `Date.parse` resolves to a finite time, or it is absent. Every
+ * comparison against `NaN` is false, so an unparsed value used to pass BOTH the interval check and
+ * the expiry check — a bundle with no expiry was a bundle that never expired.
+ */
+function manifestInstant(value) {
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * `ignoreExpiry` waives AGE only, and only for an admitted importer-owned rollback envelope, which may
+ * legitimately be older than its source retention. It never waives a missing or malformed
+ * `expiresAt`, and a source manifest cannot use it.
+ */
+export function validatePairManifest(manifest, now = Date.now(), { allowRollback = false, ignoreExpiry = false } = {}) {
   const errors = [];
   if (manifest?.formatVersion !== 1 || manifest?.graphCodecVersion !== 1) errors.push("unsupported bundle/graph codec version");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(String(manifest?.runId ?? ""))) errors.push("invalid run ID");
-  if (!manifest?.captureStartedAt || !manifest?.captureEndedAt || Date.parse(manifest.captureEndedAt) < Date.parse(manifest.captureStartedAt)) errors.push("invalid online capture interval");
-  if (Date.parse(manifest?.expiresAt ?? "") <= now) errors.push("source bundle expired before it was pinned locally");
+  const captureStarted = manifestInstant(manifest?.captureStartedAt);
+  const captureEnded = manifestInstant(manifest?.captureEndedAt);
+  if (captureStarted === null || captureEnded === null || captureEnded < captureStarted) errors.push("invalid online capture interval");
   const rollback = manifest?.kind === "staging-rollback";
+  const expires = manifestInstant(manifest?.expiresAt);
+  if (expires === null) errors.push("missing or malformed bundle expiry");
+  else if (!(ignoreExpiry && rollback && allowRollback) && (!Number.isFinite(now) || expires <= now)) errors.push("source bundle expired before it was pinned locally");
   if (rollback && !allowRollback) errors.push("importer-owned rollback bundle is not a source bundle");
   // M3: `databaseMode` was never validated here, and the value travels: `sealReadyRollback` used to
   // copy it out of the SOURCE manifest into the importer-signed rollback envelope, so a source that

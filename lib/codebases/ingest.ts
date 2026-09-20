@@ -2,8 +2,12 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { CodebaseScanPayload } from "@/lib/api/schemas";
 import { computeScores } from "@/lib/codebases/score";
+import { normalizeStoredScannerField } from "@/lib/codebases/scanner-version";
 import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
-import { projectCommitsToItems, type ScanCommit } from "@/lib/codebases/commits-to-items";
+import {
+  projectCommitsToItems,
+  type ScanCommit,
+} from "@/lib/codebases/commits-to-items";
 import { audit } from "@/lib/api/audit";
 import { reconcileCodebaseFindings } from "@/lib/codebases/finding-ledger";
 
@@ -20,8 +24,13 @@ import { reconcileCodebaseFindings } from "@/lib/codebases/finding-ledger";
 export async function ingestCodebaseScan(
   db: DbClient,
   auth: { teamId: string; memberId: string; apiKeyId: string },
-  payload: CodebaseScanPayload
-): Promise<{ codebase_id: string; metrics_id: string; contributions: number; issues: number }> {
+  payload: CodebaseScanPayload,
+): Promise<{
+  codebase_id: string;
+  metrics_id: string;
+  contributions: number;
+  issues: number;
+}> {
   const now = new Date().toISOString();
   const c = payload.codebase;
 
@@ -45,11 +54,12 @@ export async function ingestCodebaseScan(
         is_archived: c.is_archived,
         last_scan_at: now,
       },
-      { onConflict: "team_id,slug" }
+      { onConflict: "team_id,slug" },
     )
     .select("id")
     .single();
-  if (cbErr || !codebase) throw new Error(`codebase upsert failed: ${cbErr?.message}`);
+  if (cbErr || !codebase)
+    throw new Error(`codebase upsert failed: ${cbErr?.message}`);
 
   // 2. compute scores from raw metrics
   const m = payload.metrics;
@@ -125,15 +135,24 @@ export async function ingestCodebaseScan(
         // schema rejects sparse (health-only) pushes at the boundary. Nested arrays ride
         // inside a plain object, which the pg adapter auto-casts to ::jsonb as a whole.
         codebase_health: m.codebase_health ?? null,
+        // brain-api 1.24 — which scanner build produced this point (AIO-1011). Stored VERBATIM,
+        // including a version string this server cannot parse: provenance is most valuable
+        // exactly when something is wrong with it, and the interpretation ("stale" / "unknown")
+        // is a read-time reading in `lib/codebases/scanner-version`, not a write-time verdict.
+        // Nothing here can fail the upsert — a scanner that omits them writes null, which is what
+        // every pre-1.24 row already holds and can never stop holding.
+        scanner_version: normalizeStoredScannerField(m.scanner_version),
+        scanner_sha: normalizeStoredScannerField(m.scanner_sha),
         ...scores,
       },
-      { onConflict: "codebase_id,head_sha" }
+      { onConflict: "codebase_id,head_sha" },
     )
     .select("id")
     .single();
-  if (mErr || !metrics) throw new Error(`code_metrics upsert failed: ${mErr?.message}`);
+  if (mErr || !metrics)
+    throw new Error(`code_metrics upsert failed: ${mErr?.message}`);
 
-  // 4. project validated v2 findings into durable current state + append-only history.
+  // 4. project validated v2/v3 findings into durable current state + append-only history.
   // Historical v1/v1.0 snapshots remain metrics-only. The DB function is atomic and
   // idempotent for the same metrics point; incomplete evidence can never resolve absence.
   const findingLedger = await reconcileCodebaseFindings(db, {
@@ -169,15 +188,24 @@ export async function ingestCodebaseScan(
           additions: row.additions,
           deletions: row.deletions,
         },
-        { onConflict: "codebase_id,author_key,day" }
+        { onConflict: "codebase_id,author_key,day" },
       );
-      if (error) throw new Error(`contribution ${row.author_key}/${row.day}: ${error.message}`);
+      if (error)
+        throw new Error(
+          `contribution ${row.author_key}/${row.day}: ${error.message}`,
+        );
       contribCount++;
     }
 
     // Project recent commits into searchable items (author message text + member attribution),
     // so NL queries can answer per-person git history — not just the aggregate counts above.
-    commitItemCount = await projectCommitsToItems(db, auth, c.slug, recentCommits, identityMap);
+    commitItemCount = await projectCommitsToItems(
+      db,
+      auth,
+      c.slug,
+      recentCommits,
+      identityMap,
+    );
   }
 
   // 6. issues — upsert by number
@@ -200,7 +228,7 @@ export async function ingestCodebaseScan(
         closed_at: iss.closed_at || null,
         updated_at: now,
       },
-      { onConflict: "codebase_id,number" }
+      { onConflict: "codebase_id,number" },
     );
     if (error) throw new Error(`issue #${iss.number}: ${error.message}`);
     issueCount++;

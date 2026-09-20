@@ -66,7 +66,7 @@ const codebaseHealthV1Schema = z.strictObject({
     .string()
     .min(1)
     .max(20)
-    .refine((value) => value !== "2"),
+    .refine((value) => value !== "2" && value !== "3"),
   rubric_version: z.string().min(1).max(40),
   head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
   score_pct: z.number().min(0).max(100),
@@ -97,92 +97,153 @@ const evidenceStatusSchema = z.enum([
   "stale",
   "error",
 ]);
-const codebaseHealthV2Schema = z
-  .strictObject({
-    schema_version: z.literal("2"),
-    rubric_version: z.string().min(1).max(40),
-    profile_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
-    profile_version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
-    head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
-    score_pct: z.number().min(0).max(100),
-    status: z.enum(["pass", "warn", "fail"]),
-    evidence_status: evidenceStatusSchema,
-    quality_gate: z.enum(["pass", "fail", "unknown"]),
-    automation_eligible: z.boolean(),
-    dimensions: z
-      .record(
-        z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
-        z.strictObject({
-          passed: z.number().int().nonnegative(),
-          total: z.number().int().nonnegative(),
-          band: z.number().int().min(0).max(4).nullable(),
-          evidence_status: evidenceStatusSchema,
-        }),
-      )
-      .refine((dimensions) => Object.keys(dimensions).length >= 1, {
-        message: "dimensions must have at least one entry",
+const codebaseHealthV2Base = z.strictObject({
+  schema_version: z.literal("2"),
+  rubric_version: z.string().min(1).max(40),
+  profile_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+  profile_version: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/),
+  head_sha: z.string().regex(/^[0-9a-f]{7,40}$/),
+  score_pct: z.number().min(0).max(100),
+  status: z.enum(["pass", "warn", "fail"]),
+  evidence_status: evidenceStatusSchema,
+  quality_gate: z.enum(["pass", "fail", "unknown"]),
+  automation_eligible: z.boolean(),
+  dimensions: z
+    .record(
+      z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+      z.strictObject({
+        passed: z.number().int().nonnegative(),
+        total: z.number().int().nonnegative(),
+        band: z.number().int().min(0).max(4).nullable(),
+        evidence_status: evidenceStatusSchema,
       }),
-    failed_invariant_ids: z
-      .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
-      .max(200),
-    measured_at: z
-      .string()
-      .regex(
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/,
-      ),
-    findings: z
-      .array(
-        z.strictObject({
-          fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
-          check_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
-          axis: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
-          kind: z.enum(["quality_issue", "evidence_gap"]),
-          severity: z.enum(["low", "medium", "high", "critical"]),
-          evidence_status: evidenceStatusSchema,
-          remediation_tier: z.number().int().min(0).max(3),
-        }),
-      )
-      .max(500),
+    )
+    .refine((dimensions) => Object.keys(dimensions).length >= 1, {
+      message: "dimensions must have at least one entry",
+    }),
+  failed_invariant_ids: z
+    .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+    .max(200),
+  measured_at: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/),
+  findings: z
+    .array(
+      z.strictObject({
+        fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+        check_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+        axis: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+        kind: z.enum(["quality_issue", "evidence_gap"]),
+        severity: z.enum(["low", "medium", "high", "critical"]),
+        evidence_status: evidenceStatusSchema,
+        remediation_tier: z.number().int().min(0).max(3),
+      }),
+    )
+    .max(500),
+});
+
+function validateHealthEvidence(
+  health: Pick<
+    z.infer<typeof codebaseHealthV2Base>,
+    "quality_gate" | "evidence_status" | "automation_eligible" | "status"
+  >,
+  context: z.RefinementCtx,
+) {
+  if (health.quality_gate === "pass" && health.evidence_status !== "complete") {
+    context.addIssue({
+      code: "custom",
+      path: ["quality_gate"],
+      message: "a passing quality gate requires complete evidence",
+    });
+  }
+  if (
+    health.quality_gate === "unknown" &&
+    health.evidence_status === "complete"
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["quality_gate"],
+      message: "an unknown quality gate cannot claim complete evidence",
+    });
+  }
+  if (
+    health.automation_eligible &&
+    (health.quality_gate !== "pass" ||
+      health.evidence_status !== "complete" ||
+      health.status === "fail")
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["automation_eligible"],
+      message:
+        "automation requires complete evidence, a passing gate, and non-failing health",
+    });
+  }
+}
+
+const codebaseHealthV2Schema = codebaseHealthV2Base.superRefine(
+  validateHealthEvidence,
+);
+
+const checkCoverageBucket = z.strictObject({
+  configured: z.number().int().nonnegative(),
+  complete: z.number().int().nonnegative(),
+  partial: z.number().int().nonnegative(),
+  missing: z.number().int().nonnegative(),
+  stale: z.number().int().nonnegative(),
+  error: z.number().int().nonnegative(),
+});
+
+const codebaseHealthV3Schema = codebaseHealthV2Base
+  .extend({
+    schema_version: z.literal("3"),
+    check_coverage: z.strictObject({
+      all: checkCoverageBucket,
+      required: checkCoverageBucket,
+    }),
   })
+  .superRefine(validateHealthEvidence)
   .superRefine((health, context) => {
-    if (
-      health.quality_gate === "pass" &&
-      health.evidence_status !== "complete"
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["quality_gate"],
-        message: "a passing quality gate requires complete evidence",
-      });
+    const coverage = health.check_coverage;
+    for (const name of ["all", "required"] as const) {
+      const bucket = coverage[name];
+      if (
+        bucket.configured !==
+        bucket.complete +
+          bucket.partial +
+          bucket.missing +
+          bucket.stale +
+          bucket.error
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["check_coverage", name, "configured"],
+          message: "configured must equal the sum of evidence states",
+        });
+      }
     }
-    if (
-      health.quality_gate === "unknown" &&
-      health.evidence_status === "complete"
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["quality_gate"],
-        message: "an unknown quality gate cannot claim complete evidence",
-      });
-    }
-    if (
-      health.automation_eligible &&
-      (health.quality_gate !== "pass" ||
-        health.evidence_status !== "complete" ||
-        health.status === "fail")
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["automation_eligible"],
-        message:
-          "automation requires complete evidence, a passing gate, and non-failing health",
-      });
+    for (const status of [
+      "configured",
+      "complete",
+      "partial",
+      "missing",
+      "stale",
+      "error",
+    ] as const) {
+      if (coverage.required[status] > coverage.all[status]) {
+        context.addIssue({
+          code: "custom",
+          path: ["check_coverage", "required", status],
+          message: "required checks must be a subset of all checks",
+        });
+      }
     }
   });
 
 // V1 remains accepted byte-for-byte. V2 adds the evidence needed to decide whether a
 // background remediation worker may act, without accepting raw source or finding text.
 export const codebaseHealthSchema = z.union([
+  codebaseHealthV3Schema,
   codebaseHealthV2Schema,
   codebaseHealthV1Schema,
 ]);
@@ -408,6 +469,28 @@ export const codeMetricsSchema = z.object({
   // Optional and additive: a pre-1.15 payload without it stays valid unchanged. No
   // `.default()`/no null: omitted must stay distinguishable from a scored object.
   codebase_health: codebaseHealthSchema.optional(),
+  // brain-api 1.24 (AIO-1011) — WHICH SCANNER BUILD produced this payload.
+  //
+  // `scanner_version` is the ingestion package version (`aios_ingest.__version__`); `scanner_sha`
+  // is the aios-team-brain commit it ran from, provenance only. Optional and defaulting to null,
+  // so a pre-1.24 payload is byte-for-byte unchanged.
+  //
+  // `null` MEANS UNKNOWN — and here, specifically, "predates 1.24". It must never read as
+  // "current": every scan ever pushed before this revision is in that state and it cannot be
+  // backfilled, so unknown is the COMMON case. That is the whole point — 1.22's coverage
+  // denominator shipped to seven repos pinned to a scanner that had never heard of it, every scan
+  // returned 200, and nothing could tell an old scanner apart from a current one with genuinely
+  // nothing to report.
+  //
+  // DELIBERATELY PERMISSIVE, and this is the load-bearing decision. No regex, no enum, no format:
+  // just a bounded string, exactly as the canonical schema pins it. A 422 here would drop the
+  // repo's ENTIRE scan — metrics, findings, contributions, issues — and returns before
+  // `recordIngestRun`, so the failure would not even be logged. A provenance string can never be
+  // worth that. A version this server cannot parse is stored verbatim and READ as unknown
+  // (`lib/codebases/scanner-version`), never rejected. The 64-char bound exists because these
+  // become text columns, not to police shape.
+  scanner_version: z.string().max(64).nullable().optional().default(null),
+  scanner_sha: z.string().max(64).nullable().optional().default(null),
 });
 
 export const codeContributionSchema = z.object({
@@ -449,7 +532,7 @@ export const codebaseScanPayloadSchema = z
   .superRefine((payload, context) => {
     const health = payload.metrics.codebase_health;
     if (
-      health?.schema_version === "2" &&
+      (health?.schema_version === "2" || health?.schema_version === "3") &&
       health.head_sha !== payload.metrics.head_sha
     ) {
       context.addIssue({

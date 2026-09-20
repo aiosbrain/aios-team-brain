@@ -525,25 +525,31 @@ export async function runReleaseController(env = process.env, operations = {}) {
         throw new Error(mutation.status);
       }
       updateConfirmed = mutation.status === "promoted" || mutation.status === "already-promoted";
-      if (mutation.status === "promoted") {
-        phase = "production-observation";
-        mutation.production = await (operations.observeProductionDeployment ?? observeProductionDeployment)({
-          expectedSha: facts.commitSha,
-          readLatest: operations.readLatestProductionDeployment ?? (() => readLatestProductionDeployment({
-            environmentId: env.RAILWAY_PRODUCTION_ENVIRONMENT_ID,
-            serviceId: env.RAILWAY_PRODUCTION_APP_SERVICE_ID,
-            token: env.RAILWAY_PRODUCTION_READ_TOKEN,
-          })),
-          probeHealth: operations.probeProductionHealth ?? ((deployment) => {
-            if (!deployment.url) throw new Error("Railway reported no production deployment domain; the observation is UNMEASURED and no configured value may stand in for it");
-            return probeProductionHealth({ origin: deployment.url });
-          }),
-          timeoutMs: Number(env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
-        });
-        if (mutation.production.status !== "verified") {
-          finishAudit(mutation.production.status, { result: mutation }); finalized = true;
-          throw new Error(mutation.production.status);
-        }
+      // An outcome the promoter never defined is not evidence that main moved, so it cannot skip to
+      // "completed" either.
+      if (!updateConfirmed) throw new Error(`unrecognized main update outcome ${JSON.stringify(String(mutation?.status).slice(0, 48))}`);
+      // `already-promoted` is the RETRY of a run whose main update landed but whose observation did
+      // not finish (or failed). The ref is idempotent; production health is not — so BOTH established
+      // outcomes are observed before "completed", and the retry issues no second update.
+      phase = "production-observation";
+      mutation.production = await (operations.observeProductionDeployment ?? observeProductionDeployment)({
+        expectedSha: facts.commitSha,
+        readLatest: operations.readLatestProductionDeployment ?? (() => readLatestProductionDeployment({
+          environmentId: env.RAILWAY_PRODUCTION_ENVIRONMENT_ID,
+          serviceId: env.RAILWAY_PRODUCTION_APP_SERVICE_ID,
+          token: env.RAILWAY_PRODUCTION_READ_TOKEN,
+        })),
+        probeHealth: operations.probeProductionHealth ?? ((deployment) => {
+          if (!deployment.url) throw new Error("Railway reported no production deployment domain; the observation is UNMEASURED and no configured value may stand in for it");
+          return probeProductionHealth({ origin: deployment.url });
+        }),
+        timeoutMs: Number(env.PRODUCTION_DEPLOY_TIMEOUT_MS ?? 600_000),
+      });
+      if (mutation.production?.status !== "verified") {
+        // Failed stays failed; anything the observer did not positively classify is UNVERIFIED.
+        const verdict = mutation.production?.status === "promoted-but-deployment-failed" ? "promoted-but-deployment-failed" : "promoted-but-deployment-unverified";
+        finishAudit(verdict, { result: mutation }); finalized = true;
+        throw new Error(verdict);
       }
     }
     finishAudit("completed", { result: mutation }); finalized = true;

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Astra Spec Claude Build"
+  short_description: "Astra-led builds with dynamic Claude selection"
+  default_prompt: "Use $astra-spec-claude-build to specify, build, review and publish this change."

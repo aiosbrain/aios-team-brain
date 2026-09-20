@@ -320,6 +320,87 @@ describe("trusted release controller", () => {
       expect(run.audits.at(-1)).toMatchObject({ verdict, result: { status: "promoted", sha, production: observation } });
     });
 
+    /**
+     * AIO-1162 — a RETRY after the main update already landed. `updateMainNonForce` answers
+     * `already-promoted` without writing; the controller must still observe production before it may
+     * record "completed", keep failed and unverified distinct, and never issue a second PATCH.
+     */
+    describe.each(["promote", "emergency"] as const)("already-promoted retry (%s)", (action) => {
+      const retryEnv = (action === "emergency"
+        ? { ...baseEnv, RELEASE_ACTION: "emergency", RELEASE_EMERGENCY_SHA: sha,
+          RELEASE_INCIDENT_URL: "https://linear.app/acme/issue/AIO-997", RELEASE_NOTES: "Restore production login immediately",
+          EMERGENCY_APP_ID: "3", EMERGENCY_APP_INSTALLATION_ID: "4", EMERGENCY_APP_PRIVATE_KEY: "unused" }
+        : baseEnv) as NodeJS.ProcessEnv;
+      // Main already sits at the candidate, and the retry's validated expectation is that same SHA.
+      const retryMain = sha;
+
+      const runRetry = (observe: ReturnType<typeof vi.fn>) => {
+        // The REAL promoter against a fake GitHub, so "no second promotion write" is measured on the
+        // wire rather than asserted about a stub.
+        const appRequest = vi.fn(async (method: string, requestPath: string) => {
+          if (method === "GET" && requestPath.endsWith("/git/ref/heads/main")) return { object: { sha: retryMain } };
+          if (method === "POST" && requestPath.endsWith("/check-runs")) return { id: 1 };
+          throw new Error(`unexpected ${method} ${requestPath}`);
+        });
+        const run = common({
+          githubRead: vi.fn(async (_method: string, requestPath: string) => requestPath.includes("compare/") ? { status: "identical" } : { object: { sha: retryMain } }),
+          measureCandidate: vi.fn().mockResolvedValue({ ...measured, facts: { ...measured.facts, expectedMain: retryMain } }),
+          publishCandidateCheck: undefined,
+          appRequest,
+          observeProductionDeployment: observe,
+        });
+        return { run, appRequest, outcome: runReleaseController(retryEnv, run.operations) };
+      };
+      const promotionWrites = (appRequest: ReturnType<typeof vi.fn>) =>
+        appRequest.mock.calls.filter(([method, requestPath]) => method === "PATCH" || String(requestPath).includes("/git/refs/"));
+
+      it("observes a healthy production deployment before recording completed", async () => {
+        const observe = vi.fn().mockResolvedValue({ status: "verified", deployment: { commitSha: sha } });
+        const { run, appRequest, outcome } = runRetry(observe);
+        await expect(outcome).resolves.toMatchObject({ status: "already-promoted", sha, production: { status: "verified" } });
+        expect(observe).toHaveBeenCalledTimes(1);
+        expect(observe.mock.calls[0][0]).toMatchObject({ expectedSha: sha });
+        expect(promotionWrites(appRequest)).toHaveLength(0);
+        expect(run.audits.at(-1)).toMatchObject({ verdict: "completed", result: { status: "already-promoted", sha, production: { status: "verified" } } });
+      });
+
+      it("records a failed production deployment as failed, never completed", async () => {
+        const observe = vi.fn().mockResolvedValue({ status: "promoted-but-deployment-failed", deployment: { commitSha: sha, status: "CRASHED" } });
+        const { run, appRequest, outcome } = runRetry(observe);
+        await expect(outcome).rejects.toThrow(/promoted-but-deployment-failed/);
+        expect(observe).toHaveBeenCalledTimes(1);
+        expect(promotionWrites(appRequest)).toHaveLength(0);
+        expect(run.audits.at(-1)).toMatchObject({ verdict: "promoted-but-deployment-failed", result: { status: "already-promoted", production: { status: "promoted-but-deployment-failed" } } });
+        expect(run.audits.some((audit) => audit.verdict === "completed")).toBe(false);
+      });
+
+      it("records an unverified production deployment as unverified, never completed", async () => {
+        const observe = vi.fn().mockResolvedValue({ status: "promoted-but-deployment-unverified", observationError: "Railway unavailable" });
+        const { run, appRequest, outcome } = runRetry(observe);
+        await expect(outcome).rejects.toThrow(/promoted-but-deployment-unverified/);
+        expect(observe).toHaveBeenCalledTimes(1);
+        expect(promotionWrites(appRequest)).toHaveLength(0);
+        expect(run.audits.at(-1)).toMatchObject({ verdict: "promoted-but-deployment-unverified", result: { status: "already-promoted", production: { status: "promoted-but-deployment-unverified" } } });
+        expect(run.audits.some((audit) => audit.verdict === "completed")).toBe(false);
+      });
+
+      it("records an observation it cannot classify as unverified, never completed", async () => {
+        const observe = vi.fn().mockResolvedValue({ status: "something-new" });
+        const { run, appRequest, outcome } = runRetry(observe);
+        await expect(outcome).rejects.toThrow(/promoted-but-deployment-unverified/);
+        expect(promotionWrites(appRequest)).toHaveLength(0);
+        expect(run.audits.at(-1)).toMatchObject({ verdict: "promoted-but-deployment-unverified", result: { status: "already-promoted" } });
+      });
+    });
+
+    it("refuses an update outcome the promoter never defined instead of recording completed", async () => {
+      const observe = vi.fn();
+      const run = common({ updateMainNonForce: vi.fn().mockResolvedValue({ status: "mystery", sha }), observeProductionDeployment: observe });
+      await expect(runReleaseController(baseEnv, run.operations)).rejects.toThrow(/unrecognized main update outcome/);
+      expect(observe).not.toHaveBeenCalled();
+      expect(run.audits.at(-1)).toMatchObject({ verdict: "refused", result: { status: "refused", phase: "main-update", updateAttempted: true } });
+    });
+
     it("records an emergency observer exception as promoted-but-unverified and never repeats the update", async () => {
       const emergencyEnv = { ...baseEnv, RELEASE_ACTION: "emergency", RELEASE_EMERGENCY_SHA: sha,
         RELEASE_INCIDENT_URL: "https://linear.app/acme/issue/AIO-997", RELEASE_NOTES: "Restore production login immediately",

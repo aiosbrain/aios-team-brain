@@ -1,9 +1,14 @@
+import { codebaseHealthSchema } from "@/lib/api/schemas";
+import { isCodebaseStale } from "@/lib/metrics/codebases";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DebtPatrol } from "@/components/codebases/debt-patrol";
-import { DebtMovement } from "@/components/codebases/debt-dashboard";
+import {
+  DebtMovement,
+  ScannerCheckCoverage,
+} from "@/components/codebases/debt-dashboard";
 import { buildDebtPatrol } from "@/lib/codebases/debt-ranking";
 import { deriveCodebaseDebtKpis } from "@/lib/codebases/debt-kpis";
 import type { CodebaseFinding } from "@/lib/metrics/codebases";
@@ -162,5 +167,146 @@ describe("debt patrol accessibility guard", () => {
       expect(query).toContain('.eq("codebase_id", codebaseId)');
       expect(query).not.toContain(".limit(");
     }
+  });
+});
+
+// AIO-1096: census labels, unknowns and freshness are observable independently of color.
+describe("scanner check coverage", () => {
+  const fixtureSet = JSON.parse(
+    readFileSync(
+      join(
+        process.cwd(),
+        "test/fixtures/contract/codebase-payload-1.25-fixtures.json",
+      ),
+      "utf8",
+    ),
+  );
+  const makeHealth = (name = "valid-v3-complete") => {
+    const health = codebaseHealthSchema.parse(
+      fixtureSet.valid.find((f: { name: string }) => f.name === name).payload
+        .metrics.codebase_health,
+    );
+    if (health.schema_version !== "3" || !("check_coverage" in health))
+      throw new Error("v3 fixture required");
+    return health;
+  };
+  it("labels every count, full provenance and capture time", () => {
+    const health = makeHealth();
+    const html = renderToStaticMarkup(
+      ScannerCheckCoverage({ health, stale: false }),
+    );
+    for (const label of [
+      "Scanner check coverage",
+      "Complete scan",
+      "Configured checks",
+      "Complete required",
+      "Findings emitted",
+      "All checks",
+      "Required checks",
+      "Partial",
+      "Missing",
+      "Stale",
+      "Error",
+      "Profile",
+      "Rubric",
+      "Head",
+      "Measured time",
+    ])
+      expect(html).toContain(label);
+    for (const value of [
+      health.profile_id,
+      health.profile_version,
+      health.rubric_version,
+      health.head_sha,
+      health.measured_at,
+    ])
+      expect(html).toContain(value);
+    expect(html).toContain('<th scope="row"');
+    expect(html).toContain(`dateTime="${health.measured_at}"`);
+  });
+  it("shows partial, stale and error cues together without claiming completeness", () => {
+    const health = makeHealth("valid-v3-mixed");
+    health.evidence_status = "error";
+    const html = renderToStaticMarkup(
+      ScannerCheckCoverage({ health, stale: true }),
+    );
+    for (const flag of ["Partial scan", "Stale scan", "Error evidence"])
+      expect(html).toContain(flag);
+    expect(html).not.toContain("Complete scan");
+  });
+  it("required completeness never means all-check completeness and zero is measured", () => {
+    const health = makeHealth();
+    health.check_coverage.all.complete -= 1;
+    health.check_coverage.all.partial += 1;
+    expect(
+      renderToStaticMarkup(ScannerCheckCoverage({ health, stale: false })),
+    ).toContain("Partial scan");
+    const zero = renderToStaticMarkup(
+      ScannerCheckCoverage({
+        health: makeHealth("valid-v3-zero"),
+        stale: false,
+      }),
+    );
+    expect(zero).toContain("No configured checks");
+    expect(zero).not.toContain("100%");
+    expect(zero).not.toContain("Complete scan");
+  });
+  it("renders absent and v1/v2 census as unknown rather than zero", () => {
+    const legacy = fixtureSet.valid.filter((f: { name: string }) =>
+      [
+        "valid-v2-unchanged",
+        "valid-with-health: full metrics block plus codebase_health",
+      ].includes(f.name),
+    );
+    expect(legacy).toHaveLength(2);
+    for (const health of [
+      null,
+      ...legacy.map(
+        (f: { payload: { metrics: { codebase_health: unknown } } }) =>
+          codebaseHealthSchema.parse(f.payload.metrics.codebase_health),
+      ),
+    ]) {
+      const html = renderToStaticMarkup(
+        ScannerCheckCoverage({ health, stale: true }),
+      );
+      expect(html).toContain("Coverage unknown");
+      expect(html).toContain("Configured checks: Unknown");
+      expect(html).not.toContain("Complete scan");
+      expect(html).not.toContain("<table");
+    }
+  });
+  it("places coverage below the intake gap and above debt; page freshness uses health time", () => {
+    const source = readFileSync(
+      join(process.cwd(), "components/codebases/debt-dashboard.tsx"),
+      "utf8",
+    );
+    const movement = source.slice(
+      source.indexOf("export function DebtMovement"),
+    );
+    expect(movement.indexOf('label="UltraHarden intake"')).toBeLessThan(
+      movement.indexOf("<ScannerCheckCoverage"),
+    );
+    expect(movement.indexOf("<ScannerCheckCoverage")).toBeLessThan(
+      movement.indexOf('aria-labelledby="debt-movement-heading"'),
+    );
+    const page = readFileSync(
+      join(process.cwd(), "app/t/[team]/codebases/[slug]/page.tsx"),
+      "utf8",
+    );
+    expect(page).toMatch(
+      /healthStale=\{isCodebaseStale\(\s*cb\.breakdown\?\.codebase_health\?\.measured_at/,
+    );
+    expect(
+      isCodebaseStale(
+        "2026-08-01T00:00:00Z",
+        Date.parse("2026-09-01T00:00:00Z"),
+      ),
+    ).toBe(true);
+    expect(
+      isCodebaseStale(
+        "2026-09-01T00:00:00Z",
+        Date.parse("2026-09-01T00:00:00Z"),
+      ),
+    ).toBe(false);
   });
 });
