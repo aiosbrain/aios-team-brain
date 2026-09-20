@@ -561,6 +561,12 @@ Seven focused real-Postgres cases cover an old root with a recent reply, an invi
 
 The staging-targeted PR's brain-unit job failed three `timeline-panel-refresh` cases before render with `ReferenceError: navigator is not defined` on the CI Node runtime; local Node 25 supplies a global navigator and had masked the test setup gap. The test now stubs `navigator` before its first `react-dom/client` import, and its existing cleanup restores globals after each case. `NODE_OPTIONS=--no-experimental-global-navigator npx vitest run test/timeline-panel-refresh.test.ts` passed **3/3** locally, reproducing CI's missing-global condition. This is a test-host correction; no timeline product code or behavior changed. The PR job must rerun to confirm the GitHub environment.
 
+### CI fixture correction — September 19
+
+Two fixture-only failures were corrected without changing product behavior: the readiness test now ingests a legacy Slack item and uses test-only SQL to model a pre-existing canonical scoped row, preserving the ingress refusal for ordinary scoped writes; the external-costs fixtures use one UTC date derived 30 days before test time so their 90-day read assertions remain in-window.
+
+The coordinator reran both changed files on disposable PostgreSQL: **16/16 passed**. Typecheck, targeted ESLint and `git diff --check` passed. Claude subscription login is now verified (`claude.ai`, Max), and the exact `claude-fable-5-1` model ran twice for a focused review, but both CLI invocations returned empty final review text. Neither is counted as a completed Fable review. The separate staging paired-refresh CI job remains failed on a rollback catalog digest mismatch and requires diagnosis before readiness.
+
 ### Inactive Slack source and evidence page — September 19, implementation packet
 
 GPT-5.6 Sol was the implementation writer from clean `bedfaeb9` on `codex/aio-1170-resume`, under the accepted AIO-1170 specification. The coordinator reported weekly Codex usage at 35%, below the 40% ceiling. This packet has no active caller, access decision, cache/API/UI wiring, merge or deployment.

@@ -8,6 +8,10 @@ import {
 import { IngestValidationError } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 
+const IN_WINDOW_UTC_DATE = new Date(Date.now() - 30 * 86_400_000)
+  .toISOString()
+  .slice(0, 10);
+
 describe("usage_costs ingest + read (W2.1)", () => {
   it("upserts daily provider cost and reads it back team-wide for admin", async () => {
     const seed = await seedTeam();
@@ -18,7 +22,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     };
 
     await ingestUsageCost(db(), auth, {
-      date: "2026-06-22",
+      date: IN_WINDOW_UTC_DATE,
       provider: "cursor",
       source: "dashboard-api",
       project: "aios",
@@ -31,7 +35,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     });
 
     await ingestUsageCost(db(), auth, {
-      date: "2026-06-22",
+      date: IN_WINDOW_UTC_DATE,
       provider: "claude",
       source: "session-logs",
       project: "aios",
@@ -79,7 +83,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
       apiKeyId: "test-key",
     };
     const payload = {
-      date: "2026-06-20",
+      date: IN_WINDOW_UTC_DATE,
       provider: "cursor" as const,
       source: "dashboard-api",
       project: "",
@@ -125,7 +129,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
       db(),
       { teamId: seed.teamId, memberId: seed.memberId, apiKeyId: "k1" },
       {
-        date: "2026-07-09",
+        date: IN_WINDOW_UTC_DATE,
         provider: "opencode",
         source: "session-api",
         project: "aios",
@@ -139,7 +143,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
       db(),
       { teamId: seed.teamId, memberId: otherId, apiKeyId: "k2" },
       {
-        date: "2026-07-09",
+        date: IN_WINDOW_UTC_DATE,
         provider: "codex",
         source: "session-logs",
         project: "aios",
@@ -161,7 +165,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     // codex (session-logs) is an estimate; opencode (session-api) is billed.
     expect(admin.estimatedProviders).toEqual(["codex"]);
     expect(admin.spendByDay.length).toBe(1);
-    expect(admin.spendByDay[0].date).toBe("2026-07-09");
+    expect(admin.spendByDay[0].date).toBe(IN_WINDOW_UTC_DATE);
     expect(admin.spendByDay[0].opencode).toBeCloseTo(4.0, 2);
     expect(admin.spendByDay[0].codex).toBeCloseTo(2.0, 2);
     expect(admin.tokensByDay[0].input).toBe(800);
@@ -188,7 +192,7 @@ describe("usage_costs ingest + read (W2.1)", () => {
     await expect(
       ingestUsageCost(db(), auth, {
         member: "nobody-here",
-        date: "2026-06-22",
+        date: IN_WINDOW_UTC_DATE,
         provider: "cursor",
         source: "dashboard-api",
         project: "",

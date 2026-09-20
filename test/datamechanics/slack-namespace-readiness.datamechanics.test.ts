@@ -184,11 +184,17 @@ describe("inactive new Slack channel namespace producer (real Postgres)", () => 
 
     const other = await seedTeam();
     await verifiedPublic(other);
-    await ingest(other, {
-      path: "slack/t0source1/c0newgate/1718900000.000100.md", project: "slack",
+    const legacy = await ingest(other, {
+      path: "slack/legacy/1718900000.000100.md", project: "slack",
       kind: "transcript", access: "team", body: "already scoped",
       frontmatter: { source: "slack", workspace_id: WORKSPACE, channel_id: CHANNEL },
     });
+    // Ordinary ingest correctly refuses canonical scoped Slack paths. Simulate a historical row
+    // that predates that ingress guard so readiness still verifies the blocked condition.
+    await c.query(
+      `update items set path = $1 where team_id = $2 and id = $3`,
+      ["slack/t0source1/c0newgate/1718900000.000100.md", other.teamId, legacy.id]
+    );
     expect(await tx((s) => prepareNewSlackChannelNamespace(s, {
       teamId: other.teamId, rawChannelId: CHANNEL,
     }))).toEqual({ outcome: "blocked" });
