@@ -33,8 +33,8 @@ import {
   beginWitnessItem, runWitnessPublisherJob, serveWitnessItem, transformToDisposable, unresolvedCreateIntents,
   INTENT_JOB_NAME, intentArtifactEntry, intentArtifactName, derivedRulesetNames, pollWitnessPublication,
   validateEnvironmentControl, validateEvidenceBinding, verifyWitnessedPolicy, writeEvidenceFile,
-  completedJsonResponse, conformResponse, createGuardedRequest, createLocalGhTransport, createTokenTransport,
-  incompleteResponse, responseEvidence, RESPONSE_SHAPES,
+  completedJsonResponse, conformResponse, createLocalGhTransport, createTokenTransport,
+  incompleteResponse, responseEvidence,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
@@ -6647,6 +6647,21 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl: github.spawnImpl } }).catch(() => null);
     const names = [...github.rulesets.values()].map((ruleset) => ruleset.name);
     expect(new Set(names).size, "a ruleset name was created twice").toBe(names.length);
+  });
+
+  it("R02-1 · a cleanup DELETE whose 204 carried stray bytes journals the incomplete answer; removal is decided by readback alone", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    const scripted = scriptedGh(github, ({ method, path: requestPath }) => (method === "DELETE" && /\/git\/refs\/heads\//.test(requestPath)
+      ? { apply: true, stdout: "HTTP/2.0 204 No Content\r\n\r\n{\"partial", code: 0 }
+      : null));
+    await runPhase({ phase: "cleanup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl: scripted.spawnImpl } }).catch(() => null);
+    const results = (readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[])
+      .filter((record) => record.type === "cleanup-result" && record.data.kind === "ref");
+    expect(results.length).toBeGreaterThan(0);
+    for (const result of results) {
+      expect(result.data).toMatchObject({ status: 0, response_complete: false, response_incomplete: "body-unexpected", measured_status: 204, removed: true });
+    }
   });
 
   async function emergencyFirstPre(github: ReturnType<typeof createFakeGitHub>) {

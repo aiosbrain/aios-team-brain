@@ -3351,7 +3351,6 @@ export function unresolvedCreateIntents(records) {
     if (created.has(key)) continue;
     const result = results.get(key) ?? null;
     const identity = result ? (positiveProviderId(result.id) ?? positiveProviderId(result.number)) : null;
-    const status = result ? Number(result.status) : null;
     // Decisive only with the transport's completion fact on the result itself (R02-1).
     const resultClass = result ? mutationRequestClass(result.status, result.response_complete) : "ambiguous";
     let state;
@@ -6380,7 +6379,7 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       const response = await request("DELETE", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
       const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/rulesets/${owned.id}`);
       const removed = readback.status === 404;
-      journal.append("cleanup-result", { kind: "ruleset", id: owned.id, status: response.status, removed });
+      journal.append("cleanup-result", { kind: "ruleset", id: owned.id, status: response.status, ...responseEvidence(response), removed });
       outcomes.push({ kind: "ruleset", id: owned.id, name: owned.name, result: removed ? "removed" : "still-present", fingerprint_stage: fingerprintStage });
       if (!removed) refused += 1;
     }
@@ -6397,7 +6396,7 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
       journal.append("cleanup-intent", { kind: "ref", ref: owned.ref, sha: current });
       const response = await request("DELETE", `/repos/${COMMISSIONING_REPOSITORY}/git/refs/heads/${branchOf(owned.ref)}`);
       const readback = await readDerivedRefSha({ request, ref: owned.ref });
-      journal.append("cleanup-result", { kind: "ref", ref: owned.ref, status: response.status, removed: readback === null });
+      journal.append("cleanup-result", { kind: "ref", ref: owned.ref, status: response.status, ...responseEvidence(response), removed: readback === null });
       outcomes.push({ kind: "ref", ref: owned.ref, result: readback === null ? "removed" : "still-present" });
       if (readback !== null) refused += 1;
     }
@@ -6416,7 +6415,7 @@ export async function runCleanupPhase({ runId, attempt, evidenceDir, env, deps =
         const response = await request("PATCH", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${pull.number}`, { state: "closed" });
         const readback = await request("GET", `/repos/${COMMISSIONING_REPOSITORY}/pulls/${pull.number}`);
         const closed = String(readback.body?.state) === "closed";
-        journal.append("cleanup-result", { kind: "pull-request", number: pull.number, status: response.status, closed });
+        journal.append("cleanup-result", { kind: "pull-request", number: pull.number, status: response.status, ...responseEvidence(response), closed });
         outcomes.push({ kind: "pull-request", number: pull.number, result: closed ? "closed" : "still-open" });
         if (!closed) refused += 1;
       }
