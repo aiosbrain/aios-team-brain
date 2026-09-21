@@ -853,15 +853,19 @@ export async function runGhProcess(args, { input, timeoutMs = 20_000, spawnImpl 
   const stderr = [];
   let bytes = 0;
   let terminated = null;
+  let terminatedBy = null;
   const collect = (target) => (chunk) => {
+    // Once the bound has tripped nothing more is buffered: the process is being killed, and the
+    // bytes that race the kill are exactly the ones the bound exists to refuse.
+    if (terminated) return;
     const value = Buffer.from(chunk);
     bytes += value.length;
-    if (bytes > maxBytes) { terminated = "output exceeded the commissioning transport maximum"; child.kill("SIGKILL"); return; }
+    if (bytes > maxBytes) { terminated = "output exceeded the commissioning transport maximum"; terminatedBy = "oversize"; child.kill("SIGKILL"); return; }
     target.push(value);
   };
   child.stdout?.on("data", collect(stdout));
   child.stderr?.on("data", collect(stderr));
-  const timer = setTimeout(() => { terminated = `gh request exceeded ${timeoutMs}ms`; child.kill("SIGKILL"); }, timeoutMs);
+  const timer = setTimeout(() => { if (!terminated) { terminated = `gh request exceeded ${timeoutMs}ms`; terminatedBy = "timeout"; } child.kill("SIGKILL"); }, timeoutMs);
   timer.unref?.();
   child.stdin?.on("error", () => {});
   if (input !== undefined) child.stdin?.end(input);
@@ -877,6 +881,7 @@ export async function runGhProcess(args, { input, timeoutMs = 20_000, spawnImpl 
     code: outcome.code,
     spawnError: outcome.spawnError ?? null,
     terminated,
+    terminatedBy,
     stdout: raw.toString("utf8"),
     // The SAME bytes, unconverted. An artifact archive is binary, and `toString("utf8")` on a ZIP
     // silently replaces every invalid sequence — which reads as a corrupt archive rather than as the
@@ -899,7 +904,117 @@ export function parseGhResponse({ stdout }) {
   const status = /^HTTP\/[\d.]+\s+(\d{3})/m.exec(head)?.[1];
   // No status line means `gh` never got as far as an HTTP response. `null`, not 0 — the caller
   // turns that into a transport failure, which is a different thing from a provider refusal.
-  return { status: status ? Number(status) : null, text: rest };
+  // `headersComplete` is false when the stream stopped inside the head: a status line followed by
+  // nothing is a response that never finished, not an empty body.
+  return { status: status ? Number(status) : null, text: rest, headersComplete: index >= 0 };
+}
+
+/**
+ * ── THE COMPLETED-RESPONSE CONTRACT: ONE OWNER, AT THE TRANSPORT (R02-1) ─────────────────────────
+ *
+ * Both JSON transports return `{status, body, diagnostic, complete, incomplete, measured_status}`,
+ * and `complete: true` is a positive statement that ALL of these were measured:
+ *
+ *  - an HTTP status line and the end of the response head;
+ *  - the whole body, collected under {@link MAX_TRANSPORT_BYTES} — collection stops at the bound,
+ *    it is never buffered first and checked afterwards;
+ *  - body completion: the fetch body stream ended without error, or the `gh` process exited with the
+ *    code that goes with the status it printed (0 below 400; `gh` exits 1 on an HTTP error);
+ *  - a valid UTF-8 body that parses as a JSON object or array — the only exception is a 204/205,
+ *    which must be EMPTY, because an empty 204 is a complete answer and not a failed read;
+ *  - the endpoint's documented success shape ({@link RESPONSE_SHAPES}, applied by the guard).
+ *
+ * Anything short of that is INCOMPLETE, and an incomplete response is normalised here — the only
+ * place that saw the bytes — to status 0 with the reason retained. The measured status line stays on
+ * the record as `measured_status` (provenance, never a class), and the provider text of an unfinished
+ * body is never read as a diagnostic: a truncated "Cannot update this protected ref" is not a policy
+ * denial. Downstream code cannot recover completion that was erased, so it is not erased: every
+ * consumer that branches on `status` sees the one value that is decisive nowhere, and every decisive
+ * class ({@link mutationRequestClass}) additionally requires `complete === true` on the record.
+ */
+export const RESPONSE_INCOMPLETE_REASONS = Object.freeze([
+  "transport-timeout", "transport-unavailable", "headers-incomplete", "process-incomplete", "body-read-failed",
+  "body-oversize", "body-encoding-invalid", "body-missing", "body-unexpected", "body-malformed", "shape-invalid",
+  "completion-unstated",
+]);
+
+export function incompleteResponse(reason, measuredStatus = null) {
+  const why = RESPONSE_INCOMPLETE_REASONS.includes(reason) ? reason : "transport-unavailable";
+  const category = why === "transport-timeout" || why === "transport-unavailable" ? why : "response-incomplete";
+  return {
+    status: 0, body: null, complete: false, incomplete: why,
+    measured_status: Number.isInteger(measuredStatus) && measuredStatus > 0 ? measuredStatus : null,
+    diagnostic: { status: 0, category, ruleIds: [], policyDenial: false },
+  };
+}
+
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+/** A status and the COMPLETE body bytes → a completed response, or an incomplete one. Never a guess. */
+export function completedJsonResponse(status, bytes, redact = createRedactor()) {
+  if (!Number.isInteger(status) || status < 100 || status > 599) return incompleteResponse("headers-incomplete");
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
+  if (buffer.length > MAX_TRANSPORT_BYTES) return incompleteResponse("body-oversize", status);
+  let text;
+  try { text = STRICT_UTF8.decode(buffer); } catch { return incompleteResponse("body-encoding-invalid", status); }
+  if (status === 204 || status === 205) {
+    if (buffer.length) return incompleteResponse("body-unexpected", status);
+    return { status, body: null, complete: true, incomplete: null, measured_status: status, diagnostic: classifyDiagnostic(status, "") };
+  }
+  if (!text.trim()) return incompleteResponse("body-missing", status);
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return incompleteResponse("body-malformed", status); }
+  if (parsed === null || typeof parsed !== "object") return incompleteResponse("body-malformed", status);
+  // A provider error is a JSON OBJECT carrying its message; anything else is not an error body.
+  if (status >= 400 && Array.isArray(parsed)) return incompleteResponse("body-malformed", status);
+  return {
+    status, body: status >= 400 ? null : parsed, complete: true, incomplete: null, measured_status: status,
+    diagnostic: classifyDiagnostic(status, redact(text)),
+  };
+}
+
+/**
+ * The fetch body, read INCREMENTALLY and abandoned at the bound. A declared length beyond it is
+ * refused before a byte is read; the running total is what actually stops the transfer, because a
+ * declared length is exactly the value a broken or adversarial sender controls.
+ */
+async function readBoundedFetchBody(response, maxBytes) {
+  const declared = Number(response?.headers?.get?.("content-length") ?? Number.NaN);
+  const stream = response?.body;
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    try { await stream?.cancel?.(); } catch { /* nothing to release */ }
+    return { failure: "body-oversize" };
+  }
+  // The fetch standard's own representation of "this response has no body" (a 204, for instance).
+  if (stream === null) return { bytes: Buffer.alloc(0) };
+  if (stream && typeof stream.getReader === "function") {
+    const reader = stream.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        received += chunk.length;
+        if (received > maxBytes) return { failure: "body-oversize" };
+        chunks.push(chunk);
+      }
+    } catch {
+      return { failure: "body-read-failed" };
+    } finally {
+      try { await reader.cancel(); } catch { /* an already-finished reader has nothing to cancel */ }
+    }
+    return { bytes: Buffer.concat(chunks, received) };
+  }
+  // A body with no readable stream (a test double). The read is still checked against the bound,
+  // and a read that rejects is a failed read — never an empty body.
+  try {
+    const whole = typeof response?.arrayBuffer === "function" ? Buffer.from(await response.arrayBuffer()) : Buffer.from(String(await response.text()), "utf8");
+    return whole.length > maxBytes ? { failure: "body-oversize" } : { bytes: whole };
+  } catch {
+    return { failure: "body-read-failed" };
+  }
 }
 
 export function createLocalGhTransport({ spawnImpl = spawn, timeoutMs = 20_000, redact = createRedactor(), env = process.env } = {}) {
@@ -907,18 +1022,30 @@ export function createLocalGhTransport({ spawnImpl = spawn, timeoutMs = 20_000, 
     const args = ["api", "-i", "--method", method, "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", requestPath];
     if (body !== undefined && body !== null) args.push("--input", "-");
     const run = await runGhProcess(args, { input: body === undefined || body === null ? undefined : JSON.stringify(body), timeoutMs, spawnImpl, env });
-    if (run.terminated) return { status: 0, body: null, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } };
-    if (run.spawnError) return { status: 0, body: null, diagnostic: { status: 0, category: "transport-unavailable", ruleIds: [], policyDenial: false } };
-    const { status, text } = parseGhResponse(run);
+    if (run.terminated) {
+      redact(run.stderr);
+      return incompleteResponse(run.terminatedBy === "oversize" ? "body-oversize" : "transport-timeout", parseGhResponse(run).status);
+    }
+    if (run.spawnError) return incompleteResponse("transport-unavailable");
+    // Decoded STRICTLY from the raw bytes: the lossy `stdout` string replaces an invalid sequence
+    // with U+FFFD, which would let a corrupted body parse as a different, valid one.
+    let decoded;
+    try { decoded = STRICT_UTF8.decode(run.stdoutBytes ?? Buffer.from(run.stdout ?? "", "utf8")); } catch { decoded = null; }
+    const { status, text, headersComplete } = parseGhResponse({ stdout: decoded ?? run.stdout ?? "" });
     if (status === null) {
       // Never conflate "gh could not run" with "the provider refused". Both are exit-nonzero for
       // gh; only one is a statement about the policy. The captured output is redacted and dropped.
       redact(run.stderr);
-      return { status: 0, body: null, diagnostic: { status: 0, category: "transport-unavailable", ruleIds: [], policyDenial: false } };
+      return incompleteResponse("transport-unavailable");
     }
-    let parsed = null;
-    try { parsed = text.trim() ? JSON.parse(text) : null; } catch { parsed = null; }
-    return { status, body: status >= 400 ? null : parsed, diagnostic: classifyDiagnostic(status, redact(text)) };
+    if (decoded === null) return incompleteResponse("body-encoding-invalid", status);
+    if (!headersComplete) return incompleteResponse("headers-incomplete", status);
+    // The process exit is part of the response: `gh` exits 0 for a success it finished and 1 for an
+    // HTTP error. A success status followed by any other exit, or an error status followed by
+    // anything but 0/1 (a signal, a crash), is a response that stopped part-way.
+    const exitMatches = status < 400 ? run.code === 0 : run.code === 0 || run.code === 1;
+    if (!exitMatches) { redact(run.stderr); return incompleteResponse("process-incomplete", status); }
+    return completedJsonResponse(status, Buffer.from(text, "utf8"), redact);
   };
 }
 
@@ -945,7 +1072,7 @@ export function createLocalGhArchiveTransport({ spawnImpl = spawn, timeoutMs = 3
   };
 }
 
-export function createTokenTransport({ token, fetchImpl = fetch, timeoutMs = 15_000, baseUrl = "https://api.github.com", redact = createRedactor() }) {
+export function createTokenTransport({ token, fetchImpl = fetch, timeoutMs = 15_000, baseUrl = "https://api.github.com", redact = createRedactor(), maxBytes = MAX_TRANSPORT_BYTES }) {
   if (!token) throw new UsageError("a commissioning API transport requires a token");
   return async (method, requestPath, body) => {
     let response;
@@ -964,16 +1091,15 @@ export function createTokenTransport({ token, fetchImpl = fetch, timeoutMs = 15_
       });
     } catch (error) {
       const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
-      return { status: 0, body: null, diagnostic: { status: 0, category: timedOut ? "transport-timeout" : "transport-unavailable", ruleIds: [], policyDenial: false } };
+      return incompleteResponse(timedOut ? "transport-timeout" : "transport-unavailable");
     }
-    const text = await response.text().catch(() => "");
-    let parsed = null;
-    try { parsed = text.trim() ? JSON.parse(text) : null; } catch { parsed = null; }
-    return {
-      status: response.status,
-      body: response.ok ? parsed : null,
-      diagnostic: classifyDiagnostic(response.status, redact(text)),
-    };
+    const status = Number(response?.status);
+    if (!Number.isInteger(status) || status < 100 || status > 599) return incompleteResponse("headers-incomplete");
+    // A body read that rejects, or one that crosses the bound, is an unfinished response — never an
+    // empty one. This used to become `""`, and a 200 with no body then classified as `accepted`.
+    const read = await readBoundedFetchBody(response, maxBytes);
+    if (read.failure) return incompleteResponse(read.failure, status);
+    return completedJsonResponse(status, read.bytes, redact);
   };
 }
 
@@ -1065,6 +1191,69 @@ export function createArchiveTransport({ token, fetchImpl = fetch, timeoutMs = 2
  * Bind a transport to one execution role and one run's derived targets. Every request in the whole
  * harness goes through this; there is no unguarded path to either transport.
  */
+/**
+ * The documented SUCCESS shape of each write, and of every JSON read by default (R02-1).
+ *
+ * A 2xx is only a complete answer from the endpoint that was asked when its body is the thing that
+ * endpoint returns. A delete or a dispatch answers 204 with NO body; a ref update answers the ref
+ * with its object SHA; a create answers the identity it created. A "success" in any other shape — a
+ * 200 where 204 is documented, a ref update with no SHA, a ruleset create with no ID — did not come
+ * from a completed request to this endpoint, so it is incomplete: never accepted, never refused.
+ * The body is validated, not rewritten: every field the provider returned stays on it.
+ */
+const positiveIdField = (field) => (body) => Number.isSafeInteger(body?.[field]) && body[field] > 0;
+const refObjectShape = (body) => isSha(body?.object?.sha);
+const emptyAnswer = (body, status) => status === 204 && body === null;
+export const RESPONSE_SHAPES = Object.freeze({
+  "create-tree": (body) => isSha(body?.sha),
+  "create-commit": (body) => isSha(body?.sha),
+  "create-derived-ref": refObjectShape,
+  "update-derived-ref": refObjectShape,
+  "delete-derived-ref": emptyAnswer,
+  "create-disposable-ruleset": positiveIdField("id"),
+  "delete-disposable-ruleset": emptyAnswer,
+  "publish-test-only-check": positiveIdField("id"),
+  "create-synthetic-pull": positiveIdField("number"),
+  "merge-synthetic-pull": (body) => isSha(body?.sha) && body?.merged === true,
+  "close-synthetic-pull": positiveIdField("number"),
+  "dispatch-witness-workflow": emptyAnswer,
+});
+/** The operations whose response is bytes, bounded and validated by their own archive reader. */
+const BINARY_OPERATIONS = Object.freeze(["download-artifact-archive"]);
+const defaultJsonShape = (body) => body !== null && typeof body === "object";
+
+/** Hold a transport result to the completed-response contract for the operation it answered. */
+export function conformResponse(operation, result) {
+  if (BINARY_OPERATIONS.includes(operation)) return result;
+  // A transport that does not STATE completion has not measured it. That is not a pass-through for
+  // a well-formed-looking status: the status is exactly the part that cannot vouch for itself.
+  if (result?.complete !== true) {
+    if (result?.complete === false && result?.status === 0) return result;
+    const reason = result?.complete === false ? result?.incomplete : "completion-unstated";
+    return incompleteResponse(reason, Number.isInteger(result?.measured_status) ? result.measured_status : result?.status);
+  }
+  const status = Number(result.status);
+  if (status >= 200 && status < 300) {
+    const shape = RESPONSE_SHAPES[operation] ?? defaultJsonShape;
+    if (!shape(result.body ?? null, status)) return incompleteResponse("shape-invalid", status);
+  }
+  return result;
+}
+
+/**
+ * The completion facts every PERSISTED mutation result carries beside its status, so no journal,
+ * state file, challenge or evidence packet can be read back as a bare status. A record without
+ * them is read as incomplete by {@link mutationRequestClass}.
+ */
+export function responseEvidence(response) {
+  const complete = response?.complete === true;
+  return {
+    response_complete: complete,
+    response_incomplete: complete ? null : (RESPONSE_INCOMPLETE_REASONS.includes(response?.incomplete) ? response.incomplete : "completion-unstated"),
+    measured_status: Number.isInteger(response?.measured_status) && response.measured_status > 0 ? response.measured_status : null,
+  };
+}
+
 export function createGuardedRequest(transport, ctx) {
   if (!ctx?.role || !ctx?.runId || !ctx?.attempt) throw new UsageError("a guarded commissioning request needs its role and run identity");
   const issued = [];
@@ -1072,7 +1261,7 @@ export function createGuardedRequest(transport, ctx) {
     const operation = assertAllowedRequest({ method, path: requestPath, body }, ctx);
     const result = await transport(method, requestPath, body);
     issued.push(operation);
-    return { ...result, operation };
+    return { ...conformResponse(operation, result), operation };
   };
   request.issued = issued;
   request.context = ctx;
@@ -1962,8 +2151,10 @@ export const CASE_OUTCOMES = Object.freeze([
  */
 export function classifyCaseOutcome({ expected, response, beforeSha, afterSha, requestedSha, operation, requiresRuleId = null }) {
   const status = response?.status ?? null;
-  const requestClass = mutationRequestClass(status);
-  const statusLabel = Number.isInteger(status) ? String(status) : "no status";
+  const requestClass = mutationRequestClass(status, response?.complete);
+  const statusLabel = response?.complete === true
+    ? (Number.isInteger(status) ? String(status) : "no status")
+    : `incomplete response: ${String(response?.incomplete ?? "completion-unstated")}${Number.isInteger(response?.measured_status) ? `, status line ${response.measured_status}` : ""}`;
   const diagnostic = response?.diagnostic ?? { category: "unclassified", policyDenial: false, ruleIds: [] };
   const changed = String(beforeSha) !== String(afterSha);
   const ambiguousVerdict = (readbackNote) => ({
@@ -2133,14 +2324,14 @@ export async function runActorCase({ request, kase, ctx, graphShas, journal, pul
   } else {
     response = await request("PATCH", `/repos/${COMMISSIONING_REPOSITORY}/git/refs/heads/${branchOf(ref)}`, { sha: requestedSha, force: kase.force });
   }
-  journal.append("mutation-result", { case: kase.id, status: response.status, diagnostic: response.diagnostic, operation_id: response.operation });
+  journal.append("mutation-result", { case: kase.id, status: response.status, ...responseEvidence(response), diagnostic: response.diagnostic, operation_id: response.operation });
   const afterSha = await readDerivedRefSha({ request, ref });
   journal.append("readback", { case: kase.id, ref, after_sha: afterSha });
   const verdict = classifyCaseOutcome({ expected: kase.expected, response, beforeSha, afterSha, requestedSha, operation: kase.operation, requiresRuleId: kase.requiresRuleId ?? null });
   const record = {
     case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force,
     expected: kase.expected, before_sha: beforeSha, requested_sha: requestedSha, after_sha: afterSha,
-    http_status: response.status, diagnostic: response.diagnostic, outcome: verdict.outcome, check_state: checkState,
+    http_status: response.status, ...responseEvidence(response), diagnostic: response.diagnostic, outcome: verdict.outcome, check_state: checkState,
     passed: verdict.outcome === kase.expected, reason: verdict.reason,
     ...(target ? { pull_target: target } : {}),
   };
@@ -3155,6 +3346,8 @@ export function unresolvedCreateIntents(records) {
     const result = results.get(key) ?? null;
     const identity = result ? (positiveProviderId(result.id) ?? positiveProviderId(result.number)) : null;
     const status = result ? Number(result.status) : null;
+    // Decisive only with the transport's completion fact on the result itself (R02-1).
+    const resultClass = result ? mutationRequestClass(result.status, result.response_complete) : "ambiguous";
     let state;
     /**
      * AN OWNERSHIP GAP IS NOT A SETTLED RECONCILIATION (F8, corrected).
@@ -3171,8 +3364,8 @@ export function unresolvedCreateIntents(records) {
     else if (identity !== null) state = "identified";
     // A ref create carries no identity of its own — its identity IS its name — so a measured 2xx
     // for a ref is `identified` by the ref it named rather than by a number it never returns.
-    else if (record.data?.kind === "ref" && Number.isFinite(status) && status >= 200 && status < 300) state = "identified";
-    else if (mutationRequestClass(status) === "refused") state = "refused";
+    else if (record.data?.kind === "ref" && resultClass === "accepted") state = "identified";
+    else if (resultClass === "refused") state = "refused";
     else state = "response-ambiguous";
     out.push({
       key, seq: record.seq, intent: record.data, result,
@@ -3216,7 +3409,7 @@ export async function createSyntheticGraph({ request, ctx, journal, guardCtx, ma
       message: `AIO-1124 synthetic commissioning ${ctx.runId}-${ctx.attempt} node ${node.key}`,
       tree: tree.body.sha, parents: node.parents.map((key) => shas[key]),
     });
-    journal.append("mutation-result", { kind: "commit", key: node.key, node: node.key, status: commit.status, sha: commit.body?.sha ? String(commit.body.sha) : null, operation_id: commit.operation });
+    journal.append("mutation-result", { kind: "commit", key: node.key, node: node.key, status: commit.status, ...responseEvidence(commit), sha: commit.body?.sha ? String(commit.body.sha) : null, operation_id: commit.operation });
     if (commit.status < 200 || commit.status >= 300 || !commit.body?.sha) throw new IncompleteEvidence(`the synthetic commit for node ${node.key} could not be created (${commit.status})`);
     shas[node.key] = String(commit.body.sha);
     guardCtx.graphShas.add(shas[node.key]);
@@ -3247,7 +3440,7 @@ export async function createDerivedRefs({ request, ctx, journal, shas }) {
     const response = await request("POST", `/repos/${COMMISSIONING_REPOSITORY}/git/refs`, { ref, sha: startSha });
     // The RESULT, fsynced before the readback that follows (F5): a 201 whose readback then fails
     // must not leave a created ref the journal cannot name.
-    journal.append("mutation-result", { kind: "ref", key: suffix, suffix, ref, status: response.status, sha: startSha, operation_id: response.operation });
+    journal.append("mutation-result", { kind: "ref", key: suffix, suffix, ref, status: response.status, ...responseEvidence(response), sha: startSha, operation_id: response.operation });
     if (response.status < 200 || response.status >= 300) throw new IncompleteEvidence(`${ref} could not be created (${response.status})`);
     journal.append("resource-created", { kind: "ref", suffix, ref, start_node: REF_START_NODES[suffix], sha: startSha, provenance: "created" });
     const readback = await readDerivedRefSha({ request, ref });
@@ -3395,7 +3588,7 @@ export async function createDisposableRulesets({ request, journal, plan, guardCt
       // FSYNCED BEFORE THE NEXT FALLIBLE CALL. This event is written whether the create succeeded or
       // not, and it carries the identity when there is one, so "the response was seen" is durable.
       journal.append("mutation-result", {
-        kind: "ruleset", key: entry.name, name: entry.name, status: response.status,
+        kind: "ruleset", key: entry.name, name: entry.name, status: response.status, ...responseEvidence(response),
         id, operation_id: response.operation,
       });
       if (response.status < 200 || response.status >= 300 || id === null) {
@@ -3615,7 +3808,7 @@ export async function createSyntheticPull({ request, ctx, journal }) {
   const number = positiveProviderId(response.body?.number);
   // The RESULT before anything else can fail (F5). A created pull request whose number was never
   // journaled is a pull request cleanup will not close. POSITIVE identity only (F7).
-  journal.append("mutation-result", { kind: "pull-request", key: head, base, head, status: response.status, number, operation_id: response.operation });
+  journal.append("mutation-result", { kind: "pull-request", key: head, base, head, status: response.status, ...responseEvidence(response), number, operation_id: response.operation });
   if (response.status < 200 || response.status >= 300 || number === null) {
     throw new IncompleteEvidence(`the synthetic pull request could not be created (${response.status})`);
   }
@@ -4749,8 +4942,9 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       binding: postBinding, nonce: postNonce, createdAt: readbackAt,
       extra: {
         before_sha: beforeSha, requested_sha: requestedSha,
-        request_class: mutationRequestClass(response.status),
+        request_class: mutationRequestClass(response.status, response.complete),
         request_status: Number(response.status),
+        request_complete: response.complete === true,
         readback_sha: afterSha, readback_at: readbackAt,
         pre_artifact_id: received.artifact.artifact_id, pre_artifact_digest: received.entry_digest,
       },
@@ -4794,7 +4988,7 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       pre_publisher_run_id: positiveProviderId(received.artifact?.provenance?.publisher_run_id),
       source_continuity: continuity,
       rechecked_check_state: recheckedChecks,
-      http_status: Number(response.status), diagnostic: response.diagnostic, operation_id: response.operation,
+      http_status: Number(response.status), ...responseEvidence(response), diagnostic: response.diagnostic, operation_id: response.operation,
       after_sha: afterSha, readback_at: readbackAt, mutation_started_at: mutationStartedAt,
       token_proof: tokenProof, grants: credential.grants,
     });
@@ -4842,14 +5036,21 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
 
   const verdict = classifyCaseOutcome({
     expected: kase.expected,
-    response: { status: Number(prior.http_status), diagnostic: prior.diagnostic },
+    // The retained completion facts travel WITH the status. Rebuilding the response from the status
+    // alone is the status-only fallback that let an unfinished 200 finalize as accepted (R02-1).
+    response: {
+      status: Number(prior.http_status), diagnostic: prior.diagnostic, complete: prior.response_complete === true,
+      incomplete: prior.response_incomplete ?? null, measured_status: prior.measured_status ?? null,
+    },
     beforeSha: prior.before_sha, afterSha: prior.after_sha, requestedSha: prior.requested_sha,
     operation: kase.operation, requiresRuleId: kase.requiresRuleId ?? null,
   });
   const record = {
     case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force,
     expected: kase.expected, before_sha: prior.before_sha, requested_sha: prior.requested_sha, after_sha: prior.after_sha,
-    http_status: Number(prior.http_status), diagnostic: prior.diagnostic, outcome: verdict.outcome,
+    http_status: Number(prior.http_status),
+    ...responseEvidence({ complete: prior.response_complete, incomplete: prior.response_incomplete, measured_status: prior.measured_status }),
+    diagnostic: prior.diagnostic, outcome: verdict.outcome,
     check_state: prior.rechecked_check_state ?? prior.check_state,
     passed: verdict.outcome === kase.expected, reason: verdict.reason,
     /**
@@ -4899,7 +5100,7 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       post_provenance_facts: received.artifact?.provenance_facts ?? null,
     },
     // The exact request the case issued and what came back, so the outcome is re-derivable.
-    request_class: mutationRequestClass(prior.http_status),
+    request_class: mutationRequestClass(prior.http_status, prior.response_complete),
     mutation_started_at: prior.mutation_started_at ?? null,
     readback_at: prior.readback_at ?? null,
     // The bindings this case's challenges carried, so a case cannot be joined to another run's plan.
@@ -5730,12 +5931,12 @@ export async function beginWitnessItem({
     ref: branchOf(COMMISSIONING_DISPATCH_REF), inputs: envelope.inputs,
   });
   journal.append("dispatch-result", {
-    case_id: item.caseId, direction: item.direction, status: Number(dispatch.status),
-    ambiguous: mutationRequestClass(dispatch.status) === "ambiguous", operation_id: dispatch.operation,
+    case_id: item.caseId, direction: item.direction, status: Number(dispatch.status), ...responseEvidence(dispatch),
+    ambiguous: mutationRequestClass(dispatch.status, dispatch.complete) === "ambiguous", operation_id: dispatch.operation,
   });
   // Only a MEASURED refusal stops here. A 5xx is the same unknown outcome as a lost response: the
   // dispatch may have been accepted, so it is pending and reconciled by the exact artifact below.
-  if (mutationRequestClass(dispatch.status) === "refused") {
+  if (mutationRequestClass(dispatch.status, dispatch.complete) === "refused") {
     throw new IncompleteEvidence(`the witness dispatch for ${expectedName} was refused (${dispatch.status})`);
   }
   // The dispatch is away. Its OUTCOME is now the scheduler's business: a dispatch returns 204 with
@@ -6544,9 +6745,11 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
   if (!diagnostic || typeof diagnostic !== "object") complain("carries no provider diagnostic");
   // The request class is DERIVED from the recorded status by the one owner, never read from the
   // record: a `request_class` that disagrees with its own status is an asserted outcome.
-  const requestClass = mutationRequestClass(record.http_status);
+  // Completion is part of that derivation (R02-1): a record with no `response_complete: true` is a
+  // request whose response the transport never measured as finished, whatever status it carries.
+  const requestClass = mutationRequestClass(record.http_status, record.response_complete);
   if (record.request_class !== undefined && record.request_class !== requestClass) {
-    complain(`labels its request ${JSON.stringify(String(record.request_class))}, but HTTP ${Number.isFinite(status) ? status : "?"} is ${requestClass}`);
+    complain(`labels its request ${JSON.stringify(String(record.request_class))}, but HTTP ${Number.isFinite(status) ? status : "?"} (${record.response_complete === true ? "complete" : "incomplete"} response) is ${requestClass}`);
   }
 
   // ── NON-VACUITY, BOUND TO THE FROZEN GRAPH (F3) ────────────────────────────────────────────────
@@ -6647,7 +6850,7 @@ export function cloudCasesIssuedAfterHalt(files) {
         problems.push(`case ${kase.id} records ${String(issued[0]?.outcome)} after ${halted} had stopped further ${actor} mutations; an attempt never issues a mutation after an ambiguous or halting one`);
       }
       const halts = issued.some((record) => ["unexpected-success", "unexpected-mutation"].includes(String(record?.outcome))
-        || mutationRequestClass(record?.http_status) === "ambiguous");
+        || mutationRequestClass(record?.http_status, record?.response_complete) === "ambiguous");
       if (halts) halted = halted ?? kase.id;
     }
   }
@@ -7060,6 +7263,17 @@ function reconstructCaseTransport(record, { runId, attempt, role, kase, intent, 
   if (witness.post_challenge_created_at !== undefined && record?.readback_at !== undefined
     && String(witness.post_challenge_created_at) !== String(record.readback_at)) {
     problems.push("records a post-challenge creation time that is not its own measured readback instant");
+  }
+  // The post challenge published the request's status AND completion (R02-1). A record that now
+  // claims a different status or a completion the published challenge did not is a restamped result.
+  const postChallenge = witness.post_challenge;
+  if (postChallenge && typeof postChallenge === "object") {
+    if (Number(postChallenge.request_status) !== Number(record?.http_status)) {
+      problems.push("records a request status that is not the one its published post challenge carried");
+    }
+    if (postChallenge.request_complete !== (record?.response_complete === true)) {
+      problems.push("records a response completion that is not the one its published post challenge carried");
+    }
   }
   return problems;
 }

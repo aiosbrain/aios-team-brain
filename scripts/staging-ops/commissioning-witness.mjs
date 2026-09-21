@@ -483,7 +483,7 @@ const CHALLENGE_PRE_FIELDS = Object.freeze([...CHALLENGE_BASE_FIELDS, "before_sh
 /** A post challenge additionally binds the request it followed and the pre-response it answers. */
 const CHALLENGE_POST_FIELDS = Object.freeze([
   ...CHALLENGE_PRE_FIELDS,
-  "request_class", "request_status", "readback_sha", "readback_at", "pre_artifact_id", "pre_artifact_digest",
+  "request_class", "request_status", "request_complete", "readback_sha", "readback_at", "pre_artifact_id", "pre_artifact_digest",
 ]);
 export const RESPONSE_FIELDS = Object.freeze([
   "schema_version", "kind", ...BINDING_FIELDS,
@@ -514,10 +514,19 @@ export const REQUEST_CLASSES = Object.freeze(["accepted", "refused", "ambiguous"
  * An ambiguous write halts every further mutation and is never retried. A readback that shows the
  * requested commit does not resolve it: that proves where the ref is, not that this request moved it.
  *
+ * A STATUS ALONE IS NEVER DECISIVE (R02-1). `complete` is the transport's own statement that the
+ * response it measured finished: the status line, the whole body within the transport bound, a valid
+ * encoding and parse, the process exit that goes with it, and the shape the endpoint documents. Only
+ * a literal `true` admits a decisive class. A 200 whose body never finished, or a 422 whose refusal
+ * text was cut off, is the same unknown outcome as a timeout, and a record that carries a status but
+ * no completion fact is read the same way — there is no status-only fallback that restores
+ * acceptance or refusal after the adapter said the response was incomplete.
+ *
  * Runtime classification, the post challenge, create-intent reconciliation, witness dispatch and the
  * offline assessor all use this function, so no path can widen the class on its own.
  */
-export function mutationRequestClass(status) {
+export function mutationRequestClass(status, complete) {
+  if (complete !== true) return "ambiguous";
   const code = typeof status === "number" ? status : (typeof status === "string" && /^\d+$/.test(status) ? Number(status) : Number.NaN);
   if (!Number.isInteger(code)) return "ambiguous";
   if (code >= 200 && code < 300) return "accepted";
@@ -598,10 +607,15 @@ export function assertChallengeShape(challenge) {
       if (!REQUEST_CLASSES.includes(String(challenge.request_class))) {
         throw new WitnessRefusal(`a post challenge's request class is one of ${REQUEST_CLASSES.join("/")}, not ${JSON.stringify(String(challenge.request_class ?? ""))}`);
       }
-      // The class is DERIVED from the measured status, never asserted beside it: a 503 labelled
-      // `accepted` or `refused` would launder an unknown outcome into a decisive one.
-      if (challenge.request_class !== mutationRequestClass(challenge.request_status)) {
-        throw new WitnessRefusal(`a post challenge labels request status ${challenge.request_status} as ${JSON.stringify(String(challenge.request_class))}, but that status is ${mutationRequestClass(challenge.request_status)}`);
+      if (typeof challenge.request_complete !== "boolean") {
+        throw new WitnessRefusal("a post challenge must state whether the transport measured a complete response");
+      }
+      // The class is DERIVED from the measured status AND completion, never asserted beside them: a
+      // 503, or a 200 whose body never finished, labelled `accepted` or `refused` would launder an
+      // unknown outcome into a decisive one.
+      const derivedClass = mutationRequestClass(challenge.request_status, challenge.request_complete);
+      if (challenge.request_class !== derivedClass) {
+        throw new WitnessRefusal(`a post challenge labels request status ${challenge.request_status} (${challenge.request_complete ? "complete" : "incomplete"} response) as ${JSON.stringify(String(challenge.request_class))}, but that status is ${derivedClass}`);
       }
       requireString(challenge.pre_artifact_digest, "the post challenge pre-response digest", SHA256);
       // The pre-response artifact's own POSITIVE identity, so the post challenge names the exact
