@@ -6465,14 +6465,21 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     expect(humanMutations).toBe(1);
 
     const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
-    const first = buildActorMatrix().filter((kase) => kase.actor === "human")[0];
+    // Exactly one human mutation was ever issued. (Without the normal job's check publication the
+    // two update cases stop at their unmet check precondition, before any request.)
+    const intents = records.filter((record) => record.type === "mutation-intent" && record.data.actor === "human" && record.data.case);
+    expect(intents).toHaveLength(1);
+    const first = buildActorMatrix().find((kase) => kase.id === intents[0].data.case)!;
     const mutation = records.find((record) => record.type === "mutation-result" && record.data.case === first.id)!;
     expect(mutation.data).toMatchObject({ status: 0, response_complete: false, response_incomplete: "body-malformed", measured_status: 422 });
     expect(mutation.data.diagnostic).toMatchObject({ policyDenial: false });
     const evidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
     expect(evidence.halted_after).toBe(first.id);
-    expect(evidence.cases[0]).toMatchObject({ case: first.id, outcome: "inconclusive", passed: false, response_complete: false });
-    expect(evidence.cases.slice(1).every((record: CaseRecord) => record.outcome === "not-run")).toBe(true);
+    const position = evidence.cases.findIndex((record: CaseRecord) => record.case === first.id);
+    expect(evidence.cases[position]).toMatchObject({ case: first.id, outcome: "inconclusive", passed: false, response_complete: false, measured_status: 422 });
+    expect(evidence.cases.slice(position + 1).every((record: CaseRecord) => record.outcome === "not-run")).toBe(true);
+    // Nothing in this matrix is a measured failure: every failing case is inconclusive or not-run.
+    expect(evidence.cases.every((record: CaseRecord) => ["inconclusive", "not-run"].includes(String(record.outcome)))).toBe(true);
 
     // A restarted phase admits from the journal: still exit 3, and still no further mutation.
     expect(await humanCli(scripted.spawnImpl, (text) => emitted.push(text))).toBe(3);
@@ -6505,9 +6512,16 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     const emitted: string[] = [];
     expect(await humanCli(scripted.spawnImpl, (text) => emitted.push(text))).toBe(1);
     expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "human-tests", status: "failed" });
-    const outcomes = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human")).cases.map((record: CaseRecord) => record.outcome);
-    expect(outcomes.slice(0, 2)).toEqual(["inconclusive", "unexpected-success"]);
-    expect(outcomes.slice(2).every((outcome: string) => outcome === "not-run")).toBe(true);
+    const cases = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human")).cases as CaseRecord[];
+    const outcomes = cases.map((record) => record.outcome);
+    // The first ISSUED case is the complete 403 (inconclusive, non-halting); a later case is the
+    // measured unexpected success that halts; anything after it never runs.
+    const refused = cases.findIndex((record) => (record as { http_status?: number }).http_status === 403);
+    expect(cases[refused]).toMatchObject({ outcome: "inconclusive", response_complete: true });
+    const failure = outcomes.indexOf("unexpected-success");
+    expect(failure).toBeGreaterThan(refused);
+    expect(outcomes.slice(failure + 1).every((outcome) => outcome === "not-run")).toBe(true);
+    expect(outcomes.filter((outcome) => outcome === "inconclusive").length).toBeGreaterThan(1);
   });
 
   // ── the staged cloud finalizers, through the real TOKEN adapter ─────────────────────────────────
@@ -6563,7 +6577,11 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     expect(state.record.after_sha).toBe(state.record.requested_sha);
     const post = JSON.parse(readFileSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: "emergency", ordinal: 1, direction: "post" })}.json`), "utf8"));
     expect(post).toMatchObject({ request_class: "ambiguous", request_status: 0, request_complete: false });
-    expect(() => assertChallengeShape({ ...post, request_complete: true })).toThrow(/but that status is ambiguous/);
+    // The class is derived from status AND completion: relabelling either decisive refuses.
+    for (const laundered of ["accepted", "refused"]) {
+      expect(() => assertChallengeShape({ ...post, request_class: laundered }), laundered).toThrow(/but that status is ambiguous/);
+      expect(() => assertChallengeShape({ ...post, request_status: 200, request_class: laundered }), laundered).toThrow(/incomplete response.*but that status is ambiguous/);
+    }
     // The durable halt: the next case refuses at prepare, before any request.
     const before = github.calls.length;
     await expect(runCaseStage({ stage: "prepare", caseId: second, env: cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps }))
@@ -6577,8 +6595,8 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     expect(mutations).toBe(1);
   });
 
-  it("R02-2 · a MIXED staged matrix keeps exit 1: a measured unexpected denial, then an incomplete refusal that halts", async () => {
-    const github = createFakeGitHub();
+  it("R02-2 · a MIXED staged matrix keeps exit 1: a must-deny write that MOVED the ref is measured even though its answer was cut off", async () => {
+    const github = createFakeGitHub({ ignoreRuleTypes: ["non_fast_forward", "update"] });
     await intentAndSetup(github);
     await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
     github.approve("emergency");
@@ -6586,25 +6604,25 @@ describe("R02 — an incomplete provider response is never decisive, from the ad
     const fetchImpl = cutFetch(github, (method, pathname) => {
       if (method !== "PATCH" || !pathname.endsWith(emergencyBranch())) return null;
       mutations += 1;
-      // 1st: the write landed but the provider answered a COMPLETE refusal — a measured unexpected denial.
-      if (mutations === 1) return { apply: true, response: () => streamed(422, ["{\"message\":\"Update is not a fast forward\"}"]).response };
-      // 2nd: the provider's refusal, cut off mid-body.
-      return { apply: false, response: () => streamed(422, ["{\"message\":\"Cannot force-push to this protected"], { error: true }).response };
+      // The first (accepted) case is answered normally by the provider.
+      if (mutations === 1) return null;
+      // The force rewind the policy must refuse LANDED, and its answer was cut off mid-body.
+      return { apply: true, response: () => streamed(200, [`{"ref":"refs/heads/${emergencyBranch()}","object":`], { error: true }).response };
     });
     const deps = { ...cloudDeps(github), fetchImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
     const [first, second, third] = CLOUD_CASE_SEQUENCE.emergency;
-    const measured = await emergencyStage(github, first, deps);
+    expect(await emergencyStage(github, first, deps)).toBeNull();
+    expect(stateOf(1).record).toMatchObject({ outcome: "accepted", passed: true, response_complete: true });
+    const measured = await emergencyStage(github, second, deps);
+    // The ref moved on a case that must be denied: that is measured, whatever the response said.
     expect(measured?.exitCode).toBe(1);
-    expect(stateOf(1).record).toMatchObject({ outcome: "unexpected-denial", response_complete: true, http_status: 422 });
-    const unknown = await emergencyStage(github, second, deps);
-    expect(unknown?.exitCode).toBe(3);
-    expect(stateOf(2)).toMatchObject({ halt: true, record: { outcome: "inconclusive", response_complete: false, response_incomplete: "body-read-failed", measured_status: 422 } });
-    expect(stateOf(2).record.diagnostic).toMatchObject({ policyDenial: false });
+    expect(stateOf(2)).toMatchObject({ halt: true, record: { outcome: "unexpected-mutation", response_complete: false, response_incomplete: "body-read-failed", request_class: "ambiguous" } });
     await expect(runCaseStage({ stage: "prepare", caseId: third, env: cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps }))
       .rejects.toThrow(/halted this actor/);
     expect(mutations).toBe(2);
     github.finish("emergency");
     const emitted: string[] = [];
+    // Measured failure beside not-run cases: exit 1, never laundered into "incomplete".
     expect(await emergencyCli(cloudDeps(github), (text) => emitted.push(text))).toBe(1);
     expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "emergency-tests", status: "failed" });
   });
