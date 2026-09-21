@@ -95,7 +95,6 @@ export const specificDiagnosticMessage = (branch, environment) =>
 export const GENERIC_DIAGNOSTIC_MESSAGE = "The deployment was rejected or didn't satisfy other protection rules.";
 
 const POSITIVE_DECIMAL = /^[1-9][0-9]{0,17}$/;
-const FULL_SHA = /^[0-9a-f]{40}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- raw provider JSON is mutated field by field throughout, as in the other fake-provider suites */
 /**
  * AIO-1124 PC-06 — the staged off-branch probe: operator lifecycle, raw captures and the cross-run
  * variant validator (accepted API-only design, SHA-256 45e0b818…c01e0).
@@ -22,7 +23,7 @@ import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
   PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, assertPolicyAgreesWithCommissioning, commissioningIdentity,
   parseCheckRunUrl, parseDiagnosticAnnotations, parseEnvironmentPolicy, parseProbeCheck, parseProbeJobs, parseProbeRun,
-  probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage, validateOffBranchRecord,
+  probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage,
 } from "../scripts/staging-ops/offbranch-probe.mjs";
 import { createGitLeaseDeleter, main, runProbePhase } from "../scripts/staging-ops/offbranch-probe-operator.mjs";
 

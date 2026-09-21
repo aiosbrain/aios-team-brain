@@ -94,9 +94,8 @@ import {
   responseArtifactName, serializeDispatchEnvelope, validateGovernedSnapshot,
 } from "./commissioning-witness.mjs";
 import {
-  OFFBRANCH_CONTROL, OFFBRANCH_SCHEMA_VERSION, PROBE_BRANCH, PROBE_ENVIRONMENTS, PROBE_REF, PROBE_REPOSITORY,
-  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, commissioningIdentity, crossCheckOffBranchPair, probeJournalName,
-  validateOffBranchRecord,
+  OFFBRANCH_CONTROL, OFFBRANCH_SCHEMA_VERSION, PROBE_BRANCH, PROBE_ENVIRONMENTS, PROBE_REF,
+  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, commissioningIdentity, crossCheckOffBranchPair, validateOffBranchRecord,
 } from "./offbranch-probe.mjs";
 
 // ──────────────────────────────────────────────────────────────────────────────
