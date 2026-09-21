@@ -182,6 +182,16 @@ describe("the Slack source pipeline is not wired to anything", () => {
     expect(importGraph(tree).get("instrumentation.ts")?.has("sentry.server.config.ts")).toBe(true);
   });
 
+  it("reaches a guarded module from a root-level entry file such as proxy.ts (fold-review FF-02: pinned, not just mutated)", () => {
+    const tree = new Map<string, string>([
+      ["proxy.ts", `import "@/lib/ingest/slack-source-discovery";`],
+      ["lib/ingest/slack-source-discovery.ts", ""],
+    ]);
+    expect(entryPoints(tree)).toContain("proxy.ts");
+    const via = reach(importGraph(tree), entryPoints(tree));
+    expect(chainTo(via, "lib/ingest/slack-source-discovery.ts")).toBe("proxy.ts → lib/ingest/slack-source-discovery.ts");
+  });
+
   it("is reachable from no route, page, action, script or instrumentation entry point", () => {
     const tree = readTree();
     const roots = entryPoints(tree);
