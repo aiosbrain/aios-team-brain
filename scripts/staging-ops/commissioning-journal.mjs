@@ -34,6 +34,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
+import { PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT } from "./offbranch-probe.mjs";
 
 export const JOURNAL_SCHEMA_VERSION = 1;
 
@@ -72,6 +73,12 @@ export const JOURNAL_EVENTS = Object.freeze([
    * swapped after the fact no longer matches the hash-linked record that named it.
    */
   "production-inputs-bound",
+  /**
+   * PC-06's staged off-branch probe, LINKED into this original attempt before its ref exists: the
+   * probe intent's basename and digest plus the probe journal it owns. The one cross-run bridge,
+   * and it points forward only — a probe cannot attach itself to an attempt that never staged it.
+   */
+  RESOURCE_LINK_EVENT,
   "run-closed",
 ]);
 
@@ -97,6 +104,10 @@ export const WITNESS_JOURNAL_EVENTS = Object.freeze([
 export const JOURNAL_KINDS = Object.freeze({
   resource: Object.freeze({ suffix: "", events: JOURNAL_EVENTS }),
   witness: Object.freeze({ suffix: ".witness", events: WITNESS_JOURNAL_EVENTS }),
+  // The staged off-branch probe's OWN ownership chain, under its own lock: create-once ref, one
+  // dispatch, run identity, captures, cancellation and exact-SHA cleanup. Its payloads are closed
+  // per event in `offbranch-probe.mjs`; this vocabulary is the same list, imported, not retyped.
+  probe: Object.freeze({ suffix: ".probe", events: PROBE_JOURNAL_EVENT_TYPES }),
 });
 
 function assertJournalKind(kind) {

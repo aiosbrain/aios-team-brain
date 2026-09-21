@@ -93,6 +93,11 @@ import {
   challengeArtifactName, mutationRequestClass, publishWitnessResponse, readSingleEntryZip, readWitnessEnvelopeFromEvent,
   responseArtifactName, serializeDispatchEnvelope, validateGovernedSnapshot,
 } from "./commissioning-witness.mjs";
+import {
+  OFFBRANCH_CONTROL, OFFBRANCH_SCHEMA_VERSION, PROBE_BRANCH, PROBE_ENVIRONMENTS, PROBE_REF, PROBE_REPOSITORY,
+  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, commissioningIdentity, crossCheckOffBranchPair, probeJournalName,
+  validateOffBranchRecord,
+} from "./offbranch-probe.mjs";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 1. Fixed targets. Nothing below is configurable, and nothing reads a target from input.
@@ -442,9 +447,9 @@ function noBody(body) {
  */
 export const ALLOWED_OPERATIONS = Object.freeze([
   // ── metadata and identity reads ─────────────────────────────────────────────
-  { id: "read-repository", method: "GET", roles: ["local", "normal", "emergency", "fixture", "rehearsal", "witness-publisher"], path: `/repos/${REPO}`, body: noBody },
-  { id: "read-viewer", method: "GET", roles: ["local"], path: "/user", body: noBody },
-  { id: "read-collaborator-permission", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/collaborators/[A-Za-z0-9-]{1,39}/permission$`), body: noBody },
+  { id: "read-repository", method: "GET", roles: ["local", "normal", "emergency", "fixture", "rehearsal", "witness-publisher", "probe"], path: `/repos/${REPO}`, body: noBody },
+  { id: "read-viewer", method: "GET", roles: ["local", "probe"], path: "/user", body: noBody },
+  { id: "read-collaborator-permission", method: "GET", roles: ["local", "probe"], pattern: new RegExp(`^/repos/${R}/collaborators/[A-Za-z0-9-]{1,39}/permission$`), body: noBody },
   // The token-side binding: which repositories THIS installation token can actually reach. Its
   // documented response is `total_count` + `repositories` and nothing else — notably NOT
   // `repository_selection`, which is installation metadata and is read from the JWT endpoint below.
@@ -473,9 +478,9 @@ export const ALLOWED_OPERATIONS = Object.freeze([
   // ATTEMPT-scoped for the ORIGINAL run, and also how every witness-transport participant measures a
   // run's identity: the publisher checks its own, the local witness checks the publisher's, and the
   // actor checks the publisher run that owns the artifact it is about to consume.
-  { id: "read-workflow-run-attempt", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}$`), body: noBody },
-  { id: "read-workflow-run-jobs", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
-  { id: "read-workflow-run-approvals", method: "GET", roles: ["local"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/approvals$`), body: noBody },
+  { id: "read-workflow-run-attempt", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher", "probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}$`), body: noBody },
+  { id: "read-workflow-run-jobs", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher", "probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/attempts/[1-9][0-9]{0,17}/jobs$`), body: noBody },
+  { id: "read-workflow-run-approvals", method: "GET", roles: ["local", "probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/[1-9][0-9]{0,17}/approvals$`), body: noBody },
 
   // ── the F1 witness transport: artifacts in, one bounded dispatch out ───────────────────────────
   // Discovery is by EXACT NAME, which is why `name` is the one query key widened beyond pagination.
@@ -523,7 +528,7 @@ export const ALLOWED_OPERATIONS = Object.freeze([
     // execution and at response consumption, and a role that cannot READ `staging` cannot make it.
     // This is a fixed read-only GET of one hardcoded ref — it grants no target and no write, and it
     // is the only admission this correction adds. See {@link assertSourceContinuity}.
-    id: "read-staging-ref", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher"],
+    id: "read-staging-ref", method: "GET", roles: ["local", "normal", "emergency", "rehearsal", "witness-publisher", "probe"],
     path: `/repos/${REPO}/git/ref/heads/staging`, body: noBody,
   },
   { id: "read-main-protection", method: "GET", roles: ["local"], path: `/repos/${REPO}/branches/main/protection`, body: noBody },
@@ -702,7 +707,86 @@ export const ALLOWED_OPERATIONS = Object.freeze([
     check: (match, ctx) => { if (Number(match[1]) !== ctx.pullNumber) throw new UsageError("only this run's own synthetic pull request may be closed"); },
     body: (body) => { if (body?.state !== "closed" || Object.keys(body).length !== 1) throw new UsageError("the synthetic pull request may only be closed"); return true; },
   },
+
+  // ── PC-06's staged off-branch probe: the `probe` role, and ONLY that role ─────────────────────
+  // Every target below is a fixed literal or an identity this probe already journaled — the one
+  // workflow, the one disposable ref, the probe run it reconciled, the check runs that run's own jobs
+  // named, the two protected environments. Nothing here reaches another ref, run, check or endpoint,
+  // no row takes a caller-chosen URL, and the commissioning roles gain none of these rows.
+  ...probeOperations(),
 ]);
+
+/**
+ * The staged probe's closed operations (accepted PC-06 API-only design). A function only so the
+ * table above can spread them; every row is static and names fixed literals.
+ */
+function probeOperations() {
+  const pageQuery = (query, prefix) => {
+    const match = new RegExp(`^${prefix}per_page=${PAGE_SIZE}&page=([1-9][0-9]?)$`).exec(String(query ?? ""));
+    if (!match || Number(match[1]) > MAX_PAGES) throw new UsageError(`a probe read is paged at exactly ${PAGE_SIZE} per page within ${MAX_PAGES} pages`);
+  };
+  const ownRun = (match, ctx) => {
+    if (!POSITIVE_DECIMAL.test(String(ctx.probeRunId ?? "")) || match[1] !== String(ctx.probeRunId)) {
+      throw new UsageError("a probe run read or cancellation names only the one probe run this probe journaled");
+    }
+  };
+  const ownCheck = (match, ctx) => {
+    if (!(ctx.probeCheckIds instanceof Set) || !ctx.probeCheckIds.has(match[1])) {
+      throw new UsageError("a probe check read names only a check run the probe's own jobs linked");
+    }
+  };
+  const environment = `(${PROBE_ENVIRONMENTS.map(literal).join("|")})`;
+  return [
+    { id: "read-probe-ref", method: "GET", roles: ["probe"], path: `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`, body: noBody },
+    {
+      id: "create-probe-ref", method: "POST", roles: ["probe"], path: `/repos/${REPO}/git/refs`,
+      body: (body, ctx) => {
+        if (canonicalJson(Object.keys(body ?? {}).sort()) !== canonicalJson(["ref", "sha"])) throw new UsageError("a probe ref is created with exactly its ref and SHA");
+        if (body.ref !== PROBE_REF) throw new UsageError("only the one fixed probe ref may be created");
+        if (!isSha(body.sha) || body.sha !== ctx.probeSha) throw new UsageError("the probe ref is created only at the reviewed commissioning source");
+        return true;
+      },
+    },
+    {
+      id: "dispatch-probe-workflow", method: "POST", roles: ["probe"], path: `/repos/${REPO}/actions/workflows/${PROBE_WORKFLOW_FILE}/dispatches`,
+      body: (body) => {
+        if (canonicalJson(body) !== canonicalJson({ ref: PROBE_BRANCH })) throw new UsageError("the probe dispatch carries exactly the fixed probe ref and no inputs");
+        return true;
+      },
+    },
+    { id: "read-probe-workflow", method: "GET", roles: ["probe"], path: `/repos/${REPO}/actions/workflows/${PROBE_WORKFLOW_FILE}`, body: noBody },
+    {
+      id: "read-probe-workflow-source", method: "GET", roles: ["probe"], path: `/repos/${REPO}/contents/${PROBE_WORKFLOW_PATH}`, query: Object.freeze(["ref"]),
+      check: (_match, ctx, query) => {
+        if (!isSha(ctx.probeSha) || String(query ?? "") !== `ref=${ctx.probeSha}`) throw new UsageError("the probe workflow source is read only at the reviewed commissioning SHA");
+      },
+      body: noBody,
+    },
+    {
+      id: "list-probe-runs", method: "GET", roles: ["probe"], path: `/repos/${REPO}/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`,
+      query: Object.freeze(["branch", "event", "per_page", "page"]),
+      check: (_match, _ctx, query) => pageQuery(query, `branch=${literal(PROBE_BRANCH)}&event=workflow_dispatch&`), body: noBody,
+    },
+    { id: "read-probe-run", method: "GET", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/([1-9][0-9]{0,17})$`), check: ownRun, body: noBody },
+    {
+      id: "read-probe-run-jobs", method: "GET", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/([1-9][0-9]{0,17})/jobs$`),
+      query: Object.freeze(["filter", "per_page", "page"]),
+      check: (match, ctx, query) => { ownRun(match, ctx); pageQuery(query, "filter=all&"); }, body: noBody,
+    },
+    { id: "cancel-probe-run", method: "POST", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/actions/runs/([1-9][0-9]{0,17})/cancel$`), check: ownRun, body: noBody },
+    { id: "read-probe-check-run", method: "GET", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/check-runs/([1-9][0-9]{0,17})$`), check: ownCheck, body: noBody },
+    {
+      id: "read-probe-check-annotations", method: "GET", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/check-runs/([1-9][0-9]{0,17})/annotations$`),
+      check: (match, ctx, query) => { ownCheck(match, ctx); pageQuery(query, ""); }, body: noBody,
+    },
+    { id: "read-protected-environment", method: "GET", roles: ["probe"], pattern: new RegExp(`^/repos/${R}/environments/${environment}$`), body: noBody },
+    {
+      id: "list-environment-branch-policies", method: "GET", roles: ["probe"],
+      pattern: new RegExp(`^/repos/${R}/environments/${environment}/deployment-branch-policies$`),
+      check: (_match, _ctx, query) => pageQuery(query, ""), body: noBody,
+    },
+  ];
+}
 
 /**
  * Refuse before the network. Returns the matched operation ID, which is what evidence records —
@@ -951,7 +1035,7 @@ export function incompleteResponse(reason, measuredStatus = null) {
 const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 /** A status and the COMPLETE body bytes → a completed response, or an incomplete one. Never a guess. */
-export function completedJsonResponse(status, bytes, redact = createRedactor()) {
+export function completedJsonResponse(status, bytes, redact = createRedactor(), { retainRaw = false } = {}) {
   if (!Number.isInteger(status) || status < 100 || status > 599) return incompleteResponse("headers-incomplete");
   const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes ?? []);
   if (buffer.length > MAX_TRANSPORT_BYTES) return incompleteResponse("body-oversize", status);
@@ -970,6 +1054,12 @@ export function completedJsonResponse(status, bytes, redact = createRedactor()) 
   return {
     status, body: status >= 400 ? null : parsed, complete: true, incomplete: null, measured_status: status,
     diagnostic: classifyDiagnostic(status, redact(text)),
+    /**
+     * OPT-IN raw retention, for the PC-06 probe collector only: the exact completed body text, so a
+     * retained capture is the provider's bytes rather than a re-serialization. Never set on a body the
+     * redactor would alter — that text is not retained, and the collector treats it as uncapturable.
+     */
+    ...(retainRaw ? { raw_text: redact(text) === text ? text : null } : {}),
   };
 }
 
@@ -1017,7 +1107,7 @@ async function readBoundedFetchBody(response, maxBytes) {
   }
 }
 
-export function createLocalGhTransport({ spawnImpl = spawn, timeoutMs = 20_000, redact = createRedactor(), env = process.env } = {}) {
+export function createLocalGhTransport({ spawnImpl = spawn, timeoutMs = 20_000, redact = createRedactor(), env = process.env, retainRaw = false } = {}) {
   return async (method, requestPath, body) => {
     const args = ["api", "-i", "--method", method, "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", requestPath];
     if (body !== undefined && body !== null) args.push("--input", "-");
@@ -1045,7 +1135,7 @@ export function createLocalGhTransport({ spawnImpl = spawn, timeoutMs = 20_000, 
     // anything but 0/1 (a signal, a crash), is a response that stopped part-way.
     const exitMatches = status < 400 ? run.code === 0 : run.code === 0 || run.code === 1;
     if (!exitMatches) { redact(run.stderr); return incompleteResponse("process-incomplete", status); }
-    return completedJsonResponse(status, Buffer.from(text, "utf8"), redact);
+    return completedJsonResponse(status, Buffer.from(text, "utf8"), redact, { retainRaw });
   };
 }
 
@@ -1217,6 +1307,10 @@ export const RESPONSE_SHAPES = Object.freeze({
   "merge-synthetic-pull": (body) => isSha(body?.sha) && body?.merged === true,
   "close-synthetic-pull": positiveIdField("number"),
   "dispatch-witness-workflow": emptyAnswer,
+  "create-probe-ref": refObjectShape,
+  "dispatch-probe-workflow": emptyAnswer,
+  // `POST …/cancel` answers 202 with an empty JSON object.
+  "cancel-probe-run": (body, status) => status === 202 && body !== null && typeof body === "object" && !Array.isArray(body),
 });
 /** The operations whose response is bytes, bounded and validated by their own archive reader. */
 const BINARY_OPERATIONS = Object.freeze(["download-artifact-archive"]);
@@ -6556,11 +6650,29 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  * the caller records as a blocker. `unverified` is never an error here — it is the honest state, and
  * it blocks activation on its own.
  */
-export function validateEnvironmentControl(record, { dir, key, environment, environmentId = null, runId = null, attempt = null, window = null }) {
+export function validateEnvironmentControl(record, { dir, key, environment, environmentId = null, runId = null, attempt = null, window = null, offbranch = null }) {
   const schema = ENVIRONMENT_CONTROL_SCHEMAS[String(key)];
   if (!schema) return `names the control ${JSON.stringify(String(key))}, which is outside the closed PC-06 list`;
   if (record === undefined || record === null) return "is absent";
   if (typeof record !== "object" || Array.isArray(record)) return "is not a control record";
+  /**
+   * ── THE ONE CROSS-RUN VARIANT, SELECTED EXPLICITLY (accepted PC-06 API-only design) ─────────────
+   *
+   * Only the exact key `off_branch_environment_reference_refused` WITH the integer marker
+   * `offbranch_schema_version: 1` reaches the separately staged probe's validator. The marker under
+   * any other control refuses — the same-run self-review and unauthorized-reviewer controls cannot
+   * borrow cross-run semantics through it — an unknown version refuses, and a record WITHOUT the
+   * marker keeps the legacy same-run validation below: absence never infers a link.
+   */
+  if (Object.hasOwn(record, "offbranch_schema_version")) {
+    if (String(key) !== OFFBRANCH_CONTROL) return `carries the cross-run off-branch marker, which only ${OFFBRANCH_CONTROL} may use`;
+    if (record.offbranch_schema_version !== OFFBRANCH_SCHEMA_VERSION) return `declares the off-branch schema version ${JSON.stringify(record.offbranch_schema_version)}, which this build does not know`;
+    if (!offbranch) return "is a cross-run off-branch record, but no trusted commissioning context exists to validate it against";
+    return validateOffBranchRecord(record, {
+      dir, environment, environmentId, expected: schema.expected, trusted: offbranch,
+      readProbeJournal: () => readJournal({ dir, runId, attempt, kind: "probe" }),
+    });
+  }
   const status = String(record.status ?? "");
   if (status !== "verified") return `is ${status || "absent"}`;
   if (!schema.sources.includes(String(record.source ?? ""))) {
@@ -8244,6 +8356,17 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     } else {
       // One environment has ONE numeric identity. Every accepted observation of it must agree (R3).
       const measuredIds = new Map(PROTECTED_JOBS.map((spec) => [spec.environment, new Set()]));
+      /**
+       * The TRUSTED context the cross-run off-branch variant is validated against: the commissioning
+       * identity recomputed from the verified original intent, the verified resource journal, this
+       * run's window and the collected approvals. Nothing in it comes from the record under review.
+       */
+      const offbranch = files.intent && journalRecords?.length && runWindow ? {
+        commissioning: commissioningIdentity({
+          intent: files.intent, runId, attempt, repository: COMMISSIONING_REPOSITORY, workflowPath: COMMISSIONING_WORKFLOW_PATH,
+        }),
+        resourceJournal: journalRecords, window: runWindow, approvals: files.approvals ?? null,
+      } : null;
       for (const key of ENVIRONMENT_CONTROL_KEYS) {
         const perEnvironment = controls[key];
         if (!perEnvironment || typeof perEnvironment !== "object" || Array.isArray(perEnvironment)) {
@@ -8251,14 +8374,23 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
           continue;
         }
         for (const spec of PROTECTED_JOBS) {
-          const problem = validateEnvironmentControl(perEnvironment[spec.environment], {
-            dir, key, environment: spec.environment, runId, attempt, window: runWindow,
-          });
+          let problem;
+          try {
+            problem = validateEnvironmentControl(perEnvironment[spec.environment], {
+              dir, key, environment: spec.environment, runId, attempt, window: runWindow, offbranch,
+            });
+          } catch (error) {
+            // A probe journal that does not verify is a refusal of THIS record, never a crash of the gate.
+            problem = `could not be validated (${error instanceof Error ? error.message : String(error)})`;
+          }
           if (problem) block("PC-06", "unverified", `the protected-environment control ${key} for ${spec.environment} ${problem}`);
           else measuredIds.get(spec.environment).add(String(perEnvironment[spec.environment].environment_id));
         }
         const unknownEnvironments = Object.keys(perEnvironment).filter((name) => !PROTECTED_JOBS.some((spec) => spec.environment === name));
         if (unknownEnvironments.length) block("PC-06", "invalid", `the control ${key} names ${unknownEnvironments.length} environment(s) outside this workflow's two`);
+        if (key === OFFBRANCH_CONTROL) {
+          for (const problem of crossCheckOffBranchPair(perEnvironment, dir)) block("PC-06", "invalid", `the control ${key}: ${problem}`);
+        }
       }
       for (const [environment, ids] of measuredIds) {
         if (ids.size > 1) block("PC-06", "invalid", `the ${environment} controls were observed on ${ids.size} different numeric environment IDs (${[...ids].sort().join(", ")}); one environment has one identity`);
