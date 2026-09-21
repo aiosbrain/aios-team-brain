@@ -344,10 +344,22 @@ describe("the ORIGINAL record must exist, match the subject, and be complete (PU
  * contain it: a refusal names what failed with a fixed code, never what was rejected.
  */
 describe("every deficient scanner measurement refuses or stays blocked after operator substitution (AC-AUDIT-08)", () => {
-  type Mutate = (record: Record<string, any>, marker: string) => Record<string, any>;
-  const withScanner = (change: (scanner: Record<string, any>, marker: string) => Record<string, any>): Mutate =>
+  type Fields = Record<string, unknown>;
+  /** The production scanner record's shape, as far as these rows reach into it. */
+  interface ScannerRecord extends Fields {
+    settings: Fields & { ruleLimitations: readonly string[] };
+    representation: Fields;
+    capabilityCanary: Fields;
+  }
+  interface AuditRecord extends Fields {
+    scanner: ScannerRecord;
+    coverage: Fields;
+  }
+  type Mutate = (record: AuditRecord, marker: string) => Fields;
+  const withScanner = (change: (scanner: ScannerRecord, marker: string) => Fields): Mutate =>
     (record, marker) => ({ ...record, scanner: change(structuredClone(record.scanner), marker) });
-  const without = (object: Record<string, any>, key: string) => { const { [key]: _gone, ...rest } = object; return rest; };
+  const without = (object: Fields, key: string): Fields => { const { [key]: _gone, ...rest } = object; return rest; };
+  const baseRecord = () => originalAudit() as unknown as AuditRecord;
   const hex = (character: string) => character.repeat(64);
 
   const rows: [string, Mutate, string?][] = [
@@ -393,7 +405,7 @@ describe("every deficient scanner measurement refuses or stays blocked after ope
   for (const [label, mutate, code] of rows) {
     it(`${label} → ${code}`, () => {
       const marker = `ZZ-${syntheticSecret("m").slice(1)}`;
-      const record = mutate(originalAudit() as Record<string, any>, marker);
+      const record = mutate(baseRecord(), marker);
       const result = reconcile(record);
       expect(result.transitionReady).toBe(false);
       expect(result.verdict).toBe("refused");
@@ -405,7 +417,7 @@ describe("every deficient scanner measurement refuses or stays blocked after ope
 
   it("a COMPLETE pre-remediation v1 original is refused by name, however otherwise valid", () => {
     const v1 = "aios.image-audit.scan-surface.v1";
-    const valid = originalAudit() as Record<string, any>;
+    const valid = baseRecord();
     const record = {
       ...valid,
       coverage: { ...without(valid.coverage, "archiveSurfaceBytes"), representation: v1 },

@@ -13,7 +13,7 @@ import {
 import { UNSUPPORTED_FORMATS, unsupportedMagicFormat } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret, ustarSplit } from "./helpers/tar-fixture";
-import { inspectSynthetic, memberScanFiles, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
+import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
 
 /**
  * PUB-07's hostile-archive row, against the reader that will read real image layers.
