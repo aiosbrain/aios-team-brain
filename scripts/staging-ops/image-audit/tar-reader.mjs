@@ -32,36 +32,82 @@ export function bufferSource(buffer) {
   };
 }
 
+/**
+ * STRUCTURAL refusal, as a FIXED code. A malformed archive is not a smaller archive: reading it as one
+ * is how a short buffer or a truncated layer used to come back as a verified, fully covered, empty
+ * inventory. The message is this module's own text and never quotes archive bytes.
+ */
 export class TarFormatError extends Error {
   constructor(message) {
     super(message);
     this.name = "TarFormatError";
+    this.code = "AUDIT_TAR_STRUCTURE_INVALID";
   }
 }
+
+/**
+ * A RESOURCE bound, as a different fixed code. "The archive is malformed" and "the archive is shaped to
+ * exhaust the audit" have different remedies, and the sanitized record carries only this code.
+ */
+export class TarLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TarLimitError";
+    this.code = "AUDIT_TAR_LIMIT_EXCEEDED";
+  }
+}
+
+/**
+ * The reviewed ceilings for the metadata a tar carries ABOUT its members (AC-AUDIT-04).
+ *
+ * THE DEFECT THESE EXIST FOR. A GNU `L`/`K` or PAX `x`/`g` body used to be read with ONE
+ * `source.read(offset, size)` BEFORE any bound was consulted, and those headers never counted towards
+ * `maxMembers`. A 300 MiB long-name declaration in a small compressed layer requested a 314,572,800-byte
+ * allocation, and an archive of nothing but metadata headers walked forever without touching the member
+ * count or the clock. Each ceiling below is checked BEFORE the read it bounds.
+ *
+ *   `maxMetadataRecordBytes`  — one metadata body. Real long names and PAX records are tiny.
+ *   `maxPendingMetadataBytes` — every metadata body accumulated since the last member, so a flood of
+ *                               small `x` records ahead of one member is bounded as a total.
+ *   `maxPhysicalHeaders`      — EVERY header block the reader processes, metadata included.
+ */
+export const TAR_READER_LIMITS = Object.freeze({
+  maxMetadataRecordBytes: 1024 * 1024,
+  maxPendingMetadataBytes: 4 * 1024 * 1024,
+  maxPhysicalHeaders: 1_500_000,
+});
+
+/** How many physical headers, and how many content bytes, pass between consultations of the clock. */
+const DEADLINE_EVERY_HEADERS = 512;
+const DEADLINE_EVERY_BYTES = 64 * 1024 * 1024;
 
 function trimNul(buffer) {
   const end = buffer.indexOf(0);
   return (end === -1 ? buffer : buffer.subarray(0, end)).toString("utf8");
 }
 
-/** Octal, or GNU base-256 for values that do not fit. An unparseable size is a corrupt archive. */
+const isZeroBlock = (buffer) => buffer.every((byte) => byte === 0);
+
+/**
+ * Octal, or GNU base-256 for values that do not fit. An unparseable, negative or unsafe value is a
+ * corrupt archive — never a zero, which is the value that would quietly shorten a member.
+ */
 function numericField(buffer, label) {
   if (buffer.length && (buffer[0] & 0x80) !== 0) {
+    // 0x80 is the positive base-256 marker. 0xff (and anything else with the high bit set) is GNU's
+    // NEGATIVE encoding or garbage, and a negative size or mode has no meaning here.
+    if (buffer[0] !== 0x80) throw new TarFormatError(`tar ${label} is a negative or malformed base-256 field`);
     let value = 0n;
-    // The high bit is the base-256 marker, not part of the magnitude.
-    let first = true;
-    for (const byte of buffer) {
-      value = (value << 8n) | BigInt(first ? byte & 0x7f : byte);
-      first = false;
-    }
-    const asNumber = Number(value);
-    if (!Number.isSafeInteger(asNumber)) throw new TarFormatError(`tar ${label} exceeds a safe integer`);
-    return asNumber;
+    for (const byte of buffer.subarray(1)) value = (value << 8n) | BigInt(byte);
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new TarFormatError(`tar ${label} exceeds a safe integer`);
+    return Number(value);
   }
   const text = trimNul(buffer).trim();
   if (text === "") return 0;
   if (!/^[0-7]+$/.test(text)) throw new TarFormatError(`tar ${label} is not an octal field`);
-  return Number.parseInt(text, 8);
+  const value = Number.parseInt(text, 8);
+  if (!Number.isSafeInteger(value)) throw new TarFormatError(`tar ${label} exceeds a safe integer`);
+  return value;
 }
 
 /**
@@ -85,22 +131,61 @@ function verifyChecksum(header) {
   }
 }
 
-/** PAX records are `<len> <key>=<value>\n`, with `<len>` counting its own digits. */
-export function parsePaxRecords(text) {
+/** The only PAX keys whose VALUES this reader interprets. Every other value is opaque bytes. */
+const INTERPRETED_PAX_KEYS = Object.freeze(["path", "linkpath", "size"]);
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * PAX records are `<len> <key>=<value>\n`, where `<len>` is a DECIMAL BYTE COUNT of the whole record
+ * including its own digits (AC-AUDIT-05).
+ *
+ * BYTES, NOT CHARACTERS. This used to decode the body to a JavaScript string and walk string offsets,
+ * so a correctly byte-counted `path=app/é.txt` was refused as out of range and any record after a
+ * multi-byte character was misframed. Framing now happens on the raw bytes; only the values of
+ * `path`, `linkpath` and `size` are ever decoded, strictly (no lossy replacement character). Every
+ * other value — a binary xattr included — stays opaque: it is not rejected for being invalid UTF-8,
+ * and it is never interpreted, because its bytes reach the scanner through the archive surface.
+ *
+ * Returns ONLY the interpreted keys that were present.
+ */
+export function parsePaxRecords(input) {
+  const bytes = Buffer.isBuffer(input) ? input : Buffer.from(String(input), "utf8");
   const records = {};
   let offset = 0;
-  while (offset < text.length) {
-    const space = text.indexOf(" ", offset);
-    if (space === -1) throw new TarFormatError("PAX record has no length separator");
-    const length = Number.parseInt(text.slice(offset, space), 10);
-    if (!Number.isSafeInteger(length) || length <= 0 || offset + length > text.length) {
+  while (offset < bytes.length) {
+    const space = bytes.indexOf(0x20, offset);
+    if (space === -1 || space === offset || space - offset > 16) throw new TarFormatError("PAX record has no valid length field");
+    const digits = bytes.subarray(offset, space).toString("latin1");
+    if (!/^[1-9][0-9]*$/.test(digits)) throw new TarFormatError("PAX record length is not a decimal byte count");
+    const length = Number(digits);
+    const end = offset + length;
+    // The smallest well-formed record after the length is ` k=\n`: a space, a one-byte key, `=`, `\n`.
+    if (!Number.isSafeInteger(end) || length < digits.length + 4 || end > bytes.length) {
       throw new TarFormatError("PAX record length is out of range");
     }
-    const body = text.slice(space + 1, offset + length).replace(/\n$/, "");
-    const equals = body.indexOf("=");
-    if (equals === -1) throw new TarFormatError("PAX record has no key separator");
-    records[body.slice(0, equals)] = body.slice(equals + 1);
-    offset += length;
+    if (bytes[end - 1] !== 0x0a) throw new TarFormatError("PAX record does not end at its declared newline");
+    const body = bytes.subarray(space + 1, end - 1);
+    const equals = body.indexOf(0x3d);
+    if (equals <= 0) throw new TarFormatError("PAX record has no key separator");
+    const key = body.subarray(0, equals).toString("latin1");
+    if (INTERPRETED_PAX_KEYS.includes(key)) {
+      const raw = body.subarray(equals + 1);
+      let value;
+      try {
+        value = STRICT_UTF8.decode(raw);
+      } catch {
+        throw new TarFormatError("PAX path, linkpath or size value is not valid UTF-8");
+      }
+      if (key === "size") {
+        if (!/^[0-9]{1,16}$/.test(value) || !Number.isSafeInteger(Number(value))) {
+          throw new TarFormatError("PAX size record is not a safe non-negative decimal");
+        }
+        records.size = Number(value);
+      } else {
+        records[key] = value;
+      }
+    }
+    offset = end;
   }
   return records;
 }
@@ -147,74 +232,185 @@ export const MEMBER_TYPES = Object.freeze({
   "7": "file",
 });
 
+/** Typeflags that describe a member with NO body. A non-zero effective size on one hides bytes. */
+const HEADER_ONLY_TYPES = new Set(["hardlink", "symlink", "character-device", "block-device", "directory", "fifo"]);
+
 /**
- * Iterate members. `content(sink)` streams the member's bytes in bounded chunks and returns their
- * sha256 — the ONE way content leaves this module, so nothing can read a member without the caller
- * deciding where its bytes go.
+ * Iterate members, validating the archive's STRUCTURE independently of what is later scanned.
+ *
+ * `content(sink)` streams a regular member's bytes in bounded chunks and returns their sha256 — the ONE
+ * way member content leaves this module.
+ *
+ * THE ACCEPTED SHAPE (AC-AUDIT-03), stated once:
+ *   - input of zero bytes is not an archive, and a canonical empty archive is exactly two zero blocks;
+ *   - every header is a complete 512-byte block with a valid checksum — a partial header anywhere,
+ *     including a 1–511-byte "archive", is refused rather than read as zero members;
+ *   - every declared body and its padding lies inside the input, with safe-integer arithmetic;
+ *   - the archive ENDS with two complete zero blocks. EOF without them, or a single zero block, is
+ *     refused. Further zero padding is accepted; NON-ZERO bytes after the marker are either reported
+ *     to `onSurface` as opaque bytes to scan (`nonzeroTrailer: "surface"`, the default) or refused
+ *     (`"refuse"`) — never silently discarded, which is what the old `break` did;
+ *   - a header-only typeflag (`1`–`6`) with a non-zero effective size is refused: striding past a body
+ *     nobody reads and still reporting a complete inventory is how a member hides inside another.
+ *
+ * THE ARCHIVE SURFACE (AC-AUDIT-02). Everything that is not a regular member's content — every header
+ * block (ordinary, PAX `x`/`g`, GNU `L`/`K`), metadata bodies, member padding, the body of an
+ * unsupported typeflag, the end-of-archive blocks and trailing bytes — is reported, IN ARCHIVE ORDER,
+ * as `onSurface({ offset, length, kind })`. Each call is one contiguous range the caller must keep
+ * whole; adjacent ranges may be joined. A regular member's content is the complement, reached through
+ * `content()`. Together they account for every byte of the input.
+ *
+ * BOUNDS (AC-AUDIT-04). Metadata bodies are checked against `maxMetadataRecordBytes` BEFORE they are
+ * read, accumulated metadata since the last member against `maxPendingMetadataBytes`, and every
+ * physical header against `maxPhysicalHeaders`. The clock (`deadline.assert`) is consulted on entry,
+ * every `deadlineEveryHeaders` headers — metadata-only archives included — and every
+ * `deadlineEveryBytes` of content streamed.
  */
-export function* readTarMembers(source, { maxMembers = 500_000, chunkBytes = 1024 * 1024 } = {}) {
+export function* readTarMembers(source, {
+  maxMembers = 500_000,
+  chunkBytes = 1024 * 1024,
+  maxMetadataRecordBytes = TAR_READER_LIMITS.maxMetadataRecordBytes,
+  maxPendingMetadataBytes = TAR_READER_LIMITS.maxPendingMetadataBytes,
+  maxPhysicalHeaders = TAR_READER_LIMITS.maxPhysicalHeaders,
+  deadline,
+  deadlineEveryHeaders = DEADLINE_EVERY_HEADERS,
+  deadlineEveryBytes = DEADLINE_EVERY_BYTES,
+  onSurface,
+  nonzeroTrailer = "surface",
+} = {}) {
+  if (!Number.isSafeInteger(source.size) || source.size < 0) throw new TarFormatError("tar source size is not a safe integer");
+  if (source.size === 0) throw new TarFormatError("a zero-length input is not a tar archive; an empty archive is two zero blocks");
+  deadline?.assert("tar headers");
+
+  const surface = (offset, length, kind) => {
+    if (length > 0) onSurface?.(Object.freeze({ offset, length, kind }));
+  };
+  const readExactly = (position, length) => {
+    const bytes = source.read(position, length);
+    if (bytes.length !== length) throw new TarFormatError("tar archive ended inside a block it declared");
+    return bytes;
+  };
+
   let offset = 0;
   let pax = {};
-  let globalPax = {};
   let gnuName;
   let gnuLink;
   let emitted = 0;
+  let headers = 0;
+  let pendingMetadata = 0;
 
-  while (offset + BLOCK <= source.size) {
-    const header = source.read(offset, BLOCK);
-    if (header.length < BLOCK) throw new TarFormatError("tar archive ends inside a header block");
-    if (header.every((byte) => byte === 0)) break; // end-of-archive marker
+  while (true) {
+    const remaining = source.size - offset;
+    if (remaining === 0) throw new TarFormatError("tar archive ends without its end-of-archive blocks");
+    if (remaining < BLOCK) throw new TarFormatError("tar archive ends inside a header block");
+    const header = readExactly(offset, BLOCK);
+
+    if (isZeroBlock(header)) {
+      // The end-of-archive marker is TWO complete zero blocks. One, or one followed by anything
+      // non-zero, is a truncated or spliced archive and is refused rather than read as complete.
+      if (remaining < 2 * BLOCK) throw new TarFormatError("tar archive ends inside its end-of-archive marker");
+      if (!isZeroBlock(readExactly(offset + BLOCK, BLOCK))) {
+        throw new TarFormatError("tar end-of-archive marker is a single zero block");
+      }
+      if (nonzeroTrailer === "refuse") {
+        // Nothing may follow but zeros. Checked in bounded chunks, under the clock.
+        let at = offset + 2 * BLOCK;
+        let sinceCheck = 0;
+        while (at < source.size) {
+          const chunk = readExactly(at, Math.min(chunkBytes, source.size - at));
+          if (!isZeroBlock(chunk)) throw new TarFormatError("tar archive carries non-zero bytes after its end-of-archive marker");
+          at += chunk.length;
+          sinceCheck += chunk.length;
+          if (deadline && sinceCheck >= deadlineEveryBytes) {
+            sinceCheck = 0;
+            deadline.assert("tar trailer");
+          }
+        }
+      }
+      // The marker and everything after it, as ONE contiguous range: trailing bytes are distributed
+      // with the archive, so they are scanned as opaque bytes rather than dropped.
+      surface(offset, source.size - offset, "terminator");
+      return;
+    }
+
+    headers += 1;
+    if (headers > maxPhysicalHeaders) throw new TarLimitError(`tar archive exceeds the ${maxPhysicalHeaders}-header limit`);
+    if (deadline && headers % deadlineEveryHeaders === 0) deadline.assert("tar headers");
     verifyChecksum(header);
 
     const typeflag = String.fromCharCode(header[156]);
     const size = numericField(header.subarray(124, 136), "size");
     const dataOffset = offset + BLOCK;
-    /** Blocks occupied by `bytes` of member data. The stride to the next header. */
-    const strideTo = (bytes) => dataOffset + Math.ceil(bytes / BLOCK) * BLOCK;
+    /** The stride to the next header, with the arithmetic proven safe rather than assumed. */
+    const strideTo = (bytes) => {
+      const end = dataOffset + Math.ceil(bytes / BLOCK) * BLOCK;
+      if (!Number.isSafeInteger(end)) throw new TarFormatError("tar member stride exceeds a safe integer");
+      if (end > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
+      return end;
+    };
 
     // The extended headers below carry their OWN length in the ustar size field — a PAX `size`
     // record describes the member the header applies to, never the header itself.
-    if (typeflag === "L" || typeflag === "K") {
-      if (strideTo(size) > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
-      const value = trimNul(source.read(dataOffset, size));
-      if (typeflag === "L") gnuName = value;
-      else gnuLink = value;
-      offset = strideTo(size);
-      continue;
-    }
-    if (typeflag === "x" || typeflag === "g") {
-      if (strideTo(size) > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
-      const records = parsePaxRecords(source.read(dataOffset, size).toString("utf8"));
-      if (typeflag === "g") globalPax = { ...globalPax, ...records };
-      else pax = { ...pax, ...records };
-      offset = strideTo(size);
+    if (typeflag === "L" || typeflag === "K" || typeflag === "x" || typeflag === "g") {
+      // BEFORE the read: a declared body past the ceiling is refused without allocating it.
+      if (size > maxMetadataRecordBytes) {
+        throw new TarLimitError(`a tar metadata record declares more than the ${maxMetadataRecordBytes}-byte ceiling`);
+      }
+      pendingMetadata += size;
+      if (pendingMetadata > maxPendingMetadataBytes) {
+        throw new TarLimitError(`tar metadata ahead of one member exceeds the ${maxPendingMetadataBytes}-byte ceiling`);
+      }
+      const end = strideTo(size);
+      const body = readExactly(dataOffset, size);
+      if (typeflag === "L") gnuName = trimNul(body);
+      else if (typeflag === "K") gnuLink = trimNul(body);
+      else {
+        const records = parsePaxRecords(body);
+        if (typeflag === "g") {
+          // A GLOBAL override would redefine the name, target or size of EVERY later member; this
+          // reader refuses to assume that filesystem semantics rather than guess at them. Global
+          // records carrying only opaque metadata are accepted — and scanned, as surface.
+          if (INTERPRETED_PAX_KEYS.some((key) => records[key] !== undefined)) {
+            throw new TarFormatError("a global PAX header overrides path, linkpath or size");
+          }
+        } else {
+          pax = { ...pax, ...records };
+        }
+      }
+      surface(offset, end - offset, "metadata");
+      offset = end;
       continue;
     }
 
     const ustarName = trimNul(header.subarray(0, 100));
     const prefix = trimNul(header.subarray(345, 500));
     const linkname = trimNul(header.subarray(157, 257));
-    const merged = { ...globalPax, ...pax };
-    const name = merged.path ?? gnuName ?? (prefix ? `${prefix}/${ustarName}` : ustarName);
-    const link = merged.linkpath ?? gnuLink ?? linkname;
+    const name = pax.path ?? gnuName ?? (prefix ? `${prefix}/${ustarName}` : ustarName);
+    const link = pax.linkpath ?? gnuLink ?? linkname;
     /**
      * A PAX `size` record OVERRIDES the ustar size field — that is the whole point of it, and for a
-     * member larger than the octal field can hold the ustar size is `0`.
-     *
-     * So it must drive the STRIDE to the next header, not just the content length. Taking
-     * `min(size, paxSize)` (or the ustar size alone) would read zero bytes AND land the next header
-     * read in the middle of this member's data, silently misparsing the rest of the archive into
-     * plausible garbage — an inventory that looks complete and is not.
+     * member larger than the octal field can hold the ustar size is `0`. So it drives the STRIDE to
+     * the next header, not just the content length; anything else lands the next header read in the
+     * middle of this member's data and misparses the rest of the archive into plausible garbage.
      */
-    const dataSize = merged.size !== undefined ? Number.parseInt(merged.size, 10) : size;
-    if (!Number.isSafeInteger(dataSize) || dataSize < 0) throw new TarFormatError("PAX size record is out of range");
-    const nextOffset = strideTo(dataSize);
-    if (nextOffset > source.size) throw new TarFormatError("tar member data runs past the end of the archive");
-
-    if (++emitted > maxMembers) throw new TarFormatError(`tar archive exceeds the ${maxMembers}-member limit`);
-
+    const dataSize = pax.size !== undefined ? pax.size : size;
     const type = MEMBER_TYPES[typeflag] ?? "unsupported";
+    if (HEADER_ONLY_TYPES.has(type) && dataSize > 0) {
+      throw new TarFormatError("a header-only tar member declares a non-zero body");
+    }
+    const nextOffset = strideTo(dataSize);
+
+    if (++emitted > maxMembers) throw new TarLimitError(`tar archive exceeds the ${maxMembers}-member limit`);
+
     const contentSize = type === "file" ? dataSize : 0;
+    if (type === "unsupported") {
+      // A body this reader does not interpret is still distributed: header, body and padding are one
+      // opaque surface range. The caller ALSO records the unsupported type as a limitation.
+      surface(offset, nextOffset - offset, "unsupported-member");
+    } else {
+      surface(offset, BLOCK, "header");
+    }
+
     yield Object.freeze({
       name,
       type,
@@ -224,10 +420,8 @@ export function* readTarMembers(source, { maxMembers = 500_000, chunkBytes = 102
       mode: numericField(header.subarray(100, 108), "mode"),
       path: classifyMemberPath(name),
       /**
-       * Where this member's bytes start in the SOURCE. A second pass uses it to stream a large
-       * member (an image layer blob) straight through a decompressor without ever holding it in
-       * memory — the alternative, buffering a multi-gigabyte layer to hash it, is how a bounded
-       * audit turns into an out-of-memory failure that looks like a product bug.
+       * Where this member's bytes start in the SOURCE. A second pass uses it to stream a large member
+       * (an image layer blob) straight through a decompressor without ever holding it in memory.
        */
       dataOffset,
       /**
@@ -238,20 +432,31 @@ export function* readTarMembers(source, { maxMembers = 500_000, chunkBytes = 102
         if (type !== "file") throw new Error(`member ${type} has no content to read`);
         const hash = createHash("sha256");
         let read = 0;
+        let sinceCheck = 0;
         while (read < contentSize) {
           const chunk = source.read(dataOffset + read, Math.min(chunkBytes, contentSize - read));
           if (chunk.length === 0) throw new TarFormatError("tar member data ended early");
           hash.update(chunk);
           sink?.(chunk);
           read += chunk.length;
+          sinceCheck += chunk.length;
+          if (deadline && sinceCheck >= deadlineEveryBytes) {
+            sinceCheck = 0;
+            deadline.assert("tar member content");
+          }
         }
         return { sha256: hash.digest("hex"), bytes: read };
       },
     });
 
+    // The padding after a regular member's content, reported AFTER the caller has handled the member,
+    // so ranges reach `onSurface` in archive order and the padding joins the next header's range.
+    if (type === "file") surface(dataOffset + contentSize, nextOffset - dataOffset - contentSize, "padding");
+
     pax = {};
     gnuName = undefined;
     gnuLink = undefined;
+    pendingMetadata = 0;
     offset = nextOffset;
   }
 }

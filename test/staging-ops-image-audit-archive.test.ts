@@ -251,10 +251,22 @@ describe("tar reader: a corrupt or oversized archive FAILS (PUB-02)", () => {
     expect(() => [...readTarMembers(bufferSource(tar), { maxMembers: 2 })]).toThrow(/2-member limit/);
   });
 
-  it("stops at the end-of-archive marker rather than reading trailing bytes", () => {
+  /**
+   * INVERTED (AC-AUDIT-03). This test used to pin the reader IGNORING a secret-bearing trailer, which
+   * is exactly the independent reviewer's witness: bytes distributed with the layer that no scanner
+   * ever saw, under a complete-coverage claim. The trailer is now either reported as surface to scan
+   * or — where there is no surface to put it on — refused. It is never silently discarded.
+   */
+  it("reports trailing bytes after the end-of-archive marker instead of discarding them", () => {
     const secret = syntheticSecret();
     const tar = Buffer.concat([buildTar([{ name: "app/x", content: "y" }]), Buffer.from(secret)]);
-    expect(members(tar).map((m) => m.name)).toEqual(["app/x"]);
+    const surfaced: Buffer[] = [];
+    const parsed = [...readTarMembers(bufferSource(tar), {
+      onSurface: ({ offset, length }: { offset: number; length: number }) => surfaced.push(tar.subarray(offset, offset + length)),
+    })];
+    expect(parsed.map((m) => m.name)).toEqual(["app/x"]);
+    expect(Buffer.concat(surfaced).toString("latin1")).toContain(secret);
+    expect(() => [...readTarMembers(bufferSource(tar), { nonzeroTrailer: "refuse" })]).toThrow(TarFormatError);
   });
 });
 
