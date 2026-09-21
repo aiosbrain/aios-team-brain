@@ -565,3 +565,121 @@ describe("ambiguous extended metadata is refused, whatever order it arrives in (
     expect(read(tar).map((m) => [m.canonicalName, m.linkTarget])).toEqual([["app/a", ""], ["app/long.js", ""], ["app/gnu-long.js", ""], ["app/sym", "target"]]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// B3/B4 — header format decides the name; one strict octal rule
+// ---------------------------------------------------------------------------
+
+/**
+ * A header in a chosen FORMAT, independent of the reader: the magic/version per Go's `getFormat`, an
+ * optional region written at byte 345, an optional STAR trailer at 508, checksum recomputed.
+ */
+function formatHeader(spec: RawHeader & { format: "posix" | "gnu" | "v7" | "star"; region?: Buffer; regionAt?: number }): Buffer {
+  const block = header(spec);
+  block.fill(0, 257, 265);
+  if (spec.format === "posix" || spec.format === "star") { block.write("ustar\0", 257, "latin1"); block.write("00", 263, "latin1"); }
+  if (spec.format === "gnu") { block.write("ustar ", 257, "latin1"); block.write(" \0", 263, "latin1"); }
+  if (spec.format === "star") block.write("tar\0", 508, "latin1");
+  if (spec.region) spec.region.copy(block, spec.regionAt ?? 345);
+  block.write("        ", 148, "ascii");
+  let sum = 0;
+  for (const byte of block) sum += byte;
+  block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return block;
+}
+
+describe("the header FORMAT decides whether bytes 345–500 are a name prefix (B3)", () => {
+  const withBody = (block: Buffer) => Buffer.concat([block, END]);
+
+  it("applies the 155-byte prefix for POSIX ustar only", () => {
+    const [only] = read(withBody(formatHeader({ name: "ok.js", format: "posix", region: Buffer.from("app") })));
+    expect(only.canonicalName).toBe("app/ok.js");
+  });
+
+  it("REFUSES a V7 header whose bytes at 345 would have named a planted file differently", () => {
+    expect(() => read(withBody(formatHeader({ name: "app/planted.js", format: "v7", region: Buffer.from("decoy") }))))
+      .toThrow(/a v7 tar header carries bytes where only POSIX ustar has a name prefix/);
+  });
+
+  it("REFUSES a GNU header carrying an atime (a valid number) at 345", () => {
+    expect(() => read(withBody(formatHeader({ name: "app/planted.js", format: "gnu", region: Buffer.from("00000000001\0") }))))
+      .toThrow(/a gnu tar header carries bytes/);
+  });
+
+  it("REFUSES a STAR layout with a prefix or with times at 476–500", () => {
+    expect(() => read(withBody(formatHeader({ name: "planted.js", format: "star", region: Buffer.from("app") })))).toThrow(/a star tar header/);
+    expect(() => read(withBody(formatHeader({ name: "app/planted.js", format: "star", region: Buffer.from("00000000001\0"), regionAt: 476 })))).toThrow(/a star tar header/);
+  });
+
+  it("keeps V7, GNU and STAR headers with a zero region, and GNU metadata members", () => {
+    for (const format of ["v7", "gnu", "star"] as const) {
+      const [only] = read(withBody(formatHeader({ name: "app/ok.js", format })));
+      expect(only.canonicalName, format).toBe("app/ok.js");
+    }
+    // `ustar ` with a non-GNU version is V7 to Go, and a zero region keeps it valid here.
+    const odd = formatHeader({ name: "app/ok.js", format: "gnu" });
+    odd.write("xx", 263, "latin1");
+    odd.write("        ", 148, "ascii");
+    let sum = 0;
+    for (const byte of odd) sum += byte;
+    odd.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+    expect(read(withBody(odd))[0].canonicalName).toBe("app/ok.js");
+  });
+});
+
+describe("one octal rule for checksum, size and mode (B4)", () => {
+  const sizeHeader = (sizeField: Buffer, name = "app/empty.txt") => header({ name, sizeField });
+
+  it("reads a LEADING-NUL size as its real value, never as 0 with a phantom member", () => {
+    const body = Buffer.concat([header({ name: "tmp/decoy", size: 0 }), Buffer.alloc(0)]);
+    expect(body.length).toBe(BLOCK);
+    const sizeField = Buffer.concat([Buffer.from([0]), Buffer.from("0000001000", "ascii"), Buffer.from([0])]);
+    const tar = Buffer.concat([sizeHeader(sizeField), body, END]);
+    const parsed = read(tar);
+    expect(parsed.map((m) => [m.name, m.size])).toEqual([["app/empty.txt", 512]]);
+    expect(parsed[0].content().sha256).toBe(createHash("sha256").update(body).digest("hex"));
+  });
+
+  it("accepts ordinary NUL and space padding at either end", () => {
+    for (const field of ["00000001000\0", "     1000 \0\0", "\0\0 0001000  ", "1000        "]) {
+      const tar = Buffer.concat([sizeHeader(Buffer.from(field, "latin1")), Buffer.alloc(BLOCK, 0x61), END]);
+      expect(read(tar)[0].size, JSON.stringify(field)).toBe(512);
+    }
+  });
+
+  it("REFUSES an interior NUL, an interior space or any non-octal byte", () => {
+    for (const field of ["0000\x00001000\0", "0000 001000\0", "00000001008\0", "0000000100x\0"]) {
+      const tar = Buffer.concat([sizeHeader(Buffer.from(field, "latin1")), Buffer.alloc(BLOCK, 0x61), END]);
+      expect(() => read(tar), JSON.stringify(field)).toThrow(/is not an octal field/);
+    }
+  });
+
+  it("keeps positive base-256, and refuses negative or unsafe base-256", () => {
+    const positive = Buffer.alloc(12, 0);
+    positive[0] = 0x80;
+    positive.writeUInt16BE(512, 10);
+    expect(read(Buffer.concat([sizeHeader(positive), Buffer.alloc(BLOCK, 0x61), END]))[0].size).toBe(512);
+    expect(() => read(Buffer.concat([sizeHeader(Buffer.alloc(12, 0xff)), END]))).toThrow(/negative or malformed base-256/);
+    expect(() => read(Buffer.concat([sizeHeader(Buffer.concat([Buffer.from([0x80]), Buffer.alloc(11, 0xff)])), END]))).toThrow(/safe integer/);
+  });
+
+  it("applies the same rule to the checksum and mode, and never accepts a blank checksum", () => {
+    const blank = header({ name: "app/a" });
+    blank.fill(0x20, 148, 156);
+    expect(() => read(Buffer.concat([blank, END]))).toThrow(/carries no checksum/);
+    // A checksum written with a LEADING NUL still verifies: the same trim as every other field.
+    const leading = header({ name: "app/a" });
+    const digits = leading.subarray(148, 154).toString("latin1");
+    leading.write(`\0${digits}\0`, 148, "latin1");
+    expect(read(Buffer.concat([leading, END]))[0].name).toBe("app/a");
+    // An interior NUL in the mode is refused like one in the size.
+    const mode = header({ name: "app/a" });
+    mode.write("000\u0000644\0", 100, "latin1");
+    expect(mode[103]).toBe(0);
+    mode.write("        ", 148, "ascii");
+    let sum = 0;
+    for (const byte of mode) sum += byte;
+    mode.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+    expect(() => read(Buffer.concat([mode, END]))).toThrow(/mode is not an octal field/);
+  });
+});
