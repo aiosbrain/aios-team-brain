@@ -50,6 +50,18 @@ describe("inactive hydration failure decisions", () => {
     expect(completedTransactions).toBe(1); // claim committed; page transaction threw and rolled back
   });
 
+  it("requeues, rather than throwing, when the database measures the snapshot over the cap", async () => {
+    // AIO-1170 review P3-01: the DB bound is octet_length(messages::text), larger than the JSON.stringify count
+    // the hydrator pre-checks, so the write itself can report `too_large` for a thread that passed the pre-check.
+    // Uncaught, that reached the caller as a raw 23514 with the lease left to expire and every reclaim repeating it.
+    stubs.slackReservedRequest.mockResolvedValue({ outcome: "ok", page: {
+      messages: [{ ts: ROOT, text: "root" }], hasMore: false, nextCursor: null } });
+    stubs.writeSlackThreadSnapshot.mockResolvedValue("too_large");
+    expect(await hydrateOneSlackThread(input)).toEqual({ outcome: "failed", category: "snapshot_too_large" });
+    expect(stubs.checkpointSlackThread).not.toHaveBeenCalled();
+    expect(stubs.releaseSlackThreadForRetry.mock.calls[0][2].errorCode).toBe("snapshot_too_large");
+  });
+
   it("resets a cursor with no matching staged body before refetching the root", async () => {
     const resumed = { ...claim, pageCursor: "page-2", snapshotGeneration: 1 };
     const restarted = { ...resumed, pageCursor: null, snapshotGeneration: 2 };

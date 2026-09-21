@@ -430,7 +430,7 @@ export async function readSlackThreadSnapshot(session: TransactionSession, claim
 
 /** Fenced snapshot replacement. Callers supply already bounded JSON and then checkpoint the cursor
  * in the same short transaction; no HTTP request ever runs while this transaction is open. */
-export async function writeSlackThreadSnapshot(session: TransactionSession, claim: SlackThreadClaim, snapshot: SlackThreadSnapshot): Promise<"written" | "refused"> {
+export async function writeSlackThreadSnapshot(session: TransactionSession, claim: SlackThreadClaim, snapshot: SlackThreadSnapshot): Promise<"written" | "refused" | "too_large"> {
   if (!Array.isArray(snapshot.messages)) throw new SlackThreadStateError("invalid bounded snapshot");
   const serialized = JSON.stringify(snapshot.messages);
   if (typeof serialized !== "string" || Buffer.byteLength(serialized, "utf8") > 1048576) throw new SlackThreadStateError("invalid bounded snapshot");
@@ -438,6 +438,12 @@ export async function writeSlackThreadSnapshot(session: TransactionSession, clai
   if (seenCursors.length > 1000 || seenCursors.some((c) => typeof c !== "string" || !c.trim() || c.length > 1024) || new Set(seenCursors).size !== seenCursors.length) throw new SlackThreadStateError("invalid snapshot cursor history");
   const nextGeneration = claim.snapshotGeneration + 1;
   assertGeneration(nextGeneration);
+  // The database bound is `octet_length(messages::text)`, and jsonb::text is LARGER than JSON.stringify (it
+  // writes `": "` and `", "`), so the JS check above is necessary but not sufficient. Measure with the SAME
+  // function the constraint uses: a snapshot in the gap is an ordinary refusal here, not a raw 23514 out of
+  // the insert below that the hydrator does not catch.
+  const stored = await session.executeSql<{ n: string }>(`select octet_length(($1::jsonb)::text) as n`, [serialized]);
+  if (Number(stored.rows[0]?.n) > 1048576) return "too_large";
   const r = await session.executeSql(
     `with owner as (
        select 1 from slack_sync_threads where ${SCOPE_PREDICATE} and status='running'

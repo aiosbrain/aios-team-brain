@@ -65,6 +65,7 @@ function merged(existing: readonly Record<string, unknown>[], page: readonly Rec
 }
 function snapshotBytes(messages: readonly Record<string, unknown>[]): number { return Buffer.byteLength(JSON.stringify(messages), "utf8"); }
 class CheckpointRefused extends Error {}
+class SnapshotTooLarge extends Error {}
 function retryDate(claim: SlackThreadClaim, category: string, providerAt?: string): Date {
   const now = Date.now();
   if (providerAt) {
@@ -140,12 +141,15 @@ export async function hydrateOneSlackThread(input: SlackThreadHydratorInput, opt
         expiresAt: new Date(Date.now() + snapshotTtlMs).toISOString(),
       });
       if (result === "refused") throw new CheckpointRefused();
+      if (result === "too_large") throw new SnapshotTooLarge();
       const checkpoint = await checkpointSlackThread(s, claim, { pageCursor: page.nextCursor, snapshotGeneration: nextGeneration });
       if (checkpoint.outcome !== "checkpointed") throw new CheckpointRefused();
     });
     return { outcome: "progressed" };
   } catch (error) {
     if (error instanceof CheckpointRefused) return { outcome: "refused", category: "stale_lease" };
+    // The database measures `messages::text`, which is larger than the JSON.stringify count checked above.
+    if (error instanceof SnapshotTooLarge) return requeue(input, claim, "snapshot_too_large", retryDate(claim, "snapshot_too_large"));
     throw error;
   }
 }

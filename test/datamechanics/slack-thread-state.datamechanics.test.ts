@@ -279,6 +279,28 @@ describe("inactive replies staging — resume, fencing and retention", () => {
     expect((await staged(scope))?.snapshot_generation).toBe("1");
   });
 
+  it("refuses a snapshot whose STORED size is over the cap even when its JSON.stringify size is under it", async () => {
+    // SPEC (AIO-1170 review P3-01): one snapshot is bounded at 1 MiB, and the bound the database enforces is
+    // `octet_length(messages::text)`. jsonb::text writes `": "` and `", "` where JSON.stringify writes `":"`
+    // and `","`, so the SAME messages are larger stored than serialized. A cap measured in JS bytes lets a
+    // thread through that Postgres then rejects with a raw 23514, which the hydrator does not catch: the lease
+    // is left to expire and every reclaim crashes the same way. The refusal must be the ordinary
+    // `too_large` result, decided by the same measure the constraint uses.
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    const live = await claimed(scope);
+    const messages = Array.from({ length: 131_000 }, () => ({ a: 1 }));
+    expect(Buffer.byteLength(JSON.stringify(messages), "utf8")).toBeLessThanOrEqual(1_048_576);
+    // Non-vacuity: ask Postgres, not JS, so this cannot pass because the payload was simply too small.
+    const stored = await tx((s) => s.executeSql<{ n: string }>(`select octet_length(($1::jsonb)::text) as n`, [JSON.stringify(messages)]));
+    expect(Number(stored.rows[0].n)).toBeGreaterThan(1_048_576);
+
+    const result = await tx((s) => writeSlackThreadSnapshot(s, live, {
+      messages, complete: false, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    expect(result).toBe("too_large");
+    expect(await staged(scope)).toBeNull();
+  });
+
   it("serializes two page writes carrying the same live claim so only one generation commits", async () => {
     const seed = await seedTeam(); const scope = scopeFor(seed);
     const live = await claimed(scope);
