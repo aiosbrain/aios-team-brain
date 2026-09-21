@@ -261,8 +261,20 @@ describe("metadata, physical headers and time are bounded (AC-AUDIT-04)", () => 
 
   it("bounds ACCUMULATED metadata ahead of one member, not only each record", () => {
     const flood = Array.from({ length: 20 }, (_, i) => paxMember("x", paxRecord(`SCHILY.xattr.user.n${i}`, "v".repeat(200))));
-    const tar = Buffer.concat([...flood, member({ name: "app/a" }, Buffer.from("x")), END]);
-    expect(() => read(tar, { maxPendingMetadataBytes: 2000 })).toThrow(/ahead of one member/);
+    // A flood of repeated LOCAL `x` headers is now refused structurally, before any bound (B2)…
+    expect(() => read(Buffer.concat([...flood, member({ name: "app/a" }, Buffer.from("x")), END]), { maxPendingMetadataBytes: 2000 }))
+      .toThrow(/repeated local PAX header/);
+    // …so the accumulation bound is exercised with the metadata still LEGAL ahead of one member: one
+    // `x`, one GNU `L` and one GNU `K`, which together pass a total no single record reaches.
+    const legal = Buffer.concat([
+      paxMember("x", paxRecord("SCHILY.xattr.user.note", "v".repeat(900))),
+      member({ name: "././@LongLink", typeflag: "L" }, Buffer.from(`app/${"n".repeat(700)}\0`)),
+      member({ name: "././@LongLink", typeflag: "K" }, Buffer.from(`${"t".repeat(700)}\0`)),
+      header({ name: "app/sym", typeflag: "2", linkname: "short" }),
+      END,
+    ]);
+    expect(() => read(legal, { maxPendingMetadataBytes: 2000 })).toThrow(/ahead of one member/);
+    expect(read(legal, { maxPendingMetadataBytes: 4000 })).toHaveLength(1);
     // The same records, but spread across members, reset the accumulation and pass.
     const spread = Buffer.concat([...flood.flatMap((record, i) => [record, member({ name: `app/${i}` }, Buffer.from("x"))]), END]);
     expect(read(spread, { maxPendingMetadataBytes: 2000 })).toHaveLength(20);

@@ -25,7 +25,7 @@ import { closeSync, createReadStream, createWriteStream, mkdirSync, openSync, re
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
-import { TarFormatError, bufferSource, readTarMembers } from "./tar-reader.mjs";
+import { TarFormatError, bufferSource, isChecksumValidTarHeader, readTarMembers } from "./tar-reader.mjs";
 import { AUDIT_LIMITS } from "./subject.mjs";
 import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
@@ -329,7 +329,9 @@ const CLASSIFY_HEAD_BYTES = 1024;
 
 /**
  * THE ONE TAR-CANDIDATE PREDICATE, shared by the raw member, the gzip-decoded payload and every
- * recursive level — so the three cannot disagree about what "is a tar" (AC-AUDIT-02/03).
+ * recursive level — so the three cannot disagree about what "is a tar" (AC-AUDIT-02/03) — and built on
+ * the READER's own first-header rule (`isChecksumValidTarHeader`), so recogniser and parser do not
+ * disagree either: anything the reader would read is tried, and the reader stays the authority.
  *
  * THE DEFECT IT CLOSES. Only the ustar magic was tested, so a canonical EMPTY tar (1,024 zero bytes,
  * which has no magic) was an "ordinary file" — and bytes appended after its end blocks, a gzip stream,
@@ -340,6 +342,9 @@ const CLASSIFY_HEAD_BYTES = 1024;
 export function isTarCandidate(head) {
   if (!Buffer.isBuffer(head)) return false;
   if (looksUstar(head)) return true;
+  // A magic-less (V7) header the READER would accept is a tar here too (B1): the same checksum rule,
+  // exported from the reader, over the first bounded block.
+  if (isChecksumValidTarHeader(head)) return true;
   return head.length >= CLASSIFY_HEAD_BYTES && head.subarray(0, CLASSIFY_HEAD_BYTES).every((byte) => byte === 0);
 }
 
@@ -589,7 +594,9 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
     })) {
       members += 1;
       if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("layer inventory");
-      const name = member.name.replace(/^\.\//, "");
+      // THE CANONICAL PATH (B2) is what the inventory, whiteouts, categories and public lookup compare.
+      // An unsafe name has none; it keeps its raw spelling here and is recorded as a gap just below.
+      const name = member.canonicalName ?? member.name;
       paths.push(name);
       /**
        * AN UNSAFE NAME IS A GAP, never a silent inventory omission. An absolute, traversing, NUL-bearing
@@ -820,7 +827,7 @@ function expandArchive({ bytes, name, depth, context }) {
         limitations.push({ kind: "oversized-nested-member", layer: layerIndex, bytes: nested.size, ...at });
         continue;
       }
-      const nestedName = `${name}#${nested.name}`;
+      const nestedName = `${name}#${nested.canonicalName ?? nested.name}`;
       const chunks = [];
       if (stage(nestedName, (write) => nested.content((chunk) => { chunks.push(Buffer.from(chunk)); write(chunk); }), depth, nested.size) === undefined) {
         limitations.push({ kind: exhaustionKind(budget), layer: layerIndex, ...at });

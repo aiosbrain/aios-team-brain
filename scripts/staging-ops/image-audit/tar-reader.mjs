@@ -131,6 +131,29 @@ function verifyChecksum(header) {
   }
 }
 
+/**
+ * Is `head`'s FIRST 512-byte block a header this reader would accept? (B1)
+ *
+ * The same checksum rule and size-field rule `readTarMembers` applies, over ONE bounded block — so the
+ * inspector's tar recogniser and this reader share one definition of "a tar header", magic or not. A
+ * magic-less V7 tar is read by the parser, and a recogniser that only knew the ustar magic declined it,
+ * leaving a gzipped member inside it unexpanded under complete coverage. An all-zero block is not a
+ * header (the canonical empty archive is recognised separately). The full parser stays the authority:
+ * this only decides whether to TRY it.
+ */
+export function isChecksumValidTarHeader(head) {
+  if (!Buffer.isBuffer(head) || head.length < BLOCK) return false;
+  const block = head.subarray(0, BLOCK);
+  if (isZeroBlock(block)) return false;
+  try {
+    verifyChecksum(block);
+    numericField(block.subarray(124, 136), "size");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The only PAX keys whose VALUES this reader interprets. Every other value is opaque bytes. */
 const INTERPRETED_PAX_KEYS = Object.freeze(["path", "linkpath", "size"]);
 /**
@@ -172,6 +195,12 @@ export function parsePaxRecords(input) {
     const equals = body.indexOf(0x3d);
     if (equals <= 0) throw new TarFormatError("PAX record has no key separator");
     const key = body.subarray(0, equals).toString("latin1");
+    /**
+     * GNU SPARSE metadata renames the member (`GNU.sparse.name` IS the name Go's `archive/tar` extracts)
+     * and re-describes its data layout. This reader implements neither, so a record carrying any
+     * `GNU.sparse.*` key — local or global — is refused rather than read under the wrong name. (B2)
+     */
+    if (key.startsWith("GNU.sparse.")) throw new TarFormatError("PAX GNU.sparse metadata is not supported");
     if (INTERPRETED_PAX_KEYS.includes(key)) {
       const raw = body.subarray(equals + 1);
       let value;
@@ -206,17 +235,44 @@ export function parsePaxRecords(input) {
 }
 
 /**
- * How a member NAME would behave if anyone extracted it. Classification, not sanitisation: this
- * reader writes nothing, so an unsafe name is reported rather than repaired.
+ * THE ONE CANONICAL MEMBER PATH (B2), computed from the name AFTER ustar/PAX/GNU resolution, and the
+ * only form the inventory, the whiteout/merge computation, the build-output categories and the public
+ * path lookup see.
+ *
+ * WHY. An extractor cleans a name before writing it: `././app/x`, `.//app/x` and `app/./x` all land at
+ * `app/x`. Comparing the raw spelling put such a member outside the `/app` prefix and silently out of
+ * the inventory while the runtime wrote it inside `/app`. So repeated `/` and `.` segments collapse;
+ * Unicode and case are preserved exactly; and anything whose meaning depends on the host is REFUSED
+ * rather than guessed at: `..`, an absolute or drive-letter path, a backslash, an empty or NUL-bearing
+ * name, and a trailing `/` on anything but a directory. `.`/`./` is allowed only as the root-directory
+ * sentinel. The raw bytes still reach the scanner unchanged; a link TARGET is never canonicalised or
+ * followed.
+ *
+ * `{ ok: true, path }` or `{ ok: false, reason }` from a closed vocabulary.
  */
-export function classifyMemberPath(name) {
+export function canonicalMemberPath(name, type) {
   const raw = String(name ?? "");
-  if (raw === "") return { safe: false, reason: "empty" };
-  if (raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\")) return { safe: false, reason: "absolute" };
+  if (raw === "") return { ok: false, reason: "empty" };
+  if (raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\")) return { ok: false, reason: "absolute" };
   const segments = raw.split("/");
-  if (segments.some((segment) => segment === "..")) return { safe: false, reason: "traversal" };
-  if (raw.includes("\0")) return { safe: false, reason: "nul-byte" };
-  return { safe: true, reason: "relative" };
+  if (segments.some((segment) => segment === "..")) return { ok: false, reason: "traversal" };
+  if (raw.includes("\0")) return { ok: false, reason: "nul-byte" };
+  if (raw.includes("\\")) return { ok: false, reason: "backslash" };
+  const kept = segments.filter((segment) => segment !== "" && segment !== ".");
+  const trailingSlash = raw.endsWith("/");
+  if (kept.length === 0) return type === "directory" ? { ok: true, path: "." } : { ok: false, reason: "empty" };
+  if (trailingSlash && type !== undefined && type !== "directory") return { ok: false, reason: "trailing-slash" };
+  return { ok: true, path: `${kept.join("/")}${trailingSlash ? "/" : ""}` };
+}
+
+/**
+ * How a member NAME would behave if anyone extracted it. Classification, not sanitisation: this
+ * reader writes nothing, so an unsafe name is reported rather than repaired. Delegates to the one
+ * canonical-path rule so the two cannot disagree.
+ */
+export function classifyMemberPath(name, type) {
+  const canonical = canonicalMemberPath(name, type);
+  return canonical.ok ? { safe: true, reason: "relative" } : { safe: false, reason: canonical.reason };
 }
 
 /** A link TARGET that leaves the archive root. Recorded; never resolved, never opened. */
@@ -319,6 +375,9 @@ export function* readTarMembers(source, {
 
   let offset = 0;
   let pax = {};
+  // Set by ANY local `x` header, even one carrying only opaque keys: a second one before the member is
+  // ambiguous (Go's reader keeps only the last; a merge keeps both), so it is refused. (B2)
+  let localPaxPending = false;
   let gnuName;
   let gnuLink;
   let emitted = 0;
@@ -400,11 +459,19 @@ export function* readTarMembers(source, {
         // The same `""`-is-not-nullish hazard as an empty PAX path: refused, not taken as the name.
         const value = trimNul(body);
         if (value === "") throw new TarFormatError("GNU long name or long link is empty");
+        if ((typeflag === "L" ? gnuName : gnuLink) !== undefined) {
+          throw new TarFormatError("a repeated GNU long name or long link precedes one member");
+        }
         if (typeflag === "L") gnuName = value;
         else gnuLink = value;
       }
       else {
         const records = parsePaxRecords(body);
+        if (typeflag === "g" && (localPaxPending || gnuName !== undefined || gnuLink !== undefined)) {
+          // Go returns a `g` header as an entry of its own and RESETS pending local metadata; a reader
+          // that carries it across would name the next member differently. Refused, not guessed. (B2)
+          throw new TarFormatError("a global PAX header arrives while member metadata is pending");
+        }
         if (typeflag === "g") {
           // A GLOBAL override would redefine the name, target or size of EVERY later member; this
           // reader refuses to assume that filesystem semantics rather than guess at them. Global
@@ -413,7 +480,9 @@ export function* readTarMembers(source, {
             throw new TarFormatError("a global PAX header overrides path, linkpath or size");
           }
         } else {
-          pax = { ...pax, ...records };
+          if (localPaxPending) throw new TarFormatError("a repeated local PAX header precedes one member");
+          localPaxPending = true;
+          pax = records;
         }
       }
       surface(offset, end - offset, "metadata");
@@ -421,6 +490,12 @@ export function* readTarMembers(source, {
       continue;
     }
 
+    // A GNU long name AND a PAX path (or long link AND PAX linkpath) for one member disagree about
+    // precedence across readers — Go lets the GNU record win, this reader used to let PAX win — so the
+    // member is refused whichever order they arrived in. (B2)
+    if ((gnuName !== undefined && pax.path !== undefined) || (gnuLink !== undefined && pax.linkpath !== undefined)) {
+      throw new TarFormatError("a GNU long name or link and a PAX path or linkpath both describe one member");
+    }
     const ustarName = trimNul(header.subarray(0, 100));
     const prefix = trimNul(header.subarray(345, 500));
     const linkname = trimNul(header.subarray(157, 257));
@@ -442,6 +517,7 @@ export function* readTarMembers(source, {
     if (++emitted > maxMembers) throw new TarLimitError(`tar archive exceeds the ${maxMembers}-member limit`);
 
     const contentSize = type === "file" ? dataSize : 0;
+    const canonical = canonicalMemberPath(name, type);
     if (type === "unsupported") {
       // A body this reader does not interpret is still distributed: header, body and padding are one
       // opaque surface range. The caller ALSO records the unsupported type as a limitation.
@@ -457,7 +533,9 @@ export function* readTarMembers(source, {
       size: contentSize,
       linkTarget: type === "symlink" || type === "hardlink" ? link : "",
       mode: numericField(header.subarray(100, 108), "mode"),
-      path: classifyMemberPath(name),
+      path: canonical.ok ? { safe: true, reason: "relative" } : { safe: false, reason: canonical.reason },
+      /** The canonical relative path every consumer compares, or `undefined` when the name is unsafe. */
+      canonicalName: canonical.ok ? canonical.path : undefined,
       /**
        * Where this member's bytes start in the SOURCE. A second pass uses it to stream a large member
        * (an image layer blob) straight through a decompressor without ever holding it in memory.
@@ -493,6 +571,7 @@ export function* readTarMembers(source, {
     if (type === "file") surface(dataOffset + contentSize, nextOffset - dataOffset - contentSize, "padding");
 
     pax = {};
+    localPaxPending = false;
     gnuName = undefined;
     gnuLink = undefined;
     pendingMetadata = 0;
