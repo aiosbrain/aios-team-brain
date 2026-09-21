@@ -1280,12 +1280,20 @@ public evidence.**
     `archive-surface-range-unstageable` gap, never a split. **Non-zero bytes after a layer's or
     nested tar's end blocks** are staged but are also an `archive-trailer-nonzero` gap: opaque
     scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine.
-    A nested member is treated as a tar when its first bytes carry the ustar magic **or two zero
+    A nested member is treated as a tar when its first block is a header **the reader itself would
+    accept** (ustar or magic-less V7, by the same checksum rule), when it opens with **two zero
     blocks** (the canonical empty archive), or when its name is `.tar`/`.tgz`/`.tar.gz` — a declared
-    tar that does not parse is a `nested-archive-undecodable` gap. An ordinary `.gz` still inflates.
-  - **An unsafe member name** (absolute, traversing, NUL-bearing or empty), at any depth, is an
-    `unsafe-member-path` gap: its content is scanned, but it cannot be accounted for by the `/app`
-    inventory, so it is never silently left out of it. The claim is about the **decoded tar
+    tar that does not parse is a `nested-archive-undecodable` gap (its inflated bytes are not staged,
+    so this blocks rather than being scanned). An ordinary `.gz` still inflates.
+  - **Member names are compared CANONICALLY**, after ustar/PAX/GNU resolution: repeated `/` and `.`
+    segments collapse (`././app/x`, `.//app/x` and `app/./x` are all `app/x`), Unicode and case are
+    kept. The inventory, whiteout merge, build-output categories and public path lookup all use that
+    one form. A name that depends on the host — absolute, drive-letter, traversing, backslash-bearing,
+    NUL-bearing, empty, or a file/link with a trailing `/` — is an `unsafe-member-path` gap at any
+    depth: its content is scanned, and the record says the inventory could not account for it.
+  - **Ambiguous extended metadata refuses the run**: a repeated local PAX header, a global PAX header
+    while member metadata is pending, a GNU long name together with a PAX `path` (or long link with
+    `linkpath`) in either order, a repeated GNU long name/link, and any `GNU.sparse.*` key. The claim is about the **decoded tar
     bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
     stream), which a `docker save` export may not contain, is outside it.
   - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
