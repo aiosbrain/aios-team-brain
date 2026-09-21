@@ -684,8 +684,10 @@ export function assertResponseShape(response, { domain = null } = {}) {
     refuse("the witness observation carries no finite measured span");
   }
   if (completedAt - startedAt !== observation.span_ms) refuse("the witness observation's span does not describe its own measurement window");
-  // The observation was made before the response that reports it, and inside the challenge's life.
-  if (startedAt > createdAt) refuse("the witness observation claims to have started after the response reporting it was created");
+  // The observation was COMPLETE before the response that reports it was created (R4). Checking only
+  // its start admitted a response created mid-measurement, reporting an observation it had not yet
+  // finished. The challenge-side half of the ordering is in `assertResponseBinding`.
+  if (completedAt > createdAt) refuse("the witness observation claims to have completed after the response reporting it was created");
   if (!inert) {
     if (!Array.isArray(observation.governed_rulesets) || !observation.governed_rulesets.length) {
       refuse("the witness observation carries no complete governed ruleset set");
@@ -716,13 +718,36 @@ export function assertResponseBinding(response, { challenge, challengeDigest, ex
       throw new WitnessRefusal(`the witness response's ${field} is not the value this job derived for it`);
     }
   }
+  /**
+   * ── THE COMPLETE CAUSAL ORDER, WITH NO TOLERANCE (R4) ───────────────────────────────────────────
+   *
+   *   challenge.created ≤ observation.started ≤ observation.completed ≤ response.created
+   *                     ≤ actual receipt ≤ challenge.expires
+   *
+   * Previously only response-vs-challenge creation (with a +1ms allowance) and receipt-vs-expiry were
+   * checked here, so an observation made BEFORE the challenge existed — an old measurement answering a
+   * new challenge — was accepted, as was a response created after the instant it was received. The
+   * echoed expiry is compared EXACTLY: a response that restates a different expiry is answering some
+   * other challenge's lifetime. `observation.started ≤ observation.completed ≤ response.created` is
+   * the shape half, enforced by `assertResponseShape` above.
+   */
   const received = Date.parse(String(receivedAt));
   const created = Date.parse(String(response.created_at));
   const expires = Date.parse(String(challenge.expires_at));
+  const challengeCreated = Date.parse(String(challenge.created_at));
+  const observationStarted = Date.parse(String(response.observation?.started_at));
   if (!Number.isFinite(received)) throw new WitnessUsageError("a response receipt needs a parseable timestamp");
-  // NO positive clock-skew allowance. A response created before its challenge is an impossible
-  // ordering, and "impossible" is a refusal rather than a tolerance to widen.
-  if (created + 1 < Date.parse(String(challenge.created_at))) throw new WitnessRefusal("the witness response predates the challenge it answers; the ordering is impossible");
+  if (!Number.isFinite(challengeCreated) || !Number.isFinite(expires)) throw new WitnessRefusal("the challenge carries no parseable creation and expiry to order this response against");
+  if (String(response.challenge_expires_at) !== String(challenge.expires_at)) {
+    throw new WitnessRefusal("the witness response echoes a challenge expiry that is not the exact expiry of the challenge it answers");
+  }
+  // NO positive clock-skew allowance anywhere below. An impossible ordering is a refusal rather than
+  // a tolerance to widen.
+  if (created < challengeCreated) throw new WitnessRefusal("the witness response predates the challenge it answers; the ordering is impossible");
+  if (observationStarted < challengeCreated) {
+    throw new WitnessRefusal("the witness observation started before the challenge it answers was created; an earlier measurement cannot answer a later challenge");
+  }
+  if (created > received) throw new WitnessRefusal("the witness response claims a creation time after the instant it was received; the ordering is impossible");
   if (received > expires) {
     throw new WitnessIncomplete(
       `the witness response arrived after its ${CHALLENGE_TTL_MS}ms challenge expiry; the measurement is incomplete and the expiry is never extended`,

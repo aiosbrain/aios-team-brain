@@ -22,7 +22,8 @@ import {
   canonicalHash, collectSentinels, comparePermissions, createRedactor, deriveCaseVerdict, derivedContextNames,
   derivedRef, derivedRefs, derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug,
   assertNoCollision, assertPlannedPolicyApplies, assertSyntheticPullTarget, evaluateCheckState,
-  governedFingerprint, invertDisposable, runActorCase, runActorCases,
+  governedFingerprint, invertDisposable, runActorCase, runActorCases, resolvePublishedResponse,
+  assessHumanCaseJournal,
   createArchiveTransport, evidenceFileName, main, MAX_JOB_MINUTES, mintActorCredential, mintAppJwt,
   parseArgs, projectGovernedRuleset, readAllPages,
   positiveProviderId, readApplicableBranchRulesets, readEvidenceFile, readSingleEntryZip,
@@ -1811,20 +1812,109 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
     expect(github.refs.has(derivedRef(RUN_ID, ATTEMPT, "emergency"))).toBe(true);
   });
 
-  it("confirms an AMBIGUOUS response by ONE readback and never retries the mutation", () => {
+  it("R1 · an AMBIGUOUS mutation is inconclusive and HALTS, even when its one readback shows the requested commit", () => {
+    /**
+     * Canonical: "An ambiguous mutation ... stops further actor mutations. Never resume/retry that
+     * mutation." This test used to assert the opposite — status 0 plus a matching readback was an
+     * `accepted`, non-halting outcome, so the next actor case started. The readback is retained as
+     * reconciliation evidence; it cannot prove that THIS request moved the ref.
+     */
     const requested = sha("b");
-    const verdict = classifyCaseOutcome({
-      expected: "accepted", response: { status: 0, diagnostic: { category: "transport-timeout", policyDenial: false, ruleIds: [] } },
-      ...readback(sha("a"), requested), requestedSha: requested, operation: "update",
-    });
-    expect(verdict.outcome).toBe("accepted");
-    expect(verdict.reason).toMatch(/not retried/);
-    // And when the readback does NOT show the requested commit, it stays inconclusive — a repeat of
-    // the mutation is exactly what must not happen next.
-    expect(classifyCaseOutcome({
-      expected: "accepted", response: { status: 0, diagnostic: { category: "transport-timeout", policyDenial: false, ruleIds: [] } },
-      ...readback(sha("a"), sha("a")), requestedSha: requested, operation: "update",
-    }).outcome).toBe("inconclusive");
+    const timeout = { status: 0, diagnostic: { category: "transport-timeout", policyDenial: false, ruleIds: [] } };
+    for (const [label, after, expected] of [
+      ["accepted, readback shows the requested commit", requested, "accepted"],
+      ["accepted, readback unchanged", sha("a"), "accepted"],
+      ["denied, readback unchanged", sha("a"), "denied"],
+    ] as const) {
+      const verdict = classifyCaseOutcome({ expected, response: timeout, ...readback(sha("a"), after), requestedSha: requested, operation: "update" });
+      expect(verdict, label).toMatchObject({ outcome: "inconclusive", halt: true, ambiguous: true });
+      expect(verdict.reason, label).toMatch(/never retried, and no further actor mutation runs/);
+    }
+    // A MOVED ref on a case that must be denied stays the stronger, already-halting finding.
+    expect(classifyCaseOutcome({ expected: "denied", response: timeout, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
+      .toMatchObject({ outcome: "unexpected-mutation", halt: true });
+    // A response that never arrived at all is the same ambiguous request.
+    expect(classifyCaseOutcome({ expected: "accepted", response: undefined, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
+      .toMatchObject({ outcome: "inconclusive", halt: true });
+    // A MEASURED acceptance is unchanged.
+    expect(classifyCaseOutcome({ expected: "accepted", response: { status: 200, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } }, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
+      .toMatchObject({ outcome: "accepted", halt: false });
+  });
+
+  it("R1 · the offline verdict refuses an acceptance recorded at status 0 for BOTH accepted cases", () => {
+    const graph = Object.fromEntries(buildGraphPlan(RUN_ID, ATTEMPT).map((node, index) => [node.key, sha(`node-${index}`)]));
+    for (const caseId of ["emergency-update-no-checks", "normal-update-all-green"]) {
+      const kase = buildActorMatrix().find((entry) => entry.id === caseId)!;
+      const record = {
+        case: kase.id, actor: kase.actor, operation: kase.operation, ref: derivedRef(RUN_ID, ATTEMPT, kase.ref), force: kase.force,
+        expected: kase.expected, before_sha: graph[kase.from], requested_sha: graph[kase.to!], after_sha: graph[kase.to!],
+        http_status: 0, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false },
+        outcome: "accepted", passed: true, check_state: { expectation: kase.checks, measured: false },
+      };
+      const problems = deriveCaseVerdict(record, kase, { runId: RUN_ID, attempt: ATTEMPT, graph, normalAppId: NORMAL_APP });
+      expect(problems.some((why: string) => /acceptance at HTTP 0, which is not a measured provider acceptance/.test(why)), caseId).toBe(true);
+    }
+  });
+
+  it("R1 · a staged ambiguous accepted mutation halts its actor: the next case cannot even prepare", async () => {
+    /**
+     * Both expected-accepted cases, each with the response LOST (status 0) — once with the mutation
+     * having actually landed (readback = requested) and once without (readback unchanged). In every
+     * variant the case finalizes as a halt, the offline verdict refuses it, and the next case in the
+     * closed sequence refuses at `prepare` — before a witness, a credential or a request.
+     */
+    for (const role of ["emergency", "normal"] as const) {
+      for (const landed of [true, false]) {
+        const label = `${role} / ${landed ? "landed" : "not landed"}`;
+        rmSync(evidenceDir, { recursive: true, force: true });
+        mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+        const github = createFakeGitHub();
+        await intentAndSetup(github);
+        await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+        const env = cloudEnv(role, { ...(role === "normal" ? NORMAL_JOB_ENV : EMERGENCY_JOB_ENV), COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+        if (role === "normal") {
+          github.createNormalJob();
+          github.approve("normal");
+          await runNormalCheckPublication({ env, deps: cloudDeps(github) });
+        } else {
+          github.approve("emergency");
+        }
+        const caseId = role === "normal" ? "normal-update-all-green" : "emergency-update-no-checks";
+        const ordinal = CLOUD_CASE_SEQUENCE[role].indexOf(caseId) + 1;
+        for (const earlier of CLOUD_CASE_SEQUENCE[role].slice(0, ordinal - 1)) await runCase(github, role, earlier);
+        const branch = derivedRef(RUN_ID, ATTEMPT, role).replace("refs/heads/", "");
+        let mutations = 0;
+        const lossy = async (method: string, requestPath: string, body?: unknown) => {
+          if (method === "PATCH" && requestPath.endsWith(branch)) {
+            mutations += 1;
+            if (landed) github.handle(role, method, requestPath, body as never);
+            return { status: 0, body: null, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } };
+          }
+          const result = github.handle(role, method, requestPath, body as never);
+          return { status: result.status, body: result.status >= 400 ? null : result.body, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
+        };
+        const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, appTransport: lossy };
+        await runCaseStage({ stage: "prepare", caseId, env, deps });
+        publishChallenge(github, role, ordinal, "pre");
+        await serveOne(github, { role, caseId, ordinal, direction: "pre" });
+        await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+        publishChallenge(github, role, ordinal, "post");
+        await serveOne(github, { role, caseId, ordinal, direction: "post" });
+        await expect(runCaseStage({ stage: "await-and-finalize", caseId, env, deps }), label)
+          .rejects.toThrow(/recorded inconclusive: .*no further actor mutation runs/);
+        expect(mutations, label).toBe(1);
+        const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-${role}-${String(ordinal).padStart(2, "0")}.json`), "utf8"));
+        expect(state, label).toMatchObject({ status: "finalized", halt: true });
+        expect(state.record, label).toMatchObject({ outcome: "inconclusive", passed: false, request_class: "ambiguous" });
+        expect(state.record.after_sha === state.record.requested_sha, label).toBe(landed);
+        // The NEXT case refuses before anything else happens.
+        const next = CLOUD_CASE_SEQUENCE[role][ordinal];
+        const before = github.calls.length;
+        await expect(runCaseStage({ stage: "prepare", caseId: next, env, deps }), label).rejects.toThrow(/halted this actor/);
+        expect(github.calls.slice(before).filter((call) => ["PATCH", "DELETE", "PUT", "POST"].includes(call.method)), label).toEqual([]);
+        expect(existsSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role, ordinal: ordinal + 1, direction: "pre" })}.json`)), label).toBe(false);
+      }
+    }
   });
 
   it("refuses a reported success whose independent readback disagrees", () => {
@@ -3353,6 +3443,38 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       observation: validObservation({ started_at: "2026-09-10T08:58:00.000Z", completed_at: "2026-09-10T08:58:00.000Z" }),
     }, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: created }))
       .toThrow(/predates the challenge it answers/);
+    // R4 · the complete causal order, one invariant per case, with NO tolerance in either direction.
+    const at = (iso: string) => ({ started_at: iso, completed_at: iso, span_ms: 0 });
+    const receipt = { challenge, challengeDigest: digest, expectedBinding: binding };
+    // 1 ms before the challenge: the +1 ms allowance is gone.
+    expect(() => assertResponseBinding({ ...response, created_at: "2026-09-10T08:59:59.999Z", observation: validObservation(at("2026-09-10T08:59:59.999Z")) }, { ...receipt, receivedAt: created }))
+      .toThrow(/predates the challenge it answers/);
+    // The review's probe: an OLD observation answering a NEW challenge (observed 00:59:40–45 for a
+    // challenge created at 01:00:00), with every other ordering satisfied.
+    expect(() => assertResponseBinding({
+      ...response, created_at: "2026-09-10T09:00:10.000Z",
+      observation: validObservation({ started_at: "2026-09-10T08:59:40.000Z", completed_at: "2026-09-10T08:59:45.000Z", span_ms: 5000 }),
+    }, { ...receipt, receivedAt: "2026-09-10T09:00:20.000Z" })).toThrow(/observation started before the challenge it answers was created/);
+    // ...and the same by ONE millisecond.
+    expect(() => assertResponseBinding({ ...response, observation: validObservation({ started_at: "2026-09-10T08:59:59.999Z", completed_at: "2026-09-10T09:00:00.000Z", span_ms: 1 }) }, { ...receipt, receivedAt: created }))
+      .toThrow(/observation started before the challenge/);
+    // A response created AFTER the instant it was received (the probe's 01:00:10 vs 01:00:05), and by 1 ms.
+    expect(() => assertResponseBinding({ ...response, created_at: "2026-09-10T09:00:10.000Z" }, { ...receipt, receivedAt: "2026-09-10T09:00:05.000Z" }))
+      .toThrow(/creation time after the instant it was received/);
+    expect(() => assertResponseBinding({ ...response, created_at: "2026-09-10T09:00:05.001Z" }, { ...receipt, receivedAt: "2026-09-10T09:00:05.000Z" }))
+      .toThrow(/creation time after the instant it was received/);
+    // An observation that COMPLETED after the response reporting it was created (shape half).
+    expect(() => assertResponseBinding({ ...response, observation: validObservation({ started_at: created, completed_at: "2026-09-10T09:00:00.001Z", span_ms: 1 }) }, { ...receipt, receivedAt: "2026-09-10T09:00:01.000Z" }))
+      .toThrow(/completed after the response reporting it was created/);
+    // A CHANGED echoed expiry — later, earlier, or merely re-spelled — is some other challenge's lifetime.
+    for (const echoed of ["2026-09-10T09:03:00.001Z", "2026-09-10T09:02:59.999Z", "2026-09-10T10:03:00.000+01:00"]) {
+      expect(() => assertResponseBinding({ ...response, challenge_expires_at: echoed }, { ...receipt, receivedAt: created }), echoed)
+        .toThrow(/echoes a challenge expiry that is not the exact expiry/);
+    }
+    // The boundaries themselves are inclusive: every instant equal is a valid, if tight, ordering.
+    expect(assertResponseBinding(response, { ...receipt, receivedAt: String(challenge.expires_at) })).toBe(true);
+    expect(() => assertResponseBinding(response, { ...receipt, receivedAt: new Date(Date.parse(String(challenge.expires_at)) + 1).toISOString() }))
+      .toThrow(/after its 180000ms challenge expiry/);
     // QUEUE EXPIRY: arriving late is INCOMPLETE, and the expiry is never extended.
     expect(() => assertResponseBinding(response, { challenge, challengeDigest: digest, expectedBinding: binding, receivedAt: "2026-09-10T09:05:00.000Z" }))
       .toThrow(/after its 180000ms challenge expiry/);
@@ -4419,6 +4541,44 @@ describe("correction pass 3 — F3/F4: live source continuity, and freshness at 
       const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-normal-01.json`), "utf8"));
       expect(state.mutation_used, variant).not.toBe(true);
     }
+  });
+
+  it("R4 · judges a witness response's expiry at its ACTUAL receipt, after the archive download, where no mutation-start backstop exists", async () => {
+    /**
+     * The receipt instant was sampled BEFORE the resolver's lookup, run/job reads and archive
+     * download, so a post response whose download began before expiry and finished after it was
+     * consumed as fresh. The pre direction is incidentally backstopped by the mutation-start expiry
+     * check; the POST direction is not — so this drives the finalizer, and the clock advances ONLY
+     * inside the response archive download.
+     */
+    const github = createFakeGitHub();
+    const { caseId, deps } = await readyToExecute(github);
+    await runCaseStage({ stage: "await-and-execute", caseId, env: normalEnv(), deps });
+    publishChallenge(github, "normal", 1, "post");
+    await serveOne(github, { role: "normal", caseId, ordinal: 1, direction: "post" });
+    let clock = Date.now();
+    let downloads = 0;
+    const lateArchive = async (method: string, requestPath: string) => {
+      const result = await github.archiveImpl(method, requestPath);
+      downloads += 1;
+      clock += 200_000; // beyond the 180 s lifetime, spent entirely inside acquisition
+      return result;
+    };
+    await expect(runCaseStage({
+      stage: "await-and-finalize", caseId, env: normalEnv(),
+      deps: { ...deps, archiveTransport: lateArchive, now: () => new Date(clock) },
+    })).rejects.toThrow(/arrived after its 180000ms challenge expiry/);
+    expect(downloads).toBeGreaterThan(0);
+    // Not finalized, and not quietly retried: the case stays at its executed stage.
+    const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-normal-01.json`), "utf8"));
+    expect(state.status).not.toBe("finalized");
+    expect((state.consumed ?? []).filter((entry: { direction: string }) => entry.direction === "post")).toEqual([]);
+    // A caller cannot bring a pre-sampled receipt instant back in.
+    await expect(resolvePublishedResponse({
+      request: async () => { throw new Error("no request may be issued"); }, requestArchive: async () => { throw new Error("no download"); },
+      ctx: {}, binding: {}, challenge: { nonce: "e".repeat(64) }, challengeDigest: "d".repeat(64),
+      receivedAt: new Date().toISOString(), receiptClock: () => new Date().toISOString(),
+    })).rejects.toThrow(/read by the resolver after acquisition, never supplied in advance/);
   });
 });
 
@@ -5757,5 +5917,189 @@ describe("correction pass 5 — the dispatch/bytes/receipt join and the once-onl
       && String(record.data.direction) === "pre" ? null : record));
     const missing = blockersOf().map((entry) => entry.detail).join("\n");
     expect(missing).toMatch(/records no dispatch-result/);
+  });
+});
+
+describe("R2 — a local human case is issued once, admitted from the verified journal, and joined to it offline", () => {
+  const graph = Object.fromEntries(buildGraphPlan(RUN_ID, ATTEMPT).map((node, index) => [node.key, sha(`r2-node-${index}`)]));
+  const ctx = { role: "local", runId: RUN_ID, attempt: ATTEMPT };
+  const humanCases = () => buildActorMatrix().filter((kase) => kase.actor === "human");
+  const ref = derivedRef(RUN_ID, ATTEMPT, "human");
+  const timeout = { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false };
+  const policyDenial = { status: 422, category: "policy-denial", ruleIds: ["protected-ref-update-restricted"], policyDenial: true };
+
+  /** An in-memory stand-in for the verified chain: the same `{ type, data }` records, in order. */
+  const memoryJournal = (events: { type: string; data: Record<string, unknown> }[] = []) => ({
+    events,
+    append: (type: string, data: Record<string, unknown>) => { events.push({ type, data: JSON.parse(JSON.stringify(data ?? null)) }); },
+    read: () => events,
+  });
+
+  /** One complete, classifier-consistent denied history for a case — what a real settled case journals. */
+  const settledDenial = (kase: ReturnType<typeof humanCases>[number]) => {
+    const requested = kase.to ? graph[kase.to] : null;
+    const intent = { case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, before_sha: graph[kase.from], requested_sha: requested, expected: kase.expected, checks: kase.checks };
+    const outcome = {
+      case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, expected: kase.expected,
+      before_sha: graph[kase.from], requested_sha: requested, after_sha: graph[kase.from], http_status: 422, diagnostic: policyDenial,
+      outcome: "denied", check_state: { expectation: kase.checks, measured: false }, passed: true, reason: null,
+    };
+    return [
+      { type: "mutation-intent", data: intent },
+      { type: "mutation-result", data: { case: kase.id, status: 422, diagnostic: policyDenial } },
+      { type: "readback", data: { case: kase.id, ref, after_sha: graph[kase.from] } },
+      { type: "case-outcome", data: outcome },
+    ];
+  };
+
+  /** A provider stub: ref reads answer from `refSha`, every mutation is counted and answered by `mutate`. */
+  const provider = (mutate: (method: string) => { status: number; diagnostic: unknown }, options: { failReadbackAfterMutation?: boolean } = {}) => {
+    const calls: string[] = [];
+    let mutated = false;
+    const request = async (method: string, requestPath: string) => {
+      calls.push(`${method} ${requestPath}`);
+      if (method === "GET" && requestPath.includes("/git/ref/heads/")) {
+        if (mutated && options.failReadbackAfterMutation) return { status: 503, body: null };
+        return { status: 200, body: { object: { sha: graph.C } } };
+      }
+      if (["PATCH", "DELETE", "PUT"].includes(method)) { mutated = true; return { ...mutate(method), body: null }; }
+      throw new Error(`unexpected request ${method} ${requestPath}`);
+    };
+    return { request, calls, mutations: () => calls.filter((call) => /^(PATCH|DELETE|PUT) /.test(call)) };
+  };
+
+  it("the review probe: a replayed case is refused from the journal before ANY request, so one timeout is one request", async () => {
+    const kase = humanCases().find((entry) => entry.id === "human-force-rewind")!;
+    const journal = memoryJournal();
+    const stub = provider(() => ({ status: 0, diagnostic: timeout }));
+    const first = await runActorCase({ request: stub.request, kase, ctx, graphShas: graph, journal });
+    expect(first.halt).toBe(true);
+    expect(first.record).toMatchObject({ outcome: "inconclusive", passed: false });
+    const before = stub.calls.length;
+    await expect(runActorCase({ request: stub.request, kase, ctx, graphShas: graph, journal }))
+      .rejects.toThrow(/already has 4 journaled mutation event\(s\).*issued exactly once/);
+    expect(stub.calls.length).toBe(before); // not even a GET
+    expect(stub.mutations()).toHaveLength(1);
+    expect(journal.events.filter((event) => event.type === "mutation-intent")).toHaveLength(1);
+    // And a case cannot be admitted with no journal to admit it from.
+    await expect(runActorCase({ request: stub.request, kase, ctx, graphShas: graph, journal: null }))
+      .rejects.toThrow(/admitted only from the verified run\/attempt journal/);
+  });
+
+  it("a crash after the fsynced intent: the restarted phase issues NOTHING and stops every later case", async () => {
+    const [first] = humanCases();
+    const journal = memoryJournal([settledDenial(first)[0]]); // intent only — the process died after the fsync
+    const stub = provider(() => { throw new Error("no mutation may be issued"); });
+    const { records, halted } = await runActorCases({ request: stub.request, actor: "human", ctx, graphShas: graph, journal });
+    expect(stub.calls).toEqual([]);
+    expect(halted).toBe(first.id);
+    expect(records[0]).toMatchObject({ case: first.id, outcome: "inconclusive", passed: false });
+    expect(records[0].reason).toMatch(/never settled.*never retried/);
+    for (const record of records.slice(1)) expect(record, record.case).toMatchObject({ outcome: "not-run", passed: false });
+  });
+
+  it("a readback that fails AFTER the mutation stops the later cases in this process and in every restart", async () => {
+    const [one, two, three] = humanCases();
+    const journal = memoryJournal([...settledDenial(one), ...settledDenial(two)]);
+    const stub = provider(() => ({ status: 422, diagnostic: policyDenial }), { failReadbackAfterMutation: true });
+    const first = await runActorCases({ request: stub.request, actor: "human", ctx, graphShas: graph, journal });
+    // The two settled cases are taken from their history, never issued again.
+    expect(first.records.slice(0, 2).map((record) => record.outcome)).toEqual(["denied", "denied"]);
+    expect(first.records[2]).toMatchObject({ case: three.id, outcome: "inconclusive", passed: false });
+    expect(first.records[2].reason).toMatch(/after its mutation intent was journaled/);
+    expect(first.halted).toBe(three.id);
+    for (const record of first.records.slice(3)) expect(record, record.case).toMatchObject({ outcome: "not-run" });
+    expect(stub.mutations()).toHaveLength(1); // previously: the later cases each issued their own
+    // Restart: the chain says the third case is unresolved, so nothing at all is issued.
+    const restarted = provider(() => { throw new Error("no mutation may be issued"); });
+    const again = await runActorCases({ request: restarted.request, actor: "human", ctx, graphShas: graph, journal });
+    expect(restarted.calls).toEqual([]);
+    expect(again.halted).toBe(three.id);
+    expect(again.records.map((record) => record.outcome)).toEqual(["denied", "denied", "inconclusive", "not-run", "not-run", "not-run"]);
+  });
+
+  it("an ambiguous (timed-out) case halts, and a repeated phase re-reads its outcome instead of re-issuing it", async () => {
+    const [one, two, three] = humanCases();
+    const journal = memoryJournal([...settledDenial(one), ...settledDenial(two)]);
+    const stub = provider(() => ({ status: 0, diagnostic: timeout }));
+    const first = await runActorCases({ request: stub.request, actor: "human", ctx, graphShas: graph, journal });
+    expect(first.records[2]).toMatchObject({ case: three.id, outcome: "inconclusive" });
+    expect(first.halted).toBe(three.id);
+    expect(stub.mutations()).toHaveLength(1);
+    const repeat = provider(() => { throw new Error("no mutation may be issued"); });
+    const second = await runActorCases({ request: repeat.request, actor: "human", ctx, graphShas: graph, journal });
+    expect(repeat.calls).toEqual([]);
+    expect(second.records.slice(0, 3)).toEqual(first.records.slice(0, 3));
+    expect(second.halted).toBe(three.id);
+  });
+
+  it("the offline history owner refuses duplicate, unresolved, out-of-order, rewritten, hidden and post-halt histories", () => {
+    const [one, two, three] = humanCases();
+    const assess = (events: { type: string; data: Record<string, unknown> }[]) => assessHumanCaseJournal(events, { runId: RUN_ID, attempt: ATTEMPT });
+    const clean = assess([...settledDenial(one), ...settledDenial(two)]);
+    expect(clean.problems).toEqual([]);
+    expect(clean.cases[one.id]).toMatchObject({ state: "settled", blocking: false });
+    expect(clean.cases[three.id]).toMatchObject({ state: "none", blocking: false });
+
+    // A replay: the same case's complete sequence twice.
+    expect(assess([...settledDenial(one), ...settledDenial(one)]).cases[one.id]).toMatchObject({ state: "invalid", blocking: true });
+    // An intent with no settled sequence.
+    expect(assess(settledDenial(one).slice(0, 2)).cases[one.id]).toMatchObject({ state: "unresolved", blocking: true });
+    // Out of order.
+    const [intent, result, read, outcome] = settledDenial(one);
+    expect(assess([intent, read, result, outcome]).cases[one.id].state).toBe("invalid");
+    // An outcome the history does not support: a denial recorded for a ref the readback shows moved.
+    expect(assess([intent, result, { ...read, data: { ...read.data, after_sha: graph.B } }, outcome]).cases[one.id].state).toBe("invalid");
+    // A hidden attempt: case-scoped history for something outside the closed human matrix.
+    expect(assess([...settledDenial(one), { type: "mutation-intent", data: { ...intent.data, case: "normal-update-all-green" } }]).problems.join("\n"))
+      .toMatch(/not a local human case/);
+    // A case issued after another had already stopped further mutations.
+    expect(assess([...settledDenial(one).slice(0, 1), ...settledDenial(two)]).problems.join("\n"))
+      .toMatch(new RegExp(`${two.id} issued after ${one.id} \\(unresolved\\)`));
+  });
+
+  it("a repeated human-tests phase issues nothing new, and the final assessment joins every human case to its one history", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.createNormalJob();
+    github.approve("normal");
+    await runNormalCheckPublication({ env: cloudEnv("normal", { ...NORMAL_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: cloudDeps(github) });
+    const humanMutations = () => github.calls.filter((call) => ["PATCH", "DELETE", "PUT"].includes(call.method)
+      && (call.path.endsWith(ref.replace("refs/heads/", "")) || /\/pulls\/\d+\/merge$/.test(call.path)));
+    const first = await runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    expect(first).toMatchObject({ phase: "human-tests", status: "passed" });
+    const issued = humanMutations().length;
+    expect(issued).toBe(humanCases().length);
+    const firstEvidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
+
+    const second = await runHumanTestsPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: localDeps(github) });
+    expect(second).toMatchObject({ phase: "human-tests", status: "passed" });
+    expect(humanMutations()).toHaveLength(issued); // NOT doubled
+    expect(readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human")).cases).toEqual(firstEvidence.cases);
+    const intents = (readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as { type: string; data: { case?: string } }[])
+      .filter((record) => record.type === "mutation-intent" && record.data?.case);
+    expect(intents.map((record) => record.data.case).sort()).toEqual(humanCases().map((kase) => kase.id).sort());
+
+    const humanBlockers = () => assessEvidence({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }).blockers
+      .filter((entry: Blocker) => entry.gate === "PC-05" && /human-/.test(entry.detail));
+    expect(humanBlockers()).toEqual([]);
+
+    // A DERIVED file rewritten to disagree with the chain refuses.
+    const rewritten = structuredClone(firstEvidence);
+    rewritten.cases[0].reason = "rewritten after the fact";
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"), rewritten);
+    expect(humanBlockers().map((entry: Blocker) => `${entry.kind} ${entry.detail}`).join("\n"))
+      .toMatch(new RegExp(`invalid case ${humanCases()[0].id}'s recorded outcome is not the one its verified journal history holds`));
+    writeEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"), firstEvidence);
+
+    // A HIDDEN second attempt in the chain refuses even though the derived file shows one record.
+    const lock = acquireJournalLock({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT });
+    try {
+      const journal = openJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT, source: WORKFLOW_SHA, lock });
+      journal.append("mutation-intent", intents[1].data);
+    } finally { lock.release(); }
+    expect(humanBlockers().map((entry: Blocker) => `${entry.kind} ${entry.detail}`).join("\n"))
+      .toMatch(new RegExp(`invalid case ${String(intents[1].data.case)} was issued 2 times`));
   });
 });

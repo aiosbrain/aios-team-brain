@@ -88,7 +88,7 @@ import {
   OWNER_USER_ID, OWNER_USER_TYPE, POLL_INTERVAL_MS, PUBLISHER_DISCOVERY_CEILING, REHEARSAL_JOB_ID,
   WITNESS_ENTRY_NAME, WITNESS_JOB_ID, WITNESS_MAX_PAGES, WITNESS_MODES, WITNESS_PAGE_SIZE,
   assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
-  assertPublisherContext, assertResponseBinding, buildChallenge, buildGovernedSnapshot,
+  assertPublisherContext, assertResponseBinding, assertResponseShape, buildChallenge, buildGovernedSnapshot,
   buildResponse, bytesSha256, canonicalHash as witnessCanonicalHash, canonicalJson as witnessCanonicalJson,
   challengeArtifactName, publishWitnessResponse, readSingleEntryZip, readWitnessEnvelopeFromEvent,
   responseArtifactName, serializeDispatchEnvelope, validateGovernedSnapshot,
@@ -4394,14 +4394,26 @@ export async function readWitnessResponseArtifact({ requestArchive, artifactId }
  * evidence than the consumer would accept — and doing it BEFORE the manifest/graph and active-job
  * checks, at that.
  *
- * Every caller now gets the consumer's rules. `receivedAt` is the caller's own clock, and the
- * challenge's expiry is enforced against it as before.
+ * Every caller now gets the consumer's rules.
+ *
+ * ── THE RECEIPT INSTANT IS READ AFTER THE RESPONSE IS IN HAND (R4) ──────────────────────────────
+ *
+ * Callers used to pass `receivedAt`, sampled BEFORE this function's provider lookup, run/job reads
+ * and archive download. The expiry was then checked against an instant that preceded all of that
+ * network time, so a lookup that began before expiry and finished after it was consumed as fresh.
+ * The caller now passes its CLOCK, and it is read here, once the complete response has been
+ * acquired and its closed shape validated — the instant it was actually received. A pre-sampled
+ * instant is refused rather than silently used.
  */
 export async function resolvePublishedResponse({
-  request, requestArchive, ctx, binding, challenge, challengeDigest, receivedAt,
+  request, requestArchive, ctx, binding, challenge, challengeDigest, receiptClock, receivedAt: presampled = undefined,
 }) {
+  if (presampled !== undefined) throw new UsageError("a response's receipt instant is read by the resolver after acquisition, never supplied in advance");
+  if (typeof receiptClock !== "function") throw new UsageError("resolving a witness response needs the consumer's receipt clock");
   const found = await findWitnessResponseArtifact({ request, ctx, binding, nonce: challenge.nonce });
   const { response, entry_digest: entryDigest, archive_bytes: archiveBytes, response_bytes: responseBytes } = await readWitnessResponseArtifact({ requestArchive, artifactId: found.artifact_id });
+  assertResponseShape(response);
+  const receivedAt = String(receiptClock());
   assertResponseBinding(response, { challenge, challengeDigest, expectedBinding: binding, receivedAt });
   // The RECEIPT INSTANT is part of the binding (the expiry is checked against it), so it travels
   // with the result and is retained — the assessor re-runs the same comparison.
@@ -4430,7 +4442,8 @@ export async function awaitWitnessResponse({
     try {
       const resolved = await resolvePublishedResponse({
         request, requestArchive, ctx, binding, challenge, challengeDigest,
-        receivedAt: new Date(now()).toISOString(),
+        // Read by the resolver once the response is in hand, never before the lookup (R4).
+        receiptClock: () => new Date(now()).toISOString(),
       });
       // ONCE-ONLY, durably. A replayed response is refused by the store, not by memory.
       const consumed = store.consumeNonce(caseId, {
@@ -5556,7 +5569,7 @@ export async function beginWitnessItem({
   const challengeBinding = Object.fromEntries(BINDING_FIELDS.map((field) => [field, challenge[field] ?? null]));
   const resolveExisting = () => resolvePublishedResponse({
     request, requestArchive, ctx, binding: challengeBinding, challenge,
-    challengeDigest: entry.digest, receivedAt: now().toISOString(),
+    challengeDigest: entry.digest, receiptClock: () => now().toISOString(),
   });
 
   /**
@@ -5735,7 +5748,7 @@ export async function pollWitnessPublication({ request, requestArchive, ctx, jou
     const resolved = await resolvePublishedResponse({
       request, requestArchive, ctx, binding: pending.challengeBinding,
       challenge: pending.challenge, challengeDigest: pending.challengeDigest,
-      receivedAt: now().toISOString(),
+      receiptClock: () => now().toISOString(),
     });
     const reconciled = {
       case_id: item.caseId, role: item.role, direction: item.direction,
