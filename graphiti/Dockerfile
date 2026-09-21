@@ -379,6 +379,50 @@ RUN F=/app/graph_service/routers/ingest.py \
 COPY verify-single-worker.py /tmp/verify-single-worker.py
 RUN /app/.venv/bin/python /tmp/verify-single-worker.py /app/graph_service/routers/ingest.py
 
+# ── THE KEYLESS STAGING ENTRY — a mode SELECTOR in front of the app (AIO-997 / AC-07) ──────────────
+#
+# THE PROBLEM IT SOLVES. `graph_service/config.py` declares `openai_api_key: str` with no default and
+# the lifespan constructs ZepGraphiti/OpenAIGenericClient, so removing the provider key — which the
+# accepted copied-staging contract REQUIRES of staging — means the sidecar cannot start at all. The
+# contract needs both "no provider credentials" and "a deployed pinned sidecar", and the two
+# reconciliations that suggest themselves (a fake key, a guessed proxy) are both refused. So staging
+# gets an explicit keyless no-model mode instead.
+#
+# WHY AN ENTRY MODULE AND NOT ANOTHER `sed`. Every patch above rewrites behaviour that only exists
+# inside the library, and pays the anchored-assert tax for it. This requirement is the opposite shape:
+# "construct none of that". An import boundary states that directly; a string patch to a third-party
+# Settings class could only approximate it, and would leave the constructors it did not reach. Nothing
+# upstream is modified here — on the ordinary/production branch this module re-exports
+# `graph_service.main.app` unchanged, same lifespan, same routes, same missing-key failure.
+#
+# SCOPE SELECTION is `STAGING_OPS_ENVIRONMENT_ID` == `RAILWAY_ENVIRONMENT_ID`, and nothing else.
+# Railway injects an environment ID into every deployment, so its presence alone never selects
+# staging; only an operator-supplied pin that EQUALS it does. A mismatched pin, a pin with no actual
+# environment, a copy claim with no pin, or an unrecognised `STAGING_DATA_MODE` inside pinned scope
+# all REFUSE STARTUP rather than fall through to production — falling through is how a misconfigured
+# staging deployment would quietly become a key-requiring, extraction-capable one.
+#
+# THE GATE. `verify-staging-entry.py` runs the full scope matrix and BUILDS the keyless application
+# here, asserting it registers only /healthcheck, disables docs/redoc/openapi, answers health 200 with
+# the no-model mode, refuses everything else with the named 403, and — the load-bearing one — imports
+# none of openai/neo4j/graphiti_core/graph_service.main/zep_graphiti/routers. That is behaviour, not a
+# grep. What it CANNOT prove is what a real process does over real HTTP with a real network stack:
+# `staging-keyless-diagnostic.py` does that inside the built image (see keyless-image-check.sh), and
+# it is MOUNTED for the run, never copied — no test hook and no dummy key ships in this image.
+COPY staging-entry.py /app/graph_service/staging_entry.py
+COPY verify-staging-entry.py /tmp/verify-staging-entry.py
+RUN /app/.venv/bin/python /tmp/verify-staging-entry.py /app/graph_service/staging_entry.py
+
+# ...and one thing that gate structurally cannot check: it loads the module BY PATH, which proves the
+# code is correct and says nothing about whether UVICORN can find it. `graph_service` is installed
+# into the venv — that is why the patches above take effect at runtime — so the CMD target has to
+# resolve through the venv, not through the working directory. This runs from `/` deliberately:
+# `python -c` puts the CWD on sys.path, so the same check from /app would pass on a file uvicorn could
+# never import (a console script's sys.path[0] is /app/.venv/bin, not the CWD). It also asserts the
+# import constructs nothing — the laziness the keyless branch depends on, checked against the
+# INSTALLED module rather than the repo copy.
+RUN cd / && /app/.venv/bin/python -c "import sys; import graph_service.staging_entry as e; assert e.__file__ == '/app/graph_service/staging_entry.py', e.__file__; assert 'fastapi' not in sys.modules, 'importing the CMD target imported fastapi'; leaked = sorted(m for m in sys.modules if m.split('.')[0] in ('openai', 'neo4j', 'graphiti_core') or m == 'graph_service.main' or m == 'graph_service.zep_graphiti' or m.startswith('graph_service.routers')); assert not leaked, leaked; print('staging entry: importable as the CMD target, and importing it constructs nothing')"
+
 # ── THE RUNTIME REVERT — the trap that explains Trap 1 ─────────────────────────────────────────────
 #
 # The base image's CMD is `uv run uvicorn …`, and **`uv run` SYNCS the venv against /app/uv.lock
@@ -394,7 +438,13 @@ RUN /app/.venv/bin/python /tmp/verify-single-worker.py /app/graph_service/router
 # FIX: start uvicorn from the venv DIRECTLY. No `uv run`, so nothing can re-resolve the environment
 # between build and serve. `graph_service` is already installed into that venv (and WORKDIR is /app),
 # so this is the same process, minus the sync.
-CMD ["/app/.venv/bin/uvicorn", "graph_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# ⚠️ THE TARGET IS NOW THE SELECTOR, and the deploy precondition at the top of this file matters more
+# than ever: a Railway custom start command overrides this CMD, and the measured live override
+# invokes this same venv binary against the OLD `graph_service.main:app` target — so it bypasses the
+# selector, and a staging service with its provider key removed would simply crash. Clearing that
+# override is part of commissioning staging (docs/OPS.md §11), and nothing in the image can detect it.
+CMD ["/app/.venv/bin/uvicorn", "graph_service.staging_entry:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # Belt and braces: state the intended pin in pyproject.toml. We do NOT regenerate uv.lock (that needs
 # uv, which is root-only in this image). The deliberate consequence is that if anyone reinstates
