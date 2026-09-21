@@ -321,7 +321,9 @@ export function canonicalMemberPath(name, type) {
   const trailingSlash = raw.endsWith("/");
   if (kept.length === 0) return type === "directory" ? { ok: true, path: "." } : { ok: false, reason: "empty" };
   if (trailingSlash && type !== undefined && type !== "directory") return { ok: false, reason: "trailing-slash" };
-  return { ok: true, path: `${kept.join("/")}${trailingSlash ? "/" : ""}` };
+  // A DIRECTORY's key always ends in `/` (B6): identity is driven by its type, not by whether the
+  // archive happened to spell `app` or `app/`, so the merged view sees one key for one directory.
+  return { ok: true, path: `${kept.join("/")}${type === "directory" || trailingSlash ? "/" : ""}` };
 }
 
 /**

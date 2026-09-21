@@ -86,6 +86,15 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   const layers = [];
   const limitations = [];
   const layerPaths = [];
+  /**
+   * EVERY SYMLINK LOCATION SEEN SO FAR, image-wide (B5). An extractor resolves a member's parent
+   * directories inside the rootfs, following symlinks — so `side -> app` then `side/planted.js` writes
+   * `/app/planted.js`, which the `/app` inventory never compares. The auditor never follows a link; it
+   * records a member whose proper ancestor IS or WAS a symlink (in a lower layer, or anywhere in the
+   * same layer whatever the tar order) as a blocking gap. A historical union: a link later replaced
+   * still counts, which is conservative.
+   */
+  const symlinkLocations = new Set();
   const appMembers = [];
   const staged = new Map();
   const buildOutputs = new Map();
@@ -168,6 +177,10 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     }
     limitations.push(...inventory.limitations);
     archiveSurfaceBytes += inventory.archiveSurfaceBytes;
+    for (const link of inventory.symlinks) symlinkLocations.add(link);
+    if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline)) {
+      limitations.push({ kind: "member-through-symlink", layer: layerIndex });
+    }
     layers.push(Object.freeze({
       index: layerIndex,
       digest: descriptor.digest,
@@ -184,6 +197,8 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   }
 
   const merged = mergedFilesystem(layerPaths);
+  // Layers whose merged view extractors would not agree on (B6) — each a blocking gap.
+  for (const layer of merged.conflicts) limitations.push({ kind: "merged-type-conflict", layer });
   return {
     config,
     configScanId,
@@ -234,6 +249,24 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     }),
     identityVerified: layers.length === manifest.layers.length && layers.every((layer) => layer.form),
   };
+}
+
+/**
+ * Does any member in `paths` sit BENEATH a known symlink? Segment by segment over each path's proper
+ * ancestors — a set lookup per segment, never a pairwise scan — with the clock consulted as it goes.
+ * Only the canonical names are compared; no link target is ever read or resolved.
+ */
+function membersThroughSymlink(paths, symlinkLocations, deadline) {
+  let checked = 0;
+  for (const path of paths) {
+    checked += 1;
+    if (deadline && checked % 4096 === 0) deadline.assert("symlink ancestry");
+    const segments = (path.endsWith("/") ? path.slice(0, -1) : path).split("/");
+    for (let i = 1; i < segments.length; i += 1) {
+      if (symlinkLocations.has(segments.slice(0, i).join("/"))) return true;
+    }
+  }
+  return false;
 }
 
 /**

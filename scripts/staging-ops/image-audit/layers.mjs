@@ -190,9 +190,16 @@ const WHITEOUT = ".wh.";
 
 /** What a member name means in overlay terms. A whiteout DELETES; it is not a file called `.wh.x`. */
 export function whiteoutOf(name) {
-  const at = name.lastIndexOf("/");
-  const dir = at === -1 ? "" : name.slice(0, at + 1);
-  const base = at === -1 ? name : name.slice(at + 1);
+  /**
+   * The BASENAME after one trailing `/` is dropped (B6). Extractors test the cleaned basename whatever
+   * the entry's type, so a directory-typed `app/.wh.d/` is a whiteout of `app/d` to them. Reading the
+   * empty text after that slash as "no whiteout" left `app/d/x.js` visible. The inspector separately
+   * records any marker that is not an EMPTY REGULAR file — the only form OCI permits — as a gap.
+   */
+  const clean = name.endsWith("/") ? name.slice(0, -1) : name;
+  const at = clean.lastIndexOf("/");
+  const dir = at === -1 ? "" : clean.slice(0, at + 1);
+  const base = at === -1 ? clean : clean.slice(at + 1);
   if (base === OPAQUE) return { kind: "opaque", target: dir };
   if (base.startsWith(WHITEOUT)) return { kind: "delete", target: `${dir}${base.slice(WHITEOUT.length)}` };
   return { kind: "none" };
@@ -210,40 +217,91 @@ export function mergedFilesystem(layerPaths) {
   const visible = new Map();
   const shadowed = [];
   /**
-   * Does `key` sit at or under the deleted `target`, on a SEGMENT boundary? (I1) A directory is keyed
-   * with a trailing `/`, so a whiteout of `app/d` must remove `app/d`, `app/d/` and `app/d/…` — and
-   * never `app/different`, which merely shares a prefix.
+   * Layers in which the merged view is AMBIGUOUS (B6): a layer that both replaces a path with a
+   * non-directory and places entries beneath that path, that carries a file and a directory of the same
+   * name, or that writes beneath a path a lower layer made a non-directory. Extractors do not agree on
+   * those, so the inspector records each as a blocking gap rather than picking one outcome.
    */
-  const under = (key, target) => key === target || key === `${target}/` || key.startsWith(`${target}/`);
+  const conflicts = new Set();
+
+  /**
+   * THE KEY MODEL. A directory key ends in `/` (canonical directory identity is type-driven, so `app`
+   * and `app/` written as directories are one key); every other key does not. `.` is the root.
+   *
+   * SEGMENT INDEX. `beneath` maps a directory key to the visible keys strictly under it, so a subtree
+   * removal is a lookup rather than a scan of every visible key — bounded by the member count and the
+   * path depth, never quadratic.
+   */
+  const beneath = new Map();
+  const ancestorsOf = (key) => {
+    const bare = key.endsWith("/") ? key.slice(0, -1) : key;
+    const segments = bare.split("/");
+    const out = [];
+    for (let i = 1; i < segments.length; i += 1) out.push(`${segments.slice(0, i).join("/")}/`);
+    return out;
+  };
+  const place = (key, layer) => {
+    visible.set(key, layer);
+    for (const ancestor of ancestorsOf(key)) {
+      let set = beneath.get(ancestor);
+      if (!set) beneath.set(ancestor, (set = new Set()));
+      set.add(key);
+    }
+  };
+  const remove = (key, removedBy, reason) => {
+    if (!visible.has(key)) return;
+    shadowed.push({ path: key, layer: visible.get(key), removedBy, reason });
+    visible.delete(key);
+    for (const ancestor of ancestorsOf(key)) beneath.get(ancestor)?.delete(key);
+  };
+  /** `target` itself, its directory spelling, and everything beneath it — on a segment boundary. */
+  const subtree = (target) => [target, `${target}/`, ...(beneath.get(`${target}/`) ?? [])];
+  const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
+
   layerPaths.forEach((paths, index) => {
     /**
-     * TWO PASSES PER LAYER (I1). A layer's whiteouts apply to the state BELOW it, and its own ordinary
-     * entries are then added on top — whatever order the tar lists them in. A single pass let a file
-     * recreated in the same layer be deleted by a whiteout listed after it, and let a directory
-     * whiteout remove only its exact key, leaving everything beneath it "visible".
+     * PASS 1 — this layer's whiteouts, against the state BELOW it (I1). A `.wh.<x>` removes `x`, `x/` and
+     * everything beneath; an opaque marker removes the children of its directory.
      */
     for (const name of paths) {
       const white = whiteoutOf(name);
       if (white.kind === "delete") {
-        for (const existing of [...visible.keys()]) {
-          if (!under(existing, white.target)) continue;
-          shadowed.push({ path: existing, layer: visible.get(existing), removedBy: index, reason: "deleted" });
-          visible.delete(existing);
-        }
+        for (const existing of subtree(white.target)) remove(existing, index, "deleted");
       } else if (white.kind === "opaque") {
-        for (const existing of [...visible.keys()]) {
-          if (existing.startsWith(white.target) && existing !== white.target) {
-            shadowed.push({ path: existing, layer: visible.get(existing), removedBy: index, reason: "opaque-directory" });
-            visible.delete(existing);
-          }
-        }
+        for (const existing of [...(beneath.get(white.target) ?? [])]) remove(existing, index, "opaque-directory");
       }
     }
-    for (const name of paths) {
-      if (whiteoutOf(name).kind !== "none") continue;
-      if (visible.has(name)) shadowed.push({ path: name, layer: visible.get(name), removedBy: index, reason: "overwritten" });
-      visible.set(name, index);
+
+    /**
+     * PASS 2 — this layer's entries, with TYPE REPLACEMENT against the layers below (B6, OCI "changeset
+     * over existing files"): a non-directory at `P` replaces a lower directory `P/` and everything under
+     * it; a directory at `P/` replaces a lower non-directory `P`; a directory over a directory merges.
+     */
+    const entries = paths.filter((name) => whiteoutOf(name).kind === "none");
+    const keys = new Set(entries);
+    const hasDescendantHere = new Set();
+    for (const key of entries) for (const ancestor of ancestorsOf(key)) hasDescendantHere.add(ancestor);
+    const lowerSnapshot = new Map(visible);
+
+    for (const key of entries) {
+      if (isDirectoryKey(key)) {
+        const bare = key.slice(0, -1);
+        if (keys.has(bare)) conflicts.add(index); // a file and a directory of one name in one layer
+        if (lowerSnapshot.has(bare) && !isDirectoryKey(bare)) remove(bare, index, "replaced-by-directory");
+      } else {
+        if (keys.has(`${key}/`) || hasDescendantHere.has(`${key}/`)) conflicts.add(index);
+        for (const existing of [`${key}/`, ...(beneath.get(`${key}/`) ?? [])]) {
+          if (lowerSnapshot.has(existing)) remove(existing, index, "replaced-by-non-directory");
+        }
+      }
+      // Writing beneath a path a LOWER layer left as a non-directory is not a merge any extractor agrees on.
+      for (const ancestor of ancestorsOf(key)) {
+        const bare = ancestor.slice(0, -1);
+        if (lowerSnapshot.has(bare) && visible.has(bare) && !keys.has(ancestor)) conflicts.add(index);
+      }
+      if (visible.has(key)) remove(key, index, "overwritten");
+      place(key, index);
     }
   });
-  return { visible, shadowed };
+  return { visible, shadowed, conflicts: Object.freeze([...conflicts].sort((a, b) => a - b)) };
 }

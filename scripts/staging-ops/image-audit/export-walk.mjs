@@ -27,6 +27,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
 import { TarFormatError, bufferSource, isChecksumValidTarHeader, readTarMembers } from "./tar-reader.mjs";
 import { AUDIT_LIMITS } from "./subject.mjs";
+import { whiteoutOf } from "./layers.mjs";
 import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
 /** A positioned-read source over a file. No whole-file buffer exists at any point. */
@@ -429,6 +430,8 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   mkdirSync(join(scanDir, `L${layerIndex}`), { recursive: true });
   const budget = stagingBudget ?? createStagingBudget(limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY);
   const paths = [];
+  /** Canonical locations of EVERY symlink in this layer, inside `/app` or not (B5). Never resolved. */
+  const symlinks = [];
   const appMembers = [];
   const staged = new Map();
   const limitations = [];
@@ -436,6 +439,8 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   let sequence = 0;
   let expandedBytes = 0;
   let members = 0;
+  let malformedWhiteoutRecorded = false;
+  let rootReplacedRecorded = false;
 
   /**
    * Write bytes to scratch under an id THIS module chose, in the fixed scan representation, and
@@ -605,6 +610,25 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
        * and scanned as usual; the record says the inventory could not account for it.
        */
       if (!member.path.safe) limitations.push({ kind: "unsafe-member-path", layer: layerIndex });
+      if (member.type === "symlink") symlinks.push(name);
+      /**
+       * A WHITEOUT MARKER THAT IS NOT AN EMPTY REGULAR FILE (B6). OCI permits only that form; extractors
+       * still act on a directory-, link- or content-bearing marker by its basename. The merge applies it
+       * the way they would, and the record says it was malformed — once per layer.
+       */
+      if (whiteoutOf(name).kind !== "none" && (member.type !== "file" || member.size !== 0) && !malformedWhiteoutRecorded) {
+        malformedWhiteoutRecorded = true;
+        limitations.push({ kind: "malformed-whiteout", layer: layerIndex });
+      }
+      /**
+       * THE INVENTORY ROOT AS A NON-DIRECTORY (B6). A file or link named exactly `app` replaces the
+       * directory the inventory compares; the merge then reports every `/app` file missing, and this
+       * records why — once per layer.
+       */
+      if (name === prefix.replace(/\/$/, "") && member.type !== "directory" && !rootReplacedRecorded) {
+        rootReplacedRecorded = true;
+        limitations.push({ kind: "inventory-root-not-directory", layer: layerIndex });
+      }
 
       if (member.type === "symlink" || member.type === "hardlink") {
         // Compared AS LINKS. The target is a string here and stays one — nothing resolves it.
@@ -679,6 +703,7 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   }
   return {
     paths,
+    symlinks,
     appMembers,
     staged,
     limitations,
