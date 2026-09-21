@@ -774,7 +774,13 @@ export function assessProbeLifecycle(records, { intentSha256, intentArtifact, co
   equalOrRefuse({ workflow_file: dispatch.data.workflow_file, ref: dispatch.data.ref }, { workflow_file: PROBE_WORKFLOW_FILE, ref: PROBE_BRANCH }, "the probe dispatch intent");
   if (dispatch.seq < readback.seq) refuse("the probe was dispatched before its ref was read back");
   const dispatchMs = timeOf(dispatch.ts, "the dispatch intent time");
-  if (timeOf(dispatch.data.deadline_at, "the dispatch deadline") !== dispatchMs + DISPATCH_DEADLINE_MS) refuse("the dispatch deadline is not ten minutes from the durable dispatch intent");
+  // The operator computes the deadline from its clock read immediately BEFORE the durable append, so
+  // it can only be at or before ten minutes from the record's own time — never later. The stricter
+  // of the two bounds governs; a deadline that would extend the window refuses.
+  const deadlineMs = timeOf(dispatch.data.deadline_at, "the dispatch deadline");
+  if (deadlineMs > dispatchMs + DISPATCH_DEADLINE_MS || deadlineMs < dispatchMs + DISPATCH_DEADLINE_MS - 60_000) {
+    refuse("the dispatch deadline is not ten minutes from the durable dispatch intent");
+  }
   const dispatched = only(records, "dispatch-result");
   if (dispatched.data.response_complete === true && dispatched.data.http_status !== 204) refuse("the provider refused the probe dispatch");
   if (records.some((record) => record.type === "run-unidentified")) refuse("the probe run could not be identified uniquely");
@@ -801,7 +807,7 @@ export function assessProbeLifecycle(records, { intentSha256, intentArtifact, co
   if (closed.seq !== records[records.length - 1].seq || closed.data.outcome !== "measured") refuse("the probe journal is not closed as a measured probe");
   const policies = records.filter((record) => record.type === "policy-captured");
   return {
-    run_id: identified.data.run_id, dispatch_ms: dispatchMs, deadline_ms: dispatchMs + DISPATCH_DEADLINE_MS,
+    run_id: identified.data.run_id, dispatch_ms: dispatchMs, deadline_ms: deadlineMs,
     selection: identified.data.descriptor, cleanup_confirmed_ms: timeOf(lastAbsent.data.measured_at, "the absence readback time"),
     cleanup_intent_ms: timeOf(cleanupIntents[0].ts, "the cleanup intent time"),
     captures: records.filter((record) => record.type === "capture-recorded").map((record) => record.data),
