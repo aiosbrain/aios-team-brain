@@ -102,8 +102,29 @@ function numericField(buffer, label) {
     if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new TarFormatError(`tar ${label} exceeds a safe integer`);
     return Number(value);
   }
-  const text = trimNul(buffer).trim();
-  if (text === "") return 0;
+  return octalField(buffer, label, { allowBlank: true });
+}
+
+/**
+ * THE ONE OCTAL RULE (B4), shared by the checksum, size and mode fields.
+ *
+ * ASCII NUL and space are trimmed from BOTH ends — Go's `parseOctal` does `bytes.Trim(b, " \x00")` —
+ * and what remains must be octal digits only. This used to cut the field at its FIRST NUL, so a size
+ * field of `\0` `0000001000` `\0` read as 0 here and 512 in the runtime's extractor: the member's
+ * body was then parsed as further members, planting a phantom one. An interior NUL, space or any other
+ * byte is refused rather than truncated. A blank field is 0 only where `allowBlank` says so; a blank
+ * checksum is never accepted.
+ */
+function octalField(buffer, label, { allowBlank }) {
+  let start = 0;
+  let end = buffer.length;
+  while (start < end && (buffer[start] === 0x00 || buffer[start] === 0x20)) start += 1;
+  while (end > start && (buffer[end - 1] === 0x00 || buffer[end - 1] === 0x20)) end -= 1;
+  if (start === end) {
+    if (allowBlank) return 0;
+    throw new TarFormatError(`tar ${label} is blank`);
+  }
+  const text = buffer.subarray(start, end).toString("latin1");
   if (!/^[0-7]+$/.test(text)) throw new TarFormatError(`tar ${label} is not an octal field`);
   const value = Number.parseInt(text, 8);
   if (!Number.isSafeInteger(value)) throw new TarFormatError(`tar ${label} exceeds a safe integer`);
@@ -115,9 +136,14 @@ function numericField(buffer, label) {
  * plausible member list — silently reduced coverage is the outcome this whole build exists to avoid.
  */
 function verifyChecksum(header) {
-  const declared = trimNul(header.subarray(148, 156)).trim();
-  if (declared === "") throw new TarFormatError("tar header carries no checksum");
-  if (!/^[0-7]+$/.test(declared)) throw new TarFormatError("tar header checksum is not an octal field");
+  let expected;
+  try {
+    expected = octalField(header.subarray(148, 156), "header checksum", { allowBlank: false });
+  } catch (error) {
+    // Keep the historical message for the one case callers distinguish: a header with no checksum.
+    if (/is blank/.test(error.message)) throw new TarFormatError("tar header carries no checksum");
+    throw error;
+  }
   let unsigned = 0;
   let signed = 0;
   for (let i = 0; i < BLOCK; i++) {
@@ -125,7 +151,6 @@ function verifyChecksum(header) {
     unsigned += byte;
     signed += byte > 127 ? byte - 256 : byte;
   }
-  const expected = Number.parseInt(declared, 8);
   if (expected !== unsigned && expected !== signed) {
     throw new TarFormatError(`tar header checksum ${expected} does not match the header bytes`);
   }
@@ -152,6 +177,40 @@ export function isChecksumValidTarHeader(head) {
   } catch {
     return false;
   }
+}
+
+/**
+ * WHICH HEADER FORMAT, decided by the magic exactly as Go's `archive/tar` `getFormat` decides it (B3):
+ *   `ustar\0` + a `tar\0` trailer at 508 → STAR;  `ustar\0` → POSIX ustar/PAX;
+ *   `ustar ` + ` \0` → GNU;  anything else → V7.
+ * The format decides whether bytes 345–500 are a PATH PREFIX at all: only POSIX ustar has one of 155
+ * bytes. In GNU they are atime/ctime and sparse data; V7 has no such field; STAR splits them into a
+ * 131-byte prefix and times. Applying the prefix everywhere named a GNU or V7 member `decoy/app/x`
+ * while the runtime wrote `app/x` — outside `/app` for the inventory, silently.
+ */
+function headerFormat(header) {
+  const magic = header.subarray(257, 263).toString("latin1");
+  const version = header.subarray(263, 265).toString("latin1");
+  if (magic === "ustar\0") return header.subarray(508, 512).toString("latin1") === "tar\0" ? "star" : "posix";
+  if (magic === "ustar " && version === " \0") return "gnu";
+  return "v7";
+}
+
+/**
+ * The name PREFIX a member's header carries, or a REFUSAL (B3). POSIX ustar applies its 155-byte
+ * prefix. For every other format any non-zero byte in 345–500 is refused: GNU times, a V7 header with
+ * bytes where it defines none, or a STAR layout this reader does not implement are all places where
+ * extractors disagree about the name, and the audit refuses rather than picks one. This costs
+ * compatibility with archives that really carry GNU atime/ctime or STAR prefixes; that cost is
+ * accepted, and ordinary GNU/V7 headers (zero there) are unaffected.
+ */
+function headerPrefix(header) {
+  const format = headerFormat(header);
+  if (format === "posix") return trimNul(header.subarray(345, 500));
+  if (!isZeroBlock(header.subarray(345, 500))) {
+    throw new TarFormatError(`a ${format} tar header carries bytes where only POSIX ustar has a name prefix`);
+  }
+  return "";
 }
 
 /** The only PAX keys whose VALUES this reader interprets. Every other value is opaque bytes. */
@@ -497,7 +556,7 @@ export function* readTarMembers(source, {
       throw new TarFormatError("a GNU long name or link and a PAX path or linkpath both describe one member");
     }
     const ustarName = trimNul(header.subarray(0, 100));
-    const prefix = trimNul(header.subarray(345, 500));
+    const prefix = headerPrefix(header);
     const linkname = trimNul(header.subarray(157, 257));
     const name = pax.path ?? gnuName ?? (prefix ? `${prefix}/${ustarName}` : ustarName);
     const link = pax.linkpath ?? gnuLink ?? linkname;

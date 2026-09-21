@@ -209,23 +209,38 @@ export function whiteoutOf(name) {
 export function mergedFilesystem(layerPaths) {
   const visible = new Map();
   const shadowed = [];
+  /**
+   * Does `key` sit at or under the deleted `target`, on a SEGMENT boundary? (I1) A directory is keyed
+   * with a trailing `/`, so a whiteout of `app/d` must remove `app/d`, `app/d/` and `app/d/…` — and
+   * never `app/different`, which merely shares a prefix.
+   */
+  const under = (key, target) => key === target || key === `${target}/` || key.startsWith(`${target}/`);
   layerPaths.forEach((paths, index) => {
+    /**
+     * TWO PASSES PER LAYER (I1). A layer's whiteouts apply to the state BELOW it, and its own ordinary
+     * entries are then added on top — whatever order the tar lists them in. A single pass let a file
+     * recreated in the same layer be deleted by a whiteout listed after it, and let a directory
+     * whiteout remove only its exact key, leaving everything beneath it "visible".
+     */
     for (const name of paths) {
       const white = whiteoutOf(name);
       if (white.kind === "delete") {
-        if (visible.has(white.target)) shadowed.push({ path: white.target, layer: visible.get(white.target), removedBy: index, reason: "deleted" });
-        visible.delete(white.target);
-        continue;
-      }
-      if (white.kind === "opaque") {
+        for (const existing of [...visible.keys()]) {
+          if (!under(existing, white.target)) continue;
+          shadowed.push({ path: existing, layer: visible.get(existing), removedBy: index, reason: "deleted" });
+          visible.delete(existing);
+        }
+      } else if (white.kind === "opaque") {
         for (const existing of [...visible.keys()]) {
           if (existing.startsWith(white.target) && existing !== white.target) {
             shadowed.push({ path: existing, layer: visible.get(existing), removedBy: index, reason: "opaque-directory" });
             visible.delete(existing);
           }
         }
-        continue;
       }
+    }
+    for (const name of paths) {
+      if (whiteoutOf(name).kind !== "none") continue;
       if (visible.has(name)) shadowed.push({ path: name, layer: visible.get(name), removedBy: index, reason: "overwritten" });
       visible.set(name, index);
     }
