@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -87,6 +87,12 @@ function chainTo(via: ReadonlyMap<string, string | null>, file: string): string 
   return chain.reverse().join(" → ");
 }
 
+/** The files a request, page, action, script or process start can begin from. */
+function entryPoints(tree: ReadonlyMap<string, string>): string[] {
+  // Root-level files (proxy.ts, instrumentation*.ts, sentry.*.config.ts, next.config.ts, …) are loaded by Next itself.
+  return [...tree.keys()].filter((f) => /^(app|scripts)\//.test(f) || !f.includes("/"));
+}
+
 function readTree(): Map<string, string> {
   const tree = new Map<string, string>();
   const walk = (dir: string): void => {
@@ -104,7 +110,10 @@ function readTree(): Map<string, string> {
     }
   };
   for (const dir of ["app", "lib", "scripts", "components"]) walk(join(ROOT, dir));
-  if (existsSync(join(ROOT, "instrumentation.ts"))) tree.set("instrumentation.ts", readFileSync(join(ROOT, "instrumentation.ts"), "utf8"));
+  for (const name of readdirSync(ROOT)) {
+    const p = join(ROOT, name);
+    if (/\.(ts|tsx|mjs|js)$/.test(name) && !name.startsWith(".") && statSync(p).isFile()) tree.set(name, readFileSync(p, "utf8"));
+  }
   return tree;
 }
 
@@ -148,7 +157,7 @@ describe("the Slack source pipeline is not wired to anything", () => {
 
   it("is not vacuous over the real tree: it reaches what is known to be reachable", () => {
     const tree = readTree();
-    const roots = [...tree.keys()].filter((f) => /^(app|scripts)\//.test(f) || f === "instrumentation.ts");
+    const roots = entryPoints(tree);
     const via = reach(importGraph(tree), roots);
     expect(tree.size).toBeGreaterThan(500);
     expect(roots.length).toBeGreaterThan(100);
@@ -159,9 +168,23 @@ describe("the Slack source pipeline is not wired to anything", () => {
     for (const guarded of GUARDED) expect(tree.has(guarded), `${guarded} exists`).toBe(true);
   });
 
+  it("treats every root-level file Next loads as an entry point (fix-review FX-03)", () => {
+    // `proxy.ts` is Next's request-path entry and already imports `@/lib/auth/pg-session`; `instrumentation.ts`
+    // dynamically imports `./sentry.server.config` / `./sentry.edge.config`. None of them sat under app/ or scripts/,
+    // so an import of a guarded module from any of them was unreachable by construction, and the sentry edges were
+    // silently dropped because those files were not in the tree at all.
+    const tree = readTree();
+    const roots = entryPoints(tree);
+    for (const file of ["proxy.ts", "instrumentation.ts", "instrumentation-client.ts", "sentry.server.config.ts", "sentry.edge.config.ts"]) {
+      expect(tree.has(file), `${file} is in the tree`).toBe(true);
+      expect(roots, `${file} is a root`).toContain(file);
+    }
+    expect(importGraph(tree).get("instrumentation.ts")?.has("sentry.server.config.ts")).toBe(true);
+  });
+
   it("is reachable from no route, page, action, script or instrumentation entry point", () => {
     const tree = readTree();
-    const roots = [...tree.keys()].filter((f) => /^(app|scripts)\//.test(f) || f === "instrumentation.ts");
+    const roots = entryPoints(tree);
     const via = reach(importGraph(tree), roots);
     const reached = GUARDED.filter((g) => via.has(g)).map((g) => chainTo(via, g));
     expect(reached).toEqual([]);

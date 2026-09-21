@@ -217,6 +217,44 @@ describe("syncSlackIdentities (real Postgres)", () => {
     expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "plane", "P0GUESS1")).toBe(alexId);
   });
 
+  it("does not launder a heuristic link through another provider's identity row, and refuses an email with two candidates", async () => {
+    // AIO-1170 fix-review FX-02. (a) The resolver folds every provider identity row's email into its exact-match map,
+    // and a Plane/Linear heuristic link writes `email: u.email` on its row, so a guess made for another provider
+    // became an "exact" Slack match on the next tick. (b) The spec asks for exactly ONE roster/alias candidate; a map
+    // that keeps the last writer silently picks one when two members claim an email.
+    const seed = await seedTeam();
+    const insertMember = async (email: string, handle: string) => {
+      const { data } = await db().from("members")
+        .insert({ team_id: seed.teamId, email, display_name: handle, actor_handle: handle, role: "member", tier: "team", status: "active" })
+        .select("id").single();
+      return (data as { id: string }).id;
+    };
+    const alexId = await insertMember("alex.smith@corp.com", "alex");
+    await syncProviderIdentities(db(), seed.teamId, "plane", [{ id: "P0LAUNDER", displayName: "x", email: "alex@corp.com" }]);
+    const laundered = await syncSlackIdentities(db(), seed.teamId, [{ id: "U0LAUNDER", displayName: "A Different Alex", email: "alex@corp.com" }]);
+    expect(laundered).toMatchObject({ scanned: 1, mapped: 0, skipped: 1 });
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "slack", "U0LAUNDER")).toBeNull();
+
+    // Two candidates for one email: member A's own email is also member B's alias.
+    const aId = await insertMember("shared@corp.com", "amy");
+    const bId = await insertMember("b@corp.com", "bob");
+    await db().from("member_emails").insert([
+      { team_id: seed.teamId, member_id: bId, email: "shared@corp.com" },
+      { team_id: seed.teamId, member_id: bId, email: "solo@corp.com" },
+    ]);
+    const res = await syncSlackIdentities(db(), seed.teamId, [
+      { id: "U0AMBIG", displayName: "Shared", email: "shared@corp.com" }, // A's email AND B's alias: two candidates
+      { id: "U0ONE", displayName: "Solo", email: "solo@corp.com" },        // exactly one candidate (B's alias)
+      { id: "U0EXACT", displayName: "Alex", email: "alex.smith@corp.com" }, // exactly one candidate (alex's email)
+    ]);
+    expect(res).toMatchObject({ scanned: 3, mapped: 2, skipped: 1 });
+    const map = await buildIdentityMap(db(), seed.teamId);
+    expect(resolveByProviderId(map, "slack", "U0AMBIG")).toBeNull();
+    expect(resolveByProviderId(map, "slack", "U0ONE")).toBe(bId);
+    expect(resolveByProviderId(map, "slack", "U0EXACT")).toBe(alexId);
+    expect(aId).not.toBe(bId);
+  });
+
   it("maps Slack users to members by email; skips non-matches; never clobbers a manual mapping", async () => {
     const seed = await seedTeam(); // member A
     const other = await addMember(seed.teamId); // member B

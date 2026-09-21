@@ -442,8 +442,13 @@ export async function writeSlackThreadSnapshot(session: TransactionSession, clai
   // writes `": "` and `", "`), so the JS check above is necessary but not sufficient. Measure with the SAME
   // function the constraint uses: a snapshot in the gap is an ordinary refusal here, not a raw 23514 out of
   // the insert below that the hydrator does not catch.
-  const stored = await session.executeSql<{ n: string }>(`select octet_length(($1::jsonb)::text) as n`, [serialized]);
-  if (Number(stored.rows[0]?.n) > 1048576) return "too_large";
+  const stored = await session.executeSql<{ n: string; c: string }>(
+    `select octet_length(($1::jsonb)::text) as n, octet_length(($2::jsonb)::text) as c`,
+    [serialized, JSON.stringify(seenCursors)]
+  );
+  // `seen_cursors` has its own `octet_length(seen_cursors::text)` bound, and multibyte or escaped cursors pass the JS
+  // count/length checks above while failing it (fix-review FX-04).
+  if (Number(stored.rows[0]?.n) > 1048576 || Number(stored.rows[0]?.c) > 1048576) return "too_large";
   const r = await session.executeSql(
     `with owner as (
        select 1 from slack_sync_threads where ${SCOPE_PREDICATE} and status='running'

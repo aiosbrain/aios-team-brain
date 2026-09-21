@@ -134,7 +134,7 @@ export async function GET(req: NextRequest) {
   if (identityStatus !== "linked") {
     return htmlPage(200, "Slack connected — identity pending",
       identityStatus === "conflict"
-        ? "Your token is connected, but this Slack account can't be linked automatically: it is linked to another member, or an admin unlinked it. Ask an admin to resolve the identity."
+        ? "Your token is connected, but this Slack account can't be linked automatically: an admin unlinked it, it is linked to another member, or it needs an admin's attention. Ask an admin to resolve the identity."
         : "Your token is connected, but identity attribution is pending. Ask an admin to check the link.");
   }
   return htmlPage(200, "Slack connected", "Your Slack account is connected. You can close this tab and return to your workspace.");

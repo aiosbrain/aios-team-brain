@@ -301,6 +301,24 @@ describe("inactive replies staging — resume, fencing and retention", () => {
     expect(await staged(scope)).toBeNull();
   });
 
+  it("refuses a cursor history whose STORED size is over the cap even when its count and length bounds pass", async () => {
+    // AIO-1170 fix-review FX-04: the same gap P3-01 closed for `messages`. `seen_cursors` is bounded in JS by entry
+    // count and UTF-16 length, but the database bounds octet_length(seen_cursors::text): multibyte cursors pass the
+    // first and fail the second with a raw 23514 the hydrator does not catch.
+    const seed = await seedTeam(); const scope = scopeFor(seed);
+    const live = await claimed(scope);
+    const seenCursors = Array.from({ length: 1000 }, (_, i) => `${String(i).padStart(4, "0")}${"é".repeat(600)}`);
+    expect(seenCursors.every((c) => c.length <= 1024)).toBe(true);
+    const stored = await tx((s) => s.executeSql<{ n: string }>(`select octet_length(($1::jsonb)::text) as n`, [JSON.stringify(seenCursors)]));
+    expect(Number(stored.rows[0].n)).toBeGreaterThan(1_048_576); // non-vacuity: Postgres, not JS, measured it
+
+    const result = await tx((s) => writeSlackThreadSnapshot(s, live, {
+      messages: [rootMessage], seenCursors, complete: false, expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    expect(result).toBe("too_large");
+    expect(await staged(scope)).toBeNull();
+  });
+
   it("serializes two page writes carrying the same live claim so only one generation commits", async () => {
     const seed = await seedTeam(); const scope = scopeFor(seed);
     const live = await claimed(scope);

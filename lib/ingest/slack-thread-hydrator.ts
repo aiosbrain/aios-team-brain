@@ -47,6 +47,9 @@ export function validateSlackRepliesPage(page: SlackPage, rootTs: string, sentCu
   if (!messages.every((m) => m && typeof m === "object" && typeof m.ts === "string" && !!parseSlackTimestamp(m.ts))) return { ok: false, category: "malformed_page" };
   if (page.hasMore && messages.length === 0) return { ok: false, category: "pagination_incomplete" };
   if (page.hasMore && (!page.nextCursor || !page.nextCursor.trim())) return { ok: false, category: "pagination_incomplete" };
+  // The mirror contradiction (P4-03's sibling): a live cursor while `has_more` is false or absent. Taken as terminal it
+  // would stage a truncated thread as COMPLETE and checkpoint its cursor to null.
+  if (!page.hasMore && page.nextCursor) return { ok: false, category: "pagination_incomplete" };
   if (page.nextCursor && (page.nextCursor.length > 1024 || !page.nextCursor.trim() || /[\x00-\x1f\x7f]/.test(page.nextCursor))) return { ok: false, category: "malformed_page" };
   if (page.hasMore && page.nextCursor && (page.nextCursor === sentCursor || seenCursors.includes(page.nextCursor))) return { ok: false, category: "cursor_repeated" };
   return { ok: true, messages, nextCursor: page.hasMore ? page.nextCursor : null, terminal: !page.hasMore };
