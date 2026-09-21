@@ -800,12 +800,17 @@ export function assertAllowedRequest({ method, path: requestPath, body }, ctx) {
   if (/^https?:/i.test(raw) || raw.startsWith("//")) throw new UsageError("commissioning refuses an absolute or protocol-relative request target");
   const [pathname, query = ""] = raw.split("?");
   if (pathname.includes("..")) throw new UsageError("commissioning refuses a traversal in a request path");
+  // Two rows may share a spelling for DIFFERENT roles (the probe's fixed ref vs a derived ref, both
+  // under `git/refs`). A row this role may not issue is skipped rather than refused, so the row that
+  // IS this role's gets its own checks; if no row admits the role, the first match's refusal stands.
+  let roleRefusal = null;
   for (const operation of ALLOWED_OPERATIONS) {
     if (operation.method !== verb) continue;
     const match = operation.path ? (operation.path === pathname ? [pathname] : null) : operation.pattern.exec(pathname);
     if (!match) continue;
     if (!operation.roles.includes(ctx.role)) {
-      throw new UsageError(`the ${ctx.role} role may not issue ${operation.id}`);
+      roleRefusal ??= new UsageError(`the ${ctx.role} role may not issue ${operation.id}`);
+      continue;
     }
     // PER-OPERATION query allowlist. Pagination by default; anything wider is declared on the one
     // operation that needs it, so widening it for artifact lookup does not widen it everywhere.
@@ -818,6 +823,7 @@ export function assertAllowedRequest({ method, path: requestPath, body }, ctx) {
     operation.body(body, ctx);
     return operation.id;
   }
+  if (roleRefusal) throw roleRefusal;
   throw new UsageError(`commissioning refuses ${verb} on an endpoint outside its allowlist`);
 }
 

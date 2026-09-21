@@ -273,6 +273,9 @@ class World {
       schema_version: 1, issue: "AIO-1124", phase: "intent", repository: REPO, repository_id: REPO_ID, run_id: RUN_ID, attempt: ATTEMPT,
       workflow_path: COMMISSIONING_WORKFLOW_PATH, workflow_sha: this.sha, dispatch_ref: "refs/heads/staging", event: "workflow_dispatch",
       provider_measured: false,
+      // The rest of the closed intent manifest; values irrelevant to the probe, present so the intent binds.
+      derived_refs: {}, derived_contexts: [], graph_plan: [], normal_app_id: 1, emergency_app_id: 2, producer_ids_hash: "0".repeat(64),
+      normal_installation_id: "11", emergency_installation_id: "12",
     });
     const lock = acquireJournalLock({ dir: this.dir, runId: RUN_ID, attempt: ATTEMPT, now: this.now });
     const journal = openJournal({ dir: this.dir, runId: RUN_ID, attempt: ATTEMPT, source: this.sha, lock, now: this.now });
@@ -450,11 +453,14 @@ describe("the cross-run variant is selected only explicitly, and cannot be relab
       [(o) => { o.probe_intent.sha256 = "0".repeat(64); }, /probe intent/],
       [(o) => { delete o.provider_evidence.environment_after; }, /closed field/],
     ];
+    const file = path.join(world.dir, release().artifact);
+    const original = readFileSync(file);
     for (const [mutate, pattern] of cases) {
       expect(world.validate(world.forgeObservation(release(), mutate), "staging-release"), String(pattern)).toMatch(pattern);
-      // restore the original bytes for the next case
-      records = records;
+      rmSync(file);
+      writeFileSync(file, original, { mode: 0o600 });
     }
+    expect(world.validate(release(), "staging-release")).toBeNull();
   });
 });
 
@@ -827,9 +833,9 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     await world.phase("stage");
     await world.phase("dispatch");
     await world.phase("collect");
-    await expect(world.phase("cleanup", { deleteRef: async () => ({ outcome: "ambiguous", exit_code: 128 }) })).rejects.toThrow(/not confirmed|absence/);
+    await expect(world.phase("cleanup", { deleteRef: async () => ({ outcome: "ambiguous", exit_code: 128 }) })).rejects.toThrow(/run cleanup again/);
     expect(world.refSha()).toBe(world.sha);
-    await expect(world.phase("cleanup")).rejects.toThrow(/run cleanup again/);
+    expect(world.probeRecords().some((r: any) => r.type === "reconciliation" && r.data.outcome === "present-unchanged")).toBe(true);
     const cleaned: any = await world.phase("cleanup");
     expect(cleaned.status).toBe("cleaned");
     expect(world.refSha()).toBeNull();
@@ -849,7 +855,8 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     world.seedOriginal();
     await world.phase("stage");
     await world.phase("dispatch");
-    await expect(world.phase("cleanup")).rejects.toThrow(/not terminal|collect/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/collect before cleanup/);
+    expect(world.refSha()).toBe(world.sha);
   });
 
   it("refuses the acceptance when an original protected job was approved before the probe was cleaned", async () => {

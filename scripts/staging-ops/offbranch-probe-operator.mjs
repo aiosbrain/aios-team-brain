@@ -284,7 +284,8 @@ export function createGitLeaseDeleter({ spawnImpl = spawn, cwd = process.cwd(), 
     const run = await runGit(["push", "--porcelain", `--force-with-lease=${ref}:${expectedSha}`, remote, `:${ref}`], { spawnImpl, cwd, env, timeoutMs });
     const lines = run.stdout.split("\n");
     if (!run.terminated && run.code === 0 && lines.includes(`-\t:${ref}\t[deleted]`)) return { outcome: "deleted", exit_code: 0 };
-    if (!run.terminated && run.code === 1 && lines.some((line) => line.startsWith(`!\t:${ref}\t[rejected] (stale info)`))) return { outcome: "lease-refused", exit_code: 1 };
+    // git spells a rejected deletion's source as `(delete)` (measured with git's own porcelain output).
+    if (!run.terminated && run.code === 1 && lines.includes(`!\t(delete):${ref}\t[rejected] (stale info)`)) return { outcome: "lease-refused", exit_code: 1 };
     return { outcome: "ambiguous", exit_code: Number.isInteger(run.code) ? run.code : null };
   };
 }
@@ -673,6 +674,11 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // AFTER TERMINAL CAPTURE: an identified run must be terminal, and a terminal failure collected.
     const identified = records.find((record) => record.type === "run-identified");
     const terminal = records.find((record) => record.type === "run-terminal");
+    const dispatchResult = records.find((record) => record.type === "dispatch-result");
+    const dispatchRefused = dispatchResult?.data.response_complete === true && dispatchResult.data.http_status !== 204;
+    if (dispatchResult && !dispatchRefused && !identified && !records.some((record) => record.type === "run-unidentified")) {
+      throw new IncompleteEvidence("the dispatched probe run has not been reconciled; collect before cleanup — a run may exist that nobody has captured");
+    }
     if (identified && !terminal) throw new IncompleteEvidence("the probe run is not terminal; cancel (or collect) it before cleanup");
     const cancelled = records.some((record) => record.type === "cancel-intent");
     if (terminal && !cancelled && !records.some((record) => record.type === "observation-recorded")) {
@@ -732,6 +738,8 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     if (outcome === "ambiguous" && after.complete === true && after.status === 200) {
       const objectSha = String(after.body?.object?.sha ?? "");
       probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
+      if (objectSha !== sha) throw new AssertionFailure("the owned probe ref now points elsewhere; it is never deleted at another SHA");
+      throw new IncompleteEvidence("the ambiguous deletion did not take effect; the reconciliation is recorded — run cleanup again to issue one fresh lease deletion");
     }
     throw new IncompleteEvidence("the owned probe ref's absence could not be confirmed after deletion; cleanup is not claimed");
   } finally {
