@@ -7849,19 +7849,17 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     if (matching.length > 1) { block("PC-05", "invalid", `case ${kase.id} is recorded ${matching.length} times`); continue; }
     if (kase.actor === "human") {
       const joined = humanJournal?.cases[kase.id] ?? null;
-      if (!joined) {
-        block("PC-05", "unverified", `case ${kase.id} cannot be joined to a verified journal history`);
-        continue;
-      }
-      if (joined.state === "invalid" || joined.state === "unresolved") continue; // blocked above
-      if (joined.state === "none" && !["inconclusive", "not-run"].includes(String(matching[0]?.outcome))) {
+      // With no verified journal the case cannot pass, but the record is still judged below: its own
+      // contradictions are measured refusals, and must not be hidden behind "unverified".
+      if (!joined) block("PC-05", "unverified", `case ${kase.id} cannot be joined to a verified journal history`);
+      else if (joined.state === "none" && !["inconclusive", "not-run"].includes(String(matching[0]?.outcome))) {
         block("PC-05", "invalid", `case ${kase.id} records the outcome ${JSON.stringify(String(matching[0]?.outcome ?? ""))}, but the verified journal records no mutation for it`);
-        continue;
       }
-      if (joined.state === "settled" && canonicalJson(matching[0]) !== canonicalJson(joined.record)) {
+      if (joined?.state === "settled" && canonicalJson(matching[0]) !== canonicalJson(joined.record)) {
         block("PC-05", "invalid", `case ${kase.id}'s recorded outcome is not the one its verified journal history holds; a derived file cannot replace it`);
-        continue;
       }
+      // In every one of these the record is ALSO judged on its own terms below, so a contradiction it
+      // measures about the subject is still reported as the failure it is.
     }
     const problems = deriveCaseVerdict(matching[0], kase, {
       runId, attempt, graph,

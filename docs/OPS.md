@@ -1478,6 +1478,25 @@ may also only begin after its predecessor recorded its EXPECTED OUTCOME — `fin
 because finalization writes that state and then throws for an inconclusive verdict, which would leave
 the next case measuring against a ref state nobody established.
 
+A request whose response never arrived (status 0) is **inconclusive and halts, whatever the readback
+shows**. A readback at the requested commit is kept as reconciliation evidence, but it proves where the
+ref is, not that this request put it there — so it is never recorded as an acceptance, at runtime or
+by `check-evidence`, and no later actor case starts.
+
+The local **human** cases obey the same rule through the verified resource journal rather than a
+per-job state file. Each case is admitted from its journaled intent → result → readback → outcome
+history before any request: a case with any history is never issued again. Re-running `human-tests`
+takes a settled case's outcome from that history, and an unresolved one (a crash after the intent, a
+readback that failed after the request) or a halting one stops every later human case. `check-evidence`
+joins every human case record to its one journaled history, so a duplicate, unresolved, hidden or
+rewritten attempt refuses even when the derived `human` evidence file shows a single clean record.
+
+**Witness timing has no tolerance.** A response is accepted only when challenge creation ≤ observation
+start ≤ observation completion ≤ response creation ≤ actual receipt ≤ challenge expiry, with the
+response echoing the challenge's exact expiry. The receipt instant is read after the response artifact
+has been completely acquired — so time spent on the lookup and download counts against the lifetime —
+and `check-evidence` re-applies the same order to the retained timestamps.
+
 **The witness serves READY WORK ACROSS ROLES, in each role's own order.** The two protected jobs are
 independent — `emergency` needs only `intent` — so whichever human approves first is the role whose
 challenge appears first, and that is a supported ordering rather than a misuse. A role whose next
@@ -1582,7 +1601,14 @@ which control it was, or when. So every verified record must carry, against its 
   an attempt;
 - a retained artifact inside the evidence directory whose SHA-256 `check-evidence` recomputes from
   disk **and** whose parsed content names the same control, the same environment and the same measured
-  value — which is what makes reusing one file across controls a refusal rather than a pass.
+  value — which is what makes reusing one file across controls a refusal rather than a pass;
+- **its own provenance inside that artifact.** The retained observation is a closed object carrying
+  `control`, `environment`, `environment_id`, `source`, `measured_at`, `measured` and, for a run-bound
+  control, `run_id`/`attempt` — nothing else. Every one is required in the bytes, and the outer record
+  may only repeat it exactly. A stale observation from another run, attempt, environment or year inside
+  a freshly stamped record is refused however honestly its digest matches: the digest proves which
+  stale bytes were kept, and a wrapper cannot supply provenance its observation lacks or contradicts.
+  All accepted observations of one environment must agree on its numeric ID.
 
 `administrators_cannot_bypass` is deliberately **UI-only**: the environments API does not return that
 field, so a `provider-api` claim about it would be a claim about something nobody read.
@@ -1629,10 +1655,12 @@ about the other, and a single record covering "the environments" would hide exac
 }
 ```
 
-Each named artifact is a small JSON observation, so its content can be bound rather than merely
-hashed: `{"control": "prevent_self_review_enabled", "environment": "staging-release", "measured":
-{"prevent_self_review": true}}`, alongside whatever screenshot or export the operator retains next to
-it.
+Each named artifact is a small closed JSON observation, written when the control is measured, so its
+content and provenance can be bound rather than merely hashed: `{"control":
+"prevent_self_review_enabled", "environment": "staging-release", "environment_id": 4401, "source":
+"provider-ui", "measured_at": "2026-09-10T09:00:00.000Z", "measured": {"prevent_self_review":
+true}}` (plus `"run_id"`/`"attempt"` for a run-bound control), alongside whatever screenshot or export
+the operator retains next to it. The record above repeats those values; it never supplies them.
 
 If the second identity does not exist, leave that control `unverified` — it blocks full activation,
 which is the correct outcome, and per-control granularity is the whole reason it does not drag the

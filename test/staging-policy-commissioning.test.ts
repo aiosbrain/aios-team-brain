@@ -1752,19 +1752,21 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
   });
 
   it("treats a transport failure, a 404 and a bare credential rejection as INCONCLUSIVE, never as enforcement", () => {
-    for (const [label, response] of [
-      ["a transport timeout", { status: 0, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } }],
-      ["a transport failure", { status: 0, diagnostic: { status: 0, category: "transport-unavailable", ruleIds: [], policyDenial: false } }],
-      ["a 404", { status: 404, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } }],
-      ["a 401", { status: 401, diagnostic: { status: 401, category: "unauthorized", ruleIds: [], policyDenial: false } }],
-      ["a rate limit", { status: 403, diagnostic: { status: 403, category: "rate-limited", ruleIds: [], policyDenial: false } }],
-    ] as [string, ProviderResponse][]) {
+    for (const [label, response, ambiguous] of [
+      ["a transport timeout", { status: 0, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } }, true],
+      ["a transport failure", { status: 0, diagnostic: { status: 0, category: "transport-unavailable", ruleIds: [], policyDenial: false } }, true],
+      ["a 404", { status: 404, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } }, false],
+      ["a 401", { status: 401, diagnostic: { status: 401, category: "unauthorized", ruleIds: [], policyDenial: false } }, false],
+      ["a rate limit", { status: 403, diagnostic: { status: 403, category: "rate-limited", ruleIds: [], policyDenial: false } }, false],
+    ] as [string, ProviderResponse, boolean][]) {
       const verdict = classifyCaseOutcome({
         expected: "denied", response, ...readback(sha("a"), sha("a")), requestedSha: sha("b"), operation: "update",
       });
       // Each of these is equally consistent with the policy simply not existing.
       expect(verdict.outcome, label).toBe("inconclusive");
-      expect(verdict.halt, label).toBe(false);
+      // A MEASURED refusal leaves the ref's state known, so later cases may run. A request that never
+      // completed is an AMBIGUOUS mutation, and that stops further actor mutations (R1).
+      expect(verdict.halt, label).toBe(ambiguous);
     }
   });
 
@@ -3622,7 +3624,9 @@ describe("correction pass 2 — F1: the local witness transport and its refusals
       intended_app_id: NORMAL_APP, intended_installation_id: "5001",
       manifest_sha256: "c".repeat(64), graph_sha256: "d".repeat(64),
       challenge_nonce: "e".repeat(64), challenge_digest: "f".repeat(64),
-      challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:00.000Z",
+      // Created once its observation COMPLETED (R4): a response cannot report a measurement it had
+      // not finished. This fixture used to be created one second before its own observation ended.
+      challenge_expires_at: "2026-09-10T09:03:00.000Z", created_at: "2026-09-10T09:00:01.000Z",
       witness_identity: { login: OWNER_LOGIN, user_id: OWNER_USER_ID, type: "User" },
       observation: withGovernedDigest(validObservation({ completed_at: "2026-09-10T09:00:01.000Z", span_ms: 1000 }) as Record<string, unknown>),
     };
