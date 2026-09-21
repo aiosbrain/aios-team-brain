@@ -1300,10 +1300,20 @@ public evidence.**
     inside; an interior NUL or other byte refuses the run instead of truncating the value.
   - **Whiteouts are merged per layer before that layer's own entries**: a `.wh.<dir>` removes the
     directory, its trailing-slash spelling and everything beneath it (never a sibling that merely shares
-    the prefix), a file recreated in the same layer survives, and an expected `/app` file under a
-    deleted directory is reported missing. Deleted bytes are still scanned. A whiteout is recognised by
-    its basename whatever the entry's type (as extractors do), but only an **empty regular file** is a
-    valid marker: any other is applied and recorded as a `malformed-whiteout` gap.
+    the prefix), and an expected `/app` file under a deleted directory is reported missing. Deleted
+    bytes are still scanned. A **root** opaque marker (`.wh..wh..opq` at the top level) empties every
+    lower entry. An ordinary whiteout that overlaps an entry of **its own layer** — the entry, its
+    directory spelling or a descendant — is a `merged-type-conflict` gap in either tar order: OCI
+    applies whiteouts to lower layers only, containerd removes the entry when the whiteout follows it,
+    and the audit does not pick one (it accounts the whiteout lower-only). An opaque marker beside its
+    own layer's children is supported. A whiteout is recognised by its basename whatever the entry's
+    type (as extractors do), but only an **empty regular file** is a valid marker: any other is applied
+    and recorded as a `malformed-whiteout` gap, and one naming nothing, `.` or `..` (`.wh.`, `.wh..`,
+    `.wh...`) deletes nothing and is recorded the same way.
+  - **Member paths are bounded** at 4,096 UTF-8 bytes and 128 segments — the audit's own supported
+    input, not a claim about any extractor's limit. A longer name refuses the run with
+    `AUDIT_TAR_LIMIT_EXCEEDED` before any path work, and the merge and symlink-ancestry work run
+    under the run's deadline and a finite aggregate budget.
   - **Type changes replace, not merge** (OCI "changeset over existing files"): a file or link replacing a
     lower directory removes that directory's whole subtree, a directory replacing a lower file removes
     the file, and directories merge. A directory's identity is its type, so `app` and `app/` written as
