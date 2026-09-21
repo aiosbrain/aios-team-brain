@@ -1301,7 +1301,23 @@ public evidence.**
   - **Whiteouts are merged per layer before that layer's own entries**: a `.wh.<dir>` removes the
     directory, its trailing-slash spelling and everything beneath it (never a sibling that merely shares
     the prefix), a file recreated in the same layer survives, and an expected `/app` file under a
-    deleted directory is reported missing. Deleted bytes are still scanned.
+    deleted directory is reported missing. Deleted bytes are still scanned. A whiteout is recognised by
+    its basename whatever the entry's type (as extractors do), but only an **empty regular file** is a
+    valid marker: any other is applied and recorded as a `malformed-whiteout` gap.
+  - **Type changes replace, not merge** (OCI "changeset over existing files"): a file or link replacing a
+    lower directory removes that directory's whole subtree, a directory replacing a lower file removes
+    the file, and directories merge. A directory's identity is its type, so `app` and `app/` written as
+    directories are one entry. A layer the extractors would not agree on — a file and a directory of one
+    name, a non-directory with entries beneath it, or entries beneath a lower non-directory — is a
+    `merged-type-conflict` gap, and a file or link named exactly `app` is an
+    `inventory-root-not-directory` gap; either way the affected `/app` files are reported missing.
+  - **A member beneath a symlink is a gap.** An extractor follows a parent symlink inside the rootfs,
+    so `side -> app` then `side/planted.js` writes `/app/planted.js` — outside the `/app` names the
+    inventory compares. The audit never follows a link; it records any member whose parent path is, or
+    was in that layer or a lower one, a symlink anywhere in the image as `member-through-symlink`. This
+    is conservative: a link that was later replaced still counts. The bytes are still scanned.
+  - These gap kinds carry only the layer index, never a path or link target, and each blocks readiness
+    until a coordinator adjudicates it.
   - **Ambiguous extended metadata refuses the run**: a repeated local PAX header, a global PAX header
     while member metadata is pending, a GNU long name together with a PAX `path` (or long link with
     `linkpath`) in either order, a repeated GNU long name/link, and any `GNU.sparse.*` key. The claim is about the **decoded tar
