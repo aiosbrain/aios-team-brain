@@ -13,7 +13,7 @@ import {
   inventorySummary,
   provenanceCategory,
 } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
-import { CONFIG_SCAN_GROUP, SCAN_HEADER, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
+import { CONFIG_SCAN_GROUP, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**

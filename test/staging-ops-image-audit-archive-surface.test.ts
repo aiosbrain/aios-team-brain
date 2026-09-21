@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER, archiveSurfaceGroup } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
+import { transitionReadiness } from "../scripts/staging-ops/image-audit/evidence.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, surfaceScanFiles, synthesizeImage } from "./helpers/synthetic-image";
 
@@ -27,7 +28,7 @@ const BLOCK = 512;
 const END = Buffer.alloc(2 * BLOCK, 0);
 
 /** A checksummed ustar header written from the layout, with an optional marker in `uname`. */
-function header({ name, size = 0, typeflag = "0", linkname = "", uname = "" }: { name: string; size?: number; typeflag?: string; linkname?: string; uname?: string }): Buffer {
+function header({ name, size = 0, typeflag = "0", linkname = "", uname = "", prefix = "", v7 = false }: { name: string; size?: number; typeflag?: string; linkname?: string; uname?: string; prefix?: string; v7?: boolean }): Buffer {
   const block = Buffer.alloc(BLOCK, 0);
   block.write(name, 0, 100, "utf8");
   block.write("0000644\0", 100, "ascii");
@@ -38,9 +39,13 @@ function header({ name, size = 0, typeflag = "0", linkname = "", uname = "" }: {
   block.write("        ", 148, "ascii");
   block.write(typeflag, 156, 1, "latin1");
   block.write(linkname, 157, 100, "utf8");
-  block.write("ustar\0", 257, "ascii");
-  block.write("00", 263, "ascii");
+  // A V7 header carries no magic or version at all.
+  if (!v7) {
+    block.write("ustar\0", 257, "ascii");
+    block.write("00", 263, "ascii");
+  }
   block.write(uname, 265, 32, "utf8");
+  if (prefix) block.write(prefix, 345, 155, "utf8");
   let sum = 0;
   for (const byte of block) sum += byte;
   block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
@@ -413,6 +418,133 @@ describe("an unsafe member path never silently leaves the inventory", () => {
   it("records nothing for ordinary relative names", async () => {
     const result = await inspectLayers([buildTar([{ name: "app/a.js", content: "1" }, { name: "./app/b.js", content: "2" }])]);
     expect(result.coverage.limitations).toEqual([]);
+  });
+});
+
+/**
+ * B1 — a magic-less V7 tar the READER accepts is recognised too. With a recogniser that only knew the
+ * ustar magic, a V7 tar under a non-tar name (raw, or gzipped as a plain `.gz`) holding a gzipped member
+ * was an ordinary file: complete coverage, and the member's content on no scan surface.
+ */
+describe("a magic-less V7 tar is recognised wherever the reader would read it (B1)", () => {
+  const v7Tar = (marker: string) => Buffer.concat([
+    header({ name: "in/a.gz", size: gzipSync(Buffer.from(`TOKEN=${marker}\n`)).length, v7: true }),
+    Buffer.concat([gzipSync(Buffer.from(`TOKEN=${marker}\n`)), Buffer.alloc(BLOCK, 0)]).subarray(0, Math.ceil(gzipSync(Buffer.from(`TOKEN=${marker}\n`)).length / BLOCK) * BLOCK),
+    END,
+  ]);
+  const shapes: [string, (bytes: Buffer) => Buffer][] = [
+    ["raw extensionless app/blob.dat", (bytes) => buildTar([{ name: "app/blob.dat", content: bytes }])],
+    ["gzipped under a plain name app/blob.gz", (bytes) => buildTar([{ name: "app/blob.gz", content: gzipSync(bytes) }])],
+  ];
+  for (const [label, wrap] of shapes) {
+    it(`${label}: blocks at the depth bound instead of reporting complete`, async () => {
+      const marker = syntheticSecret();
+      const bytes = v7Tar(marker);
+      expect(bytes.subarray(257, 262).toString("latin1")).not.toBe("ustar");
+      const result = await inspectLayers([wrap(bytes)]);
+      expect(result.identityVerified).toBe(true);
+      expect(result.coverage.limitations).toContainEqual({ kind: "nested-archive-depth-limit", layer: 0, depth: 2 });
+      expect(result.coverage.complete).toBe(false);
+    });
+    it(`${label}: expands to the hidden gzip's plaintext when the depth allows`, async () => {
+      const marker = syntheticSecret();
+      const result = await inspectLayers([wrap(v7Tar(marker))], { maxNestedArchiveDepth: 3 });
+      expect(result.coverage.limitations).toEqual([]);
+      expect(scanSurface(result.scanDir)).toContain(marker);
+    });
+  }
+
+  it("an ordinary text file is not a tar candidate", async () => {
+    const result = await inspectLayers([buildTar([{ name: "app/readme.dat", content: "plain text, ".repeat(60) }])]);
+    expect(result.coverage.limitations).toEqual([]);
+    expect(result.coverage.complete).toBe(true);
+  });
+});
+
+/**
+ * B2 — the NAME the inventory compares is the canonical path, resolved after ustar/PAX/GNU, so the
+ * inventory sees what an extractor writes. Each row is a correctly hashed layer.
+ */
+describe("the inventory compares canonical member paths, and refuses ambiguous ones (B2)", () => {
+  const planted = () => member({ name: "app/planted.js" }, Buffer.from("x"));
+  const appPaths = (result: Awaited<ReturnType<typeof inspectLayers>>) => result.appMembers.map((m) => m.path);
+
+  for (const [label, layer] of [
+    ["`././app/planted.js`", () => buildTar([{ name: "././app/planted.js", content: "x" }])],
+    ["`.//app/planted.js`", () => buildTar([{ name: ".//app/planted.js", content: "x" }])],
+    ["ustar prefix `.` with name `./app/planted.js`", () => Buffer.concat([member({ name: "./app/planted.js", prefix: "." }, Buffer.from("x")), END])],
+    ["interior `app/./sub//../`-free dots: `app/.//planted.js`", () => buildTar([{ name: "app/.//planted.js", content: "x" }])],
+    ["a PAX path `app/./planted.js`", () => Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, paxRecord("path", "app/./planted.js")), member({ name: "ignored" }, Buffer.from("x")), END])],
+    ["a GNU long name `./app//planted.js`", () => Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("./app//planted.js\0")), member({ name: "ignored" }, Buffer.from("x")), END])],
+  ] as const) {
+    it(`ACCEPTS ${label} as app/planted.js in the inventory`, async () => {
+      const result = await inspectLayers([layer()]);
+      expect(appPaths(result)).toEqual(["app/planted.js"]);
+      expect(result.coverage.limitations).toEqual([]);
+    });
+  }
+
+  const refused: [string, () => Buffer][] = [
+    ["x{path=decoy}, x{comment}, then ustar app/planted.js", () => Buffer.concat([member({ name: "PaxHeader/a", typeflag: "x" }, paxRecord("path", "decoy")), member({ name: "PaxHeader/b", typeflag: "x" }, paxRecord("comment", "c")), planted(), END])],
+    ["x{path=decoy}, g{comment}, then ustar app/planted.js", () => Buffer.concat([member({ name: "PaxHeader/a", typeflag: "x" }, paxRecord("path", "decoy")), member({ name: "PaxHeader/g", typeflag: "g" }, paxRecord("comment", "c")), planted(), END])],
+    ["GNU L app/planted.js then x{path=decoy}", () => Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/planted.js\0")), member({ name: "PaxHeader/a", typeflag: "x" }, paxRecord("path", "decoy")), member({ name: "short" }, Buffer.from("x")), END])],
+    ["x{path=decoy} then GNU L app/planted.js", () => Buffer.concat([member({ name: "PaxHeader/a", typeflag: "x" }, paxRecord("path", "decoy")), member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/planted.js\0")), member({ name: "short" }, Buffer.from("x")), END])],
+    ["GNU.sparse.name=app/planted.js", () => Buffer.concat([member({ name: "PaxHeader/s", typeflag: "x" }, Buffer.concat([paxRecord("GNU.sparse.major", "1"), paxRecord("GNU.sparse.minor", "0"), paxRecord("GNU.sparse.name", "app/planted.js")])), member({ name: "other" }, Buffer.from("x")), END])],
+  ];
+  for (const [label, layer] of refused) {
+    it(`REFUSES the run for ${label}`, async () => {
+      await expect(inspectLayers([layer()])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+    });
+  }
+
+  it("records host-dependent names as unsafe gaps: a file with a trailing slash, a backslash, a drive", async () => {
+    const result = await inspectLayers([buildTar([
+      { name: "app/x.js/", content: "a" },
+      { name: "app\\y.js", content: "b" },
+      { name: "C:/z.js", content: "c" },
+      { name: "app/ok.js", content: "d" },
+    ])]);
+    expect(result.coverage.limitations.filter((l) => l.kind === "unsafe-member-path")).toHaveLength(3);
+    expect(result.coverage.complete).toBe(false);
+    expect(appPaths(result)).toContain("app/ok.js");
+  });
+
+  it("normalises before the MERGE: a dotted overwrite replaces, and a dotted whiteout deletes", async () => {
+    const result = await inspectLayers([
+      buildTar([{ name: "app/x.js", content: "first" }, { name: "app/gone.js", content: "doomed" }]),
+      buildTar([{ name: ".//app/./x.js", content: "second" }, { name: "./app/./.wh.gone.js", content: "" }]),
+    ]);
+    expect(result.merged.visible.get("app/x.js")).toBe(1);
+    expect(result.merged.visible.has("app/gone.js")).toBe(false);
+    expect(result.merged.shadowed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "app/x.js", layer: 0, removedBy: 1, reason: "overwritten" }),
+      expect.objectContaining({ path: "app/gone.js", layer: 0, removedBy: 1, reason: "deleted" }),
+    ]));
+  });
+});
+
+/**
+ * L1 (Astra adjudication) — a DECLARED tar holding gzipped plaintext is a nested gap that blocks.
+ * Its inflated bytes are not staged (no whole decoded-tar doubling), so nothing here claims the marker
+ * was scanned: the record says the content was not decoded, which is what blocks.
+ */
+describe("L1: a .tgz holding gzipped plaintext is undecodable and blocks", () => {
+  it("records nested-archive-undecodable, incomplete coverage and a blocked readiness", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([{ name: "app/notes.tgz", content: gzipSync(Buffer.from(`NOTE=${marker}\n`)) }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "nested-archive-undecodable", layer: 0, reason: "TarFormatError", depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+    const readiness = transitionReadiness({
+      coverage: result.coverage,
+      inventory: { complete: true, findings: 0, counts: { missing: 0 } },
+      findings: { total: 0, rules: 0, groups: [] },
+      packageInventory: { status: "verified", otherVersions: 0 },
+      identityVerified: true,
+      recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] },
+    });
+    expect(readiness.transitionReady).toBe(false);
+    expect(readiness.blockers.join(" ")).toMatch(/nested-archive-undecodable/);
+    expectNotPublished(result, marker);
   });
 });
 
