@@ -1,6 +1,6 @@
 # AIO-1170 — pre-activation corrections (P1-01, P4-01, P4-07, P4-02, P2-02)
 
-Status: **revised after two Fable spec reviews (2026-09-21). PA-1, PA-3 and PA-5 were judged ready for an Opus builder by the second review. PA-2 and PA-4 were revised a second time to fold that review's findings (SR-01 to SR-06, SR-07, SR-10) and have NOT been re-reviewed since.** Author: Sonnet 5 (coordinating session), design prose only, no code. Reviewer: Fable 5.1. Builder for the code: Opus 5, because four of the five items are concurrency, retry or authorization semantics (repo routing: uncertain, cross-owner state, privacy). Date: 2026-09-21.
+Status: **revised after two Fable spec reviews (2026-09-21). PA-1, PA-3 and PA-5 were judged ready for an Opus builder by the second review. PA-4 was revised a second time and a third review judged it ready once its refresh-spacing finding and three clarifications were folded, which they now are. PA-2 was not ready after a third review and has been SIMPLIFIED (three-condition predicate, known limitation recorded and pinned); the simplified PA-2 has NOT been re-reviewed.** Author: Sonnet 5 (coordinating session), design prose only, no code. Reviewer: Fable 5.1. Builder for the code: Opus 5, because four of the five items are concurrency, retry or authorization semantics (repo routing: uncertain, cross-owner state, privacy). Date: 2026-09-21.
 
 Basis: draft PR 714 at `fad7da96`. The interim Fable review of `9e3cb400` found nine MEDIUM findings; four were fixed and verified (build record, "Interim Fable review … and its corrections"). These five remain. Every one is in code that is **inactive today** (`test/guards/slack-source-not-wired.test.ts` proves nothing reaches it from an entry point), which is why they are not a live defect, and why they must be resolved **before the publisher is activated**: activation is what turns each of them from a latent contract flaw into behavior on a real workspace.
 
@@ -43,36 +43,32 @@ This document decides how each is corrected and what would show the decision wro
 
 **Tests.** Real Postgres, real budget rows (extend the fences suite). The hook is pinned at the call site: deleting the hook argument from the metadata stage must redden AC-PA-01.
 
-## PA-2 (P4-07) — a coalesced channel is read only by its prover; the proof is reused while the prover is current and can still read
+## PA-2 (P4-07) — a coalesced channel is read only by its binder; the other integration stands down while the binder is valid
 
 **Problem.** Two enabled integrations selecting one channel share one frontier row (by design). Each pass by the non-binding integration reads the recorded binding as "not mine", re-proves the channel, and re-records it under itself, so the 30-minute cadence is defeated, the shared `conversations.info` allowance is spent every wake, and the row flips owner each time.
 
-**Decision.** The binding on a coalesced frontier names one **prover**, and only the prover reads it. Three fences already enforce this (`slack-source-discovery.ts:723`, `slack-channel-state.ts:550`, the acceptance lock) and this design **keeps them**.
-- While the prover is valid, the other integration **makes no claim on the channel**: no `conversations.info`, no history request, no rebind.
-- The prover re-proves **itself** when its proof reaches one observation interval, exactly as today. The other integration never re-proves at one interval: doing so would refuse the prover's in-flight acceptance at the acceptance lock (`slack-channel-state.ts:625`), which does not release the lease (`slack-source-discovery.ts:854-861`), idling the channel for up to a lease length every interval.
-- The prover is **valid** iff all of these hold, in a **lock-free, token-free** read in its own transaction:
-  1. its integration row is `enabled`;
-  2. its `slack_integration_bindings` state is verified;
-  3. the configuration revision recomputed from the integration's current configuration (the binding module's own pure function over the row's config, never its secret) equals the `bindingConfigRevision` recorded with the proof;
-  4. the channel row carries no **reachability error code** from that prover: `not_in_channel`, `channel_not_found`, `is_archived` (provider refusals that release the channel for retry with the binding untouched, `sources/slack-page-request.ts:94-98`, `slack-source-discovery.ts:767-789`);
-  5. the proof is no older than **twice** the observation interval (a prover that has not re-proved by then is treated as absent).
-- The other integration **takes over** only when the prover is not valid. It proves the channel and takes the binding exactly as a first proof does today. A takeover is allowed at most once per observation interval per channel (measured from the stored proof time), which bounds any hand-back between two integrations that both cannot read.
-- The read lives in `slack-source-binding.ts`, beside the revision function, and reuses its microsecond timestamp rendering (`to_char(... 'HH24:MI:SS.US"Z"')`, `:236`): a `Date` read truncates microseconds and would re-create the flap. That file joins the one-owner rule for this item.
-- `lockSlackSelection` is **not** used for a sibling: it takes the integration row `for update` and decrypts the token, which would serialize the two integrations and expose a token that is not this integration's. `token_fingerprint` is deliberately not compared, matching the existing same-integration rule.
+**Decision.** The integration named in `binding_integration_id` (the **binder**) is the only one that reads the channel. Three fences already enforce that (`slack-source-discovery.ts:723`, `slack-channel-state.ts:550`, the acceptance lock) and this design **keeps them**. The other integration **stands down** while the binder is valid: no `conversations.info`, no history request, no rebind. The binder keeps re-proving itself at one observation interval exactly as today, including after its own configuration edit (its own `needsSlackPublicProof` handles the revision).
 
-**Assumption, and what would falsify it.** Whether a channel is **public** is a property of the channel; whether it is **readable** is a property of a token. Conditions 1 to 3 and 5 rely on the first; condition 4 exists because of the second. Falsified by a channel flipping private inside the interval, the same window a same-integration proof already has. If neither integration can read, the channel stays unreadable and at most one takeover happens per interval.
+The binder is **valid** iff all three hold, from stored rows, in a **lock-free, token-free** read in its own transaction that lives in `slack-source-binding.ts`:
+1. its integration row is `enabled`;
+2. its `slack_integration_bindings` state is verified;
+3. the channel is still among the channel IDs its configuration selects.
 
-**Why "disabled" needs its own check.** Disabling an integration updates only `integrations.status` and `updated_at` (`lib/integrations/manage.ts`); the binding row keeps its verified state and old revision forever, because a disabled integration never runs again. Reading the binding row alone would keep treating a disabled prover as valid.
+When the binder is **not** valid, the other integration proves the channel and takes the binding **immediately**, exactly as a first proof does today. A deleted binder is already a first proof (`binding_integration_id` goes null by foreign key). There is no proof-age rule, no takeover throttle and no revision recomputation: the binder's own revision, age and cadence are its own business, and nothing about it is inferred by the other integration.
+
+`lockSlackSelection` is **not** used for the read: it takes the integration row `for update` and decrypts the token, which would serialize the two integrations and expose a token that is not this integration's.
+
+**Why "disabled" and "de-selected" need their own check.** Disabling an integration updates only `integrations.status` and `updated_at` (`lib/integrations/manage.ts`); the binding row keeps its verified state and old revision forever, because a disabled integration never runs again. Removing a channel from the binder's selection likewise leaves the binder's binding row untouched. Reading the binding row alone would keep treating either as valid.
+
+**Known limitation, decided, not solved.** Whether a channel is **public** is a property of the channel; whether it is **readable** is a property of a token, and nothing records which integration's token can read which channel. A valid binder whose token cannot read a channel another integration's token can (`not_in_channel`, `channel_not_found`, `is_archived`, or an auth error) is therefore **not** detected: the channel stays unread until an operator deselects it on the binder or disables the binder. The refusal is visible on the channel row (`last_error_code`) and in the pass step report. Three review rounds showed that every attempt to infer this from existing state fails, because the binder's own re-proof rewrites the evidence (`public_checked_at`, `last_error_code`) and any hand-back protocol loops at the shared `conversations.info` rate. Solving it needs per-integration reachability state, which is a schema change and out of scope here (ground rule 1); it is a separate follow-up design. Today's production selection is one enabled integration on one channel (spec line 78, read 2026-09-09), so the exposure is a configuration that does not exist yet. Falsified by that configuration appearing in production or in the soak.
 
 **Acceptance.**
 - AC-PA-04: two integrations, one channel, both passes run, elapsed less than the interval: `conversations.info` for that channel is called once and `binding_integration_id` does not change.
-- AC-PA-04b: while the prover is valid, the non-binding integration issues **zero** history requests and **zero** `conversations.info` requests for that channel.
-- AC-PA-05: after the prover's configuration revision changes, exactly one re-prove happens.
-- AC-PA-05b: a prover whose proof has aged past one interval but not two re-proves itself; the other integration issues no `conversations.info`.
-- AC-PA-06: after the prover is disabled or deleted, the remaining integration proves the channel and takes over the binding.
-- AC-PA-06b: the validity read takes no `for update` lock on, and never decrypts, the sibling's integration row (assert on the statements issued).
-- AC-PA-06c: a prover that is valid on paper but whose history read is refused with a reachability code stops being valid; the other integration takes over. When neither can read, takeovers happen at most once per interval.
-- AC-PA-06d: with a microsecond-precision fixture, the recomputed revision equals the recorded one; a fixture read through a truncating `Date` would not, so the test proves the rendering is the binding module's own.
+- AC-PA-04b: while the binder is valid, the other integration issues **zero** history requests and **zero** `conversations.info` requests for that channel.
+- AC-PA-05: after the binder's own configuration revision changes, the **binder** re-proves exactly once and the other integration issues nothing.
+- AC-PA-06: after the binder is disabled, or deleted, or stops selecting the channel, the other integration proves the channel and takes the binding on its next pass, exactly once.
+- AC-PA-06b: the validity read takes no `for update` lock on, and never decrypts, the other integration's row (assert on the statements issued).
+- AC-PA-06c: the known limitation is pinned with `it.fails`: a valid binder whose history read is refused with a reachability code is not taken over. When someone solves it, this test flips red on purpose.
 
 **Tests.** Real Postgres, extending the coalescing test in the bootstrap suite (it currently asserts one row, not the request count). **Existing test changed on purpose:** `test/datamechanics/slack-source-fences.datamechanics.test.ts` builds a fixture on the current binding behavior around lines 243-310; the builder re-reads it and amends what changes, listing each change in the commit.
 
@@ -102,9 +98,11 @@ This document decides how each is corrected and what would show the decision wro
 2. the live item-visibility fingerprint equals the row's (read before every hit and re-checked in the publish compare-and-set);
 3. the Slack **source is current** for the team: at least one integration of the team is enabled with a verified binding, from a lock-free, token-free read (a sibling of PA-2's read, per team rather than per prover, not the same read). It **fails, and the read rebuilds cold, when no such integration exists**; it must never pass vacuously. Effect: `lib/dashboard/work-timeline.ts` does not filter evidence by integration status, so this check refuses the prior **row** after the source is gone; it does not filter evidence.
 
-Data and presentation generations **may lag**. The response carries an explicit `stale: true` on this branch (the freshness envelope is age-only, `lib/freshness.ts:63-74`, so a young row with a mismatched generation would otherwise report fresh); the in-memory entry is retained under the fingerprint check; a background refresh is started.
+Data and presentation generations **may lag**. The response carries an explicit `stale: true` on this branch (the freshness envelope is age-only, `lib/freshness.ts:63-74`, so a young row with a mismatched generation would otherwise report fresh); the in-memory entry is retained under the fingerprint check; a background refresh is started. `freshness()` gains an explicit override (`opts.stale`) rather than the branch hand-building the envelope. Only the team-work route puts freshness on the wire today; the timeline route, the v1 route and the panel strip it, so a lagging row is **not shown as stale in the UI**: recorded here, not solved.
 
-**Summaries on a stale serve.** On a data-lag serve the `summary` (model prose) fields are **omitted**, honouring spec line 112, "dropping unverifiable summaries": the row serves facts only, and the refreshed build restores prose. `salvageSummaries` stays **strict** (same generations required) and its item-fingerprint gate becomes a **required** argument, not an optional trailing one (closing review finding P1-02). It shares the `sameGenerations` helper with the publish compare-and-set (`timeline-cache.ts:212-220`); relaxing the compare-and-set must not relax it, so the two are separated.
+**Refresh spacing.** A stale-branch refresh is started at most once per **refresh spacing** per key (configurable, default the cache TTL). Without it a generation-lag serve on every read of a polling dashboard would start a refresh, and one model summary pass (`timeline-cache.ts:126`), per read; today the stale branch fires once per TTL.
+
+**Summaries on a stale serve.** On **any** generation-lag serve (data or presentation) the `summary` (model prose) fields are **omitted**, honouring spec line 112, "dropping unverifiable summaries": the row serves facts only, and the refreshed build restores prose. `summary` is optional on `PersonDay`, so omission is shape-safe. `salvageSummaries` stays **strict** (same generations required) and its item-fingerprint gate becomes a **required** argument, not an optional trailing one (closing review finding P1-02). It shares the `sameGenerations` helper with the publish compare-and-set (`timeline-cache.ts:212-220`); relaxing the compare-and-set must not relax it, so the two are separated.
 
 **One publish rule for both paths** (the cold inline build and the background refresh): **identity and fingerprint are strict**, an overtake by either discards the build; **data and presentation are tolerated**, and the build is published **stamped with the generations read before it built**, so the next read sees the mismatch, serves stale and refreshes again, and the sequence converges the moment ingestion pauses. The cold path keeps its retry and its actionable error only for repeated identity or fingerprint overtakes (spec line 114: repeated remaps preventing a consistent snapshot return an actionable error).
 
@@ -115,8 +113,9 @@ Data and presentation generations **may lag**. The response carries an explicit 
 **Assumption, and what would falsify it.** Bounded staleness (cache TTL, refresh cadence and the maximum stale age) is acceptable; the spec chose it. Falsified by any path where a principal who has lost access to an item still receives it. Check 2 and the strict salvage are what cover the build record's open gate, "same-hash membership revocation": a same-hash membership close is caught by the item fingerprint read before every hit, which is an item-ID fingerprint, not a hash of the visible set.
 
 **Acceptance.**
-- AC-PA-10: after a semantic data-generation bump, a read resolves with the prior row marked `stale: true`, its summaries omitted, and starts exactly one background refresh.
+- AC-PA-10: after a semantic data-generation bump, a read resolves with the prior row marked `stale: true`, its summaries omitted, and starts exactly one background refresh. All of AC-PA-10 to 10c need a fixture with one enabled integration with a verified binding, or check 3 makes them unsatisfiable.
 - AC-PA-10b: the same holds for a presentation-generation bump (the backfill case): a run of many presentation bumps never turns a read into a cold rebuild or an error.
+- AC-PA-10c: repeated reads inside the refresh spacing start no additional refresh; a read after it starts exactly one.
 - AC-PA-11: a visibility change between publication and read (fingerprint mismatch) yields a cold rebuild, never a stale serve.
 - AC-PA-12: with no enabled integration with a verified binding (source disabled or binding revoked), a read yields a cold rebuild, never a stale serve.
 - AC-PA-13: a background refresh overtaken **only** by data or presentation bumps publishes its build (stamped with the earlier generations) and the read keeps resolving, never rejecting.
@@ -127,9 +126,9 @@ Data and presentation generations **may lag**. The response carries an explicit 
 - AC-PA-14b: an identity-generation mismatch rebuilds cold and never serves the old credit.
 - AC-PA-14c: an identity correction during a backfill (many presentation bumps in flight) yields a successful cold rebuild, not an error.
 
-**Existing test changed on purpose:** the cache-generations suite currently asserts that a data mismatch is a miss (`test/datamechanics/timeline-cache-generations.datamechanics.test.ts`, around line 350); it is amended to the behavior above and the commit says so.
+**Existing test changed on purpose:** the cache-generations suite currently asserts that a data mismatch is a miss (`test/datamechanics/timeline-cache-generations.datamechanics.test.ts`, around line 350); it is amended to the behavior above and the commit says so. Making the fingerprint argument of `salvageSummaries` required also changes `test/timeline-synopsis-salvage.test.ts` (nine four-argument calls, not type-checked); the builder amends it and lists it.
 
-**Tests.** Real Postgres, extending the timeline-cache generations suite (second-worker warm hits, in-flight overtaken builds). Open watch items: the per-hit latency of the stale path, and whether the UI renders a data-stale row as stale.
+**Tests.** Real Postgres, extending the timeline-cache generations suite (second-worker warm hits, in-flight overtaken builds). Open watch items: the per-hit latency of the stale path; the UI does not render a lagging row as stale (see above).
 
 ## PA-5 (P2-02) — unlink the row you name, and fence only when nothing live remains
 
@@ -170,7 +169,7 @@ Verdict on the first draft: not ready for a builder. Two BLOCKER and seven MAJOR
 | SD-09 | MAJOR | A fence written while a variant is live freezes it. | PA-5: fence only when none remains; AC-PA-17a, 17b. |
 | SD-10, 11, 12 | MINOR | Directory-less paths; check 3 needed a stated purpose; ownership labels. | Paths qualified; purpose stated; PA-3 ownership corrected to the discovery file. |
 
-Still open after this revision: whether the real-Postgres harness can drive two real workers for AC-PA-01 and AC-PA-02 (use the isolated tier), the per-hit latency of the stale path, and whether the UI renders a data-stale row as stale. The PA-2 and PA-4 text above is the second revision and has **not** been re-reviewed; the round 2 table below says what changed.
+Still open after this revision: whether the real-Postgres harness can drive two real workers for AC-PA-01 and AC-PA-02 (use the isolated tier), the per-hit latency of the stale path, and whether the UI renders a data-stale row as stale. The PA-2 and PA-4 text above is the third revision; the round 2 and round 3 tables below say what changed. The simplified PA-2 has **not** been re-reviewed.
 
 ## Review record: Fable spec review, round 2 (2026-09-21)
 
@@ -188,3 +187,18 @@ Verdict: **PA-1, PA-3 and PA-5 ready for an Opus builder; PA-2 and PA-4 need one
 | SR-08 | MINOR | Hook failure semantics and where a blocked bucket is observable. | PA-1: promise rejects, no new result variant; step report and budget row named. |
 | SR-09 | MINOR | Runbook said 300 s; two steps needed OPEN markers. | Runbook corrected. |
 | SR-10 | MINOR | PA-4 check 3 is a sibling of PA-2's read and must fail, not pass vacuously, when no integration exists. | PA-4 check 3 rewritten. |
+
+## Review record: Fable spec review, round 3 (2026-09-21), PA-2 and PA-4 only
+
+Verdict: **PA-4 ready after TR-05 and the three clarifications; PA-2 not ready.** The PA-2 blocker (TR-01) was not patched a fourth time: it showed that inferring a prover's health from stored state cannot work, because the prover's own re-proof rewrites the evidence. PA-2 was simplified and the limitation it cannot solve without a schema change is recorded and pinned.
+
+| ID | Sev | Finding | Folded as |
+| --- | --- | --- | --- |
+| TR-01 | BLOCKER | The takeover throttle and the age rule key on `public_checked_at`, which the prover's own failed re-proof rewrites, so takeover can starve in exactly the cases the conditions were added for. | PA-2 simplified: no age rule, no throttle, no reachability inference. Validity is three stored facts; the readability gap is a recorded limitation, pinned by `it.fails` (AC-PA-06c). |
+| TR-02 | MAJOR | Condition 4 named three codes, five exist, plus auth errors; attribution to "that prover" was by inference. | Removed with the condition; the codes are listed in the limitation. |
+| TR-03 | MAJOR | With a 1/min `conversations.info` allowance a proof cannot stay under twice the interval for an integration with more than 60 selected channels. | Removed with the age rule. |
+| TR-04 | MAJOR | After the binder's own config edit both it and the sibling would act; AC-PA-05 depended on ordering. | The binder alone re-proves after its own edit; the sibling takes over only when the binder is disabled, deleted or de-selects the channel; AC-PA-05, 06 rewritten. |
+| TR-05 | MAJOR | A stale serve starts a refresh on every read, each running the model summary pass. | PA-4 refresh spacing (default the TTL); AC-PA-10c. |
+| TR-06 | MINOR | Summaries are omitted on any generation lag, not only data; AC-PA-10 needs an integration fixture. | PA-4 text and AC preconditions. |
+| TR-07 | MINOR | `stale: true` reaches the wire only on the team-work route; `freshness()` has no override. | PA-4: `freshness()` override; the UI gap recorded, not solved. |
+| TR-08 | MINOR | Required-fingerprint `salvageSummaries` changes an untyped test file. | Listed as changed on purpose. |
