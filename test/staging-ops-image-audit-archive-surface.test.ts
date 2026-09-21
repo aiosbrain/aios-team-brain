@@ -705,6 +705,199 @@ describe("L5: a backslash name is an unsafe gap that blocks readiness", () => {
   });
 });
 
+/**
+ * B5/B6 — the MERGED NAMESPACE, measured end to end: correctly hashed image → inspector → merged view
+ * → inventory → readiness. The base layer ships `app/index.js` and `app/d/x.js`, both expected.
+ */
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+const EXPECTED_BASE = [
+  { path: "index.js", type: "file", sha256: sha("index") },
+  { path: "d/x.js", type: "file", sha256: sha("x") },
+];
+const baseMembers = [
+  { name: "app/", type: "directory" as const },
+  { name: "app/index.js", content: "index" },
+  { name: "app/d/", type: "directory" as const },
+  { name: "app/d/x.js", content: "x" },
+];
+function chain(result: Awaited<ReturnType<typeof inspectLayers>>, expectedEntries: { path: string; type: string; sha256: string }[] = EXPECTED_BASE) {
+  const inventory = inventorySummary(compareInventory(latestAppMembers(result.appMembers, result.merged), expectedInventory(expectedEntries, "")));
+  const readiness = transitionReadiness({
+    coverage: result.coverage, inventory, findings: { total: 0, rules: 0, groups: [] },
+    packageInventory: { status: "verified", otherVersions: 0 }, identityVerified: true,
+    recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] },
+  });
+  return { inventory, readiness, kinds: result.coverage.limitations.map((l) => l.kind) };
+}
+
+describe("a member written through a symlinked parent is a blocking gap (B5)", () => {
+  it("CONTROL: the base image alone is ready", async () => {
+    const { readiness } = chain(await inspectLayers([buildTar(baseMembers)]));
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("same layer: `side -> app` then `side/planted.js` blocks, and the bytes are still scanned", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "side", type: "symlink", linkTarget: "app" }, { name: "side/planted.js", content: `P=${marker}` }])]);
+    const { readiness, kinds } = chain(result);
+    expect(result.coverage.limitations).toContainEqual({ kind: "member-through-symlink", layer: 0 });
+    expect(kinds).toContain("member-through-symlink");
+    expect(readiness.transitionReady).toBe(false);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+    expectNotPublished(result, "side/planted.js");
+  });
+
+  it("prior layer: `side -> /app`, then an upper `side/d/x.js` overwrite blocks at the upper layer", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([
+      buildTar([...baseMembers, { name: "side", type: "symlink", linkTarget: "/app" }]),
+      buildTar([{ name: "side/d/", type: "directory" }, { name: "side/d/x.js", content: `EVIL=${marker}` }]),
+    ]);
+    const { readiness } = chain(result);
+    expect(result.coverage.limitations).toContainEqual({ kind: "member-through-symlink", layer: 1 });
+    expect(readiness.transitionReady).toBe(false);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  it("same layer, REVERSE order (member before its link) still blocks — conservative", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "side/planted.js", content: "p" }, { name: "side", type: "symlink", linkTarget: "app" }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "member-through-symlink", layer: 0 });
+    expect(chain(result).readiness.transitionReady).toBe(false);
+  });
+
+  it("a link replaced later still counts (historical union)", async () => {
+    const result = await inspectLayers([
+      buildTar([...baseMembers, { name: "side", type: "symlink", linkTarget: "app" }]),
+      buildTar([{ name: ".wh.side", content: "" }]),
+      buildTar([{ name: "side/later.js", content: "l" }]),
+    ]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "member-through-symlink", layer: 2 });
+  });
+
+  it("an UNUSED external symlink leaves a normal /app ready", async () => {
+    const { readiness, kinds } = chain(await inspectLayers([buildTar([...baseMembers, { name: "usr/bin/", type: "directory" }, { name: "usr/bin/sh", type: "symlink", linkTarget: "busybox" }, { name: "bin", type: "symlink", linkTarget: "usr/bin" }, { name: "usr/bin/busybox", content: "b" }])]));
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("a sibling `side2` is NOT beneath `side`", async () => {
+    const { readiness, kinds } = chain(await inspectLayers([buildTar([...baseMembers, { name: "side", type: "symlink", linkTarget: "app" }, { name: "side2/file.js", content: "s" }])]));
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("the existing symlink-INSIDE-app finding is kept", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/d2", type: "symlink", linkTarget: "." }])]);
+    const { inventory, readiness, kinds } = chain(result);
+    expect(kinds).not.toContain("member-through-symlink");
+    expect(inventory.findings).toBeGreaterThan(0);
+    expect(readiness.transitionReady).toBe(false);
+  });
+});
+
+describe("type replacement and malformed whiteouts in the merged view (B6)", () => {
+  it("a directory's key is type-driven: `app/d` and `app/d/` written as directories are one key", async () => {
+    const result = await inspectLayers([buildTar([{ name: "app/d", type: "directory" }]), buildTar([{ name: "app/d/", type: "directory" }])]);
+    expect([...result.merged.visible.keys()]).toEqual(["app/d/"]);
+  });
+
+  it("`app/` replaced by a regular FILE `app`: every expected file is missing, root gap recorded, blocked", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([...baseMembers.slice(0, 3), { name: "app/d/x.js", content: "x" }, { name: "app/secret.js", content: `S=${marker}` }]), buildTar([{ name: "app", content: "EVIL" }])]);
+    const { inventory, readiness, kinds } = chain(result);
+    expect(inventory.counts.missing).toBe(2);
+    expect(kinds).toContain("inventory-root-not-directory");
+    expect(readiness.transitionReady).toBe(false);
+    expect(result.merged.shadowed).toContainEqual(expect.objectContaining({ path: "app/index.js", reason: "replaced-by-non-directory" }));
+    // The replaced lower bytes are still staged.
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  it("`app/` replaced by a SYMLINK `app -> decoy`: missing, root gap, blocked", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "decoy/", type: "directory" }, { name: "decoy/index.js", content: "EVIL" }, { name: "app", type: "symlink", linkTarget: "decoy" }])]);
+    const { inventory, readiness, kinds } = chain(result);
+    expect(inventory.counts.missing).toBe(2);
+    expect(kinds).toContain("inventory-root-not-directory");
+    expect(readiness.transitionReady).toBe(false);
+  });
+
+  it("a nested directory `app/d/` replaced by a file `app/d`: its descendant is missing, blocked", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/d", content: "now a file" }])]);
+    const { inventory, readiness } = chain(result);
+    expect(inventory.counts.missing).toBe(1);
+    expect(result.merged.shadowed).toContainEqual(expect.objectContaining({ path: "app/d/x.js", reason: "replaced-by-non-directory" }));
+    expect(readiness.transitionReady).toBe(false);
+  });
+
+  it("INVERSE: a file `app/cfg` replaced by a directory `app/cfg/`: the expected file is missing, blocked", async () => {
+    const expected = [...EXPECTED_BASE, { path: "cfg", type: "file", sha256: sha("cfg") }];
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/cfg", content: "cfg" }]), buildTar([{ name: "app/cfg/", type: "directory" }])]);
+    const { inventory, readiness } = chain(result, expected);
+    expect(inventory.counts.missing).toBe(1);
+    expect(result.merged.shadowed).toContainEqual(expect.objectContaining({ path: "app/cfg", reason: "replaced-by-directory" }));
+    expect(readiness.transitionReady).toBe(false);
+  });
+
+  for (const [label, marker] of [
+    ["a DIRECTORY-typed `app/.wh.d/`", { name: "app/.wh.d/", type: "directory" as const }],
+    ["a SYMLINK-typed `app/.wh.d`", { name: "app/.wh.d", type: "symlink" as const, linkTarget: "x" }],
+    ["a NON-EMPTY regular `app/.wh.d`", { name: "app/.wh.d", content: "not empty" }],
+  ] as const) {
+    it(`${label} is applied as extractors would, AND recorded as malformed — blocked`, async () => {
+      const result = await inspectLayers([buildTar(baseMembers), buildTar([marker])]);
+      const { inventory, readiness, kinds } = chain(result);
+      expect(inventory.counts.missing).toBe(1);
+      expect(kinds).toContain("malformed-whiteout");
+      expect(readiness.transitionReady).toBe(false);
+    });
+  }
+
+  it("a same-layer file AND descendants of the same name are a merged-type-conflict", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/z", content: "f" }, { name: "app/z/q.js", content: "q" }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+    expect(chain(result).readiness.transitionReady).toBe(false);
+  });
+
+  it("writing beneath a LOWER non-directory is a merged-type-conflict", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/f", content: "f" }]), buildTar([{ name: "app/f/inner.js", content: "i" }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+  });
+
+  it("POSITIVE: directory over directory MERGES", async () => {
+    const expected = [...EXPECTED_BASE, { path: "d/y.js", type: "file", sha256: sha("y") }];
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/d/", type: "directory" }, { name: "app/d/y.js", content: "y" }])]);
+    const { readiness, kinds } = chain(result, expected);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("POSITIVE: a valid EMPTY REGULAR whiteout removes only lower content and stays ready", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/old.js", content: "o" }]), buildTar([{ name: "app/.wh.old.js", content: "" }])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  for (const order of ["whiteout first", "recreate first"] as const) {
+    it(`POSITIVE: a same-layer recreation survives (${order}) and stays ready`, async () => {
+      const whiteout = { name: "app/.wh.d", content: "" };
+      const recreate = [{ name: "app/d/", type: "directory" as const }, { name: "app/d/x.js", content: "x" }];
+      const result = await inspectLayers([buildTar(baseMembers), buildTar(order === "whiteout first" ? [whiteout, ...recreate] : [...recreate, whiteout])]);
+      const { readiness, kinds } = chain(result);
+      expect(kinds).toEqual([]);
+      expect(result.merged.visible.get("app/d/x.js")).toBe(1);
+      expect(readiness.transitionReady).toBe(true);
+    });
+  }
+
+  it("POSITIVE: an opaque directory keeps its own layer's entries and stays ready", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/d/.wh..wh..opq", content: "" }, { name: "app/d/x.js", content: "x" }])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+});
+
 describe("structural failure refuses, whatever the identity chain says (AC-AUDIT-03)", () => {
   it("refuses a correctly hashed SHORT non-tar layer at representative lengths", async () => {
     for (const length of [1, 100, 262, 511]) {
