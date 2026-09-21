@@ -1285,12 +1285,23 @@ public evidence.**
     blocks** (the canonical empty archive), or when its name is `.tar`/`.tgz`/`.tar.gz` — a declared
     tar that does not parse is a `nested-archive-undecodable` gap (its inflated bytes are not staged,
     so this blocks rather than being scanned). An ordinary `.gz` still inflates.
-  - **Member names are compared CANONICALLY**, after ustar/PAX/GNU resolution: repeated `/` and `.`
+  - **Member names are compared CANONICALLY**, after ustar/PAX/GNU resolution — where only a POSIX
+    ustar header's bytes 345–500 are a name prefix; a GNU, V7 or STAR header carrying anything there
+    refuses the run rather than being named two ways: repeated `/` and `.`
     segments collapse (`././app/x`, `.//app/x` and `app/./x` are all `app/x`), Unicode and case are
     kept. The inventory, whiteout merge, build-output categories and public path lookup all use that
-    one form. A name that depends on the host — absolute, drive-letter, traversing, backslash-bearing,
-    NUL-bearing, empty, or a file/link with a trailing `/` — is an `unsafe-member-path` gap at any
-    depth: its content is scanned, and the record says the inventory could not account for it.
+    one form. A name that depends on the host — absolute, drive-letter, traversing, NUL-bearing, empty,
+    or a file/link with a trailing `/` — is an `unsafe-member-path` gap at any depth: its content is
+    scanned, and the record says the inventory could not account for it. **A backslash is refused the
+    same way even though it is a legal Linux filename byte** (e.g. systemd's `\x2d` unit names): a
+    deliberate, conservative limitation — an image containing one records the gap and cannot reach
+    ready without coordinator adjudication.
+  - **Numeric header fields** (checksum, size, mode) trim NUL and space at both ends and must be octal
+    inside; an interior NUL or other byte refuses the run instead of truncating the value.
+  - **Whiteouts are merged per layer before that layer's own entries**: a `.wh.<dir>` removes the
+    directory, its trailing-slash spelling and everything beneath it (never a sibling that merely shares
+    the prefix), a file recreated in the same layer survives, and an expected `/app` file under a
+    deleted directory is reported missing. Deleted bytes are still scanned.
   - **Ambiguous extended metadata refuses the run**: a repeated local PAX header, a global PAX header
     while member metadata is pending, a GNU long name together with a PAX `path` (or long link with
     `linkpath`) in either order, a repeated GNU long name/link, and any `GNU.sparse.*` key. The claim is about the **decoded tar
