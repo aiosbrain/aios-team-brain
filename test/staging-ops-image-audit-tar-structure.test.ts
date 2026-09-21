@@ -10,6 +10,7 @@ import {
   parsePaxRecords,
   readTarMembers,
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
+import { mergedFilesystem, whiteoutOf } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -499,6 +500,9 @@ describe("one canonical member path (B2)", () => {
       ["app/dir/", "directory", "app/dir/"],
       ["./app//dir/./", "directory", "app/dir/"],
       ["./", "directory", "."],
+      // B6: a DIRECTORY's key is type-driven — written without a slash, it still ends in one.
+      ["app/dir", "directory", "app/dir/"],
+      ["./app//dir", "directory", "app/dir/"],
       [".", "directory", "."],
     ];
     for (const [name, type, path] of accepted) expect(canonicalMemberPath(name, type), name).toEqual({ ok: true, path });
@@ -681,5 +685,28 @@ describe("one octal rule for checksum, size and mode (B4)", () => {
     for (const byte of mode) sum += byte;
     mode.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
     expect(() => read(Buffer.concat([mode, END]))).toThrow(/mode is not an octal field/);
+  });
+});
+
+describe("merge rules at unit level (B6)", () => {
+  it("reads a whiteout's basename after one trailing slash", () => {
+    expect(whiteoutOf("app/.wh.d/")).toEqual({ kind: "delete", target: "app/d" });
+    expect(whiteoutOf("app/d/.wh..wh..opq/")).toEqual({ kind: "opaque", target: "app/d/" });
+    expect(whiteoutOf("app/d/")).toEqual({ kind: "none" });
+  });
+
+  it("replaces by type across layers, merges directories, and flags same-layer ambiguity", () => {
+    const fileOverDir = mergedFilesystem([["app/", "app/d/", "app/d/x.js", "app/dx.js"], ["app/d"]]);
+    expect([...fileOverDir.visible.keys()].sort()).toEqual(["app/", "app/d", "app/dx.js"]);
+    expect(fileOverDir.conflicts).toEqual([]);
+    const dirOverFile = mergedFilesystem([["app/", "app/cfg"], ["app/cfg/"]]);
+    expect([...dirOverFile.visible.keys()].sort()).toEqual(["app/", "app/cfg/"]);
+    const dirOverDir = mergedFilesystem([["app/", "app/d/", "app/d/x.js"], ["app/d/", "app/d/y.js"]]);
+    expect([...dirOverDir.visible.keys()].sort()).toEqual(["app/", "app/d/", "app/d/x.js", "app/d/y.js"]);
+    expect(mergedFilesystem([["app/z", "app/z/q.js"]]).conflicts).toEqual([0]);
+    expect(mergedFilesystem([["app/z", "app/z/"]]).conflicts).toEqual([0]);
+    expect(mergedFilesystem([["app/f"], ["app/f/inner.js"]]).conflicts).toEqual([1]);
+    // …but a directory REPLACING the lower file in the same layer is not ambiguous.
+    expect(mergedFilesystem([["app/f"], ["app/f/", "app/f/inner.js"]]).conflicts).toEqual([]);
   });
 });
