@@ -122,7 +122,9 @@ export async function GET(req: NextRequest) {
       bound.teamId,
       bound.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },
-      { explicit: true, actor: { kind: "member", memberId: bound.memberId } }
+      // NOT `explicit`: that bypasses the unlink fence, and an admin's unlink must stay in force until an ADMIN
+      // relinks (AIO-1170 P2-03). A fenced account reports `conflict`; the credential is still saved.
+      { actor: { kind: "member", memberId: bound.memberId } }
     );
     identityStatus = result.conflict ? "conflict" : "linked";
   } catch {
@@ -132,7 +134,7 @@ export async function GET(req: NextRequest) {
   if (identityStatus !== "linked") {
     return htmlPage(200, "Slack connected — identity pending",
       identityStatus === "conflict"
-        ? "Your token is connected, but this Slack account is already linked to another member. Ask an admin to resolve the identity conflict."
+        ? "Your token is connected, but this Slack account can't be linked automatically: it is linked to another member, or an admin unlinked it. Ask an admin to resolve the identity."
         : "Your token is connected, but identity attribution is pending. Ask an admin to check the link.");
   }
   return htmlPage(200, "Slack connected", "Your Slack account is connected. You can close this tab and return to your workspace.");

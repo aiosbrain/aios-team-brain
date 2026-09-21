@@ -4,7 +4,7 @@ import type { NextRequest } from "next/server";
 import { GET as tokenGET, POST as tokenPOST, DELETE as tokenDELETE } from "@/app/api/v1/me/slack-token/route";
 import { issueApiKey } from "@/lib/admin/keys";
 import { setMemberSecret, getMemberSecret } from "@/lib/member-secrets/manage";
-import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { removeMemberIdentity, setMemberIdentity } from "@/lib/identity/member-identities";
 import { db, seedTeam, type Seed } from "./helpers";
 
 // The personal Slack token endpoint is owner-only BY CONSTRUCTION (member id from the API key,
@@ -161,6 +161,40 @@ describe("GET/POST/DELETE /api/v1/me/slack-token (owner-only, real Postgres)", (
       .select("member_id").eq("team_id", seed.teamId).eq("provider", "slack")
       .eq("external_id", "U0CONFLICT").single();
     expect(data.member_id).toBe(other.memberId);
+  });
+
+  it("saves the credential but does not let the account owner clear an admin's unlink", async () => {
+    // AIO-1170 review P2-03, ruled by Chetan 2026-09-21: an admin's unlink stays in force until an ADMIN relinks.
+    // The owner saving their own token is a credential operation; the spec lets it succeed while identity reports
+    // `conflict`/pending. It used to pass `explicit: true`, which bypasses the unlink fence, so the owner could
+    // silently undo the admin's decision (and this writer bumps the identity generation when it does).
+    const seed = await seedTeam();
+    const owner = await memberWithKey(seed);
+    await setMemberIdentity(db(), seed.teamId, owner.memberId, { provider: "slack", externalId: "U0FENCED" });
+    expect((await removeMemberIdentity(db(), seed.teamId, { provider: "slack", externalId: "U0FENCED" })).removed).toBe(true);
+    const fenced = () => db().from("member_identity_suppressions").select("external_id")
+      .eq("team_id", seed.teamId).eq("provider", "slack").eq("external_id", "U0FENCED");
+    expect((await fenced()).data).toHaveLength(1); // the unlink wrote its fence
+    mockSlackAuthTest(true, "U0FENCED");
+
+    const token = `xoxp-${randomUUID()}`;
+    const res = await req(tokenPOST, owner.key, seed.teamSlug, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({ ok: true, identity_status: "conflict" });
+    expect((await getMemberSecret(db(), seed.teamId, owner.memberId, "slack"))?.secret).toBe(token); // credential kept
+    const { data: mapped } = await db().from("member_identities").select("member_id")
+      .eq("team_id", seed.teamId).eq("provider", "slack").eq("external_id", "U0FENCED");
+    expect(mapped).toEqual([]); // no mapping recreated
+    expect((await fenced()).data).toHaveLength(1); // fence intact
+
+    // Non-vacuity: an ADMIN relink (force + explicit) still works, and only that clears the fence.
+    const relink = await setMemberIdentity(db(), seed.teamId, owner.memberId,
+      { provider: "slack", externalId: "U0FENCED" }, { force: true, explicit: true });
+    expect(relink.conflict).toBe(false);
+    expect((await fenced()).data).toHaveLength(0);
   });
 
   it("DELETE disconnects", async () => {

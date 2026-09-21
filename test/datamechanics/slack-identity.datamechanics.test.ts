@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { syncSlackIdentities } from "@/lib/ingest/sources/slack-identity";
+import { syncProviderIdentities } from "@/lib/identity/provider-sync";
 import { buildIdentityMap, resolveByProviderId } from "@/lib/identity/resolve";
 import { readSlackTeamGenerations } from "@/lib/ingest/slack-message-ledger";
 import { transactionCapability } from "@/lib/projects/context/transaction";
@@ -187,6 +188,35 @@ describe("setMemberIdentity (real Postgres)", () => {
 });
 
 describe("syncSlackIdentities (real Postgres)", () => {
+  it("links only on an exact roster or alias email, never on the email-local-part heuristic (AC-07)", async () => {
+    // AIO-1170 review P2-01 / spec: Slack auto-sync accepts ONLY an exact email match and disables heuristic
+    // matching "without changing unrelated provider behavior". The shared resolver's softer fallback (an email's
+    // local part matched to a team actor_handle, once the domain is in the roster) is a GUESS, and a wrong guess is
+    // a mis-credit that this writer's identity-generation bump now carries straight into the timeline.
+    const seed = await seedTeam();
+    const { data: alex } = await db().from("members")
+      .insert({ team_id: seed.teamId, email: "alex.smith@corp.com", display_name: "Alex Smith", actor_handle: "alex",
+        role: "member", tier: "team", status: "active" })
+      .select("id").single();
+    const alexId = (alex as { id: string }).id;
+
+    const res = await syncSlackIdentities(db(), seed.teamId, [
+      { id: "U0GUESS1", displayName: "A Different Alex", email: "alex@corp.com" }, // local part == handle, NOT the member's email
+      { id: "U0EXACT1", displayName: "Alex Smith", email: "alex.smith@corp.com" }, // exact roster email
+    ]);
+    expect(res).toMatchObject({ scanned: 2, mapped: 1, skipped: 1 });
+    const map = await buildIdentityMap(db(), seed.teamId);
+    expect(resolveByProviderId(map, "slack", "U0GUESS1")).toBeNull();
+    expect(resolveByProviderId(map, "slack", "U0EXACT1")).toBe(alexId);
+
+    // Non-vacuity: the SAME guess through an unrelated provider still maps, so it is the Slack path that changed,
+    // and the input above really did resolve heuristically.
+    const plane = await syncProviderIdentities(db(), seed.teamId, "plane",
+      [{ id: "P0GUESS1", displayName: "A Different Alex", email: "alex@corp.com" }]);
+    expect(plane).toMatchObject({ scanned: 1, mapped: 1 });
+    expect(resolveByProviderId(await buildIdentityMap(db(), seed.teamId), "plane", "P0GUESS1")).toBe(alexId);
+  });
+
   it("maps Slack users to members by email; skips non-matches; never clobbers a manual mapping", async () => {
     const seed = await seedTeam(); // member A
     const other = await addMember(seed.teamId); // member B

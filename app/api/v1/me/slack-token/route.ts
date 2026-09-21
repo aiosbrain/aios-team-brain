@@ -96,7 +96,9 @@ export async function POST(req: NextRequest) {
       auth.teamId,
       auth.memberId,
       { provider: "slack", externalId: test.user_id, handle: test.user ?? "", email: (m?.email as string) ?? "" },
-      { explicit: true, actor: { kind: "member", memberId: auth.memberId } }
+      // NOT `explicit`: that bypasses the unlink fence, and an admin's unlink must stay in force until an ADMIN
+      // relinks (AIO-1170 P2-03). A fenced account reports `conflict`; the credential is still saved.
+      { actor: { kind: "member", memberId: auth.memberId } }
     );
     identityStatus = result.conflict ? "conflict" : "linked";
   } catch {

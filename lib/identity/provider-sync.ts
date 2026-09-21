@@ -1,6 +1,6 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
-import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
+import { buildIdentityMap, resolveMemberDetailed } from "@/lib/identity/resolve";
 import { setMemberIdentity } from "@/lib/identity/member-identities";
 
 /**
@@ -23,11 +23,21 @@ export interface ProviderIdentitySyncResult {
   skipped: number; // email didn't resolve to a member, or a conflicting manual mapping exists
 }
 
+export interface ProviderIdentitySyncOptions {
+  /**
+   * Accept ONLY an exact roster or alias email match. The resolver's softer fallbacks — an email's local part
+   * matched to a team actor_handle, and a bare handle — are guesses, and a wrong guess is a mis-credit. Off by
+   * default so unrelated providers keep their behavior; Slack turns it on (AIO-1170 spec, AC-07).
+   */
+  exactEmailOnly?: boolean;
+}
+
 export async function syncProviderIdentities(
   admin: DbClient,
   teamId: string,
   provider: string,
-  users: ProviderUser[]
+  users: ProviderUser[],
+  opts: ProviderIdentitySyncOptions = {}
 ): Promise<ProviderIdentitySyncResult> {
   const res: ProviderIdentitySyncResult = { scanned: 0, mapped: 0, skipped: 0 };
   const withEmail = users.filter((u) => u.id && u.email);
@@ -36,7 +46,8 @@ export async function syncProviderIdentities(
   const map = await buildIdentityMap(admin, teamId);
   for (const u of withEmail) {
     res.scanned++;
-    const memberId = resolveMember(map, { email: u.email });
+    const resolved = resolveMemberDetailed(map, { email: u.email });
+    const memberId = opts.exactEmailOnly && resolved.method !== "email" ? null : resolved.memberId;
     if (!memberId) {
       res.skipped++;
       continue;
