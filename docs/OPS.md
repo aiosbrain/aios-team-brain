@@ -1483,6 +1483,21 @@ shows**. A readback at the requested commit is kept as reconciliation evidence, 
 ref is, not that this request put it there — so it is never recorded as an acceptance, at runtime or
 by `check-evidence`, and no later actor case starts.
 
+The same holds for a response that arrived but did **not complete**. Both transports (`gh` and the
+App token) hold every JSON answer to one bounded completed-response contract: a finished status line
+and head, the whole body collected under the 1 MiB bound (collection stops at the bound), a body read
+or `gh` exit that finished, strict UTF-8, a JSON body — or an *empty* 204 — and the endpoint's
+documented success shape. A body read that failed, malformed or oversize JSON, a `gh` exit that does
+not match its status, or a refusal whose text was cut off is recorded as status 0 with the reason
+(`response_incomplete`) and the status line it did see (`measured_status`), and it is never read as a
+policy denial. Every journal, case-state, post-challenge and evidence record carries
+`response_complete` beside the status; a record without it is ambiguous, not a status to trust.
+
+The halt and the exit code are separate facts. A halted matrix whose failing cases are all
+inconclusive or not-run exits **3** (`incomplete`); a matrix with any measured failure — an
+unexpected success, denial or mutation, including a must-deny ref that moved while its response was
+cut off — exits **1** (`failed`), whatever inconclusive cases sit beside it.
+
 The local **human** cases obey the same rule through the verified resource journal rather than a
 per-job state file. Each case is admitted from its journaled intent → result → readback → outcome
 history before any request: a case with any history is never issued again. Re-running `human-tests`
@@ -1739,6 +1754,8 @@ bounds — and its response can satisfy no actor case.
   clean success says nothing about which run it created. The witness always answers the same way —
   look for the exact expected artifact — and it journals intent-then-result, so a restarted witness
   reconciles an existing publication instead of publishing a second response for a consumed nonce.
+  Only a *complete* refusal stops a dispatch; a 5xx, a 204 carrying stray bytes or a cut-off refusal
+  stays pending and is reconciled by the exact artifact, never dispatched again.
 - **The complete governed policy changed across a case's window.** The case stops. That is the pre/post
   pair doing its job — and it is worth being precise about what it does not do: a change made and
   reverted inside the window is outside the guarantee, which is why the quiet-window prerequisite is a
