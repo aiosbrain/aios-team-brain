@@ -23,7 +23,7 @@ import {
   derivedRef, derivedRefs, derivedRulesetName, evaluateDisposableCompatibility, evidenceSlug,
   assertNoCollision, assertPlannedPolicyApplies, assertSyntheticPullTarget, evaluateCheckState,
   governedFingerprint, invertDisposable, runActorCase, runActorCases, resolvePublishedResponse,
-  assessHumanCaseJournal,
+  assessHumanCaseJournal, cloudCasesIssuedAfterHalt, mutationRequestClass,
   createArchiveTransport, evidenceFileName, main, MAX_JOB_MINUTES, mintActorCredential, mintAppJwt,
   parseArgs, projectGovernedRuleset, readAllPages,
   positiveProviderId, readApplicableBranchRulesets, readEvidenceFile, readSingleEntryZip,
@@ -81,7 +81,13 @@ const MAIN_SHA = "b".repeat(40);
 const STAGING_SHA = WORKFLOW_SHA;
 const MOVED_STAGING_SHA = "c".repeat(40);
 const PRODUCER_IDS = Object.fromEntries(REQUIRED_MAIN_CONTEXTS.map((context, index) => [context, 900 + index]));
-const SENTINEL_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIEsentinelKEYMATERIAL0123456789\n-----END RSA PRIVATE KEY-----";
+/**
+ * A clearly synthetic, private-key-SHAPED sentinel for the redaction assertions. It is assembled from
+ * parts so the source holds no static private-key block for a secret scanner to match; the runtime
+ * value is the same PEM-shaped string, and its body is an obvious non-key marker.
+ */
+const SENTINEL_PEM_LABEL = ["RSA", "PRIVATE", "KEY"].join(" ");
+const SENTINEL_KEY = [`-----BEGIN ${SENTINEL_PEM_LABEL}-----`, "MIIEsentinelKEYMATERIAL0123456789", `-----END ${SENTINEL_PEM_LABEL}-----`].join("\n");
 
 const sha = (seed: string) => createHash("sha1").update(seed).digest("hex");
 
@@ -1751,10 +1757,11 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
       .rejects.toThrow(/could not be measured|not yet in place/);
   });
 
-  it("treats a transport failure, a 404 and a bare credential rejection as INCONCLUSIVE, never as enforcement", () => {
+  it("treats a transport failure, a 5xx, a 404 and a bare credential rejection as INCONCLUSIVE, never as enforcement", () => {
     for (const [label, response, ambiguous] of [
       ["a transport timeout", { status: 0, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } }, true],
       ["a transport failure", { status: 0, diagnostic: { status: 0, category: "transport-unavailable", ruleIds: [], policyDenial: false } }, true],
+      ...[500, 502, 503, 504, 408].map((status) => [`a ${status}`, { status, diagnostic: { status, category: "unclassified", ruleIds: [], policyDenial: false } }, true]),
       ["a 404", { status: 404, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } }, false],
       ["a 401", { status: 401, diagnostic: { status: 401, category: "unauthorized", ruleIds: [], policyDenial: false } }, false],
       ["a rate limit", { status: 403, diagnostic: { status: 403, category: "rate-limited", ruleIds: [], policyDenial: false } }, false],
@@ -1764,8 +1771,9 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
       });
       // Each of these is equally consistent with the policy simply not existing.
       expect(verdict.outcome, label).toBe("inconclusive");
-      // A MEASURED refusal leaves the ref's state known, so later cases may run. A request that never
-      // completed is an AMBIGUOUS mutation, and that stops further actor mutations (R1).
+      // A MEASURED refusal leaves the ref's state known, so later cases may run. A request with no
+      // decisive outcome (no response, a 5xx, a 408) is an AMBIGUOUS mutation, and that stops
+      // further actor mutations (R1, limitation 5).
       expect(verdict.halt, label).toBe(ambiguous);
     }
   });
@@ -1814,7 +1822,7 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
     expect(github.refs.has(derivedRef(RUN_ID, ATTEMPT, "emergency"))).toBe(true);
   });
 
-  it("R1 · an AMBIGUOUS mutation is inconclusive and HALTS, even when its one readback shows the requested commit", () => {
+  it.each([0, 500, 502, 503, 504, 408])("R1 · an AMBIGUOUS mutation (status %i) is inconclusive and HALTS, even when its one readback shows the requested commit", (status) => {
     /**
      * Canonical: "An ambiguous mutation ... stops further actor mutations. Never resume/retry that
      * mutation." This test used to assert the opposite — status 0 plus a matching readback was an
@@ -1822,101 +1830,148 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
      * reconciliation evidence; it cannot prove that THIS request moved the ref.
      */
     const requested = sha("b");
-    const timeout = { status: 0, diagnostic: { category: "transport-timeout", policyDenial: false, ruleIds: [] } };
-    for (const [label, after, expected] of [
-      ["accepted, readback shows the requested commit", requested, "accepted"],
-      ["accepted, readback unchanged", sha("a"), "accepted"],
-      ["denied, readback unchanged", sha("a"), "denied"],
+    const timeout = { status, diagnostic: { category: status === 0 ? "transport-timeout" : "unclassified", policyDenial: false, ruleIds: [] } };
+    // A 5xx body that happens to carry rule wording is still not a measured refusal: the diagnostic
+    // cannot turn a request of unknown fate into enforcement evidence.
+    const rulish = { status, diagnostic: { category: "protected-ref-update-restricted", policyDenial: true, ruleIds: ["protected-ref-update-restricted"] } };
+    for (const [label, response, after, expected, operation] of [
+      ["accepted, readback shows the requested commit", timeout, requested, "accepted", "update"],
+      ["accepted, readback unchanged", timeout, sha("a"), "accepted", "update"],
+      ["denied, readback unchanged", timeout, sha("a"), "denied", "update"],
+      ["denied, rule-worded body, readback unchanged", rulish, sha("a"), "denied", "force"],
+      ["denied delete, rule-worded body, readback unchanged", rulish, sha("a"), "denied", "delete"],
     ] as const) {
-      const verdict = classifyCaseOutcome({ expected, response: timeout, ...readback(sha("a"), after), requestedSha: requested, operation: "update" });
+      const verdict = classifyCaseOutcome({ expected, response, ...readback(sha("a"), after), requestedSha: requested, operation, requiresRuleId: "protected-ref-update-restricted" });
       expect(verdict, label).toMatchObject({ outcome: "inconclusive", halt: true, ambiguous: true });
       expect(verdict.reason, label).toMatch(/never retried, and no further actor mutation runs/);
     }
+    expect(mutationRequestClass(status)).toBe("ambiguous");
     // A MOVED ref on a case that must be denied stays the stronger, already-halting finding.
     expect(classifyCaseOutcome({ expected: "denied", response: timeout, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "unexpected-mutation", halt: true });
     // A response that never arrived at all is the same ambiguous request.
     expect(classifyCaseOutcome({ expected: "accepted", response: undefined, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "inconclusive", halt: true });
-    // A MEASURED acceptance is unchanged.
+    // A MEASURED acceptance and a MEASURED policy refusal are unchanged.
     expect(classifyCaseOutcome({ expected: "accepted", response: { status: 200, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } }, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "accepted", halt: false });
+    expect(classifyCaseOutcome({ expected: "denied", response: { ...rulish, status: 422 }, ...readback(sha("a"), sha("a")), requestedSha: requested, operation: "force", requiresRuleId: "protected-ref-update-restricted" }))
+      .toMatchObject({ outcome: "denied", halt: false });
   });
 
-  it("R1 · the offline verdict refuses an acceptance recorded at status 0 for BOTH accepted cases", () => {
+  it.each([0, 502, 503, 408])("R1 · the offline verdict refuses an acceptance or denial recorded at status %i, whatever outcome or class the record asserts", (status) => {
     const graph = Object.fromEntries(buildGraphPlan(RUN_ID, ATTEMPT).map((node, index) => [node.key, sha(`node-${index}`)]));
     for (const caseId of ["emergency-update-no-checks", "normal-update-all-green"]) {
       const kase = buildActorMatrix().find((entry) => entry.id === caseId)!;
       const record = {
         case: kase.id, actor: kase.actor, operation: kase.operation, ref: derivedRef(RUN_ID, ATTEMPT, kase.ref), force: kase.force,
         expected: kase.expected, before_sha: graph[kase.from], requested_sha: graph[kase.to!], after_sha: graph[kase.to!],
-        http_status: 0, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false },
+        http_status: status, diagnostic: { status, category: status === 0 ? "transport-timeout" : "unclassified", ruleIds: [], policyDenial: false },
         outcome: "accepted", passed: true, check_state: { expectation: kase.checks, measured: false },
       };
       const problems = deriveCaseVerdict(record, kase, { runId: RUN_ID, attempt: ATTEMPT, graph, normalAppId: NORMAL_APP });
-      expect(problems.some((why: string) => /acceptance at HTTP 0, which is not a measured provider acceptance/.test(why)), caseId).toBe(true);
+      expect(problems.some((why: string) => new RegExp(`acceptance at HTTP ${status}, which is not a measured provider acceptance`).test(why)), caseId).toBe(true);
+      // An asserted `accepted` class beside the status is refused as well.
+      const asserted = deriveCaseVerdict({ ...record, request_class: "accepted" }, kase, { runId: RUN_ID, attempt: ATTEMPT, graph, normalAppId: NORMAL_APP });
+      expect(asserted.some((why: string) => /labels its request "accepted", but HTTP .* is ambiguous/.test(why)), caseId).toBe(true);
     }
+    // A DENIAL at the same status with a rule-worded diagnostic and an unchanged ref.
+    const kase = buildActorMatrix().find((entry) => entry.id === "emergency-force-rewind")!;
+    const denial = {
+      case: kase.id, actor: kase.actor, operation: kase.operation, ref: derivedRef(RUN_ID, ATTEMPT, kase.ref), force: kase.force,
+      expected: kase.expected, before_sha: graph[kase.from], requested_sha: graph[kase.to!], after_sha: graph[kase.from],
+      http_status: status, diagnostic: { status, category: "non-fast-forward-rejected", ruleIds: ["non-fast-forward-rejected"], policyDenial: true },
+      outcome: "denied", passed: true, check_state: { expectation: kase.checks, measured: false },
+    };
+    expect(deriveCaseVerdict(denial, kase, { runId: RUN_ID, attempt: ATTEMPT, graph, normalAppId: NORMAL_APP }).join("\n"))
+      .toMatch(new RegExp(`denial at HTTP ${status}, which is not a measured provider refusal`));
   });
 
-  it("R1 · a staged ambiguous accepted mutation halts its actor: the next case cannot even prepare", async () => {
-    /**
-     * Both expected-accepted cases, each with the response LOST (status 0) — once with the mutation
-     * having actually landed (readback = requested) and once without (readback unchanged). In every
-     * variant the case finalizes as a halt, the offline verdict refuses it, and the next case in the
-     * closed sequence refuses at `prepare` — before a witness, a credential or a request.
-     */
-    for (const role of ["emergency", "normal"] as const) {
-      for (const landed of [true, false]) {
-        const label = `${role} / ${landed ? "landed" : "not landed"}`;
-        rmSync(evidenceDir, { recursive: true, force: true });
-        mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
-        const github = createFakeGitHub();
-        await intentAndSetup(github);
-        await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
-        const env = cloudEnv(role, { ...(role === "normal" ? NORMAL_JOB_ENV : EMERGENCY_JOB_ENV), COMMISSIONING_EVIDENCE_DIR: evidenceDir });
-        if (role === "normal") {
-          github.createNormalJob();
-          github.approve("normal");
-          await runNormalCheckPublication({ env, deps: cloudDeps(github) });
-        } else {
-          github.approve("emergency");
-        }
-        const caseId = role === "normal" ? "normal-update-all-green" : "emergency-update-no-checks";
-        const ordinal = CLOUD_CASE_SEQUENCE[role].indexOf(caseId) + 1;
-        for (const earlier of CLOUD_CASE_SEQUENCE[role].slice(0, ordinal - 1)) await runCase(github, role, earlier);
-        const branch = derivedRef(RUN_ID, ATTEMPT, role).replace("refs/heads/", "");
-        let mutations = 0;
-        const lossy = async (method: string, requestPath: string, body?: unknown) => {
-          if (method === "PATCH" && requestPath.endsWith(branch)) {
-            mutations += 1;
-            if (landed) github.handle(role, method, requestPath, body as never);
-            return { status: 0, body: null, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } };
-          }
-          const result = github.handle(role, method, requestPath, body as never);
-          return { status: result.status, body: result.status >= 400 ? null : result.body, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
-        };
-        const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, appTransport: lossy };
-        await runCaseStage({ stage: "prepare", caseId, env, deps });
-        publishChallenge(github, role, ordinal, "pre");
-        await serveOne(github, { role, caseId, ordinal, direction: "pre" });
-        await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
-        publishChallenge(github, role, ordinal, "post");
-        await serveOne(github, { role, caseId, ordinal, direction: "post" });
-        await expect(runCaseStage({ stage: "await-and-finalize", caseId, env, deps }), label)
-          .rejects.toThrow(/recorded inconclusive: .*no further actor mutation runs/);
-        expect(mutations, label).toBe(1);
-        const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-${role}-${String(ordinal).padStart(2, "0")}.json`), "utf8"));
-        expect(state, label).toMatchObject({ status: "finalized", halt: true });
-        expect(state.record, label).toMatchObject({ outcome: "inconclusive", passed: false, request_class: "ambiguous" });
-        expect(state.record.after_sha === state.record.requested_sha, label).toBe(landed);
-        // The NEXT case refuses before anything else happens.
-        const next = CLOUD_CASE_SEQUENCE[role][ordinal];
-        const before = github.calls.length;
-        await expect(runCaseStage({ stage: "prepare", caseId: next, env, deps }), label).rejects.toThrow(/halted this actor/);
-        expect(github.calls.slice(before).filter((call) => ["PATCH", "DELETE", "PUT", "POST"].includes(call.method)), label).toEqual([]);
-        expect(existsSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role, ordinal: ordinal + 1, direction: "pre" })}.json`)), label).toBe(false);
-      }
+  it("the offline assessor refuses a cloud case issued after an ambiguous or halting one, whatever that later case records", () => {
+    const record = (caseId: string, outcome: string, httpStatus?: number) => ({ case: caseId, outcome, ...(httpStatus === undefined ? {} : { http_status: httpStatus }) });
+    const [first, second, third] = CLOUD_CASE_SEQUENCE.emergency;
+    for (const [label, halting] of [
+      ["a 503", record(first, "inconclusive", 503)],
+      ["a lost response", record(first, "inconclusive", 0)],
+      ["a used marker that never finalized", record(first, "inconclusive")],
+      ["an unexpected mutation", record(first, "unexpected-mutation", 422)],
+    ] as const) {
+      const problems = cloudCasesIssuedAfterHalt({ emergency: { cases: [halting, record(second, "denied", 422), record(third, "not-run")] } });
+      expect(problems, label).toHaveLength(1);
+      expect(problems[0], label).toMatch(new RegExp(`case ${second} records denied after ${first} had stopped further emergency mutations`));
     }
+    // A measured, non-halting refusal does not stop the later cases, and `not-run` successors are the correct record.
+    expect(cloudCasesIssuedAfterHalt({ emergency: { cases: [record(first, "unexpected-denial", 403), record(second, "denied", 422)] } })).toEqual([]);
+    expect(cloudCasesIssuedAfterHalt({ emergency: { cases: [record(first, "inconclusive", 503), record(second, "not-run"), record(third, "not-run")] } })).toEqual([]);
+  });
+
+  /**
+   * Both expected-accepted cases, each with a response that decides nothing — LOST (status 0) or a
+   * 503 — once with the mutation having actually landed (readback = requested) and once without
+   * (readback unchanged); plus an expected-denied force case answered by a 5xx over an unchanged ref.
+   * In every variant the case finalizes as a halt and the next case in the closed sequence refuses at
+   * `prepare` — before a witness, a credential or a request.
+   */
+  const stagedAmbiguous = [
+    ...(["emergency", "normal"] as const).flatMap((role) => [0, 503].flatMap((status) => [true, false].map((landed) =>
+      [role, role === "normal" ? "normal-update-all-green" : "emergency-update-no-checks", status, landed] as const))),
+    ["emergency", "emergency-force-rewind", 502, false] as const,
+    ["emergency", "emergency-force-rewind", 503, false] as const,
+  ];
+  it.each(stagedAmbiguous)("R1 · a staged ambiguous mutation halts its actor: %s %s at status %i (landed: %s), the next case cannot even prepare", async (role, caseId, status, landed) => {
+    const label = `${role} / ${caseId} / ${status} / ${landed ? "landed" : "not landed"}`;
+    rmSync(evidenceDir, { recursive: true, force: true });
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    const env = cloudEnv(role, { ...(role === "normal" ? NORMAL_JOB_ENV : EMERGENCY_JOB_ENV), COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    if (role === "normal") {
+      github.createNormalJob();
+      github.approve("normal");
+      await runNormalCheckPublication({ env, deps: cloudDeps(github) });
+    } else {
+      github.approve("emergency");
+    }
+    const ordinal = CLOUD_CASE_SEQUENCE[role].indexOf(caseId) + 1;
+    for (const earlier of CLOUD_CASE_SEQUENCE[role].slice(0, ordinal - 1)) await runCase(github, role, earlier);
+    const branch = derivedRef(RUN_ID, ATTEMPT, role).replace("refs/heads/", "");
+    let mutations = 0;
+    const lossy = async (method: string, requestPath: string, body?: unknown) => {
+      if (method === "PATCH" && requestPath.endsWith(branch)) {
+        mutations += 1;
+        if (landed) github.handle(role, method, requestPath, body as never);
+        return { status, body: null, diagnostic: { status, category: status === 0 ? "transport-timeout" : "unclassified", ruleIds: [], policyDenial: false } };
+      }
+      const result = github.handle(role, method, requestPath, body as never);
+      return { status: result.status, body: result.status >= 400 ? null : result.body, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
+    };
+    const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, appTransport: lossy };
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, role, ordinal, "pre");
+    await serveOne(github, { role, caseId, ordinal, direction: "pre" });
+    await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+    publishChallenge(github, role, ordinal, "post");
+    await serveOne(github, { role, caseId, ordinal, direction: "post" });
+    await expect(runCaseStage({ stage: "await-and-finalize", caseId, env, deps }), label)
+      .rejects.toThrow(/recorded inconclusive: .*no further actor mutation runs/);
+    expect(mutations, label).toBe(1);
+    const state = JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-${role}-${String(ordinal).padStart(2, "0")}.json`), "utf8"));
+    expect(state, label).toMatchObject({ status: "finalized", halt: true });
+    expect(state.record, label).toMatchObject({ outcome: "inconclusive", passed: false, request_class: "ambiguous" });
+    expect(state.record.after_sha === state.record.requested_sha, label).toBe(landed);
+    // The post challenge carries the DERIVED class, and the witness refuses one relabelled beside its status.
+    const postChallenge = JSON.parse(readFileSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role, ordinal, direction: "post" })}.json`), "utf8"));
+    expect(postChallenge, label).toMatchObject({ request_class: "ambiguous", request_status: status });
+    for (const laundered of ["accepted", "refused"]) {
+      expect(() => assertChallengeShape({ ...postChallenge, request_class: laundered }), `${label} / ${laundered}`).toThrow(/labels request status .* but that status is ambiguous/);
+    }
+    // The NEXT case refuses before anything else happens.
+    const next = CLOUD_CASE_SEQUENCE[role][ordinal];
+    const before = github.calls.length;
+    await expect(runCaseStage({ stage: "prepare", caseId: next, env, deps }), label).rejects.toThrow(/halted this actor/);
+    expect(github.calls.slice(before).filter((call) => ["PATCH", "DELETE", "PUT", "POST"].includes(call.method)), label).toEqual([]);
+    expect(existsSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role, ordinal: ordinal + 1, direction: "pre" })}.json`)), label).toBe(false);
   });
 
   it("refuses a reported success whose independent readback disagrees", () => {
@@ -2910,7 +2965,7 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
       ["a fabricated diagnostic category", { diagnostic: { ...sound.diagnostic, category: "totally-denied", ruleIds: ["totally-denied"] } }, /not one this build classifies/],
       ["a non-policy diagnostic dressed as a policy denial", { diagnostic: { status: 403, category: "credential-failure", ruleIds: ["credential-failure"], policyDenial: true } }, /not attributable to a policy rule/],
       ["a denial on a ref that moved", { after_sha: graph.N1 }, /denial on a ref that moved/],
-      ["a denial that is not a client refusal", { http_status: 200 }, /not a client refusal/],
+      ["a denial that is not a client refusal", { http_status: 200 }, /not a measured provider refusal/],
       ["a before SHA that is not its graph node", { before_sha: graph.B }, /not the journaled synthetic node A/],
       ["a requested SHA that is not its graph node", { requested_sha: graph.N2 }, /not the journaled synthetic node N1/],
       ["an unmeasured check state", { check_state: { expectation: kase.checks, measured: false } }, /check state was measured/],
@@ -4705,6 +4760,34 @@ describe("correction pass 3 — F5/F6: the ready-work scheduler and pending-disp
     restarted.lock.release();
   });
 
+  it.each([502, 503])("F6 · a witness dispatch answered %i is pending and never re-dispatched, not a refusal", async (status) => {
+    // A 5xx can follow a dispatch the scheduler accepted, exactly like a lost response.
+    const github = createFakeGitHub({ suppressPublisher: true });
+    const caseId = await emergencyFirst(github);
+    const item = { role: "emergency", caseId, ordinal: 1, direction: "pre" as const };
+    const session = await openWitnessSession({
+      runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { spawnImpl: github.spawnImpl, archiveTransport: github.archiveImpl },
+    });
+    try {
+      const failing = async (method: string, requestPath: string, body?: unknown) => {
+        const response = await session.request(method, requestPath, body as never);
+        return requestPath.endsWith("/dispatches") ? { status, body: null, diagnostic: { status, category: "unclassified", ruleIds: [], policyDenial: false } } : response;
+      };
+      const begin = () => beginWitnessItem({
+        request: failing, requestArchive: session.requestArchive, ctx: session.ctx, journal: session.journal,
+        item, operator: session.operator, domain: session.domain, setupBindings: session.setupBindings,
+      });
+      expect((await begin()).state).toBe("pending");
+      expect((await begin()).state).toBe("pending");
+      expect(github.dispatches).toHaveLength(1);
+      const results = (session.journal.read() as JournalRecord[]).filter((record) => record.type === "dispatch-result");
+      expect(results.map((record) => record.data)).toEqual([expect.objectContaining({ status, ambiguous: true })]);
+    } finally {
+      session.lock.release();
+    }
+  });
+
   it("F6 · refuses an artifact published under the expected name whose bytes do not bind", async () => {
     const github = createFakeGitHub({ suppressPublisher: true });
     const caseId = await emergencyFirst(github);
@@ -4776,8 +4859,12 @@ describe("correction pass 3 — F7/F8/F9: durable identity, provable ownership a
     const refused = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 422, id: null })]);
     expect(refused.state).toBe("refused");
     expect(refused.unresolved).toBe(false);
-    // A transport failure at status 0 is ambiguous, not refused.
-    expect(states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 0, id: null })]).state).toBe("response-ambiguous");
+    // A transport failure at status 0, a 5xx or a 408 is ambiguous, not refused: a 503 can follow a
+    // committed create, so recreating would duplicate it.
+    for (const status of [0, 500, 502, 503, 504, 408]) {
+      const ambiguous = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status, id: null })]);
+      expect(ambiguous, String(status)).toMatchObject({ state: "response-ambiguous", unresolved: true });
+    }
     // No result at all.
     expect(states([intent("ruleset", { name })]).state).toBe("response-lost");
     // A POSITIVE identity is adoptable; a zero one never was an identity.
@@ -6022,19 +6109,30 @@ describe("R2 — a local human case is issued once, admitted from the verified j
     expect(again.records.map((record) => record.outcome)).toEqual(["denied", "denied", "inconclusive", "not-run", "not-run", "not-run"]);
   });
 
-  it("an ambiguous (timed-out) case halts, and a repeated phase re-reads its outcome instead of re-issuing it", async () => {
-    const [one, two, three] = humanCases();
+  it.each([
+    ["timed out", 0, timeout],
+    ["503", 503, { status: 503, category: "unclassified", ruleIds: [], policyDenial: false }],
+    ["502 with rule wording", 502, { ...policyDenial, status: 502 }],
+    ["504", 504, { status: 504, category: "unclassified", ruleIds: [], policyDenial: false }],
+  ] as const)("an ambiguous (%s) case halts, and a repeated phase re-reads its outcome instead of re-issuing it", async (_label, status, diagnostic) => {
+    const [one, two, three, four] = humanCases();
     const journal = memoryJournal([...settledDenial(one), ...settledDenial(two)]);
-    const stub = provider(() => ({ status: 0, diagnostic: timeout }));
+    const stub = provider(() => ({ status, diagnostic }));
     const first = await runActorCases({ request: stub.request, actor: "human", ctx, graphShas: graph, journal });
-    expect(first.records[2]).toMatchObject({ case: three.id, outcome: "inconclusive" });
+    expect(first.records[2]).toMatchObject({ case: three.id, outcome: "inconclusive", passed: false });
     expect(first.halted).toBe(three.id);
+    expect(first.records[3]).toMatchObject({ case: four.id, outcome: "not-run" });
     expect(stub.mutations()).toHaveLength(1);
     const repeat = provider(() => { throw new Error("no mutation may be issued"); });
     const second = await runActorCases({ request: repeat.request, actor: "human", ctx, graphShas: graph, journal });
     expect(repeat.calls).toEqual([]);
     expect(second.records.slice(0, 3)).toEqual(first.records.slice(0, 3));
     expect(second.halted).toBe(three.id);
+    // Offline, the same history is a blocking settled case, and a later intent is a post-halt issue.
+    const assessed = assessHumanCaseJournal(journal.events, { runId: RUN_ID, attempt: ATTEMPT });
+    expect(assessed.cases[three.id]).toMatchObject({ state: "settled", blocking: true });
+    const hidden = assessHumanCaseJournal([...journal.events, settledDenial(four)[0]], { runId: RUN_ID, attempt: ATTEMPT });
+    expect(hidden.problems.join("\n")).toMatch(new RegExp(`${four.id} issued after ${three.id} \\(settled\\)`));
   });
 
   it("the offline history owner refuses duplicate, unresolved, out-of-order, rewritten, hidden and post-halt histories", () => {

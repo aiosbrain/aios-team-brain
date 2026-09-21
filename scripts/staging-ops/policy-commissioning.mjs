@@ -90,7 +90,7 @@ import {
   assertChallengeShape, assertObservationProximity, assertPublisherArtifactProvenance,
   assertPublisherContext, assertResponseBinding, assertResponseShape, buildChallenge, buildGovernedSnapshot,
   buildResponse, bytesSha256, canonicalHash as witnessCanonicalHash, canonicalJson as witnessCanonicalJson,
-  challengeArtifactName, publishWitnessResponse, readSingleEntryZip, readWitnessEnvelopeFromEvent,
+  challengeArtifactName, mutationRequestClass, publishWitnessResponse, readSingleEntryZip, readWitnessEnvelopeFromEvent,
   responseArtifactName, serializeDispatchEnvelope, validateGovernedSnapshot,
 } from "./commissioning-witness.mjs";
 
@@ -159,7 +159,7 @@ export {
   readWitnessEnvelopeFromEvent, publishWitnessResponse, buildGovernedSnapshot, crc32,
   assertChallengeShape, assertResponseShape, assertObservationProximity, WITNESS_ENTRY_NAME,
   GOVERNED_RULE_PARAMETERS, EXCLUDED_RULESET_FIELDS, BINDING_FIELDS, POLL_INTERVAL_MS,
-  MAX_WITNESS_PROCESS_MS,
+  MAX_WITNESS_PROCESS_MS, mutationRequestClass,
 } from "./commissioning-witness.mjs";
 
 /**
@@ -1951,22 +1951,30 @@ export const CASE_OUTCOMES = Object.freeze([
  * readback is still measured and retained as reconciliation evidence, but it cannot turn a request
  * of unknown fate into a measured provider result: the ref could equally have been moved by some
  * other writer, and "the provider accepted this request" is the claim the case exists to prove.
- * So status 0 is `inconclusive` and halts, whatever the readback shows, for every expectation.
+ * So an ambiguous request is `inconclusive` and halts, whatever the readback shows, for every
+ * expectation.
+ *
+ * The ambiguous class is not status 0 alone. A 5xx (or a 408, or any status that is neither a
+ * measured 2xx nor a measured 4xx) says the request reached something that then failed, which is
+ * equally consistent with the write having been applied: a gateway can time out on an upstream that
+ * committed. {@link mutationRequestClass} owns the class; a MEASURED 4xx refusal stays a decisive
+ * answer, and whether a rule caused it is still judged by the diagnostic and the unchanged ref.
  */
 export function classifyCaseOutcome({ expected, response, beforeSha, afterSha, requestedSha, operation, requiresRuleId = null }) {
-  const status = Number(response?.status ?? 0);
+  const status = response?.status ?? null;
+  const requestClass = mutationRequestClass(status);
+  const statusLabel = Number.isInteger(status) ? String(status) : "no status";
   const diagnostic = response?.diagnostic ?? { category: "unclassified", policyDenial: false, ruleIds: [] };
   const changed = String(beforeSha) !== String(afterSha);
-  const ambiguous = status === 0;
   const ambiguousVerdict = (readbackNote) => ({
     outcome: "inconclusive", halt: true, ambiguous: true,
-    reason: `the request did not complete, so its outcome is unknown; ${readbackNote}. The readback is retained as reconciliation evidence only, the mutation is never retried, and no further actor mutation runs`,
+    reason: `the request has no decisive provider outcome (${statusLabel}), so whether it was applied is unknown; ${readbackNote}. The readback is retained as reconciliation evidence only, the mutation is never retried, and no further actor mutation runs`,
   });
   if (expected === "denied") {
-    if (status >= 200 && status < 300) return { outcome: "unexpected-success", halt: true, reason: "the provider accepted an operation the policy must refuse" };
+    if (requestClass === "accepted") return { outcome: "unexpected-success", halt: true, reason: "the provider accepted an operation the policy must refuse" };
     if (changed) return { outcome: "unexpected-mutation", halt: true, reason: "the ref moved despite a non-success response" };
-    if (ambiguous) return ambiguousVerdict("the readback shows the ref unchanged, which a transport failure cannot attribute to enforcement");
-    if (status >= 400 && status < 500 && diagnostic.policyDenial === true) {
+    if (requestClass === "ambiguous") return ambiguousVerdict("the readback shows the ref unchanged, which an undecided request cannot attribute to enforcement");
+    if (diagnostic.policyDenial === true) {
       if (requiresRuleId && !(diagnostic.ruleIds ?? []).includes(requiresRuleId)) {
         return { outcome: "inconclusive", halt: false, reason: `the refusal is a policy denial but not the ${requiresRuleId} rule this case must isolate` };
       }
@@ -1977,17 +1985,17 @@ export function classifyCaseOutcome({ expected, response, beforeSha, afterSha, r
       reason: `the refusal (${status}, ${diagnostic.category}) is not attributable to a policy rule`,
     };
   }
-  if (status >= 200 && status < 300 && operation !== "delete" && String(afterSha) === String(requestedSha)) {
+  if (requestClass === "accepted" && operation !== "delete" && String(afterSha) === String(requestedSha)) {
     return { outcome: "accepted", halt: false, reason: null };
   }
-  if (status >= 200 && status < 300) return { outcome: "unexpected-mutation", halt: true, reason: "the provider reported success but the independent readback does not show the requested commit" };
-  if (ambiguous) {
+  if (requestClass === "accepted") return { outcome: "unexpected-mutation", halt: true, reason: "the provider reported success but the independent readback does not show the requested commit" };
+  if (requestClass === "ambiguous") {
     return ambiguousVerdict(String(afterSha) === String(requestedSha)
       ? "the readback shows the requested commit, which proves where the ref is but not that this request put it there"
       : "the readback does not show the requested commit");
   }
-  if (status >= 400 && status < 500) return { outcome: "unexpected-denial", halt: false, reason: `the provider refused an operation the policy must permit (${status}, ${diagnostic.category})` };
-  return { outcome: "inconclusive", halt: false, reason: `the request returned ${status}, which is neither an acceptance nor a refusal this case can attribute` };
+  // A measured 4xx: the provider decisively declined a write the policy must permit.
+  return { outcome: "unexpected-denial", halt: false, reason: `the provider refused an operation the policy must permit (${status}, ${diagnostic.category})` };
 }
 
 /** Read a derived ref's current commit. `null` means measured-absent (404), not unknown. */
@@ -3118,10 +3126,12 @@ export function intentKey(data) {
  *  - `created`            — a `resource-created` record exists. Resolved; excluded from the list.
  *  - `reconciled`         — a bounded readback already established the outcome. Replayed, not redone.
  *  - `identified`         — a result carrying a POSITIVE provider identity. Adopt that exact identity.
- *  - `refused`            — a result with a measured non-2xx status and no identity. Nothing was
- *                           created; safe to recreate, and NOT an unaccounted resource.
- *  - `response-ambiguous` — a result with no usable identity whose status is 2xx or a transport
- *                           failure (0). Something may exist. Reconcile by readback; never re-POST.
+ *  - `refused`            — a result with a measured 4xx refusal ({@link mutationRequestClass}) and
+ *                           no identity. Nothing was created; safe to recreate, and NOT an
+ *                           unaccounted resource.
+ *  - `response-ambiguous` — a result with no usable identity whose status is 2xx or has no decisive
+ *                           outcome (0, 5xx, 408, …). Something may exist: a 503 can follow a
+ *                           committed create. Reconcile by readback; never re-POST.
  *  - `response-lost`      — no result at all. Same treatment as ambiguous, different cause.
  *  - `ownership-unprovable` — a bounded readback FOUND the resource and could not prove its body is
  *                           the intended one. It exists, this run may own it, and nothing may adopt
@@ -3162,7 +3172,7 @@ export function unresolvedCreateIntents(records) {
     // A ref create carries no identity of its own — its identity IS its name — so a measured 2xx
     // for a ref is `identified` by the ref it named rather than by a number it never returns.
     else if (record.data?.kind === "ref" && Number.isFinite(status) && status >= 200 && status < 300) state = "identified";
-    else if (Number.isFinite(status) && status !== 0 && (status < 200 || status >= 300)) state = "refused";
+    else if (mutationRequestClass(status) === "refused") state = "refused";
     else state = "response-ambiguous";
     out.push({
       key, seq: record.seq, intent: record.data, result,
@@ -4739,7 +4749,7 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       binding: postBinding, nonce: postNonce, createdAt: readbackAt,
       extra: {
         before_sha: beforeSha, requested_sha: requestedSha,
-        request_class: response.status === 0 ? "ambiguous" : (response.status >= 200 && response.status < 300 ? "accepted" : "refused"),
+        request_class: mutationRequestClass(response.status),
         request_status: Number(response.status),
         readback_sha: afterSha, readback_at: readbackAt,
         pre_artifact_id: received.artifact.artifact_id, pre_artifact_digest: received.entry_digest,
@@ -4889,7 +4899,7 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
       post_provenance_facts: received.artifact?.provenance_facts ?? null,
     },
     // The exact request the case issued and what came back, so the outcome is re-derivable.
-    request_class: Number(prior.http_status) === 0 ? "ambiguous" : (Number(prior.http_status) >= 200 && Number(prior.http_status) < 300 ? "accepted" : "refused"),
+    request_class: mutationRequestClass(prior.http_status),
     mutation_started_at: prior.mutation_started_at ?? null,
     readback_at: prior.readback_at ?? null,
     // The bindings this case's challenges carried, so a case cannot be joined to another run's plan.
@@ -5721,9 +5731,11 @@ export async function beginWitnessItem({
   });
   journal.append("dispatch-result", {
     case_id: item.caseId, direction: item.direction, status: Number(dispatch.status),
-    ambiguous: Number(dispatch.status) === 0, operation_id: dispatch.operation,
+    ambiguous: mutationRequestClass(dispatch.status) === "ambiguous", operation_id: dispatch.operation,
   });
-  if (Number(dispatch.status) !== 0 && (dispatch.status < 200 || dispatch.status >= 300)) {
+  // Only a MEASURED refusal stops here. A 5xx is the same unknown outcome as a lost response: the
+  // dispatch may have been accepted, so it is pending and reconciled by the exact artifact below.
+  if (mutationRequestClass(dispatch.status) === "refused") {
     throw new IncompleteEvidence(`the witness dispatch for ${expectedName} was refused (${dispatch.status})`);
   }
   // The dispatch is away. Its OUTCOME is now the scheduler's business: a dispatch returns 204 with
@@ -6530,6 +6542,12 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
   const requested = String(record.requested_sha ?? "");
   if (!FULL_SHA.test(before)) complain("carries no measured before SHA");
   if (!diagnostic || typeof diagnostic !== "object") complain("carries no provider diagnostic");
+  // The request class is DERIVED from the recorded status by the one owner, never read from the
+  // record: a `request_class` that disagrees with its own status is an asserted outcome.
+  const requestClass = mutationRequestClass(record.http_status);
+  if (record.request_class !== undefined && record.request_class !== requestClass) {
+    complain(`labels its request ${JSON.stringify(String(record.request_class))}, but HTTP ${Number.isFinite(status) ? status : "?"} is ${requestClass}`);
+  }
 
   // ── NON-VACUITY, BOUND TO THE FROZEN GRAPH (F3) ────────────────────────────────────────────────
   //
@@ -6577,7 +6595,9 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
   for (const why of recomputeCheckState(record.check_state, { runId, attempt, expectation: kase.checks, normalAppId, headSha: checkHeadSha })) complain(why);
 
   if (outcome === "denied") {
-    if (!(status >= 400 && status < 500)) complain(`records a denial at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a client refusal`);
+    // A MEASURED refusal only. A 5xx, 408 or status 0 is a request of unknown fate, and an unchanged
+    // readback beside it is not enforcement evidence.
+    if (requestClass !== "refused") complain(`records a denial at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a measured provider refusal`);
     // POLICY DENIAL, RECOMPUTED from this build's closed diagnostic table rather than read out of the
     // record. `policyDenial` in a packet is a caller-supplied boolean, and a caller-supplied boolean
     // is exactly what a hostile or truncated packet controls.
@@ -6594,9 +6614,42 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
   } else if (outcome === "accepted") {
     if (!FULL_SHA.test(requested)) complain("carries no measured requested SHA");
     if (after !== requested) complain("records an acceptance whose independent readback is not the requested commit");
-    // A MEASURED 2xx, and nothing else (R1). Status 0 is a request whose fate is unknown; a readback
-    // that happens to show the requested commit is reconciliation evidence, never an acceptance.
-    if (!(status >= 200 && status < 300)) complain(`records an acceptance at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a measured provider acceptance`);
+    // A MEASURED 2xx, and nothing else (R1). Status 0, a 5xx or a 408 is a request whose fate is
+    // unknown; a readback that happens to show the requested commit is reconciliation evidence, never
+    // an acceptance.
+    if (requestClass !== "accepted") complain(`records an acceptance at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a measured provider acceptance`);
+  }
+  return problems;
+}
+
+/**
+ * The offline half of "an ambiguous mutation stops further actor mutations", for the CLOUD actors.
+ *
+ * The local human cases are held to this by their verified journal ({@link assessHumanCaseJournal}).
+ * A cloud actor's cases are recorded only in its own evidence file, so the rule is re-applied here
+ * from each record's values: a case halts its actor when it recorded an unexpected success or
+ * mutation, or when its request had no decisive outcome ({@link mutationRequestClass}) — including a
+ * record with no status at all, which the finalizer writes for a case that used its mutation marker
+ * and never finalized. Any later case in the closed order that records anything other than `not-run`
+ * was issued while further mutations were forbidden. The record's own `outcome` or a readback that
+ * matches cannot excuse it.
+ */
+export function cloudCasesIssuedAfterHalt(files) {
+  const problems = [];
+  for (const actor of ["normal", "emergency"]) {
+    const cases = Array.isArray(files?.[ACTOR_EVIDENCE_KEY[actor]]?.cases) ? files[ACTOR_EVIDENCE_KEY[actor]].cases : [];
+    let halted = null;
+    for (const kase of casesForActor(actor)) {
+      const recorded = cases.filter((record) => String(record?.case) === kase.id);
+      if (!recorded.length) continue;
+      const issued = recorded.filter((record) => String(record?.outcome) !== "not-run");
+      if (halted && issued.length) {
+        problems.push(`case ${kase.id} records ${String(issued[0]?.outcome)} after ${halted} had stopped further ${actor} mutations; an attempt never issues a mutation after an ambiguous or halting one`);
+      }
+      const halts = issued.some((record) => ["unexpected-success", "unexpected-mutation"].includes(String(record?.outcome))
+        || mutationRequestClass(record?.http_status) === "ambiguous");
+      if (halts) halted = halted ?? kase.id;
+    }
   }
   return problems;
 }
@@ -7869,6 +7922,7 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     const unmeasured = problems.some((why) => /recorded (inconclusive|not-run)/.test(why));
     block("PC-05", unmeasured ? "unverified" : (problems.length === 1 && /^recorded /.test(problems[0]) ? "failed" : "invalid"), `case ${kase.id} ${problems.join("; ")}`);
   }
+  for (const why of cloudCasesIssuedAfterHalt(files)) block("PC-05", "invalid", why);
 
   if (files.cleanup) {
     /**

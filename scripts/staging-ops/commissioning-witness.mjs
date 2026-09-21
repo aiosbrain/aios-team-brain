@@ -498,6 +498,33 @@ export const OBSERVATION_FIELDS = Object.freeze([
 export const INERT_OBSERVATION_FIELDS = Object.freeze(["started_at", "completed_at", "span_ms", "inert"]);
 export const REQUEST_CLASSES = Object.freeze(["accepted", "refused", "ambiguous"]);
 
+/**
+ * ── THE ONE OWNER OF "DID THIS WRITE HAVE A DECISIVE OUTCOME" ───────────────────────────────────
+ *
+ * Only two answers are decisive about a write request's fate:
+ *
+ *  - `accepted` — a measured 2xx. The provider says it applied the request.
+ *  - `refused`  — a measured 4xx, except 408. The provider says it declined the request, and a 4xx
+ *                 is answered before the write is applied. Whether a rule caused the refusal is a
+ *                 separate question, answered by the diagnostic and the unchanged readback.
+ *
+ * Everything else is `ambiguous`: status 0 (no response, including a timeout), any 5xx, 408, and
+ * any 1xx/3xx or non-integer status. A 502/503/504 can arrive after the write was applied (a
+ * gateway timing out on an upstream that committed), so it is the same unknown outcome as a timeout.
+ * An ambiguous write halts every further mutation and is never retried. A readback that shows the
+ * requested commit does not resolve it: that proves where the ref is, not that this request moved it.
+ *
+ * Runtime classification, the post challenge, create-intent reconciliation, witness dispatch and the
+ * offline assessor all use this function, so no path can widen the class on its own.
+ */
+export function mutationRequestClass(status) {
+  const code = typeof status === "number" ? status : (typeof status === "string" && /^\d+$/.test(status) ? Number(status) : Number.NaN);
+  if (!Number.isInteger(code)) return "ambiguous";
+  if (code >= 200 && code < 300) return "accepted";
+  if (code >= 400 && code < 500 && code !== 408) return "refused";
+  return "ambiguous";
+}
+
 /** Refuse any key outside the closed set. The unknown key is NAMED, so the refusal is actionable. */
 function assertClosedKeys(value, allowed, label, refuse) {
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
@@ -570,6 +597,11 @@ export function assertChallengeShape(challenge) {
       if (!Number.isInteger(challenge.request_status)) throw new WitnessRefusal("a post challenge must carry the measured request status");
       if (!REQUEST_CLASSES.includes(String(challenge.request_class))) {
         throw new WitnessRefusal(`a post challenge's request class is one of ${REQUEST_CLASSES.join("/")}, not ${JSON.stringify(String(challenge.request_class ?? ""))}`);
+      }
+      // The class is DERIVED from the measured status, never asserted beside it: a 503 labelled
+      // `accepted` or `refused` would launder an unknown outcome into a decisive one.
+      if (challenge.request_class !== mutationRequestClass(challenge.request_status)) {
+        throw new WitnessRefusal(`a post challenge labels request status ${challenge.request_status} as ${JSON.stringify(String(challenge.request_class))}, but that status is ${mutationRequestClass(challenge.request_status)}`);
       }
       requireString(challenge.pre_artifact_digest, "the post challenge pre-response digest", SHA256);
       // The pre-response artifact's own POSITIVE identity, so the post challenge names the exact
