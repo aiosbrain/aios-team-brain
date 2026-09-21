@@ -170,8 +170,9 @@ describe("tar structure is validated independently of coverage (AC-AUDIT-03)", (
 
     const secret = syntheticSecret();
     const trailed = Buffer.concat([base, Buffer.from(secret)]);
-    // Default: the trailer is part of the terminator range — reported, never dropped.
-    const { ranges } = surfaceOf(trailed);
+    // Surface mode (which requires the recording callback): the trailer is part of the terminator
+    // range — reported, never dropped.
+    const { ranges } = surfaceOf(trailed, { nonzeroTrailer: "surface", onNonzeroTrailer: () => undefined });
     const terminator = ranges.at(-1)!;
     expect(terminator.kind).toBe("terminator");
     expect(terminator.offset + terminator.length).toBe(trailed.length);
@@ -196,7 +197,7 @@ describe("tar structure is validated independently of coverage (AC-AUDIT-03)", (
     ]);
     const ranges: { offset: number; length: number }[] = [];
     const contents: { offset: number; length: number }[] = [];
-    for (const m of readTarMembers(bufferSource(tar), { onSurface: (r: { offset: number; length: number }) => ranges.push(r) })) {
+    for (const m of readTarMembers(bufferSource(tar), { nonzeroTrailer: "surface", onNonzeroTrailer: () => undefined, onSurface: (r: { offset: number; length: number }) => ranges.push(r) })) {
       if (m.type === "file") contents.push({ offset: m.dataOffset, length: m.size });
     }
     const all = [...ranges, ...contents].filter((r) => r.length > 0).sort((a, b) => a.offset - b.offset);
@@ -398,10 +399,10 @@ describe("PAX records are framed by BYTES (AC-AUDIT-05)", () => {
   it("reports a non-zero trailer to the caller exactly once, and not for zero padding (F1)", () => {
     const base = Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END]);
     let told = 0;
-    read(Buffer.concat([base, Buffer.alloc(BLOCK, 0), Buffer.from("PK\x03\x04"), Buffer.alloc(BLOCK, 0x41)]), { onNonzeroTrailer: () => { told += 1; } });
+    read(Buffer.concat([base, Buffer.alloc(BLOCK, 0), Buffer.from("PK\x03\x04"), Buffer.alloc(BLOCK, 0x41)]), { nonzeroTrailer: "surface", onNonzeroTrailer: () => { told += 1; } });
     expect(told).toBe(1);
     told = 0;
-    read(Buffer.concat([base, Buffer.alloc(4 * BLOCK, 0)]), { onNonzeroTrailer: () => { told += 1; } });
+    read(Buffer.concat([base, Buffer.alloc(4 * BLOCK, 0)]), { nonzeroTrailer: "surface", onNonzeroTrailer: () => { told += 1; } });
     expect(told).toBe(0);
   });
 

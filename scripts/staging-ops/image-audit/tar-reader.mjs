@@ -133,7 +133,11 @@ function verifyChecksum(header) {
 
 /** The only PAX keys whose VALUES this reader interprets. Every other value is opaque bytes. */
 const INTERPRETED_PAX_KEYS = Object.freeze(["path", "linkpath", "size"]);
-const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
+/**
+ * `ignoreBOM: true` KEEPS a leading U+FEFF in the decoded value. The default strips it, which would make
+ * `\uFEFFapp/x` and `app/x` the same name — a lossy decode of an interpreted value.
+ */
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * PAX records are `<len> <key>=<value>\n`, where `<len>` is a DECIMAL BYTE COUNT of the whole record
@@ -181,6 +185,11 @@ export function parsePaxRecords(input) {
       // value and extract the ustar name. Refused rather than guessed at either way.
       if ((key === "path" || key === "linkpath") && value === "") {
         throw new TarFormatError("PAX path or linkpath value is empty");
+      }
+      // A NUL is not part of any name. `"\0"` is not empty, so it slipped past the check above and named
+      // a member whose real ustar name an extractor would write — hiding it from the inventory.
+      if ((key === "path" || key === "linkpath") && value.includes("\0")) {
+        throw new TarFormatError("PAX path or linkpath value contains a NUL byte");
       }
       if (key === "size") {
         if (!/^[0-9]{1,16}$/.test(value) || !Number.isSafeInteger(Number(value))) {
@@ -255,8 +264,8 @@ const HEADER_ONLY_TYPES = new Set(["hardlink", "symlink", "character-device", "b
  *   - the archive ENDS with two complete zero blocks. EOF without them, or a single zero block, is
  *     refused. Further zero padding is accepted; NON-ZERO bytes after the marker are either reported
  *     to `onSurface` as opaque bytes to scan AND reported once to `onNonzeroTrailer`, so the caller
- *     records the gap (`nonzeroTrailer: "surface"`, the default), or refused (`"refuse"`) — never
- *     silently discarded, which is what the old `break` did;
+ *     records the gap (`nonzeroTrailer: "surface"`, which requires that callback), or refused
+ *     (`"refuse"`, the default) — never silently discarded, which is what the old `break` did;
  *   - a header-only typeflag (`1`–`6`) with a non-zero effective size is refused: striding past a body
  *     nobody reads and still reporting a complete inventory is how a member hides inside another.
  *
@@ -283,9 +292,18 @@ export function* readTarMembers(source, {
   deadlineEveryHeaders = DEADLINE_EVERY_HEADERS,
   deadlineEveryBytes = DEADLINE_EVERY_BYTES,
   onSurface,
-  nonzeroTrailer = "surface",
+  nonzeroTrailer = "refuse",
   onNonzeroTrailer,
 } = {}) {
+  /**
+   * FAIL-CLOSED BY DEFAULT. A non-zero trailer is refused unless the caller asked for `"surface"` AND
+   * supplied the callback that records it — so a caller that forgets either can only get a refusal,
+   * never a trailer that was quietly scanned as opaque bytes and reported as covered.
+   */
+  if (nonzeroTrailer !== "refuse" && nonzeroTrailer !== "surface") throw new TypeError("nonzeroTrailer must be \"refuse\" or \"surface\"");
+  if (nonzeroTrailer === "surface" && typeof onNonzeroTrailer !== "function") {
+    throw new TypeError("nonzeroTrailer \"surface\" requires an onNonzeroTrailer callback that records the gap");
+  }
   if (!Number.isSafeInteger(source.size) || source.size < 0) throw new TarFormatError("tar source size is not a safe integer");
   if (source.size === 0) throw new TarFormatError("a zero-length input is not a tar archive; an empty archive is two zero blocks");
   deadline?.assert("tar headers");

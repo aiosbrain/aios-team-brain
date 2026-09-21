@@ -319,7 +319,37 @@ export function unsupportedMagicFormat(head) {
 }
 
 const looksGzip = (head) => head.length >= 2 && head.subarray(0, 2).equals(GZIP_MAGIC);
-const looksTar = (head) => head.length >= 262 && head.subarray(257, 262).toString("ascii") === "ustar";
+const looksUstar = (head) => head.length >= 262 && head.subarray(257, 262).toString("ascii") === "ustar";
+
+/**
+ * How many leading bytes of a member every classification point keeps. Two tar blocks: enough for the
+ * ustar magic at offset 257 AND for the canonical empty archive's two zero blocks.
+ */
+const CLASSIFY_HEAD_BYTES = 1024;
+
+/**
+ * THE ONE TAR-CANDIDATE PREDICATE, shared by the raw member, the gzip-decoded payload and every
+ * recursive level — so the three cannot disagree about what "is a tar" (AC-AUDIT-02/03).
+ *
+ * THE DEFECT IT CLOSES. Only the ustar magic was tested, so a canonical EMPTY tar (1,024 zero bytes,
+ * which has no magic) was an "ordinary file" — and bytes appended after its end blocks, a gzip stream,
+ * a ZIP or a second tar, were staged opaque and reported as complete coverage. Two zero blocks at the
+ * start are now a tar candidate, which the reader then holds to its structural rules (a non-zero
+ * trailer is a recorded gap; zero padding is a complete, empty archive).
+ */
+export function isTarCandidate(head) {
+  if (!Buffer.isBuffer(head)) return false;
+  if (looksUstar(head)) return true;
+  return head.length >= CLASSIFY_HEAD_BYTES && head.subarray(0, CLASSIFY_HEAD_BYTES).every((byte) => byte === 0);
+}
+
+/**
+ * A NAME THAT DECLARES A TAR. `.tar`, `.tgz` and `.tar.gz` must parse as a tar even without magic, so a
+ * short or malformed archive under an explicit tar name is a recorded `nested-archive-undecodable` gap
+ * instead of a plain file nobody expanded. An ordinary `.gz` carries no such intent and may inflate to
+ * plaintext.
+ */
+const TAR_INTENT = /\.(?:tar|tgz|tar\.gz)$/i;
 /**
  * `looksArchive(head, name)` USED TO LIVE HERE and had no caller — the one decision it described
  * ("would this member need expanding at all") is made by `classifyExpanded` below, in the order the
@@ -549,6 +579,7 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       maxMembers: limits.maxMembersPerLayer,
       ...readerOptions,
       onSurface: (range) => layerSurface.stage(range),
+      nonzeroTrailer: "surface",
       /**
        * NON-ZERO BYTES AFTER THE END MARKER are staged as opaque surface, but opaque is not decoded:
        * a gzip stream, a ZIP or a second tar there reaches no expansion. So it is also a recorded gap
@@ -560,6 +591,13 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("layer inventory");
       const name = member.name.replace(/^\.\//, "");
       paths.push(name);
+      /**
+       * AN UNSAFE NAME IS A GAP, never a silent inventory omission. An absolute, traversing, NUL-bearing
+       * or empty member name does not start with the `/app` prefix the inventory compares, so it would
+       * simply not be compared — while an extractor may still write it somewhere. Its content is staged
+       * and scanned as usual; the record says the inventory could not account for it.
+       */
+      if (!member.path.safe) limitations.push({ kind: "unsafe-member-path", layer: layerIndex });
 
       if (member.type === "symlink" || member.type === "hardlink") {
         // Compared AS LINKS. The target is a string here and stays one — nothing resolves it.
@@ -600,8 +638,8 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       let digest;
       const id = stage(name, (write) => {
         digest = member.content((chunk) => {
-          if (headBytes < 512) {
-            const slice = chunk.subarray(0, 512 - headBytes);
+          if (headBytes < CLASSIFY_HEAD_BYTES) {
+            const slice = chunk.subarray(0, CLASSIFY_HEAD_BYTES - headBytes);
             head.push(slice);
             headBytes += slice.length;
           }
@@ -700,7 +738,9 @@ function classifyExpanded({ head, name, depth, read, context }) {
     limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, format, ...at });
     return;
   }
-  if (!looksGzip(head) && !looksTar(head)) return; // an ordinary file: already staged, nothing to expand
+  // An ordinary file — neither gzip, nor a tar candidate by its bytes, nor declared a tar by its name —
+  // is already staged and has nothing to expand.
+  if (!looksGzip(head) && !isTarCandidate(head) && !TAR_INTENT.test(name)) return;
   if (depth + 1 > limits.maxNestedArchiveDepth) {
     // The bound, recorded rather than followed. Unbounded expansion is a decompression bomb and a
     // silently truncated one is a coverage lie, so the only honest third option is to say so.
@@ -729,7 +769,8 @@ function expandArchive({ bytes, name, depth, context }) {
     let data = bytes;
     const decodedFromGzip = looksGzip(data);
     if (decodedFromGzip) data = gunzipSync(data, { maxOutputLength: limits.maxMemberBytes });
-    if (!looksTar(data)) {
+    // A declared tar is parsed as one whatever its bytes say, so a malformed one refuses into a gap.
+    if (!TAR_INTENT.test(name) && !isTarCandidate(data.subarray(0, CLASSIFY_HEAD_BYTES))) {
       // A bare gzip of a single file. Its INFLATED bytes are what a scanner must see; the compressed
       // copy staged by the caller is opaque to every rule.
       //
@@ -742,7 +783,7 @@ function expandArchive({ bytes, name, depth, context }) {
       }
       // …and the inflated bytes are themselves reclassified. A doubly-gzipped file is not a rare
       // shape, and stopping here would reintroduce the exact gap one level down.
-      classifyExpanded({ head: data.subarray(0, 512), name: inflatedName, depth, read: (sink) => sink(data), context });
+      classifyExpanded({ head: data.subarray(0, CLASSIFY_HEAD_BYTES), name: inflatedName, depth, read: (sink) => sink(data), context });
       return;
     }
     /**
@@ -757,10 +798,13 @@ function expandArchive({ bytes, name, depth, context }) {
       maxMembers: limits.maxMembersPerLayer,
       ...(readerOptions ?? tarReaderOptions(limits, deadline)),
       ...(nestedSurface ? { onSurface: (range) => nestedSurface.stage(range) } : {}),
+      nonzeroTrailer: "surface",
       // The same gap one level down, whether or not the nested tar was compressed: its trailer bytes
       // were scanned (as surface, or as the enclosing member's content) but never decoded.
       onNonzeroTrailer: () => limitations.push({ kind: "archive-trailer-nonzero", layer: layerIndex, ...at }),
     })) {
+      // The same sweep as the top level: an unsafe nested name is recorded, never silently passed over.
+      if (!nested.path.safe) limitations.push({ kind: "unsafe-member-path", layer: layerIndex, ...at });
       if (nested.type === "symlink" || nested.type === "hardlink" || nested.type === "directory") continue;
       if (nested.type !== "file") {
         // Same reasoning as the top-level loop: an unknown typeflag may carry bytes nobody read.
@@ -784,7 +828,7 @@ function expandArchive({ bytes, name, depth, context }) {
       }
       const nestedBytes = Buffer.concat(chunks);
       classifyExpanded({
-        head: nestedBytes.subarray(0, 512),
+        head: nestedBytes.subarray(0, CLASSIFY_HEAD_BYTES),
         name: nestedName,
         depth,
         read: (sink) => sink(nestedBytes),

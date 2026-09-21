@@ -262,6 +262,8 @@ describe("tar reader: a corrupt or oversized archive FAILS (PUB-02)", () => {
     const tar = Buffer.concat([buildTar([{ name: "app/x", content: "y" }]), Buffer.from(secret)]);
     const surfaced: Buffer[] = [];
     const parsed = [...readTarMembers(bufferSource(tar), {
+      nonzeroTrailer: "surface",
+      onNonzeroTrailer: () => undefined,
       onSurface: ({ offset, length }: { offset: number; length: number }) => surfaced.push(tar.subarray(offset, offset + length)),
     })];
     expect(parsed.map((m) => m.name)).toEqual(["app/x"]);
