@@ -957,10 +957,11 @@ describe("a same-layer ordinary whiteout overlapping its own layer is a conflict
   }
 
   it("POSITIVE: a similar-prefix SIBLING is not an overlap", async () => {
-    // `app/.wh.d` beside a same-layer `app/d2.js`, and `app/.wh.old.js` beside `app/old.js2`.
+    // `app/.wh.old.js` beside a same-layer `app/old.js2` (and an unrelated `app/d2.js`): prefix-sharing
+    // names that are not the whiteout's target, its directory spelling or a descendant.
     const expected = [...EXPECTED_BASE, { path: "d2.js", type: "file", sha256: sha("d2") }, { path: "old.js2", type: "file", sha256: sha("n") }];
     const result = await inspectLayers([
-      buildTar([...baseMembers, { name: "app/old.js", content: "o" }, { name: "app/d/", type: "directory" }]),
+      buildTar([...baseMembers, { name: "app/old.js", content: "o" }]),
       buildTar([{ name: "app/.wh.old.js", content: "" }, { name: "app/old.js2", content: "n" }, { name: "app/d2.js", content: "d2" }]),
     ]);
     const { readiness, kinds } = chain(result, expected);
@@ -1004,6 +1005,20 @@ describe("empty, dot and dot-dot whiteout targets are malformed (L6)", () => {
     expect(result.merged.visible.has("stale.txt")).toBe(false);
     expect(result.merged.visible.has("app/d/old.js")).toBe(false);
     expect(readiness.transitionReady).toBe(true);
+  });
+});
+
+/** B9 — a deep member path refuses the run with the fixed limit code, before the merge or staging expands it. */
+describe("a member path past the supported bound refuses the run (B9)", () => {
+  it("a 250,000-segment PAX path in a correctly hashed layer is AUDIT_TAR_LIMIT_EXCEEDED", async () => {
+    const layer = Buffer.concat([member({ name: "PaxHeader/deep", typeflag: "x" }, paxRecord("path", `${"a/".repeat(250_000)}x`)), member({ name: "short" }, Buffer.from("x")), END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+  });
+
+  it("CONTROL: a 128-segment path at the bound is inventoried", async () => {
+    const path = `app/${Array.from({ length: 127 }, (_, i) => `s${i}`).join("/")}`;
+    const result = await inspectLayers([buildTar([{ name: path, content: "deep", paxLongName: true }])]);
+    expect(result.appMembers.map((m) => m.path)).toEqual([path]);
   });
 });
 

@@ -6,11 +6,14 @@ import {
   TarLimitError,
   bufferSource,
   canonicalMemberPath,
+  MEMBER_PATH_LIMITS,
+  assertMemberPathBounded,
   isChecksumValidTarHeader,
   parsePaxRecords,
   readTarMembers,
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
 import { mergedFilesystem, whiteoutOf } from "../scripts/staging-ops/image-audit/layers.mjs";
+import { membersThroughSymlink } from "../scripts/staging-ops/image-audit/inspect.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -708,5 +711,87 @@ describe("merge rules at unit level (B6)", () => {
     expect(mergedFilesystem([["app/f"], ["app/f/inner.js"]]).conflicts).toEqual([1]);
     // …but a directory REPLACING the lower file in the same layer is not ambiguous.
     expect(mergedFilesystem([["app/f"], ["app/f/", "app/f/inner.js"]]).conflicts).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B9 — bounded member-path work (AC-AUDIT-04)
+// ---------------------------------------------------------------------------
+
+describe("member paths are bounded before any ancestor work (B9)", () => {
+  const limitCode = { code: "AUDIT_TAR_LIMIT_EXCEEDED" };
+
+  it("accepts exactly 4,096 UTF-8 bytes and refuses one more, counting BYTES not characters", () => {
+    expect(MEMBER_PATH_LIMITS).toEqual({ maxBytes: 4096, maxSegments: 128 });
+    expect(() => assertMemberPathBounded("a".repeat(4096))).not.toThrow();
+    expect(() => assertMemberPathBounded("a".repeat(4097))).toThrow(expect.objectContaining(limitCode));
+    // 2,048 two-byte characters are exactly 4,096 bytes; one more byte, or one more character, is over.
+    expect(() => assertMemberPathBounded("é".repeat(2048))).not.toThrow();
+    expect(() => assertMemberPathBounded(`${"é".repeat(2048)}a`)).toThrow(expect.objectContaining(limitCode));
+    expect(() => assertMemberPathBounded("é".repeat(2049))).toThrow(/4096-byte/);
+  });
+
+  it("accepts exactly 128 segments and refuses 129; a directory's trailing slash is not a segment", () => {
+    const segments = (n: number) => Array.from({ length: n }, (_, i) => `s${i}`).join("/");
+    expect(() => assertMemberPathBounded(segments(128))).not.toThrow();
+    expect(() => assertMemberPathBounded(`${segments(128)}/`)).not.toThrow();
+    expect(() => assertMemberPathBounded(segments(129))).toThrow(/128-segment/);
+    expect(canonicalMemberPath(segments(128), "file")).toEqual({ ok: true, path: segments(128) });
+    expect(() => canonicalMemberPath(segments(129), "file")).toThrow(expect.objectContaining(limitCode));
+    // Unsafe names are bounded too — before they are classified.
+    expect(() => canonicalMemberPath(`/${segments(129)}`, "file")).toThrow(expect.objectContaining(limitCode));
+  });
+
+  it("refuses a 250,000-segment PAX path at READ time, before any member is yielded", () => {
+    const deep = `${"a/".repeat(250_000)}x`;
+    const record = paxRecord("path", deep);
+    expect(record.length).toBeLessThan(TAR_READER_LIMITS.maxMetadataRecordBytes);
+    const tar = Buffer.concat([paxMember("x", record), header({ name: "short" }), END]);
+    const seen: string[] = [];
+    expect(() => { for (const m of readTarMembers(bufferSource(tar))) seen.push(m.name); }).toThrow(TarLimitError);
+    expect(seen).toEqual([]);
+  });
+
+  it("direct helper callers are bounded too", () => {
+    const deep = `${"a/".repeat(200)}x`;
+    expect(() => mergedFilesystem([[deep]])).toThrow(expect.objectContaining(limitCode));
+    expect(() => membersThroughSymlink([deep], new Set(["a"]))).toThrow(expect.objectContaining(limitCode));
+  });
+
+  it("refuses when aggregate ancestor work passes an injected budget", () => {
+    const paths = Array.from({ length: 10 }, (_, i) => `a/b/c/d/f${i}`);
+    expect(() => mergedFilesystem([paths], { maxAncestorSteps: 20 })).toThrow(expect.objectContaining(limitCode));
+    expect(() => mergedFilesystem([paths], { maxAncestorSteps: 10_000 })).not.toThrow();
+  });
+
+  const expiring = (after: number, only?: string) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      assert(operation: string) {
+        if (only !== undefined && operation !== only) return;
+        asked.push(operation);
+        if (asked.length >= after) throw Object.assign(new Error("deadline"), { code: "STAGING_OPERATION_TIMEOUT" });
+      },
+    };
+  };
+
+  it("consults the clock INSIDE one path, across paths, and during subtree removal", () => {
+    // Inside ONE path: six ancestors, expiry on the third check.
+    const one = expiring(3);
+    expect(() => mergedFilesystem([["a/b/c/d/e/f/g"]], { deadline: one, deadlineEvery: 1 })).toThrow(/deadline/);
+    expect(one.asked.length).toBe(3);
+    // Across paths: one ancestor each, expiry part-way through the list.
+    const across = expiring(5);
+    expect(() => mergedFilesystem([Array.from({ length: 20 }, (_, i) => `d/f${i}`)], { deadline: across, deadlineEvery: 1 })).toThrow(/deadline/);
+    // During the removal of a whited-out subtree.
+    const removal = expiring(2, "merged namespace removal");
+    expect(() => mergedFilesystem([["d/", ...Array.from({ length: 10 }, (_, i) => `d/f${i}`)], ["x", ".wh.d"]], { deadline: removal, deadlineEvery: 1 })).toThrow(/deadline/);
+  });
+
+  it("the symlink-ancestry check consults the clock inside a single path", () => {
+    const one = expiring(2);
+    expect(() => membersThroughSymlink(["a/b/c/d/e"], new Set(["zz"]), one, { deadlineEvery: 1 })).toThrow(/deadline/);
+    expect(one.asked).toEqual(["symlink ancestry", "symlink ancestry"]);
   });
 });
