@@ -907,6 +907,106 @@ describe("type replacement and malformed whiteouts in the merged view (B6)", () 
   });
 });
 
+/** B7 — a ROOT opaque marker empties everything below it; its own layer's entries are then applied. */
+describe("a root opaque whiteout empties the lower rootfs (B7)", () => {
+  it("lower expected /app files become missing and readiness blocks; their bytes are still scanned", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/secret.js", content: `S=${marker}` }]), buildTar([{ name: ".wh..wh..opq", content: "" }])]);
+    const { inventory, readiness, kinds } = chain(result);
+    expect(inventory.counts.missing).toBe(2);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(false);
+    expect([...result.merged.visible.keys()]).toEqual([]);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  it("CONTROL: a root opaque plus a full same-layer recreation of /app is ready", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "etc/old.conf", content: "o" }]), buildTar([{ name: ".wh..wh..opq", content: "" }, ...baseMembers])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(result.merged.visible.has("etc/old.conf")).toBe(false);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("CONTROL: nested opacity preserves siblings outside its directory", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "app/e/", type: "directory" }, { name: "app/e/y.js", content: "y" }]), buildTar([{ name: "app/e/.wh..wh..opq", content: "" }])]);
+    expect(result.merged.visible.has("app/e/y.js")).toBe(false);
+    expect(result.merged.visible.has("app/d/x.js")).toBe(true);
+    expect(chain(result).readiness.transitionReady).toBe(true);
+  });
+});
+
+/**
+ * B8 — an ordinary whiteout overlapping an entry of its OWN layer. OCI applies it below only; containerd
+ * v2.1.4 removes the entry when the whiteout follows it. Recorded as a conflict in either order.
+ */
+describe("a same-layer ordinary whiteout overlapping its own layer is a conflict (B8)", () => {
+  const shapes: [string, () => { name: string; content?: string; type?: "directory" }[], { name: string; content: string }][] = [
+    ["a FILE", () => [{ name: "app/index.js", content: "index" }], { name: "app/.wh.index.js", content: "" }],
+    ["a DIRECTORY and its subtree", () => [{ name: "app/d/", type: "directory" }, { name: "app/d/x.js", content: "x" }], { name: "app/.wh.d", content: "" }],
+    ["only a DESCENDANT (no directory entry)", () => [{ name: "app/d/x.js", content: "x" }], { name: "app/.wh.d", content: "" }],
+  ];
+  for (const [label, entries, whiteout] of shapes) {
+    for (const order of ["entry first", "whiteout first"] as const) {
+      it(`${label}, ${order}: merged-type-conflict and blocked`, async () => {
+        const result = await inspectLayers([buildTar(baseMembers), buildTar(order === "entry first" ? [...entries(), whiteout] : [whiteout, ...entries()])]);
+        expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+        expect(chain(result).readiness.transitionReady).toBe(false);
+      });
+    }
+  }
+
+  it("POSITIVE: a similar-prefix SIBLING is not an overlap", async () => {
+    // `app/.wh.d` beside a same-layer `app/d2.js`, and `app/.wh.old.js` beside `app/old.js2`.
+    const expected = [...EXPECTED_BASE, { path: "d2.js", type: "file", sha256: sha("d2") }, { path: "old.js2", type: "file", sha256: sha("n") }];
+    const result = await inspectLayers([
+      buildTar([...baseMembers, { name: "app/old.js", content: "o" }, { name: "app/d/", type: "directory" }]),
+      buildTar([{ name: "app/.wh.old.js", content: "" }, { name: "app/old.js2", content: "n" }, { name: "app/d2.js", content: "d2" }]),
+    ]);
+    const { readiness, kinds } = chain(result, expected);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("POSITIVE: recreation in a LATER layer is ready", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/.wh.d", content: "" }]), buildTar([{ name: "app/d/", type: "directory" }, { name: "app/d/x.js", content: "x" }])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(result.merged.visible.get("app/d/x.js")).toBe(2);
+    expect(readiness.transitionReady).toBe(true);
+  });
+
+  it("POSITIVE: an OPAQUE marker with a same-layer child is supported, not a conflict", async () => {
+    const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/d/x.js", content: "x" }, { name: "app/d/.wh..wh..opq", content: "" }])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(readiness.transitionReady).toBe(true);
+  });
+});
+
+/** L6 — an ordinary whiteout naming nothing, `.` or `..` is malformed and deletes NOTHING. */
+describe("empty, dot and dot-dot whiteout targets are malformed (L6)", () => {
+  for (const name of [".wh.", ".wh..", ".wh...", "app/.wh.", "app/.wh..", "app/.wh...", "app/d/.wh.."]) {
+    it(`\`${name}\` records malformed-whiteout and removes nothing`, async () => {
+      const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name, content: "" }])]);
+      const { inventory, readiness, kinds } = chain(result);
+      expect(kinds).toEqual(["malformed-whiteout"]);
+      expect(inventory.counts.missing).toBe(0);
+      expect(result.merged.visible.has("app/d/x.js")).toBe(true);
+      expect(readiness.transitionReady).toBe(false);
+    });
+  }
+
+  it("CONTROL: a valid `.wh.name` at the root and nested still deletes, with no gap", async () => {
+    const result = await inspectLayers([buildTar([...baseMembers, { name: "stale.txt", content: "s" }, { name: "app/d/old.js", content: "o" }]), buildTar([{ name: ".wh.stale.txt", content: "" }, { name: "app/d/.wh.old.js", content: "" }])]);
+    const { readiness, kinds } = chain(result);
+    expect(kinds).toEqual([]);
+    expect(result.merged.visible.has("stale.txt")).toBe(false);
+    expect(result.merged.visible.has("app/d/old.js")).toBe(false);
+    expect(readiness.transitionReady).toBe(true);
+  });
+});
+
 describe("structural failure refuses, whatever the identity chain says (AC-AUDIT-03)", () => {
   it("refuses a correctly hashed SHORT non-tar layer at representative lengths", async () => {
     for (const length of [1, 100, 262, 511]) {
