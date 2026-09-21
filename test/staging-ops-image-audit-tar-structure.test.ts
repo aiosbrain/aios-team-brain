@@ -5,6 +5,8 @@ import {
   TarFormatError,
   TarLimitError,
   bufferSource,
+  canonicalMemberPath,
+  isChecksumValidTarHeader,
   parsePaxRecords,
   readTarMembers,
 } from "../scripts/staging-ops/image-audit/tar-reader.mjs";
@@ -452,5 +454,114 @@ describe("PAX records are framed by BYTES (AC-AUDIT-05)", () => {
     const name = `app/${"é".repeat(60)}/数据.txt`;
     const [only] = read(buildTar([{ name, content: "u", paxLongName: true }]));
     expect(only.name).toBe(name);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1/B2 — one header rule, one canonical path, no ambiguous metadata
+// ---------------------------------------------------------------------------
+
+/** A magic-less V7 header: the ustar magic and version cleared, checksum recomputed. */
+function v7Header(spec: RawHeader): Buffer {
+  const block = header(spec);
+  block.fill(0, 257, 265);
+  block.write("        ", 148, "ascii");
+  let sum = 0;
+  for (const byte of block) sum += byte;
+  block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return block;
+}
+
+describe("the reader's first-header rule is exported and bounded (B1)", () => {
+  it("accepts a checksum-valid ustar or V7 header and nothing else", () => {
+    expect(isChecksumValidTarHeader(header({ name: "app/a" }))).toBe(true);
+    const v7 = v7Header({ name: "app/a" });
+    expect(v7.subarray(257, 262).toString("latin1")).not.toBe("ustar");
+    expect(isChecksumValidTarHeader(v7)).toBe(true);
+    // …and the reader agrees: the same bytes read as a tar.
+    expect(read(Buffer.concat([v7, END])).map((m) => m.name)).toEqual(["app/a"]);
+    expect(isChecksumValidTarHeader(Buffer.alloc(BLOCK, 0))).toBe(false);
+    expect(isChecksumValidTarHeader(Buffer.alloc(BLOCK, 0x41))).toBe(false);
+    expect(isChecksumValidTarHeader(header({ name: "app/a" }).subarray(0, BLOCK - 1))).toBe(false);
+    const corrupt = header({ name: "app/a" });
+    corrupt[0] ^= 1;
+    expect(isChecksumValidTarHeader(corrupt)).toBe(false);
+  });
+});
+
+describe("one canonical member path (B2)", () => {
+  it("collapses repeated / and . segments, preserving Unicode and case", () => {
+    const accepted: [string, string | undefined, string][] = [
+      ["././app/planted.js", "file", "app/planted.js"],
+      [".//app/planted.js", "file", "app/planted.js"],
+      ["app/./sub//x.js", "file", "app/sub/x.js"],
+      ["App/É/数据.JS", "file", "App/É/数据.JS"],
+      ["app/dir/", "directory", "app/dir/"],
+      ["./app//dir/./", "directory", "app/dir/"],
+      ["./", "directory", "."],
+      [".", "directory", "."],
+    ];
+    for (const [name, type, path] of accepted) expect(canonicalMemberPath(name, type), name).toEqual({ ok: true, path });
+  });
+
+  it("refuses what depends on the host: .., absolute, drive, backslash, empty, NUL, a trailing slash on a file or link", () => {
+    const refused: [string, string | undefined, string][] = [
+      ["app/../x", "file", "traversal"],
+      ["/app/x", "file", "absolute"],
+      ["C:/app/x", "file", "absolute"],
+      ["app\\x.js", "file", "backslash"],
+      ["", "file", "empty"],
+      ["./", "file", "empty"],
+      ["app/\0x", "file", "nul-byte"],
+      ["app/x.js/", "file", "trailing-slash"],
+      ["app/link/", "symlink", "trailing-slash"],
+    ];
+    for (const [name, type, reason] of refused) expect(canonicalMemberPath(name, type), JSON.stringify(name)).toEqual({ ok: false, reason });
+  });
+
+  it("is what every member carries, resolved AFTER ustar/PAX/GNU", () => {
+    const tar = Buffer.concat([
+      paxMember("x", paxRecord("path", "app/.//pax.js")), header({ name: "ignored" }),
+      member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("./app//gnu.js\0")), header({ name: "ignored" }),
+      header({ name: "./app/./plain.js" }),
+      END,
+    ]);
+    expect(read(tar).map((m) => m.canonicalName)).toEqual(["app/pax.js", "app/gnu.js", "app/plain.js"]);
+  });
+});
+
+describe("ambiguous extended metadata is refused, whatever order it arrives in (B2)", () => {
+  const planted = () => header({ name: "app/planted.js" });
+  const refusals: [string, Buffer, RegExp][] = [
+    ["a repeated local x (even opaque-only)", Buffer.concat([paxMember("x", paxRecord("path", "decoy")), paxMember("x", paxRecord("comment", "c")), planted(), END]), /repeated local PAX header/],
+    ["a g while a local x is pending", Buffer.concat([paxMember("x", paxRecord("path", "decoy")), paxMember("g", paxRecord("comment", "c")), planted(), END]), /global PAX header arrives while member metadata is pending/],
+    ["a g while a GNU long name is pending", Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/x\0")), paxMember("g", paxRecord("comment", "c")), planted(), END]), /global PAX header arrives/],
+    ["a g while a GNU long link is pending", Buffer.concat([member({ name: "././@LongLink", typeflag: "K" }, Buffer.from("t\0")), paxMember("g", paxRecord("comment", "c")), planted(), END]), /global PAX header arrives/],
+    ["GNU L then PAX path", Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/planted.js\0")), paxMember("x", paxRecord("path", "decoy")), planted(), END]), /both describe one member/],
+    ["PAX path then GNU L", Buffer.concat([paxMember("x", paxRecord("path", "decoy")), member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/planted.js\0")), planted(), END]), /both describe one member/],
+    ["GNU K then PAX linkpath", Buffer.concat([member({ name: "././@LongLink", typeflag: "K" }, Buffer.from("a\0")), paxMember("x", paxRecord("linkpath", "b")), header({ name: "app/s", typeflag: "2" }), END]), /both describe one member/],
+    ["PAX linkpath then GNU K", Buffer.concat([paxMember("x", paxRecord("linkpath", "b")), member({ name: "././@LongLink", typeflag: "K" }, Buffer.from("a\0")), header({ name: "app/s", typeflag: "2" }), END]), /both describe one member/],
+    ["a repeated GNU L", Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("a\0")), member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("b\0")), planted(), END]), /repeated GNU long name/],
+    ["a local GNU.sparse key", Buffer.concat([paxMember("x", Buffer.concat([paxRecord("GNU.sparse.major", "1"), paxRecord("GNU.sparse.name", "app/planted.js")])), planted(), END]), /GNU.sparse/],
+    ["a global GNU.sparse key", Buffer.concat([paxMember("g", paxRecord("GNU.sparse.name", "app/planted.js")), planted(), END]), /GNU.sparse/],
+  ];
+  for (const [label, tar, message] of refusals) {
+    it(`refuses ${label}`, () => {
+      expect(() => read(tar)).toThrow(TarFormatError);
+      expect(() => read(tar)).toThrow(message);
+    });
+  }
+
+  it("keeps ordinary PAX and GNU metadata working", () => {
+    const tar = Buffer.concat([
+      paxMember("g", paxRecord("comment", "global, nothing pending")),
+      paxMember("x", paxRecord("comment", "opaque only")), header({ name: "app/a" }),
+      paxMember("x", Buffer.concat([paxRecord("path", "app/long.js"), paxRecord("SCHILY.xattr.user.n", "v")])), header({ name: "ignored" }),
+      member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/gnu-long.js\0")), header({ name: "ignored" }),
+      // A GNU long NAME and a PAX LINKPATH describe different fields and do not conflict.
+      member({ name: "././@LongLink", typeflag: "L" }, Buffer.from("app/sym\0")), paxMember("x", paxRecord("linkpath", "target")), header({ name: "ignored", typeflag: "2" }),
+      END,
+    ]);
+    expect(read(tar).map((m) => [m.canonicalName, m.linkTarget])).toEqual([["app/a", ""], ["app/long.js", ""], ["app/gnu-long.js", ""], ["app/sym", "target"]]);
   });
 });
