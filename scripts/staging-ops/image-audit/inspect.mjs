@@ -15,10 +15,12 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   classifyLayerMember,
+  forEachAncestor,
   mergedFilesystem,
   verifyConfig,
 } from "./layers.mjs";
 import { LAYER_MEDIA_TYPES } from "./subject.mjs";
+import { assertMemberPathBounded } from "./tar-reader.mjs";
 import {
   copyMemberToFile,
   createStagingBudget,
@@ -196,7 +198,8 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
     rmSync(layerTarPath, { force: true });
   }
 
-  const merged = mergedFilesystem(layerPaths);
+  // The run's own clock reaches INSIDE the merge (B9), not only around it.
+  const merged = mergedFilesystem(layerPaths, { deadline });
   // Layers whose merged view extractors would not agree on (B6) — each a blocking gap.
   for (const layer of merged.conflicts) limitations.push({ kind: "merged-type-conflict", layer });
   return {
@@ -256,15 +259,19 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
  * ancestors — a set lookup per segment, never a pairwise scan — with the clock consulted as it goes.
  * Only the canonical names are compared; no link target is ever read or resolved.
  */
-function membersThroughSymlink(paths, symlinkLocations, deadline) {
-  let checked = 0;
+export function membersThroughSymlink(paths, symlinkLocations, deadline, { deadlineEvery = 1024 } = {}) {
+  let steps = 0;
   for (const path of paths) {
-    checked += 1;
-    if (deadline && checked % 4096 === 0) deadline.assert("symlink ancestry");
-    const segments = (path.endsWith("/") ? path.slice(0, -1) : path).split("/");
-    for (let i = 1; i < segments.length; i += 1) {
-      if (symlinkLocations.has(segments.slice(0, i).join("/"))) return true;
-    }
+    // Bounded BEFORE any ancestor work, for direct callers too (B9).
+    assertMemberPathBounded(path);
+    // One pass over the path's separators — no repeated joins — with the clock consulted INSIDE a
+    // single path as well as across paths.
+    const hit = forEachAncestor(path, (ancestor) => {
+      steps += 1;
+      if (deadline && steps % deadlineEvery === 0) deadline.assert("symlink ancestry");
+      return symlinkLocations.has(ancestor.slice(0, -1));
+    });
+    if (hit) return true;
   }
   return false;
 }

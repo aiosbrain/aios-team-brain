@@ -294,6 +294,32 @@ export function parsePaxRecords(input) {
 }
 
 /**
+ * THE SUPPORTED MEMBER-PATH SIZE (B9, AC-AUDIT-04): at most 4,096 UTF-8 bytes and at most 128 path
+ * segments. A PAX `path` of a quarter-million segments fits the metadata ceiling and made every
+ * per-ancestor step (merge index, symlink ancestry) quadratic in depth — CPU and heap exhausted before
+ * any sanitized record existed. These bounds are the audit's own conservative input contract; they are
+ * NOT a claim that every extractor rejects longer names. A name past them refuses the run with the
+ * fixed limit code, whether or not it would otherwise have been safe.
+ */
+export const MEMBER_PATH_LIMITS = Object.freeze({ maxBytes: 4096, maxSegments: 128 });
+
+/** Refuse a path past `MEMBER_PATH_LIMITS`. Linear in the path's length; checked before ANY ancestor work. */
+export function assertMemberPathBounded(path, limits = MEMBER_PATH_LIMITS) {
+  const text = String(path ?? "");
+  // The byte test first, and bounded: a string longer than maxBytes UTF-16 units already exceeds it
+  // (every unit is at least one byte), so the O(n) byte count only runs on short strings.
+  if (text.length > limits.maxBytes || Buffer.byteLength(text, "utf8") > limits.maxBytes) {
+    throw new TarLimitError(`a tar member path exceeds the ${limits.maxBytes}-byte supported bound`);
+  }
+  let segments = 1;
+  for (let at = text.indexOf("/"); at !== -1; at = text.indexOf("/", at + 1)) {
+    if (at < text.length - 1) segments += 1;
+    if (segments > limits.maxSegments) throw new TarLimitError(`a tar member path exceeds the ${limits.maxSegments}-segment supported bound`);
+  }
+  return text;
+}
+
+/**
  * THE ONE CANONICAL MEMBER PATH (B2), computed from the name AFTER ustar/PAX/GNU resolution, and the
  * only form the inventory, the whiteout/merge computation, the build-output categories and the public
  * path lookup see.
@@ -310,7 +336,8 @@ export function parsePaxRecords(input) {
  * `{ ok: true, path }` or `{ ok: false, reason }` from a closed vocabulary.
  */
 export function canonicalMemberPath(name, type) {
-  const raw = String(name ?? "");
+  // The size bound applies to EVERY name, safe or not, before any split (B9).
+  const raw = assertMemberPathBounded(String(name ?? ""));
   if (raw === "") return { ok: false, reason: "empty" };
   if (raw.startsWith("/") || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\")) return { ok: false, reason: "absolute" };
   const segments = raw.split("/");

@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { CONFIG_MEDIA_TYPES, LAYER_MEDIA_TYPES, isDigest } from "./subject.mjs";
+import { assertMemberPathBounded } from "./tar-reader.mjs";
 import { ACCEPTED_MEDIA_TYPES } from "../image-publication.mjs";
 
 export class AuditIdentityError extends Error {
@@ -201,7 +202,17 @@ export function whiteoutOf(name) {
   const dir = at === -1 ? "" : clean.slice(0, at + 1);
   const base = at === -1 ? clean : clean.slice(at + 1);
   if (base === OPAQUE) return { kind: "opaque", target: dir };
-  if (base.startsWith(WHITEOUT)) return { kind: "delete", target: `${dir}${base.slice(WHITEOUT.length)}` };
+  if (base.startsWith(WHITEOUT)) {
+    /**
+     * An ordinary whiteout naming NOTHING, the directory itself or its parent (`.wh.`, `.wh..`,
+     * `.wh...`) is malformed (L6): containerd refuses to unpack it, and applying it here would delete
+     * the root or a parent. It is reported as `malformed` and deletes nothing. (The exact
+     * `.wh..wh..opq` opaque marker is handled above, before this rule.)
+     */
+    const named = base.slice(WHITEOUT.length);
+    if (named === "" || named === "." || named === "..") return { kind: "malformed" };
+    return { kind: "delete", target: `${dir}${named}` };
+  }
   return { kind: "none" };
 }
 
@@ -213,62 +224,108 @@ export function whiteoutOf(name) {
  * Every layer's content is inspected regardless of this; the merged view is only used to REPORT that
  * a finding is invisible to anyone who inspects a started container.
  */
-export function mergedFilesystem(layerPaths) {
+/**
+ * Every PROPER ancestor directory key of `key` (`a/`, `a/b/` for `a/b/c`), found by walking the
+ * separators of the original string once — no repeated split/join (B9). `visit` may stop early by
+ * returning `true`. Callers bound the path first (`assertMemberPathBounded`), so this is at most
+ * `MEMBER_PATH_LIMITS.maxSegments` steps.
+ */
+export function forEachAncestor(key, visit) {
+  const end = key.endsWith("/") ? key.length - 1 : key.length;
+  for (let at = key.indexOf("/"); at !== -1 && at < end; at = key.indexOf("/", at + 1)) {
+    if (visit(key.slice(0, at + 1)) === true) return true;
+  }
+  return false;
+}
+
+/**
+ * The finite AGGREGATE budget for ancestor-index work across every path of every layer (B9). Each
+ * ancestor visited costs one step; exceeding the budget refuses the run with the fixed limit code
+ * rather than letting the index grow without bound. Real images use a small fraction of it.
+ */
+export const MERGE_WORK_LIMITS = Object.freeze({ maxAncestorSteps: 64_000_000, deadlineEvery: 1024 });
+
+export function mergedFilesystem(layerPaths, { deadline, maxAncestorSteps = MERGE_WORK_LIMITS.maxAncestorSteps, deadlineEvery = MERGE_WORK_LIMITS.deadlineEvery } = {}) {
   const visible = new Map();
   const shadowed = [];
   /**
-   * Layers in which the merged view is AMBIGUOUS (B6): a layer that both replaces a path with a
-   * non-directory and places entries beneath that path, that carries a file and a directory of the same
-   * name, or that writes beneath a path a lower layer made a non-directory. Extractors do not agree on
-   * those, so the inspector records each as a blocking gap rather than picking one outcome.
+   * Layers in which the merged view is AMBIGUOUS (B6, B8): a file and a directory of one name, a
+   * non-directory with entries beneath it, entries beneath a lower non-directory, or an ORDINARY
+   * whiteout that overlaps an entry of its own layer (OCI says whiteouts apply only to lower layers;
+   * containerd v2.1.4 removes the entry when the whiteout follows it). Extractors do not agree on these,
+   * so the inspector records each as a blocking gap rather than picking one outcome.
    */
   const conflicts = new Set();
+
+  /** Bounded work: one step per ancestor visited or key removed, the clock every `deadlineEvery`. */
+  let steps = 0;
+  const step = (operation) => {
+    steps += 1;
+    if (steps > maxAncestorSteps) {
+      throw Object.assign(new Error(`merged-namespace work exceeds the ${maxAncestorSteps}-step bound`), { name: "TarLimitError", code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+    }
+    if (deadline && steps % deadlineEvery === 0) deadline.assert(operation);
+  };
+  const ancestors = (key, visit) => forEachAncestor(key, (ancestor) => { step("merged namespace"); return visit(ancestor); });
 
   /**
    * THE KEY MODEL. A directory key ends in `/` (canonical directory identity is type-driven, so `app`
    * and `app/` written as directories are one key); every other key does not. `.` is the root.
    *
    * SEGMENT INDEX. `beneath` maps a directory key to the visible keys strictly under it, so a subtree
-   * removal is a lookup rather than a scan of every visible key — bounded by the member count and the
-   * path depth, never quadratic.
+   * removal is a lookup rather than a scan of every visible key.
    */
   const beneath = new Map();
-  const ancestorsOf = (key) => {
-    const bare = key.endsWith("/") ? key.slice(0, -1) : key;
-    const segments = bare.split("/");
-    const out = [];
-    for (let i = 1; i < segments.length; i += 1) out.push(`${segments.slice(0, i).join("/")}/`);
-    return out;
-  };
   const place = (key, layer) => {
+    assertMemberPathBounded(key);
     visible.set(key, layer);
-    for (const ancestor of ancestorsOf(key)) {
+    ancestors(key, (ancestor) => {
       let set = beneath.get(ancestor);
       if (!set) beneath.set(ancestor, (set = new Set()));
       set.add(key);
-    }
+    });
   };
   const remove = (key, removedBy, reason) => {
+    step("merged namespace removal");
     if (!visible.has(key)) return;
     shadowed.push({ path: key, layer: visible.get(key), removedBy, reason });
     visible.delete(key);
-    for (const ancestor of ancestorsOf(key)) beneath.get(ancestor)?.delete(key);
+    ancestors(key, (ancestor) => { beneath.get(ancestor)?.delete(key); });
   };
   /** `target` itself, its directory spelling, and everything beneath it — on a segment boundary. */
   const subtree = (target) => [target, `${target}/`, ...(beneath.get(`${target}/`) ?? [])];
   const isDirectoryKey = (key) => key.endsWith("/") || key === ".";
 
   layerPaths.forEach((paths, index) => {
+    for (const name of paths) assertMemberPathBounded(name);
+    // This layer's ordinary entries, and every directory they sit beneath — computed ONCE, before
+    // either pass, so both passes and the conflict rules see the same sets whatever the tar order.
+    const entries = paths.filter((name) => whiteoutOf(name).kind === "none");
+    const keys = new Set(entries);
+    const hasDescendantHere = new Set();
+    for (const key of entries) ancestors(key, (ancestor) => { hasDescendantHere.add(ancestor); });
+    /** Keys THIS layer placed. Anything else visible is lower — no per-layer copy of the whole map. */
+    const placedHere = new Set();
+    const isLower = (key) => visible.has(key) && !placedHere.has(key);
+
     /**
      * PASS 1 — this layer's whiteouts, against the state BELOW it (I1). A `.wh.<x>` removes `x`, `x/` and
-     * everything beneath; an opaque marker removes the children of its directory.
+     * everything beneath; an opaque marker removes the children of its directory — and at the ROOT
+     * (target `""`) every visible entry except the `.` sentinel (B7).
      */
     for (const name of paths) {
       const white = whiteoutOf(name);
       if (white.kind === "delete") {
-        for (const existing of subtree(white.target)) remove(existing, index, "deleted");
+        const target = white.target;
+        // B8: an ordinary whiteout overlapping this layer's own entry is order-dependent across
+        // extractors. A similar-prefix sibling (`app/d2` for `app/.wh.d`) is not an overlap.
+        if (keys.has(target) || keys.has(`${target}/`) || hasDescendantHere.has(`${target}/`)) conflicts.add(index);
+        for (const existing of subtree(target)) remove(existing, index, "deleted");
       } else if (white.kind === "opaque") {
-        for (const existing of [...(beneath.get(white.target) ?? [])]) remove(existing, index, "opaque-directory");
+        const children = white.target === ""
+          ? [...visible.keys()].filter((key) => key !== ".")
+          : [...(beneath.get(white.target) ?? [])];
+        for (const existing of children) remove(existing, index, "opaque-directory");
       }
     }
 
@@ -277,30 +334,25 @@ export function mergedFilesystem(layerPaths) {
      * over existing files"): a non-directory at `P` replaces a lower directory `P/` and everything under
      * it; a directory at `P/` replaces a lower non-directory `P`; a directory over a directory merges.
      */
-    const entries = paths.filter((name) => whiteoutOf(name).kind === "none");
-    const keys = new Set(entries);
-    const hasDescendantHere = new Set();
-    for (const key of entries) for (const ancestor of ancestorsOf(key)) hasDescendantHere.add(ancestor);
-    const lowerSnapshot = new Map(visible);
-
     for (const key of entries) {
       if (isDirectoryKey(key)) {
         const bare = key.slice(0, -1);
         if (keys.has(bare)) conflicts.add(index); // a file and a directory of one name in one layer
-        if (lowerSnapshot.has(bare) && !isDirectoryKey(bare)) remove(bare, index, "replaced-by-directory");
+        if (isLower(bare) && !isDirectoryKey(bare)) remove(bare, index, "replaced-by-directory");
       } else {
         if (keys.has(`${key}/`) || hasDescendantHere.has(`${key}/`)) conflicts.add(index);
         for (const existing of [`${key}/`, ...(beneath.get(`${key}/`) ?? [])]) {
-          if (lowerSnapshot.has(existing)) remove(existing, index, "replaced-by-non-directory");
+          if (isLower(existing)) remove(existing, index, "replaced-by-non-directory");
         }
       }
       // Writing beneath a path a LOWER layer left as a non-directory is not a merge any extractor agrees on.
-      for (const ancestor of ancestorsOf(key)) {
+      ancestors(key, (ancestor) => {
         const bare = ancestor.slice(0, -1);
-        if (lowerSnapshot.has(bare) && visible.has(bare) && !keys.has(ancestor)) conflicts.add(index);
-      }
+        if (isLower(bare) && !keys.has(ancestor)) conflicts.add(index);
+      });
       if (visible.has(key)) remove(key, index, "overwritten");
       place(key, index);
+      placedHere.add(key);
     }
   });
   return { visible, shadowed, conflicts: Object.freeze([...conflicts].sort((a, b) => a - b)) };

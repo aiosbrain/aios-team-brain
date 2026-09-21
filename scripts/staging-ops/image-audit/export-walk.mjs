@@ -616,7 +616,9 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
        * still act on a directory-, link- or content-bearing marker by its basename. The merge applies it
        * the way they would, and the record says it was malformed — once per layer.
        */
-      if (whiteoutOf(name).kind !== "none" && (member.type !== "file" || member.size !== 0) && !malformedWhiteoutRecorded) {
+      const whiteout = whiteoutOf(name).kind;
+      // …and an ordinary marker naming nothing, `.` or `..` (L6), which deletes nothing here.
+      if ((whiteout === "malformed" || (whiteout !== "none" && (member.type !== "file" || member.size !== 0))) && !malformedWhiteoutRecorded) {
         malformedWhiteoutRecorded = true;
         limitations.push({ kind: "malformed-whiteout", layer: layerIndex });
       }
