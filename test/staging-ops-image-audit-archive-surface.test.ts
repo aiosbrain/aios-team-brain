@@ -665,7 +665,12 @@ describe("directory whiteouts delete the whole subtree, and same-layer recreates
   });
 
   for (const order of ["whiteout first", "recreate first"] as const) {
-    it(`a same-layer recreate survives its own whiteout (${order})`, async () => {
+    /**
+     * SUPERSEDED (B8). This used to assert the recreate simply "survives" in both orders. OCI says a
+     * whiteout applies only below its layer; containerd v2.1.4 removes the entry when the whiteout
+     * follows it. The merge still ACCOUNTS lower-only, and now also records the disagreement as a gap.
+     */
+    it(`a same-layer recreate under its own whiteout is accounted lower-only AND recorded as a conflict (${order})`, async () => {
       const whiteout = { name: "app/.wh.d", content: "" };
       const recreate = { name: "app/d/new.js", content: "new" };
       const result = await inspectLayers([
@@ -674,6 +679,8 @@ describe("directory whiteouts delete the whole subtree, and same-layer recreates
       ]);
       expect(visible(result)).toEqual(["app/d/new.js"]);
       expect(result.merged.visible.get("app/d/new.js")).toBe(1);
+      expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+      expect(result.coverage.complete).toBe(false);
     });
   }
 
@@ -879,14 +886,16 @@ describe("type replacement and malformed whiteouts in the merged view (B6)", () 
   });
 
   for (const order of ["whiteout first", "recreate first"] as const) {
-    it(`POSITIVE: a same-layer recreation survives (${order}) and stays ready`, async () => {
+    // SUPERSEDED (B8): this was a POSITIVE; a same-layer ordinary whiteout overlapping a recreated
+    // directory is order-dependent across extractors, so it is now a blocking conflict in either order.
+    it(`a same-layer delete overlapping a recreated directory BLOCKS (${order})`, async () => {
       const whiteout = { name: "app/.wh.d", content: "" };
       const recreate = [{ name: "app/d/", type: "directory" as const }, { name: "app/d/x.js", content: "x" }];
       const result = await inspectLayers([buildTar(baseMembers), buildTar(order === "whiteout first" ? [whiteout, ...recreate] : [...recreate, whiteout])]);
       const { readiness, kinds } = chain(result);
-      expect(kinds).toEqual([]);
+      expect(kinds).toEqual(["merged-type-conflict"]);
       expect(result.merged.visible.get("app/d/x.js")).toBe(1);
-      expect(readiness.transitionReady).toBe(true);
+      expect(readiness.transitionReady).toBe(false);
     });
   }
 
