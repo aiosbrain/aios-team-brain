@@ -2424,14 +2424,20 @@ export function assessHumanCaseHistory(events, kase, { runId, attempt }) {
   if (String(readback.ref) !== ref) problems.push("has a journaled readback of a different ref");
   const verdict = classifyCaseOutcome({
     expected: kase.expected,
-    response: { status: mutation.status, diagnostic: mutation.diagnostic },
+    // The journaled completion facts, never the status alone (R02-1): a result event without
+    // `response_complete: true` re-derives as the ambiguous request it was.
+    response: {
+      status: mutation.status, diagnostic: mutation.diagnostic, complete: mutation.response_complete === true,
+      incomplete: mutation.response_incomplete ?? null, measured_status: mutation.measured_status ?? null,
+    },
     beforeSha: intent.before_sha, afterSha: readback.after_sha, requestedSha: intent.requested_sha,
     operation: kase.operation, requiresRuleId: kase.requiresRuleId ?? null,
   });
   const bound = {
     case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, expected: kase.expected,
     before_sha: intent.before_sha, requested_sha: intent.requested_sha, after_sha: readback.after_sha,
-    http_status: mutation.status, outcome: verdict.outcome, passed: verdict.outcome === kase.expected,
+    http_status: mutation.status, ...responseEvidence({ complete: mutation.response_complete, incomplete: mutation.response_incomplete, measured_status: mutation.measured_status }),
+    outcome: verdict.outcome, passed: verdict.outcome === kase.expected,
   };
   for (const [field, value] of Object.entries(bound)) {
     if (canonicalJson(outcome?.[field] ?? null) !== canonicalJson(value ?? null)) {
@@ -4090,12 +4096,26 @@ export async function runHumanTestsPhase({ runId, attempt, evidenceDir, env, dep
   }
 }
 
+/**
+ * ── THE PHASE OUTCOME: HALT AND COMPLETENESS ARE ORTHOGONAL (R02-2) ─────────────────────────────
+ *
+ * `halted` is a SAFETY fact — no further actor mutation runs, and nothing is retried — and it is
+ * already durable in the journal/state before this function is reached. It says nothing about
+ * whether the matrix MEASURED a failure. So:
+ *
+ *  - any measured failure (an unexpected success, mutation or denial, a wrong measured outcome) is
+ *    exit 1, even when inconclusive or not-run cases sit beside it: an unknown case never launders a
+ *    measured one;
+ *  - a matrix whose every failing case is inconclusive or not-run is exit 3 — including one that
+ *    halted on an ambiguous mutation, which used to be reported as a measured failure.
+ */
 function finishTestPhase({ runId, attempt, phase, caseRecords, halted, evidencePath }) {
   const failed = caseRecords.filter((record) => record.passed !== true);
   if (!failed.length) return closedResult({ runId, attempt, phase, status: "passed", evidencePath });
   const onlyInconclusive = failed.every((record) => record.outcome === "inconclusive" || record.outcome === "not-run");
-  if (onlyInconclusive && !halted) {
-    throw new IncompleteEvidence(`${failed.length} of ${caseRecords.length} ${phase} cases could not be measured`, { evidencePath });
+  if (onlyInconclusive) {
+    const stop = halted ? `; ${halted} left the outcome unknown and stopped every later ${phase} mutation, which is never retried` : "";
+    throw new IncompleteEvidence(`${failed.length} of ${caseRecords.length} ${phase} cases could not be measured${stop}`, { evidencePath });
   }
   throw new AssertionFailure(`${failed.length} of ${caseRecords.length} ${phase} cases did not record their expected provider outcome`, { evidencePath });
 }
@@ -5116,12 +5136,16 @@ export async function runCaseStage({ stage, caseId, env = process.env, deps = {}
     grants: prior.grants ?? null,
   };
   store.write(caseId, { ...store.read(caseId), stage: "await-and-finalize", status: "finalized", record, halt: verdict.halt === true });
+  // The halt is durable above; the error class reports what was MEASURED (R02-2). An inconclusive
+  // case — ambiguous and halting, or merely unattributable — is incomplete evidence (exit 3); an
+  // unexpected success, mutation or denial is a measured failure (exit 1).
+  const Outcome = verdict.outcome === "inconclusive" ? IncompleteEvidence : AssertionFailure;
   if (verdict.halt) {
-    throw new AssertionFailure(
+    throw new Outcome(
       `case ${caseId} recorded ${verdict.outcome}: ${verdict.reason}. No further actor mutation runs in this attempt.`,
     );
   }
-  if (!record.passed) throw new AssertionFailure(`case ${caseId} recorded ${verdict.outcome}, not the expected ${kase.expected}`);
+  if (!record.passed) throw new Outcome(`case ${caseId} recorded ${verdict.outcome}, not the expected ${kase.expected}`);
   return { schema_version: RESULT_SCHEMA_VERSION, run_id: runId, attempt, phase: `${role}-case-${stage}`, case_id: caseId, status: "finalized", outcome: verdict.outcome };
 }
 

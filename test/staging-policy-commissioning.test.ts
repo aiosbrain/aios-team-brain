@@ -33,6 +33,8 @@ import {
   beginWitnessItem, runWitnessPublisherJob, serveWitnessItem, transformToDisposable, unresolvedCreateIntents,
   INTENT_JOB_NAME, intentArtifactEntry, intentArtifactName, derivedRulesetNames, pollWitnessPublication,
   validateEnvironmentControl, validateEvidenceBinding, verifyWitnessedPolicy, writeEvidenceFile,
+  completedJsonResponse, conformResponse, createGuardedRequest, createLocalGhTransport, createTokenTransport,
+  incompleteResponse, responseEvidence, RESPONSE_SHAPES,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { buildMainRulesets, REQUIRED_MAIN_CONTEXTS } from "../scripts/staging-ops/main-policy.mjs";
 import {
@@ -287,7 +289,19 @@ type CaseRecord = {
 };
 
 /** One transport response, as the guarded request returns it to a case. */
-type ProviderResponse = { status: number; diagnostic: { status?: number; category: string; ruleIds: string[]; policyDenial: boolean } };
+type ProviderResponse = {
+  status: number; diagnostic: { status?: number; category: string; ruleIds: string[]; policyDenial: boolean };
+  complete?: boolean; incomplete?: string | null; measured_status?: number | null;
+};
+
+/**
+ * A fake provider answer, put on the wire the way a real transport completes it. Raw test transports
+ * go through the REAL completion owner rather than stamping `complete: true` by hand, so a fixture
+ * cannot describe a response the contract would never have produced.
+ */
+const wire = (result: { status: number; body: unknown }) =>
+  completedJsonResponse(result.status, Buffer.from(result.body === null || result.body === undefined ? "" : JSON.stringify(result.body), "utf8"));
+const lostResponse = () => incompleteResponse("transport-timeout");
 
 /** One blocker from {@link assessEvidence}. */
 type Blocker = { gate: string; kind: string; detail: string };
@@ -746,7 +760,7 @@ function createFakeGitHub(options: FakeOptions = {}) {
       const denial = evaluate(base, "merge", actor, headSha);
       if (denial) return json(405, { message: denial });
       refs.set(base, headSha);
-      return json(200, { merged: true });
+      return json(200, { sha: headSha, merged: true, message: "Pull Request successfully merged" });
     }
     return json(404, { message: "Not Found" });
   }
@@ -1767,7 +1781,7 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
       ["a rate limit", { status: 403, diagnostic: { status: 403, category: "rate-limited", ruleIds: [], policyDenial: false } }, false],
     ] as [string, ProviderResponse, boolean][]) {
       const verdict = classifyCaseOutcome({
-        expected: "denied", response, ...readback(sha("a"), sha("a")), requestedSha: sha("b"), operation: "update",
+        expected: "denied", response: { ...response, complete: response.status !== 0 }, ...readback(sha("a"), sha("a")), requestedSha: sha("b"), operation: "update",
       });
       // Each of these is equally consistent with the policy simply not existing.
       expect(verdict.outcome, label).toBe("inconclusive");
@@ -1780,13 +1794,13 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
 
   it("HALTS on an unexpected success or an unexpected mutation, rather than continuing with a proven over-privileged token", () => {
     const success = classifyCaseOutcome({
-      expected: "denied", response: { status: 200, diagnostic: { policyDenial: false, category: "ok", ruleIds: [] } },
+      expected: "denied", response: { status: 200, complete: true, diagnostic: { policyDenial: false, category: "ok", ruleIds: [] } },
       ...readback(sha("a"), sha("b")), requestedSha: sha("b"), operation: "update",
     });
     expect(success).toMatchObject({ outcome: "unexpected-success", halt: true });
     // The ref moved despite a refusal: worse than either, and it must stop the actor immediately.
     const mutated = classifyCaseOutcome({
-      expected: "denied", response: { status: 422, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: [] } },
+      expected: "denied", response: { status: 422, complete: true, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: [] } },
       ...readback(sha("a"), sha("b")), requestedSha: sha("b"), operation: "update",
     });
     expect(mutated).toMatchObject({ outcome: "unexpected-mutation", halt: true });
@@ -1830,10 +1844,11 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
      * reconciliation evidence; it cannot prove that THIS request moved the ref.
      */
     const requested = sha("b");
-    const timeout = { status, diagnostic: { category: status === 0 ? "transport-timeout" : "unclassified", policyDenial: false, ruleIds: [] } };
+    // A COMPLETE 5xx/408 is still ambiguous by its status; status 0 never completed at all.
+    const timeout = { status, complete: status !== 0, diagnostic: { category: status === 0 ? "transport-timeout" : "unclassified", policyDenial: false, ruleIds: [] } };
     // A 5xx body that happens to carry rule wording is still not a measured refusal: the diagnostic
     // cannot turn a request of unknown fate into enforcement evidence.
-    const rulish = { status, diagnostic: { category: "protected-ref-update-restricted", policyDenial: true, ruleIds: ["protected-ref-update-restricted"] } };
+    const rulish = { status, complete: status !== 0, diagnostic: { category: "protected-ref-update-restricted", policyDenial: true, ruleIds: ["protected-ref-update-restricted"] } };
     for (const [label, response, after, expected, operation] of [
       ["accepted, readback shows the requested commit", timeout, requested, "accepted", "update"],
       ["accepted, readback unchanged", timeout, sha("a"), "accepted", "update"],
@@ -1845,7 +1860,7 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
       expect(verdict, label).toMatchObject({ outcome: "inconclusive", halt: true, ambiguous: true });
       expect(verdict.reason, label).toMatch(/never retried, and no further actor mutation runs/);
     }
-    expect(mutationRequestClass(status)).toBe("ambiguous");
+    expect(mutationRequestClass(status, true)).toBe("ambiguous");
     // A MOVED ref on a case that must be denied stays the stronger, already-halting finding.
     expect(classifyCaseOutcome({ expected: "denied", response: timeout, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "unexpected-mutation", halt: true });
@@ -1853,9 +1868,9 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
     expect(classifyCaseOutcome({ expected: "accepted", response: undefined, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "inconclusive", halt: true });
     // A MEASURED acceptance and a MEASURED policy refusal are unchanged.
-    expect(classifyCaseOutcome({ expected: "accepted", response: { status: 200, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } }, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
+    expect(classifyCaseOutcome({ expected: "accepted", response: { status: 200, complete: true, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } }, ...readback(sha("a"), requested), requestedSha: requested, operation: "update" }))
       .toMatchObject({ outcome: "accepted", halt: false });
-    expect(classifyCaseOutcome({ expected: "denied", response: { ...rulish, status: 422 }, ...readback(sha("a"), sha("a")), requestedSha: requested, operation: "force", requiresRuleId: "protected-ref-update-restricted" }))
+    expect(classifyCaseOutcome({ expected: "denied", response: { ...rulish, status: 422, complete: true }, ...readback(sha("a"), sha("a")), requestedSha: requested, operation: "force", requiresRuleId: "protected-ref-update-restricted" }))
       .toMatchObject({ outcome: "denied", halt: false });
   });
 
@@ -1888,7 +1903,7 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
   });
 
   it("the offline assessor refuses a cloud case issued after an ambiguous or halting one, whatever that later case records", () => {
-    const record = (caseId: string, outcome: string, httpStatus?: number) => ({ case: caseId, outcome, ...(httpStatus === undefined ? {} : { http_status: httpStatus }) });
+    const record = (caseId: string, outcome: string, httpStatus?: number) => ({ case: caseId, outcome, ...(httpStatus === undefined ? {} : { http_status: httpStatus, response_complete: httpStatus !== 0 }) });
     const [first, second, third] = CLOUD_CASE_SEQUENCE.emergency;
     for (const [label, halting] of [
       ["a 503", record(first, "inconclusive", 503)],
@@ -1941,10 +1956,9 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
       if (method === "PATCH" && requestPath.endsWith(branch)) {
         mutations += 1;
         if (landed) github.handle(role, method, requestPath, body as never);
-        return { status, body: null, diagnostic: { status, category: status === 0 ? "transport-timeout" : "unclassified", ruleIds: [], policyDenial: false } };
+        return status === 0 ? lostResponse() : wire({ status, body: { message: "Service Unavailable" } });
       }
-      const result = github.handle(role, method, requestPath, body as never);
-      return { status: result.status, body: result.status >= 400 ? null : result.body, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
+      return wire(github.handle(role, method, requestPath, body as never));
     };
     const deps = { ...cloudDeps(github), archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1, appTransport: lossy };
     await runCaseStage({ stage: "prepare", caseId, env, deps });
@@ -1976,7 +1990,7 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
 
   it("refuses a reported success whose independent readback disagrees", () => {
     expect(classifyCaseOutcome({
-      expected: "accepted", response: { status: 200, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } },
+      expected: "accepted", response: { status: 200, complete: true, diagnostic: { category: "ok", policyDenial: false, ruleIds: [] } },
       ...readback(sha("a"), sha("z")), requestedSha: sha("b"), operation: "update",
     })).toMatchObject({ outcome: "unexpected-mutation", halt: true });
   });
@@ -1984,9 +1998,9 @@ describe("PC-05 the actor matrix: every required case, and no outcome that flatt
   it("requires the PR merge denial to be the WRITER rule, not an incidental red check", () => {
     const base = { expected: "denied" as const, ...readback(sha("a"), sha("a")), requestedSha: sha("b"), operation: "merge" as const, requiresRuleId: "protected-ref-update-restricted" };
     // A merge refused because unrelated CI is red says nothing about who may write to the ref.
-    expect(classifyCaseOutcome({ ...base, response: { status: 405, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: ["required-status-checks"] } } }))
+    expect(classifyCaseOutcome({ ...base, response: { status: 405, complete: true, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: ["required-status-checks"] } } }))
       .toMatchObject({ outcome: "inconclusive" });
-    expect(classifyCaseOutcome({ ...base, response: { status: 405, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: ["protected-ref-update-restricted"] } } }))
+    expect(classifyCaseOutcome({ ...base, response: { status: 405, complete: true, diagnostic: { policyDenial: true, category: "policy-denial", ruleIds: ["protected-ref-update-restricted"] } } }))
       .toMatchObject({ outcome: "denied" });
   });
 
@@ -2924,7 +2938,7 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     const sound = {
       case: kase.id, actor: "normal", operation: "update", force: false, expected: "denied", ref,
       outcome: "denied", passed: true, before_sha: graph.A, after_sha: graph.A, requested_sha: graph.N1,
-      http_status: 422, diagnostic: { status: 422, category: "repository-rule-violation", ruleIds: ["repository-rule-violation"], policyDenial: true },
+      http_status: 422, response_complete: true, diagnostic: { status: 422, category: "repository-rule-violation", ruleIds: ["repository-rule-violation"], policyDenial: true },
       check_state: checkState(kase.checks, graph[kase.to]),
     };
     expect(deriveCaseVerdict(sound, kase, context)).toEqual([]);
@@ -2934,7 +2948,7 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     const noopAccept = {
       case: green.id, actor: "normal", operation: "update", force: false, expected: "accepted", ref,
       outcome: "accepted", passed: true, before_sha: graph.A, requested_sha: graph.A, after_sha: graph.A,
-      http_status: 200, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false },
+      http_status: 200, response_complete: true, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false },
       check_state: checkState(green.checks, graph[green.to]),
     };
     expect(deriveCaseVerdict(noopAccept, green, context).join("; "))
@@ -2966,6 +2980,9 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
       ["a non-policy diagnostic dressed as a policy denial", { diagnostic: { status: 403, category: "credential-failure", ruleIds: ["credential-failure"], policyDenial: true } }, /not attributable to a policy rule/],
       ["a denial on a ref that moved", { after_sha: graph.N1 }, /denial on a ref that moved/],
       ["a denial that is not a client refusal", { http_status: 200 }, /not a measured provider refusal/],
+      // R02-1: a refusal status whose response the transport never measured as complete.
+      ["a denial whose response did not complete", { response_complete: false }, /not a measured provider refusal/],
+      ["a denial that states no response completion at all", { response_complete: undefined }, /not a measured provider refusal/],
       ["a before SHA that is not its graph node", { before_sha: graph.B }, /not the journaled synthetic node A/],
       ["a requested SHA that is not its graph node", { requested_sha: graph.N2 }, /not the journaled synthetic node N1/],
       ["an unmeasured check state", { check_state: { expectation: kase.checks, measured: false } }, /check state was measured/],
@@ -4580,8 +4597,7 @@ describe("correction pass 3 — F3/F4: live source continuity, and freshness at 
       const advance = () => { clock += 100_000; };
       const rawTransport = (actor: string) => async (method: string, requestPath: string, body?: unknown) => {
         if (variant === "scoped-read") advance();
-        const result = github.handle(actor, method, requestPath, body as never);
-        return { status: result.status, body: result.status >= 400 ? null : result.body, diagnostic: { status: result.status, category: "ok", ruleIds: [], policyDenial: false } };
+        return wire(github.handle(actor, method, requestPath, body as never));
       };
       const deps = {
         fetchImpl: github.fetchImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1,
@@ -4772,7 +4788,7 @@ describe("correction pass 3 — F5/F6: the ready-work scheduler and pending-disp
     try {
       const failing = async (method: string, requestPath: string, body?: unknown) => {
         const response = await session.request(method, requestPath, body as never);
-        return requestPath.endsWith("/dispatches") ? { status, body: null, diagnostic: { status, category: "unclassified", ruleIds: [], policyDenial: false } } : response;
+        return requestPath.endsWith("/dispatches") ? (status === 0 ? lostResponse() : wire({ status, body: { message: "Server Error" } })) : response;
       };
       const begin = () => beginWitnessItem({
         request: failing, requestArchive: session.requestArchive, ctx: session.ctx, journal: session.journal,
@@ -4856,13 +4872,23 @@ describe("correction pass 3 — F7/F8/F9: durable identity, provable ownership a
     // A response with NO usable identity at a 2xx: something may exist and nobody can name it.
     expect(states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 201, id: null })]).state).toBe("response-ambiguous");
     // A MEASURED refusal: nothing was created, and that is settled rather than outstanding.
-    const refused = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 422, id: null })]);
+    const refused = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 422, response_complete: true, id: null })]);
     expect(refused.state).toBe("refused");
     expect(refused.unresolved).toBe(false);
+    // R02-1: the same 422 whose response the transport did NOT measure as complete (or a legacy
+    // result that states no completion) is not a refusal — the create may have been committed.
+    for (const completion of [{ response_complete: false }, {}]) {
+      const unfinished = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status: 422, ...completion, id: null })]);
+      expect(unfinished, JSON.stringify(completion)).toMatchObject({ state: "response-ambiguous", unresolved: true });
+    }
+    // And a ref create's 201 is only `identified` by its name when it completed.
+    const refName = derivedRef(RUN_ID, ATTEMPT, "normal");
+    expect(states([intent("ref", { suffix: "normal", ref: refName }), result("ref", { key: "normal", suffix: "normal", ref: refName, status: 201, response_complete: true })]).state).toBe("identified");
+    expect(states([intent("ref", { suffix: "normal", ref: refName }), result("ref", { key: "normal", suffix: "normal", ref: refName, status: 201, response_complete: false })]).state).toBe("response-ambiguous");
     // A transport failure at status 0, a 5xx or a 408 is ambiguous, not refused: a 503 can follow a
     // committed create, so recreating would duplicate it.
     for (const status of [0, 500, 502, 503, 504, 408]) {
-      const ambiguous = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status, id: null })]);
+      const ambiguous = states([intent("ruleset", { name }), result("ruleset", { key: `ruleset:${name}`, name, status, response_complete: status !== 0, id: null })]);
       expect(ambiguous, String(status)).toMatchObject({ state: "response-ambiguous", unresolved: true });
     }
     // No result at all.
@@ -5239,17 +5265,17 @@ describe("correction pass 4 — every first fingerprint proves the measured GET 
         lostOnce = true;
         // A transport timeout AFTER the provider committed: the ruleset exists, the response is gone.
         github.handle("local", method, url, body);
-        return { status: 0, body: null, diagnostic: { status: 0, category: "transport-timeout", ruleIds: [], policyDenial: false } };
+        return lostResponse();
       }
       const response = github.handle("local", method, url, body);
-      if (method !== "GET" || !/\/rulesets\/\d+$/.test(rel) || response.status !== 200) return response;
-      if (!String((response.body as Record<string, unknown>)?.name ?? "").startsWith("commissioning-")) return response;
+      if (method !== "GET" || !/\/rulesets\/\d+$/.test(rel) || response.status !== 200) return wire(response);
+      if (!String((response.body as Record<string, unknown>)?.name ?? "").startsWith("commissioning-")) return wire(response);
       if (options.failFirstGet && !failedOnce) {
         failedOnce = true;
-        return { status: 503, body: null, diagnostic: { status: 503, category: "server-error", ruleIds: [], policyDenial: false } };
+        return wire({ status: 503, body: { message: "Service Unavailable" } });
       }
       const mutated = mutate(structuredClone(response.body) as Record<string, unknown>);
-      return mutated === null ? response : { ...response, body: mutated };
+      return wire(mutated === null ? response : { ...response, body: mutated });
     };
   };
 
@@ -5398,7 +5424,7 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
     intentJobConclusion?: string;
   } = {}) => async (method: string, url: string) => {
     const rel = url.split("?")[0].replace(`/repos/${COMMISSIONING_REPOSITORY}`, "");
-    const ok = (body: unknown) => ({ status: 200, body, diagnostic: { status: 200, category: "ok", ruleIds: [], policyDenial: false } });
+    const ok = (body: unknown) => wire({ status: 200, body });
     if (rel === "") return ok({ id: REPOSITORY_ID, full_name: COMMISSIONING_REPOSITORY, default_branch: "staging" });
     if (rel === "/git/ref/heads/staging") return ok({ object: { sha: WORKFLOW_SHA } });
     if (rel === "/actions/artifacts") {
@@ -5423,7 +5449,7 @@ describe("correction pass 4 — the actual publisher reads the authenticated int
       ];
       return ok({ total_count: jobs.length, jobs });
     }
-    return { status: 404, body: { message: "Not Found" }, diagnostic: { status: 404, category: "not-found", ruleIds: [], policyDenial: false } };
+    return wire({ status: 404, body: { message: "Not Found" } });
   };
 
   const archiveOf = (bytes: Buffer | null) => async () => (bytes
@@ -6032,12 +6058,13 @@ describe("R2 — a local human case is issued once, admitted from the verified j
     const intent = { case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, before_sha: graph[kase.from], requested_sha: requested, expected: kase.expected, checks: kase.checks };
     const outcome = {
       case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, expected: kase.expected,
-      before_sha: graph[kase.from], requested_sha: requested, after_sha: graph[kase.from], http_status: 422, diagnostic: policyDenial,
+      before_sha: graph[kase.from], requested_sha: requested, after_sha: graph[kase.from], http_status: 422,
+      response_complete: true, response_incomplete: null, measured_status: 422, diagnostic: policyDenial,
       outcome: "denied", check_state: { expectation: kase.checks, measured: false }, passed: true, reason: null,
     };
     return [
       { type: "mutation-intent", data: intent },
-      { type: "mutation-result", data: { case: kase.id, status: 422, diagnostic: policyDenial } },
+      { type: "mutation-result", data: { case: kase.id, status: 422, response_complete: true, response_incomplete: null, measured_status: 422, diagnostic: policyDenial } },
       { type: "readback", data: { case: kase.id, ref, after_sha: graph[kase.from] } },
       { type: "case-outcome", data: outcome },
     ];
@@ -6053,7 +6080,12 @@ describe("R2 — a local human case is issued once, admitted from the verified j
         if (mutated && options.failReadbackAfterMutation) return { status: 503, body: null };
         return { status: 200, body: { object: { sha: graph.C } } };
       }
-      if (["PATCH", "DELETE", "PUT"].includes(method)) { mutated = true; return { ...mutate(method), body: null }; }
+      if (["PATCH", "DELETE", "PUT"].includes(method)) {
+        mutated = true;
+        // A stub answer with a status line is a COMPLETED one unless it says otherwise; status 0 never completed.
+        const answer = mutate(method);
+        return { complete: answer.status !== 0, incomplete: answer.status === 0 ? "transport-timeout" : null, ...answer, body: null };
+      }
       throw new Error(`unexpected request ${method} ${requestPath}`);
     };
     return { request, calls, mutations: () => calls.filter((call) => /^(PATCH|DELETE|PUT) /.test(call)) };
