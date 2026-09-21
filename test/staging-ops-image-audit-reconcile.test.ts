@@ -398,6 +398,13 @@ describe("every deficient scanner measurement refuses or stays blocked after ope
     ["verified canary without binaryMagicSkipReproduced", withScanner((scanner) => ({ ...scanner, capabilityCanary: without(scanner.capabilityCanary, "binaryMagicSkipReproduced") })), "original-scanner-canary-malformed"],
     ["verified canary carrying a failure reason", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, reason: marker } })), "original-scanner-canary-malformed"],
     ["a FAILED canary beside complete coverage", withScanner((scanner) => ({ ...scanner, capabilityCanary: assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 0 }) })), "original-internally-inconsistent"],
+    // F5 — canary TEXT is bound to the producer's constants; anything else is refused, never carried.
+    ["a verified canary with an altered note", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...scanner.capabilityCanary, note: marker } })), "original-scanner-canary-malformed"],
+    ["an unverified canary with an arbitrary reason", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }), reason: marker } })), "original-scanner-canary-malformed"],
+    ["an unverified canary carrying a note", withScanner((scanner, marker) => ({ ...scanner, capabilityCanary: { ...assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }), note: marker } })), "original-scanner-canary-malformed"],
+    // F6 — the archive-surface figure must be consistent with the rest of coverage.
+    ["archiveSurfaceBytes greater than stagedBytes", (record) => ({ ...record, coverage: { ...record.coverage, archiveSurfaceBytes: Number(record.coverage.stagedBytes) + 1 } }), "original-internally-inconsistent"],
+    ["archiveSurfaceBytes of 0 beside complete coverage of a layer", (record) => ({ ...record, coverage: { ...record.coverage, archiveSurfaceBytes: 0 } }), "original-internally-inconsistent"],
     // Contradictory complete coverage.
     ["complete coverage beside a recorded limitation", (record) => ({ ...record, coverage: { ...record.coverage, limitations: [{ kind: "oversized-member", layer: 0 }] } }), "original-internally-inconsistent"],
   ];

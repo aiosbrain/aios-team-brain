@@ -34,7 +34,7 @@ import { scanSurface, synthesizeImage } from "./helpers/synthetic-image";
  * inventory, recipe and label checks are satisfied by measurement rather than stubbed.
  */
 
-const state = vi.hoisted(() => ({ manifestDigest: "", assetSha: "" }));
+const state = vi.hoisted(() => ({ manifestDigest: "", assetSha: "", extraScanArgs: [] as string[] }));
 
 vi.mock("../scripts/staging-ops/image-audit/layers.mjs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../scripts/staging-ops/image-audit/layers.mjs")>();
@@ -48,6 +48,11 @@ vi.mock("../scripts/staging-ops/image-audit/scanner.mjs", async (importOriginal)
   const actual = await importOriginal<typeof import("../scripts/staging-ops/image-audit/scanner.mjs")>();
   return {
     ...actual,
+    /**
+     * F7's seam: arguments appended to the invocation the audit really runs, so a test can make the
+     * settings READ BACK from that invocation differ from the reviewed policy. Empty by default.
+     */
+    scannerArgs: (options: Parameters<typeof actual.scannerArgs>[0]) => [...actual.scannerArgs(options), ...state.extraScanArgs],
     verifyScannerDownload: (bytes: Buffer) => {
       const measured = createHash("sha256").update(bytes).digest("hex");
       if (measured !== state.assetSha) throw new Error("synthetic scanner asset mismatch");
@@ -90,7 +95,7 @@ function globalMetadata(marker: string): Buffer {
   return withEnd.subarray(0, withEnd.length - 1024); // the record without its archive's end blocks
 }
 
-function cleanHarness({ canaryArchiveFindings = 1, packageApiStatus = 403, metadataMarker = "" } = {}) {
+function cleanHarness({ canaryArchiveFindings = 1, packageApiStatus = 403, metadataMarker = "", detectFindingIn = "" } = {}) {
   const layer = buildTar(Object.entries(SOURCE_FILES).map(([path, content]) => ({ name: `app/${path}`, content })));
   const image = synthesizeImage([metadataMarker ? Buffer.concat([globalMetadata(metadataMarker), layer]) : layer]);
   state.manifestDigest = `sha256:${createHash("sha256").update(image.manifestBytes).digest("hex")}`;
@@ -113,7 +118,11 @@ function cleanHarness({ canaryArchiveFindings = 1, packageApiStatus = 403, metad
       case "scanner-canary-wrapped": return hit();
       case "scanner-canary-unwrapped": return report("[]");
       case "scanner-canary-archive-metadata": return canaryArchiveFindings ? hit() : report("[]");
-      case "scanner-detect": return report("[]");
+      // Optionally ONE finding at a staged id under the scan root, reported as the pinned scanner does:
+      // an absolute location.
+      case "scanner-detect": return report(detectFindingIn
+        ? JSON.stringify([{ RuleID: "generic-api-key", File: join(at("--source"), detectFindingIn) }])
+        : "[]");
       case "source-checkout": {
         // The checkout lands the source tree on disk, where `readSourceTree` hashes it for real.
         const dir = args[args.indexOf("-C") + 1];
@@ -236,6 +245,42 @@ describe("the EMITTED record validates and reconciles to ready (AC-AUDIT-08)", (
     const written = readFileSync(env.AUDIT_EVIDENCE_PATH, "utf8");
     expect(written).not.toContain(env.RUNNER_TEMP);
     expect(written).not.toContain(marker);
+  });
+
+  /**
+   * F7 — the producer's settings refusal is a CALL SITE, pinned here. Removing it from `runAudit` used
+   * to leave every test green: the settings were validated only by the reconciliation.
+   */
+  it("REFUSES a run whose invocation's settings are not the reviewed policy (AC-AUDIT-06)", async () => {
+    state.extraScanArgs = ["--max-archive-depth", "3"];
+    try {
+      const { env, run, fetchImpl, labels } = cleanHarness();
+      await expect(runAudit(env, { run, fetchImpl })).rejects.toMatchObject({ code: "AUDIT_SCANNER_SETTINGS_UNSUPPORTED" });
+      // The scan did run — the refusal is of the record it would have produced, not of the scan.
+      expect(labels).toContain("scanner-detect");
+      const written = JSON.parse(readFileSync(env.AUDIT_EVIDENCE_PATH, "utf8"));
+      expect(written).toMatchObject({ verdict: "refused", transitionReady: false, failure: { errorCode: "AUDIT_SCANNER_SETTINGS_UNSUPPORTED" } });
+    } finally {
+      state.extraScanArgs = [];
+    }
+  });
+
+  /**
+   * F7 — a finding in an ARCHIVE-SURFACE file is attributed to the fixed `archive-metadata` category and
+   * its layer, never to a path. Removing that branch of `publicPathResolver` used to survive every test.
+   */
+  it("attributes a finding in archive metadata to the fixed category and layer, with no path", async () => {
+    const { env, run, fetchImpl } = cleanHarness({ detectFindingIn: "L0/M/000000.txt" });
+    const record = await runAudit(env, { run, fetchImpl });
+    expect(record.findings.total).toBe(1);
+    const [occurrence] = record.findings.groups[0].occurrences;
+    expect(occurrence.category).toBe("archive-metadata");
+    expect(occurrence.layer).toBe(0);
+    expect(occurrence.path).toBeUndefined();
+    // …and the artifact on disk names no path for it either.
+    const written = JSON.parse(readFileSync(env.AUDIT_EVIDENCE_PATH, "utf8"));
+    expect(written.findings.groups[0].occurrences[0]).not.toHaveProperty("path");
+    expect(record.transitionReady).toBe(false);
   });
 
   it("the SAME emitted record is refused once any required scanner measurement is removed", async () => {

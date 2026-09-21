@@ -1277,12 +1277,15 @@ public evidence.**
     link targets, padding, unsupported-member bodies, end blocks and trailing bytes — is staged as
     whole ranges under a fixed `archive-metadata` category (never a path) and counted in
     `coverage.archiveSurfaceBytes`. A range too large for one surface file is an
-    `archive-surface-range-unstageable` gap, never a split. The claim is about the **decoded tar
+    `archive-surface-range-unstageable` gap, never a split. **Non-zero bytes after a layer's or
+    nested tar's end blocks** are staged but are also an `archive-trailer-nonzero` gap: opaque
+    scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine. The claim is about the **decoded tar
     bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
     stream), which a `docker save` export may not contain, is outside it.
   - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
     truncated or unterminated input, a header-only member declaring a body, a global PAX
-    path/linkpath/size override, a non-zero trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
+    path/linkpath/size override, an empty PAX `path`/`linkpath` or GNU long name/link, a non-zero
+    trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
     (a metadata body, accumulated metadata or physical-header count past its reviewed bound). A broken
     *nested* tar is a `nested-archive-undecodable` gap instead.
 - **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
@@ -1299,9 +1302,10 @@ public evidence.**
   that reports anything else.
 - **`scanner.capabilityCanary`** is measured on three private synthetic fixtures before the real scan,
   with the same binary, config and isolation: the wrapped ELF case, its unwrapped negative control,
-  and a wrapped NUL-padded 512-byte **archive-metadata** block. Verified means both wrapped fixtures
-  were detected (`archiveSurfaceDetected: true`); a miss of either is `unverified`, a coverage gap
-  that blocks. The archive-metadata case has **not yet been measured on the live 8.28.0 binary** — the
+  and a wrapped NUL-padded 512-byte **archive-metadata** block whose value is NUL-terminated, as a
+  real header field is. Verified means both wrapped fixtures were detected
+  (`archiveSurfaceDetected: true`); a miss of either — or no canary at all — is `unverified`, a
+  coverage gap that blocks. Its `reason`/`note` are fixed strings, and reconciliation refuses any other. The archive-metadata case has **not yet been measured on the live 8.28.0 binary** — the
   first real run establishes it, and a miss blocks rather than passes.
 - **`failure`** appears only on a refused run, and carries a fixed `stage` from a closed vocabulary
   plus an error **code**, never a message. `AUDIT_SUBPROCESS_TIMEOUT`, `AUDIT_SUBPROCESS_LOG_OVERFLOW`
