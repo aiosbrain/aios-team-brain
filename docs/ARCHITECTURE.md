@@ -108,6 +108,19 @@ Eleven cloud cases × pre and post = exactly **22** publications per attempt, an
 JOINS that exact closed set across the immutable intent, each actor's own consumed evidence and BOTH
 hash-chained journals rather than counting it.
 
+**The one cross-run negative control: the staged off-branch probe** (PC-06). The commissioning
+workflow admits only `staging`, so `off_branch_environment_reference_refused` is measured by a
+SEPARATE inert workflow, `.github/workflows/release-environment-negative-probe.yml` (no inputs,
+`permissions: {}`, one literal no-op per protected environment, bytes pinned), dispatched once from
+the one fixed disposable ref `remediation/pc06-off-branch-negative-20260921` by
+`scripts/staging-ops/offbranch-probe-operator.mjs` (`stage → dispatch → collect → cleanup`, plus
+`cancel`) under a `probe` role at the same request boundary. Its intent is linked into the ORIGINAL
+attempt's resource journal (`probe-staged`) before the ref exists; its own ownership chain is the
+third journal kind (`.probe.jsonl`). `check-evidence` reaches the separate validator in
+`scripts/staging-ops/offbranch-probe.mjs` only for that control key with `offbranch_schema_version: 1`,
+and re-derives the refusal from retained raw run/jobs/check/annotation responses and before/after
+environment policy captures — never from a verdict field. Runbook: `docs/OPS.md` §14.
+
 **What each of those joins actually recomputes** (AIO-1124 defensive correction). `check-evidence` is
 a re-derivation, not a re-reading, so five things it used to accept as declarations are now rebuilt
 from independent artefacts:

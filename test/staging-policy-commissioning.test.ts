@@ -2793,11 +2793,16 @@ describe("the request allowlist has no dead surface", () => {
        */
       "list-synthetic-pulls-by-head",
     ];
-    const declared = ALLOWED_OPERATIONS.map((operation) => operation.id);
+    // The staged off-branch probe's rows belong to the `probe` role alone and are exercised by ITS
+    // lifecycle, with the same dead-surface guard, in test/staging-offbranch-probe.test.ts.
+    const declared = ALLOWED_OPERATIONS
+      .filter((operation) => !(operation.roles.length === 1 && operation.roles[0] === "probe"))
+      .map((operation) => operation.id);
     // An allowlisted operation nothing ever issues is either dead surface or an untested path. Both
     // are worth naming out loud rather than leaving in a list nobody re-reads.
     expect(declared.filter((id) => !exercised.has(id)).sort()).toEqual([...errorPathOnly].sort());
-    expect(new Set(declared).size, "duplicate operation id").toBe(declared.length);
+    const all = ALLOWED_OPERATIONS.map((operation) => operation.id);
+    expect(new Set(all).size, "duplicate operation id").toBe(all.length);
   });
 });
 

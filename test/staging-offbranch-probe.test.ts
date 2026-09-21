@@ -14,7 +14,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   COMMISSIONING_REPOSITORY, COMMISSIONING_WORKFLOW_PATH, ENVIRONMENT_CONTROL_SCHEMAS, OWNER_LOGIN, OWNER_USER_ID,
-  PROTECTED_JOBS, assertAllowedRequest, assessEvidence, completedJsonResponse, createGuardedRequest, createRedactor,
+  ALLOWED_OPERATIONS, PROTECTED_JOBS, assertAllowedRequest, assessEvidence, completedJsonResponse, createGuardedRequest, createRedactor,
   evidenceSlug, incompleteResponse, readEvidenceFile, validateEnvironmentControl, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
 import { acquireJournalLock, openJournal, readJournal } from "../scripts/staging-ops/commissioning-journal.mjs";
@@ -944,6 +944,32 @@ describe("the probe role at the one request boundary", () => {
     const response: any = await request("POST", `/repos/${REPO}/git/refs`, { ref: PROBE_REF, sha });
     expect(response.status).toBe(0);
     expect(response.complete).toBe(false);
+  });
+});
+
+describe("the probe role's allowlist has no dead surface", () => {
+  it("every probe-only operation is issued by some probe lifecycle, and matched role-aware", async () => {
+    const calls: Array<{ method: string; path: string }> = [];
+    const scenario = async (setup: (w: World) => void, phases: string[]) => {
+      const local = new World();
+      try {
+        setup(local);
+        local.seedOriginal();
+        for (const phase of phases) await local.phase(phase).catch(() => {});
+        calls.push(...local.calls);
+      } finally { rmSync(local.root, { recursive: true, force: true }); }
+    };
+    await scenario(() => {}, ["stage", "dispatch", "collect", "cleanup"]);
+    await scenario((w) => { w.neverComplete = true; }, ["stage", "dispatch", "collect", "cleanup"]);
+    const probeOnly = ALLOWED_OPERATIONS.filter((operation: any) => operation.roles.length === 1 && operation.roles[0] === "probe");
+    const exercised = new Set<string>();
+    for (const call of calls) {
+      const matched = ALLOWED_OPERATIONS.find((operation: any) => operation.roles.includes("probe") && operation.method === call.method
+        && (operation.path ? operation.path === call.path.split("?")[0] : operation.pattern.test(call.path.split("?")[0])));
+      if (matched) exercised.add(matched.id);
+    }
+    expect(probeOnly.map((operation: any) => operation.id).filter((id: string) => !exercised.has(id))).toEqual([]);
+    expect(probeOnly.length).toBe(13);
   });
 });
 

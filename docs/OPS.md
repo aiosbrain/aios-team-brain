@@ -1681,6 +1681,62 @@ If the second identity does not exist, leave that control `unverified` — it bl
 which is the correct outcome, and per-control granularity is the whole reason it does not drag the
 other six down with a single flag.
 
+### The staged off-branch probe — `release-environment-negative-probe.yml` (PC-06)
+
+`off_branch_environment_reference_refused` is the one control that can be measured honestly without
+widening the commissioning workflow's admission: a SEPARATE inert workflow, dispatched once from one
+fixed disposable ref, whose two jobs target `staging-release` and `staging-emergency`. Both
+environments admit only the branch `staging`, so the expected result is a provider refusal before any
+runner exists. It is API-only: UI denial evidence has no reviewed closed schema and stays unverified.
+
+**Prerequisite, before the commissioning attempt is dispatched.** The workflow must already be merged
+to the default branch (`staging`) through a normal reviewed PR, because `workflow_dispatch` needs the
+file on the default branch. The probe's source is the ORIGINAL attempt's trusted workflow SHA, so the
+commit that commissioning dispatches from must carry the reviewed probe bytes (`PROBE_WORKFLOW_SHA256`).
+`stage` refuses a registration newer than the original attempt's journal window.
+
+**Sequence** — all while the original attempt is active and its protected jobs are UNAPPROVED, after
+`setup` recorded the baseline, and before approving anything:
+
+```bash
+P=scripts/staging-ops/offbranch-probe-operator.mjs
+A="--run-id <original run> --attempt <its attempt> --evidence-dir <the same private dir>"
+node $P stage    $A   # registration + reviewed bytes, no induced automation, ref ABSENT, baseline policies,
+                      # create-once intent, linked into the ORIGINAL journal, probe journal opened
+node $P dispatch $A   # create the ref once, before-probe policies, dispatch once (10-minute deadline)
+node $P collect  $A   # one eligible run; terminal or cancel at the deadline; raw captures; observations
+node $P cleanup  $A   # exact-SHA lease deletion via local git; verified absence; journal closed
+node $P cancel   $A   # operator abort: cancels ONLY the identified probe run, confirms terminal
+```
+
+Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job, a changed ref, a
+refused dispatch), 3 = incomplete (lost answers, no eligible run, cancellation, policy drift), 2 =
+usage. No command takes a ref, workflow, URL or environment; there is nothing to point elsewhere.
+
+**What never happens.** No approval, rejection or bypass of a deployment review; no environment,
+policy, reviewer, App or protection change; no run records deleted. A lost create, dispatch or
+deletion answer is reconciled by readback and never retried or adopted: a probe ref of uncertain
+ownership is neither dispatched nor deleted (root reconciles it), a second eligible run is refused
+rather than selected, and a changed ref is left untouched because the deletion carries an
+expected-old-SHA lease (`git push --force-with-lease=<ref>:<sha> … :<ref>`), not a GET followed by a
+DELETE. A run still nonterminal two minutes after cancellation blocks cleanup and claims nothing.
+
+**What `collect` writes.** One create-once, mode-0600 observation per environment
+(`commissioning-<run>-<attempt>-offbranch-observation-<environment>.json`), only when the refusal is
+re-derived from the retained raw responses, plus the exact `environment-controls` record to file for
+each. That record carries `offbranch_schema_version: 1` and the `commissioning` identity, and its
+`run_id`/`attempt` name the PROBE run (attempt `"1"`) — the only control where they may differ from
+the commissioning run. `check-evidence` re-derives everything: the forward link, the probe journal's
+reconciled lifecycle, the one eligible run, the run → job → `check_run_url` → check → suite/producer/
+deployment joins, the exact branch-policy annotation for this branch and environment, unchanged
+policies (baseline = before = after, agreeing with the other controls), original times in order, and
+cleanup completed before any original protected approval. A passing probe is still not PC-06 on its
+own; actual human approval of the original protected jobs remains separately required.
+
+**What it cannot claim.** Captures are taken under the trusted local operator boundary: hashes and
+local JSON are not a provider signature, `check-evidence` does not re-contact GitHub, and
+before/after equality shows the endpoints agreed, not that the policy was continuously immutable.
+
 > **A note on what changed here.** An earlier version of this section claimed the two release Apps'
 > installation permission sets were "an owner provisioning fact this harness does not measure", and
 > asked for them as two more attested controls. That was wrong: each protected job already holds its
