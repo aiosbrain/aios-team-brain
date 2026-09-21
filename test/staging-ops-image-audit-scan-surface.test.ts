@@ -126,21 +126,46 @@ describe("F1 — a staged scan file is a fixed header plus the member's EXACT by
    */
   describe("the capability canary decides coverage, and never contributes a finding", () => {
     it("is UNVERIFIED when the scanner did not detect the sentinel in this representation", () => {
-      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0 }).status).toBe("unverified");
+      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 }).status).toBe("unverified");
       // Even with the negative control absent: what matters is whether the representation was read.
-      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 1 }).status).toBe("unverified");
-      // A missing/garbled count is not a pass either.
-      expect(assessCanary({ wrappedFindings: undefined, unwrappedFindings: 0 }).status).toBe("unverified");
+      expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 1, archiveSurfaceFindings: 1 }).status).toBe("unverified");
+      // A missing/garbled count is not a pass either — and reports NO archive boolean, having no answer.
+      const unreadable = assessCanary({ wrappedFindings: undefined, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
+      expect(unreadable.status).toBe("unverified");
+      expect(unreadable).not.toHaveProperty("archiveSurfaceDetected");
     });
 
-    it("is VERIFIED when the wrapped fixture was detected, and reports the negative control honestly", () => {
-      const reproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 });
+    it("is UNVERIFIED when the archive-metadata sentinel was missed, or its count is absent (AC-AUDIT-07)", () => {
+      const missed = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 0 });
+      expect(missed).toMatchObject({ status: "unverified", archiveSurfaceDetected: false, representation: SCAN_REPRESENTATION.version });
+      // A pre-v2 caller that never measured the archive surface does not get a verified canary.
+      expect(assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 }).status).toBe("unverified");
+    });
+
+    it("is VERIFIED only when the wrapped AND archive fixtures were detected, and reports the negative control honestly", () => {
+      const reproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
       expect(reproduced.status).toBe("verified");
       expect(reproduced.binaryMagicSkipReproduced).toBe(true);
+      expect(reproduced.archiveSurfaceDetected).toBe(true);
       // The skip not reproducing is a FACT to record, not a failure and not something to imply away.
-      const notReproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 1 });
+      const notReproduced = assessCanary({ wrappedFindings: 1, unwrappedFindings: 1, archiveSurfaceFindings: 1 });
       expect(notReproduced.status).toBe("verified");
       expect(notReproduced.binaryMagicSkipReproduced).toBe(false);
+    });
+
+    it("builds the archive-metadata fixture as a wrapped, NUL-padded 512-byte block carrying the measured line", () => {
+      const sentinel = canarySentinel();
+      const fixtures = canaryFixtures(sentinel);
+      expect(fixtures.archiveMetadataBlock.length).toBe(512);
+      expect(fixtures.archiveMetadata.equals(wrapForScan(fixtures.archiveMetadataBlock))).toBe(true);
+      // The SAME line shape as the ELF case, whose detection by the pinned rule was measured.
+      expect(fixtures.archiveMetadataBlock.toString("latin1")).toContain(`\nGITHUB_TOKEN=${sentinel}\n`);
+      const line = Buffer.from(`\nGITHUB_TOKEN=${sentinel}\n`, "ascii");
+      const at = fixtures.archiveMetadataBlock.indexOf(line);
+      // NUL-padded on both sides, as a tar header field is.
+      expect(at).toBeGreaterThan(0);
+      expect(fixtures.archiveMetadataBlock.subarray(0, at).every((byte) => byte === 0)).toBe(true);
+      expect(fixtures.archiveMetadataBlock.subarray(at + line.length).every((byte) => byte === 0)).toBe(true);
     });
 
     it("builds both fixtures from ONE sentinel, differing only by the representation", () => {

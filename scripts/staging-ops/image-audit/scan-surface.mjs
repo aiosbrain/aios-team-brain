@@ -40,9 +40,14 @@ import { randomBytes } from "node:crypto";
 /**
  * The representation, pinned. `header` is the EXACT 23-byte string the feasibility probe measured;
  * changing it changes what the pinned scanner sees, so it is versioned and recorded in the evidence.
+ *
+ * v2 (AC-AUDIT-01/02). The per-file shape is unchanged; what v2 adds is the ARCHIVE SURFACE — every
+ * non-content byte of each decoded layer and gzip-decoded nested tar is staged too. A v1 record's
+ * complete-coverage claim was made without it, which is why a v1 original is refused rather than
+ * grandfathered: it needs a fresh audit.
  */
 export const SCAN_REPRESENTATION = Object.freeze({
-  version: "aios.image-audit.scan-surface.v1",
+  version: "aios.image-audit.scan-surface.v2",
   header: "AIOS binary scan input\n",
   /**
    * ONE suffix for every staged file, whatever the member was called. Inheriting `.bin`/`.svg` is
@@ -50,9 +55,11 @@ export const SCAN_REPRESENTATION = Object.freeze({
    */
   suffix: ".txt",
   note:
-    "each staged scan file is this fixed ASCII header followed by the member's exact original bytes; " +
-    "no strings extraction, decoding, truncation, normalisation or dropped NULs. Identity, inventory " +
-    "and archive classification use the original bytes, never this representation.",
+    "each staged scan file is this fixed ASCII header followed by exact original bytes: one member's " +
+    "content, or whole archive-surface ranges (tar headers, extended metadata, link targets, padding, " +
+    "unsupported-member bodies, end blocks and trailing bytes) in archive order; no strings extraction, " +
+    "decoding, truncation, normalisation, dropped NULs or split ranges. Identity, inventory and archive " +
+    "classification use the original bytes, never this representation.",
 });
 
 /** The header as bytes. Frozen at module load so no caller can re-derive it differently. */
@@ -105,23 +112,43 @@ export function canarySentinel(random = randomBytes) {
   return `ghp_${body}`;
 }
 
+/** Where the archive-metadata canary places its line: the ustar `linkname` field of a header block. */
+const ARCHIVE_METADATA_SENTINEL_OFFSET = 157;
+
 /**
- * The two canary fixtures, as a matched pair. Both carry the SAME sentinel and differ only by the
- * representation — which is what makes the result attributable to the representation rather than to
- * the rule, the config or the binary being broken.
+ * The canary fixtures. All carry the SAME sentinel in the SAME `\nGITHUB_TOKEN=<sentinel>\n` line —
+ * the shape already measured against the pinned rule — and differ only by what surrounds it, which is
+ * what makes each result attributable to the representation rather than to the rule, the config or
+ * the binary being broken.
  *
- *   `unwrapped` — ELF magic + sentinel. The measured behaviour is ZERO findings.
- *   `wrapped`   — the representation applied to those exact bytes. Expected: ONE finding.
+ *   `unwrapped`        — ELF magic + sentinel. The measured behaviour is ZERO findings.
+ *   `wrapped`          — the representation applied to those exact bytes. Expected: ONE finding.
+ *   `archiveMetadata`  — the representation applied to a NUL-padded 512-byte block carrying the line
+ *                        where a tar header keeps a link target (AC-AUDIT-07). This is the shape the
+ *                        archive surface actually stages; if the pinned scanner does not read a
+ *                        sentinel inside it, archive-surface coverage is unverified and blocks.
+ *
+ * NOT YET MEASURED ON THE LIVE BINARY. No live scan is authorised in this phase, so whether gitleaks
+ * 8.28.0 detects the sentinel inside a NUL-padded block is established by the first real run's canary,
+ * where a miss blocks readiness rather than passing silently.
  */
 export function canaryFixtures(sentinel) {
-  const original = Buffer.concat([ELF_MAGIC, Buffer.from(`\nGITHUB_TOKEN=${sentinel}\n`, "ascii")]);
+  const line = Buffer.from(`\nGITHUB_TOKEN=${sentinel}\n`, "ascii");
+  const original = Buffer.concat([ELF_MAGIC, line]);
+  const block = Buffer.alloc(512, 0);
+  line.copy(block, ARCHIVE_METADATA_SENTINEL_OFFSET);
   return Object.freeze({
     sentinel,
     original,
     unwrapped: original,
     wrapped: wrapForScan(original),
+    archiveMetadataBlock: block,
+    archiveMetadata: wrapForScan(block),
   });
 }
+
+/** The canary variants, in the order the runner scans them. Each is scanned in its own directory. */
+export const CANARY_VARIANTS = Object.freeze(["wrapped", "unwrapped", "archiveMetadata"]);
 
 /**
  * What the canary's two reports mean for COVERAGE.
@@ -135,10 +162,12 @@ export function canaryFixtures(sentinel) {
  * did not occur on this platform/version, so the wrapper was belt-and-braces for this run — recorded
  * so a reader can see the negative control did not hold, rather than silently reading as proof.
  */
-export function assessCanary({ wrappedFindings, unwrappedFindings }) {
+export function assessCanary({ wrappedFindings, unwrappedFindings, archiveSurfaceFindings }) {
   const wrapped = Number.isInteger(wrappedFindings) ? wrappedFindings : -1;
   const unwrapped = Number.isInteger(unwrappedFindings) ? unwrappedFindings : -1;
-  if (wrapped < 0 || unwrapped < 0) {
+  const archive = Number.isInteger(archiveSurfaceFindings) ? archiveSurfaceFindings : -1;
+  if (wrapped < 0 || unwrapped < 0 || archive < 0) {
+    // No boolean is reported here: there is no measured answer to report.
     return Object.freeze({
       status: "unverified",
       representation: SCAN_REPRESENTATION.version,
@@ -149,7 +178,16 @@ export function assessCanary({ wrappedFindings, unwrappedFindings }) {
     return Object.freeze({
       status: "unverified",
       representation: SCAN_REPRESENTATION.version,
+      archiveSurfaceDetected: archive > 0,
       reason: "the pinned scanner did not detect the synthetic sentinel in this audit's staged representation",
+    });
+  }
+  if (archive === 0) {
+    return Object.freeze({
+      status: "unverified",
+      representation: SCAN_REPRESENTATION.version,
+      archiveSurfaceDetected: false,
+      reason: "the pinned scanner did not detect the synthetic sentinel inside a staged archive-metadata block",
     });
   }
   return Object.freeze({
@@ -161,6 +199,8 @@ export function assessCanary({ wrappedFindings, unwrappedFindings }) {
      * combination, and a fact a reader is entitled to instead of an implied guarantee.
      */
     binaryMagicSkipReproduced: unwrapped === 0,
+    /** The archive-surface capability, measured (AC-AUDIT-07). Always true on the verified path. */
+    archiveSurfaceDetected: true,
     note: "measured on a synthetic per-run sentinel in private scratch; never counted as an image finding",
   });
 }

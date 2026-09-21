@@ -10,7 +10,7 @@ import { scannerIdentity } from "../scripts/staging-ops/image-audit/evidence.mjs
 import { assessPackageInventory } from "../scripts/staging-ops/image-audit/registry.mjs";
 import { assessCanary, SCAN_REPRESENTATION } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "../scripts/staging-ops/image-audit/subject.mjs";
-import { SCANNER } from "../scripts/staging-ops/image-audit/scanner.mjs";
+import { SCANNER, scannerArgs, scannerSettings } from "../scripts/staging-ops/image-audit/scanner.mjs";
 import { syntheticSecret } from "./helpers/tar-fixture";
 
 /**
@@ -52,6 +52,20 @@ const apiFailed = assessPackageInventory({ status: "unverified", reason: "the ve
 });
 
 /**
+ * THE SCANNER EXACTLY AS THE PRODUCER EMITS IT (AC-AUDIT-08) — built by the production
+ * `scannerIdentity` from the tracked config's real bytes, the settings read back from a real argument
+ * list, the v2 representation and a VERIFIED three-fixture canary. The four-field stand-in this
+ * replaces (`{ name, version, sha256, configPath }`) was the incomplete positive fixture that let a
+ * record with every scanner measurement dropped reconcile to ready.
+ */
+const verifiedCanary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 });
+const productionScanner = (canary: unknown = verifiedCanary) => scannerIdentity(SCANNER, readFileSync(SCANNER.configPath), {
+  settings: scannerSettings(scannerArgs({ sourceDir: "/scratch/scan", reportPath: "/scratch/report.json", ignorePath: "/scratch/cwd/.gitleaksignore" })),
+  representation: SCAN_REPRESENTATION,
+  canary,
+});
+
+/**
  * A REAL original audit record, assembled by the production `assembleAudit` from synthetic measured
  * outputs. Deliberately not a hand-built `{ blockers: [...] }` object: the positive control has to
  * prove that what the audit actually writes is what reconciliation accepts, and a hand-built stand-in
@@ -69,11 +83,12 @@ function originalAudit(overrides: Record<string, unknown> = {}, assembly: Record
         limitations: [],
         layers: 1,
         members: 3,
-        stagedBytes: 512,
+        stagedBytes: 2048,
+        archiveSurfaceBytes: 1536,
         stagedByteLimit: AUDIT_LIMITS.maxTotalStagedBytes,
-        representation: "aios.image-audit.scan-surface.v1",
+        representation: SCAN_REPRESENTATION.version,
         configBytes: 240,
-        scanSurfaceBytes: 844,
+        scanSurfaceBytes: 2380,
         representationOverheadBytes: 92,
       },
       config: { digest: `sha256:${"a".repeat(64)}` },
@@ -88,7 +103,8 @@ function originalAudit(overrides: Record<string, unknown> = {}, assembly: Record
     recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied", detail: "no secret reference" }] },
     labelFailures: [],
     tagReadback: { status: "confirmed" },
-    scanner: { name: SCANNER.name, version: SCANNER.version, sha256: SCANNER.sha256, configPath: SCANNER.configPath },
+    canary: verifiedCanary,
+    scanner: productionScanner(),
     audit: { repository: SUBJECT.repository, runId: "1" },
     startedAt: "2026-09-09T00:00:00.000Z",
     completedAt: "2026-09-09T00:10:00.000Z",
@@ -382,7 +398,9 @@ describe("readiness is RECOMPUTED from measurements, never filtered out of a blo
     const valid = originalAudit();
     const result = reconcile({
       ...valid,
-      scanner: { ...(valid.scanner as object), capabilityCanary: { status: "unverified", reason: "the pinned scanner did not detect the sentinel" } },
+      // The production UNVERIFIED canary, not a hand-shaped one: it names the v2 representation, so the
+      // only thing wrong with this record is the contradiction under test.
+      scanner: productionScanner(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 1 })),
     });
     expect(codes(result)).toEqual(["original-internally-inconsistent"]);
   });
@@ -609,16 +627,13 @@ describe("a valid original whose ONLY blocker is the API inventory DOES become r
    * canary-less scanner, so this is the one case that exercises the field the defect was in.
    */
   it("validates an original whose scanner carries a REAL verified capability canary", () => {
-    const canary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0 }) as Record<string, unknown>;
+    const canary = assessCanary({ wrappedFindings: 1, unwrappedFindings: 0, archiveSurfaceFindings: 1 }) as Record<string, unknown>;
     // The premise, asserted rather than assumed: `note` is present on the verified path only.
     expect(canary.status).toBe("verified");
     expect(typeof canary.note).toBe("string");
-    expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0 })).not.toHaveProperty("note");
+    expect(assessCanary({ wrappedFindings: 0, unwrappedFindings: 0, archiveSurfaceFindings: 0 })).not.toHaveProperty("note");
 
-    const record = originalAudit({}, {
-      canary,
-      scanner: scannerIdentity(SCANNER, "[allowlist]\n", { representation: SCAN_REPRESENTATION, canary }),
-    });
+    const record = originalAudit({}, { canary, scanner: productionScanner(canary) });
     // The audit really does carry the canary into the record — otherwise this case proves nothing.
     expect(record.scanner.capabilityCanary).toEqual(canary);
 
