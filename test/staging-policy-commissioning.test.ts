@@ -1026,15 +1026,18 @@ const environmentControls = (
       const schema = schemas[key];
       const name = `env-${key}-${spec.environment}.json`;
       // The artifact must be ABOUT this control on this environment, with this measurement: reusing
-      // one file across controls or environments is a refusal, which is the F2 correction.
-      const bytes = Buffer.from(`${JSON.stringify({ control: key, environment: spec.environment, measured: schema.expected }, null, 2)}\n`, "utf8");
+      // one file across controls or environments is a refusal, which is the F2 correction. And it
+      // carries its OWN provenance — source, numeric environment ID, capture time and (for a run-bound
+      // control) run/attempt — which the wrapper may only repeat (R3).
+      const provenance = {
+        environment_id: 4400 + index, source: schema.sources[0], measured_at: measuredAt,
+        ...(schema.run_bound ? { run_id: RUN_ID, attempt: ATTEMPT } : {}),
+      };
+      const bytes = Buffer.from(`${JSON.stringify({ control: key, environment: spec.environment, measured: schema.expected, ...provenance }, null, 2)}\n`, "utf8");
       writeFileSync(path.join(dir, name), bytes);
       controls[key][spec.environment] = {
-        status: "verified", source: schema.sources[0],
-        environment_name: spec.environment, environment_id: 4400 + index,
-        expected: schema.expected, measured: schema.expected,
-        measured_at: measuredAt,
-        ...(schema.run_bound ? { run_id: RUN_ID, attempt: ATTEMPT } : {}),
+        status: "verified", environment_name: spec.environment,
+        expected: schema.expected, measured: schema.expected, ...provenance,
         artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex"),
       };
     }
@@ -2070,21 +2073,26 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
       writeFileSync(path.join(evidenceDir, name), bytes);
       return { artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex") };
     };
-    const proof = artifactFor("proof.json", { control: key, environment, measured: expected });
+    // The observation's own provenance (R3): the wrapper below may only repeat it.
+    const provenance = { environment_id: 4401, source: "provider-api", measured_at: "2026-09-10T09:00:00.000Z" };
+    const proof = artifactFor("proof.json", { control: key, environment, measured: expected, ...provenance });
     const context = { dir: evidenceDir, key, environment, runId: RUN_ID, attempt: ATTEMPT, window: { start: "2026-01-01T00:00:00.000Z" } };
     const good = {
-      status: "verified", source: "provider-api", environment_name: environment, environment_id: 4401,
-      expected, measured: expected, measured_at: "2026-09-10T09:00:00.000Z", ...proof,
+      status: "verified", environment_name: environment, ...provenance,
+      expected, measured: expected, ...proof,
     };
     expect(validateEnvironmentControl(good, context)).toBeNull();
 
-    const falseProof = artifactFor("false-proof.json", { control: key, environment, measured: { prevent_self_review: false } });
-    const otherControlProof = artifactFor("other-control.json", { control: "administrators_cannot_bypass", environment, measured: expected });
-    const otherEnvProof = artifactFor("other-env.json", { control: key, environment: "staging-emergency", measured: expected });
+    const falseProof = artifactFor("false-proof.json", { control: key, environment, measured: { prevent_self_review: false }, ...provenance });
+    const otherControlProof = artifactFor("other-control.json", { control: "administrators_cannot_bypass", environment, measured: expected, ...provenance });
+    const otherEnvProof = artifactFor("other-env.json", { control: key, environment: "staging-emergency", measured: expected, ...provenance });
+    const staleProof = artifactFor("stale-proof.json", { control: key, environment, measured: expected, ...provenance, measured_at: "2020-01-01T00:00:00.000Z" });
     const cases: [string, Record<string, unknown>, RegExp][] = [
       // THE REVIEWED PACKET: a measurement that says the control is OFF, dated years ago.
       ["the reviewed hostile record: a FALSE measurement", { ...good, measured: { prevent_self_review: false }, ...falseProof }, /not the required outcome/],
-      ["a historical capture time", { ...good, measured_at: "2020-01-01T00:00:00.000Z" }, /before this run's window opened/],
+      ["a historical capture time", { ...good, measured_at: "2020-01-01T00:00:00.000Z", ...staleProof }, /before this run's window opened/],
+      // R3: a fresh outer timestamp around a stale observation is a restamp, not a capture time.
+      ["a fresh wrapper time around a stale observation", { ...good, ...staleProof }, /an outer timestamp cannot restamp an observation/],
       ["an artifact recording a DIFFERENT control", { ...good, ...otherControlProof }, /artifact recording the control/],
       ["an artifact recording a DIFFERENT environment", { ...good, ...otherEnvProof }, /artifact recording environment/],
       ["a swapped environment name", { ...good, environment_name: "staging-emergency" }, /measured on environment/],
@@ -2107,17 +2115,93 @@ describe("PC-06 protected-environment controls: the approval is read where it ca
     // an API-sourced claim about it would be a claim about something nobody read.
     const uiOnly = "administrators_cannot_bypass";
     const uiExpected = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[uiOnly].expected;
-    const uiProof = artifactFor("ui-proof.json", { control: uiOnly, environment, measured: uiExpected });
+    const uiProof = artifactFor("ui-proof.json", { control: uiOnly, environment, measured: uiExpected, ...provenance, source: "provider-ui" });
     const uiRecord = { ...good, expected: uiExpected, measured: uiExpected, ...uiProof };
     expect(validateEnvironmentControl({ ...uiRecord, source: "provider-api" }, { ...context, key: uiOnly })).toMatch(/does not accept/);
     expect(validateEnvironmentControl({ ...uiRecord, source: "provider-ui" }, { ...context, key: uiOnly })).toBeNull();
+    // R3 for the UI-only control: its UI source is the OBSERVATION's own fact. An API-sourced artifact
+    // cannot be relabelled UI by its wrapper, and a UI capture with no capture time is refused.
+    const uiFromApi = artifactFor("ui-from-api.json", { control: uiOnly, environment, measured: uiExpected, ...provenance });
+    expect(validateEnvironmentControl({ ...uiRecord, source: "provider-ui", ...uiFromApi }, { ...context, key: uiOnly })).toMatch(/source "provider-api", which this control does not accept/);
+    const uiUntimed = artifactFor("ui-untimed.json", { control: uiOnly, environment, measured: uiExpected, environment_id: 4401, source: "provider-ui" });
+    expect(validateEnvironmentControl({ ...uiRecord, source: "provider-ui", ...uiUntimed }, { ...context, key: uiOnly })).toMatch(/does not record its own measured_at/);
     // A run-bound negative case must name the attempt it was produced in.
     const bound = "self_review_refused";
     const boundExpected = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[bound].expected;
-    const boundProof = artifactFor("bound-proof.json", { control: bound, environment, measured: boundExpected });
+    const boundProof = artifactFor("bound-proof.json", { control: bound, environment, measured: boundExpected, ...provenance, run_id: RUN_ID, attempt: ATTEMPT });
     const boundRecord = { ...good, expected: boundExpected, measured: boundExpected, ...boundProof, run_id: RUN_ID, attempt: ATTEMPT };
     expect(validateEnvironmentControl(boundRecord, { ...context, key: bound })).toBeNull();
     expect(validateEnvironmentControl({ ...boundRecord, attempt: "9" }, { ...context, key: bound })).toMatch(/names a different attempt/);
+  });
+
+  /**
+   * R3 · the retained observation owns its provenance; a wrapper cannot restamp it.
+   *
+   * The independent review's exact probe: a stale observation from another run, attempt, numeric
+   * environment, source and year, inside a wrapper carrying fresh values for every one of them, with
+   * the artifact digest honestly matching the stale bytes. It was accepted (`null`). Then the same
+   * mismatch one field at a time, and the same observation with each provenance field ABSENT — for
+   * every control's own closed schema.
+   */
+  it("refuses a stale or cross-run PC-06 observation restamped by a fresh wrapper, and one missing its own provenance", () => {
+    const retain = (name: string, body: unknown) => {
+      const bytes = Buffer.from(JSON.stringify(body), "utf8");
+      writeFileSync(path.join(evidenceDir, name), bytes);
+      return { artifact: name, artifact_sha256: createHash("sha256").update(bytes).digest("hex") };
+    };
+    const window = { start: "2026-09-21T00:00:00.000Z", end: "2026-09-21T02:00:00.000Z" };
+    const environment = "staging-release";
+
+    // THE EXACT REVIEW PROBE.
+    const probeKey = "self_review_refused";
+    const probeMeasured = (ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { expected: unknown }>)[probeKey].expected;
+    const stale = retain("stale.json", {
+      control: probeKey, environment, measured: probeMeasured,
+      environment_id: "999", run_id: "1", attempt: "1", source: "provider-ui", measured_at: "2020-01-01T00:00:00.000Z",
+    });
+    expect(validateEnvironmentControl({
+      status: "verified", source: "provider-api", environment_name: environment, environment_id: "123",
+      expected: probeMeasured, measured: probeMeasured, measured_at: "2026-09-21T01:00:00.000Z",
+      run_id: "9001", attempt: "2", ...stale,
+    }, { dir: evidenceDir, key: probeKey, environment, runId: "9001", attempt: "2", window })).not.toBeNull();
+
+    const schemas = ENVIRONMENT_CONTROL_SCHEMAS as Record<string, { sources: string[]; expected: unknown; run_bound: boolean }>;
+    for (const key of ENVIRONMENT_CONTROL_KEYS as string[]) {
+      const schema = schemas[key];
+      const own: Record<string, unknown> = {
+        environment_id: "4401", source: schema.sources[schema.sources.length - 1], measured_at: "2026-09-21T01:00:00.000Z",
+        ...(schema.run_bound ? { run_id: "9001", attempt: "2" } : {}),
+      };
+      const context = { dir: evidenceDir, key, environment, runId: "9001", attempt: "2", window };
+      const wrapper = (body: Record<string, unknown>) => ({
+        status: "verified", environment_name: environment, expected: schema.expected, measured: schema.expected, ...own,
+        ...retain(`${key}-${Object.keys(body).length}-${createHash("sha256").update(JSON.stringify(body)).digest("hex").slice(0, 8)}.json`, body),
+      });
+      const valid = { control: key, environment, measured: schema.expected, ...own };
+      expect(validateEnvironmentControl(wrapper(valid), context), `${key}: a coherent observation`).toBeNull();
+
+      // Each provenance field CONTRADICTED by the retained bytes.
+      const contradictions: [string, unknown][] = [
+        ["environment_id", "999"],
+        ["measured_at", "2020-01-01T00:00:00.000Z"],
+        ["measured_at", "2026-09-21T01:00:00.001Z"],
+        ...(schema.sources.length > 1 ? [["source", schema.sources[0]] as [string, unknown]] : []),
+        ...(schema.run_bound ? [["run_id", "1"], ["attempt", "1"]] as [string, unknown][] : []),
+      ];
+      for (const [field, value] of contradictions) {
+        expect(validateEnvironmentControl(wrapper({ ...valid, [field]: value }), context), `${key}: contradicted ${field}`).not.toBeNull();
+      }
+      // Each provenance field ABSENT from the retained bytes: the wrapper cannot supply it.
+      for (const field of Object.keys(own)) {
+        const { [field]: _dropped, ...without } = valid;
+        expect(validateEnvironmentControl(wrapper(without), context), `${key}: absent ${field}`).toMatch(new RegExp(`does not record its own ${field}`));
+      }
+      // A field outside the control's closed observation schema.
+      expect(validateEnvironmentControl(wrapper({ ...valid, note: "trust me" }), context), `${key}: open schema`).toMatch(/outside this control's closed observation schema/);
+      if (!schema.run_bound) {
+        expect(validateEnvironmentControl(wrapper({ ...valid, run_id: "9001" }), context), `${key}: run field on an unbound control`).toMatch(/closed observation schema/);
+      }
+    }
   });
 
   it("cannot reach a full PASS while PC-06 is unverified, even with the whole actor matrix green", async () => {

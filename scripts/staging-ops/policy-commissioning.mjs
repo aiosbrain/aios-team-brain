@@ -1942,14 +1942,30 @@ export const CASE_OUTCOMES = Object.freeze([
  * `inconclusive`, because each of them is equally consistent with the policy not existing. An
  * ACCEPTANCE requires the exact expected descendant on an independent GET, never the mutation
  * response's own word for it.
+ *
+ * ── AN AMBIGUOUS MUTATION IS NEVER AN OUTCOME (R1) ──────────────────────────────────────────────
+ *
+ * A request whose response never arrived (status 0) used to be recorded as `accepted`, non-halting,
+ * whenever the single readback showed the requested commit — and the next actor case then started.
+ * The canonical rule is the opposite: an ambiguous mutation STOPS further actor mutations. The
+ * readback is still measured and retained as reconciliation evidence, but it cannot turn a request
+ * of unknown fate into a measured provider result: the ref could equally have been moved by some
+ * other writer, and "the provider accepted this request" is the claim the case exists to prove.
+ * So status 0 is `inconclusive` and halts, whatever the readback shows, for every expectation.
  */
 export function classifyCaseOutcome({ expected, response, beforeSha, afterSha, requestedSha, operation, requiresRuleId = null }) {
   const status = Number(response?.status ?? 0);
   const diagnostic = response?.diagnostic ?? { category: "unclassified", policyDenial: false, ruleIds: [] };
   const changed = String(beforeSha) !== String(afterSha);
+  const ambiguous = status === 0;
+  const ambiguousVerdict = (readbackNote) => ({
+    outcome: "inconclusive", halt: true, ambiguous: true,
+    reason: `the request did not complete, so its outcome is unknown; ${readbackNote}. The readback is retained as reconciliation evidence only, the mutation is never retried, and no further actor mutation runs`,
+  });
   if (expected === "denied") {
     if (status >= 200 && status < 300) return { outcome: "unexpected-success", halt: true, reason: "the provider accepted an operation the policy must refuse" };
     if (changed) return { outcome: "unexpected-mutation", halt: true, reason: "the ref moved despite a non-success response" };
+    if (ambiguous) return ambiguousVerdict("the readback shows the ref unchanged, which a transport failure cannot attribute to enforcement");
     if (status >= 400 && status < 500 && diagnostic.policyDenial === true) {
       if (requiresRuleId && !(diagnostic.ruleIds ?? []).includes(requiresRuleId)) {
         return { outcome: "inconclusive", halt: false, reason: `the refusal is a policy denial but not the ${requiresRuleId} rule this case must isolate` };
@@ -1958,21 +1974,20 @@ export function classifyCaseOutcome({ expected, response, beforeSha, afterSha, r
     }
     return {
       outcome: "inconclusive", halt: false,
-      reason: status === 0 ? "the request did not complete; a transport failure is not evidence of enforcement"
-        : `the refusal (${status}, ${diagnostic.category}) is not attributable to a policy rule`,
+      reason: `the refusal (${status}, ${diagnostic.category}) is not attributable to a policy rule`,
     };
   }
   if (status >= 200 && status < 300 && operation !== "delete" && String(afterSha) === String(requestedSha)) {
     return { outcome: "accepted", halt: false, reason: null };
   }
   if (status >= 200 && status < 300) return { outcome: "unexpected-mutation", halt: true, reason: "the provider reported success but the independent readback does not show the requested commit" };
-  if (status === 0 && String(afterSha) === String(requestedSha)) {
-    // The request may have reached GitHub even when its response did not reach us. Read back once;
-    // never repeat a mutation against an ambiguous outcome.
-    return { outcome: "accepted", halt: false, reason: "confirmed by readback after an ambiguous response; the mutation was not retried" };
+  if (ambiguous) {
+    return ambiguousVerdict(String(afterSha) === String(requestedSha)
+      ? "the readback shows the requested commit, which proves where the ref is but not that this request put it there"
+      : "the readback does not show the requested commit");
   }
   if (status >= 400 && status < 500) return { outcome: "unexpected-denial", halt: false, reason: `the provider refused an operation the policy must permit (${status}, ${diagnostic.category})` };
-  return { outcome: "inconclusive", halt: false, reason: "the request did not complete and the readback does not show the requested commit" };
+  return { outcome: "inconclusive", halt: false, reason: `the request returned ${status}, which is neither an acceptance nor a refusal this case can attribute` };
 }
 
 /** Read a derived ref's current commit. `null` means measured-absent (404), not unknown. */
@@ -2073,6 +2088,10 @@ export function assertDirectExecutionAdmitted(kase, ctx) {
  */
 export async function runActorCase({ request, kase, ctx, graphShas, journal, pull = null }) {
   assertDirectExecutionAdmitted(kase, ctx);
+  // ADMISSION FROM THE VERIFIED JOURNAL, before any request (R2). A case with ANY journaled mutation
+  // history in this run/attempt is never issued again, whatever that history says: a settled one has
+  // its outcome, and an unresolved one is exactly the ambiguous state that must not be retried.
+  assertHumanCaseUnissued(journal, kase);
   const ref = derivedRef(ctx.runId, ctx.attempt, kase.ref);
   const beforeSha = await readDerivedRefSha({ request, ref });
   assertCasePrecondition(kase, { beforeSha, graphShas });
@@ -2092,7 +2111,10 @@ export async function runActorCase({ request, kase, ctx, graphShas, journal, pul
     before_sha: beforeSha, requested_sha: requestedSha, expected: kase.expected, checks: kase.checks,
     ...(target ? { pull_number: target.number, pull_base: target.base, pull_head: target.head, pull_head_sha: target.head_sha } : {}),
   };
-  journal?.append("mutation-intent", intent);
+  // Re-admitted against the chain as it stands at the instant the intent is written: the reads above
+  // took time, and the intent is the durable fact that makes this request once-only.
+  assertHumanCaseUnissued(journal, kase);
+  journal.append("mutation-intent", intent);
   let response;
   if (kase.operation === "delete") {
     response = await request("DELETE", `/repos/${COMMISSIONING_REPOSITORY}/git/refs/heads/${branchOf(ref)}`);
@@ -2103,9 +2125,9 @@ export async function runActorCase({ request, kase, ctx, graphShas, journal, pul
   } else {
     response = await request("PATCH", `/repos/${COMMISSIONING_REPOSITORY}/git/refs/heads/${branchOf(ref)}`, { sha: requestedSha, force: kase.force });
   }
-  journal?.append("mutation-result", { case: kase.id, status: response.status, diagnostic: response.diagnostic, operation_id: response.operation });
+  journal.append("mutation-result", { case: kase.id, status: response.status, diagnostic: response.diagnostic, operation_id: response.operation });
   const afterSha = await readDerivedRefSha({ request, ref });
-  journal?.append("readback", { case: kase.id, ref, after_sha: afterSha });
+  journal.append("readback", { case: kase.id, ref, after_sha: afterSha });
   const verdict = classifyCaseOutcome({ expected: kase.expected, response, beforeSha, afterSha, requestedSha, operation: kase.operation, requiresRuleId: kase.requiresRuleId ?? null });
   const record = {
     case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force,
@@ -2114,8 +2136,149 @@ export async function runActorCase({ request, kase, ctx, graphShas, journal, pul
     passed: verdict.outcome === kase.expected, reason: verdict.reason,
     ...(target ? { pull_target: target } : {}),
   };
-  journal?.append("case-outcome", record);
+  journal.append("case-outcome", record);
   return { record, halt: verdict.halt };
+}
+
+/**
+ * ── THE HUMAN CASE HISTORY: ONE OWNER FOR RUNTIME ADMISSION AND OFFLINE ASSESSMENT (R2) ─────────
+ *
+ * The local human cases write four events per mutation to the verified resource journal: intent
+ * (fsynced before the request), result, readback and outcome. That append-only chain — not the
+ * derived human evidence file, which every phase run rewrites — is the authority on whether a case
+ * was issued, how often, and what happened.
+ *
+ * The defect this replaces: admission never read the chain. Re-running `human-tests` against the
+ * same run/attempt issued every case AGAIN, including one whose first request timed out; a readback
+ * that failed after a request was issued was recorded as "could not measure yet" and the later
+ * cases carried on; and the final assessment checked case uniqueness inside the rewritten file,
+ * which a second run had just replaced. Two PATCHes for one case, with the first one masked.
+ *
+ * These functions are the ONE place the history is interpreted. `runActorCase`/`runActorCases`
+ * admit from them before any request, and `assessEvidence` joins every recorded human case to them.
+ */
+export const HUMAN_CASE_EVENTS = Object.freeze(["mutation-intent", "mutation-result", "readback", "case-outcome"]);
+
+/** Every case-scoped event in chain order. Create intents carry a `kind` and no `case`, so they never match. */
+export function humanCaseEvents(records) {
+  const out = [];
+  (Array.isArray(records) ? records : []).forEach((record, position) => {
+    if (!HUMAN_CASE_EVENTS.includes(String(record?.type))) return;
+    const caseId = record?.data?.case;
+    if (typeof caseId !== "string" || !caseId) return;
+    out.push({ position, seq: record.seq ?? null, type: String(record.type), case: caseId, data: record.data });
+  });
+  return out;
+}
+
+/**
+ * Interpret ONE case's journaled history.
+ *
+ *  - `none`       — nothing was ever issued for it; it may be admitted.
+ *  - `settled`    — exactly one complete intent → result → readback → outcome sequence whose outcome
+ *                   the canonical classifier re-derives from the journaled values. Never reissued.
+ *  - `unresolved` — one intent without its complete sequence: a crash after the fsynced intent, or a
+ *                   readback that failed after the request left. The request's fate is unknown.
+ *  - `invalid`    — a duplicate intent (a replay), events out of order or disagreeing with each other,
+ *                   or an outcome the recorded values do not support.
+ *
+ * `blocking` is true for everything that must stop further actor mutations: unresolved, invalid, and
+ * a settled outcome the classifier says halts (an ambiguous mutation, an unexpected success).
+ */
+export function assessHumanCaseHistory(events, kase, { runId, attempt }) {
+  const own = (events ?? []).filter((event) => event.case === kase.id);
+  if (!own.length) return { case: kase.id, state: "none", blocking: false, problems: [], record: null, verdict: null, first_position: null };
+  const problems = [];
+  const intents = own.filter((event) => event.type === "mutation-intent");
+  const firstPosition = own[0].position;
+  const result = (state, extra = {}) => ({
+    case: kase.id, state, problems, record: null, verdict: null, first_position: firstPosition,
+    blocking: state !== "none", ...extra,
+  });
+  if (intents.length === 0) {
+    problems.push(`has journaled ${own[0].type} history with no mutation intent before it`);
+    return result("invalid");
+  }
+  if (intents.length > 1) {
+    problems.push(`was issued ${intents.length} times; a case is issued exactly once per attempt, and a repeated mutation is never an outcome`);
+    return result("invalid");
+  }
+  if (own[0].type !== "mutation-intent") problems.push(`has a journaled ${own[0].type} before its mutation intent`);
+  const expectedOrder = HUMAN_CASE_EVENTS.slice(0, own.length);
+  if (own.length > HUMAN_CASE_EVENTS.length || own.some((event, index) => event.type !== expectedOrder[index])) {
+    problems.push(`has journaled events out of their intent → result → readback → outcome order (${own.map((event) => event.type).join(", ")})`);
+  }
+  if (problems.length) return result("invalid");
+
+  const intent = own[0].data;
+  const ref = derivedRef(runId, attempt, kase.ref);
+  if (String(intent.actor) !== kase.actor || String(intent.operation) !== kase.operation || intent.force !== kase.force
+    || String(intent.expected) !== kase.expected || String(intent.ref) !== ref) {
+    problems.push("has a journaled intent that is not this case's closed actor/operation/force/expectation/ref");
+    return result("invalid");
+  }
+  if (own.length < HUMAN_CASE_EVENTS.length) {
+    problems.push(`was issued and never settled: its journal stops after ${own.at(-1).type}, so the request's outcome is unknown and it is never retried`);
+    return result("unresolved");
+  }
+  const [, mutation, readback, outcome] = own.map((event) => event.data);
+  if (String(readback.ref) !== ref) problems.push("has a journaled readback of a different ref");
+  const verdict = classifyCaseOutcome({
+    expected: kase.expected,
+    response: { status: mutation.status, diagnostic: mutation.diagnostic },
+    beforeSha: intent.before_sha, afterSha: readback.after_sha, requestedSha: intent.requested_sha,
+    operation: kase.operation, requiresRuleId: kase.requiresRuleId ?? null,
+  });
+  const bound = {
+    case: kase.id, actor: kase.actor, operation: kase.operation, ref, force: kase.force, expected: kase.expected,
+    before_sha: intent.before_sha, requested_sha: intent.requested_sha, after_sha: readback.after_sha,
+    http_status: mutation.status, outcome: verdict.outcome, passed: verdict.outcome === kase.expected,
+  };
+  for (const [field, value] of Object.entries(bound)) {
+    if (canonicalJson(outcome?.[field] ?? null) !== canonicalJson(value ?? null)) {
+      problems.push(`has a journaled outcome whose ${field} is not the one its own intent/result/readback history derives`);
+    }
+  }
+  if (problems.length) return result("invalid");
+  return result("settled", { record: outcome, verdict, blocking: verdict.halt === true });
+}
+
+/** Every human case, assessed against the chain; plus the chain-level facts no single case owns. */
+export function assessHumanCaseJournal(records, { runId, attempt }) {
+  const events = humanCaseEvents(records);
+  const matrix = casesForActor("human");
+  const known = new Set(matrix.map((kase) => kase.id));
+  const problems = [];
+  const foreign = [...new Set(events.filter((event) => !known.has(event.case)).map((event) => event.case))];
+  // A case-scoped event for anything outside the closed human matrix is a hidden attempt: cloud jobs
+  // never append to this journal, so there is no legitimate writer of one.
+  if (foreign.length) problems.push(`the verified journal records mutation history for ${foreign.map((id) => JSON.stringify(id)).join(", ")}, which is not a local human case`);
+  const cases = Object.fromEntries(matrix.map((kase) => [kase.id, assessHumanCaseHistory(events, kase, { runId, attempt })]));
+  // Anything issued AFTER a blocking case began was issued while further actor mutations were forbidden.
+  const blockers = Object.values(cases).filter((entry) => entry.blocking && entry.first_position !== null);
+  for (const blocker of blockers) {
+    const later = [...new Set(events
+      .filter((event) => event.type === "mutation-intent" && event.case !== blocker.case && event.position > blocker.first_position)
+      .map((event) => event.case))];
+    if (later.length) {
+      problems.push(`the verified journal records ${later.join(", ")} issued after ${blocker.case} (${blocker.state}) had already stopped further actor mutations`);
+    }
+  }
+  return { cases, problems, blocking: blockers.map((entry) => entry.case) };
+}
+
+/** Refuse a case that already has ANY journaled history — the runtime half of the one owner above. */
+function assertHumanCaseUnissued(journal, kase) {
+  if (typeof journal?.read !== "function" || typeof journal?.append !== "function") {
+    throw new UsageError("a local human case is admitted only from the verified run/attempt journal, which must be open for this run");
+  }
+  const prior = humanCaseEvents(journal.read()).filter((event) => event.case === kase.id);
+  if (prior.length) {
+    throw new AssertionFailure(
+      `case ${kase.id} already has ${prior.length} journaled mutation event(s) in this run/attempt; a case is issued exactly once, and a request whose outcome was lost is reconciled, never repeated`,
+    );
+  }
+  return true;
 }
 
 /**
@@ -2128,15 +2291,51 @@ export async function runActorCases({ request, actor, ctx, graphShas, journal, p
   if (!DIRECT_EXECUTION_ACTORS.includes(String(actor))) {
     throw new UsageError(`the ${String(actor)} actor's cases run only through the admitted staged cloud path, never through direct execution`);
   }
+  if (typeof journal?.read !== "function") {
+    throw new UsageError("local human cases are admitted only from the verified run/attempt journal, which must be open for this run");
+  }
   const records = [];
   let halted = null;
+  const history = () => assessHumanCaseJournal(journal.read(), { runId: ctx.runId, attempt: ctx.attempt });
   for (const kase of casesForActor(actor)) {
-    if (halted) { records.push({ case: kase.id, actor, outcome: "not-run", passed: false, reason: `halted after ${halted}` }); continue; }
+    // ADMISSION FROM THE CHAIN, re-read before every case (R2). A resumed phase takes an already
+    // settled case's outcome from its journaled history instead of issuing it again, and ANY
+    // blocking history — an unresolved or replayed case anywhere in this attempt, or an outcome that
+    // halts — stops every further mutation, in this process and in every later one.
+    const journaled = history();
+    const own = journaled.cases[kase.id];
+    if (own.state === "settled") {
+      records.push(own.record);
+      if (own.blocking) halted = halted ?? kase.id;
+      continue;
+    }
+    const unissued = own.state === "none";
+    if (halted) {
+      records.push({ case: kase.id, actor, outcome: unissued ? "not-run" : "inconclusive", passed: false, reason: `halted after ${halted}${unissued ? "" : `; ${own.problems.join("; ")}`}` });
+      continue;
+    }
+    const reasons = [
+      ...journaled.problems,
+      ...journaled.blocking.map((id) => journaled.cases[id])
+        .map((entry) => `${entry.case} ${entry.state === "settled" ? `recorded ${entry.record.outcome}, which halts this actor` : entry.problems.join("; ")}`),
+    ];
+    if (reasons.length) {
+      records.push({ case: kase.id, actor, outcome: unissued ? "not-run" : "inconclusive", passed: false, reason: `no further actor mutation runs in this attempt: ${reasons.join("; ")}` });
+      halted = journaled.blocking[0] ?? kase.id;
+      continue;
+    }
     try {
       const { record, halt } = await runActorCase({ request, kase, ctx, graphShas, journal, pull });
       records.push(record);
       if (halt) halted = record.case;
     } catch (error) {
+      // A failure AFTER the intent was journaled is not "could not measure this yet": the request may
+      // have left, and its outcome is now unknown. The chain says which it was, not the error class.
+      if (history().cases[kase.id].state !== "none" && (error instanceof IncompleteEvidence || error instanceof AssertionFailure)) {
+        records.push({ case: kase.id, actor, outcome: "inconclusive", passed: false, reason: `${error.message} — after its mutation intent was journaled, so the request's outcome is unknown and no further actor mutation runs in this attempt` });
+        halted = kase.id;
+        continue;
+      }
       if (error instanceof IncompleteEvidence) {
         // "I could not measure this case yet" does not invalidate the independent cases after it,
         // and each of them re-reads the ref state for itself. Record it and carry on.
@@ -6108,7 +6307,7 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
  * the caller records as a blocker. `unverified` is never an error here — it is the honest state, and
  * it blocks activation on its own.
  */
-export function validateEnvironmentControl(record, { dir, key, environment, runId = null, attempt = null, window = null }) {
+export function validateEnvironmentControl(record, { dir, key, environment, environmentId = null, runId = null, attempt = null, window = null }) {
   const schema = ENVIRONMENT_CONTROL_SCHEMAS[String(key)];
   if (!schema) return `names the control ${JSON.stringify(String(key))}, which is outside the closed PC-06 list`;
   if (record === undefined || record === null) return "is absent";
@@ -6172,12 +6371,67 @@ export function validateEnvironmentControl(record, { dir, key, environment, runI
   let observation;
   try { observation = JSON.parse(bytes.toString("utf8")); }
   catch { return `names an artifact that is not a parseable observation (${artifact})`; }
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return `names an artifact that is not an observation object (${artifact})`;
   if (String(observation?.control ?? "") !== String(key)) return `names an artifact recording the control ${JSON.stringify(String(observation?.control ?? ""))}`;
   if (String(observation?.environment ?? "") !== String(environment)) return `names an artifact recording environment ${JSON.stringify(String(observation?.environment ?? ""))}`;
   if (canonicalJson(observation?.measured) !== canonicalJson(record.measured)) {
     return `names an artifact whose recorded measurement is not the one this record claims (${artifact})`;
   }
+
+  /**
+   * ── THE RETAINED OBSERVATION OWNS ITS PROVENANCE (R3) ─────────────────────────────────────────
+   *
+   * The checks above bound the retained bytes to the control, the environment NAME and the measured
+   * value — and nothing else. Source, capture time, numeric environment ID and run/attempt were read
+   * only from the OUTER record, so a stale observation from another run, attempt, environment and year
+   * was accepted as soon as a fresh wrapper was put around it: the digest proved which stale bytes
+   * were retained, and the wrapper supplied provenance the bytes contradicted.
+   *
+   * So the observation carries its own closed provenance, every field is REQUIRED in the bytes, and
+   * the wrapper may only repeat it. The window and run checks above therefore apply to the capture
+   * time and run identity the observation itself recorded; a fresh outer timestamp cannot replace it.
+   */
+  const allowed = environmentObservationFields(schema);
+  const unexpected = Object.keys(observation).filter((field) => !allowed.includes(field)).sort();
+  if (unexpected.length) return `names an artifact carrying field(s) outside this control's closed observation schema (${unexpected.join(", ")})`;
+  const missing = allowed.filter((field) => observation[field] === undefined || observation[field] === null || observation[field] === "");
+  if (missing.length) return `names an artifact that does not record its own ${missing.join(", ")}; provenance the retained observation lacks cannot be supplied by its wrapper`;
+  if (!schema.sources.includes(String(observation.source))) {
+    return `names an artifact recording the source ${JSON.stringify(String(observation.source))}, which this control does not accept`;
+  }
+  if (String(observation.source) !== String(record.source)) {
+    return `names an artifact recorded from ${JSON.stringify(String(observation.source))}, not the ${JSON.stringify(String(record.source))} source its record claims`;
+  }
+  if (!POSITIVE_DECIMAL.test(String(observation.environment_id))) return "names an artifact recording no numeric environment ID";
+  if (String(observation.environment_id) !== String(record.environment_id)) {
+    return `names an artifact recording environment ID ${String(observation.environment_id)}, not the ${String(record.environment_id)} its record claims`;
+  }
+  if (environmentId !== null && String(observation.environment_id) !== String(environmentId)) {
+    return `names an artifact recording environment ID ${String(observation.environment_id)}, not ${String(environmentId)}`;
+  }
+  // EXACT, not "parses to something near": the capture time is the observation's own fact.
+  if (!Number.isFinite(Date.parse(String(observation.measured_at))) || String(observation.measured_at) !== String(record.measured_at)) {
+    return `names an artifact captured at ${JSON.stringify(String(observation.measured_at))}, not the ${JSON.stringify(String(record.measured_at))} its record claims; an outer timestamp cannot restamp an observation`;
+  }
+  if (schema.run_bound) {
+    for (const [field, expectedValue] of [["run_id", runId], ["attempt", attempt]]) {
+      if (String(observation[field]) !== String(record[field] ?? "")) {
+        return `names an artifact recording ${field} ${String(observation[field])}, not the ${String(record[field] ?? "")} its record claims`;
+      }
+      if (expectedValue !== null && String(observation[field]) !== String(expectedValue)) {
+        return `names an artifact produced in a different ${field === "run_id" ? "run" : "attempt"} (${String(observation[field])})`;
+      }
+    }
+  }
   return null;
+}
+
+/** The closed field set a retained PC-06 observation carries: its subject, measurement and provenance. */
+export function environmentObservationFields(schema) {
+  return [
+    "control", "environment", "environment_id", "source", "measured_at", "measured",
+    ...(schema?.run_bound ? ["run_id", "attempt"] : []),
+  ];
 }
 
 /**
@@ -6327,7 +6581,9 @@ export function deriveCaseVerdict(record, kase, { runId, attempt, graph = null, 
   } else if (outcome === "accepted") {
     if (!FULL_SHA.test(requested)) complain("carries no measured requested SHA");
     if (after !== requested) complain("records an acceptance whose independent readback is not the requested commit");
-    if (!(status >= 200 && status < 300) && status !== 0) complain(`records an acceptance at HTTP ${Number.isFinite(status) ? status : "?"}`);
+    // A MEASURED 2xx, and nothing else (R1). Status 0 is a request whose fate is unknown; a readback
+    // that happens to show the requested commit is reconciliation evidence, never an acceptance.
+    if (!(status >= 200 && status < 300)) complain(`records an acceptance at HTTP ${Number.isFinite(status) ? status : "?"}, which is not a measured provider acceptance`);
   }
   return problems;
 }
@@ -7555,14 +7811,45 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     const count = buildActorMatrix().filter((kase) => kase.actor === actor).length;
     block("PC-05", "unverified", `${count} ${actor} case(s) have no usable recorded outcome, because its evidence file was absent or rejected`);
   }
+  /**
+   * THE LOCAL HUMAN CASES, JOINED TO THEIR HISTORY (R2).
+   *
+   * The human evidence file is a DERIVED view that every `human-tests` run rewrites, so uniqueness
+   * inside it proves nothing about how many requests were issued. Each human case is joined to its
+   * one intent → result → readback → outcome sequence in the verified chain, through the same owner
+   * runtime admission uses, and a duplicate, unresolved or rewritten history refuses.
+   */
+  const humanJournal = journalRecords ? assessHumanCaseJournal(journalRecords, { runId, attempt }) : null;
+  for (const why of humanJournal?.problems ?? []) block("PC-05", "invalid", why);
   for (const kase of buildActorMatrix()) {
     const source = files[ACTOR_EVIDENCE_KEY[kase.actor]];
+    if (kase.actor === "human" && humanJournal) {
+      const joined = humanJournal.cases[kase.id];
+      if (joined.state === "invalid") block("PC-05", "invalid", `case ${kase.id} ${joined.problems.join("; ")}`);
+      else if (joined.state === "unresolved") block("PC-05", "unverified", `case ${kase.id} ${joined.problems.join("; ")}`);
+    }
     if (!source) continue; // reported once per actor, immediately above
     const cases = Array.isArray(source.cases) ? source.cases : null;
     if (!cases) { block("PC-05", "invalid", `the ${kase.actor} evidence does not carry a case list`); continue; }
     const matching = cases.filter((record) => String(record?.case) === kase.id);
     if (!matching.length) { block("PC-05", "unverified", `case ${kase.id} has no recorded outcome in the ${kase.actor} evidence`); continue; }
     if (matching.length > 1) { block("PC-05", "invalid", `case ${kase.id} is recorded ${matching.length} times`); continue; }
+    if (kase.actor === "human") {
+      const joined = humanJournal?.cases[kase.id] ?? null;
+      if (!joined) {
+        block("PC-05", "unverified", `case ${kase.id} cannot be joined to a verified journal history`);
+        continue;
+      }
+      if (joined.state === "invalid" || joined.state === "unresolved") continue; // blocked above
+      if (joined.state === "none" && !["inconclusive", "not-run"].includes(String(matching[0]?.outcome))) {
+        block("PC-05", "invalid", `case ${kase.id} records the outcome ${JSON.stringify(String(matching[0]?.outcome ?? ""))}, but the verified journal records no mutation for it`);
+        continue;
+      }
+      if (joined.state === "settled" && canonicalJson(matching[0]) !== canonicalJson(joined.record)) {
+        block("PC-05", "invalid", `case ${kase.id}'s recorded outcome is not the one its verified journal history holds; a derived file cannot replace it`);
+        continue;
+      }
+    }
     const problems = deriveCaseVerdict(matching[0], kase, {
       runId, attempt, graph,
       normalAppId: files.intent ? Number(files.intent.normal_app_id) : null,
@@ -7653,6 +7940,8 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
     if (!controls || typeof controls !== "object" || Array.isArray(controls)) {
       block("PC-06", "invalid", "the environment-controls evidence does not carry a controls map");
     } else {
+      // One environment has ONE numeric identity. Every accepted observation of it must agree (R3).
+      const measuredIds = new Map(PROTECTED_JOBS.map((spec) => [spec.environment, new Set()]));
       for (const key of ENVIRONMENT_CONTROL_KEYS) {
         const perEnvironment = controls[key];
         if (!perEnvironment || typeof perEnvironment !== "object" || Array.isArray(perEnvironment)) {
@@ -7664,9 +7953,17 @@ export function assessEvidence({ dir, runId, attempt, now = () => new Date() }) 
             dir, key, environment: spec.environment, runId, attempt, window: runWindow,
           });
           if (problem) block("PC-06", "unverified", `the protected-environment control ${key} for ${spec.environment} ${problem}`);
+          else measuredIds.get(spec.environment).add(String(perEnvironment[spec.environment].environment_id));
         }
         const unknownEnvironments = Object.keys(perEnvironment).filter((name) => !PROTECTED_JOBS.some((spec) => spec.environment === name));
         if (unknownEnvironments.length) block("PC-06", "invalid", `the control ${key} names ${unknownEnvironments.length} environment(s) outside this workflow's two`);
+      }
+      for (const [environment, ids] of measuredIds) {
+        if (ids.size > 1) block("PC-06", "invalid", `the ${environment} controls were observed on ${ids.size} different numeric environment IDs (${[...ids].sort().join(", ")}); one environment has one identity`);
+      }
+      const shared = [...measuredIds.values()].filter((ids) => ids.size === 1).map((ids) => [...ids][0]);
+      if (shared.length > 1 && new Set(shared).size !== shared.length) {
+        block("PC-06", "invalid", "two different protected environments were observed under the same numeric environment ID");
       }
       const unknown = Object.keys(controls).filter((key) => !ENVIRONMENT_CONTROL_KEYS.includes(key));
       if (unknown.length) block("PC-06", "invalid", `the environment-controls evidence declares ${unknown.length} control(s) outside the closed PC-06 list`);
