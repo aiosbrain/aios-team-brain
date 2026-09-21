@@ -2957,7 +2957,7 @@ describe("correction pass 1 — the reviewed findings, each with the defect it w
     const noopForce = {
       case: rewind.id, actor: "normal", operation: "force", force: true, expected: "denied", ref,
       outcome: "denied", passed: true, before_sha: graph.N4, after_sha: graph.N4, requested_sha: graph.N4,
-      http_status: 422, diagnostic: { status: 422, category: "non-fast-forward-rejected", ruleIds: ["non-fast-forward-rejected"], policyDenial: true },
+      http_status: 422, response_complete: true, diagnostic: { status: 422, category: "non-fast-forward-rejected", ruleIds: ["non-fast-forward-rejected"], policyDenial: true },
       check_state: { expectation: "irrelevant", measured: false },
     };
     expect(deriveCaseVerdict(noopForce, rewind, context).join("; "))
