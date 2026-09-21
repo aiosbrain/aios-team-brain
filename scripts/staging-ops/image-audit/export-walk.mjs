@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
 import { TarFormatError, bufferSource, readTarMembers } from "./tar-reader.mjs";
+import { AUDIT_LIMITS } from "./subject.mjs";
 import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
 /** A positioned-read source over a file. No whole-file buffer exists at any point. */
@@ -438,7 +439,9 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
 
   let surfaceSequence = 0;
   let archiveSurfaceBytes = 0;
-  const surfaceFileLimit = limits.maxArchiveSurfaceFileBytes ?? Number.POSITIVE_INFINITY;
+  // The reviewed bound when a caller's limits omit it — never "unbounded", which would let one range
+  // of any size become one staged file.
+  const surfaceFileLimit = limits.maxArchiveSurfaceFileBytes ?? AUDIT_LIMITS.maxArchiveSurfaceFileBytes;
   const surfaceCheckBytes = readerTuning.deadlineEveryBytes ?? DEADLINE_CHECK_BYTES;
   const readerOptions = { ...tarReaderOptions(limits, deadline), ...readerTuning };
   mkdirSync(join(scanDir, archiveSurfaceGroup(layerIndex)), { recursive: true });
@@ -546,6 +549,12 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
       maxMembers: limits.maxMembersPerLayer,
       ...readerOptions,
       onSurface: (range) => layerSurface.stage(range),
+      /**
+       * NON-ZERO BYTES AFTER THE END MARKER are staged as opaque surface, but opaque is not decoded:
+       * a gzip stream, a ZIP or a second tar there reaches no expansion. So it is also a recorded gap
+       * that blocks. Real layers carry zero-only padding there, so this costs no false positives.
+       */
+      onNonzeroTrailer: () => limitations.push({ kind: "archive-trailer-nonzero", layer: layerIndex }),
     })) {
       members += 1;
       if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("layer inventory");
@@ -748,6 +757,9 @@ function expandArchive({ bytes, name, depth, context }) {
       maxMembers: limits.maxMembersPerLayer,
       ...(readerOptions ?? tarReaderOptions(limits, deadline)),
       ...(nestedSurface ? { onSurface: (range) => nestedSurface.stage(range) } : {}),
+      // The same gap one level down, whether or not the nested tar was compressed: its trailer bytes
+      // were scanned (as surface, or as the enclosing member's content) but never decoded.
+      onNonzeroTrailer: () => limitations.push({ kind: "archive-trailer-nonzero", layer: layerIndex, ...at }),
     })) {
       if (nested.type === "symlink" || nested.type === "hardlink" || nested.type === "directory") continue;
       if (nested.type !== "file") {

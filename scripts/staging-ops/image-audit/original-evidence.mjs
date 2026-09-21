@@ -32,7 +32,7 @@
  */
 import { EVIDENCE_SCHEMA, VERDICTS } from "./evidence.mjs";
 import { UNSUPPORTED_FORMATS } from "./export-walk.mjs";
-import { SCAN_REPRESENTATION } from "./scan-surface.mjs";
+import { CANARY_TEXT, CANARY_UNVERIFIED_REASONS, SCAN_REPRESENTATION } from "./scan-surface.mjs";
 import { SCANNER, settingsMatchPolicy } from "./scanner.mjs";
 import { AUDIT_LIMITS, SUBJECT } from "./subject.mjs";
 
@@ -344,11 +344,16 @@ function scannerBindingCodes(measured) {
   }
   const canary = measured.capabilityCanary;
   if (canary.representation !== SCAN_REPRESENTATION.version) codes.push("original-scanner-canary-representation-mismatch");
+  // The canary's TEXT is bound to the constants the producer writes: its `note`/`reason` reach the
+  // public reconciled record, so any other printable string is refused rather than carried.
   if (canary.status === "verified"
-    && (!isBool(canary.binaryMagicSkipReproduced) || canary.archiveSurfaceDetected !== true || canary.reason !== undefined)) {
+    && (!isBool(canary.binaryMagicSkipReproduced) || canary.archiveSurfaceDetected !== true || canary.reason !== undefined
+      || canary.note !== CANARY_TEXT.verifiedNote)) {
     codes.push("original-scanner-canary-malformed");
   }
-  if (canary.status === "unverified" && canary.reason === undefined) codes.push("original-scanner-canary-malformed");
+  if (canary.status === "unverified" && (!CANARY_UNVERIFIED_REASONS.includes(canary.reason) || canary.note !== undefined)) {
+    codes.push("original-scanner-canary-malformed");
+  }
   return codes;
 }
 
@@ -508,8 +513,11 @@ export function validateOriginalEvidence(record, subject = SUBJECT) {
     // The canary's `unverified` is mirrored into coverage as a limitation by `coverageWithCanary`;
     // a record claiming complete coverage beside an unverified canary contradicts its own scanner.
     measured.scanner.capabilityCanary.status !== "verified" && measured.coverage.complete,
-    // …and the coverage figure must be about the same representation the scanner reports.
-    measured.coverage.representation !== measured.scanner.representation.version,
+    // The ARCHIVE SURFACE is part of the staged total, never more than it (AC-AUDIT-02)…
+    measured.coverage.archiveSurfaceBytes > measured.coverage.stagedBytes,
+    // …and complete coverage of N layers staged at least each layer's two end blocks: a valid layer
+    // cannot be complete with less surface than that.
+    measured.coverage.complete && measured.coverage.archiveSurfaceBytes < 2 * 512 * measured.coverage.layers,
   ];
   if (inconsistent.some(Boolean)) return { ok: false, codes: Object.freeze(["original-internally-inconsistent"]) };
 

@@ -153,14 +153,15 @@ describe("F1 — a staged scan file is a fixed header plus the member's EXACT by
       expect(notReproduced.binaryMagicSkipReproduced).toBe(false);
     });
 
-    it("builds the archive-metadata fixture as a wrapped, NUL-padded 512-byte block carrying the measured line", () => {
+    it("builds the archive-metadata fixture as a wrapped, NUL-padded 512-byte block with a NUL-TERMINATED value", () => {
       const sentinel = canarySentinel();
       const fixtures = canaryFixtures(sentinel);
       expect(fixtures.archiveMetadataBlock.length).toBe(512);
       expect(fixtures.archiveMetadata.equals(wrapForScan(fixtures.archiveMetadataBlock))).toBe(true);
-      // The SAME line shape as the ELF case, whose detection by the pinned rule was measured.
-      expect(fixtures.archiveMetadataBlock.toString("latin1")).toContain(`\nGITHUB_TOKEN=${sentinel}\n`);
-      const line = Buffer.from(`\nGITHUB_TOKEN=${sentinel}\n`, "ascii");
+      // The assignment shape the pinned rule was measured on — but NUL-delimited like a real header or
+      // link field, with no newline anywhere in the block (F9): the harder, realistic shape.
+      const line = Buffer.from(`GITHUB_TOKEN=${sentinel}`, "ascii");
+      expect(fixtures.archiveMetadataBlock.includes(0x0a)).toBe(false);
       const at = fixtures.archiveMetadataBlock.indexOf(line);
       // NUL-padded on both sides, as a tar header field is.
       expect(at).toBeGreaterThan(0);

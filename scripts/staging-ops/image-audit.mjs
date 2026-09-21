@@ -402,7 +402,13 @@ export function publicPathResolver(staged, expected, { configScanId } = {}) {
  * more useful than an abort.
  */
 export function coverageWithCanary(coverage, canary) {
-  if (canary === undefined || canary?.status === "verified") return coverage;
+  /**
+   * FAIL-CLOSED ON ABSENCE (AC-AUDIT-07). Only a canary that verified BOTH capabilities for the v2
+   * representation leaves coverage as it was. An absent canary used to be treated like a verified one,
+   * so a caller that forgot to measure it produced complete coverage; now it is the same gap as a miss.
+   */
+  if (canary?.status === "verified" && canary.archiveSurfaceDetected === true
+    && canary.representation === SCAN_REPRESENTATION.version) return coverage;
   const limitations = Object.freeze([
     ...(coverage?.limitations ?? []),
     Object.freeze({ kind: "binary-scan-capability-unverified" }),

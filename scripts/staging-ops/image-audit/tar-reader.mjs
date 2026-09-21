@@ -176,6 +176,12 @@ export function parsePaxRecords(input) {
       } catch {
         throw new TarFormatError("PAX path, linkpath or size value is not valid UTF-8");
       }
+      // An EMPTY path or linkpath is not "no override": `?? ustarName` would take it, name the member
+      // `""`, and hide a real `/app` file from the inventory, while POSIX readers ignore the empty
+      // value and extract the ustar name. Refused rather than guessed at either way.
+      if ((key === "path" || key === "linkpath") && value === "") {
+        throw new TarFormatError("PAX path or linkpath value is empty");
+      }
       if (key === "size") {
         if (!/^[0-9]{1,16}$/.test(value) || !Number.isSafeInteger(Number(value))) {
           throw new TarFormatError("PAX size record is not a safe non-negative decimal");
@@ -248,8 +254,9 @@ const HEADER_ONLY_TYPES = new Set(["hardlink", "symlink", "character-device", "b
  *   - every declared body and its padding lies inside the input, with safe-integer arithmetic;
  *   - the archive ENDS with two complete zero blocks. EOF without them, or a single zero block, is
  *     refused. Further zero padding is accepted; NON-ZERO bytes after the marker are either reported
- *     to `onSurface` as opaque bytes to scan (`nonzeroTrailer: "surface"`, the default) or refused
- *     (`"refuse"`) — never silently discarded, which is what the old `break` did;
+ *     to `onSurface` as opaque bytes to scan AND reported once to `onNonzeroTrailer`, so the caller
+ *     records the gap (`nonzeroTrailer: "surface"`, the default), or refused (`"refuse"`) — never
+ *     silently discarded, which is what the old `break` did;
  *   - a header-only typeflag (`1`–`6`) with a non-zero effective size is refused: striding past a body
  *     nobody reads and still reporting a complete inventory is how a member hides inside another.
  *
@@ -277,6 +284,7 @@ export function* readTarMembers(source, {
   deadlineEveryBytes = DEADLINE_EVERY_BYTES,
   onSurface,
   nonzeroTrailer = "surface",
+  onNonzeroTrailer,
 } = {}) {
   if (!Number.isSafeInteger(source.size) || source.size < 0) throw new TarFormatError("tar source size is not a safe integer");
   if (source.size === 0) throw new TarFormatError("a zero-length input is not a tar archive; an empty archive is two zero blocks");
@@ -312,19 +320,27 @@ export function* readTarMembers(source, {
       if (!isZeroBlock(readExactly(offset + BLOCK, BLOCK))) {
         throw new TarFormatError("tar end-of-archive marker is a single zero block");
       }
-      if (nonzeroTrailer === "refuse") {
-        // Nothing may follow but zeros. Checked in bounded chunks, under the clock.
-        let at = offset + 2 * BLOCK;
-        let sinceCheck = 0;
-        while (at < source.size) {
-          const chunk = readExactly(at, Math.min(chunkBytes, source.size - at));
-          if (!isZeroBlock(chunk)) throw new TarFormatError("tar archive carries non-zero bytes after its end-of-archive marker");
-          at += chunk.length;
-          sinceCheck += chunk.length;
-          if (deadline && sinceCheck >= deadlineEveryBytes) {
-            sinceCheck = 0;
-            deadline.assert("tar trailer");
-          }
+      /**
+       * Anything but zeros after the marker. Checked in bounded chunks, under the clock, in EVERY mode:
+       * a non-zero trailer is bytes no member interpretation decoded — a gzip stream, a ZIP or a whole
+       * second tar can sit there (`tar -A` produces exactly that) — so staging it as opaque bytes is
+       * not decoded inspection. `"refuse"` throws; otherwise `onNonzeroTrailer` is told once, so the
+       * caller records a gap that blocks while still scanning the bytes it has.
+       */
+      let at = offset + 2 * BLOCK;
+      let sinceCheck = 0;
+      while (at < source.size) {
+        const chunk = readExactly(at, Math.min(chunkBytes, source.size - at));
+        if (!isZeroBlock(chunk)) {
+          if (nonzeroTrailer === "refuse") throw new TarFormatError("tar archive carries non-zero bytes after its end-of-archive marker");
+          onNonzeroTrailer?.();
+          break;
+        }
+        at += chunk.length;
+        sinceCheck += chunk.length;
+        if (deadline && sinceCheck >= deadlineEveryBytes) {
+          sinceCheck = 0;
+          deadline.assert("tar trailer");
         }
       }
       // The marker and everything after it, as ONE contiguous range: trailing bytes are distributed
@@ -362,8 +378,13 @@ export function* readTarMembers(source, {
       }
       const end = strideTo(size);
       const body = readExactly(dataOffset, size);
-      if (typeflag === "L") gnuName = trimNul(body);
-      else if (typeflag === "K") gnuLink = trimNul(body);
+      if (typeflag === "L" || typeflag === "K") {
+        // The same `""`-is-not-nullish hazard as an empty PAX path: refused, not taken as the name.
+        const value = trimNul(body);
+        if (value === "") throw new TarFormatError("GNU long name or long link is empty");
+        if (typeflag === "L") gnuName = value;
+        else gnuLink = value;
+      }
       else {
         const records = parsePaxRecords(body);
         if (typeflag === "g") {

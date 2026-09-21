@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { gzipSync } from "node:zlib";
+import { crc32, gzipSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
@@ -221,6 +221,85 @@ describe("every distributed archive byte reaches the scan surface (AC-AUDIT-02)"
   });
 });
 
+/** A minimal STORED zip holding one file — a real container shape, built from the zip layout. */
+function storedZip(name: string, body: Buffer): Buffer {
+  const fileName = Buffer.from(name, "utf8");
+  const crc = crc32(body);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(body.length, 18); local.writeUInt32LE(body.length, 22); local.writeUInt16LE(fileName.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6); central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(body.length, 20); central.writeUInt32LE(body.length, 24); central.writeUInt16LE(fileName.length, 28);
+  const localLength = local.length + fileName.length + body.length;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length + fileName.length, 12); end.writeUInt32LE(localLength, 16);
+  return Buffer.concat([local, fileName, body, central, fileName, end]);
+}
+
+/**
+ * F1 — a NON-ZERO TRAILER is bytes no member interpretation decoded. Staged as opaque surface, it was
+ * reported as complete coverage while a gzip stream, a ZIP or a whole second tar sat there unexpanded
+ * (the review's three witnesses). It is now also a recorded `archive-trailer-nonzero` gap that blocks,
+ * at the layer AND inside nested tars. Zero-only padding after the marker stays complete.
+ */
+describe("a non-zero trailer fails closed at every level (F1)", () => {
+  const valid = () => Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END]);
+  const trailers: [string, (marker: string) => Buffer][] = [
+    ["a gzip stream", (marker) => gzipSync(Buffer.from(`TOKEN=${marker}\n`))],
+    ["a ZIP archive", (marker) => storedZip("secret.txt", Buffer.from(`TOKEN=${marker}\n`))],
+    ["a second tar holding a gzipped member", (marker) => buildTar([{ name: "app/extra.gz", content: gzipSync(Buffer.from(`TOKEN=${marker}\n`)) }])],
+  ];
+
+  for (const [label, trailer] of trailers) {
+    it(`records a layer trailer that is ${label} as a blocking gap, with identity still verified`, async () => {
+      const marker = syntheticSecret();
+      const result = await inspectLayers([Buffer.concat([valid(), trailer(marker)])]);
+      expect(result.identityVerified).toBe(true);
+      expect(result.coverage.limitations).toContainEqual({ kind: "archive-trailer-nonzero", layer: 0 });
+      expect(result.coverage.complete).toBe(false);
+      expectNotPublished(result, marker);
+    });
+  }
+
+  it("keeps zero-only padding after the marker COMPLETE — no false positive on real layers", async () => {
+    const result = await inspectLayers([Buffer.concat([valid(), Buffer.alloc(8 * BLOCK, 0)])]);
+    expect(result.coverage.limitations).toEqual([]);
+    expect(result.coverage.complete).toBe(true);
+  });
+
+  it("records a trailer inside a gzip-decoded nested tar, at its depth", async () => {
+    const inner = Buffer.concat([member({ name: "fixture/a.txt" }, Buffer.from("inner")), END, gzipSync(Buffer.from(`TOKEN=${syntheticSecret()}`))]);
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: gzipSync(inner) }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "archive-trailer-nonzero", layer: 0, depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+  });
+
+  it("records a trailer inside an UNCOMPRESSED nested tar too — scanned as member bytes, never decoded", async () => {
+    const inner = Buffer.concat([member({ name: "fixture/a.txt" }, Buffer.from("inner")), END, storedZip("s.txt", Buffer.from("x"))]);
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tar", content: inner }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "archive-trailer-nonzero", layer: 0, depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+  });
+});
+
+/**
+ * F2 — an EMPTY PAX path hid a real `/app` file from the provenance inventory: `pax.path ?? ustar`
+ * took `""`, while a POSIX extractor ignores the empty value and writes the ustar name. Refused.
+ */
+describe("an empty extended name is refused, not taken as the member's name (F2)", () => {
+  it("refuses a correctly hashed layer whose PAX `path=` is empty before a real /app member", async () => {
+    const layer = Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, Buffer.from("8 path=\n")), member({ name: "app/planted.js" }, Buffer.from("x")), END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("refuses an empty PAX `linkpath=` the same way", async () => {
+    const layer = Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, Buffer.from("12 linkpath=\n")), header({ name: "app/sym", typeflag: "2", linkname: "real" }), END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+});
+
 describe("structural failure refuses, whatever the identity chain says (AC-AUDIT-03)", () => {
   it("refuses a correctly hashed SHORT non-tar layer at representative lengths", async () => {
     for (const length of [1, 100, 262, 511]) {
@@ -305,6 +384,14 @@ describe("expiry and partial output go through the production error path (AC-AUD
     for (const entry of surface) {
       expect(readFileSync(join(scanDir, archiveSurfaceGroup(0), entry)).includes(Buffer.alloc(64, 0x62))).toBe(false);
     }
+  });
+
+  it("F8: falls back to the REVIEWED surface-file bound, never to unbounded, when limits omit it", () => {
+    const { maxArchiveSurfaceFileBytes: _omitted, ...limits } = AUDIT_LIMITS;
+    const body = Buffer.alloc(AUDIT_LIMITS.maxArchiveSurfaceFileBytes + BLOCK, 0x2e);
+    const { layerTarPath, scanDir } = layerOnDisk(Buffer.concat([member({ name: "app/odd", typeflag: "M" }, body), END]));
+    const result = inventoryLayer({ layerTarPath, layerIndex: 0, scanDir, limits: limits as typeof AUDIT_LIMITS, stagingBudget: createStagingBudget() });
+    expect(result.limitations).toContainEqual({ kind: "archive-surface-range-unstageable", layer: 0 });
   });
 
   it("consults the clock while staging content, not only between members", () => {

@@ -383,6 +383,28 @@ describe("PAX records are framed by BYTES (AC-AUDIT-05)", () => {
     expect(tar.subarray(metadata.offset, metadata.offset + metadata.length).toString("latin1")).toContain(marker);
   });
 
+  it("REFUSES an empty path or linkpath value (F2), and an empty GNU long name or link", () => {
+    expect(() => parsePaxRecords(paxRecord("path", ""))).toThrow(/empty/);
+    expect(() => parsePaxRecords(paxRecord("linkpath", ""))).toThrow(/empty/);
+    // The review's exact record: an 8-byte `path=` ahead of a real member.
+    const tar = Buffer.concat([paxMember("x", Buffer.from("8 path=\n")), member({ name: "app/planted.js" }, Buffer.from("x")), END]);
+    expect(() => read(tar)).toThrow(/empty/);
+    for (const typeflag of ["L", "K"]) {
+      const gnu = Buffer.concat([member({ name: "././@LongLink", typeflag }, Buffer.from("\0")), member({ name: "app/a" }, Buffer.from("x")), END]);
+      expect(() => read(gnu), typeflag).toThrow(/empty/);
+    }
+  });
+
+  it("reports a non-zero trailer to the caller exactly once, and not for zero padding (F1)", () => {
+    const base = Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END]);
+    let told = 0;
+    read(Buffer.concat([base, Buffer.alloc(BLOCK, 0), Buffer.from("PK\x03\x04"), Buffer.alloc(BLOCK, 0x41)]), { onNonzeroTrailer: () => { told += 1; } });
+    expect(told).toBe(1);
+    told = 0;
+    read(Buffer.concat([base, Buffer.alloc(4 * BLOCK, 0)]), { onNonzeroTrailer: () => { told += 1; } });
+    expect(told).toBe(0);
+  });
+
   it("REFUSES a global path, linkpath or size override", () => {
     for (const key of ["path", "linkpath", "size"]) {
       const tar = Buffer.concat([paxMember("g", paxRecord(key, key === "size" ? "1" : "app/x")), member({ name: "app/a" }, Buffer.from("x")), END]);
