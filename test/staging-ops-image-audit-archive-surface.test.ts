@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { crc32, gzipSync } from "node:zlib";
@@ -6,6 +7,9 @@ import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
 import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER, archiveSurfaceGroup } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { transitionReadiness } from "../scripts/staging-ops/image-audit/evidence.mjs";
+import { compareInventory, expectedInventory, inventorySummary } from "../scripts/staging-ops/image-audit/expected-tree.mjs";
+import { latestAppMembers } from "../scripts/staging-ops/image-audit/inspect.mjs";
+import { mergedFilesystem } from "../scripts/staging-ops/image-audit/layers.mjs";
 import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
 import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, surfaceScanFiles, synthesizeImage } from "./helpers/synthetic-image";
 
@@ -28,7 +32,7 @@ const BLOCK = 512;
 const END = Buffer.alloc(2 * BLOCK, 0);
 
 /** A checksummed ustar header written from the layout, with an optional marker in `uname`. */
-function header({ name, size = 0, typeflag = "0", linkname = "", uname = "", prefix = "", v7 = false }: { name: string; size?: number; typeflag?: string; linkname?: string; uname?: string; prefix?: string; v7?: boolean }): Buffer {
+function header({ name, size = 0, typeflag = "0", linkname = "", uname = "", prefix = "", v7 = false, gnu = false, region }: { name: string; size?: number; typeflag?: string; linkname?: string; uname?: string; prefix?: string; v7?: boolean; gnu?: boolean; region?: Buffer }): Buffer {
   const block = Buffer.alloc(BLOCK, 0);
   block.write(name, 0, 100, "utf8");
   block.write("0000644\0", 100, "ascii");
@@ -40,12 +44,17 @@ function header({ name, size = 0, typeflag = "0", linkname = "", uname = "", pre
   block.write(typeflag, 156, 1, "latin1");
   block.write(linkname, 157, 100, "utf8");
   // A V7 header carries no magic or version at all.
-  if (!v7) {
+  if (gnu) {
+    block.write("ustar ", 257, "ascii");
+    block.write(" \0", 263, "latin1");
+  } else if (!v7) {
     block.write("ustar\0", 257, "ascii");
     block.write("00", 263, "ascii");
   }
   block.write(uname, 265, 32, "utf8");
   if (prefix) block.write(prefix, 345, 155, "utf8");
+  // Raw bytes at 345, whatever the format makes of them (B3).
+  if (region) region.copy(block, 345);
   let sum = 0;
   for (const byte of block) sum += byte;
   block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
@@ -545,6 +554,154 @@ describe("L1: a .tgz holding gzipped plaintext is undecodable and blocks", () =>
     expect(readiness.transitionReady).toBe(false);
     expect(readiness.blockers.join(" ")).toMatch(/nested-archive-undecodable/);
     expectNotPublished(result, marker);
+  });
+});
+
+/**
+ * B3 — only a POSIX ustar header has a name prefix. Applying bytes 345–500 as one for V7 or GNU named
+ * `app/planted.js` as `decoy/app/planted.js` (or `00000000001/app/planted.js`): outside `/app`, so the
+ * file silently left the inventory under complete coverage while the runtime wrote it inside `/app`.
+ */
+describe("the header format decides the name prefix (B3)", () => {
+  it("REFUSES a V7 planted file whose unused bytes would have renamed it", async () => {
+    const layer = Buffer.concat([member({ name: "app/planted.js", v7: true, region: Buffer.from("decoy") }, Buffer.from("x")), END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("REFUSES a GNU planted file carrying an atime where POSIX keeps its prefix", async () => {
+    const layer = Buffer.concat([member({ name: "app/planted.js", gnu: true, region: Buffer.from("00000000001\0") }, Buffer.from("x")), END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  for (const [label, spec] of [
+    ["POSIX ustar prefix `app` + name `ok.js`", { name: "ok.js", prefix: "app" }],
+    ["GNU with a zero region", { name: "app/ok.js", gnu: true }],
+    ["V7 with a zero region", { name: "app/ok.js", v7: true }],
+  ] as const) {
+    it(`CONTROL: ${label} is inventoried as app/ok.js`, async () => {
+      const result = await inspectLayers([Buffer.concat([member(spec, Buffer.from("x")), END])]);
+      expect(result.appMembers.map((m) => m.path)).toEqual(["app/ok.js"]);
+      expect(result.coverage.complete).toBe(true);
+    });
+  }
+});
+
+/** B4 — a LEADING-NUL size is the real size, never 0 with the body parsed as a phantom member. */
+describe("a leading-NUL size field reads its real value (B4)", () => {
+  it("inventories ONE member with the full 512-byte body and no phantom", async () => {
+    const body = header({ name: "tmp/decoy" });
+    const planted = header({ name: "app/empty.txt", size: 0 });
+    Buffer.concat([Buffer.from([0]), Buffer.from("0000001000", "ascii"), Buffer.from([0])]).copy(planted, 124);
+    planted.write("        ", 148, "ascii");
+    let sum = 0;
+    for (const byte of planted) sum += byte;
+    planted.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+    const result = await inspectLayers([Buffer.concat([planted, body, END])]);
+    expect(result.appMembers).toHaveLength(1);
+    expect(result.appMembers[0]).toMatchObject({ path: "app/empty.txt", sha256: createHash("sha256").update(body).digest("hex") });
+    expect([...result.merged.visible.keys()]).not.toContain("tmp/decoy");
+    expect(result.coverage.members).toBe(1);
+  });
+});
+
+/**
+ * I1 — a directory whiteout removes the directory, its trailing-slash spelling and everything beneath
+ * it on a segment boundary; a layer's whiteouts apply before its own entries.
+ */
+describe("directory whiteouts delete the whole subtree, and same-layer recreates survive (I1)", () => {
+  const visible = (result: Awaited<ReturnType<typeof inspectLayers>>) => [...result.merged.visible.keys()].sort();
+
+  it("an expected file under a deleted directory becomes MISSING, and readiness blocks", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([
+      buildTar([{ name: "app/d/", type: "directory" }, { name: "app/d/x.js", content: `X=${marker}` }, { name: "app/keep.js", content: "k" }]),
+      buildTar([{ name: "app/.wh.d", content: "" }]),
+    ]);
+    const expected = expectedInventory([
+      { path: "d/x.js", type: "file", sha256: createHash("sha256").update(`X=${marker}`).digest("hex") },
+      { path: "keep.js", type: "file", sha256: createHash("sha256").update("k").digest("hex") },
+    ], "");
+    const inventory = inventorySummary(compareInventory(latestAppMembers(result.appMembers, result.merged), expected));
+    expect(inventory.counts.missing).toBe(1);
+    expect(inventory.complete).toBe(false);
+    const readiness = transitionReadiness({
+      coverage: result.coverage, inventory, findings: { total: 0, rules: 0, groups: [] },
+      packageInventory: { status: "verified", otherVersions: 0 }, identityVerified: true,
+      recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] },
+    });
+    expect(readiness.transitionReady).toBe(false);
+    expect(readiness.blockers.join(" ")).toMatch(/inventory comparison is incomplete/);
+    // The deleted layer's bytes are STILL scanned.
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  for (const whiteout of ["app/.wh.d", "./app/./.wh.d", ".//app//.wh.d"]) {
+    it(`\`${whiteout}\` removes app/d, app/d/ and every descendant, and keeps siblings sharing the prefix`, async () => {
+      const result = await inspectLayers([
+        buildTar([
+          { name: "app/d", type: "directory" },
+          { name: "app/d/x.js", content: "1" },
+          { name: "app/d/sub/y.js", content: "2" },
+          { name: "app/different/z.js", content: "3" },
+          { name: "app/d2.js", content: "4" },
+        ]),
+        buildTar([{ name: whiteout, content: "" }]),
+      ]);
+      expect(visible(result)).toEqual(["app/d2.js", "app/different/z.js"]);
+    });
+  }
+
+  it("a directory keyed with its trailing slash is removed too", () => {
+    const merged = mergedFilesystem([["app/d/", "app/d/x.js", "app/dx"], ["app/.wh.d"]]);
+    expect([...merged.visible.keys()]).toEqual(["app/dx"]);
+  });
+
+  it("a FILE whiteout still removes exactly that file", async () => {
+    const result = await inspectLayers([
+      buildTar([{ name: "app/f.js", content: "1" }, { name: "app/f.js.bak", content: "2" }]),
+      buildTar([{ name: "app/.wh.f.js", content: "" }]),
+    ]);
+    expect(visible(result)).toEqual(["app/f.js.bak"]);
+  });
+
+  for (const order of ["whiteout first", "recreate first"] as const) {
+    it(`a same-layer recreate survives its own whiteout (${order})`, async () => {
+      const whiteout = { name: "app/.wh.d", content: "" };
+      const recreate = { name: "app/d/new.js", content: "new" };
+      const result = await inspectLayers([
+        buildTar([{ name: "app/d/old.js", content: "old" }]),
+        buildTar(order === "whiteout first" ? [whiteout, recreate] : [recreate, whiteout]),
+      ]);
+      expect(visible(result)).toEqual(["app/d/new.js"]);
+      expect(result.merged.visible.get("app/d/new.js")).toBe(1);
+    });
+  }
+
+  it("CONTROL: an opaque directory clears lower children and keeps its own layer's", async () => {
+    const result = await inspectLayers([
+      buildTar([{ name: "app/d/", type: "directory" }, { name: "app/d/old.js", content: "old" }, { name: "app/other.js", content: "o" }]),
+      buildTar([{ name: "app/d/keep.js", content: "keep" }, { name: "app/d/.wh..wh..opq", content: "" }]),
+    ]);
+    expect(visible(result)).toEqual(["app/d/", "app/d/keep.js", "app/other.js"]);
+  });
+});
+
+/**
+ * L5 — a backslash in a member name stays REFUSED as unsafe: a deliberate, conservative compatibility
+ * limitation (backslash is a legal Linux filename byte). It is recorded, and it blocks.
+ */
+describe("L5: a backslash name is an unsafe gap that blocks readiness", () => {
+  it("records unsafe-member-path, incomplete coverage and a blocked transition", async () => {
+    const result = await inspectLayers([buildTar([{ name: "usr/lib/system-systemd\\x2dcryptsetup.slice", content: "u" }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "unsafe-member-path", layer: 0 });
+    expect(result.coverage.complete).toBe(false);
+    const readiness = transitionReadiness({
+      coverage: result.coverage, inventory: { complete: true, findings: 0, counts: { missing: 0 } },
+      findings: { total: 0, rules: 0, groups: [] }, packageInventory: { status: "verified", otherVersions: 0 },
+      identityVerified: true, recipe: { assertions: [{ id: "workflow.no-secret-refs", status: "satisfied" }] },
+    });
+    expect(readiness.transitionReady).toBe(false);
+    expect(readiness.blockers.join(" ")).toMatch(/unsafe-member-path/);
   });
 });
 
