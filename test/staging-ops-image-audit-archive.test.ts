@@ -13,7 +13,7 @@ import {
 import { UNSUPPORTED_FORMATS, unsupportedMagicFormat } from "../scripts/staging-ops/image-audit/export-walk.mjs";
 import { SCAN_HEADER } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
 import { buildTar, syntheticSecret, ustarSplit } from "./helpers/tar-fixture";
-import { inspectSynthetic, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
+import { inspectSynthetic, memberScanFiles, scanFiles, scanSurface, scratchPool, synthesizeImage } from "./helpers/synthetic-image";
 
 /**
  * PUB-07's hostile-archive row, against the reader that will read real image layers.
@@ -367,7 +367,7 @@ describe("an unsupported container is recognised by its MAGIC, at every depth", 
     // STAGING IS UNCHANGED by the recognition: the member is still staged through the same
     // byte-preserving representation, so a scanner rule that CAN read the container still sees it.
     // Recording a gap must not become a reason to stop staging the bytes.
-    const staged = scanFiles(`${result.scanDir}/L0`);
+    const staged = memberScanFiles(`${result.scanDir}/L0`);
     expect(staged).toHaveLength(1);
     expect(readFileSync(staged[0]).subarray(SCAN_HEADER.length).equals(zip)).toBe(true);
   });

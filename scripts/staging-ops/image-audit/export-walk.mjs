@@ -25,8 +25,8 @@ import { closeSync, createReadStream, createWriteStream, mkdirSync, openSync, re
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
-import { bufferSource, readTarMembers } from "./tar-reader.mjs";
-import { CONFIG_SCAN_GROUP, SCAN_HEADER, scanId } from "./scan-surface.mjs";
+import { TarFormatError, bufferSource, readTarMembers } from "./tar-reader.mjs";
+import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
 /** A positioned-read source over a file. No whole-file buffer exists at any point. */
 export function fileSource(path) {
@@ -67,11 +67,16 @@ function openSink(path) {
  * sanitized record. The entry assert is what makes an already-exhausted budget abort at the first
  * thing the inspection does rather than after a full walk; the periodic one bounds the walk itself.
  */
-export function indexExportByDigest(source, { maxMembers = 4096, deadline } = {}) {
+export function indexExportByDigest(source, { maxMembers = 4096, deadline, limits } = {}) {
   const byDigest = new Map();
   let members = 0;
   deadline?.assert("export index");
-  for (const member of readTarMembers(source, { maxMembers })) {
+  /**
+   * THE OUTER EXPORT GETS THE SAME STRUCTURAL RULES as every layer (AC-AUDIT-03), with one
+   * difference: it has no scan surface of its own, so a non-zero trailer cannot be "scanned as opaque
+   * bytes" and is REFUSED. A structural failure here refuses the whole run with a fixed code.
+   */
+  for (const member of readTarMembers(source, { maxMembers, ...tarReaderOptions(limits, deadline), nonzeroTrailer: "refuse" })) {
     members += 1;
     if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("export index");
     if (member.type !== "file" || member.size === 0) continue;
@@ -145,6 +150,22 @@ async function streamMember(exportPath, entry, outPath, transform, { maxOutputBy
 const DEADLINE_CHECK_BYTES = 64 * 1024 * 1024;
 /** How many members may be inventoried before the clock is consulted again. */
 const DEADLINE_CHECK_MEMBERS = 512;
+
+/**
+ * The reader's metadata and header bounds, from the run's reviewed limits (AC-AUDIT-04). Absent keys
+ * fall back to the reader's own reviewed defaults, never to "unbounded".
+ */
+export function tarReaderOptions(limits = {}, deadline) {
+  return {
+    ...(limits.maxTarMetadataRecordBytes !== undefined ? { maxMetadataRecordBytes: limits.maxTarMetadataRecordBytes } : {}),
+    ...(limits.maxTarPendingMetadataBytes !== undefined ? { maxPendingMetadataBytes: limits.maxTarPendingMetadataBytes } : {}),
+    ...(limits.maxTarPhysicalHeadersPerLayer !== undefined ? { maxPhysicalHeaders: limits.maxTarPhysicalHeadersPerLayer } : {}),
+    deadline,
+  };
+}
+
+/** How much archive surface may be copied before the clock is consulted again. */
+const SURFACE_COPY_CHUNK_BYTES = 1024 * 1024;
 
 /**
  * PASS 2 — stream one exported member through gunzip into a scratch file, returning the sha256 of
@@ -361,7 +382,13 @@ export function buildOutputCategory(path) {
  * unsupported type — so a gap at depth 2 is recorded exactly like a gap at depth 0, which makes
  * coverage incomplete and blocks the transition until a coordinator adjudicates it.
  */
-export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, prefix = "app/", stagingBudget, deadline }) {
+/**
+ * `readerTuning` is the reader's chunk size and clock interval (`chunkBytes`, `deadlineEveryBytes`),
+ * applied to member content, archive-surface staging and nested expansion alike. Production passes
+ * nothing and gets the reviewed defaults; it exists so a test can drive expiry and the partial-file
+ * cleanup through THIS code path without staging tens of megabytes.
+ */
+export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, prefix = "app/", stagingBudget, deadline, readerTuning = {} }) {
   const source = fileSource(layerTarPath);
   mkdirSync(join(scanDir, `L${layerIndex}`), { recursive: true });
   const budget = stagingBudget ?? createStagingBudget(limits.maxTotalStagedBytes ?? Number.POSITIVE_INFINITY);
@@ -389,17 +416,120 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
   const stage = (name, emit, depth, bytes) => {
     if (!budget.reserve(bytes, SCAN_HEADER.length)) return undefined;
     const id = scanId(`L${layerIndex}`, sequence++);
-    const sink = openSink(join(scanDir, id));
+    const path = join(scanDir, id);
+    const sink = openSink(path);
     try {
       // The header FIRST, then the member's exact bytes. The suffix of the staged file is therefore
       // the original member, byte for byte — asserted directly by the representation test.
       sink.write(SCAN_HEADER);
       emit((chunk) => sink.write(chunk));
-    } finally {
+    } catch (error) {
+      // A PARTIAL staged file is not a member (AC-AUDIT-04): an emitter that threw part-way — a
+      // deadline, a short read, a structural refusal — must not leave a truncated copy in the scan
+      // tree for the scanner to read as though it were the whole thing.
       sink.close();
+      rmSync(path, { force: true });
+      throw error;
     }
+    sink.close();
     staged.set(id, { name, layer: layerIndex, depth });
     return id;
+  };
+
+  let surfaceSequence = 0;
+  let archiveSurfaceBytes = 0;
+  const surfaceFileLimit = limits.maxArchiveSurfaceFileBytes ?? Number.POSITIVE_INFINITY;
+  const surfaceCheckBytes = readerTuning.deadlineEveryBytes ?? DEADLINE_CHECK_BYTES;
+  const readerOptions = { ...tarReaderOptions(limits, deadline), ...readerTuning };
+  mkdirSync(join(scanDir, archiveSurfaceGroup(layerIndex)), { recursive: true });
+
+  /**
+   * THE ARCHIVE SURFACE (AC-AUDIT-02): every byte of a decoded tar that is not a regular member's
+   * content — headers, PAX and GNU metadata, link targets, padding, unsupported-member bodies, the
+   * end-of-archive blocks and trailing bytes — staged for the scanner as a COMPLEMENT to member
+   * content, never by duplicating the whole layer.
+   *
+   * THE SHAPE OF A SURFACE FILE. The fixed scan header, then whole ranges in archive order, packed
+   * until the next range would pass `maxArchiveSurfaceFileBytes`. A range is NEVER split across files:
+   * a credential cut in two is a credential no rule matches, so a range too large for one file is a
+   * recorded `archive-surface-range-unstageable` limitation rather than an invented split. Ranges are
+   * packed without separators; the join between two ranges can only ADD a spurious match, never hide
+   * one inside a range.
+   *
+   * NAMED BY THE AUDIT, ATTRIBUTED BY CATEGORY. Files live under `L<n>/M/`, so a finding keeps its
+   * layer; their private `staged` entry carries the fixed `archive-metadata` category and NO archive
+   * name, so nothing about them can become a public path.
+   *
+   * CHARGED LIKE CONTENT: to the run's total staging allowance, the representation overhead (one header
+   * per file), and the layer's expanded-byte budget. Any refusal is a recorded limitation.
+   *
+   * One stager per archive, so a failure inside a nested archive discards only its own partial file.
+   */
+  const createSurfaceStager = ({ source: surfaceSource, depth }) => {
+    const at = depth > 0 ? { depth } : {};
+    let current;
+    let stopped = false;
+    let sinceCheck = 0;
+    const close = () => {
+      if (current) current.sink.close();
+      current = undefined;
+    };
+    return {
+      stage(range) {
+        if (stopped) return;
+        if (range.length > surfaceFileLimit) {
+          limitations.push({ kind: "archive-surface-range-unstageable", layer: layerIndex, ...at });
+          return;
+        }
+        if (expandedBytes + range.length > limits.maxExpandedBytesPerLayer) {
+          limitations.push({ kind: "layer-byte-budget-exhausted", layer: layerIndex, ...at });
+          stopped = true;
+          close();
+          return;
+        }
+        const fits = current !== undefined && current.bytes + range.length <= surfaceFileLimit;
+        if (!fits) close();
+        if (!budget.reserve(range.length, fits ? 0 : SCAN_HEADER.length)) {
+          limitations.push({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
+          stopped = true;
+          close();
+          return;
+        }
+        if (!fits) {
+          const id = scanId(archiveSurfaceGroup(layerIndex), surfaceSequence++);
+          const path = join(scanDir, id);
+          current = { id, path, sink: openSink(path), bytes: 0 };
+          current.sink.write(SCAN_HEADER);
+          staged.set(id, { category: ARCHIVE_SURFACE_CATEGORY, layer: layerIndex, depth });
+        }
+        try {
+          let copied = 0;
+          while (copied < range.length) {
+            const chunk = surfaceSource.read(range.offset + copied, Math.min(readerTuning.chunkBytes ?? SURFACE_COPY_CHUNK_BYTES, range.length - copied));
+            if (chunk.length === 0) throw new TarFormatError("tar archive surface ended early");
+            current.sink.write(chunk);
+            copied += chunk.length;
+            // Cumulative across calls: thousands of small header ranges are as much work as one big one.
+            sinceCheck += chunk.length;
+            if (deadline && sinceCheck >= surfaceCheckBytes) {
+              sinceCheck = 0;
+              deadline.assert("archive surface staging");
+            }
+          }
+        } catch (error) {
+          // The partial file goes, and so does its private entry: nothing half-written is scanned.
+          const { id, path } = current;
+          close();
+          rmSync(path, { force: true });
+          staged.delete(id);
+          throw error;
+        }
+        current.bytes += range.length;
+        archiveSurfaceBytes += range.length;
+        expandedBytes += range.length;
+      },
+      close,
+    };
   };
 
   const countBuildOutput = (name, bytes) => {
@@ -410,8 +540,13 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
     buildOutputs.set(category, totals);
   };
 
+  const layerSurface = createSurfaceStager({ source, depth: 0 });
   try {
-    for (const member of readTarMembers(source, { maxMembers: limits.maxMembersPerLayer })) {
+    for (const member of readTarMembers(source, {
+      maxMembers: limits.maxMembersPerLayer,
+      ...readerOptions,
+      onSurface: (range) => layerSurface.stage(range),
+    })) {
       members += 1;
       if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("layer inventory");
       const name = member.name.replace(/^\.\//, "");
@@ -481,10 +616,11 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
         name,
         depth: 0,
         read: (sink) => member.content(sink),
-        context: { layerIndex, limitations, limits, stage, deadline, budget },
+        context: { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions },
       });
     }
   } finally {
+    layerSurface.close();
     source.close();
   }
   return {
@@ -494,6 +630,7 @@ export function inventoryLayer({ layerTarPath, layerIndex, scanDir, limits, pref
     limitations,
     members,
     expandedBytes,
+    archiveSurfaceBytes,
     buildOutputs: Object.fromEntries([...buildOutputs].map(([category, totals]) => [category, Object.freeze({ ...totals })])),
   };
 }
@@ -575,12 +712,14 @@ function classifyExpanded({ head, name, depth, read, context }) {
  * shared staging budget, which the inflated bytes charge against exactly like layer content.
  */
 function expandArchive({ bytes, name, depth, context }) {
-  const { layerIndex, limitations, limits, stage, deadline, budget } = context;
+  const { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions } = context;
   const at = { depth };
   deadline?.assert("nested archive expansion");
+  let nestedSurface;
   try {
     let data = bytes;
-    if (looksGzip(data)) data = gunzipSync(data, { maxOutputLength: limits.maxMemberBytes });
+    const decodedFromGzip = looksGzip(data);
+    if (decodedFromGzip) data = gunzipSync(data, { maxOutputLength: limits.maxMemberBytes });
     if (!looksTar(data)) {
       // A bare gzip of a single file. Its INFLATED bytes are what a scanner must see; the compressed
       // copy staged by the caller is opaque to every rule.
@@ -597,7 +736,19 @@ function expandArchive({ bytes, name, depth, context }) {
       classifyExpanded({ head: data.subarray(0, 512), name: inflatedName, depth, read: (sink) => sink(data), context });
       return;
     }
-    for (const nested of readTarMembers(bufferSource(data), { maxMembers: limits.maxMembersPerLayer })) {
+    /**
+     * A nested tar's own archive surface. For a tar DECODED FROM GZIP it is staged here: the only
+     * copy the scanner otherwise saw was the compressed member, which no rule reads. An UNCOMPRESSED
+     * nested tar needs nothing more — its every byte, headers and trailer included, was already staged
+     * as the enclosing member's content, and staging it twice buys no coverage.
+     */
+    const nestedSource = bufferSource(data);
+    nestedSurface = decodedFromGzip && createSurfaceStager ? createSurfaceStager({ source: nestedSource, depth }) : undefined;
+    for (const nested of readTarMembers(nestedSource, {
+      maxMembers: limits.maxMembersPerLayer,
+      ...(readerOptions ?? tarReaderOptions(limits, deadline)),
+      ...(nestedSurface ? { onSurface: (range) => nestedSurface.stage(range) } : {}),
+    })) {
       if (nested.type === "symlink" || nested.type === "hardlink" || nested.type === "directory") continue;
       if (nested.type !== "file") {
         // Same reasoning as the top-level loop: an unknown typeflag may carry bytes nobody read.
@@ -633,5 +784,7 @@ function expandArchive({ bytes, name, depth, context }) {
     // A nested archive that would not decode is a GAP, not a pass. Only the error's NAME is kept —
     // its message can quote member paths and content.
     limitations.push({ kind: "nested-archive-undecodable", layer: layerIndex, reason: error?.name ?? "Error", ...at });
+  } finally {
+    nestedSurface?.close();
   }
 }

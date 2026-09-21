@@ -1,0 +1,321 @@
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { gzipSync } from "node:zlib";
+import { afterAll, describe, expect, it } from "vitest";
+import { AUDIT_LIMITS } from "../scripts/staging-ops/image-audit/subject.mjs";
+import { createStagingBudget, inventoryLayer } from "../scripts/staging-ops/image-audit/export-walk.mjs";
+import { SCAN_HEADER, archiveSurfaceGroup } from "../scripts/staging-ops/image-audit/scan-surface.mjs";
+import { buildTar, syntheticSecret } from "./helpers/tar-fixture";
+import { inspectSynthetic, memberScanFiles, scanSurface, scratchPool, surfaceScanFiles, synthesizeImage } from "./helpers/synthetic-image";
+
+/**
+ * AC-AUDIT-02/03/04 through the FULL inspector, on correctly hashed synthetic images.
+ *
+ * THE WITNESSES THESE REPLACE. An independent review drove the inspector over a valid layer with a
+ * plaintext marker (a) after the end blocks, (b) in a PAX extended attribute, (c) in a symlink target,
+ * and (d) as a short non-tar "layer". All four returned `identityVerified: true`, `coverage.complete:
+ * true`, no limitations — and the marker was on no staged scan file. Every case below asserts the
+ * marker now reaches the scan surface UNCHANGED, or the run records incomplete coverage / refuses.
+ *
+ * Every image is correctly hashed, so identity success cannot mask a structural failure.
+ */
+
+const pool = scratchPool();
+afterAll(() => pool.cleanup());
+
+const BLOCK = 512;
+const END = Buffer.alloc(2 * BLOCK, 0);
+
+/** A checksummed ustar header written from the layout, with an optional marker in `uname`. */
+function header({ name, size = 0, typeflag = "0", linkname = "", uname = "" }: { name: string; size?: number; typeflag?: string; linkname?: string; uname?: string }): Buffer {
+  const block = Buffer.alloc(BLOCK, 0);
+  block.write(name, 0, 100, "utf8");
+  block.write("0000644\0", 100, "ascii");
+  block.write("0000000\0", 108, "ascii");
+  block.write("0000000\0", 116, "ascii");
+  block.write(`${size.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+  block.write("00000000000\0", 136, "ascii");
+  block.write("        ", 148, "ascii");
+  block.write(typeflag, 156, 1, "latin1");
+  block.write(linkname, 157, 100, "utf8");
+  block.write("ustar\0", 257, "ascii");
+  block.write("00", 263, "ascii");
+  block.write(uname, 265, 32, "utf8");
+  let sum = 0;
+  for (const byte of block) sum += byte;
+  block.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return block;
+}
+
+/** Padding that is NOT zero — a writer is free to leave anything there, and it ships. */
+const padWith = (body: Buffer, filler: Buffer) => {
+  const gap = (BLOCK - (body.length % BLOCK)) % BLOCK;
+  return Buffer.concat([body, Buffer.concat([filler, Buffer.alloc(BLOCK, 0)]).subarray(0, gap)]);
+};
+
+function paxRecord(key: string, value: string): Buffer {
+  const tail = Buffer.from(` ${key}=${value}\n`, "utf8");
+  for (let digits = 1; digits < 12; digits += 1) {
+    if (String(digits + tail.length).length === digits) return Buffer.concat([Buffer.from(String(digits + tail.length)), tail]);
+  }
+  throw new Error("unreachable");
+}
+
+const member = (spec: Parameters<typeof header>[0], body = Buffer.alloc(0), filler = Buffer.alloc(0)) =>
+  Buffer.concat([header({ ...spec, size: spec.size ?? body.length }), padWith(body, filler)]);
+
+async function inspectLayers(layers: Buffer[], limits: Partial<typeof AUDIT_LIMITS> = {}) {
+  return inspectSynthetic(synthesizeImage(layers), pool.make(), limits);
+}
+
+/** The marker must be on the staged surface, byte for byte, or coverage must be incomplete. */
+function expectCoveredOrIncomplete(result: Awaited<ReturnType<typeof inspectLayers>>, marker: string) {
+  const onSurface = scanSurface(result.scanDir).includes(marker);
+  expect(onSurface || result.coverage.complete === false, "marker neither scanned nor reported").toBe(true);
+}
+
+/** …and nothing about it may reach what the audit PUBLISHES from the inspection. */
+function expectNotPublished(result: Awaited<ReturnType<typeof inspectLayers>>, marker: string) {
+  const published = JSON.stringify({ coverage: result.coverage, layers: result.layers, buildOutputs: result.buildOutputs });
+  expect(published).not.toContain(marker);
+}
+
+describe("every distributed archive byte reaches the scan surface (AC-AUDIT-02)", () => {
+  it("POSITIVE: ordinary ustar, PAX and GNU members, links and zero padding give complete coverage", async () => {
+    const result = await inspectLayers([buildTar([
+      { name: "app/", type: "directory" },
+      { name: "app/index.js", content: "export const ok = true;\n" },
+      { name: `app/${"deep/".repeat(30)}pax.js`, content: "1", paxLongName: true },
+      { name: `app/${"gnu/".repeat(40)}gnu.js`, content: "2", gnuLongName: true },
+      { name: "app/sym", type: "symlink", linkTarget: "index.js" },
+      { name: "app/hard", type: "hardlink", linkTarget: "app/index.js" },
+    ])]);
+    expect(result.identityVerified).toBe(true);
+    expect(result.coverage.limitations).toEqual([]);
+    expect(result.coverage.complete).toBe(true);
+    expect(result.coverage.archiveSurfaceBytes).toBeGreaterThan(0);
+    // Links stay METADATA: recorded as links, never resolved and never staged as content.
+    expect(result.appMembers.filter((m) => m.type === "symlink").map((m) => m.path)).toEqual(["app/sym", "app/hard"]);
+    expect(memberScanFiles(join(result.scanDir, "L0"))).toHaveLength(3);
+  });
+
+  it("POSITIVE: the canonical empty tar is a valid, completely covered layer", async () => {
+    const result = await inspectLayers([Buffer.from(END)]);
+    expect(result.identityVerified).toBe(true);
+    expect(result.coverage.complete).toBe(true);
+    expect(result.coverage.members).toBe(0);
+    // Its two end blocks are the whole layer, and they are the whole surface.
+    expect(result.coverage.archiveSurfaceBytes).toBe(2 * BLOCK);
+  });
+
+  const cases: { label: string; layer: (marker: string) => Buffer }[] = [
+    {
+      label: "a PAX extended attribute (local)",
+      layer: (marker) => Buffer.concat([member({ name: "PaxHeader/a", typeflag: "x" }, paxRecord("SCHILY.xattr.user.note", marker)), member({ name: "app/a" }, Buffer.from("x")), END]),
+    },
+    {
+      label: "a PAX global record",
+      layer: (marker) => Buffer.concat([member({ name: "PaxHeader/g", typeflag: "g" }, paxRecord("comment", marker)), member({ name: "app/a" }, Buffer.from("x")), END]),
+    },
+    {
+      label: "a GNU long-name record",
+      layer: (marker) => Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.from(`app/${marker}\0`)), member({ name: "app/short" }, Buffer.from("x")), END]),
+    },
+    {
+      label: "a GNU long-link record",
+      layer: (marker) => Buffer.concat([member({ name: "././@LongLink", typeflag: "K" }, Buffer.from(`../${marker}\0`)), header({ name: "app/sym", typeflag: "2", linkname: "short" }), END]),
+    },
+    {
+      label: "a symlink target",
+      layer: (marker) => Buffer.concat([header({ name: "app/sym", typeflag: "2", linkname: marker }), END]),
+    },
+    {
+      label: "a header field the filesystem view ignores (uname)",
+      layer: (marker) => Buffer.concat([member({ name: "app/a", uname: marker.slice(0, 31) }, Buffer.from("x")), END]),
+    },
+    {
+      label: "member padding",
+      layer: (marker) => Buffer.concat([member({ name: "app/a" }, Buffer.from("x"), Buffer.from(`\n${marker}\n`)), END]),
+    },
+    {
+      label: "the body of an unsupported typeflag",
+      layer: (marker) => Buffer.concat([member({ name: "app/odd", typeflag: "M" }, Buffer.from(`TOKEN=${marker}\n`)), END]),
+    },
+    {
+      label: "trailing bytes after the end-of-archive blocks",
+      layer: (marker) => Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END, Buffer.from(marker)]),
+    },
+  ];
+
+  for (const { label, layer } of cases) {
+    it(`NEGATIVE: a marker in ${label} reaches the scan surface unchanged, and is not published`, async () => {
+      const marker = syntheticSecret();
+      // `uname` holds 32 bytes, so that case carries a 31-byte prefix of the marker.
+      const probe = label.includes("uname") ? marker.slice(0, 31) : marker;
+      const result = await inspectLayers([layer(marker)]);
+      expect(result.identityVerified).toBe(true);
+      expect(scanSurface(result.scanDir)).toContain(probe);
+      // It reached the surface through the ARCHIVE-METADATA files specifically, not by luck.
+      const surface = surfaceScanFiles(result.scanDir).map((path) => readFileSync(path, "latin1")).join("");
+      expect(surface).toContain(probe);
+      expectCoveredOrIncomplete(result, probe);
+      expectNotPublished(result, probe);
+    });
+  }
+
+  it("keeps an unsupported member's LIMITATION alongside staging its body as opaque bytes", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([cases[7].layer(marker)]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "unsupported-member-type", layer: 0, typeflag: "M" });
+    expect(result.coverage.complete).toBe(false);
+  });
+
+  it("stages the metadata of a tar DECODED FROM GZIP inside a layer", async () => {
+    const marker = syntheticSecret();
+    const inner = Buffer.concat([
+      member({ name: "PaxHeader/i", typeflag: "x" }, paxRecord("SCHILY.xattr.user.note", marker)),
+      member({ name: "fixture/a.txt" }, Buffer.from("inner")),
+      END,
+    ]);
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: gzipSync(inner) }])]);
+    expect(result.coverage.limitations).toEqual([]);
+    const surface = surfaceScanFiles(result.scanDir).map((path) => readFileSync(path, "latin1")).join("");
+    expect(surface).toContain(marker);
+  });
+
+  it("does NOT stage an uncompressed nested tar's metadata twice — its bytes were already member content", async () => {
+    const marker = syntheticSecret();
+    const inner = Buffer.concat([member({ name: "PaxHeader/i", typeflag: "x" }, paxRecord("SCHILY.xattr.user.note", marker)), member({ name: "a" }, Buffer.from("i")), END]);
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tar", content: inner }])]);
+    const members = memberScanFiles(result.scanDir).map((path) => readFileSync(path, "latin1")).join("");
+    const surface = surfaceScanFiles(result.scanDir).map((path) => readFileSync(path, "latin1")).join("");
+    expect(members).toContain(marker);
+    expect(surface).not.toContain(marker);
+  });
+
+  it("keeps each range WHOLE: one too large for a surface file is a recorded limitation, never split", async () => {
+    const marker = syntheticSecret();
+    const body = Buffer.concat([Buffer.alloc(3000, 0x2e), Buffer.from(marker)]);
+    const result = await inspectLayers([Buffer.concat([member({ name: "app/odd", typeflag: "M" }, body), END])], {
+      maxArchiveSurfaceFileBytes: 2048,
+    });
+    expect(result.coverage.limitations).toContainEqual({ kind: "archive-surface-range-unstageable", layer: 0 });
+    expect(result.coverage.complete).toBe(false);
+    for (const path of surfaceScanFiles(result.scanDir)) {
+      expect(readFileSync(path).length).toBeLessThanOrEqual(SCAN_HEADER.length + 2048);
+    }
+  });
+
+  it("charges the surface to the total allowance and records the refusal", async () => {
+    const layer = buildTar([{ name: "app/a", content: "x" }]);
+    const result = await inspectLayers([layer], { maxTotalStagedBytes: 1 + 512 });
+    expect(result.coverage.limitations).toContainEqual({ kind: "total-staging-budget-exhausted", layer: 0 });
+    expect(result.coverage.complete).toBe(false);
+    expect(result.coverage.stagedBytes).toBeLessThanOrEqual(513);
+  });
+
+  it("charges the surface to the per-layer expanded-byte budget", async () => {
+    const result = await inspectLayers([buildTar([{ name: "app/a", content: "x" }])], { maxExpandedBytesPerLayer: 600 });
+    expect(result.coverage.limitations).toContainEqual({ kind: "layer-byte-budget-exhausted", layer: 0 });
+    expect(result.coverage.complete).toBe(false);
+  });
+});
+
+describe("structural failure refuses, whatever the identity chain says (AC-AUDIT-03)", () => {
+  it("refuses a correctly hashed SHORT non-tar layer at representative lengths", async () => {
+    for (const length of [1, 100, 262, 511]) {
+      const marker = syntheticSecret();
+      const bytes = Buffer.concat([Buffer.from(marker), Buffer.alloc(BLOCK, 0x20)]).subarray(0, length);
+      await expect(inspectLayers([bytes]), `length ${length}`).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+    }
+  });
+
+  it("refuses a zero-length layer", async () => {
+    await expect(inspectLayers([Buffer.alloc(0)])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("refuses a layer with a header-only member whose declared body conceals another member", async () => {
+    const concealed = member({ name: "app/hidden.txt" }, Buffer.from(`TOKEN=${syntheticSecret()}\n`));
+    const layer = Buffer.concat([header({ name: "app/link", typeflag: "2", linkname: "x", size: concealed.length }), concealed, END]);
+    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("refuses a layer without its end-of-archive blocks, and one with a single end block", async () => {
+    const body = member({ name: "app/a" }, Buffer.from("x"));
+    await expect(inspectLayers([body])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+    await expect(inspectLayers([Buffer.concat([body, Buffer.alloc(BLOCK)])])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("refuses an OUTER export carrying non-zero bytes after its end blocks — it has no surface to scan them on", async () => {
+    const image = synthesizeImage([buildTar([{ name: "app/a", content: "x" }])]);
+    const dir = pool.make();
+    const withTrailer = { ...image, exportTar: Buffer.concat([image.exportTar, Buffer.from(syntheticSecret())]) };
+    await expect(inspectSynthetic(withTrailer, dir)).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  });
+
+  it("records a structurally broken NESTED tar as `nested-archive-undecodable`, which blocks", async () => {
+    const inner = buildTar([{ name: "fixture/a.txt", content: "inner" }]);
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: gzipSync(inner.subarray(0, inner.length - BLOCK)) }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "nested-archive-undecodable", layer: 0, reason: "TarFormatError", depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+  });
+
+  it("refuses a layer whose metadata exceeds the reviewed ceiling, with a fixed limit code", async () => {
+    const layer = Buffer.concat([member({ name: "././@LongLink", typeflag: "L" }, Buffer.alloc(4096, 0x61)), member({ name: "app/a" }, Buffer.from("x")), END]);
+    await expect(inspectLayers([layer], { maxTarMetadataRecordBytes: 1024 })).rejects.toMatchObject({ code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+  });
+});
+
+describe("expiry and partial output go through the production error path (AC-AUDIT-04)", () => {
+  const expiring = (operation: string) => ({
+    assert(asked: string) {
+      if (asked === operation) throw Object.assign(new Error("deadline"), { code: "STAGING_OPERATION_TIMEOUT" });
+    },
+  });
+
+  function layerOnDisk(tar: Buffer) {
+    const dir = pool.make();
+    const layerTarPath = join(dir, "layer.tar");
+    writeFileSync(layerTarPath, tar);
+    return { dir, layerTarPath, scanDir: join(dir, "scan") };
+  }
+
+  it("removes the PARTIAL member file when its content emitter throws mid-stream", () => {
+    const { layerTarPath, scanDir } = layerOnDisk(buildTar([{ name: "app/big", content: Buffer.alloc(4096, 0x61) }]));
+    expect(() => inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS,
+      stagingBudget: createStagingBudget(),
+      deadline: expiring("tar member content"),
+      readerTuning: { chunkBytes: 256, deadlineEveryBytes: 1024 },
+    })).toThrow(/deadline/);
+    // Only the complete surface file of the header remains; no truncated member copy.
+    expect(readdirSync(join(scanDir, "L0"))).toEqual(["M"]);
+  });
+
+  it("removes the PARTIAL surface file when surface staging expires mid-range", () => {
+    const { layerTarPath, scanDir } = layerOnDisk(Buffer.concat([buildTar([{ name: "app/a", content: "x" }]), Buffer.alloc(8192, 0x62)]));
+    expect(() => inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS,
+      stagingBudget: createStagingBudget(),
+      deadline: expiring("archive surface staging"),
+      readerTuning: { chunkBytes: 512, deadlineEveryBytes: 2048 },
+    })).toThrow(/deadline/);
+    const surface = readdirSync(join(scanDir, archiveSurfaceGroup(0)));
+    // Whatever was left is whole — no file holds a truncated copy of the trailer range.
+    for (const entry of surface) {
+      expect(readFileSync(join(scanDir, archiveSurfaceGroup(0), entry)).includes(Buffer.alloc(64, 0x62))).toBe(false);
+    }
+  });
+
+  it("consults the clock while staging content, not only between members", () => {
+    const { layerTarPath, scanDir } = layerOnDisk(buildTar([{ name: "app/big", content: Buffer.alloc(4096, 0x61) }]));
+    const asked: string[] = [];
+    inventoryLayer({
+      layerTarPath, layerIndex: 0, scanDir, limits: AUDIT_LIMITS,
+      stagingBudget: createStagingBudget(),
+      deadline: { assert: (operation: string) => { asked.push(operation); } },
+      readerTuning: { chunkBytes: 256, deadlineEveryBytes: 1024 },
+    });
+    expect(asked.filter((operation) => operation === "tar member content").length).toBeGreaterThanOrEqual(3);
+  });
+});

@@ -61,6 +61,18 @@ export const SCAN_HEADER = Buffer.from(SCAN_REPRESENTATION.header, "ascii");
 /** Where the image CONFIG/history is staged. A group of its own, so a finding there is attributable. */
 export const CONFIG_SCAN_GROUP = "C";
 
+/**
+ * The fixed private category of a staged ARCHIVE-SURFACE file (AC-AUDIT-02): tar headers, PAX/GNU
+ * metadata, link targets, padding, unsupported-member bodies, end-of-archive blocks and trailing bytes.
+ * A finding there is attributed to this category and its layer — never to a path.
+ */
+export const ARCHIVE_SURFACE_CATEGORY = "archive-metadata";
+
+/** `L3/M` — layer 3's archive-surface files, kept under the layer so a finding keeps its layer. */
+export function archiveSurfaceGroup(layerIndex) {
+  return `L${layerIndex}/M`;
+}
+
 /** `L3/000412.txt` — a layer index (or the config group) and an ordinal, and nothing else. */
 export function scanId(group, sequence) {
   return `${group}/${String(sequence).padStart(6, "0")}${SCAN_REPRESENTATION.suffix}`;

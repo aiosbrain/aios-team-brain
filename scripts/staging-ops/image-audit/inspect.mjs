@@ -70,7 +70,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   try {
     // The budget reaches PASS 1, not only the layer loop below: hashing every member of a large
     // export is real work, and it happens before anything is decoded.
-    index = indexExportByDigest(source, { deadline });
+    index = indexExportByDigest(source, { deadline, limits });
     const configEntry = index.get(manifest.config.digest);
     if (!configEntry) {
       // The export does not contain the config the registry manifest names. Refusing here is the
@@ -89,6 +89,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   const appMembers = [];
   const staged = new Map();
   const buildOutputs = new Map();
+  let archiveSurfaceBytes = 0;
   // ONE allowance for the whole scan tree, shared across every layer and every nested expansion
   // inside them (PUB-01). A per-layer bound is not a total.
   const stagingBudget = createStagingBudget(
@@ -166,6 +167,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       buildOutputs.set(category, { files: running.files + totals.files, bytes: running.bytes + totals.bytes });
     }
     limitations.push(...inventory.limitations);
+    archiveSurfaceBytes += inventory.archiveSurfaceBytes;
     layers.push(Object.freeze({
       index: layerIndex,
       digest: descriptor.digest,
@@ -203,8 +205,16 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       complete: limitations.length === 0,
       layers: layers.length,
       members: layers.reduce((total, layer) => total + layer.members, 0),
-      /** Bytes actually written into the scan tree, against the run's cumulative allowance. */
+      /**
+       * Bytes actually written into the scan tree, against the run's cumulative allowance — member
+       * content AND archive surface, because both are charged to that one allowance.
+       */
       stagedBytes: stagingBudget.used,
+      /**
+       * THE ARCHIVE SURFACE, counted on its own (AC-AUDIT-02): the non-content bytes of every decoded
+       * layer and every gzip-decoded nested tar that reached the scanner. Included in `stagedBytes`.
+       */
+      archiveSurfaceBytes,
       // `Infinity` does not survive JSON, so an unbounded budget says so in words rather than
       // serializing as `null` and reading like a missing measurement.
       stagedByteLimit: Number.isFinite(stagingBudget.limit) ? stagingBudget.limit : "unbounded",

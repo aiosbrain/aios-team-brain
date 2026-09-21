@@ -52,6 +52,7 @@ import {
   verifyScannerDownload,
 } from "./image-audit/scanner.mjs";
 import {
+  ARCHIVE_SURFACE_CATEGORY,
   SCAN_REPRESENTATION,
   assessCanary,
   canaryFixtures,
@@ -355,6 +356,8 @@ export function publicPathResolver(staged, expected, { configScanId } = {}) {
     if (configScanId !== undefined && scratchId === configScanId) return { category: "image-config" };
     const detail = staged.get(scratchId);
     if (!detail) return { category: "unresolved" };
+    // Archive metadata has no member name to resolve and must never be named: category and layer only.
+    if (detail.category === ARCHIVE_SURFACE_CATEGORY) return { category: ARCHIVE_SURFACE_CATEGORY };
     if (detail.depth > 0) return { category: "nested-archive-content" };
     if (SENSITIVE.test(detail.name)) return { category: "sensitive-path" };
     if (expected.has(detail.name)) return { publicPath: detail.name, category: "public-source-path" };
