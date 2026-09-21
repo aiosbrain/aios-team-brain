@@ -1279,12 +1279,19 @@ public evidence.**
     `coverage.archiveSurfaceBytes`. A range too large for one surface file is an
     `archive-surface-range-unstageable` gap, never a split. **Non-zero bytes after a layer's or
     nested tar's end blocks** are staged but are also an `archive-trailer-nonzero` gap: opaque
-    scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine. The claim is about the **decoded tar
+    scanning is not decoding, and a gzip stream, ZIP or second tar can sit there. Zero padding is fine.
+    A nested member is treated as a tar when its first bytes carry the ustar magic **or two zero
+    blocks** (the canonical empty archive), or when its name is `.tar`/`.tgz`/`.tar.gz` — a declared
+    tar that does not parse is a `nested-archive-undecodable` gap. An ordinary `.gz` still inflates.
+  - **An unsafe member name** (absolute, traversing, NUL-bearing or empty), at any depth, is an
+    `unsafe-member-path` gap: its content is scanned, but it cannot be accounted for by the `/app`
+    inventory, so it is never silently left out of it. The claim is about the **decoded tar
     bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
     stream), which a `docker save` export may not contain, is outside it.
   - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
     truncated or unterminated input, a header-only member declaring a body, a global PAX
-    path/linkpath/size override, an empty PAX `path`/`linkpath` or GNU long name/link, a non-zero
+    path/linkpath/size override, an empty or NUL-bearing PAX `path`/`linkpath`, an empty GNU long
+    name/link, a non-zero
     trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
     (a metadata body, accumulated metadata or physical-header count past its reviewed bound). A broken
     *nested* tar is a `nested-archive-undecodable` gap instead.

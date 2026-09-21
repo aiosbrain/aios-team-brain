@@ -396,6 +396,29 @@ describe("PAX records are framed by BYTES (AC-AUDIT-05)", () => {
     }
   });
 
+  it("REFUSES a NUL anywhere in an interpreted path or linkpath, byte-counted", () => {
+    for (const [key, value] of [["path", "app/x\0y"], ["path", "\0"], ["linkpath", "\0"], ["linkpath", "../t\0"]] as const) {
+      expect(() => parsePaxRecords(paxRecord(key, Buffer.from(value, "utf8"))), `${key}=${JSON.stringify(value)}`).toThrow(/NUL byte/);
+    }
+    // An opaque value may carry NULs: it is scanned, never interpreted.
+    expect(parsePaxRecords(Buffer.concat([paxRecord("SCHILY.xattr.user.b", Buffer.from([0, 1, 0])), paxRecord("path", "app/x")]))).toEqual({ path: "app/x" });
+  });
+
+  it("PRESERVES a leading byte-order mark in an interpreted value instead of stripping it", () => {
+    const bom = "\uFEFFapp/bom.txt";
+    expect(parsePaxRecords(paxRecord("path", bom))).toEqual({ path: bom });
+    const [only] = read(Buffer.concat([paxMember("x", paxRecord("path", bom)), member({ name: "app/plain" }, Buffer.from("x")), END]));
+    expect(only.name).toBe(bom);
+    expect(only.name).not.toBe("app/bom.txt");
+  });
+
+  it("refuses a non-zero trailer BY DEFAULT, and refuses surface mode without a recording callback", () => {
+    const trailed = Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END, Buffer.from("PK\x03\x04")]);
+    expect(() => read(trailed)).toThrow(/non-zero bytes after its end-of-archive/);
+    expect(() => read(trailed, { nonzeroTrailer: "surface" })).toThrow(/requires an onNonzeroTrailer callback/);
+    expect(() => read(trailed, { nonzeroTrailer: "scan" })).toThrow(/must be "refuse" or "surface"/);
+  });
+
   it("reports a non-zero trailer to the caller exactly once, and not for zero padding (F1)", () => {
     const base = Buffer.concat([member({ name: "app/a" }, Buffer.from("x")), END]);
     let told = 0;

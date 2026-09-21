@@ -294,9 +294,125 @@ describe("an empty extended name is refused, not taken as the member's name (F2)
     await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
   });
 
-  it("refuses an empty PAX `linkpath=` the same way", async () => {
-    const layer = Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, Buffer.from("12 linkpath=\n")), header({ name: "app/sym", typeflag: "2", linkname: "real" }), END]);
-    await expect(inspectLayers([layer])).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+  it("refuses an empty PAX `linkpath=` the same way — through the EMPTY branch, not a framing error", async () => {
+    // 13 bytes: "13" + " " + "linkpath=" + "\n". (A 12-byte fixture was misframed and refused for the
+    // wrong reason, so it never reached the empty-value check it was meant to test.)
+    const record = Buffer.from("13 linkpath=\n");
+    expect(record.length).toBe(13);
+    const layer = Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, record), header({ name: "app/sym", typeflag: "2", linkname: "real" }), END]);
+    const refusal = inspectLayers([layer]);
+    await expect(refusal).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+    await expect(refusal).rejects.toThrow(/linkpath value is empty/);
+  });
+
+  it("refuses a PAX `path` that is only a NUL — non-empty, and still not a name", async () => {
+    const layer = Buffer.concat([member({ name: "PaxHeader/p", typeflag: "x" }, Buffer.from("9 path=\0\n")), member({ name: "app/planted.js" }, Buffer.from("x")), END]);
+    const refusal = inspectLayers([layer]);
+    await expect(refusal).rejects.toMatchObject({ code: "AUDIT_TAR_STRUCTURE_INVALID" });
+    await expect(refusal).rejects.toThrow(/NUL byte/);
+  });
+});
+
+/**
+ * NESTED EMPTY AND DECLARED TARS. The canonical empty tar is 1,024 zero bytes with no ustar magic, so a
+ * nested `app/empty.tar` (or its gzip) was an "ordinary file" and anything appended after its end blocks
+ * was staged opaque under complete coverage. One shared tar-candidate predicate now decides for the raw
+ * member, the gzip-decoded payload and every recursive level; an explicit tar name must parse as a tar.
+ */
+describe("nested empty and declared tars are parsed, and their trailers block (AC-AUDIT-02/03)", () => {
+  const trailerKinds: [string, (marker: string) => Buffer][] = [
+    ["a gzip stream", (marker) => gzipSync(Buffer.from(`TOKEN=${marker}\n`))],
+    ["a ZIP archive", (marker) => storedZip("secret.txt", Buffer.from(`TOKEN=${marker}\n`))],
+    ["a second tar holding a gzipped member", (marker) => buildTar([{ name: "fixture/x.gz", content: gzipSync(Buffer.from(`TOKEN=${marker}\n`)) }])],
+  ];
+  const emptyWith = (trailer: Buffer) => Buffer.concat([END, trailer]);
+  const containers: [string, (inner: Buffer) => Buffer, Partial<typeof AUDIT_LIMITS>, number][] = [
+    ["raw app/empty.tar", (inner) => buildTar([{ name: "app/empty.tar", content: inner }]), {}, 1],
+    ["raw EXTENSIONLESS app/data (recognised by its zero blocks, not its name)", (inner) => buildTar([{ name: "app/data", content: inner }]), {}, 1],
+    ["gzip app/empty.tgz", (inner) => buildTar([{ name: "app/empty.tgz", content: gzipSync(inner) }]), {}, 1],
+    ["gzip app/empty.tar.gz", (inner) => buildTar([{ name: "app/empty.tar.gz", content: gzipSync(inner) }]), {}, 1],
+    [
+      "recursive: app/outer.tgz holding empty.tar",
+      (inner) => buildTar([{ name: "app/outer.tgz", content: gzipSync(buildTar([{ name: "empty.tar", content: inner }])) }]),
+      { maxNestedArchiveDepth: 2 },
+      2,
+    ],
+  ];
+
+  for (const [container, wrap, limits, depth] of containers) {
+    for (const [kind, trailer] of trailerKinds) {
+      it(`NEGATIVE: ${container} + ${kind} after its end blocks is a blocking gap at depth ${depth}`, async () => {
+        const marker = syntheticSecret();
+        const result = await inspectLayers([wrap(emptyWith(trailer(marker)))], limits);
+        expect(result.identityVerified).toBe(true);
+        expect(result.coverage.limitations).toContainEqual({ kind: "archive-trailer-nonzero", layer: 0, depth });
+        expect(result.coverage.complete).toBe(false);
+        expectNotPublished(result, marker);
+      });
+    }
+    it(`POSITIVE: ${container} holding a zero-only empty tar is complete`, async () => {
+      const result = await inspectLayers([wrap(emptyWith(Buffer.alloc(4 * BLOCK, 0)))], limits);
+      expect(result.coverage.limitations).toEqual([]);
+      expect(result.coverage.complete).toBe(true);
+    });
+  }
+
+  it("POSITIVE: an ordinary .gz of plaintext still inflates, completely, onto the scan surface", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([{ name: "app/notes.gz", content: gzipSync(Buffer.from(`NOTE=${marker}\n`)) }])]);
+    expect(result.coverage.complete).toBe(true);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  it("POSITIVE: a well-formed .tgz expands completely, its member on the scan surface", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: gzipSync(buildTar([{ name: "fixture/a.txt", content: `A=${marker}` }])) }])]);
+    expect(result.coverage.complete).toBe(true);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+  });
+
+  it("a DECLARED tar that is short or malformed is a nested gap, not an ordinary file", async () => {
+    for (const [name, content] of [
+      ["app/short.tar", Buffer.from("not a tar at all\n")],
+      ["app/short.tgz", gzipSync(Buffer.from("not a tar either\n"))],
+      ["app/short.tar.gz", gzipSync(Buffer.alloc(300, 0x41))],
+    ] as const) {
+      const result = await inspectLayers([buildTar([{ name, content }])]);
+      expect(result.coverage.limitations, name).toContainEqual({ kind: "nested-archive-undecodable", layer: 0, reason: "TarFormatError", depth: 1 });
+      expect(result.coverage.complete).toBe(false);
+    }
+  });
+});
+
+/**
+ * EVERY UNSAFE NAME IS A GAP. An absolute, traversing, NUL-bearing or empty member name does not
+ * start with the `/app` prefix the inventory compares, so it used to fall out of the comparison with
+ * nothing recorded while an extractor might still write it. Content is staged and scanned as usual.
+ */
+describe("an unsafe member path never silently leaves the inventory", () => {
+  it("records unsafe top-level names, and stages their content", async () => {
+    const marker = syntheticSecret();
+    const result = await inspectLayers([buildTar([
+      { name: "/app/absolute.js", content: `A=${marker}` },
+      { name: "app/../escape.js", content: "x" },
+      { name: "app/ok.js", content: "fine" },
+    ])]);
+    const unsafe = result.coverage.limitations.filter((limitation) => limitation.kind === "unsafe-member-path");
+    expect(unsafe).toEqual([{ kind: "unsafe-member-path", layer: 0 }, { kind: "unsafe-member-path", layer: 0 }]);
+    expect(result.coverage.complete).toBe(false);
+    expect(scanSurface(result.scanDir)).toContain(marker);
+    expectNotPublished(result, "absolute.js");
+  });
+
+  it("records an unsafe name inside a nested archive, at its depth", async () => {
+    const result = await inspectLayers([buildTar([{ name: "app/pkg.tgz", content: gzipSync(buildTar([{ name: "../outside.txt", content: "x" }])) }])]);
+    expect(result.coverage.limitations).toContainEqual({ kind: "unsafe-member-path", layer: 0, depth: 1 });
+    expect(result.coverage.complete).toBe(false);
+  });
+
+  it("records nothing for ordinary relative names", async () => {
+    const result = await inspectLayers([buildTar([{ name: "app/a.js", content: "1" }, { name: "./app/b.js", content: "2" }])]);
+    expect(result.coverage.limitations).toEqual([]);
   });
 });
 
