@@ -6237,3 +6237,446 @@ describe("R2 — a local human case is issued once, admitted from the verified j
       .toMatch(new RegExp(`invalid case ${String(intents[1].data.case)} was issued 2 times`));
   });
 });
+
+/**
+ * ── R02 — THE COMPLETED-RESPONSE CONTRACT, THROUGH THE REAL ADAPTERS AND THE PUBLIC CALLERS ──────
+ *
+ * The independent review demonstrated six provider answers that the two REAL transports turned into
+ * a decisive outcome: a body read that rejected, malformed JSON, an oversize body, a truncated body
+ * followed by a failing `gh` exit, and a truncated refusal whose half-sentence was read as a policy
+ * denial. Tests that inject an already-normalised status cannot see that class of defect — the bug
+ * lived in the normalisation. So everything below drives `createTokenTransport` with a fetch double
+ * and `createLocalGhTransport` with a `gh` double that emits raw process output, and then follows the
+ * same bytes through the public phases, the staged finalizer and the CLI exit code.
+ */
+describe("R02 — an incomplete provider response is never decisive, from the adapter to the exit code", () => {
+  const A = sha("r02-a"), B = sha("r02-b");
+  const encode = (text: string) => new TextEncoder().encode(text);
+  /** The review's own judgement: an acceptance whose independent readback matches. */
+  const judge = (response: unknown, expected: "accepted" | "denied" = "accepted") => classifyCaseOutcome({
+    expected, response: response as ProviderResponse, beforeSha: A, afterSha: expected === "accepted" ? B : A, requestedSha: B, operation: "update",
+  });
+
+  /** A fetch Response double whose body is a real stream, so the bound and the read failure are the adapter's. */
+  const streamed = (status: number, chunks: (string | Uint8Array)[], options: { error?: boolean; headers?: Record<string, string> } = {}) => {
+    const counter = { pulled: 0 };
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (counter.pulled < chunks.length) {
+          const chunk = chunks[counter.pulled++];
+          controller.enqueue(typeof chunk === "string" ? encode(chunk) : chunk);
+          return;
+        }
+        if (options.error) controller.error(new Error("mock connection reset during response body"));
+        else controller.close();
+      },
+    }, { highWaterMark: 0 });
+    return { counter, response: { status, ok: status >= 200 && status < 300, headers: new Headers(options.headers ?? {}), body } };
+  };
+  const tokenOver = (response: unknown, extra: Record<string, unknown> = {}) => createTokenTransport({
+    token: "LOCAL-MOCK-NOT-A-CREDENTIAL", fetchImpl: (async () => response) as unknown as typeof fetch, ...extra,
+  });
+
+  /**
+   * A `gh` double: ONE scripted request answers with raw process output (bytes and exit code), and
+   * every other request is served by the fake provider exactly as the suite's normal `gh` does.
+   */
+  function scriptedGh(
+    github: ReturnType<typeof createFakeGitHub>,
+    script: (call: { method: string; path: string; body: unknown }) => { apply?: boolean; stdout: string | Buffer; code: number | null } | null,
+  ) {
+    const kills: string[] = [];
+    const spawnImpl = ((_command: string, args: string[]) => {
+      const method = args[args.indexOf("--method") + 1];
+      const requestPath = args.find((arg, index) => arg.startsWith("/") && args[index - 1] !== "-H")!;
+      const received: Buffer[] = [];
+      const child = new EventEmitter() as FakeChild;
+      child.pid = 4343;
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      let closed = false;
+      const close = (code: number | null) => { if (!closed) { closed = true; child.emit("close", code); } };
+      child.kill = () => { kills.push(`${method} ${requestPath}`); queueMicrotask(() => close(null)); };
+      child.stdin = new Writable({ write(chunk, _encoding, callback) { received.push(Buffer.from(chunk)); callback(); } });
+      child.stdin.on("finish", () => {
+        const raw = Buffer.concat(received).toString("utf8");
+        const body = raw ? JSON.parse(raw) : undefined;
+        const scripted = script({ method, path: requestPath, body });
+        if (!scripted) {
+          const result = github.handle("local", method, requestPath, body as never);
+          child.stdout.on("end", () => close(result.status >= 400 ? 1 : 0));
+          child.stdout.end(`HTTP/2.0 ${result.status} Status\r\nContent-Type: application/json\r\n\r\n${result.body === null ? "" : JSON.stringify(result.body)}`);
+          return;
+        }
+        if (scripted.apply) github.handle("local", method, requestPath, body as never);
+        child.stdout.on("end", () => close(scripted.code));
+        child.stdout.end(scripted.stdout);
+      });
+      return child;
+    }) as unknown as ReturnType<typeof createFakeGitHub>["spawnImpl"];
+    return { spawnImpl, kills };
+  }
+  const ghOnce = (stdout: string | Buffer, code: number | null) => {
+    const github = createFakeGitHub();
+    const scripted = scriptedGh(github, () => ({ stdout, code }));
+    return { request: createLocalGhTransport({ env: {}, spawnImpl: scripted.spawnImpl as never }), kills: scripted.kills };
+  };
+
+  // ── the six reviewed adapter answers, exactly as the review's probe issued them ─────────────────
+  it("R02-1 · the token transport: a rejected body read, malformed JSON and an oversize body are incomplete, never accepted", async () => {
+    for (const [label, text, reason] of [
+      ["body-read-failure", async () => { throw new Error("mock connection reset during response body"); }, "body-read-failed"],
+      ["malformed-json", async () => "{\"object\":", "body-malformed"],
+      ["oversize-json", async () => JSON.stringify({ padding: "x".repeat(1024 * 1024 + 1) }), "body-oversize"],
+    ] as const) {
+      const response = await tokenOver({ status: 200, ok: true, text })("PATCH", "/local-mock", { sha: B, force: false });
+      expect(response, label).toMatchObject({ status: 0, complete: false, incomplete: reason, measured_status: 200, body: null });
+      expect(judge(response), label).toMatchObject({ outcome: "inconclusive", halt: true, ambiguous: true });
+      expect(mutationRequestClass(response.status, response.complete), label).toBe("ambiguous");
+    }
+  });
+
+  it("R02-1 · the local gh transport: malformed success, a success with a failing exit, and a truncated refusal are incomplete", async () => {
+    for (const [label, status, body, code, expected, reason] of [
+      ["malformed-success", 200, "{\"object\":", 0, "accepted", "body-malformed"],
+      ["incomplete-process-success", 200, "{\"object\":", 1, "accepted", "process-incomplete"],
+      ["malformed-policy-refusal", 422, "{\"message\":\"Cannot update this protected ref", 1, "denied", "body-malformed"],
+    ] as const) {
+      const { request } = ghOnce(`HTTP/2 ${status}\r\n\r\n${body}`, code);
+      const response = await request("PATCH", "/local-mock", { sha: B, force: false });
+      expect(response, label).toMatchObject({ status: 0, complete: false, incomplete: reason, measured_status: status, body: null });
+      // The cut-off refusal text is never read as enforcement.
+      expect(response.diagnostic, label).toMatchObject({ policyDenial: false, ruleIds: [] });
+      expect(judge(response, expected), label).toMatchObject({ outcome: "inconclusive", halt: true, ambiguous: true });
+    }
+  });
+
+  it("R02-1 · the token transport stops collecting at the bound instead of buffering first, and a failed stream read is not an empty body", async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x20);
+    const oversize = streamed(200, Array.from({ length: 64 }, () => chunk));
+    const response = await tokenOver(oversize.response)("PATCH", "/local-mock", { sha: B });
+    expect(response).toMatchObject({ status: 0, complete: false, incomplete: "body-oversize", measured_status: 200 });
+    // 1 MiB is 16 of these chunks: collection stopped just past it, far short of the 4 MiB offered.
+    expect(oversize.counter.pulled).toBeLessThanOrEqual(18);
+    // A smaller configured bound is honoured the same way.
+    const small = streamed(200, ["{\"object\":{\"sha\":\"", "x".repeat(600), "\"}}"]);
+    expect(await tokenOver(small.response, { maxBytes: 512 })("PATCH", "/local-mock", {})).toMatchObject({ complete: false, incomplete: "body-oversize" });
+    expect(small.counter.pulled).toBe(2);
+    // A declared length beyond the bound is refused before a single byte is read.
+    const declared = streamed(200, ["{}"], { headers: { "content-length": String(8 * 1024 * 1024) } });
+    expect(await tokenOver(declared.response)("PATCH", "/local-mock", {})).toMatchObject({ complete: false, incomplete: "body-oversize" });
+    expect(declared.counter.pulled).toBe(0);
+    // Part of a body, then a reset: the half that arrived is not the response.
+    const reset = streamed(200, [`{"ref":"refs/heads/x","object":{"sha":"${B}"`], { error: true });
+    expect(await tokenOver(reset.response)("PATCH", "/local-mock", {})).toMatchObject({ status: 0, complete: false, incomplete: "body-read-failed", measured_status: 200 });
+    // A 200 with no body at all is a missing body, not a success.
+    expect(await tokenOver(streamed(200, []).response)("PATCH", "/local-mock", {})).toMatchObject({ complete: false, incomplete: "body-missing" });
+    // Invalid UTF-8 is not re-read through a replacement character into some other valid JSON.
+    expect(await tokenOver(streamed(200, [new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d])]).response)("PATCH", "/local-mock", {}))
+      .toMatchObject({ complete: false, incomplete: "body-encoding-invalid" });
+  });
+
+  it("R02-1 · the local gh transport: a cut-off head, invalid UTF-8, a signal exit and oversize output are incomplete; the bound kills the process", async () => {
+    expect(await ghOnce("HTTP/2 200\r\ncontent-type: application/json", 0).request("PATCH", "/local-mock", {}))
+      .toMatchObject({ status: 0, complete: false, incomplete: "headers-incomplete", measured_status: 200 });
+    expect(await ghOnce(Buffer.concat([Buffer.from("HTTP/2 200\r\n\r\n{\"a\":\""), Buffer.from([0xff]), Buffer.from("\"}")]), 0).request("PATCH", "/local-mock", {}))
+      .toMatchObject({ complete: false, incomplete: "body-encoding-invalid" });
+    // A complete-looking refusal from a process killed by a signal did not finish.
+    expect(await ghOnce("HTTP/2 422\r\n\r\n{\"message\":\"Cannot update this protected ref.\"}", null).request("PATCH", "/local-mock", {}))
+      .toMatchObject({ complete: false, incomplete: "process-incomplete", measured_status: 422 });
+    const oversize = ghOnce(`HTTP/2 200\r\n\r\n{"padding":"${"x".repeat(1024 * 1024 + 1)}"}`, 0);
+    expect(await oversize.request("PATCH", "/local-mock", {})).toMatchObject({ status: 0, complete: false, incomplete: "body-oversize" });
+    expect(oversize.kills).toHaveLength(1);
+  });
+
+  it("R02-1 · a COMPLETE answer is still decisive, and a legitimate empty 204 is complete — through both adapters", async () => {
+    const refused = "{\"message\":\"Cannot update this protected ref.\",\"documentation_url\":\"https://docs.github.com\"}";
+    for (const [label, response] of [
+      ["token", await tokenOver(streamed(422, [refused]).response)("PATCH", "/local-mock", {})],
+      ["gh", await ghOnce(`HTTP/2 422\r\n\r\n${refused}`, 1).request("PATCH", "/local-mock", {})],
+    ] as const) {
+      expect(response, label).toMatchObject({ status: 422, complete: true, incomplete: null, measured_status: 422 });
+      expect(judge(response, "denied"), label).toMatchObject({ outcome: "denied", halt: false });
+    }
+    const updated = JSON.stringify({ ref: "refs/heads/x", object: { sha: B, type: "commit" }, url: "https://api.github.com/x" });
+    for (const [label, response] of [
+      ["token", await tokenOver(streamed(200, [updated]).response)("PATCH", "/local-mock", {})],
+      ["gh", await ghOnce(`HTTP/2 200\r\n\r\n${updated}`, 0).request("PATCH", "/local-mock", {})],
+    ] as const) {
+      expect(response, label).toMatchObject({ status: 200, complete: true });
+      // Validated, never rewritten: every field the provider returned is still on the body.
+      expect(conformResponse("update-derived-ref", response), label).toMatchObject({ body: JSON.parse(updated), complete: true });
+      expect(judge(response), label).toMatchObject({ outcome: "accepted", halt: false });
+    }
+    // An EMPTY 204 is a complete answer (fetch's own null body, and gh's empty body on exit 0).
+    for (const [label, response] of [
+      ["token", await tokenOver({ status: 204, ok: true, headers: new Headers(), body: null })("POST", "/local-mock", {})],
+      ["gh", await ghOnce("HTTP/2 204\r\n\r\n", 0).request("POST", "/local-mock", {})],
+    ] as const) {
+      expect(response, label).toMatchObject({ status: 204, complete: true, incomplete: null, body: null });
+      expect(conformResponse("dispatch-witness-workflow", response), label).toMatchObject({ status: 204, complete: true });
+      expect(mutationRequestClass(response.status, response.complete), label).toBe("accepted");
+    }
+    // …but a 204 carrying bytes is not an empty 204, and a failed read is not an empty 204 either.
+    expect(await ghOnce("HTTP/2 204\r\n\r\n{\"partial", 0).request("POST", "/local-mock", {})).toMatchObject({ complete: false, incomplete: "body-unexpected" });
+    expect(await tokenOver(streamed(204, [], { error: true }).response)("POST", "/local-mock", {})).toMatchObject({ complete: false, incomplete: "body-read-failed" });
+  });
+
+  it("R02-1 · the guard holds each write to its endpoint's documented shape, and a result that states no completion is not a status to trust", () => {
+    const done = (status: number, body: unknown) => completedJsonResponse(status, Buffer.from(body === null ? "" : JSON.stringify(body), "utf8"));
+    // A 2xx in the wrong shape did not come from a completed request to this endpoint.
+    expect(conformResponse("update-derived-ref", done(200, {}))).toMatchObject({ status: 0, complete: false, incomplete: "shape-invalid", measured_status: 200 });
+    expect(conformResponse("dispatch-witness-workflow", done(200, { ok: true }))).toMatchObject({ complete: false, incomplete: "shape-invalid" });
+    expect(conformResponse("create-disposable-ruleset", done(201, { name: "no-id" }))).toMatchObject({ complete: false, incomplete: "shape-invalid" });
+    expect(conformResponse("delete-derived-ref", done(200, { ref: "x" }))).toMatchObject({ complete: false, incomplete: "shape-invalid" });
+    // No stated completion: the status is exactly the part that cannot vouch for itself.
+    expect(conformResponse("update-derived-ref", { status: 200, body: { object: { sha: B } } }))
+      .toMatchObject({ status: 0, complete: false, incomplete: "completion-unstated", measured_status: 200 });
+    // A create keeps every provenance field the provider returned.
+    const created = done(201, { id: 7, name: "commissioning-x", source: COMMISSIONING_REPOSITORY, source_type: "Repository" });
+    expect(conformResponse("create-disposable-ruleset", created).body).toEqual({ id: 7, name: "commissioning-x", source: COMMISSIONING_REPOSITORY, source_type: "Repository" });
+    // Persisted evidence carries the completion facts beside the status.
+    expect(responseEvidence(incompleteResponse("body-malformed", 422))).toEqual({ response_complete: false, response_incomplete: "body-malformed", measured_status: 422 });
+    expect(responseEvidence({ status: 422 })).toEqual({ response_complete: false, response_incomplete: "completion-unstated", measured_status: null });
+  });
+
+  // ── the local human finalizer and the public CLI ────────────────────────────────────────────────
+  const humanBranch = () => derivedRef(RUN_ID, ATTEMPT, "human").replace("refs/heads/", "");
+  const isHumanMutation = (method: string, requestPath: string) => ["PATCH", "DELETE", "PUT"].includes(method)
+    && (requestPath.endsWith(humanBranch()) || /\/pulls\/\d+\/merge$/.test(requestPath));
+  const humanCli = (spawnImpl: unknown, write: (text: string) => void) =>
+    main(["human-tests", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir], LOCAL_ENV, { spawnImpl, write });
+
+  it("R02-1/R02-2 · a truncated refusal to the FIRST human case halts the matrix, exits 3, issues no later mutation, and re-derives offline as unknown", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    let humanMutations = 0;
+    const scripted = scriptedGh(github, ({ method, path: requestPath }) => {
+      if (!isHumanMutation(method, requestPath)) return null;
+      humanMutations += 1;
+      // The provider refused (nothing moved), and the process died part-way through the refusal text.
+      return { stdout: "HTTP/2.0 422 Unprocessable Entity\r\n\r\n{\"message\":\"Cannot update this protected ref", code: 1 };
+    });
+    const emitted: string[] = [];
+    expect(await humanCli(scripted.spawnImpl, (text) => emitted.push(text))).toBe(3);
+    const result = JSON.parse(emitted.at(-1)!);
+    expect(result).toMatchObject({ phase: "human-tests", status: "incomplete" });
+    expect(result.errors.join(" ")).toMatch(/stopped every later human-tests mutation, which is never retried/);
+    expect(humanMutations).toBe(1);
+
+    const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    const first = buildActorMatrix().filter((kase) => kase.actor === "human")[0];
+    const mutation = records.find((record) => record.type === "mutation-result" && record.data.case === first.id)!;
+    expect(mutation.data).toMatchObject({ status: 0, response_complete: false, response_incomplete: "body-malformed", measured_status: 422 });
+    expect(mutation.data.diagnostic).toMatchObject({ policyDenial: false });
+    const evidence = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human"));
+    expect(evidence.halted_after).toBe(first.id);
+    expect(evidence.cases[0]).toMatchObject({ case: first.id, outcome: "inconclusive", passed: false, response_complete: false });
+    expect(evidence.cases.slice(1).every((record: CaseRecord) => record.outcome === "not-run")).toBe(true);
+
+    // A restarted phase admits from the journal: still exit 3, and still no further mutation.
+    expect(await humanCli(scripted.spawnImpl, (text) => emitted.push(text))).toBe(3);
+    expect(humanMutations).toBe(1);
+
+    // OFFLINE: the journaled history re-derives as the unknown outcome it was, and blocks.
+    const assessed = assessHumanCaseJournal(records, { runId: RUN_ID, attempt: ATTEMPT });
+    expect(assessed.problems).toEqual([]);
+    expect(assessed.blocking).toEqual([first.id]);
+    expect(assessed.cases[first.id]).toMatchObject({ state: "settled", blocking: true, verdict: { outcome: "inconclusive", ambiguous: true } });
+    // A status-only restamp of that result as a complete policy refusal cannot restore a denial:
+    // with no completion fact it is still ambiguous, and it disagrees with the journaled outcome.
+    const restamped = structuredClone(records).map((record) => (record.type === "mutation-result" && record.data.case === first.id
+      ? { ...record, data: { case: first.id, status: 422, diagnostic: { status: 422, category: "protected-ref-update-restricted", ruleIds: ["protected-ref-update-restricted"], policyDenial: true } } }
+      : record));
+    const relabelled = assessHumanCaseJournal(restamped, { runId: RUN_ID, attempt: ATTEMPT }).cases[first.id];
+    expect(relabelled.verdict?.outcome ?? relabelled.state).not.toBe("denied");
+    expect(relabelled.blocking).toBe(true);
+  });
+
+  it("R02-2 · a MIXED human matrix keeps exit 1: an unattributable refusal beside a measured unexpected success is a failure", async () => {
+    const github = createFakeGitHub({ ignoreRuleTypes: ["update", "pull_request", "required_status_checks"] });
+    await intentAndSetup(github);
+    let seen = 0;
+    const scripted = scriptedGh(github, ({ method, path: requestPath }) => {
+      if (!isHumanMutation(method, requestPath) || seen++ > 0) return null;
+      // A complete 403 that is not a policy rule: inconclusive, and not halting.
+      return { stdout: "HTTP/2.0 403 Forbidden\r\n\r\n{\"message\":\"Resource not accessible by integration\"}", code: 1 };
+    });
+    const emitted: string[] = [];
+    expect(await humanCli(scripted.spawnImpl, (text) => emitted.push(text))).toBe(1);
+    expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "human-tests", status: "failed" });
+    const outcomes = readEvidenceFile(evidenceDir, evidenceSlug(RUN_ID, ATTEMPT, "human")).cases.map((record: CaseRecord) => record.outcome);
+    expect(outcomes.slice(0, 2)).toEqual(["inconclusive", "unexpected-success"]);
+    expect(outcomes.slice(2).every((outcome: string) => outcome === "not-run")).toBe(true);
+  });
+
+  // ── the staged cloud finalizers, through the real TOKEN adapter ─────────────────────────────────
+  /** A fetch double over the fake provider: ONE scripted request lands (or not) and answers with raw bytes. */
+  const cutFetch = (github: ReturnType<typeof createFakeGitHub>, script: (method: string, pathname: string) => { apply: boolean; response: () => unknown } | null) =>
+    (async (input: unknown, init: RequestInit = {}) => {
+      const scripted = script(String(init.method ?? "GET"), new URL(String(input)).pathname);
+      if (!scripted) return github.fetchImpl(input as never, init);
+      if (scripted.apply) await github.fetchImpl(input as never, init);
+      return scripted.response();
+    }) as unknown as typeof fetch;
+
+  async function emergencyStage(github: ReturnType<typeof createFakeGitHub>, caseId: string, deps: Record<string, unknown>) {
+    const ordinal = CLOUD_CASE_SEQUENCE.emergency.indexOf(caseId) + 1;
+    const env = cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir });
+    await runCaseStage({ stage: "prepare", caseId, env, deps });
+    publishChallenge(github, "emergency", ordinal, "pre");
+    await serveOne(github, { role: "emergency", caseId, ordinal, direction: "pre" });
+    await runCaseStage({ stage: "await-and-execute", caseId, env, deps });
+    publishChallenge(github, "emergency", ordinal, "post");
+    await serveOne(github, { role: "emergency", caseId, ordinal, direction: "post" });
+    return runCaseStage({ stage: "await-and-finalize", caseId, env, deps }).then(() => null, (error: Error & { exitCode?: number }) => error);
+  }
+  const emergencyCli = (deps: Record<string, unknown>, write: (text: string) => void) =>
+    main(["emergency-tests", "--run-id", RUN_ID, "--attempt", ATTEMPT, "--evidence-dir", evidenceDir], cloudEnv("emergency", EMERGENCY_JOB_ENV), { ...deps, write });
+  const emergencyBranch = () => derivedRef(RUN_ID, ATTEMPT, "emergency").replace("refs/heads/", "");
+  const stateOf = (ordinal: number) => JSON.parse(readFileSync(path.join(cloudDir("state"), `case-${RUN_ID}-${ATTEMPT}-emergency-${String(ordinal).padStart(2, "0")}.json`), "utf8"));
+
+  it("R02-1/R02-2 · a staged acceptance whose body read fails after the write LANDED finalizes incomplete (exit 3), halts, and the finalizer exits 3", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.approve("emergency");
+    let mutations = 0;
+    const fetchImpl = cutFetch(github, (method, pathname) => {
+      if (method !== "PATCH" || !pathname.endsWith(emergencyBranch())) return null;
+      mutations += 1;
+      return { apply: true, response: () => streamed(200, [`{"ref":"refs/heads/${emergencyBranch()}","object":{"sha":"`], { error: true }).response };
+    });
+    const deps = { ...cloudDeps(github), fetchImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    const [first, second] = CLOUD_CASE_SEQUENCE.emergency;
+    const error = await emergencyStage(github, first, deps);
+    expect(error?.exitCode).toBe(3);
+    expect(error?.message).toMatch(/recorded inconclusive: .*no further actor mutation runs/);
+    expect(mutations).toBe(1);
+    const state = stateOf(1);
+    expect(state).toMatchObject({ status: "finalized", halt: true });
+    expect(state.record).toMatchObject({
+      outcome: "inconclusive", passed: false, request_class: "ambiguous",
+      http_status: 0, response_complete: false, response_incomplete: "body-read-failed", measured_status: 200,
+    });
+    // It landed — the readback shows the requested commit — and that still does not make it accepted.
+    expect(state.record.after_sha).toBe(state.record.requested_sha);
+    const post = JSON.parse(readFileSync(path.join(cloudDir("challenges"), `${challengeArtifactName({ runId: RUN_ID, attempt: ATTEMPT, role: "emergency", ordinal: 1, direction: "post" })}.json`), "utf8"));
+    expect(post).toMatchObject({ request_class: "ambiguous", request_status: 0, request_complete: false });
+    expect(() => assertChallengeShape({ ...post, request_complete: true })).toThrow(/but that status is ambiguous/);
+    // The durable halt: the next case refuses at prepare, before any request.
+    const before = github.calls.length;
+    await expect(runCaseStage({ stage: "prepare", caseId: second, env: cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps }))
+      .rejects.toThrow(/halted this actor/);
+    expect(github.calls.slice(before).filter((call) => ["PATCH", "DELETE", "PUT", "POST"].includes(call.method))).toEqual([]);
+    // The public actor finalizer reports what was measured: nothing decisive failed, so exit 3.
+    github.finish("emergency");
+    const emitted: string[] = [];
+    expect(await emergencyCli(cloudDeps(github), (text) => emitted.push(text))).toBe(3);
+    expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "emergency-tests", status: "incomplete" });
+    expect(mutations).toBe(1);
+  });
+
+  it("R02-2 · a MIXED staged matrix keeps exit 1: a measured unexpected denial, then an incomplete refusal that halts", async () => {
+    const github = createFakeGitHub();
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.approve("emergency");
+    let mutations = 0;
+    const fetchImpl = cutFetch(github, (method, pathname) => {
+      if (method !== "PATCH" || !pathname.endsWith(emergencyBranch())) return null;
+      mutations += 1;
+      // 1st: the write landed but the provider answered a COMPLETE refusal — a measured unexpected denial.
+      if (mutations === 1) return { apply: true, response: () => streamed(422, ["{\"message\":\"Update is not a fast forward\"}"]).response };
+      // 2nd: the provider's refusal, cut off mid-body.
+      return { apply: false, response: () => streamed(422, ["{\"message\":\"Cannot force-push to this protected"], { error: true }).response };
+    });
+    const deps = { ...cloudDeps(github), fetchImpl, archiveTransport: github.archiveImpl, sleep: async () => {}, intervalMs: 1 };
+    const [first, second, third] = CLOUD_CASE_SEQUENCE.emergency;
+    const measured = await emergencyStage(github, first, deps);
+    expect(measured?.exitCode).toBe(1);
+    expect(stateOf(1).record).toMatchObject({ outcome: "unexpected-denial", response_complete: true, http_status: 422 });
+    const unknown = await emergencyStage(github, second, deps);
+    expect(unknown?.exitCode).toBe(3);
+    expect(stateOf(2)).toMatchObject({ halt: true, record: { outcome: "inconclusive", response_complete: false, response_incomplete: "body-read-failed", measured_status: 422 } });
+    expect(stateOf(2).record.diagnostic).toMatchObject({ policyDenial: false });
+    await expect(runCaseStage({ stage: "prepare", caseId: third, env: cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps }))
+      .rejects.toThrow(/halted this actor/);
+    expect(mutations).toBe(2);
+    github.finish("emergency");
+    const emitted: string[] = [];
+    expect(await emergencyCli(cloudDeps(github), (text) => emitted.push(text))).toBe(1);
+    expect(JSON.parse(emitted.at(-1)!)).toMatchObject({ phase: "emergency-tests", status: "failed" });
+  });
+
+  // ── create and dispatch reconciliation, through the real gh adapter ─────────────────────────────
+  it("R02-1 · a ruleset create that LANDED but whose answer was cut off is response-ambiguous, never refused, and is not created twice", async () => {
+    const github = createFakeGitHub();
+    await runIntentPhase({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: INTENT_ENV() });
+    let cut = false;
+    const scripted = scriptedGh(github, ({ method, path: requestPath }) => {
+      if (cut || method !== "POST" || !requestPath.endsWith("/rulesets")) return null;
+      cut = true;
+      return { apply: true, stdout: "HTTP/2.0 201 Created\r\n\r\n{\"id\":", code: 0 };
+    });
+    await expect(runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl: scripted.spawnImpl } })).rejects.toThrow();
+    const records = readJournal({ dir: evidenceDir, runId: RUN_ID, attempt: ATTEMPT }) as JournalRecord[];
+    const result = records.find((record) => record.type === "mutation-result" && record.data.kind === "ruleset")!;
+    expect(result.data).toMatchObject({ status: 0, response_complete: false, response_incomplete: "body-malformed", measured_status: 201 });
+    const pending = unresolvedCreateIntents(records).find((entry: { intent: { kind?: string } }) => entry.intent?.kind === "ruleset");
+    expect(pending).toMatchObject({ state: "response-ambiguous", unresolved: true });
+    // Whatever the resume does with it, the same name never exists twice.
+    await runPhase({ phase: "setup", runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV, deps: { spawnImpl: github.spawnImpl } }).catch(() => null);
+    const names = [...github.rulesets.values()].map((ruleset) => ruleset.name);
+    expect(new Set(names).size, "a ruleset name was created twice").toBe(names.length);
+  });
+
+  async function emergencyFirstPre(github: ReturnType<typeof createFakeGitHub>) {
+    await intentAndSetup(github);
+    await runFixtureChecks(cloudEnv("fixture", { COMMISSIONING_EVIDENCE_DIR: evidenceDir }), { fetchImpl: github.fetchImpl, wait: WAIT });
+    github.approve("emergency");
+    const caseId = CLOUD_CASE_SEQUENCE.emergency[0];
+    await runCaseStage({ stage: "prepare", caseId, env: cloudEnv("emergency", { ...EMERGENCY_JOB_ENV, COMMISSIONING_EVIDENCE_DIR: evidenceDir }), deps: { ...cloudDeps(github), archiveTransport: github.archiveImpl } });
+    publishChallenge(github, "emergency", 1, "pre");
+    return caseId;
+  }
+
+  it.each([
+    ["an empty 204 (complete)", { apply: true, stdout: "HTTP/2.0 204 No Content\r\n\r\n", code: 0 }, "pending", { ambiguous: false, response_complete: true }, 1],
+    ["a 204 followed by stray bytes", { apply: true, stdout: "HTTP/2.0 204 No Content\r\n\r\n{\"partial", code: 0 }, "pending", { ambiguous: true, response_complete: false, response_incomplete: "body-unexpected" }, 1],
+    ["a truncated refusal", { apply: false, stdout: "HTTP/2.0 422 Unprocessable Entity\r\n\r\n{\"message\":\"Workflow does not", code: 1 }, "pending", { ambiguous: true, response_complete: false, response_incomplete: "body-malformed" }, 0],
+    ["a complete refusal", { apply: false, stdout: "HTTP/2.0 422 Unprocessable Entity\r\n\r\n{\"message\":\"Workflow does not have 'workflow_dispatch' trigger\"}", code: 1 }, "refused", { ambiguous: false, response_complete: true }, 0],
+  ] as const)("R02-1 · a witness dispatch answered with %s", async (_label, answer, expected, fields, dispatched) => {
+    const github = createFakeGitHub({ suppressPublisher: true });
+    const caseId = await emergencyFirstPre(github);
+    let issued = 0;
+    const scripted = scriptedGh(github, ({ method, path: requestPath }) => {
+      if (method !== "POST" || !requestPath.endsWith("/dispatches")) return null;
+      issued += 1;
+      return { ...answer };
+    });
+    const session = await openWitnessSession({
+      runId: RUN_ID, attempt: ATTEMPT, evidenceDir, env: LOCAL_ENV,
+      deps: { spawnImpl: scripted.spawnImpl, archiveTransport: github.archiveImpl },
+    });
+    try {
+      const begin = () => beginWitnessItem({
+        request: session.request, requestArchive: session.requestArchive, ctx: session.ctx, journal: session.journal,
+        item: { role: "emergency", caseId, ordinal: 1, direction: "pre" }, operator: session.operator, domain: session.domain, setupBindings: session.setupBindings,
+      });
+      if (expected === "refused") {
+        await expect(begin()).rejects.toThrow(/was refused \(422\)/);
+      } else {
+        expect((await begin()).state).toBe("pending");
+        // Pending is reconciled by the exact artifact, never re-dispatched.
+        expect((await begin()).state).toBe("pending");
+      }
+      expect(issued).toBe(1);
+      expect(github.dispatches).toHaveLength(dispatched);
+      const results = (session.journal.read() as JournalRecord[]).filter((record) => record.type === "dispatch-result");
+      expect(results.map((record) => record.data)).toEqual([expect.objectContaining(fields)]);
+    } finally {
+      session.lock.release();
+    }
+  });
+});
