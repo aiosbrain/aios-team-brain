@@ -1272,6 +1272,19 @@ public evidence.**
     inflated payload has no name at all) is a recorded `unexpanded-archive-format` gap. The label is
     `extension` when the NAME was recognised and `format` when the BYTES were, each from a closed
     vocabulary in reviewed source — neither is derived from the member.
+  - **The archive surface is scanned too** (scan representation **v2**, AIO-1112). Every byte of a
+    decoded layer or gzip-decoded nested tar that is not member content — headers, PAX/GNU metadata,
+    link targets, padding, unsupported-member bodies, end blocks and trailing bytes — is staged as
+    whole ranges under a fixed `archive-metadata` category (never a path) and counted in
+    `coverage.archiveSurfaceBytes`. A range too large for one surface file is an
+    `archive-surface-range-unstageable` gap, never a split. The claim is about the **decoded tar
+    bytes**: original registry-layer gzip framing (`FNAME`/`FCOMMENT`/`FEXTRA`, bytes after the
+    stream), which a `docker save` export may not contain, is outside it.
+  - **Malformed archives refuse the run** with a fixed code: `AUDIT_TAR_STRUCTURE_INVALID` (short,
+    truncated or unterminated input, a header-only member declaring a body, a global PAX
+    path/linkpath/size override, a non-zero trailer on the outer export) or `AUDIT_TAR_LIMIT_EXCEEDED`
+    (a metadata body, accumulated metadata or physical-header count past its reviewed bound). A broken
+    *nested* tar is a `nested-archive-undecodable` gap instead.
 - **`provenance.recipe`** is measured *and* gates the verdict: a `violated` or `unverified` assertion
   blocks `transitionReady` and lands the verdict on **`unresolved`** — a question for coordinator
   adjudication, deliberately *not* re-labelled as secret presence. A missing recipe blocks too, so a
@@ -1281,7 +1294,15 @@ public evidence.**
 - **`scanner.settings`** records the coverage-relevant flags read back from the invocation that ran:
   no file-size cap (`--max-target-megabytes 0`), and the scanner's own archive traversal left at the
   8.28.0 default of disabled — the audit expands one nested level itself and records every format it
-  could not expand.
+  could not expand. These must **equal the reviewed policy** (`SCANNER_SETTINGS_POLICY`): the run
+  refuses with `AUDIT_SCANNER_SETTINGS_UNSUPPORTED` otherwise, and reconciliation refuses a record
+  that reports anything else.
+- **`scanner.capabilityCanary`** is measured on three private synthetic fixtures before the real scan,
+  with the same binary, config and isolation: the wrapped ELF case, its unwrapped negative control,
+  and a wrapped NUL-padded 512-byte **archive-metadata** block. Verified means both wrapped fixtures
+  were detected (`archiveSurfaceDetected: true`); a miss of either is `unverified`, a coverage gap
+  that blocks. The archive-metadata case has **not yet been measured on the live 8.28.0 binary** — the
+  first real run establishes it, and a miss blocks rather than passes.
 - **`failure`** appears only on a refused run, and carries a fixed `stage` from a closed vocabulary
   plus an error **code**, never a message. `AUDIT_SUBPROCESS_TIMEOUT`, `AUDIT_SUBPROCESS_LOG_OVERFLOW`
   and `AUDIT_SUBPROCESS_START` are distinct because the remedies are. A prerequisite refusal
@@ -1302,7 +1323,11 @@ public evidence.**
   - That route is the `reconcile` command (`node scripts/staging-ops/image-audit.mjs reconcile
     --evidence <audit.json> --operator <inventory.json>`), and it **validates the audit record
     first**: schema, exact subject binding, every required measurement (including the persisted
-    `provenance.identityVerified`), and internal consistency. An absent, foreign, incomplete,
+    `provenance.identityVerified`, the pinned `scanner.configSha256`, the reviewed
+    `scanner.settings`, the v2 `scanner.representation`, the `capabilityCanary` and
+    `coverage.representation`), and internal consistency. A **v1 original** (captured before the
+    archive surface was scanned) is refused as `original-scan-representation-unsupported` and needs a
+    fresh audit — no operator inventory can grandfather it. An absent, foreign, incomplete,
     self-contradictory or itself-`refused` record is **refused** — verdict `refused`,
     `transitionReady: false`, fixed codes in `provenance.refusal.codes`, and no reconciled
     measurements at all. Readiness is then RECOMPUTED from the validated measurements by the same
@@ -1350,6 +1375,12 @@ for auditing or exposing the currently covered package.
   the same version and executing this exact linux_x64 binary is a separate measurement. The repo's
   `ci.yml` gitleaks download is unpinned by checksum and on an older version — it is **not** evidence
   for this one.
+- **The scanner CONFIG digest — PINNED.** `SCANNER.configSha256` holds the sha256 of
+  `config/staging-ops/image-audit-gitleaks.toml` (`1bd01cf2…d73ec`). `test/guards/image-audit-config-digest.test.ts`
+  fails the build if the tracked file drifts from it, the run refuses with
+  `AUDIT_SCANNER_CONFIG_MISMATCH` before any scan if the bytes it would use differ, and reconciliation
+  refuses any other reported digest. Editing the config means re-pinning the constant in the same
+  reviewed change.
 - **The `docker save` export form.** How a layer is decoded is decided by its **declared media type**,
   never by which digest the export happens to contain: for an uncompressed `…layer.v1.tar` layer the
   descriptor digest *is* the `diff_id`, so "the export has a member hashing to the descriptor" is true
