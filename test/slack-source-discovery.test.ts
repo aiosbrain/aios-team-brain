@@ -96,6 +96,18 @@ describe("validateSlackHistoryPage", () => {
     ).toMatchObject({ ok: false, category: "cursor_repeated" });
   });
 
+  it("refuses a page that offers a continuation cursor while saying, or omitting, that there is no more", () => {
+    // AIO-1170 review P4-03. The transport reads an absent `has_more` as false, so an absent flag and an explicit
+    // `false` both arrive here as `hasMore: false`. Taken as the TERMINAL page, that contradiction certifies the
+    // interval and closes the historical lane for good with the rest of the history never read: silent loss.
+    // Fail closed instead; the sibling contradiction (`has_more` true with no cursor) is already refused above.
+    expect(validateSlackHistoryPage(page({ hasMore: false, nextCursor: "page-2" }), { sentCursor: null })).toMatchObject(
+      { ok: false, category: "pagination_incomplete" }
+    );
+    // The ordinary terminal page (no cursor) is still accepted, so the refusal is not blanket.
+    expect(ok(validateSlackHistoryPage(page({ hasMore: false, nextCursor: null }), { sentCursor: "page-2" })).hasMore).toBe(false);
+  });
+
   it("refuses a response that carried no `messages` field at all", () => {
     // `conversations.history` always answers with a messages array. ABSENT is not `[]`: the
     // transport preserves that difference precisely so this reading — "no messages, therefore an

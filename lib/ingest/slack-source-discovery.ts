@@ -175,6 +175,10 @@ export function validateSlackHistoryPage(
   // never mentioned messages cannot be read here as an empty range we may certify.
   if (!Array.isArray(page.messages)) return { ok: false, category: "malformed_page" };
   if (page.hasMore && page.nextCursor === null) return { ok: false, category: "pagination_incomplete" };
+  // The mirror contradiction: a live continuation cursor while `has_more` is false or absent (the transport reads
+  // an absent flag as false). Taken as the terminal page it would certify the interval and close the historical
+  // lane with the rest of the history never read, so it is refused like its sibling above.
+  if (!page.hasMore && page.nextCursor !== null) return { ok: false, category: "pagination_incomplete" };
   if (page.nextCursor !== null && page.nextCursor === opts.sentCursor) {
     return { ok: false, category: "cursor_repeated" };
   }
