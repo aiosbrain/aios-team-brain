@@ -1,7 +1,9 @@
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { audit } from "@/lib/api/audit";
-import { buildIdentityMap, resolveMember } from "@/lib/identity/resolve";
+import { resolveMember } from "@/lib/identity/resolve";
+import { buildIdentityAuthoritySnapshot, validateIdentityAuthorityRevision } from "@/lib/identity/authority";
+import { withTransaction } from "@/lib/db/pg/pool";
 
 /**
  * GitHub-API codebase sync — the "auto-scan on link" path. Unlike the CLI scanner
@@ -220,6 +222,8 @@ export async function ingestGithubApiScan(
      *  METADATA leg only (fetchRepoMeta + the codebases upsert, so star/language/branch
      *  freshness is untouched) and skip the commit pagination + contribution upserts. */
     skipCommits?: boolean;
+    /** Test seam for proving the revision fence between resolution and the common write boundary. */
+    afterIdentitySnapshot?: () => Promise<void>;
   }
 ): Promise<GithubApiScanResult> {
   // `sinceIso` is the RESOLVED instant, owned by the caller (`commitSinceIso` — AIO-807). This used
@@ -283,29 +287,33 @@ export async function ingestGithubApiScan(
   if (cbErr || !cb) throw new Error(`codebase upsert failed (${slug}): ${cbErr?.message}`);
   const codebaseId = (cb as { id: string }).id;
 
-  const identityMap = await buildIdentityMap(db, auth.teamId);
+  const identitySnapshot=await buildIdentityAuthoritySnapshot(db,auth.teamId);
+  await params.afterIdentitySnapshot?.();
   let written = 0;
-  for (const row of contributions) {
-    const memberId = resolveMember(identityMap, { email: row.author_email, key: row.author_key });
-    const { error } = await db.from("code_contributions").upsert(
-      {
-        team_id: auth.teamId,
-        codebase_id: codebaseId,
-        author_key: row.author_key,
-        author_name: row.author_name,
-        author_email: row.author_email,
-        member_id: memberId,
-        day: row.day,
-        commits: row.commits,
-        ai_commits: row.ai_commits,
-        additions: 0,
-        deletions: 0,
-      },
-      { onConflict: "codebase_id,author_key,day" }
-    );
-    if (error) throw new Error(`contribution ${row.author_key}/${row.day}: ${error.message}`);
-    written++;
-  }
+  await withTransaction(async()=>{
+    await validateIdentityAuthorityRevision(auth.teamId,identitySnapshot.revision);
+    for (const row of contributions) {
+      const memberId = resolveMember(identitySnapshot.map, { email: row.author_email, key: row.author_key });
+      const { error } = await db.from("code_contributions").upsert(
+        {
+          team_id: auth.teamId,
+          codebase_id: codebaseId,
+          author_key: row.author_key,
+          author_name: row.author_name,
+          author_email: row.author_email,
+          member_id: memberId,
+          day: row.day,
+          commits: row.commits,
+          ai_commits: row.ai_commits,
+          additions: 0,
+          deletions: 0,
+        },
+        { onConflict: "codebase_id,author_key,day" }
+      );
+      if (error) throw new Error(`contribution ${row.author_key}/${row.day}: ${error.message}`);
+      written++;
+    }
+  });
 
   await audit(db, {
     team_id: auth.teamId,

@@ -4,6 +4,9 @@ import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { ingestItem } from "@/lib/ingest";
 import type { ItemPayload } from "@/lib/api/schemas";
 import { db, seedTeam, sha, type Seed } from "./helpers";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { drainIdentityRepairs } from "@/lib/ingest/identity-repair";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 /**
  * Spec: a document push carrying an author signal in its frontmatter attributes to the RESOLVED human
@@ -31,6 +34,16 @@ async function addConnector(teamId: string): Promise<string> {
   return (data as { id: string }).id;
 }
 
+async function addMember(teamId:string,name:string):Promise<string>{
+  const {data,error}=await db().from("members").insert({
+    team_id:teamId,email:`${randomUUID()}@test.local`,display_name:name,
+    actor_handle:`${name.toLowerCase().replaceAll(" ","-")}-${randomUUID().slice(0,8)}`,
+    role:"member",tier:"team",status:"active",is_connector:false,
+  }).select("id").single();
+  if(error||!data) throw new Error(`addMember failed: ${error?.message}`);
+  return (data as {id:string}).id;
+}
+
 function payload(frontmatter: Record<string, unknown>): ItemPayload {
   const body = `body ${randomUUID()}`;
   return {
@@ -49,7 +62,15 @@ function payload(frontmatter: Record<string, unknown>): ItemPayload {
 async function ingestAs(seed: Seed, actorMemberId: string, fm: Record<string, unknown>): Promise<string | null> {
   const p = payload(fm);
   const { opts } = await attributeIncomingItem(db(), seed.teamId, p, actorMemberId);
-  const res = await ingestItem(db(), { teamId: seed.teamId, memberId: actorMemberId, apiKeyId: randomUUID() }, p, "team", opts);
+  const res = await ingestItem(
+    db(),
+    { teamId: seed.teamId, memberId: actorMemberId, apiKeyId: randomUUID() },
+    p,
+    "team",
+    opts,
+    "team",
+    undefined,
+  );
   const { data } = await db().from("items").select("member_id").eq("id", res.id).single();
   return (data as { member_id: string | null }).member_id;
 }
@@ -136,6 +157,59 @@ describe("author attribution at ingest → stored member_id (real Postgres)", ()
     expect(fm.state).toBe("new"); // real change healed
     expect(fm.author_email).toBe("alice@corp.com"); // best-effort author key PRESERVED, not wiped
     expect(fm.author).toBe("Alice");
+  });
+
+  it("rejects a stale mapping-derived override at the common item/version write boundary", async()=>{
+    const seed=await seedTeam();
+    const connector=await addConnector(seed.teamId);
+    const bob=await addMember(seed.teamId,"Fence Bob");
+    const externalId=`permission:${randomUUID()}`;
+    const first=await setMemberIdentity(db(),seed.teamId,seed.memberId,{
+      provider:"gdrive",externalId,email:"fence-author@example.com",
+    });
+    const existing=payload({
+      source:"notion",authors:[{provider:"gdrive",external_id:externalId,role:"author"}],
+    });
+    const pOpts=(await attributeIncomingItem(db(),seed.teamId,existing,connector)).opts!;
+    const auth={teamId:seed.teamId,memberId:connector,apiKeyId:randomUUID()};
+    const created=await ingestItem(db(),auth,existing,"team",pOpts);
+
+    await setMemberIdentity(db(),seed.teamId,bob,{
+      provider:"gdrive",externalId,email:"fence-author@example.com",
+    },{force:true,expectedRevision:first.mappingRevision});
+    await drainIdentityRepairs(db(),{maxObligations:10,batchSize:50});
+    await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:10,batchSize:50});
+    expect((await db().from("team_identity_authority").select("repair_status")
+      .eq("team_id",seed.teamId).single()).data).toMatchObject({repair_status:"complete"});
+    expect((await db().from("items").select("member_id").eq("id",created.id).single()).data)
+      .toMatchObject({member_id:bob});
+    const versionsBefore=(await db().from("item_versions").select("id")
+      .eq("item_id",created.id)).data?.length ?? 0;
+
+    const changedBody=`changed ${randomUUID()}`;
+    const changed={...existing,body:changedBody,content_sha256:sha(changedBody)};
+    await expect(ingestItem(db(),auth,changed,"team",pOpts)).rejects.toThrow(/identity mapping changed/);
+    expect((await db().from("items").select("body,member_id").eq("id",created.id).single()).data)
+      .toMatchObject({body:existing.body,member_id:bob});
+    expect((await db().from("item_versions").select("id").eq("item_id",created.id)).data?.length)
+      .toBe(versionsBefore);
+
+    const unseen=payload({
+      source:"notion",authors:[{provider:"gdrive",external_id:externalId,role:"author"}],
+    });
+    await expect(ingestItem(db(),auth,unseen,"team",pOpts)).rejects.toThrow(/identity mapping changed/);
+    expect((await db().from("items").select("id").eq("team_id",seed.teamId)
+      .eq("path",unseen.path)).data).toEqual([]);
+
+    const currentOpts=(await attributeIncomingItem(db(),seed.teamId,changed,connector)).opts!;
+    await ingestItem(db(),auth,changed,"team",currentOpts);
+    await ingestItem(db(),auth,unseen,"team",currentOpts);
+    const {data:current}=await db().from("items").select("path,member_id")
+      .eq("team_id",seed.teamId).in("path",[existing.path,unseen.path]);
+    expect(current).toHaveLength(2);
+    expect(current?.every((row)=>row.member_id===bob)).toBe(true);
+    expect((await db().from("item_versions").select("member_id").eq("item_id",created.id)).data
+      ?.every((row)=>row.member_id===bob)).toBe(true);
   });
 });
 

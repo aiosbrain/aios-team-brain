@@ -17,14 +17,18 @@ export function ProviderIdentityLink({
   label,
   externalId,
   handle,
+  email,
+  revision,
   placeholder,
 }: {
   teamSlug: string;
   memberId: string;
-  provider: "slack" | "linear" | "plane";
+  provider: "slack" | "linear" | "plane" | "gdrive";
   label: string;
   externalId: string | null;
   handle: string | null;
+  email: string | null;
+  revision: number;
   placeholder: string;
 }) {
   const router = useRouter();
@@ -36,7 +40,9 @@ export function ProviderIdentityLink({
   function submit() {
     setError(null);
     startTransition(async () => {
-      const res = await linkMemberIdentity(teamSlug, memberId, provider, value, handle ?? undefined);
+      const res = await linkMemberIdentity(
+        teamSlug, memberId, provider, value, handle ?? undefined, revision,
+      );
       if (!res.ok) return setError(res.error ?? "could not link");
       setEditing(false);
       router.refresh();
@@ -46,7 +52,7 @@ export function ProviderIdentityLink({
     if (!externalId) return;
     setError(null);
     startTransition(async () => {
-      const res = await unlinkMemberIdentity(teamSlug, provider, externalId);
+      const res = await unlinkMemberIdentity(teamSlug, provider, externalId, revision);
       if (!res.ok) return setError(res.error ?? "could not unlink");
       router.refresh();
     });
@@ -83,6 +89,9 @@ export function ProviderIdentityLink({
               <span className="font-mono">{handle || externalId}</span>
               <Check className="size-3 text-emerald-600" />
             </span>
+            {provider === "gdrive" && email ? (
+              <span className="text-xs text-ink-tertiary" title="Verified Google account email">{email}</span>
+            ) : null}
             <button onClick={() => setEditing(true)} className="rounded border border-border-default px-1.5 py-0 text-xs text-ink-secondary hover:text-ink">
               Change
             </button>

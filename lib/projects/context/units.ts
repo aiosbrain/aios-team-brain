@@ -22,6 +22,7 @@ type UnitRow = {
   audience: string;
   content_sha256: string;
   occurred_at: string;
+  state?: string | null;
 };
 
 /**
@@ -35,7 +36,7 @@ export async function reconcileItemUnitLocked(
   const item = context.item;
   const { data: existing, error: existingError } = await db
     .from("project_context_units")
-    .select("id, audience, content_sha256, occurred_at")
+    .select("id, audience, content_sha256, occurred_at, state")
     .eq("team_id", context.teamId)
     .eq("source_item_id", context.itemId)
     .eq("unit_kind", "item")
@@ -45,16 +46,22 @@ export async function reconcileItemUnitLocked(
   if (existing) {
     const row = existing as UnitRow;
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
+    // A retracted unit (Drive source revocation) is drift too: a reconcile under a surviving claim
+    // reactivates it in the same single-statement mirror. `state` is NOT NULL in Postgres; only an
+    // in-memory fixture can omit it, and an absent value is not a retraction.
+    const retracted = row.state != null && row.state !== "active";
     if (
       row.audience !== item.access ||
       row.content_sha256 !== item.content_sha256 ||
-      workAtDrift
+      workAtDrift ||
+      retracted
     ) {
       const mirrored = await context.session.executeSql<{ audience: "team" | "external" }>(
         `update project_context_units u
             set audience = i.access,
                 content_sha256 = i.content_sha256,
                 occurred_at = i.work_at,
+                state = 'active',
                 updated_at = now()
            from items i
           where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
@@ -114,6 +121,38 @@ export async function reconcileItemUnit(
       const context = await lockItemContext(session, teamId, itemId);
       if (!context) return { ok: false, error: "item not found" };
       return reconcileItemUnitLocked(context);
+    });
+  } catch (error) {
+    return { ok: false, error: contextFailureMessage(error) };
+  }
+}
+
+/**
+ * Durable visibility suppression used by source revocation. Retraction leaves membership history
+ * intact but every enforced reader rejects the unit until a surviving claim reactivates it through
+ * `reconcileItemUnit`.
+ */
+export async function retractItemUnit(
+  db: DbClient,
+  teamId: string,
+  itemId: string
+): Promise<ReconcileResult> {
+  try {
+    // Same item lock as every other unit write, so a retraction cannot interleave with a mirror.
+    return await runContextTransaction(db, async (session) => {
+      const context = await lockItemContext(session, teamId, itemId);
+      if (!context) return { ok: false, error: "item not found" };
+      const { data, error } = await session.db
+        .from("project_context_units")
+        .update({ state: "retracted", updated_at: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("source_item_id", itemId)
+        .eq("unit_kind", "item")
+        .select("id")
+        .maybeSingle();
+      if (error) return { ok: false, error: error.message };
+      if (!data) return { ok: false, error: "context unit not found" };
+      return { ok: true, unitId: (data as { id: string }).id, created: false };
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };

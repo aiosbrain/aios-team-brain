@@ -55,6 +55,10 @@ const SHAPE_BY_VERSION: Record<number, Record<string, string[]>> = {
   // change, shape identical. 15 is RESERVED by the pending Slack-semantics PR (#714) and is NOT pinned
   // here: whichever lands second must take the next unclaimed number, never share one.
   get 16() { return this[12]; },
+  // v18 (AIO-1167): Drive ledger/correction semantics changed; shape remains identical. Authored as
+  // v15 and renumbered on the rebase — 17 is the number #714's branch now claims and, like 15 before
+  // it, is NOT pinned here until that change lands.
+  get 18() { return this[12]; },
   // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
   get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.
@@ -97,6 +101,8 @@ const REQUIRED_BY_VERSION: Record<number, Record<string, string[]>> = {
   },
   // v16 (TIERRET-1): meaning-only, shape identical (see SHAPE_BY_VERSION; 15 reserved by #714).
   get 16() { return this[12]; },
+  // v18 (AIO-1167): meaning-only, shape identical (see SHAPE_BY_VERSION; 17 reserved by #714).
+  get 18() { return this[12]; },
   // v14 (PRET-6): the permissive tier row retired — again a meaning change, shape identical.
   get 14() { return this[12]; },
   // v13 (PRET-5): the wall drop changes ROW SELECTION meaning, not shape — identical keys.

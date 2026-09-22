@@ -10,13 +10,14 @@ import {
   TierViolationError,
 } from "@/lib/api/schemas";
 import { MAX_PAYLOAD_ROWS, wireItemPayloadSchema } from "@/lib/api/item-payload-schema";
-import { ingestItem } from "@/lib/ingest";
+import { ingestApiItem } from "@/lib/ingest";
 import { attributeIncomingItem } from "@/lib/attribution/resolve-authors";
 import { projectChangedTasksAfterWrite } from "@/lib/pm-sync";
 import {
   meetingBackfillScheduler,
   shouldScheduleMeetingBackfill,
 } from "@/lib/meetings/schedule-backfill";
+import { GdriveAuthorityError } from "@/lib/integrations/gdrive-authority";
 
 export const runtime = "nodejs";
 
@@ -48,6 +49,18 @@ const MAX_PAYLOAD = 1_000_000; // 1 MB per contract
  */
 const MAX_REQUEST_BYTES = Math.ceil((MAX_PAYLOAD + MAX_PAYLOAD_ROWS * 700) * 1.2);
 const PAGE_SIZE = 200;
+
+function gdriveExecution(req: NextRequest) {
+  const integrationId = req.headers.get("x-aios-integration-id") ?? "";
+  const owner = req.headers.get("x-aios-execution-owner") ?? "";
+  const generation = Number(req.headers.get("x-aios-execution-generation"));
+  const fence = Number(req.headers.get("x-aios-execution-fence"));
+  if (!/^[0-9a-f-]{36}$/i.test(integrationId) || !/^[0-9a-f-]{36}$/i.test(owner)
+      || !Number.isSafeInteger(generation) || generation < 1 || !Number.isSafeInteger(fence) || fence < 1) {
+    throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required", 403);
+  }
+  return { integrationId, owner, generation, fence };
+}
 
 export async function POST(req: NextRequest) {
   const auth = await authenticateApiKey(req);
@@ -108,12 +121,19 @@ export async function POST(req: NextRequest) {
     // silently to the ingesting connector. ONLY for trusted team-tier keys: an external (client) key
     // must not be able to attribute content to a team member (spoofing) — it keeps actor attribution.
     const { opts } = isRestrictedTier(auth.memberTier)
-      ? {}
+      ? { opts: undefined }
       : await attributeIncomingItem(db, auth.teamId, parsed.data, auth.memberId);
     // Pass the key's tier: ingestItem resolves the item's tier from it on BOTH write paths, so an
     // external key can neither reclassify an existing item nor declare `team` on a new one.
     const pusherTier = isRestrictedTier(auth.memberTier) ? "external" : "team";
-    const result = await ingestItem(db, auth, parsed.data, tier, opts, pusherTier);
+    const hasExecutionHeaders = req.headers.has("x-aios-integration-id")
+      || req.headers.has("x-aios-execution-owner")
+      || req.headers.has("x-aios-execution-generation")
+      || req.headers.has("x-aios-execution-fence");
+    const execution = hasExecutionHeaders ? gdriveExecution(req) : undefined;
+    const result = await ingestApiItem(
+      db,auth,parsed.data,tier,opts,pusherTier,execution,
+    );
 
     // Reactive auto-projection (brain-api v1.2 Phase 2): on a task push that actually changed
     // projected fields, schedule a bounded projection of ONLY the changed rows into the team's
@@ -154,7 +174,9 @@ export async function POST(req: NextRequest) {
     // §11 first-create/repair hook: new content keeps the existing post-response placement path,
     // with the scheduler as backstop. Existing-item access changes already moved item + context in
     // ingestItem's transaction; this idempotent hook may reconfirm them after commit.
-    if (result.status !== "unchanged" || result.accessChanged) {
+    // Never for Google Drive: its context is derived solely from the surviving audience claims
+    // inside the ingest transaction, so the system-project routing here would widen it.
+    if ((result.status !== "unchanged" || result.accessChanged) && parsed.data.frontmatter?.source !== "gdrive") {
       const teamId = auth.teamId;
       const itemId = result.id;
       // Scheduling the post-response work must never fail the push — not the work (best-effort
@@ -190,6 +212,9 @@ export async function POST(req: NextRequest) {
     // client key gets an unambiguous "not yours" instead of hunting for a markdown problem.
     if (e instanceof TierViolationError) {
       return errorResponse("forbidden_tier", e.message, 403);
+    }
+    if (e instanceof GdriveAuthorityError) {
+      return errorResponse(e.code, e.message, e.status);
     }
     return errorResponse("internal", e instanceof Error ? e.message : "ingest failed", 500);
   }

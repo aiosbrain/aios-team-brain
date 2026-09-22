@@ -23,7 +23,8 @@ export type MembershipMethod =
   | "embedding"
   | "llm"
   | "manual"
-  | "exclude_shadow_repair";
+  | "exclude_shadow_repair"
+  | "gdrive_claim";
 
 export interface EnsureIncludeArgs {
   projectId: string;
@@ -374,6 +375,37 @@ export async function closeMembershipInto(
       const context = await lockContextForUnit(session, teamId, contextUnitId);
       if (!context) return { ok: false, error: "context unit or item not found" };
       return closeMembershipIntoLocked(context, contextUnitId, projectId);
+    });
+  } catch (error) {
+    return { ok: false, error: contextFailureMessage(error) };
+  }
+}
+
+/**
+ * Close only machine-owned Drive/default includes; human curation is never a claim side effect.
+ * Same lock/revalidation protocol as every other membership write.
+ */
+export async function closeGdriveManagedMembership(
+  db: DbClient,
+  teamId: string,
+  contextUnitId: string,
+  projectId: string
+): Promise<WriteResult> {
+  try {
+    return await runContextTransaction(db, async (session) => {
+      const context = await lockContextForUnit(session, teamId, contextUnitId);
+      if (!context) return { ok: false, error: "context unit or item not found" };
+      const { error } = await session.db
+        .from("project_context_memberships")
+        .update({ valid_to: new Date().toISOString() })
+        .eq("team_id", teamId)
+        .eq("context_unit_id", contextUnitId)
+        .eq("project_id", projectId)
+        .eq("decision", "include")
+        .eq("mode", "auto")
+        .in("method", ["gdrive_claim", "ingestion_project"])
+        .is("valid_to", null);
+      return error ? { ok: false, error: error.message } : { ok: true };
     });
   } catch (error) {
     return { ok: false, error: contextFailureMessage(error) };

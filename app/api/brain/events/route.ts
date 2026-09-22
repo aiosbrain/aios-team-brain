@@ -3,9 +3,12 @@ import { serverClient } from "@/lib/db/server";
 import { adminClient } from "@/lib/db/admin";
 import { getSessionUser } from "@/lib/auth/session";
 import { errorResponse } from "@/lib/api/schemas";
-import { recentEvents } from "@/lib/graph/learning";
+import { recentEventsWithStatus } from "@/lib/graph/learning";
 import { resolveHumanActorsByItem } from "@/lib/graph/human-actors";
 import { attributeEventParticipants } from "@/lib/graph/arc-attribution";
+import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { visibleItemIdsForProjects } from "@/lib/access/enforce";
+import { GraphProvenanceUnavailableError, readAuthorizedGraphFacts } from "@/lib/graph/provenance-read";
 
 export const runtime = "nodejs";
 
@@ -88,7 +91,39 @@ export async function GET(req: NextRequest) {
     console.error(`[events] partition resolution failed for team ${teamSlug}:`, e);
     return Response.json({ events: [], as_of: new Date().toISOString(), degraded: true });
   }
-  const events = await recentEvents(groups, since, LIMIT);
+  let events: Awaited<ReturnType<typeof recentEventsWithStatus>>["events"] = [];
+  try {
+    let settled = false;
+    for (let attempt = 0; attempt < 2 && !settled; attempt += 1) {
+      const epoch = await authorizationEpoch(admin, team.id);
+      const visible = await visibleItemIdsForProjects(admin, team.id, oracle.set.projectIds);
+      if (visible.error) throw new GraphProvenanceUnavailableError("event item authorization read failed");
+      const graph = await recentEventsWithStatus(groups, since, LIMIT);
+      if (!graph.ok) throw new GraphProvenanceUnavailableError("graph event read failed");
+      const authorizedFacts = await readAuthorizedGraphFacts(admin, {
+        teamId: team.id, groupIds: groups, sinceISO: since, limit: LIMIT * 20,
+      });
+      if (await authorizationEpoch(admin, team.id) !== epoch) continue;
+      const authorizedFactIds = new Set(authorizedFacts.map((fact) => fact.id));
+      events = graph.events.flatMap((event) => {
+        // Titles and participants are episode-derived prose too: the event's canonical item must
+        // remain visible. Facts additionally require their complete relationship dependency set.
+        if (!event.itemId || !visible.ids.has(event.itemId)) return [];
+        const facts = (event.factEvidence ?? [])
+          .filter((evidence) => authorizedFactIds.has(evidence.id))
+          .map((evidence) => evidence.fact);
+        const { factEvidence: _privateEvidence, ...wire } = event;
+        return [{ ...wire, facts, factCount: facts.length }];
+      });
+      settled = true;
+    }
+    if (!settled) throw new GraphProvenanceUnavailableError("event authorization changed repeatedly");
+  } catch (error) {
+    if (error instanceof GraphProvenanceUnavailableError) {
+      return errorResponse("temporarily_unavailable", "graph provenance authorization is temporarily unavailable", 503);
+    }
+    throw error;
+  }
 
   // Tag any recognized AI-agent participant name with the human behind that event's item, or
   // "(unattributed AI agent)" when none resolves — same attribution as narrative arcs (Layer 3);

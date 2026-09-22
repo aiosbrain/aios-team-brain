@@ -46,6 +46,19 @@ describe("the shared disabled-feature vocabulary", () => {
   });
 });
 
+/** Fusion binds every read to the team's authorization epoch and arc-correction version (AIO-1167).
+ *  Both are Postgres reads; held constant here so the no-model behaviour is the only variable. */
+function mockStableArcAuthorization(): void {
+  vi.doMock("@/lib/access/authorization-epoch", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@/lib/access/authorization-epoch")>()),
+    authorizationEpoch: async () => 1,
+  }));
+  vi.doMock("@/lib/graph/arc-corrections", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
+    arcCorrectionVersion: async () => 0,
+  }));
+}
+
 describe("the arcs panel degrades to its cached rows instead of failing", () => {
   it("synthesizes nothing and warms nothing when there is no model", async () => {
     // `null` keys is the explicit no-model signal. The observable is that neither the inline
@@ -63,6 +76,7 @@ describe("the arcs panel degrades to its cached rows instead of failing", () => 
       getArcs, schedulePartitionRefresh,
     }));
     vi.doMock("@/lib/graph/extraction-health", () => ({ latestPushByGroup: async () => new Map() }));
+    mockStableArcAuthorization();
 
     const { getFusedArcs } = await import("@/lib/graph/arc-fusion");
     const panel = await getFusedArcs({} as never, "team", "slug", ["one", "two"], null);
@@ -86,6 +100,7 @@ describe("the arcs panel degrades to its cached rows instead of failing", () => 
       getArcs, schedulePartitionRefresh,
     }));
     vi.doMock("@/lib/graph/extraction-health", () => ({ latestPushByGroup: async () => new Map() }));
+    mockStableArcAuthorization();
 
     const { getFusedArcs } = await import("@/lib/graph/arc-fusion");
     await getFusedArcs({} as never, "team", "slug", ["one", "two"], {} as never);

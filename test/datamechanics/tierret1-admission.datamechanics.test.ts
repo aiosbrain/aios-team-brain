@@ -382,9 +382,11 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
   const keysOf = async (teamId: string) =>
     (((await db().from("work_timeline_cache").select("group_key, payload").eq("team_id", teamId)).data ?? []) as { group_key: string; payload: { v: number } }[]);
 
-  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at payload v16", async () => {
+  it("cold then warm: the granted content is served under adm:<class>:<tier>:<hash> at the current payload version", async () => {
     const { F } = await timelineFixture();
-    expect(PAYLOAD_VERSION, "15 is reserved by PR 714").toBe(16);
+    // 16 was TIERRET-1's own bump; AIO-1167's Drive-ledger meaning change takes 18 (17 is reserved
+    // by PR 714). The `adm:` namespace, not the number, is what this case is about.
+    expect(PAYLOAD_VERSION, "17 is reserved by PR 714").toBe(18);
     const cold = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
     await settleTimelineRefreshes();
     const warm = await getCachedWorkTimeline(db(), F.seed.teamId, "external", F.external);
@@ -392,7 +394,7 @@ describe("TIERRET-1 AC-12 — timeline cache: new namespace, v16, admission-sepa
     const rows = await keysOf(F.seed.teamId);
     const key = await timelineViewKey(db(), F.seed.teamId, "external", F.external);
     expect(key.startsWith("adm:"), key).toBe(true);
-    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(16);
+    expect(rows.find((r) => r.group_key === key)?.payload.v).toBe(PAYLOAD_VERSION);
   });
 
   it("revoking the grant moves the member to a different variant that no longer names the work", async () => {

@@ -1,6 +1,6 @@
 import "server-only";
 import type { PoolClient } from "pg";
-import { getPool } from "./pool";
+import { ambientTransactionClient, doomAmbientTransaction, getPool } from "./pool";
 import type { DbClient, SqlExecutor, TransactionSession } from "@/lib/db/types";
 
 type SqlStateError = Error & { code?: string };
@@ -148,10 +148,17 @@ function withControlFailure(
 
 async function rollback(
   client: PoolClient,
-  primary: unknown
+  primary: unknown,
+  /** Joined session: undo only this session's statements; the enclosing transaction stays open. */
+  savepoint: string | null = null
 ): Promise<{ ok: true } | { ok: false; error: TransactionExecutionError }> {
   try {
-    await client.query("ROLLBACK");
+    if (savepoint) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+    } else {
+      await client.query("ROLLBACK");
+    }
     return { ok: true };
   } catch (cleanup) {
     return {
@@ -190,12 +197,31 @@ export interface PgTransactionFactory {
 /**
  * Transaction engine for PgClient. Query-builder errors are normally returned in envelopes, so
  * the tracker is checked independently of the callback's return/throw path before COMMIT.
+ *
+ * JOINED SESSIONS (AIO-1167). When an ambient `withTransaction` from `lib/db/pg/pool` encloses the
+ * call, the session runs on THAT connection behind a savepoint instead of checking out a second
+ * one. The enclosing writer already holds the item/provider locks and its uncommitted rows, so a
+ * second connection would wait on its own caller and see none of its writes. Every session rule
+ * above is kept, scoped to the savepoint: tracked failures and an unsanctioned `ok:false` roll back
+ * to it, success releases it, and a connection that cannot be proven healthy dooms the enclosing
+ * transaction (it can only roll back) rather than being released. With no ambient transaction —
+ * every caller that predates the Drive connector — nothing here differs.
  */
 export async function runPgClientTransaction<T>(
   factory: PgTransactionFactory,
   fn: (session: TransactionSession) => Promise<T>
 ): Promise<T> {
-  const client = factory.connect ? await factory.connect() : await getPool().connect();
+  const ambient = factory.connect ? undefined : ambientTransactionClient();
+  const savepoint = ambient ? `auditfix13_joined_${++savepointSerial}` : null;
+  const client =
+    ambient ?? (factory.connect ? await factory.connect() : await getPool().connect());
+  const releaseHealthy = (): void => {
+    if (!ambient) normalRelease(client);
+  };
+  const releaseUncertain = (cause: unknown): void => {
+    if (ambient) doomAmbientTransaction(cause);
+    else destroyRelease(client, cause);
+  };
   let begun = false;
   let released = false;
   const tracker = new FailureTracker();
@@ -310,11 +336,11 @@ export async function runPgClientTransaction<T>(
     transactionSessions.set(db, session);
 
     try {
-      await control("BEGIN");
+      await control(savepoint ? `SAVEPOINT ${savepoint}` : "BEGIN");
       begun = true;
     } catch (error) {
       session.active = false;
-      destroyRelease(client, error);
+      releaseUncertain(error);
       released = true;
       throw new TransactionExecutionError(`BEGIN failed: ${messageOf(error)}`, {
         cause: error,
@@ -328,18 +354,18 @@ export async function runPgClientTransaction<T>(
     } catch (callbackError) {
       const failure = tracker.lastSince();
       const primary = failure ? executionError(failure) : callbackError;
-      const rb = await rollback(client, primary);
+      const rb = await rollback(client, primary, savepoint);
       session.active = false;
       if (!rb.ok || session.fatalControlFailure || isConnectionFailure(primary)) {
         const rollbackPrimary = !rb.ok ? rb.error : primary;
         const fatal = session.fatalControlFailure
           ? withControlFailure(rollbackPrimary, session.fatalControlFailure)
           : rollbackPrimary;
-        destroyRelease(client, fatal);
+        releaseUncertain(fatal);
         released = true;
         throw fatal;
       }
-      normalRelease(client);
+      releaseHealthy();
       released = true;
       throw primary;
     }
@@ -352,56 +378,62 @@ export async function runPgClientTransaction<T>(
             `transaction session control failed: ${messageOf(session.fatalControlFailure)}`,
             { cause: session.fatalControlFailure, code: sqlStateOf(session.fatalControlFailure) }
           );
-      const rb = await rollback(client, primary);
+      const rb = await rollback(client, primary, savepoint);
       session.active = false;
       if (!rb.ok || session.fatalControlFailure || isConnectionFailure(primary)) {
         const rollbackPrimary = !rb.ok ? rb.error : primary;
         const fatal = failure && session.fatalControlFailure
           ? withControlFailure(rollbackPrimary, session.fatalControlFailure)
           : rollbackPrimary;
-        destroyRelease(client, fatal);
+        releaseUncertain(fatal);
         released = true;
         throw fatal;
       }
-      normalRelease(client);
+      releaseHealthy();
       released = true;
       throw primary;
     }
 
     if (returnedFailure(result) && !deliberateCommitResults.has(result as object)) {
-      const rb = await rollback(client, "transaction callback returned ok:false");
+      const rb = await rollback(client, "transaction callback returned ok:false", savepoint);
       session.active = false;
       if (!rb.ok) {
-        destroyRelease(client, rb.error);
+        releaseUncertain(rb.error);
         released = true;
         throw rb.error;
       }
-      normalRelease(client);
+      releaseHealthy();
       released = true;
       return result;
     }
 
     try {
-      await control("COMMIT");
+      await control(savepoint ? `RELEASE SAVEPOINT ${savepoint}` : "COMMIT");
     } catch (error) {
       session.active = false;
-      const unknown = new TransactionExecutionError(
-        `COMMIT failed; outcome unknown and will not be replayed: ${messageOf(error)}`,
-        { cause: error, code: sqlStateOf(error), unknownCommit: true }
-      );
-      destroyRelease(client, unknown);
+      // A joined session has no durable outcome of its own: a failed release dooms the enclosing
+      // transaction, which then rolls back, so nothing is left in the unknown-commit state.
+      const unknown = savepoint
+        ? new TransactionExecutionError(`RELEASE SAVEPOINT failed: ${messageOf(error)}`, {
+            cause: error,
+            code: sqlStateOf(error),
+          })
+        : new TransactionExecutionError(
+            `COMMIT failed; outcome unknown and will not be replayed: ${messageOf(error)}`,
+            { cause: error, code: sqlStateOf(error), unknownCommit: true }
+          );
+      releaseUncertain(unknown);
       released = true;
       throw unknown;
     }
     session.active = false;
-    normalRelease(client);
+    releaseHealthy();
     released = true;
     return result;
   } finally {
     if (live.session) live.session.active = false;
     if (!released) {
-      destroyRelease(
-        client,
+      releaseUncertain(
         new Error(begun ? "transaction ended with uncertain state" : "transaction setup did not complete")
       );
     }
