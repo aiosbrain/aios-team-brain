@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request, Response
 from .config import BrainSettings, Connection, load_connections
 from .engine import ingest_docs
 from .sources import build_source
+from .state import StateStore
 
 app = FastAPI(title="aios-ingest webhooks")
 
@@ -39,6 +40,11 @@ def health() -> dict[str, str]:
 async def webhook(source: str, request: Request) -> Response:
     raw = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()}
+
+    # Drive notifications are empty-body, header-only HINTS. Validate all persisted channel
+    # identity before scheduling an idempotent poll; never fetch provider content in this request.
+    if source == "gdrive":
+        return _gdrive_notification(headers)
 
     # Slack Events API URL verification handshake.
     if source == "slack":
@@ -75,3 +81,32 @@ async def _safe_json(raw: bytes) -> dict:
     except json.JSONDecodeError as e:
         raise ValueError("invalid JSON") from e
     return data if isinstance(data, dict) else {}
+
+
+def _gdrive_notification(headers: dict[str, str]) -> Response:
+    channel_id = headers.get("x-goog-channel-id")
+    resource_id = headers.get("x-goog-resource-id")
+    token = headers.get("x-goog-channel-token")
+    if not channel_id or not resource_id:
+        return Response(status_code=401, content="invalid Drive notification")
+    state = StateStore(os.environ.get("AIOS_INGEST_STATE", "aios_ingest_state.sqlite"))
+    try:
+        channel = state.validate_notification(
+            channel_id=channel_id, resource_id=resource_id, verification_token=token
+        )
+        if not channel:
+            return Response(status_code=401, content="invalid Drive notification")
+        if channel.namespace:
+            progress = state.get_progress(channel.namespace)
+            if progress:
+                message_number = headers.get("x-goog-message-number", "unknown")
+                state.enqueue_work(
+                    channel.namespace,
+                    progress.generation,
+                    f"notification:{channel_id}:{message_number}",
+                    "poll",
+                    {"resource_state": headers.get("x-goog-resource-state", "")},
+                )
+        return Response(status_code=202, content="Drive poll scheduled")
+    finally:
+        state.close()

@@ -872,6 +872,8 @@ export const INTEGRATION_TYPES = [
   // The connector already exists (ingestion/aios_ingest/sources/notion.py + notion_authors.py, which
   // resolves created_by/last_edited_by → the item's authors) — it just had nowhere to read a token from.
   "notion",
+  // Google Drive/Docs data connector. Distinct from `google`, which is an LLM provider key.
+  "gdrive",
   "linear",
   "plane",
   // ClickUp: the token is the SECRET (a `pk_…` personal API token); the non-secret selection is the
@@ -1004,6 +1006,26 @@ const integrationConfigSchemas: Record<IntegrationType, z.ZodType> = {
     .object({
       pageIds: z.array(z.string().min(1).max(120)).max(200).default([]),
       databaseId: z.string().max(120).optional(),
+    })
+    .strict(),
+  gdrive: z
+    .object({
+      fileIds: z.array(z.string().min(1).max(200)).max(500).default([]),
+      folderIds: z.array(z.string().min(1).max(200)).max(200).default([]),
+      sharedDriveIds: z.array(z.string().min(1).max(200)).max(100).default([]),
+      recursive: z.boolean().default(false),
+      // Absent config, intentional empty scope, successful selection, denied discovery and a
+      // partial discovery result are operationally different; never turn [] into "all Drive".
+      selectionState: z.enum(["absent", "empty", "selected", "denied", "partial"]).default("absent"),
+      projectSlug: z.string().min(1).max(120).regex(/^[a-z0-9][a-z0-9-]*$/).optional(),
+      access: z.enum(["team", "external"]).default("team"),
+      authMode: z.enum(["oauth", "service_account"]).default("oauth"),
+      serviceAccountStatus: z.enum(["pending", "verified", "failed"]).optional(),
+      serviceAccountIdentity: z.string().email().max(320).optional(),
+      authenticatedAccount: z.string().email().max(320).optional(),
+      authenticatedAccountId: z.string().min(1).max(300).optional(),
+      scopeSet: z.array(z.string().min(1).max(200)).max(20).optional(),
+      audienceProjectIds: z.array(z.string().uuid()).max(100).optional(),
     })
     .strict(),
   linear: z

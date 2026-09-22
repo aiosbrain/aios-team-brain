@@ -37,6 +37,8 @@ export interface PurgeOptions {
   /** Injectable for tests; defaults to the configured Graphiti (or a no-op when it isn't configured). */
   client?: GraphitiClient;
   actor?: { memberId?: string | null; apiKeyId?: string | null };
+  /** Revocation path: hard-delete cache payloads before content removal; failure keeps content retryable. */
+  requireCachePurge?: boolean;
 }
 
 /** How many paths an audit row records inline. A record, not a backup — the count stays authoritative. */
@@ -160,6 +162,19 @@ export async function purgeItemIds(
   // the wrong trade for the one operation in the ingest path that cannot be undone. (Found by watching
   // the first live purge in prod: 13 items → 12, and nothing on the box could say which one went.)
   const { paths, readFailed } = await purgedPaths(db, teamId, itemIds);
+
+  if (opts.requireCachePurge) {
+    const { data: team, error: teamError } = await db
+      .from("teams")
+      .select("slug")
+      .eq("id", teamId)
+      .maybeSingle();
+    if (teamError || !(team as { slug?: string } | null)?.slug) {
+      throw new Error(`revocation cache scope read failed: ${teamError?.message ?? "team slug missing"}`);
+    }
+    const { purgeTeamLearningCachesStrict } = await import("@/lib/ingest/reconcile-attribution");
+    await purgeTeamLearningCachesStrict(db, teamId, (team as { slug: string }).slug);
+  }
 
   // Graph FIRST. Deleting the items first would strand the ledger rows AND leave the extracted facts
   // answering questions in Graphiti with nothing left pointing at them — the graph is the one

@@ -55,7 +55,7 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
     : { data: null };
 
   const db = adminClient();
-  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth] = await Promise.all([
+  const [integrations, ingestRuns, pipelineHealth, freshness, retrievalHealth, gdriveRunsResult] = await Promise.all([
     listIntegrations(db, team.id, { role: me?.role as string | undefined }) as Promise<IntegrationRow[]>,
     listRecentIngestRuns(db, team.id, 30),
     getPipelineHealth(team.id),
@@ -68,6 +68,11 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
       me ? await (await import("@/lib/access/posture")).resolveViewerPosture(db, team.id, (me as { id: string }).id) : "external"
     ),
     getRetrievalHealth(team.id),
+    db.from("gdrive_run_requests")
+      .select("id,integration_id,trigger,status,created_at,started_at,finished_at,summary,error")
+      .eq("team_id", team.id)
+      .order("created_at", { ascending: false })
+      .limit(25),
   ]);
   const githubIntegration = integrations.find((i) => i.type === "github") ?? null;
   const openrouter = integrations.find((i) => i.type === "openrouter") ?? null;
@@ -189,6 +194,22 @@ export default async function IntegrationsPage({ params }: { params: Promise<{ t
         integrations={integrations}
         primaryPmProvider={(team.primary_pm_provider as "plane" | "linear" | null) ?? null}
         meetingTaskStatus={normalizeMeetingTaskStatus(team.meeting_task_status)}
+        gdrivePicker={
+          process.env.GOOGLE_DRIVE_CLIENT_ID
+          && process.env.GOOGLE_DRIVE_PICKER_API_KEY
+          && process.env.GOOGLE_DRIVE_APP_ID
+            ? {
+                clientId: process.env.GOOGLE_DRIVE_CLIENT_ID,
+                apiKey: process.env.GOOGLE_DRIVE_PICKER_API_KEY,
+                appId: process.env.GOOGLE_DRIVE_APP_ID,
+              }
+            : null
+        }
+        gdriveRuns={(gdriveRunsResult.data ?? []) as Array<{
+          id: string; integration_id: string; trigger: string; status: string;
+          created_at: string; started_at: string | null; finished_at: string | null;
+          summary: Record<string, unknown>; error: string | null;
+        }>}
         answering={{
           provider: answeringProvider,
           models: answeringModels,

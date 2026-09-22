@@ -61,6 +61,7 @@ const STALE_MS_BY_SOURCE: Record<string, number | null> = {
   llm: null, // event-driven; not a banner leg at all since LLMOBS-1 — see NOT_PIPELINE_LEGS
   scan: null, // manual / CI
   pm_sync: null, // reactive — its own staleness heuristic lives in lib/pm-sync/runs
+  gdrive: null, // run ledger is team-scoped; connection progress supplies backlog/cursor diagnostics
   // One-time marker-guarded materialization (PRET-4): the tick retry writes a row ONLY on
   // failure (success is the boot log + the marker), so "no row for N hours" is its healthy
   // steady state forever — a staleness threshold can only cry wolf; a recorded FAILURE row

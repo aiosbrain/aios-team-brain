@@ -24,7 +24,7 @@ const factsMock = vi.hoisted(() => ({ recentFacts: vi.fn(), resolveEpisodeItems:
 const llmMock = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
 const gateMock = vi.hoisted(() => ({ arcIneligibleItemIds: vi.fn() }));
 const creditMock = vi.hoisted(() => ({ resolveItemCredit: vi.fn() }));
-const correctionsMock = vi.hoisted(() => ({ listArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
+const correctionsMock = vi.hoisted(() => ({ listAuthorizedArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
 
 vi.mock("@/lib/graph/learning", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/learning")>()),
@@ -41,7 +41,7 @@ vi.mock("@/lib/attribution/contributor-credit", async (importOriginal) => ({
 }));
 vi.mock("@/lib/graph/arc-corrections", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
-  listArcCorrections: correctionsMock.listArcCorrections,
+  listAuthorizedArcCorrections: correctionsMock.listAuthorizedArcCorrections,
   recordArcCorrections: correctionsMock.recordArcCorrections,
 }));
 vi.mock("@/lib/llm/complete", async (importOriginal) => ({
@@ -78,7 +78,7 @@ beforeEach(() => {
   llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
   gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
   creditMock.resolveItemCredit.mockResolvedValue(new Map());
-  correctionsMock.listArcCorrections.mockResolvedValue({ corrections: [], ok: true });
+  correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({ corrections: [], ok: true });
   factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
   factsMock.resolveEpisodeItems.mockResolvedValue({
     items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),

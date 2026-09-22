@@ -54,6 +54,8 @@ export interface EvidenceItem {
   kind: string;
   /** WORK time — ISO. Its date places the row on a day. */
   at: string;
+  /** Source-observed contribution role (editor/creator/owner/…). */
+  contributionRole?: string;
   /** LEGACY chip — no longer populated (any referenced task now heads its own group). Kept so cached
    *  payloads from the previous build still render during their TTL. */
   linkedTask?: EvidenceTaskRef;
@@ -323,7 +325,7 @@ export function groupTimeline(
     const b = bucket(dayOf(ev.at), ev.memberId);
     // EXPLICIT copy — a new EvidenceItem field must be added here too, or it is silently dropped
     // between the builder and the payload (the field exists on the type, so nothing type-errors).
-    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, linkedTask: ev.linkedTask, linkVia: ev.linkVia, via: ev.via };
+    const item: EvidenceItem = { id: ev.id, title: ev.title, url: ev.url, source: ev.source, kind: ev.kind, at: ev.at, contributionRole: ev.contributionRole, linkedTask: ev.linkedTask, linkVia: ev.linkVia, via: ev.via };
     if (ev.taskId && taskInfo.has(ev.taskId)) {
       const arr = b.tasks.get(ev.taskId) ?? [];
       arr.push(item);

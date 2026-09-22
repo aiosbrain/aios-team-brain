@@ -25,7 +25,9 @@ const llmMock = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
 // (The control case caught exactly that.)
 const gateMock = vi.hoisted(() => ({ arcIneligibleItemIds: vi.fn() }));
 const creditMock = vi.hoisted(() => ({ resolveItemCredit: vi.fn() }));
-const correctionsMock = vi.hoisted(() => ({ listArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
+const correctionsMock = vi.hoisted(() => ({ listAuthorizedArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
+const authorizationMock = vi.hoisted(() => ({ authorizedArcFacts: vi.fn() }));
+const epochMock = vi.hoisted(() => ({ current: 1 }));
 
 vi.mock("@/lib/graph/learning", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/learning")>()),
@@ -42,12 +44,22 @@ vi.mock("@/lib/attribution/contributor-credit", async (importOriginal) => ({
 }));
 vi.mock("@/lib/graph/arc-corrections", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
-  listArcCorrections: correctionsMock.listArcCorrections,
+  listAuthorizedArcCorrections: correctionsMock.listAuthorizedArcCorrections,
   recordArcCorrections: correctionsMock.recordArcCorrections,
 }));
 vi.mock("@/lib/llm/complete", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/llm/complete")>()),
   completeTextOrNull: llmMock.completeTextOrNull,
+}));
+vi.mock("@/lib/graph/arc-input-authorization", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/graph/arc-input-authorization")>()),
+  authorizedArcFacts: authorizationMock.authorizedArcFacts,
+}));
+vi.mock("@/lib/access/authorization-epoch", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/access/authorization-epoch")>()),
+  authorizationEpoch: vi.fn(async () => epochMock.current),
+  lockedAuthorizationEpoch: vi.fn(async () => epochMock.current),
+  withLockedAuthorizationEpoch: vi.fn(async (_teamId, fn) => fn(epochMock.current)),
 }));
 
 /** Enough of a DbClient for the arc-cache read/write and the answering-key lookups to no-op. */
@@ -120,13 +132,18 @@ const FACT = {
   episodeUuids: ["ep-1"],
 };
 
+beforeEach(() => {
+  epochMock.current = 1;
+  authorizationMock.authorizedArcFacts.mockImplementation(async (_db, args) => args.facts);
+});
+
 describe("a degraded synthesis never reaches the model", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
     gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
     creditMock.resolveItemCredit.mockResolvedValue(new Map());
-    correctionsMock.listArcCorrections.mockResolvedValue({ corrections: [], ok: true });
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({ corrections: [], ok: true });
     correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
   });
 
@@ -139,7 +156,8 @@ describe("a degraded synthesis never reaches the model", () => {
     const { getArcs } = await import("@/lib/graph/arcs");
     const { db } = fakeDb();
     const g = externalGroups();
-    await getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
+    await expect(getArcs(db, "team-1", "acme", g, KEYS, { scopeKey: `g:${g[0]}` }))
+      .rejects.toThrow("arc source provenance read failed");
 
     expect(llmMock.completeTextOrNull).not.toHaveBeenCalled();
   });
@@ -204,6 +222,79 @@ describe("a degraded synthesis never reaches the model", () => {
 
     expect(llmMock.completeTextOrNull).toHaveBeenCalled();
   });
+
+  it("keeps an unauthorized source marker out of prompt, cache, and initiating response", async () => {
+    const restricted = {
+      ...FACT,
+      id: "restricted",
+      fact: "RESTRICTED-WAFFLEBERRY-MARKER",
+      episodeUuids: ["ep-restricted"],
+    };
+    factsMock.recentFacts.mockResolvedValue({ facts: [FACT, restricted], ok: true });
+    factsMock.resolveEpisodeItems.mockResolvedValue({
+      items: new Map([
+        ["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }],
+        ["ep-restricted", { itemId: "22222222-2222-4222-8222-222222222222", source: "gdrive" }],
+      ]),
+      ok: true,
+    });
+    authorizationMock.authorizedArcFacts.mockImplementation(async (_db, args) =>
+      args.facts.filter((fact: { id: string }) => fact.id !== "restricted"));
+    llmMock.completeTextOrNull.mockResolvedValue(
+      '{"arcs":[{"title":"Safe arc","summary":"safe only","confidence":"high","participants":[],"supporting_facts":[1]}]}',
+    );
+
+    const { getArcs } = await import("@/lib/graph/arcs");
+    const { db, upserts } = fakeDb();
+    const g = externalGroups();
+    const response = await getArcs(db, "team-auth-filter", "acme", g, KEYS, { scopeKey: `g:${g[0]}` });
+
+    expect(JSON.stringify(llmMock.completeTextOrNull.mock.calls)).not.toContain("RESTRICTED-WAFFLEBERRY-MARKER");
+    expect(JSON.stringify(upserts)).not.toContain("RESTRICTED-WAFFLEBERRY-MARKER");
+    expect(JSON.stringify(response)).not.toContain("RESTRICTED-WAFFLEBERRY-MARKER");
+  });
+
+  it("re-resolves route scope after revocation while synthesis is blocked", async () => {
+    factsMock.recentFacts.mockResolvedValue({ facts: [FACT], ok: true });
+    const itemId = "11111111-1111-4111-8111-111111111111";
+    factsMock.resolveEpisodeItems.mockResolvedValue({
+      items: new Map([["ep-1", { itemId, source: "github" }]]),
+      ok: true,
+    });
+    let releaseFirst!: (value: string) => void;
+    llmMock.completeTextOrNull
+      .mockImplementationOnce(() => new Promise<string>((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce(
+        '{"arcs":[{"title":"Current scope","summary":"CURRENT-SCOPE-MARKER","confidence":"high","participants":[],"supporting_facts":[1]}]}',
+      );
+
+    const { getAuthorizationBoundFusedArcs } = await import("@/lib/graph/arc-fusion");
+    const { db, upserts } = fakeDb();
+    const firstGroup = `${slug()}_team`;
+    const secondGroup = `${slug()}_team`;
+    let resolutions = 0;
+    const pending = getAuthorizationBoundFusedArcs(
+      db, "team-blocked-synthesis", "acme", KEYS,
+      async () => {
+        resolutions += 1;
+        return {
+          groups: [resolutions === 1 ? firstGroup : secondGroup],
+          visibleItemIds: new Set([itemId]),
+        };
+      },
+    );
+    await vi.waitFor(() => expect(llmMock.completeTextOrNull).toHaveBeenCalledTimes(1));
+    epochMock.current = 2;
+    releaseFirst(
+      '{"arcs":[{"title":"Revoked scope","summary":"REVOKED-DURING-SYNTHESIS","confidence":"high","participants":[],"supporting_facts":[1]}]}',
+    );
+
+    const panel = await pending;
+    expect(resolutions).toBe(2);
+    expect(JSON.stringify(panel)).toContain("CURRENT-SCOPE-MARKER");
+    expect(JSON.stringify(panel)).not.toContain("REVOKED-DURING-SYNTHESIS");
+    expect(JSON.stringify(upserts)).not.toContain("REVOKED-DURING-SYNTHESIS");
+  });
 });
 
 
@@ -222,7 +313,7 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     // influence, and arcs quietly reverted to the version a human had already rejected. Reading the
     // corrections from Postgres on every synthesis is what makes a rebuilt graph still produce corrected
     // arcs. Nothing here goes near Graphiti: the facts leg is mocked and GRAPHITI_URL is unset.
-    correctionsMock.listArcCorrections.mockResolvedValue({
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({
       corrections: [
         { arc_id: "a1", arc_title: "Payments", corrected_text: "Dana led this, not Alex.", created_by: null, updated_at: "" },
       ],
@@ -243,12 +334,12 @@ describe("H13: a stored correction reaches synthesis even with the graph wiped",
     const prompt = JSON.stringify(llmMock.completeTextOrNull.mock.calls[0]);
     expect(prompt).toContain("Dana led this, not Alex.");
     // …and read for THIS team. The mock answers any argument, so without this a wrong teamId would pass.
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledWith(
+    expect(correctionsMock.listAuthorizedArcCorrections).toHaveBeenCalledWith(
       expect.anything(),
       "team-1",
       // PRET-3: every synthesis is partition-scoped; the legacy arm is dead (the H2 migration
       // re-keyed tier-set rows, so exact-scope is complete).
-      expect.objectContaining({ includeLegacy: false, groupKey: `g:${tg[0]}` })
+      expect.objectContaining({ partitionGroup: tg[0], groupKey: `g:${tg[0]}` })
     );
   });
 });
@@ -265,7 +356,7 @@ describe("PRET-3 H1: corrections never reach an EXTERNAL-SHAPED partition's synt
       items: new Map([["ep-1", { itemId: "11111111-1111-4111-8111-111111111111", source: "github" }]]),
       ok: true,
     });
-    correctionsMock.listArcCorrections.mockResolvedValue({
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({
       corrections: [
         {
           arc_id: "a1",
@@ -318,7 +409,7 @@ describe("a STORED correction must not disable the stability skip", () => {
     gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
     creditMock.resolveItemCredit.mockResolvedValue(new Map());
     correctionsMock.recordArcCorrections.mockResolvedValue(undefined);
-    correctionsMock.listArcCorrections.mockResolvedValue({
+    correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({
       corrections: [{ arc_id: "a1", arc_title: "P", corrected_text: "Dana led this.", created_by: null, updated_at: "" }],
       ok: true,
     });

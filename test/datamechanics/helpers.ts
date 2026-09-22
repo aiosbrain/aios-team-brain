@@ -97,6 +97,17 @@ export async function persistLegacyEmptyScopeForTest(teamId: string, tokenRowId:
 
 export type Seed = { teamId: string; teamSlug: string; memberId: string };
 
+export async function approvedAudienceProject(seed: Seed, tier: "team" | "external" = "team"): Promise<string> {
+  const { ensureAccessBootstrap, GENERAL_SLUG, EXTERNAL_SHARED_SLUG } = await import("@/lib/access/bootstrap");
+  const ready = await ensureAccessBootstrap(db(), seed.teamId);
+  if (!ready.ok) throw new Error(`access bootstrap failed: ${ready.error}`);
+  const slug = tier === "external" ? EXTERNAL_SHARED_SLUG : GENERAL_SLUG;
+  const { data, error } = await db().from("projects").select("id")
+    .eq("team_id", seed.teamId).eq("kind", "system").eq("slug", slug).single();
+  if (error || !data) throw new Error(`audience project missing: ${error?.message}`);
+  return (data as { id: string }).id;
+}
+
 /** Seed a real team + active member (FK targets the ingest/read paths require). */
 export async function seedTeam(): Promise<Seed> {
   const admin = db();
@@ -211,7 +222,20 @@ export async function externalMember(seed: Seed): Promise<string> {
   if (error || !data) throw new Error(`externalMember failed: ${error?.message}`);
   const id = (data as { id: string }).id;
   await placeMemberByTier(seed.teamId, id, "external");
+  await convergeIdentityAttribution(seed);
   return id;
+}
+
+/** Active roster mutations intentionally make attribution-dependent caches unavailable until the
+ * durable repair converges. Fixtures that need an immediately usable viewer call the production
+ * repair owner rather than bypassing the authority row. */
+export async function convergeIdentityAttribution(seed: Seed): Promise<void> {
+  const { data, error } = await db().from("team_identity_authority").select("repair_status")
+    .eq("team_id",seed.teamId).maybeSingle();
+  if(error) throw new Error(`identity authority fixture read failed: ${error.message}`);
+  if((data as {repair_status?:string}|null)?.repair_status === "complete") return;
+  const { repairAttributionNow } = await import("@/lib/ingest/reconcile-attribution");
+  await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:20,batchSize:100});
 }
 
 /** Ingest one item through the real lib/ingest path against the real DB. */

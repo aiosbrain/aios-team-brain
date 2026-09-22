@@ -26,7 +26,7 @@ export interface PgBuilder extends PromiseLike<DbResult<any[] | null>> {
   select(spec?: string, opts?: { count?: "exact"; head?: boolean }): PgBuilder;
   insert(values: unknown): PgBuilder;
   update(values: unknown): PgBuilder;
-  upsert(values: unknown, opts?: { onConflict?: string }): PgBuilder;
+  upsert(values: unknown, opts?: { onConflict?: string; ignoreDuplicates?: boolean }): PgBuilder;
   delete(): PgBuilder;
   eq(col: string, val: unknown): PgBuilder;
   neq(col: string, val: unknown): PgBuilder;

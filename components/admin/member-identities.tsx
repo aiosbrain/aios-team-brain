@@ -10,6 +10,8 @@ import { ProviderIdentityLink } from "@/components/admin/provider-identity-link"
 export interface ProviderLink {
   externalId: string;
   handle: string;
+  email: string;
+  revision: number;
 }
 
 export interface MemberIdentityProps {
@@ -21,12 +23,14 @@ export interface MemberIdentityProps {
   slack: ProviderLink | null;
   linear: ProviderLink | null;
   plane: ProviderLink | null;
+  gdrive: ProviderLink[];
 }
 
 const PROVIDER_META = [
   { key: "slack", label: "Slack", placeholder: "U0123ABC" },
   { key: "linear", label: "Linear", placeholder: "user uuid" },
   { key: "plane", label: "Plane", placeholder: "member id" },
+  { key: "gdrive", label: "Google", placeholder: "subject:… or permission:…" },
 ] as const;
 
 /**
@@ -36,16 +40,16 @@ const PROVIDER_META = [
  * is visible and fixable: add the alternate email as an alias, or link the provider id directly.
  */
 export function MemberIdentities(props: MemberIdentityProps) {
-  const { teamSlug, memberId, rosterEmail, github, emails, slack, linear, plane } = props;
+  const { teamSlug, memberId, rosterEmail, github, emails, slack, linear, plane, gdrive } = props;
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [pending, startTransition] = useTransition();
   const [newEmail, setNewEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  const providers: Record<string, ProviderLink | null> = { slack, linear, plane };
-  const linkedCount = [github, slack, linear, plane].filter(Boolean).length;
-  const unlinked = PROVIDER_META.filter((p) => !providers[p.key]).map((p) => p.label);
+  const providers: Record<string, ProviderLink | null> = { slack, linear, plane, gdrive: gdrive[0] ?? null };
+  const linkedCount = [github, slack, linear, plane].filter(Boolean).length + gdrive.length;
+  const unlinked = PROVIDER_META.filter((p) => p.key === "gdrive" ? gdrive.length === 0 : !providers[p.key]).map((p) => p.label);
 
   function addEmail() {
     const e = newEmail.trim();
@@ -134,7 +138,7 @@ export function MemberIdentities(props: MemberIdentityProps) {
                 avatarUrl={github?.avatarUrl ?? null}
               />
             </div>
-            {PROVIDER_META.map((p) => (
+            {PROVIDER_META.filter((p) => p.key !== "gdrive").map((p) => (
               <ProviderIdentityLink
                 key={p.key}
                 teamSlug={teamSlug}
@@ -143,9 +147,36 @@ export function MemberIdentities(props: MemberIdentityProps) {
                 label={p.label}
                 externalId={providers[p.key]?.externalId ?? null}
                 handle={providers[p.key]?.handle ?? null}
+                email={providers[p.key]?.email ?? null}
+                revision={providers[p.key]?.revision ?? 0}
                 placeholder={p.placeholder}
               />
             ))}
+            {gdrive.map((identity) => (
+              <ProviderIdentityLink
+                key={identity.externalId}
+                teamSlug={teamSlug}
+                memberId={memberId}
+                provider="gdrive"
+                label="Google"
+                externalId={identity.externalId}
+                handle={identity.handle}
+                email={identity.email}
+                revision={identity.revision}
+                placeholder="subject:… or permission:…"
+              />
+            ))}
+            <ProviderIdentityLink
+              teamSlug={teamSlug}
+              memberId={memberId}
+              provider="gdrive"
+              label={gdrive.length ? "Google +" : "Google"}
+              externalId={null}
+              handle={null}
+              email={null}
+              revision={0}
+              placeholder="subject:… or permission:…"
+            />
           </div>
           {error ? <p className="text-xs text-red">{error}</p> : null}
         </div>

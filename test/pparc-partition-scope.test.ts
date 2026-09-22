@@ -12,7 +12,7 @@ const factsMock = vi.hoisted(() => ({ recentFacts: vi.fn(), resolveEpisodeItems:
 const llmMock = vi.hoisted(() => ({ completeTextOrNull: vi.fn() }));
 const gateMock = vi.hoisted(() => ({ arcIneligibleItemIds: vi.fn() }));
 const creditMock = vi.hoisted(() => ({ resolveItemCredit: vi.fn() }));
-const correctionsMock = vi.hoisted(() => ({ listArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
+const correctionsMock = vi.hoisted(() => ({ listAuthorizedArcCorrections: vi.fn(), recordArcCorrections: vi.fn() }));
 
 vi.mock("@/lib/graph/learning", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/learning")>()),
@@ -29,7 +29,7 @@ vi.mock("@/lib/attribution/contributor-credit", async (importOriginal) => ({
 }));
 vi.mock("@/lib/graph/arc-corrections", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/graph/arc-corrections")>()),
-  listArcCorrections: correctionsMock.listArcCorrections,
+  listAuthorizedArcCorrections: correctionsMock.listAuthorizedArcCorrections,
   recordArcCorrections: correctionsMock.recordArcCorrections,
 }));
 vi.mock("@/lib/llm/complete", async (importOriginal) => ({
@@ -63,7 +63,7 @@ beforeEach(() => {
   llmMock.completeTextOrNull.mockResolvedValue('{"arcs":[]}');
   gateMock.arcIneligibleItemIds.mockResolvedValue(new Set());
   creditMock.resolveItemCredit.mockResolvedValue(new Map());
-  correctionsMock.listArcCorrections.mockResolvedValue({ corrections: [], ok: true });
+  correctionsMock.listAuthorizedArcCorrections.mockResolvedValue({ corrections: [], ok: true });
   factsMock.recentFacts.mockResolvedValue({ facts: [], ok: true });
   factsMock.resolveEpisodeItems.mockResolvedValue({ items: new Map(), ok: true });
 });
@@ -83,10 +83,11 @@ describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criter
     const t = slug();
     const group = projGroup();
     await getArcs(fakeDb(), "team-1", t, [group], KEYS, { scopeKey: `g:${group}` });
-    expect(correctionsMock.listArcCorrections).toHaveBeenCalledTimes(1);
-    expect(correctionsMock.listArcCorrections.mock.calls[0][2]).toMatchObject({
+    expect(correctionsMock.listAuthorizedArcCorrections).toHaveBeenCalledTimes(1);
+    expect(correctionsMock.listAuthorizedArcCorrections.mock.calls[0][2]).toMatchObject({
       groupKey: `g:${group}`,
-      includeLegacy: false,
+      partitionGroup: group,
+      expectedAuthorizationEpoch: 1,
     });
   });
 
@@ -98,6 +99,6 @@ describe("PPARC-2 — a g:-scoped synthesis reads ONLY its own partition (criter
     const t = slug();
     const group = `${t}_external`;
     await getArcs(fakeDb(), "team-1", t, [group], KEYS, { scopeKey: `g:${group}` });
-    expect(correctionsMock.listArcCorrections).not.toHaveBeenCalled();
+    expect(correctionsMock.listAuthorizedArcCorrections).not.toHaveBeenCalled();
   });
 });

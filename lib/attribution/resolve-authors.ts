@@ -2,13 +2,15 @@ import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import type { ItemPayload } from "@/lib/api/schemas";
 import {
-  buildIdentityMap,
+  providerIdentityState,
   resolveByProviderId,
   resolveMemberDetailed,
   type IdentityMap,
   type ResolveMethod,
 } from "@/lib/identity/resolve";
 import { parseAuthorIdentity } from "@/lib/codebases/commits-to-items";
+import { buildIdentityAuthoritySnapshot } from "@/lib/identity/authority";
+import type { AttributionOverride } from "@/lib/ingest";
 
 /**
  * Source-agnostic author attribution at INGEST — resolve "whose work is this?" from an item's
@@ -57,10 +59,14 @@ const ROLE_RANK: Record<string, number> = {
   author: 0,
   creator: 1,
   editor: 2,
-  speaker: 3,
-  assignee: 4,
-  reviewer: 5,
-  commenter: 6,
+  contributor: 3,
+  owner: 8,
+  speaker: 4,
+  assignee: 5,
+  organizer: 6,
+  attendee: 7,
+  reviewer: 9,
+  commenter: 10,
 };
 
 function roleRank(role: string | undefined): number {
@@ -145,8 +151,20 @@ function resolveRef(map: IdentityMap, ref: AuthorRef): { memberId: string | null
   if (ref.provider && ref.externalId) {
     const id = resolveByProviderId(map, ref.provider, ref.externalId);
     if (id) return { memberId: id, method: "provider" };
+    if (ref.provider.toLowerCase() === "gdrive" && providerIdentityState(map, "gdrive", ref.externalId)) {
+      return { memberId: null, method: "unresolved" };
+    }
   }
   if (ref.email) {
+    // Google account/permission evidence has a stricter trust boundary than generic author strings:
+    // exact confirmed roster/alias email only. Never promote a same-domain local part, handle or
+    // display name into a verified Google link.
+    if (ref.provider?.toLowerCase() === "gdrive") {
+      const email = ref.email.trim().toLowerCase();
+      const exact = !map.ambiguousEmails?.has(email) ? map.byEmail.get(email) : undefined;
+      if (exact) return { memberId: exact, method: "email" };
+      return { memberId: null, method: "unresolved" };
+    }
     const r = resolveMemberDetailed(map, { email: ref.email, key: ref.email });
     if (r.memberId) return r;
   }
@@ -207,8 +225,13 @@ export function resolveItemAuthorMember(
 /** Connector member ids for a team — resolution targets to EXCLUDE (authorship never lands on a sync
  *  account) AND the set that gates the never-actor rule below. Best-effort: on error, warn and return
  *  empty rather than silently degrading the never-connector invariant unseen. */
-export async function connectorMemberIds(db: DbClient, teamId: string): Promise<Set<string>> {
+export async function connectorMemberIds(
+  db: DbClient,
+  teamId: string,
+  opts: { strict?: boolean } = {},
+): Promise<Set<string>> {
   const { data, error } = await db.from("members").select("id").eq("team_id", teamId).eq("is_connector", true);
+  if (opts.strict && error) throw new Error(`connector identity read failed: ${error.message}`);
   if (error) console.warn(`[attribution] connectorMemberIds failed for team ${teamId}: ${error.message}`);
   return new Set((data ?? []).map((r) => (r as { id: string }).id));
 }
@@ -232,8 +255,12 @@ export async function attributeIncomingItem(
   teamId: string,
   payload: ItemPayload,
   actorMemberId: string
-): Promise<{ opts?: { authorMemberId: string | null } }> {
+): Promise<{ opts?: AttributionOverride }> {
   const refs = parseAuthorRefs(payload.frontmatter ?? {});
+  // Attribution is an authorization-like mutation boundary for every source, not only Drive.
+  // The authority snapshot makes every roster/alias/provider/connector read mandatory and carries
+  // the revision that the item transaction must validate before writing.
+  const snapshot = await buildIdentityAuthoritySnapshot(db, teamId);
   if (refs.length === 0) {
     // NO author signal at all — common for web/gdrive/confluence, which often carry no author.
     // The never-connector invariant has to hold here too, not just when a signal exists but fails to
@@ -241,21 +268,21 @@ export async function attributeIncomingItem(
     // credit flows from `items.member_id`) that content lands in a real person's timeline and arcs.
     // A HUMAN push with no signal keeps its own attribution — that IS their work (`aios push` on
     // their own notes); only an automated actor is barred from claiming it.
-    const connectors = await connectorMemberIds(db, teamId);
-    return connectors.has(actorMemberId) ? { opts: { authorMemberId: null } } : {};
+    return snapshot.connectorIds.has(actorMemberId)
+      ? { opts:{authorMemberId:null,mappingRevision:snapshot.revision} }
+      : {};
   }
-  const [map, connectors] = await Promise.all([buildIdentityMap(db, teamId), connectorMemberIds(db, teamId)]);
-  const res = resolveAuthors(map, refs, connectors);
-  if (res.memberId) return { opts: { authorMemberId: res.memberId } };
+  const res = resolveAuthors(snapshot.map, refs, snapshot.connectorIds);
+  if (res.memberId) return {opts:{authorMemberId:res.memberId,mappingRevision:snapshot.revision}};
   // Unresolved. A connector must never claim the work → null; a human self-push keeps its own actor
   // attribution (no override). (Perf note: this builds the identity map per author-bearing push,
   // including unchanged re-pushes whose dedup happens later in ingestItem — a cheap per-team cache is a
   // deferred optimization, not correctness.)
-  if (connectors.has(actorMemberId)) {
+  if (snapshot.connectorIds.has(actorMemberId)) {
     console.warn(
       `[attribution] connector push with unresolved author(s) [${res.unresolved.join(", ")}] (${payload.path}) → left unattributed`
     );
-    return { opts: { authorMemberId: null } };
+    return {opts:{authorMemberId:null,mappingRevision:snapshot.revision}};
   }
   return {};
 }

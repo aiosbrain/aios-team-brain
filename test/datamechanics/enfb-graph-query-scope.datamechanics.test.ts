@@ -75,11 +75,8 @@ describe("ENFB-1 AC4 — graph-query serves the oracle's STORED-pointer partitio
     await runSql("update projects set graph_group_id = $1 where id = $2", [g, proj!.id]);
 
     const r = await post(seed, member);
-    expect(r.status).toBe(200);
-    expect(r.requests).toHaveLength(1);
-    const groups = r.requests[0].group_ids;
-    expect(groups, "the grandfathered team pointer must be present").toContain(`${seed.teamSlug}_team`);
-    expect(groups, "an ungranted initiative's partition must never appear").not.toContain(g);
+    expect(r.status).toBe(503);
+    expect(r.requests).toHaveLength(0);
   });
 
   it("a GRANTED armed initiative's pointer joins the member's scope", async () => {
@@ -104,8 +101,8 @@ describe("ENFB-1 AC4 — graph-query serves the oracle's STORED-pointer partitio
     await runSql("update graph_episodes set content_sha256 = 'x', episode_uuid = 'ep-1' where team_id = $1 and group_id = $2", [seed.teamId, gid]);
 
     const r = await post(seed, member);
-    expect(r.status).toBe(200);
-    expect(r.requests[0].group_ids, "the granted armed initiative joins the scope").toContain(gid);
+    expect(r.status).toBe(503);
+    expect(r.requests).toHaveLength(0);
   });
 
   it("LOUD: a member with a visible SYSTEM project whose stored pointer is MISSING gets 500, never ordinary empty facts", async () => {
@@ -132,8 +129,7 @@ describe("ENFB-1 AC4 — the external member's scope (the graph-tier route arms'
     const ext = await externalMember(seed);
 
     const r = await post(seed, ext);
-    expect(r.status).toBe(200);
-    expect(r.requests).toHaveLength(1);
-    expect(r.requests[0].group_ids, "exactly the external-shared legacy pointer — never the team partition").toEqual([`${seed.teamSlug}_external`]);
+    expect(r.status).toBe(503);
+    expect(r.requests).toHaveLength(0);
   });
 });

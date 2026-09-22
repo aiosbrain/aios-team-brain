@@ -1,6 +1,7 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
-import { runSql } from "@/lib/db/pg/pool";
+import { runSql, withTransaction } from "@/lib/db/pg/pool";
+import { lockIdentityMutationAuthorities, withIdentityMutationBoundary } from "@/lib/identity/authority";
 import { hashPassword, verifyPasswordHash } from "./password";
 import { purgeExpiredAuthRows } from "./cleanup";
 import type { SessionUser } from "./pg-session";
@@ -36,23 +37,44 @@ export async function ensureAuthUser(email: string): Promise<string> {
 export async function linkMemberByEmail(
   authUserId: string,
   email: string,
-  teamId?: string | null
+  teamId?: string | null,
+  opts: { concurrencyHooks?: {
+    beforeIdentityLock?: () => Promise<void>;
+    afterIdentityLock?: () => Promise<void>;
+  } } = {},
 ): Promise<void> {
-  await runSql(
-    `update members set auth_user_id = $1
-     where email = $2 and auth_user_id is null and status <> 'disabled'`,
-    [authUserId, email]
-  );
-  if (teamId) {
-    await runSql(
-      `update members set status = 'active'
-       where team_id = $1 and email = $2 and status = 'invited'`,
-      [teamId, email]
+  await withTransaction(async () => {
+    // Discover without row locks, then mutate only this fixed set. A concurrent create on a new
+    // team is intentionally left for its own first-login pass instead of entering an unordered
+    // multi-team UPDATE whose trigger order PostgreSQL does not guarantee.
+    const { rows } = await runSql<{ team_id: string }>(
+      `select distinct team_id from members where email=$1 and status<>'disabled'`,
+      [email],
     );
-    // PRET-4 §1c: no membership hook on activation — the builtin row has existed since
-    // createMember wrote the invite default at creation (inert while 'invited' via the
-    // oracle's isPrincipal), so activation changes nothing group-side.
-  }
+    const teamIds = rows.map((row) => row.team_id);
+    await lockIdentityMutationAuthorities(teamIds, {
+      beforeAuthorityLocks: opts.concurrencyHooks?.beforeIdentityLock,
+      afterAuthorityLocks: opts.concurrencyHooks?.afterIdentityLock,
+    });
+    if (teamIds.length > 0) {
+      await runSql(
+        `update members set auth_user_id=$1
+          where email=$2 and team_id=any($3::uuid[])
+            and auth_user_id is null and status<>'disabled'`,
+        [authUserId, email, teamIds],
+      );
+    }
+    if (teamId && teamIds.includes(teamId)) {
+      await runSql(
+        `update members set status='active'
+          where team_id=$1 and email=$2 and status='invited'`,
+        [teamId, email],
+      );
+      // PRET-4 §1c: no membership hook on activation — the builtin row has existed since
+      // createMember wrote the invite default at creation (inert while 'invited' via the
+      // oracle's isPrincipal), so activation changes nothing group-side.
+    }
+  });
 }
 
 /**
@@ -61,12 +83,24 @@ export async function linkMemberByEmail(
  * resolving the session user's row). `authUserId` comes from the caller's session, so this can
  * only ever activate the caller's own membership.
  */
-export async function activateInvitedMembership(teamId: string, authUserId: string): Promise<void> {
-  await runSql(
-    `update members set status = 'active'
-     where team_id = $1 and auth_user_id = $2 and status = 'invited'`,
-    [teamId, authUserId]
-  );
+export async function activateInvitedMembership(
+  teamId: string,
+  authUserId: string,
+  opts: { concurrencyHooks?: {
+    beforeIdentityLock?: () => Promise<void>;
+    afterIdentityLock?: () => Promise<void>;
+  } } = {},
+): Promise<void> {
+  await withIdentityMutationBoundary(teamId, async () => {
+    await runSql(
+      `update members set status = 'active'
+       where team_id = $1 and auth_user_id = $2 and status = 'invited'`,
+      [teamId, authUserId],
+    );
+  }, {
+    beforeAuthorityLocks: opts.concurrencyHooks?.beforeIdentityLock,
+    afterAuthorityLocks: opts.concurrencyHooks?.afterIdentityLock,
+  });
   // PRET-4 §1c: no membership hook here either — see linkMemberByEmail.
 }
 

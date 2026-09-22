@@ -3,12 +3,11 @@
 import { revalidatePath } from "next/cache";
 import { after } from "next/server";
 import { adminClient } from "@/lib/db/admin";
-import { reconcileAttribution, bustTeamLearningCaches } from "@/lib/ingest/reconcile-attribution";
+import { reconcileAttribution, repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 import { requireTeamAdmin as requireAdmin } from "@/lib/auth/guard";
 import { linkGithub } from "@/lib/codebases/github";
 import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
 import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
-import { reattributeItems } from "@/lib/ingest/reattribute";
 import { adminSetPassword } from "@/lib/auth/pg-login";
 import { isPasswordStrongEnough, randomPassword, MIN_PASSWORD_LENGTH } from "@/lib/auth/password";
 import { audit } from "@/lib/api/audit";
@@ -18,7 +17,22 @@ import { runProvisioning } from "@/lib/provisioning/run";
 import type { ProvisioningResult, ProvisioningTool } from "@/lib/provisioning/types";
 
 // Providers whose identity is a stable user id in member_identities (GitHub uses its own login flow).
-const PROVIDERS = new Set(["slack", "linear", "plane"]);
+const PROVIDERS = new Set(["slack", "linear", "plane", "gdrive"]);
+
+function scheduleIdentityEffects(db: ReturnType<typeof adminClient>, teamId: string, teamSlug: string, provider: string) {
+  if (provider === "gdrive") {
+    after(async () => {
+      const { drainIdentityRepairs } = await import("@/lib/ingest/identity-repair");
+      await drainIdentityRepairs(db, { maxObligations: 4 });
+      // The provider obligation repairs retained Drive evidence; the team-wide obligation is the
+      // common authority for items, versions, code contributions, and cache publication. A Drive
+      // mapping is not healthy-complete until both converge at the same current revision.
+      await repairAttributionNow(db, teamId, teamSlug, { maxBatches: 20 });
+    });
+    return;
+  }
+  after(() => reconcileAttribution(db, teamId, teamSlug));
+}
 
 /**
  * Link a roster member to a GitHub login (admins only). Reuses `linkGithub`, which writes
@@ -55,7 +69,8 @@ export async function linkMemberGithub(
  * Map a roster member to a provider user id (admins only) — the manual path / correction when
  * auto-reconciliation missed or mismapped (e.g. a person uses a different email on that platform).
  * Writes a `member_identities` row so future ingestion attributes that provider's content to this
- * member. Admin-set → forces over any prior mapping. Provider ∈ {slack, linear, plane} (GitHub has
+ * member. Admin-set → forces over any prior mapping. Provider ∈ {slack, linear, plane, gdrive}
+ * (GitHub has
  * its own login flow via `linkMemberGithub`).
  */
 export async function linkMemberIdentity(
@@ -63,7 +78,8 @@ export async function linkMemberIdentity(
   memberId: string,
   provider: string,
   externalId: string,
-  handle?: string
+  handle?: string,
+  expectedRevision?: number,
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
@@ -72,15 +88,33 @@ export async function linkMemberIdentity(
   const ext = externalId.trim();
   if (!ext) return { ok: false, error: `${p} user id is required` };
   try {
+    const identityDb = adminClient();
+    let fencedRevision = expectedRevision;
+    // A blank "Add Google account" row starts with revision 0. Resolve a prior unlinked tombstone
+    // so an intentional reconnect is possible, but never turn the add path into a silent remap.
+    // Two concurrent first claims both observe 0; the writer lock lets one win and rejects the other.
+    if (p === "gdrive" && expectedRevision === 0) {
+      const { data: state, error } = await identityDb.from("member_identity_mapping_state")
+        .select("revision,state")
+        .eq("team_id", ctx.teamId)
+        .eq("provider", "gdrive")
+        .eq("external_id", ext)
+        .maybeSingle();
+      if (error) throw new Error(`Google identity authority read failed: ${error.message}`);
+      if (state?.state === "linked") {
+        return { ok: false, error: "this Google identity is already linked; refresh and use Change" };
+      }
+      fencedRevision = state ? Number(state.revision) : 0;
+    }
     await setMemberIdentity(
-      adminClient(),
+      identityDb,
       ctx.teamId,
       memberId,
       { provider: p, externalId: ext, handle: (handle ?? "").trim() },
-      { force: true, actor: { kind: "member", memberId: ctx.memberId } }
+      { force: true, expectedRevision: fencedRevision, actor: { kind: "member", memberId: ctx.memberId } }
     );
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
+    scheduleIdentityEffects(adminClient(), ctx.teamId, teamSlug, p);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not link identity" };
@@ -101,7 +135,8 @@ export async function linkMemberSlack(
 export async function unlinkMemberIdentity(
   teamSlug: string,
   provider: string,
-  externalId: string
+  externalId: string,
+  expectedRevision?: number,
 ): Promise<{ ok: boolean; error?: string }> {
   const ctx = await requireAdmin(teamSlug);
   if (!ctx) return { ok: false, error: "admins only" };
@@ -110,12 +145,10 @@ export async function unlinkMemberIdentity(
       adminClient(),
       ctx.teamId,
       { provider: provider.trim().toLowerCase(), externalId: externalId.trim() },
-      { actor: { kind: "member", memberId: ctx.memberId } }
+      { expectedRevision, actor: { kind: "member", memberId: ctx.memberId } }
     );
     revalidatePath(`/t/${teamSlug}/admin/members`);
-    // Unlink is conservative — reattribute never un-attributes, so this only re-points items that now
-    // resolve to a DIFFERENT member (it won't clear attribution). Refreshes arcs either way.
-    after(() => reconcileAttribution(adminClient(), ctx.teamId, teamSlug));
+    scheduleIdentityEffects(adminClient(), ctx.teamId, teamSlug, provider.trim().toLowerCase());
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "could not unlink identity" };
@@ -166,8 +199,7 @@ export async function reattributeIdentitiesNow(
     // Inline (returns a summary the button shows). Bust arcs too so this recovery path ALSO clears the
     // 10-min arc lag — matching the auto-reconcile hooks (the correction lock protects it from the same
     // TOCTOU race a concurrent auto-reconcile might hit).
-    const s = await reattributeItems(adminClient(), ctx.teamId);
-    await bustTeamLearningCaches(adminClient(), ctx.teamId, teamSlug);
+    const s = await repairAttributionNow(adminClient(), ctx.teamId, teamSlug, { maxBatches: 100 });
     revalidatePath(`/t/${teamSlug}/admin/members`);
     return {
       ok: true,

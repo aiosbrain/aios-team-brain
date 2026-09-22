@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolveMember, resolveByProviderId, type IdentityMap } from "@/lib/identity/resolve";
+import { resolveConfirmedEmail } from "@/lib/identity/provider-sync";
 
 // Pure-logic spec for the shared identity resolver (lib/identity/resolve). Locks the
 // misattribution-prevention rules so codebase contributions and cost attribution stay aligned.
@@ -56,5 +57,22 @@ describe("resolveByProviderId()", () => {
     expect(resolveByProviderId(mapOf(), "slack", "U999")).toBeNull();
     expect(resolveByProviderId(mapOf(), "linear", "U123")).toBeNull(); // wrong provider
     expect(resolveByProviderId(mapOf(), "slack", "")).toBeNull();
+  });
+
+  it("treats Google subject and permission ids as exact opaque identifiers", () => {
+    const map = mapOf();
+    map.byProviderId.set("gdrive:subject:AccountCase", "m-jane");
+    expect(resolveByProviderId(map, "gdrive", "subject:AccountCase")).toBe("m-jane");
+    expect(resolveByProviderId(map, "gdrive", "subject:accountcase")).toBeNull();
+  });
+});
+
+describe("resolveConfirmedEmail()", () => {
+  it("AC-08: provider auto-linking uses only an exact confirmed address, never local-part heuristics", () => {
+    expect(resolveConfirmedEmail(mapOf(), "jane@acme.com")).toBe("m-jane");
+    // Generic resolution intentionally supports this legacy convenience, but provider account
+    // verification must not promote it to a durable identity mapping.
+    expect(resolveMember(mapOf(), { email: "bob@acme.com" })).toBe("m-bob");
+    expect(resolveConfirmedEmail(mapOf(), "bob@acme.com")).toBeNull();
   });
 });

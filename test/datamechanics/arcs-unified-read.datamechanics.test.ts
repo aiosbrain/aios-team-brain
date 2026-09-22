@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { convergeIdentityAttribution, db, ingest, seedTeam } from "./helpers";
 import { runSql } from "@/lib/db/pg/pool";
 import { readFileSync } from "node:fs";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
@@ -59,6 +59,7 @@ describe("PRET-3/6 — resolveArcScope is the ONE resolution (spec §3; oracle-o
     // to nothing) but — since PRET-4 — has already written their builtin row from the invite
     // default, so activation is just the status flip (no recompute exists to call).
     await db().from("members").update({ status: "active" }).eq("id", m.id);
+    await convergeIdentityAttribution(seed);
 
     const r = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
     expect(r.arm, "an enforcing member's read arms — any tier").toBe(true);
@@ -95,13 +96,16 @@ describe("PRET-3 — the tier-row path stays COLD for re-routed readers (criteri
     expect((await ensureAccessBootstrap(db(), seed.teamId)).ok).toBe(true);
     const teamGroup = episodeGroupId(seed.teamSlug, "team");
     const extGroup = episodeGroupId(seed.teamSlug, "external");
-    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC("team-only-prose") as never, "h1");
-    await writeArcCache(db(), seed.teamId, `g:${extGroup}`, ARC("ext-shared-prose") as never, "h2");
     // A REAL external member — the retired permissive arm read the tier ARG; the one resolution
     // reads the MEMBER's oracle, so the fixture needs an actual external-posture principal.
     const { createMember } = await import("@/lib/admin/members");
     const m = await createMember(db(), seed.teamId, { email: `${randomUUID()}@test.local`, displayName: "Ext", actorHandle: `x-${randomUUID().slice(0, 8)}`, role: "member", tier: "external" });
     await db().from("members").update({ status: "active" }).eq("id", m.id);
+    await convergeIdentityAttribution(seed);
+    // Mapping repair purges every pre-mutation cache variant. Seed the current-epoch fixtures only
+    // after the new active principal's attribution effects have converged.
+    await writeArcCache(db(), seed.teamId, `g:${teamGroup}`, ARC("team-only-prose") as never, "h1");
+    await writeArcCache(db(), seed.teamId, `g:${extGroup}`, ARC("ext-shared-prose") as never, "h2");
 
     const scope = await resolveArcScope(db(), { teamId: seed.teamId, teamSlug: seed.teamSlug, memberId: m.id, tier: "external" });
     const panel = await getFusedArcs(db(), seed.teamId, seed.teamSlug, scope.groups, KEYS);

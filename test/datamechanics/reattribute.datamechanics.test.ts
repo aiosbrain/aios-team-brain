@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { ingestItem } from "@/lib/ingest";
 import { reattributeItems } from "@/lib/ingest/reattribute";
-import { setMemberIdentity } from "@/lib/identity/member-identities";
-import { addAuthorAlias } from "@/lib/admin/aliases";
+import { setMemberIdentity, removeMemberIdentity } from "@/lib/identity/member-identities";
+import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { db, seedTeam, sha, type Seed } from "./helpers";
 
 // Spec: ingest only stamps items.member_id on create/change, and (post attribution-fix) an
@@ -132,6 +132,45 @@ describe("reattributeItems (real Postgres)", () => {
     expect((await reattributeItems(db(), seed.teamId)).updated).toBe(0); // idempotent
   });
 
+  it("a successful provider unlink clears unlocked item and version credit but not unknown evidence", async () => {
+    const seed = await seedTeam();
+    const author = await addMember(seed.teamId);
+    await putResolved(seed, seed.memberId, author, "slack/eng/unlink.md", {
+      source: "slack", author_id: "U-unlink",
+    });
+    const linked = await setMemberIdentity(db(), seed.teamId, author, {
+      provider: "slack", externalId: "U-unlink",
+    });
+    await reattributeItems(db(), seed.teamId);
+    await removeMemberIdentity(db(), seed.teamId, {
+      provider: "slack", externalId: "U-unlink",
+    }, { expectedRevision: linked.mappingRevision });
+    const result = await reattributeItems(db(), seed.teamId);
+    expect(result.updated).toBe(1);
+    expect(await memberOf(seed.teamId, "slack/eng/unlink.md")).toBeNull();
+    expect(await versionMembersOf(seed.teamId, "slack/eng/unlink.md")).toEqual([null]);
+
+    await putResolved(seed, seed.memberId, author, "slack/eng/never-reviewed.md", {
+      source: "slack", author_id: "U-never-reviewed",
+    });
+    // Never-reviewed unresolved evidence is not an unlink and remains conservative.
+    expect((await reattributeItems(db(), seed.teamId)).updated).toBe(0);
+    expect(await memberOf(seed.teamId, "slack/eng/never-reviewed.md")).toBe(author);
+  });
+
+  it("clears retained unlocked provider credit when the mapped member is deactivated", async () => {
+    const seed=await seedTeam();
+    const author=await addMember(seed.teamId);
+    await setMemberIdentity(db(),seed.teamId,author,{provider:"slack",externalId:"U-disabled"});
+    await putResolved(seed,seed.memberId,author,"slack/eng/disabled.md",{
+      source:"slack",author_id:"U-disabled",
+    });
+    await db().from("members").update({status:"disabled"}).eq("id",author).eq("team_id",seed.teamId);
+    await reattributeItems(db(),seed.teamId);
+    expect(await memberOf(seed.teamId,"slack/eng/disabled.md")).toBeNull();
+    expect(await versionMembersOf(seed.teamId,"slack/eng/disabled.md")).toEqual([null]);
+  });
+
   it("re-points a git commit item once an email alias is added", async () => {
     const seed = await seedTeam();
     const author = await addMember(seed.teamId);
@@ -144,6 +183,19 @@ describe("reattributeItems (real Postgres)", () => {
     await addAuthorAlias(db(), seed.teamId, author, "bob@personal.com");
     expect((await reattributeItems(db(), seed.teamId)).updated).toBe(1);
     expect(await memberOf(seed.teamId, "commits/repo/abc.md")).toBe(author);
+  });
+
+  it("records an alias-unlink tombstone and clears unlocked git item/version credit", async () => {
+    const seed = await seedTeam();
+    const author = await addMember(seed.teamId);
+    await addAuthorAlias(db(), seed.teamId, author, "gone@personal.example");
+    await putResolved(seed, seed.memberId, author, "commits/repo/gone.md", {
+      source: "git", author: "Gone <gone@personal.example>",
+    });
+    await removeAuthorAlias(db(), seed.teamId, "gone@personal.example");
+    await reattributeItems(db(), seed.teamId);
+    expect(await memberOf(seed.teamId, "commits/repo/gone.md")).toBeNull();
+    expect(await versionMembersOf(seed.teamId, "commits/repo/gone.md")).toEqual([null]);
   });
 
   it("never un-attributes a real human's existing attribution when the author no longer resolves", async () => {

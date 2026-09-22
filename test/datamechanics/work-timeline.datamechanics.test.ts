@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
-import { db, seedTeam, ingest, viewFor, type Seed } from "./helpers";
+import { recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
+import { upsertIntegration } from "@/lib/integrations/manage";
+import { setMemberIdentity } from "@/lib/identity/member-identities";
+import { approvedAudienceProject, db, seedTeam, ingest, viewFor, type Seed } from "./helpers";
 
 // Spec: the Learning Timeline reads Postgres items+tasks into a day → person → (tasks + Other) ledger.
 // A task appears iff ≥1 of the person's in-window evidence references it (EVIDENCE-GATED) — empty headers
@@ -304,6 +307,9 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
 
   it("dates a doc whose source spells its edit time differently (previously dropped)", async () => {
     const seed = await seedTeam();
+    await setMemberIdentity(db(), seed.teamId, seed.memberId, {
+      provider: "gdrive", externalId: "permission:timeline-spelling",
+    });
     // Linked so the assertions test the DATE-KEY spelling, not the linking rule.
     const anchor = await commit(seed, "seed");
     await insertTask(seed, anchor.projectId!, { row_key: "AIO-21", title: "Spellings", status: "in_progress" });
@@ -312,8 +318,30 @@ describe("work timeline — attributed docs (Notion / Google Docs / deliverables
     // Each reader spells its timestamp its own way. Work-time matched EXACT key names, so a spelling
     // the list didn't enumerate resolved to null and the doc was silently DROPPED — ingested,
     // attributed, and invisible. Keys are now matched on a normalized form.
-    await ingest(seed, { kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, access: "team", body: "d",
-      frontmatter: { source: "gdrive", title: "Drive doc spaced key AIO-21", "modified at": day1ago } });
+    const audienceProjectId = await approvedAudienceProject(seed);
+    const driveIntegration = await upsertIntegration(db(), {
+      teamId: seed.teamId, memberId: seed.memberId,
+    }, {
+      type: "gdrive", name: "timeline-drive", status: "enabled",
+      config: {
+        fileIds: ["timeline-drive-doc"], folderIds: [], sharedDriveIds: [], recursive: false,
+        selectionState: "selected", authMode: "service_account",
+        audienceProjectIds: [audienceProjectId],
+      },
+    });
+    const driveItem = await ingest(seed, {
+      kind: "deliverable", path: `drive/spaced-${randomUUID()}.md`, access: "external", body: "d",
+      frontmatter: {
+        source: "gdrive", source_id: "timeline-drive-doc",
+        title: "Drive doc spaced key AIO-21", "modified at": day1ago,
+        contributions: [{ external_id: "permission:timeline-spelling", role: "editor", at: day1ago }],
+      },
+    });
+    await recordGdriveItemClaim(db(), {
+      teamId: seed.teamId, integrationId: driveIntegration.id,
+      providerId: "timeline-drive-doc", itemId: driveItem.id, generation: 1,
+      audienceProjectIds: [audienceProjectId],
+    });
     await ingest(seed, { kind: "deliverable", path: `conf/updatedat-${randomUUID()}.md`, access: "team", body: "c",
       frontmatter: { source: "confluence", title: "Confluence doc updatedAt AIO-21", updated_at: day1ago } });
     // A repo file's work-time is its last commit — github-files fetched that commit for the author

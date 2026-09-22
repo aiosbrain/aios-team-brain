@@ -41,6 +41,7 @@ const DATA_TABLES = [
   "task_pm_links",
   "tasks",
   "item_versions",
+  "source_item_mappings",
   "items",
   "projects",
   "rate_limits",

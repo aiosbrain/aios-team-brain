@@ -173,6 +173,21 @@ describe("parseArcsJson evidence (verifiable, linkable)", () => {
     const raw = JSON.stringify({ arcs: [{ title: "T", confidence: "low", supporting_sources: ["Slack #eng", "a PR"] }] });
     const [arc] = parseArcsJson(raw, { facts, epToItem, now: NOW });
     expect(arc.evidence).toEqual([{ fact: "Slack #eng" }, { fact: "a PR" }]);
+    expect(arc.source_provenance).toEqual({ state: "incomplete", item_ids: [] });
+  });
+
+  it("captures every source item behind mixed supporting facts, not only the displayed citation", () => {
+    const mixedFacts = [fact("mixed", "A mixed source fact", ["ep-a", "ep-b"])];
+    const mixedItems = new Map([
+      ["ep-a", { itemId: "item-a", source: "gdrive" }],
+      ["ep-b", { itemId: "item-b", source: "github" }],
+    ]);
+    const [arc] = parseArcsJson(
+      JSON.stringify({ arcs: [{ title: "Mixed", confidence: "high", supporting_facts: [1] }] }),
+      { facts: mixedFacts, epToItem: mixedItems, now: NOW },
+    );
+    expect(arc.evidence[0].itemId).toBe("item-a");
+    expect(arc.source_provenance).toEqual({ state: "complete", item_ids: ["item-a", "item-b"] });
   });
 });
 

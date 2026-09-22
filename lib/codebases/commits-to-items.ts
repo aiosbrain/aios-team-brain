@@ -132,6 +132,7 @@ export async function projectCommitsToItems(
   codebaseSlug: string,
   recentCommits: ScanCommit[],
   identityMap: IdentityMap,
+  identityRevision: number,
 ): Promise<number> {
   let processed = 0;
   for (const commit of recentCommits) {
@@ -147,7 +148,7 @@ export async function projectCommitsToItems(
       ? { name: str(commit.author), email, key: email }
       : parseAuthorIdentity(str(commit.author));
     const authorMemberId = resolveMember(identityMap, identity);
-    await ingestItem(db, auth, payload, "team", { authorMemberId });
+    await ingestItem(db, auth, payload, "team", { authorMemberId,mappingRevision:identityRevision });
     processed++;
   }
   return processed;

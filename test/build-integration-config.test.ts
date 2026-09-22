@@ -64,6 +64,44 @@ describe("notion — the token is the secret, the selection is what to pull", ()
   });
 });
 
+describe("gdrive — explicit file/folder scope", () => {
+  it("parses file, folder, Shared Drive, recursion, audience and project fields", () => {
+    const projectA = "11111111-1111-4111-8111-111111111111";
+    const projectB = "22222222-2222-4222-8222-222222222222";
+    const cfg = buildConfig(
+      "gdrive",
+      `fileIds=DocA|DocB, folderIds=Folder1, sharedDriveIds=Drive1, recursive=true, projectSlug=legal-drive, access=external, authMode=service_account, audienceProjectIds=${projectA}|${projectB}`,
+    );
+    expect(cfg).toEqual({
+      fileIds: ["DocA", "DocB"],
+      folderIds: ["Folder1"],
+      sharedDriveIds: ["Drive1"],
+      recursive: true,
+      selectionState: "selected",
+      projectSlug: "legal-drive",
+      access: "external",
+      authMode: "service_account",
+      audienceProjectIds: [projectA, projectB],
+    });
+    expect(validateIntegrationConfig("gdrive", cfg)).toEqual(cfg);
+  });
+
+  it("records an intentional empty scope instead of treating it as all Drive", () => {
+    expect(buildConfig("gdrive", "selectionState=empty, authMode=oauth")).toEqual({
+      fileIds: [],
+      folderIds: [],
+      sharedDriveIds: [],
+      recursive: false,
+      selectionState: "empty",
+      authMode: "oauth",
+    });
+  });
+
+  it("does not invent an audience when the Admin selection omits it", () => {
+    expect(buildConfig("gdrive", "fileIds=DocA")).not.toHaveProperty("audienceProjectIds");
+  });
+});
+
 describe("clickup — the pk_ token is the secret, the selection is workspace + Lists + Docs", () => {
   it("parses workspace, Lists and Docs out of the one free-text field", () => {
     // `,` is the OUTER separator (toList), so a multi-value entry needs `|`.

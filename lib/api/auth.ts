@@ -18,6 +18,8 @@ export type ApiAuth = {
   actorHandle: string;
   displayName: string | null;
   email: string | null;
+  /** Machine ingest identity, independently verified from the member row. */
+  isConnector: boolean;
 };
 
 /**
@@ -148,7 +150,7 @@ export async function authenticateApiKey(
 
   const { data: key, error: keyError } = await db
     .from("api_keys")
-    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, status, role, display_name, email), teams(slug)")
+    .select("id, team_id, member_id, key_hash, revoked_at, members(actor_handle, status, role, display_name, email, is_connector), teams(slug)")
     .eq("key_id", keyId)
     .maybeSingle();
 
@@ -162,7 +164,7 @@ export async function authenticateApiKey(
     return fail("bad_secret");
   }
 
-  const member = key.members as unknown as { actor_handle: string; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null };
+  const member = key.members as unknown as { actor_handle: string; status: string; role: "admin" | "lead" | "member"; display_name: string | null; email: string | null; is_connector: boolean };
   if (member?.status !== "active") return fail("member_not_active");
 
   const team = key.teams as unknown as { slug: string };
@@ -199,5 +201,6 @@ export async function authenticateApiKey(
     actorHandle: member.actor_handle,
     displayName: member.display_name,
     email: member.email,
+    isConnector: member.is_connector === true,
   };
 }

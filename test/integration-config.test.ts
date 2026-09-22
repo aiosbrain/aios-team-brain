@@ -8,6 +8,53 @@ import {
 // selection only — secrets stay in the sidecar's local config. These assertions are the contract.
 
 describe("validateIntegrationConfig()", () => {
+  it("AC-01/06: accepts an explicit Google Drive scope without conflating empty and absent selection", () => {
+    const audienceProjectId = "11111111-1111-4111-8111-111111111111";
+    expect(
+      validateIntegrationConfig("gdrive", {
+        fileIds: [],
+        folderIds: [],
+        sharedDriveIds: ["shared-1"],
+        recursive: true,
+        selectionState: "empty",
+        projectSlug: "legal-drive",
+        access: "team",
+        authMode: "oauth",
+        audienceProjectIds: [audienceProjectId],
+      }),
+    ).toEqual({
+      fileIds: [],
+      folderIds: [],
+      sharedDriveIds: ["shared-1"],
+      recursive: true,
+      selectionState: "empty",
+      projectSlug: "legal-drive",
+      access: "team",
+      authMode: "oauth",
+      audienceProjectIds: [audienceProjectId],
+    });
+    expect(validateIntegrationConfig("gdrive", {})).toMatchObject({
+      selectionState: "absent",
+      fileIds: [],
+      folderIds: [],
+    });
+  });
+
+  it("rejects malformed Google Drive audience grants", () => {
+    expect(() =>
+      validateIntegrationConfig("gdrive", { audienceProjectIds: ["not-a-project-id"] }),
+    ).toThrow(IntegrationConfigError);
+  });
+
+  it("AC-01: Google Drive config rejects credential material and invalid discovery states", () => {
+    expect(() =>
+      validateIntegrationConfig("gdrive", { fileIds: ["d1"], refreshToken: "secret" }),
+    ).toThrow(/secret-like key/i);
+    expect(() =>
+      validateIntegrationConfig("gdrive", { selectionState: "everything" }),
+    ).toThrow(IntegrationConfigError);
+  });
+
   it("accepts a valid per-type config and normalizes defaults", () => {
     expect(
       validateIntegrationConfig("github", {
