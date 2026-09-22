@@ -11,4 +11,4 @@ alter table project_context_memberships
   drop constraint if exists project_context_memberships_method_check;
 alter table project_context_memberships
   add constraint project_context_memberships_method_check
-  check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual','exclude_shadow_repair'));
+  check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual','exclude_shadow_repair','gdrive_claim'));

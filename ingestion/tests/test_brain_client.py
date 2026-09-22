@@ -1,10 +1,39 @@
+import json
+
 import httpx
 import pytest
 
-from aios_ingest.brain_client import BrainClient, BrainError
+from aios_ingest.brain_client import BrainClient, BrainError, GdriveExecution, GdriveRunRequest
+from aios_ingest.engine import IngestSummary
 from aios_ingest.payload import ItemPayload
 
 ITEM = ItemPayload.build(project="p", path="github/o/r/x.md", kind="deliverable", body="b")
+
+
+async def test_gdrive_completion_omits_absent_error_and_reports_explicit_outcome():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(req.content))
+        return httpx.Response(200, json={"ok": True})
+
+    summary = IngestSummary(
+        "drive", unchanged=2, skipped=1, authoritative_complete=True,
+        backlog=0, cursor_age_seconds=12.5,
+    )
+    request = GdriveRunRequest(
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", "drive", "manual", "now",
+    )
+    async with _client(httpx.MockTransport(handler)) as client:
+        await client.complete_gdrive_run_request(request, summary, status="complete")
+
+    assert "error" not in seen
+    assert seen == {
+        "requestId": request.id, "status": "complete", "created": 0, "updated": 0,
+        "unchanged": 2, "removed": 0, "failed": 0, "skipped": 1,
+        "backlog": 0, "cursorAgeSeconds": 12.5, "authoritativeComplete": True,
+    }
 
 
 def _client(transport: httpx.MockTransport) -> BrainClient:
@@ -101,6 +130,146 @@ async def test_fetch_integration_selections_raises_on_definitive_4xx():
         with pytest.raises(BrainError) as ei:
             await c.fetch_integration_selections()
     assert ei.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_gdrive_execution_then_broker_never_sends_or_persists_refresh_secret():
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append((request.url.path, request.content.decode()))
+        if request.url.path.endswith("/execution"):
+            return httpx.Response(200, json={
+                "integration_id": "11111111-1111-1111-1111-111111111111",
+                "generation": 7, "fence": 3,
+                "owner": "22222222-2222-2222-2222-222222222222",
+                "lease_expires_at": "2099-01-01T00:00:00Z", "scope_hash": "scope",
+                "config": {"authMode": "oauth", "fileIds": ["DocA"]},
+            })
+        return httpx.Response(200, json={
+            "access_token": "short-lived-access", "expires_at": "2099-01-01T00:00:00Z",
+            "scopes": ["drive.file"],
+            "account": {"subject": "subject:123", "email": "docs@example.com"},
+        }, headers={"cache-control": "no-store"})
+
+    async with _client(httpx.MockTransport(handler)) as c:
+        execution = await c.acquire_gdrive_execution(
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        )
+        grant = await c.broker_gdrive_access_token(execution)
+    assert grant["access_token"] == "short-lived-access"
+    assert all("refresh" not in body and "client_secret" not in body for _, body in seen)
+
+
+def test_gdrive_provider_gate_sends_complete_fence_and_fails_closed():
+    execution = GdriveExecution(
+        "11111111-1111-1111-1111-111111111111", 7, 3,
+        "22222222-2222-2222-2222-222222222222", "later", "scope", {},
+    )
+    client = BrainClient("http://brain", "aios_abc_def", "demo")
+    gate = client.gdrive_provider_gate(execution)
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append(request)
+        return httpx.Response(409, json={
+            "error": {"code": "stale_execution", "message": "replaced"},
+        })
+
+    gate._client.close()
+    gate._client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(BrainError) as exc:
+        gate()
+    assert exc.value.code == "stale_execution"
+    payload = json.loads(seen[0].content)
+    assert payload == {
+        "action": "authorize_provider",
+        "integration_id": execution.integration_id,
+        "generation": 7,
+        "fence": 3,
+        "owner": execution.owner,
+    }
+    assert seen[0].headers["authorization"] == "Bearer aios_abc_def"
+    gate.close()
+
+
+@pytest.mark.asyncio
+async def test_gdrive_checkpoint_retries_429_with_revision_stable_and_retry_after():
+    calls = []
+    sleeps = []
+    clock = [100.0]
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    def handler(request: httpx.Request):
+        payload = json.loads(request.content)
+        calls.append(payload)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"retry-after": "3"}, json={
+                "error": {"code": "rate_limited", "message": "wait"},
+            })
+        return httpx.Response(200, json={
+            "progress_revision": payload["progress_revision"] + 1,
+            "progress": payload["progress"],
+        })
+
+    client = BrainClient(
+        "http://brain", "aios_abc_def", "demo", sleep=sleep,
+        random_fn=lambda: 0, monotonic_fn=lambda: clock[0],
+    )
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    execution = GdriveExecution(
+        "11111111-1111-1111-1111-111111111111", 2, 4,
+        "22222222-2222-2222-2222-222222222222", "later", "scope", {},
+        progress_revision=9,
+    )
+    async with client:
+        first = await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
+        await client.checkpoint_gdrive_execution(execution, {"page_token": "terminal"})
+
+    assert first["progress_revision"] == 10
+    assert [call["progress_revision"] for call in calls] == [9, 9, 10]
+    assert sleeps == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_gdrive_checkpoint_retry_is_bounded_by_deadline():
+    calls = 0
+    sleeps = []
+    clock = [100.0]
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    def handler(_request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(503, headers={"retry-after": "60"}, json={
+            "error": {"code": "unavailable", "message": "down"},
+        })
+
+    client = BrainClient(
+        "http://brain", "aios_abc_def", "demo", sleep=sleep,
+        random_fn=lambda: 0, monotonic_fn=lambda: clock[0],
+    )
+    await client._client.aclose()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    execution = GdriveExecution(
+        "11111111-1111-1111-1111-111111111111", 2, 4,
+        "22222222-2222-2222-2222-222222222222", "later", "scope", {},
+    )
+    async with client:
+        with pytest.raises(BrainError) as exc:
+            await client.checkpoint_gdrive_execution(execution, {"page_token": "next"})
+
+    assert exc.value.code == "unavailable"
+    assert calls == 1
+    assert sleeps == [45.0]
 
 
 def _scan_client(

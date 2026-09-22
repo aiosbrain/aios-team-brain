@@ -62,8 +62,8 @@ const REQUIRED: { file: string; needle: string; why: string }[] = [
   },
   {
     file: join("app", "api", "brain", "arcs", "route.ts"),
-    needle: "await getFusedArcs(admin, team.id, teamSlug, scope.groups, keys)",
-    why: "the fused panel is THE arcs read (ruling 1) — dropping this silently resurrects a tier fallback (the laundering path)",
+    needle: "getAuthorizationBoundFusedArcs(admin, team.id, teamSlug, keys",
+    why: "the epoch-bound fused panel is THE arcs read — dropping it silently resurrects a tier fallback or reuses stale authorization",
   },
   {
     file: join("app", "api", "brain", "arcs", "recompute", "route.ts"),

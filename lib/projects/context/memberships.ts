@@ -20,7 +20,8 @@ export type MembershipMethod =
   // EXCLSHADOW-1: the repair include written when reconcile closes an AUTOMATIC exclude
   // found in the item's target SYSTEM project (the table is its own audit trail — this value
   // is how a repair stays legible). CHECK-widened by migration 20260820150000.
-  | "exclude_shadow_repair";
+  | "exclude_shadow_repair"
+  | "gdrive_claim";
 
 export interface EnsureIncludeArgs {
   projectId: string;
@@ -332,4 +333,24 @@ export async function closeMembershipInto(
   // Everything that had to go is gone — by us or by a concurrent writer — and whatever remains is
   // protected. Converged, and `spared` reports the FINAL state rather than the stale first read.
   return { ok: true, closed, spared: after.rows.length };
+}
+
+/** Close only machine-owned Drive/default includes; human curation is never a claim side effect. */
+export async function closeGdriveManagedMembership(
+  db: DbClient,
+  teamId: string,
+  contextUnitId: string,
+  projectId: string,
+): Promise<WriteResult> {
+  const { error } = await db
+    .from("project_context_memberships")
+    .update({ valid_to: new Date().toISOString() })
+    .eq("team_id", teamId)
+    .eq("context_unit_id", contextUnitId)
+    .eq("project_id", projectId)
+    .eq("decision", "include")
+    .eq("mode", "auto")
+    .in("method", ["gdrive_claim", "ingestion_project"])
+    .is("valid_to", null);
+  return error ? { ok: false, error: error.message } : { ok: true };
 }

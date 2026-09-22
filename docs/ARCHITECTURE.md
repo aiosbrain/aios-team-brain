@@ -9,7 +9,7 @@ portable: plain SQL migrations, Postgres-backed rate limiting, no Vercel-only de
 > ingestion sources) are guarded against drift by `scripts/check-docs-drift.mjs` — see
 > [Docs drift guard](#docs-drift-guard).
 >
-> **Last verified against code: 2026-08-03.** If a flow here disagrees with the code, the
+> **Last verified against code: 2026-09-22.** If a flow here disagrees with the code, the
 > code wins — fix the doc (same PR).
 
 ## First-install deployment flow
@@ -137,6 +137,18 @@ Reason from this table, not from a random call site.
 | Narrative-arc cache (Layer 3)                       | `arc_cache` (regenerable LLM-synthesis cache, keyed `(team_id, group_key)` — group_key is the SYNTHESIS SCOPE: the sorted tier group set, or PCCC6B-1's `p:<slug>:<groups>` namespace for an ENFORCED team member's partition-scoped arcs, resolved per read via `selectEnforcedGraphPartitions`; corrections in `arc_corrections` carry the same scope key and feed ONLY same-scope synthesis, legacy `''` rows feeding the tier path alone; PCCC-7: the `p:` namespace keys on the IMMUTABLE team id, reconcile hard-purges scoped rows before any self-purge flag clears — a pre-restriction row's summary prose is invisible to the evidence filter — and age-sweeps oracle-churn orphans, never touching the human-authored corrections store; PPARC-2/3: the partition-native `g:<group_id>` namespace — one row per partition, shared across principals, purged PER-PARTITION at both self-clear doors; PPARC-3 CUTS THE ENFORCED READ OVER: the panel is `lib/graph/arc-fusion.getFusedArcs` — prose-free fusion of the reader's partitions' rows (at most ONE inline synthesis, rest SWR-warmed, covered/total disclosed, fused envelope = oldest-row as_of + any-row stale/degraded), the recompute route takes ONE partition per POST (`sourceGroup` validated against the freshly-resolved scope), and the migration re-keys single-group `p:` corrections to `g:` + wipes pre-cutover `g:` rows (marker-bounded), its stranded count visible via the pg-load-schema notice listener; PPARC-4: the `p:` namespace is fully RETIRED — no writer mints it (guarded), the g: per-partition purge doors stand alone, and reconcile sweeps both pre-cutover `p:` stragglers and orphaned `g:` rows whose partition no longer exists) **Day-to-day stability:** an arc's `id` used to be `sha(title)`, so any rewording made it a NEW arc; `lib/graph/arc-continuity.reconcileArcIdentity` now matches each synthesized arc to the PRIOR set on the brain item ids its evidence cites and inherits that id (title kept while ≥50% of the prior's items are still cited). Merge/split are first-class — the strongest match continues the id; absorbed priors are recorded in `supersedes` and a split sibling in `splitFrom` (different claims, named apart), and any non-inheriting arc whose id collides is re-keyed so a split can't emit one id twice. **No two arcs share a TITLE (ARCDUP-1):** prod rendered two cards both called "PR Review Attestation Gate Enforcement" (one high, one medium). Two paths produced it — the id was hashed from the RAW model title while the card renders the `stripTaskKeys`-normalized one, so "… (AIO-123)" and "…" minted two ids for one display string; and two *identical* titles minted one id that the re-keying above then split apart, fixing the React key while leaving the duplicate title on screen. Enforced in TWO layers, because one is provably not enough: (i) `stableId` is fed the NORMALIZED title and `parseArcsJson` runs `mergeDuplicateTitles`, collapsing duplicates the model emits in one response; (ii) `reconcileArcIdentity` enforces it again TITLE-keyed at the end, because that function is the last thing that writes a title and is itself a source of duplicates — a continuation inheriting its prior's name can collide with a sibling the model named differently, and by then the two carry DIFFERENT ids so the id-keyed pass sees nothing. Left unguarded the prod pair REGENERATES itself, since both duplicates sit in `prior`. The survivor of a title collapse is the arc that INHERITED a prior id, so `arc_corrections` and the lineage fields stay bound to it; the loser is folded in via `mergeArcPair` (strongest confidence, union of participants/sources/evidence, both summaries) and, when it too carried an inherited id, that id is recorded in `supersedes` so the absorbed identity stays inspectable. This REPLACES the older contract in which a split's children could both carry the parent's title and be told apart by id alone. The prompt additionally requires distinct titles: the nudge is the primary fix, the two merges are the guarantee. NOTE `continuity.nextCount`/`ratio` are computed BEFORE this dedupe, so on a collapse they describe the synthesized set, not the persisted one. The requested arc count is held steady by `stableArcTarget` (hysteresis, clamped to the `arcsRequested` band so a short model reply can't ratchet it down), and the prompt shows the model the standing arc titles — a nudge only; identity is settled deterministically. Carry-over is recorded to `ingest_runs` (`source='arcs'`, `trigger='api'`, `meta.group_key`/`continuity_pct`; a failed synthesis records `synthesis_failed` instead) because arc stability was previously unmeasurable.                                                                                                                                                                                                                                   | **`lib/graph/arc-cache` only** (via `lib/graph/arcs` — `getArcs`/`recomputeArcs`) — persists the fully-attributed `NarrativeArc[]` so it survives restarts/deploys and is shared across instances. Read is serve-stale-while-revalidate: a fresh row (< 4h) returns as-is; a stale row returns immediately while a fire-and-forget recompute (in-flight-deduped) refreshes it; a cold miss computes inline. **Stability (fact-set-hash skip):** the row stores `facts_hash` = a hash of everything that determines the arcs' displayed content — the **system prompt** (so a prompt/arc-count deploy resynthesizes), the **attributed fact texts** (so a re-attribution resynthesizes), and the per-item **contributor set** (so a contributor-only correction resynthesizes). The background refresh SKIPS the non-deterministic LLM re-synthesis when the hash is unchanged (`canReuseArcs`) — so arcs change only when the underlying work does, not on every recompute. Determinism holds because the fact fetch is uuid-tiebroken (`recentFacts` `ORDER BY … , r.uuid`) and contributor sets are version-work order; a human correction always resynthesizes. **TRUSTWORTHINESS (H11/H12):** `commitArcs` refuses to stamp a result FRESH unless it can be trusted, because fresh-and-wrong is the one state SWR can never heal (it only re-fires on a stale row). Two untrustworthy shapes: `arcs=[] && factsHash!=null` means the window HAD facts and synthesis produced none — the model failed, not the truth (a genuinely quiet window carries `factsHash=null`); and `degraded`, meaning a leg synthesis depends on (episode→item resolution, credit — now STRICT, the eligibility gate) failed, which yields a plausible but unattributed/unfiltered set that is NON-empty and so sailed past the empty-clobber guard. Either shape keeps a healthy recent prior; with no prior the result is persisted with a deliberately SHORT life (`retryAfterMs` backdates `computed_at` to `TTL − 5min`) so the next view retries in minutes instead of pinning a failure for 4h — and not *already* stale, which would fire a rebuild per viewer for as long as the failure lasted. A degraded synthesis also returns BEFORE the model runs: the result was going to be refused, so paying for a reasoning-model call once per retry buys nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | the Pulse home arcs hero (`POST /api/brain/arcs`, `getArcs`). (The "Working on" card no longer reads arcs — it renders the work-timeline, each person's most recent day.) **Access enforcement (Phase B slice 5, §5.8/§5.8b; PRET-6: the only behavior): BOTH arc routes drop any arc with an evidence entry the member can't see** — a READ-TIME `filterArcsByVisibleItems` over the tier `arc_cache` (an arc is a synthesized narrative over its evidence, so the gate is all-or-nothing: EVERY evidence entry must resolve to a VISIBLE item — a no-`itemId` entry carries raw fact text with no verifiable partition and fails the arc closed too, so a mixed visible+unresolved arc is dropped, not served). `POST /api/brain/arcs` AND `POST /api/brain/arcs/recompute` both filter — the recompute route returns the same tier arc set and is **team-tier-gated, not admin-gated**, so without the filter it is an unfiltered bypass of the enforced read. No per-principal re-synthesis and no cache variant — arc synthesis is LLM-expensive and the spec plans `arc_cache` to go **per-project in Phase C**, not per-hash in B. The enforcement resolution fails closed (a substrate error → 500, never the unfiltered set). **RESIDUAL (deferred to Phase C):** an arc's title/summary and its LLM-name participant fallback are synthesized from the full tier fact pool, so a KEPT arc's prose can still reference restricted work not among its cited evidence (the coherence prune can even remove a restricted citation after the prose is written) — read-time filtering is a substantial reduction, not a complete guarantee; per-project synthesis (Phase C) is the structural fix. NOT enforced here: the social `discover-arcs` pipeline (background content-gen, admin-only + already tier-gated by `evidenceCeiling`).                                                                                                                                                                                                                                                                                                                                                                     | tier-scoped by construction: `group_key` is the caller's `visibleGroupIds(tier)` set, so an `external` viewer only ever reads/writes the external-group cache row (no cross-tier bleed). **A tier RECLASSIFICATION is the one case where stale isn't enough:** the external row holds prose synthesized from the item, and the read is serve-stale-while-revalidate (a stale row is still SERVED), so narrowing external→team **purges** that row (`lib/cache/tier-invalidation.purgeExternalTierCaches`) while widening only stale-marks it. That purge fires **TWICE**, and both are load-bearing: once when `lib/ingest` heals `items.access`, and again from `lib/graph/run` once the projector has actually moved the item's episodes out of the external group — because arcs are synthesized FROM that group, so a rebuild in between re-synthesizes over still-dirty facts and `commitArcs` stamps the result FRESH, turning the first purge into a 4h extension of the exposure rather than the end of it. Regenerable — safe to truncate. **HUMAN CORRECTIONS (H13) live in `arc_corrections`, not the graph** (sole writer `lib/graph/arc-corrections`): they used to exist ONLY as `correction:<arc_id>` Graphiti episodes written inside a swallowed catch, so a graph rollback destroyed the one human-authored input in the learning layer, and a failed write silently reverted the user's edit within a TTL. The recompute route now persists to Postgres FIRST and lets a failure surface (a cache can be recomputed; a person's edit cannot), then projects the episode best-effort as a derived copy. Stored corrections feed EVERY synthesis — previously they reached later synthesis only by having become a graph fact, so a wipe lost not just the record but the influence. `arc_title` is stored beside `arc_id` because the id is sha(title) and churns each recompute (M7). |
 | Work-timeline layer                                 | `work_timeline_cache` (regenerable day→person→work ledger, keyed `(team_id, group_key)`; `group_key` = a §5.8 visibility variant `vis:<tier>:<hash>` keyed by the member's sorted effective-project-set hash — PRET-6: the plain viewer-tier row shape is retired; old tier rows are unreachable dead rows, never read)                                                                                                                                                                                            | **`lib/dashboard/timeline-cache` only** — persists the `TimelineDay[]` assembled by the builder `lib/dashboard/work-timeline.getWorkTimeline` (reads `items` + `tasks`), serve-stale-while-revalidate (5-min TTL). NO 48h empty-clobber (factual ledger — a quiet week reads empty). Busted on re-attribution via `bustTeamLearningCaches`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | the Pulse home **Working on** card + its **Timeline** disclosure + **`GET /api/v1/timeline`** (CLI/machines) — all via `getCachedWorkTimeline`                                                                                                                                                                                                                                                                                                                                                                              | tier-scoped by construction: `group_key` = the viewer tier, and the `(team_id, group_key)` PK scopes by team, so a team viewer's (team+external) ledger and an external viewer's (external-only) ledger are separate rows; the builder's `visibleItems`/`visibleTasks` do the row-level filtering (no RLS backstop). A tier reclassification **purges** the external row when narrowing (`purgeTimelineCacheTier`, which also sweeps that tier's `vis:` variants) — the payload carries item/task titles + the LLM day-summaries built from the old tier-filtered set — and stale-marks it when widening. **Phase B slice 4 (§5.8): on an enforcing team every member read passes its principal (`getCachedWorkTimeline`'s required `memberId`) and is served a `vis:<tier>:<hash>` variant built through `memberEnforcement` — item legs filter in-query, tasks/decisions/meetings gate on their source item, salvage is same-key only, and a read with no principal THROWS (fail closed, never the tier row). PRET-5/6: the builder's walls are the vis-set alone (ruling 2 reaches timeline evidence — the permissive posture-wall arms deleted with the model); the null-source hand-typed-task arm KEEPS the posture conjunct (no membership axis exists for it), meeting notes gate on their source item (`srcVisible`) with the posture bit as the coarse wall (ENFB-3 extended the same rule to the meetings pages), `PAYLOAD_VERSION` is 14 (the meaning narrowed — any old tier-row payload is a MISS → inline rebuild, never a 500 or a served-empty window), and the key's posture segment stays load-bearing for the meeting carve-out.** Regenerable — safe to truncate.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | Company graph                                       | `graph_entities`, `graph_relationships`                                                                                                                                                                                                                                                                       | **`lib/graph/company-actors` only** for member-derived rows (single-writer guarded; `scripts/seed-demo.ts`'s fictional fixture data is the sole exemption) — `syncMemberActor` upserts one `actor` entity per real (`is_connector=false`) member, keyed `entity_id = member:<uuid>`; `syncReportsTo` keeps a `REPORTS_TO` edge in lock-step with `attrs.reports_to` on the entity (both written together — `retrieve.ts`'s prompt reads the edge, `/api/v1/company-graph` reads the attr). Hooked into member create (`inviteMember`, CLI `create-member`), role change (`setMemberRole`), manager change (`setMemberManager`), and soft-disable (`removeMember`) — all best-effort (never fails the parent mutation). A hard delete (`removeMemberActor`) removes the entity + every relationship touching it and re-syncs any direct reports. Backfilled once for pre-existing members via a migration (`postgres/migrations/20260707120100_backfill_graph_actors.sql`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `lib/query/retrieve.ts` (chat/query context — actors, commitments, REPORTS_TO/OWNS/BLOCKS), `GET /api/v1/company-graph` (brain-api v1.5 stakeholder-map API)                                                                                                                                                                                                                                                                                                                                | team-scoped, no per-row tier column and no RLS backstop — both readers gate app-code-side. STRUCTURE-classed since PRET-4 (the QMIR-1 external closure deliberately INVERTED per the triad): the org chart serves EVERY member — the query-context legs for every member principal, `/api/v1/company-graph` for every authenticated key (payload unchanged) — while delegated tokens and the default-deny principal arms stay omitted. An ENFORCING member is served the org-structural allowlist in query context — `actor` entities + `REPORTS_TO` edges only (`principal === "member"` discriminant; commitments/OWNS/BLOCKS stay omitted under enforcing — no production writer, and a future item-derived writer must partition-class at write, obligation recorded in spec §5.8b covering `/api/v1/company-graph` too). A disabled member's entity is kept for history but filtered out of both readers' output (`attrs.status !== "disabled"`), so a departed person is never cited as current staff. `role`/`job_family` (job title) stay `null` for member-synced actors — no job-title source exists yet; the permission level lives under the distinct `attrs.member_role` key so it's never confused with the job-title semantics the brain-api v1.5 contract defines for `role`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+### Narrative-arc source authorization
+
+AIO-1167 makes source authorization part of synthesis, not only a read-time evidence filter. Before
+hashing, contributor balancing, continuity, or prompting, every graph fact must resolve its complete
+episode-to-item provenance. The fact is admitted only when every contributing item is unsuppressed and
+belongs to the exact one-project partition being synthesized; missing or mixed provenance fails closed,
+so a visible citation cannot launder text derived from a restricted item. Enforcement, visible item ids,
+partition scope, synthesis, publication, final filtering, and route serving share one durable authorization
+epoch. A change rebuilds the whole decision once and then returns retryable-unavailable instead of serving
+a mixed snapshot. Migration marker `aio1167_arc_input_authorization_v1` advances existing teams' epochs
+and purges pre-policy arc rows once, which also fences rolling old publishers.
 
 ### Managed GitHub gateway sources of truth (contract v1.10; feature disabled)
 
@@ -431,6 +443,261 @@ still observe that a send happens only for recognized emails (inherent to any em
 The emailed link is built only from the trusted `APP_URL`, never the request `Host`. `POST
 /api/auth/login` likewise keeps a uniform 401 `invalid_credentials` response for every credential
 failure.
+
+### Google Docs connector (AIO-1167)
+
+`gdrive` is a distinct integration type; `google` remains the Gemini provider-key type. Admin-only
+OAuth routes bind short-lived, single-use state to the initiating team/member and store refresh
+credentials through the encrypted integration-secret owner. Per-file consent uses `drive.file`;
+folder/Shared Drive discovery uses `drive.readonly`, and the UI names that difference before consent.
+The individual-file UI uses Google Picker with a browser-obtained GIS token; that token is never
+returned by the brain. Picker IDs are published only after the encrypted server credential proves
+the exact Google Doc remains app-accessible under the same Admin/generation/credential snapshot.
+Pasted IDs take the same proof path, while broad discovery remains an explicit separate consent.
+The sidecar also retains service-account configuration compatibility.
+
+`GET /api/v1/integrations` remains selection-only. OAuth execution uses the dedicated
+`POST /api/v1/integrations/gdrive/token` broker: the brain refreshes from encrypted credentials and
+returns only a short-lived access token, expiry, exact granted scopes, and stable non-secret account
+identity. Every grant is `no-store`, rate-limited and audited without credential values. Pause,
+disconnect, key revocation, generation change, or fence replacement prevents issuance. The sidecar
+never receives the OAuth refresh token/client secret and never persists access tokens. Documented
+local service-account credentials remain local and use the same execution authority.
+Admin service-account mode never accepts a key upload and does not require an OAuth secret. It is
+stored as `pending` until a matching local sidecar credential completes a real fenced provider
+identity read; only then does the connector publish the stable non-secret account email as
+`verified`. Missing local material fails closed, while OAuth remains exclusively broker-backed.
+The in-memory OAuth token provider validates the configured account and scopes, refreshes through
+the broker before a bounded expiry margin, updates the shared Drive/Docs credential object, and may
+recover once from an unexpected provider 401. Broker failure, authority loss, identity/scope drift,
+or a second 401 is run-terminal; no refresh credential enters the sidecar.
+At each acquired execution the sidecar builds one effective connection from the authoritative
+selection, project, access and auth mode instead of overlaying stale local values. An explicit empty
+remote selection therefore removes legacy `folder_id`/selection aliases; OAuth always uses the
+broker even if obsolete local service-account material remains, while explicit service-account mode
+requires compatible local credentials.
+
+The direct Drive/Docs adapter requests `includeTabsContent`, preserves ordered root/child tabs,
+headings, lists, tables, links, footnotes and Unicode, and refuses to overwrite a prior complete item
+when required extraction is incomplete. SQLite retains one namespaced opaque stream per selected
+Shared Drive and (when selected) My Drive. Before any baseline listing, every required stream's start
+token is captured. Shared Drive listing, traversal, rescan, and parent-membership checks use the
+provider's actual `driveId` as the root; the former synthetic `root` key is repaired only when the
+persisted root/drive identity matches exactly, otherwise the stream enters controlled recovery and
+cannot treat the mismatch as removal evidence. Each stream has an explicit snapshot incarnation: roots and traversal seeds are
+created atomically, a replacement builds beside the prior authoritative membership, and only a fully
+enumerated snapshot is published. Missing or mismatched local durable state for remote v2 progress
+enters controlled recovery; absence reconciliation remains disabled until a fresh baseline is
+published. Selection roots, recursive traversal pages, deduplicated membership, provider-page
+continuations, document obligations, acknowledgments, and deferred retry times are durable. A page is
+materialized atomically with all of its outcomes, continuation and traversal completion; folder-change
+pages also persist their subtree-rescan incarnation in that transaction and cannot retire until it is
+published. Change polling requests both file and Shared Drive control-plane shapes (`changeType`,
+file/drive IDs, and file metadata). A no-file folder/ancestor tombstone or Shared Drive removal/access
+change resolves against durable root/traversal/drive provenance and materializes a replacement
+snapshot before its cursor may advance. Confirmed absence retires only this connection's claims after
+the tombstone page durably materializes targeted removal work from retained root provenance. A doc
+that also survives through another selected root remains claimed. Cleanup and replacement traversal
+are retryable separately; uncertain/ambiguous shapes and authorization outages force authorized
+recovery and can never establish absence or purge. Restoration requires a new current access and
+membership proof. Each stream assigns a durable monotonic observation revision to every provider item;
+newer upsert/removal observations atomically supersede conflicting work while retaining each page's
+outcome ledger, and the winner is rechecked after provider reads and immediately before the sink.
+Restoration revalidates live provider access and current selected membership. Document obligations may
+outlive their listing page, so separately bounded discovery, fresh-work and retry counters continue past
+a malformed document without charging one class against another. A durable per-generation stream
+rotation gives later drives the fresh-work turn across runs and restarts even with a one-item budget,
+while fair work-class scheduling and a global run deadline cap the backlog.
+Acknowledgments remain until the
+fenced terminal or continuation cursor is committed, so exact-budget exits and a crash after sink
+acknowledgment do not lose or endlessly replay work. Each stream persists terminal-drain evidence
+bound to the current generation, a monotonic poll observation, terminal token, and acknowledged
+checkpoint. Provider cursor tokens identify positions, not polling attempts: every materialized
+change page is keyed by stream/generation/observation/input-token, an unfinished observation is
+reused across crash recovery, and the next poll advances the durable observation even when Google
+returns the same terminal token. Pending document obligations remain attached to their original
+observation and are never discarded to permit a later poll. An outstanding
+`nextPageToken` remains `catching_up`, including zero-document pages. Starting a new drain or recovery
+invalidates that evidence. Cursor enumeration checkpoints remain `partial`
+and preserve the prior complete-success timestamp until the snapshot, local page retirement, every
+durable obligation and the final all-stream reconciliation are all fenced complete. Only a complete
+all-stream snapshot can establish absence.
+Provider calls use explicit request/transport context (including OAuth and local service accounts),
+bounded deadline-aware retries with jitter, honor mapping-style and normal
+`Retry-After` headers, durably defer affected streams across restarts when a delay exceeds the run
+window, recompute the effective remainder after token refresh, authority validation, and request
+construction immediately before transport execution, tighten new and reused transport sockets from
+that reduced request/run budget, treat authentication loss as terminal, and recover an invalid opaque
+cursor only through a fresh-token controlled rescan. The local service-account `AuthorizedHttp` wraps
+its raw transport with that same absolute monotonic deadline, so credential refresh calls, provider
+dispatch, 401 replay, redirects, and httplib2 connection retries all recheck the remaining budget and
+cannot extend it. SQLite
+retains these cursors and obligations, but it is not write authority. `gdrive_connection_authority`
+binds the exact `gdrive-sync` connector
+member/API-key to an immutable integration/team only through the audited Admin provision/rotate
+action; acquire never claims an unbound row. Rotation revokes the old key and advances the generation
+and fence while preserving progress. The authority owns a monotonic generation, lease fence, and
+monotonic progress revision. Every acquire/broker/write/reconcile/checkpoint transaction rereads the
+bound key's revocation, member active/connector state, built-in team posture, integration state and
+current fence. Selection A → B → A, credential replacement, pause, resume and disconnect all advance
+the generation or invalidate the lease. `/api/v1/items` locks both incoming and persisted item/mapping
+identity in the same PostgreSQL transaction as the ingest-owner mutation; stale workers and
+omitted/relabelled provenance cannot commit content, removal, or progress. The sidecar checkpoints the
+actual next/terminal cursor on the brain before mirroring it to SQLite, so restart recovery survives a
+crash between those writes. Google push notifications are validated against overlapping persisted
+channel/resource/token records and only enqueue poll work; production watch create/renew acquires the
+same immutable execution and broker grant, fences channel publication, and never resets the
+consumption cursor. Periodic polling remains the recovery authority.
+Immediately before every new Drive/Docs request, pagination step, retry, or watch call, the sidecar
+renews and revalidates the current server authority. A failed check is run-terminal and remains
+outside provider-read recovery catches. Watch renewal first acquires current authority and derives
+its exact account/drive/generation namespace and cursor from server progress; stale SQLite channels
+can overlap for notification delivery but can never choose a renewal cursor.
+Shared Drive watches carry the authoritative cursor and `driveId` together through both watch-manager
+layers; My Drive deliberately omits `driveId`. Execution quotas isolate provider checks, lifecycle,
+progress and release. Progress permits the 100/min ingestion envelope and uses revision-conditional,
+idempotent checkpoints; the client honors `Retry-After` within a fixed deadline, while cleanup
+release retains independent capacity. Admin connection tests use the same generation policy, bound
+also to credential revision and the initiating active Admin, with revalidation after refresh, before
+every selected-root call, and immediately before success. Preview is explicitly batched at 100 roots
+and returns checked/total/continuation rather than silently declaring an unchecked tail healthy.
+Admin Run now/retry writes a durable `gdrive_run_requests` row; the bound sidecar claims it and invokes
+the same coordinator as polling/watch work. Scheduled/manual/retry outcomes share this reporting
+owner and the normal `ingest_runs` ledger. Reports retain created/updated/unchanged/removed/skipped
+counts, nullable backlog/cursor age, and an explicit authoritative-complete bit; a busy lease defers
+the request instead of claiming success, and only a fully drained/reconciled snapshot advances proven
+success. Completion delivery is idempotent for lost HTTP responses. Concurrent requests coalesce per
+integration and interrupted claims become retryable after the coordinator lease window.
+
+Graph query discovery is query-aware and pages through a bounded candidate corpus before applying
+the complete source-provenance authorization gate. Unauthorized high-ranked candidates are refilled
+from later pages. When the discovery budget is exhausted the API returns an explicit `incomplete`
+flag and continuation offset; provenance or epoch instability remains retryable-unavailable rather
+than a healthy empty result.
+
+Provider IDs are retained exactly in `frontmatter.source_id`, with connection and scope-generation
+provenance. `source_item_mappings` is the durable `(team, source, exact provider id) → item UUID`
+identity authority; it survives content purge so rename, move, reconnect and a later restore do not
+mint a second identity. The mapping also retains the canonical project/path tombstone. Normal updates,
+provider renames and replay preserve that location; a deliberate move must serialize under the same
+provider lock and prove the destination collision-free rather than overwriting it implicitly. Complete
+authorized snapshots and positive Drive tombstones reconcile through
+`POST /api/v1/items/source-reconcile`, which calls the shared `lib/ingest` purge owner so item history,
+search derivatives and graph retirement follow the existing lifecycle. Incomplete/denied listings
+never establish absence. Revision observations are retained as a contribution ledger; exact `gdrive`
+permission identities (or exact verified email fallback) produce source-time UTC person/day Timeline
+evidence with the provider role rendered visibly. OAuth account subjects use the separate
+`subject:<sub>` namespace and are never treated as Drive permission IDs; author addresses retained
+without a permission id use `author-email:<address>`. Opaque Google ids are case-sensitive. Drive
+ownership and connector/service-account transport identity are retained as provenance/diagnostics,
+not promoted to human authorship.
+
+When an OAuth account email is an exact, unambiguous match to an active roster identity, callback
+publication atomically records both its `subject:<sub>` transport identity and an
+`author-email:<address>` attribution bridge. Shared or unmatched login accounts remain unlinked for
+an audited Admin decision. A durable unlink tombstone blocks the email bridge from being silently
+recreated by roster-email fallback; only a newer explicit mapping revision can restore it.
+
+Google identity mappings retain a monotonic authority row in `member_identity_mapping_state`, which
+survives unlink. Every link/remap/unlink serializes on the exact team/provider/id, validates the
+current active non-connector member and expected revision, audits the mutation, and enqueues an
+`identity_repair_obligations` row for that revision. Repair is bounded and restartable by item cursor;
+each item is locked and the mapping revision plus `member_id_locked` correction policy is rechecked at
+write time, so a stale worker cannot restore old credit. Item/version ownership is recomputed from its
+own retained provenance. `gdrive_contribution_evidence` retains independent immutable role/time/source
+observations while its derived member/revision is repaired; an explicit credit-nobody correction is
+persisted and honored rather than re-resolved. Completion follows strict derived Timeline/arc/cache
+invalidation, and failures remain retryable instead of reporting a partial repair complete. Mapping
+mutation advances the durable cross-process cache epoch immediately; successful final drain advances
+it again after the last item effect, fencing both old payloads and any rebuild that overlapped repair.
+
+All roster, alias, and provider-identity mutations enter the shared application boundary in
+`lib/identity/authority` before affected rows. Multi-team login linking sorts team IDs before taking
+their authority locks. The database trigger is bookkeeping only: while the caller already owns the
+boundary, it advances the durable revision/repair/cache epoch in `team_identity_authority`; it never
+acquires a late row-to-authority lock. A source-inventory guard rejects new direct identity writers
+that do not use the boundary. Complete member/alias/provider/connector reads are built under the same
+transaction advisory lock. Every bounded item/version/contribution commit locks the item and validates
+the same team revision before writing; a concurrent mapping or lifecycle change resets the durable
+cursor and leaves a pending repair instead of allowing an older snapshot to publish. Alias unlink uses
+an `email-alias:` mapping tombstone, so successful unlink clears unlocked stale credit while ordinary
+never-resolved evidence remains conservative. Manual repair propagates read failures; background repair
+records retry state and the scheduler resumes it. Completion is published only after strict cache purge.
+The common ingest owner follows the same boundary: after path/provider identity resolves the canonical
+item UUID, it takes the shared item advisory lock, rereads `member_id`/`member_id_locked` under the row
+lock, and holds both through item, version, and contribution writes. Path/provider locks precede sorted
+item locks; repair arrives with its validated identity snapshot, and correction takes identity authority
+before those item locks. This prevents lock inversion and ensures explicit named and credit-nobody
+corrections win in either arrival order.
+Named correction follows the complete global order: identity-authority advisory, sorted item
+advisory/row locks, then target-member validation with `FOR SHARE`, then versions/evidence. `FOR SHARE`
+keeps active/non-connector status stable against deactivation or deletion while remaining compatible
+with the `KEY SHARE` acquired by ingest's member foreign key; roster lifecycle writers take identity
+authority before the member row, so neither side relies on deadlock detection or retry.
+Timeline and arc cache reads/publications require both the current shared authorization epoch and
+`repair_status='complete'`; pending/failed repairs are retryable-unavailable, never a healthy partial
+replacement. Completion validates the same mapping revision and advances the cache epoch atomically.
+
+The Timeline reads Drive evidence through a stable seek-paginated ledger independent of the generic
+item cap, re-resolves against complete current identity reads, and reapplies manual correction locks.
+Required roster/alias/provider/ledger failures abort the build, so neither persisted nor process-local
+cache can publish a partial Drive Timeline as a healthy empty result. Distinct source roles and UTC
+instants produce separate evidence rows with provider title/link; unchanged observation replay is
+idempotent and missing identity/time remains retained with an explicit diagnostic.
+
+Drive visibility is connection-claim based, not frontmatter based. Each integration stores a validated
+set of existing, granted audience projects in non-secret config. Acquisition and every fenced commit
+resolve that audience again and fail closed if it is empty or no longer granted. A canonical Drive item
+may have multiple independent `gdrive_item_claims`; each claim owns normalized
+`gdrive_item_claim_projects`, and the project-context owner publishes the union of active claims as
+machine-managed `gdrive_claim` memberships. Removing one connection retires only its claim, so the
+canonical item survives while another claim does. Manual context curation is never closed by this
+reconciliation, and restricted Drive content is never defaulted into General. The scalar legacy
+connection field in frontmatter or `source_item_mappings` is retained only as historical evidence and
+cannot widen access.
+
+`team_authorization_epochs` is the durable revocation barrier shared by Drive claim changes and the
+Timeline/arc cache owners. Final-claim retirement commits context suppression, the epoch advance, and
+a `gdrive_cleanup_obligations` row under the canonical team/provider lock before reporting success;
+physical item, graph, and cache cleanup runs afterward and is retryable. A retry takes the same lock and
+rechecks for a restored claim before deleting. Every memory/persisted cache read checks the current epoch,
+and persistent publication is atomic with an epoch lock; Timeline synopsis salvage and arc fusion/fallbacks
+carry the build-start epoch through their final serving boundary. Timeline publication distinguishes an
+epoch rejection from an ordinary cache outage: rejected payloads are discarded and rebuilt once under
+current authority (then fail retryably), while an ordinary outage may use process memory only after a
+final locked epoch check. Arc scheduling carries the prior row's epoch and rereads it at background start;
+old-epoch titles/prose cannot participate in hash reuse, continuity prompting, reconciliation, or fallback.
+A pre-revocation rebuild therefore cannot
+repopulate or serve stale visibility even if cleanup or a later rebuild fails. Historical Drive rows are
+adopted only from an exact, unambiguous retained provider-ID mapping. A normalized-path-only match is
+never ownership evidence: ingestion allocates a deterministic collision-safe Drive path (or fails
+visibly if even that conflicts) instead of overwriting case-colliding, sanitized, or non-Drive content.
+
+Human arc corrections retain their editorial history in `arc_corrections`, but prose eligibility is
+separate and fail-closed. The server captures every item behind the exact authorized arc's cited facts
+into immutable `arc_correction_revisions` plus `arc_correction_revision_dependencies`, together with
+provenance completeness and the capture epoch; `arc_corrections` is only the serialized logical identity
+and current-revision pointer. A correction edit appends a revision and advances that pointer atomically;
+rollback moves the pointer without rewriting history. `team_arc_correction_versions` is a distinct cache
+publication fence, so a paused synthesis cannot publish after a same-epoch correction change. The
+client cannot nominate a narrower dependency set. Before any correction can enter a synthesis prompt
+or the Graphiti projection, the arc owner re-resolves every dependency against current suppression and
+the exact partition audience under one live authorization epoch. Legacy, incomplete, missing, deleted,
+or unreadable provenance remains inspectable as history but contributes no prose. The captured epoch is
+audit evidence, never a substitute for the live dependency decision.
+
+Graph reads deliberately do not trust Graphiti `/search`, whose wire response omits complete episode
+dependencies. Graph-query, events, ordinary retrieval, and the Layer-1 feed instead share the direct
+Neo4j provenance path: every relationship retains `r.episodes` and `r.group_id`, every episode must
+resolve to a canonical item, and every dependency must remain visible in that exact partition under
+one authorization epoch. Event titles/participants additionally require the event episode's item to
+remain visible. Legacy/unproven/mixed/revoked facts are excluded; graph/provenance/visibility failure
+or a repeatedly changing epoch returns retryable unavailable rather than a healthy empty result.
+
+Pause/disable stops scheduled reads while retaining cursor state and ingested data. Disconnect stops
+credential use but is not an implicit purge; provider-confirmed revocation still follows the removal
+path above. Live Google behavior is a separate certification gate from mocked automated tests; see
+`docs/design/google-docs-connector-upgrade.md`.
 
 ## Key flows
 
@@ -1299,7 +1566,8 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — list non-secret credential metadata
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials` — add a client-generated overlapping credential without returning its secret
 - `POST /api/internal/executor-gateway/v1/admin/:teamSlug/service-identities/:serviceIdentityId/credentials/:credentialId/revoke` — advisory-lock-linearized credential revocation
-- `POST /api/v1/items` — upsert synced content
+- `POST /api/v1/items` — upsert synced content; its ingest owner transaction locks candidate path/provider identities and requires the current Drive execution when incoming provenance OR the persisted item/mapping is Drive-owned, so omission/relabel and first-create races cannot bypass the fence
+- `POST /api/v1/items/source-reconcile` — authenticated gdrive tombstone/complete-snapshot reconciliation through the shared ingest purge owner; incomplete snapshots never delete
 - `GET /api/v1/items` — tier-filtered, keyset-paginated pull
 - `GET /api/v1/items/:id` — single item fetch
 - `GET /api/v1/tasks` — dashboard task changes for `aios pull` writeback; `?all=1` selects the tier-filtered full tasks-table read (bounded at 500 rows, `updated_at` ASC, no cursor — a full page is the STALEST prefix, so it can confirm a key but can never prove one absent); `?mode=table&keys=A,B` (brain-api 1.14) is the by-key lookup that can — bounded by the keys asked for, answering `unknown_keys` outright (`null` = couldn't determine, never a wrong list). Refused outside table mode, since the other modes filter rows and a real key would look missing
@@ -1319,6 +1587,12 @@ PR as the code change, or the [drift guard](#docs-drift-guard) fails.
 - `GET /api/auth/slack/start` — member-authed: mint single-use state nonce + return Slack OAuth authorize_url with the full `slack-personal` user-scope set (including matched conversation read/history scopes and `files:write`; signed short-TTL state JWT; CSRF/replay guard)
 - `GET /api/auth/slack/callback` — browser (no API key): verify+consume state nonce, exchange `code` (`oauth.v2.access`), re-validate via `auth.test`, store the user token encrypted (`member_secrets`) + capture identity; renders HTML (never the token)
 - `GET /api/auth/slack/status` — member-authed: `{ connected, slack_user_id, workspace }` (never returns the token; `no-store`)
+- `GET /api/auth/gdrive/start` — team-admin-authenticated Google Drive OAuth start; signed single-use team/member-bound state and explicit per-file vs folder-discovery scopes
+- `GET /api/auth/gdrive/callback` — consume bound state, exchange and verify the Google account, then atomically publish account config + encrypted refresh credential; an old refresh token is reusable only for the same verified subject/client pair
+- `POST /api/v1/integrations/gdrive/execution` — dedicated connector-principal acquire/checkpoint/release for the current immutable integration generation + lease fence and authoritative progress revision; acquire never self-binds, and every commit transaction rereads the bound key/member/posture plus connection/fence. Selection/account/credential changes advance the content generation and reset its cursor obligations; status-only pause/resume instead advances the fence, clears the lease, and retains generation/progress so resumption cannot skip acknowledged work or request a fresh start token
+- `POST /api/v1/integrations/gdrive/token` — fenced no-store OAuth access-token broker; refresh/client secrets remain server-side, and bound-principal revocation is reread after provider refresh before issuance
+- `GET /api/v1/integrations/gdrive/runs` — connection-bound connector claim for durable Admin Run-now/retry requests
+- `POST /api/v1/integrations/gdrive/runs` — connection-bound completion for a claimed Drive run; appends the ordinary `ingest_runs` summary
 - `POST /api/v1/evidence/search` — bounded native FTS passages with recorded contributors; live member/delegated visibility, no answer generation
 - `POST /api/v1/query` — SSE grounded query (`delta`/`sources`/`done`); persists the thread (`conversation_id`)
 - `GET /api/v1/conversations` — API-key list of the key member's own chat threads (owner-scoped)
@@ -1385,12 +1659,12 @@ leak. See `docs/specs/meeting-participation-as-work-v1.md`. A person's evidence 
 `projects` · `items` · `item_versions` · `tasks` · `decisions` · `extracted_facts` · `stakeholder_mentions` · `graph_entities` ·
 `graph_relationships` · `query_log` · `policies` · `approval_requests` · `actions` ·
 `codebases` · `code_metrics` · `codebase_findings` · `codebase_finding_events` · `code_contributions` · `github_issues` · `member_emails` ·
-`member_identities` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` ·
-`agentic_maturity_snapshots` · `migration_markers` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `graph_project_arming` · `arc_cache` · `arc_corrections` · `work_timeline_cache` · `doc_task_inference` ·
+`member_identities` · `member_identity_mapping_state` · `identity_repair_obligations` · `team_identity_authority` · `gdrive_contribution_evidence` · `member_secrets` · `member_profiles` · `member_time_off` · `member_goals` · `member_provisioning` · `integrations` · `gdrive_connection_authority` · `gdrive_run_requests` · `gdrive_item_claims` · `gdrive_item_claim_projects` · `gdrive_cleanup_obligations` · `team_authorization_epochs` ·
+`agentic_maturity_snapshots` · `migration_markers` · `task_pm_links` · `task_evidence` · `work_events` · `usage_costs` · `llm_usage` · `llm_failures` · `subscriptions` · `graph_episodes` · `graph_project_arming` · `arc_cache` · `arc_corrections` · `arc_correction_source_dependencies` · `arc_correction_revisions` · `arc_correction_revision_dependencies` · `arc_correction_revision_parents` · `team_arc_correction_versions` · `work_timeline_cache` · `doc_task_inference` ·
 `conversations` · `chat_messages` · `chat_turn_runs` · `ingest_runs` · `social_jobs` · `brand_profiles` · `brand_assets` · `social_opportunities` · `content_plans` · `content_variants` · `media_assets` · `social_image_usage` · `social_settings` · `content_approvals` · `social_publications` · `publication_analytics` ·
 `meeting_notes` · `meeting_note_attendees` · `meeting_note_submitters` ·
 `groups` · `group_members` · `project_groups` · `agent_tokens` ·
-`project_context_units` · `project_context_memberships` · `connector_cursors`
+`project_context_units` · `project_context_memberships` · `connector_cursors` · `source_item_mappings`
 
 <!-- /drift:tables -->
 

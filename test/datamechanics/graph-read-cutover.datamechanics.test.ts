@@ -4,7 +4,6 @@ import type { AddressInfo } from "node:net";
 import { projectItemsToGraph } from "@/lib/graph/project";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { fetchGraphFactsForGroups, nativeProvider } from "@/lib/query/retrieve";
-import { episodeGroupId } from "@/lib/graph/group";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { runSql } from "@/lib/db/pg/pool";
 import { db, ingest, seedTeam, sha, type Seed } from "./helpers";
@@ -189,7 +188,7 @@ describe("PCCC-6 — enforced partition selection", () => {
     expect(deferredStill.rows[0].deferred).toBe(true); // and costs zero LLM
   });
 
-  it("fetchGraphFactsForGroups searches EXACTLY the selected groups (the wiring pin)", async () => {
+  it("excludes unproven Graphiti search facts until revision-bound provenance is available", async () => {
     const fake = new FakeGraphiti();
     const searches: string[][] = [];
     (fake as unknown as { search: (q: string, g: string[], n: number) => Promise<unknown[]> }).search = async (
@@ -200,13 +199,14 @@ describe("PCCC-6 — enforced partition selection", () => {
       return [];
     };
     await fetchGraphFactsForGroups("what changed", ["g1", "g2"], client(fake));
-    expect(searches).toEqual([["g1", "g2"]]);
+    expect(searches).toEqual([]);
     // Empty set short-circuits — an empty group list must NEVER reach the wire (no-filter = everything).
     await fetchGraphFactsForGroups("what changed", [], client(fake));
-    expect(searches).toHaveLength(1);
+    expect(searches).toHaveLength(0);
   });
 
-  it("an ENFORCED member's retrieve hands exactly the selected partitions to Graphiti — the production path end to end (Codex code-review Medium 3: the string guard alone is green-by-construction)", async () => {
+  it("keeps ordinary retrieval off the provenance-free Graphiti search wire", async () => {
+    const { GraphProvenanceUnavailableError } = await import("@/lib/graph/provenance-read");
     const seed = await seedTeam();
     const { init, itemId } = await bootstrapWithInitiative(seed, "wire-e2e");
     await landGroup(seed, init.group);
@@ -229,20 +229,19 @@ describe("PCCC-6 — enforced partition selection", () => {
     const prev = process.env.GRAPHITI_URL;
     process.env.GRAPHITI_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
-      await nativeProvider.retrieve({
+      await expect(nativeProvider.retrieve({
         db: db(),
         teamId: seed.teamId,
         tier: "team",
         question: "what changed in wire-e2e",
         enforce: { visibleItemIds: new Set([itemId]), graphProjectIds: ids },
-      });
+      })).rejects.toBeInstanceOf(GraphProvenanceUnavailableError);
     } finally {
       if (prev === undefined) delete process.env.GRAPHITI_URL;
       else process.env.GRAPHITI_URL = prev;
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
     const searches = captured.filter((c) => c.url.startsWith("/search"));
-    expect(searches).toHaveLength(1);
-    expect([...(searches[0].group_ids ?? [])].sort()).toEqual([...expected.groups].sort());
+    expect(searches).toHaveLength(0);
   });
 });

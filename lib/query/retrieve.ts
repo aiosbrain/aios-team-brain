@@ -3,6 +3,7 @@ export { buildFtsQuery, significantTerms, conjunctiveTerms, toOrQuery } from "./
 import "server-only";
 import type { DbClient } from "@/lib/db/types";
 import { GraphitiClient, type GraphFact } from "@/lib/graph/graphiti-client";
+import { GraphProvenanceUnavailableError, readAuthorizedGraphFacts } from "@/lib/graph/provenance-read";
 import { selectEnforcedGraphPartitions } from "@/lib/graph/partition-read";
 import { isRestrictedTier } from "@/lib/auth/visibility";
 import { runSql } from "@/lib/db/pg/pool";
@@ -25,6 +26,7 @@ export type { Source, RetrievedContext };
 
 const MAX_SOURCE_CHARS = 8_000;
 const MAX_TOTAL_CHARS = 160_000; // ~40k tokens context cap
+const GRAPH_FACT_LIMIT = 20;
 // How many ranked keyword candidates to pull before the char budget truncates. Was 20 — too small
 // once many channels make a broad query legitimately match dozens of items; the top-20 then dropped
 // relevant evidence. `MAX_TOTAL_CHARS` is the real output ceiling (it truncates large corpora), so a
@@ -133,8 +135,6 @@ async function fetchAugmentedSources(
 // Graphiti graph-memory blend (temporal knowledge graph over ALL ingestions). Best-effort:
 // tier-scoped via group_ids, short timeout, never throws — a clean [] when GRAPHITI_URL is unset
 // or the call fails, so retrieval degrades to Postgres-only. Facts join the structured digest.
-const GRAPH_FACTS_LIMIT = Number(process.env.GRAPH_QUERY_FACTS ?? 12);
-const GRAPH_QUERY_TIMEOUT_MS = Number(process.env.GRAPH_QUERY_TIMEOUT_MS ?? 4000);
 
 
 /**
@@ -179,15 +179,25 @@ export type RetrieveEnforce =
 export async function fetchGraphFactsForGroups(
   question: string,
   groupIds: readonly string[],
-  client?: GraphitiClient
+  client?: GraphitiClient,
+  authority?: { db: DbClient; teamId: string },
 ): Promise<GraphFact[]> {
-  const c = client ?? new GraphitiClient({ timeoutMs: GRAPH_QUERY_TIMEOUT_MS });
-  if (!c.configured || groupIds.length === 0) return [];
-  try {
-    return await c.search(question, [...groupIds], GRAPH_FACTS_LIMIT);
-  } catch {
-    return [];
-  }
+  // The REST /search payload still lacks relationship episodes. Production retrieval therefore
+  // uses the direct, provenance-complete Neo4j path; keeping the client parameter preserves the
+  // injectable public seam without ever dispatching an unsafe /search request.
+  void client;
+  if (groupIds.length === 0) return [];
+  if (!authority) return [];
+  const facts = await readAuthorizedGraphFacts(authority.db, {
+    teamId: authority.teamId, groupIds, query: question, limit: GRAPH_FACT_LIMIT,
+  });
+  return facts.map((fact) => ({
+    uuid: fact.id,
+    fact: fact.fact,
+    valid_at: fact.at,
+    source_node_name: fact.subject,
+    target_node_name: fact.object,
+  }));
 }
 
 /**
@@ -497,8 +507,9 @@ async function nativeRetrieve(
     try {
       const scope = await selectEnforcedGraphPartitions(db, { teamId, visibleProjectIds: enforce.graphProjectIds });
       graphScope = { covered: scope.covered, total: scope.total };
-      return fetchGraphFactsForGroups(q, scope.groups);
+      return fetchGraphFactsForGroups(q, scope.groups, undefined, { db, teamId });
     } catch (err) {
+      if (err instanceof GraphProvenanceUnavailableError) throw err;
       // Fail CLOSED and gracefully (review Medium 6) — but never SILENTLY (review-2 Medium 6): a
       // wedged arming path must be distinguishable from the healthy omit for operators.
       console.error(

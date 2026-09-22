@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, visOf, externalMember, type Seed } from "./helpers";
+import { db, ingest, seedTeam, visOf, externalMember, convergeIdentityAttribution, type Seed } from "./helpers";
 import {
   getCachedWorkTimeline,
+  TimelineAuthorizationChangedError,
   settleTimelineRefreshes,
   readTimelineCache,
   bustTeamTimeline,
   PAYLOAD_VERSION,
 } from "@/lib/dashboard/timeline-cache";
+import { advanceAuthorizationEpoch, authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { AttributionRepairPendingError } from "@/lib/access/authorization-epoch";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 // Spec (PR-B — the persisted work-timeline LAYER): getCachedWorkTimeline builds from items+tasks on a
 // cold miss, persists the TimelineDay[] to work_timeline_cache (serve-stale-while-revalidate), and keys
@@ -37,6 +41,9 @@ async function seedLinkedTeam(): Promise<Seed> {
     title: "Cached work", status: "in_progress", assignee: "Tester", origin: "sync", audience: "external",
     source_item_id: src.id,
   });
+  // Member creation advances the attribution authority. Establish the supported repair-complete
+  // baseline before cache tests; tests that exercise pending repair do so explicitly below.
+  await convergeIdentityAttribution(seed);
   return seed;
 }
 
@@ -105,6 +112,9 @@ describe("work-timeline cache layer (real Postgres)", () => {
     await seedCommit(seed, "internal-work", recentIso()); // team-tier item
 
     const ext = await externalMember(seed);
+    // Roster mutation is an attribution mutation. Complete its durable repair before treating a
+    // replacement cache payload as healthy.
+    await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:10,batchSize:20});
     const { days: teamDays } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     const { days: extDays } = await getCachedWorkTimeline(db(), seed.teamId, "external", ext);
 
@@ -116,6 +126,7 @@ describe("work-timeline cache layer (real Postgres)", () => {
     const extRow = await readRow(seed, "external", ext);
     expect((teamRow?.payload as { days: unknown[] }).days.length).toBeGreaterThan(0);
     expect((extRow?.payload as { days: unknown[] }).days.length).toBe(0);
+    await settleTimelineRefreshes();
   });
 
   it("SWR: a stale row is served immediately, and the background rebuild picks up new work", async () => {
@@ -164,5 +175,57 @@ describe("work-timeline cache layer (real Postgres)", () => {
     // Stale-marked to > the 5-min TTL in the past, so the next view rebuilds behind the request.
     expect(ms(after!.computed_at)).toBeLessThan(ms(before!.computed_at));
     expect(Date.now() - ms(after!.computed_at)).toBeGreaterThan(5 * 60_000);
+    await settleTimelineRefreshes();
+  });
+
+  it("discards an epoch-rejected initiating payload and rebuilds once under current authorization", async () => {
+    const seed = await seedLinkedTeam();
+    await seedCommit(seed, "epoch-race", recentIso());
+    let hookCalls = 0;
+    const result = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId, {
+      beforeColdPublish: async (attempt) => {
+        hookCalls += 1;
+        if (attempt === 0) await advanceAuthorizationEpoch(seed.teamId);
+      },
+    });
+    expect(result.days.length).toBeGreaterThan(0);
+    expect(hookCalls).toBe(2);
+    const row = await readRow(seed, "team");
+    expect(row).not.toBeNull();
+    const { data: stamped } = await db().from("work_timeline_cache").select("authorization_epoch")
+      .eq("team_id", seed.teamId).eq("group_key", row!.group_key).single();
+    expect(Number((stamped as { authorization_epoch: string | number }).authorization_epoch))
+      .toBe(await authorizationEpoch(db(), seed.teamId));
+    await settleTimelineRefreshes();
+  });
+
+  it("bounds repeated initiating-response revocation races and returns retryable unavailable", async () => {
+    const seed = await seedLinkedTeam();
+    await seedCommit(seed, "epoch-race-bounded", recentIso());
+    let hookCalls = 0;
+    await expect(getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId, {
+      beforeColdPublish: async () => {
+        hookCalls += 1;
+        await advanceAuthorizationEpoch(seed.teamId);
+      },
+    })).rejects.toBeInstanceOf(TimelineAuthorizationChangedError);
+    expect(hookCalls).toBe(2);
+    expect(await readRow(seed, "team")).toBeNull();
+  });
+
+  it("rejects cache reads and publication while attribution repair is pending", async () => {
+    const seed=await seedLinkedTeam();
+    await seedCommit(seed,"pending-repair",recentIso());
+    // A real roster mutation advances the durable identity authority and leaves the supported repair
+    // obligation pending. Do not mock the guard: the cache owners must observe the database barrier.
+    const {error}=await db().from("members").insert({
+      team_id:seed.teamId,email:`pending-${randomUUID()}@test.local`,display_name:"Pending Repair",
+      actor_handle:`pending-${randomUUID().slice(0,8)}`,role:"member",tier:"team",status:"active",
+    });
+    if(error) throw new Error(error.message);
+
+    await expect(getCachedWorkTimeline(db(),seed.teamId,"team",seed.memberId))
+      .rejects.toBeInstanceOf(AttributionRepairPendingError);
+    expect(await readTimelineCache(db(),seed.teamId,"team",await visOf(seed))).toBeNull();
   });
 });

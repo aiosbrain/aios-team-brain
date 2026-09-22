@@ -1,4 +1,6 @@
 import "server-only";
+import { authorizationEpoch, lockedAuthorizationEpoch, withLockedAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import { withTransaction } from "@/lib/db/pg/pool";
 import { resolvePositiveInt } from "@/lib/util/env";
 import { createHash } from "node:crypto";
 import { completeTextOrNull } from "@/lib/llm/complete";
@@ -19,10 +21,15 @@ import {
   UNTRUSTED_RETRY_AFTER_MS,
 } from "./arc-cache";
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
-import { listArcCorrections, recordArcCorrections } from "./arc-corrections";
+import { arcCorrectionVersion, listAuthorizedArcCorrections, recordArcCorrections } from "./arc-corrections";
 import { arcIneligibleItemIds } from "./arc-eligibility";
 import { recordIngestRun } from "@/lib/ingest/runs";
 import { reconcileArcIdentity, stableArcTarget, mergeArcPair, type ArcContinuity } from "./arc-continuity";
+import {
+  authorizedArcFacts,
+  ArcInputAuthorizationUnavailableError,
+  ArcSynthesisAuthorizationChangedError,
+} from "./arc-input-authorization";
 
 /**
  * Layer 3 — narrative arcs. Gathers the recent graph substrate (facts, tier-scoped, and NOT
@@ -58,6 +65,13 @@ export interface NarrativeArc {
   /** Legacy free-text refs (kept for back-compat); `evidence` is the linkable, verifiable version. */
   supporting_sources: string[];
   evidence: ArcEvidence[];
+  /** Server-derived complete source set for every fact the model cited as supporting this prose.
+   * Legacy/free-text/unresolved arcs are explicitly incomplete and cannot authorize a correction. */
+  source_provenance?: {
+    state: "complete" | "incomplete";
+    item_ids: string[];
+    correction_revision_ids?: string[];
+  };
   derived_at: string;
 }
 
@@ -67,6 +81,9 @@ export interface ArcCorrection {
   /** The arc's title at correction time. `arc_id` is sha(title) and churns on every recompute (M7), so
    *  without this a stored correction becomes an un-diagnosable orphan as soon as arcs re-rank. */
   arc_title?: string;
+  /** Server-only capture from the exact cached arc being corrected. */
+  source_provenance?: NarrativeArc["source_provenance"];
+  captured_authorization_epoch?: number;
 }
 
 /** Full backend keys — resolve via `lib/query/answering.resolveAnsweringKeys` at the call site. */
@@ -395,6 +412,35 @@ function buildEvidence(
   return out;
 }
 
+/** Complete source dependency set for one model arc. Unlike the display evidence (capped and one
+ * link per fact), this retains every item behind every cited fact. Any malformed citation or
+ * unresolved episode makes the whole capture incomplete. */
+function buildSourceProvenance(
+  indices: unknown,
+  facts: AtomicFact[],
+  epToItem: Map<string, { itemId?: string; source?: string }>,
+): NonNullable<NarrativeArc["source_provenance"]> {
+  if (!Array.isArray(indices) || indices.length === 0) return { state: "incomplete", item_ids: [] };
+  const itemIds = new Set<string>();
+  const seenFacts = new Set<string>();
+  for (const rawIdx of indices) {
+    const i = typeof rawIdx === "number" ? rawIdx : parseInt(String(rawIdx), 10);
+    if (!Number.isInteger(i) || i < 1 || i > facts.length) return { state: "incomplete", item_ids: [...itemIds] };
+    const fact = facts[i - 1];
+    if (seenFacts.has(fact.id)) continue;
+    seenFacts.add(fact.id);
+    if (fact.episodeUuids.length === 0) return { state: "incomplete", item_ids: [...itemIds] };
+    for (const episodeUuid of fact.episodeUuids) {
+      const itemId = epToItem.get(episodeUuid)?.itemId;
+      if (!itemId) return { state: "incomplete", item_ids: [...itemIds] };
+      itemIds.add(itemId);
+    }
+  }
+  return itemIds.size > 0
+    ? { state: "complete", item_ids: [...itemIds].sort() }
+    : { state: "incomplete", item_ids: [] };
+}
+
 /**
  * Parse + normalize the LLM's JSON into safe arcs: caps at MAX_ARCS, coerces confidence, defaults missing
  * fields, assigns a stable id from the title, stamps `derived_at`, and resolves cited `supporting_facts`
@@ -412,6 +458,7 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
     const parsed = obj.arcs.slice(0, MAX_ARCS).map((a) => {
       const supporting_sources = Array.isArray(a.supporting_sources) ? a.supporting_sources.map(String) : [];
       const cited = buildEvidence(a.supporting_facts, facts, epToItem);
+      const source_provenance = buildSourceProvenance(a.supporting_facts, facts, epToItem);
       // Fall back to free-text sources (unlinked) if the model didn't cite fact numbers.
       const evidence = cited.length ? cited : supporting_sources.map((s) => ({ fact: s }));
       // Normalize FIRST, then hash: the id must be derived from the string the card renders, or two
@@ -427,6 +474,7 @@ export function parseArcsJson(raw: string | null, opts: ParseArcsOptions = {}): 
         participants: Array.isArray(a.participants) ? a.participants.map(String) : [],
         supporting_sources,
         evidence,
+        source_provenance,
         derived_at: now,
       };
     });
@@ -650,7 +698,7 @@ async function pruneIncoherentEvidence(
 
 /**
  * Core synthesis pipeline (no caching): recent facts → attributed prompt → LLM → attributed arcs.
- * `correctionTexts` is empty for a normal derive, populated for the human-correction recompute.
+ * Human corrections enter only through the durable, dependency-authorized correction owner.
  * Sequential, not Promise.all-able: the PROMPT needs each fact's human attribution baked in
  * (attributedFactTexts), so item/human resolution must finish before the LLM call starts — a real
  * latency cost, traded for a synthesis input grounded in a human from the start rather than patched
@@ -671,6 +719,29 @@ export interface SynthesisResult {
    *  so the arcs are plausible but wrong — typically unattributed, or unfiltered backlog noise. Reported
    *  as DATA so `commitArcs` can refuse to overwrite good arcs and refuse to stamp this fresh (H11). */
   degraded: boolean;
+  /** Separate from the source-authorization epoch: fences concurrent correction edits with the same
+   * dependency count and prevents a paused old reader publishing after a newer revision. */
+  correctionVersion: number;
+}
+
+export interface ArcSynthesisPrior {
+  arcs: NarrativeArc[];
+  factsHash: string | null;
+  degraded?: boolean;
+  /** The durable authorization epoch under which this prose was produced. */
+  authorizationEpoch: number;
+  correctionVersion?: number;
+}
+
+/** The sole gate through which cached prose may become a synthesis input. */
+export function arcPriorForEpoch(
+  prior: ArcSynthesisPrior | null,
+  expectedAuthorizationEpoch: number | undefined,
+  expectedCorrectionVersion?: number,
+): ArcSynthesisPrior | null {
+  if (expectedAuthorizationEpoch !== undefined && prior?.authorizationEpoch !== expectedAuthorizationEpoch) return null;
+  if (expectedCorrectionVersion !== undefined && (prior?.correctionVersion ?? 0) !== expectedCorrectionVersion) return null;
+  return prior;
 }
 
 /** Pure: may the background refresh REUSE the prior arcs instead of re-running the (non-deterministic)
@@ -678,9 +749,10 @@ export interface SynthesisResult {
  *  to apply, and the prior actually had arcs. This is the stability guard — arcs then change only when the
  *  underlying work does, not on every recompute. A null/empty prior hash never reuses. */
 export function canReuseArcs(
-  prior: { factsHash: string | null; arcCount: number; degraded?: boolean } | null,
+  prior: { factsHash: string | null; arcCount: number; degraded?: boolean; authorizationEpoch?: number; correctionVersion?: number } | null,
   factsHash: string,
-  hasCorrections: boolean
+  hasCorrections: boolean,
+  expectedAuthorizationEpoch?: number,
 ): boolean {
   // A DEGRADED prior is never reusable, however stable the fact set is. Reuse means "the inputs didn't
   // change, so keep the previous answer and skip the model" — sound only if that answer was trustworthy.
@@ -690,6 +762,7 @@ export function canReuseArcs(
   // built, so the hash is unchanged; unattributed arcs persist degraded; 5 minutes later the retry
   // hash-skips and stamps them healthy for 4h, with the attribution pass never re-running.
   if (prior?.degraded) return false;
+  if (expectedAuthorizationEpoch !== undefined && prior?.authorizationEpoch !== expectedAuthorizationEpoch) return false;
   return !hasCorrections && !!prior && !!prior.factsHash && prior.factsHash === factsHash && prior.arcCount > 0;
 }
 
@@ -697,14 +770,13 @@ async function synthesizeArcs(
   db: DbClient,
   teamId: string,
   groups: string[],
-  correctionTexts: string[],
   keys: ProviderKeys,
   // Route-bound cold-miss callers keep the default (under the 120s route budget); the non-route-bound
   // background refresh passes BG_ARC_TIMEOUT_MS so a slow reasoning model doesn't false-alarm as a timeout.
   llmTimeoutMs: number = INLINE_ARC_TIMEOUT_MS,
   // The prior cached arcs + their fact hash (background refresh only). When the freshly-built prompt hashes
   // identically AND there's no correction, we KEEP the prior arcs and skip the LLM (the stability guard).
-  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null = null,
+  prior: ArcSynthesisPrior | null = null,
   // Run the extra evidence-COHERENCE LLM pass? Only the non-route-bound BACKGROUND refresh sets this — the
   // route-bound cold-miss + correction paths skip it (a second LLM call would blow the 120s route budget).
   // A cold-miss arc may briefly show a spurious participant; the next SWR refresh prunes it.
@@ -712,8 +784,19 @@ async function synthesizeArcs(
   // PCCC6B-1: the synthesis SCOPE key (identical to the arc_cache group_key this result commits
   // under). Corrections are loaded for EXACTLY this scope. REQUIRED since PRET-3 — the legacy
   // tier fallback (sorted group join) is retired with the arcs unification.
-  scopeKey: string
+  scopeKey: string,
+  expectedAuthorizationEpoch?: number,
+  forceResynthesize = false,
 ): Promise<SynthesisResult> {
+  const correctionVersion = await arcCorrectionVersion(teamId);
+  const result = (value: Omit<SynthesisResult, "correctionVersion">): SynthesisResult => ({
+    ...value,
+    correctionVersion,
+  });
+  // Never let prose from a pre-revocation row influence either reuse, the continuity prompt, or
+  // identity reconciliation. Filtering only at publication is too late: old titles can already have
+  // steered the newly-authorized synthesis even when its final write carries the new epoch.
+  const authorizedPrior = arcPriorForEpoch(prior, expectedAuthorizationEpoch, correctionVersion);
   // Arcs are NOT time-boxed — synthesize from the most-recent facts regardless of age (a quiet week,
   // or a stalled projector, must not blank the panel). `null` = no window. Fetch a DEEP pool (not just
   // MAX_FACTS), so we can balance it across contributors — otherwise the globally-newest MAX_FACTS are
@@ -726,6 +809,13 @@ async function synthesizeArcs(
   // PCCC6B-1 scope rule: EXACT match on this synthesis's own scope key (always g:-prefixed
   // since PRET-3 — the tier fallback is gone, so no caller can reach a legacy semantics here).
   const effectiveScopeKey = scopeKey;
+  if (expectedAuthorizationEpoch === undefined) {
+    throw new ArcInputAuthorizationUnavailableError("arc synthesis is missing its authorization epoch");
+  }
+  const partitionGroup = effectiveScopeKey.startsWith("g:") ? effectiveScopeKey.slice(2) : "";
+  if (!partitionGroup || groups.length !== 1 || groups[0] !== partitionGroup) {
+    throw new ArcInputAuthorizationUnavailableError("arc synthesis scope is not one exact partition");
+  }
   // PRET-3 H1 (docs/design/pret3-arcs-unification.md §1a): a synthesis whose PARTITION is
   // external-shaped is CORRECTIONS-FREE — client-facing prose carries no internal editorial
   // text. This REVERSES the Fable-6b-Medium-4 allowance (corrections loaded for a
@@ -742,14 +832,13 @@ async function synthesizeArcs(
   // tier path was its only trigger; the H2 migration re-keyed tier-set rows).
   const correctionsEligible = !scopeIsExternalPartition;
   const correctionsRead = correctionsEligible
-    ? await listArcCorrections(db, teamId, {
+    ? await listAuthorizedArcCorrections(db, teamId, {
         groupKey: effectiveScopeKey,
-        includeLegacy: false,
+        partitionGroup,
+        expectedAuthorizationEpoch,
       })
     : { corrections: [], ok: true };
-  const allCorrections = [
-    ...new Set([...correctionTexts, ...correctionsRead.corrections.map((c) => c.corrected_text)]),
-  ];
+  const allCorrections = [...new Set(correctionsRead.corrections.map((c) => c.corrected_text))];
 
   // Degradation is tracked from the FIRST leg that can fail, not swallowed: any leg leaving the
   // synthesis inputs incomplete means `commitArcs` must refuse to overwrite good arcs with the
@@ -766,15 +855,24 @@ async function synthesizeArcs(
   // Neo4j outage on a cold miss writes a blank panel stamped fresh for 4h — H12's shape, on the leg that
   // still conflated them.
   if (pool.length === 0 && allCorrections.length === 0)
-    return { arcs: [], factsHash: null, degraded: degraded || !factsRead.ok };
+    return result({ arcs: [], factsHash: null, degraded: degraded || !factsRead.ok });
   // Resolve attribution for the WHOLE pool (higher uuid cap to match) so balancing sees each fact's
   // human. epToItem/creditByItem stay supersets of the balanced set — safe for evidence + attribution.
   // Degradation is tracked, not swallowed: any leg below that fails leaves the synthesis inputs
   // incomplete, and `commitArcs` must then refuse to overwrite good arcs with the plausible-but-wrong
   // result that follows (H11). Each leg says whether it worked.
   const episodeItems = await resolveEpisodeItems(groups, pool.flatMap((f) => f.episodeUuids), FACT_POOL * 3);
-  if (!episodeItems.ok) degraded = true;
+  if (!episodeItems.ok) {
+    throw new ArcInputAuthorizationUnavailableError("arc source provenance read failed");
+  }
   const epToItem = episodeItems.items;
+  const authorizedPool = await authorizedArcFacts(db, {
+    teamId,
+    partitionGroup,
+    expectedAuthorizationEpoch,
+    facts: pool,
+    episodeItems: epToItem,
+  });
   // Shape-filtered before it reaches a uuid column. These ids are parsed verbatim out of Graphiti
   // episode NAMES, and `resolveItemCredit` (now strict) binds them into `id IN (…)`: one malformed value
   // raises 22P02 on every retry, so strict would throw forever — degraded permanently, model never
@@ -783,8 +881,8 @@ async function synthesizeArcs(
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const allItemIds = [
     ...new Set(
-      [...epToItem.values()]
-        .map((v) => v.itemId)
+      authorizedPool.flatMap((fact) => fact.episodeUuids)
+        .map((episodeUuid) => epToItem.get(episodeUuid)?.itemId)
         .filter((id): id is string => !!id && UUID_RE.test(id))
     ),
   ];
@@ -860,21 +958,21 @@ async function synthesizeArcs(
   // to a model failure: keep a healthy prior, else persist a short-lived row that retries soon.
   if (degraded) {
     console.warn("[arcs] synthesis inputs degraded — skipping the model and keeping whatever is cached");
-    return { arcs: [], factsHash: null, degraded: true };
+    return result({ arcs: [], factsHash: null, degraded: true });
   }
 
   const factItemIds = (f: AtomicFact): string[] =>
     f.episodeUuids.map((u) => epToItem.get(u)?.itemId).filter((id): id is string => !!id);
   const eligiblePool = ineligible.size
-    ? pool.filter((f) => {
+    ? authorizedPool.filter((f) => {
         const items = factItemIds(f);
         return items.length === 0 || items.some((id) => !ineligible.has(id));
       })
-    : pool;
+    : authorizedPool;
   // If every recent fact traces ONLY to non-active Linear work, there's nothing to synthesize — return
   // [] so it flows into the empty-clobber guard (keep a recent prior, else honest blank), rather than
   // firing a zero-fact LLM call whose fabricated (evidence-less) arcs would clobber the real prior set.
-  if (eligiblePool.length === 0 && allCorrections.length === 0) return { arcs: [], factsHash: null, degraded };
+  if (eligiblePool.length === 0 && allCorrections.length === 0) return result({ arcs: [], factsHash: null, degraded });
   // Two-level balance (contributor → item, per-item capped) → a representative MAX_FACTS so every active
   // contributor is in the prompt AND no single giant document dominates its author's share.
   const facts = balanceFacts(eligiblePool, humanOfFact, itemOfFact, MAX_FACTS, PER_ITEM_CAP);
@@ -886,7 +984,7 @@ async function synthesizeArcs(
   // had not changed — churn manufactured by the request, not by the team.
   const requested = stableArcTarget(
     arcsRequested(contributorCount),
-    prior?.arcs.length ?? 0,
+    authorizedPrior?.arcs.length ?? 0,
     MIN_ARCS_REQUESTED,
     MAX_ARCS
   );
@@ -897,7 +995,7 @@ async function synthesizeArcs(
   // Folding them in makes the hash change whenever the model reworded anything last run, so an unchanged
   // fact set re-synthesizes anyway and the reuse guard quietly stops working: the continuity nudge would
   // have disabled the very stability mechanism it was added to reinforce.
-  const systemPrompt = buildSystemPrompt(requested, (prior?.arcs ?? []).map((a) => a.title));
+  const systemPrompt = buildSystemPrompt(requested, (authorizedPrior?.arcs ?? []).map((a) => a.title));
   const systemPromptForHash = buildSystemPrompt(requested);
   const userPrompt = buildPrompt(attributedFactTexts(facts, epToItem, primaryByItem), allCorrections);
 
@@ -929,22 +1027,79 @@ async function synthesizeArcs(
   // LLM non-determinism). The background refresh still runs (fetch/balance/hash), just not the model.
   if (
     canReuseArcs(
-      prior ? { factsHash: prior.factsHash, arcCount: prior.arcs.length, degraded: prior.degraded } : null,
+      authorizedPrior ? {
+        factsHash: authorizedPrior.factsHash,
+        arcCount: authorizedPrior.arcs.length,
+        degraded: authorizedPrior.degraded,
+        authorizationEpoch: authorizedPrior.authorizationEpoch,
+        correctionVersion: authorizedPrior.correctionVersion,
+      } : null,
       factsHash,
-      correctionTexts.length > 0
+      forceResynthesize,
+      expectedAuthorizationEpoch,
     )
   ) {
-    return { arcs: prior!.arcs, factsHash, degraded };
+    return result({ arcs: authorizedPrior!.arcs, factsHash, degraded });
   }
 
+  if (await authorizationEpoch(db, teamId) !== expectedAuthorizationEpoch) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
   const raw = await callLLMRaw(systemPrompt, userPrompt, keys, { db, teamId }, llmTimeoutMs);
+  if (await authorizationEpoch(db, teamId) !== expectedAuthorizationEpoch) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
+  if (await arcCorrectionVersion(teamId) !== correctionVersion) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
+  // Authority follows every source-derived prompt input, not the citations the model elects to show.
+  // This intentionally over-approximates: every generated arc inherits all balanced fact sources, all
+  // immutable correction revisions, and all prior prose lineage used by the continuity prompt.
+  const transitiveItemIds = new Set<string>();
+  const transitiveRevisionIds = new Set<string>();
+  let transitiveComplete = true;
+  for (const fact of facts) {
+    if (fact.episodeUuids.length === 0) transitiveComplete = false;
+    for (const episodeUuid of fact.episodeUuids) {
+      const itemId = epToItem.get(episodeUuid)?.itemId;
+      if (itemId) transitiveItemIds.add(itemId); else transitiveComplete = false;
+    }
+  }
+  for (const correction of correctionsRead.corrections) {
+    if (!correction.revision_id || correction.provenance_state !== "complete" || !correction.source_item_ids?.length) {
+      transitiveComplete = false;
+      continue;
+    }
+    transitiveRevisionIds.add(correction.revision_id);
+    correction.source_correction_revision_ids?.forEach((id) => transitiveRevisionIds.add(id));
+    correction.source_item_ids.forEach((id) => transitiveItemIds.add(id));
+  }
+  for (const priorArc of authorizedPrior?.arcs ?? []) {
+    if (priorArc.source_provenance?.state !== "complete" || !priorArc.source_provenance.item_ids.length) {
+      transitiveComplete = false;
+      continue;
+    }
+    priorArc.source_provenance.item_ids.forEach((id) => transitiveItemIds.add(id));
+    priorArc.source_provenance.correction_revision_ids?.forEach((id) => transitiveRevisionIds.add(id));
+  }
+  const transitiveProvenance: NonNullable<NarrativeArc["source_provenance"]> = {
+    state: transitiveComplete && transitiveItemIds.size > 0 ? "complete" : "incomplete",
+    item_ids: [...transitiveItemIds].sort(),
+    correction_revision_ids: [...transitiveRevisionIds].sort(),
+  };
   // EVIDENCE-COHERENCE pass BEFORE attribution: drop a cited fact that's a cross-topic outlier (a different
   // person's unrelated work the model loosely cited), so `attributeArcs` re-derives participants from the
   // surviving evidence — an off-topic citation can't drag its author onto the arc as a spurious participant.
-  const parsed = parseArcsJson(raw, { facts, epToItem });
+  const parsed = parseArcsJson(raw, { facts, epToItem }).map((arc) => ({
+    ...arc,
+    source_provenance: transitiveProvenance,
+  }));
   const coherent = runCoherence
     ? await pruneIncoherentEvidence(parsed, keys, { db, teamId, contributorsByItem })
     : parsed;
+  if (await authorizationEpoch(db, teamId) !== expectedAuthorizationEpoch) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
   // Rank by recency → relevance so recent contributors' arcs lead, then attribute AI-agent names to
   // the humans behind each arc's own evidence.
   // IDENTITY RECONCILIATION — the last step, after ranking/attribution have settled the final set.
@@ -952,8 +1107,8 @@ async function synthesizeArcs(
   // so a reworded arc over the same work is a CONTINUATION rather than a new arc. Without this, `id` is
   // sha(title) and every rephrasing was a different arc (M7).
   const ranked = rankArcs(attributeArcs(coherent, contributorsByItem));
-  const { arcs: reconciled, continuity } = reconcileArcIdentity(prior?.arcs ?? [], ranked);
-  return { arcs: reconciled, factsHash, degraded, continuity };
+  const { arcs: reconciled, continuity } = reconcileArcIdentity(authorizedPrior?.arcs ?? [], ranked);
+  return result({ arcs: reconciled, factsHash, degraded, continuity });
 }
 
 // In-memory cache (per process). Keyed by the tier-visible group set. Fronts the Postgres `arc_cache`
@@ -962,7 +1117,7 @@ async function synthesizeArcs(
 // it a degraded result would read back healthy — and with the full 4h TTL — for the life of the process.
 const cache = new Map<
   string,
-  { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }
+  { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean; authorizationEpoch: number; correctionVersion: number }
 >();
 /** PCCC-7 (post-merge Codex Medium 2): scoped keys made the map's cardinality one entry per
  *  DISTINCT oracle state ever seen, unbounded across member/latch churn. Insertion-order eviction
@@ -978,16 +1133,30 @@ export function arcMemoryCacheSize(): number {
 export function arcMemoryCacheHas(key: string): boolean {
   return cache.has(key);
 }
-export function memCacheSet(key: string, entry: { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean }): void {
+export function memCacheSet(key: string, entry: { arcs: NarrativeArc[]; at: number; factsHash: string | null; degraded: boolean; authorizationEpoch?: number; correctionVersion?: number }): void {
   if (!cache.has(key) && cache.size >= MAX_ARC_MEMORY_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
-  cache.set(key, entry);
+  cache.set(key, { ...entry, authorizationEpoch: entry.authorizationEpoch ?? 1, correctionVersion: entry.correctionVersion ?? 0 });
 }
 // Group keys currently being recomputed in the background, so concurrent stale reads fire ONE
 // recompute (and thus one LLM call), not N.
 const refreshing = new Set<string>();
+
+// Pure unit suites use deliberately tiny DbClient fakes and have no PostgreSQL runtime. The real-PG
+// tier sets DATABASE_URL and exercises the fence end-to-end; every production environment fences.
+const authorizationFenceOpts = (epoch: number): { authorizationEpoch?: number } =>
+  process.env.NODE_ENV === "test" && !process.env.DATABASE_URL ? {} : { authorizationEpoch: epoch };
+
+/** Await fire-and-forget arc refreshes. Primarily deterministic test/graceful-shutdown support. */
+export async function settleArcRefreshes(timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (refreshing.size > 0) {
+    if (Date.now() >= deadline) throw new Error("arc refreshes did not settle before the deadline");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 /**
  * Evict THIS process's in-memory arc cache for one team, so it stops serving a warm copy after a
@@ -998,7 +1167,7 @@ const refreshing = new Set<string>();
 /** Does an arc-cache key (a comma-joined set of `${slug}_${tier}` group ids) belong to `teamSlug`? The
  *  `_` separator makes the `${slug}_` prefix test exact — team slugs are `[a-z0-9-]` (no `_`), so
  *  "acme" never matches "acme-corp_team" or "acmex_team". Pure + unit-tested. */
-export function arcKeyBelongsToTeam(key: string, teamSlug: string, teamId?: string): boolean {
+export function arcKeyBelongsToTeam(key: string, teamSlug: string, _teamId?: string): boolean {
   // PCCC6B-1 partition-scope keys carry the TEAM ID explicitly (`p:<teamId>:<groups>`) — the id,
   // not the slug, since PCCC-7 (post-merge Codex High 2): a supported team RENAME changes the slug
   // and would have stranded every slug-keyed correction and cache row silently. Project-group
@@ -1103,7 +1272,7 @@ export async function commitArcs(
   key: string,
   next: NarrativeArc[],
   factsHash: string | null,
-  opts: { degraded?: boolean } = {}
+  opts: { degraded?: boolean; authorizationEpoch?: number; correctionVersion?: number } = {}
 ): Promise<{
   arcs: NarrativeArc[];
   computedAt: number;
@@ -1128,10 +1297,17 @@ export async function commitArcs(
   //    empty-clobber guard below and overwrote correct arcs for 4h.
   const modelFailed = next.length === 0 && factsHash !== null;
   const untrustworthy = modelFailed || opts.degraded === true;
+  // Every branch, including keep-the-prior fallbacks, is bound to the epoch that authorized the
+  // synthesis. This must be captured before consulting a prior: otherwise a revoked build can return
+  // old prose through the fallback without ever reaching the publication fence below.
+  const authorizationEnforced = opts.authorizationEpoch !== undefined || process.env.NODE_ENV !== "test";
+  const authEpoch = opts.authorizationEpoch
+    ?? (authorizationEnforced ? await authorizationEpoch(db, teamId) : 1);
+  const correctionVersion = opts.correctionVersion ?? await arcCorrectionVersion(teamId);
 
   if (untrustworthy && next.length > 0) {
     // A degraded but non-empty result: the empty guard below won't look at it, so check the prior here.
-    const prior = await priorArcs(db, teamId, key);
+    const prior = await priorArcs(db, teamId, key, authEpoch, authorizationEnforced);
     if (prior && prior.arcs.length > 0 && Date.now() - prior.at < EMPTY_CLOBBER_MAX_AGE_MS) {
       console.warn(
         `[arcs] degraded synthesis for ${key}; keeping ${prior.arcs.length} cached arcs rather than overwriting them with a partial set`
@@ -1144,7 +1320,7 @@ export async function commitArcs(
   }
 
   if (next.length === 0) {
-    const prior = await priorArcs(db, teamId, key);
+    const prior = await priorArcs(db, teamId, key, authEpoch, authorizationEnforced);
     if (prior && prior.arcs.length > 0) {
       const ageMs = Date.now() - prior.at;
       if (ageMs < EMPTY_CLOBBER_MAX_AGE_MS) {
@@ -1186,8 +1362,26 @@ export async function commitArcs(
       `[arcs] ${modelFailed ? "synthesis produced no arcs from a non-empty fact set" : "degraded synthesis"} for ${key}; persisting with a ${Math.round(UNTRUSTED_RETRY_AFTER_MS / 60_000)}min life so it retries soon`
     );
   }
-  memCacheSet(key, { arcs: next, at, factsHash, degraded: untrustworthy });
-  await writeArcCache(db, teamId, key, next, factsHash, { degraded: untrustworthy });
+  if (authorizationEnforced && await authorizationEpoch(db, teamId) !== authEpoch) {
+    return { arcs: [], computedAt: at, untrustworthy: true, payloadDegraded: true };
+  }
+  if (await arcCorrectionVersion(teamId) !== correctionVersion) {
+    return { arcs: [], computedAt: at, untrustworthy: true, payloadDegraded: true };
+  }
+  const published = await writeArcCache(db, teamId, key, next, factsHash, {
+    degraded: untrustworthy,
+    authorizationEpoch: authEpoch,
+    correctionVersion,
+  });
+  // A failed write may be an ordinary regenerable cache failure, or the atomic epoch fence rejecting
+  // a revoked build. Distinguish them before deciding whether the initiating request may use `next`.
+  if (!published && (authorizationEnforced && await authorizationEpoch(db, teamId) !== authEpoch
+    || await arcCorrectionVersion(teamId) !== correctionVersion)) {
+    return { arcs: [], computedAt: at, untrustworthy: true, payloadDegraded: true };
+  }
+  if (published) {
+    memCacheSet(key, { arcs: next, at, factsHash, degraded: untrustworthy, authorizationEpoch: authEpoch, correctionVersion });
+  }
   return { arcs: next, computedAt: at, untrustworthy, payloadDegraded: untrustworthy };
 }
 
@@ -1195,12 +1389,29 @@ export async function commitArcs(
 async function priorArcs(
   db: DbClient,
   teamId: string,
-  key: string
+  key: string,
+  expectedAuthorizationEpoch: number,
+  authorizationEnforced: boolean,
 ): Promise<{ arcs: NarrativeArc[]; at: number; degraded: boolean } | null> {
-  const mem = cache.get(key);
-  if (mem) return { arcs: mem.arcs, at: mem.at, degraded: mem.degraded };
-  const row = await readArcCache(db, teamId, key);
-  return row ? { arcs: row.arcs, at: row.computedAt, degraded: row.degraded } : null;
+  if (!authorizationEnforced) {
+    const mem = cache.get(key);
+    if (mem) return { arcs: mem.arcs, at: mem.at, degraded: mem.degraded };
+    const row = await readArcCache(db, teamId, key);
+    return row ? { arcs: row.arcs, at: row.computedAt, degraded: row.degraded } : null;
+  }
+  return withTransaction(async () => {
+    const epoch = await lockedAuthorizationEpoch(teamId);
+    if (epoch !== expectedAuthorizationEpoch) return null;
+    const correctionVersion = await arcCorrectionVersion(teamId, true);
+    const mem = cache.get(key);
+    if (mem && mem.authorizationEpoch === epoch && mem.correctionVersion === correctionVersion) {
+      return { arcs: mem.arcs, at: mem.at, degraded: mem.degraded };
+    }
+    const row = await readArcCache(db, teamId, key);
+    return row && row.authorizationEpoch === epoch
+      ? { arcs: row.arcs, at: row.computedAt, degraded: row.degraded }
+      : null;
+  });
 }
 
 /** Fire-and-forget background recompute for a stale cache key (serve-stale-while-revalidate). Uses
@@ -1211,7 +1422,7 @@ function refreshArcsInBackground(
   key: string,
   groups: string[],
   keys: ProviderKeys,
-  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded?: boolean } | null,
+  prior: ArcSynthesisPrior | null,
   /** PPARC-2: callers thread their pool-backed client; the adminClient() fallback covers legacy
    *  call shapes. (Also what makes the fence TESTABLE — the unit env cannot construct adminClient,
    *  so a refresh without this seam silently never ran there, which is how the fence pin's first
@@ -1228,7 +1439,33 @@ function refreshArcsInBackground(
       // fact-set-hash guard skip the LLM when nothing changed. Run the extra evidence-COHERENCE pass HERE
       // (background only — the route-bound cold-miss/correction paths can't afford the second LLM call).
       const generationAtStart = currentPurgeGeneration(key);
-      const { arcs, factsHash, degraded, continuity } = await synthesizeArcs(bg, teamId, groups, [], keys, BG_ARC_TIMEOUT_MS, prior, true, key);
+      const authEpochAtStart = await authorizationEpoch(bg, teamId);
+      // Re-read the durable row after taking the build epoch. The scheduled snapshot may have waited in
+      // the single-flight queue across a revocation; it is advisory only. A test-only fallback preserves
+      // the pure fake-DB unit seam, but is still epoch-gated.
+      const reread = await readArcCache(bg, teamId, key);
+      const activePrior: ArcSynthesisPrior | null = reread?.authorizationEpoch === authEpochAtStart
+        ? {
+            arcs: reread.arcs,
+            factsHash: reread.factsHash,
+            degraded: reread.degraded,
+            authorizationEpoch: reread.authorizationEpoch,
+            correctionVersion: reread.correctionVersion,
+          }
+        : process.env.NODE_ENV === "test" && !process.env.DATABASE_URL && prior?.authorizationEpoch === authEpochAtStart
+          ? prior
+          : null;
+      const { arcs, factsHash, degraded, continuity, correctionVersion } = await synthesizeArcs(
+        bg,
+        teamId,
+        groups,
+        keys,
+        BG_ARC_TIMEOUT_MS,
+        activePrior,
+        true,
+        key,
+        authEpochAtStart,
+      );
       if (currentPurgeGeneration(key) !== generationAtStart) {
         // A purge landed while this refresh was in flight — its facts may predate the purge's
         // reason (a redaction, a restriction move). Committing would resurrect the poisoned row
@@ -1236,7 +1473,11 @@ function refreshArcsInBackground(
         console.error(`[arcs] dropping in-flight refresh for ${key} — purged mid-synthesis (Codex PPARC-2 High 1)`);
         return;
       }
-      const committed = await commitArcs(bg, teamId, key, arcs, factsHash, { degraded }); // fire-and-forget: nobody awaits its freshness
+      const committed = await commitArcs(bg, teamId, key, arcs, factsHash, {
+        degraded,
+        correctionVersion,
+        ...authorizationFenceOpts(authEpochAtStart),
+      }); // fire-and-forget: nobody awaits its freshness
       // Record how much of the previous set survived. "Arcs feel unstable" was unmeasurable — `arc_cache`
       // keeps only the CURRENT set, so there was no way to say whether carry-over was 30% or 90%, and
       // therefore no way to confirm a stability fix actually worked (CLAUDE.md §3). Only the background
@@ -1314,7 +1555,7 @@ export function schedulePartitionRefresh(
   teamId: string,
   group: string,
   keys: ProviderKeys,
-  prior: { arcs: NarrativeArc[]; factsHash: string | null; degraded: boolean } | null
+  prior: ArcSynthesisPrior | null
 ): boolean {
   const key = `g:${group}`;
   if (refreshing.has(key)) return false;
@@ -1331,18 +1572,31 @@ export async function getArcs(
   /** The `g:<group>` partition scope key — REQUIRED since PRET-3 (the arcs unification): the
    *  tier-key fallback is retired; every synthesis is partition-native, and the cache row AND
    *  the corrections scope both key on this. */
-  opts: { scopeKey: string }
+  opts: { scopeKey: string; expectedAuthorizationEpoch?: number }
 ): Promise<CachedArcs> {
   // No visible groups is not a degraded read — it's a correct empty answer, computed now.
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = opts.scopeKey;
 
   const now = Date.now();
+  // Give an in-process hit the same revocation-barrier linearization as a persistent read. A plain
+  // epoch read followed by a map read can resume after revocation and serve the old payload.
+  const { authEpoch, currentCorrectionVersion, mem } = await withLockedAuthorizationEpoch(teamId, async (epoch) => {
+    const currentCorrectionVersion = await arcCorrectionVersion(teamId, true);
+    const hit = cache.get(key);
+    return {
+      authEpoch: epoch,
+      currentCorrectionVersion,
+      mem: hit?.authorizationEpoch === epoch && hit.correctionVersion === currentCorrectionVersion ? hit : undefined,
+    };
+  });
+  if (opts.expectedAuthorizationEpoch !== undefined && authEpoch !== opts.expectedAuthorizationEpoch) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
 
   // 1. In-memory (fastest, same process). `at` is the PERSISTED computed_at (set below), not the time
   //    this process happened to populate its map — so a warm process reports the row's age, not zero.
-  const mem = cache.get(key);
-  if (mem) {
+  if (mem && mem.authorizationEpoch === authEpoch && mem.correctionVersion === currentCorrectionVersion) {
     // `arcTtlMs(degraded)` — a degraded entry expires in minutes, which is what makes the memo retry as
     // fast as the row does. Using the flat TTL here would let the process serve an untrustworthy set for
     // the full 4h while Postgres considered it stale.
@@ -1352,12 +1606,20 @@ export async function getArcs(
 
   // 2. Persistent cache (survives restart, shared across instances).
   const persisted = await readArcCache(db, teamId, key);
+  if (
+    opts.expectedAuthorizationEpoch !== undefined
+    && await authorizationEpoch(db, teamId) !== opts.expectedAuthorizationEpoch
+  ) {
+    throw new ArcSynthesisAuthorizationChangedError();
+  }
   if (persisted) {
     memCacheSet(key, {
       arcs: persisted.arcs,
       at: persisted.computedAt,
       factsHash: persisted.factsHash,
       degraded: persisted.degraded,
+      authorizationEpoch: persisted.authorizationEpoch,
+      correctionVersion: persisted.correctionVersion,
     });
     // The persisted verdict, and the TTL derived from it. `degraded` now OUTLIVES the request that
     // discovered it, so a later reader of the same row is told the payload is untrustworthy instead of
@@ -1373,13 +1635,21 @@ export async function getArcs(
       arcs: persisted.arcs,
       factsHash: persisted.factsHash,
       degraded: persisted.degraded, // a degraded prior must NOT be hash-reused — see canReuseArcs
+      authorizationEpoch: persisted.authorizationEpoch,
+      correctionVersion: persisted.correctionVersion,
     });
     return { arcs: persisted.arcs, freshness: f };
   }
 
   // 3. Cold miss — first-ever load for this key. Compute inline so the user gets a real answer.
-  const { arcs, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, [], keys, INLINE_ARC_TIMEOUT_MS, null, false, key);
-  const committed = await commitArcs(db, teamId, key, arcs, factsHash, { degraded });
+  const { arcs, factsHash, degraded, correctionVersion } = await synthesizeArcs(
+    db, teamId, groups, keys, INLINE_ARC_TIMEOUT_MS, null, false, key, authEpoch,
+  );
+  const committed = await commitArcs(db, teamId, key, arcs, factsHash, {
+    degraded,
+    correctionVersion,
+    ...authorizationFenceOpts(authEpoch),
+  });
   // `computedAt` comes from commitArcs, NOT from `Date.now()`: on a degraded synthesis it hands back the
   // healthy PRIOR (H11), which is hours old, and stamping that "now" is the M6 lie one branch deep.
   // `degraded` is reported from the SYNTHESIS rather than re-derived from the result, because those
@@ -1417,16 +1687,20 @@ export async function recomputeArcs(
   memberId: string | null = null,
   /** The `g:<group>` partition scope this recompute runs in — REQUIRED since PRET-3 (the arcs
    *  unification): the tier-key fallback is retired; the route always names one partition. */
-  opts: { scopeKey: string }
+  opts: { scopeKey: string; expectedAuthorizationEpoch?: number }
 ): Promise<CachedArcs> {
   if (groups.length === 0) return { arcs: [], freshness: computedNow() };
   const key = opts.scopeKey;
+  if (!key.startsWith("g:") || groups.length !== 1 || key.slice(2) !== groups[0]) {
+    throw new ArcInputAuthorizationUnavailableError("arc recompute scope is not one exact partition");
+  }
 
   // PERSIST FIRST, and let a failure surface. Everything else on this path degrades quietly because a
   // cache can be recomputed; a person's edit cannot. If this throws the route answers with an error and
   // the user knows to retry — which beats the old behaviour of showing corrected arcs that silently
   // revert on the next refresh.
-  await recordArcCorrections(
+  const authEpoch = opts.expectedAuthorizationEpoch ?? await authorizationEpoch(db, teamId);
+  const persistCorrections = () => recordArcCorrections(
     db,
     teamId,
     memberId,
@@ -1434,13 +1708,42 @@ export async function recomputeArcs(
       arc_id: c.arc_id,
       arc_title: c.arc_title ?? "",
       corrected_text: c.corrected_text,
+      source_item_ids: c.source_provenance?.item_ids ?? [],
+      source_correction_revision_ids: c.source_provenance?.correction_revision_ids ?? [],
+      provenance_state: c.source_provenance?.state ?? "incomplete",
+      captured_authorization_epoch: c.captured_authorization_epoch ?? null,
     })),
     // The scope the corrector was LOOKING AT — the only scope this correction may ever feed.
     key
   );
+  if (opts.expectedAuthorizationEpoch != null) {
+    await withTransaction(async () => {
+      if (await lockedAuthorizationEpoch(teamId) !== authEpoch) {
+        throw new ArcSynthesisAuthorizationChangedError();
+      }
+      await persistCorrections();
+    });
+  } else {
+    await persistCorrections();
+  }
 
-  const { arcs: synthesized, factsHash, degraded } = await synthesizeArcs(db, teamId, groups, corrections.map((c) => c.corrected_text), keys, INLINE_ARC_TIMEOUT_MS, null, false, key);
-  const committed = await commitArcs(db, teamId, key, synthesized, factsHash, { degraded });
+  const { arcs: synthesized, factsHash, degraded, correctionVersion } = await synthesizeArcs(
+    db,
+    teamId,
+    groups,
+    keys,
+    INLINE_ARC_TIMEOUT_MS,
+    null,
+    false,
+    key,
+    authEpoch,
+    true,
+  );
+  const committed = await commitArcs(db, teamId, key, synthesized, factsHash, {
+    degraded,
+    correctionVersion,
+    ...authorizationFenceOpts(authEpoch),
+  });
   const arcs = committed.arcs;
   // Same rule as getArcs: a recompute whose synthesis was degraded is REFUSED and the prior is kept
   // (H11), so "the user clicked recompute" is not evidence the arcs are new. Report what commitArcs
@@ -1452,6 +1755,18 @@ export async function recomputeArcs(
     now: Date.now(),
     degraded: degraded || committed.untrustworthy,
   });
+
+  // Projection uses the same live dependency decision as the prompt. Re-reading is intentional:
+  // provider work may have taken long enough for a claim to be revoked after synthesis began.
+  const authorizedForProjection = await listAuthorizedArcCorrections(db, teamId, {
+    groupKey: key,
+    partitionGroup: groups[0],
+    expectedAuthorizationEpoch: authEpoch,
+  });
+  const submittedIds = new Set(corrections.map((correction) => correction.arc_id));
+  const projectableCorrections = authorizedForProjection.ok
+    ? authorizedForProjection.corrections.filter((correction) => submittedIds.has(correction.arc_id))
+    : [];
 
   // Project the corrections into the graph so they also read as facts to future extraction. This is now
   // a DERIVED copy — Postgres above is the record — so it stays best-effort: losing it costs some graph
@@ -1483,12 +1798,23 @@ export async function recomputeArcs(
       // transient pointer-read failure must not 500 a recompute whose edit already landed.
       await builtinTierGroupId(db, { teamId, teamSlug, access: "team" }).catch(() => null);
   const client = new GraphitiClient();
-  if (client.configured && corrections.length && writebackTarget) {
+  // Disabled until Graphiti episodes have an authoritative revision/team/partition/full-dependency
+  // mapping that every retrieval boundary can enforce. Postgres revisions remain the sole durable input;
+  // legacy/unmapped correction episodes are already excluded by item-provenance authorization.
+  const correctionProjectionEnabled = false;
+  // The graph is a derived projection, but projecting old-scope prose after revocation can feed a
+  if (
+    correctionProjectionEnabled
+    && client.configured
+    && projectableCorrections.length
+    && writebackTarget
+    && await authorizationEpoch(db, teamId) === authEpoch
+  ) {
     const now = new Date().toISOString();
     try {
       await client.addEpisodes(
         writebackTarget,
-        corrections.map((c) => ({
+        projectableCorrections.map((c) => ({
           content: c.corrected_text,
           timestamp: now,
           sourceDescription: "human correction to a narrative arc",

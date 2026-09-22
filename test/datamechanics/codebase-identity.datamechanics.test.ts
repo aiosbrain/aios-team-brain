@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { ingestCodebaseScan } from "@/lib/codebases/ingest";
 import { getCodebaseDetail } from "@/lib/metrics/codebases";
-import { addAuthorAlias } from "@/lib/admin/aliases";
+import { addAuthorAlias, removeAuthorAlias } from "@/lib/admin/aliases";
 import { createMember } from "@/lib/admin/members";
 import { codebaseScanPayloadSchema } from "@/lib/api/schemas";
 import { db, seedTeam } from "./helpers";
 import { fullMetrics } from "@/test/fixtures/codebase-scan";
+import { repairAttributionNow } from "@/lib/ingest/reconcile-attribution";
 
 const NOREPLY = "123+john@users.noreply.github.com";
 
@@ -89,5 +90,67 @@ describe("codebase contributor identity (real Postgres)", () => {
     expect(noForce.remapped).toBe(0);
     const forced = await addAuthorAlias(db(), seed.teamId, b.id, "a@x.test", { force: true });
     expect(forced.remapped).toBeGreaterThan(0);
+  });
+
+  it("a verified alias unlink atomically clears its unlocked contribution credit", async () => {
+    const seed = await seedTeam();
+    const author = await createMember(db(), seed.teamId, {
+      email: "alias-owner@x.test", displayName: "Alias Owner", actorHandle: "alias-owner", role: "member",
+    });
+    const email = `unlink-${randomUUID()}@users.noreply.github.com`;
+    await addAuthorAlias(db(), seed.teamId, author.id, email);
+    const slug = `repo-${randomUUID().slice(0, 6)}`;
+    await ingest(seed, scan(slug, [{
+      author_key: email, author_email: email, day: new Date().toISOString().slice(0, 10), commits: 2,
+    }]));
+    expect((await db().from("code_contributions").select("member_id")
+      .eq("team_id",seed.teamId).eq("author_key",email).single()).data)
+      .toMatchObject({member_id:author.id});
+
+    expect(await removeAuthorAlias(db(),seed.teamId,email)).toEqual({removed:true});
+    expect((await db().from("code_contributions").select("member_id")
+      .eq("team_id",seed.teamId).eq("author_key",email).single()).data)
+      .toMatchObject({member_id:null});
+  });
+
+  it("revision-fences a paused internal contribution writer after a completed alias remap", async () => {
+    const seed=await seedTeam();
+    const alice=await createMember(db(),seed.teamId,{
+      email:"fence-a@x.test",displayName:"Fence A",actorHandle:`fence-a-${randomUUID()}`,role:"member",
+    });
+    const bob=await createMember(db(),seed.teamId,{
+      email:"fence-b@x.test",displayName:"Fence B",actorHandle:`fence-b-${randomUUID()}`,role:"member",
+    });
+    const author=`fenced-${randomUUID()}@users.noreply.github.com`;
+    await addAuthorAlias(db(),seed.teamId,alice.id,author);
+    await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:10,batchSize:10});
+    const slug=`repo-fence-${randomUUID().slice(0,6)}`;
+    const payload=scan(slug,[{
+      author_key:author,author_email:author,day:new Date().toISOString().slice(0,10),commits:3,
+    }]);
+
+    let release!:()=>void;
+    let ready!:()=>void;
+    const gate=new Promise<void>((resolve)=>{release=resolve;});
+    const snapshotted=new Promise<void>((resolve)=>{ready=resolve;});
+    const paused=ingestCodebaseScan(
+      db(),{teamId:seed.teamId,memberId:seed.memberId,apiKeyId:randomUUID()},payload,
+      {afterIdentitySnapshot:async()=>{ready();await gate;}},
+    );
+    await snapshotted;
+
+    const remap=await addAuthorAlias(db(),seed.teamId,bob.id,author,{force:true});
+    expect(remap.remapped).toBeGreaterThanOrEqual(0);
+    const repaired=await repairAttributionNow(db(),seed.teamId,seed.teamSlug,{maxBatches:10,batchSize:10});
+    expect(repaired.partial).toBe(false);
+    release();
+    await expect(paused).rejects.toThrow(/identity mapping changed/);
+    expect((await db().from("code_contributions").select("id")
+      .eq("team_id",seed.teamId).eq("author_key",author)).data).toEqual([]);
+
+    await ingest(seed,payload);
+    expect((await db().from("code_contributions").select("member_id")
+      .eq("team_id",seed.teamId).eq("author_key",author).single()).data)
+      .toMatchObject({member_id:bob.id});
   });
 });

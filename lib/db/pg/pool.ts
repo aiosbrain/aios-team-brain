@@ -1,5 +1,6 @@
 import "server-only";
-import { Pool, types, type PoolConfig } from "pg";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Pool, types, type PoolClient, type PoolConfig } from "pg";
 
 /**
  * Singleton pg Pool for DB_BACKEND=postgres. Reads DATABASE_URL (Railway/any
@@ -22,6 +23,7 @@ types.setTypeParser(1114, (val: string) => val);
 types.setTypeParser(1184, (val: string) => val);
 
 let pool: Pool | undefined;
+const transactionClient = new AsyncLocalStorage<PoolClient>();
 
 /** Parse an int from env, falling back to `fallback` when unset/blank/NaN. `0` is honored (disables). */
 function intFromEnv(raw: string | undefined, fallback: number): number {
@@ -95,6 +97,29 @@ export async function runSql<T = Record<string, unknown>>(
   text: string,
   params: unknown[]
 ): Promise<SqlResult<T>> {
-  const res = await getPool().query(text, params);
+  const res = await (transactionClient.getStore() ?? getPool()).query(text, params);
   return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
+}
+
+/**
+ * Run all `runSql`/`PgQuery` calls made by `fn` on one PostgreSQL transaction.
+ *
+ * The async-local binding is deliberately below the PostgREST-shaped adapter: existing single
+ * writers can gain a real transaction without growing a second query API. Nested callers reuse the
+ * outer transaction, which keeps route composition predictable and prevents accidental commits.
+ */
+export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  if (transactionClient.getStore()) return fn();
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const result = await transactionClient.run(client, fn);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }

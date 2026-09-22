@@ -5,6 +5,11 @@ import { getArcs, schedulePartitionRefresh, PPARC_SYNTH_BUDGET_PER_READ, MAX_ARC
 import { readArcCache, arcTtlMs, type ArcCacheEntry } from "./arc-cache";
 import { freshness, computedNow, type Freshness } from "@/lib/freshness";
 import { latestPushByGroup } from "./extraction-health";
+import { authorizationEpoch } from "@/lib/access/authorization-epoch";
+import { withLockedAuthorizationEpoch } from "@/lib/access/authorization-epoch";
+import { filterArcsByVisibleItems } from "./arc-visibility";
+import { ArcSynthesisAuthorizationChangedError } from "./arc-input-authorization";
+import { arcCorrectionVersion } from "./arc-corrections";
 
 /**
  * PPARC-3 — serve-time FUSION of partition-native arc rows (design docs/design/per-project-arcs.md
@@ -41,6 +46,21 @@ export interface FusedArcPanel {
   /** Partitions with a cached (or just-synthesized) row vs. the reader's resolvable total. */
   covered: number;
   total: number;
+}
+
+/** The caller may retry this response; serving a mixed/pre-revocation fusion is never an option. */
+export class ArcFusionAuthorizationChangedError extends Error {
+  readonly retryable = true;
+  constructor() {
+    super("arc visibility changed during synthesis; retry");
+    this.name = "ArcFusionAuthorizationChangedError";
+  }
+}
+
+export interface ArcFusionReadHooks {
+  beforeFinalEpochCheck?: (attempt: number) => Promise<void>;
+  /** Bind a caller-owned enforcement/scope snapshot to this exact durable epoch. */
+  expectedAuthorizationEpoch?: number;
 }
 
 /** Pure fusion core — exported for the unit tier. Entries arrive ALREADY ranked (highest first). */
@@ -81,9 +101,27 @@ export async function getFusedArcs(
   teamId: string,
   teamSlug: string,
   groups: readonly string[],
-  keys: ProviderKeys
+  keys: ProviderKeys,
+  testHooks: ArcFusionReadHooks = {},
+): Promise<FusedArcPanel> {
+  return getFusedArcsAttempt(db, teamId, teamSlug, groups, keys, 0, testHooks);
+}
+
+async function getFusedArcsAttempt(
+  db: DbClient,
+  teamId: string,
+  teamSlug: string,
+  groups: readonly string[],
+  keys: ProviderKeys,
+  attempt: number,
+  testHooks: ArcFusionReadHooks,
 ): Promise<FusedArcPanel> {
   if (groups.length === 0) return { arcs: [], warmScheduled: 0, freshness: computedNow(), covered: 0, total: 0 };
+  const buildEpoch = testHooks.expectedAuthorizationEpoch ?? await authorizationEpoch(db, teamId);
+  const buildCorrectionVersion = await arcCorrectionVersion(teamId);
+  if (testHooks.expectedAuthorizationEpoch !== undefined && await authorizationEpoch(db, teamId) !== buildEpoch) {
+    throw new ArcFusionAuthorizationChangedError();
+  }
 
   // Rank by the partition's own latest real push — the same recency prior the K-cap uses; a
   // failed read degrades RANKING only, never coverage.
@@ -106,6 +144,7 @@ export async function getFusedArcs(
   if (inlineTarget) {
     const { arcs, freshness: inlineFreshness } = await getArcs(db, teamId, teamSlug, [inlineTarget], keys, {
       scopeKey: `g:${inlineTarget}`,
+      expectedAuthorizationEpoch: buildEpoch,
     });
     const refreshed = await readArcCache(db, teamId, `g:${inlineTarget}`);
     const slot = entries.find((e) => e.group === inlineTarget);
@@ -116,7 +155,14 @@ export async function getFusedArcs(
       slot.entry =
         refreshed ??
         (arcs.length > 0
-          ? { arcs, computedAt: inlineFreshness.computedAt, factsHash: null, degraded: inlineFreshness.degraded }
+          ? {
+              arcs,
+              computedAt: inlineFreshness.computedAt,
+              factsHash: null,
+              degraded: inlineFreshness.degraded,
+              authorizationEpoch: buildEpoch,
+              correctionVersion: buildCorrectionVersion,
+            }
           : null);
   }
   // Background-warm EVERYTHING else — missing AND stale-present (Fable PPARC-3 High 2: warming
@@ -137,16 +183,28 @@ export async function getFusedArcs(
       e.entry != null &&
       !freshness(e.entry.computedAt, arcTtlMs(e.entry.degraded), { now, degraded: e.entry.degraded }).stale;
     if (isFresh) continue;
-    const prior = e.entry ? { arcs: e.entry.arcs, factsHash: e.entry.factsHash, degraded: e.entry.degraded } : null;
+    const prior = e.entry ? {
+      arcs: e.entry.arcs,
+      factsHash: e.entry.factsHash,
+      degraded: e.entry.degraded,
+      authorizationEpoch: e.entry.authorizationEpoch,
+    } : null;
     if (schedulePartitionRefresh(db, teamId, e.group, keys, prior)) warmScheduled++;
   }
 
-  const present = entries.filter((e): e is { group: string; entry: ArcCacheEntry } => e.entry != null);
+  // Every fallback payload participates in the same build-start epoch. This rejects rows obtained
+  // after a mid-read revocation just as strictly as rows from before it.
+  const present = entries.filter(
+    (e): e is { group: string; entry: ArcCacheEntry } =>
+      e.entry != null
+        && e.entry.authorizationEpoch === buildEpoch
+        && e.entry.correctionVersion === buildCorrectionVersion,
+  );
   const { arcs, asOf, anyDegraded } = fuseArcRows(present);
   const anyStale = present.some(
     (p) => freshness(p.entry.computedAt, arcTtlMs(p.entry.degraded), { now, degraded: p.entry.degraded }).stale
   );
-  return {
+  const result: FusedArcPanel = {
     arcs,
     warmScheduled,
     freshness:
@@ -156,4 +214,57 @@ export async function getFusedArcs(
     covered: present.length,
     total: groups.length,
   };
+  await testHooks.beforeFinalEpochCheck?.(attempt);
+  // Arc fusion can await a slow provider synthesis after all cache reads. Revalidate at the final
+  // boundary so revoking audience A while B synthesizes cannot publish/serve a mixed old envelope.
+  if (await authorizationEpoch(db, teamId) !== buildEpoch
+    || await arcCorrectionVersion(teamId) !== buildCorrectionVersion) {
+    if (testHooks.expectedAuthorizationEpoch !== undefined) throw new ArcFusionAuthorizationChangedError();
+    if (attempt === 0) return getFusedArcsAttempt(db, teamId, teamSlug, groups, keys, 1, testHooks);
+    throw new ArcFusionAuthorizationChangedError();
+  }
+  return result;
+}
+
+/**
+ * Resolve member enforcement + partitions, synthesize/fuse, and serve under one durable epoch. An
+ * epoch change retries the WHOLE resolution once — visible ids and groups are never reused from the
+ * superseded attempt. The final filter runs while holding the shared epoch lock.
+ */
+export async function getAuthorizationBoundFusedArcs(
+  db: DbClient,
+  teamId: string,
+  teamSlug: string,
+  keys: ProviderKeys,
+  resolveAuthorization: () => Promise<{ groups: string[]; visibleItemIds: ReadonlySet<string> }>,
+  testHooks: {
+    beforeFinalAuthorizationCheck?: (attempt: number) => Promise<void>;
+    fusion?: ArcFusionReadHooks;
+  } = {},
+): Promise<FusedArcPanel> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const epoch = await withLockedAuthorizationEpoch(teamId, (current) => current);
+    const authorization = await resolveAuthorization();
+    if (await authorizationEpoch(db, teamId) !== epoch) continue;
+    try {
+      const panel = await getFusedArcs(db, teamId, teamSlug, authorization.groups, keys, {
+        ...testHooks.fusion,
+        expectedAuthorizationEpoch: epoch,
+      });
+      await testHooks.beforeFinalAuthorizationCheck?.(attempt);
+      const served = await withLockedAuthorizationEpoch(teamId, (current) => {
+        if (current !== epoch) return null;
+        return {
+          ...panel,
+          arcs: filterArcsByVisibleItems(panel.arcs, authorization.visibleItemIds) as FusedArc[],
+        };
+      });
+      if (served) return served;
+    } catch (error) {
+      if (!(error instanceof ArcFusionAuthorizationChangedError) && !(error instanceof ArcSynthesisAuthorizationChangedError)) {
+        throw error;
+      }
+    }
+  }
+  throw new ArcFusionAuthorizationChangedError();
 }

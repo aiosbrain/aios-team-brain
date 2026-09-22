@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { getWorkTimeline } from "@/lib/dashboard/work-timeline";
 import { getCachedWorkTimeline, purgeTimelineCacheTier, settleTimelineRefreshes, PAYLOAD_VERSION } from "@/lib/dashboard/timeline-cache";
 import type { TimelineDay } from "@/lib/dashboard/timeline-group";
-import { db, seedTeam, ingest, type Seed } from "./helpers";
+import { convergeIdentityAttribution, db, seedTeam, ingest, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { createGroup, grantProjectToGroup, addMemberToGroup } from "@/lib/access/groups";
@@ -41,6 +41,7 @@ async function seedMember(seed: Seed): Promise<string> {
     .single();
   const { placeMemberByTier } = await import("./helpers");
   await placeMemberByTier(seed.teamId, data!.id as string, "team");
+  await convergeIdentityAttribution(seed);
   return data!.id as string;
 }
 /** Move an item's context membership into a fresh RESTRICTED project the seed admin can see but

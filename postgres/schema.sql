@@ -282,6 +282,149 @@ create table if not exists member_identities (
 );
 create index if not exists member_identities_member_idx on member_identities (member_id);
 
+-- Required by the team-scoped identity-state foreign key below. Keep this beside the
+-- referencing table as well as the later compatibility declaration so a from-zero schema
+-- never depends on statement ordering.
+create unique index if not exists members_team_id_id_idx on members (team_id, id);
+
+-- Monotonic mapping authority and durable repair queue. The mapping-state row survives unlink so a
+-- stale repair worker can never restore an older member assignment. `member_identities` remains the
+-- shared resolver table; this is its revision/fencing companion, not a competing people directory.
+create table if not exists member_identity_mapping_state (
+  team_id uuid not null references teams(id) on delete cascade,
+  provider text not null,
+  external_id text not null,
+  member_id uuid,
+  revision bigint not null default 1 check (revision > 0),
+  state text not null default 'linked' check (state in ('linked','unlinked')),
+  updated_at timestamptz not null default now(),
+  primary key (team_id, provider, external_id),
+  foreign key (team_id, member_id) references members(team_id, id) on delete set null (member_id)
+);
+create index if not exists member_identity_mapping_state_member_idx
+  on member_identity_mapping_state(team_id, member_id) where member_id is not null;
+
+create table if not exists identity_repair_obligations (
+  team_id uuid not null references teams(id) on delete cascade,
+  provider text not null,
+  external_id text not null,
+  mapping_revision bigint not null check (mapping_revision > 0),
+  status text not null default 'pending'
+    check (status in ('pending','running','retry','complete','obsolete')),
+  cursor_item_id uuid,
+  items_scanned bigint not null default 0,
+  items_updated bigint not null default 0,
+  versions_updated bigint not null default 0,
+  contributions_updated bigint not null default 0,
+  attempts integer not null default 0,
+  last_error text,
+  next_attempt_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  completed_at timestamptz,
+  primary key (team_id, provider, external_id, mapping_revision)
+);
+create index if not exists identity_repair_obligations_pending_idx
+  on identity_repair_obligations(status, next_attempt_at, updated_at)
+  where status in ('pending','running','retry');
+
+-- Team-wide attribution snapshot fence. Database triggers cover every dependency writer (including
+-- direct/legacy writers), while bounded repair commits validate this monotonic revision atomically.
+create table if not exists team_identity_authority (
+  team_id uuid primary key references teams(id) on delete cascade,
+  revision bigint not null default 1 check (revision > 0),
+  repair_revision bigint not null default 1 check (repair_revision > 0),
+  repair_status text not null default 'complete'
+    check (repair_status in ('pending','running','retry','awaiting_cache','complete')),
+  cursor_item_id uuid,
+  items_scanned bigint not null default 0,
+  items_updated bigint not null default 0,
+  versions_updated bigint not null default 0,
+  contributions_updated bigint not null default 0,
+  attempts integer not null default 0,
+  last_error text,
+  next_attempt_at timestamptz,
+  updated_at timestamptz not null default now(),
+  completed_at timestamptz,
+  check (repair_revision <= revision)
+);
+create index if not exists team_identity_authority_pending_idx
+  on team_identity_authority(repair_status,next_attempt_at,updated_at)
+  where repair_status in ('pending','running','retry','awaiting_cache');
+
+create or replace function bump_team_identity_authority()
+returns trigger language plpgsql as $$
+declare
+  v_team_id uuid;
+  v_changed boolean := true;
+  v_had_authority boolean;
+begin
+  v_team_id := case when tg_op='DELETE' then old.team_id else new.team_id end;
+  if tg_table_name='members' then
+    if tg_op='UPDATE' then
+      v_changed := old.email is distinct from new.email
+        or old.actor_handle is distinct from new.actor_handle
+        or old.status is distinct from new.status
+        or old.is_connector is distinct from new.is_connector;
+    end if;
+  elsif tg_table_name='member_emails' and tg_op='UPDATE' then
+    v_changed := old.team_id is distinct from new.team_id
+      or old.member_id is distinct from new.member_id
+      or old.email is distinct from new.email;
+  elsif tg_table_name='member_identities' and tg_op='UPDATE' then
+    v_changed := old.team_id is distinct from new.team_id
+      or old.member_id is distinct from new.member_id
+      or old.provider is distinct from new.provider
+      or old.external_id is distinct from new.external_id
+      or old.handle is distinct from new.handle
+      or old.email is distinct from new.email;
+  end if;
+  if not v_changed then return coalesce(new,old); end if;
+  if not exists (select 1 from teams where id=v_team_id) then return coalesce(new,old); end if;
+
+  -- Lock ordering belongs to the application mutation boundary. This trigger is bookkeeping only.
+  select exists(select 1 from team_identity_authority where team_id=v_team_id)
+    into v_had_authority;
+  insert into team_identity_authority(
+    team_id,revision,repair_revision,repair_status,cursor_item_id,
+    items_scanned,items_updated,versions_updated,contributions_updated,
+    attempts,last_error,next_attempt_at,updated_at,completed_at
+  ) values (
+    v_team_id,1,1,'pending',null,0,0,0,0,0,null,null,now(),null
+  ) on conflict (team_id) do update set
+    revision=team_identity_authority.revision+1,
+    repair_revision=team_identity_authority.revision+1,
+    repair_status='pending',cursor_item_id=null,
+    items_scanned=0,items_updated=0,versions_updated=0,contributions_updated=0,
+    attempts=0,last_error=null,next_attempt_at=null,updated_at=now(),completed_at=null;
+  if not exists (select 1 from items where team_id=v_team_id)
+     and not exists (select 1 from code_contributions where team_id=v_team_id)
+     and not exists (select 1 from gdrive_contribution_evidence where team_id=v_team_id) then
+    update team_identity_authority
+       set repair_status='complete',completed_at=now()
+     where team_id=v_team_id;
+  end if;
+  if v_had_authority then
+    insert into team_authorization_epochs(team_id,epoch,updated_at) values (v_team_id,2,now())
+    on conflict (team_id) do update set
+      epoch=team_authorization_epochs.epoch+1,updated_at=now();
+  end if;
+  return coalesce(new,old);
+end $$;
+
+drop trigger if exists members_identity_authority_trg on members;
+create trigger members_identity_authority_trg
+after insert or delete or update on members
+for each row execute function bump_team_identity_authority();
+drop trigger if exists member_emails_identity_authority_trg on member_emails;
+create trigger member_emails_identity_authority_trg
+after insert or delete or update on member_emails
+for each row execute function bump_team_identity_authority();
+drop trigger if exists member_identities_identity_authority_trg on member_identities;
+create trigger member_identities_identity_authority_trg
+after insert or delete or update on member_identities
+for each row execute function bump_team_identity_authority();
+
 -- Per-member encrypted secrets (e.g. a member's own Slack USER token for "act as me").
 -- DISTINCT from team `integrations.secret_ciphertext` (team-scoped, bot/read): this is
 -- per-member + write-capable, written only by lib/member-secrets/manage.ts (audited
@@ -1156,6 +1299,33 @@ create index if not exists items_kind_idx on items (team_id, kind);
 -- composite (team_id, id) target for context-unit same-team FKs (Phase A slice 4)
 create unique index if not exists items_team_id_id_idx on items (team_id, id);
 
+-- Durable provider-id → item-id compatibility map. Deliberately no FK to items: a verified source
+-- removal purges restricted content and derivatives, while this non-content tombstone preserves the
+-- UUID so a later authorized restore repairs citations instead of creating a second identity.
+create table if not exists source_item_mappings (
+  team_id uuid not null references teams(id) on delete cascade,
+  source text not null,
+  provider_id text not null,
+  item_id uuid not null,
+  connection_id text,
+  project_id uuid references projects(id) on delete set null,
+  canonical_path text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (team_id, source, provider_id),
+  unique (team_id, item_id)
+);
+create index if not exists source_item_mappings_connection_idx
+  on source_item_mappings (team_id, source, connection_id);
+
+create table if not exists team_authorization_epochs (
+  team_id uuid primary key references teams(id) on delete cascade,
+  epoch bigint not null default 1 check (epoch > 0),
+  updated_at timestamptz not null default now()
+);
+insert into team_authorization_epochs(team_id)
+select id from teams on conflict (team_id) do nothing;
+
 -- ── Context substrate (partitioning/permissioning Phase A slice 4 — spec §context-units) ──
 -- Item-grain subset; task/decision/meeting-segment grains + events/suggestions/rules = Phase D.
 -- Sole writers: lib/projects/context/units.ts and lib/projects/context/memberships.ts (guarded).
@@ -1192,7 +1362,7 @@ create table if not exists project_context_memberships (
   -- AUTOMATIC exclude in the target system project. Widened by migration 20260820150000
   -- (from-zero gets it here; an existing DB gets it from the migration's drop-and-re-add).
   method text not null default 'ingestion_project'
-    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual','exclude_shadow_repair')),
+    check (method in ('ingestion_project','explicit_ref','rule','embedding','llm','manual','exclude_shadow_repair','gdrive_claim')),
   decided_by uuid,
   valid_from timestamptz not null default now(),
   valid_to timestamptz,
@@ -1215,6 +1385,35 @@ create table if not exists item_versions (
   created_at timestamptz not null default now()
 );
 create index if not exists item_versions_item_idx on item_versions (item_id, created_at desc);
+
+-- Source-time Google contribution ledger. Provider provenance is immutable; only the derived member
+-- mapping/revision is repaired. Timeline reads join the current item correction lock at serve time.
+create table if not exists gdrive_contribution_evidence (
+  team_id uuid not null references teams(id) on delete cascade,
+  item_id uuid not null,
+  evidence_key text not null,
+  external_id text,
+  email citext,
+  display_name text,
+  role text not null,
+  source_at timestamptz,
+  source_at_raw text not null default '',
+  member_id uuid,
+  mapping_revision bigint,
+  authority_revision bigint,
+  diagnostic text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (team_id, item_id, evidence_key),
+  foreign key (team_id, item_id) references items(team_id, id) on delete cascade,
+  foreign key (team_id, member_id) references members(team_id, id) on delete set null (member_id)
+);
+create index if not exists gdrive_contribution_evidence_time_idx
+  on gdrive_contribution_evidence(team_id, source_at desc, item_id, evidence_key);
+create index if not exists gdrive_contribution_evidence_identity_idx
+  on gdrive_contribution_evidence(team_id, external_id) where external_id is not null;
+create index if not exists gdrive_contribution_evidence_member_idx
+  on gdrive_contribution_evidence(team_id, member_id, source_at desc) where member_id is not null;
 
 -- ── entities / graph ─────────────────────────────────────────────────────────
 create table if not exists tasks (
@@ -2447,7 +2646,7 @@ create table if not exists integrations (
   -- from the app's zod type union, so nothing can create one. The values stay in this CHECK on
   -- PURPOSE — narrowing an enumerated CHECK is the #251 incident shape, and a self-host holding a
   -- legacy row would fail its next schema load. Dead here is harmless; a failed deploy is not.
-  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion','clickup')),
+  type text not null check (type in ('github','granola','slack','wise','linear','plane','openai','anthropic','google','openrouter','typefully','notion','gdrive','clickup')),
   name text not null,
   config jsonb not null default '{}',
   secret_ciphertext text,                 -- AES-256-GCM blob (base64); null if no secret set
@@ -2460,6 +2659,144 @@ create table if not exists integrations (
 create index if not exists integrations_team_type_idx on integrations (team_id, type);
 -- Additive column for existing deployments (idempotent rollout via `npm run pg:schema`).
 alter table integrations add column if not exists secret_ciphertext text;
+
+-- Brain-authoritative execution generation and lease fence for the HTTP-only Google Drive sidecar.
+-- Selection hashes describe scope; only the monotonic generation + current lease fence authorize
+-- provider reads, content/reconciliation commits, and progress mutation (AIO-1167).
+create table if not exists gdrive_connection_authority (
+  integration_id uuid primary key references integrations(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  generation bigint not null default 1 check (generation > 0),
+  scope_hash text not null,
+  credential_revision bigint not null default 1 check (credential_revision > 0),
+  connector_member_id uuid references members(id) on delete set null,
+  connector_api_key_id uuid references api_keys(id) on delete set null,
+  lease_owner text,
+  fence bigint not null default 0 check (fence >= 0),
+  lease_until timestamptz,
+  progress jsonb not null default '{}',
+  progress_revision bigint not null default 0 check (progress_revision >= 0),
+  progress_updated_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (team_id, integration_id),
+  check ((lease_owner is null) = (lease_until is null)),
+  check ((connector_member_id is null) = (connector_api_key_id is null))
+);
+alter table gdrive_connection_authority add column if not exists progress_revision bigint not null default 0;
+create index if not exists gdrive_connection_authority_principal_idx
+  on gdrive_connection_authority (team_id, connector_api_key_id);
+
+create or replace function gdrive_selection_fingerprint(p_config jsonb)
+returns text language sql immutable parallel safe as $$
+  select md5(jsonb_build_object(
+    'fileIds', coalesce(p_config->'fileIds', '[]'::jsonb),
+    'folderIds', coalesce(p_config->'folderIds', '[]'::jsonb),
+    'sharedDriveIds', coalesce(p_config->'sharedDriveIds', '[]'::jsonb),
+    'recursive', coalesce(p_config->'recursive', 'false'::jsonb),
+    'selectionState', coalesce(p_config->'selectionState', '"absent"'::jsonb),
+    'projectSlug', coalesce(p_config->'projectSlug', 'null'::jsonb),
+    'access', coalesce(p_config->'access', '"team"'::jsonb),
+    'authMode', coalesce(p_config->'authMode', '"oauth"'::jsonb),
+    'authenticatedAccountId', coalesce(p_config->'authenticatedAccountId', 'null'::jsonb),
+    'scopeSet', coalesce(p_config->'scopeSet', '[]'::jsonb),
+    'audienceProjectIds', coalesce(p_config->'audienceProjectIds', '[]'::jsonb)
+  )::text)
+$$;
+
+create or replace function sync_gdrive_connection_authority()
+returns trigger language plpgsql as $$
+declare
+  next_hash text;
+  scope_changed boolean;
+  credential_changed boolean;
+  status_changed boolean;
+begin
+  if new.type <> 'gdrive' then return new; end if;
+  next_hash := gdrive_selection_fingerprint(new.config);
+  if tg_op = 'INSERT' then
+    insert into gdrive_connection_authority(integration_id, team_id, scope_hash)
+    values (new.id, new.team_id, next_hash) on conflict (integration_id) do nothing;
+    return new;
+  end if;
+  scope_changed := next_hash is distinct from gdrive_selection_fingerprint(old.config);
+  credential_changed := new.secret_ciphertext is distinct from old.secret_ciphertext;
+  status_changed := new.status is distinct from old.status;
+  insert into gdrive_connection_authority(integration_id, team_id, scope_hash)
+  values (new.id, new.team_id, next_hash)
+  on conflict (integration_id) do update set
+    team_id = excluded.team_id,
+    scope_hash = excluded.scope_hash,
+    generation = gdrive_connection_authority.generation + case when scope_changed or credential_changed then 1 else 0 end,
+    credential_revision = gdrive_connection_authority.credential_revision + case when credential_changed then 1 else 0 end,
+    fence = gdrive_connection_authority.fence + case when status_changed then 1 else 0 end,
+    lease_owner = case when scope_changed or credential_changed or status_changed then null else gdrive_connection_authority.lease_owner end,
+    lease_until = case when scope_changed or credential_changed or status_changed then null else gdrive_connection_authority.lease_until end,
+    progress = case when scope_changed or credential_changed then '{}'::jsonb else gdrive_connection_authority.progress end,
+    progress_revision = gdrive_connection_authority.progress_revision
+      + case when scope_changed or credential_changed then 1 else 0 end,
+    progress_updated_at = case when scope_changed or credential_changed then null else gdrive_connection_authority.progress_updated_at end,
+    updated_at = now();
+  return new;
+end
+$$;
+drop trigger if exists integrations_gdrive_authority on integrations;
+create trigger integrations_gdrive_authority
+  after insert or update of config, status, secret_ciphertext on integrations
+  for each row execute function sync_gdrive_connection_authority();
+insert into gdrive_connection_authority(integration_id, team_id, scope_hash)
+select id, team_id, gdrive_selection_fingerprint(config) from integrations where type = 'gdrive'
+on conflict (integration_id) do nothing;
+update gdrive_connection_authority authority
+set scope_hash = gdrive_selection_fingerprint(integration.config), updated_at = now()
+from integrations integration
+where integration.id = authority.integration_id and integration.type = 'gdrive';
+
+create table if not exists gdrive_item_claims (
+  team_id uuid not null references teams(id) on delete cascade,
+  integration_id uuid not null,
+  provider_id text not null,
+  item_id uuid not null,
+  active boolean not null default true,
+  generation bigint not null check (generation > 0),
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  revoked_at timestamptz,
+  primary key (team_id, integration_id, provider_id),
+  foreign key (team_id, integration_id) references gdrive_connection_authority(team_id, integration_id) on delete cascade,
+  foreign key (team_id, item_id) references items(team_id, id) on delete cascade
+);
+create index if not exists gdrive_item_claims_item_idx
+  on gdrive_item_claims(team_id, item_id) where active;
+create table if not exists gdrive_item_claim_projects (
+  team_id uuid not null,
+  integration_id uuid not null,
+  provider_id text not null,
+  project_id uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (team_id, integration_id, provider_id, project_id),
+  foreign key (team_id, integration_id, provider_id)
+    references gdrive_item_claims(team_id, integration_id, provider_id) on delete cascade,
+  foreign key (team_id, project_id) references projects(team_id, id) on delete cascade
+);
+create index if not exists gdrive_item_claim_projects_project_idx
+  on gdrive_item_claim_projects(team_id, project_id);
+
+create table if not exists gdrive_cleanup_obligations (
+  team_id uuid not null references teams(id) on delete cascade,
+  provider_id text not null,
+  item_id uuid not null,
+  reason text not null,
+  actor_member_id uuid references members(id) on delete set null,
+  actor_api_key_id uuid references api_keys(id) on delete set null,
+  attempt_count integer not null default 0 check (attempt_count >= 0),
+  last_error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (team_id, provider_id)
+);
+create index if not exists gdrive_cleanup_obligations_retry_idx
+  on gdrive_cleanup_obligations(updated_at, team_id);
 
 -- Graphiti projection state (idempotency for the brain → Graphiti projector, lib/graph/project).
 -- Graphiti does not dedupe by source id, so we track which brain rows we've already projected
@@ -2548,10 +2885,14 @@ create table if not exists arc_cache (
   -- Before this, an untrusted result was persisted with a BACKDATED `computed_at` to shorten its life —
   -- which made the timestamp lie by ~4h. The short life is now derived from this flag instead (`arcTtlMs`).
   degraded boolean not null default false,
+  authorization_epoch bigint not null default 1,
+  correction_version bigint not null default 0,
   primary key (team_id, group_key)
 );
 alter table arc_cache add column if not exists facts_hash text;
 alter table arc_cache add column if not exists degraded boolean not null default false;
+alter table arc_cache add column if not exists authorization_epoch bigint not null default 1;
+alter table arc_cache add column if not exists correction_version bigint not null default 0;
 
 -- One-shot migration markers (PPARC-3): a data migration whose effect must run ONCE per instance
 -- (not per replay) stamps its first-run moment here and bounds itself on it — a source-code date
@@ -2578,6 +2919,13 @@ create table if not exists arc_corrections (
   -- correction never feeds a different scope. '' = legacy pre-6b row (tier-scope by construction;
   -- accepted only by the tier-path synthesis, never a partition scope).
   group_key text not null default '',
+  -- Source authorization for human prose. Legacy rows are `unproven` and remain historical only;
+  -- only a complete row whose dependency ledger is still authorized may enter synthesis/projection.
+  provenance_state text not null default 'unproven'
+    check (provenance_state in ('unproven','incomplete','complete')),
+  source_dependency_count integer not null default 0 check (source_dependency_count >= 0),
+  captured_authorization_epoch bigint,
+  current_revision_id uuid,
   created_by uuid references members(id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -2587,11 +2935,70 @@ create index if not exists arc_corrections_team_idx on arc_corrections (team_id,
 -- group_key migration loads THIS file first — the create-table above no-ops, so the column must be
 -- altered-in here BEFORE the index below references it.
 alter table arc_corrections add column if not exists group_key text not null default '';
+alter table arc_corrections add column if not exists provenance_state text not null default 'unproven';
+alter table arc_corrections add column if not exists source_dependency_count integer not null default 0;
+alter table arc_corrections add column if not exists captured_authorization_epoch bigint;
+alter table arc_corrections add column if not exists current_revision_id uuid;
 create index if not exists arc_corrections_team_scope_idx on arc_corrections (team_id, group_key, updated_at desc);
 -- Latest take per arc PER SCOPE (Fable 6b High 2) — the upsert's arbiter; identically named in the
 -- migration so a migrated DB and a from-zero DB hold ONE arbiter each. Live DBs drop the old
 -- team-global unique in the migration; from-zero never creates it.
 create unique index if not exists arc_corrections_scope_arc_key on arc_corrections (team_id, group_key, arc_id);
+
+-- Durable, intentionally non-FK source ids: deleting an item must leave the dependency evidence in
+-- history so the correction fails closed rather than shrinking its dependency set.
+create table if not exists arc_correction_source_dependencies (
+  correction_id uuid not null references arc_corrections(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  source_item_id uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (correction_id, source_item_id)
+);
+create index if not exists arc_correction_source_dependencies_team_item_idx
+  on arc_correction_source_dependencies(team_id, source_item_id);
+
+-- Append-only correction history. `arc_corrections` is the logical identity/current pointer; text and
+-- dependencies used for synthesis always come from one immutable revision.
+create table if not exists arc_correction_revisions (
+  id uuid primary key default gen_random_uuid(),
+  correction_id uuid not null references arc_corrections(id) on delete cascade,
+  revision_number bigint not null,
+  corrected_text text not null check (corrected_text <> ''),
+  provenance_state text not null default 'unproven'
+    check (provenance_state in ('unproven','incomplete','complete')),
+  source_dependency_count integer not null default 0 check (source_dependency_count >= 0),
+  parent_revision_count integer not null default 0 check (parent_revision_count >= 0),
+  captured_authorization_epoch bigint,
+  created_by uuid references members(id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique (correction_id, revision_number)
+);
+alter table arc_correction_revisions
+  add column if not exists parent_revision_count integer not null default 0 check (parent_revision_count >= 0);
+create table if not exists arc_correction_revision_dependencies (
+  revision_id uuid not null references arc_correction_revisions(id) on delete cascade,
+  team_id uuid not null references teams(id) on delete cascade,
+  source_item_id uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (revision_id, source_item_id)
+);
+create index if not exists arc_correction_revision_dependencies_team_item_idx
+  on arc_correction_revision_dependencies(team_id, source_item_id);
+create table if not exists arc_correction_revision_parents (
+  revision_id uuid not null references arc_correction_revisions(id) on delete cascade,
+  parent_revision_id uuid not null references arc_correction_revisions(id),
+  primary key (revision_id, parent_revision_id),
+  check (revision_id <> parent_revision_id)
+);
+do $$ begin
+  alter table arc_corrections add constraint arc_corrections_current_revision_fk
+    foreign key (current_revision_id) references arc_correction_revisions(id);
+exception when duplicate_object then null; end $$;
+create table if not exists team_arc_correction_versions (
+  team_id uuid primary key references teams(id) on delete cascade,
+  version bigint not null default 0 check (version >= 0),
+  updated_at timestamptz not null default now()
+);
 
 -- ── work-timeline cache (the persisted, queryable work-timeline context layer) ──
 -- The day → person → work ledger (from `items` + `tasks`) assembled by lib/dashboard/work-timeline,
@@ -2610,9 +3017,11 @@ create table if not exists work_timeline_cache (
   -- real but its prose isn't computed for it. NOT set when the team simply has no answering model
   -- configured — that's a choice, not a failure (R2/M6).
   degraded boolean not null default false,
+  authorization_epoch bigint not null default 1,
   primary key (team_id, group_key)
 );
 alter table work_timeline_cache add column if not exists degraded boolean not null default false;
+alter table work_timeline_cache add column if not exists authorization_epoch bigint not null default 1;
 
 -- ── chat conversations (persistent, owner-scoped chat history) ────────────────
 -- ChatGPT-style threads persisted server-side so history survives across sessions AND interfaces
@@ -2718,6 +3127,26 @@ create table if not exists ingest_runs (
 );
 create index if not exists ingest_runs_team_source_idx on ingest_runs (team_id, source, finished_at desc);
 create index if not exists ingest_runs_finished_idx on ingest_runs (finished_at desc);
+
+-- Durable Admin/manual Google Drive run queue. Claimed only by the connection-bound sidecar;
+-- provider work still requires the normal generation/fence lease.
+create table if not exists gdrive_run_requests (
+  id uuid primary key default gen_random_uuid(),
+  team_id uuid not null references teams(id) on delete cascade,
+  integration_id uuid not null references integrations(id) on delete cascade,
+  requested_by uuid references members(id) on delete set null,
+  trigger text not null default 'manual' check (trigger in ('manual','retry','scheduler')),
+  status text not null default 'pending' check (status in ('pending','running','complete','partial','failed','deferred','cancelled')),
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  finished_at timestamptz,
+  summary jsonb not null default '{}'::jsonb,
+  error text
+);
+create index if not exists gdrive_run_requests_claim_idx
+  on gdrive_run_requests (team_id, integration_id, status, created_at);
+create unique index if not exists gdrive_run_requests_one_active_idx
+  on gdrive_run_requests (integration_id) where status in ('pending','running');
 
 -- TICKFIT-1: per-repo remote sync watermarks (docs/design/tickfit1-github-watermark.md D1/D2).
 -- The remote's OWN values ({pushedAt, updatedAt, defaultBranch, configHash} for github), compared

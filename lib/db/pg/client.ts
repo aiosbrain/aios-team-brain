@@ -62,6 +62,12 @@ export class PgClient {
   }
 }
 
+/** Runtime discriminator for owners that must add a PostgreSQL transaction around a DbClient call.
+ * Unit fakes intentionally remain transaction-free; every production DbClient is a PgClient. */
+export function isPgClient(value: unknown): value is PgClient {
+  return value instanceof PgClient;
+}
+
 let singleton: PgClient | undefined;
 
 /** Shared stateless data client (the pg Pool underneath handles concurrency). */

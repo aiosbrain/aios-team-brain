@@ -60,6 +60,7 @@ scoped as (
          case when i.access = 'external' then sys.general_id else sys.external_id end as opposite_id
     from items i cross join sys
    where i.team_id = $1
+     and coalesce(i.frontmatter->>'source','') <> 'gdrive'
      and ($4::uuid is null or i.id > $4::uuid)
      and ($5::timestamptz is null or i.created_at < $5::timestamptz)
 )

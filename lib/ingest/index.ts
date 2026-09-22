@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { audit } from "@/lib/api/audit";
 import { ensureProjectGraphPointer } from "@/lib/graph/project-pointer";
 import { decideReattribution } from "@/lib/ingest/reattribution-decision";
@@ -26,6 +26,21 @@ import {
   cascadeInheritedAudience,
   settleReclassification,
 } from "@/lib/ingest/reclassify";
+import { mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
+import { syncGdriveContributionEvidence } from "@/lib/ingest/gdrive-contribution-store";
+import { validateIdentityAuthorityRevision } from "@/lib/identity/authority";
+import { lockGdriveProvider, recordGdriveItemClaim } from "@/lib/projects/context/gdrive-claims";
+import type { ApiAuth } from "@/lib/api/auth";
+import { runSql, withTransaction } from "@/lib/db/pg/pool";
+import { isPgClient } from "@/lib/db/pg/client";
+import { lockItemAttribution } from "@/lib/ingest/item-attribution-lock";
+import {
+  GdriveAuthorityError,
+  type GdriveExecutionRef,
+  withGdriveExecutionCommit,
+} from "@/lib/integrations/gdrive-authority";
+
+export { mergeGdriveContributions } from "@/lib/ingest/gdrive-ledger";
 
 export interface IngestResult {
   status: "created" | "updated" | "unchanged";
@@ -39,6 +54,26 @@ export interface IngestResult {
    * slice-4 H2 guards, and it arrives as `status:"unchanged"` (slice-5 Fable HIGH).
    */
   accessChanged?: boolean;
+}
+
+export interface AttributionOverride {
+  authorMemberId: string | null;
+  /** Mapping-derived credit is valid only at this complete team identity revision. Omitted means the
+   * caller supplied an explicit/manual actor (meeting submitter, correction, trusted internal fact)
+   * and no mutable resolver snapshot was consulted. */
+  mappingRevision?: number;
+}
+
+/** Deterministic concurrency seams for real-Postgres serialization regressions. */
+export interface IngestConcurrencyHooks {
+  beforeAttributionLock?: (itemId: string) => Promise<void>;
+  afterAttributionLock?: (itemId: string) => Promise<void>;
+  afterAttributionRead?: (itemId: string) => Promise<void>;
+}
+
+interface IngestInternalOptions {
+  transactionBound?: boolean;
+  concurrencyHooks?: IngestConcurrencyHooks;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -67,6 +102,125 @@ function isoOf(value: string | Date | null | undefined): string | null {
  */
 export function contentHash(body: string): string {
   return createHash("sha256").update(body, "utf8").digest("hex");
+}
+
+/**
+ * Public-ingest owner. Locks both candidate identities before deciding whether the stored target is
+ * Drive-owned, so omitting/relabeling incoming provenance and concurrent first creation cannot skip
+ * the immutable connection fence.
+ */
+export async function ingestApiItem(
+  db: DbClient,
+  auth: ApiAuth,
+  rawPayload: ItemPayload,
+  access: "team" | "external",
+  opts: AttributionOverride | undefined,
+  pusherTier: "team" | "external",
+  execution?: GdriveExecutionRef,
+  concurrencyHooks: IngestConcurrencyHooks = {},
+): Promise<IngestResult> {
+  return withTransaction(async () => {
+    // Global lock order: team identity authority -> path/provider identity -> canonical item.
+    if (opts?.mappingRevision !== undefined) {
+      await validateIdentityAuthorityRevision(auth.teamId,opts.mappingRevision);
+    }
+    const incomingSourceId = rawPayload.frontmatter?.source === "gdrive"
+      && typeof rawPayload.frontmatter.source_id === "string"
+      ? rawPayload.frontmatter.source_id.trim() : "";
+    // Transaction-scoped identity locks close both path-vs-provider and two-new-writer races.
+    await runSql(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+      `${auth.teamId}:item:${rawPayload.project}:${rawPayload.path}`,
+    ]);
+    if (incomingSourceId) {
+      await lockGdriveProvider(auth.teamId, incomingSourceId);
+    }
+    // Resolve candidate immutable ids without taking row locks, then acquire the canonical item
+    // advisory locks in sorted order before any `for update`. Correction/repair take item advisory ->
+    // item row too; doing the inverse here would permit the classic ingest-vs-correction deadlock.
+    // The path and provider locks above keep these candidate identities stable until the locked reread.
+    const {rows:candidates}=await runSql<{target_id:string|null;incoming_id:string|null}>(
+      `select (
+         select i.id from items i join projects p on p.id=i.project_id and p.team_id=i.team_id
+          where i.team_id=$1 and p.slug=$2 and i.path=$3
+       ) as target_id, (
+         select m.item_id from source_item_mappings m
+          where m.team_id=$1 and m.source='gdrive' and m.provider_id=nullif($4,'')
+       ) as incoming_id`,
+      [auth.teamId,rawPayload.project,rawPayload.path,incomingSourceId],
+    );
+    const candidateIds=[...new Set([candidates[0]?.target_id,candidates[0]?.incoming_id]
+      .filter((id):id is string=>Boolean(id)))].sort();
+    for(const itemId of candidateIds){
+      await concurrencyHooks.beforeAttributionLock?.(itemId);
+      await lockItemAttribution(auth.teamId,itemId);
+      await concurrencyHooks.afterAttributionLock?.(itemId);
+    }
+    const { rows } = await runSql<{
+      item_id: string | null;
+      item_source: string | null;
+      item_connection: string | null;
+      mapping_connection: string | null;
+      incoming_mapping_item: string | null;
+      incoming_mapping_connection: string | null;
+    }>(
+      `with target as (
+         select i.id, i.frontmatter->>'source' as source, i.frontmatter->>'connection_id' as connection_id
+           from items i join projects p on p.id=i.project_id and p.team_id=i.team_id
+          where i.team_id=$1 and p.slug=$2 and i.path=$3
+          for update of i
+       ), target_mapping as (
+         select m.item_id, m.connection_id from source_item_mappings m
+          where m.team_id=$1 and m.source='gdrive' and m.item_id=(select id from target)
+          for update
+       ), incoming_mapping as (
+         select m.item_id, m.connection_id from source_item_mappings m
+          where m.team_id=$1 and m.source='gdrive' and m.provider_id=nullif($4,'')
+          for update
+       )
+       select t.id as item_id, t.source as item_source, t.connection_id as item_connection,
+              tm.connection_id as mapping_connection, im.item_id as incoming_mapping_item,
+              im.connection_id as incoming_mapping_connection
+         from (select 1) seed left join target t on true
+         left join target_mapping tm on true left join incoming_mapping im on true`,
+      [auth.teamId, rawPayload.project, rawPayload.path, incomingSourceId],
+    );
+    const stored = rows[0];
+    const incomingConnection = rawPayload.frontmatter?.source === "gdrive"
+      && typeof rawPayload.frontmatter.connection_id === "string"
+      ? rawPayload.frontmatter.connection_id.trim() : "";
+    const requiresDriveAuthority = rawPayload.frontmatter?.source === "gdrive"
+      || stored?.item_source === "gdrive"
+      || Boolean(stored?.mapping_connection)
+      || Boolean(stored?.incoming_mapping_item);
+    const commit = () => ingestItem(
+      db,auth,rawPayload,access,opts,pusherTier,undefined,{transactionBound:true},
+    );
+    if (!requiresDriveAuthority) return commit();
+    if (!execution) {
+      throw new GdriveAuthorityError("connector_principal_required", "current Google Drive execution authority is required for this stored item", 403);
+    }
+    if (!incomingSourceId || incomingConnection !== execution.integrationId) {
+      throw new GdriveAuthorityError("wrong_connection", "Google Drive payload is not bound to this authorized connection", 403);
+    }
+    return withGdriveExecutionCommit(auth, execution, (audience) => ingestItem(
+      db,
+      auth,
+      rawPayload,
+      // Context memberships are the authority. External is the conservative inherited unit tier:
+      // it may enter either a restricted team project or an external-visible project without the
+      // no-widening gate ever laundering a team unit into an external grant.
+      "external",
+      opts,
+      pusherTier,
+      {
+        integrationId: execution.integrationId,
+        providerId: incomingSourceId,
+        generation: execution.generation,
+        audienceProjectIds: audience.projectIds,
+      },
+      {transactionBound:true},
+    ));
+  });
 }
 
 function canonicalJson(value: unknown): string {
@@ -102,14 +256,34 @@ export async function ingestItem(
   // `authorMemberId: null` explicitly (not omit opts) — that's the only way to say "leave this
   // unattributed" rather than "attribute to whoever's pushing," so a connector ingesting on behalf of
   // an unresolved human never silently falls back to the connector's own member_id.
-  opts?: { authorMemberId: string | null },
+  opts?: AttributionOverride,
   // Tier of the PRINCIPAL pushing this item. Only a trusted (`team`) pusher may change an existing
   // item's `access` (reclassification) — an `external`-tier key must never RAISE a team item's
   // visibility by re-pushing it (see the access-heal on the unchanged path). Defaults to `team`
   // because every INTERNAL caller (connectors, scanner, meetings) is trusted; ONLY the public
   // `/api/v1/items` route passes the real key tier, so an untrusted external key is gated out.
-  pusherTier: "team" | "external" = "team"
+  pusherTier: "team" | "external" = "team",
+  gdriveClaim?: {
+    integrationId: string;
+    providerId: string;
+    generation: number;
+    audienceProjectIds: readonly string[];
+  },
+  _internal: IngestInternalOptions = {},
 ): Promise<IngestResult> {
+  const mappingRevision=opts?.mappingRevision;
+  // Every production caller receives one transaction. It is the lifetime of both the canonical item
+  // attribution lock and all item/version/contribution writes. Unit DbClient fakes deliberately skip
+  // PostgreSQL-only mechanics; every runtime DbClient is a PgClient (lib/db/types.ts).
+  if (!_internal.transactionBound && isPgClient(db)) {
+    return withTransaction(() => ingestItem(
+      db, auth, rawPayload, access, opts, pusherTier, gdriveClaim,
+      {..._internal,transactionBound:true},
+    ));
+  }
+  if (mappingRevision !== undefined) {
+    await validateIdentityAuthorityRevision(auth.teamId,mappingRevision);
+  }
   const parsedPayload = itemPayloadSchema.safeParse({
     ...rawPayload,
     access: rawPayload.access ?? access,
@@ -119,7 +293,14 @@ export async function ingestItem(
       `invalid item payload: ${parsedPayload.error.issues[0]?.message ?? "bad shape"}`
     );
   }
-  const payload = parsedPayload.data;
+  let payload = parsedPayload.data;
+  if (_internal.transactionBound) {
+    // Creation identity precedes canonical item identity. This closes two-new-writer races for direct
+    // internal callers; API ingestion already holds the same key, and advisory locks are re-entrant.
+    await runSql(`select pg_advisory_xact_lock(hashtextextended($1,0))`, [
+      `${auth.teamId}:item:${payload.project}:${payload.path}`,
+    ]);
+  }
   // Authoritative change key (see contentHash). The wire `content_sha256` is advisory from here on:
   // a mismatch means the pushing client hashes something other than the body it sent, which we record
   // on the item's audit row (below) so a buggy connector is diagnosable instead of silently corrupting
@@ -147,13 +328,232 @@ export async function ingestItem(
   const ptr = await ensureProjectGraphPointer(db, { teamId: auth.teamId, projectId: project.id as string });
   if (!ptr.ok) throw new Error(ptr.error);
 
-  const { data: existing } = await db
-    .from("items")
-    .select("id, content_sha256, member_id, member_id_locked, frontmatter, access, created_at, work_at, work_at_from_source")
-    .eq("team_id", auth.teamId)
-    .eq("project_id", project.id)
-    .eq("path", payload.path)
-    .maybeSingle();
+  const existingFields = "id, project_id, path, content_sha256, member_id, member_id_locked, frontmatter, access, created_at, work_at, work_at_from_source";
+  type ExistingItem = {
+    id: string;
+    project_id: string;
+    path: string;
+    content_sha256: string;
+    member_id: string | null;
+    member_id_locked?: boolean | null;
+    frontmatter: Record<string, unknown> | null;
+    access?: "team" | "external" | null;
+    created_at?: string | Date;
+    work_at?: string | Date | null;
+    work_at_from_source?: boolean | null;
+  };
+  let existing: ExistingItem | null = null;
+
+  // Google document identity is its exact provider id, not the normalized path. Historical gdrive
+  // paths lower-cased/sanitized that id, so rename/move/reconnect must first recover the established
+  // row through retained provenance. More than one match is an old collision: fail visibly rather
+  // than guessing and overwriting an unrelated document.
+  const gdriveSourceId =
+    payload.frontmatter?.source === "gdrive" && typeof payload.frontmatter.source_id === "string"
+      ? payload.frontmatter.source_id.trim()
+      : "";
+  let mappedItemId = "";
+  let mappedProjectId: string | null = null;
+  let mappedCanonicalPath: string | null = null;
+  if (gdriveSourceId) {
+    const { data: mapped, error: mappingError } = await db
+      .from("source_item_mappings")
+      .select("item_id, project_id, canonical_path")
+      .eq("team_id", auth.teamId)
+      .eq("source", "gdrive")
+      .eq("provider_id", gdriveSourceId)
+      .maybeSingle();
+    if (mappingError) throw new Error(`gdrive identity mapping lookup failed: ${mappingError.message}`);
+    const identity = mapped as { item_id?: string; project_id?: string | null; canonical_path?: string | null } | null;
+    mappedItemId = identity?.item_id ?? "";
+    mappedProjectId = identity?.project_id ?? null;
+    mappedCanonicalPath = identity?.canonical_path ?? null;
+    if (mappedItemId) {
+      const { data: mappedItem, error: mappedItemError } = await db
+        .from("items")
+        .select(existingFields)
+        .eq("team_id", auth.teamId)
+        .eq("id", mappedItemId)
+        .maybeSingle();
+      if (mappedItemError) throw new Error(`gdrive mapped item lookup failed: ${mappedItemError.message}`);
+      existing = mappedItem as ExistingItem | null;
+    }
+  }
+
+  // A retained mapping is a tombstone as well as an identity map. If the content row was physically
+  // removed, reconnect at its established collision-safe location instead of silently falling back to
+  // the newly-normalized requested path. An occupied tombstone target is a visible repair condition —
+  // never overwrite the unrelated row.
+  if (gdriveSourceId && mappedItemId && !existing && mappedCanonicalPath) {
+    const targetProjectId = mappedProjectId ?? (project.id as string);
+    const { data: occupant, error: occupantError } = await db
+      .from("items")
+      .select(existingFields)
+      .eq("team_id", auth.teamId)
+      .eq("project_id", targetProjectId)
+      .eq("path", mappedCanonicalPath)
+      .maybeSingle();
+    if (occupantError) throw new Error(`gdrive canonical path lookup failed: ${occupantError.message}`);
+    if (occupant && (occupant as ExistingItem).id !== mappedItemId) {
+      throw new IngestValidationError(
+        `Drive canonical path collision for '${mappedCanonicalPath}' requires manual repair`,
+      );
+    }
+  }
+  if (gdriveSourceId && !existing && !mappedItemId) {
+    const { data: providerMatches, error: providerMatchError } = await db
+      .from("items")
+      .select(existingFields)
+      .eq("team_id", auth.teamId)
+      .eq("frontmatter->>source", "gdrive")
+      .eq("frontmatter->>source_id", gdriveSourceId)
+      .limit(2);
+    if (providerMatchError) {
+      throw new Error(`gdrive identity lookup failed: ${providerMatchError.message}`);
+    }
+    const matches = (providerMatches ?? []) as ExistingItem[];
+    if (matches.length > 1) {
+      throw new IngestValidationError(
+        `ambiguous historical gdrive identity '${gdriveSourceId}'; manual repair is required`
+      );
+    }
+    existing = matches[0] ?? null;
+  }
+
+  if (!existing && !mappedItemId) {
+    const { data, error } = await db
+      .from("items")
+      .select(existingFields)
+      .eq("team_id", auth.teamId)
+      .eq("project_id", project.id)
+      .eq("path", payload.path)
+      .maybeSingle();
+    if (error) throw new Error(`item identity lookup failed: ${error.message}`);
+    const pathMatch = data as ExistingItem | null;
+    if (!gdriveSourceId) {
+      existing = pathMatch;
+    } else if (pathMatch) {
+      const fm = isRecord(pathMatch.frontmatter) ? pathMatch.frontmatter : {};
+      // A path is never Drive identity. Adopt only exact historical Drive provenance; otherwise
+      // allocate a deterministic collision-safe path and leave the unrelated row untouched.
+      if (fm.source === "gdrive" && fm.source_id === gdriveSourceId) {
+        existing = pathMatch;
+      } else {
+        const dot = payload.path.lastIndexOf(".");
+        const suffix = createHash("sha256").update(gdriveSourceId).digest("hex").slice(0, 10);
+        const safePath = dot > payload.path.lastIndexOf("/")
+          ? `${payload.path.slice(0, dot)}--drive-${suffix}${payload.path.slice(dot)}`
+          : `${payload.path}--drive-${suffix}`;
+        payload = { ...payload, path: safePath };
+        const { data: safeMatch, error: safeError } = await db
+          .from("items").select(existingFields).eq("team_id", auth.teamId)
+          .eq("project_id", project.id).eq("path", safePath).maybeSingle();
+        if (safeError) throw new Error(`collision-safe Drive identity lookup failed: ${safeError.message}`);
+        const safe = safeMatch as ExistingItem | null;
+        if (safe) {
+          const safeFm = isRecord(safe.frontmatter) ? safe.frontmatter : {};
+          if (safeFm.source !== "gdrive" || safeFm.source_id !== gdriveSourceId) {
+            throw new IngestValidationError(`Drive path collision for '${payload.path}' requires manual repair`);
+          }
+          existing = safe;
+        }
+      }
+    }
+  }
+
+  if (gdriveSourceId) {
+    const proposedItemId = existing?.id ?? (mappedItemId || randomUUID());
+    const proposedProjectId = existing?.project_id ?? mappedProjectId ?? (project.id as string);
+    const proposedCanonicalPath = existing?.path ?? mappedCanonicalPath ?? payload.path;
+    const { error: mappingWriteError } = await db
+      .from("source_item_mappings")
+      .upsert(
+        {
+          team_id: auth.teamId,
+          source: "gdrive",
+          provider_id: gdriveSourceId,
+          item_id: proposedItemId,
+          connection_id: null,
+          project_id: proposedProjectId,
+          canonical_path: proposedCanonicalPath,
+        },
+        { onConflict: "team_id,source,provider_id", ignoreDuplicates: true },
+      );
+    if (mappingWriteError) {
+      throw new Error(`gdrive identity mapping write failed: ${mappingWriteError.message}`);
+    }
+    const { data: mapping, error: mappingReadError } = await db
+      .from("source_item_mappings")
+      .select("item_id, project_id, canonical_path")
+      .eq("team_id", auth.teamId)
+      .eq("source", "gdrive")
+      .eq("provider_id", gdriveSourceId)
+      .single();
+    if (mappingReadError || !mapping) {
+      throw new Error(`gdrive identity mapping read failed: ${mappingReadError?.message}`);
+    }
+    const authoritative = mapping as { item_id: string; project_id?: string | null; canonical_path?: string | null };
+    const authoritativeId = authoritative.item_id;
+    if (existing && authoritativeId !== existing.id) {
+      throw new IngestValidationError(
+        `ambiguous historical gdrive identity '${gdriveSourceId}'; mapping and item disagree`,
+      );
+    }
+    mappedItemId = authoritativeId;
+    mappedProjectId = existing?.project_id ?? authoritative.project_id ?? proposedProjectId;
+    mappedCanonicalPath = existing?.path ?? authoritative.canonical_path ?? proposedCanonicalPath;
+    const { error: mappingMetaError } = await db
+      .from("source_item_mappings")
+      .update({ project_id: mappedProjectId, canonical_path: mappedCanonicalPath, updated_at: now })
+      .eq("team_id", auth.teamId)
+      .eq("source", "gdrive")
+      .eq("provider_id", gdriveSourceId)
+      .eq("item_id", authoritativeId);
+    if (mappingMetaError) throw new Error(`gdrive identity mapping update failed: ${mappingMetaError.message}`);
+  }
+
+  // Provider identity owns the canonical storage location. A source rename, changed normalization,
+  // or reconnect is metadata/content evolution, not an implicit project/path move. A future move API
+  // must take both the provider lock and the destination path lock and update this mapping explicitly.
+  const itemProjectId = gdriveSourceId
+    ? existing?.project_id ?? mappedProjectId ?? (project.id as string)
+    : (project.id as string);
+  const itemPath = gdriveSourceId
+    ? existing?.path ?? mappedCanonicalPath ?? payload.path
+    : payload.path;
+  if (gdriveSourceId) payload = { ...payload, path: itemPath };
+
+  // The provider/path phase has now resolved the immutable canonical id. Serialize with correction
+  // and repair, then throw away the pre-lock attribution snapshot and reread it under the item row
+  // lock. This lock is held by the surrounding transaction through item, version and contribution
+  // writes, so a manual credit-nobody or named correction cannot be overwritten by a stale ingest.
+  const canonicalItemId = existing?.id ?? (mappedItemId || randomUUID());
+  if (_internal.transactionBound) {
+    await _internal.concurrencyHooks?.beforeAttributionLock?.(canonicalItemId);
+    await lockItemAttribution(auth.teamId,canonicalItemId);
+    await _internal.concurrencyHooks?.afterAttributionLock?.(canonicalItemId);
+    const { rows: authoritativeRows } = await runSql<ExistingItem>(
+      `select id,project_id,path,content_sha256,member_id,member_id_locked,frontmatter,access,
+              created_at,work_at,work_at_from_source
+         from items where team_id=$1 and id=$2 for update`,
+      [auth.teamId,canonicalItemId],
+    );
+    const authoritative = authoritativeRows[0] ?? null;
+    if (existing && !authoritative) {
+      throw new Error("canonical item disappeared before attribution serialization");
+    }
+    if (authoritative) existing=authoritative;
+    await _internal.concurrencyHooks?.afterAttributionRead?.(canonicalItemId);
+  }
+
+  const storedFrontmatter = isRecord(existing?.frontmatter) ? existing.frontmatter : {};
+  const persistedFrontmatter: Record<string, unknown> = { ...(payload.frontmatter ?? {}) };
+  if (payload.frontmatter?.source === "gdrive") {
+    persistedFrontmatter.contributions = mergeGdriveContributions(
+      storedFrontmatter.contributions,
+      payload.frontmatter.contributions,
+    );
+  }
 
   // ── Who may set this item's tier ────────────────────────────────────────────────────────────────
   // Tier is an access-control decision, so it is resolved ONCE here and both write paths below use the
@@ -250,11 +650,9 @@ export async function ingestItem(
     // poisoning, and a skewed episode timestamp. It gets the `synced_at` bump and nothing else.
     const metadataWritable = !(untrustedPusher && existingAccess === "team");
     if (metadataWritable) {
-      const existingFrontmatter = isRecord(existing.frontmatter)
-        ? existing.frontmatter
-        : {};
+      const existingFrontmatter = storedFrontmatter;
       const healedFrontmatter: Record<string, unknown> = {
-        ...(payload.frontmatter ?? {}),
+        ...persistedFrontmatter,
       };
       // Author signals a connector may LOSE on a later tick. `authors[]` matters most: Notion's
       // author enrichment is best-effort (the API returns [] on any hiccup), so without preserving it
@@ -380,17 +778,31 @@ export async function ingestItem(
       });
     }
     // No projection on an unchanged push (the route also guards status !== "unchanged").
+    if (gdriveClaim) {
+      await recordGdriveItemClaim(db, {
+        teamId: auth.teamId,
+        itemId: existing.id,
+        ...gdriveClaim,
+      });
+    }
+    if (gdriveSourceId) {
+      await syncGdriveContributionEvidence(db, auth.teamId, existing.id, healedFm, undefined, {
+        memberIdLocked: existing.member_id_locked,
+        memberId: existing.member_id,
+        authorityRevision: mappingRevision,
+      });
+    }
     return {
       status: "unchanged",
       id: existing.id,
-      projectId: project.id,
+      projectId: itemProjectId,
       accessChanged,
     };
   }
 
   const taskRows =
     payload.kind === "task" && payload.rows
-      ? await validateTaskRows(db, auth.teamId, project.id, payload.rows)
+      ? await validateTaskRows(db, auth.teamId, itemProjectId, payload.rows)
       : undefined;
 
   // Phase 1 of a reclassification on the CHANGED path: before the item row (which carries `access`) is
@@ -402,16 +814,20 @@ export async function ingestItem(
 
   const pendingSha = "";
   const changedWork = resolvePersistedWorkTime(
-    payload.frontmatter,
+    persistedFrontmatter,
     isoOf((existing as { created_at?: string | Date } | null)?.created_at) ?? now
   );
+  const requestedMemberId = opts ? opts.authorMemberId : auth.memberId;
+  const authoritativeMemberId = existing?.member_id_locked === true
+    ? existing.member_id
+    : requestedMemberId;
   const itemRecord = {
     team_id: auth.teamId,
-    project_id: project.id,
-    path: payload.path,
+    project_id: itemProjectId,
+    path: itemPath,
     kind: payload.kind,
     access: effectiveAccess,
-    frontmatter: payload.frontmatter,
+    frontmatter: persistedFrontmatter,
     body: payload.body,
     // Work-time resolved through the ONE resolver and written down (R1). An existing row keeps its
     // `created_at` as the fallback anchor; a brand-new one has none yet, so `now` is its first-seen.
@@ -419,7 +835,7 @@ export async function ingestItem(
     work_at_from_source: changedWork.fromSource,
     content_sha256: existing ? existing.content_sha256 : pendingSha,
     actor: payload.actor,
-    member_id: opts ? opts.authorMemberId : auth.memberId,
+    member_id: authoritativeMemberId,
     synced_at: now,
     updated_at: now,
   };
@@ -443,7 +859,7 @@ export async function ingestItem(
       // enough to make "work_at === created_at" false for every undated item. Deliberately not part of
       // `itemRecord`, which the update path spreads: re-stamping it there would turn first-seen into
       // last-changed and quietly corrupt the knowledge-growth metric that reads it.
-      .insert({ ...itemRecord, created_at: now })
+      .insert({ ...itemRecord, id: canonicalItemId, created_at: now })
       .select("id")
       .single();
     if (error || !data) throw new Error(`item insert failed: ${error?.message}`);
@@ -453,9 +869,9 @@ export async function ingestItem(
   const { error: versionError } = await db.from("item_versions").insert({
     item_id: itemId,
     content_sha256: contentSha,
-    frontmatter: payload.frontmatter,
+    frontmatter: persistedFrontmatter,
     body: payload.body,
-    member_id: opts ? opts.authorMemberId : auth.memberId,
+    member_id: authoritativeMemberId,
   });
   if (versionError) {
     throw new Error(`item version insert failed: ${versionError.message}`);
@@ -480,7 +896,7 @@ export async function ingestItem(
     changedTaskRowKeys = await materializeTasks(
       db,
       auth.teamId,
-      project.id,
+      itemProjectId,
       itemId,
       taskRows,
       now,
@@ -490,7 +906,7 @@ export async function ingestItem(
     await materializeDecisions(
       db,
       auth.teamId,
-      project.id,
+      itemProjectId,
       itemId,
       payload.rows,
       now
@@ -499,7 +915,7 @@ export async function ingestItem(
     await materializeFacts(
       db,
       auth.teamId,
-      project.id,
+      itemProjectId,
       itemId,
       payload.rows,
       now,
@@ -509,7 +925,7 @@ export async function ingestItem(
     await materializeStakeholderMentions(
       db,
       auth.teamId,
-      project.id,
+      itemProjectId,
       itemId,
       payload.rows,
       now,
@@ -591,10 +1007,20 @@ export async function ingestItem(
     }
   }
 
+  if (gdriveClaim) {
+    await recordGdriveItemClaim(db, { teamId: auth.teamId, itemId, ...gdriveClaim });
+  }
+  if (gdriveSourceId) {
+    await syncGdriveContributionEvidence(db, auth.teamId, itemId, persistedFrontmatter, undefined, {
+      memberIdLocked: existing?.member_id_locked,
+      memberId: existing?.member_id_locked === true ? existing.member_id : authoritativeMemberId,
+      authorityRevision: mappingRevision,
+    });
+  }
   return {
     status: existing ? "updated" : "created",
     id: itemId,
-    projectId: project.id,
+    projectId: itemProjectId,
     changedTaskRowKeys,
     accessChanged,
   };

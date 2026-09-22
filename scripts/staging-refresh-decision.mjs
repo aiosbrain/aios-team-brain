@@ -79,6 +79,11 @@ export const EXCLUDED_TABLE_DATA = Object.freeze([
   "gateway_connections",
   "gateway_executions",
   "gateway_resolution_leases",
+  "gdrive_cleanup_obligations",
+  "gdrive_connection_authority",
+  "gdrive_run_requests",
+  "gdrive_item_claim_projects",
+  "gdrive_item_claims",
   "graph_episodes",
   "integrations",
   "member_secrets",
@@ -150,13 +155,29 @@ const CIPHERTEXT_COLUMN_RE = /\b([a-z0-9_]*ciphertext)\b/i;
 export function ciphertextTables(sql) {
   const lines = stripSqlComments(sql).split("\n");
   const found = new Set();
-  let current = null;
+  let currentCreate = null;
+  let currentAlter = null;
   for (const line of lines) {
     const created = CREATE_TABLE_RE.exec(line);
-    if (created) current = created[1].toLowerCase();
+    if (created) {
+      currentCreate = created[1].toLowerCase();
+      currentAlter = null;
+    }
     const altered = ALTER_TABLE_RE.exec(line);
-    if (altered) current = altered[1].toLowerCase();
+    if (altered) {
+      currentAlter = altered[1].toLowerCase();
+      currentCreate = null;
+    }
+    const current = currentCreate ?? currentAlter;
     if (CIPHERTEXT_COLUMN_RE.test(line) && current) found.add(current);
+    // Do not carry a table attribution into a later trigger/function body that merely REFERENCES a
+    // ciphertext column. Both CREATE TABLE and ALTER TABLE statements terminate at `;`; retaining
+    // `current` beyond that boundary falsely classified the next function's `new.secret_ciphertext`
+    // as a column on the preceding table.
+    if (/;\s*$/.test(line)) {
+      currentCreate = null;
+      currentAlter = null;
+    }
   }
   return [...found].sort();
 }

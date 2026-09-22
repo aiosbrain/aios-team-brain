@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, visOf, externalMember, type Seed } from "./helpers";
+import { db, ingest, seedTeam, visOf, externalMember, convergeIdentityAttribution, type Seed } from "./helpers";
 import { getCachedWorkTimeline, PAYLOAD_VERSION, MIN_SALVAGEABLE_VERSION } from "@/lib/dashboard/timeline-cache";
+import { advanceAuthorizationEpoch, authorizationEpoch } from "@/lib/access/authorization-epoch";
 
 /**
  * Spec: a PAYLOAD_VERSION bump must not blank the daily synopsis.
@@ -48,6 +49,9 @@ async function seedLinkedTeam(): Promise<Seed> {
     audience: "external",
     source_item_id: src.id,
   });
+  // Establish a legitimate cacheable attribution generation through the production repair owner.
+  // The pending-repair rejection contract has its own explicit test in timeline-cache.
+  await convergeIdentityAttribution(seed);
   return seed;
 }
 
@@ -66,7 +70,28 @@ async function seedCommit(seed: Seed, title: string, whenIso: string, access: "t
   return r;
 }
 
-const visKey = async (seed: Seed, memberId: string = seed.memberId, tier = "team"): Promise<string> => `vis:${tier}:${(await visOf(seed, memberId))!.visibilityHash}`;
+async function preparedView(
+  seed: Seed,
+  memberId: string = seed.memberId,
+  tier: "team" | "external" = "team",
+): Promise<{ groupKey: string; authorizationEpoch: number }> {
+  // Finish every roster/viewer mutation first, then converge through the supported repair owner.
+  // Normal salvage cases must begin at a genuinely healthy current generation; old-epoch and
+  // pending-repair rejection have separate, explicit tests.
+  await convergeIdentityAttribution(seed);
+  const visibility = await visOf(seed, memberId);
+  if (!visibility) throw new Error("prepared viewer has no visibility");
+  const epoch = await authorizationEpoch(db(), seed.teamId);
+  const { data, error } = await db().from("team_identity_authority")
+    .select("revision, repair_revision, repair_status")
+    .eq("team_id", seed.teamId)
+    .single();
+  if (error || !data) throw new Error(`identity authority fixture read failed: ${error?.message}`);
+  expect(data).toMatchObject({ repair_status: "complete" });
+  expect(Number((data as { revision: number }).revision))
+    .toBe(Number((data as { repair_revision: number }).repair_revision));
+  return { groupKey: `vis:${tier}:${visibility.visibilityHash}`, authorizationEpoch: epoch };
+}
 
 /** Write a cache row from a PREVIOUS payload version that carries a synopsis for one person-day. */
 async function seedPriorRow(args: {
@@ -77,6 +102,7 @@ async function seedPriorRow(args: {
   version?: number;
   computedAt?: string;
   groupKey: string;
+  authorizationEpoch: number;
 }) {
   const payload = {
     // A FOREIGN version that is still SALVAGEABLE. It used to be `PAYLOAD_VERSION - 1`, which broke the
@@ -115,10 +141,19 @@ async function seedPriorRow(args: {
       group_key: args.groupKey,
       payload: JSON.stringify(payload),
       computed_at: args.computedAt ?? new Date().toISOString(),
+      authorization_epoch: args.authorizationEpoch,
     },
     { onConflict: "team_id,group_key" }
   );
   if (error) throw new Error(`prior row seed failed: ${error.message}`);
+  const seeded = await db().from("work_timeline_cache")
+    .select("authorization_epoch")
+    .eq("team_id", args.teamId)
+    .eq("group_key", args.groupKey)
+    .single();
+  expect(seeded.error).toBeNull();
+  expect(Number((seeded.data as { authorization_epoch: number }).authorization_epoch))
+    .toBe(args.authorizationEpoch);
 }
 
 // ONE timestamp for both the commit and the prior row's date. `dayOf` slices the ISO string, so the
@@ -150,10 +185,11 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
   it("carries a foreign version's summary into the first post-bump view", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "carried", WHEN);
+    const view = await preparedView(seed);
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
-      groupKey: await visKey(seed),
+      ...view,
       date: dayOfWhen,
       summary: "Shipped the carried work.",
     });
@@ -170,10 +206,11 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     // forward would re-persist that misattribution as prose in the new row. Blank beats wrong.
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "carried", WHEN);
+    const view = await preparedView(seed);
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
-      groupKey: await visKey(seed),
+      ...view,
       date: dayOfWhen,
       summary: "Shared two sizzle reels.", // the shape of the misattributed claim
       version: MIN_SALVAGEABLE_VERSION - 1,
@@ -186,11 +223,12 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
   it("matches a summary to ITS OWN person-day, never another's", async () => {
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "carried", WHEN);
+    const view = await preparedView(seed);
     // A summary stored against a DIFFERENT member on the same day must not land on ours.
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: randomUUID(),
-      groupKey: await visKey(seed), // the READER's key — the foreign person-day is inside their own row
+      ...view, // the READER's key — the foreign person-day is inside their own row
       date: dayOfWhen,
       summary: "Someone else's day.",
     });
@@ -203,10 +241,11 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     // A shelf life, because a salvaged sentence is only defensible as a bridge to the next refresh.
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "carried", WHEN);
+    const view = await preparedView(seed);
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
-      groupKey: await visKey(seed),
+      ...view,
       date: dayOfWhen,
       summary: "Stale from last week.",
       computedAt: new Date(Date.now() - 8 * 24 * 3600_000).toISOString(),
@@ -214,6 +253,24 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
 
     const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
+  });
+
+  it("does NOT salvage a synopsis from a pre-revocation authorization epoch", async () => {
+    const seed = await seedLinkedTeam();
+    await seedCommit(seed, "carried", WHEN);
+    const view = await preparedView(seed);
+    await seedPriorRow({
+      teamId: seed.teamId,
+      memberId: seed.memberId,
+      ...view,
+      date: dayOfWhen,
+      summary: "OLD-EPOCH-SUMMARY-MUST-NOT-SURVIVE",
+    });
+    await advanceAuthorizationEpoch(seed.teamId);
+
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "team", seed.memberId);
+    expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
+    expect(JSON.stringify(days)).not.toContain("OLD-EPOCH-SUMMARY-MUST-NOT-SURVIVE");
   });
 
   it("TIER: an external viewer never receives a summary written for the TEAM tier", async () => {
@@ -224,15 +281,17 @@ describe("the daily synopsis survives a PAYLOAD_VERSION bump (real Postgres)", (
     // whole suite. Tier isolation is app-code only; there is no RLS backstop.
     const seed = await seedLinkedTeam();
     await seedCommit(seed, "external-work", WHEN, "external");
+    const externalId = await externalMember(seed);
+    const teamView = await preparedView(seed);
     await seedPriorRow({
       teamId: seed.teamId,
       memberId: seed.memberId,
-      groupKey: await visKey(seed),
+      ...teamView,
       date: dayOfWhen,
       summary: "Team-tier sentence about work an external viewer must not learn about.",
     });
 
-    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "external", await externalMember(seed));
+    const { days } = await getCachedWorkTimeline(db(), seed.teamId, "external", externalId);
     expect(summaryOfRenderedDay(days, seed.memberId)).toBeUndefined();
   });
 });

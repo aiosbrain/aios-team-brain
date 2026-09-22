@@ -52,16 +52,16 @@ export async function reconcileItemUnit(
 
   const { data: existing } = await db
     .from("project_context_units")
-    .select("id, audience, content_sha256, occurred_at")
+    .select("id, audience, content_sha256, occurred_at, state")
     .eq("team_id", teamId)
     .eq("source_item_id", itemId)
     .eq("unit_kind", "item")
     .maybeSingle();
 
   if (existing) {
-    const row = existing as { id: string; audience: string; content_sha256: string; occurred_at: string };
+    const row = existing as { id: string; audience: string; content_sha256: string; occurred_at: string; state: string };
     const workAtDrift = new Date(row.occurred_at).getTime() !== new Date(item.work_at).getTime();
-    if (row.audience !== item.access || row.content_sha256 !== item.content_sha256 || workAtDrift) {
+    if (row.audience !== item.access || row.content_sha256 !== item.content_sha256 || workAtDrift || row.state !== "active") {
       // SINGLE-STATEMENT MIRROR (AUDITFIX-4, Fable diff review HIGH 1). The audience written is read
       // from `items` INSIDE the same statement, and the value the caller routes on is the one
       // RETURNED — so the placement is bound to the item version that authorized it.
@@ -87,6 +87,7 @@ export async function reconcileItemUnit(
               set audience = i.access,
                   content_sha256 = i.content_sha256,
                   occurred_at = i.work_at,
+                  state = 'active',
                   updated_at = now()
              from items i
             where u.id = $1 and u.team_id = $2 and i.id = $3 and i.team_id = $2
@@ -135,4 +136,19 @@ export async function reconcileItemUnit(
     return { ok: false, error: error?.message ?? "insert failed" };
   }
   return { ok: true, unitId: data.id as string, created: true, audience: item.access };
+}
+
+/**
+ * Durable visibility suppression used by source revocation. Retraction leaves membership history
+ * intact but every enforced reader rejects the unit until a surviving claim reactivates it through
+ * `reconcileItemUnit`.
+ */
+export async function retractItemUnit(db: DbClient, teamId: string, itemId: string): Promise<ReconcileResult> {
+  const { data, error } = await db.from("project_context_units")
+    .update({ state: "retracted", updated_at: new Date().toISOString() })
+    .eq("team_id", teamId).eq("source_item_id", itemId).eq("unit_kind", "item")
+    .select("id").maybeSingle();
+  if (error) return { ok: false, error: error.message };
+  if (!data) return { ok: false, error: "context unit not found" };
+  return { ok: true, unitId: (data as { id: string }).id, created: false };
 }

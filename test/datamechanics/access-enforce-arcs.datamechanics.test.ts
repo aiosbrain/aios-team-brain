@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { db, ingest, seedTeam, type Seed } from "./helpers";
+import { convergeIdentityAttribution, db, ingest, seedTeam, type Seed } from "./helpers";
 import { backfillTeamContext } from "@/lib/projects/context/backfill";
 import { memberEnforcement } from "@/lib/access/enforce";
 import { filterArcsByVisibleItems } from "@/lib/graph/arc-visibility";
@@ -10,6 +10,7 @@ import { getFusedArcs } from "@/lib/graph/arc-fusion";
 import { ensureAccessBootstrap } from "@/lib/access/bootstrap";
 import { episodeGroupId } from "@/lib/graph/group";
 import { createGroup, grantProjectToGroup } from "@/lib/access/groups";
+import { writeArcCache } from "@/lib/graph/arc-cache";
 
 // Phase B slice 5 (spec §5.8/§5.8b), re-homed onto the PRET-3 unified read: the enforcement
 // COMPOSITION is proven over the FUSED path every reader now uses — resolveArcScope resolves the
@@ -25,6 +26,7 @@ async function seedMember(seed: Seed): Promise<string> {
     .single();
   const { placeMemberByTier } = await import("./helpers");
   await placeMemberByTier(seed.teamId, data!.id as string, "team");
+  await convergeIdentityAttribution(seed);
   return data!.id as string;
 }
 async function restrictItem(seed: Seed, itemId: string): Promise<void> {
@@ -42,11 +44,8 @@ const arc = (id: string, itemIds: string[]): NarrativeArc => ({
 async function seedArcCache(seed: Seed, arcs: NarrativeArc[]) {
   // The General built-in's PARTITION row — where the fused read actually looks (PRET-3).
   const groupKey = `g:${episodeGroupId(seed.teamSlug, "team")}`;
-  const { error } = await db().from("arc_cache").upsert(
-    { team_id: seed.teamId, group_key: groupKey, arcs: JSON.stringify(arcs), computed_at: new Date().toISOString() },
-    { onConflict: "team_id,group_key" }
-  );
-  expect(error, "arc_cache seed must insert").toBeNull();
+  expect(await writeArcCache(db(),seed.teamId,groupKey,arcs,"fixture"),"arc_cache seed must insert")
+    .toBe(true);
 }
 /** Mirrors the arcs route post-PRET-3: resolveArcScope → getFusedArcs → the evidence filter. */
 async function visibleArcTitles(seed: Seed, memberId: string): Promise<string[]> {
@@ -134,10 +133,8 @@ describe("the arcs read serves ONLY partition rows (PCCC6B-1 property; PRET-3: f
     // dead weight — no read path can reach a non-g: key (getArcs/getFusedArcs are g:-only by
     // signature), which is the WHOLE mechanism.
     const tierKey = [episodeGroupId(seed.teamSlug, "team"), episodeGroupId(seed.teamSlug, "external")].sort().join(",");
-    await db().from("arc_cache").upsert(
-      { team_id: seed.teamId, group_key: tierKey, arcs: JSON.stringify([arc("tier-laundered", [])]), computed_at: new Date().toISOString() },
-      { onConflict: "team_id,group_key" }
-    );
+    expect(await writeArcCache(db(),seed.teamId,tierKey,[arc("tier-laundered", [])],"fixture"))
+      .toBe(true);
 
     const titles = await visibleArcTitles(seed, seed.memberId);
     expect(titles, "the tier row's content reaches no panel").not.toContain("arc tier-laundered");

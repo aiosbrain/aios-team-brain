@@ -72,12 +72,6 @@ interface Entry {
  * that is the whole point, and the failure message says so.
  */
 const INVENTORY: Record<string, Entry> = {
-  "app/api/v1/items/route.ts": {
-    sites: 1,
-    class: "RECONCILES_AFTER_RESPONSE",
-    reason: "the workspace CLI push path; reconciling in after() keeps the push from blocking on it",
-    latency: "measured 0.0 min median on prod — 41/41 items partitioned inside 60s",
-  },
   "lib/meetings/notes.ts": {
     sites: 1,
     class: "RECONCILES_INLINE",
@@ -678,7 +672,6 @@ describe("§11 context-partition — the WRITER INVENTORY (AUDITFIX-2)", () => {
     // that makes the guard non-vacuous — and it is only as strong as the recognizer behind it,
     // which is why controls 4 and 5 pin canonical resolution.
     expect(sites).toEqual({
-      "app/api/v1/items/route.ts": 1,
       "lib/meetings/notes.ts": 1,
       "lib/meetings/merge.ts": 1,
       "lib/codebases/commits-to-items.ts": 1,

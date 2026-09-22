@@ -7,7 +7,9 @@
 #   selections from the brain (Admin → Integrations) and OVERLAYS their non-secret
 #   selection — slack channel ids — onto the matching
 #   local connection. Matching is by (source == brain type) AND (name == brain name).
-#   The brain rejects secret-like keys at write time, so secrets ALWAYS stay local:
+#   The brain rejects secret-like keys at write time. Source secrets stay local, except that Google
+#   OAuth refresh credentials remain encrypted in the brain and the sidecar receives only a
+#   short-lived access token from the fenced broker:
 #   the token / signing_secret / webhook_secret / api_key you set below via ${ENV_VAR}
 #   are preserved verbatim and never overwritten by a brain selection.
 #
@@ -49,5 +51,9 @@ connections:
     project: client-acme
     access: external          # this connection's content is externally visible
     options:
-      folder_id: 1AbCdEfGhIjKlMnOpQrStUvWxYz
+      api_mode: docs          # all Drive runs migrate through the authorized direct API coordinator
+      folder_ids: [1AbCdEfGhIjKlMnOpQrStUvWxYz]
+      recursive: true
+      selection_state: selected
       service_account_key_path: ${GOOGLE_SA_KEY_PATH}
+      # webhook_url: https://brain.example.com/webhooks/gdrive  # enables fenced watch create/renew
