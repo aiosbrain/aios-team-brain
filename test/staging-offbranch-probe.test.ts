@@ -26,7 +26,7 @@ import {
   parseCheckRunUrl, parseDiagnosticAnnotations, parseEnvironmentPolicy, parseProbeCheck, parseProbeJobs, parseProbeRun,
   probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage,
 } from "../scripts/staging-ops/offbranch-probe.mjs";
-import { createGitLeaseDeleter, main, runProbePhase } from "../scripts/staging-ops/offbranch-probe-operator.mjs";
+import { createGitLeaseDeleter, main, runProbePhase, runStage, runDispatch, runCollect, runCancel, runCleanup } from "../scripts/staging-ops/offbranch-probe-operator.mjs";
 
 const REPO = COMMISSIONING_REPOSITORY;
 const API = `https://api.github.com/repos/${REPO}`;
@@ -736,7 +736,7 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
   });
 
   it("refuses to stage before the original baseline, after an approval, or once the attempt completed", async () => {
-    writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "intent"), { schema_version: 1, repository: REPO, repository_id: REPO_ID, run_id: RUN_ID, attempt: ATTEMPT, workflow_path: COMMISSIONING_WORKFLOW_PATH, workflow_sha: world.sha });
+    writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "intent"), { schema_version: 1, repository: REPO, repository_id: REPO_ID, run_id: RUN_ID, attempt: ATTEMPT, workflow_path: COMMISSIONING_WORKFLOW_PATH, workflow_sha: world.sha, dispatcher: "original-dispatcher" });
     await expect(world.phase("stage")).rejects.toThrow(/journal|baseline/);
     world.seedOriginal();
     world.approvals = [{ state: "approved", user: JOHN, environments: [{ name: "staging-emergency" }], updated_at: iso(world.clock) }];
@@ -756,10 +756,10 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     expect(world.count("POST", "/git/refs")).toBe(0);
   });
 
-  it("stages once per attempt: a second stage is refused", async () => {
+  it("stages once per attempt: an unchanged staged intent is idempotent", async () => {
     world.seedOriginal();
     await world.phase("stage");
-    await expect(world.phase("stage")).rejects.toThrow(/already staged/);
+    expect((await world.phase("stage")).status).toBe("already-staged");
   });
 
   it("reconciles a lost create answer (applied) by readback, marks ownership uncertain, and never dispatches or deletes", async () => {
@@ -1558,7 +1558,7 @@ describe("R05-F2: an observed staging move is kept, and interrupts measurement f
 
     // The move is observed from here on. Cancelling this probe's own run is still allowed.
     const cancelled: any = await world.phase("cancel", { transport: drifting(world) });
-    expect(cancelled.status).toBe("already-terminal");
+    expect(cancelled.status).toBe("terminal-aborted");
     // ...and so is removing what this run created: the remedy is never the casualty.
     const cleaned: any = await world.phase("cleanup", { transport: drifting(world) });
     expect(cleaned.outcome).toBe("inconclusive");
@@ -1732,7 +1732,7 @@ describe("R06: separated qualification, run authority and ref authority", () => 
       world.clock += 60_000; // the run finishes on its own while the attempt is interrupted
       // No cancellation is aimed at a run that has already finished: it is reconciled as terminal.
       const cancelled: any = await world.phase("cancel");
-      expect(cancelled.status).toBe("already-terminal");
+      expect(cancelled.status).toBe("terminal-aborted");
       expect(world.count("POST", "/cancel")).toBe(0);
       const terminal = world.probeRecords().find((record: any) => record.type === "run-terminal");
       expect(terminal.data.status).toBe("completed");
@@ -2091,7 +2091,7 @@ describe("R07: remaining dispatch/recovery boundaries", () => {
       reconcile: async (intent: any) => { seen.push(intent); return { reconciled: true, readback: { present: true } }; } });
     expect(seen.map((i) => i.kind_of_intent)).toEqual(["ref-create-intent"]);
     expect(recovered.unresolvedIntentType).toBe("ref-create-intent"); recovered.lock.release();
-    await expect(world.phase("cleanup")).rejects.toThrow(/unresolved probe intent/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/ownership is uncertain/);
     expect(world.refSha()).toBe(world.sha);
     expect(world.count("POST", "/dispatches")).toBe(0);
   });
@@ -2119,5 +2119,127 @@ describe("R07: remaining dispatch/recovery boundaries", () => {
       reconcile: async (intent: any) => { seen.push(intent.kind_of_intent); return { reconciled: intent.kind_of_intent !== "dispatch-intent" }; } })).rejects.toThrow(/could not be reconciled/);
     expect(seen).toEqual(["ref-create-intent", "dispatch-intent"]);
     expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe").nonce).toBe(owner.nonce);
+  });
+});
+
+
+describe("phase admission and terminal recovery", () => {
+  const direct: Record<string, any> = { stage: runStage, dispatch: runDispatch, collect: runCollect, cancel: runCancel, cleanup: runCleanup };
+  const invoke = (phase: string, extra: any = {}) => direct[phase]({ runId: RUN_ID, attempt: ATTEMPT, evidenceDir: world.dir, env: {}, deps: world.deps(extra) });
+  const unavailable = (method: string, route: string, body: any) => route.includes("/check-runs/") ? Promise.resolve(incompleteResponse("transport-timeout")) : world.transport(method, route, body);
+  for (const closure of ["inconclusive", "measured", "failed"]) for (const phase of Object.keys(direct)) {
+    it(`${closure} closed history admits ${phase} only as read-only terminal reporting`, async () => {
+      world.seedOriginal(); await invoke("stage");
+      if (closure !== "inconclusive") {
+        if (closure === "failed") world.admitted = "probe-release";
+        await invoke("dispatch");
+        if (closure === "failed") { await expect(invoke("collect", { transport: unavailable })).rejects.toThrow(); await invoke("cancel"); }
+        else await invoke("collect");
+      }
+      await invoke("cleanup");
+      const before = JSON.stringify(world.probeRecords());
+      const mutations = world.calls.filter((call) => call.method !== "GET").length;
+      if (["cancel", "cleanup"].includes(phase)) expect((await invoke(phase)).status).toBe("already-closed");
+      else await expect(invoke(phase)).rejects.toThrow(/closed/);
+      expect(JSON.stringify(world.probeRecords())).toBe(before);
+      expect(world.calls.filter((call) => call.method !== "GET").length).toBe(mutations);
+      expect(world.refSha()).toBeNull();
+    });
+  }
+  for (const phase of ["dispatch", "collect", "cancel", "cleanup"]) {
+    it(`direct ${phase} cannot invent an unstaged probe`, async () => {
+      world.seedOriginal(); await expect(invoke(phase)).rejects.toThrow(/staged/);
+      expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+      expect(world.probeRecords()).toHaveLength(0);
+    });
+  }
+  for (const apply of [false, true]) for (const changed of [false, true]) {
+    it(`missing create result reconciles without retry (applied=${apply}, changed=${changed})`, async () => {
+      world.seedOriginal(); await invoke("stage");
+      await expect(invoke("dispatch", { transport: async (method: string, route: string, body: any) => {
+        if (method === "POST" && route.endsWith("/git/refs")) {
+          world.calls.push({ method, path: route, body });
+          if (apply) world.setRef(changed ? world.otherSha : world.sha);
+          throw new Error("cut before result append");
+        }
+        return world.transport(method, route, body);
+      } })).rejects.toThrow(/cut/);
+      if (apply) {
+        await expect(invoke("cleanup")).rejects.toThrow(/uncertain/);
+        world.setRef(null); await expect(invoke("cleanup")).rejects.toThrow(/uncertain/);
+      } else { expect((await invoke("cleanup")).status).toBe("nothing-owned"); expect((await invoke("cleanup")).status).toBe("already-closed"); }
+      expect(world.count("POST", "/git/refs")).toBe(1);
+      expect(world.count("POST", "/dispatches")).toBe(0);
+    });
+  }
+  for (const job of ["probe-release", "probe-emergency", null]) {
+    it(`terminal incomplete capture explicitly aborts, preserving ${job ?? "unverified"} qualification`, async () => {
+      world.seedOriginal(); await invoke("stage"); world.admitted = job; await invoke("dispatch");
+      await expect(invoke("collect", { transport: unavailable })).rejects.toThrow();
+      expect(world.probeRecords().some((row: any) => row.type === "capture-failed")).toBe(true);
+      expect(world.probeRecords().filter((row: any) => row.type === "admission-observed")).toHaveLength(job ? 1 : 0);
+      await expect(invoke("cleanup")).rejects.toThrow(/collect before cleanup/);
+      expect((await invoke("cancel", { transport: unavailable })).status).toBe("terminal-aborted");
+      await expect(invoke("collect")).rejects.toThrow(/qualification/);
+      expect((await invoke("cleanup")).outcome).toBe(job ? "failed" : "inconclusive");
+      expect(world.count("POST", "/cancel")).toBe(0); expect(world.refSha()).toBeNull();
+    });
+  }
+  it("complete paired collection followed by terminal cancel preserves observation bytes and acceptance", async () => {
+    world.seedOriginal(); await invoke("stage"); await invoke("dispatch"); const collected = await invoke("collect");
+    const observations = world.probeRecords().filter((row: any) => row.type === "observation-recorded");
+    expect((await invoke("cancel")).status).toBe("already-terminal");
+    expect(world.probeRecords().filter((row: any) => row.type === "observation-recorded")).toEqual(observations);
+    expect(world.probeRecords().some((row: any) => ["cancel-intent", "cancel-result", "qualification-ended"].includes(row.type))).toBe(false);
+    expect((await invoke("cleanup")).outcome).toBe("measured");
+    for (const [environment, record] of Object.entries(collected.records)) expect(world.validate(record, environment)).toBeNull();
+  });
+  for (const interruption of ["original-completed", "original-unavailable", "source-unavailable", "expired"]) {
+    it(`independent recovery survives ${interruption} qualification`, async () => {
+      world.seedOriginal(); await invoke("stage"); await invoke("dispatch");
+      if (interruption === "original-completed") world.originalRunStatus = "completed";
+      if (interruption === "expired") world.clock += 11 * 60_000;
+      const transport = (method: string, route: string, body: any) => {
+        if ((interruption === "original-unavailable" && route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`))
+          || (interruption === "source-unavailable" && route.endsWith("/git/ref/heads/staging"))) return Promise.resolve(incompleteResponse("transport-timeout"));
+        return world.transport(method, route, body);
+      };
+      await expect(invoke("collect", { transport })).rejects.toThrow();
+      await invoke("cancel", { transport }); await invoke("cleanup", { transport });
+      expect(world.refSha()).toBeNull();
+      expect(world.probeRecords().at(-1)?.data.outcome).toBe("inconclusive");
+    });
+  }
+  const substitutions: Record<string, (body: any) => void> = {
+    id: (b) => { b.id++; }, attempt: (b) => { b.run_attempt++; },
+    repository_id: (b) => { b.repository.id++; }, repository_name: (b) => { b.repository.full_name = "other/repo"; },
+    head_repository_id: (b) => { b.head_repository.id++; }, head_repository_name: (b) => { b.head_repository.full_name = "other/repo"; },
+    actor_login: (b) => { b.actor.login = "substitute"; }, actor_id_missing: (b) => { delete b.actor.id; },
+    actor_type: (b) => { b.actor.type = ""; }, trigger_missing: (b) => { delete b.triggering_actor; },
+    run_attempt_missing: (b) => { delete b.run_attempt; }, repository_missing: (b) => { delete b.repository; },
+  };
+  for (const [field, substitute] of Object.entries(substitutions)) it(`original ${field} substitution refuses before launch mutation`, async () => {
+    world.seedOriginal();
+    const transport = async (method: string, route: string, body: any) => {
+      if (route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`)) {
+        const original = world.respond(method, route, body).body; substitute(original);
+        return completedJsonResponse(200, Buffer.from(JSON.stringify(original)), createRedactor(), { retainRaw: true });
+      }
+      return world.transport(method, route, body);
+    };
+    await expect(invoke("stage", { transport })).rejects.toThrow();
+    expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+  });
+  for (const field of ["actor", "triggering_actor"]) it(`original ${field} tuple cannot change after baseline`, async () => {
+    world.seedOriginal(); await invoke("stage");
+    const transport = async (method: string, route: string, body: any) => {
+      if (route.endsWith(`/actions/runs/${RUN_ID}/attempts/${ATTEMPT}`)) {
+        const original = world.respond(method, route, body).body; original[field].id++;
+        return completedJsonResponse(200, Buffer.from(JSON.stringify(original)), createRedactor(), { retainRaw: true });
+      }
+      return world.transport(method, route, body);
+    };
+    await expect(invoke("dispatch", { transport })).rejects.toThrow(/actor identity/);
+    expect(world.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
   });
 });

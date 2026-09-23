@@ -38,9 +38,9 @@ import path from "node:path";
 import { acquireJournalLock, assertPrivateDirectory, openJournal, readJournal } from "./commissioning-journal.mjs";
 import { isDirectEntry as directEntry } from "./direct-entry.mjs";
 import {
-  AssertionFailure, COMMISSIONING_DISPATCH_REF, COMMISSIONING_EVENT_NAME, COMMISSIONING_REPOSITORY, COMMISSIONING_WORKFLOW_PATH,
+  AssertionFailure, COMMISSIONING_REPOSITORY, COMMISSIONING_WORKFLOW_PATH,
   IncompleteEvidence, RESULT_SCHEMA_VERSION, UsageError, assertLocalOperator, assertProtectedJobsWaiting, assertRunIdentity,
-  assertSourceContinuity, branchOf, canonicalHash, collectSentinels, createGuardedRequest, createLocalGhTransport, createRedactor,
+  assertSourceContinuity, canonicalHash, collectSentinels, createGuardedRequest, createLocalGhTransport, createRedactor,
   evidenceSlug, readEvidenceFile, responseEvidence, summarizeApprovals,
 } from "./policy-commissioning.mjs";
 import {
@@ -172,7 +172,7 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   }
   if (phase === "stage" && records.length && (state.create || state.dispatch || state.cleanup || state.ended)) throw new AssertionFailure("a probe is already staged for this attempt");
   if (["dispatch", "collect"].includes(phase) && (state.cleanup || state.aborted || state.ended || state.failed || state.ref.state === "uncertain")) {
-    throw new IncompleteEvidence("this probe's cumulative history ended qualification; only bounded recovery remains");
+    throw new IncompleteEvidence("this probe's cumulative history interrupted or ended qualification; mutations are never re-issued and only bounded recovery remains");
   }
   if (phase === "collect" && !state.dispatch) throw new IncompleteEvidence("the probe has no dispatch intent to collect");
   const recovery = phase === "cancel" || phase === "cleanup";
@@ -584,7 +584,13 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     if (readback.complete !== true || readback.status !== 200 || readback.body?.object?.sha !== sha) throw new IncompleteEvidence("the created probe ref could not be read back at the reviewed source");
 
     for (const environment of PROBE_ENVIRONMENTS) {
-      if (probe.records().some((row) => row.type === "policy-captured" && row.data.phase === "before" && row.data.environment === environment)) continue;
+      const previous = probe.records().find((row) => row.type === "policy-captured" && row.data.phase === "before" && row.data.environment === environment);
+      if (previous) {
+        const prior = asIncomplete(() => readPolicyDescriptor(session.dir, previous.data.descriptor, { environment, phase: "before" }));
+        const original = asIncomplete(() => readPolicyDescriptor(session.dir, staged.intent.baseline_policy[environment], { environment, phase: "baseline" }));
+        if (canonicalHash(prior.policy) !== canonicalHash(original.policy)) throw new AssertionFailure("the earlier before-probe policy contradicted the baseline; dispatch remains refused");
+        continue;
+      }
       const baseline = asIncomplete(() => readPolicyDescriptor(session.dir, staged.intent.baseline_policy[environment], { environment, phase: "baseline" }));
       const before = await capturePolicy(session, environment, "before");
       probe.append("policy-captured", { phase: "before", environment, environment_id: before.policy.environment_id, descriptor: before.ref, completed_at: before.completed_at });
@@ -948,6 +954,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
       probe.append("capture-failed", { run_id: captureRunId, phase: "collect", category: captureCategory,
         capture_sequences: probe.records().filter((row) => ["capture-progress", "capture-recorded", "run-observed"].includes(row.type)).map((row) => row.seq) });
     }
+    if (assessProbePhaseState(probe.records(), { workflowSha: session.commissioning.workflow_sha }).failed) throw new AssertionFailure("an exactly bound probe job was admitted; the negative control FAILED and retained captures require explicit cancel before cleanup");
     throw error;
   } finally {
     probe.lock.release();
@@ -984,7 +991,7 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
       if (!state.aborted) {
         const records = probe.records();
         const jobs = records.find((row) => row.type === "capture-recorded" && row.data.kind === "jobs");
-        const run = records.find((row) => row.type === "run-observed" && row.seq < (jobs?.seq ?? 0));
+        const run = records.filter((row) => row.type === "run-observed" && row.seq < (jobs?.seq ?? 0)).at(-1);
         if (jobs && run) retainAdmissions(session, probe, identified.data.run_id, run.data.capture, jobs.data.descriptor);
         const terminal = probe.records().filter((row) => row.type === "run-observed").at(-1);
         probe.append("qualification-ended", { run_id: identified.data.run_id, reason: "operator-terminal-abort", terminal_sequence: terminal.seq });

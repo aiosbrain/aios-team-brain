@@ -994,7 +994,7 @@ export function deriveProbeAdmissions(dir, { runCapture, jobsDescriptor, commiss
     if (matches.length !== 1) continue;
     const job = matches[0];
     if (!Number.isSafeInteger(job.id) || job.id <= 0 || rows.filter((row) => row?.id === job.id).length !== 1
-      || String(job.run_id) !== String(runId) || job.run_attempt !== PROBE_ATTEMPT
+      || String(job.run_id) !== String(runId) || job.run_attempt !== Number(PROBE_ATTEMPT)
       || job.head_branch !== PROBE_BRANCH || job.head_sha !== commissioning.workflow_sha || job.status !== "completed"
       || job.url !== `${repoApi()}/actions/jobs/${job.id}` || job.run_url !== `${repoApi()}/actions/runs/${runId}`
       || job.html_url !== `${repoWeb()}/actions/runs/${runId}/job/${job.id}` || typeof job.node_id !== "string" || !job.node_id) continue;
@@ -1274,7 +1274,7 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   assessOriginalProbeBinding(records, { dir, commissioning, dispatcher: originalIntent.dispatcher });
   verifyProbeRecoveryHistory(records, { dir, commissioning });
   const phaseState = assessProbePhaseState(records, { workflowSha });
-  if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed or irreversibly incomplete");
+  if (phaseState.failed || phaseState.ended) refuse("the cumulative probe qualification is failed, interrupted or irreversibly incomplete");
   const foreign = records.filter((record) => String(record.source) !== String(workflowSha));
   if (foreign.length) refuse(`${foreign.length} probe journal record(s) were written against a different immutable source`);
   if (records[0].type !== "probe-opened") refuse("the probe journal does not begin with its opening record");
