@@ -36,9 +36,39 @@ export const RETAINED_CHARGES = Object.freeze({
   record: 1024,
 });
 
+/**
+ * THE PRIVATE MARKER that says "the RUN'S OWN shared authority is exhausted", as distinct from a tar
+ * reader limit (a path, a metadata record, a header count) that belongs to one archive.
+ *
+ * Both surface publicly as the same fixed `AUDIT_TAR_LIMIT_EXCEEDED` code — the public contract does not
+ * change and nothing internal leaks — but only THIS category may escape nested-archive handling as a run
+ * refusal. A reader limit inside a nested archive stays what it has always been: a recorded
+ * `nested-archive-undecodable` coverage gap.
+ */
+const SHARED_AUTHORITY = Symbol.for("aios.image-audit.shared-authority-exhausted");
+
 const refuse = (message) => {
-  throw Object.assign(new Error(message), { name: "TarLimitError", code: "AUDIT_TAR_LIMIT_EXCEEDED" });
+  throw Object.assign(new Error(message), { name: "TarLimitError", code: "AUDIT_TAR_LIMIT_EXCEEDED", [SHARED_AUTHORITY]: true });
 };
+
+/** Is this the run's shared retained-state/work authority refusing, rather than a per-archive limit? */
+export function isSharedAuthorityExhaustion(error) {
+  return Boolean(error && typeof error === "object" && error[SHARED_AUTHORITY] === true);
+}
+
+/** A ceiling must be a real, finite, non-negative number — `NaN`/`Infinity` are not budgets. */
+function finiteCeiling(value, label) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${label} must be a finite non-negative safe integer`);
+  }
+  return value;
+}
+
+/** An interval must be a positive integer: a zero or fractional interval never fires. */
+function positiveInterval(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${label} must be a positive safe integer`);
+  return value;
+}
 
 /**
  * The run's retained-state authority. Created once by `inspectExport`, passed into every layer
@@ -51,6 +81,8 @@ export function createRetainedStateBudget({
   maxLogicalBytes = RETAINED_STATE_LIMITS.maxLogicalBytes,
   maxRelations = RETAINED_STATE_LIMITS.maxRelations,
 } = {}) {
+  finiteCeiling(maxLogicalBytes, "maxLogicalBytes");
+  finiteCeiling(maxRelations, "maxRelations");
   let used = 0;
   let relations = 0;
   const take = (bytes) => {
@@ -101,6 +133,8 @@ export const WORK_LIMITS = Object.freeze({ maxSteps: 64_000_000, deadlineEvery: 
  * workload of shallow or root-level paths cannot bypass both counters.
  */
 export function createWorkBudget({ maxSteps = WORK_LIMITS.maxSteps, deadlineEvery = WORK_LIMITS.deadlineEvery, deadline } = {}) {
+  finiteCeiling(maxSteps, "maxSteps");
+  positiveInterval(deadlineEvery, "deadlineEvery");
   let steps = 0;
   return {
     get steps() { return steps; },
@@ -109,6 +143,34 @@ export function createWorkBudget({ maxSteps = WORK_LIMITS.maxSteps, deadlineEver
       steps += 1;
       if (steps > maxSteps) refuse(`audit path work exceeds the ${maxSteps}-step bound`);
       if (deadline && steps % deadlineEvery === 0) deadline.assert(operation);
+    },
+  };
+}
+
+/**
+ * THE ONE CHARGED WRITER for coverage limitations.
+ *
+ * Every limitation the audit records is retained for the whole run, so every one of them is charged —
+ * and routing them all through this object is what makes bypassing the authority structurally hard
+ * rather than a rule to remember at nineteen call sites. `record` reserves a limitation's record and
+ * its string fields BEFORE the object is stored; `adopt` takes an already-charged limitation from a
+ * nested collector and charges only the new membership.
+ */
+export function createLimitationCollector(retained) {
+  const items = [];
+  return {
+    get items() { return items; },
+    get length() { return items.length; },
+    record(limitation) {
+      retained.record(1);
+      for (const value of Object.values(limitation)) if (typeof value === "string") retained.string(value);
+      items.push(limitation);
+      return limitation;
+    },
+    adopt(limitation) {
+      retained.membership();
+      items.push(limitation);
+      return limitation;
     },
   };
 }

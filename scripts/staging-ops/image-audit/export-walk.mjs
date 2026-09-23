@@ -27,7 +27,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, gunzipSync } from "node:zlib";
 import { TarFormatError, bufferSource, isChecksumValidTarHeader, readTarMembers } from "./tar-reader.mjs";
 import { AUDIT_LIMITS } from "./subject.mjs";
-import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
+import { createLimitationCollector, createRetainedStateBudget, createWorkBudget, isSharedAuthorityExhaustion } from "./budgets.mjs";
 import { whiteoutOf } from "./layers.mjs";
 import { ARCHIVE_SURFACE_CATEGORY, CONFIG_SCAN_GROUP, SCAN_HEADER, archiveSurfaceGroup, scanId } from "./scan-surface.mjs";
 
@@ -444,17 +444,15 @@ export function inventoryLayer({
   const symlinks = [];
   const appMembers = [];
   const staged = new Map();
-  const limitations = [];
+  /**
+   * ONE CHARGED WRITER for every limitation this layer records — ordinary members, nested entries,
+   * surface staging, classification, trailers and decode failures alike. Nothing appends directly.
+   */
+  const limitations = createLimitationCollector(retained);
   const buildOutputs = new Map();
   let sequence = 0;
   let expandedBytes = 0;
   let members = 0;
-  /** Every limitation is retained for the whole run, so each is charged before it is recorded. */
-  const recordLimitation = (limitation) => {
-    retained.record(1);
-    retained.string(limitation.kind);
-    limitations.push(limitation);
-  };
   let malformedWhiteoutRecorded = false;
   let rootReplacedRecorded = false;
 
@@ -474,6 +472,14 @@ export function inventoryLayer({
     if (!budget.reserve(bytes, SCAN_HEADER.length)) return undefined;
     const id = scanId(`L${layerIndex}`, sequence++);
     const path = join(scanDir, id);
+    /**
+     * RESERVED BEFORE THE FIRST SIDE EFFECT (round 9). The staged record's charge used to be taken after
+     * the file was opened, written and closed, so a refusal left a real file on the scan surface with no
+     * map entry. Nothing is opened until the state it will require is paid for.
+     */
+    retained.record(2);
+    retained.string(id);
+    retained.string(name);
     const sink = openSink(path);
     try {
       // The header FIRST, then the member's exact bytes. The suffix of the staged file is therefore
@@ -489,10 +495,6 @@ export function inventoryLayer({
       throw error;
     }
     sink.close();
-    // The private staged record — id, real name and layer — is retained for the whole run.
-    retained.record(2);
-    retained.string(id);
-    retained.string(name);
     staged.set(id, { name, layer: layerIndex, depth });
     return id;
   };
@@ -541,11 +543,11 @@ export function inventoryLayer({
       stage(range) {
         if (stopped) return;
         if (range.length > surfaceFileLimit) {
-          limitations.push({ kind: "archive-surface-range-unstageable", layer: layerIndex, ...at });
+          limitations.record({ kind: "archive-surface-range-unstageable", layer: layerIndex, ...at });
           return;
         }
         if (expandedBytes + range.length > limits.maxExpandedBytesPerLayer) {
-          limitations.push({ kind: "layer-byte-budget-exhausted", layer: layerIndex, ...at });
+          limitations.record({ kind: "layer-byte-budget-exhausted", layer: layerIndex, ...at });
           stopped = true;
           close();
           return;
@@ -553,7 +555,7 @@ export function inventoryLayer({
         const fits = current !== undefined && current.bytes + range.length <= surfaceFileLimit;
         if (!fits) close();
         if (!budget.reserve(range.length, fits ? 0 : SCAN_HEADER.length)) {
-          limitations.push({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
+          limitations.record({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
           stopped = true;
           close();
           return;
@@ -561,10 +563,18 @@ export function inventoryLayer({
         if (!fits) {
           const id = scanId(archiveSurfaceGroup(layerIndex), surfaceSequence++);
           const path = join(scanDir, id);
-          current = { id, path, sink: openSink(path), bytes: 0 };
-          current.sink.write(SCAN_HEADER);
+          // Reserved BEFORE the sink is opened and the header written, so a refusal leaves no file.
           retained.record(2);
           retained.string(id);
+          const sink = openSink(path);
+          try {
+            sink.write(SCAN_HEADER);
+          } catch (error) {
+            sink.close();
+            rmSync(path, { force: true });
+            throw error;
+          }
+          current = { id, path, sink, bytes: 0 };
           staged.set(id, { category: ARCHIVE_SURFACE_CATEGORY, layer: layerIndex, depth });
         }
         try {
@@ -617,7 +627,7 @@ export function inventoryLayer({
        * a gzip stream, a ZIP or a second tar there reaches no expansion. So it is also a recorded gap
        * that blocks. Real layers carry zero-only padding there, so this costs no false positives.
        */
-      onNonzeroTrailer: () => limitations.push({ kind: "archive-trailer-nonzero", layer: layerIndex }),
+      onNonzeroTrailer: () => limitations.record({ kind: "archive-trailer-nonzero", layer: layerIndex }),
     })) {
       members += 1;
       if (deadline && members % DEADLINE_CHECK_MEMBERS === 0) deadline.assert("layer inventory");
@@ -634,7 +644,7 @@ export function inventoryLayer({
        * simply not be compared — while an extractor may still write it somewhere. Its content is staged
        * and scanned as usual; the record says the inventory could not account for it.
        */
-      if (!member.path.safe) recordLimitation({ kind: "unsafe-member-path", layer: layerIndex });
+      if (!member.path.safe) limitations.record({ kind: "unsafe-member-path", layer: layerIndex });
       if (member.type === "symlink") {
         retained.path(name);
         symlinks.push(name);
@@ -648,7 +658,7 @@ export function inventoryLayer({
       // …and an ordinary marker naming nothing, `.` or `..` (L6), which deletes nothing here.
       if ((whiteout === "malformed" || (whiteout !== "none" && (member.type !== "file" || member.size !== 0))) && !malformedWhiteoutRecorded) {
         malformedWhiteoutRecorded = true;
-        recordLimitation({ kind: "malformed-whiteout", layer: layerIndex });
+        limitations.record({ kind: "malformed-whiteout", layer: layerIndex });
       }
       /**
        * THE INVENTORY ROOT AS A NON-DIRECTORY (B6). A file or link named exactly `app` replaces the
@@ -657,7 +667,7 @@ export function inventoryLayer({
        */
       if (name === prefix.replace(/\/$/, "") && member.type !== "directory" && !rootReplacedRecorded) {
         rootReplacedRecorded = true;
-        recordLimitation({ kind: "inventory-root-not-directory", layer: layerIndex });
+        limitations.record({ kind: "inventory-root-not-directory", layer: layerIndex });
       }
 
       if (member.type === "symlink" || member.type === "hardlink") {
@@ -675,7 +685,7 @@ export function inventoryLayer({
         // whose TYPEFLAG this reader does not know is different: it may carry bytes nobody looked at,
         // and dropping it silently is the same coverage hole as skipping a file.
         if (member.type === "unsupported") {
-          limitations.push({
+          limitations.record({
             kind: "unsupported-member-type",
             layer: layerIndex,
             // The typeflag is one attacker-controlled byte, and limitations reach the PUBLIC evidence
@@ -687,11 +697,11 @@ export function inventoryLayer({
       }
 
       if (member.size > limits.maxMemberBytes) {
-        limitations.push({ kind: "oversized-member", layer: layerIndex, bytes: member.size });
+        limitations.record({ kind: "oversized-member", layer: layerIndex, bytes: member.size });
         continue;
       }
       if (expandedBytes + member.size > limits.maxExpandedBytesPerLayer) {
-        limitations.push({ kind: "layer-byte-budget-exhausted", layer: layerIndex });
+        limitations.record({ kind: "layer-byte-budget-exhausted", layer: layerIndex });
         break;
       }
 
@@ -715,7 +725,7 @@ export function inventoryLayer({
         // continuing to stage whichever later members happen to be small enough to squeeze in — a
         // coverage story that depends on member order is not one a coordinator can reason about.
         // Either way the gap is recorded, which is what makes coverage incomplete.
-        limitations.push({ kind: exhaustionKind(budget), layer: layerIndex });
+        limitations.record({ kind: exhaustionKind(budget), layer: layerIndex });
         break;
       }
       expandedBytes += member.size;
@@ -731,7 +741,7 @@ export function inventoryLayer({
         name,
         depth: 0,
         read: (sink) => member.content(sink),
-        context: { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions },
+        context: { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions, work, retained },
       });
     }
   } finally {
@@ -743,7 +753,7 @@ export function inventoryLayer({
     symlinks,
     appMembers,
     staged,
-    limitations,
+    limitations: limitations.items,
     members,
     expandedBytes,
     archiveSurfaceBytes,
@@ -789,12 +799,14 @@ export function stageConfig({ scanDir, configBytes }) {
  * drift apart again.
  */
 function classifyExpanded({ head, name, depth, read, context }) {
-  const { layerIndex, limitations, limits } = context;
+  const { layerIndex, limitations, limits, work } = context;
   const at = depth > 0 ? { depth } : {};
+  // Classification is work even when it stages nothing and records nothing.
+  work?.step("nested classification");
   const extension = unexpandableFormat(name);
   if (extension !== undefined) {
     // Scanned as OPAQUE BYTES, which is not decoded inspection and is not reported as one.
-    limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, extension, ...at });
+    limitations.record({ kind: "unexpanded-archive-format", layer: layerIndex, extension, ...at });
     return;
   }
   /**
@@ -804,7 +816,7 @@ function classifyExpanded({ head, name, depth, read, context }) {
    */
   const format = unsupportedMagicFormat(head);
   if (format !== undefined) {
-    limitations.push({ kind: "unexpanded-archive-format", layer: layerIndex, format, ...at });
+    limitations.record({ kind: "unexpanded-archive-format", layer: layerIndex, format, ...at });
     return;
   }
   // An ordinary file — neither gzip, nor a tar candidate by its bytes, nor declared a tar by its name —
@@ -813,7 +825,7 @@ function classifyExpanded({ head, name, depth, read, context }) {
   if (depth + 1 > limits.maxNestedArchiveDepth) {
     // The bound, recorded rather than followed. Unbounded expansion is a decompression bomb and a
     // silently truncated one is a coverage lie, so the only honest third option is to say so.
-    limitations.push({ kind: "nested-archive-depth-limit", layer: layerIndex, depth: depth + 1 });
+    limitations.record({ kind: "nested-archive-depth-limit", layer: layerIndex, depth: depth + 1 });
     return;
   }
   const chunks = [];
@@ -830,7 +842,7 @@ function classifyExpanded({ head, name, depth, read, context }) {
  * shared staging budget, which the inflated bytes charge against exactly like layer content.
  */
 function expandArchive({ bytes, name, depth, context }) {
-  const { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions } = context;
+  const { layerIndex, limitations, limits, stage, deadline, budget, createSurfaceStager, readerOptions, work } = context;
   const at = { depth };
   deadline?.assert("nested archive expansion");
   let nestedSurface;
@@ -847,7 +859,7 @@ function expandArchive({ bytes, name, depth, context }) {
       // and a nested archive is exactly where an unbounded expansion would come from.
       const inflatedName = `${name}#inflated`;
       if (stage(inflatedName, (write) => write(data), depth, data.length) === undefined) {
-        limitations.push({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
+        limitations.record({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
         return;
       }
       // …and the inflated bytes are themselves reclassified. A doubly-gzipped file is not a rare
@@ -870,14 +882,16 @@ function expandArchive({ bytes, name, depth, context }) {
       nonzeroTrailer: "surface",
       // The same gap one level down, whether or not the nested tar was compressed: its trailer bytes
       // were scanned (as surface, or as the enclosing member's content) but never decoded.
-      onNonzeroTrailer: () => limitations.push({ kind: "archive-trailer-nonzero", layer: layerIndex, ...at }),
+      onNonzeroTrailer: () => limitations.record({ kind: "archive-trailer-nonzero", layer: layerIndex, ...at }),
     })) {
+      // Every nested entry is charged work, whether or not it stages, classifies or records anything.
+      work?.step("nested entry");
       // The same sweep as the top level: an unsafe nested name is recorded, never silently passed over.
-      if (!nested.path.safe) limitations.push({ kind: "unsafe-member-path", layer: layerIndex, ...at });
+      if (!nested.path.safe) limitations.record({ kind: "unsafe-member-path", layer: layerIndex, ...at });
       if (nested.type === "symlink" || nested.type === "hardlink" || nested.type === "directory") continue;
       if (nested.type !== "file") {
         // Same reasoning as the top-level loop: an unknown typeflag may carry bytes nobody read.
-        limitations.push({
+        limitations.record({
           kind: "unsupported-member-type",
           layer: layerIndex,
           typeflag: /^[A-Za-z0-9]$/.test(nested.typeflag) ? nested.typeflag : "non-printable",
@@ -886,13 +900,13 @@ function expandArchive({ bytes, name, depth, context }) {
         continue;
       }
       if (nested.size > limits.maxMemberBytes) {
-        limitations.push({ kind: "oversized-nested-member", layer: layerIndex, bytes: nested.size, ...at });
+        limitations.record({ kind: "oversized-nested-member", layer: layerIndex, bytes: nested.size, ...at });
         continue;
       }
       const nestedName = `${name}#${nested.canonicalName ?? nested.name}`;
       const chunks = [];
       if (stage(nestedName, (write) => nested.content((chunk) => { chunks.push(Buffer.from(chunk)); write(chunk); }), depth, nested.size) === undefined) {
-        limitations.push({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
+        limitations.record({ kind: exhaustionKind(budget), layer: layerIndex, ...at });
         break;
       }
       const nestedBytes = Buffer.concat(chunks);
@@ -906,12 +920,16 @@ function expandArchive({ bytes, name, depth, context }) {
     }
   } catch (error) {
     if (error?.code === "STAGING_OPERATION_TIMEOUT") throw error;
-    // A RESOURCE refusal is not a "this archive would not decode" gap: it means the run's own budget is
-    // exhausted, so it propagates to the sanitized run-refusal path instead of becoming a limitation.
-    if (error?.code === "AUDIT_TAR_LIMIT_EXCEEDED") throw error;
+    /**
+     * ONLY THE RUN'S SHARED AUTHORITY escapes. Its exhaustion means the audit itself is out of budget,
+     * so it propagates to the sanitized run-refusal path. A tar READER limit inside this nested archive
+     * (a path, a metadata record, a header count) is a property of the archive, and keeps its adjudicated
+     * behaviour: the `nested-archive-undecodable` gap recorded just below.
+     */
+    if (isSharedAuthorityExhaustion(error)) throw error;
     // A nested archive that would not decode is a GAP, not a pass. Only the error's NAME is kept —
     // its message can quote member paths and content.
-    limitations.push({ kind: "nested-archive-undecodable", layer: layerIndex, reason: error?.name ?? "Error", ...at });
+    limitations.record({ kind: "nested-archive-undecodable", layer: layerIndex, reason: error?.name ?? "Error", ...at });
   } finally {
     nestedSurface?.close();
   }

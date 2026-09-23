@@ -21,7 +21,7 @@ import {
 } from "./layers.mjs";
 import { LAYER_MEDIA_TYPES } from "./subject.mjs";
 import { assertMemberPathBounded } from "./tar-reader.mjs";
-import { createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
+import { createLimitationCollector, createRetainedStateBudget, createWorkBudget } from "./budgets.mjs";
 import {
   copyMemberToFile,
   createStagingBudget,
@@ -87,7 +87,6 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   const config = verifyConfig(configBytes, manifest, { platform });
 
   const layers = [];
-  const limitations = [];
   const layerPaths = [];
   /**
    * EVERY SYMLINK LOCATION SEEN SO FAR, image-wide (B5). An extractor resolves a member's parent
@@ -105,6 +104,8 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
    */
   const retained = createRetainedStateBudget();
   const work = createWorkBudget({ deadline });
+  /** The run's own charged writer: each layer's limitations are ADOPTED, and the inspector's own RECORDED. */
+  const limitations = createLimitationCollector(retained);
   const appMembers = [];
   const staged = new Map();
   const buildOutputs = new Map();
@@ -196,7 +197,10 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       const running = buildOutputs.get(category) ?? { files: 0, bytes: 0 };
       buildOutputs.set(category, { files: running.files + totals.files, bytes: running.bytes + totals.bytes });
     }
-    limitations.push(...inventory.limitations);
+    for (const limitation of inventory.limitations) {
+      work.step("limitation adoption");
+      limitations.adopt(limitation);
+    }
     archiveSurfaceBytes += inventory.archiveSurfaceBytes;
     for (const link of inventory.symlinks) {
       work.step("symlink location");
@@ -204,7 +208,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       symlinkLocations.add(link);
     }
     if (symlinkLocations.size > 0 && membersThroughSymlink(inventory.paths, symlinkLocations, deadline)) {
-      limitations.push({ kind: "member-through-symlink", layer: layerIndex });
+      limitations.record({ kind: "member-through-symlink", layer: layerIndex });
     }
     layers.push(Object.freeze({
       index: layerIndex,
@@ -224,7 +228,7 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
   // The run's own clock reaches INSIDE the merge (B9), not only around it.
   const merged = mergedFilesystem(layerPaths, { deadline, retained, work });
   // Layers whose merged view extractors would not agree on (B6) — each a blocking gap.
-  for (const layer of merged.conflicts) limitations.push({ kind: "merged-type-conflict", layer });
+  for (const layer of merged.conflicts) limitations.record({ kind: "merged-type-conflict", layer });
   return {
     config,
     configScanId,
@@ -271,7 +275,14 @@ export async function inspectExport({ exportPath, manifest, scratchDir, limits, 
       configBytes: configBytes.length,
       scanSurfaceBytes: stagingBudget.used + configBytes.length + stagingBudget.overheadUsed + SCAN_HEADER.length,
       representationOverheadBytes: stagingBudget.overheadUsed + SCAN_HEADER.length,
-      limitations: Object.freeze(limitations.map((limitation) => Object.freeze(limitation))),
+      /**
+       * The published copy is retained too: one membership per limitation, charged before the copy.
+       * (`Object.freeze` on the originals adds nothing retained.)
+       */
+      limitations: Object.freeze(limitations.items.map((limitation) => {
+        retained.membership();
+        return Object.freeze(limitation);
+      })),
     }),
     identityVerified: layers.length === manifest.layers.length && layers.every((layer) => layer.form),
   };

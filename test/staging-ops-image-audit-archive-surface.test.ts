@@ -1070,11 +1070,31 @@ describe("opaque-marker ordering ambiguity (B10)", () => {
     expectNotPublished(result, secret);
   });
 
-  it("the ROOT opaque marker keeps its own behaviour", async () => {
+  /**
+   * THE ROOT MARKER IS NOT EXEMPT (round 9). An earlier entry that only created `app/` and `app/sub/`
+   * implicitly is the same ambiguity one level up, so the ordering rule applies to `.wh..wh..opq` at the
+   * root as well; B7's emptying of the layers below it is unchanged.
+   */
+  it("BLOCKS: a root marker after entries whose ancestor directories were never declared", async () => {
     const result = await inspectLayers([buildTar(baseMembers), buildTar([{ name: "app/sub/x.js", content: "x" }, { name: ".wh..wh..opq", content: "" }])]);
-    // Root opacity empties what is below it (B7) and is not itself an ordering conflict.
-    expect(result.coverage.limitations).toEqual([]);
-    expect(chain(result).inventory.counts.missing).toBe(2);
+    expect(result.coverage.limitations).toContainEqual({ kind: "merged-type-conflict", layer: 1 });
+    const { inventory, readiness } = chain(result);
+    expect(inventory.counts.missing).toBe(2); // B7 still empties what is below the marker
+    expect(readiness.transitionReady).toBe(false);
+  });
+
+  it("stays eligible: a root marker FIRST, and one whose directories are all declared before it", async () => {
+    const markerFirst = await inspectLayers([buildTar(baseMembers), buildTar([{ name: ".wh..wh..opq", content: "" }, ...baseMembers])]);
+    expect(markerFirst.coverage.limitations).toEqual([]);
+    expect(chain(markerFirst).readiness.transitionReady).toBe(true);
+
+    const declared = await inspectLayers([buildTar(baseMembers), buildTar([
+      { name: "app/", type: "directory" }, { name: "app/index.js", content: "index" },
+      { name: "app/d/", type: "directory" }, { name: "app/d/x.js", content: "x" },
+      { name: ".wh..wh..opq", content: "" },
+    ])]);
+    expect(declared.coverage.limitations).toEqual([]);
+    expect(chain(declared).readiness.transitionReady).toBe(true);
   });
 });
 

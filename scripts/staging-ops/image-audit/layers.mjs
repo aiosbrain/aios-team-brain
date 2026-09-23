@@ -324,7 +324,8 @@ export function mergedFilesystem(layerPaths, {
   const opaqueOrderAmbiguity = (target, earlierOrdinary, explicitDirsSeen) => {
     for (const candidate of earlierOrdinary) {
       work.step("opaque ordering candidate");
-      if (candidate === target || !candidate.startsWith(target)) continue; // `target` ends in `/`
+      // `target` ends in `/`, or is `""` for the root marker — where every earlier entry is a candidate.
+      if (candidate === target || candidate === "." || !candidate.startsWith(target)) continue;
       const missing = forEachAncestor(candidate, (ancestor) => {
         work.step("opaque ordering ancestor");
         // Only the directories strictly BETWEEN the marker's target and this descendant matter.
@@ -399,7 +400,13 @@ export function mergedFilesystem(layerPaths, {
         }
         continue;
       }
-      if (white.kind === "opaque" && white.target !== "" && opaqueOrderAmbiguity(white.target, earlierOrdinary, explicitDirsSeen)) {
+      /**
+       * B10 applies to the ROOT marker too (round 9). A root `.wh..wh..opq` after entries that created
+       * `app/` and `app/d/` implicitly is the same ambiguity one level up: the non-overlay converter can
+       * remove those undeclared directories and everything under them. Only the semantic root `.` is
+       * exempt — it is never an intermediate — and B7's lower-layer emptying is unchanged.
+       */
+      if (white.kind === "opaque" && opaqueOrderAmbiguity(white.target, earlierOrdinary, explicitDirsSeen)) {
         conflicts.add(index);
       }
       if (white.kind === "delete") {
