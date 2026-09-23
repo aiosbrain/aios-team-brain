@@ -532,6 +532,7 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
       await expect(world.phase("dispatch")).rejects.toThrow(/lets administrators bypass/);
       const observed = world.probeRecords().filter((row: any) => row.type === "policy-observed" && row.data.environment === environment);
       expect(observed).toHaveLength(1);
+      truncateProbeJournalAfter(world, (row) => row.seq === observed[0].seq);
       world.canAdminsBypass[environment] = false;
       await expect(world.phase("dispatch")).rejects.toThrow(/cumulative history interrupted or ended qualification/);
       let deletions = 0;
@@ -545,8 +546,8 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
 
     it(`does not adopt an orphan ${environment} policy descriptor after a cut before policy-observed`, async () => {
       world.seedOriginal(); await world.phase("stage");
-      world.canAdminsBypass[environment] = undefined;
-      await expect(world.phase("dispatch")).rejects.toThrow(/bypass state is unmeasured/);
+      world.canAdminsBypass[environment] = true;
+      await expect(world.phase("dispatch")).rejects.toThrow(/lets administrators bypass/);
       const intent = world.probeRecords().find((row: any) => row.type === "policy-capture-intent" && row.data.environment === environment);
       expect(intent).toBeDefined();
       truncateProbeJournalAfter(world, (row) => row.seq === intent.seq);
@@ -587,6 +588,25 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     }
   }
 
+  for (const environment of Object.keys(ENV_IDS)) for (const disposition of ["contradictory", "incomplete"] as const) {
+    it(`keeps ${environment} after-policy ${disposition} through collect recovery and exact-owned cleanup`, async () => {
+      world.seedOriginal(); await world.phase("stage");
+      world.afterDispatchPolicyChange = () => { world.canAdminsBypass[environment] = disposition === "contradictory" ? true : undefined; };
+      await world.phase("dispatch");
+      await expect(world.phase("collect")).rejects.toThrow(disposition === "contradictory" ? /lets administrators bypass|FAILED/ : /bypass state is unmeasured/);
+      world.canAdminsBypass[environment] = false;
+      await expect(world.phase("collect")).rejects.toThrow(/cumulative history interrupted or ended qualification/);
+      expect((await world.phase("cancel") as any).status).toBe("terminal-aborted");
+      let deletions = 0;
+      const cleaned: any = await world.phase("cleanup", { deleteRef: async () => {
+        deletions++; world.setRef(null); return { outcome: "deleted", exit_code: 0 };
+      } });
+      expect([cleaned.outcome, world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), world.count("POST", "/cancel"), deletions])
+        .toEqual([disposition === "contradictory" ? "failed" : "inconclusive", 1, 1, 0, 1]);
+      expect(world.refSha()).toBeNull();
+    });
+  }
+
   for (const change of ["administrator-bypass", "environment-id"] as const) {
     it(`both offline APIs reject every environment after retained ${change} policy evidence and provider restoration`, async () => {
       const collected: any = await world.fullProbe();
@@ -603,6 +623,32 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
         .filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toHaveLength(2);
     });
   }
+
+  for (const environmentWithIncompletePolicy of Object.keys(ENV_IDS)) {
+    it(`both offline APIs reject a journal-bound incomplete ${environmentWithIncompletePolicy} policy observation`, async () => {
+      const collected: any = await world.fullProbe();
+      rewriteObservedPolicy(world, "after", environmentWithIncompletePolicy, (settings) => { delete settings.can_admins_bypass; });
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(/qualification|incomplete/);
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+        controls: { [OFFBRANCH_CONTROL]: collected.records },
+      });
+      expect(assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers
+        .filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toHaveLength(2);
+    });
+  }
+
+  it("preserves admitted-job failure precedence over an incomplete after-policy capture", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    world.admitted = "probe-release";
+    world.afterDispatchPolicyChange = () => { world.canAdminsBypass["staging-release"] = undefined; };
+    await world.phase("dispatch");
+    await expect(world.phase("collect")).rejects.toThrow(/FAILED|admitted/);
+    expect(world.probeRecords().filter((row: any) => row.type === "admission-observed")).toHaveLength(1);
+    expect((await world.phase("cancel") as any).outcome).toBe("failed");
+    expect((await world.phase("cleanup") as any).outcome).toBe("failed");
+    expect(world.refSha()).toBeNull();
+  });
 
   it("keeps local policy artifact corruption a hard integrity refusal", async () => {
     const collected: any = await world.fullProbe();
