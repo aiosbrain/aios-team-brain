@@ -49,6 +49,7 @@ import {
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
   PolicyContradiction, PolicyObservationIncomplete, ProbeProviderIncomplete, ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
   deriveProbeResolutionEvents, verifyIdentifiedProbeRun, deriveProbeAdmissions, verifyProbeRecoveryHistory, assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
+  assessRefResponseIdentity,
   assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readAdmissionJobPages, readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
@@ -391,6 +392,28 @@ const facts = (response) => {
   };
 };
 
+/** Preserve returned ref/commit identity without substituting request facts for missing values. */
+const refResponseIdentity = (response) => {
+  const body = response?.body;
+  const bodyObject = body !== null && typeof body === "object" && !Array.isArray(body);
+  const object = bodyObject ? body.object : undefined;
+  const objectRecord = object !== null && typeof object === "object" && !Array.isArray(object);
+  const stringFact = (parentValid, value, { sha = false } = {}) => {
+    if (!parentValid || value === undefined || value === null) return { value: null, state: parentValid ? "missing" : "invalid" };
+    if (typeof value !== "string") return { value: null, state: "invalid" };
+    if (sha && !FULL_SHA.test(value)) return { value: null, state: "invalid" };
+    return { value, state: sha ? "valid-sha" : "present" };
+  };
+  const returnedRef = stringFact(bodyObject, body?.ref);
+  const objectType = stringFact(objectRecord, object?.type);
+  const objectSha = stringFact(objectRecord, object?.sha, { sha: true });
+  return {
+    returned_ref: returnedRef.value, returned_ref_state: returnedRef.state,
+    object_type: objectType.value, object_type_state: objectType.state,
+    object_sha: objectSha.value, object_sha_state: objectSha.state,
+  };
+};
+
 const probeRefPath = `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`;
 
 /**
@@ -615,11 +638,12 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
       // CREATE ONCE: durable intent, one request, its result — and reconciliation, not a retry.
       probe.append("ref-create-intent", { ref: PROBE_REF, sha });
       const created = await session.request("POST", `/repos/${REPO}/git/refs`, { ref: PROBE_REF, sha });
-      const objectSha = created.complete === true && FULL_SHA.test(String(created.body?.object?.sha ?? "")) ? created.body.object.sha : null;
-      probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
-      if (!(created.complete === true && created.status === 201 && objectSha === sha)) {
+      const createdData = { ref: PROBE_REF, sha, ...facts(created), ...refResponseIdentity(created) };
+      probe.append("ref-create-result", createdData);
+      const createdIdentity = asAssertion(() => assessRefResponseIdentity(createdData, { expectedSha: sha, label: "the probe ref creation result" }));
+      if (!(created.complete === true && created.status === 201 && createdIdentity.matches)) {
         const readback = await session.request("GET", probeRefPath);
-        probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+        probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
         const at = session.now().toISOString();
         if (readback.complete === true && readback.status === 404) {
           probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
@@ -633,8 +657,13 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
       }
     }
     const readback = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
-    if (readback.complete !== true || readback.status !== 200 || readback.body?.object?.sha !== sha) throw new IncompleteEvidence("the created probe ref could not be read back at the reviewed source");
+    const readbackData = { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() };
+    probe.append("ref-readback", readbackData);
+    const readbackIdentity = asAssertion(() => assessRefResponseIdentity(readbackData, { expectedSha: sha, label: "the created probe ref readback" }));
+    if (readback.complete !== true || readback.status !== 200 || !readbackIdentity.matches) {
+      if (readback.complete === true && readback.status === 200 && readbackIdentity.classification === "contradictory") throw new AssertionFailure(readbackIdentity.reason);
+      throw new IncompleteEvidence("the created probe ref could not be read back at the reviewed source");
+    }
 
     for (const environment of PROBE_ENVIRONMENTS) {
       const previous = probe.records().find((row) => row.type === "policy-captured" && row.data.phase === "before" && row.data.environment === environment);
@@ -1132,7 +1161,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // uncertainty permanent and never grants adoption or deletion authority.
     if (ownership.pending?.of === "ref-create-intent") {
       const readback = await session.request("GET", probeRefPath);
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: session.now().toISOString() });
       } else if (readback.complete === true && readback.status === 200) {
@@ -1233,7 +1262,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      */
     if (ownership.pending) {
       const readback = await session.request("GET", probeRefPath);
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
         probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
@@ -1250,7 +1279,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     }
 
     const readback = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: session.now().toISOString() });
     if (readback.complete !== true || ![200, 404].includes(readback.status)) throw new IncompleteEvidence("the owned probe ref could not be read back before cleanup");
     if (readback.status === 404) {
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
@@ -1260,7 +1289,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       return await close("cleaned-after-reconciliation");
     }
     if (readback.body?.object?.sha !== sha) {
-      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at() });
+      probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), ...refResponseIdentity(readback), measured_at: at() });
       // `settle` is what refuses, and it is what makes the refusal STICK: the recorded readback
       // leaves the ownership permanently uncertain, so a later invocation finding the ref restored
       // to the reviewed SHA derives the same answer instead of deleting somebody else's ref. The
@@ -1278,7 +1307,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     probe.append("cleanup-result", { ref: PROBE_REF, expected_sha: sha, outcome, exit_code: Number.isInteger(deletion?.exit_code) ? deletion.exit_code : null });
     if (outcome === "lease-refused") throw new AssertionFailure("the lease deletion was refused: the owned probe ref changed, and it is left untouched");
     const after = await session.request("GET", probeRefPath);
-    probe.append("ref-readback", { ref: PROBE_REF, ...facts(after), object_sha: after.complete === true ? (String(after.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(after), ...refResponseIdentity(after), measured_at: session.now().toISOString() });
     if (after.complete === true && after.status === 404) {
       if (outcome === "ambiguous") probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(after), measured_at: at() });

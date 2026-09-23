@@ -43,6 +43,14 @@ const sha256 = (value: string | Buffer) => createHash("sha256").update(value).di
 const FIXTURE = path.join(__dirname, "fixtures", "pc06-historical-diagnostic");
 const PROBE_YAML = readFileSync(path.join(__dirname, "..", PROBE_WORKFLOW_PATH));
 const EXPECTED = { attempt_outcome: "refused" };
+const exactRefIdentity = (sha: string, ref: string = PROBE_REF, type: string = "commit") => ({
+  returned_ref: ref, returned_ref_state: "present", object_type: type, object_type_state: "present",
+  object_sha: sha, object_sha_state: "valid-sha",
+});
+const missingRefIdentity = () => ({
+  returned_ref: null, returned_ref_state: "missing", object_type: null, object_type_state: "missing",
+  object_sha: null, object_sha_state: "missing",
+});
 
 const git = (args: string[], cwd?: string) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
@@ -454,17 +462,17 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
         const created = records.find((record: any) => record.type === "ref-create-result");
         const initial = records.find((record: any) => record.type === "ref-readback" && record.seq > created.seq && record.seq < dispatch.seq);
         if (fault === "missing-201") {
-          Object.assign(created.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null });
+          Object.assign(created.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, ...missingRefIdentity() });
         } else if (fault === "foreign-ref") {
           initial.data.ref = "refs/heads/foreign-probe";
         } else if (fault === "404-then-restored") {
-          Object.assign(initial.data, { http_status: 404, response_complete: true, response_incomplete: null, measured_status: 404, object_sha: null });
+          Object.assign(initial.data, { http_status: 404, response_complete: true, response_incomplete: null, measured_status: 404, ...missingRefIdentity() });
         } else if (fault === "changed-sha-then-restored") {
           initial.data.object_sha = world.otherSha;
         } else if (fault === "late-measured-time") {
           initial.data.measured_at = iso(Date.parse(dispatch.ts) + 1000);
         } else {
-          Object.assign(initial.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null });
+          Object.assign(initial.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, ...missingRefIdentity() });
         }
         if (fault !== "missing-201") {
           const laterMatch = records.find((record: any) => record.type === "ref-readback" && record.seq > dispatch.seq
@@ -1738,7 +1746,7 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     const sha = "a".repeat(40);
     const facts = (status: number) => ({ http_status: status, response_complete: true, response_incomplete: null, measured_status: status });
     const record = (seq: number, type: string, data: unknown) => ({ seq, type, data });
-    const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), object_sha: sha })];
+    const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), ...exactRefIdentity(sha) })];
     expect(assessRefOwnership(created, { workflowSha: sha }).may_delete).toBe(true);
     const deleted = [...created,
       record(2, "cleanup-intent", { ref: PROBE_REF, expected_sha: sha }),
@@ -1945,12 +1953,12 @@ describe("R06: separated qualification, run authority and ref authority", () => 
       const sha = "a".repeat(40);
       const facts = (status: number) => ({ http_status: status, response_complete: true, response_incomplete: null, measured_status: status });
       const record = (seq: number, type: string, data: unknown) => ({ seq, type, data });
-      const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), object_sha: sha })];
+      const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), ...exactRefIdentity(sha) })];
       // A complete 404 under `ref-readback` is the same disappearance as one under `absence-verified`.
-      const vanished = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, ...facts(404), object_sha: null, measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+      const vanished = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, ...facts(404), ...missingRefIdentity(), measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
       expect([vanished.state, vanished.may_delete, vanished.may_accept]).toEqual(["uncertain", false, false]);
       // An INCOMPLETE read of the same thing decides nothing at all.
-      const unread = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null, measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+      const unread = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, ...missingRefIdentity(), measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
       expect([unread.state, unread.may_delete]).toEqual(["owned", true]);
       // An ambiguous deletion plus the ref still at the reviewed bytes: undecided, and NOT deletable.
       const undecided = [...created,

@@ -95,6 +95,7 @@ export const specificDiagnosticMessage = (branch, environment) =>
 export const GENERIC_DIAGNOSTIC_MESSAGE = "The deployment was rejected or didn't satisfy other protection rules.";
 
 const POSITIVE_DECIMAL = /^[1-9][0-9]{0,17}$/;
+const FULL_SHA = /^[0-9a-f]{40}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
@@ -202,6 +203,9 @@ export const RESOURCE_LINK_FIELDS = Object.freeze(["intent_artifact", "intent_sh
  * facts every persisted mutation result must carry (R02-1); a bare status is never journaled.
  */
 const RESPONSE_FACTS = Object.freeze(["http_status", "response_complete", "response_incomplete", "measured_status"]);
+export const REF_RESPONSE_IDENTITY_FIELDS = Object.freeze([
+  "returned_ref", "returned_ref_state", "object_type", "object_type_state", "object_sha", "object_sha_state",
+]);
 export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "original-identity-bound": Object.freeze(["capture"]),
   "original-identity-observed": Object.freeze(["capture"]),
@@ -215,8 +219,8 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "automation-inspected": Object.freeze(["workflow_count", "workflows_sha256", "induced"]),
   "ref-absent-verified": Object.freeze(["ref", ...RESPONSE_FACTS, "measured_at"]),
   "ref-create-intent": Object.freeze(["ref", "sha"]),
-  "ref-create-result": Object.freeze(["ref", "sha", ...RESPONSE_FACTS, "object_sha"]),
-  "ref-readback": Object.freeze(["ref", ...RESPONSE_FACTS, "object_sha", "measured_at"]),
+  "ref-create-result": Object.freeze(["ref", "sha", ...RESPONSE_FACTS, ...REF_RESPONSE_IDENTITY_FIELDS]),
+  "ref-readback": Object.freeze(["ref", ...RESPONSE_FACTS, ...REF_RESPONSE_IDENTITY_FIELDS, "measured_at"]),
   "policy-capture-intent": Object.freeze(["phase", "environment"]),
   "policy-observed": Object.freeze(["phase", "environment", "descriptor", "completed_at"]),
   "policy-captured": Object.freeze(["phase", "environment", "environment_id", "descriptor", "completed_at"]),
@@ -268,6 +272,7 @@ export function assertProbeEventPayload(type, data) {
     positiveInt(data.page, "the capture progress page");
     assertClosed(data.capture, RAW_REF_FIELDS, "the retained partial capture");
   }
+  if (["ref-create-result", "ref-readback"].includes(type)) assertRefResponseIdentityFacts(data, `the ${type} response identity`);
   if (type === "capture-failed") {
     if (data.phase !== "collect" || !["run", "jobs", "denial", "terminal", "policy", "derivation"].includes(data.category)) refuse("unknown capture failure disposition");
     if (!Array.isArray(data.capture_sequences) || data.capture_sequences.some((seq) => !Number.isSafeInteger(seq) || seq < 1)) refuse("invalid capture failure references");
@@ -315,6 +320,36 @@ export function assertProbeEventPayload(type, data) {
     }
   }
   return data;
+}
+
+/** Validate the closed normalized facts retained from one ref response without filling from request. */
+export function assertRefResponseIdentityFacts(data, label = "the ref response identity") {
+  const pairs = [
+    ["returned_ref", "returned_ref_state", ["present", "missing", "invalid"]],
+    ["object_type", "object_type_state", ["present", "missing", "invalid"]],
+    ["object_sha", "object_sha_state", ["valid-sha", "missing", "invalid"]],
+  ];
+  for (const [valueField, stateField, states] of pairs) {
+    const state = data?.[stateField], value = data?.[valueField];
+    if (!states.includes(state)) refuse(`${label} has an unknown ${stateField}`);
+    if (["present", "valid-sha"].includes(state) && typeof value !== "string") refuse(`${label} does not retain its ${valueField}`);
+    if (["missing", "invalid"].includes(state) && value !== null) refuse(`${label} must use null for a missing or invalid ${valueField}`);
+    if (state === "valid-sha" && !FULL_SHA.test(value)) refuse(`${label} labels a malformed object SHA as valid`);
+  }
+  return data;
+}
+
+/** The common runtime/offline classification of one affirmative fixed-ref response. */
+export function assessRefResponseIdentity(data, { expectedRef = PROBE_REF, expectedSha, label = "the ref response" } = {}) {
+  assertRefResponseIdentityFacts(data, label);
+  if (!FULL_SHA.test(String(expectedSha ?? ""))) refuse(`${label} needs the original reviewed commit SHA`);
+  if (data.returned_ref_state !== "present" || data.object_type_state !== "present" || data.object_sha_state !== "valid-sha") {
+    return Object.freeze({ classification: "incomplete", matches: false, reason: `${label} does not retain a complete ref/commit identity` });
+  }
+  if (data.returned_ref !== expectedRef || data.object_type !== "commit" || data.object_sha !== expectedSha) {
+    return Object.freeze({ classification: "contradictory", matches: false, reason: `${label} identifies ${JSON.stringify(data.returned_ref)} at ${JSON.stringify(data.object_type)} ${JSON.stringify(data.object_sha)}, not the fixed probe ref at the reviewed commit` });
+  }
+  return Object.freeze({ classification: "matching", matches: true, reason: null });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1010,7 +1045,8 @@ export function unresolvedProbeIntents(records) {
     const nextIntent = later.findIndex((entry) => entry.type === record.type);
     const window = nextIntent >= 0 ? later.slice(0, nextIntent) : later;
     const resolved = window.some((entry) => (entry.type === resultType
-        && (record.type === "ref-create-intent" ? entry.data.response_complete === true && entry.data.http_status === 201 && entry.data.object_sha === record.data.sha
+        && (record.type === "ref-create-intent" ? entry.data.response_complete === true && entry.data.http_status === 201
+          && assessRefResponseIdentity(entry.data, { expectedSha: record.data.sha, label: "the probe ref creation result" }).matches
           : record.type === "dispatch-intent" ? entry.data.response_complete === true && entry.data.http_status === 204
             : record.type === "cancel-intent" ? false : entry.data.outcome === "deleted"))
       || (entry.type === "reconciliation" && entry.data?.of === record.type
@@ -1383,10 +1419,16 @@ export function assessRefOwnership(records, { workflowSha }) {
         else contradict("a probe creation intent was repeated", "assertion");
         break;
       case "ref-create-result":
-        if (state === "unowned" && data.response_complete === true && data.http_status === 201 && data.object_sha === workflowSha) {
+        if (state === "unowned" && data.response_complete === true && data.http_status === 201
+          && assessRefResponseIdentity(data, { expectedSha: workflowSha, label: "the probe ref creation result" }).matches) {
           state = "owned";
           pending = null;
         } else if (state === "unowned") {
+          const identity = assessRefResponseIdentity(data, { expectedSha: workflowSha, label: "the probe ref creation result" });
+          if (data.response_complete === true && data.http_status === 201 && identity.classification === "contradictory") {
+            contradict(identity.reason, "assertion");
+            break;
+          }
           // A complete error can follow an applied create just as a lost response can. It is not
           // evidence of nonapplication and must survive process restart until a bounded readback.
           pending ??= Object.freeze({ seq: record.seq, of: "ref-create-intent", outcome: "unknown" });
@@ -1394,10 +1436,13 @@ export function assessRefOwnership(records, { workflowSha }) {
         break;
       case "ref-readback":
         if (data.response_complete === true && data.http_status === 200) {
-          if (state === "unowned" && pending?.of === "ref-create-intent") {
+          const identity = assessRefResponseIdentity(data, { expectedSha: workflowSha, label: "the probe ref readback" });
+          if (!identity.matches) {
+            contradict(identity.reason, identity.classification === "contradictory" ? "assertion" : "incomplete");
+          } else if (state === "unowned" && pending?.of === "ref-create-intent") {
             contradict("the probe ref exists after a create whose application was not established; ownership is uncertain, so it is never adopted or deleted automatically — root reconciliation is required", "incomplete");
           } else {
-            observePresent(String(data.object_sha ?? ""), "the owned probe ref points at a SHA this probe did not create; it is never deleted");
+            observePresent(data.object_sha, "the owned probe ref points at a SHA this probe did not create; it is never deleted");
           }
         // A COMPLETE 404 under this event is the same measured disappearance as one under
         // `absence-verified` (R06-F1): the post-create readback is where it is actually seen, and
@@ -1544,7 +1589,8 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
     refuse("the probe ref was not measured absent before it was created");
   }
   const created = only(records, "ref-create-result");
-  if (created.seq < create.seq || created.data.http_status !== 201 || created.data.response_complete !== true || created.data.object_sha !== workflowSha) {
+  if (created.seq < create.seq || created.data.http_status !== 201 || created.data.response_complete !== true
+    || !assessRefResponseIdentity(created.data, { expectedSha: workflowSha, label: "the probe ref creation result" }).matches) {
     refuse("the probe ref's creation is not a complete 201 at the reviewed source; ownership is not established");
   }
   const dispatch = only(records, "dispatch-intent");
@@ -1559,7 +1605,8 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   const readback = records.find((record, index) => {
     if (record.type !== "ref-readback" || record.seq <= created.seq || record.seq >= dispatch.seq
       || record.data.ref !== PROBE_REF || record.data.http_status !== 200
-      || record.data.response_complete !== true || record.data.object_sha !== workflowSha) return false;
+      || record.data.response_complete !== true
+      || !assessRefResponseIdentity(record.data, { expectedSha: workflowSha, label: "the pre-dispatch probe ref readback" }).matches) return false;
     const measuredMs = timeOf(record.data.measured_at, "the ref readback measurement time");
     const recordedMs = timeOf(record.ts, "the ref readback journal time");
     return measuredMs >= createdRecordMs && measuredMs <= recordedMs && recordedMs < dispatchMs
