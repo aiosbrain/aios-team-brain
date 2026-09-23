@@ -34,7 +34,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import path from "node:path";
-import { PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT } from "./offbranch-probe.mjs";
+import { PROBE_INTENT_PAIRS, PROBE_JOURNAL_EVENT_TYPES, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertProbeEventPayload, checkProbeJournalShape, parseProbeIntent, readDescriptor } from "./offbranch-probe.mjs";
 
 export const JOURNAL_SCHEMA_VERSION = 1;
 
@@ -329,12 +329,44 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
     // the one a resumed run most needs reconciled before it decides anything.
     // `dispatch-intent`/`dispatch-result` are the witness chain's counterparts: a lost witness
     // dispatch is exactly as unresolved as a lost ruleset create, and is reconciled the same way.
-    const INTENTS = ["mutation-intent", "cleanup-intent", "dispatch-intent"];
-    const RESULTS = ["mutation-result", "cleanup-result", "dispatch-result"];
+    const INTENTS = kind === "probe" ? Object.keys(PROBE_INTENT_PAIRS) : ["mutation-intent", "cleanup-intent", "dispatch-intent"];
+    const RESULTS = kind === "probe" ? Object.values(PROBE_INTENT_PAIRS) : ["mutation-result", "cleanup-result", "dispatch-result"];
     const lastIntent = [...records].reverse().find((record) => INTENTS.includes(record.type));
-    const lastResult = [...records].reverse().find((record) => RESULTS.includes(record.type));
+    const lastResult = [...records].reverse().find((record) => kind === "probe" ? record.type === PROBE_INTENT_PAIRS[lastIntent?.type] : RESULTS.includes(record.type));
     const unresolved = lastIntent && (!lastResult || lastResult.seq < lastIntent.seq) ? lastIntent : null;
-    const reconciliation = await reconcile(unresolved ? { kind_of_intent: unresolved.type, ...unresolved.data } : null);
+    let probeBinding = null;
+    const reconciledIntents = [];
+    if (kind === "probe") {
+      checkProbeJournalShape(records);
+      const opened = records[0];
+      if (opened?.type !== "probe-opened" || records.some((record) => record.type === "probe-closed")) {
+        throw new JournalRefusalError("only an open bound probe journal can recover its writer lock");
+      }
+      const resource = readJournal({ dir: root, runId, attempt });
+      const links = resource.filter((record) => record.type === RESOURCE_LINK_EVENT);
+      if (links.length !== 1 || links[0].data.intent_artifact !== opened.data.intent_artifact
+        || links[0].data.intent_sha256 !== opened.data.intent_sha256
+        || links[0].data.probe_journal !== path.basename(journalPath(root, runId, attempt, kind))) {
+        throw new JournalRefusalError("probe recovery requires the exact original resource-journal link");
+      }
+      probeBinding = readDescriptor(root, { artifact: opened.data.intent_artifact, sha256: opened.data.intent_sha256 }, "the recovery probe intent");
+      parseProbeIntent(probeBinding, { commissioning: probeBinding.commissioning });
+      if (probeBinding.commissioning.run_id !== String(runId) || probeBinding.commissioning.attempt !== String(attempt)
+        || opened.data.commissioning_run_id !== String(runId) || opened.data.commissioning_attempt !== String(attempt)
+        || [...records, ...resource].some((record) => record.source !== probeBinding.commissioning.workflow_sha)) {
+        throw new JournalRefusalError("probe recovery source/run/attempt binding differs from its original journal");
+      }
+      // Reconcile EVERY probe mutation, including results whose transport completed but whose
+      // effect is ambiguous. The lock event never resolves these resource intents by assertion.
+      for (const intent of records.filter((record) => PROBE_INTENT_PAIRS[record.type])) {
+        const readback = await reconcile({ kind_of_intent: intent.type, intent_seq: intent.seq, ...intent.data });
+        if (readback?.reconciled !== true) throw new JournalRefusalError("a probe mutation could not be reconciled by provider readback; the old lock is retained");
+        reconciledIntents.push({ seq: intent.seq, type: intent.type });
+      }
+    }
+    const reconciliation = kind === "probe" && reconciledIntents.length
+      ? { reconciled: true }
+      : await reconcile(unresolved ? { kind_of_intent: unresolved.type, ...unresolved.data } : null);
     if (reconciliation?.reconciled !== true) {
       throw new JournalRefusalError("the last recorded mutation could not be reconciled by provider readback; the run stays inconclusive");
     }
@@ -347,14 +379,28 @@ export async function recoverJournalLock({ dir, runId, attempt, kind = "resource
     if (current.nonce !== owner.nonce) throw new JournalRefusalError("the lock was replaced while this recovery was reconciling; refusing to remove the new owner's lock");
     unlinkSync(lockPath(root, runId, attempt, kind));
     const lock = acquireJournalLock({ dir: root, runId, attempt, kind, now });
-    const journal = openJournal({ dir: root, runId, attempt, kind, source: records[0]?.source ?? "unknown", lock });
-    journal.append(kind === "witness" ? "reconciliation" : "recovery", {
-      replaced_owner: { pid: owner.pid, host: owner.host, acquired_at: owner.acquired_at },
-      unresolved_intent_seq: unresolved?.seq ?? null,
-      unresolved_intent_type: unresolved?.type ?? null,
-      readback: reconciliation.readback ?? null,
-    });
-    return { lock, journal, unresolvedIntent: unresolved?.data ?? null, unresolvedIntentType: unresolved?.type ?? null, readback: reconciliation.readback ?? null };
+    try {
+      const journal = openJournal({ dir: root, runId, attempt, kind, source: records[0]?.source ?? "unknown", lock, now });
+      const replacedOwner = { pid: owner.pid, host: owner.host, acquired_at: owner.acquired_at };
+      if (kind === "probe") {
+        journal.append("lock-recovered", assertProbeEventPayload("lock-recovered", {
+          replaced_owner: replacedOwner, intent_sha256: records[0].data.intent_sha256, reconciled_intents: reconciledIntents,
+        }));
+      } else {
+        journal.append(kind === "witness" ? "reconciliation" : "recovery", {
+          replaced_owner: replacedOwner,
+          unresolved_intent_seq: unresolved?.seq ?? null,
+          unresolved_intent_type: unresolved?.type ?? null,
+          readback: reconciliation.readback ?? null,
+        });
+      }
+      return { lock, journal, unresolvedIntent: unresolved?.data ?? null, unresolvedIntentType: unresolved?.type ?? null, readback: reconciliation.readback ?? null };
+    } catch (error) {
+      // Recovery owns this replacement; no append/open failure may strand it. A partial journal
+      // write still fails chain verification on the next open, rather than becoming authority.
+      lock.release();
+      throw error;
+    }
   } finally {
     try { unlinkSync(recoveryLock); } catch { /* a recovery that never created it has nothing to remove */ }
   }

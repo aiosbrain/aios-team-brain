@@ -18,7 +18,7 @@ import {
   ALLOWED_OPERATIONS, PROTECTED_JOBS, assertAllowedRequest, assessEvidence, completedJsonResponse, createGuardedRequest, createRedactor,
   evidenceSlug, incompleteResponse, readEvidenceFile, validateEnvironmentControl, writeEvidenceFile,
 } from "../scripts/staging-ops/policy-commissioning.mjs";
-import { acquireJournalLock, openJournal, readJournal } from "../scripts/staging-ops/commissioning-journal.mjs";
+import { acquireJournalLock, openJournal, readJournal, readLockOwner, recoverJournalLock } from "../scripts/staging-ops/commissioning-journal.mjs";
 import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
   PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership,
@@ -1162,7 +1162,7 @@ describe("R04-F2: the durable dispatch intent owns recovery, with or without its
     expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
   });
 
-  it("closes an interrupted dispatch that produced no run at all, without re-dispatching", async () => {
+  it("keeps an interrupted dispatch unresolved when the listing cannot prove nonapplication", async () => {
     world.seedOriginal();
     await world.phase("stage");
     const transport = async (method: string, requestPath: string, body?: unknown) => {
@@ -1173,10 +1173,9 @@ describe("R04-F2: the durable dispatch intent owns recovery, with or without its
     expect(world.runs).toHaveLength(0);
     await expect(world.phase("collect")).rejects.toThrow(/no eligible probe run/);
     const reconciled = world.probeRecords().filter((record: any) => record.type === "reconciliation" && record.data.of === "dispatch-intent");
-    expect(reconciled).toHaveLength(1);
-    expect(reconciled[0].data.outcome).toBe("absent");
-    const cleaned: any = await world.phase("cleanup");
-    expect(cleaned.outcome).toBe("inconclusive");
+    expect(reconciled).toHaveLength(0);
+    await expect(world.phase("cleanup")).rejects.toThrow(/NOT deleted and the journal is NOT closed/);
+    expect(world.refSha()).toBe(world.sha);
     expect(world.count("POST", "/dispatches")).toBe(1);
   });
 });
@@ -1679,22 +1678,6 @@ describe("R06: separated qualification, run authority and ref authority", () => 
       });
     }
 
-    it("keeps the distinct outcome of a dispatch positively reconciled to no run at all", async () => {
-      world.seedOriginal();
-      await world.phase("stage");
-      const transport = async (method: string, requestPath: string, body?: unknown) => {
-        if (method === "POST" && requestPath.endsWith("/dispatches")) { world.calls.push({ method, path: requestPath }); throw new Error("simulated interruption before the provider applied anything"); }
-        return world.transport(method, requestPath, body);
-      };
-      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/simulated interruption/);
-      await expect(world.phase("collect")).rejects.toThrow(/no eligible probe run/);
-      // `absent` is a FINDING about the dispatch — the provider created nothing — not an unanswered
-      // question, so it is not the blocked case above and the owned ref may still be removed.
-      expect(world.probeRecords().some((record: any) => record.type === "reconciliation"
-        && record.data.of === "dispatch-intent" && record.data.outcome === "absent")).toBe(true);
-      const cleaned: any = await world.phase("cleanup");
-      expect([cleaned.outcome, world.refSha()]).toEqual(["inconclusive", null]);
-    });
 
     it("does not hand a restarted process a fresh cancellation-confirmation budget", async () => {
       world.seedOriginal();
@@ -1768,5 +1751,145 @@ describe("R06: separated qualification, run authority and ref authority", () => 
       const observed = world.probeRecords().filter((record: any) => record.type === SOURCE_OBSERVED_EVENT);
       expect(observed.map((record: any) => record.data.phase)).toEqual(["stage", "dispatch", "collect", "cleanup"]);
     });
+  });
+});
+
+
+describe("R07: observable mutation uncertainty and current cleanup authority", () => {
+  for (const applied of [false, true]) for (const response of ["missing", "500"]) {
+    it(`keeps ${response} dispatch unknown with empty listing in hidden applied=${applied} world`, async () => {
+      world.seedOriginal(); world.neverComplete = true;
+      await world.phase("stage");
+      const transport = async (method: string, requestPath: string, body?: unknown) => {
+        if (method === "POST" && requestPath.endsWith("/dispatches")) {
+          if (applied) await world.transport(method, requestPath, body);
+          else world.calls.push({ method, path: requestPath });
+          if (response === "missing") throw new Error("simulated dispatch interruption");
+          return completedJsonResponse(500, Buffer.from('{"message":"server error"}'), createRedactor(), { retainRaw: true });
+        }
+        if (method === "GET" && requestPath.includes(`/actions/workflows/${PROBE_WORKFLOW_FILE}/runs`)) {
+          return completedJsonResponse(200, Buffer.from('{"total_count":0,"workflow_runs":[]}'), createRedactor(), { retainRaw: true });
+        }
+        return world.transport(method, requestPath, body);
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/interruption|effect is unknown/);
+      const deadline = world.probeRecords().find((r: any) => r.type === "dispatch-intent").data.deadline_at;
+      let deletes = 0;
+      const deleteRef = async () => { deletes++; return { outcome: "deleted", exit_code: 0 }; };
+      await expect(world.phase("cancel", { transport })).rejects.toThrow(/no eligible probe run/);
+      await expect(world.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/NOT deleted and the journal is NOT closed/);
+      await expect(world.phase("cancel", { transport })).rejects.toThrow(/unidentifiable/);
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/never re-issued/);
+      expect([deletes, world.count("POST", "/cancel"), world.count("POST", "/dispatches")]).toEqual([0, 0, 1]);
+      expect(world.refSha()).toBe(world.sha);
+      expect(world.probeRecords().some((r: any) => r.type === "probe-closed")).toBe(false);
+      expect(world.probeRecords().find((r: any) => r.type === "dispatch-intent").data.deadline_at).toBe(deadline);
+      expect(world.runs.length).toBe(applied ? 1 : 0);
+    });
+  }
+
+  for (const changed of [false, true]) {
+    it(`retains immediate post-delete presence (changed=${changed}) permanently through later absence`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+      const collected: any = await world.phase("collect");
+      let deletes = 0;
+      const deleteRef = async () => { deletes++; world.setRef(null); world.setRef(changed ? world.otherSha : world.sha); return { outcome: "deleted", exit_code: 0 }; };
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create/);
+      expect(world.probeRecords().some((r: any) => r.type === "ref-readback" && r.data.http_status === 200
+        && r.seq > world.probeRecords().find((e: any) => e.type === "cleanup-result").seq)).toBe(true);
+      world.setRef(null);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create/);
+      expect(deletes).toBe(1);
+      for (const environment of ["staging-release", "staging-emergency"]) expect(world.validate(collected.records[environment], environment)).not.toBeNull();
+    });
+  }
+
+  for (const boundary of ["cancel", "cleanup"]) for (const change of ["attempt", "state", "actor"]) {
+    it(`retains ${change} contradiction at cached-terminal ${boundary}, even after restoration`, async () => {
+      world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+      const collected: any = await world.phase("collect");
+      if (change === "attempt") world.runs[0].attempt = 2;
+      if (change === "state") world.neverComplete = true;
+      if (change === "actor") world.runs[0].actor = { id: 3, login: "foreign", type: "User" };
+      let deletes = 0;
+      const deleteRef = async () => { deletes++; return { outcome: "deleted", exit_code: 0 }; };
+      await expect(world.phase(boundary, { deleteRef })).rejects.toThrow(/attempt|contradicts|not this probe's own run/);
+      world.runs[0].attempt = 1; world.neverComplete = false; world.runs[0].actor = { ...JOHN };
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/attempt|contradicts|dispatcher/);
+      expect([deletes, world.count("POST", "/cancel")]).toEqual([0, 0]);
+      expect(world.refSha()).toBe(world.sha);
+      for (const environment of ["staging-release", "staging-emergency"]) expect(world.validate(collected.records[environment], environment)).not.toBeNull();
+    });
+  }
+
+  it("refreshes run identity after the ref GET, before deletion, and again before final closure", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); await world.phase("collect");
+    let deletes = 0;
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      const result = await world.transport(method, requestPath, body);
+      if (method === "GET" && requestPath.includes(`/git/ref/heads/${PROBE_BRANCH}`)) world.runs[0].attempt = 2;
+      return result;
+    };
+    await expect(world.phase("cleanup", { transport, deleteRef: async () => { deletes++; } })).rejects.toThrow(/attempt/);
+    expect(deletes).toBe(0);
+  });
+
+  it("blocks closure when the provider reruns during the owned deletion", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch"); const collected: any = await world.phase("collect");
+    await expect(world.phase("cleanup", { deleteRef: async () => {
+      world.setRef(null); world.runs[0].attempt = 2; return { outcome: "deleted", exit_code: 0 };
+    } })).rejects.toThrow(/attempt/);
+    expect(world.probeRecords().some((r: any) => r.type === "probe-closed")).toBe(false);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/attempt/);
+  });
+});
+
+describe("R07: explicit public probe lock recovery", () => {
+  const recover = (extra: any = {}) => recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now, reconcile: async () => ({ reconciled: true }), ...extra });
+  const abandoned = () => acquireJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", pid: 2147483647, host: "synthetic-gone-owner", now: world.now });
+
+  it("recovers stage→cleanup and repeated recovery without adopting resources", async () => {
+    world.seedOriginal(); await world.phase("stage");
+    for (let i = 0; i < 2; i++) {
+      abandoned(); const restored = await recover();
+      expect(restored.journal.read().at(-1).type).toBe("lock-recovered"); restored.lock.release();
+    }
+    expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
+  });
+
+  it("reconciles create, dispatch and cancel across recovery before public cancel→cleanup", async () => {
+    world.seedOriginal(); world.neverComplete = true;
+    await world.phase("stage"); await world.phase("dispatch");
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      const response = await world.transport(method, requestPath, body);
+      if (method === "POST" && requestPath.endsWith("/cancel")) throw new Error("interrupted cancel result");
+      return response;
+    };
+    await expect(world.phase("cancel", { transport })).rejects.toThrow(/interrupted cancel/);
+    abandoned(); const seen: any[] = [];
+    const restored = await recover({ reconcile: async (intent: any) => { seen.push(intent); return { reconciled: true }; } });
+    expect(seen.map((i) => i.kind_of_intent)).toEqual(["ref-create-intent", "dispatch-intent", "cancel-intent"]);
+    restored.lock.release();
+    await world.phase("cancel");
+    // Terminal confirmation resolves the interrupted cancel; no second cancellation is permitted.
+    await world.phase("cleanup");
+    expect(world.count("POST", "/cancel")).toBe(1); expect(world.refSha()).toBeNull();
+  });
+
+  it("keeps the original lock on callback failure and permits a later explicit recovery", async () => {
+    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
+    const owner = abandoned();
+    await expect(recover({ reconcile: async () => { throw new Error("readback failed"); } })).rejects.toThrow(/readback failed/);
+    expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe").nonce).toBe(owner.nonce);
+    await expect(recover({ ownerGone: false })).rejects.toThrow(/owner is gone/);
+    const restored = await recover(); restored.lock.release();
+  });
+
+  it("releases the replacement when its recovery append fails", async () => {
+    world.seedOriginal(); await world.phase("stage"); abandoned();
+    let reads = 0;
+    await expect(recover({ now: () => { if (++reads === 3) throw new Error("append clock failure"); return world.now(); } })).rejects.toThrow(/append clock failure/);
+    expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe")).toBeNull();
+    expect((await world.phase("cleanup") as any).status).toBe("nothing-owned");
   });
 });

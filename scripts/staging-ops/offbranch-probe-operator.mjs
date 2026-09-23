@@ -48,7 +48,7 @@ import {
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
   ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
-  assessRefOwnership, assessSourceContinuity, commissioningIdentity, inducedAutomation,
+  assessRefOwnership, assessRunContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
 } from "./offbranch-probe.mjs";
@@ -544,6 +544,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     probe.append("ref-create-result", { ref: PROBE_REF, sha, ...facts(created), object_sha: objectSha });
     if (created.complete !== true) {
       const readback = await session.request("GET", probeRefPath);
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
       const at = session.now().toISOString();
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "ref-create-intent", outcome: "absent", object_sha: null, measured_at: at });
@@ -572,7 +573,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
     probe.append("dispatch-intent", { workflow_file: PROBE_WORKFLOW_FILE, ref: PROBE_BRANCH, deadline_at: deadlineAt });
     const dispatched = await session.request("POST", `/repos/${REPO}/actions/workflows/${PROBE_WORKFLOW_FILE}/dispatches`, { ref: PROBE_BRANCH });
     probe.append("dispatch-result", facts(dispatched));
-    if (dispatched.complete === true && dispatched.status !== 204) throw new AssertionFailure(`the provider refused the probe dispatch (${dispatched.status}); nothing ran — clean up the ref`);
+    if (dispatched.complete === true && dispatched.status !== 204) throw new IncompleteEvidence(`the probe dispatch returned ${dispatched.status}; its effect is unknown — reconcile the run without re-dispatching`);
     return result(session, "dispatch", dispatched.complete === true ? "dispatched" : "dispatch-ambiguous", {
       deadline_at: deadlineAt, note: "Collect before the deadline. A lost dispatch answer is reconciled by collect, never re-dispatched.",
     });
@@ -600,13 +601,15 @@ function assertRunOwnership(session, runId, body, when) {
   }
 }
 
-async function assertOwnedProbeRun(session, runId, when) {
-  const read = await session.request("GET", `/repos/${REPO}/actions/runs/${runId}`);
-  if (read.complete !== true || read.status !== 200 || !read.body) {
-    throw new IncompleteEvidence(`the probe run's identity could not be measured ${when} (${read.status})`);
-  }
-  assertRunOwnership(session, runId, read.body, when);
-  return read.body;
+async function assertOwnedProbeRun(session, probe, runId, when, boundary = "read") {
+  const captured = await rawCapture(session, `/repos/${REPO}/actions/runs/${runId}`, `the probe run's identity ${when}`);
+  // Persist before identity/status checks: a rejected rerun must survive a later restored response.
+  probe.append("run-observed", { run_id: runId, boundary, capture: captured.ref });
+  assertRunOwnership(session, runId, captured.body, when);
+  asIncomplete(() => assessRunContinuity(probe.records(), {
+    dir: session.dir, repositoryId: session.commissioning.repository_id, workflowSha: session.commissioning.workflow_sha,
+  }));
+  return captured.body;
 }
 
 /**
@@ -614,10 +617,10 @@ async function assertOwnedProbeRun(session, runId, when) {
  * be set first — it is what permits the read at all — so a failed proof unbinds it again rather
  * than leaving a run this probe never established as owned reachable through the boundary.
  */
-async function bindProbeRun(session, runId, when) {
+async function bindProbeRun(session, probe, runId, when, boundary = "read") {
   session.guardCtx.probeRunId = runId;
   try {
-    return await assertOwnedProbeRun(session, runId, when);
+    return await assertOwnedProbeRun(session, probe, runId, when, boundary);
   } catch (error) {
     session.guardCtx.probeRunId = null;
     throw error;
@@ -629,13 +632,15 @@ async function bindProbeRun(session, runId, when) {
  * — but every read re-checks the identity, so a run that is rerun or otherwise stops being ours
  * during the wait refuses here instead of being carried into a cancellation.
  */
-async function waitTerminal(session, runId, untilMs) {
+async function waitTerminal(session, probe, runId, untilMs) {
   for (;;) {
-    const read = await session.request("GET", `/repos/${REPO}/actions/runs/${runId}`);
-    if (read.complete === true && read.status === 200 && read.body) {
-      assertRunOwnership(session, runId, read.body, "while waiting for it to reach a terminal state");
-      if (read.body.status === "completed") return read.body;
+    let body;
+    try { body = await assertOwnedProbeRun(session, probe, runId, "while waiting for it to reach a terminal state"); }
+    catch (error) {
+      // Unavailable reads may be retried inside the original bound; retained contradictions may not.
+      if (!(error instanceof IncompleteEvidence) || probe.records().at(-1)?.type === "run-observed") throw error;
     }
+    if (body?.status === "completed") return body;
     if (session.now().getTime() >= untilMs) return null;
     await session.sleep(PROBE_POLL_INTERVAL_MS);
   }
@@ -672,8 +677,6 @@ async function reconcileOwnedRun(session, probe, when) {
   // the listing, never by dispatching again.
   const dispatch = records.find((record) => record.type === "dispatch-intent");
   if (!dispatch) throw new IncompleteEvidence("the probe has not been dispatched");
-  const dispatched = records.find((record) => record.type === "dispatch-result");
-  if (dispatched?.data.response_complete === true && dispatched.data.http_status !== 204) throw new AssertionFailure(`the probe dispatch was refused; there is nothing to ${when}`);
   // FROM THE DURABLE INTENT, never from this invocation's clock: a reconciliation that ran an hour
   // later must still be choosing among the runs the original window admits.
   const dispatchMs = Date.parse(dispatch.ts);
@@ -702,7 +705,8 @@ async function reconcileOwnedRun(session, probe, when) {
   const eligible = asIncomplete(() => selectEligibleRuns(pages, { dispatchIntentMs: dispatchMs, deadlineMs, identity }));
   if (eligible.length !== 1) {
     probe.append("run-unidentified", { eligible: eligible.length, descriptor, reason: eligible.length ? "several eligible runs" : "no eligible run by the deadline" });
-    reconcileDispatch(eligible.length ? "present-ownership-uncertain" : "absent", null);
+    // A complete empty listing cannot distinguish an unapplied request from a hidden live run.
+    // No reconciliation row may turn that uncertainty into nonapplication authority.
     if (eligible.length > 1) throw new AssertionFailure(`${eligible.length} eligible probe runs exist; none is selected, and the probe cannot pass`);
     throw new IncompleteEvidence("no eligible probe run appeared by the deadline; the probe is inconclusive and nothing is re-dispatched");
   }
@@ -723,7 +727,7 @@ async function cancelAndConfirm(session, probe, runId, reason) {
   let intent = probe.records().find((record) => record.type === "cancel-intent");
   if (!intent) {
     // The last thing before the ONE mutation this probe aims at a run: prove it is still ours.
-    const live = await assertOwnedProbeRun(session, runId, "immediately before cancelling it");
+    const live = await assertOwnedProbeRun(session, probe, runId, "immediately before cancelling it", "cancel");
     // ALREADY TERMINAL: what an exactly-owned run that has already finished needs is its terminal
     // state written down, not a cancellation aimed at a run that has nothing left to stop (R06).
     if (live.status === "completed") return journalTerminal(session, probe, runId, live);
@@ -735,7 +739,7 @@ async function cancelAndConfirm(session, probe, runId, reason) {
   // this invocation's clock handed every fresh process another two minutes, so a run that never
   // reaches a terminal state could be waited on indefinitely, two minutes at a time, while the
   // evidence said it had been confirmed within the canonical bound. Exhaustion stays exhausted.
-  const terminal = await waitTerminal(session, runId, Date.parse(intent.ts) + CANCEL_CONFIRM_MS);
+  const terminal = await waitTerminal(session, probe, runId, Date.parse(intent.ts) + CANCEL_CONFIRM_MS);
   if (!terminal) {
     throw new IncompleteEvidence("the probe run is still not terminal two minutes after cancellation; cleanup is BLOCKED — evidence is retained and nothing is claimed");
   }
@@ -755,7 +759,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
     const identified = await reconcileOwnedRun(session, probe, "collect");
     const probeRunId = identified.data.run_id;
     // Binding a run this process did not itself select — a resumed collection — re-proves it first.
-    await bindProbeRun(session, probeRunId, "before collecting it");
+    await bindProbeRun(session, probe, probeRunId, "before collecting it");
 
     let records = probe.records();
     // THE ORIGINAL WINDOW, re-read from the durable intent the reconciliation selected within, so
@@ -765,7 +769,7 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
     const deadlineMs = Date.parse(dispatch.data.deadline_at);
     let terminalRecord = records.find((record) => record.type === "run-terminal");
     if (!terminalRecord) {
-      const terminal = await waitTerminal(session, probeRunId, deadlineMs);
+      const terminal = await waitTerminal(session, probe, probeRunId, deadlineMs);
       if (!terminal) {
         await cancelAndConfirm(session, probe, probeRunId, "deadline");
         throw new IncompleteEvidence("the probe reached no terminal state within ten minutes; it was cancelled, which is inconclusive — clean up next");
@@ -887,11 +891,15 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
     // Recorded, never blocking: cancelling this probe's OWN run is exactly the safe action a source
     // interruption still permits (R05-F2).
     recordSourceObservation(session, probe, "cancel");
-    if (probe.records().some((record) => record.type === "run-terminal")) return result(session, "cancel", "already-terminal");
+    if (probe.records().some((record) => record.type === "probe-closed")) return result(session, "cancel", "already-closed");
     // A run this probe dispatched but never identified — because the collection that would have
     // identified it was interrupted — is still exactly ours to authenticate and stop (R06-F2).
     const identified = await reconcileOwnedRun(session, probe, "cancel");
-    await bindProbeRun(session, identified.data.run_id, "before cancelling it");
+    const live = await bindProbeRun(session, probe, identified.data.run_id, "before cancelling it", "cancel");
+    if (live.status === "completed") {
+      if (!probe.records().some((record) => record.type === "run-terminal")) journalTerminal(session, probe, identified.data.run_id, live);
+      return result(session, "cancel", "already-terminal");
+    }
     await cancelAndConfirm(session, probe, identified.data.run_id, "operator");
     return result(session, "cancel", "cancelled", { note: "A cancelled probe is inconclusive. Clean up next." });
   } finally {
@@ -938,8 +946,6 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // AFTER TERMINAL CAPTURE: an identified run must be terminal, and a terminal failure collected.
     let identified = records.find((record) => record.type === "run-identified");
     const dispatchIntent = records.find((record) => record.type === "dispatch-intent");
-    const dispatchResult = records.find((record) => record.type === "dispatch-result");
-    const dispatchRefused = dispatchResult?.data.response_complete === true && dispatchResult.data.http_status !== 204;
     // Driven by the durable INTENT, not by whether its result was ever appended (R04-F2). A process
     // cut after the provider applied the dispatch leaves a live run behind; closing over it because
     // no `dispatch-result` exists would delete the ref and file the probe while the run is queued.
@@ -948,7 +954,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // back to `collect`: when the interruption that stopped the collection is the reason the run was
     // never identified, "collect before cleanup" is an instruction to a phase that will refuse for
     // ever, and the owned ref never goes.
-    if (dispatchIntent && !dispatchRefused && !identified && !records.some((record) => record.type === "run-unidentified")) {
+    if (dispatchIntent && !identified && !records.some((record) => record.type === "run-unidentified")) {
       identified = await reconcileOwnedRun(session, probe, "clean up");
       records = probe.records();
     }
@@ -959,16 +965,15 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // may still be holding the very ref this phase is about to remove. Refusing keeps the evidence
     // and hands it to root reconciliation, which is the only authority that can resolve it.
     //
-    // The ONE resolved reading of "no run" is a dispatch this probe reconciled to `absent`: that is
-    // a positive finding that the provider never created anything, not an unanswered question, and
-    // it keeps its own distinct outcome.
-    if (records.some((record) => record.type === "run-unidentified")) {
-      const noRun = records.some((record) => record.type === "reconciliation"
-        && record.data.of === "dispatch-intent" && record.data.outcome === "absent");
-      if (!noRun) {
-        throw new IncompleteEvidence("this probe's dispatched run was never resolved to exactly one owned run; a run it started may still be live, so the owned ref is NOT deleted and the journal is NOT closed — the evidence is retained for root reconciliation");
-      }
+    if (dispatchIntent && !identified) {
+      throw new IncompleteEvidence("this probe's dispatched run was never resolved to exactly one owned run; a run it started may still be live, so the owned ref is NOT deleted and the journal is NOT closed — the evidence is retained for root reconciliation");
     }
+    const confirmTerminal = async (boundary) => {
+      if (!identified) return;
+      const live = await bindProbeRun(session, probe, identified.data.run_id, "before cleanup", boundary);
+      if (live.status !== "completed") throw new IncompleteEvidence("the probe run is not terminal; cancel (or collect) it before cleanup");
+    };
+    await confirmTerminal("cleanup-entry");
     if (ownership.state === "unowned") {
       if (unresolvedProbeIntents(records).length) throw new IncompleteEvidence("an unresolved probe intent remains; reconcile before closing");
       probe.append("probe-closed", { outcome: "inconclusive" });
@@ -984,7 +989,8 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       throw new IncompleteEvidence("the terminal probe run has not been collected; collect before cleanup so the original evidence is captured first");
     }
     const at = () => session.now().toISOString();
-    const close = (status, extra = {}) => {
+    const close = async (status, extra = {}) => {
+      await confirmTerminal("closure");
       const current = probe.records();
       // The journal is never closed over an unknown outcome: every intent carries a result or an
       // explicit reconciliation by now, or this probe stays open and blocked (R04-F2).
@@ -1024,11 +1030,12 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      */
     if (ownership.pending) {
       const readback = await session.request("GET", probeRefPath);
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
         probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
         settle();
-        return close("cleaned-after-reconciliation");
+        return await close("cleaned-after-reconciliation");
       }
       if (readback.complete === true && readback.status === 200) {
         const objectSha = String(readback.body?.object?.sha ?? "");
@@ -1040,13 +1047,14 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     }
 
     const readback = await session.request("GET", probeRefPath);
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: readback.complete === true ? (String(readback.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
     if (readback.complete !== true || ![200, 404].includes(readback.status)) throw new IncompleteEvidence("the owned probe ref could not be read back before cleanup");
     if (readback.status === 404) {
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
       // An absence this probe's OWN durable history explains is the expected end state, not a
       // disappearance. Without such a deletion recorded, the ownership history really is broken.
       settle();
-      return close("cleaned-after-reconciliation");
+      return await close("cleaned-after-reconciliation");
     }
     if (readback.body?.object?.sha !== sha) {
       probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at() });
@@ -1060,19 +1068,21 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // THE ONE PLACE A DELETION IS ISSUED, and it is gated on the derived authority rather than on
     // this invocation's readback: presence at the expected bytes is not, by itself, ownership.
     if (!settle().may_delete) throw new IncompleteEvidence("the owned probe ref's accumulated lifecycle does not authorise a lease deletion; root reconciliation is required");
+    await confirmTerminal("delete");
     probe.append("cleanup-intent", { ref: PROBE_REF, expected_sha: sha });
     const deletion = await deleteRef({ ref: PROBE_REF, expectedSha: sha });
     const outcome = ["deleted", "lease-refused", "ambiguous"].includes(deletion?.outcome) ? deletion.outcome : "ambiguous";
     probe.append("cleanup-result", { ref: PROBE_REF, expected_sha: sha, outcome, exit_code: Number.isInteger(deletion?.exit_code) ? deletion.exit_code : null });
     if (outcome === "lease-refused") throw new AssertionFailure("the lease deletion was refused: the owned probe ref changed, and it is left untouched");
     const after = await session.request("GET", probeRefPath);
+    probe.append("ref-readback", { ref: PROBE_REF, ...facts(after), object_sha: after.complete === true ? (String(after.body?.object?.sha ?? "") || null) : null, measured_at: session.now().toISOString() });
     if (after.complete === true && after.status === 404) {
       if (outcome === "ambiguous") probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(after), measured_at: at() });
       settle();
-      return close("cleaned");
+      return await close("cleaned");
     }
-    if (outcome === "ambiguous" && after.complete === true && after.status === 200) {
+    if (after.complete === true && after.status === 200) {
       const objectSha = String(after.body?.object?.sha ?? "");
       probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
       settle();

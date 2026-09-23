@@ -196,6 +196,8 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "dispatch-result": Object.freeze(RESPONSE_FACTS),
   "run-identified": Object.freeze(["run_id", "eligible", "descriptor"]),
   "run-unidentified": Object.freeze(["eligible", "descriptor", "reason"]),
+  "run-observed": Object.freeze(["run_id", "boundary", "capture"]),
+  "lock-recovered": Object.freeze(["replaced_owner", "intent_sha256", "reconciled_intents"]),
   "run-terminal": Object.freeze(["run_id", "run_attempt", "status", "conclusion", "observed_at"]),
   "cancel-intent": Object.freeze(["run_id", "reason"]),
   "cancel-result": Object.freeze(["run_id", ...RESPONSE_FACTS]),
@@ -230,6 +232,19 @@ export function assertProbeEventPayload(type, data) {
   const fields = PROBE_JOURNAL_EVENTS[String(type)];
   if (!fields) refuse(`unknown probe journal event ${JSON.stringify(String(type))}`);
   assertClosed(data, fields, `the ${type} payload`);
+  if (type === "run-observed") {
+    decimalString(data.run_id, "the observed run id");
+    if (!["read", "cancel", "cleanup-entry", "delete", "closure"].includes(data.boundary)) refuse("unknown run observation boundary");
+    assertClosed(data.capture, RAW_REF_FIELDS, "the run observation capture");
+  }
+  if (type === "lock-recovered") {
+    assertClosed(data.replaced_owner, ["pid", "host", "acquired_at"], "the replaced lock owner");
+    if (!SHA256_HEX.test(data.intent_sha256) || !Array.isArray(data.reconciled_intents)) refuse("invalid probe lock recovery binding");
+    for (const intent of data.reconciled_intents) {
+      assertClosed(intent, ["seq", "type"], "a recovered mutation binding");
+      if (!Number.isSafeInteger(intent.seq) || intent.seq < 1 || !PROBE_INTENT_PAIRS[intent.type]) refuse("unknown recovered probe mutation");
+    }
+  }
   return data;
 }
 
@@ -815,10 +830,36 @@ export function unresolvedProbeIntents(records) {
     const nextIntent = later.findIndex((entry) => entry.type === record.type);
     const window = nextIntent >= 0 ? later.slice(0, nextIntent) : later;
     const resolved = window.some((entry) => entry.type === resultType
-      || (entry.type === "reconciliation" && entry.data?.of === record.type));
+      || (entry.type === "reconciliation" && entry.data?.of === record.type
+        && (record.type !== "dispatch-intent" || entry.data.outcome === "present-unchanged"))
+      || (record.type === "cancel-intent" && entry.type === "run-terminal"
+        && entry.data.run_id === record.data.run_id && entry.data.run_attempt === 1 && entry.data.status === "completed"));
     if (!resolved) open.push({ seq: record.seq, type: record.type });
   }
   return open;
+}
+
+/** Current run evidence is retained before it is consumed, including rejected identities.
+ * A later return to attempt 1 or terminal state cannot erase a measured substitution.
+ */
+export function assessRunContinuity(records, { dir, repositoryId, workflowSha }) {
+  const identified = records.find((record) => record.type === "run-identified");
+  let terminal = null;
+  const observations = [];
+  for (const record of records) {
+    if (record.type === "run-terminal") terminal = record.data;
+    if (record.type !== "run-observed") continue;
+    assertProbeEventPayload(record.type, record.data);
+    if (!identified || record.data.run_id !== identified.data.run_id) refuse("a run observation is not bound to the identified owned run");
+    const captured = readRaw(dir, record.data.capture, "the current owned run observation", RAW_REF_FIELDS);
+    assertProbeRunIdentity(captured.body, { runId: identified.data.run_id, repositoryId, workflowSha });
+    if (terminal && (captured.body.status !== "completed" || captured.body.conclusion !== terminal.conclusion)) {
+      refuse("the probe run's current state contradicts its retained terminal state; cleanup is blocked");
+    }
+    if (captured.completed > timeOf(record.ts, "the run observation journal time")) refuse("the run observation was journaled before its capture completed");
+    observations.push({ seq: record.seq, boundary: record.data.boundary, body: captured.body });
+  }
+  return observations;
 }
 
 export const REF_OWNERSHIP_STATES = Object.freeze(["unowned", "owned", "ended", "uncertain"]);
@@ -1062,7 +1103,8 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   const results = records.filter((record) => record.type === "dispatch-result");
   if (results.length > 1) refuse(`the probe journal records ${results.length} dispatch results, not exactly one`);
   if (results.length === 1) {
-    if (results[0].data.response_complete === true && results[0].data.http_status !== 204) refuse("the provider refused the probe dispatch");
+    // Even a complete 5xx may follow an applied dispatch. Exact retained run evidence below
+    // establishes the application; response completion alone supplies no nonapplication proof.
   } else {
     const reconciled = records.filter((record) => record.type === "reconciliation" && record.data.of === "dispatch-intent");
     if (reconciled.length !== 1) refuse(`the probe dispatch has no result and ${reconciled.length} reconciliation(s); exactly one must resolve it`);
@@ -1073,6 +1115,7 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   }
   if (records.some((record) => record.type === "run-unidentified")) refuse("the probe run could not be identified uniquely");
   const identified = only(records, "run-identified");
+  const runObservations = assessRunContinuity(records, { dir, repositoryId: commissioning.repository_id, workflowSha });
   if (identified.data.eligible !== 1) refuse("the probe run was not the single eligible run");
   const terminal = only(records, "run-terminal");
   if (terminal.data.run_id !== identified.data.run_id || terminal.data.run_attempt !== 1 || terminal.data.status !== "completed" || terminal.data.conclusion !== "failure") {
@@ -1113,7 +1156,11 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
 
   const cleanupIntents = records.filter((record) => record.type === "cleanup-intent");
   if (!cleanupIntents.length) refuse("the owned probe ref has no cleanup intent");
-  for (const intent of cleanupIntents) equalOrRefuse(intent.data, { ref: PROBE_REF, expected_sha: workflowSha }, "a probe cleanup intent");
+  for (const intent of cleanupIntents) {
+    equalOrRefuse(intent.data, { ref: PROBE_REF, expected_sha: workflowSha }, "a probe cleanup intent");
+    const current = runObservations.find((row) => row.seq === intent.seq - 1 && row.boundary === "delete");
+    if (!current || current.body.status !== "completed") refuse("cleanup lacks current exact-owned terminal run evidence at deletion");
+  }
   const absent = records.filter((record) => record.type === "absence-verified");
   const lastAbsent = absent[absent.length - 1];
   if (!lastAbsent || lastAbsent.data.http_status !== 404 || lastAbsent.data.response_complete !== true || lastAbsent.seq < cleanupIntents[0].seq) {
@@ -1121,6 +1168,8 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
   }
   if (records.some((record) => record.type === "cleanup-result" && record.data.outcome === "lease-refused")) refuse("the owned probe ref changed and its cleanup was refused");
   const closed = only(records, "probe-closed");
+  const finalRun = runObservations.find((row) => row.seq === closed.seq - 1 && row.boundary === "closure");
+  if (!finalRun || finalRun.body.status !== "completed") refuse("closure lacks current exact-owned terminal run evidence");
   if (closed.seq !== records[records.length - 1].seq || closed.data.outcome !== "measured") refuse("the probe journal is not closed as a measured probe");
   const policies = records.filter((record) => record.type === "policy-captured");
   return {
