@@ -21,7 +21,8 @@ import {
 import { acquireJournalLock, openJournal, readJournal } from "../scripts/staging-ops/commissioning-journal.mjs";
 import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
-  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership, commissioningIdentity,
+  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership,
+  assessSourceContinuity, commissioningIdentity,
   parseCheckRunUrl, parseDiagnosticAnnotations, parseEnvironmentPolicy, parseProbeCheck, parseProbeJobs, parseProbeRun,
   probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage,
 } from "../scripts/staging-ops/offbranch-probe.mjs";
@@ -792,8 +793,11 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     await expect(world.phase("collect")).rejects.toThrow(/2 eligible probe runs/);
     expect(world.probeRecords().some((record: any) => record.type === "run-unidentified" && record.data.eligible === 2)).toBe(true);
     expect(world.count("POST", "/dispatches")).toBe(1);
-    const cleaned: any = await world.phase("cleanup");
-    expect(cleaned.outcome).toBe("inconclusive");
+    // WAS: cleanup closed this as inconclusive. Two candidate runs may BOTH be live, and deleting
+    // the ref out from under them while filing the probe is a closure over a question nobody
+    // answered (R06). It is blocked, and the evidence is kept for root reconciliation.
+    await expect(world.phase("cleanup")).rejects.toThrow(/NOT deleted and the journal is NOT closed/);
+    expect(world.refSha()).toBe(world.sha);
   });
 
   it("cancels only the exact probe run at the ten-minute deadline; cancellation is inconclusive, never success", async () => {
@@ -1462,5 +1466,307 @@ describe("R05-F2: an observed staging move is kept, and interrupts measurement f
       });
     }
     expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
+  });
+});
+
+/**
+ * ── R06: QUALIFICATION, RUN AUTHORITY AND REF AUTHORITY ARE THREE SEPARATE THINGS ───────────────
+ *
+ * Every case here runs through the public `runProbePhase`, the real hash-chained journals and the
+ * real offline validator, against the fake provider and a throwaway local bare repository.
+ *
+ *  - Q (qualification) is permanently lost by a measured source move, at ANY phase, and restoring
+ *    staging or starting a fresh process never gives it back.
+ *  - U (run authority) survives that loss: the exact run this probe's own dispatch created can
+ *    still be authenticated, cancelled and confirmed terminal — under its ORIGINAL bounds.
+ *  - R (ref authority) is its own chain: a measured disappearance ends it whatever event carried
+ *    the observation, and an undecided deletion is never decided by a ref sitting at equal bytes.
+ */
+describe("R06: separated qualification, run authority and ref authority", () => {
+  /** Only the source-continuity read reports the other commit; every other read is untouched. */
+  const drifting = (target: World) => async (method: string, requestPath: string, body?: unknown) => {
+    if (requestPath === `/repos/${REPO}/git/ref/heads/staging`) {
+      return completedJsonResponse(200, Buffer.from(JSON.stringify({ ref: "refs/heads/staging", object: { sha: target.otherSha, type: "commit" } })), createRedactor(), { retainRaw: true });
+    }
+    return target.transport(method, requestPath, body);
+  };
+
+  describe("R06-F1: every COMPLETE ref observation ends ownership, whatever the event is called", () => {
+    it("refuses to delete a same-SHA recreation after the post-create readback measured a complete 404", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      let created = false;
+      const transport = async (method: string, requestPath: string, body?: unknown) => {
+        if (method === "GET" && created && requestPath === `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`) {
+          world.setRef(null); // it disappeared between the create and its readback, and we SAW that.
+          created = false;
+        }
+        const answer = await world.transport(method, requestPath, body);
+        if (method === "POST" && requestPath.endsWith("/git/refs")) created = true;
+        return answer;
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/could not be read back/);
+      const readback = world.probeRecords().filter((record: any) => record.type === "ref-readback");
+      expect(readback.map((record: any) => [record.data.response_complete, record.data.http_status])).toEqual([[true, 404]]);
+      expect(world.count("POST", "/dispatches")).toBe(0);
+
+      // Somebody else puts a ref back at exactly the reviewed bytes. It is NOT this probe's ref.
+      world.setRef(world.sha);
+      let deletions = 0;
+      const deleteRef = async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/disappeared without this probe deleting it/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/disappeared without this probe deleting it/);
+      expect([deletions, world.refSha()]).toEqual([0, world.sha]);
+      const ownership = assessRefOwnership(world.probeRecords(), { workflowSha: world.sha });
+      expect([ownership.state, ownership.may_delete, ownership.may_accept]).toEqual(["uncertain", false, false]);
+    });
+
+    it("keeps recoverable ownership when the same readback is merely INCOMPLETE", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      let created = false;
+      const transport = async (method: string, requestPath: string, body?: unknown) => {
+        if (method === "GET" && created && requestPath === `/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`) {
+          created = false;
+          return incompleteResponse("transport-timeout");
+        }
+        const answer = await world.transport(method, requestPath, body);
+        if (method === "POST" && requestPath.endsWith("/git/refs")) created = true;
+        return answer;
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/could not be read back/);
+      // An unanswered read is not an observation of absence: the created ref is still ours to remove.
+      expect(assessRefOwnership(world.probeRecords(), { workflowSha: world.sha }).may_delete).toBe(true);
+      let deletions = 0;
+      const cleaned: any = await world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } });
+      expect([cleaned.outcome, deletions, world.refSha()]).toEqual(["inconclusive", 1, null]);
+    });
+
+    it("derives R06's ref rules from the journal alone, so a fresh process agrees", () => {
+      const sha = "a".repeat(40);
+      const facts = (status: number) => ({ http_status: status, response_complete: true, response_incomplete: null, measured_status: status });
+      const record = (seq: number, type: string, data: unknown) => ({ seq, type, data });
+      const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), object_sha: sha })];
+      // A complete 404 under `ref-readback` is the same disappearance as one under `absence-verified`.
+      const vanished = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, ...facts(404), object_sha: null, measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+      expect([vanished.state, vanished.may_delete, vanished.may_accept]).toEqual(["uncertain", false, false]);
+      // An INCOMPLETE read of the same thing decides nothing at all.
+      const unread = assessRefOwnership([...created, record(2, "ref-readback", { ref: PROBE_REF, http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null, measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+      expect([unread.state, unread.may_delete]).toEqual(["owned", true]);
+      // An ambiguous deletion plus the ref still at the reviewed bytes: undecided, and NOT deletable.
+      const undecided = [...created,
+        record(2, "cleanup-intent", { ref: PROBE_REF, expected_sha: sha }),
+        record(3, "cleanup-result", { ref: PROBE_REF, expected_sha: sha, outcome: "ambiguous", exit_code: 128 }),
+        record(4, "reconciliation", { of: "cleanup-intent", outcome: "present-unchanged", object_sha: sha, measured_at: "2026-09-21T12:00:00Z" })];
+      const stillUndecided = assessRefOwnership(undecided, { workflowSha: sha });
+      expect([stillUndecided.state, stillUndecided.may_delete, stillUndecided.may_accept]).toEqual(["owned", false, false]);
+      // Repeating the observation does not wear the refusal down.
+      const repeated = assessRefOwnership([...undecided, record(5, "reconciliation", { of: "cleanup-intent", outcome: "present-unchanged", object_sha: sha, measured_at: "2026-09-21T12:05:00Z" })], { workflowSha: sha });
+      expect(repeated.may_delete).toBe(false);
+      // An EXACT ABSENCE is an observation about this ref, and it does decide it — applied.
+      const settled = assessRefOwnership([...undecided, record(5, "absence-verified", { ref: PROBE_REF, ...facts(404), measured_at: "2026-09-21T12:05:00Z" })], { workflowSha: sha });
+      expect([settled.state, settled.may_accept, settled.may_delete]).toEqual(["ended", true, false]);
+    });
+  });
+
+  describe("R06-F2: an interrupted attempt can still be recovered from, under its original bounds", () => {
+    it("identifies, cancels and confirms the exact owned run after the FIRST collection was interrupted", async () => {
+      world.seedOriginal();
+      world.neverComplete = true;
+      await world.phase("stage");
+      await world.phase("dispatch");
+
+      // The move is measured at the first collection boundary, before any run was ever identified.
+      await expect(world.phase("collect", { transport: drifting(world) })).rejects.toThrow(/interrupted/);
+      expect(world.probeRecords().some((record: any) => record.type === "run-identified")).toBe(false);
+      expect(world.runState(world.runs[0]).status).toBe("queued");
+
+      // Staging is back, and the attempt is still disqualified — but its own run is still its own.
+      const cancelled: any = await world.phase("cancel");
+      expect(cancelled.status).toBe("cancelled");
+      const events = world.probeRecords().map((record: any) => record.type);
+      expect(events).toContain("run-identified");
+      expect(events).toContain("run-terminal");
+      expect([world.count("POST", "/cancel"), world.count("POST", "/dispatches")]).toEqual([1, 1]);
+
+      // And the ref this run created goes, with the close honestly inconclusive.
+      const cleaned: any = await world.phase("cleanup");
+      expect([cleaned.outcome, world.refSha()]).toEqual(["inconclusive", null]);
+      expect(assessSourceContinuity(world.probeRecords() as any).interrupted).toBe(true);
+      // A later collection is still refused: cleaning up is not qualifying.
+      await expect(world.phase("collect")).rejects.toThrow(/already-closed|interrupted|closed/);
+    });
+
+    it("cleans up after an interruption even when the owned run reached a terminal state by itself", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      await world.phase("dispatch");
+      await expect(world.phase("collect", { transport: drifting(world) })).rejects.toThrow(/interrupted/);
+      world.clock += 60_000; // the run finishes on its own while the attempt is interrupted
+      // No cancellation is aimed at a run that has already finished: it is reconciled as terminal.
+      const cancelled: any = await world.phase("cancel");
+      expect(cancelled.status).toBe("cancelled");
+      expect(world.count("POST", "/cancel")).toBe(0);
+      const terminal = world.probeRecords().find((record: any) => record.type === "run-terminal");
+      expect(terminal.data.status).toBe("completed");
+      const cleaned: any = await world.phase("cleanup");
+      expect([cleaned.outcome, world.refSha()]).toEqual(["inconclusive", null]);
+    });
+
+    /**
+     * ZERO, DUPLICATE AND FOREIGN CANDIDATES ARE BLOCKED THROUGH **BOTH** RECOVERY PHASES.
+     *
+     * The recovery primitive cannot pick one of an unresolved set — but refusing only the selection
+     * is not enough. If cleanup then went ahead, it would delete the ref out from under a run that
+     * may still be live and file the probe as though the question had been settled. So a run set
+     * nobody resolved blocks the deletion AND the close, and the evidence stays for root
+     * reconciliation. No cancellation is issued in any of these shapes.
+     */
+    const blockedCandidates: Array<{ shape: string; arrange: (w: World) => void; cancel: RegExp; cleanup: RegExp; unidentified: boolean }> = [
+      {
+        shape: "duplicate", arrange: (w) => { w.runsPerDispatch = 2; },
+        cancel: /2 eligible probe runs exist/, cleanup: /NOT deleted and the journal is NOT closed/, unidentified: true,
+      },
+      {
+        shape: "zero", arrange: (w) => { w.runsPerDispatch = 0; },
+        cancel: /no eligible probe run appeared by the deadline/, cleanup: /NOT deleted and the journal is NOT closed/, unidentified: true,
+      },
+      // Foreign: a run on the fixed ref that some other dispatcher started. Selection refuses ON the
+      // foreign identity itself — it does not quietly become "no eligible run" — so this one never
+      // even reaches the unresolved-set rule, and every phase keeps refusing for the same reason.
+      {
+        shape: "foreign",
+        arrange: (w) => {
+          const body = w.runBody.bind(w);
+          w.runBody = ((entry: any) => ({ ...body(entry), triggering_actor: { id: 999, login: "someone-else", type: "User" } })) as any;
+        },
+        cancel: /is not this probe's own run .*nothing is selected and nothing is cancelled/s,
+        cleanup: /is not this probe's own run .*nothing is selected and nothing is cancelled/s,
+        unidentified: false,
+      },
+    ];
+
+    for (const { shape, arrange, cancel: cancelRefusal, cleanup: cleanupRefusal, unidentified } of blockedCandidates) {
+      it(`blocks ${shape} candidates through cancel AND cleanup, deleting nothing and closing nothing`, async () => {
+        const local = new World();
+        try {
+          local.seedOriginal();
+          local.neverComplete = true;
+          arrange(local);
+          await local.phase("stage");
+          await local.phase("dispatch");
+          await expect(local.phase("collect", { transport: drifting(local) })).rejects.toThrow(/interrupted/);
+          local.clock += 11 * 60_000; // past the ORIGINAL deadline, which no new invocation extends
+
+          // CANCEL: no exact ownership, so no cancellation — the ambiguity is preserved, not resolved.
+          await expect(local.phase("cancel")).rejects.toThrow(cancelRefusal);
+          expect(local.count("POST", "/cancel")).toBe(0);
+
+          // CLEANUP: no closure over a run nobody resolved, and the owned ref is left in place.
+          let deletions = 0;
+          const deleteRef = async () => { deletions += 1; local.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+          await expect(local.phase("cleanup", { deleteRef })).rejects.toThrow(cleanupRefusal);
+          expect([deletions, local.refSha()]).toEqual([0, local.sha]);
+          expect(local.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
+          expect(local.probeRecords().some((record: any) => record.type === "cleanup-intent")).toBe(false);
+
+          // A second attempt re-derives the same refusal; repetition is not a way through.
+          await expect(local.phase("cleanup", { deleteRef })).rejects.toThrow(cleanupRefusal);
+          expect([deletions, local.count("POST", "/cancel"), local.refSha()]).toEqual([0, 0, local.sha]);
+          // Whatever the candidate set was, it stays on the record for root reconciliation.
+          expect(local.probeRecords().some((record: any) => record.type === "run-unidentified")).toBe(unidentified);
+        } finally { rmSync(local.root, { recursive: true, force: true }); }
+      });
+    }
+
+    it("keeps the distinct outcome of a dispatch positively reconciled to no run at all", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      const transport = async (method: string, requestPath: string, body?: unknown) => {
+        if (method === "POST" && requestPath.endsWith("/dispatches")) { world.calls.push({ method, path: requestPath }); throw new Error("simulated interruption before the provider applied anything"); }
+        return world.transport(method, requestPath, body);
+      };
+      await expect(world.phase("dispatch", { transport })).rejects.toThrow(/simulated interruption/);
+      await expect(world.phase("collect")).rejects.toThrow(/no eligible probe run/);
+      // `absent` is a FINDING about the dispatch — the provider created nothing — not an unanswered
+      // question, so it is not the blocked case above and the owned ref may still be removed.
+      expect(world.probeRecords().some((record: any) => record.type === "reconciliation"
+        && record.data.of === "dispatch-intent" && record.data.outcome === "absent")).toBe(true);
+      const cleaned: any = await world.phase("cleanup");
+      expect([cleaned.outcome, world.refSha()]).toEqual(["inconclusive", null]);
+    });
+
+    it("does not hand a restarted process a fresh cancellation-confirmation budget", async () => {
+      world.seedOriginal();
+      world.neverComplete = true;
+      world.terminalOnCancel = false;
+      await world.phase("stage");
+      await world.phase("dispatch");
+      await expect(world.phase("collect")).rejects.toThrow(/cleanup is BLOCKED/);
+      const afterFirst = world.clock;
+      // A second explicit cancel re-confirms against the FIRST cancellation's own two minutes, which
+      // have already run out — it does not wait another two, and it issues no second request.
+      await expect(world.phase("cancel")).rejects.toThrow(/BLOCKED/);
+      expect(world.count("POST", "/cancel")).toBe(1);
+      expect(world.clock - afterFirst).toBeLessThan(120_000);
+      expect(world.refSha()).toBe(world.sha);
+    });
+  });
+
+  describe("R06-F3: a measured move is written down before the phase refuses", () => {
+    it("keeps a dispatch-time move, and the restored head never revives the attempt", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      await expect(world.phase("dispatch", { transport: drifting(world) })).rejects.toThrow(/interrupted/);
+      const moved = world.probeRecords().filter((record: any) => record.type === SOURCE_OBSERVED_EVENT && record.data.moved === true);
+      expect(moved.map((record: any) => [record.data.phase, record.data.mode])).toEqual([["dispatch", "enforce"]]);
+      // Nothing was created and nothing was dispatched at the moved source.
+      expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches"), world.refSha()]).toEqual([0, 0, null]);
+
+      // Staging is back. The attempt is still interrupted, because it is the HISTORY that refuses.
+      await expect(world.phase("dispatch")).rejects.toThrow(/interrupted/);
+      await expect(world.phase("collect")).rejects.toThrow(/interrupted/);
+      expect([world.count("POST", "/git/refs"), world.count("POST", "/dispatches")]).toEqual([0, 0]);
+      // No observation exists to be accepted, and the probe closes owning nothing.
+      expect(world.probeRecords().some((record: any) => record.type === "observation-recorded")).toBe(false);
+      const cleaned: any = await world.phase("cleanup");
+      expect(cleaned.status).toBe("nothing-owned");
+      const closed = world.probeRecords().find((record: any) => record.type === "probe-closed");
+      expect(closed.data.outcome).toBe("inconclusive");
+    });
+
+    it("keeps a stage-time move in the original attempt's own journal, and staging again refuses", async () => {
+      world.seedOriginal();
+      await expect(world.phase("stage", { transport: drifting(world) })).rejects.toThrow(/interrupted/);
+      const resource = readJournal({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT });
+      const moved = resource.filter((record: any) => record.type === SOURCE_OBSERVED_EVENT && record.data.moved === true);
+      expect(moved.map((record: any) => record.data.phase)).toEqual(["stage"]);
+      // Nothing was staged: no probe intent, no link into the original journal, no probe journal.
+      expect(resource.some((record: any) => record.type === "probe-staged")).toBe(false);
+      expect(readdirSync(world.dir).includes(probeIntentName(RUN_ID, ATTEMPT))).toBe(false);
+      expect(world.probeRecords()).toHaveLength(0);
+
+      // Restored staging, fresh process — the recorded move is what answers.
+      await expect(world.phase("stage")).rejects.toThrow(/interrupted/);
+      expect(readdirSync(world.dir).includes(probeIntentName(RUN_ID, ATTEMPT))).toBe(false);
+    });
+
+    it("refuses a later non-moved observation appended to launder an interrupted history", async () => {
+      world.seedOriginal();
+      await world.phase("stage");
+      await world.phase("dispatch");
+      const collected: any = await world.phase("collect");
+      const cleaned: any = await world.phase("cleanup", { transport: drifting(world) });
+      expect(cleaned.outcome).toBe("inconclusive");
+      // The valid paired observation is a real one — what it lacks is a qualifying attempt.
+      expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/interrupted|not closed as a measured probe/);
+    });
+
+    it("accepts the complete normal paired lifecycle unchanged", async () => {
+      const collected: any = await world.fullProbe();
+      for (const spec of PROBE_JOBS) expect(world.validate(collected.records[spec.environment], spec.environment)).toBeNull();
+      const observed = world.probeRecords().filter((record: any) => record.type === SOURCE_OBSERVED_EVENT);
+      expect(observed.map((record: any) => record.data.phase)).toEqual(["stage", "dispatch", "collect", "cleanup"]);
+    });
   });
 });

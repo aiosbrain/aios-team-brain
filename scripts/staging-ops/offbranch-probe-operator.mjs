@@ -935,11 +935,6 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     if (ownership.state === "uncertain") {
       throw ownership.severity === "assertion" ? new AssertionFailure(ownership.reason) : new IncompleteEvidence(ownership.reason);
     }
-    if (ownership.state === "unowned") {
-      if (unresolvedProbeIntents(records).length) throw new IncompleteEvidence("an unresolved probe intent remains; reconcile before closing");
-      probe.append("probe-closed", { outcome: "inconclusive" });
-      return result(session, "cleanup", "nothing-owned", { note: "No owned probe ref exists; the journal is closed as inconclusive." });
-    }
     // AFTER TERMINAL CAPTURE: an identified run must be terminal, and a terminal failure collected.
     let identified = records.find((record) => record.type === "run-identified");
     const dispatchIntent = records.find((record) => record.type === "dispatch-intent");
@@ -956,6 +951,28 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     if (dispatchIntent && !dispatchRefused && !identified && !records.some((record) => record.type === "run-unidentified")) {
       identified = await reconcileOwnedRun(session, probe, "clean up");
       records = probe.records();
+    }
+    // ── NOTHING IS DELETED OR CLOSED OVER A RUN SET NOBODY RESOLVED (R06) ────────────────────────
+    // Zero, duplicate and foreign candidates are BLOCKED here, not just at selection. The recovery
+    // primitive above deliberately cannot pick one of them, so at this point the attempt either owns
+    // exactly one run or owns no knowledge of what it started — and in the second case a live run
+    // may still be holding the very ref this phase is about to remove. Refusing keeps the evidence
+    // and hands it to root reconciliation, which is the only authority that can resolve it.
+    //
+    // The ONE resolved reading of "no run" is a dispatch this probe reconciled to `absent`: that is
+    // a positive finding that the provider never created anything, not an unanswered question, and
+    // it keeps its own distinct outcome.
+    if (records.some((record) => record.type === "run-unidentified")) {
+      const noRun = records.some((record) => record.type === "reconciliation"
+        && record.data.of === "dispatch-intent" && record.data.outcome === "absent");
+      if (!noRun) {
+        throw new IncompleteEvidence("this probe's dispatched run was never resolved to exactly one owned run; a run it started may still be live, so the owned ref is NOT deleted and the journal is NOT closed — the evidence is retained for root reconciliation");
+      }
+    }
+    if (ownership.state === "unowned") {
+      if (unresolvedProbeIntents(records).length) throw new IncompleteEvidence("an unresolved probe intent remains; reconcile before closing");
+      probe.append("probe-closed", { outcome: "inconclusive" });
+      return result(session, "cleanup", "nothing-owned", { note: "No owned probe ref exists; the journal is closed as inconclusive." });
     }
     const terminal = records.find((record) => record.type === "run-terminal");
     if (identified && !terminal) throw new IncompleteEvidence("the probe run is not terminal; cancel (or collect) it before cleanup");
