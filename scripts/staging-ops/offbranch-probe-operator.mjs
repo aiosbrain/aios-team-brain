@@ -752,13 +752,17 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
     // before anything is captured so a restored head cannot erase it.
     const interrupted = sourceInterruption(recordSourceObservation(session, probe, "collect"));
     if (interrupted) throw new IncompleteEvidence(`${interrupted}; clean up next`);
-    let records = probe.records();
     const identified = await reconcileOwnedRun(session, probe, "collect");
     const probeRunId = identified.data.run_id;
     // Binding a run this process did not itself select — a resumed collection — re-proves it first.
     await bindProbeRun(session, probeRunId, "before collecting it");
 
-    records = probe.records();
+    let records = probe.records();
+    // THE ORIGINAL WINDOW, re-read from the durable intent the reconciliation selected within, so
+    // the wait and the capture bounds are the ones this attempt has had all along.
+    const dispatch = records.find((record) => record.type === "dispatch-intent");
+    const dispatchMs = Date.parse(dispatch.ts);
+    const deadlineMs = Date.parse(dispatch.data.deadline_at);
     let terminalRecord = records.find((record) => record.type === "run-terminal");
     if (!terminalRecord) {
       const terminal = await waitTerminal(session, probeRunId, deadlineMs);
