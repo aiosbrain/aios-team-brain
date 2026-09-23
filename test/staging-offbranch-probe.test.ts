@@ -2276,12 +2276,13 @@ describe("phase admission and terminal recovery", () => {
     });
   }
 
-  for (const shape of ["missing-total", "mismatched-total", "malformed-page", "truncated-pages", "malformed-diagnostic"]) {
+  for (const shape of ["missing-total", "mismatched-total", "malformed-page", "invalid-json-page", "truncated-pages", "malformed-diagnostic"]) {
     it(`terminal ${shape} remains nonaccepting but explicit abort and repeated cleanup recover the exact owned ref`, async () => {
       world.seedOriginal(); await invoke("stage"); await invoke("dispatch");
       const transport = async (method: string, route: string, body: any) => {
         const response: any = world.respond(method, route, body);
         if (/\/actions\/runs\/\d+\/jobs\?/.test(route)) {
+          if (shape === "invalid-json-page") return completedJsonResponse(response.status, Buffer.from("{"), createRedactor(), { retainRaw: true });
           if (shape === "missing-total") delete response.body.total_count;
           if (shape === "mismatched-total") response.body.total_count += 1;
           if (shape === "malformed-page") response.body.jobs = { malformed: true };
@@ -2298,8 +2299,38 @@ describe("phase admission and terminal recovery", () => {
       expect(world.refSha()).toBeNull();
       expect(world.count("POST", "/cancel")).toBe(0);
       expect(assessProbePhaseState(world.probeRecords(), { workflowSha: world.sha }).qualification).toBe("inconclusive");
+      expect(validateEnvironmentControl(undefined, {
+        dir: world.dir, key: OFFBRANCH_CONTROL, environment: "staging-release", runId: RUN_ID, attempt: ATTEMPT,
+        window: world.trusted().window, offbranch: world.trusted(),
+      })).toBe("is absent");
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT, controls: {},
+      });
+      expect(assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers
+        .some((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toBe(true);
     });
   }
+
+  it("refuses corrupt supporting evidence for a previously proved admission instead of trusting the event", async () => {
+    world.seedOriginal(); await invoke("stage"); world.admitted = "probe-release"; await invoke("dispatch");
+    await expect(invoke("collect", { transport: unavailable })).rejects.toThrow(/admitted/);
+    const admission = world.probeRecords().find((row: any) => row.type === "admission-observed");
+    expect(admission?.data.environment).toBe("staging-release");
+    writeFileSync(path.join(world.dir, admission.data.jobs_descriptor.artifact), "{}\n");
+    await expect(invoke("cancel")).rejects.toThrow(/digest/);
+    expect(world.probeRecords().some((row: any) => row.type === "qualification-ended")).toBe(false);
+    expect(world.refSha()).toBe(world.sha);
+  });
+
+  it("rethrows a local jobs descriptor integrity failure and does not convert it to provider incompleteness", async () => {
+    world.seedOriginal(); await invoke("stage"); await invoke("dispatch");
+    await expect(invoke("collect", { transport: unavailable })).rejects.toThrow();
+    const jobs = world.probeRecords().find((row: any) => row.type === "capture-recorded" && row.data.kind === "jobs");
+    writeFileSync(path.join(world.dir, jobs.data.descriptor.artifact), "not the retained descriptor\n");
+    await expect(invoke("cancel")).rejects.toThrow(/digest/);
+    expect(world.probeRecords().some((row: any) => row.type === "qualification-ended")).toBe(false);
+    expect(world.refSha()).toBe(world.sha);
+  });
 });
 
 
