@@ -1449,7 +1449,7 @@ describe("lifecycle ownership: create once, dispatch once, never adopt, never re
     await world.phase("dispatch");
     await world.phase("collect");
     world.setRef(world.otherSha);
-    await expect(world.phase("cleanup")).rejects.toThrow(/did not create/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/not the fixed probe ref at the reviewed commit/);
     expect(world.refSha()).toBe(world.otherSha);
   });
 
@@ -1844,7 +1844,7 @@ describe("R04-F4: a successful deletion owns the recovery of its own missing rea
           : local.transport(method, requestPath, body));
       await expect(local.phase("cleanup", { transport, deleteRef })).rejects.toThrow(/absence could not be confirmed/);
       local.setRef(local.otherSha);
-      await expect(local.phase("cleanup")).rejects.toThrow(/never deleted/);
+      await expect(local.phase("cleanup")).rejects.toThrow(/not the fixed probe ref at the reviewed commit/);
       expect(local.refSha()).toBe(local.otherSha);
     } finally { rmSync(local.root, { recursive: true, force: true }); }
   });
@@ -1893,7 +1893,7 @@ describe("R05-F1: a successful deletion ends that creation's ownership irreversi
     await world.phase("dispatch");
     const collected: any = await world.phase("collect");
     world.setRef(world.otherSha);
-    await expect(world.phase("cleanup")).rejects.toThrow(/did not create/);
+    await expect(world.phase("cleanup")).rejects.toThrow(/not the fixed probe ref at the reviewed commit/);
 
     // Restored to the exact bytes this probe created — and still not this probe's ref.
     world.setRef(world.sha);
@@ -2380,7 +2380,7 @@ describe("R07: observable mutation uncertainty and current cleanup authority", (
       const collected: any = await world.phase("collect");
       let deletes = 0;
       const deleteRef = async () => { deletes++; world.setRef(null); world.setRef(changed ? world.otherSha : world.sha); return { outcome: "deleted", exit_code: 0 }; };
-      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create/);
+      await expect(world.phase("cleanup", { deleteRef })).rejects.toThrow(/inconsistent|points elsewhere|SHA this probe did not create|not the fixed probe ref at the reviewed commit/);
       expect(world.probeRecords().some((r: any) => r.type === "ref-readback" && r.data.http_status === 200
         && r.seq > world.probeRecords().find((e: any) => e.type === "cleanup-result").seq)).toBe(true);
       world.setRef(null);
@@ -2624,7 +2624,7 @@ describe("phase admission and terminal recovery", () => {
       } })).rejects.toThrow(/cut/);
       if (apply) {
         await expect(invoke("cleanup")).rejects.toThrow(/uncertain/);
-        world.setRef(null); await expect(invoke("cleanup")).rejects.toThrow(/uncertain/);
+        world.setRef(null); await expect(invoke("cleanup")).rejects.toThrow(/uncertain|not the fixed probe ref at the reviewed commit/);
       } else { expect((await invoke("cleanup")).status).toBe("nothing-owned"); expect((await invoke("cleanup")).status).toBe("already-closed"); }
       expect(world.count("POST", "/git/refs")).toBe(1);
       expect(world.count("POST", "/dispatches")).toBe(0);
