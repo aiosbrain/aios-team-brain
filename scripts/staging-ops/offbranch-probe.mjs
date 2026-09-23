@@ -205,6 +205,10 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "cleanup-result": Object.freeze(["ref", "expected_sha", "outcome", "exit_code"]),
   "absence-verified": Object.freeze(["ref", ...RESPONSE_FACTS, "measured_at"]),
   reconciliation: Object.freeze(["of", "outcome", "object_sha", "measured_at"]),
+  // The measured live source, KEPT (R05-F2). `observe` mode reports a move instead of throwing so
+  // that cleanup can still remove what the run created; the report is worthless unless the phase
+  // that took it writes it into the bound history, which is what this event is.
+  "source-observed": Object.freeze(["phase", "mode", "moved", "staging_sha", "trusted_source_sha", "measured_at"]),
   "probe-closed": Object.freeze(["outcome"]),
 });
 export const PROBE_JOURNAL_EVENT_TYPES = Object.freeze(Object.keys(PROBE_JOURNAL_EVENTS));
@@ -215,6 +219,7 @@ export const PROBE_INTENT_PAIRS = Object.freeze({
   "cancel-intent": "cancel-result",
   "cleanup-intent": "cleanup-result",
 });
+export const SOURCE_OBSERVED_EVENT = "source-observed";
 export const CLEANUP_OUTCOMES = Object.freeze(["deleted", "lease-refused", "ambiguous"]);
 export const OBSERVATION_OUTCOMES = Object.freeze(["refused", "admitted", "unverified"]);
 export const PROBE_CLOSED_OUTCOMES = Object.freeze(["measured", "inconclusive", "failed"]);
@@ -816,6 +821,157 @@ export function unresolvedProbeIntents(records) {
   return open;
 }
 
+export const REF_OWNERSHIP_STATES = Object.freeze(["unowned", "owned", "ended", "uncertain"]);
+
+/**
+ * ── THE OWNED PROBE REF'S LIFECYCLE, DERIVED FROM THE WHOLE HISTORY (R05-F1) ────────────────────
+ *
+ * Authority to mutate the probe ref — and the right to close the probe as MEASURED — is a property
+ * of the ACCUMULATED append-only history, never of the newest record. What this replaces read the
+ * last cleanup reconciliation as confirmation of the last deletion RESULT, so after a successful
+ * deletion whose absence readback was lost, a third invocation took "a reconciliation exists" as
+ * permission, issued a SECOND lease deletion, and removed a ref another creator had put back at the
+ * same bytes — then closed the probe measured and passed the offline assessment.
+ *
+ * The rules, in the order they bind:
+ *
+ *  - Ownership begins ONLY at a complete 201 create of the fixed ref at the reviewed source.
+ *  - A deletion this probe recorded as SUCCESSFUL ends that ownership irreversibly. Presence
+ *    afterwards is a contradiction, never continuity: an equal SHA is equal BYTES, and bytes are
+ *    not a continuous resource. A same-SHA recreation is somebody else's ref.
+ *  - A ref measured at another SHA ends it too, and a later return to the reviewed SHA does not
+ *    revive it. The state is monotonic, so a restored value cannot walk the contradiction back.
+ *  - An UNDECIDED deletion — an ambiguous transport, or an intent whose result was never appended
+ *    — stays undecided until evidence about THAT SAME operation decides it. Absence decides it
+ *    applied. Presence at the reviewed SHA decides it unapplied ONLY while no successful deletion
+ *    is on record; that, and only that, is the case that may issue one fresh lease deletion.
+ *  - Absence with no deletion of ours on record is a broken ownership history, not a clean end.
+ *
+ * `uncertain` is terminal, and it survives a fresh process precisely because it is re-derived from
+ * the journal rather than held in memory. The operator and the offline assessment both derive from
+ * here, so neither can admit an action the other would refuse.
+ */
+export function assessRefOwnership(records, { workflowSha }) {
+  let state = "unowned";
+  let reason = null;
+  let severity = null;
+  /** An issued deletion whose effect on THIS ref no evidence has decided yet. */
+  let pending = null;
+  let deleted = false;
+  let absenceConfirmed = false;
+
+  const contradict = (why, how) => {
+    if (state === "uncertain") return;
+    state = "uncertain";
+    reason = why;
+    severity = how;
+    pending = null;
+  };
+  const observePresent = (objectSha, changedReason) => {
+    if (state === "uncertain" || state === "unowned") return;
+    if (objectSha !== workflowSha) return contradict(changedReason, "assertion");
+    if (state === "ended") {
+      return contradict("a deletion this probe recorded as successful did not remove the owned probe ref; that history is inconsistent, so no second deletion is issued — root reconciliation is required", "incomplete");
+    }
+    pending = null;
+  };
+  const observeAbsent = () => {
+    if (state === "uncertain" || state === "unowned") return;
+    if (state === "owned" && !pending) {
+      return contradict("the owned probe ref disappeared without this probe deleting it; its ownership history is broken", "assertion");
+    }
+    state = "ended";
+    absenceConfirmed = true;
+    pending = null;
+  };
+
+  for (const record of records ?? []) {
+    const data = record?.data ?? {};
+    switch (record?.type) {
+      case "ref-create-result":
+        if (state === "unowned" && data.response_complete === true && data.http_status === 201 && data.object_sha === workflowSha) state = "owned";
+        break;
+      case "ref-readback":
+        if (data.response_complete === true && data.http_status === 200) {
+          observePresent(String(data.object_sha ?? ""), "the owned probe ref points at a SHA this probe did not create; it is never deleted");
+        }
+        break;
+      case "absence-verified":
+        if (data.response_complete === true && data.http_status === 404) observeAbsent();
+        break;
+      case "cleanup-intent":
+        if (state === "owned") pending = Object.freeze({ seq: record.seq, of: "cleanup-intent", outcome: null });
+        break;
+      case "cleanup-result":
+        if (data.outcome === "deleted") {
+          deleted = true;
+          if (state === "ended") contradict("a second deletion was issued against a ref this probe had already deleted; the ownership history is inconsistent — root reconciliation is required", "assertion");
+          else if (state === "owned") { state = "ended"; pending = Object.freeze({ seq: record.seq, of: "cleanup-result", outcome: "deleted" }); }
+        } else if (data.outcome === "lease-refused") {
+          contradict("the owned probe ref changed and its lease deletion was refused; it is never deleted at another SHA", "assertion");
+        } else if (state === "owned") {
+          pending = Object.freeze({ seq: record.seq, of: "cleanup-result", outcome: "ambiguous" });
+        }
+        break;
+      case "reconciliation":
+        if (data.of === "ref-create-intent") {
+          if (data.outcome === "present-ownership-uncertain") {
+            contradict("the probe ref's ownership is uncertain; it is never deleted automatically — root reconciliation is required", "incomplete");
+          }
+        } else if (data.of === "cleanup-intent") {
+          if (data.outcome === "absent") observeAbsent();
+          else if (data.outcome === "present-unchanged" || data.outcome === "present-changed") {
+            // The RECORDED SHA decides, not the label: a row that claims "unchanged" about another
+            // commit is describing a ref this probe did not create.
+            observePresent(String(data.object_sha ?? ""), "the owned probe ref now points elsewhere; it is never deleted at another SHA");
+          } else if (data.outcome === "present-ownership-uncertain") {
+            contradict("the owned probe ref's cleanup was reconciled to a ref whose ownership was never established; root reconciliation is required", "incomplete");
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return Object.freeze({
+    state, reason, severity, deleted, absence_confirmed: absenceConfirmed,
+    pending,
+    /** One fresh lease deletion is admissible only against an ownership the history still supports. */
+    may_delete: state === "owned" && pending === null,
+    /** A measured close, and offline acceptance, need the owned ref gone and its absence measured. */
+    may_accept: state === "ended" && absenceConfirmed && pending === null,
+  });
+}
+
+/**
+ * ── THE MEASURED LIVE SOURCE, KEPT (R05-F2) ────────────────────────────────────────────────────
+ *
+ * `assertSourceContinuity` in `observe` mode deliberately REPORTS a staging move instead of
+ * throwing, so that the phase whose job is to remove what the run created is not blocked by the
+ * move. The reporting only means anything if the caller writes the observation into the bound
+ * history: the defect this replaces obtained the result in every local probe phase and consumed it
+ * in none, so a collection that measured staging at a different commit still returned `measured`,
+ * and once staging came back the closure and the offline assessment saw nothing at all.
+ *
+ * An interruption is monotonic. It is recorded under the original attempt's own hash-chained probe
+ * journal, so a restored staging head, a later phase or a fresh process re-derives it unchanged.
+ */
+export function assessSourceContinuity(records) {
+  const observations = (records ?? []).filter((record) => record?.type === SOURCE_OBSERVED_EVENT);
+  const moved = observations.filter((record) => record.data?.moved === true);
+  return Object.freeze({
+    observed: observations.length,
+    phases: Object.freeze(observations.map((record) => String(record.data?.phase ?? ""))),
+    interrupted: moved.length > 0,
+    first_move: moved.length
+      ? Object.freeze({
+        seq: moved[0].seq, phase: String(moved[0].data.phase ?? ""),
+        staging_sha: String(moved[0].data.staging_sha ?? ""), measured_at: String(moved[0].data.measured_at ?? ""),
+      })
+      : null,
+  });
+}
+
 const only = (records, type, label) => {
   const matches = records.filter((record) => record.type === type);
   if (matches.length !== 1) refuse(`the probe journal records ${matches.length} ${label ?? type} event(s), not exactly one`);
@@ -909,6 +1065,33 @@ export function assessProbeLifecycle(records, { dir, intentSha256, intentArtifac
     refuse("the owned probe ref's absence was not verified after cleanup");
   }
   if (records.some((record) => record.type === "cleanup-result" && record.data.outcome === "lease-refused")) refuse("the owned probe ref changed and its cleanup was refused");
+
+  // ── THE SAME DERIVATION THE OPERATOR ACTS ON (R05) ───────────────────────────────────────────
+  // Acceptance follows from the accumulated lifecycle, so a contradiction recorded at any point —
+  // a ref that came back after a successful deletion, a ref that moved and was put back, a
+  // deletion still undecided — refuses here exactly as it refuses the next mutation.
+  const ownership = assessRefOwnership(records, { workflowSha });
+  if (!ownership.may_accept) {
+    refuse(`the owned probe ref's accumulated lifecycle does not support acceptance (${ownership.reason ?? `ownership is ${ownership.state}`})`);
+  }
+
+  // ── THE MEASURED SOURCE (R05-F2) ─────────────────────────────────────────────────────────────
+  const observed = records.filter((record) => record.type === SOURCE_OBSERVED_EVENT);
+  if (!observed.length) refuse("the probe journal records no measured source-continuity observation");
+  for (const record of observed) {
+    if (typeof record.data.moved !== "boolean") refuse("a probe source observation does not record whether the source moved");
+    const staging = String(record.data.staging_sha ?? "");
+    const trusted = String(record.data.trusted_source_sha ?? "");
+    if (!/^[0-9a-f]{40}$/.test(staging) || trusted !== workflowSha) refuse("a probe source observation is not a full live staging head measured against this attempt's trusted source");
+    if (record.data.moved !== (staging !== trusted)) refuse("a probe source observation's move flag contradicts the commits it records");
+    timeOf(record.data.measured_at, "a probe source observation's measured time");
+  }
+  const continuity = assessSourceContinuity(records);
+  if (!continuity.phases.includes("collect")) refuse("the probe collection recorded no measured source-continuity observation");
+  if (continuity.interrupted) {
+    refuse(`the probe measured the live staging head at ${continuity.first_move.staging_sha.slice(0, 12)} during ${continuity.first_move.phase}; the attempt is interrupted and is never accepted`);
+  }
+
   const closed = only(records, "probe-closed");
   if (closed.seq !== records[records.length - 1].seq || closed.data.outcome !== "measured") refuse("the probe journal is not closed as a measured probe");
   const policies = records.filter((record) => record.type === "policy-captured");

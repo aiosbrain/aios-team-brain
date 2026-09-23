@@ -21,7 +21,7 @@ import {
 import { acquireJournalLock, openJournal, readJournal } from "../scripts/staging-ops/commissioning-journal.mjs";
 import {
   GENERIC_DIAGNOSTIC_MESSAGE, OFFBRANCH_CONTROL, PROBE_BRANCH, PROBE_JOBS, PROBE_JOURNAL_EVENTS, PROBE_REF,
-  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, assertPolicyAgreesWithCommissioning, commissioningIdentity,
+  PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, SOURCE_OBSERVED_EVENT, assertPolicyAgreesWithCommissioning, assessRefOwnership, commissioningIdentity,
   parseCheckRunUrl, parseDiagnosticAnnotations, parseEnvironmentPolicy, parseProbeCheck, parseProbeJobs, parseProbeRun,
   probeIntentName, probeObservationName, selectEligibleRuns, specificDiagnosticMessage,
 } from "../scripts/staging-ops/offbranch-probe.mjs";
@@ -1217,5 +1217,205 @@ describe("R04-F4: a successful deletion owns the recovery of its own missing rea
       await expect(local.phase("cleanup")).rejects.toThrow(/never deleted at another SHA/);
       expect(local.refSha()).toBe(local.otherSha);
     } finally { rmSync(local.root, { recursive: true, force: true }); }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// R05. Authority and acceptance derive from the ACCUMULATED history, never the newest record.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/** A cleanup deletion that succeeds locally but whose absence readback is then lost. */
+const losingDeleter = (target: World, deletions: { count: number }) => async () => {
+  deletions.count += 1;
+  target.setRef(null);
+  target.lose[`GET /repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`] = "lost-unapplied";
+  return { outcome: "deleted", exit_code: 0 };
+};
+
+describe("R05-F1: a successful deletion ends that creation's ownership irreversibly", () => {
+  it("never issues a second deletion against a same-SHA ref recreated after a confirmed deletion, however often cleanup is retried", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    const deletions = { count: 0 };
+    await expect(world.phase("cleanup", { deleteRef: losingDeleter(world, deletions) })).rejects.toThrow(/absence could not be confirmed/);
+    expect(deletions.count).toBe(1);
+
+    // Another creator now owns a ref at the same bytes. Equal bytes are not a continuous resource.
+    world.setRef(world.sha);
+    await expect(world.phase("cleanup")).rejects.toThrow(/no second deletion/);
+    // ...and the reconciliation that refusal recorded is a FACT, never a later permission: every
+    // further invocation, in this process or a fresh one, derives the same refusal.
+    for (let retry = 0; retry < 3; retry += 1) {
+      await expect(world.phase("cleanup", { deleteRef: losingDeleter(world, deletions) })).rejects.toThrow(/no second deletion/);
+    }
+    expect(deletions.count).toBe(1);
+    expect(world.refSha()).toBe(world.sha);
+    expect(world.probeRecords().some((record: any) => record.type === "probe-closed")).toBe(false);
+    // And the measurement that lifecycle produced is not accepted offline.
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance|no second deletion/);
+  });
+
+  it("does not revive a changed ref that is put back at the reviewed SHA", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    world.setRef(world.otherSha);
+    await expect(world.phase("cleanup")).rejects.toThrow(/did not create/);
+
+    // Restored to the exact bytes this probe created — and still not this probe's ref.
+    world.setRef(world.sha);
+    let deletions = 0;
+    await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; } }))
+      .rejects.toThrow(/never deleted at another SHA|does not authorise/);
+    expect(deletions).toBe(0);
+    expect(world.refSha()).toBe(world.sha);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/does not support acceptance/);
+  });
+
+  it("refuses a ref that comes back after an absence this probe never explained", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    await world.phase("collect");
+    world.setRef(null);
+    await expect(world.phase("cleanup")).rejects.toThrow(/disappeared without this probe deleting it/);
+    world.setRef(world.sha);
+    let deletions = 0;
+    await expect(world.phase("cleanup", { deleteRef: async () => { deletions += 1; return { outcome: "deleted", exit_code: 0 }; } }))
+      .rejects.toThrow(/disappeared without this probe deleting it|does not authorise/);
+    expect(deletions).toBe(0);
+    expect(world.refSha()).toBe(world.sha);
+  });
+
+  it("derives the same states from the journal alone, so a fresh process reaches the same answer", () => {
+    const sha = "a".repeat(40);
+    const facts = (status: number) => ({ http_status: status, response_complete: true, response_incomplete: null, measured_status: status });
+    const record = (seq: number, type: string, data: unknown) => ({ seq, type, data });
+    const created = [record(1, "ref-create-result", { ref: PROBE_REF, sha, ...facts(201), object_sha: sha })];
+    expect(assessRefOwnership(created, { workflowSha: sha }).may_delete).toBe(true);
+    const deleted = [...created,
+      record(2, "cleanup-intent", { ref: PROBE_REF, expected_sha: sha }),
+      record(3, "cleanup-result", { ref: PROBE_REF, expected_sha: sha, outcome: "deleted", exit_code: 0 })];
+    // A successful deletion plus a confirmed absence: accepted, and never deletable again.
+    const confirmed = assessRefOwnership([...deleted, record(4, "absence-verified", { ref: PROBE_REF, ...facts(404), measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+    expect([confirmed.state, confirmed.may_accept, confirmed.may_delete]).toEqual(["ended", true, false]);
+    // The same deletion plus a later presence at the same bytes: terminal, and never acceptable.
+    const contradicted = assessRefOwnership([...deleted, record(4, "reconciliation", { of: "cleanup-intent", outcome: "present-unchanged", object_sha: sha, measured_at: "2026-09-21T12:00:00Z" })], { workflowSha: sha });
+    expect([contradicted.state, contradicted.may_accept, contradicted.may_delete]).toEqual(["uncertain", false, false]);
+    // ...and no later record walks that back.
+    const restored = assessRefOwnership([
+      ...deleted,
+      record(4, "reconciliation", { of: "cleanup-intent", outcome: "present-unchanged", object_sha: sha, measured_at: "2026-09-21T12:00:00Z" }),
+      record(5, "absence-verified", { ref: PROBE_REF, ...facts(404), measured_at: "2026-09-21T12:01:00Z" }),
+    ], { workflowSha: sha });
+    expect([restored.state, restored.may_accept]).toEqual(["uncertain", false]);
+  });
+
+  it("still recovers the legitimate lost-absence and explicitly-unapplied paths (positive controls)", async () => {
+    // A confirmed absence after a lost readback closes measured, with no second deletion.
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    let deletions = 0;
+    const deleteRef = async () => { deletions += 1; world.setRef(null); return { outcome: "deleted", exit_code: 0 }; };
+    let deleted = false;
+    const transport = async (method: string, requestPath: string, body?: unknown) => {
+      if (deleted && requestPath.startsWith(`/repos/${REPO}/git/ref/heads/${PROBE_BRANCH}`)) return incompleteResponse("transport-timeout");
+      return world.transport(method, requestPath, body);
+    };
+    await expect(world.phase("cleanup", { transport, deleteRef: async () => { deleted = true; return deleteRef(); } })).rejects.toThrow(/absence could not be confirmed/);
+    const cleaned: any = await world.phase("cleanup", { deleteRef });
+    expect([cleaned.status, cleaned.outcome, deletions]).toEqual(["cleaned-after-reconciliation", "measured", 1]);
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
+
+    // An ambiguous deletion the ref itself shows did NOT apply may still issue one fresh lease.
+    const local = new World();
+    try {
+      local.seedOriginal();
+      await local.phase("stage");
+      await local.phase("dispatch");
+      const localCollected: any = await local.phase("collect");
+      await expect(local.phase("cleanup", { deleteRef: async () => ({ outcome: "ambiguous", exit_code: 128 }) })).rejects.toThrow(/run cleanup again/);
+      const retried: any = await local.phase("cleanup");
+      expect([retried.status, retried.outcome]).toEqual(["cleaned", "measured"]);
+      expect(local.refSha()).toBeNull();
+      expect(local.validate(localCollected.records["staging-emergency"], "staging-emergency")).toBeNull();
+    } finally { rmSync(local.root, { recursive: true, force: true }); }
+  });
+});
+
+describe("R05-F2: an observed staging move is kept, and interrupts measurement for good", () => {
+  /** Only the source-continuity read reports the other commit; every other read is untouched. */
+  const drifting = (target: World) => async (method: string, requestPath: string, body?: unknown) => {
+    if (requestPath === `/repos/${REPO}/git/ref/heads/staging`) {
+      return completedJsonResponse(200, Buffer.from(JSON.stringify({ ref: "refs/heads/staging", object: { sha: target.otherSha, type: "commit" } })), createRedactor(), { retainRaw: true });
+    }
+    return target.transport(method, requestPath, body);
+  };
+
+  it("refuses a collection that measured the source elsewhere, and keeps refusing once the head is restored", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    await expect(world.phase("collect", { transport: drifting(world) })).rejects.toThrow(/interrupted/);
+    expect(world.probeRecords().some((record: any) => record.type === SOURCE_OBSERVED_EVENT && record.data.moved === true)).toBe(true);
+    // Nothing was measured, and no observation was written.
+    expect(world.probeRecords().some((record: any) => record.type === "observation-recorded")).toBe(false);
+    expect(readdirSync(world.dir).includes(probeObservationName(RUN_ID, ATTEMPT, "staging-release"))).toBe(false);
+
+    // Staging is back at the trusted source, and a fresh process still refuses: the interruption is
+    // a durable fact of this attempt, not a condition of the moment.
+    await expect(world.phase("collect")).rejects.toThrow(/interrupted/);
+    expect(world.count("POST", "/dispatches")).toBe(1);
+  });
+
+  it("still cancels the owned run and still cleans up, closing inconclusive rather than measured", async () => {
+    world.seedOriginal();
+    world.neverComplete = true;
+    await world.phase("stage");
+    await world.phase("dispatch");
+    await expect(world.phase("collect")).rejects.toThrow(/cancelled/);
+
+    // The move is observed from here on. Cancelling this probe's own run is still allowed.
+    const cancelled: any = await world.phase("cancel", { transport: drifting(world) });
+    expect(cancelled.status).toBe("already-terminal");
+    // ...and so is removing what this run created: the remedy is never the casualty.
+    const cleaned: any = await world.phase("cleanup", { transport: drifting(world) });
+    expect(cleaned.outcome).toBe("inconclusive");
+    expect(world.refSha()).toBeNull();
+    expect(world.probeRecords().filter((record: any) => record.type === SOURCE_OBSERVED_EVENT && record.data.moved === true).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("refuses to launder a clean collection into acceptance when cleanup measured the move", async () => {
+    world.seedOriginal();
+    await world.phase("stage");
+    await world.phase("dispatch");
+    const collected: any = await world.phase("collect");
+    expect(collected.status).toBe("measured");
+
+    // The move is first measured at cleanup. The owned ref still goes — and the close does not
+    // claim a measurement taken across a source this attempt is no longer bound to.
+    const cleaned: any = await world.phase("cleanup", { transport: drifting(world) });
+    expect(cleaned.outcome).toBe("inconclusive");
+    expect(world.refSha()).toBeNull();
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/interrupted|not closed as a measured probe/);
+    expect(world.validate(collected.records["staging-emergency"], "staging-emergency")).not.toBeNull();
+  });
+
+  it("records the measured source in every phase, and offline acceptance needs the collection's own observation", async () => {
+    const collected: any = await world.fullProbe();
+    const observed = world.probeRecords().filter((record: any) => record.type === SOURCE_OBSERVED_EVENT);
+    expect(observed.map((record: any) => record.data.phase)).toEqual(["stage", "dispatch", "collect", "cleanup"]);
+    for (const record of observed) {
+      expect(record.data).toEqual({
+        phase: record.data.phase, mode: record.data.phase === "collect" || record.data.phase === "cleanup" ? "observe" : "enforce",
+        moved: false, staging_sha: world.sha, trusted_source_sha: world.sha, measured_at: record.data.measured_at,
+      });
+    }
+    expect(world.validate(collected.records["staging-release"], "staging-release")).toBeNull();
   });
 });

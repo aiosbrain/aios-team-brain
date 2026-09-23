@@ -47,7 +47,8 @@ import {
   CANCEL_CONFIRM_MS, CAPTURE_SCHEMA_VERSION, DIAGNOSTIC_SCHEMA_VERSION, DISPATCH_DEADLINE_MS, MAX_PAGES, OFFBRANCH_CONTROL,
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
-  ProbeRefusal, RESOURCE_LINK_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity, commissioningIdentity, inducedAutomation,
+  ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
+  assessRefOwnership, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
 } from "./offbranch-probe.mjs";
@@ -182,6 +183,42 @@ function openProbeJournal(session) {
     lock.release();
     throw error;
   }
+}
+
+/**
+ * WRITE THIS PHASE'S MEASURED SOURCE-CONTINUITY OBSERVATION INTO THE BOUND HISTORY (R05-F2).
+ *
+ * `openProbeSession` measures the live staging head on every phase; in `observe` mode — collect,
+ * cancel, cleanup — a move is REPORTED rather than thrown, so that removing what the run created
+ * is never blocked by somebody else's legitimate merge. That report has to become a durable fact
+ * of this probe, or the interruption vanishes the moment staging returns to its old value. It is
+ * appended before the phase acts, so the phase's own decisions are derived from it.
+ */
+function recordSourceObservation(session, probe, phase) {
+  const measured = session.sourceContinuity;
+  // Never after the close: a closed probe's history is final, and appending past it would invalidate
+  // the very evidence this observation exists to protect.
+  if (probe.records().some((record) => record.type === "probe-closed")) return assessSourceContinuity(probe.records());
+  probe.append(SOURCE_OBSERVED_EVENT, {
+    phase,
+    mode: String(measured?.mode ?? "observe"),
+    moved: measured?.moved === true,
+    staging_sha: String(measured?.staging_sha ?? ""),
+    trusted_source_sha: String(measured?.trusted_source_sha ?? ""),
+    measured_at: session.now().toISOString(),
+  });
+  return assessSourceContinuity(probe.records());
+}
+
+/**
+ * The interruption, once observed, binds every later phase and process (R05-F2). Measurement and
+ * acceptance stop; owned-run cancellation and owned-resource cleanup deliberately continue, which
+ * is the canonical's "interrupts the attempt, WITH CLEANUP and root reconciliation".
+ */
+function sourceInterruption(continuity) {
+  if (!continuity.interrupted) return null;
+  const move = continuity.first_move;
+  return `this attempt measured the live staging head at ${move.staging_sha.slice(0, 12)} during ${move.phase}, which is not the immutable trusted source it is bound to; the attempt is interrupted — it is never measured or accepted, and only owned cancellation and cleanup may continue`;
 }
 
 /** The staged probe: intent bytes, their link in the original journal, and the probe journal binding. */
@@ -368,6 +405,7 @@ export async function runStage({ runId, attempt, evidenceDir, env, deps }) {
   const probe = openProbeJournal(session);
   try {
     probe.append("probe-opened", { intent_artifact: intentName, intent_sha256: written.sha256, commissioning_run_id: session.runId, commissioning_attempt: session.attempt });
+    recordSourceObservation(session, probe, "stage");
     probe.append("registration-verified", {
       workflow_id: workflow.body.id, workflow_state: workflow.body.state, workflow_created_at: String(workflow.body.created_at),
       source_sha256: PROBE_WORKFLOW_SHA256, descriptor: registration,
@@ -392,6 +430,7 @@ export async function runDispatch({ runId, attempt, evidenceDir, env, deps }) {
   try {
     const records = probe.records();
     if (records[0]?.type !== "probe-opened" || records[0].data.intent_sha256 !== staged.digest) throw new AssertionFailure("the probe journal is not bound to the staged intent");
+    recordSourceObservation(session, probe, "dispatch");
     if (records.some((record) => record.type === "ref-create-intent")) {
       throw new AssertionFailure("this attempt's probe ref was already created once; the create is never re-issued (collect, cancel or clean up instead)");
     }
@@ -527,6 +566,11 @@ export async function runCollect({ runId, attempt, evidenceDir, env, deps }) {
   const staged = loadStagedProbe(session);
   const probe = openProbeJournal(session);
   try {
+    // THE MEASURED SOURCE FIRST (R05-F2). A collection that opened while the live staging head was
+    // somewhere else is not measuring the tree this attempt is bound to, and the move is recorded
+    // before anything is captured so a restored head cannot erase it.
+    const interrupted = sourceInterruption(recordSourceObservation(session, probe, "collect"));
+    if (interrupted) throw new IncompleteEvidence(`${interrupted}; clean up next`);
     let records = probe.records();
     // THE DURABLE INTENT ADMITS THE COLLECTION, not the presence of its result (R04-F2). A process
     // cut between the dispatch intent and its journaled answer does not erase the dispatch: the
@@ -698,6 +742,9 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
   loadStagedProbe(session);
   const probe = openProbeJournal(session);
   try {
+    // Recorded, never blocking: cancelling this probe's OWN run is exactly the safe action a source
+    // interruption still permits (R05-F2).
+    recordSourceObservation(session, probe, "cancel");
     const records = probe.records();
     const identified = records.find((record) => record.type === "run-identified");
     if (!identified) throw new IncompleteEvidence("no probe run is identified; there is no owned run to cancel");
@@ -710,9 +757,16 @@ export async function runCancel({ runId, attempt, evidenceDir, env, deps }) {
   }
 }
 
-function closeOutcome(records) {
+function closeOutcome(records, { workflowSha }) {
   const observations = records.filter((record) => record.type === "observation-recorded");
+  // An ADMITTED job is a real negative-control failure and keeps precedence over every other
+  // reading: an interrupted attempt is untrustworthy in the passing direction, not in this one.
   if (observations.some((record) => record.data.outcome === "admitted")) return "failed";
+  // MEASURED needs the accumulated lifecycle to support it: the owned ref actually gone and its
+  // absence measured (R05-F1), and no recorded source interruption anywhere in this history
+  // (R05-F2). Either one alone downgrades the close to inconclusive, permanently.
+  if (!assessRefOwnership(records, { workflowSha }).may_accept) return "inconclusive";
+  if (assessSourceContinuity(records).interrupted) return "inconclusive";
   if (observations.length === PROBE_ENVIRONMENTS.length && observations.every((record) => record.data.outcome === "refused")
     && !records.some((record) => record.type === "cancel-intent")) return "measured";
   return "inconclusive";
@@ -724,16 +778,22 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
   const deleteRef = deps.deleteRef ?? createGitLeaseDeleter({ spawnImpl: deps.spawnImpl, env });
   const probe = openProbeJournal(session);
   try {
+    if (probe.records().some((record) => record.type === "probe-closed")) return result(session, "cleanup", "already-closed");
+    // Recorded, never blocking: removing what this run created is the one thing a source move must
+    // NOT stop (R05-F2). What it does stop is the measured close, derived in `closeOutcome`.
+    recordSourceObservation(session, probe, "cleanup");
     const records = probe.records();
-    if (records.some((record) => record.type === "probe-closed")) return result(session, "cleanup", "already-closed");
     const sha = session.commissioning.workflow_sha;
-    const created = records.find((record) => record.type === "ref-create-result");
-    const createReconciled = records.find((record) => record.type === "reconciliation" && record.data.of === "ref-create-intent");
-    if (createReconciled?.data.outcome === "present-ownership-uncertain") {
-      throw new IncompleteEvidence("the probe ref's ownership is uncertain; it is never deleted automatically — root reconciliation is required");
+
+    // ── ACTION AUTHORITY, DERIVED FROM THE WHOLE HISTORY (R05-F1) ────────────────────────────────
+    // A contradiction recorded by any earlier invocation binds this one. It is re-derived here, so
+    // a fresh process reaches the same refusal, and a ref that merely LOOKS familiar again cannot
+    // re-open a creation whose ownership already ended.
+    const ownership = assessRefOwnership(records, { workflowSha: sha });
+    if (ownership.state === "uncertain") {
+      throw ownership.severity === "assertion" ? new AssertionFailure(ownership.reason) : new IncompleteEvidence(ownership.reason);
     }
-    const owned = created?.data.response_complete === true && created.data.http_status === 201 && created.data.object_sha === sha;
-    if (!owned) {
+    if (ownership.state === "unowned") {
       if (unresolvedProbeIntents(records).length) throw new IncompleteEvidence("an unresolved probe intent remains; reconcile before closing");
       probe.append("probe-closed", { outcome: "inconclusive" });
       return result(session, "cleanup", "nothing-owned", { note: "No owned probe ref exists; the journal is closed as inconclusive." });
@@ -755,9 +815,6 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     if (terminal && !cancelled && !records.some((record) => record.type === "observation-recorded")) {
       throw new IncompleteEvidence("the terminal probe run has not been collected; collect before cleanup so the original evidence is captured first");
     }
-    if (records.some((record) => record.type === "cleanup-result" && record.data.outcome === "lease-refused")) {
-      throw new AssertionFailure("the owned probe ref changed and its lease deletion was refused; it is never deleted at another SHA");
-    }
     const at = () => session.now().toISOString();
     const close = (status, extra = {}) => {
       const current = probe.records();
@@ -767,9 +824,22 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       if (open.length) {
         throw new IncompleteEvidence(`${open.length} probe intent(s) are still unresolved (${open.map((entry) => `${entry.type}#${entry.seq}`).join(", ")}); the journal is not closed until each is reconciled`);
       }
-      const outcome = closeOutcome(current);
+      const outcome = closeOutcome(current, { workflowSha: sha });
       probe.append("probe-closed", { outcome });
       return result(session, "cleanup", status, { outcome, ...extra });
+    };
+    /**
+     * WHAT A MEASUREMENT MEANS IS DERIVED; WHAT IT PERMITS IS NEVER ASSUMED (R05-F1).
+     *
+     * Every branch below appends what it measured and then RE-DERIVES the ownership from the whole
+     * history including it. That ordering is the fix: the reconciliation row is a fact about the
+     * ref, not a permission, so a later invocation reading "a reconciliation exists" can no longer
+     * treat it as confirmation of the deletion that preceded it.
+     */
+    const settle = (why) => {
+      const derived = assessRefOwnership(probe.records(), { workflowSha: sha });
+      if (derived.state !== "uncertain") return derived;
+      throw derived.severity === "assertion" ? new AssertionFailure(derived.reason) : new IncompleteEvidence(why ?? derived.reason);
     };
     /**
      * A deletion whose TERMINAL READBACK is missing is RECONCILED before anything else happens.
@@ -779,28 +849,23 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      * measured probe whose own history explains the 404 that follows. Treating that expected
      * absence as an unexplained disappearance stranded the probe; so the retained delete result
      * owns the recovery of its own missing confirmation, and no second deletion is issued.
+     *
+     * The other reading of that same missing confirmation is the one R05-F1 found: a ref that is
+     * PRESENT again. It is never this creation coming back — the deletion succeeded — so it ends
+     * the lifecycle instead of resuming it, whatever bytes it carries.
      */
-    const unresolved = unresolvedProbeIntents(records).filter((entry) => entry.type === "cleanup-intent");
-    const lastResult = [...records].reverse().find((record) => record.type === "cleanup-result");
-    const lastReconciliation = [...records].reverse().find((record) => record.type === "reconciliation" && record.data.of === "cleanup-intent");
-    const lastAbsence = [...records].reverse().find((record) => record.type === "absence-verified");
-    const confirmed = lastResult && ((lastAbsence && lastAbsence.seq > lastResult.seq) || (lastReconciliation && lastReconciliation.seq > lastResult.seq));
-    const needsReconcile = Boolean(unresolved.length || (lastResult && !confirmed));
-    if (needsReconcile) {
-      const deletedAlready = lastResult?.data.outcome === "deleted";
+    if (ownership.pending) {
       const readback = await session.request("GET", probeRefPath);
       if (readback.complete === true && readback.status === 404) {
         probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
         probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
+        settle();
         return close("cleaned-after-reconciliation");
       }
       if (readback.complete === true && readback.status === 200) {
         const objectSha = String(readback.body?.object?.sha ?? "");
         probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
-        if (objectSha !== sha) throw new AssertionFailure("the owned probe ref now points elsewhere; it is never deleted at another SHA");
-        if (deletedAlready) {
-          throw new IncompleteEvidence("a deletion this probe recorded as successful did not remove the owned probe ref; that history is inconsistent, so no second deletion is issued — root reconciliation is required");
-        }
+        settle();
         throw new IncompleteEvidence("the lost deletion did not take effect; the reconciliation is recorded — run cleanup again to issue one fresh lease deletion");
       }
       throw new IncompleteEvidence("a lost deletion could not be reconciled; its readback failed");
@@ -812,13 +877,17 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(readback), measured_at: at() });
       // An absence this probe's OWN durable history explains is the expected end state, not a
       // disappearance. Without such a deletion recorded, the ownership history really is broken.
-      if (lastResult?.data.outcome === "deleted") return close("cleaned-after-reconciliation");
-      throw new AssertionFailure("the owned probe ref disappeared without this probe deleting it; its ownership history is broken");
+      settle();
+      return close("cleaned-after-reconciliation");
     }
     if (readback.body?.object?.sha !== sha) {
       probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at() });
+      settle();
       throw new AssertionFailure("the owned probe ref points at a SHA this probe did not create; it is never deleted");
     }
+    // THE ONE PLACE A DELETION IS ISSUED, and it is gated on the derived authority rather than on
+    // this invocation's readback: presence at the expected bytes is not, by itself, ownership.
+    if (!settle().may_delete) throw new IncompleteEvidence("the owned probe ref's accumulated lifecycle does not authorise a lease deletion; root reconciliation is required");
     probe.append("cleanup-intent", { ref: PROBE_REF, expected_sha: sha });
     const deletion = await deleteRef({ ref: PROBE_REF, expectedSha: sha });
     const outcome = ["deleted", "lease-refused", "ambiguous"].includes(deletion?.outcome) ? deletion.outcome : "ambiguous";
@@ -828,12 +897,13 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     if (after.complete === true && after.status === 404) {
       if (outcome === "ambiguous") probe.append("reconciliation", { of: "cleanup-intent", outcome: "absent", object_sha: null, measured_at: at() });
       probe.append("absence-verified", { ref: PROBE_REF, ...facts(after), measured_at: at() });
+      settle();
       return close("cleaned");
     }
     if (outcome === "ambiguous" && after.complete === true && after.status === 200) {
       const objectSha = String(after.body?.object?.sha ?? "");
       probe.append("reconciliation", { of: "cleanup-intent", outcome: objectSha === sha ? "present-unchanged" : "present-changed", object_sha: objectSha || null, measured_at: at() });
-      if (objectSha !== sha) throw new AssertionFailure("the owned probe ref now points elsewhere; it is never deleted at another SHA");
+      settle();
       throw new IncompleteEvidence("the ambiguous deletion did not take effect; the reconciliation is recorded — run cleanup again to issue one fresh lease deletion");
     }
     throw new IncompleteEvidence("the owned probe ref's absence could not be confirmed after deletion; cleanup is not claimed");
