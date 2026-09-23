@@ -48,7 +48,7 @@ import {
   OFFBRANCH_SCHEMA_VERSION, PAGE_SIZE, PROBE_ATTEMPT, PROBE_BRANCH, PROBE_DISPATCHER, PROBE_ENVIRONMENTS, PROBE_EVENT,
   PROBE_INTENT_SCHEMA_VERSION, PROBE_JOBS, PROBE_REF, PROBE_WORKFLOW_FILE, PROBE_WORKFLOW_PATH, PROBE_WORKFLOW_SHA256,
   ProbeRefusal, RESOURCE_LINK_EVENT, SOURCE_OBSERVED_EVENT, assertInertProbeWorkflow, assertProbeEventPayload, assertProbeRunIdentity,
-  deriveProbeAdmissions, verifyProbeRecoveryHistory, assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
+  deriveProbeResolutionEvents, verifyIdentifiedProbeRun, deriveProbeAdmissions, verifyProbeRecoveryHistory, assessProbePhaseState, assessOriginalProbeBinding, assertOriginalProbeIdentity,
   assessRefOwnership, assessRunContinuity, assessRunSelectionContinuity, assessSourceContinuity, commissioningIdentity, inducedAutomation,
   parseCheckRunUrl, parseProbeIntent, probeCaptureName, probeIntentName, probeJournalName, probeObservationName,
   readPolicyDescriptor, selectEligibleRuns, unresolvedProbeIntents, verifyProbeCaptures,
@@ -182,16 +182,40 @@ async function openProbeSession({ runId, attempt, evidenceDir, env, deps, phase,
   try {
     session.sourceContinuity = await assertSourceContinuity({ request, label: "the staged off-branch probe", mode: "observe",
       expected: { repositoryId: Number(intent.repository_id), workflowSha: commissioning.workflow_sha } });
-  } catch (error) { if (!recovery) throw error; }
-  if (session.sourceContinuity?.moved === true) persistKnownSourceMove(session);
-  if (!recovery) {
-    const captured = await rawCapture(session, `/repos/${REPO}/actions/runs/${runId}/attempts/${attempt}`, "the original commissioning attempt");
-    if (records.length) appendUnderLock(session, "probe", "original-identity-observed", { capture: captured.ref });
-    asAssertion(() => assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher: intent.dispatcher, baseline }));
-    session.originalRun = captured.body;
-    session.originalCapture = captured.ref;
+  } catch (error) {
+    if (!(error instanceof IncompleteEvidence || error instanceof AssertionFailure)) throw error;
+    if (records.length) recordQualificationGap(session, error instanceof IncompleteEvidence ? "source-unavailable" : "source-invalid");
+    if (!recovery) throw error;
   }
+  if (session.sourceContinuity?.moved === true) persistKnownSourceMove(session);
+  let captured;
+  try {
+    captured = await rawCapture(session, `/repos/${REPO}/actions/runs/${runId}/attempts/${attempt}`, "the original commissioning attempt");
+  } catch (error) {
+    if (!(error instanceof IncompleteEvidence)) throw error;
+    if (records.length) recordQualificationGap(session, "original-unavailable");
+    if (!recovery) throw error;
+  }
+  if (captured) {
+    if (records.length) appendUnderLock(session, "probe", "original-identity-observed", { capture: captured.ref });
+    try {
+      asAssertion(() => assertOriginalProbeIdentity(captured.body, { commissioning, dispatcher: intent.dispatcher, baseline }));
+      session.originalRun = captured.body;
+      session.originalCapture = captured.ref;
+      if (recovery && !["queued", "in_progress", "waiting", "pending", "requested"].includes(captured.body.status)) recordQualificationGap(session, "original-inactive");
+    } catch (error) {
+      if (!(error instanceof AssertionFailure)) throw error;
+      if (records.length) recordQualificationGap(session, "original-invalid");
+      if (!recovery) throw error;
+    }
+  }
+  if (recovery && readJournal({ dir, runId, attempt }).some((row) => row.type === "run-closed")) recordQualificationGap(session, "original-closed");
   return session;
+}
+
+/** A known qualification gap is durable before another fallible read; it grants no U/R authority. */
+function recordQualificationGap(session, category) {
+  appendUnderLock(session, "probe", "qualification-incomplete", { phase: session.phase, category, observed_at: session.now().toISOString() });
 }
 
 /** The measured live source, in the exact closed shape both journals carry it in. */
@@ -278,11 +302,18 @@ function openProbeJournal(session) {
     const records = journal.read();
     if (records.some((record) => record.source !== session.commissioning.workflow_sha)) throw new AssertionFailure("the probe journal was written against a different immutable source");
     const append = (type, data) => journal.append(type, assertProbeEventPayload(type, data));
-    return { lock, journal, append, records: () => journal.read() };
+    const probe = { lock, journal, append, records: () => journal.read() };
+    reconcileDurableEffects(session, probe);
+    return probe;
   } catch (error) {
     lock.release();
     throw error;
   }
+}
+
+function reconcileDurableEffects(session, probe) {
+  const events = asIncomplete(() => deriveProbeResolutionEvents(probe.records(), { dir: session.dir, commissioning: session.commissioning }));
+  for (const event of events) probe.append(event.type, event.data);
 }
 
 /**
@@ -703,7 +734,11 @@ async function waitTerminal(session, probe, runId, untilMs) {
 async function reconcileOwnedRun(session, probe) {
   const records = probe.records();
   const identified = records.find((record) => record.type === "run-identified");
-  if (identified) return identified;
+  if (identified) {
+    asIncomplete(() => verifyIdentifiedProbeRun(records, { dir: session.dir, commissioning: session.commissioning }));
+    reconcileDurableEffects(session, probe);
+    return identified;
+  }
   if (records.some((record) => record.type === "run-unidentified")) throw new IncompleteEvidence("the probe run was already recorded as unidentifiable; this attempt's probe is inconclusive");
   // THE DURABLE INTENT ADMITS THE RECONCILIATION, not the presence of its result (R04-F2). A process
   // cut between the dispatch intent and its journaled answer does not erase the dispatch: the
@@ -726,13 +761,6 @@ async function reconcileOwnedRun(session, probe) {
   const retainSelection = (selectionId, boundary, page, ref) => {
     probe.append("run-selection-observed", { selection_id: selectionId, boundary, page, capture: ref });
     assessSelections();
-  };
-  /** Resolve an interrupted dispatch intent exactly once, from what the listing actually shows. */
-  const reconcileDispatch = (outcome, objectSha) => {
-    const current = probe.records();
-    if (current.some((record) => record.type === "dispatch-result")
-      || current.some((record) => record.type === "reconciliation" && record.data.of === "dispatch-intent")) return;
-    probe.append("reconciliation", { of: "dispatch-intent", outcome, object_sha: objectSha, measured_at: session.now().toISOString() });
   };
 
   // THE ONE ELIGIBLE RUN. Zero or several is never resolved by picking; nothing is re-dispatched.
@@ -767,7 +795,7 @@ async function reconcileOwnedRun(session, probe) {
     throw new IncompleteEvidence("no eligible probe run appeared by the deadline; the probe is inconclusive and nothing is re-dispatched");
   }
   const record = probe.append("run-identified", { run_id: eligible[0], eligible: 1, descriptor });
-  reconcileDispatch("present-unchanged", session.commissioning.workflow_sha);
+  reconcileDurableEffects(session, probe);
   return record;
 }
 
@@ -1094,7 +1122,7 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     // back to `collect`: when the interruption that stopped the collection is the reason the run was
     // never identified, "collect before cleanup" is an instruction to a phase that will refuse for
     // ever, and the owned ref never goes.
-    if (dispatchIntent && !identified && !records.some((record) => record.type === "run-unidentified")) {
+    if (dispatchIntent && !records.some((record) => record.type === "run-unidentified")) {
       identified = await reconcileOwnedRun(session, probe, "clean up");
       records = probe.records();
     }

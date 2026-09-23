@@ -188,6 +188,7 @@ export const PROBE_JOURNAL_EVENTS = Object.freeze({
   "original-identity-observed": Object.freeze(["capture"]),
   "capture-progress": Object.freeze(["run_id", "kind", "page", "capture"]),
   "capture-failed": Object.freeze(["run_id", "phase", "category", "capture_sequences"]),
+  "qualification-incomplete": Object.freeze(["phase", "category", "observed_at"]),
   "qualification-ended": Object.freeze(["run_id", "reason", "terminal_sequence"]),
   "admission-observed": Object.freeze(["run_id", "environment", "job_id", "run_capture", "jobs_descriptor"]),
   "probe-opened": Object.freeze(["intent_artifact", "intent_sha256", "commissioning_run_id", "commissioning_attempt"]),
@@ -249,6 +250,11 @@ export function assertProbeEventPayload(type, data) {
   if (type === "capture-failed") {
     if (data.phase !== "collect" || !["run", "jobs", "denial", "terminal", "policy", "derivation"].includes(data.category)) refuse("unknown capture failure disposition");
     if (!Array.isArray(data.capture_sequences) || data.capture_sequences.some((seq) => !Number.isSafeInteger(seq) || seq < 1)) refuse("invalid capture failure references");
+  }
+  if (type === "qualification-incomplete") {
+    if (!["stage", "dispatch", "collect", "cancel", "cleanup"].includes(data.phase)
+      || !["source-unavailable", "source-invalid", "original-unavailable", "original-invalid", "original-inactive", "original-closed"].includes(data.category)) refuse("unknown qualification incompleteness category");
+    timeOf(data.observed_at, "the qualification incompleteness time");
   }
   if (type === "qualification-ended") {
     if (data.reason !== "operator-terminal-abort") refuse("unknown qualification end reason");
@@ -911,15 +917,85 @@ export function unresolvedProbeIntents(records) {
     const nextIntent = later.findIndex((entry) => entry.type === record.type);
     const window = nextIntent >= 0 ? later.slice(0, nextIntent) : later;
     const resolved = window.some((entry) => (entry.type === resultType
-        && (record.type !== "ref-create-intent" || (entry.data.response_complete === true
-          && entry.data.http_status === 201 && entry.data.object_sha === record.data.sha)))
+        && (record.type === "ref-create-intent" ? entry.data.response_complete === true && entry.data.http_status === 201 && entry.data.object_sha === record.data.sha
+          : record.type === "dispatch-intent" ? entry.data.response_complete === true && entry.data.http_status === 204
+            : record.type === "cancel-intent" ? false : entry.data.outcome === "deleted"))
       || (entry.type === "reconciliation" && entry.data?.of === record.type
-        && (record.type !== "dispatch-intent" || entry.data.outcome === "present-unchanged"))
+        && (record.type === "dispatch-intent" ? entry.data.outcome === "present-unchanged" : ["ref-create-intent", "cleanup-intent"].includes(record.type) && entry.data.outcome === "absent"))
       || (record.type === "cancel-intent" && entry.type === "run-terminal"
         && entry.data.run_id === record.data.run_id && entry.data.run_attempt === 1 && entry.data.status === "completed"));
     if (!resolved) open.push({ seq: record.seq, type: record.type });
   }
   return open;
+}
+
+/** Re-authenticate a retained run identification before deriving a dispatch effect from it. */
+export function verifyIdentifiedProbeRun(records, { dir, commissioning }) {
+  const dispatch = only(records, "dispatch-intent");
+  const identified = only(records, "run-identified");
+  if (records.some((row) => row.type === "run-unidentified")) refuse("the run selection is ambiguous");
+  equalOrRefuse({ workflow_file: dispatch.data.workflow_file, ref: dispatch.data.ref }, { workflow_file: PROBE_WORKFLOW_FILE, ref: PROBE_BRANCH }, "the original dispatch identity");
+  const dispatchIntentMs = timeOf(dispatch.ts, "the original dispatch time"), deadlineMs = timeOf(dispatch.data.deadline_at, "the original dispatch deadline");
+  if (deadlineMs > dispatchIntentMs + DISPATCH_DEADLINE_MS || deadlineMs < dispatchIntentMs + DISPATCH_DEADLINE_MS - 60_000) refuse("the original dispatch deadline changed");
+  const identity = { repositoryId: commissioning.repository_id, workflowSha: commissioning.workflow_sha };
+  const groups = assessRunSelectionContinuity(records, { dir, dispatchIntentMs, deadlineMs, identity });
+  const descriptor = readDescriptor(dir, identified.data.descriptor, "the retained run identification");
+  assertClosed(descriptor, CAPTURE_DESCRIPTORS["run-selection"].fields, "the retained selection descriptor");
+  if (descriptor.kind !== "run-selection" || descriptor.capture_schema_version !== CAPTURE_SCHEMA_VERSION
+    || identified.seq <= dispatch.seq || identified.data.eligible !== 1) refuse("invalid retained run identification");
+  if (!groups.some((group) => group.boundary === "listing" && canonicalJson(group.pages) === canonicalJson(descriptor.pages))) refuse("the identified descriptor is not bound to retained selection pages");
+  const pages = readPages(dir, descriptor.pages, "the identified selection pages");
+  if (pages.some((page) => page.completed > Date.parse(identified.ts))) refuse("run identification precedes its selection evidence");
+  const eligible = selectEligibleRuns(pages, { dispatchIntentMs, deadlineMs, identity });
+  equalOrRefuse(eligible, [identified.data.run_id], "the retained unique run identification");
+  assessRunContinuity(records, { dir, repositoryId: commissioning.repository_id, workflowSha: commissioning.workflow_sha });
+  return identified;
+}
+
+/** Missing bookkeeping is completed from authenticated durable effects, never by retrying a write.
+ * All public phase writers consume this same plan; a cut after any proposed append is idempotent.
+ */
+export function deriveProbeResolutionEvents(records, { dir, commissioning }) {
+  checkProbeJournalShape(records);
+  if (records.some((row) => row.type === "probe-closed")) return [];
+  const events = [], sha = commissioning.workflow_sha;
+  const ownership = assessRefOwnership(records, { workflowSha: sha });
+  const pending = unresolvedProbeIntents(records);
+  const reconciliation = (of, outcome, fact) => events.push({ type: "reconciliation", data: { of, outcome,
+    object_sha: outcome === "absent" ? null : sha, measured_at: fact.data.measured_at ?? fact.ts } });
+  for (const type of Object.keys(PROBE_INTENT_PAIRS)) {
+    const intents = records.filter((row) => row.type === type);
+    if (intents.length > 1) refuse(`the probe repeats its ${type}`);
+    const intent = intents[0]; if (!intent) continue;
+    if (type === "ref-create-intent" || type === "cleanup-intent") {
+      equalOrRefuse(intent.data, type === "ref-create-intent" ? { ref: PROBE_REF, sha } : { ref: PROBE_REF, expected_sha: sha }, "the retained ref mutation intent");
+      const absence = records.find((row) => row.seq > intent.seq && ["ref-readback", "absence-verified"].includes(row.type)
+        && row.data.ref === PROBE_REF && row.data.response_complete === true && row.data.http_status === 404
+        && row.data.measured_status === 404 && row.data.response_incomplete === null);
+      if (!absence || ownership.state === "uncertain") continue;
+      const supported = type === "ref-create-intent" ? ownership.state === "unowned" : ownership.state === "ended" && ownership.absence_confirmed;
+      if (!supported) continue;
+      if (pending.some((row) => row.seq === intent.seq)) reconciliation(type, "absent", absence);
+      if (type === "cleanup-intent" && !records.some((row) => row.seq > intent.seq && row.type === "absence-verified")) {
+        events.push({ type: "absence-verified", data: { ref: PROBE_REF, http_status: 404, response_complete: true,
+          response_incomplete: null, measured_status: 404, measured_at: absence.data.measured_at } });
+      }
+    } else if (type === "dispatch-intent" && records.some((row) => row.type === "run-identified")) {
+      const identified = verifyIdentifiedProbeRun(records, { dir, commissioning });
+      if (pending.some((row) => row.seq === intent.seq)) reconciliation(type, "present-unchanged", identified);
+    } else if (type === "cancel-intent" && !records.some((row) => row.type === "run-terminal")) {
+      const identified = verifyIdentifiedProbeRun(records, { dir, commissioning });
+      if (intent.data.run_id !== identified.data.run_id) refuse("the cancellation intent names a different run");
+      const observed = assessRunContinuity(records, { dir, repositoryId: commissioning.repository_id, workflowSha: sha })
+        .filter((row) => row.seq > intent.seq && row.body.status === "completed").at(-1);
+      if (observed) {
+        const fact = records.find((row) => row.seq === observed.seq);
+        events.push({ type: "run-terminal", data: { run_id: identified.data.run_id, run_attempt: observed.body.run_attempt,
+          status: observed.body.status, conclusion: observed.body.conclusion ?? null, observed_at: fact.data.capture.completed_at } });
+      }
+    }
+  }
+  return events;
 }
 
 /** Current run evidence is retained before it is consumed, including rejected identities.
@@ -1054,7 +1130,7 @@ export function assessProbePhaseState(records, { workflowSha }) {
     && ["run", "jobs"].every((kind) => captures.filter((row) => row.data.kind === kind).length === 1)
     && PROBE_ENVIRONMENTS.every((environment) => captures.some((row) => row.data.kind === "denial" && row.data.environment === environment));
   const failed = has("admission-observed") || observations.some((row) => row.data.outcome === "admitted");
-  const ended = has("qualification-ended") || has("capture-failed") || has("cancel-intent") || assessSourceContinuity(records).interrupted;
+  const ended = has("qualification-incomplete") || has("qualification-ended") || has("capture-failed") || has("cancel-intent") || assessSourceContinuity(records).interrupted;
   const ref = assessRefOwnership(records, { workflowSha });
   return Object.freeze({ closed: has("probe-closed"), staged: has("probe-opened"), create: has("ref-create-intent"), dispatch: has("dispatch-intent"),
     cleanup: has("cleanup-intent"), capture_started: has("capture-progress") || has("capture-recorded"), paired, failed, ended, aborted: has("qualification-ended"), ref,
