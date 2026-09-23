@@ -2477,16 +2477,13 @@ describe("recovery gap schema and original closure", () => {
 
 
 describe("authenticated recovery facts", () => {
-  const truncate = (predicate: (row: any) => boolean) => {
-    const file = journalPath(world.dir, RUN_ID, ATTEMPT, "probe");
-    const lines = readFileSync(file, "utf8").trimEnd().split("\n"); const index = lines.findIndex((line) => predicate(JSON.parse(line)));
-    expect(index).toBeGreaterThanOrEqual(0); writeFileSync(file, `${lines.slice(0, index + 1).join("\n")}\n`);
-  };
   for (const boundary of ["ref-create-result", "ref-readback"]) it(`successful creation cut after ${boundary} retains exact cleanup authority`, async () => {
-    world.seedOriginal(); await world.phase("stage"); await world.phase("dispatch");
-    // Simulate a cut before dispatch itself reached the provider: only the create took effect.
-    world.runs = []; world.calls = world.calls.filter((call) => !call.path.endsWith("/dispatches"));
-    truncate((row) => row.type === boundary);
+    world.seedOriginal(); await world.phase("stage");
+    await expect(world.phase("dispatch", { transport: async (method: string, route: string, body: any) => {
+      const rows = world.probeRecords(); const intent = rows.find((row: any) => row.type === "ref-create-intent");
+      if (intent && rows.some((row: any) => row.type === boundary && row.seq > intent.seq)) throw new Error("process cut after durable create fact");
+      return world.transport(method, route, body);
+    } })).rejects.toThrow(/process cut after durable create fact/);
     expect((await world.phase("cleanup") as any).outcome).toBe("inconclusive");
     expect(world.count("POST", "/git/refs")).toBe(1); expect(world.count("POST", "/dispatches")).toBe(0); expect(world.refSha()).toBeNull();
   });
