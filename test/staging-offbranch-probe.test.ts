@@ -2286,7 +2286,7 @@ describe("durable close and capture process cuts", () => {
     const owner = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" }));
     const before = JSON.stringify(world.probeRecords()); let callbacks = 0;
     for (const phase of ["cancel", "cleanup"]) expect((await world.phase(phase) as any).status).toBe("already-closed");
-    await expect(recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now, reconcile: async () => { callbacks++; return { reconciled: true }; } })).rejects.toThrow(/open probe/);
+    await expect(recoverJournalLock({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, kind: "probe", ownerGone: true, now: world.now, reconcile: async () => { callbacks++; return { reconciled: true }; } })).rejects.toThrow(/open bound probe/);
     expect(callbacks).toBe(0); expect(readLockOwner(world.dir, RUN_ID, ATTEMPT, "probe").nonce).toBe(owner.nonce);
     expect(JSON.stringify(world.probeRecords())).toBe(before);
   });
@@ -2302,7 +2302,7 @@ describe("durable close and capture process cuts", () => {
     const forged = { ...last, seq: last.seq + 1, prev: sha256(lastLine), ts: world.now().toISOString(), type: "ref-create-intent", data: { ref: PROBE_REF, sha: world.sha } };
     writeFileSync(file, `${bytes}${JSON.stringify(forged)}\n`);
     await expect(world.phase("cleanup")).rejects.toThrow(/closed/);
-    expect(world.validate(collected.records["staging-release"], "staging-release")).toMatch(/closed/);
+    expect(() => world.validate(collected.records["staging-release"], "staging-release")).toThrow(/closed/);
   });
   it("an original numeric identity contradiction remains disqualifying after the provider response restores", async () => {
     world.seedOriginal(); await world.phase("stage");

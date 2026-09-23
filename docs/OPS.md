@@ -1832,7 +1832,7 @@ collection followed by `cancel` returns `already-terminal` and preserves its ori
 A closed probe never reopens. Stage, dispatch and collect refuse it; cancel and cleanup report
 `already-closed` without appending or taking a writer lock. A leftover lock after a durable close is
 left intact; explicit lock recovery remains restricted to open probes. A create intent whose result
-was lost is reconciled once by retained fixed-ref reads: absence can close inconclusive, while any
+was lost is reconciled through retained fixed-ref reads: absence can close inconclusive, while any
 observed presence leaves ownership uncertain and never permits adoption or deletion.
 
 Exit codes follow the commissioning CLI: 1 = a measured failure (an admitted job or a changed ref),
