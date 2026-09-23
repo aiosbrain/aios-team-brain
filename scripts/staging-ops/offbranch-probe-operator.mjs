@@ -836,10 +836,10 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
      * ref, not a permission, so a later invocation reading "a reconciliation exists" can no longer
      * treat it as confirmation of the deletion that preceded it.
      */
-    const settle = (why) => {
+    const settle = () => {
       const derived = assessRefOwnership(probe.records(), { workflowSha: sha });
       if (derived.state !== "uncertain") return derived;
-      throw derived.severity === "assertion" ? new AssertionFailure(derived.reason) : new IncompleteEvidence(why ?? derived.reason);
+      throw derived.severity === "assertion" ? new AssertionFailure(derived.reason) : new IncompleteEvidence(derived.reason);
     };
     /**
      * A deletion whose TERMINAL READBACK is missing is RECONCILED before anything else happens.
@@ -882,6 +882,10 @@ export async function runCleanup({ runId, attempt, evidenceDir, env, deps }) {
     }
     if (readback.body?.object?.sha !== sha) {
       probe.append("ref-readback", { ref: PROBE_REF, ...facts(readback), object_sha: String(readback.body?.object?.sha ?? "") || null, measured_at: at() });
+      // `settle` is what refuses, and it is what makes the refusal STICK: the recorded readback
+      // leaves the ownership permanently uncertain, so a later invocation finding the ref restored
+      // to the reviewed SHA derives the same answer instead of deleting somebody else's ref. The
+      // throw below states the same conclusion should the derivation ever be loosened.
       settle();
       throw new AssertionFailure("the owned probe ref points at a SHA this probe did not create; it is never deleted");
     }

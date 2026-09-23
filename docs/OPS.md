@@ -1721,6 +1721,27 @@ rather than selected, and a changed ref is left untouched because the deletion c
 expected-old-SHA lease (`git push --force-with-lease=<ref>:<sha> … :<ref>`), not a GET followed by a
 DELETE. A run still nonterminal two minutes after cancellation blocks cleanup and claims nothing.
 
+**What the journal permits is DERIVED from all of it, not from its newest row.** Both the operator
+and the offline assessment read the probe journal through one shared derivation
+(`assessRefOwnership` / `assessSourceContinuity`), so a refusal cannot be walked back by appending
+something later:
+
+- **A deletion this probe recorded as SUCCESSFUL ends that creation's ownership for good.** If the
+  ref is PRESENT afterwards, that is a contradiction and never continuity — an equal SHA is equal
+  bytes, and a same-SHA recreation belongs to whoever made it. `cleanup` refuses from then on, in
+  this process and every later one, and `check-evidence` refuses the observations too. The
+  reconciliation row that refusal writes is a fact about the ref, not a permission to try again.
+- **A ref measured at another SHA is not revived by being put back** at the reviewed SHA.
+- **Still supported, unchanged:** a `deleted` result whose absence readback was lost recovers when
+  the ref reads 404, with no second deletion; and an ambiguous deletion the ref itself shows did not
+  apply may issue exactly one fresh lease deletion.
+- **A measured move of the live `staging` head interrupts the attempt permanently.** Every phase
+  records what it measured (`source-observed`), so a head that returns to the trusted source does
+  not erase it and a fresh process re-derives it. `collect` then refuses to measure; `cancel` and
+  `cleanup` deliberately still run — removing what the run created is exactly what must not be
+  blocked — but the journal closes `inconclusive`, never `measured`, and offline acceptance refuses.
+  Root reconciles.
+
 **What `collect` writes.** One create-once, mode-0600 observation per environment
 (`commissioning-<run>-<attempt>-offbranch-observation-<environment>.json`), only when the refusal is
 re-derived from the retained raw responses, plus the exact `environment-controls` record to file for
