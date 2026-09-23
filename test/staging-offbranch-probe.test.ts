@@ -327,6 +327,19 @@ class World {
   }
 }
 
+/** Rewrite a synthetic probe chain while preserving its sequence and hash linkage. */
+const rewriteProbeJournal = (target: World, mutate: (records: any[]) => void) => {
+  const records = target.probeRecords();
+  mutate(records);
+  let previous = records[0].prev;
+  const lines = records.map((record: any) => {
+    const line = JSON.stringify({ ...record, prev: previous });
+    previous = sha256(line);
+    return line;
+  });
+  writeFileSync(journalPath(target.dir, RUN_ID, ATTEMPT, "probe"), `${lines.join("\n")}\n`);
+};
+
 let world: World;
 beforeEach(() => { world = new World(); });
 afterEach(() => { rmSync(world.root, { recursive: true, force: true }); });
@@ -397,6 +410,44 @@ describe("the staged probe lifecycle (mock provider — not live proof)", () => 
     const blockers = assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers;
     expect(blockers.filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL))).toEqual([]);
   });
+
+  for (const fault of ["postdispatch-only", "missing-201", "foreign-ref", "404-then-restored", "changed-sha-then-restored"] as const) {
+    it(`refuses ${fault} lifecycle evidence through both offline validators`, async () => {
+      const collected: any = await world.fullProbe();
+      rewriteProbeJournal(world, (records) => {
+        const dispatch = records.find((record: any) => record.type === "dispatch-intent");
+        const created = records.find((record: any) => record.type === "ref-create-result");
+        const initial = records.find((record: any) => record.type === "ref-readback" && record.seq > created.seq && record.seq < dispatch.seq);
+        if (fault === "missing-201") {
+          Object.assign(created.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null });
+        } else if (fault === "foreign-ref") {
+          initial.data.ref = "refs/heads/foreign-probe";
+        } else if (fault === "404-then-restored") {
+          Object.assign(initial.data, { http_status: 404, response_complete: true, response_incomplete: null, measured_status: 404, object_sha: null });
+        } else if (fault === "changed-sha-then-restored") {
+          initial.data.object_sha = world.otherSha;
+        } else {
+          Object.assign(initial.data, { http_status: 0, response_complete: false, response_incomplete: "transport-timeout", measured_status: null, object_sha: null });
+        }
+        if (fault !== "missing-201") {
+          const laterMatch = records.find((record: any) => record.type === "ref-readback" && record.seq > dispatch.seq
+            && record.data.response_complete === true && record.data.http_status === 200 && record.data.object_sha === world.sha);
+          expect(laterMatch).toBeDefined();
+        }
+      });
+
+      for (const environment of Object.keys(ENV_IDS)) expect(world.validate(collected.records[environment], environment)).toMatch(
+        fault === "missing-201" ? /creation is not a complete 201/ : /authenticated readback.*before dispatch|accumulated lifecycle/,
+      );
+      writeEvidenceFile(world.dir, evidenceSlug(RUN_ID, ATTEMPT, "environment"), {
+        schema_version: 1, phase: "environment-controls", run_id: RUN_ID, attempt: ATTEMPT,
+        controls: { [OFFBRANCH_CONTROL]: collected.records },
+      });
+      const blockers = assessEvidence({ dir: world.dir, runId: RUN_ID, attempt: ATTEMPT, now: () => new Date(world.clock + 1000) }).blockers
+        .filter((entry: any) => entry.detail.includes(OFFBRANCH_CONTROL));
+      expect(blockers).toHaveLength(2);
+    });
+  }
 
   it("retains the provider's exact bytes, create-once at mode 0600", async () => {
     await world.fullProbe();
